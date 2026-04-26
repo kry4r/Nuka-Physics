@@ -1,0 +1,107 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// nuka::scene::SceneIR – Canonical intermediate representation for scenes
+// ---------------------------------------------------------------------------
+
+#include "scene/canonical_types.hpp"
+#include "math/transform.hpp"
+
+#include <string>
+#include <vector>
+
+namespace nuka::scene {
+
+// ---------------------------------------------------------------------------
+// Record types
+// ---------------------------------------------------------------------------
+
+struct RigidBodyRecord {
+    std::string name;
+    BodyId id                              = kInvalidBody;
+    BodyId parent_id                       = kInvalidBody;
+    math::Transform local_transform        = math::Transform::Identity();
+    float mass                             = 1.0f;
+    math::Vec3 inertia                     = {1.0f, 1.0f, 1.0f};
+    bool is_static                         = false;
+};
+
+struct CollisionShapeRecord {
+    ShapeId id                             = 0;
+    BodyId body_id                         = kInvalidBody;
+    ShapeType type                         = ShapeType::Box;
+    math::Transform local_transform        = math::Transform::Identity();
+    math::Vec3 half_extents                = {0.5f, 0.5f, 0.5f};
+    float radius                           = 0.5f;
+    float half_height                      = 0.5f;
+};
+
+struct JointRecord {
+    std::string name;
+    JointId id                             = kInvalidJoint;
+    BodyId parent_body                     = kInvalidBody;
+    BodyId child_body                      = kInvalidBody;
+    JointType type                         = JointType::Revolute;
+    math::Vec3 axis                        = {0.0f, 0.0f, 1.0f};
+    math::Transform parent_frame           = math::Transform::Identity();
+    math::Transform child_frame            = math::Transform::Identity();
+    float lower_limit                      = -3.14159f;
+    float upper_limit                      =  3.14159f;
+    float damping                          = 0.0f;
+    float stiffness                        = 0.0f;
+};
+
+struct SensorRecord {
+    std::string name;
+    SensorId id                            = 0;
+    BodyId attached_body                   = kInvalidBody;
+    math::Transform local_transform        = math::Transform::Identity();
+};
+
+// ---------------------------------------------------------------------------
+// SceneIR
+// ---------------------------------------------------------------------------
+
+class SceneIR {
+public:
+    // -- mutators -----------------------------------------------------------
+    BodyId   AddRigidBody(std::string name);
+    BodyId   AddRigidBody(RigidBodyRecord record);
+
+    ShapeId  AddCollisionShape(BodyId body, ShapeType type);
+    ShapeId  AddCollisionShape(CollisionShapeRecord record);
+
+    JointId  AddJoint(std::string name, BodyId parent, BodyId child);
+    JointId  AddJoint(JointRecord record);
+
+    SensorId AddSensor(std::string name, BodyId body);
+
+    // -- counts -------------------------------------------------------------
+    size_t RigidBodyCount() const;
+    size_t JointCount()     const;
+    size_t ShapeCount()     const;
+    size_t SensorCount()    const;
+
+    // -- accessors ----------------------------------------------------------
+    const RigidBodyRecord&      GetBody(BodyId id)    const;
+    const JointRecord&          GetJoint(JointId id)  const;
+    const CollisionShapeRecord& GetShape(ShapeId id)  const;
+    const SensorRecord&         GetSensor(SensorId id) const;
+
+    RigidBodyRecord&      GetBodyMut(BodyId id);
+    JointRecord&          GetJointMut(JointId id);
+    CollisionShapeRecord& GetShapeMut(ShapeId id);
+
+    // -- bulk accessors -----------------------------------------------------
+    const std::vector<RigidBodyRecord>&      Bodies()  const;
+    const std::vector<JointRecord>&          Joints()  const;
+    const std::vector<CollisionShapeRecord>& Shapes()  const;
+    const std::vector<SensorRecord>&         Sensors() const;
+
+private:
+    std::vector<RigidBodyRecord>      bodies_;
+    std::vector<JointRecord>          joints_;
+    std::vector<CollisionShapeRecord> shapes_;
+    std::vector<SensorRecord>         sensors_;
+};
+
+} // namespace nuka::scene

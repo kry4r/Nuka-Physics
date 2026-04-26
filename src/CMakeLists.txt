@@ -23,6 +23,26 @@ target_include_directories(nuka_math
 )
 
 # ---------------------------------------------------------------------------
+# nuka_scene – Scene IR and runtime cooking
+# ---------------------------------------------------------------------------
+add_library(nuka_scene STATIC
+    scene/scene_ir.cpp
+    scene/cooker.cpp
+)
+
+target_include_directories(nuka_scene
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_scene
+    PUBLIC
+        nuka_math
+)
+
+nuka_set_warnings(nuka_scene)
+
+# ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
 # ---------------------------------------------------------------------------
 if(CMAKE_CUDA_COMPILER)

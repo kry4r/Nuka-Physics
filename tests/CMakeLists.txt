@@ -29,6 +29,20 @@ target_link_libraries(nuka_math_test
 
 gtest_discover_tests(nuka_math_test)
 
+# --- Scene tests -----------------------------------------------------------
+add_executable(nuka_scene_test
+    scene/test_scene_ir.cpp
+    scene/test_scene_cooker.cpp
+)
+
+target_link_libraries(nuka_scene_test
+    PRIVATE
+        nuka_scene
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_scene_test)
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test
