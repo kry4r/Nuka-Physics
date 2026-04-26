@@ -43,6 +43,20 @@ target_link_libraries(nuka_scene_test
 
 gtest_discover_tests(nuka_scene_test)
 
+# --- Import tests ----------------------------------------------------------
+add_executable(nuka_import_test
+    import/test_mjcf_importer.cpp
+    import/test_urdf_importer.cpp
+)
+
+target_link_libraries(nuka_import_test
+    PRIVATE
+        nuka_import
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_import_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test

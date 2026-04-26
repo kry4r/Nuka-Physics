@@ -43,6 +43,27 @@ target_link_libraries(nuka_scene
 nuka_set_warnings(nuka_scene)
 
 # ---------------------------------------------------------------------------
+# nuka_import – MJCF and URDF importers
+# ---------------------------------------------------------------------------
+add_library(nuka_import STATIC
+    import/mjcf_importer.cpp
+    import/urdf_importer.cpp
+)
+
+target_include_directories(nuka_import
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_import
+    PUBLIC
+        nuka_scene
+        tinyxml2::tinyxml2
+)
+
+nuka_set_warnings(nuka_import)
+
+# ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
 # ---------------------------------------------------------------------------
 if(CMAKE_CUDA_COMPILER)

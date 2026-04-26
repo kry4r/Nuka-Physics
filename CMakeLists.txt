@@ -42,8 +42,18 @@ endif()
 # ---------------------------------------------------------------------------
 # Third-party dependencies
 # ---------------------------------------------------------------------------
+include(FetchContent)
+
+# tinyxml2 (needed by importers)
+FetchContent_Declare(
+    tinyxml2
+    GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
+    GIT_TAG        10.0.0
+)
+set(tinyxml2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(tinyxml2)
+
 if(NK_BUILD_TESTS)
-    include(FetchContent)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
