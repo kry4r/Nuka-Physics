@@ -11,3 +11,13 @@ target_include_directories(nuka_core
 )
 
 nuka_set_warnings(nuka_core)
+
+# ---------------------------------------------------------------------------
+# nuka_math – header-only math library (Vec3, Quat, Transform, Spatial)
+# ---------------------------------------------------------------------------
+add_library(nuka_math INTERFACE)
+
+target_include_directories(nuka_math
+    INTERFACE
+        ${CMAKE_SOURCE_DIR}/src
+)
