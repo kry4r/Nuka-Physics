@@ -1,0 +1,228 @@
+// ---------------------------------------------------------------------------
+// nuka::solver – PGS iterative rigid body constraint solver
+// ---------------------------------------------------------------------------
+
+#include "solver/rigid_solver.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace nuka::solver {
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Dot product of two Vec3.
+inline float Dot(const math::Vec3& a, const math::Vec3& b) {
+    return a.Dot(b);
+}
+
+/// Compute the velocity error (Jv) for a single constraint row.
+inline float ComputeJv(
+    const constraint::ConstraintBlock& block,
+    uint32_t row,
+    const runtime::rigid::BodyState& body_a,
+    const runtime::rigid::BodyState& body_b)
+{
+    float jv = 0.0f;
+    jv += Dot(block.jacobian_linear_a[row],  body_a.linear_velocity);
+    jv += Dot(block.jacobian_angular_a[row], body_a.angular_velocity);
+    jv += Dot(block.jacobian_linear_b[row],  body_b.linear_velocity);
+    jv += Dot(block.jacobian_angular_b[row], body_b.angular_velocity);
+    return jv;
+}
+
+/// Apply an impulse delta to the two bodies referenced by a constraint row.
+inline void ApplyImpulse(
+    const constraint::ConstraintBlock& block,
+    uint32_t row,
+    float delta_impulse,
+    runtime::rigid::BodyState& body_a,
+    runtime::rigid::BodyState& body_b)
+{
+    // body A
+    body_a.linear_velocity  += block.jacobian_linear_a[row]  * (body_a.inv_mass * delta_impulse);
+    body_a.angular_velocity += math::Vec3{
+        block.jacobian_angular_a[row].x * body_a.inv_inertia.x,
+        block.jacobian_angular_a[row].y * body_a.inv_inertia.y,
+        block.jacobian_angular_a[row].z * body_a.inv_inertia.z
+    } * delta_impulse;
+
+    // body B
+    body_b.linear_velocity  += block.jacobian_linear_b[row]  * (body_b.inv_mass * delta_impulse);
+    body_b.angular_velocity += math::Vec3{
+        block.jacobian_angular_b[row].x * body_b.inv_inertia.x,
+        block.jacobian_angular_b[row].y * body_b.inv_inertia.y,
+        block.jacobian_angular_b[row].z * body_b.inv_inertia.z
+    } * delta_impulse;
+}
+
+/// Precompute effective mass for each constraint row.
+inline void PrecomputeEffectiveMass(
+    constraint::ConstraintBlock& block,
+    const runtime::rigid::BodyState& body_a,
+    const runtime::rigid::BodyState& body_b)
+{
+    for (uint32_t r = 0; r < block.row_count; ++r) {
+        float diag = 0.0f;
+
+        // Linear contribution
+        diag += body_a.inv_mass * Dot(block.jacobian_linear_a[r], block.jacobian_linear_a[r]);
+        diag += body_b.inv_mass * Dot(block.jacobian_linear_b[r], block.jacobian_linear_b[r]);
+
+        // Angular contribution (diagonal inertia)
+        const auto& ja = block.jacobian_angular_a[r];
+        diag += ja.x * ja.x * body_a.inv_inertia.x
+              + ja.y * ja.y * body_a.inv_inertia.y
+              + ja.z * ja.z * body_a.inv_inertia.z;
+
+        const auto& jb = block.jacobian_angular_b[r];
+        diag += jb.x * jb.x * body_b.inv_inertia.x
+              + jb.y * jb.y * body_b.inv_inertia.y
+              + jb.z * jb.z * body_b.inv_inertia.z;
+
+        block.effective_mass[r] = (diag > 1e-12f) ? (1.0f / diag) : 0.0f;
+    }
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// SolveConstraints – PGS solver
+// ---------------------------------------------------------------------------
+
+SolveResult SolveConstraints(
+    std::vector<constraint::ConstraintBlock>& blocks,
+    std::vector<runtime::rigid::BodyState>& bodies,
+    const SolverConfig& config)
+{
+    // Guard against empty input
+    if (blocks.empty() || bodies.empty()) {
+        return {0.0f, 0};
+    }
+
+    // Create a static "ground" body for constraints referencing body ~0u
+    runtime::rigid::BodyState ground_body{};  // zero inv_mass = infinite mass
+
+    // Precompute effective masses
+    for (auto& block : blocks) {
+        auto& ba = (block.body_a < bodies.size()) ? bodies[block.body_a] : ground_body;
+        auto& bb = (block.body_b < bodies.size()) ? bodies[block.body_b] : ground_body;
+        PrecomputeEffectiveMass(block, ba, bb);
+    }
+
+    // --- Velocity iterations (PGS) ---
+    for (uint32_t iter = 0; iter < config.velocity_iterations; ++iter) {
+        for (auto& block : blocks) {
+            auto& ba = (block.body_a < bodies.size()) ? bodies[block.body_a] : ground_body;
+            auto& bb = (block.body_b < bodies.size()) ? bodies[block.body_b] : ground_body;
+
+            for (uint32_t r = 0; r < block.row_count; ++r) {
+                float jv = ComputeJv(block, r, ba, bb);
+                float lambda = block.effective_mass[r] * (block.rhs[r] - jv);
+
+                // Accumulate and clamp
+                float old_impulse = block.impulse[r];
+                float new_impulse = old_impulse + lambda;
+                new_impulse = std::max(new_impulse, block.lower_limit[r]);
+                new_impulse = std::min(new_impulse, block.upper_limit[r]);
+                block.impulse[r] = new_impulse;
+
+                float delta = new_impulse - old_impulse;
+                if (std::abs(delta) > 1e-12f) {
+                    ApplyImpulse(block, r, delta, ba, bb);
+                }
+            }
+        }
+    }
+
+    // --- Position stabilization (Baumgarte) ---
+    float max_penetration = 0.0f;
+    for (uint32_t iter = 0; iter < config.position_iterations; ++iter) {
+        max_penetration = 0.0f;
+        for (auto& block : blocks) {
+            if (block.type != constraint::ConstraintType::Contact) continue;
+
+            auto& ba = (block.body_a < bodies.size()) ? bodies[block.body_a] : ground_body;
+            auto& bb = (block.body_b < bodies.size()) ? bodies[block.body_b] : ground_body;
+
+            for (uint32_t r = 0; r < block.row_count; ++r) {
+                // Use rhs as a proxy for penetration depth (negative = penetrating)
+                float penetration = -block.rhs[r];
+                if (penetration > max_penetration) {
+                    max_penetration = penetration;
+                }
+
+                // Baumgarte correction
+                float correction = config.baumgarte * std::max(penetration - config.slop, 0.0f);
+                if (correction > 1e-8f) {
+                    // Apply position correction along normal
+                    float eff_mass = block.effective_mass[r];
+                    float position_impulse = correction * eff_mass;
+
+                    if (block.body_a < bodies.size() && ba.inv_mass > 0.0f) {
+                        ba.position += block.jacobian_linear_a[r] * (ba.inv_mass * position_impulse);
+                    }
+                    if (block.body_b < bodies.size() && bb.inv_mass > 0.0f) {
+                        bb.position += block.jacobian_linear_b[r] * (bb.inv_mass * position_impulse);
+                    }
+                }
+            }
+        }
+    }
+
+    return {max_penetration, config.velocity_iterations};
+}
+
+// ---------------------------------------------------------------------------
+// SolveUnitGroundContact – unit-test helper
+// ---------------------------------------------------------------------------
+
+SolveResult SolveUnitGroundContact() {
+    // Create a single dynamic body resting on a ground plane (y = 0).
+    // The body is a 1 kg box at y = 0 (slightly penetrating).
+    std::vector<runtime::rigid::BodyState> bodies(1);
+    auto& body = bodies[0];
+    body.inv_mass = 1.0f;                              // 1 kg
+    body.inv_inertia = {6.0f, 6.0f, 6.0f};            // simplified
+    body.position = {0.0f, 0.0f, 0.0f};               // at ground level
+    body.linear_velocity = {0.0f, -9.81f * (1.0f / 60.0f), 0.0f}; // gravity impulse for one frame
+
+    // Build a contact constraint: ground (infinite mass) vs body 0
+    // Normal pointing up (y+), with slight penetration
+    constraint::ConstraintBlock contact{};
+    contact.type = constraint::ConstraintType::Contact;
+    contact.body_a = 0;       // dynamic body
+    contact.body_b = ~0u;     // ground (static, not in bodies array)
+    contact.row_count = 1;
+
+    // Normal row (contact normal = +Y)
+    contact.jacobian_linear_a[0]  = {0.0f, -1.0f, 0.0f};  // body moves down => violates
+    contact.jacobian_angular_a[0] = math::Vec3::Zero();
+    contact.jacobian_linear_b[0]  = {0.0f, 1.0f, 0.0f};
+    contact.jacobian_angular_b[0] = math::Vec3::Zero();
+    contact.rhs[0] = 0.0f;  // target relative velocity = 0 (resting)
+    contact.lower_limit[0] = 0.0f;       // normal force >= 0
+    contact.upper_limit[0] = 1e6f;       // no upper bound practically
+    contact.impulse[0] = 0.0f;
+
+    std::vector<constraint::ConstraintBlock> blocks;
+    blocks.push_back(contact);
+
+    SolverConfig config{};
+    config.velocity_iterations = 10;
+    config.position_iterations = 4;
+
+    auto result = SolveConstraints(blocks, bodies, config);
+
+    // After solving, the body should have near-zero downward velocity
+    // and minimal penetration
+    result.max_penetration = std::abs(bodies[0].position.y);
+
+    return result;
+}
+
+} // namespace nuka::solver

@@ -99,6 +99,34 @@ target_link_libraries(nuka_constraint_test
 
 gtest_discover_tests(nuka_constraint_test)
 
+# --- Solver tests ----------------------------------------------------------
+add_executable(nuka_solver_test
+    solver/test_contact_resting.cpp
+    solver/test_joint_limit.cpp
+)
+
+target_link_libraries(nuka_solver_test
+    PRIVATE
+        nuka_solver
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_solver_test)
+
+# --- Articulation tests ----------------------------------------------------
+add_executable(nuka_articulation_test
+    runtime/test_revolute_joint.cpp
+    runtime/test_joint_drive.cpp
+)
+
+target_link_libraries(nuka_articulation_test
+    PRIVATE
+        nuka_articulation
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_articulation_test)
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test

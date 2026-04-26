@@ -123,6 +123,46 @@ target_link_libraries(nuka_constraint
 nuka_set_warnings(nuka_constraint)
 
 # ---------------------------------------------------------------------------
+# nuka_solver – Iterative rigid body constraint solver (PGS)
+# ---------------------------------------------------------------------------
+add_library(nuka_solver STATIC
+    solver/rigid_solver.cpp
+)
+
+target_include_directories(nuka_solver
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_solver
+    PUBLIC
+        nuka_constraint
+        nuka_runtime
+)
+
+nuka_set_warnings(nuka_solver)
+
+# ---------------------------------------------------------------------------
+# nuka_articulation – Articulation graphs and joint drives
+# ---------------------------------------------------------------------------
+add_library(nuka_articulation STATIC
+    runtime/articulation/joint_constraints.cpp
+)
+
+target_include_directories(nuka_articulation
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_articulation
+    PUBLIC
+        nuka_constraint
+        nuka_runtime
+)
+
+nuka_set_warnings(nuka_articulation)
+
+# ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
 # ---------------------------------------------------------------------------
 if(CMAKE_CUDA_COMPILER)
