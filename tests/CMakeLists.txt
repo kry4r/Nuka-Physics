@@ -167,6 +167,36 @@ target_link_libraries(nuka_batch_test
 
 gtest_discover_tests(nuka_batch_test)
 
+# --- Regression tests ------------------------------------------------------
+add_executable(nuka_regression_test
+    regression/test_free_fall.cpp
+    regression/test_rest_stack.cpp
+    regression/test_two_link_arm.cpp
+)
+
+target_link_libraries(nuka_regression_test
+    PRIVATE
+        nuka_solver
+        nuka_articulation
+        nuka_collision
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_regression_test)
+
+# --- Performance tests -----------------------------------------------------
+add_executable(nuka_perf_test
+    perf/test_step_timing.cpp
+)
+
+target_link_libraries(nuka_perf_test
+    PRIVATE
+        nuka_runtime
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_perf_test)
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test
