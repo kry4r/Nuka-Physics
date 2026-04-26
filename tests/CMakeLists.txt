@@ -43,6 +43,20 @@ target_link_libraries(nuka_scene_test
 
 gtest_discover_tests(nuka_scene_test)
 
+# --- Runtime tests ---------------------------------------------------------
+add_executable(nuka_runtime_test
+    runtime/test_world_build.cpp
+    runtime/test_rigid_integration.cpp
+)
+
+target_link_libraries(nuka_runtime_test
+    PRIVATE
+        nuka_runtime
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_runtime_test)
+
 # --- Import tests ----------------------------------------------------------
 add_executable(nuka_import_test
     import/test_mjcf_importer.cpp

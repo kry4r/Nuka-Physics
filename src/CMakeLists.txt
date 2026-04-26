@@ -43,6 +43,26 @@ target_link_libraries(nuka_scene
 nuka_set_warnings(nuka_scene)
 
 # ---------------------------------------------------------------------------
+# nuka_runtime – Runtime containers, world building, rigid body integration
+# ---------------------------------------------------------------------------
+add_library(nuka_runtime STATIC
+    runtime/world_builder.cpp
+    runtime/rigid/integrator.cpp
+)
+
+target_include_directories(nuka_runtime
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_runtime
+    PUBLIC
+        nuka_scene
+)
+
+nuka_set_warnings(nuka_runtime)
+
+# ---------------------------------------------------------------------------
 # nuka_import – MJCF and URDF importers
 # ---------------------------------------------------------------------------
 add_library(nuka_import STATIC
