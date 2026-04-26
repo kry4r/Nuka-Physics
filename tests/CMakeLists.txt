@@ -127,6 +127,46 @@ target_link_libraries(nuka_articulation_test
 
 gtest_discover_tests(nuka_articulation_test)
 
+# --- Sensor tests ----------------------------------------------------------
+add_executable(nuka_sensor_test
+    sensor/test_imu_sensor.cpp
+    sensor/test_lidar_sensor.cpp
+)
+
+target_link_libraries(nuka_sensor_test
+    PRIVATE
+        nuka_sensor
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_sensor_test)
+
+# --- Debug draw tests ------------------------------------------------------
+add_executable(nuka_debug_draw_test
+    apps/test_debug_draw_list.cpp
+)
+
+target_link_libraries(nuka_debug_draw_test
+    PRIVATE
+        nuka_debug_draw
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_debug_draw_test)
+
+# --- Batch context tests ---------------------------------------------------
+add_executable(nuka_batch_test
+    runtime/test_batch_context.cpp
+)
+
+target_link_libraries(nuka_batch_test
+    PRIVATE
+        nuka_runtime
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_batch_test)
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test

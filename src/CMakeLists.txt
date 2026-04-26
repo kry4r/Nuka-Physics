@@ -48,6 +48,7 @@ nuka_set_warnings(nuka_scene)
 add_library(nuka_runtime STATIC
     runtime/world_builder.cpp
     runtime/rigid/integrator.cpp
+    runtime/batch_scheduler.cpp
 )
 
 target_include_directories(nuka_runtime
@@ -161,6 +162,47 @@ target_link_libraries(nuka_articulation
 )
 
 nuka_set_warnings(nuka_articulation)
+
+# ---------------------------------------------------------------------------
+# nuka_sensor – Sensor graph and queries
+# ---------------------------------------------------------------------------
+add_library(nuka_sensor STATIC
+    sensor/state_sensor.cpp
+    sensor/ray_sensor.cpp
+)
+
+target_include_directories(nuka_sensor
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_sensor
+    PUBLIC
+        nuka_runtime
+        nuka_collision
+)
+
+nuka_set_warnings(nuka_sensor)
+
+# ---------------------------------------------------------------------------
+# nuka_debug_draw – Debug draw command list (no GPU dependency)
+# ---------------------------------------------------------------------------
+add_library(nuka_debug_draw STATIC
+    apps/debug_shell/debug_draw.cpp
+)
+
+target_include_directories(nuka_debug_draw
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_debug_draw
+    PUBLIC
+        nuka_collision
+        nuka_math
+)
+
+nuka_set_warnings(nuka_debug_draw)
 
 # ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
