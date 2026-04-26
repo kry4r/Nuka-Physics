@@ -71,6 +71,34 @@ target_link_libraries(nuka_import_test
 
 gtest_discover_tests(nuka_import_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# --- Collision tests -------------------------------------------------------
+add_executable(nuka_collision_test
+    collision/test_raycast.cpp
+    collision/test_broadphase.cpp
+)
+
+target_link_libraries(nuka_collision_test
+    PRIVATE
+        nuka_collision
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_collision_test)
+
+# --- Constraint tests ------------------------------------------------------
+add_executable(nuka_constraint_test
+    constraint/test_contact_manifold.cpp
+    constraint/test_constraint_block.cpp
+)
+
+target_link_libraries(nuka_constraint_test
+    PRIVATE
+        nuka_constraint
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_constraint_test)
+
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test

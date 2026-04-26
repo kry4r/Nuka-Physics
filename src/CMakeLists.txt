@@ -84,6 +84,45 @@ target_link_libraries(nuka_import
 nuka_set_warnings(nuka_import)
 
 # ---------------------------------------------------------------------------
+# nuka_collision – broadphase and geometry queries
+# ---------------------------------------------------------------------------
+add_library(nuka_collision STATIC
+    collision/query.cpp
+    collision/dynamic_broadphase.cpp
+)
+
+target_include_directories(nuka_collision
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_collision
+    PUBLIC
+        nuka_math
+)
+
+nuka_set_warnings(nuka_collision)
+
+# ---------------------------------------------------------------------------
+# nuka_constraint – contact manifolds and constraint blocks
+# ---------------------------------------------------------------------------
+add_library(nuka_constraint STATIC
+    constraint/contact_builder.cpp
+)
+
+target_include_directories(nuka_constraint
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_constraint
+    PUBLIC
+        nuka_math
+)
+
+nuka_set_warnings(nuka_constraint)
+
+# ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
 # ---------------------------------------------------------------------------
 if(CMAKE_CUDA_COMPILER)
