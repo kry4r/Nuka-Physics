@@ -158,3 +158,142 @@ TEST(WorldStepper, UsesPlaneShapeTransformWhenGeneratingContacts) {
     EXPECT_EQ(report.contact_manifold_count, 1u);
     EXPECT_GT(world.instance.poses[box_id].position.y, 1.48f);
 }
+
+TEST(WorldStepper, SolvesCookedRevoluteJointAnchors) {
+    nuka::scene::SceneIR scene;
+
+    nuka::scene::RigidBodyRecord base;
+    base.name = "base";
+    base.is_static = true;
+    base.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto base_id = scene.AddRigidBody(std::move(base));
+
+    nuka::scene::RigidBodyRecord link;
+    link.name = "link";
+    link.mass = 1.0f;
+    link.inertia = {1.0f, 1.0f, 1.0f};
+    link.local_transform.position = {0.0f, 1.0f, 0.0f};
+    const auto link_id = scene.AddRigidBody(std::move(link));
+
+    nuka::scene::JointRecord joint;
+    joint.name = "hinge";
+    joint.type = nuka::scene::JointType::Revolute;
+    joint.parent_body = base_id;
+    joint.child_body = link_id;
+    joint.axis = nuka::math::Vec3::UnitZ();
+    joint.parent_frame.position = nuka::math::Vec3::Zero();
+    joint.child_frame.position = nuka::math::Vec3::Zero();
+    scene.AddJoint(std::move(joint));
+
+    auto world = nuka::runtime::BuildWorld(nuka::scene::CookScene(scene));
+    world.instance.linear_velocities[link_id] = {0.0f, -1.0f, 0.0f};
+
+    nuka::runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 60.0f;
+    options.enable_contacts = false;
+    options.solver_position_iterations = 12;
+    options.solver_baumgarte = 0.5f;
+    options.solver_slop = 0.0f;
+
+    const auto report = nuka::runtime::StepWorldInstance(world.template_view,
+                                                         world.instance,
+                                                         options);
+
+    EXPECT_EQ(report.joint_constraint_count, 1u);
+    EXPECT_EQ(report.constraint_block_count, 1u);
+    EXPECT_GE(report.constraint_row_count, 5u);
+    EXPECT_NEAR(world.instance.poses[link_id].position.y, 0.0f, 1e-3f);
+}
+
+TEST(WorldStepper, AppliesCookedVelocityActuatorAsDriveConstraint) {
+    nuka::scene::SceneIR scene;
+
+    const auto parent_id = scene.AddRigidBody("parent");
+
+    nuka::scene::RigidBodyRecord child;
+    child.name = "child";
+    child.mass = 1.0f;
+    child.inertia = {1.0f, 1.0f, 1.0f};
+    const auto child_id = scene.AddRigidBody(std::move(child));
+
+    nuka::scene::JointRecord joint;
+    joint.name = "hinge";
+    joint.type = nuka::scene::JointType::Revolute;
+    joint.parent_body = parent_id;
+    joint.child_body = child_id;
+    joint.axis = nuka::math::Vec3::UnitZ();
+    const auto joint_id = scene.AddJoint(std::move(joint));
+
+    nuka::scene::ActuatorRecord actuator;
+    actuator.name = "velocity_motor";
+    actuator.type = nuka::scene::ActuatorType::Velocity;
+    actuator.joint_id = joint_id;
+    actuator.gain = 4.0f;
+    actuator.force_limit = 20.0f;
+    scene.AddActuator(std::move(actuator));
+
+    auto world = nuka::runtime::BuildWorld(nuka::scene::CookScene(scene));
+
+    nuka::runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 60.0f;
+    options.enable_contacts = false;
+    options.solver_position_iterations = 0;
+
+    const auto report = nuka::runtime::StepWorldInstance(world.template_view,
+                                                         world.instance,
+                                                         options);
+
+    EXPECT_EQ(report.drive_constraint_count, 1u);
+    EXPECT_GT(world.instance.angular_velocities[child_id].z, 0.0f);
+}
+
+TEST(WorldStepper, MaintainsCookedVelocityActuatorTargetAcrossSteps) {
+    nuka::scene::SceneIR scene;
+
+    const auto parent_id = scene.AddRigidBody("parent");
+
+    nuka::scene::RigidBodyRecord child;
+    child.name = "child";
+    child.mass = 1.0f;
+    child.inertia = {1.0f, 1.0f, 1.0f};
+    const auto child_id = scene.AddRigidBody(std::move(child));
+
+    nuka::scene::JointRecord joint;
+    joint.name = "hinge";
+    joint.type = nuka::scene::JointType::Revolute;
+    joint.parent_body = parent_id;
+    joint.child_body = child_id;
+    joint.axis = nuka::math::Vec3::UnitZ();
+    const auto joint_id = scene.AddJoint(std::move(joint));
+
+    nuka::scene::ActuatorRecord actuator;
+    actuator.name = "velocity_motor";
+    actuator.type = nuka::scene::ActuatorType::Velocity;
+    actuator.joint_id = joint_id;
+    actuator.gain = 2.0f;
+    actuator.force_limit = 20.0f;
+    scene.AddActuator(std::move(actuator));
+
+    auto world = nuka::runtime::BuildWorld(nuka::scene::CookScene(scene));
+
+    nuka::runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 60.0f;
+    options.enable_contacts = false;
+    options.solver_position_iterations = 0;
+
+    nuka::runtime::WorldStepReport report;
+    for (int step = 0; step < 8; ++step) {
+        report = nuka::runtime::StepWorldInstance(world.template_view,
+                                                  world.instance,
+                                                  options);
+    }
+
+    EXPECT_EQ(report.drive_constraint_count, 1u);
+    const float relative_velocity =
+        world.instance.angular_velocities[child_id].z
+        - world.instance.angular_velocities[parent_id].z;
+    EXPECT_NEAR(relative_velocity, 2.0f, 1e-4f);
+}

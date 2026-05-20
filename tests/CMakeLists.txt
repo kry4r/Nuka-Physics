@@ -190,6 +190,7 @@ target_link_libraries(nuka_regression_test
         nuka_solver
         nuka_articulation
         nuka_collision
+        nuka_runtime
         GTest::gtest_main
 )
 
@@ -217,6 +218,7 @@ gtest_discover_tests(nuka_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_phi_test
         phi/test_capabilities.cpp
+        phi/test_platform_contract.cpp
     )
 
     target_link_libraries(nuka_phi_test
@@ -227,3 +229,16 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_phi_test)
 endif()
+
+# --- Vulkan renderer tests -------------------------------------------------
+add_executable(nuka_render_test
+    render/test_vulkan_backend.cpp
+)
+
+target_link_libraries(nuka_render_test
+    PRIVATE
+        nuka_render
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_render_test)

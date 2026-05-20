@@ -28,6 +28,8 @@ struct WorldStepReport {
     uint32_t broadphase_pair_count = 0;
     uint32_t contact_manifold_count = 0;
     uint32_t contact_point_count = 0;
+    uint32_t joint_constraint_count = 0;
+    uint32_t drive_constraint_count = 0;
     uint32_t constraint_block_count = 0;
     uint32_t constraint_row_count = 0;
     uint32_t solver_iterations_used = 0;

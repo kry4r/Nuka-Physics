@@ -61,6 +61,7 @@ target_include_directories(nuka_runtime
 
 add_library(nuka_render STATIC
     render/render_scene.cpp
+    render/vulkan_renderer.cpp
 )
 
 target_include_directories(nuka_render
@@ -71,6 +72,7 @@ target_include_directories(nuka_render
 target_link_libraries(nuka_render
     PUBLIC
         nuka_scene
+        Vulkan::Vulkan
 )
 
 nuka_set_warnings(nuka_render)
@@ -175,16 +177,6 @@ target_link_libraries(nuka_solver
 
 nuka_set_warnings(nuka_solver)
 
-target_link_libraries(nuka_runtime
-    PUBLIC
-        nuka_scene
-        nuka_collision
-        nuka_constraint
-        nuka_solver
-)
-
-nuka_set_warnings(nuka_runtime)
-
 # ---------------------------------------------------------------------------
 # nuka_articulation – Articulation graphs and joint drives
 # ---------------------------------------------------------------------------
@@ -200,10 +192,20 @@ target_include_directories(nuka_articulation
 target_link_libraries(nuka_articulation
     PUBLIC
         nuka_constraint
-        nuka_runtime
 )
 
 nuka_set_warnings(nuka_articulation)
+
+target_link_libraries(nuka_runtime
+    PUBLIC
+        nuka_scene
+        nuka_collision
+        nuka_constraint
+        nuka_articulation
+        nuka_solver
+)
+
+nuka_set_warnings(nuka_runtime)
 
 # ---------------------------------------------------------------------------
 # nuka_sensor – Sensor graph and queries

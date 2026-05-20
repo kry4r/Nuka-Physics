@@ -6,7 +6,7 @@
 
 **Architecture:** The implementation starts with core infrastructure, then builds canonical scene compilation, PHI, runtime containers, rigid simulation, collision, constraints, articulation, sensors, and debug tooling in that order. Every runtime-facing feature is compiled from authoring formats into canonical IR and then cooked into device-friendly runtime blobs. The hot path lives in CUDA-oriented data layouts while host code owns orchestration, compilation, tooling, and verification.
 
-**Tech Stack:** C++20, CUDA, CMake, GoogleTest, Python 3.11, GLFW, OpenGL, Dear ImGui, tinyxml2, USD SDK, optional pybind11 for tooling bindings.
+**Tech Stack:** C++20, CUDA, Vulkan, CMake, GoogleTest, Python 3.11, Dear ImGui, tinyxml2, USD SDK, optional pybind11 for tooling bindings.
 
 **Execution Notes:** Use `@superpowers:test-driven-development` and `@superpowers:verification-before-completion` during execution. If the repository is still not a Git repo when execution starts, run Task 1 first to initialize it before attempting task commits.
 
@@ -974,7 +974,9 @@ Expected: debug shell scaffolding does not exist.
 uint32_t BuildContactOverlayCommandCount(uint32_t contacts);
 ```
 
-Implementation goal: create a native app target that opens an ImGui + OpenGL window and can render contact, AABB, and joint-frame overlays.
+Implementation goal: create a native app target with a Vulkan production
+renderer and ImGui controls that can render contact, AABB, and joint-frame
+overlays. The headless PPM rasterizer remains only a CI/reference artifact path.
 
 **Step 4: Run test to verify it passes**
 

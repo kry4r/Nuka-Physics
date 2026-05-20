@@ -98,6 +98,8 @@ constraint::ConstraintBlock BuildDriveConstraint(
     const JointDrive& drive,
     float current_velocity)
 {
+    (void)current_velocity;
+
     constraint::ConstraintBlock block{};
     block.type = constraint::ConstraintType::Drive;
     block.body_a = body_a;
@@ -111,9 +113,9 @@ constraint::ConstraintBlock BuildDriveConstraint(
     block.jacobian_linear_b[0]  = math::Vec3::Zero();
     block.jacobian_angular_b[0] = -norm_axis;
 
-    // Drive target: rhs encodes the desired velocity change
-    float velocity_error = drive.target_velocity - current_velocity;
-    block.rhs[0] = drive.damping * velocity_error;
+    // Drive target: rhs stores the desired relative row velocity. The solver
+    // computes rhs - Jv, so current velocity must not be subtracted here.
+    block.rhs[0] = drive.target_velocity;
 
     block.lower_limit[0] = -drive.max_force;
     block.upper_limit[0] = drive.max_force;

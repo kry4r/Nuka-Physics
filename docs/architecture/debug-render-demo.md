@@ -1,15 +1,17 @@
 # Imported Scene Debug Render Demo
 
 `nuka_scene_demo` is the current runnable rendering demonstration for the engine.
-It is intentionally headless so it can run in CI and on machines without a window
-system while still exercising the same scene and debug visualization path that a
-native viewport will use.
+It is intentionally headless so it can run in CI while still exercising the same
+scene and debug visualization command source that the Vulkan production viewport
+will consume.
 
 ## Pipeline
 
 1. Load an input scene through `LoadMjcf`, `LoadUrdf`, or `LoadUsd`.
 2. Compile it with `scene::BuildCompiledScene()`.
-3. Advance the compiled `PhysicsWorld` instance with `runtime::StepWorldInstance()`.
+3. Advance the compiled `PhysicsWorld` instance with the CPU reference
+   `runtime::StepWorldInstance()` path until the CUDA production stepper replaces
+   it.
 4. Synchronize simulated body poses into `SceneGraph` and `RenderScene` with
    `scene::ApplyRuntimeStateToCompiledScene()`.
 5. Generate debug overlays with `app::BuildDebugVisualization()`.
@@ -21,6 +23,9 @@ The headless rasterizer uses an X/Y physics-plane projection for debug output.
 bounds so simulated bodies remain visible after large vertical motion. Tests also
 cover a fixed-view path to prove the PPM bytes change when runtime body poses
 change.
+
+The production rendering backend is Vulkan. The headless PPM output is a
+deterministic regression artifact, not the long-term interactive renderer.
 
 The demo currently supports `.xml`, `.urdf`, text `.usd`, and `.usda` inputs.
 Binary `.usd`, `.usdc`, and `.usdz` still route through the isolated USD adapter

@@ -1,6 +1,6 @@
 # Nuka Physics Engine
 
-A high-performance, GPU-ready physics engine designed for robotics simulation,
+A high-performance, CUDA-first physics engine designed for robotics simulation,
 reinforcement learning, and real-time applications.
 
 ## Features
@@ -13,7 +13,10 @@ reinforcement learning, and real-time applications.
 - Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
 - Isolated USD stage adapter with explicit `.usd`/`.usda`/`.usdc`/`.usdz` routing and an OpenUSD SDK backend boundary for binary USD/USDZ
 - Batched simulation via WorldTemplate/Instance for parallel environments
-- Optional GPU acceleration through the PHI (Platform Hardware Interface) layer
+- CUDA is the preferred/default production physics backend through the PHI
+  (Platform Hardware Interface) backend selection layer
+- Vulkan is the required production rendering backend; the current headless PPM
+  debug rasterizer remains a deterministic CI/reference artifact path
 - Debug draw and visualization utilities for collision proxies, AABBs, joints, contacts, centers of mass, and constraint errors
 
 ## Quick Start
@@ -22,7 +25,8 @@ reinforcement learning, and real-time applications.
 
 - CMake 3.20+
 - C++20 compiler (MSVC, GCC, or Clang)
-- (Optional) CUDA Toolkit for GPU acceleration
+- CUDA Toolkit for the preferred production physics backend
+- Vulkan SDK for the production rendering backend
 
 ### Configure
 
@@ -90,7 +94,10 @@ For detailed architecture documentation see:
 - **Language**: C++20
 - **Build System**: CMake
 - **Testing**: Google Test
-- **GPU**: CUDA (optional, via PHI abstraction)
+- **Physics backend**: CUDA preferred by default via PHI backend selection;
+  CPU reference is kept for validation/orchestration only
+- **Rendering backend**: Vulkan production backend with headless debug raster
+  output for CI artifacts
 - **CI**: GitHub Actions
 
 ## Project Structure

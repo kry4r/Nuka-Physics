@@ -5,6 +5,16 @@ All tests in this matrix must pass on every commit before merge.
 
 ## Regression Tests
 
+## Platform Contract Tests
+
+| Test Name | File | Description | Required Backend |
+|-----------|------|-------------|------------------|
+| PlatformContract/RequiresCudaForProductionPhysics | `tests/phi/test_platform_contract.cpp` | Verifies the PHI platform contract keeps CUDA as the production physics backend and CPU as reference-only | CUDA, CPU reference |
+| PlatformContract/DefaultSelectionPrefersCudaOnThisWorkstation | `tests/phi/test_platform_contract.cpp` | Verifies the backend selection API resolves the default policy to CUDA on this machine | CUDA |
+| PlatformContract/CpuReferenceSelectionIsMarkedValidationOnly | `tests/phi/test_platform_contract.cpp` | Verifies explicit CPU selection remains validation/reference-only | CPU reference |
+| VulkanRenderer/CreatesInstanceAndEnumeratesPhysicalDevices | `tests/render/test_vulkan_backend.cpp` | Verifies the Vulkan production renderer backend can create an instance and see a physical device | Vulkan |
+| VulkanRenderer/DeclaresVulkanAsProductionBackend | `tests/render/test_vulkan_backend.cpp` | Verifies Vulkan is the declared production render backend | Vulkan |
+
 ## Import Regression Tests
 
 | Test Name | File | Description | Required Records |
@@ -58,6 +68,10 @@ All tests in this matrix must pass on every commit before merge.
 | WorldStepper/AppliesForcesTorquesAndClearsAccumulatorsAfterEachStep | `tests/runtime/test_world_stepper.cpp` | Applies force and torque accumulators through body tables and clears them after stepping | Velocity/accumulators | expected values / zeroed accumulators |
 | WorldStepper/GeneratesCookedShapeContactsAndSolvesAgainstStaticPlane | `tests/runtime/test_world_stepper.cpp` | Cooked plane and box shapes flow through broadphase, contact manifold generation, contact constraint assembly, PGS solve, and pose writeback | contact report, velocity, pose | one manifold, contact rows, no downward velocity, depenetrated pose |
 | WorldStepper/UsesPlaneShapeTransformWhenGeneratingContacts | `tests/runtime/test_world_stepper.cpp` | Plane contact generation honors cooked local/world shape transforms instead of assuming y=0 | contact report, pose | one manifold, raised-plane depenetration |
+| WorldStepper/SolvesCookedRevoluteJointAnchors | `tests/runtime/test_world_stepper.cpp` | Cooked revolute joint records emit runtime joint constraints and project child anchors onto parent anchors | joint report, constraint rows, child pose | one joint block, five rows, anchor gap corrected |
+| WorldStepper/AppliesCookedVelocityActuatorAsDriveConstraint | `tests/runtime/test_world_stepper.cpp` | Cooked velocity actuator records emit drive constraints and change child angular velocity along the joint axis | drive report, angular velocity | one drive block, positive child angular velocity |
+| SceneCooker/CooksJoints | `tests/scene/test_scene_cooker.cpp` | Cooked joint tables preserve parent/child body ids, axes, limits, and local joint frames | joint table | exact authored fields |
+| WorldBuild/CopiesJointFramesAndActuatorsIntoTemplate | `tests/runtime/test_world_build.cpp` | Runtime templates retain cooked joint frames and actuator rows for stepper constraint assembly | WorldTemplate | frames, actuator count, gains, limits preserved |
 | ConstraintBlock/ContactPenetrationPropagatesToPositionError | `tests/constraint/test_constraint_block.cpp` | Manifold penetration becomes position error instead of velocity rhs | position_error, rhs | penetration in position_error and zero velocity rhs |
 
 ## Performance Tests
@@ -68,6 +82,7 @@ All tests in this matrix must pass on every commit before merge.
 | StepTiming/ThousandStepsSingleBody | `tests/perf/test_step_timing.cpp` | 1000 steps on 1 body | Wall time | < 1000 ms |
 | StepTiming/ContactMaterialSolveUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 PGS contact-material solves over 64 bodies with friction and restitution rows | Wall time | < 1000 ms |
 | StepTiming/RuntimeContactPipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 48 cooked dynamic boxes and a static plane through broadphase, narrowphase, contact builder, solver, and integration | Wall time | < 1000 ms |
+| StepTiming/RuntimeJointDrivePipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 32 cooked revolute joints and velocity drives through joint/drive constraint assembly, PGS solve, and integration | Wall time | < 1000 ms |
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool

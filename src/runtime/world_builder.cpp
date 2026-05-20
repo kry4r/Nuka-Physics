@@ -14,9 +14,11 @@ BuiltWorld BuildWorld(const scene::CookedBlob& blob) {
     tmpl.body_count    = blob.body_count;
     tmpl.joint_count   = blob.joint_count;
     tmpl.shape_count   = blob.shape_count;
+    tmpl.actuator_count = blob.actuator_count;
     tmpl.body_table    = blob.bodies;
     tmpl.joint_table   = blob.joints;
     tmpl.shape_table   = blob.shapes;
+    tmpl.actuator_table = blob.actuators;
 
     // --- Instance: initialise mutable state ---
     auto& inst        = result.instance;

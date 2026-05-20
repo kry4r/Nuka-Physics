@@ -27,21 +27,40 @@ Each instance evolves independently during simulation.
 
 ### World Stepper
 
-`runtime::StepWorldInstance()` advances a `WorldInstance` against its
-`WorldTemplate` with fixed-step CPU simulation. It converts each body row into
-the rigid `BodyState`, applies gravity and accumulated forces/torques, builds
-shape proxies from cooked box/sphere/capsule/plane data, runs the dynamic
-broadphase over shape AABBs, generates contact manifolds for plane, sphere, and
-box-style contacts, assembles contact constraints, invokes the PGS solver, then
-integrates velocities and writes poses back. Cooked body poses are stored in
-world space so imported hierarchies start simulation from the same transforms
-used by `SceneGraph`.
+Production simulation is selected through PHI and must prefer the CUDA backend
+on this workstation. `phi::ResolvePhysicsBackend()` is the API boundary for that
+selection layer: the default policy resolves to CUDA when a device is available,
+while the CPU path is explicitly marked as reference-only for deterministic
+validation, differential checks, and host-side debugging.
+
+`runtime::StepWorldInstance()` is the current fixed-step CPU reference stepper.
+It advances a `WorldInstance` against its `WorldTemplate` by converting each
+body row into the rigid `BodyState`, applying gravity and accumulated
+forces/torques, building shape proxies from cooked box/sphere/capsule/plane
+data, running the dynamic broadphase over shape AABBs, generating contact
+manifolds for plane, sphere, and box-style contacts, assembling contact
+constraints, adding cooked joint constraints and actuator drive rows, invoking
+the PGS solver, then integrating velocities and writing poses back. Cooked body
+poses are stored in world space so imported hierarchies start simulation from
+the same transforms used by `SceneGraph`.
 
 `StepWorldInstance()` returns a `WorldStepReport` with step count, broadphase
 pairs, contact manifolds/points, constraint blocks/rows, solver iterations, and
 maximum constraint error. Tests and demos use the report to prove the imported
 scene path is exercising the physical contact pipeline instead of only advancing
-free bodies.
+free bodies. The next production stepper must preserve the same report contract
+while moving broadphase, narrowphase, constraint assembly, solver iterations,
+and integration into CUDA-resident buffers/kernels.
+
+Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
+projection uses authoring anchors instead of assuming every joint is body-center
+to body-center. Revolute joints currently map to the five-row maximal-coordinate
+constraint builder; fixed joints add the sixth rotational lock row. Prismatic,
+spherical, and free joints are routed through the same revolute-style anchor
+projection until their specialized rows are implemented. Cooked velocity,
+motor, force, and position actuator records emit drive constraint rows against
+their target joint; velocity-style actuators interpret `gain` as target velocity
+and `force_limit` as the clamp.
 
 ### BatchContext / BatchScheduler
 
@@ -71,17 +90,18 @@ debugging a simulated frame.
 
 `app::BuildDebugVisualization()` consumes the compiled `RenderScene`,
 `PhysicsWorld`, and `SceneGraph`, plus optional contact manifolds and constraint
-blocks, and emits a GPU-independent `DebugDrawList`. The bridge covers collision
-shape proxies, shape AABBs, joint axes, centers of mass, contact points/normals,
-and constraint error vectors. Native shells and future renderers should consume
-this command list instead of re-deriving overlay geometry from raw physics state.
+blocks, and emits a renderer-independent `DebugDrawList`. The bridge covers
+collision shape proxies, shape AABBs, joint axes, centers of mass, contact
+points/normals, and constraint error vectors. Native shells and renderers should
+consume this command list instead of re-deriving overlay geometry from raw
+physics state.
 
 `nuka_scene_demo` is the current runnable debug render path. It imports a scene,
-builds the compiled runtime views, steps the runtime instance with fixed-step
-simulation, synchronizes simulated poses to render/debug views, emits the debug
+builds the compiled runtime views, steps the runtime instance with the reference
+stepper, synchronizes simulated poses to render/debug views, emits the debug
 draw command list, and rasterizes it through the headless renderer to a PPM
 image. This keeps the demo usable in CI while preserving the same command source
-that a native OpenGL/ImGui viewport will consume.
+that the Vulkan viewport/backend will consume.
 
 ## Domain Modules
 
@@ -126,27 +146,39 @@ Each simulation step follows this pipeline:
 3. **Broadphase** -- identify potentially colliding pairs.
 4. **Narrow-phase / contact generation** -- compute contact manifolds.
 5. **Constraint assembly** -- collect contact and joint constraint blocks.
-6. **Iterative solve** (PGS) -- resolve contact, friction, restitution, joint,
+6. **Actuator assembly** -- convert cooked actuator records into drive rows.
+7. **Iterative solve** (PGS) -- resolve contact, friction, restitution, joint,
    and drive rows, producing velocity corrections.
-7. **Position projection** -- apply Baumgarte contact correction and
+8. **Position projection** -- apply Baumgarte contact correction and
    mass/inertia-weighted joint anchor projection. Joint projection computes
    world-space parent/child anchor separation, distributes linear correction by
    inverse mass, and applies angular correction through diagonal inverse inertia
    for eccentric anchors. Static bodies keep zero inverse mass/inertia and do
    not move.
-8. **Velocity integration** -- advance positions and orientations.
-9. **Sensor update** -- read joint states, compute IMU/lidar readings.
+9. **Velocity integration** -- advance positions and orientations.
+10. **Sensor update** -- read joint states, compute IMU/lidar readings.
 
 ## PHI Layer
 
-The Platform Hardware Interface (PHI) abstracts GPU compute and memory management.
-When a CUDA-capable device is available the solver and broadphase can offload work
-to the GPU via PHI kernels. On CPU-only builds the same API falls back to a
-single-threaded reference implementation.
+The Platform Hardware Interface (PHI) abstracts physics backend selection, GPU
+compute, and memory management. The default selection policy is
+`PreferCuda`: on this workstation production physics resolves to CUDA. The CPU
+backend remains available only as a reference path for validation, not as the
+performance target.
 
 Key PHI concepts:
 
 - **Device / Context** -- enumerate and select compute devices.
+- **Backend selection** -- resolve CUDA production or CPU reference execution
+  before constructing runtime device state.
 - **Buffer** -- typed GPU memory with upload / download helpers.
 - **Kernel** -- compute shader dispatch with grid/block configuration.
 - **Capabilities** -- runtime feature queries (shared memory size, warp width, etc.).
+
+## Vulkan Rendering Contract
+
+The production renderer backend is Vulkan. `render::ProbeVulkanRenderer()`
+creates a Vulkan instance and enumerates physical devices so tests can prove the
+required graphics path is available on the workstation. The existing headless
+debug rasterizer is still useful for deterministic CI artifacts, but it is not
+the production renderer target.

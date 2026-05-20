@@ -201,3 +201,68 @@ TEST(StepTiming, RuntimeContactPipelineUnderOneSecond) {
     EXPECT_GT(last_report.constraint_row_count, 0u);
     EXPECT_LT(ms, 1000) << "runtime contact pipeline took " << ms << " ms";
 }
+
+TEST(StepTiming, RuntimeJointDrivePipelineUnderOneSecond) {
+    scene::SceneIR scene;
+    constexpr int joint_count = 32;
+
+    for (int i = 0; i < joint_count; ++i) {
+        scene::RigidBodyRecord parent;
+        parent.name = "parent";
+        parent.is_static = true;
+        parent.local_transform.position = {static_cast<float>(i), 0.0f, 0.0f};
+        const auto parent_id = scene.AddRigidBody(std::move(parent));
+
+        scene::RigidBodyRecord child;
+        child.name = "child";
+        child.mass = 1.0f;
+        child.inertia = {1.0f, 1.0f, 1.0f};
+        child.local_transform.position = {static_cast<float>(i), 0.02f, 0.0f};
+        const auto child_id = scene.AddRigidBody(std::move(child));
+
+        scene::JointRecord joint;
+        joint.name = "hinge";
+        joint.type = scene::JointType::Revolute;
+        joint.parent_body = parent_id;
+        joint.child_body = child_id;
+        joint.axis = math::Vec3::UnitZ();
+        const auto joint_id = scene.AddJoint(std::move(joint));
+
+        scene::ActuatorRecord actuator;
+        actuator.name = "drive";
+        actuator.type = scene::ActuatorType::Velocity;
+        actuator.joint_id = joint_id;
+        actuator.gain = 2.0f;
+        actuator.force_limit = 10.0f;
+        scene.AddActuator(std::move(actuator));
+    }
+
+    auto world = runtime::BuildWorld(scene::CookScene(scene));
+
+    runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 120.0f;
+    options.enable_contacts = false;
+    options.solver_velocity_iterations = 8;
+    options.solver_position_iterations = 4;
+    options.solver_baumgarte = 0.5f;
+    options.solver_slop = 0.0f;
+
+    runtime::WorldStepReport last_report;
+    auto start = std::chrono::high_resolution_clock::now();
+
+    constexpr int step_count = 120;
+    for (int step = 0; step < step_count; ++step) {
+        last_report = runtime::StepWorldInstance(world.template_view,
+                                                 world.instance,
+                                                 options);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    EXPECT_EQ(last_report.joint_constraint_count, static_cast<uint32_t>(joint_count));
+    EXPECT_EQ(last_report.drive_constraint_count, static_cast<uint32_t>(joint_count));
+    EXPECT_GT(world.instance.angular_velocities[1].z, 0.0f);
+    EXPECT_LT(ms, 1000) << "runtime joint-drive pipeline took " << ms << " ms";
+}

@@ -52,6 +52,8 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.joints.parent_bodies.reserve(joints.size());
     blob.joints.child_bodies.reserve(joints.size());
     blob.joints.axes.reserve(joints.size());
+    blob.joints.parent_frames.reserve(joints.size());
+    blob.joints.child_frames.reserve(joints.size());
     blob.joints.lower_limits.reserve(joints.size());
     blob.joints.upper_limits.reserve(joints.size());
 
@@ -60,6 +62,8 @@ CookedBlob CookScene(const SceneIR& scene) {
         blob.joints.parent_bodies.push_back(j.parent_body);
         blob.joints.child_bodies.push_back(j.child_body);
         blob.joints.axes.push_back(j.axis);
+        blob.joints.parent_frames.push_back(j.parent_frame);
+        blob.joints.child_frames.push_back(j.child_frame);
         blob.joints.lower_limits.push_back(j.lower_limit);
         blob.joints.upper_limits.push_back(j.upper_limit);
     }

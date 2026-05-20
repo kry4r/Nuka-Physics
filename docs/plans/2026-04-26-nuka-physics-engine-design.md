@@ -58,7 +58,11 @@ This is combined with two compilation chains:
 
 ### 4.1 Rendering and Tool Shell Layer
 
-P0 uses a simple native shell built with C++, Dear ImGui, and OpenGL. Its role is debug visualization, scene inspection, sensor preview, and execution control. It is not the source of truth for physics. It consumes exported runtime state, debug buffers, and sensor packets.
+P0 uses Vulkan as the production rendering backend. The native shell should be
+built around Vulkan rendering and may use Dear ImGui for controls, while the
+headless PPM debug rasterizer remains a deterministic CI artifact path. The
+shell is not the source of truth for physics. It consumes exported runtime
+state, debug buffers, and sensor packets.
 
 The debug shell should visualize:
 
@@ -71,7 +75,8 @@ The debug shell should visualize:
 7. Sensor frusta and ray hits
 8. Basic depth or segmentation previews
 
-Future rendering paths can extend to Web viewers or Hydra-based rendering integration, but those are layered on top of the same exported runtime state.
+Future rendering paths can extend to Web viewers or Hydra-based rendering
+integration, but those are layered on top of the same exported runtime state.
 
 ### 4.2 Embodied Runtime Layer
 
@@ -256,7 +261,10 @@ Capability query must expose backend-specific properties such as:
 6. Peer-to-peer support
 7. Optional vendor library hooks
 
-This abstraction is the basis for future MUSA support. The goal is not only cross-compilation, but also backend-aware execution policies.
+This abstraction is the basis for backend-aware execution policies. On this
+workstation, the default production policy is CUDA. CPU execution is retained as
+an explicitly selected reference/validation path and must not become the P0
+performance target.
 
 ## 8. Data Layout and Memory Model
 

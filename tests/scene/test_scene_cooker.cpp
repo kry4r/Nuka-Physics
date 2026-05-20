@@ -79,6 +79,8 @@ TEST(SceneCooker, CooksJoints) {
     jrec.child_body  = b1;
     jrec.type        = JointType::Prismatic;
     jrec.axis        = {1.0f, 0.0f, 0.0f};
+    jrec.parent_frame.position = {0.25f, 0.0f, 0.0f};
+    jrec.child_frame.position = {-0.75f, 0.0f, 0.0f};
     jrec.lower_limit = -1.0f;
     jrec.upper_limit =  2.0f;
     scene.AddJoint(std::move(jrec));
@@ -89,6 +91,8 @@ TEST(SceneCooker, CooksJoints) {
     EXPECT_EQ(blob.joints.parent_bodies[0], b0);
     EXPECT_EQ(blob.joints.child_bodies[0], b1);
     EXPECT_FLOAT_EQ(blob.joints.axes[0].x, 1.0f);
+    EXPECT_FLOAT_EQ(blob.joints.parent_frames[0].position.x, 0.25f);
+    EXPECT_FLOAT_EQ(blob.joints.child_frames[0].position.x, -0.75f);
     EXPECT_FLOAT_EQ(blob.joints.lower_limits[0], -1.0f);
     EXPECT_FLOAT_EQ(blob.joints.upper_limits[0], 2.0f);
 }

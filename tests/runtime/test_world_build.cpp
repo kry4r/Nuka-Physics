@@ -81,6 +81,40 @@ TEST(WorldBuild, PosesCopiedFromTemplate) {
     EXPECT_FLOAT_EQ(world.template_view.body_table.poses[0].position.x, 1.0f);
 }
 
+TEST(WorldBuild, CopiesJointFramesAndActuatorsIntoTemplate) {
+    scene::SceneIR scene;
+    const auto parent = scene.AddRigidBody("parent");
+    const auto child = scene.AddRigidBody("child");
+
+    scene::JointRecord joint;
+    joint.name = "hinge";
+    joint.parent_body = parent;
+    joint.child_body = child;
+    joint.parent_frame.position = {0.25f, 0.0f, 0.0f};
+    joint.child_frame.position = {-0.25f, 0.0f, 0.0f};
+    const auto joint_id = scene.AddJoint(std::move(joint));
+
+    scene::ActuatorRecord actuator;
+    actuator.name = "motor";
+    actuator.joint_id = joint_id;
+    actuator.type = scene::ActuatorType::Velocity;
+    actuator.gain = 3.0f;
+    actuator.force_limit = 9.0f;
+    scene.AddActuator(std::move(actuator));
+
+    const auto blob = scene::CookScene(scene);
+    auto world = runtime::BuildWorld(blob);
+
+    ASSERT_EQ(world.template_view.joint_table.parent_frames.size(), 1u);
+    ASSERT_EQ(world.template_view.actuator_table.joint_ids.size(), 1u);
+    EXPECT_FLOAT_EQ(world.template_view.joint_table.parent_frames[0].position.x, 0.25f);
+    EXPECT_FLOAT_EQ(world.template_view.joint_table.child_frames[0].position.x, -0.25f);
+    EXPECT_EQ(world.template_view.actuator_count, 1u);
+    EXPECT_EQ(world.template_view.actuator_table.joint_ids[0], joint_id);
+    EXPECT_FLOAT_EQ(world.template_view.actuator_table.gains[0], 3.0f);
+    EXPECT_FLOAT_EQ(world.template_view.actuator_table.force_limits[0], 9.0f);
+}
+
 // ---------------------------------------------------------------------------
 // Forces and torques initialised to zero
 // ---------------------------------------------------------------------------

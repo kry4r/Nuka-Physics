@@ -22,6 +22,8 @@ struct CookedJointTable {
     std::vector<BodyId>     parent_bodies;
     std::vector<BodyId>     child_bodies;
     std::vector<math::Vec3> axes;
+    std::vector<math::Transform> parent_frames;
+    std::vector<math::Transform> child_frames;
     std::vector<float>      lower_limits;
     std::vector<float>      upper_limits;
 };

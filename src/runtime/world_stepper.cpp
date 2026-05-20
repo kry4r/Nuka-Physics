@@ -7,6 +7,7 @@
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "constraint/contact_builder.hpp"
+#include "runtime/articulation/joint_constraints.hpp"
 #include "runtime/rigid/integrator.hpp"
 #include "solver/rigid_solver.hpp"
 
@@ -361,6 +362,181 @@ std::vector<rigid::BodyState> LoadBodyStates(const WorldTemplate& world_template
     return bodies;
 }
 
+math::Transform JointFrameOrIdentity(const std::vector<math::Transform>& frames,
+                                     uint32_t joint_index) {
+    if (joint_index < frames.size()) {
+        return frames[joint_index];
+    }
+    return math::Transform::Identity();
+}
+
+math::Vec3 JointAxisOrDefault(const WorldTemplate& world_template, uint32_t joint_index) {
+    if (joint_index < world_template.joint_table.axes.size()) {
+        return world_template.joint_table.axes[joint_index];
+    }
+    return math::Vec3::UnitZ();
+}
+
+float JointLowerLimitOrDefault(const WorldTemplate& world_template, uint32_t joint_index) {
+    if (joint_index < world_template.joint_table.lower_limits.size()) {
+        return world_template.joint_table.lower_limits[joint_index];
+    }
+    return -3.14159f;
+}
+
+float JointUpperLimitOrDefault(const WorldTemplate& world_template, uint32_t joint_index) {
+    if (joint_index < world_template.joint_table.upper_limits.size()) {
+        return world_template.joint_table.upper_limits[joint_index];
+    }
+    return 3.14159f;
+}
+
+float RelativeAngularVelocityAlongAxis(const std::vector<rigid::BodyState>& bodies,
+                                       uint32_t body_a,
+                                       uint32_t body_b,
+                                       math::Vec3 axis) {
+    const math::Vec3 normalized_axis = axis.Normalized();
+    const math::Vec3 omega_a = body_a < bodies.size()
+        ? bodies[body_a].angular_velocity
+        : math::Vec3::Zero();
+    const math::Vec3 omega_b = body_b < bodies.size()
+        ? bodies[body_b].angular_velocity
+        : math::Vec3::Zero();
+    return (omega_a - omega_b).Dot(normalized_axis);
+}
+
+constraint::ConstraintBlock BuildFixedConstraint(uint32_t body_a,
+                                                 uint32_t body_b,
+                                                 math::Transform parent_frame,
+                                                 math::Transform child_frame) {
+    auto block = articulation::BuildRevoluteConstraint(body_a,
+                                                       body_b,
+                                                       math::Vec3::UnitZ(),
+                                                       parent_frame,
+                                                       child_frame,
+                                                       -3.14159f,
+                                                       3.14159f);
+    block.row_count = 6;
+    block.jacobian_linear_a[5] = math::Vec3::Zero();
+    block.jacobian_angular_a[5] = math::Vec3::UnitZ();
+    block.jacobian_linear_b[5] = math::Vec3::Zero();
+    block.jacobian_angular_b[5] = -math::Vec3::UnitZ();
+    block.rhs[5] = 0.0f;
+    block.lower_limit[5] = -1.0e6f;
+    block.upper_limit[5] = 1.0e6f;
+    return block;
+}
+
+bool AppendJointConstraint(const WorldTemplate& world_template,
+                           uint32_t joint_index,
+                           std::vector<constraint::ConstraintBlock>& blocks) {
+    if (joint_index >= world_template.joint_table.parent_bodies.size()
+        || joint_index >= world_template.joint_table.child_bodies.size()) {
+        return false;
+    }
+
+    const uint32_t parent = world_template.joint_table.parent_bodies[joint_index];
+    const uint32_t child = world_template.joint_table.child_bodies[joint_index];
+    const auto type = joint_index < world_template.joint_table.types.size()
+        ? world_template.joint_table.types[joint_index]
+        : scene::JointType::Revolute;
+    const math::Vec3 axis = JointAxisOrDefault(world_template, joint_index);
+    const math::Transform parent_frame =
+        JointFrameOrIdentity(world_template.joint_table.parent_frames, joint_index);
+    const math::Transform child_frame =
+        JointFrameOrIdentity(world_template.joint_table.child_frames, joint_index);
+
+    if (type == scene::JointType::Revolute
+        || type == scene::JointType::Prismatic
+        || type == scene::JointType::Spherical
+        || type == scene::JointType::Free) {
+        blocks.push_back(articulation::BuildRevoluteConstraint(
+            parent,
+            child,
+            axis,
+            parent_frame,
+            child_frame,
+            JointLowerLimitOrDefault(world_template, joint_index),
+            JointUpperLimitOrDefault(world_template, joint_index)));
+        return true;
+    }
+
+    if (type == scene::JointType::Fixed) {
+        blocks.push_back(BuildFixedConstraint(parent, child, parent_frame, child_frame));
+        return true;
+    }
+
+    return false;
+}
+
+float TargetVelocityFromActuatorType(scene::ActuatorType type, float gain) {
+    if (type == scene::ActuatorType::Velocity || type == scene::ActuatorType::Motor) {
+        return gain;
+    }
+    if (type == scene::ActuatorType::Force) {
+        return gain;
+    }
+    return 0.0f;
+}
+
+float DriveDampingFromActuatorType(scene::ActuatorType type, float gain) {
+    if (type == scene::ActuatorType::Force) {
+        return 1.0f;
+    }
+    if (type == scene::ActuatorType::Position) {
+        return std::max(std::abs(gain), 1.0f);
+    }
+    return 1.0f;
+}
+
+float DriveForceLimitOrDefault(const WorldTemplate& world_template, uint32_t actuator_index) {
+    if (actuator_index < world_template.actuator_table.force_limits.size()
+        && world_template.actuator_table.force_limits[actuator_index] > 0.0f) {
+        return world_template.actuator_table.force_limits[actuator_index];
+    }
+    return 1.0e6f;
+}
+
+bool AppendDriveConstraint(const WorldTemplate& world_template,
+                           const std::vector<rigid::BodyState>& bodies,
+                           uint32_t actuator_index,
+                           std::vector<constraint::ConstraintBlock>& blocks) {
+    if (actuator_index >= world_template.actuator_table.joint_ids.size()) {
+        return false;
+    }
+
+    const scene::JointId joint_id = world_template.actuator_table.joint_ids[actuator_index];
+    if (joint_id >= world_template.joint_count
+        || joint_id >= world_template.joint_table.parent_bodies.size()
+        || joint_id >= world_template.joint_table.child_bodies.size()) {
+        return false;
+    }
+
+    const auto type = actuator_index < world_template.actuator_table.types.size()
+        ? world_template.actuator_table.types[actuator_index]
+        : scene::ActuatorType::Motor;
+    const float gain = actuator_index < world_template.actuator_table.gains.size()
+        ? world_template.actuator_table.gains[actuator_index]
+        : 0.0f;
+    const math::Vec3 axis = JointAxisOrDefault(world_template, joint_id);
+    const uint32_t parent = world_template.joint_table.parent_bodies[joint_id];
+    const uint32_t child = world_template.joint_table.child_bodies[joint_id];
+
+    articulation::JointDrive drive;
+    drive.target_velocity = TargetVelocityFromActuatorType(type, gain);
+    drive.damping = DriveDampingFromActuatorType(type, gain);
+    drive.max_force = DriveForceLimitOrDefault(world_template, actuator_index);
+
+    const float current_velocity =
+        RelativeAngularVelocityAlongAxis(bodies, child, parent, axis);
+    blocks.push_back(articulation::BuildDriveConstraint(child,
+                                                        parent,
+                                                        axis,
+                                                        drive,
+                                                        current_velocity));
+    return true;
+}
+
 } // namespace
 
 WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
@@ -385,6 +561,26 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
             rigid::IntegrateForces(body, options.dt);
         }
 
+        std::vector<constraint::ConstraintBlock> blocks;
+
+        if (world_template.joint_count > 0u) {
+            for (uint32_t joint_index = 0; joint_index < world_template.joint_count; ++joint_index) {
+                if (AppendJointConstraint(world_template, joint_index, blocks)) {
+                    ++report.joint_constraint_count;
+                }
+            }
+        }
+
+        if (world_template.actuator_count > 0u) {
+            for (uint32_t actuator_index = 0;
+                 actuator_index < world_template.actuator_count;
+                 ++actuator_index) {
+                if (AppendDriveConstraint(world_template, bodies, actuator_index, blocks)) {
+                    ++report.drive_constraint_count;
+                }
+            }
+        }
+
         if (options.enable_contacts && world_template.shape_count > 0u) {
             const auto shapes = BuildShapeProxies(world_template, instance);
             std::vector<collision::AABB> shape_aabbs;
@@ -404,13 +600,9 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
                 GenerateContact(shapes[pair.body_a], shapes[pair.body_b], bodies, manifolds);
             }
 
-            auto blocks = constraint::BuildContactConstraints(manifolds);
-            uint32_t row_count = 0;
-            for (auto& block : blocks) {
-                row_count += block.row_count;
-            }
+            auto contact_blocks = constraint::BuildContactConstraints(manifolds);
 
-            for (auto& block : blocks) {
+            for (auto& block : contact_blocks) {
                 for (uint32_t row = 0; row < block.normal_row_count; ++row) {
                     block.lower_limit[row] = 0.0f;
                     block.upper_limit[row] = 1.0e6f;
@@ -423,7 +615,19 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
                     block.upper_limit[row] = 0.0f;
                 }
             }
+            blocks.insert(blocks.end(), contact_blocks.begin(), contact_blocks.end());
+            report.broadphase_pair_count += static_cast<uint32_t>(broadphase.GetPairs().size());
+            report.contact_manifold_count += static_cast<uint32_t>(manifolds.size());
+            for (const auto& manifold : manifolds) {
+                report.contact_point_count += manifold.point_count;
+            }
+        }
 
+        if (!blocks.empty()) {
+            uint32_t row_count = 0;
+            for (const auto& block : blocks) {
+                row_count += block.row_count;
+            }
             solver::SolverConfig solver_config;
             solver_config.velocity_iterations = options.solver_velocity_iterations;
             solver_config.position_iterations = options.solver_position_iterations;
@@ -431,16 +635,11 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
             solver_config.baumgarte = options.solver_baumgarte;
             const auto solve_result = solver::SolveConstraints(blocks, bodies, solver_config);
 
-            report.broadphase_pair_count += static_cast<uint32_t>(broadphase.GetPairs().size());
-            report.contact_manifold_count += static_cast<uint32_t>(manifolds.size());
             report.constraint_block_count += static_cast<uint32_t>(blocks.size());
             report.constraint_row_count += row_count;
             report.solver_iterations_used += solve_result.iterations_used;
             report.max_constraint_error = std::max(report.max_constraint_error,
                                                    solve_result.max_penetration);
-            for (const auto& manifold : manifolds) {
-                report.contact_point_count += manifold.point_count;
-            }
         }
 
         for (auto& body : bodies) {

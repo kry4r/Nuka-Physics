@@ -21,23 +21,30 @@ include(cmake/Warnings.cmake)
 # Options
 # ---------------------------------------------------------------------------
 option(NK_BUILD_TESTS "Build unit / smoke tests" ON)
+option(NK_REQUIRE_CUDA "Require CUDA support for the preferred production physics backend" ON)
+set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend")
+set_property(CACHE NK_PHYSICS_BACKEND PROPERTY STRINGS CUDA CPU_REFERENCE)
 
 # ---------------------------------------------------------------------------
-# CUDA (optional – some early tasks are CPU-only)
+# CUDA-preferred physics backend and Vulkan renderer backend
 # ---------------------------------------------------------------------------
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    # Auto-detect GPU architecture; fall back to broad set
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES native)
     endif()
-    message(STATUS "CUDA enabled – compiler: ${CMAKE_CUDA_COMPILER}")
+    message(STATUS "CUDA enabled for preferred physics backend: ${CMAKE_CUDA_COMPILER}")
 else()
-    message(STATUS "CUDA compiler not found – CUDA targets will be skipped")
+    if(NK_REQUIRE_CUDA OR NK_PHYSICS_BACKEND STREQUAL "CUDA")
+        message(FATAL_ERROR "CUDA compiler not found, but CUDA is the required/preferred production physics backend.")
+    endif()
+    message(STATUS "CUDA compiler not found; building CPU reference backend only")
 endif()
+
+find_package(Vulkan REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Third-party dependencies

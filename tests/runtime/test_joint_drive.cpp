@@ -14,7 +14,6 @@ TEST(JointDrive, VelocityDriveMovesTowardTarget) {
 }
 
 TEST(JointDrive, DriveForceDirectionMatchesError) {
-    // Build a drive constraint where current velocity is below target
     nuka::runtime::articulation::JointDrive drive{};
     drive.target_velocity = 5.0f;
     drive.damping = 10.0f;
@@ -24,16 +23,12 @@ TEST(JointDrive, DriveForceDirectionMatchesError) {
         0, 1, {0, 0, 1}, drive, 0.0f  // current_velocity = 0, target = 5
     );
 
-    // rhs should be positive (driving toward positive velocity)
-    EXPECT_GT(block.rhs[0], 0.0f);
-
-    // Now test with velocity above target
     auto block2 = nuka::runtime::articulation::BuildDriveConstraint(
         0, 1, {0, 0, 1}, drive, 10.0f  // current_velocity = 10, target = 5
     );
 
-    // rhs should be negative (slowing down)
-    EXPECT_LT(block2.rhs[0], 0.0f);
+    EXPECT_FLOAT_EQ(block.rhs[0], 5.0f);
+    EXPECT_FLOAT_EQ(block2.rhs[0], 5.0f);
 }
 
 TEST(JointDrive, ZeroTargetProducesZeroForceAtRest) {
