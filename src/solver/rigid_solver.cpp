@@ -88,6 +88,59 @@ inline void PrecomputeEffectiveMass(
     }
 }
 
+inline uint32_t ContactNormalRowCount(const constraint::ConstraintBlock& block) {
+    if (block.type != constraint::ConstraintType::Contact) {
+        return 0;
+    }
+    return block.normal_row_count > 0u ? block.normal_row_count : block.row_count;
+}
+
+inline bool IsContactFrictionRow(const constraint::ConstraintBlock& block, uint32_t row) {
+    return block.type == constraint::ConstraintType::Contact
+        && block.friction_row_count > 0u
+        && row >= block.first_friction_row
+        && row < block.first_friction_row + block.friction_row_count;
+}
+
+inline float TotalNormalImpulse(const constraint::ConstraintBlock& block) {
+    float impulse = 0.0f;
+    const uint32_t normal_rows = ContactNormalRowCount(block);
+    for (uint32_t row = 0; row < normal_rows; ++row) {
+        impulse += std::max(block.impulse[row], 0.0f);
+    }
+    return impulse;
+}
+
+inline void PrepareContactVelocityTargets(
+    constraint::ConstraintBlock& block,
+    const runtime::rigid::BodyState& body_a,
+    const runtime::rigid::BodyState& body_b) {
+    if (block.type != constraint::ConstraintType::Contact || block.restitution <= 0.0f) {
+        return;
+    }
+
+    const uint32_t normal_rows = ContactNormalRowCount(block);
+    for (uint32_t row = 0; row < normal_rows; ++row) {
+        const float jv = ComputeJv(block, row, body_a, body_b);
+        if (jv < 0.0f) {
+            block.rhs[row] = std::max(block.rhs[row], -block.restitution * jv);
+        }
+    }
+}
+
+inline void UpdateFrictionLimits(const constraint::ConstraintBlock& block,
+                                 uint32_t row,
+                                 float& lower_limit,
+                                 float& upper_limit) {
+    if (!IsContactFrictionRow(block, row)) {
+        return;
+    }
+
+    const float max_friction = std::max(block.friction, 0.0f) * TotalNormalImpulse(block);
+    lower_limit = -max_friction;
+    upper_limit = max_friction;
+}
+
 inline void ApplyAngularCorrection(runtime::rigid::BodyState& body,
                                    const math::Vec3& angular_delta) {
     const float angle = angular_delta.Length();
@@ -231,6 +284,7 @@ SolveResult SolveConstraints(
         auto& ba = (block.body_a < bodies.size()) ? bodies[block.body_a] : ground_body;
         auto& bb = (block.body_b < bodies.size()) ? bodies[block.body_b] : ground_body;
         PrecomputeEffectiveMass(block, ba, bb);
+        PrepareContactVelocityTargets(block, ba, bb);
     }
 
     // --- Velocity iterations (PGS) ---
@@ -246,8 +300,11 @@ SolveResult SolveConstraints(
                 // Accumulate and clamp
                 float old_impulse = block.impulse[r];
                 float new_impulse = old_impulse + lambda;
-                new_impulse = std::max(new_impulse, block.lower_limit[r]);
-                new_impulse = std::min(new_impulse, block.upper_limit[r]);
+                float lower_limit = block.lower_limit[r];
+                float upper_limit = block.upper_limit[r];
+                UpdateFrictionLimits(block, r, lower_limit, upper_limit);
+                new_impulse = std::max(new_impulse, lower_limit);
+                new_impulse = std::min(new_impulse, upper_limit);
                 block.impulse[r] = new_impulse;
 
                 float delta = new_impulse - old_impulse;

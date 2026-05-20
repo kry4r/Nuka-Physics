@@ -93,6 +93,19 @@ that a native OpenGL/ImGui viewport will consume.
 - **Joint Drives**: PD-style drive targets that inject torques into articulated
   bodies each frame.
 
+### Constraint and Contact Solver (`constraint/`, `solver/`)
+
+- **Contact manifolds**: Store contact points, warm-start impulses, friction,
+  and restitution parameters before constraint assembly.
+- **Contact blocks**: Build normal rows plus two tangent rows per manifold. The
+  solver updates tangent limits from `friction * accumulatedNormalImpulse`, so
+  tangential impulses stay inside a Coulomb friction cone and disappear when no
+  normal impulse is produced.
+- **Restitution**: Before velocity iterations, contact normal rows convert
+  closing velocity into a bounce target using the block restitution coefficient.
+  This keeps the material response explicit in the same PGS path as resting
+  contacts.
+
 ## Solver Pipeline
 
 Each simulation step follows this pipeline:
@@ -102,8 +115,8 @@ Each simulation step follows this pipeline:
 3. **Broadphase** -- identify potentially colliding pairs.
 4. **Narrow-phase / contact generation** -- compute contact manifolds.
 5. **Constraint assembly** -- collect contact and joint constraint blocks.
-6. **Iterative solve** (PGS) -- resolve contact, joint, and drive rows,
-   producing velocity corrections.
+6. **Iterative solve** (PGS) -- resolve contact, friction, restitution, joint,
+   and drive rows, producing velocity corrections.
 7. **Position projection** -- apply Baumgarte contact correction and
    mass/inertia-weighted joint anchor projection. Joint projection computes
    world-space parent/child anchor separation, distributes linear correction by

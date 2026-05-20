@@ -34,6 +34,11 @@ struct ConstraintBlock {
     float upper_limit[kMaxRows]    = {};
     float impulse[kMaxRows]        = {};   // accumulated impulse (warm start)
     float effective_mass[kMaxRows] = {};
+    float friction                 = 0.5f;
+    float restitution              = 0.0f;
+    uint32_t normal_row_count      = 0;
+    uint32_t first_friction_row    = 0;
+    uint32_t friction_row_count    = 0;
 
     // Local joint anchor offsets for position projection. Contact and drive
     // blocks leave these at zero.

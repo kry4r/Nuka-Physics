@@ -22,6 +22,8 @@ struct ContactManifold {
     uint32_t body_a      = ~0u;
     uint32_t body_b      = ~0u;
     uint32_t point_count = 0;
+    float friction       = 0.5f;
+    float restitution    = 0.0f;
 
     static constexpr uint32_t kMaxPoints = 4;
     ContactPoint points[kMaxPoints];

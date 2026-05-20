@@ -106,6 +106,7 @@ gtest_discover_tests(nuka_constraint_test)
 # --- Solver tests ----------------------------------------------------------
 add_executable(nuka_solver_test
     solver/test_contact_resting.cpp
+    solver/test_contact_material.cpp
     solver/test_joint_limit.cpp
     solver/test_joint_projection.cpp
 )
@@ -206,6 +207,7 @@ target_link_libraries(nuka_perf_test
         nuka_debug_draw
         nuka_scene_pipeline
         nuka_import
+        nuka_solver
         GTest::gtest_main
 )
 

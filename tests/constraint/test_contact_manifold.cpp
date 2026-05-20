@@ -58,3 +58,12 @@ TEST(ContactManifold, ClearResetsCount) {
     m.Clear();
     EXPECT_EQ(m.point_count, 0u);
 }
+
+TEST(ContactManifold, StoresMaterialResponseParameters) {
+    ContactManifold m;
+    m.friction = 0.7f;
+    m.restitution = 0.35f;
+
+    EXPECT_FLOAT_EQ(m.friction, 0.7f);
+    EXPECT_FLOAT_EQ(m.restitution, 0.35f);
+}

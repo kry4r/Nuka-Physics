@@ -46,6 +46,9 @@ All tests in this matrix must pass on every commit before merge.
 | RestStackRegression/PenetrationIsBounded | `tests/regression/test_rest_stack.cpp` | Two boxes stacked on ground, solver run | Max penetration | < 1e-2 |
 | RestStackRegression/TopBoxStaysAboveBottomBox | `tests/regression/test_rest_stack.cpp` | Vertical ordering preserved after solve | top_y > bottom_y | true |
 | RestStackRegression/BottomBoxStaysAboveGround | `tests/regression/test_rest_stack.cpp` | Bottom box does not fall through ground | bottom_y >= 0 | true |
+| ContactMaterial/FrictionImpulseIsClampedByNormalImpulse | `tests/solver/test_contact_material.cpp` | Tangential contact impulse is clamped by friction coefficient times normal impulse | friction impulse | <= mu * normal impulse |
+| ContactMaterial/NoNormalImpulseProducesNoFrictionImpulse | `tests/solver/test_contact_material.cpp` | Separating contacts cannot generate tangential friction without positive normal force | friction impulse | 0 |
+| ContactMaterial/RestitutionBouncesAlongContactNormal | `tests/solver/test_contact_material.cpp` | Closing normal velocity is reflected by the restitution coefficient | normal velocity | expected bounce speed |
 | TwoLinkArmRegression/JointMaintainsConnectivity | `tests/regression/test_two_link_arm.cpp` | Revolute joint gap after 10 steps with gravity | Gap distance | < 0.05 |
 | TwoLinkArmRegression/AnchorPointsCoincide | `tests/regression/test_two_link_arm.cpp` | Per-axis anchor point agreement | Per-axis error | < 0.05 |
 | JointProjection/StaticAnchorPullsDynamicAnchorOntoPivot | `tests/solver/test_joint_projection.cpp` | Static parent anchor remains fixed while dynamic child is projected onto the pivot | Anchor gap | < 1e-3 |
@@ -60,6 +63,7 @@ All tests in this matrix must pass on every commit before merge.
 |-----------|------|-------------|--------|-----------|
 | StepTiming/HundredStepsUnderOneSecond | `tests/perf/test_step_timing.cpp` | 100 steps on 10 bodies | Wall time | < 1000 ms |
 | StepTiming/ThousandStepsSingleBody | `tests/perf/test_step_timing.cpp` | 1000 steps on 1 body | Wall time | < 1000 ms |
+| StepTiming/ContactMaterialSolveUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 PGS contact-material solves over 64 bodies with friction and restitution rows | Wall time | < 1000 ms |
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
