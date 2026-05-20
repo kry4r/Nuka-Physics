@@ -34,6 +34,11 @@ struct ConstraintBlock {
     float upper_limit[kMaxRows]    = {};
     float impulse[kMaxRows]        = {};   // accumulated impulse (warm start)
     float effective_mass[kMaxRows] = {};
+
+    // Local joint anchor offsets for position projection. Contact and drive
+    // blocks leave these at zero.
+    math::Vec3 anchor_local_a;
+    math::Vec3 anchor_local_b;
 };
 
 } // namespace nuka::constraint

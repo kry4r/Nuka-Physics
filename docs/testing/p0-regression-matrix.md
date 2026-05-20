@@ -43,6 +43,9 @@ All tests in this matrix must pass on every commit before merge.
 | RestStackRegression/BottomBoxStaysAboveGround | `tests/regression/test_rest_stack.cpp` | Bottom box does not fall through ground | bottom_y >= 0 | true |
 | TwoLinkArmRegression/JointMaintainsConnectivity | `tests/regression/test_two_link_arm.cpp` | Revolute joint gap after 10 steps with gravity | Gap distance | < 0.05 |
 | TwoLinkArmRegression/AnchorPointsCoincide | `tests/regression/test_two_link_arm.cpp` | Per-axis anchor point agreement | Per-axis error | < 0.05 |
+| JointProjection/StaticAnchorPullsDynamicAnchorOntoPivot | `tests/solver/test_joint_projection.cpp` | Static parent anchor remains fixed while dynamic child is projected onto the pivot | Anchor gap | < 1e-3 |
+| JointProjection/MassWeightedCorrectionMovesLightBodyMore | `tests/solver/test_joint_projection.cpp` | Joint projection distributes correction by inverse mass | Light body motion | > 5x heavy body motion |
+| JointProjection/EccentricAnchorProjectionUsesAngularInertia | `tests/solver/test_joint_projection.cpp` | Eccentric joint anchor projection applies angular correction through inverse inertia | Gap reduction, orientation change | gap < 25% initial and rotation > 1e-3 |
 | WorldStepper/AdvancesDynamicBodiesAndKeepsStaticBodiesFixed | `tests/runtime/test_world_stepper.cpp` | Fixed-step world stepping advances dynamic bodies and preserves static body state | Pose/velocity | expected symplectic Euler values |
 | WorldStepper/AppliesForcesTorquesAndClearsAccumulatorsAfterEachStep | `tests/runtime/test_world_stepper.cpp` | Applies force and torque accumulators through body tables and clears them after stepping | Velocity/accumulators | expected values / zeroed accumulators |
 

@@ -87,6 +87,9 @@ that a native OpenGL/ImGui viewport will consume.
 
 - **Joint Constraints**: Builds constraint blocks for revolute, prismatic, and
   fixed joints. Each joint produces a `ConstraintBlock` consumed by the solver.
+  Revolute blocks store the local parent and child anchor offsets so the solver
+  can project assembled joints at the position level, not only damp relative
+  velocity drift.
 - **Joint Drives**: PD-style drive targets that inject torques into articulated
   bodies each frame.
 
@@ -99,9 +102,16 @@ Each simulation step follows this pipeline:
 3. **Broadphase** -- identify potentially colliding pairs.
 4. **Narrow-phase / contact generation** -- compute contact manifolds.
 5. **Constraint assembly** -- collect contact and joint constraint blocks.
-6. **Iterative solve** (PGS) -- resolve constraints, producing velocity corrections.
-7. **Velocity integration** -- advance positions and orientations.
-8. **Sensor update** -- read joint states, compute IMU/lidar readings.
+6. **Iterative solve** (PGS) -- resolve contact, joint, and drive rows,
+   producing velocity corrections.
+7. **Position projection** -- apply Baumgarte contact correction and
+   mass/inertia-weighted joint anchor projection. Joint projection computes
+   world-space parent/child anchor separation, distributes linear correction by
+   inverse mass, and applies angular correction through diagonal inverse inertia
+   for eccentric anchors. Static bodies keep zero inverse mass/inertia and do
+   not move.
+8. **Velocity integration** -- advance positions and orientations.
+9. **Sensor update** -- read joint states, compute IMU/lidar readings.
 
 ## PHI Layer
 

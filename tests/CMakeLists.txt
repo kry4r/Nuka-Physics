@@ -107,11 +107,13 @@ gtest_discover_tests(nuka_constraint_test)
 add_executable(nuka_solver_test
     solver/test_contact_resting.cpp
     solver/test_joint_limit.cpp
+    solver/test_joint_projection.cpp
 )
 
 target_link_libraries(nuka_solver_test
     PRIVATE
         nuka_solver
+        nuka_articulation
         GTest::gtest_main
 )
 

@@ -26,6 +26,8 @@ constraint::ConstraintBlock BuildRevoluteConstraint(
     block.body_a = body_a;
     block.body_b = body_b;
     block.row_count = 5; // 3 translational + 2 rotational (perpendicular to axis)
+    block.anchor_local_a = parent_frame.position;
+    block.anchor_local_b = child_frame.position;
 
     const math::Vec3 norm_axis = axis.Normalized();
 

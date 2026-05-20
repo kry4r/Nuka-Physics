@@ -88,6 +88,125 @@ inline void PrecomputeEffectiveMass(
     }
 }
 
+inline void ApplyAngularCorrection(runtime::rigid::BodyState& body,
+                                   const math::Vec3& angular_delta) {
+    const float angle = angular_delta.Length();
+    if (angle <= 1e-8f) {
+        return;
+    }
+
+    const math::Quat dq = math::Quat::FromAxisAngle(angular_delta / angle, angle);
+    body.orientation = (dq * body.orientation).Normalized();
+}
+
+inline void ApplyPositionCorrection(runtime::rigid::BodyState& body,
+                                    const math::Vec3& linear_jacobian,
+                                    const math::Vec3& angular_jacobian,
+                                    float position_impulse) {
+    if (body.inv_mass > 0.0f) {
+        body.position += linear_jacobian * (body.inv_mass * position_impulse);
+    }
+
+    const math::Vec3 angular_delta{
+        angular_jacobian.x * body.inv_inertia.x * position_impulse,
+        angular_jacobian.y * body.inv_inertia.y * position_impulse,
+        angular_jacobian.z * body.inv_inertia.z * position_impulse
+    };
+    ApplyAngularCorrection(body, angular_delta);
+}
+
+inline float ComputeJointRowMass(const math::Vec3& linear_a,
+                                 const math::Vec3& angular_a,
+                                 const math::Vec3& linear_b,
+                                 const math::Vec3& angular_b,
+                                 const runtime::rigid::BodyState& body_a,
+                                 const runtime::rigid::BodyState& body_b) {
+    float diag = 0.0f;
+    diag += body_a.inv_mass * Dot(linear_a, linear_a);
+    diag += body_b.inv_mass * Dot(linear_b, linear_b);
+    diag += angular_a.x * angular_a.x * body_a.inv_inertia.x
+          + angular_a.y * angular_a.y * body_a.inv_inertia.y
+          + angular_a.z * angular_a.z * body_a.inv_inertia.z;
+    diag += angular_b.x * angular_b.x * body_b.inv_inertia.x
+          + angular_b.y * angular_b.y * body_b.inv_inertia.y
+          + angular_b.z * angular_b.z * body_b.inv_inertia.z;
+    return (diag > 1e-12f) ? (1.0f / diag) : 0.0f;
+}
+
+inline float StabilizeContactPositions(const constraint::ConstraintBlock& block,
+                                       runtime::rigid::BodyState& body_a,
+                                       runtime::rigid::BodyState& body_b,
+                                       const SolverConfig& config) {
+    float max_penetration = 0.0f;
+    for (uint32_t r = 0; r < block.row_count; ++r) {
+        // Contacts encode penetration as a negative velocity bias in some
+        // builders and as a positive depth in older tests. Accept either sign.
+        const float penetration = std::abs(block.rhs[r]);
+        max_penetration = std::max(max_penetration, penetration);
+
+        const float correction = config.baumgarte * std::max(penetration - config.slop, 0.0f);
+        if (correction <= 1e-8f) {
+            continue;
+        }
+
+        const float position_impulse = correction * block.effective_mass[r];
+        ApplyPositionCorrection(body_a,
+                                block.jacobian_linear_a[r],
+                                math::Vec3::Zero(),
+                                position_impulse);
+        ApplyPositionCorrection(body_b,
+                                block.jacobian_linear_b[r],
+                                math::Vec3::Zero(),
+                                position_impulse);
+    }
+    return max_penetration;
+}
+
+inline float StabilizeJointPositions(const constraint::ConstraintBlock& block,
+                                     runtime::rigid::BodyState& body_a,
+                                     runtime::rigid::BodyState& body_b,
+                                     const SolverConfig& config) {
+    const math::Vec3 axes[3] = {
+        math::Vec3::UnitX(),
+        math::Vec3::UnitY(),
+        math::Vec3::UnitZ()
+    };
+
+    float max_error = 0.0f;
+    for (const auto& axis : axes) {
+        const math::Vec3 r_a = body_a.orientation.Rotate(block.anchor_local_a);
+        const math::Vec3 r_b = body_b.orientation.Rotate(block.anchor_local_b);
+        const math::Vec3 error = (body_a.position + r_a) - (body_b.position + r_b);
+        const float row_error = error.Dot(axis);
+        max_error = std::max(max_error, std::abs(row_error));
+
+        const float correction = config.baumgarte * row_error;
+        if (std::abs(correction) <= config.slop) {
+            continue;
+        }
+
+        const math::Vec3 linear_a = -axis;
+        const math::Vec3 linear_b = axis;
+        const math::Vec3 angular_a = -r_a.Cross(axis);
+        const math::Vec3 angular_b = r_b.Cross(axis);
+        const float effective_mass = ComputeJointRowMass(linear_a,
+                                                         angular_a,
+                                                         linear_b,
+                                                         angular_b,
+                                                         body_a,
+                                                         body_b);
+        const float position_impulse = correction * effective_mass;
+        if (effective_mass <= 0.0f) {
+            continue;
+        }
+
+        ApplyPositionCorrection(body_a, linear_a, angular_a, position_impulse);
+        ApplyPositionCorrection(body_b, linear_b, angular_b, position_impulse);
+    }
+
+    return max_error;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -139,37 +258,20 @@ SolveResult SolveConstraints(
         }
     }
 
-    // --- Position stabilization (Baumgarte) ---
+    // --- Position stabilization (Baumgarte / joint projection) ---
     float max_penetration = 0.0f;
     for (uint32_t iter = 0; iter < config.position_iterations; ++iter) {
         max_penetration = 0.0f;
         for (auto& block : blocks) {
-            if (block.type != constraint::ConstraintType::Contact) continue;
-
             auto& ba = (block.body_a < bodies.size()) ? bodies[block.body_a] : ground_body;
             auto& bb = (block.body_b < bodies.size()) ? bodies[block.body_b] : ground_body;
 
-            for (uint32_t r = 0; r < block.row_count; ++r) {
-                // Use rhs as a proxy for penetration depth (negative = penetrating)
-                float penetration = -block.rhs[r];
-                if (penetration > max_penetration) {
-                    max_penetration = penetration;
-                }
-
-                // Baumgarte correction
-                float correction = config.baumgarte * std::max(penetration - config.slop, 0.0f);
-                if (correction > 1e-8f) {
-                    // Apply position correction along normal
-                    float eff_mass = block.effective_mass[r];
-                    float position_impulse = correction * eff_mass;
-
-                    if (block.body_a < bodies.size() && ba.inv_mass > 0.0f) {
-                        ba.position += block.jacobian_linear_a[r] * (ba.inv_mass * position_impulse);
-                    }
-                    if (block.body_b < bodies.size() && bb.inv_mass > 0.0f) {
-                        bb.position += block.jacobian_linear_b[r] * (bb.inv_mass * position_impulse);
-                    }
-                }
+            if (block.type == constraint::ConstraintType::Contact) {
+                max_penetration = std::max(max_penetration,
+                                           StabilizeContactPositions(block, ba, bb, config));
+            } else if (block.type == constraint::ConstraintType::Joint) {
+                max_penetration = std::max(max_penetration,
+                                           StabilizeJointPositions(block, ba, bb, config));
             }
         }
     }
