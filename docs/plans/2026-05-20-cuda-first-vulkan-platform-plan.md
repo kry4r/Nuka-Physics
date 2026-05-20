@@ -81,18 +81,39 @@ path.
 
 ### Task 4: CUDA Broadphase and Narrowphase
 
+**Status:** Completed in the current iteration. CUDA now owns cooked shape
+tables in `DeviceWorld`, generates shape AABBs and deterministic broadphase
+pair slots on device, and emits plane, sphere-sphere, and box-style contact
+manifolds into device buffers. CPU readback is used only for validation,
+regression comparisons, and timing reports.
+
 **Files:**
 - Create: `src/collision/gpu/broadphase.cuh`
 - Create: `src/collision/gpu/broadphase.cu`
 - Create: `src/constraint/gpu/contact_generation.cuh`
 - Create: `src/constraint/gpu/contact_generation.cu`
 - Create: `tests/runtime/test_cuda_contacts.cpp`
+- Create: `tests/perf/test_cuda_contact_timing.cpp`
 - Modify: `src/CMakeLists.txt`
 - Modify: `tests/CMakeLists.txt`
+- Modify: `docs/architecture/runtime-overview.md`
+- Modify: `docs/testing/p0-regression-matrix.md`
+- Modify: `README.md`
 
 **Scope:** Generate AABBs, broadphase candidate pairs, and plane/sphere/box contact manifolds on CUDA. Keep deterministic ordering for regression comparisons.
 
 **Validation:** Compare contact pair counts, manifold counts, contact normals, penetration depths, and contact points against CPU reference scenes.
+
+Current validation commands:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure -R "CudaContacts|CudaWorldStepper|CudaDeviceWorld|CudaStepTiming|CudaContactTiming"
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Current result: focused CUDA runtime/performance checks pass 9/9, and the full
+Release regression suite passes 211/211 on the local CUDA/Vulkan workstation.
 
 ### Task 5: CUDA Constraint Assembly and Solver
 

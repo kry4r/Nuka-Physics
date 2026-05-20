@@ -58,7 +58,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production-path runtime and timing checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaStepTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaStepTiming|CudaContactTiming"
 ```
 
 ### Imported Scene Debug Render Demo

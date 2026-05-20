@@ -62,6 +62,15 @@ free-fall and forced-body scenes with contacts disabled. The next stepper stages
 must keep that CPU path as validation-only while extending CUDA execution to
 broadphase, contact generation, constraint assembly, and PGS solving.
 
+`collision::gpu::BuildCudaBroadphase()` and
+`constraint::gpu::GenerateCudaContacts()` are the current CUDA collision stage.
+They consume CUDA-resident `DeviceWorld` state and cooked shape tables, generate
+shape AABBs on device, fill deterministic pair slots for overlapping shapes,
+and emit plane, sphere-sphere, and box-style contact manifolds into device
+buffers. Host downloads are limited to validation reports, regression checks,
+and timing tests; the intended production path keeps broadphase and contact
+data resident for the upcoming CUDA constraint assembly and solver stage.
+
 Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
 projection uses authoring anchors instead of assuming every joint is body-center
 to body-center. Revolute joints currently map to the five-row maximal-coordinate
@@ -191,9 +200,12 @@ Key PHI concepts:
 cooked `WorldTemplate` tables into PHI buffers and keeps body, shape, joint, and
 actuator counts next to the device allocations. It also owns mutable state
 buffers for poses, linear velocities, angular velocities, forces, and torques.
-Tests use compact summary downloads for upload integrity and full state
-downloads for CPU-reference differential validation. Full state readback is a
-validation and tooling boundary; production stepping keeps state on the GPU.
+Shape type, body binding, local transform, half extent, and radius tables are
+also uploaded so CUDA kernels can build world-space collision proxies without
+returning to CPU-side cooked data. Tests use compact summary downloads for
+upload integrity and full state/contact readbacks for CPU-reference differential
+validation. Full state readback is a validation and tooling boundary; production
+stepping keeps state on the GPU.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production

@@ -18,6 +18,9 @@ All tests in this matrix must pass on every commit before merge.
 | CudaWorldStepper/IntegratesGravityForceAndVelocityOnDevice | `tests/runtime/test_cuda_world_stepper.cpp` | Verifies the CUDA rigid integration kernel updates velocity, pose, and force accumulators on device buffers | CUDA |
 | CudaWorldStepper/MatchesCpuReferenceForFreeFallAndForces | `tests/runtime/test_cuda_world_stepper.cpp` | Compares CUDA free-fall and forced-body integration against the CPU reference path with contacts disabled | CUDA, CPU reference |
 | CudaWorldStepper/RejectsStepBeforeDeviceStateUpload | `tests/runtime/test_cuda_world_stepper.cpp` | Verifies CUDA stepping fails before kernel launch when mutable state has not been uploaded | CUDA |
+| CudaContacts/GeneratesAabbsPairsAndPlaneBoxContactOnDevice | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA AABB generation, deterministic broadphase pair output, plane-box contact generation, and CPU-reference report parity | CUDA, CPU reference |
+| CudaContacts/GeneratesSphereSphereContactOnDevice | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA narrowphase emits a sphere-sphere contact manifold with deterministic normal and penetration | CUDA |
+| CudaContacts/EmitsDeterministicPairOrderFromDeviceBroadphase | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA broadphase compacts overlapping pairs in deterministic slot order | CUDA |
 
 ## Import Regression Tests
 
@@ -89,6 +92,7 @@ All tests in this matrix must pass on every commit before merge.
 | StepTiming/RuntimeJointDrivePipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 32 cooked revolute joints and velocity drives through joint/drive constraint assembly, PGS solve, and integration | Wall time | < 1000 ms |
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 | CudaStepTiming/RigidIntegrationKernelUnderOneSecond | `tests/perf/test_cuda_step_timing.cpp` | 240 CUDA rigid integration steps over 4096 cooked dynamic bodies | Wall time | < 1000 ms |
+| CudaContactTiming/BroadphaseAndContactGenerationUnderOneSecond | `tests/perf/test_cuda_contact_timing.cpp` | 60 CUDA broadphase/contact passes over 256 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

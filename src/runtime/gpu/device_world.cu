@@ -21,6 +21,17 @@ phi::Buffer UploadVector(const std::vector<T>& values) {
 }
 
 template <typename T>
+std::vector<T> DefaultedCopy(const std::vector<T>& values, uint32_t count, T fallback) {
+    std::vector<T> result(count, fallback);
+    const uint32_t copied_count =
+        std::min<uint32_t>(count, static_cast<uint32_t>(values.size()));
+    for (uint32_t index = 0; index < copied_count; ++index) {
+        result[index] = values[index];
+    }
+    return result;
+}
+
+template <typename T>
 std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
     std::vector<T> values(count);
     if (!values.empty()) {
@@ -38,7 +49,11 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
                          phi::Buffer body_poses,
                          phi::Buffer body_inv_masses,
                          phi::Buffer body_inv_inertias,
+                         phi::Buffer shape_types,
                          phi::Buffer shape_body_ids,
+                         phi::Buffer shape_local_transforms,
+                         phi::Buffer shape_half_extents,
+                         phi::Buffer shape_radii,
                          phi::Buffer joint_child_bodies,
                          phi::Buffer actuator_gains,
                          phi::Buffer actuator_force_limits)
@@ -49,7 +64,11 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
     , body_poses_(std::move(body_poses))
     , body_inv_masses_(std::move(body_inv_masses))
     , body_inv_inertias_(std::move(body_inv_inertias))
+    , shape_types_(std::move(shape_types))
     , shape_body_ids_(std::move(shape_body_ids))
+    , shape_local_transforms_(std::move(shape_local_transforms))
+    , shape_half_extents_(std::move(shape_half_extents))
+    , shape_radii_(std::move(shape_radii))
     , joint_child_bodies_(std::move(joint_child_bodies))
     , actuator_gains_(std::move(actuator_gains))
     , actuator_force_limits_(std::move(actuator_force_limits)) {}
@@ -58,7 +77,11 @@ std::size_t DeviceWorld::DeviceBytes() const {
     return body_poses_.Size()
         + body_inv_masses_.Size()
         + body_inv_inertias_.Size()
+        + shape_types_.Size()
         + shape_body_ids_.Size()
+        + shape_local_transforms_.Size()
+        + shape_half_extents_.Size()
+        + shape_radii_.Size()
         + joint_child_bodies_.Size()
         + actuator_gains_.Size()
         + actuator_force_limits_.Size()
@@ -172,6 +195,10 @@ math::Transform* DeviceWorld::DevicePoses() {
     return static_cast<math::Transform*>(state_poses_.Data());
 }
 
+const math::Transform* DeviceWorld::DevicePoses() const {
+    return static_cast<const math::Transform*>(state_poses_.Data());
+}
+
 math::Vec3* DeviceWorld::DeviceLinearVelocities() {
     return static_cast<math::Vec3*>(state_linear_velocities_.Data());
 }
@@ -196,7 +223,48 @@ const math::Vec3* DeviceWorld::DeviceInvInertias() const {
     return static_cast<const math::Vec3*>(body_inv_inertias_.Data());
 }
 
+const scene::ShapeType* DeviceWorld::DeviceShapeTypes() const {
+    return static_cast<const scene::ShapeType*>(shape_types_.Data());
+}
+
+const scene::BodyId* DeviceWorld::DeviceShapeBodyIds() const {
+    return static_cast<const scene::BodyId*>(shape_body_ids_.Data());
+}
+
+const math::Transform* DeviceWorld::DeviceShapeLocalTransforms() const {
+    return static_cast<const math::Transform*>(shape_local_transforms_.Data());
+}
+
+const math::Vec3* DeviceWorld::DeviceShapeHalfExtents() const {
+    return static_cast<const math::Vec3*>(shape_half_extents_.Data());
+}
+
+const float* DeviceWorld::DeviceShapeRadii() const {
+    return static_cast<const float*>(shape_radii_.Data());
+}
+
 DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
+    const auto shape_types =
+        DefaultedCopy(world_template.shape_table.types,
+                      world_template.shape_count,
+                      scene::ShapeType::Box);
+    const auto shape_body_ids =
+        DefaultedCopy(world_template.shape_table.body_ids,
+                      world_template.shape_count,
+                      scene::kInvalidBody);
+    const auto shape_local_transforms =
+        DefaultedCopy(world_template.shape_table.local_transforms,
+                      world_template.shape_count,
+                      math::Transform::Identity());
+    const auto shape_half_extents =
+        DefaultedCopy(world_template.shape_table.half_extents,
+                      world_template.shape_count,
+                      math::Vec3{0.5f, 0.5f, 0.5f});
+    const auto shape_radii =
+        DefaultedCopy(world_template.shape_table.radii,
+                      world_template.shape_count,
+                      0.5f);
+
     return DeviceWorld(
         world_template.body_count,
         world_template.shape_count,
@@ -205,7 +273,11 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         UploadVector(world_template.body_table.poses),
         UploadVector(world_template.body_table.inv_masses),
         UploadVector(world_template.body_table.inv_inertias),
-        UploadVector(world_template.shape_table.body_ids),
+        UploadVector(shape_types),
+        UploadVector(shape_body_ids),
+        UploadVector(shape_local_transforms),
+        UploadVector(shape_half_extents),
+        UploadVector(shape_radii),
         UploadVector(world_template.joint_table.child_bodies),
         UploadVector(world_template.actuator_table.gains),
         UploadVector(world_template.actuator_table.force_limits));

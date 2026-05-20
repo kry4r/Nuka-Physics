@@ -232,6 +232,7 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_cuda_runtime_test
         runtime/test_cuda_device_world.cpp
         runtime/test_cuda_world_stepper.cpp
+        runtime/test_cuda_contacts.cpp
     )
 
     target_link_libraries(nuka_cuda_runtime_test
@@ -244,6 +245,7 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_cuda_runtime_test)
 
     add_executable(nuka_cuda_perf_test
+        perf/test_cuda_contact_timing.cpp
         perf/test_cuda_step_timing.cpp
     )
 

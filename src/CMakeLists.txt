@@ -298,6 +298,8 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     add_library(nuka_runtime_gpu STATIC
+        collision/gpu/broadphase.cu
+        constraint/gpu/contact_generation.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
     )

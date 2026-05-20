@@ -59,7 +59,11 @@ public:
                 phi::Buffer body_poses,
                 phi::Buffer body_inv_masses,
                 phi::Buffer body_inv_inertias,
+                phi::Buffer shape_types,
                 phi::Buffer shape_body_ids,
+                phi::Buffer shape_local_transforms,
+                phi::Buffer shape_half_extents,
+                phi::Buffer shape_radii,
                 phi::Buffer joint_child_bodies,
                 phi::Buffer actuator_gains,
                 phi::Buffer actuator_force_limits);
@@ -83,12 +87,18 @@ public:
     void UploadState(const WorldInstance& instance);
 
     math::Transform* DevicePoses();
+    const math::Transform* DevicePoses() const;
     math::Vec3* DeviceLinearVelocities();
     math::Vec3* DeviceAngularVelocities();
     math::Vec3* DeviceForces();
     math::Vec3* DeviceTorques();
     const float* DeviceInvMasses() const;
     const math::Vec3* DeviceInvInertias() const;
+    const scene::ShapeType* DeviceShapeTypes() const;
+    const scene::BodyId* DeviceShapeBodyIds() const;
+    const math::Transform* DeviceShapeLocalTransforms() const;
+    const math::Vec3* DeviceShapeHalfExtents() const;
+    const float* DeviceShapeRadii() const;
 
 private:
     uint32_t body_count_ = 0;
@@ -99,7 +109,11 @@ private:
     phi::Buffer body_poses_;
     phi::Buffer body_inv_masses_;
     phi::Buffer body_inv_inertias_;
+    phi::Buffer shape_types_;
     phi::Buffer shape_body_ids_;
+    phi::Buffer shape_local_transforms_;
+    phi::Buffer shape_half_extents_;
+    phi::Buffer shape_radii_;
     phi::Buffer joint_child_bodies_;
     phi::Buffer actuator_gains_;
     phi::Buffer actuator_force_limits_;
