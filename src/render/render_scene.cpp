@@ -47,6 +47,7 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         mesh.body_id = shape.body_id;
         mesh.material_id = shape.material_id;
         mesh.shape_type = shape.type;
+        mesh.local_transform = shape.local_transform;
         mesh.world_transform = shape_world;
         mesh.half_extents = shape.half_extents;
         mesh.radius = shape.radius;
@@ -57,6 +58,7 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         proxy.body_id = shape.body_id;
         proxy.shape_id = shape.id;
         proxy.shape_type = shape.type;
+        proxy.local_transform = shape.local_transform;
         proxy.world_transform = shape_world;
         proxy.half_extents = shape.half_extents;
         proxy.radius = shape.radius;
@@ -69,6 +71,7 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         RenderCamera out;
         out.camera_id = camera.id;
         out.attached_body = camera.attached_body;
+        out.local_transform = camera.local_transform;
         out.world_transform = BodyWorldTransform(scene, camera.attached_body) * camera.local_transform;
         out.vertical_fov_degrees = camera.vertical_fov_degrees;
         out.near_clip = camera.near_clip;
@@ -82,6 +85,7 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         out.light_id = light.id;
         out.type = light.type;
         out.attached_body = light.attached_body;
+        out.local_transform = light.local_transform;
         out.world_transform = BodyWorldTransform(scene, light.attached_body) * light.local_transform;
         out.color = light.color;
         out.intensity = light.intensity;

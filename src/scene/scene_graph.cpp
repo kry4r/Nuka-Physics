@@ -27,6 +27,13 @@ const SceneGraphNode& SceneGraph::GetNode(BodyId id) const {
     return nodes_[id];
 }
 
+SceneGraphNode& SceneGraph::GetNodeMut(BodyId id) {
+    if (id >= nodes_.size()) {
+        throw std::out_of_range("SceneGraph::GetNodeMut - invalid BodyId");
+    }
+    return nodes_[id];
+}
+
 const std::vector<SceneGraphNode>& SceneGraph::Nodes() const {
     return nodes_;
 }

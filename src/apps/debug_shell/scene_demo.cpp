@@ -9,11 +9,13 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "runtime/world_stepper.hpp"
 #include "scene/scene_pipeline.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -43,6 +45,95 @@ scene::SceneIR LoadSceneForDemo(const std::string& path) {
     throw std::runtime_error("Unsupported scene demo input extension: " + extension);
 }
 
+struct DebugDrawBoundsXY {
+    math::Vec3 min = {0.0f, 0.0f, 0.0f};
+    math::Vec3 max = {0.0f, 0.0f, 0.0f};
+    bool valid = false;
+};
+
+DebugDrawBoundsXY ComputeDebugDrawBoundsXY(const DebugDrawList& commands) {
+    DebugDrawBoundsXY bounds;
+    if (commands.Commands().empty()) {
+        return bounds;
+    }
+
+    math::Vec3 min_point{
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        0.0f
+    };
+    math::Vec3 max_point{
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+        0.0f
+    };
+
+    const auto include_point = [&](math::Vec3 point) {
+        min_point.x = std::min(min_point.x, point.x);
+        min_point.y = std::min(min_point.y, point.y);
+        max_point.x = std::max(max_point.x, point.x);
+        max_point.y = std::max(max_point.y, point.y);
+    };
+
+    for (const auto& command : commands.Commands()) {
+        include_point(command.position);
+        switch (command.type) {
+        case DrawCommandType::Line:
+        case DrawCommandType::AABB:
+            include_point(command.end);
+            break;
+        case DrawCommandType::Box:
+            include_point(command.position - command.size);
+            include_point(command.position + command.size);
+            break;
+        case DrawCommandType::Sphere: {
+            const math::Vec3 radius{command.radius, command.radius, 0.0f};
+            include_point(command.position - radius);
+            include_point(command.position + radius);
+            break;
+        }
+        case DrawCommandType::Capsule: {
+            const math::Vec3 axis = command.end.Normalized();
+            const math::Vec3 a = command.position - axis * command.half_height;
+            const math::Vec3 b = command.position + axis * command.half_height;
+            const math::Vec3 radius{command.radius, command.radius, 0.0f};
+            include_point(a - radius);
+            include_point(a + radius);
+            include_point(b - radius);
+            include_point(b + radius);
+            break;
+        }
+        case DrawCommandType::Frame:
+        case DrawCommandType::ContactPoint:
+            break;
+        }
+    }
+
+    bounds.min = min_point;
+    bounds.max = max_point;
+    bounds.valid = true;
+    return bounds;
+}
+
+void FitRasterViewXY(const DebugDrawList& commands, DebugRasterOptions& options) {
+    const DebugDrawBoundsXY bounds = ComputeDebugDrawBoundsXY(commands);
+    if (!bounds.valid || options.width == 0 || options.height == 0) {
+        return;
+    }
+
+    const float width_world = std::max(bounds.max.x - bounds.min.x, 1e-3f);
+    const float height_world = std::max(bounds.max.y - bounds.min.y, 1e-3f);
+    const float scale_x = (static_cast<float>(options.width) * 0.82f) / width_world;
+    const float scale_y = (static_cast<float>(options.height) * 0.82f) / height_world;
+
+    options.view_center = {
+        (bounds.min.x + bounds.max.x) * 0.5f,
+        (bounds.min.y + bounds.max.y) * 0.5f,
+        0.0f
+    };
+    options.view_scale = std::min(options.view_scale, std::min(scale_x, scale_y));
+}
+
 } // namespace
 
 SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
@@ -54,7 +145,19 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     }
 
     const auto scene = LoadSceneForDemo(options.input_path);
-    const auto compiled = scene::BuildCompiledScene(scene);
+    auto compiled = scene::BuildCompiledScene(scene);
+
+    if (options.simulation_steps > 0) {
+        runtime::WorldStepOptions step_options;
+        step_options.gravity = options.gravity;
+        step_options.dt = options.dt;
+        step_options.step_count = options.simulation_steps;
+        runtime::StepWorldInstance(compiled.physics.runtime_world.template_view,
+                                   compiled.physics.runtime_world.instance,
+                                   step_options);
+        scene::ApplyRuntimeStateToCompiledScene(compiled.physics.runtime_world.instance,
+                                                compiled);
+    }
 
     DebugVisualizationInput input;
     input.render_scene = &compiled.render;
@@ -66,6 +169,11 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     DebugRasterOptions raster_options;
     raster_options.width = options.width;
     raster_options.height = options.height;
+    raster_options.view_scale = options.view_scale;
+    raster_options.view_center = options.view_center;
+    if (options.auto_fit_view) {
+        FitRasterViewXY(commands, raster_options);
+    }
     const DebugRasterImage image = RasterizeDebugDrawList(commands, raster_options);
 
     std::filesystem::path output_path(options.output_path);
@@ -83,6 +191,12 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     result.light_count = compiled.render.light_count;
     result.debug_command_count = static_cast<uint32_t>(commands.CommandCount());
     result.non_background_pixel_count = image.NonBackgroundPixelCount();
+    result.simulation_steps = options.simulation_steps;
+    result.simulated_time_seconds = options.dt * static_cast<float>(options.simulation_steps);
+    result.body_world_poses.reserve(compiled.graph.NodeCount());
+    for (const auto& node : compiled.graph.Nodes()) {
+        result.body_world_poses.push_back(node.world_transform);
+    }
     return result;
 }
 

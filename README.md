@@ -53,12 +53,14 @@ ctest --test-dir build -C Release --output-on-failure
 
 ```powershell
 cmake --build build --config Release --target nuka_scene_demo
-.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
 ```
 
 The demo imports MJCF/URDF/USD text scenes, compiles them into
-`SceneGraph`/`PhysicsWorld`/`RenderScene`, generates physics debug overlays, and
-writes a deterministic PPM image for quick validation or CI artifacts.
+`SceneGraph`/`PhysicsWorld`/`RenderScene`, advances the runtime world with fixed
+steps, synchronizes the simulated body poses back into render/debug views,
+generates physics debug overlays, and writes a deterministic PPM image for quick
+validation or CI artifacts.
 
 ## Architecture
 

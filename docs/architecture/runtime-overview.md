@@ -25,6 +25,16 @@ A mutable simulation state derived from a `WorldTemplate`. Holds per-body dynami
 state: positions, orientations, linear and angular velocities, forces, and torques.
 Each instance evolves independently during simulation.
 
+### World Stepper
+
+`runtime::StepWorldInstance()` advances a `WorldInstance` against its
+`WorldTemplate` with fixed-step CPU integration. It converts each body row into
+the rigid `BodyState`, applies gravity and accumulated forces/torques through the
+shared symplectic Euler integrator, writes poses and velocities back, and clears
+force accumulators by default. Cooked body poses are stored in world space so
+imported hierarchies start simulation from the same transforms used by
+`SceneGraph`.
+
 ### BatchContext / BatchScheduler
 
 Manages multiple `WorldInstance` objects that share a common `WorldTemplate`.
@@ -44,6 +54,11 @@ which emits:
 This keeps rendering decoupled from simulation while still sharing stable body,
 shape, material, camera, light, actuator, and sensor identifiers.
 
+After simulation, `scene::ApplyRuntimeStateToCompiledScene()` copies runtime body
+poses back into the compiled `SceneGraph` and updates render mesh, debug proxy,
+camera, and light transforms. App layers use this bridge before drawing or
+debugging a simulated frame.
+
 ### Debug Visualization Bridge
 
 `app::BuildDebugVisualization()` consumes the compiled `RenderScene`,
@@ -54,10 +69,11 @@ and constraint error vectors. Native shells and future renderers should consume
 this command list instead of re-deriving overlay geometry from raw physics state.
 
 `nuka_scene_demo` is the current runnable debug render path. It imports a scene,
-builds the compiled runtime views, emits the debug draw command list, and
-rasterizes it through the headless renderer to a PPM image. This keeps the demo
-usable in CI while preserving the same command source that a native OpenGL/ImGui
-viewport will consume.
+builds the compiled runtime views, steps the runtime instance with fixed-step
+simulation, synchronizes simulated poses to render/debug views, emits the debug
+draw command list, and rasterizes it through the headless renderer to a PPM
+image. This keeps the demo usable in CI while preserving the same command source
+that a native OpenGL/ImGui viewport will consume.
 
 ## Domain Modules
 

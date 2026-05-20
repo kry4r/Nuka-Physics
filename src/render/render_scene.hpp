@@ -17,6 +17,7 @@ struct RenderMeshInstance {
     scene::BodyId body_id = scene::kInvalidBody;
     scene::MaterialId material_id = scene::kInvalidMaterial;
     scene::ShapeType shape_type = scene::ShapeType::Box;
+    math::Transform local_transform = math::Transform::Identity();
     math::Transform world_transform = math::Transform::Identity();
     math::Vec3 half_extents = {0.5f, 0.5f, 0.5f};
     float radius = 0.5f;
@@ -34,6 +35,7 @@ struct RenderMaterial {
 struct RenderCamera {
     scene::CameraId camera_id = 0;
     scene::BodyId attached_body = scene::kInvalidBody;
+    math::Transform local_transform = math::Transform::Identity();
     math::Transform world_transform = math::Transform::Identity();
     float vertical_fov_degrees = 45.0f;
     float near_clip = 0.01f;
@@ -44,6 +46,7 @@ struct RenderLight {
     scene::LightId light_id = 0;
     scene::LightType type = scene::LightType::Point;
     scene::BodyId attached_body = scene::kInvalidBody;
+    math::Transform local_transform = math::Transform::Identity();
     math::Transform world_transform = math::Transform::Identity();
     math::Vec3 color = {1.0f, 1.0f, 1.0f};
     float intensity = 1.0f;
@@ -53,6 +56,7 @@ struct DebugProxy {
     scene::BodyId body_id = scene::kInvalidBody;
     scene::ShapeId shape_id = 0;
     scene::ShapeType shape_type = scene::ShapeType::Box;
+    math::Transform local_transform = math::Transform::Identity();
     math::Transform world_transform = math::Transform::Identity();
     math::Vec3 half_extents = {0.5f, 0.5f, 0.5f};
     float radius = 0.5f;

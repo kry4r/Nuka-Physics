@@ -15,6 +15,8 @@ All tests in this matrix must pass on every commit before merge.
 | ScenePipeline/ImportedMjcfSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies MJCF import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
 | ScenePipeline/ImportedUsdSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies USD import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
 | ScenePipeline/RenderSceneKeepsShapeMaterialAndBodyBindings | `tests/scene/test_scene_pipeline.cpp` | Verifies RenderScene keeps shape, material, and body bindings for debug/render use | RenderScene bindings |
+| ScenePipeline/AppliesRuntimeStateToRenderAndDebugViews | `tests/scene/test_scene_pipeline.cpp` | Verifies simulated runtime poses update SceneGraph world transforms plus render/debug/camera transforms without overwriting local authoring transforms | WorldInstance, SceneGraph, RenderScene |
+| SceneCooker/CooksBodyPosesInWorldSpaceForRuntimeStepping | `tests/scene/test_scene_cooker.cpp` | Verifies cooked runtime body poses include parent transforms before physics stepping | SceneIR hierarchy, cooked body table |
 
 ## Debug Visualization Regression Tests
 
@@ -26,6 +28,8 @@ All tests in this matrix must pass on every commit before merge.
 | HeadlessDebugRenderer/RasterizesImportedSceneDebugCommands | `tests/apps/test_scene_demo.cpp` | Rasterizes imported MJCF debug commands into a non-empty image | PPM pixels |
 | SceneDemo/ExportsMjcfSceneDebugViewToPpm | `tests/apps/test_scene_demo.cpp` | Runs the imported-scene demo path for the example MJCF scene and writes a PPM artifact | MJCF, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
 | SceneDemo/ExportsUsdSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs the same demo path for USDA/text USD input | USD adapter, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
+| SceneDemo/SimulatesImportedSceneBeforeRendering | `tests/apps/test_scene_demo.cpp` | Steps an imported scene, synchronizes runtime poses, and renders debug overlays from the simulated state | WorldInstance, SceneGraph, RenderScene, DebugDrawList |
+| SceneDemo/RenderedImageChangesWhenSimulationChangesRuntimePose | `tests/apps/test_scene_demo.cpp` | Verifies fixed-view PPM bytes change when simulation changes runtime body poses | WorldInstance, DebugDrawList, PPM pixels |
 
 ## Physics Regression Tests
 
@@ -39,6 +43,8 @@ All tests in this matrix must pass on every commit before merge.
 | RestStackRegression/BottomBoxStaysAboveGround | `tests/regression/test_rest_stack.cpp` | Bottom box does not fall through ground | bottom_y >= 0 | true |
 | TwoLinkArmRegression/JointMaintainsConnectivity | `tests/regression/test_two_link_arm.cpp` | Revolute joint gap after 10 steps with gravity | Gap distance | < 0.05 |
 | TwoLinkArmRegression/AnchorPointsCoincide | `tests/regression/test_two_link_arm.cpp` | Per-axis anchor point agreement | Per-axis error | < 0.05 |
+| WorldStepper/AdvancesDynamicBodiesAndKeepsStaticBodiesFixed | `tests/runtime/test_world_stepper.cpp` | Fixed-step world stepping advances dynamic bodies and preserves static body state | Pose/velocity | expected symplectic Euler values |
+| WorldStepper/AppliesForcesTorquesAndClearsAccumulatorsAfterEachStep | `tests/runtime/test_world_stepper.cpp` | Applies force and torque accumulators through body tables and clears them after stepping | Velocity/accumulators | expected values / zeroed accumulators |
 
 ## Performance Tests
 
@@ -46,7 +52,7 @@ All tests in this matrix must pass on every commit before merge.
 |-----------|------|-------------|--------|-----------|
 | StepTiming/HundredStepsUnderOneSecond | `tests/perf/test_step_timing.cpp` | 100 steps on 10 bodies | Wall time | < 1000 ms |
 | StepTiming/ThousandStepsSingleBody | `tests/perf/test_step_timing.cpp` | 1000 steps on 1 body | Wall time | < 1000 ms |
-| RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
+| RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

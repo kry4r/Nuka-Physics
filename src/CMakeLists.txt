@@ -49,6 +49,7 @@ nuka_set_warnings(nuka_scene)
 add_library(nuka_runtime STATIC
     runtime/world_builder.cpp
     runtime/physics_world.cpp
+    runtime/world_stepper.cpp
     runtime/rigid/integrator.cpp
     runtime/batch_scheduler.cpp
 )

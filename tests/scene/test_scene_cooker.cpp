@@ -182,6 +182,29 @@ TEST(SceneCooker, MultipleBodiesCooked) {
     EXPECT_EQ(blob.bodies.is_static.size(), 3u);
 }
 
+TEST(SceneCooker, CooksBodyPosesInWorldSpaceForRuntimeStepping) {
+    SceneIR scene;
+
+    RigidBodyRecord base;
+    base.name = "base";
+    base.local_transform.position = {2.0f, 0.0f, 0.0f};
+    const auto base_id = scene.AddRigidBody(std::move(base));
+
+    RigidBodyRecord child;
+    child.name = "child";
+    child.parent_id = base_id;
+    child.local_transform.position = {0.0f, 3.0f, 0.0f};
+    scene.AddRigidBody(std::move(child));
+
+    const auto blob = CookScene(scene);
+
+    ASSERT_EQ(blob.bodies.poses.size(), 2u);
+    EXPECT_FLOAT_EQ(blob.bodies.poses[0].position.x, 2.0f);
+    EXPECT_FLOAT_EQ(blob.bodies.poses[0].position.y, 0.0f);
+    EXPECT_FLOAT_EQ(blob.bodies.poses[1].position.x, 2.0f);
+    EXPECT_FLOAT_EQ(blob.bodies.poses[1].position.y, 3.0f);
+}
+
 // ---------------------------------------------------------------------------
 // Empty scene
 // ---------------------------------------------------------------------------

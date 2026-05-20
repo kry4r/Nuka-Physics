@@ -24,6 +24,7 @@ public:
     BodyId AddNode(SceneGraphNode node);
     size_t NodeCount() const;
     const SceneGraphNode& GetNode(BodyId id) const;
+    SceneGraphNode& GetNodeMut(BodyId id);
     const std::vector<SceneGraphNode>& Nodes() const;
 
 private:

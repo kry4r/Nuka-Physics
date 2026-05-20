@@ -27,6 +27,8 @@ TEST(RenderDemoTiming, ImportedSceneDebugViewUnderOneSecond) {
     const auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
+    EXPECT_EQ(result.simulation_steps, 60u);
+    EXPECT_NEAR(result.simulated_time_seconds, 1.0f, 1e-6f);
     EXPECT_GT(result.non_background_pixel_count, 0u);
     EXPECT_LT(elapsed_ms, 1000);
     EXPECT_TRUE(std::filesystem::exists(output_path));

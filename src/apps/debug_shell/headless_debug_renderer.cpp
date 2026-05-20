@@ -30,7 +30,7 @@ PixelPoint Project(math::Vec3 point, const DebugRasterOptions& options) {
     const float x = (point.x - options.view_center.x) * options.view_scale
         + static_cast<float>(options.width) * 0.5f;
     const float y = static_cast<float>(options.height) * 0.5f
-        - (point.z - options.view_center.z) * options.view_scale;
+        - (point.y - options.view_center.y) * options.view_scale;
     return {
         static_cast<int>(std::lround(x)),
         static_cast<int>(std::lround(y))
@@ -132,7 +132,7 @@ void RasterizeCommand(DebugRasterImage& image,
         DrawRect(image,
                  position,
                  static_cast<int>(std::ceil(command.size.x * options.view_scale)),
-                 static_cast<int>(std::ceil(command.size.z * options.view_scale)),
+                 static_cast<int>(std::ceil(command.size.y * options.view_scale)),
                  color);
         break;
     case DrawCommandType::AABB: {

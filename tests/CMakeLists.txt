@@ -49,6 +49,7 @@ gtest_discover_tests(nuka_scene_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(nuka_runtime_test
     runtime/test_world_build.cpp
     runtime/test_rigid_integration.cpp
+    runtime/test_world_stepper.cpp
 )
 
 target_link_libraries(nuka_runtime_test

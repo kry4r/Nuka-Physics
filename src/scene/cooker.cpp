@@ -6,6 +6,18 @@
 
 namespace nuka::scene {
 
+namespace {
+
+math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
+    const auto& body = scene.GetBody(body_id);
+    if (body.parent_id == kInvalidBody) {
+        return body.local_transform;
+    }
+    return ResolveWorldTransform(scene, body.parent_id) * body.local_transform;
+}
+
+} // namespace
+
 CookedBlob CookScene(const SceneIR& scene) {
     CookedBlob blob;
 
@@ -17,7 +29,7 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.bodies.is_static.reserve(bodies.size());
 
     for (const auto& b : bodies) {
-        blob.bodies.poses.push_back(b.local_transform);
+        blob.bodies.poses.push_back(ResolveWorldTransform(scene, b.id));
 
         if (b.is_static) {
             blob.bodies.inv_masses.push_back(0.0f);

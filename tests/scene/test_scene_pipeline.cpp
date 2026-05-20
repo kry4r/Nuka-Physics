@@ -35,6 +35,7 @@ nuka::scene::SceneIR BuildProgrammaticRobotScene() {
     shape.body_id = link_id;
     shape.material_id = material_id;
     shape.type = nuka::scene::ShapeType::Box;
+    shape.local_transform.position = {0.1f, 0.2f, 0.3f};
     shape.half_extents = {0.1f, 0.2f, 0.3f};
     scene.AddCollisionShape(std::move(shape));
 
@@ -62,6 +63,7 @@ nuka::scene::SceneIR BuildProgrammaticRobotScene() {
     nuka::scene::CameraRecord camera;
     camera.name = "camera";
     camera.attached_body = link_id;
+    camera.local_transform.position = {0.0f, 0.0f, 0.4f};
     scene.AddCamera(std::move(camera));
 
     nuka::scene::LightRecord light;
@@ -135,4 +137,35 @@ TEST(ScenePipeline, RenderSceneKeepsShapeMaterialAndBodyBindings) {
     EXPECT_EQ(compiled.render.mesh_instances[0].body_id, 1u);
     EXPECT_EQ(compiled.render.mesh_instances[0].material_id, 0u);
     EXPECT_EQ(compiled.render.mesh_instances[0].shape_type, nuka::scene::ShapeType::Box);
+}
+
+TEST(ScenePipeline, AppliesRuntimeStateToRenderAndDebugViews) {
+    auto compiled = nuka::scene::BuildCompiledScene(BuildProgrammaticRobotScene());
+
+    ASSERT_EQ(compiled.physics.runtime_world.instance.poses.size(), 2u);
+    compiled.physics.runtime_world.instance.poses[1].position = {4.0f, 5.0f, 6.0f};
+
+    nuka::scene::ApplyRuntimeStateToCompiledScene(
+        compiled.physics.runtime_world.instance,
+        compiled);
+
+    EXPECT_FLOAT_EQ(compiled.graph.GetNode(1).local_transform.position.z, 1.0f);
+    EXPECT_FLOAT_EQ(compiled.graph.GetNode(1).world_transform.position.x, 4.0f);
+    EXPECT_FLOAT_EQ(compiled.graph.GetNode(1).world_transform.position.y, 5.0f);
+    EXPECT_FLOAT_EQ(compiled.graph.GetNode(1).world_transform.position.z, 6.0f);
+
+    ASSERT_EQ(compiled.render.mesh_instance_count, 1u);
+    EXPECT_FLOAT_EQ(compiled.render.mesh_instances[0].world_transform.position.x, 4.1f);
+    EXPECT_FLOAT_EQ(compiled.render.mesh_instances[0].world_transform.position.y, 5.2f);
+    EXPECT_FLOAT_EQ(compiled.render.mesh_instances[0].world_transform.position.z, 6.3f);
+
+    ASSERT_EQ(compiled.render.debug_proxy_count, 1u);
+    EXPECT_FLOAT_EQ(compiled.render.debug_proxies[0].world_transform.position.x, 4.1f);
+    EXPECT_FLOAT_EQ(compiled.render.debug_proxies[0].world_transform.position.y, 5.2f);
+    EXPECT_FLOAT_EQ(compiled.render.debug_proxies[0].world_transform.position.z, 6.3f);
+
+    ASSERT_EQ(compiled.render.camera_count, 1u);
+    EXPECT_FLOAT_EQ(compiled.render.cameras[0].world_transform.position.x, 4.0f);
+    EXPECT_FLOAT_EQ(compiled.render.cameras[0].world_transform.position.y, 5.0f);
+    EXPECT_FLOAT_EQ(compiled.render.cameras[0].world_transform.position.z, 6.4f);
 }
