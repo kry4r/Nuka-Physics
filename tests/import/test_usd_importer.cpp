@@ -3,10 +3,36 @@
 // ---------------------------------------------------------------------------
 
 #include "import/usd_importer.hpp"
+#include "import/usd_stage_adapter.hpp"
 #include "scene/cooker.hpp"
 
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <string>
+
+namespace {
+
+std::filesystem::path TempUsdPath(const char* name) {
+    return std::filesystem::temp_directory_path() / name;
+}
+
+void CopyFileTo(const std::filesystem::path& source, const std::filesystem::path& target) {
+    std::filesystem::remove(target);
+    std::filesystem::copy_file(source, target);
+}
+
+std::string ExceptionTextForLoadUsd(const std::string& path) {
+    try {
+        (void)nuka::import::LoadUsd(path);
+    } catch (const std::runtime_error& error) {
+        return error.what();
+    }
+    return {};
+}
+
+} // namespace
 
 TEST(UsdImporter, LoadsUsdPhysicsRigidBodyAndJoint) {
     const auto scene = nuka::import::LoadUsd("tests/data/minimal_scene.usda");
@@ -67,6 +93,82 @@ TEST(UsdImporter, ParsesRenderControlAndSensorRecords) {
     EXPECT_EQ(scene.GetLight(0).type, nuka::scene::LightType::Directional);
     EXPECT_EQ(scene.GetActuator(0).type, nuka::scene::ActuatorType::Velocity);
     EXPECT_EQ(scene.GetSensor(0).type, nuka::scene::SensorType::Imu);
+}
+
+TEST(UsdImporter, DetectsUsdStageFormatsCaseInsensitively) {
+    using nuka::import::DetectUsdStageFormat;
+    using nuka::import::UsdStageFormat;
+
+    EXPECT_EQ(DetectUsdStageFormat("robot.USDA"), UsdStageFormat::UsdaText);
+    EXPECT_EQ(DetectUsdStageFormat("robot.usd"), UsdStageFormat::Usd);
+    EXPECT_EQ(DetectUsdStageFormat("robot.USDC"), UsdStageFormat::UsdcCrate);
+    EXPECT_EQ(DetectUsdStageFormat("robot.USDZ"), UsdStageFormat::UsdzPackage);
+    EXPECT_EQ(DetectUsdStageFormat("robot.obj"), UsdStageFormat::Unknown);
+}
+
+TEST(UsdImporter, LoadsTextUsdExtensionThroughAdapter) {
+    const auto usd_path = TempUsdPath("nuka_minimal_scene_text.usd");
+    CopyFileTo("tests/data/minimal_scene.usda", usd_path);
+
+    const auto scene = nuka::import::LoadUsd(usd_path.string());
+
+    EXPECT_EQ(scene.RigidBodyCount(), 2u);
+    EXPECT_EQ(scene.JointCount(), 1u);
+    EXPECT_EQ(scene.ShapeCount(), 2u);
+
+    std::filesystem::remove(usd_path);
+}
+
+TEST(UsdImporter, BinaryUsdExtensionReportsOpenUsdSdkAdapterRequirement) {
+    const auto usd_path = TempUsdPath("nuka_binary_scene.usd");
+    {
+        std::ofstream out(usd_path, std::ios::binary);
+        out << "PXR-USDC";
+        out.put('\0');
+    }
+
+    const std::string message = ExceptionTextForLoadUsd(usd_path.string());
+
+    EXPECT_NE(message.find("OpenUSD SDK adapter"), std::string::npos);
+    EXPECT_NE(message.find(".usd"), std::string::npos);
+
+    std::filesystem::remove(usd_path);
+}
+
+TEST(UsdImporter, UsdcAndUsdzRouteThroughOpenUsdSdkAdapterDiagnostics) {
+    const auto usdc_path = TempUsdPath("nuka_scene.usdc");
+    const auto usdz_path = TempUsdPath("nuka_scene.usdz");
+    {
+        std::ofstream usdc(usdc_path, std::ios::binary);
+        usdc << "PXR-USDC";
+        std::ofstream usdz(usdz_path, std::ios::binary);
+        usdz << "PK";
+    }
+
+    const std::string usdc_message = ExceptionTextForLoadUsd(usdc_path.string());
+    const std::string usdz_message = ExceptionTextForLoadUsd(usdz_path.string());
+
+    EXPECT_NE(usdc_message.find("OpenUSD SDK adapter"), std::string::npos);
+    EXPECT_NE(usdc_message.find("USDC"), std::string::npos);
+    EXPECT_NE(usdz_message.find("OpenUSD SDK adapter"), std::string::npos);
+    EXPECT_NE(usdz_message.find("USDZ"), std::string::npos);
+
+    std::filesystem::remove(usdc_path);
+    std::filesystem::remove(usdz_path);
+}
+
+TEST(UsdImporter, RejectsUnsupportedUsdExtensionBeforeParsing) {
+    const auto txt_path = TempUsdPath("nuka_scene.txt");
+    {
+        std::ofstream out(txt_path);
+        out << "#usda 1.0\n";
+    }
+
+    const std::string message = ExceptionTextForLoadUsd(txt_path.string());
+
+    EXPECT_NE(message.find("unsupported USD extension"), std::string::npos);
+
+    std::filesystem::remove(txt_path);
 }
 
 TEST(UsdImporter, ThrowsOnMissingFile) {

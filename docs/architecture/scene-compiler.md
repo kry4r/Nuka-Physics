@@ -22,10 +22,12 @@ Importers read external scene descriptions and populate the `SceneIR`:
 |--------|--------|-------------|
 | MJCF   | `src/import/mjcf_importer.cpp` | `LoadMjcf(path)` |
 | URDF   | `src/import/urdf_importer.cpp` | `LoadUrdf(path)` |
-| USD/USDA | `src/import/usd_importer.cpp` | `LoadUsd(path)` |
+| USD/USDA/USDC/USDZ | `src/import/usd_importer.cpp`, `src/import/usd_stage_adapter.cpp` | `LoadUsd(path)` |
 
 Each importer:
-- Parses the source format: XML for MJCF/URDF, and an isolated USD adapter for USDA/text USD until the official OpenUSD C++ SDK backend is wired in.
+- Parses the source format: XML for MJCF/URDF, and an isolated USD stage
+  adapter for USDA/text USD until the official OpenUSD C++ SDK backend is wired
+  in for binary crate and package inputs.
 - Maps format-specific concepts to `SceneIR` records: bodies, joints, collision geometry, materials, cameras, lights, actuators, and sensors.
 - Resolves named body, joint, and material references before emitting the canonical IR.
 
@@ -83,10 +85,21 @@ optimized for runtime consumption:
 ## USD Adapter Boundary
 
 `LoadUsd()` is the stable engine-facing entry point. The current implementation
-supports ASCII `.usda` and text `.usd` files and rejects binary `.usdc`/`.usdz`
-with an explicit error that points to the pending OpenUSD SDK adapter. This keeps
-callers and tests aligned with the final import path while avoiding a hard SDK
-dependency before build-system support is added.
+delegates file loading and format detection to `usd_stage_adapter`. The adapter
+recognizes `.usd`, `.usda`, `.usdc`, and `.usdz` case-insensitively:
+
+- ASCII `.usda` and text `.usd` stages are parsed by the built-in stage reader.
+- Binary `.usd`, crate `.usdc`, and package `.usdz` inputs route through the same
+  adapter boundary and currently return an explicit OpenUSD SDK adapter
+  requirement instead of falling through to the text parser.
+- Unsupported extensions are rejected before parsing, so callers get a stable
+  diagnostic at the import boundary.
+
+The dependency choice remains the official OpenUSD C++ SDK for binary USD and
+USDZ support because it is the maintained implementation of crate/package
+decoding and UsdPhysics schema traversal. The local adapter avoids making the SDK
+a hard build dependency before CMake package discovery, binary distribution, and
+CI availability are settled.
 
 The cooked blob is consumed by `runtime::BuildWorld(blob)` and
 `runtime::BuildPhysicsWorld(blob)` to construct a `WorldTemplate`, an initial

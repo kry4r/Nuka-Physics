@@ -4,13 +4,13 @@
 
 #include "import/usd_importer.hpp"
 
+#include "import/usd_stage_adapter.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 
 #include <algorithm>
 #include <cctype>
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -79,24 +79,6 @@ std::string Lowercase(std::string_view text) {
         return static_cast<char>(std::tolower(c));
     });
     return out;
-}
-
-std::string ExtensionOf(const std::string& path) {
-    const size_t dot = path.find_last_of('.');
-    if (dot == std::string::npos) {
-        return {};
-    }
-    return Lowercase(std::string_view(path).substr(dot));
-}
-
-std::string ReadFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("USD: failed to load file: " + path);
-    }
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    return buffer.str();
 }
 
 bool ParseDefLine(const std::string& line, std::string& type, std::string& name) {
@@ -536,13 +518,8 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
 } // namespace
 
 scene::SceneIR LoadUsd(const std::string& path) {
-    const std::string ext = ExtensionOf(path);
-    if (ext == ".usdc" || ext == ".usdz") {
-        throw std::runtime_error(
-            "USD: binary USD/USDZ import requires the OpenUSD SDK adapter: " + path);
-    }
-
-    auto scene = BuildSceneFromUsdPrims(ParseUsdaText(ReadFile(path)));
+    const UsdStageData stage = LoadUsdStageData(path);
+    auto scene = BuildSceneFromUsdPrims(ParseUsdaText(stage.text));
     if (scene.RigidBodyCount() == 0u) {
         throw std::runtime_error("USD: no enabled UsdPhysics rigid bodies found in " + path);
     }

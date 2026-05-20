@@ -12,6 +12,10 @@ All tests in this matrix must pass on every commit before merge.
 | MjcfImporter/ParsesSceneAuthoringRecords | `tests/import/test_mjcf_importer.cpp` | Loads a complete MJCF XML scene with robot, render, control, and sensor authoring data | body, joint, geom, material, camera, light, actuator, sensor |
 | UsdImporter/ParsesRenderControlAndSensorRecords | `tests/import/test_usd_importer.cpp` | Loads a USDA/text USD scene through the isolated USD adapter and emits canonical metadata | body, joint, geom, material, camera, light, actuator, sensor |
 | UsdImporter/CookedBlobContainsUsdImportedTables | `tests/import/test_usd_importer.cpp` | Verifies imported USD records flatten into cooked runtime metadata tables | body, joint, shape, material, camera, light, actuator, sensor |
+| UsdImporter/DetectsUsdStageFormatsCaseInsensitively | `tests/import/test_usd_importer.cpp` | Verifies `.usd`, `.usda`, `.usdc`, and `.usdz` route through the isolated adapter boundary | extension dispatch |
+| UsdImporter/LoadsTextUsdExtensionThroughAdapter | `tests/import/test_usd_importer.cpp` | Verifies text `.usd` files compile through the same adapter path as `.usda` | body, joint, geom |
+| UsdImporter/BinaryUsdExtensionReportsOpenUsdSdkAdapterRequirement | `tests/import/test_usd_importer.cpp` | Verifies binary `.usd` reports the pending official OpenUSD SDK backend instead of text-parsing garbage | diagnostic |
+| UsdImporter/UsdcAndUsdzRouteThroughOpenUsdSdkAdapterDiagnostics | `tests/import/test_usd_importer.cpp` | Verifies crate and package inputs hit the explicit OpenUSD adapter boundary | diagnostic |
 | ScenePipeline/ImportedMjcfSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies MJCF import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
 | ScenePipeline/ImportedUsdSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies USD import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
 | ScenePipeline/RenderSceneKeepsShapeMaterialAndBodyBindings | `tests/scene/test_scene_pipeline.cpp` | Verifies RenderScene keeps shape, material, and body bindings for debug/render use | RenderScene bindings |
@@ -28,6 +32,7 @@ All tests in this matrix must pass on every commit before merge.
 | HeadlessDebugRenderer/RasterizesImportedSceneDebugCommands | `tests/apps/test_scene_demo.cpp` | Rasterizes imported MJCF debug commands into a non-empty image | PPM pixels |
 | SceneDemo/ExportsMjcfSceneDebugViewToPpm | `tests/apps/test_scene_demo.cpp` | Runs the imported-scene demo path for the example MJCF scene and writes a PPM artifact | MJCF, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
 | SceneDemo/ExportsUsdSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs the same demo path for USDA/text USD input | USD adapter, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
+| SceneDemo/ExportsUsdExampleSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs `examples/scenes/complete_robot.usda` through import, simulation sync, debug visualization, and raster output | USD example, DebugDrawList, PPM pixels |
 | SceneDemo/SimulatesImportedSceneBeforeRendering | `tests/apps/test_scene_demo.cpp` | Steps an imported scene, synchronizes runtime poses, and renders debug overlays from the simulated state | WorldInstance, SceneGraph, RenderScene, DebugDrawList |
 | SceneDemo/RenderedImageChangesWhenSimulationChangesRuntimePose | `tests/apps/test_scene_demo.cpp` | Verifies fixed-view PPM bytes change when simulation changes runtime body poses | WorldInstance, DebugDrawList, PPM pixels |
 

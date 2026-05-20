@@ -22,20 +22,22 @@ bounds so simulated bodies remain visible after large vertical motion. Tests als
 cover a fixed-view path to prove the PPM bytes change when runtime body poses
 change.
 
-The demo currently supports `.xml`, `.urdf`, `.usd`, and `.usda` inputs. Binary
-`.usdc` and `.usdz` still route through the isolated USD adapter and return the
-explicit pending-OpenUSD-SDK error until the native SDK backend is added.
+The demo currently supports `.xml`, `.urdf`, text `.usd`, and `.usda` inputs.
+Binary `.usd`, `.usdc`, and `.usdz` still route through the isolated USD adapter
+and return the explicit pending-OpenUSD-SDK error until the native SDK backend is
+added.
 
 ## Run
 
 ```powershell
 cmake --build build2 --config Release --target nuka_scene_demo
 .\build2\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
+.\build2\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
 ```
 
 The output image shows collision bodies, AABBs, joint axes, and centers of mass
 after fixed-step runtime simulation. The default CLI and API settings run 60
 steps at `dt=1/60`, and the optional final arguments override step count and
 time step. The tests under `tests/apps/test_scene_demo.cpp` verify the same path
-for both MJCF and USDA inputs, including the simulated pose handoff and
-simulation-sensitive raster output.
+for both MJCF and USDA inputs, including the checked-in USD example scene, the
+simulated pose handoff, and simulation-sensitive raster output.

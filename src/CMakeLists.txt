@@ -106,6 +106,7 @@ nuka_set_warnings(nuka_scene_pipeline)
 add_library(nuka_import STATIC
     import/mjcf_importer.cpp
     import/urdf_importer.cpp
+    import/usd_stage_adapter.cpp
     import/usd_importer.cpp
 )
 

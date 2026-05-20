@@ -11,6 +11,7 @@ reinforcement learning, and real-time applications.
 - Collision detection: broadphase (sweep-and-prune) and narrow-phase (GJK/SAT)
 - Sensor simulation: IMU, lidar, force/torque
 - Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
+- Isolated USD stage adapter with explicit `.usd`/`.usda`/`.usdc`/`.usdz` routing and an OpenUSD SDK backend boundary for binary USD/USDZ
 - Batched simulation via WorldTemplate/Instance for parallel environments
 - Optional GPU acceleration through the PHI (Platform Hardware Interface) layer
 - Debug draw and visualization utilities for collision proxies, AABBs, joints, contacts, centers of mass, and constraint errors
@@ -54,6 +55,7 @@ ctest --test-dir build -C Release --output-on-failure
 ```powershell
 cmake --build build --config Release --target nuka_scene_demo
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
 ```
 
 The demo imports MJCF/URDF/USD text scenes, compiles them into
