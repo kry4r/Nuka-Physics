@@ -15,6 +15,9 @@ All tests in this matrix must pass on every commit before merge.
 | VulkanRenderer/CreatesInstanceAndEnumeratesPhysicalDevices | `tests/render/test_vulkan_backend.cpp` | Verifies the Vulkan production renderer backend can create an instance and see a physical device | Vulkan |
 | VulkanRenderer/DeclaresVulkanAsProductionBackend | `tests/render/test_vulkan_backend.cpp` | Verifies Vulkan is the declared production render backend | Vulkan |
 | CudaDeviceWorld/UploadsCookedRuntimeTablesAndDownloadsSummary | `tests/runtime/test_cuda_device_world.cpp` | Verifies cooked runtime body, shape, joint, and actuator tables upload into CUDA buffers and can be validated by compact readback | CUDA |
+| CudaWorldStepper/IntegratesGravityForceAndVelocityOnDevice | `tests/runtime/test_cuda_world_stepper.cpp` | Verifies the CUDA rigid integration kernel updates velocity, pose, and force accumulators on device buffers | CUDA |
+| CudaWorldStepper/MatchesCpuReferenceForFreeFallAndForces | `tests/runtime/test_cuda_world_stepper.cpp` | Compares CUDA free-fall and forced-body integration against the CPU reference path with contacts disabled | CUDA, CPU reference |
+| CudaWorldStepper/RejectsStepBeforeDeviceStateUpload | `tests/runtime/test_cuda_world_stepper.cpp` | Verifies CUDA stepping fails before kernel launch when mutable state has not been uploaded | CUDA |
 
 ## Import Regression Tests
 
@@ -85,6 +88,7 @@ All tests in this matrix must pass on every commit before merge.
 | StepTiming/RuntimeContactPipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 48 cooked dynamic boxes and a static plane through broadphase, narrowphase, contact builder, solver, and integration | Wall time | < 1000 ms |
 | StepTiming/RuntimeJointDrivePipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 32 cooked revolute joints and velocity drives through joint/drive constraint assembly, PGS solve, and integration | Wall time | < 1000 ms |
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
+| CudaStepTiming/RigidIntegrationKernelUnderOneSecond | `tests/perf/test_cuda_step_timing.cpp` | 240 CUDA rigid integration steps over 4096 cooked dynamic bodies | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

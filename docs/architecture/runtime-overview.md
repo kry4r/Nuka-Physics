@@ -48,9 +48,19 @@ the same transforms used by `SceneGraph`.
 pairs, contact manifolds/points, constraint blocks/rows, solver iterations, and
 maximum constraint error. Tests and demos use the report to prove the imported
 scene path is exercising the physical contact pipeline instead of only advancing
-free bodies. The next production stepper must preserve the same report contract
-while moving broadphase, narrowphase, constraint assembly, solver iterations,
-and integration into CUDA-resident buffers/kernels.
+free bodies. CUDA production steppers must preserve the meaningful parts of the
+same reporting contract while moving broadphase, narrowphase, constraint
+assembly, solver iterations, and integration into CUDA-resident
+buffers/kernels.
+
+`runtime::gpu::StepCudaWorld()` is the first CUDA production stepper stage. It
+operates on `DeviceWorld` state buffers and launches a fixed-step rigid
+integration kernel for gravity, external forces/torques, linear/angular
+velocity updates, pose integration, and accumulator clearing. Current
+differential tests compare the CUDA result against the CPU reference for
+free-fall and forced-body scenes with contacts disabled. The next stepper stages
+must keep that CPU path as validation-only while extending CUDA execution to
+broadphase, contact generation, constraint assembly, and PGS solving.
 
 Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
 projection uses authoring anchors instead of assuming every joint is body-center
@@ -177,11 +187,18 @@ Key PHI concepts:
 
 ### CUDA DeviceWorld
 
-`runtime::gpu::DeviceWorld` is the first CUDA-resident runtime container. It
-uploads cooked `WorldTemplate` tables into PHI buffers and keeps body, shape,
-joint, and actuator counts next to the device allocations. Its summary download
-API is intentionally narrow: tests use it to verify upload integrity before the
-next stage adds CUDA integration, broadphase, contact, and solver kernels.
+`runtime::gpu::DeviceWorld` is the CUDA-resident runtime container. It uploads
+cooked `WorldTemplate` tables into PHI buffers and keeps body, shape, joint, and
+actuator counts next to the device allocations. It also owns mutable state
+buffers for poses, linear velocities, angular velocities, forces, and torques.
+Tests use compact summary downloads for upload integrity and full state
+downloads for CPU-reference differential validation. Full state readback is a
+validation and tooling boundary; production stepping keeps state on the GPU.
+
+The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
+`CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production
+kernels compiled for the workstation GPU instead of inheriting stale CMake cache
+values such as an older `sm_75` target.
 
 ## Vulkan Rendering Contract
 

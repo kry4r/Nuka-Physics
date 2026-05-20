@@ -6,11 +6,13 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "runtime/world_instance.hpp"
 #include "runtime/world_template.hpp"
 #include "scene/canonical_types.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace nuka::runtime::gpu {
 
@@ -26,6 +28,24 @@ struct DeviceWorldSummary {
     scene::BodyId first_joint_child_body = 0;
     float first_actuator_gain = 0.0f;
     float first_actuator_force_limit = 0.0f;
+};
+
+struct DeviceStateSnapshot {
+    uint32_t body_count = 0;
+    math::Vec3 first_body_position = math::Vec3::Zero();
+    math::Vec3 first_linear_velocity = math::Vec3::Zero();
+    math::Vec3 first_angular_velocity = math::Vec3::Zero();
+    math::Vec3 first_force = math::Vec3::Zero();
+    math::Vec3 first_torque = math::Vec3::Zero();
+};
+
+struct DeviceState {
+    uint32_t body_count = 0;
+    std::vector<math::Transform> poses;
+    std::vector<math::Vec3> linear_velocities;
+    std::vector<math::Vec3> angular_velocities;
+    std::vector<math::Vec3> forces;
+    std::vector<math::Vec3> torques;
 };
 
 class DeviceWorld {
@@ -55,7 +75,20 @@ public:
     uint32_t ActuatorCount() const { return actuator_count_; }
 
     std::size_t DeviceBytes() const;
+    bool HasUploadedState() const;
     DeviceWorldSummary DownloadSummary() const;
+    DeviceStateSnapshot DownloadStateSnapshot() const;
+    DeviceState DownloadState() const;
+
+    void UploadState(const WorldInstance& instance);
+
+    math::Transform* DevicePoses();
+    math::Vec3* DeviceLinearVelocities();
+    math::Vec3* DeviceAngularVelocities();
+    math::Vec3* DeviceForces();
+    math::Vec3* DeviceTorques();
+    const float* DeviceInvMasses() const;
+    const math::Vec3* DeviceInvInertias() const;
 
 private:
     uint32_t body_count_ = 0;
@@ -70,8 +103,14 @@ private:
     phi::Buffer joint_child_bodies_;
     phi::Buffer actuator_gains_;
     phi::Buffer actuator_force_limits_;
+    phi::Buffer state_poses_;
+    phi::Buffer state_linear_velocities_;
+    phi::Buffer state_angular_velocities_;
+    phi::Buffer state_forces_;
+    phi::Buffer state_torques_;
 };
 
 DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template);
+void UploadDeviceState(DeviceWorld& device_world, const WorldInstance& instance);
 
 } // namespace nuka::runtime::gpu

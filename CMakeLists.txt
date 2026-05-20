@@ -24,6 +24,7 @@ option(NK_BUILD_TESTS "Build unit / smoke tests" ON)
 option(NK_REQUIRE_CUDA "Require CUDA support for the preferred production physics backend" ON)
 set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend")
 set_property(CACHE NK_PHYSICS_BACKEND PROPERTY STRINGS CUDA CPU_REFERENCE)
+set(NK_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures for production physics kernels")
 
 # ---------------------------------------------------------------------------
 # CUDA-preferred physics backend and Vulkan renderer backend
@@ -33,9 +34,7 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES native)
-    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${NK_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures to build" FORCE)
     message(STATUS "CUDA enabled for preferred physics backend: ${CMAKE_CUDA_COMPILER}")
 else()
     if(NK_REQUIRE_CUDA OR NK_PHYSICS_BACKEND STREQUAL "CUDA")

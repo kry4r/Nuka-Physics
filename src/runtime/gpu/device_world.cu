@@ -61,7 +61,24 @@ std::size_t DeviceWorld::DeviceBytes() const {
         + shape_body_ids_.Size()
         + joint_child_bodies_.Size()
         + actuator_gains_.Size()
-        + actuator_force_limits_.Size();
+        + actuator_force_limits_.Size()
+        + state_poses_.Size()
+        + state_linear_velocities_.Size()
+        + state_angular_velocities_.Size()
+        + state_forces_.Size()
+        + state_torques_.Size();
+}
+
+bool DeviceWorld::HasUploadedState() const {
+    if (body_count_ == 0) {
+        return true;
+    }
+
+    return state_poses_.Size() == body_count_ * sizeof(math::Transform)
+        && state_linear_velocities_.Size() == body_count_ * sizeof(math::Vec3)
+        && state_angular_velocities_.Size() == body_count_ * sizeof(math::Vec3)
+        && state_forces_.Size() == body_count_ * sizeof(math::Vec3)
+        && state_torques_.Size() == body_count_ * sizeof(math::Vec3);
 }
 
 DeviceWorldSummary DeviceWorld::DownloadSummary() const {
@@ -103,6 +120,82 @@ DeviceWorldSummary DeviceWorld::DownloadSummary() const {
     return summary;
 }
 
+DeviceStateSnapshot DeviceWorld::DownloadStateSnapshot() const {
+    DeviceStateSnapshot snapshot;
+    snapshot.body_count = body_count_;
+    if (body_count_ == 0) {
+        return snapshot;
+    }
+
+    const auto poses = DownloadVector<math::Transform>(state_poses_, body_count_);
+    const auto linear_velocities =
+        DownloadVector<math::Vec3>(state_linear_velocities_, body_count_);
+    const auto angular_velocities =
+        DownloadVector<math::Vec3>(state_angular_velocities_, body_count_);
+    const auto forces = DownloadVector<math::Vec3>(state_forces_, body_count_);
+    const auto torques = DownloadVector<math::Vec3>(state_torques_, body_count_);
+
+    snapshot.first_body_position = poses.front().position;
+    snapshot.first_linear_velocity = linear_velocities.front();
+    snapshot.first_angular_velocity = angular_velocities.front();
+    snapshot.first_force = forces.front();
+    snapshot.first_torque = torques.front();
+    return snapshot;
+}
+
+DeviceState DeviceWorld::DownloadState() const {
+    DeviceState state;
+    state.body_count = body_count_;
+    if (body_count_ == 0) {
+        return state;
+    }
+
+    state.poses = DownloadVector<math::Transform>(state_poses_, body_count_);
+    state.linear_velocities =
+        DownloadVector<math::Vec3>(state_linear_velocities_, body_count_);
+    state.angular_velocities =
+        DownloadVector<math::Vec3>(state_angular_velocities_, body_count_);
+    state.forces = DownloadVector<math::Vec3>(state_forces_, body_count_);
+    state.torques = DownloadVector<math::Vec3>(state_torques_, body_count_);
+    return state;
+}
+
+void DeviceWorld::UploadState(const WorldInstance& instance) {
+    state_poses_ = UploadVector(instance.poses);
+    state_linear_velocities_ = UploadVector(instance.linear_velocities);
+    state_angular_velocities_ = UploadVector(instance.angular_velocities);
+    state_forces_ = UploadVector(instance.forces);
+    state_torques_ = UploadVector(instance.torques);
+}
+
+math::Transform* DeviceWorld::DevicePoses() {
+    return static_cast<math::Transform*>(state_poses_.Data());
+}
+
+math::Vec3* DeviceWorld::DeviceLinearVelocities() {
+    return static_cast<math::Vec3*>(state_linear_velocities_.Data());
+}
+
+math::Vec3* DeviceWorld::DeviceAngularVelocities() {
+    return static_cast<math::Vec3*>(state_angular_velocities_.Data());
+}
+
+math::Vec3* DeviceWorld::DeviceForces() {
+    return static_cast<math::Vec3*>(state_forces_.Data());
+}
+
+math::Vec3* DeviceWorld::DeviceTorques() {
+    return static_cast<math::Vec3*>(state_torques_.Data());
+}
+
+const float* DeviceWorld::DeviceInvMasses() const {
+    return static_cast<const float*>(body_inv_masses_.Data());
+}
+
+const math::Vec3* DeviceWorld::DeviceInvInertias() const {
+    return static_cast<const math::Vec3*>(body_inv_inertias_.Data());
+}
+
 DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
     return DeviceWorld(
         world_template.body_count,
@@ -116,6 +209,10 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         UploadVector(world_template.joint_table.child_bodies),
         UploadVector(world_template.actuator_table.gains),
         UploadVector(world_template.actuator_table.force_limits));
+}
+
+void UploadDeviceState(DeviceWorld& device_world, const WorldInstance& instance) {
+    device_world.UploadState(instance);
 }
 
 } // namespace nuka::runtime::gpu

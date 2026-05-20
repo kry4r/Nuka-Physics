@@ -36,6 +36,10 @@ reinforcement learning, and real-time applications.
 
 # Or directly with CMake
 cmake -S . -B build -DNK_BUILD_TESTS=ON
+
+# This workstation defaults to the CUDA production path and native GPU kernels.
+# Override only when intentionally cross-compiling or reproducing another GPU.
+cmake -S . -B build -DNK_BUILD_TESTS=ON -DNK_CUDA_ARCHITECTURES=native
 ```
 
 ### Build
@@ -52,6 +56,9 @@ cmake --build build --config Release
 
 # Or directly with CTest
 ctest --test-dir build -C Release --output-on-failure
+
+# CUDA production-path runtime and timing checks
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaStepTiming"
 ```
 
 ### Imported Scene Debug Render Demo

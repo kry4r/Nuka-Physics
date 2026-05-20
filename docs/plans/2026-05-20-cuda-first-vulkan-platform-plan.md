@@ -12,6 +12,9 @@
 
 ### Task 1: Backend Contract and Build Policy
 
+**Status:** Completed. Commit `3b8a71d` added the CUDA-first platform contract,
+backend selector, Vulkan renderer probe, tests, and documentation.
+
 **Files:**
 - Modify: `CMakeLists.txt`
 - Modify: `src/CMakeLists.txt`
@@ -34,6 +37,9 @@ ctest --test-dir build -C Release --output-on-failure -R "PlatformContract|Phi|V
 
 ### Task 2: CUDA Device World State
 
+**Status:** Completed. Commit `00dd1f8` added CUDA-resident cooked runtime table
+uploads, compact readback validation, and the `nuka_runtime_gpu` target.
+
 **Files:**
 - Create: `src/runtime/gpu/device_world.hpp`
 - Create: `src/runtime/gpu/device_world.cu`
@@ -47,6 +53,12 @@ ctest --test-dir build -C Release --output-on-failure -R "PlatformContract|Phi|V
 
 ### Task 3: CUDA Rigid Integration Kernel
 
+**Status:** Completed in the current iteration. `DeviceWorld` now owns mutable
+state buffers, exposes validation readback, and `StepCudaWorld()` runs fixed-step
+rigid integration on CUDA. The build now forces `CMAKE_CUDA_ARCHITECTURES` from
+`NK_CUDA_ARCHITECTURES`, defaulting to `native`, so this workstation compiles
+kernels for the installed GPU instead of stale cached architectures.
+
 **Files:**
 - Create: `src/runtime/gpu/cuda_world_stepper.hpp`
 - Create: `src/runtime/gpu/cuda_world_stepper.cu`
@@ -57,6 +69,15 @@ ctest --test-dir build -C Release --output-on-failure -R "PlatformContract|Phi|V
 **Scope:** Implement gravity, force integration, velocity integration, accumulator clearing, and fixed-step loop on CUDA buffers. Preserve `WorldStepReport` fields that are meaningful before contacts.
 
 **Validation:** Run free-fall and forced-body scenes through CUDA and CPU reference paths, compare poses/velocities within deterministic tolerances, and record timing.
+
+Current validation command:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaStepTiming"
+```
+
+Current result: 5/5 CUDA runtime and CUDA timing tests pass on the local CUDA
+path.
 
 ### Task 4: CUDA Broadphase and Narrowphase
 
