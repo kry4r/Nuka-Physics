@@ -14,6 +14,7 @@ All tests in this matrix must pass on every commit before merge.
 | PlatformContract/CpuReferenceSelectionIsMarkedValidationOnly | `tests/phi/test_platform_contract.cpp` | Verifies explicit CPU selection remains validation/reference-only | CPU reference |
 | VulkanRenderer/CreatesInstanceAndEnumeratesPhysicalDevices | `tests/render/test_vulkan_backend.cpp` | Verifies the Vulkan production renderer backend can create an instance and see a physical device | Vulkan |
 | VulkanRenderer/DeclaresVulkanAsProductionBackend | `tests/render/test_vulkan_backend.cpp` | Verifies Vulkan is the declared production render backend | Vulkan |
+| CudaDeviceWorld/UploadsCookedRuntimeTablesAndDownloadsSummary | `tests/runtime/test_cuda_device_world.cpp` | Verifies cooked runtime body, shape, joint, and actuator tables upload into CUDA buffers and can be validated by compact readback | CUDA |
 
 ## Import Regression Tests
 

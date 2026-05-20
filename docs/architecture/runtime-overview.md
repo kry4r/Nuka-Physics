@@ -175,6 +175,14 @@ Key PHI concepts:
 - **Kernel** -- compute shader dispatch with grid/block configuration.
 - **Capabilities** -- runtime feature queries (shared memory size, warp width, etc.).
 
+### CUDA DeviceWorld
+
+`runtime::gpu::DeviceWorld` is the first CUDA-resident runtime container. It
+uploads cooked `WorldTemplate` tables into PHI buffers and keeps body, shape,
+joint, and actuator counts next to the device allocations. Its summary download
+API is intentionally narrow: tests use it to verify upload integrity before the
+next stage adds CUDA integration, broadphase, contact, and solver kernels.
+
 ## Vulkan Rendering Contract
 
 The production renderer backend is Vulkan. `render::ProbeVulkanRenderer()`

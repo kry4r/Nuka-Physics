@@ -228,6 +228,19 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_phi_test)
+
+    add_executable(nuka_cuda_runtime_test
+        runtime/test_cuda_device_world.cpp
+    )
+
+    target_link_libraries(nuka_cuda_runtime_test
+        PRIVATE
+            nuka_runtime_gpu
+            nuka_runtime
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_cuda_runtime_test)
 endif()
 
 # --- Vulkan renderer tests -------------------------------------------------

@@ -296,4 +296,19 @@ if(CMAKE_CUDA_COMPILER)
     target_compile_options(nuka_phi PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /WX>
     )
+
+    add_library(nuka_runtime_gpu STATIC
+        runtime/gpu/device_world.cu
+    )
+
+    target_include_directories(nuka_runtime_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_runtime_gpu
+        PUBLIC
+            nuka_runtime
+            nuka_phi
+    )
 endif()
