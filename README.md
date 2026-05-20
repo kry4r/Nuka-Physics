@@ -10,7 +10,7 @@ reinforcement learning, and real-time applications.
 - Articulated body support (revolute, prismatic, fixed joints) with PD drives
 - Collision detection: broadphase (sweep-and-prune) and narrow-phase (GJK/SAT)
 - Sensor simulation: IMU, lidar, force/torque
-- Scene import from MJCF, URDF, and USD (planned) formats
+- Scene import from MJCF, URDF, and USDA/text USD formats
 - Batched simulation via WorldTemplate/Instance for parallel environments
 - Optional GPU acceleration through the PHI (Platform Hardware Interface) layer
 - Debug draw and visualization utilities

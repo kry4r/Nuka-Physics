@@ -1,118 +1,219 @@
 // ---------------------------------------------------------------------------
-// nuka::import – MJCF (MuJoCo XML) importer implementation
+// nuka::import - MJCF (MuJoCo XML) importer implementation
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
-#include "scene/canonical_types.hpp"
-#include "math/vec3.hpp"
+
+#include "math/quat.hpp"
 #include "math/transform.hpp"
+#include "math/vec3.hpp"
+#include "scene/canonical_types.hpp"
 
 #include <tinyxml2.h>
 
+#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sstream>
 #include <unordered_map>
+#include <utility>
 
 namespace nuka::import {
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 namespace {
 
-/// Parse a whitespace-separated list of 3 floats into a Vec3.
+struct MjcfParseContext {
+    std::unordered_map<std::string, scene::BodyId> body_ids;
+    std::unordered_map<std::string, scene::JointId> joint_ids;
+    std::unordered_map<std::string, scene::MaterialId> material_ids;
+};
+
 math::Vec3 ParseVec3(const char* text) {
     math::Vec3 v{};
-    if (!text) return v;
+    if (!text) {
+        return v;
+    }
     std::istringstream ss(text);
     ss >> v.x >> v.y >> v.z;
     return v;
 }
 
-/// Map MJCF geom type strings to ShapeType.
+float FirstFloat(const char* text, float fallback = 0.0f) {
+    if (!text) {
+        return fallback;
+    }
+    float value = fallback;
+    std::istringstream ss(text);
+    ss >> value;
+    return value;
+}
+
+void ParseRange(const char* text, float& lower, float& upper) {
+    if (!text) {
+        return;
+    }
+    std::istringstream ss(text);
+    ss >> lower >> upper;
+}
+
 scene::ShapeType MjcfGeomType(const char* type_str) {
-    if (!type_str) return scene::ShapeType::Box; // MJCF default
+    if (!type_str) {
+        return scene::ShapeType::Box;
+    }
     const std::string t(type_str);
-    if (t == "sphere")  return scene::ShapeType::Sphere;
-    if (t == "capsule") return scene::ShapeType::Capsule;
-    if (t == "box")     return scene::ShapeType::Box;
-    if (t == "plane")   return scene::ShapeType::Plane;
+    if (t == "sphere") {
+        return scene::ShapeType::Sphere;
+    }
+    if (t == "capsule" || t == "cylinder") {
+        return scene::ShapeType::Capsule;
+    }
+    if (t == "box") {
+        return scene::ShapeType::Box;
+    }
+    if (t == "plane") {
+        return scene::ShapeType::Plane;
+    }
+    if (t == "mesh") {
+        return scene::ShapeType::TriMesh;
+    }
     return scene::ShapeType::Box;
 }
 
-/// Map MJCF joint type strings to JointType.
 scene::JointType MjcfJointType(const char* type_str) {
-    if (!type_str) return scene::JointType::Revolute; // "hinge" is default
+    if (!type_str) {
+        return scene::JointType::Revolute;
+    }
     const std::string t(type_str);
-    if (t == "hinge")  return scene::JointType::Revolute;
-    if (t == "slide")  return scene::JointType::Prismatic;
-    if (t == "ball")   return scene::JointType::Spherical;
-    if (t == "free")   return scene::JointType::Free;
+    if (t == "hinge") {
+        return scene::JointType::Revolute;
+    }
+    if (t == "slide") {
+        return scene::JointType::Prismatic;
+    }
+    if (t == "ball") {
+        return scene::JointType::Spherical;
+    }
+    if (t == "free") {
+        return scene::JointType::Free;
+    }
     return scene::JointType::Revolute;
 }
 
-/// Recursively parse <body> elements under worldbody.
-/// @param parent_id  The BodyId of the parent (kInvalidBody for worldbody root).
+scene::SensorType MjcfSensorType(const std::string& tag) {
+    if (tag == "rangefinder") {
+        return scene::SensorType::Lidar;
+    }
+    if (tag == "camera") {
+        return scene::SensorType::Camera;
+    }
+    if (tag == "force" || tag == "torque") {
+        return scene::SensorType::ForceTorque;
+    }
+    if (tag == "touch") {
+        return scene::SensorType::Contact;
+    }
+    if (tag == "framepos" || tag == "framequat") {
+        return scene::SensorType::Imu;
+    }
+    return scene::SensorType::Imu;
+}
+
+void ParseMaterials(tinyxml2::XMLElement* mujoco,
+                    scene::SceneIR& scene,
+                    MjcfParseContext& context) {
+    auto* asset = mujoco->FirstChildElement("asset");
+    if (!asset) {
+        return;
+    }
+
+    for (auto* material = asset->FirstChildElement("material");
+         material != nullptr;
+         material = material->NextSiblingElement("material")) {
+
+        scene::MaterialRecord record;
+        const char* name = material->Attribute("name");
+        record.name = name ? name : "material";
+
+        if (const char* rgba = material->Attribute("rgba")) {
+            std::istringstream ss(rgba);
+            ss >> record.base_color.x >> record.base_color.y >> record.base_color.z >> record.alpha;
+        }
+        material->QueryFloatAttribute("roughness", &record.roughness);
+        material->QueryFloatAttribute("metallic", &record.metallic);
+
+        const scene::MaterialId id = scene.AddMaterial(std::move(record));
+        context.material_ids[scene.GetMaterial(id).name] = id;
+    }
+}
+
+scene::BodyId ResolveBody(const char* name, const MjcfParseContext& context) {
+    if (!name) {
+        return scene::kInvalidBody;
+    }
+    const auto it = context.body_ids.find(name);
+    return it == context.body_ids.end() ? scene::kInvalidBody : it->second;
+}
+
+scene::JointId ResolveJoint(const char* name, const MjcfParseContext& context) {
+    if (!name) {
+        return scene::kInvalidJoint;
+    }
+    const auto it = context.joint_ids.find(name);
+    return it == context.joint_ids.end() ? scene::kInvalidJoint : it->second;
+}
+
 void ParseBody(tinyxml2::XMLElement* body_elem,
                scene::BodyId parent_id,
-               scene::SceneIR& scene) {
+               scene::SceneIR& scene,
+               MjcfParseContext& context) {
 
-    // -- Create the rigid body ------------------------------------------------
     const char* name_attr = body_elem->Attribute("name");
     const std::string body_name = name_attr ? name_attr : "unnamed";
 
     scene::RigidBodyRecord rec;
     rec.name = body_name;
     rec.parent_id = parent_id;
-
-    // Parse position from "pos" attribute
-    const char* pos_attr = body_elem->Attribute("pos");
-    if (pos_attr) {
-        const math::Vec3 pos = ParseVec3(pos_attr);
-        rec.local_transform = math::Transform{pos, math::Quat::Identity()};
+    if (const char* pos_attr = body_elem->Attribute("pos")) {
+        rec.local_transform = math::Transform{ParseVec3(pos_attr), math::Quat::Identity()};
     }
 
-    // Parse <inertial> if present
     if (auto* inertial = body_elem->FirstChildElement("inertial")) {
         inertial->QueryFloatAttribute("mass", &rec.mass);
-
-        const char* inertia_pos = inertial->Attribute("pos");
-        if (inertia_pos) {
-            // inertial pos is the center-of-mass offset; we store it but
-            // keep the body transform as-is for this skeleton importer.
-            (void)ParseVec3(inertia_pos);
-        }
-
-        const char* diag = inertial->Attribute("diaginertia");
-        if (diag) {
+        if (const char* diag = inertial->Attribute("diaginertia")) {
             rec.inertia = ParseVec3(diag);
         }
     }
 
     const scene::BodyId body_id = scene.AddRigidBody(std::move(rec));
+    context.body_ids[body_name] = body_id;
 
-    // -- Parse <geom> children ------------------------------------------------
     for (auto* geom = body_elem->FirstChildElement("geom");
          geom != nullptr;
          geom = geom->NextSiblingElement("geom")) {
 
         scene::CollisionShapeRecord shape;
         shape.body_id = body_id;
+        shape.name = geom->Attribute("name") ? geom->Attribute("name") : "";
         shape.type = MjcfGeomType(geom->Attribute("type"));
 
-        // Parse size attribute (interpretation depends on type)
-        const char* size_attr = geom->Attribute("size");
-        if (size_attr) {
-            math::Vec3 sz = ParseVec3(size_attr);
-            if (shape.type == scene::ShapeType::Box) {
+        if (const char* material_name = geom->Attribute("material")) {
+            const auto it = context.material_ids.find(material_name);
+            if (it != context.material_ids.end()) {
+                shape.material_id = it->second;
+            }
+        }
+
+        if (const char* pos = geom->Attribute("pos")) {
+            shape.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+        }
+
+        if (const char* size_attr = geom->Attribute("size")) {
+            const math::Vec3 sz = ParseVec3(size_attr);
+            if (shape.type == scene::ShapeType::Box || shape.type == scene::ShapeType::Plane) {
                 shape.half_extents = sz;
             } else if (shape.type == scene::ShapeType::Sphere) {
                 shape.radius = sz.x;
             } else if (shape.type == scene::ShapeType::Capsule) {
                 shape.radius = sz.x;
-                // half_height from fromto or second size component
                 if (sz.y > 0.0f) {
                     shape.half_height = sz.y;
                 }
@@ -122,41 +223,125 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         scene.AddCollisionShape(std::move(shape));
     }
 
-    // -- Parse <joint> children -----------------------------------------------
     for (auto* joint = body_elem->FirstChildElement("joint");
          joint != nullptr;
          joint = joint->NextSiblingElement("joint")) {
 
         const char* jname = joint->Attribute("name");
-        const std::string joint_name = jname ? jname : "unnamed_joint";
-
         scene::JointRecord jrec;
-        jrec.name = joint_name;
+        jrec.name = jname ? jname : "unnamed_joint";
         jrec.parent_body = parent_id;
         jrec.child_body = body_id;
         jrec.type = MjcfJointType(joint->Attribute("type"));
-
-        const char* axis_attr = joint->Attribute("axis");
-        if (axis_attr) {
+        if (const char* axis_attr = joint->Attribute("axis")) {
             jrec.axis = ParseVec3(axis_attr);
         }
+        ParseRange(joint->Attribute("range"), jrec.lower_limit, jrec.upper_limit);
 
-        scene.AddJoint(std::move(jrec));
+        const scene::JointId joint_id = scene.AddJoint(std::move(jrec));
+        context.joint_ids[scene.GetJoint(joint_id).name] = joint_id;
     }
 
-    // -- Recurse into child <body> elements -----------------------------------
+    for (auto* camera = body_elem->FirstChildElement("camera");
+         camera != nullptr;
+         camera = camera->NextSiblingElement("camera")) {
+
+        scene::CameraRecord record;
+        record.name = camera->Attribute("name") ? camera->Attribute("name") : "camera";
+        record.attached_body = body_id;
+        if (const char* pos = camera->Attribute("pos")) {
+            record.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+        }
+        camera->QueryFloatAttribute("fovy", &record.vertical_fov_degrees);
+        scene.AddCamera(std::move(record));
+    }
+
     for (auto* child = body_elem->FirstChildElement("body");
          child != nullptr;
          child = child->NextSiblingElement("body")) {
-        ParseBody(child, body_id, scene);
+        ParseBody(child, body_id, scene, context);
     }
 }
 
-} // anonymous namespace
+void ParseLights(tinyxml2::XMLElement* worldbody, scene::SceneIR& scene) {
+    for (auto* light = worldbody->FirstChildElement("light");
+         light != nullptr;
+         light = light->NextSiblingElement("light")) {
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+        scene::LightRecord record;
+        record.name = light->Attribute("name") ? light->Attribute("name") : "light";
+        bool directional = false;
+        light->QueryBoolAttribute("directional", &directional);
+        record.type = directional ? scene::LightType::Directional : scene::LightType::Point;
+        if (const char* pos = light->Attribute("pos")) {
+            record.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+        }
+        if (const char* diffuse = light->Attribute("diffuse")) {
+            record.color = ParseVec3(diffuse);
+        }
+        light->QueryFloatAttribute("intensity", &record.intensity);
+        scene.AddLight(std::move(record));
+    }
+}
+
+void ParseActuators(tinyxml2::XMLElement* mujoco,
+                    scene::SceneIR& scene,
+                    const MjcfParseContext& context) {
+    auto* actuator_root = mujoco->FirstChildElement("actuator");
+    if (!actuator_root) {
+        return;
+    }
+
+    for (auto* actuator = actuator_root->FirstChildElement();
+         actuator != nullptr;
+         actuator = actuator->NextSiblingElement()) {
+
+        scene::ActuatorRecord record;
+        record.name = actuator->Attribute("name") ? actuator->Attribute("name") : "actuator";
+        const std::string tag = actuator->Name() ? actuator->Name() : "";
+        if (tag == "position") {
+            record.type = scene::ActuatorType::Position;
+        } else if (tag == "velocity") {
+            record.type = scene::ActuatorType::Velocity;
+        } else if (tag == "motor" || tag == "general") {
+            record.type = scene::ActuatorType::Motor;
+        } else {
+            record.type = scene::ActuatorType::Force;
+        }
+        record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
+        actuator->QueryFloatAttribute("gear", &record.gain);
+        ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
+        scene.AddActuator(std::move(record));
+    }
+}
+
+void ParseSensors(tinyxml2::XMLElement* mujoco,
+                  scene::SceneIR& scene,
+                  const MjcfParseContext& context) {
+    auto* sensor_root = mujoco->FirstChildElement("sensor");
+    if (!sensor_root) {
+        return;
+    }
+
+    for (auto* sensor = sensor_root->FirstChildElement();
+         sensor != nullptr;
+         sensor = sensor->NextSiblingElement()) {
+
+        const std::string tag = sensor->Name() ? sensor->Name() : "";
+        scene::SensorRecord record;
+        record.name = sensor->Attribute("name") ? sensor->Attribute("name") : "sensor";
+        record.type = MjcfSensorType(tag);
+
+        const char* body_name = sensor->Attribute("objname");
+        if (!body_name) {
+            body_name = sensor->Attribute("body");
+        }
+        record.attached_body = ResolveBody(body_name, context);
+        scene.AddSensor(std::move(record));
+    }
+}
+
+} // namespace
 
 scene::SceneIR LoadMjcf(const std::string& path) {
     tinyxml2::XMLDocument doc;
@@ -177,13 +362,19 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     }
 
     scene::SceneIR scene;
+    MjcfParseContext context;
 
-    // Iterate over top-level <body> elements inside <worldbody>
+    ParseMaterials(mujoco, scene, context);
+    ParseLights(worldbody, scene);
+
     for (auto* body = worldbody->FirstChildElement("body");
          body != nullptr;
          body = body->NextSiblingElement("body")) {
-        ParseBody(body, scene::kInvalidBody, scene);
+        ParseBody(body, scene::kInvalidBody, scene, context);
     }
+
+    ParseActuators(mujoco, scene, context);
+    ParseSensors(mujoco, scene, context);
 
     return scene;
 }

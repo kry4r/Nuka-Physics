@@ -29,19 +29,67 @@ struct CookedJointTable {
 struct CookedShapeTable {
     std::vector<ShapeType>       types;
     std::vector<BodyId>          body_ids;
+    std::vector<MaterialId>      material_ids;
     std::vector<math::Transform> local_transforms;
     std::vector<math::Vec3>      half_extents;
     std::vector<float>           radii;
+};
+
+struct CookedSensorTable {
+    std::vector<SensorType>      types;
+    std::vector<BodyId>          attached_bodies;
+    std::vector<math::Transform> local_transforms;
+    std::vector<float>           sample_rates_hz;
+};
+
+struct CookedMaterialTable {
+    std::vector<math::Vec3> base_colors;
+    std::vector<float>      alphas;
+    std::vector<float>      roughnesses;
+    std::vector<float>      metallics;
+};
+
+struct CookedCameraTable {
+    std::vector<BodyId>          attached_bodies;
+    std::vector<math::Transform> local_transforms;
+    std::vector<float>           vertical_fovs_degrees;
+    std::vector<float>           near_clips;
+    std::vector<float>           far_clips;
+};
+
+struct CookedLightTable {
+    std::vector<LightType>       types;
+    std::vector<BodyId>          attached_bodies;
+    std::vector<math::Transform> local_transforms;
+    std::vector<math::Vec3>      colors;
+    std::vector<float>           intensities;
+};
+
+struct CookedActuatorTable {
+    std::vector<ActuatorType> types;
+    std::vector<JointId>      joint_ids;
+    std::vector<float>        gains;
+    std::vector<float>        force_limits;
 };
 
 struct CookedBlob {
     uint32_t body_count  = 0;
     uint32_t joint_count = 0;
     uint32_t shape_count = 0;
+    uint32_t sensor_count = 0;
+    uint32_t material_count = 0;
+    uint32_t camera_count = 0;
+    uint32_t light_count = 0;
+    uint32_t actuator_count = 0;
 
     CookedBodyTable  bodies;
     CookedJointTable joints;
     CookedShapeTable shapes;
+    CookedSensorTable sensors;
+    CookedMaterialTable materials;
+    CookedCameraTable cameras;
+    CookedLightTable lights;
+    CookedActuatorTable actuators;
 };
 
 } // namespace nuka::scene

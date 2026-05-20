@@ -116,6 +116,53 @@ TEST(SceneCooker, CooksShapes) {
 }
 
 // ---------------------------------------------------------------------------
+// Render, sensor, and actuator metadata cooking
+// ---------------------------------------------------------------------------
+
+TEST(SceneCooker, CooksImportMetadataTables) {
+    SceneIR scene;
+    const auto body = scene.AddRigidBody("robot");
+    const auto child = scene.AddRigidBody("tool");
+    const auto joint = scene.AddJoint("tool_joint", body, child);
+    scene.AddSensor("imu", child);
+
+    MaterialRecord material;
+    material.name = "blue";
+    material.base_color = {0.0f, 0.1f, 1.0f};
+    scene.AddMaterial(std::move(material));
+
+    CameraRecord camera;
+    camera.name = "cam";
+    camera.attached_body = child;
+    camera.vertical_fov_degrees = 70.0f;
+    scene.AddCamera(std::move(camera));
+
+    LightRecord light;
+    light.name = "sun";
+    light.type = LightType::Directional;
+    light.intensity = 1200.0f;
+    scene.AddLight(std::move(light));
+
+    ActuatorRecord actuator;
+    actuator.name = "motor";
+    actuator.joint_id = joint;
+    actuator.type = ActuatorType::Velocity;
+    actuator.gain = 10.0f;
+    scene.AddActuator(std::move(actuator));
+
+    const auto blob = CookScene(scene);
+    EXPECT_EQ(blob.sensor_count, 1u);
+    EXPECT_EQ(blob.material_count, 1u);
+    EXPECT_EQ(blob.camera_count, 1u);
+    EXPECT_EQ(blob.light_count, 1u);
+    EXPECT_EQ(blob.actuator_count, 1u);
+    EXPECT_EQ(blob.materials.base_colors[0], nuka::math::Vec3(0.0f, 0.1f, 1.0f));
+    EXPECT_EQ(blob.cameras.attached_bodies[0], child);
+    EXPECT_EQ(blob.lights.types[0], LightType::Directional);
+    EXPECT_EQ(blob.actuators.joint_ids[0], joint);
+}
+
+// ---------------------------------------------------------------------------
 // Multiple bodies
 // ---------------------------------------------------------------------------
 
@@ -143,4 +190,9 @@ TEST(SceneCooker, EmptySceneProducesEmptyBlob) {
     EXPECT_EQ(blob.body_count, 0u);
     EXPECT_EQ(blob.joint_count, 0u);
     EXPECT_EQ(blob.shape_count, 0u);
+    EXPECT_EQ(blob.sensor_count, 0u);
+    EXPECT_EQ(blob.material_count, 0u);
+    EXPECT_EQ(blob.camera_count, 0u);
+    EXPECT_EQ(blob.light_count, 0u);
+    EXPECT_EQ(blob.actuator_count, 0u);
 }

@@ -1,0 +1,92 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Scope "Looks"
+    {
+        def Material "mat_robot"
+        {
+            color3f inputs:diffuseColor = (0.8, 0.2, 0.1)
+            float inputs:roughness = 0.6
+            float inputs:metallic = 0.0
+        }
+    }
+
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        bool physics:kinematicEnabled = true
+        float physics:mass = 0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "base_geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 0.2
+        }
+    }
+
+    def Xform "link1" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.5
+        double3 xformOp:translate = (0, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "tip_geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.05
+        }
+    }
+
+    def Camera "track"
+    {
+        double3 xformOp:translate = (1, -2, 1)
+        float focalLength = 24
+        float clippingRange:min = 0.01
+        float clippingRange:max = 100
+    }
+
+    def DistantLight "sun"
+    {
+        color3f inputs:color = (1, 0.95, 0.9)
+        float inputs:intensity = 500
+    }
+
+    def PhysicsRevoluteJoint "joint0"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/link1>
+        token physics:axis = "Z"
+        float physics:lowerLimit = -1.57
+        float physics:upperLimit = 1.57
+    }
+
+    def NukaActuator "motor0"
+    {
+        rel nuka:joint = </World/joint0>
+        token nuka:type = "velocity"
+        float nuka:gain = 12
+        float nuka:forceLimit = 50
+    }
+
+    def NukaSensor "imu0"
+    {
+        rel nuka:body = </World/link1>
+        token nuka:type = "imu"
+        float nuka:sampleRate = 240
+    }
+}

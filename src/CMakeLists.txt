@@ -69,6 +69,7 @@ nuka_set_warnings(nuka_runtime)
 add_library(nuka_import STATIC
     import/mjcf_importer.cpp
     import/urdf_importer.cpp
+    import/usd_importer.cpp
 )
 
 target_include_directories(nuka_import
