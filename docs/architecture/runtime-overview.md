@@ -53,6 +53,12 @@ shape proxies, shape AABBs, joint axes, centers of mass, contact points/normals,
 and constraint error vectors. Native shells and future renderers should consume
 this command list instead of re-deriving overlay geometry from raw physics state.
 
+`nuka_scene_demo` is the current runnable debug render path. It imports a scene,
+builds the compiled runtime views, emits the debug draw command list, and
+rasterizes it through the headless renderer to a PPM image. This keeps the demo
+usable in CI while preserving the same command source that a native OpenGL/ImGui
+viewport will consume.
+
 ## Domain Modules
 
 ### Rigid Body (`runtime/rigid/`)

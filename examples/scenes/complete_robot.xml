@@ -1,0 +1,24 @@
+<mujoco model="complete_robot_demo">
+  <asset>
+    <material name="mat_robot" rgba="0.8 0.2 0.1 1" roughness="0.6" metallic="0.0"/>
+  </asset>
+  <worldbody>
+    <light name="sun" directional="true" pos="0 -1 2" diffuse="1 0.95 0.9"/>
+    <body name="base" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.1 0.1 0.1"/>
+      <geom name="base_geom" type="box" size="0.1 0.1 0.1" material="mat_robot"/>
+      <joint name="joint0" type="hinge" axis="0 0 1" range="-1.57 1.57"/>
+      <body name="link1" pos="0 0 0.5">
+        <inertial pos="0 0 0.25" mass="0.5" diaginertia="0.05 0.05 0.01"/>
+        <geom name="tip" type="sphere" size="0.05"/>
+        <camera name="track" pos="1 -2 1" fovy="60"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="motor0" joint="joint0" gear="12" ctrllimited="true" ctrlrange="-1 1"/>
+  </actuator>
+  <sensor>
+    <framepos name="imu0" objtype="body" objname="link1"/>
+  </sensor>
+</mujoco>

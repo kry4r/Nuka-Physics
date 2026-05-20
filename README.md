@@ -49,6 +49,17 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+### Imported Scene Debug Render Demo
+
+```powershell
+cmake --build build --config Release --target nuka_scene_demo
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360
+```
+
+The demo imports MJCF/URDF/USD text scenes, compiles them into
+`SceneGraph`/`PhysicsWorld`/`RenderScene`, generates physics debug overlays, and
+writes a deterministic PPM image for quick validation or CI artifacts.
+
 ## Architecture
 
 The engine is organized into layered modules:
@@ -68,6 +79,7 @@ The engine is organized into layered modules:
 For detailed architecture documentation see:
 - [Runtime Overview](docs/architecture/runtime-overview.md)
 - [Scene Compiler Pipeline](docs/architecture/scene-compiler.md)
+- [Imported Scene Debug Render Demo](docs/architecture/debug-render-demo.md)
 
 ## Tech Stack
 
@@ -94,6 +106,7 @@ nuka-physics/
     phi/                  # GPU abstraction
     sensor/               # Sensor simulation
     apps/                 # Debug draw and tools
+  examples/               # Runnable imported-scene fixtures
   tests/                  # Test suite
     regression/           # Regression tests
     perf/                 # Performance benchmarks

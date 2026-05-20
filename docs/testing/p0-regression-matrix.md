@@ -23,6 +23,9 @@ All tests in this matrix must pass on every commit before merge.
 | DebugVisualization/EmitsCollisionBodyPrimitivesAndAabbs | `tests/apps/test_debug_draw_list.cpp` | Converts RenderScene debug proxies into body primitive and AABB draw commands | box, sphere, capsule, AABB |
 | DebugVisualization/EmitsJointAxesAndCentersOfMass | `tests/apps/test_debug_draw_list.cpp` | Converts PhysicsWorld joint/body tables plus SceneGraph transforms into joint-axis and center-of-mass commands | joint axis, center of mass |
 | DebugVisualization/EmitsContactsAndConstraintErrors | `tests/apps/test_debug_draw_list.cpp` | Converts contact manifolds and constraint blocks into contact normal and constraint error commands | contact point, contact normal, constraint error |
+| HeadlessDebugRenderer/RasterizesImportedSceneDebugCommands | `tests/apps/test_scene_demo.cpp` | Rasterizes imported MJCF debug commands into a non-empty image | PPM pixels |
+| SceneDemo/ExportsMjcfSceneDebugViewToPpm | `tests/apps/test_scene_demo.cpp` | Runs the imported-scene demo path for the example MJCF scene and writes a PPM artifact | MJCF, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
+| SceneDemo/ExportsUsdSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs the same demo path for USDA/text USD input | USD adapter, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
 
 ## Physics Regression Tests
 
@@ -43,6 +46,7 @@ All tests in this matrix must pass on every commit before merge.
 |-----------|------|-------------|--------|-----------|
 | StepTiming/HundredStepsUnderOneSecond | `tests/perf/test_step_timing.cpp` | 100 steps on 10 bodies | Wall time | < 1000 ms |
 | StepTiming/ThousandStepsSingleBody | `tests/perf/test_step_timing.cpp` | 1000 steps on 1 body | Wall time | < 1000 ms |
+| RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

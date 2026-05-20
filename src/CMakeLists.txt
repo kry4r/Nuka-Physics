@@ -227,6 +227,8 @@ nuka_set_warnings(nuka_sensor)
 add_library(nuka_debug_draw STATIC
     apps/debug_shell/debug_draw.cpp
     apps/debug_shell/debug_visualization.cpp
+    apps/debug_shell/headless_debug_renderer.cpp
+    apps/debug_shell/scene_demo.cpp
 )
 
 target_include_directories(nuka_debug_draw
@@ -238,13 +240,31 @@ target_link_libraries(nuka_debug_draw
     PUBLIC
         nuka_collision
         nuka_constraint
+        nuka_import
         nuka_math
         nuka_render
         nuka_runtime
         nuka_scene
+        nuka_scene_pipeline
 )
 
 nuka_set_warnings(nuka_debug_draw)
+
+add_executable(nuka_scene_demo
+    apps/debug_shell/main.cpp
+)
+
+target_include_directories(nuka_scene_demo
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_scene_demo
+    PRIVATE
+        nuka_debug_draw
+)
+
+nuka_set_warnings(nuka_scene_demo)
 
 # ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
