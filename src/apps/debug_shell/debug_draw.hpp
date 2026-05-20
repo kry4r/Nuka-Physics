@@ -15,6 +15,7 @@ namespace nuka::app {
 enum class DrawCommandType : uint8_t {
     Line,
     Sphere,
+    Capsule,
     Box,
     AABB,
     Frame,
@@ -27,6 +28,7 @@ struct DrawCommand {
     math::Vec3 end      = {};   // for lines
     math::Vec3 size     = {};   // for boxes
     float      radius   = 0.0f;
+    float      half_height = 0.0f;
     uint32_t   color    = 0xFFFFFFFF;
 };
 
@@ -34,6 +36,8 @@ class DebugDrawList {
 public:
     void AddLine(math::Vec3 from, math::Vec3 to, uint32_t color = 0xFFFFFFFF);
     void AddSphere(math::Vec3 center, float radius, uint32_t color = 0xFFFFFFFF);
+    void AddCapsule(math::Vec3 center, math::Vec3 axis, float radius, float half_height,
+                    uint32_t color = 0xFFFFFFFF);
     void AddBox(math::Vec3 center, math::Vec3 half_extents, uint32_t color = 0xFFFFFFFF);
     void AddAABB(const collision::AABB& aabb, uint32_t color = 0xFFFFFFFF);
     void AddFrame(math::Transform transform, float size = 0.1f);

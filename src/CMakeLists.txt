@@ -226,6 +226,7 @@ nuka_set_warnings(nuka_sensor)
 # ---------------------------------------------------------------------------
 add_library(nuka_debug_draw STATIC
     apps/debug_shell/debug_draw.cpp
+    apps/debug_shell/debug_visualization.cpp
 )
 
 target_include_directories(nuka_debug_draw
@@ -236,7 +237,11 @@ target_include_directories(nuka_debug_draw
 target_link_libraries(nuka_debug_draw
     PUBLIC
         nuka_collision
+        nuka_constraint
         nuka_math
+        nuka_render
+        nuka_runtime
+        nuka_scene
 )
 
 nuka_set_warnings(nuka_debug_draw)

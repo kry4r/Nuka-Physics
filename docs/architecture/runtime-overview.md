@@ -44,6 +44,15 @@ which emits:
 This keeps rendering decoupled from simulation while still sharing stable body,
 shape, material, camera, light, actuator, and sensor identifiers.
 
+### Debug Visualization Bridge
+
+`app::BuildDebugVisualization()` consumes the compiled `RenderScene`,
+`PhysicsWorld`, and `SceneGraph`, plus optional contact manifolds and constraint
+blocks, and emits a GPU-independent `DebugDrawList`. The bridge covers collision
+shape proxies, shape AABBs, joint axes, centers of mass, contact points/normals,
+and constraint error vectors. Native shells and future renderers should consume
+this command list instead of re-deriving overlay geometry from raw physics state.
+
 ## Domain Modules
 
 ### Rigid Body (`runtime/rigid/`)

@@ -152,6 +152,8 @@ add_executable(nuka_debug_draw_test
 target_link_libraries(nuka_debug_draw_test
     PRIVATE
         nuka_debug_draw
+        nuka_scene_pipeline
+        nuka_constraint
         GTest::gtest_main
 )
 

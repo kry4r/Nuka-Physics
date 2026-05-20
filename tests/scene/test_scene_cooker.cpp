@@ -103,16 +103,18 @@ TEST(SceneCooker, CooksShapes) {
 
     CollisionShapeRecord srec;
     srec.body_id      = body;
-    srec.type         = ShapeType::Sphere;
+    srec.type         = ShapeType::Capsule;
     srec.radius       = 2.0f;
+    srec.half_height  = 3.0f;
     srec.half_extents = {0.0f, 0.0f, 0.0f};
     scene.AddCollisionShape(std::move(srec));
 
     const auto blob = CookScene(scene);
     EXPECT_EQ(blob.shape_count, 1u);
-    EXPECT_EQ(blob.shapes.types[0], ShapeType::Sphere);
+    EXPECT_EQ(blob.shapes.types[0], ShapeType::Capsule);
     EXPECT_EQ(blob.shapes.body_ids[0], body);
     EXPECT_FLOAT_EQ(blob.shapes.radii[0], 2.0f);
+    EXPECT_FLOAT_EQ(blob.shapes.half_heights[0], 3.0f);
 }
 
 // ---------------------------------------------------------------------------

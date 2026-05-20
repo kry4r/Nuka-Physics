@@ -33,6 +33,7 @@ struct CookedShapeTable {
     std::vector<math::Transform> local_transforms;
     std::vector<math::Vec3>      half_extents;
     std::vector<float>           radii;
+    std::vector<float>           half_heights;
 };
 
 struct CookedSensorTable {

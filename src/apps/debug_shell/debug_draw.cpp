@@ -24,6 +24,21 @@ void DebugDrawList::AddSphere(math::Vec3 center, float radius, uint32_t color) {
     commands_.push_back(cmd);
 }
 
+void DebugDrawList::AddCapsule(math::Vec3 center,
+                               math::Vec3 axis,
+                               float radius,
+                               float half_height,
+                               uint32_t color) {
+    DrawCommand cmd{};
+    cmd.type        = DrawCommandType::Capsule;
+    cmd.position    = center;
+    cmd.end         = axis.Normalized();
+    cmd.radius      = radius;
+    cmd.half_height = half_height;
+    cmd.color       = color;
+    commands_.push_back(cmd);
+}
+
 void DebugDrawList::AddBox(math::Vec3 center, math::Vec3 half_extents, uint32_t color) {
     DrawCommand cmd{};
     cmd.type     = DrawCommandType::Box;

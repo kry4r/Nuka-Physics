@@ -13,14 +13,14 @@ reinforcement learning, and real-time applications.
 - Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
 - Batched simulation via WorldTemplate/Instance for parallel environments
 - Optional GPU acceleration through the PHI (Platform Hardware Interface) layer
-- Debug draw and visualization utilities
+- Debug draw and visualization utilities for collision proxies, AABBs, joints, contacts, centers of mass, and constraint errors
 
 ## Quick Start
 
 ### Prerequisites
 
 - CMake 3.20+
-- C++17 compiler (MSVC, GCC, or Clang)
+- C++20 compiler (MSVC, GCC, or Clang)
 - (Optional) CUDA Toolkit for GPU acceleration
 
 ### Configure
@@ -63,7 +63,7 @@ The engine is organized into layered modules:
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
 | **Sensors** | `sensor` | IMU, lidar, force/torque sensor simulation |
 | **PHI** | `phi` | GPU abstraction layer (CUDA backend) |
-| **Apps** | `apps`, `debug_draw` | Debug visualization, shell utilities |
+| **Apps** | `apps`, `debug_draw` | Debug draw command buffers and compiled-scene visualization overlays |
 
 For detailed architecture documentation see:
 - [Runtime Overview](docs/architecture/runtime-overview.md)
@@ -71,7 +71,7 @@ For detailed architecture documentation see:
 
 ## Tech Stack
 
-- **Language**: C++17
+- **Language**: C++20
 - **Build System**: CMake
 - **Testing**: Google Test
 - **GPU**: CUDA (optional, via PHI abstraction)

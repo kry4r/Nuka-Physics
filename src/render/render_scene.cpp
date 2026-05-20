@@ -50,6 +50,7 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         mesh.world_transform = shape_world;
         mesh.half_extents = shape.half_extents;
         mesh.radius = shape.radius;
+        mesh.half_height = shape.half_height;
         render.mesh_instances.push_back(mesh);
 
         DebugProxy proxy;
@@ -57,6 +58,9 @@ RenderScene BuildRenderScene(const scene::SceneIR& scene) {
         proxy.shape_id = shape.id;
         proxy.shape_type = shape.type;
         proxy.world_transform = shape_world;
+        proxy.half_extents = shape.half_extents;
+        proxy.radius = shape.radius;
+        proxy.half_height = shape.half_height;
         render.debug_proxies.push_back(proxy);
     }
 

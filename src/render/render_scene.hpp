@@ -20,6 +20,7 @@ struct RenderMeshInstance {
     math::Transform world_transform = math::Transform::Identity();
     math::Vec3 half_extents = {0.5f, 0.5f, 0.5f};
     float radius = 0.5f;
+    float half_height = 0.5f;
 };
 
 struct RenderMaterial {
@@ -53,6 +54,9 @@ struct DebugProxy {
     scene::ShapeId shape_id = 0;
     scene::ShapeType shape_type = scene::ShapeType::Box;
     math::Transform world_transform = math::Transform::Identity();
+    math::Vec3 half_extents = {0.5f, 0.5f, 0.5f};
+    float radius = 0.5f;
+    float half_height = 0.5f;
 };
 
 struct RenderScene {

@@ -16,6 +16,14 @@ All tests in this matrix must pass on every commit before merge.
 | ScenePipeline/ImportedUsdSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies USD import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
 | ScenePipeline/RenderSceneKeepsShapeMaterialAndBodyBindings | `tests/scene/test_scene_pipeline.cpp` | Verifies RenderScene keeps shape, material, and body bindings for debug/render use | RenderScene bindings |
 
+## Debug Visualization Regression Tests
+
+| Test Name | File | Description | Required Overlays |
+|-----------|------|-------------|-------------------|
+| DebugVisualization/EmitsCollisionBodyPrimitivesAndAabbs | `tests/apps/test_debug_draw_list.cpp` | Converts RenderScene debug proxies into body primitive and AABB draw commands | box, sphere, capsule, AABB |
+| DebugVisualization/EmitsJointAxesAndCentersOfMass | `tests/apps/test_debug_draw_list.cpp` | Converts PhysicsWorld joint/body tables plus SceneGraph transforms into joint-axis and center-of-mass commands | joint axis, center of mass |
+| DebugVisualization/EmitsContactsAndConstraintErrors | `tests/apps/test_debug_draw_list.cpp` | Converts contact manifolds and constraint blocks into contact normal and constraint error commands | contact point, contact normal, constraint error |
+
 ## Physics Regression Tests
 
 | Test Name | File | Description | Key Metric | Threshold |

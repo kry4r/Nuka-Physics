@@ -60,6 +60,7 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.shapes.local_transforms.reserve(shapes.size());
     blob.shapes.half_extents.reserve(shapes.size());
     blob.shapes.radii.reserve(shapes.size());
+    blob.shapes.half_heights.reserve(shapes.size());
 
     for (const auto& s : shapes) {
         blob.shapes.types.push_back(s.type);
@@ -68,6 +69,7 @@ CookedBlob CookScene(const SceneIR& scene) {
         blob.shapes.local_transforms.push_back(s.local_transform);
         blob.shapes.half_extents.push_back(s.half_extents);
         blob.shapes.radii.push_back(s.radius);
+        blob.shapes.half_heights.push_back(s.half_height);
     }
 
     const auto& sensors = scene.Sensors();

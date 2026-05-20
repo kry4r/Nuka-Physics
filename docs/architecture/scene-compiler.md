@@ -63,6 +63,13 @@ The conversion path is the required bridge from XML/USD importers to simulation
 and rendering. Tests cover programmatic scenes plus MJCF and USD imported scenes
 through the same `BuildCompiledScene()` entry point.
 
+`RenderScene` debug proxies retain shape dimensions needed by debug overlays:
+box half extents, sphere radii, and capsule radii/half heights. The debug
+visualization bridge uses those proxies together with `PhysicsWorld` joint/body
+tables and `SceneGraph` world transforms to draw collision bodies, AABBs, joint
+axes, centers of mass, contacts, and constraint errors without coupling the
+render module back to simulation internals.
+
 ### 4. Cooked Blobs
 
 `scene::CookScene(SceneIR)` serializes the IR into a compact binary blob
