@@ -74,3 +74,22 @@ TEST(ConstraintBlock, ContactMaterialParametersPropagateFromManifold) {
     EXPECT_EQ(blocks[0].friction_row_count, 2u);
     EXPECT_EQ(blocks[0].first_friction_row, 1u);
 }
+
+TEST(ConstraintBlock, ContactPenetrationPropagatesToPositionError) {
+    ContactManifold m;
+    m.body_a = 0;
+    m.body_b = 1;
+
+    ContactPoint pt;
+    pt.position = {0.0f, 0.0f, 0.0f};
+    pt.normal = {0.0f, 1.0f, 0.0f};
+    pt.penetration = 0.075f;
+    m.AddPoint(pt);
+
+    auto blocks = BuildContactConstraints({m});
+
+    ASSERT_EQ(blocks.size(), 1u);
+    ASSERT_GE(blocks[0].normal_row_count, 1u);
+    EXPECT_FLOAT_EQ(blocks[0].position_error[0], 0.075f);
+    EXPECT_FLOAT_EQ(blocks[0].rhs[0], 0.0f);
+}

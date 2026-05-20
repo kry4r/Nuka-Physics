@@ -59,13 +59,6 @@ target_include_directories(nuka_runtime
         ${CMAKE_SOURCE_DIR}/src
 )
 
-target_link_libraries(nuka_runtime
-    PUBLIC
-        nuka_scene
-)
-
-nuka_set_warnings(nuka_runtime)
-
 add_library(nuka_render STATIC
     render/render_scene.cpp
 )
@@ -177,10 +170,20 @@ target_include_directories(nuka_solver
 target_link_libraries(nuka_solver
     PUBLIC
         nuka_constraint
-        nuka_runtime
+        nuka_math
 )
 
 nuka_set_warnings(nuka_solver)
+
+target_link_libraries(nuka_runtime
+    PUBLIC
+        nuka_scene
+        nuka_collision
+        nuka_constraint
+        nuka_solver
+)
+
+nuka_set_warnings(nuka_runtime)
 
 # ---------------------------------------------------------------------------
 # nuka_articulation – Articulation graphs and joint drives

@@ -30,6 +30,7 @@ struct ConstraintBlock {
     math::Vec3 jacobian_angular_b[kMaxRows];
 
     float rhs[kMaxRows]            = {};
+    float position_error[kMaxRows] = {};
     float lower_limit[kMaxRows]    = {};
     float upper_limit[kMaxRows]    = {};
     float impulse[kMaxRows]        = {};   // accumulated impulse (warm start)

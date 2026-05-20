@@ -71,3 +71,90 @@ TEST(WorldStepper, AppliesForcesTorquesAndClearsAccumulatorsAfterEachStep) {
     EXPECT_EQ(world.instance.forces[1], nuka::math::Vec3::Zero());
     EXPECT_EQ(world.instance.torques[1], nuka::math::Vec3::Zero());
 }
+
+TEST(WorldStepper, GeneratesCookedShapeContactsAndSolvesAgainstStaticPlane) {
+    nuka::scene::SceneIR scene;
+
+    nuka::scene::RigidBodyRecord ground;
+    ground.name = "ground";
+    ground.is_static = true;
+    const auto ground_id = scene.AddRigidBody(std::move(ground));
+
+    nuka::scene::CollisionShapeRecord plane;
+    plane.body_id = ground_id;
+    plane.type = nuka::scene::ShapeType::Plane;
+    scene.AddCollisionShape(std::move(plane));
+
+    nuka::scene::RigidBodyRecord box;
+    box.name = "box";
+    box.mass = 1.0f;
+    box.inertia = {1.0f, 1.0f, 1.0f};
+    box.local_transform.position = {0.0f, 0.45f, 0.0f};
+    const auto box_id = scene.AddRigidBody(std::move(box));
+
+    nuka::scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_id;
+    box_shape.type = nuka::scene::ShapeType::Box;
+    box_shape.half_extents = {0.5f, 0.5f, 0.5f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    auto world = nuka::runtime::BuildWorld(nuka::scene::CookScene(scene));
+    world.instance.linear_velocities[box_id] = {0.0f, -1.0f, 0.0f};
+
+    nuka::runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 60.0f;
+
+    const auto report = nuka::runtime::StepWorldInstance(world.template_view,
+                                                         world.instance,
+                                                         options);
+
+    EXPECT_EQ(report.broadphase_pair_count, 1u);
+    EXPECT_EQ(report.contact_manifold_count, 1u);
+    EXPECT_GE(report.contact_point_count, 1u);
+    EXPECT_GE(report.constraint_row_count, 3u);
+    EXPECT_GE(world.instance.linear_velocities[box_id].y, -1e-5f);
+    EXPECT_GT(world.instance.poses[box_id].position.y, 0.48f);
+}
+
+TEST(WorldStepper, UsesPlaneShapeTransformWhenGeneratingContacts) {
+    nuka::scene::SceneIR scene;
+
+    nuka::scene::RigidBodyRecord ground;
+    ground.name = "raised_ground";
+    ground.is_static = true;
+    const auto ground_id = scene.AddRigidBody(std::move(ground));
+
+    nuka::scene::CollisionShapeRecord plane;
+    plane.body_id = ground_id;
+    plane.type = nuka::scene::ShapeType::Plane;
+    plane.local_transform.position = {0.0f, 1.0f, 0.0f};
+    scene.AddCollisionShape(std::move(plane));
+
+    nuka::scene::RigidBodyRecord box;
+    box.name = "box";
+    box.mass = 1.0f;
+    box.inertia = {1.0f, 1.0f, 1.0f};
+    box.local_transform.position = {0.0f, 1.45f, 0.0f};
+    const auto box_id = scene.AddRigidBody(std::move(box));
+
+    nuka::scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_id;
+    box_shape.type = nuka::scene::ShapeType::Box;
+    box_shape.half_extents = {0.5f, 0.5f, 0.5f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    auto world = nuka::runtime::BuildWorld(nuka::scene::CookScene(scene));
+    world.instance.linear_velocities[box_id] = {0.0f, -1.0f, 0.0f};
+
+    nuka::runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 60.0f;
+
+    const auto report = nuka::runtime::StepWorldInstance(world.template_view,
+                                                         world.instance,
+                                                         options);
+
+    EXPECT_EQ(report.contact_manifold_count, 1u);
+    EXPECT_GT(world.instance.poses[box_id].position.y, 1.48f);
+}

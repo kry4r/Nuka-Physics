@@ -16,10 +16,26 @@ struct WorldStepOptions {
     float dt = 1.0f / 60.0f;
     uint32_t step_count = 1;
     bool clear_forces_after_step = true;
+    bool enable_contacts = true;
+    uint32_t solver_velocity_iterations = 10;
+    uint32_t solver_position_iterations = 4;
+    float solver_slop = 0.005f;
+    float solver_baumgarte = 0.2f;
 };
 
-void StepWorldInstance(const WorldTemplate& world_template,
-                       WorldInstance& instance,
-                       const WorldStepOptions& options = {});
+struct WorldStepReport {
+    uint32_t simulated_step_count = 0;
+    uint32_t broadphase_pair_count = 0;
+    uint32_t contact_manifold_count = 0;
+    uint32_t contact_point_count = 0;
+    uint32_t constraint_block_count = 0;
+    uint32_t constraint_row_count = 0;
+    uint32_t solver_iterations_used = 0;
+    float max_constraint_error = 0.0f;
+};
+
+WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
+                                  WorldInstance& instance,
+                                  const WorldStepOptions& options = {});
 
 } // namespace nuka::runtime

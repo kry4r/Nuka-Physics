@@ -28,12 +28,20 @@ Each instance evolves independently during simulation.
 ### World Stepper
 
 `runtime::StepWorldInstance()` advances a `WorldInstance` against its
-`WorldTemplate` with fixed-step CPU integration. It converts each body row into
-the rigid `BodyState`, applies gravity and accumulated forces/torques through the
-shared symplectic Euler integrator, writes poses and velocities back, and clears
-force accumulators by default. Cooked body poses are stored in world space so
-imported hierarchies start simulation from the same transforms used by
-`SceneGraph`.
+`WorldTemplate` with fixed-step CPU simulation. It converts each body row into
+the rigid `BodyState`, applies gravity and accumulated forces/torques, builds
+shape proxies from cooked box/sphere/capsule/plane data, runs the dynamic
+broadphase over shape AABBs, generates contact manifolds for plane, sphere, and
+box-style contacts, assembles contact constraints, invokes the PGS solver, then
+integrates velocities and writes poses back. Cooked body poses are stored in
+world space so imported hierarchies start simulation from the same transforms
+used by `SceneGraph`.
+
+`StepWorldInstance()` returns a `WorldStepReport` with step count, broadphase
+pairs, contact manifolds/points, constraint blocks/rows, solver iterations, and
+maximum constraint error. Tests and demos use the report to prove the imported
+scene path is exercising the physical contact pipeline instead of only advancing
+free bodies.
 
 ### BatchContext / BatchScheduler
 
@@ -101,6 +109,9 @@ that a native OpenGL/ImGui viewport will consume.
   solver updates tangent limits from `friction * accumulatedNormalImpulse`, so
   tangential impulses stay inside a Coulomb friction cone and disappear when no
   normal impulse is produced.
+- **Position error**: Contact penetration is stored separately from velocity
+  `rhs` in `ConstraintBlock::position_error`. This lets resting contacts project
+  overlap without turning penetration depth into artificial bounce velocity.
 - **Restitution**: Before velocity iterations, contact normal rows convert
   closing velocity into a bounce target using the block restitution coefficient.
   This keeps the material response explicit in the same PGS path as resting

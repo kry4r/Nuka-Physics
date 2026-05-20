@@ -191,10 +191,13 @@ inline float StabilizeContactPositions(const constraint::ConstraintBlock& block,
                                        runtime::rigid::BodyState& body_b,
                                        const SolverConfig& config) {
     float max_penetration = 0.0f;
-    for (uint32_t r = 0; r < block.row_count; ++r) {
-        // Contacts encode penetration as a negative velocity bias in some
-        // builders and as a positive depth in older tests. Accept either sign.
-        const float penetration = std::abs(block.rhs[r]);
+    const uint32_t normal_rows = ContactNormalRowCount(block);
+    for (uint32_t r = 0; r < normal_rows; ++r) {
+        // Position error is the canonical penetration depth. Older tests may
+        // still encode it in rhs, so keep that path as a compatibility fallback.
+        const float penetration = block.position_error[r] > 0.0f
+            ? block.position_error[r]
+            : std::abs(block.rhs[r]);
         max_penetration = std::max(max_penetration, penetration);
 
         const float correction = config.baumgarte * std::max(penetration - config.slop, 0.0f);

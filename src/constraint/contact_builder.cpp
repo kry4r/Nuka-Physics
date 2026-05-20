@@ -85,7 +85,8 @@ std::vector<ConstraintBlock> BuildContactConstraints(
                 const math::Vec3 point_normal = point.normal.Normalized();
                 block.jacobian_linear_a[i] = point_normal;
                 block.jacobian_linear_b[i] = -point_normal;
-                block.rhs[i] = m.restitution;
+                block.position_error[i] = point.penetration;
+                block.rhs[i] = 0.0f;
                 block.impulse[i] = point.normal_impulse;
             }
             if (block.friction_row_count == 2u) {

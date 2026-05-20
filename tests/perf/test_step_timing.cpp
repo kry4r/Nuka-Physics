@@ -5,6 +5,10 @@
 #include "runtime/rigid/integrator.hpp"
 #include "constraint/constraint_block.hpp"
 #include "math/vec3.hpp"
+#include "runtime/world_builder.hpp"
+#include "runtime/world_stepper.hpp"
+#include "scene/cooker.hpp"
+#include "scene/scene_ir.hpp"
 #include "solver/rigid_solver.hpp"
 
 #include <gtest/gtest.h>
@@ -134,4 +138,66 @@ TEST(StepTiming, ContactMaterialSolveUnderOneSecond) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     EXPECT_LT(ms, 1000) << "contact material solve took " << ms << " ms";
+}
+
+TEST(StepTiming, RuntimeContactPipelineUnderOneSecond) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord ground;
+    ground.name = "ground";
+    ground.is_static = true;
+    const auto ground_id = scene.AddRigidBody(std::move(ground));
+
+    scene::CollisionShapeRecord plane;
+    plane.body_id = ground_id;
+    plane.type = scene::ShapeType::Plane;
+    scene.AddCollisionShape(std::move(plane));
+
+    constexpr int dynamic_body_count = 48;
+    for (int i = 0; i < dynamic_body_count; ++i) {
+        scene::RigidBodyRecord body;
+        body.name = "box";
+        body.mass = 1.0f;
+        body.inertia = {1.0f, 1.0f, 1.0f};
+        body.local_transform.position = {
+            static_cast<float>(i % 12) * 1.25f,
+            0.45f + static_cast<float>(i / 12) * 0.02f,
+            static_cast<float>(i / 12) * 1.25f
+        };
+        const auto body_id = scene.AddRigidBody(std::move(body));
+
+        scene::CollisionShapeRecord shape;
+        shape.body_id = body_id;
+        shape.type = scene::ShapeType::Box;
+        shape.half_extents = {0.5f, 0.5f, 0.5f};
+        scene.AddCollisionShape(std::move(shape));
+    }
+
+    auto world = runtime::BuildWorld(scene::CookScene(scene));
+    for (uint32_t body_id = 1; body_id < world.instance.body_count; ++body_id) {
+        world.instance.linear_velocities[body_id] = {0.2f, -1.0f, 0.1f};
+    }
+
+    runtime::WorldStepOptions options;
+    options.gravity = {0.0f, 0.0f, 0.0f};
+    options.dt = 1.0f / 120.0f;
+    options.solver_velocity_iterations = 8;
+    options.solver_position_iterations = 4;
+
+    runtime::WorldStepReport last_report;
+    auto start = std::chrono::high_resolution_clock::now();
+
+    constexpr int step_count = 120;
+    for (int step = 0; step < step_count; ++step) {
+        last_report = runtime::StepWorldInstance(world.template_view,
+                                                 world.instance,
+                                                 options);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    EXPECT_GT(last_report.contact_manifold_count, 0u);
+    EXPECT_GT(last_report.constraint_row_count, 0u);
+    EXPECT_LT(ms, 1000) << "runtime contact pipeline took " << ms << " ms";
 }

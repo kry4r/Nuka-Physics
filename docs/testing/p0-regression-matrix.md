@@ -56,6 +56,9 @@ All tests in this matrix must pass on every commit before merge.
 | JointProjection/EccentricAnchorProjectionUsesAngularInertia | `tests/solver/test_joint_projection.cpp` | Eccentric joint anchor projection applies angular correction through inverse inertia | Gap reduction, orientation change | gap < 25% initial and rotation > 1e-3 |
 | WorldStepper/AdvancesDynamicBodiesAndKeepsStaticBodiesFixed | `tests/runtime/test_world_stepper.cpp` | Fixed-step world stepping advances dynamic bodies and preserves static body state | Pose/velocity | expected symplectic Euler values |
 | WorldStepper/AppliesForcesTorquesAndClearsAccumulatorsAfterEachStep | `tests/runtime/test_world_stepper.cpp` | Applies force and torque accumulators through body tables and clears them after stepping | Velocity/accumulators | expected values / zeroed accumulators |
+| WorldStepper/GeneratesCookedShapeContactsAndSolvesAgainstStaticPlane | `tests/runtime/test_world_stepper.cpp` | Cooked plane and box shapes flow through broadphase, contact manifold generation, contact constraint assembly, PGS solve, and pose writeback | contact report, velocity, pose | one manifold, contact rows, no downward velocity, depenetrated pose |
+| WorldStepper/UsesPlaneShapeTransformWhenGeneratingContacts | `tests/runtime/test_world_stepper.cpp` | Plane contact generation honors cooked local/world shape transforms instead of assuming y=0 | contact report, pose | one manifold, raised-plane depenetration |
+| ConstraintBlock/ContactPenetrationPropagatesToPositionError | `tests/constraint/test_constraint_block.cpp` | Manifold penetration becomes position error instead of velocity rhs | position_error, rhs | penetration in position_error and zero velocity rhs |
 
 ## Performance Tests
 
@@ -64,6 +67,7 @@ All tests in this matrix must pass on every commit before merge.
 | StepTiming/HundredStepsUnderOneSecond | `tests/perf/test_step_timing.cpp` | 100 steps on 10 bodies | Wall time | < 1000 ms |
 | StepTiming/ThousandStepsSingleBody | `tests/perf/test_step_timing.cpp` | 1000 steps on 1 body | Wall time | < 1000 ms |
 | StepTiming/ContactMaterialSolveUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 PGS contact-material solves over 64 bodies with friction and restitution rows | Wall time | < 1000 ms |
+| StepTiming/RuntimeContactPipelineUnderOneSecond | `tests/perf/test_step_timing.cpp` | 120 fixed runtime steps over 48 cooked dynamic boxes and a static plane through broadphase, narrowphase, contact builder, solver, and integration | Wall time | < 1000 ms |
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
