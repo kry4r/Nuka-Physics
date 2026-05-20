@@ -28,6 +28,7 @@ target_include_directories(nuka_math
 add_library(nuka_scene STATIC
     scene/scene_ir.cpp
     scene/cooker.cpp
+    scene/scene_graph.cpp
 )
 
 target_include_directories(nuka_scene
@@ -47,6 +48,7 @@ nuka_set_warnings(nuka_scene)
 # ---------------------------------------------------------------------------
 add_library(nuka_runtime STATIC
     runtime/world_builder.cpp
+    runtime/physics_world.cpp
     runtime/rigid/integrator.cpp
     runtime/batch_scheduler.cpp
 )
@@ -62,6 +64,40 @@ target_link_libraries(nuka_runtime
 )
 
 nuka_set_warnings(nuka_runtime)
+
+add_library(nuka_render STATIC
+    render/render_scene.cpp
+)
+
+target_include_directories(nuka_render
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_render
+    PUBLIC
+        nuka_scene
+)
+
+nuka_set_warnings(nuka_render)
+
+add_library(nuka_scene_pipeline STATIC
+    scene/scene_pipeline.cpp
+)
+
+target_include_directories(nuka_scene_pipeline
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_scene_pipeline
+    PUBLIC
+        nuka_scene
+        nuka_runtime
+        nuka_render
+)
+
+nuka_set_warnings(nuka_scene_pipeline)
 
 # ---------------------------------------------------------------------------
 # nuka_import – MJCF and URDF importers

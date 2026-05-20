@@ -33,15 +33,17 @@ gtest_discover_tests(nuka_math_test)
 add_executable(nuka_scene_test
     scene/test_scene_ir.cpp
     scene/test_scene_cooker.cpp
+    scene/test_scene_pipeline.cpp
 )
 
 target_link_libraries(nuka_scene_test
     PRIVATE
-        nuka_scene
+        nuka_scene_pipeline
+        nuka_import
         GTest::gtest_main
 )
 
-gtest_discover_tests(nuka_scene_test)
+gtest_discover_tests(nuka_scene_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test

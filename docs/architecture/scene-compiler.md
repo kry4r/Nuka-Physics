@@ -6,11 +6,11 @@ formats into runtime-ready data in the Nuka Physics Engine.
 ## Pipeline Stages
 
 ```
-Authoring Formats          Canonical IR           Cooked Blobs
- (MJCF, URDF, USD)  --->  (SceneIR)       --->  (Binary blob)
-       |                       |                       |
-   Importers              In-memory graph         Serialized for
-                          of bodies, joints,      fast runtime load
+Authoring Formats          Canonical IR          Compiled Runtime Views
+ (MJCF, URDF, USD)  --->  (SceneIR)       --->  SceneGraph
+       |                       |            \-->  PhysicsWorld
+   Importers              In-memory graph   \-->  RenderScene
+                          of bodies, joints, \->  CookedBlob
                           shapes, sensors
 ```
 
@@ -47,7 +47,23 @@ The `SceneIR` is the engine's format-independent scene representation:
 The IR can also be built programmatically via `SceneIR::AddRigidBody()`,
 `SceneIR::AddJoint()`, etc., without going through an importer.
 
-### 3. Cooked Blobs
+### 3. Unified Compiled Views
+
+`scene::BuildCompiledScene(SceneIR)` converts imported or programmatic scenes
+into the three internal views used by the simulator:
+
+- **SceneGraph** -- hierarchical body nodes with local and world transforms.
+- **PhysicsWorld** -- physics-facing tables and a `runtime::BuiltWorld` built
+  from cooked body, joint, shape, actuator, and sensor data.
+- **RenderScene** -- render-facing mesh instances, material records, cameras,
+  lights, and debug proxies. This view shares identifiers and transforms with
+  the SceneGraph instead of owning physics state.
+
+The conversion path is the required bridge from XML/USD importers to simulation
+and rendering. Tests cover programmatic scenes plus MJCF and USD imported scenes
+through the same `BuildCompiledScene()` entry point.
+
+### 4. Cooked Blobs
 
 `scene::CookScene(SceneIR)` serializes the IR into a compact binary blob
 optimized for runtime consumption:
@@ -65,8 +81,9 @@ with an explicit error that points to the pending OpenUSD SDK adapter. This keep
 callers and tests aligned with the final import path while avoiding a hard SDK
 dependency before build-system support is added.
 
-The cooked blob is consumed by `runtime::BuildWorld(blob)` to construct a
-`WorldTemplate` and an initial `WorldInstance`.
+The cooked blob is consumed by `runtime::BuildWorld(blob)` and
+`runtime::BuildPhysicsWorld(blob)` to construct a `WorldTemplate`, an initial
+`WorldInstance`, and a physics-facing world view.
 
 ## Adding a New Importer
 

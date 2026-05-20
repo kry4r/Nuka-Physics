@@ -10,7 +10,7 @@ reinforcement learning, and real-time applications.
 - Articulated body support (revolute, prismatic, fixed joints) with PD drives
 - Collision detection: broadphase (sweep-and-prune) and narrow-phase (GJK/SAT)
 - Sensor simulation: IMU, lidar, force/torque
-- Scene import from MJCF, URDF, and USDA/text USD formats
+- Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
 - Batched simulation via WorldTemplate/Instance for parallel environments
 - Optional GPU acceleration through the PHI (Platform Hardware Interface) layer
 - Debug draw and visualization utilities
@@ -56,7 +56,8 @@ The engine is organized into layered modules:
 | Layer | Modules | Description |
 |-------|---------|-------------|
 | **Core** | `math`, `core` | Spatial algebra, vectors, quaternions, transforms |
-| **Scene** | `scene`, `import` | Scene IR, cooker, MJCF/URDF/USD importers |
+| **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline, MJCF/URDF/USD importers |
+| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies |
 | **Runtime** | `runtime`, `rigid`, `articulation` | World containers, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |

@@ -11,6 +11,14 @@ Contains body tables (poses, masses, inertias), joint descriptors, collision sha
 and sensor definitions. Multiple `WorldInstance` objects can share the same template
 to enable batched simulation.
 
+### PhysicsWorld
+
+`runtime::PhysicsWorld` is the physics-facing compiled view created from a cooked
+scene. It owns body, joint, shape, actuator, and sensor tables plus the single
+instance `BuiltWorld` used by the current runtime. It is intentionally separate
+from render data so simulation can step without depending on cameras, lights, or
+debug draw state.
+
 ### WorldInstance
 
 A mutable simulation state derived from a `WorldTemplate`. Holds per-body dynamic
@@ -22,6 +30,19 @@ Each instance evolves independently during simulation.
 Manages multiple `WorldInstance` objects that share a common `WorldTemplate`.
 The `BatchScheduler` orchestrates parallel stepping of instances, enabling
 domain-randomized training and large-scale evaluation scenarios.
+
+## Scene Integration
+
+Imported and programmatic scenes flow through `scene::BuildCompiledScene()`,
+which emits:
+
+1. `SceneGraph` for authoritative hierarchy and shared transforms.
+2. `PhysicsWorld` for simulation tables and mutable runtime state.
+3. `RenderScene` for mesh instances, materials, cameras, lights, and debug
+   proxies.
+
+This keeps rendering decoupled from simulation while still sharing stable body,
+shape, material, camera, light, actuator, and sensor identifiers.
 
 ## Domain Modules
 

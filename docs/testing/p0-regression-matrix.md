@@ -12,6 +12,9 @@ All tests in this matrix must pass on every commit before merge.
 | MjcfImporter/ParsesSceneAuthoringRecords | `tests/import/test_mjcf_importer.cpp` | Loads a complete MJCF XML scene with robot, render, control, and sensor authoring data | body, joint, geom, material, camera, light, actuator, sensor |
 | UsdImporter/ParsesRenderControlAndSensorRecords | `tests/import/test_usd_importer.cpp` | Loads a USDA/text USD scene through the isolated USD adapter and emits canonical metadata | body, joint, geom, material, camera, light, actuator, sensor |
 | UsdImporter/CookedBlobContainsUsdImportedTables | `tests/import/test_usd_importer.cpp` | Verifies imported USD records flatten into cooked runtime metadata tables | body, joint, shape, material, camera, light, actuator, sensor |
+| ScenePipeline/ImportedMjcfSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies MJCF import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
+| ScenePipeline/ImportedUsdSceneBuildsPhysicsAndRenderViews | `tests/scene/test_scene_pipeline.cpp` | Verifies USD import converts into SceneGraph, PhysicsWorld, and RenderScene | SceneGraph, PhysicsWorld, RenderScene |
+| ScenePipeline/RenderSceneKeepsShapeMaterialAndBodyBindings | `tests/scene/test_scene_pipeline.cpp` | Verifies RenderScene keeps shape, material, and body bindings for debug/render use | RenderScene bindings |
 
 ## Physics Regression Tests
 
