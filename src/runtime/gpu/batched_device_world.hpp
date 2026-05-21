@@ -25,6 +25,8 @@ struct CudaBatchedWorldStepOptions {
     uint32_t step_count = 1;
     bool clear_forces_after_step = true;
     bool enable_contacts = false;
+    bool enable_joints = false;
+    bool enable_drives = false;
     uint32_t solver_velocity_iterations = 10;
     uint32_t solver_position_iterations = 4;
     float solver_slop = 0.005f;
@@ -42,6 +44,8 @@ struct CudaBatchedWorldStepReport {
     uint32_t contact_manifold_count = 0;
     uint32_t contact_point_count = 0;
     uint32_t contact_constraint_count = 0;
+    uint32_t joint_constraint_count = 0;
+    uint32_t drive_constraint_count = 0;
     uint32_t constraint_block_count = 0;
     uint32_t constraint_row_count = 0;
     uint32_t solver_iterations_used = 0;
@@ -86,6 +90,8 @@ struct CudaBatchedConstraintSolverReport {
     uint32_t constraint_block_count = 0;
     uint32_t constraint_row_count = 0;
     uint32_t contact_constraint_count = 0;
+    uint32_t joint_constraint_count = 0;
+    uint32_t drive_constraint_count = 0;
     uint32_t velocity_iterations = 0;
     uint32_t position_iterations = 0;
     float max_position_error = 0.0f;
@@ -184,6 +190,8 @@ public:
     BatchedDeviceWorld(uint32_t instance_count,
                        uint32_t body_count_per_instance,
                        uint32_t shape_count_per_instance,
+                       uint32_t joint_count_per_instance,
+                       uint32_t actuator_count_per_instance,
                        phi::Buffer body_inv_masses,
                        phi::Buffer body_inv_inertias,
                        phi::Buffer shape_types,
@@ -191,6 +199,16 @@ public:
                        phi::Buffer shape_local_transforms,
                        phi::Buffer shape_half_extents,
                        phi::Buffer shape_radii,
+                       phi::Buffer joint_types,
+                       phi::Buffer joint_parent_bodies,
+                       phi::Buffer joint_child_bodies,
+                       phi::Buffer joint_axes,
+                       phi::Buffer joint_parent_frames,
+                       phi::Buffer joint_child_frames,
+                       phi::Buffer actuator_types,
+                       phi::Buffer actuator_joint_ids,
+                       phi::Buffer actuator_gains,
+                       phi::Buffer actuator_force_limits,
                        phi::Buffer poses,
                        phi::Buffer linear_velocities,
                        phi::Buffer angular_velocities,
@@ -205,10 +223,16 @@ public:
     uint32_t InstanceCount() const { return instance_count_; }
     uint32_t BodyCountPerInstance() const { return body_count_per_instance_; }
     uint32_t ShapeCountPerInstance() const { return shape_count_per_instance_; }
+    uint32_t JointCountPerInstance() const { return joint_count_per_instance_; }
+    uint32_t ActuatorCountPerInstance() const { return actuator_count_per_instance_; }
     uint32_t TotalBodyCount() const { return instance_count_ * body_count_per_instance_; }
     uint32_t TotalShapeCount() const { return instance_count_ * shape_count_per_instance_; }
+    uint32_t TotalJointCount() const { return instance_count_ * joint_count_per_instance_; }
+    uint32_t TotalActuatorCount() const { return instance_count_ * actuator_count_per_instance_; }
     bool HasUploadedState() const;
     bool HasUploadedShapeTables() const;
+    bool HasUploadedJointTables() const;
+    bool HasUploadedActuatorTables() const;
 
     BatchedDeviceState DownloadState() const;
 
@@ -225,11 +249,23 @@ public:
     const math::Transform* DeviceShapeLocalTransforms() const;
     const math::Vec3* DeviceShapeHalfExtents() const;
     const float* DeviceShapeRadii() const;
+    const scene::JointType* DeviceJointTypes() const;
+    const scene::BodyId* DeviceJointParentBodies() const;
+    const scene::BodyId* DeviceJointChildBodies() const;
+    const math::Vec3* DeviceJointAxes() const;
+    const math::Transform* DeviceJointParentFrames() const;
+    const math::Transform* DeviceJointChildFrames() const;
+    const scene::ActuatorType* DeviceActuatorTypes() const;
+    const scene::JointId* DeviceActuatorJointIds() const;
+    const float* DeviceActuatorGains() const;
+    const float* DeviceActuatorForceLimits() const;
 
 private:
     uint32_t instance_count_ = 0;
     uint32_t body_count_per_instance_ = 0;
     uint32_t shape_count_per_instance_ = 0;
+    uint32_t joint_count_per_instance_ = 0;
+    uint32_t actuator_count_per_instance_ = 0;
 
     phi::Buffer body_inv_masses_;
     phi::Buffer body_inv_inertias_;
@@ -238,6 +274,16 @@ private:
     phi::Buffer shape_local_transforms_;
     phi::Buffer shape_half_extents_;
     phi::Buffer shape_radii_;
+    phi::Buffer joint_types_;
+    phi::Buffer joint_parent_bodies_;
+    phi::Buffer joint_child_bodies_;
+    phi::Buffer joint_axes_;
+    phi::Buffer joint_parent_frames_;
+    phi::Buffer joint_child_frames_;
+    phi::Buffer actuator_types_;
+    phi::Buffer actuator_joint_ids_;
+    phi::Buffer actuator_gains_;
+    phi::Buffer actuator_force_limits_;
     phi::Buffer poses_;
     phi::Buffer linear_velocities_;
     phi::Buffer angular_velocities_;
@@ -259,6 +305,11 @@ CudaBatchedContactResult GenerateBatchedCudaContacts(
 CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult& contacts,
+    const CudaBatchedConstraintSolverConfig& config = {});
+
+CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult* contacts,
     const CudaBatchedConstraintSolverConfig& config = {});
 
 CudaBatchedWorldStepReport StepBatchedCudaWorld(

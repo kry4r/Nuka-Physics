@@ -484,6 +484,83 @@ __device__ constraint::ConstraintBlock BuildBatchedContactBlock(
     return block;
 }
 
+__device__ constraint::ConstraintBlock BuildBatchedRevoluteBlock(uint32_t instance_index,
+                                                                 uint32_t body_count_per_instance,
+                                                                 uint32_t parent,
+                                                                 uint32_t child,
+                                                                 math::Vec3 axis,
+                                                                 math::Transform parent_frame,
+                                                                 math::Transform child_frame,
+                                                                 bool fixed_joint) {
+    constraint::ConstraintBlock block;
+    ClearBlock(&block);
+    block.type = constraint::ConstraintType::Joint;
+    block.body_a = FlattenBody(instance_index, body_count_per_instance, parent);
+    block.body_b = FlattenBody(instance_index, body_count_per_instance, child);
+    block.row_count = fixed_joint ? 6u : 5u;
+    block.anchor_local_a = parent_frame.position;
+    block.anchor_local_b = child_frame.position;
+
+    const math::Vec3 norm_axis = Normalize(axis);
+    const math::Vec3 perp1 =
+        fabsf(norm_axis.x) < 0.9f
+            ? Normalize(Cross(norm_axis, UnitX()))
+            : Normalize(Cross(norm_axis, UnitY()));
+    const math::Vec3 perp2 = Normalize(Cross(norm_axis, perp1));
+    const math::Vec3 dirs[3] = {UnitX(), UnitY(), UnitZ()};
+    const math::Vec3 r_a = parent_frame.position;
+    const math::Vec3 r_b = child_frame.position;
+
+    for (uint32_t row = 0; row < 3u; ++row) {
+        block.jacobian_linear_a[row] = dirs[row];
+        block.jacobian_angular_a[row] = Cross(r_a, dirs[row]);
+        block.jacobian_linear_b[row] = Neg(dirs[row]);
+        block.jacobian_angular_b[row] = Neg(Cross(r_b, dirs[row]));
+        block.lower_limit[row] = -kHugeLimit;
+        block.upper_limit[row] = kHugeLimit;
+    }
+
+    const math::Vec3 rot_axes[3] = {perp1, perp2, norm_axis};
+    for (uint32_t i = 0; i < block.row_count - 3u; ++i) {
+        const uint32_t row = 3u + i;
+        block.jacobian_angular_a[row] = rot_axes[i];
+        block.jacobian_angular_b[row] = Neg(rot_axes[i]);
+        block.lower_limit[row] = -kHugeLimit;
+        block.upper_limit[row] = kHugeLimit;
+    }
+
+    return block;
+}
+
+__device__ constraint::ConstraintBlock BuildBatchedDriveBlock(uint32_t instance_index,
+                                                              uint32_t body_count_per_instance,
+                                                              uint32_t child,
+                                                              uint32_t parent,
+                                                              math::Vec3 axis,
+                                                              scene::ActuatorType type,
+                                                              float gain,
+                                                              float force_limit) {
+    constraint::ConstraintBlock block;
+    ClearBlock(&block);
+    block.type = constraint::ConstraintType::Drive;
+    block.body_a = FlattenBody(instance_index, body_count_per_instance, child);
+    block.body_b = FlattenBody(instance_index, body_count_per_instance, parent);
+    block.row_count = 1u;
+    const math::Vec3 norm_axis = Normalize(axis);
+    block.jacobian_angular_a[0] = norm_axis;
+    block.jacobian_angular_b[0] = Neg(norm_axis);
+    block.rhs[0] =
+        (type == scene::ActuatorType::Velocity
+         || type == scene::ActuatorType::Motor
+         || type == scene::ActuatorType::Force)
+            ? gain
+            : 0.0f;
+    const float limit = force_limit > 0.0f ? force_limit : kHugeLimit;
+    block.lower_limit[0] = -limit;
+    block.upper_limit[0] = limit;
+    return block;
+}
+
 __device__ math::Vec3 BodyLinearVelocity(uint32_t flat_body,
                                          uint32_t total_body_count,
                                          const math::Vec3* velocities) {
@@ -500,6 +577,18 @@ __device__ math::Vec3 BodyAngularVelocity(uint32_t flat_body,
         return ZeroVec3();
     }
     return velocities[flat_body];
+}
+
+__device__ math::Transform BodyPose(uint32_t flat_body,
+                                    uint32_t total_body_count,
+                                    const math::Transform* poses) {
+    math::Transform transform;
+    transform.position = ZeroVec3();
+    transform.rotation = MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
+    if (flat_body < total_body_count && flat_body != kInvalidBody) {
+        transform = poses[flat_body];
+    }
+    return transform;
 }
 
 __device__ float ComputeJv(constraint::ConstraintBlock block,
@@ -548,6 +637,36 @@ __device__ float ComputeEffectiveMass(constraint::ConstraintBlock block,
           + jb.y * jb.y * inv_inertia_b.y
           + jb.z * jb.z * inv_inertia_b.z;
 
+    return diag > 1.0e-12f ? 1.0f / diag : 0.0f;
+}
+
+__device__ float JointRowMass(math::Vec3 linear_a,
+                              math::Vec3 angular_a,
+                              math::Vec3 linear_b,
+                              math::Vec3 angular_b,
+                              uint32_t body_a,
+                              uint32_t body_b,
+                              uint32_t total_body_count,
+                              uint32_t body_count_per_instance,
+                              const float* inv_masses,
+                              const math::Vec3* inv_inertias) {
+    float diag = 0.0f;
+    const float inv_mass_a =
+        BodyInvMass(body_a, total_body_count, body_count_per_instance, inv_masses);
+    const float inv_mass_b =
+        BodyInvMass(body_b, total_body_count, body_count_per_instance, inv_masses);
+    const math::Vec3 inv_inertia_a =
+        BodyInvInertia(body_a, total_body_count, body_count_per_instance, inv_inertias);
+    const math::Vec3 inv_inertia_b =
+        BodyInvInertia(body_b, total_body_count, body_count_per_instance, inv_inertias);
+    diag += inv_mass_a * Dot(linear_a, linear_a);
+    diag += inv_mass_b * Dot(linear_b, linear_b);
+    diag += angular_a.x * angular_a.x * inv_inertia_a.x
+          + angular_a.y * angular_a.y * inv_inertia_a.y
+          + angular_a.z * angular_a.z * inv_inertia_a.z;
+    diag += angular_b.x * angular_b.x * inv_inertia_b.x
+          + angular_b.y * angular_b.y * inv_inertia_b.y
+          + angular_b.z * angular_b.z * inv_inertia_b.z;
     return diag > 1.0e-12f ? 1.0f / diag : 0.0f;
 }
 
@@ -880,6 +999,8 @@ __global__ void ClearBatchedSolverReportKernel(uint32_t* block_count,
     report->constraint_block_count = 0u;
     report->constraint_row_count = 0u;
     report->contact_constraint_count = 0u;
+    report->joint_constraint_count = 0u;
+    report->drive_constraint_count = 0u;
     report->velocity_iterations = 0u;
     report->position_iterations = 0u;
     report->max_position_error = 0.0f;
@@ -900,6 +1021,84 @@ __global__ void AssembleBatchedContactBlocksKernel(
     blocks[out_index] = BuildBatchedContactBlock(manifolds[slot], body_count_per_instance);
 }
 
+__global__ void AssembleBatchedJointBlocksKernel(uint32_t total_joint_count,
+                                                 uint32_t joint_count_per_instance,
+                                                 uint32_t body_count_per_instance,
+                                                 const scene::JointType* joint_types,
+                                                 const scene::BodyId* joint_parent_bodies,
+                                                 const scene::BodyId* joint_child_bodies,
+                                                 const math::Vec3* joint_axes,
+                                                 const math::Transform* joint_parent_frames,
+                                                 const math::Transform* joint_child_frames,
+                                                 constraint::ConstraintBlock* blocks,
+                                                 uint32_t* block_count) {
+    const uint32_t flat_joint = blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat_joint >= total_joint_count || joint_count_per_instance == 0u) {
+        return;
+    }
+
+    const uint32_t instance_index = flat_joint / joint_count_per_instance;
+    const uint32_t local_joint = flat_joint % joint_count_per_instance;
+    const scene::BodyId parent = joint_parent_bodies[local_joint];
+    const scene::BodyId child = joint_child_bodies[local_joint];
+    if (parent == scene::kInvalidBody && child == scene::kInvalidBody) {
+        return;
+    }
+
+    const bool fixed_joint = joint_types[local_joint] == scene::JointType::Fixed;
+    const uint32_t out_index = atomicAdd(block_count, 1u);
+    blocks[out_index] = BuildBatchedRevoluteBlock(instance_index,
+                                                  body_count_per_instance,
+                                                  parent,
+                                                  child,
+                                                  joint_axes[local_joint],
+                                                  joint_parent_frames[local_joint],
+                                                  joint_child_frames[local_joint],
+                                                  fixed_joint);
+}
+
+__global__ void AssembleBatchedDriveBlocksKernel(uint32_t total_actuator_count,
+                                                 uint32_t actuator_count_per_instance,
+                                                 uint32_t joint_count_per_instance,
+                                                 uint32_t body_count_per_instance,
+                                                 const scene::JointId* actuator_joint_ids,
+                                                 const scene::ActuatorType* actuator_types,
+                                                 const float* actuator_gains,
+                                                 const float* actuator_force_limits,
+                                                 const scene::BodyId* joint_parent_bodies,
+                                                 const scene::BodyId* joint_child_bodies,
+                                                 const math::Vec3* joint_axes,
+                                                 constraint::ConstraintBlock* blocks,
+                                                 uint32_t* block_count) {
+    const uint32_t flat_actuator = blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat_actuator >= total_actuator_count || actuator_count_per_instance == 0u) {
+        return;
+    }
+
+    const uint32_t instance_index = flat_actuator / actuator_count_per_instance;
+    const uint32_t local_actuator = flat_actuator % actuator_count_per_instance;
+    const scene::JointId joint_id = actuator_joint_ids[local_actuator];
+    if (joint_id >= joint_count_per_instance || joint_id == scene::kInvalidJoint) {
+        return;
+    }
+
+    const scene::BodyId parent = joint_parent_bodies[joint_id];
+    const scene::BodyId child = joint_child_bodies[joint_id];
+    if (parent == scene::kInvalidBody && child == scene::kInvalidBody) {
+        return;
+    }
+
+    const uint32_t out_index = atomicAdd(block_count, 1u);
+    blocks[out_index] = BuildBatchedDriveBlock(instance_index,
+                                               body_count_per_instance,
+                                               child,
+                                               parent,
+                                               joint_axes[joint_id],
+                                               actuator_types[local_actuator],
+                                               actuator_gains[local_actuator],
+                                               actuator_force_limits[local_actuator]);
+}
+
 __global__ void FinalizeBatchedSolverReportKernel(
     const constraint::ConstraintBlock* blocks,
     const uint32_t* block_count,
@@ -908,10 +1107,16 @@ __global__ void FinalizeBatchedSolverReportKernel(
     report->constraint_block_count = count;
     report->constraint_row_count = 0u;
     report->contact_constraint_count = 0u;
+    report->joint_constraint_count = 0u;
+    report->drive_constraint_count = 0u;
     for (uint32_t index = 0; index < count; ++index) {
         report->constraint_row_count += blocks[index].row_count;
         if (blocks[index].type == constraint::ConstraintType::Contact) {
             ++report->contact_constraint_count;
+        } else if (blocks[index].type == constraint::ConstraintType::Joint) {
+            ++report->joint_constraint_count;
+        } else if (blocks[index].type == constraint::ConstraintType::Drive) {
+            ++report->drive_constraint_count;
         }
     }
 }
@@ -1058,6 +1263,87 @@ __global__ void SolveBatchedContactPositionIterationKernel(
     report->max_position_error = max_error;
 }
 
+__global__ void SolveBatchedJointPositionIterationKernel(
+    uint32_t total_body_count,
+    uint32_t body_count_per_instance,
+    const constraint::ConstraintBlock* blocks,
+    const uint32_t* block_count,
+    const float* inv_masses,
+    const math::Vec3* inv_inertias,
+    math::Transform* poses,
+    float slop,
+    float baumgarte,
+    CudaBatchedConstraintSolverReport* report) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) {
+        return;
+    }
+
+    float max_error = report->max_position_error;
+    const math::Vec3 axes[3] = {UnitX(), UnitY(), UnitZ()};
+    const uint32_t count = *block_count;
+    for (uint32_t block_index = 0; block_index < count; ++block_index) {
+        const constraint::ConstraintBlock block = blocks[block_index];
+        if (block.type != constraint::ConstraintType::Joint) {
+            continue;
+        }
+
+        for (uint32_t axis_index = 0; axis_index < 3u; ++axis_index) {
+            const math::Vec3 axis = axes[axis_index];
+            const math::Transform pose_a = BodyPose(block.body_a, total_body_count, poses);
+            const math::Transform pose_b = BodyPose(block.body_b, total_body_count, poses);
+            const math::Vec3 r_a = Rotate(pose_a.rotation, block.anchor_local_a);
+            const math::Vec3 r_b = Rotate(pose_b.rotation, block.anchor_local_b);
+            const math::Vec3 error =
+                Sub(Add(pose_a.position, r_a), Add(pose_b.position, r_b));
+            const float row_error = Dot(error, axis);
+            max_error = fmaxf(max_error, fabsf(row_error));
+            const float correction = baumgarte * row_error;
+            if (fabsf(correction) <= slop) {
+                continue;
+            }
+
+            const math::Vec3 linear_a = Neg(axis);
+            const math::Vec3 linear_b = axis;
+            const math::Vec3 angular_a = Neg(Cross(r_a, axis));
+            const math::Vec3 angular_b = Cross(r_b, axis);
+            const float effective_mass = JointRowMass(linear_a,
+                                                      angular_a,
+                                                      linear_b,
+                                                      angular_b,
+                                                      block.body_a,
+                                                      block.body_b,
+                                                      total_body_count,
+                                                      body_count_per_instance,
+                                                      inv_masses,
+                                                      inv_inertias);
+            if (effective_mass <= 0.0f) {
+                continue;
+            }
+
+            const float position_impulse = correction * effective_mass;
+            ApplyPositionCorrection(block.body_a,
+                                    total_body_count,
+                                    body_count_per_instance,
+                                    linear_a,
+                                    angular_a,
+                                    position_impulse,
+                                    inv_masses,
+                                    inv_inertias,
+                                    poses);
+            ApplyPositionCorrection(block.body_b,
+                                    total_body_count,
+                                    body_count_per_instance,
+                                    linear_b,
+                                    angular_b,
+                                    position_impulse,
+                                    inv_masses,
+                                    inv_inertias,
+                                    poses);
+        }
+    }
+    report->max_position_error = max_error;
+}
+
 __global__ void SetBatchedSolverIterationReportKernel(
     uint32_t velocity_iterations,
     uint32_t position_iterations,
@@ -1192,6 +1478,8 @@ CudaBatchedConstraintSolverReport CudaBatchedConstraintSolverResult::DownloadRep
 BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
                                        uint32_t body_count_per_instance,
                                        uint32_t shape_count_per_instance,
+                                       uint32_t joint_count_per_instance,
+                                       uint32_t actuator_count_per_instance,
                                        phi::Buffer body_inv_masses,
                                        phi::Buffer body_inv_inertias,
                                        phi::Buffer shape_types,
@@ -1199,6 +1487,16 @@ BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
                                        phi::Buffer shape_local_transforms,
                                        phi::Buffer shape_half_extents,
                                        phi::Buffer shape_radii,
+                                       phi::Buffer joint_types,
+                                       phi::Buffer joint_parent_bodies,
+                                       phi::Buffer joint_child_bodies,
+                                       phi::Buffer joint_axes,
+                                       phi::Buffer joint_parent_frames,
+                                       phi::Buffer joint_child_frames,
+                                       phi::Buffer actuator_types,
+                                       phi::Buffer actuator_joint_ids,
+                                       phi::Buffer actuator_gains,
+                                       phi::Buffer actuator_force_limits,
                                        phi::Buffer poses,
                                        phi::Buffer linear_velocities,
                                        phi::Buffer angular_velocities,
@@ -1207,6 +1505,8 @@ BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
     : instance_count_(instance_count)
     , body_count_per_instance_(body_count_per_instance)
     , shape_count_per_instance_(shape_count_per_instance)
+    , joint_count_per_instance_(joint_count_per_instance)
+    , actuator_count_per_instance_(actuator_count_per_instance)
     , body_inv_masses_(std::move(body_inv_masses))
     , body_inv_inertias_(std::move(body_inv_inertias))
     , shape_types_(std::move(shape_types))
@@ -1214,6 +1514,16 @@ BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
     , shape_local_transforms_(std::move(shape_local_transforms))
     , shape_half_extents_(std::move(shape_half_extents))
     , shape_radii_(std::move(shape_radii))
+    , joint_types_(std::move(joint_types))
+    , joint_parent_bodies_(std::move(joint_parent_bodies))
+    , joint_child_bodies_(std::move(joint_child_bodies))
+    , joint_axes_(std::move(joint_axes))
+    , joint_parent_frames_(std::move(joint_parent_frames))
+    , joint_child_frames_(std::move(joint_child_frames))
+    , actuator_types_(std::move(actuator_types))
+    , actuator_joint_ids_(std::move(actuator_joint_ids))
+    , actuator_gains_(std::move(actuator_gains))
+    , actuator_force_limits_(std::move(actuator_force_limits))
     , poses_(std::move(poses))
     , linear_velocities_(std::move(linear_velocities))
     , angular_velocities_(std::move(angular_velocities))
@@ -1244,6 +1554,32 @@ bool BatchedDeviceWorld::HasUploadedShapeTables() const {
         && shape_local_transforms_.Size() == shape_count * sizeof(math::Transform)
         && shape_half_extents_.Size() == shape_count * sizeof(math::Vec3)
         && shape_radii_.Size() == shape_count * sizeof(float);
+}
+
+bool BatchedDeviceWorld::HasUploadedJointTables() const {
+    const auto joint_count = JointCountPerInstance();
+    if (joint_count == 0u) {
+        return true;
+    }
+
+    return joint_types_.Size() == joint_count * sizeof(scene::JointType)
+        && joint_parent_bodies_.Size() == joint_count * sizeof(scene::BodyId)
+        && joint_child_bodies_.Size() == joint_count * sizeof(scene::BodyId)
+        && joint_axes_.Size() == joint_count * sizeof(math::Vec3)
+        && joint_parent_frames_.Size() == joint_count * sizeof(math::Transform)
+        && joint_child_frames_.Size() == joint_count * sizeof(math::Transform);
+}
+
+bool BatchedDeviceWorld::HasUploadedActuatorTables() const {
+    const auto actuator_count = ActuatorCountPerInstance();
+    if (actuator_count == 0u) {
+        return true;
+    }
+
+    return actuator_types_.Size() == actuator_count * sizeof(scene::ActuatorType)
+        && actuator_joint_ids_.Size() == actuator_count * sizeof(scene::JointId)
+        && actuator_gains_.Size() == actuator_count * sizeof(float)
+        && actuator_force_limits_.Size() == actuator_count * sizeof(float);
 }
 
 BatchedDeviceState BatchedDeviceWorld::DownloadState() const {
@@ -1317,6 +1653,46 @@ const float* BatchedDeviceWorld::DeviceShapeRadii() const {
     return static_cast<const float*>(shape_radii_.Data());
 }
 
+const scene::JointType* BatchedDeviceWorld::DeviceJointTypes() const {
+    return static_cast<const scene::JointType*>(joint_types_.Data());
+}
+
+const scene::BodyId* BatchedDeviceWorld::DeviceJointParentBodies() const {
+    return static_cast<const scene::BodyId*>(joint_parent_bodies_.Data());
+}
+
+const scene::BodyId* BatchedDeviceWorld::DeviceJointChildBodies() const {
+    return static_cast<const scene::BodyId*>(joint_child_bodies_.Data());
+}
+
+const math::Vec3* BatchedDeviceWorld::DeviceJointAxes() const {
+    return static_cast<const math::Vec3*>(joint_axes_.Data());
+}
+
+const math::Transform* BatchedDeviceWorld::DeviceJointParentFrames() const {
+    return static_cast<const math::Transform*>(joint_parent_frames_.Data());
+}
+
+const math::Transform* BatchedDeviceWorld::DeviceJointChildFrames() const {
+    return static_cast<const math::Transform*>(joint_child_frames_.Data());
+}
+
+const scene::ActuatorType* BatchedDeviceWorld::DeviceActuatorTypes() const {
+    return static_cast<const scene::ActuatorType*>(actuator_types_.Data());
+}
+
+const scene::JointId* BatchedDeviceWorld::DeviceActuatorJointIds() const {
+    return static_cast<const scene::JointId*>(actuator_joint_ids_.Data());
+}
+
+const float* BatchedDeviceWorld::DeviceActuatorGains() const {
+    return static_cast<const float*>(actuator_gains_.Data());
+}
+
+const float* BatchedDeviceWorld::DeviceActuatorForceLimits() const {
+    return static_cast<const float*>(actuator_force_limits_.Data());
+}
+
 BatchedDeviceWorld UploadBatchedDeviceWorld(
     const WorldTemplate& world_template,
     const std::vector<WorldInstance>& instances) {
@@ -1327,6 +1703,8 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
     const uint32_t instance_count = static_cast<uint32_t>(instances.size());
     const uint32_t body_count = world_template.body_count;
     const uint32_t shape_count = world_template.shape_count;
+    const uint32_t joint_count = world_template.joint_count;
+    const uint32_t actuator_count = world_template.actuator_count;
     const uint32_t total_body_count = instance_count * body_count;
 
     std::vector<math::Transform> poses;
@@ -1372,10 +1750,52 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
                       math::Vec3::Zero());
     const auto shape_radii =
         DefaultedCopy(world_template.shape_table.radii, shape_count, 0.0f);
+    const auto joint_types =
+        DefaultedCopy(world_template.joint_table.types,
+                      joint_count,
+                      scene::JointType::Revolute);
+    const auto joint_parent_bodies =
+        DefaultedCopy(world_template.joint_table.parent_bodies,
+                      joint_count,
+                      scene::kInvalidBody);
+    const auto joint_child_bodies =
+        DefaultedCopy(world_template.joint_table.child_bodies,
+                      joint_count,
+                      scene::kInvalidBody);
+    const auto joint_axes =
+        DefaultedCopy(world_template.joint_table.axes,
+                      joint_count,
+                      math::Vec3::UnitZ());
+    const auto joint_parent_frames =
+        DefaultedCopy(world_template.joint_table.parent_frames,
+                      joint_count,
+                      math::Transform::Identity());
+    const auto joint_child_frames =
+        DefaultedCopy(world_template.joint_table.child_frames,
+                      joint_count,
+                      math::Transform::Identity());
+    const auto actuator_types =
+        DefaultedCopy(world_template.actuator_table.types,
+                      actuator_count,
+                      scene::ActuatorType::Motor);
+    const auto actuator_joint_ids =
+        DefaultedCopy(world_template.actuator_table.joint_ids,
+                      actuator_count,
+                      scene::kInvalidJoint);
+    const auto actuator_gains =
+        DefaultedCopy(world_template.actuator_table.gains,
+                      actuator_count,
+                      0.0f);
+    const auto actuator_force_limits =
+        DefaultedCopy(world_template.actuator_table.force_limits,
+                      actuator_count,
+                      kHugeLimit);
 
     return BatchedDeviceWorld(instance_count,
                               body_count,
                               shape_count,
+                              joint_count,
+                              actuator_count,
                               UploadVector(inv_masses),
                               UploadVector(inv_inertias),
                               UploadVector(shape_types),
@@ -1383,6 +1803,16 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
                               UploadVector(shape_local_transforms),
                               UploadVector(shape_half_extents),
                               UploadVector(shape_radii),
+                              UploadVector(joint_types),
+                              UploadVector(joint_parent_bodies),
+                              UploadVector(joint_child_bodies),
+                              UploadVector(joint_axes),
+                              UploadVector(joint_parent_frames),
+                              UploadVector(joint_child_frames),
+                              UploadVector(actuator_types),
+                              UploadVector(actuator_joint_ids),
+                              UploadVector(actuator_gains),
+                              UploadVector(actuator_force_limits),
                               UploadVector(poses),
                               UploadVector(linear_velocities),
                               UploadVector(angular_velocities),
@@ -1518,16 +1948,32 @@ CudaBatchedContactResult GenerateBatchedCudaContacts(
                                    std::move(report));
 }
 
-CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
+namespace {
+
+CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     BatchedDeviceWorld& batch,
-    const CudaBatchedContactResult& contacts,
+    const CudaBatchedContactResult* contacts,
+    bool include_joints,
+    bool include_drives,
     const CudaBatchedConstraintSolverConfig& config) {
     if (!batch.HasUploadedState()) {
         throw std::runtime_error(
-            "SolveBatchedCudaContactConstraints requires uploaded batched state");
+            "SolveBatchedCudaConstraints requires uploaded batched state");
+    }
+    if (include_joints && !batch.HasUploadedJointTables()) {
+        throw std::runtime_error(
+            "SolveBatchedCudaConstraints requires uploaded batched joint tables");
+    }
+    if (include_drives
+        && (!batch.HasUploadedJointTables() || !batch.HasUploadedActuatorTables())) {
+        throw std::runtime_error(
+            "SolveBatchedCudaConstraints requires uploaded batched actuator tables");
     }
 
-    const uint32_t block_capacity = contacts.TotalPairSlotCount();
+    const uint32_t contact_capacity = contacts != nullptr ? contacts->TotalPairSlotCount() : 0u;
+    const uint32_t joint_capacity = include_joints ? batch.TotalJointCount() : 0u;
+    const uint32_t actuator_capacity = include_drives ? batch.TotalActuatorCount() : 0u;
+    const uint32_t block_capacity = contact_capacity + joint_capacity + actuator_capacity;
     phi::Buffer blocks(block_capacity * sizeof(constraint::ConstraintBlock),
                        phi::MemoryKind::Device);
     phi::Buffer block_count(sizeof(uint32_t), phi::MemoryKind::Device);
@@ -1539,22 +1985,64 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
     CheckCuda(cudaGetLastError(), "ClearBatchedSolverReportKernel launch");
 
     constexpr uint32_t kBlockSize = 128u;
-    if (block_capacity > 0u) {
-        const uint32_t blocks_grid = (block_capacity + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedContactBlocksKernel<<<blocks_grid, kBlockSize>>>(
-            contacts.TotalPairSlotCount(),
+    if (contacts != nullptr && contacts->TotalPairSlotCount() > 0u) {
+        const uint32_t contact_blocks =
+            (contacts->TotalPairSlotCount() + kBlockSize - 1u) / kBlockSize;
+        AssembleBatchedContactBlocksKernel<<<contact_blocks, kBlockSize>>>(
+            contacts->TotalPairSlotCount(),
             batch.BodyCountPerInstance(),
-            contacts.DeviceManifolds(),
+            contacts->DeviceManifolds(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
             static_cast<uint32_t*>(block_count.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedContactBlocksKernel launch");
+    }
 
-        FinalizeBatchedSolverReportKernel<<<1, 1>>>(
+    if (include_joints && batch.TotalJointCount() > 0u) {
+        const uint32_t joint_blocks =
+            (batch.TotalJointCount() + kBlockSize - 1u) / kBlockSize;
+        AssembleBatchedJointBlocksKernel<<<joint_blocks, kBlockSize>>>(
+            batch.TotalJointCount(),
+            batch.JointCountPerInstance(),
+            batch.BodyCountPerInstance(),
+            batch.DeviceJointTypes(),
+            batch.DeviceJointParentBodies(),
+            batch.DeviceJointChildBodies(),
+            batch.DeviceJointAxes(),
+            batch.DeviceJointParentFrames(),
+            batch.DeviceJointChildFrames(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
-            static_cast<const uint32_t*>(block_count.Data()),
-            static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
-        CheckCuda(cudaGetLastError(), "FinalizeBatchedSolverReportKernel launch");
+            static_cast<uint32_t*>(block_count.Data()));
+        CheckCuda(cudaGetLastError(), "AssembleBatchedJointBlocksKernel launch");
+    }
 
+    if (include_drives && batch.TotalActuatorCount() > 0u) {
+        const uint32_t drive_blocks =
+            (batch.TotalActuatorCount() + kBlockSize - 1u) / kBlockSize;
+        AssembleBatchedDriveBlocksKernel<<<drive_blocks, kBlockSize>>>(
+            batch.TotalActuatorCount(),
+            batch.ActuatorCountPerInstance(),
+            batch.JointCountPerInstance(),
+            batch.BodyCountPerInstance(),
+            batch.DeviceActuatorJointIds(),
+            batch.DeviceActuatorTypes(),
+            batch.DeviceActuatorGains(),
+            batch.DeviceActuatorForceLimits(),
+            batch.DeviceJointParentBodies(),
+            batch.DeviceJointChildBodies(),
+            batch.DeviceJointAxes(),
+            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<uint32_t*>(block_count.Data()));
+        CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksKernel launch");
+    }
+
+    FinalizeBatchedSolverReportKernel<<<1, 1>>>(
+        static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+        static_cast<const uint32_t*>(block_count.Data()),
+        static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
+    CheckCuda(cudaGetLastError(), "FinalizeBatchedSolverReportKernel launch");
+
+    if (block_capacity > 0u) {
+        const uint32_t blocks_grid = (block_capacity + kBlockSize - 1u) / kBlockSize;
         PrecomputeBatchedBlocksKernel<<<blocks_grid, kBlockSize>>>(
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
@@ -1592,6 +2080,19 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
                 config.baumgarte,
                 static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
             CheckCuda(cudaGetLastError(), "SolveBatchedContactPositionIterationKernel launch");
+
+            SolveBatchedJointPositionIterationKernel<<<1, 1>>>(
+                batch.TotalBodyCount(),
+                batch.BodyCountPerInstance(),
+                static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+                static_cast<const uint32_t*>(block_count.Data()),
+                batch.DeviceInvMasses(),
+                batch.DeviceInvInertias(),
+                batch.DevicePoses(),
+                config.slop,
+                config.baumgarte,
+                static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
+            CheckCuda(cudaGetLastError(), "SolveBatchedJointPositionIterationKernel launch");
         }
     }
 
@@ -1600,12 +2101,32 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
         config.position_iterations,
         static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "SetBatchedSolverIterationReportKernel launch");
-    CheckCuda(cudaDeviceSynchronize(), "SolveBatchedCudaContactConstraints synchronize");
+    CheckCuda(cudaDeviceSynchronize(), "SolveBatchedCudaConstraints synchronize");
 
     return CudaBatchedConstraintSolverResult(block_capacity,
                                             std::move(blocks),
                                             std::move(block_count),
                                             std::move(report));
+}
+
+} // namespace
+
+CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult& contacts,
+    const CudaBatchedConstraintSolverConfig& config) {
+    return SolveBatchedCudaConstraintsImpl(batch, &contacts, false, false, config);
+}
+
+CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult* contacts,
+    const CudaBatchedConstraintSolverConfig& config) {
+    return SolveBatchedCudaConstraintsImpl(batch,
+                                           contacts,
+                                           true,
+                                           config.velocity_iterations > 0u,
+                                           config);
 }
 
 CudaBatchedWorldStepReport StepBatchedCudaWorld(
@@ -1647,22 +2168,49 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
         CheckCuda(cudaGetLastError(), "IntegrateBatchedRigidBodiesKernel launch");
         ++report.kernel_launch_count;
 
-        if (options.enable_contacts) {
-            auto broadphase = BuildBatchedCudaBroadphase(batch);
-            auto contacts = GenerateBatchedCudaContacts(batch, broadphase);
+        if (options.enable_contacts || options.enable_joints || options.enable_drives) {
             CudaBatchedConstraintSolverConfig config;
             config.velocity_iterations = options.solver_velocity_iterations;
             config.position_iterations = options.solver_position_iterations;
             config.slop = options.solver_slop;
             config.baumgarte = options.solver_baumgarte;
-            auto solver = SolveBatchedCudaContactConstraints(batch, contacts, config);
 
-            const auto contact_report = contacts.DownloadReport();
+            if (options.enable_contacts) {
+                auto broadphase = BuildBatchedCudaBroadphase(batch);
+                auto contacts = GenerateBatchedCudaContacts(batch, broadphase);
+                auto solver = SolveBatchedCudaConstraintsImpl(batch,
+                                                              &contacts,
+                                                              options.enable_joints,
+                                                              options.enable_drives,
+                                                              config);
+
+                const auto contact_report = contacts.DownloadReport();
+                report.broadphase_pair_count += contact_report.pair_count;
+                report.contact_manifold_count += contact_report.contact_manifold_count;
+                report.contact_point_count += contact_report.contact_point_count;
+
+                const auto solver_report = solver.DownloadReport();
+                report.contact_constraint_count += solver_report.contact_constraint_count;
+                report.joint_constraint_count += solver_report.joint_constraint_count;
+                report.drive_constraint_count += solver_report.drive_constraint_count;
+                report.constraint_block_count += solver_report.constraint_block_count;
+                report.constraint_row_count += solver_report.constraint_row_count;
+                report.solver_iterations_used +=
+                    solver_report.velocity_iterations + solver_report.position_iterations;
+                report.max_constraint_error =
+                    std::max(report.max_constraint_error, solver_report.max_position_error);
+                continue;
+            }
+
+            auto solver = SolveBatchedCudaConstraintsImpl(batch,
+                                                          nullptr,
+                                                          options.enable_joints,
+                                                          options.enable_drives,
+                                                          config);
             const auto solver_report = solver.DownloadReport();
-            report.broadphase_pair_count += contact_report.pair_count;
-            report.contact_manifold_count += contact_report.contact_manifold_count;
-            report.contact_point_count += contact_report.contact_point_count;
             report.contact_constraint_count += solver_report.contact_constraint_count;
+            report.joint_constraint_count += solver_report.joint_constraint_count;
+            report.drive_constraint_count += solver_report.drive_constraint_count;
             report.constraint_block_count += solver_report.constraint_block_count;
             report.constraint_row_count += solver_report.constraint_row_count;
             report.solver_iterations_used +=

@@ -125,12 +125,14 @@ narrowphase, and contact solving. `BuildBatchedCudaBroadphase()` generates AABBs
 for `instance_count * shape_count_per_instance` shapes and pair slots only
 inside each instance, so environments never collide with one another.
 `GenerateBatchedCudaContacts()` emits contact manifolds with a local
-`instance_index`, and `SolveBatchedCudaContactConstraints()` assembles contact
-blocks using flattened body ids before solving PGS rows against the batched
-device state. This currently covers plane, box-style, and sphere contact
-scenes; batched joint/drive assembly, batched sensors, and render
-synchronization remain the next CUDA-first follow-on stages rather than CPU
-fallbacks.
+`instance_index`, and `SolveBatchedCudaConstraints()` assembles contact, cooked
+joint, and actuator drive blocks using flattened body ids before solving PGS
+rows against the batched device state. `StepBatchedCudaWorld()` can now run
+batched rigid integration, contact generation/solve, joint anchor projection,
+and velocity drive solve in one CUDA pipeline. This currently covers
+plane/box/sphere contact scenes plus cooked revolute/fixed-style joint rows and
+velocity drive rows; batched sensors and render synchronization remain the next
+CUDA-first follow-on stages rather than CPU fallbacks.
 
 ## Scene Integration
 
@@ -278,8 +280,10 @@ flat_body = instance_index * body_count_per_instance + body_index
 ```
 
 Template data such as inverse mass and inverse inertia is uploaded once and
-indexed by `body_index`. Mutable pose, velocity, force, and torque are uploaded
-per flattened body. `DownloadState()` is a validation and tooling boundary; the
+indexed by `body_index`. Shared shape, joint, and actuator tables are also
+uploaded once per template and assembled into per-instance constraint blocks by
+CUDA kernels. Mutable pose, velocity, force, and torque are uploaded per
+flattened body. `DownloadState()` is a validation and tooling boundary; the
 production path keeps batched state resident for the next CUDA stage.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces

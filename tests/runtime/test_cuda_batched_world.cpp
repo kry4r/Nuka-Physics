@@ -78,6 +78,45 @@ PlaneBoxScene BuildPlaneBoxScene() {
     return result;
 }
 
+struct JointDriveScene {
+    scene::SceneIR scene;
+    scene::BodyId child_body = scene::kInvalidBody;
+};
+
+JointDriveScene BuildJointDriveScene() {
+    JointDriveScene result;
+
+    scene::RigidBodyRecord parent;
+    parent.name = "parent";
+    parent.is_static = true;
+    const auto parent_body = result.scene.AddRigidBody(std::move(parent));
+
+    scene::RigidBodyRecord child;
+    child.name = "child";
+    child.mass = 1.0f;
+    child.inertia = {1.0f, 1.0f, 1.0f};
+    child.local_transform.position = {0.0f, 1.0f, 0.0f};
+    result.child_body = result.scene.AddRigidBody(std::move(child));
+
+    scene::JointRecord joint;
+    joint.name = "hinge";
+    joint.type = scene::JointType::Revolute;
+    joint.parent_body = parent_body;
+    joint.child_body = result.child_body;
+    joint.axis = math::Vec3::UnitZ();
+    const auto joint_id = result.scene.AddJoint(std::move(joint));
+
+    scene::ActuatorRecord actuator;
+    actuator.name = "velocity_motor";
+    actuator.type = scene::ActuatorType::Velocity;
+    actuator.joint_id = joint_id;
+    actuator.gain = 4.0f;
+    actuator.force_limit = 20.0f;
+    result.scene.AddActuator(std::move(actuator));
+
+    return result;
+}
+
 std::vector<runtime::WorldInstance> BuildInstances(const runtime::BuiltWorld& world) {
     std::vector<runtime::WorldInstance> instances(3, world.instance);
     instances[0].forces[0] = {2.0f, 0.0f, 0.0f};
@@ -252,4 +291,100 @@ TEST(CudaBatchedWorld, StepPipelineCanSolveBatchedContacts) {
     EXPECT_EQ(report.contact_manifold_count, 1u);
     EXPECT_GE(report.constraint_row_count, 3u);
     EXPECT_GE(state.linear_velocities[fixture.box_body].y, -1.0e-5f);
+}
+
+TEST(CudaBatchedWorld, UploadsSharedJointAndActuatorTables) {
+    const auto fixture = BuildJointDriveScene();
+    auto world = runtime::BuildWorld(scene::CookScene(fixture.scene));
+    std::vector<runtime::WorldInstance> instances(2, world.instance);
+
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(world.template_view, instances);
+
+    EXPECT_EQ(batch.JointCountPerInstance(), 1u);
+    EXPECT_EQ(batch.ActuatorCountPerInstance(), 1u);
+    EXPECT_TRUE(batch.HasUploadedJointTables());
+    EXPECT_TRUE(batch.HasUploadedActuatorTables());
+}
+
+TEST(CudaBatchedWorld, ProjectsJointAnchorsIndependentlyOnDevice) {
+    const auto fixture = BuildJointDriveScene();
+    auto world = runtime::BuildWorld(scene::CookScene(fixture.scene));
+    std::vector<runtime::WorldInstance> instances(2, world.instance);
+    instances[0].poses[fixture.child_body].position.y = 1.0f;
+    instances[1].poses[fixture.child_body].position.y = 2.0f;
+
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(world.template_view, instances);
+
+    runtime::gpu::CudaBatchedConstraintSolverConfig config;
+    config.velocity_iterations = 0u;
+    config.position_iterations = 12u;
+    config.baumgarte = 0.5f;
+    config.slop = 0.0f;
+
+    auto result = runtime::gpu::SolveBatchedCudaConstraints(batch, nullptr, config);
+    const auto report = result.DownloadReport();
+    const auto state = batch.DownloadState();
+    const uint32_t instance0_child = fixture.child_body;
+    const uint32_t instance1_child = state.body_count_per_instance + fixture.child_body;
+
+    EXPECT_EQ(report.joint_constraint_count, 2u);
+    EXPECT_EQ(report.drive_constraint_count, 0u);
+    EXPECT_GE(report.constraint_row_count, 10u);
+    EXPECT_NEAR(state.poses[instance0_child].position.y, 0.0f, 1.0e-3f);
+    EXPECT_NEAR(state.poses[instance1_child].position.y, 0.0f, 1.0e-3f);
+}
+
+TEST(CudaBatchedWorld, AppliesVelocityDrivesIndependentlyOnDevice) {
+    const auto fixture = BuildJointDriveScene();
+    auto world = runtime::BuildWorld(scene::CookScene(fixture.scene));
+    std::vector<runtime::WorldInstance> instances(2, world.instance);
+    instances[1].angular_velocities[fixture.child_body].z = 1.0f;
+
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(world.template_view, instances);
+
+    runtime::gpu::CudaBatchedConstraintSolverConfig config;
+    config.velocity_iterations = 12u;
+    config.position_iterations = 0u;
+
+    auto result = runtime::gpu::SolveBatchedCudaConstraints(batch, nullptr, config);
+    const auto report = result.DownloadReport();
+    const auto state = batch.DownloadState();
+    const uint32_t instance0_child = fixture.child_body;
+    const uint32_t instance1_child = state.body_count_per_instance + fixture.child_body;
+
+    EXPECT_EQ(report.joint_constraint_count, 2u);
+    EXPECT_EQ(report.drive_constraint_count, 2u);
+    EXPECT_GE(report.constraint_row_count, 12u);
+    EXPECT_NEAR(state.angular_velocities[instance0_child].z, 4.0f, 1.0e-4f);
+    EXPECT_NEAR(state.angular_velocities[instance1_child].z, 4.0f, 1.0e-4f);
+}
+
+TEST(CudaBatchedWorld, StepPipelineCanSolveBatchedJointsAndDrives) {
+    const auto fixture = BuildJointDriveScene();
+    auto world = runtime::BuildWorld(scene::CookScene(fixture.scene));
+    std::vector<runtime::WorldInstance> instances(2, world.instance);
+    instances[0].poses[fixture.child_body].position.y = 1.0f;
+    instances[1].angular_velocities[fixture.child_body].z = 1.0f;
+
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(world.template_view, instances);
+
+    runtime::gpu::CudaBatchedWorldStepOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 60.0f;
+    options.step_count = 1u;
+    options.enable_joints = true;
+    options.enable_drives = true;
+    options.solver_velocity_iterations = 12u;
+    options.solver_position_iterations = 12u;
+    options.solver_baumgarte = 0.5f;
+    options.solver_slop = 0.0f;
+
+    const auto report = runtime::gpu::StepBatchedCudaWorld(batch, options);
+    const auto state = batch.DownloadState();
+
+    EXPECT_EQ(report.simulated_step_count, 1u);
+    EXPECT_EQ(report.joint_constraint_count, 2u);
+    EXPECT_EQ(report.drive_constraint_count, 2u);
+    EXPECT_GE(report.constraint_row_count, 12u);
+    EXPECT_NEAR(state.angular_velocities[fixture.child_body].z, 4.0f, 1.0e-4f);
 }
