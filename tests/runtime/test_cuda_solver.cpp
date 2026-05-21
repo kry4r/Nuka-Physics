@@ -132,6 +132,42 @@ JointProjectionScene BuildJointProjectionScene() {
     return result;
 }
 
+struct WorldAnchoredJointScene {
+    scene::SceneIR scene;
+    scene::BodyId child_body = scene::kInvalidBody;
+};
+
+WorldAnchoredJointScene BuildWorldAnchoredJointScene(bool with_actuator) {
+    WorldAnchoredJointScene result;
+
+    scene::RigidBodyRecord child;
+    child.name = "world_hinged_body";
+    child.mass = 1.0f;
+    child.inertia = {1.0f, 1.0f, 1.0f};
+    child.local_transform.position = {0.0f, 1.0f, 0.0f};
+    result.child_body = result.scene.AddRigidBody(std::move(child));
+
+    scene::JointRecord joint;
+    joint.name = "world_hinge";
+    joint.type = scene::JointType::Revolute;
+    joint.parent_body = scene::kInvalidBody;
+    joint.child_body = result.child_body;
+    joint.axis = math::Vec3::UnitZ();
+    const auto joint_id = result.scene.AddJoint(std::move(joint));
+
+    if (with_actuator) {
+        scene::ActuatorRecord actuator;
+        actuator.name = "world_velocity_motor";
+        actuator.type = scene::ActuatorType::Velocity;
+        actuator.joint_id = joint_id;
+        actuator.gain = 4.0f;
+        actuator.force_limit = 20.0f;
+        result.scene.AddActuator(std::move(actuator));
+    }
+
+    return result;
+}
+
 runtime::gpu::DeviceWorld UploadSceneToDevice(const scene::SceneIR& scene,
                                               runtime::BuiltWorld& world) {
     world = runtime::BuildWorld(scene::CookScene(scene));
@@ -266,4 +302,41 @@ TEST(CudaConstraintSolver, ProjectsCookedJointAnchorsOnDevice) {
     EXPECT_EQ(report.joint_constraint_count, 1u);
     EXPECT_GE(report.constraint_row_count, 5u);
     EXPECT_NEAR(state.poses[scene.child_body].position.y, 0.0f, 1.0e-3f);
+}
+
+TEST(CudaConstraintSolver, ProjectsWorldAnchoredJointOnDevice) {
+    const auto scene = BuildWorldAnchoredJointScene(false);
+    runtime::BuiltWorld world;
+    auto device_world = UploadSceneToDevice(scene.scene, world);
+
+    solver::gpu::CudaConstraintSolverConfig config;
+    config.velocity_iterations = 0u;
+    config.position_iterations = 12u;
+    config.baumgarte = 0.5f;
+    config.slop = 0.0f;
+    auto result = solver::gpu::SolveCudaConstraints(device_world, nullptr, config);
+    const auto report = result.DownloadReport();
+    const auto state = device_world.DownloadState();
+
+    EXPECT_EQ(report.joint_constraint_count, 1u);
+    EXPECT_GE(report.constraint_row_count, 5u);
+    EXPECT_NEAR(state.poses[scene.child_body].position.y, 0.0f, 1.0e-3f);
+}
+
+TEST(CudaConstraintSolver, AppliesWorldAnchoredVelocityActuatorOnDevice) {
+    const auto scene = BuildWorldAnchoredJointScene(true);
+    runtime::BuiltWorld world;
+    auto device_world = UploadSceneToDevice(scene.scene, world);
+
+    solver::gpu::CudaConstraintSolverConfig config;
+    config.velocity_iterations = 12u;
+    config.position_iterations = 0u;
+    auto result = solver::gpu::SolveCudaConstraints(device_world, nullptr, config);
+    const auto report = result.DownloadReport();
+    const auto state = device_world.DownloadState();
+
+    EXPECT_EQ(report.joint_constraint_count, 1u);
+    EXPECT_EQ(report.drive_constraint_count, 1u);
+    EXPECT_GE(report.constraint_row_count, 6u);
+    EXPECT_NEAR(state.angular_velocities[scene.child_body].z, 4.0f, 1.0e-4f);
 }

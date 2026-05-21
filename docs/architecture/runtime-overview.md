@@ -81,6 +81,13 @@ kept as a validation/tooling entry for uploading a small host-authored row set
 into the same device solver; production scenes should enter through
 `DeviceWorld` plus device contact results.
 
+CUDA joint and drive assembly accepts single-ended joints where either parent or
+child is `scene::kInvalidBody`. Those rows represent a static world anchor and
+are solved the same way as the CPU reference path: invalid bodies contribute
+zero inverse mass and inertia but the valid body still receives velocity and
+position corrections. This is required for MJCF-style world-hinged bodies and
+for imported actuators attached to those joints.
+
 Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
 projection uses authoring anchors instead of assuming every joint is body-center
 to body-center. Revolute joints currently map to the five-row maximal-coordinate
@@ -125,12 +132,15 @@ points/normals, and constraint error vectors. Native shells and renderers should
 consume this command list instead of re-deriving overlay geometry from raw
 physics state.
 
-`nuka_scene_demo` is the current runnable debug render path. It imports a scene,
-builds the compiled runtime views, steps the runtime instance with the reference
-stepper, synchronizes simulated poses to render/debug views, emits the debug
-draw command list, and rasterizes it through the headless renderer to a PPM
-image. This keeps the demo usable in CI while preserving the same command source
-that the Vulkan viewport/backend will consume.
+`nuka_scene_demo` is the current runnable imported-scene debug render path. It
+imports a scene, builds the compiled runtime views, resolves the physics backend
+through PHI, and on this workstation runs fixed-step CUDA integration,
+broadphase/contact generation, and constraint solving before downloading the
+final state for `SceneGraph` / `RenderScene` synchronization. The headless
+renderer still writes a deterministic PPM image for CI artifacts, while the
+synchronized render/debug state is the same handoff source that the Vulkan
+viewport/backend will consume. Explicit CPU selection remains a
+reference-validation path only.
 
 ## Domain Modules
 

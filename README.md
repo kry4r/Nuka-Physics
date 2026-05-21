@@ -58,7 +58,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production-path runtime and timing checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaStepTiming|CudaContactTiming|CudaSolverTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaStepTiming|CudaContactTiming|CudaSolverTiming|CudaSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -70,10 +70,15 @@ cmake --build build --config Release --target nuka_scene_demo
 ```
 
 The demo imports MJCF/URDF/USD text scenes, compiles them into
-`SceneGraph`/`PhysicsWorld`/`RenderScene`, advances the runtime world with fixed
-steps, synchronizes the simulated body poses back into render/debug views,
+`SceneGraph`/`PhysicsWorld`/`RenderScene`, resolves physics through the PHI
+backend selection layer, and on this workstation advances the scene through the
+CUDA production path: device world upload, fixed-step integration, CUDA
+broadphase/contact generation, and CUDA joint/contact/drive constraint solving.
+It then synchronizes the simulated body poses back into render/debug views,
 generates physics debug overlays, and writes a deterministic PPM image for quick
-validation or CI artifacts.
+validation or CI artifacts. The CLI prints backend, CUDA constraint row counts,
+joint/drive/contact block counts, and maximum position error so global demo
+runs prove more than file output.
 
 ## Architecture
 

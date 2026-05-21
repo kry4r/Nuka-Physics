@@ -10,6 +10,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "phi/platform_contract.hpp"
 
 namespace nuka::app {
 
@@ -24,6 +25,7 @@ struct SceneDemoOptions {
     bool auto_fit_view = true;
     float view_scale = 180.0f;
     math::Vec3 view_center = {0.0f, 0.0f, 0.0f};
+    phi::BackendSelectionPolicy physics_backend_policy = phi::BackendSelectionPolicy::PreferCuda;
 };
 
 struct SceneDemoResult {
@@ -35,6 +37,19 @@ struct SceneDemoResult {
     size_t non_background_pixel_count = 0;
     uint32_t simulation_steps = 0;
     float simulated_time_seconds = 0.0f;
+    phi::PhysicsBackend physics_backend = phi::PhysicsBackend::CpuReference;
+    bool production_physics_backend = false;
+    uint32_t cuda_broadphase_pair_count = 0;
+    uint32_t cuda_contact_manifold_count = 0;
+    uint32_t cuda_contact_point_count = 0;
+    uint32_t cuda_constraint_block_count = 0;
+    uint32_t cuda_constraint_row_count = 0;
+    uint32_t cuda_contact_constraint_count = 0;
+    uint32_t cuda_joint_constraint_count = 0;
+    uint32_t cuda_drive_constraint_count = 0;
+    uint32_t cuda_solver_velocity_iterations = 0;
+    uint32_t cuda_solver_position_iterations = 0;
+    float cuda_max_position_error = 0.0f;
     std::vector<math::Transform> body_world_poses;
 };
 

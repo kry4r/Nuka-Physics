@@ -152,12 +152,36 @@ ctest --test-dir build -C Release --output-on-failure
 
 ### Task 6: End-to-End CUDA Scene Demo and Benchmark
 
+**Status:** Completed in the current iteration. Imported-scene demo simulation
+now resolves through PHI backend selection, defaults to CUDA production physics
+on this workstation, runs device world upload -> CUDA integration -> CUDA
+broadphase/contact generation -> CUDA contact/joint/drive PGS solving, then
+synchronizes the downloaded final state into `SceneGraph` and `RenderScene` for
+debug visualization and the Vulkan handoff boundary. The CUDA solver also now
+keeps single-ended world-anchor joints and drives, which is required for MJCF
+scenes whose body joints attach to the static world.
+
 **Files:**
 - Modify: `src/apps/debug_shell/scene_demo.cpp`
-- Create: `tests/perf/test_cuda_step_timing.cpp`
+- Modify: `src/apps/debug_shell/scene_demo.hpp`
+- Modify: `src/apps/debug_shell/main.cpp`
+- Modify: `src/solver/gpu/cuda_constraint_solver.cu`
+- Modify: `tests/runtime/test_cuda_solver.cpp`
+- Modify: `tests/apps/test_scene_demo.cpp`
+- Create: `tests/perf/test_cuda_scene_demo_timing.cpp`
 - Modify: `docs/testing/p0-regression-matrix.md`
+- Modify: `docs/architecture/runtime-overview.md`
+- Modify: `docs/architecture/debug-render-demo.md`
 - Modify: `README.md`
 
 **Scope:** Route imported-scene simulation through backend selection. Default demo path uses CUDA on this workstation, then synchronizes state to `SceneGraph`/`RenderScene` for debug visualization and Vulkan rendering.
 
 **Validation:** Run MJCF and USDA examples through import -> cook -> CUDA simulation -> render/debug sync. Compare against CPU reference snapshots and record GPU timing versus current CPU reference benchmarks.
+
+Current validation commands:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure -R "DefaultsImportedSceneSimulationToCudaBackendWhenAvailable|CudaSceneDemoTiming|CudaConstraintSolver"
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```

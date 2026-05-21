@@ -6,6 +6,7 @@
 #include "apps/debug_shell/scene_demo.hpp"
 #include "apps/debug_shell/debug_visualization.hpp"
 #include "import/mjcf_importer.hpp"
+#include "phi/platform_contract.hpp"
 #include "scene/scene_pipeline.hpp"
 
 #include <gtest/gtest.h>
@@ -150,6 +151,38 @@ TEST(SceneDemo, SimulatesImportedSceneBeforeRendering) {
     EXPECT_NE(result.body_world_poses[1].position.z, 0.5f);
     EXPECT_GT(result.body_world_poses[1].position.y, -0.053955f);
     EXPECT_GT(result.non_background_pixel_count, 0u);
+    EXPECT_TRUE(std::filesystem::exists(output_path));
+
+    std::filesystem::remove(output_path);
+}
+
+TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
+    const auto output_path = TempPpmPath("nuka_scene_demo_cuda_default.ppm");
+    std::filesystem::remove(output_path);
+
+    nuka::app::SceneDemoOptions options;
+    options.input_path = "examples/scenes/complete_robot.usda";
+    options.output_path = output_path.string();
+    options.width = 160;
+    options.height = 120;
+    options.simulation_steps = 8;
+    options.dt = 1.0f / 120.0f;
+
+    const auto result = nuka::app::ExportImportedSceneDebugView(options);
+
+    EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
+    EXPECT_TRUE(result.production_physics_backend);
+    EXPECT_EQ(result.cuda_broadphase_pair_count, 1u);
+    EXPECT_GE(result.cuda_constraint_block_count, 1u);
+    EXPECT_GE(result.cuda_constraint_row_count, 5u);
+    EXPECT_EQ(result.cuda_joint_constraint_count, 1u);
+    EXPECT_EQ(result.cuda_drive_constraint_count, 1u);
+    EXPECT_EQ(result.cuda_solver_velocity_iterations, 10u);
+    EXPECT_EQ(result.cuda_solver_position_iterations, 4u);
+    EXPECT_GE(result.cuda_max_position_error, 0.0f);
+    EXPECT_GT(result.non_background_pixel_count, 0u);
+    ASSERT_EQ(result.body_world_poses.size(), 2u);
+    EXPECT_NE(result.body_world_poses[1].position.z, 0.5f);
     EXPECT_TRUE(std::filesystem::exists(output_path));
 
     std::filesystem::remove(output_path);

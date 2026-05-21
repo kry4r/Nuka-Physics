@@ -511,7 +511,7 @@ __global__ void AssembleJointBlocksKernel(uint32_t joint_count,
 
     const scene::BodyId parent = joint_parent_bodies[joint_index];
     const scene::BodyId child = joint_child_bodies[joint_index];
-    if (parent == scene::kInvalidBody || child == scene::kInvalidBody) {
+    if (parent == scene::kInvalidBody && child == scene::kInvalidBody) {
         return;
     }
 
@@ -548,7 +548,7 @@ __global__ void AssembleDriveBlocksKernel(uint32_t actuator_count,
 
     const scene::BodyId parent = joint_parent_bodies[joint_id];
     const scene::BodyId child = joint_child_bodies[joint_id];
-    if (parent == scene::kInvalidBody || child == scene::kInvalidBody) {
+    if (parent == scene::kInvalidBody && child == scene::kInvalidBody) {
         return;
     }
 

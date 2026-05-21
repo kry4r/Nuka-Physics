@@ -9,8 +9,17 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "phi/platform_contract.hpp"
 #include "runtime/world_stepper.hpp"
 #include "scene/scene_pipeline.hpp"
+
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+#include "collision/gpu/broadphase.cuh"
+#include "constraint/gpu/contact_generation.cuh"
+#include "runtime/gpu/cuda_world_stepper.hpp"
+#include "runtime/gpu/device_world.hpp"
+#include "solver/gpu/cuda_constraint_solver.cuh"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -134,6 +143,71 @@ void FitRasterViewXY(const DebugDrawList& commands, DebugRasterOptions& options)
     options.view_scale = std::min(options.view_scale, std::min(scale_x, scale_y));
 }
 
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+void StepCompiledSceneCuda(scene::CompiledScene& compiled,
+                           const SceneDemoOptions& options,
+                           SceneDemoResult& result) {
+    auto& runtime_world = compiled.physics.runtime_world;
+    auto device_world = runtime::gpu::UploadDeviceWorld(runtime_world.template_view);
+    runtime::gpu::UploadDeviceState(device_world, runtime_world.instance);
+
+    runtime::gpu::CudaWorldStepOptions integration_options;
+    integration_options.gravity = options.gravity;
+    integration_options.dt = options.dt;
+    integration_options.step_count = 1u;
+    integration_options.clear_forces_after_step = true;
+
+    solver::gpu::CudaConstraintSolverConfig solver_config;
+    solver_config.velocity_iterations = 10u;
+    solver_config.position_iterations = 4u;
+    solver_config.slop = 0.005f;
+    solver_config.baumgarte = 0.2f;
+
+    for (uint32_t step = 0; step < options.simulation_steps; ++step) {
+        runtime::gpu::StepCudaWorld(device_world, integration_options);
+        auto broadphase = collision::gpu::BuildCudaBroadphase(device_world);
+        auto contacts = constraint::gpu::GenerateCudaContacts(device_world, broadphase);
+        const auto contact_report = contacts.DownloadReport();
+        auto solver_result =
+            solver::gpu::SolveCudaConstraints(device_world, &contacts, solver_config);
+        const auto solver_report = solver_result.DownloadReport();
+
+        result.cuda_broadphase_pair_count = contact_report.pair_count;
+        result.cuda_contact_manifold_count = contact_report.contact_manifold_count;
+        result.cuda_contact_point_count = contact_report.contact_point_count;
+        result.cuda_constraint_block_count = solver_report.constraint_block_count;
+        result.cuda_constraint_row_count = solver_report.constraint_row_count;
+        result.cuda_contact_constraint_count = solver_report.contact_constraint_count;
+        result.cuda_joint_constraint_count = solver_report.joint_constraint_count;
+        result.cuda_drive_constraint_count = solver_report.drive_constraint_count;
+        result.cuda_solver_velocity_iterations = solver_report.velocity_iterations;
+        result.cuda_solver_position_iterations = solver_report.position_iterations;
+        result.cuda_max_position_error = solver_report.max_position_error;
+    }
+
+    const auto state = device_world.DownloadState();
+    runtime_world.instance.poses = state.poses;
+    runtime_world.instance.linear_velocities = state.linear_velocities;
+    runtime_world.instance.angular_velocities = state.angular_velocities;
+    runtime_world.instance.forces = state.forces;
+    runtime_world.instance.torques = state.torques;
+    scene::ApplyRuntimeStateToCompiledScene(runtime_world.instance, compiled);
+}
+#endif
+
+void StepCompiledSceneCpuReference(scene::CompiledScene& compiled,
+                                   const SceneDemoOptions& options) {
+    runtime::WorldStepOptions step_options;
+    step_options.gravity = options.gravity;
+    step_options.dt = options.dt;
+    step_options.step_count = options.simulation_steps;
+    runtime::StepWorldInstance(compiled.physics.runtime_world.template_view,
+                               compiled.physics.runtime_world.instance,
+                               step_options);
+    scene::ApplyRuntimeStateToCompiledScene(compiled.physics.runtime_world.instance,
+                                            compiled);
+}
+
 } // namespace
 
 SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
@@ -146,17 +220,32 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
 
     const auto scene = LoadSceneForDemo(options.input_path);
     auto compiled = scene::BuildCompiledScene(scene);
+    SceneDemoResult result;
+
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+    phi::BackendSelectionRequest backend_request;
+    backend_request.policy = options.physics_backend_policy;
+    const auto backend_selection = phi::ResolvePhysicsBackend(backend_request);
+    result.physics_backend = backend_selection.selected_backend;
+    result.production_physics_backend = backend_selection.production_backend;
+#else
+    if (options.physics_backend_policy == phi::BackendSelectionPolicy::ForceCuda) {
+        throw std::runtime_error("CUDA physics backend selected, but nuka_runtime_gpu is not built");
+    }
+    result.physics_backend = phi::PhysicsBackend::CpuReference;
+    result.production_physics_backend = false;
+#endif
 
     if (options.simulation_steps > 0) {
-        runtime::WorldStepOptions step_options;
-        step_options.gravity = options.gravity;
-        step_options.dt = options.dt;
-        step_options.step_count = options.simulation_steps;
-        runtime::StepWorldInstance(compiled.physics.runtime_world.template_view,
-                                   compiled.physics.runtime_world.instance,
-                                   step_options);
-        scene::ApplyRuntimeStateToCompiledScene(compiled.physics.runtime_world.instance,
-                                                compiled);
+        if (result.physics_backend == phi::PhysicsBackend::Cuda) {
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+            StepCompiledSceneCuda(compiled, options, result);
+#else
+            throw std::runtime_error("CUDA physics backend selected, but nuka_runtime_gpu is not built");
+#endif
+        } else {
+            StepCompiledSceneCpuReference(compiled, options);
+        }
     }
 
     DebugVisualizationInput input;
@@ -184,7 +273,6 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
         throw std::runtime_error("Failed to write scene demo image: " + options.output_path);
     }
 
-    SceneDemoResult result;
     result.body_count = compiled.physics.body_count;
     result.mesh_instance_count = compiled.render.mesh_instance_count;
     result.camera_count = compiled.render.camera_count;

@@ -26,6 +26,8 @@ All tests in this matrix must pass on every commit before merge.
 | CudaConstraintSolver/RestitutionBouncesAlongContactNormalOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA PGS applies restitution along the contact normal | CUDA |
 | CudaConstraintSolver/AppliesCookedVelocityActuatorOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies cooked actuator tables assemble CUDA drive rows and update angular velocity | CUDA |
 | CudaConstraintSolver/ProjectsCookedJointAnchorsOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies cooked joint tables assemble CUDA joint rows and project child anchors on device | CUDA |
+| CudaConstraintSolver/ProjectsWorldAnchoredJointOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA joint assembly keeps MJCF-style static world anchor joints instead of dropping single-ended constraints | CUDA |
+| CudaConstraintSolver/AppliesWorldAnchoredVelocityActuatorOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA actuator assembly drives a joint whose parent is the static world anchor | CUDA |
 
 ## Import Regression Tests
 
@@ -56,6 +58,7 @@ All tests in this matrix must pass on every commit before merge.
 | SceneDemo/ExportsUsdSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs the same demo path for USDA/text USD input | USD adapter, SceneGraph, PhysicsWorld, RenderScene, DebugDrawList |
 | SceneDemo/ExportsUsdExampleSceneThroughSamePipeline | `tests/apps/test_scene_demo.cpp` | Runs `examples/scenes/complete_robot.usda` through import, simulation sync, debug visualization, and raster output | USD example, DebugDrawList, PPM pixels |
 | SceneDemo/SimulatesImportedSceneBeforeRendering | `tests/apps/test_scene_demo.cpp` | Steps an imported scene, synchronizes runtime poses, and renders debug overlays from the simulated state | WorldInstance, SceneGraph, RenderScene, DebugDrawList |
+| SceneDemo/DefaultsImportedSceneSimulationToCudaBackendWhenAvailable | `tests/apps/test_scene_demo.cpp` | Verifies imported-scene demo defaults to the CUDA production backend, reports CUDA solver rows, and synchronizes simulated poses into debug/render state | CUDA, SceneGraph, RenderScene, DebugDrawList |
 | SceneDemo/RenderedImageChangesWhenSimulationChangesRuntimePose | `tests/apps/test_scene_demo.cpp` | Verifies fixed-view PPM bytes change when simulation changes runtime body poses | WorldInstance, DebugDrawList, PPM pixels |
 
 ## Physics Regression Tests
@@ -99,6 +102,8 @@ All tests in this matrix must pass on every commit before merge.
 | CudaStepTiming/RigidIntegrationKernelUnderOneSecond | `tests/perf/test_cuda_step_timing.cpp` | 240 CUDA rigid integration steps over 4096 cooked dynamic bodies | Wall time | < 1000 ms |
 | CudaContactTiming/BroadphaseAndContactGenerationUnderOneSecond | `tests/perf/test_cuda_contact_timing.cpp` | 60 CUDA broadphase/contact passes over 256 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
 | CudaSolverTiming/ContactAssemblyAndPgsUnderOneSecond | `tests/perf/test_cuda_solver_timing.cpp` | 30 CUDA broadphase/contact/constraint assembly/PGS passes over 128 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
+| CudaSceneDemoTiming/ImportedMjcfSceneCudaSimulationRenderUnderOneSecond | `tests/perf/test_cuda_scene_demo_timing.cpp` | MJCF import, cook, CUDA simulation, SceneGraph/RenderScene sync, debug overlay, and PPM artifact generation | Wall time | < 1000 ms |
+| CudaSceneDemoTiming/ImportedUsdSceneCudaSimulationRenderUnderOneSecond | `tests/perf/test_cuda_scene_demo_timing.cpp` | USDA import, cook, CUDA simulation, SceneGraph/RenderScene sync, debug overlay, and PPM artifact generation | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

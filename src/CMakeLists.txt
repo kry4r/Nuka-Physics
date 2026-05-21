@@ -315,4 +315,14 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_phi
     )
+
+    target_link_libraries(nuka_debug_draw
+        PUBLIC
+            nuka_runtime_gpu
+    )
+
+    target_compile_definitions(nuka_debug_draw
+        PUBLIC
+            NUKA_HAS_CUDA_RUNTIME=1
+    )
 endif()

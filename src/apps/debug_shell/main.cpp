@@ -37,6 +37,15 @@ int main(int argc, char** argv) {
                   << " lights=" << result.light_count
                   << " sim_steps=" << result.simulation_steps
                   << " sim_time=" << result.simulated_time_seconds
+                  << " backend=" << (result.physics_backend == nuka::phi::PhysicsBackend::Cuda
+                      ? "cuda"
+                      : "cpu-reference")
+                  << " production_backend=" << (result.production_physics_backend ? "true" : "false")
+                  << " cuda_rows=" << result.cuda_constraint_row_count
+                  << " cuda_joint_blocks=" << result.cuda_joint_constraint_count
+                  << " cuda_drive_blocks=" << result.cuda_drive_constraint_count
+                  << " cuda_contact_blocks=" << result.cuda_contact_constraint_count
+                  << " cuda_max_error=" << result.cuda_max_position_error
                   << " debug_commands=" << result.debug_command_count
                   << " lit_pixels=" << result.non_background_pixel_count << '\n';
     } catch (const std::exception& ex) {

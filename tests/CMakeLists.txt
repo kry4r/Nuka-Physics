@@ -247,18 +247,20 @@ if(CMAKE_CUDA_COMPILER)
 
     add_executable(nuka_cuda_perf_test
         perf/test_cuda_contact_timing.cpp
+        perf/test_cuda_scene_demo_timing.cpp
         perf/test_cuda_solver_timing.cpp
         perf/test_cuda_step_timing.cpp
     )
 
     target_link_libraries(nuka_cuda_perf_test
         PRIVATE
+            nuka_debug_draw
             nuka_runtime_gpu
             nuka_runtime
             GTest::gtest_main
     )
 
-    gtest_discover_tests(nuka_cuda_perf_test)
+    gtest_discover_tests(nuka_cuda_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # --- Vulkan renderer tests -------------------------------------------------
