@@ -136,11 +136,12 @@ physics state.
 imports a scene, builds the compiled runtime views, resolves the physics backend
 through PHI, and on this workstation runs fixed-step CUDA integration,
 broadphase/contact generation, and constraint solving before downloading the
-final state for `SceneGraph` / `RenderScene` synchronization. The headless
-renderer still writes a deterministic PPM image for CI artifacts, while the
-synchronized render/debug state is the same handoff source that the Vulkan
-viewport/backend will consume. Explicit CPU selection remains a
-reference-validation path only.
+final state for `SceneGraph` / `RenderScene` synchronization. The default render
+path converts the resulting `DebugDrawList` into render-layer Vulkan debug
+commands, runs `render::RenderDebugDrawListVulkan()` into an offscreen storage
+image, reads back the RGBA8 pixels, and writes the PPM artifact from the Vulkan
+image. The CPU headless rasterizer remains an explicit reference path. Explicit
+CPU physics selection remains a reference-validation path only.
 
 ## Domain Modules
 
@@ -238,6 +239,16 @@ values such as an older `sm_75` target.
 
 The production renderer backend is Vulkan. `render::ProbeVulkanRenderer()`
 creates a Vulkan instance and enumerates physical devices so tests can prove the
-required graphics path is available on the workstation. The existing headless
-debug rasterizer is still useful for deterministic CI artifacts, but it is not
-the production renderer target.
+required graphics path is available on the workstation.
+
+`render::RenderDebugDrawListVulkan()` is the current executable Vulkan render
+path. It creates a swapchain-free Vulkan instance/device/compute queue, uploads
+debug draw commands to a storage buffer, rasterizes line/sphere/capsule/box/AABB
+commands in a GLSL compute shader into an RGBA8 storage image, copies that image
+to a host-visible staging buffer, and returns pixels plus non-background counts
+for artifact generation and regression checks. This offscreen path is deliberately
+decoupled from windowing so CI can validate real Vulkan rendering while the
+future interactive viewport reuses the same render/debug handoff.
+
+The existing CPU headless debug rasterizer is still useful for deterministic
+reference artifacts, but it is not the default production renderer target.

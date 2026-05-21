@@ -172,6 +172,12 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
 
     EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
     EXPECT_TRUE(result.production_physics_backend);
+    EXPECT_EQ(result.render_backend, nuka::app::SceneDemoRenderBackend::Vulkan);
+    EXPECT_TRUE(result.production_render_backend);
+    EXPECT_EQ(result.vulkan_render_width, options.width);
+    EXPECT_EQ(result.vulkan_render_height, options.height);
+    EXPECT_GE(result.vulkan_physical_device_count, 1u);
+    EXPECT_FALSE(result.vulkan_selected_device_name.empty());
     EXPECT_EQ(result.cuda_broadphase_pair_count, 1u);
     EXPECT_GE(result.cuda_constraint_block_count, 1u);
     EXPECT_GE(result.cuda_constraint_row_count, 5u);

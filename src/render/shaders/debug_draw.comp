@@ -1,0 +1,124 @@
+#version 450
+
+struct DebugCommand {
+    uint type;
+    uint color;
+    vec3 position;
+    float radius;
+    vec3 end;
+    float half_height;
+    vec3 size;
+    float _pad0;
+};
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D out_image;
+
+layout(std430, binding = 1) readonly buffer CommandBuffer {
+    DebugCommand commands[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint command_count;
+    float view_scale;
+    vec4 view_center;
+    vec4 background;
+} pc;
+
+vec2 project_point(vec3 p) {
+    return vec2(
+        (p.x - pc.view_center.x) * pc.view_scale + float(pc.width) * 0.5,
+        float(pc.height) * 0.5 - (p.y - pc.view_center.y) * pc.view_scale);
+}
+
+vec4 color_from_u32(uint color) {
+    return vec4(
+        float((color >> 24) & 0xffu) / 255.0,
+        float((color >> 16) & 0xffu) / 255.0,
+        float((color >> 8) & 0xffu) / 255.0,
+        float(color & 0xffu) / 255.0);
+}
+
+float distance_to_segment(vec2 p, vec2 a, vec2 b) {
+    vec2 ab = b - a;
+    float len_sq = dot(ab, ab);
+    if (len_sq <= 1.0e-6) {
+        return length(p - a);
+    }
+    float t = clamp(dot(p - a, ab) / len_sq, 0.0, 1.0);
+    return length(p - (a + ab * t));
+}
+
+float distance_to_rect_outline(vec2 p, vec2 center, vec2 half_extents) {
+    vec2 d = abs(p - center);
+    vec2 clamped = min(d, half_extents);
+    vec2 nearest_x = vec2(half_extents.x, clamped.y);
+    vec2 nearest_y = vec2(clamped.x, half_extents.y);
+    return min(length(d - nearest_x), length(d - nearest_y));
+}
+
+bool command_hits_pixel(DebugCommand command, vec2 pixel_center) {
+    if (command.type == 0u) {
+        return distance_to_segment(pixel_center,
+                                   project_point(command.position),
+                                   project_point(command.end)) <= 1.25;
+    }
+
+    if (command.type == 1u) {
+        float r = max(command.radius * pc.view_scale, 1.0);
+        return length(pixel_center - project_point(command.position)) <= r;
+    }
+
+    if (command.type == 2u) {
+        vec3 axis = normalize(command.end);
+        vec2 a = project_point(command.position - axis * command.half_height);
+        vec2 b = project_point(command.position + axis * command.half_height);
+        float r = max(command.radius * pc.view_scale, 1.0);
+        return distance_to_segment(pixel_center, a, b) <= r;
+    }
+
+    if (command.type == 3u) {
+        vec2 half_extents = max(abs(command.size.xy) * pc.view_scale, vec2(1.0));
+        return distance_to_rect_outline(pixel_center,
+                                        project_point(command.position),
+                                        half_extents) <= 1.25;
+    }
+
+    if (command.type == 4u) {
+        vec2 a = project_point(command.position);
+        vec2 b = project_point(command.end);
+        vec2 center = (a + b) * 0.5;
+        vec2 half_extents = max(abs(b - a) * 0.5, vec2(1.0));
+        return distance_to_rect_outline(pixel_center, center, half_extents) <= 1.25;
+    }
+
+    if (command.type == 6u) {
+        vec2 p = project_point(command.position);
+        vec2 n = project_point(command.position + normalize(command.end) * 0.1);
+        return length(pixel_center - p) <= 3.0 ||
+            distance_to_segment(pixel_center, p, n) <= 1.25;
+    }
+
+    return false;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) {
+        return;
+    }
+
+    vec2 pixel_center = vec2(pixel) + vec2(0.5);
+    vec4 out_color = pc.background;
+    for (uint i = 0u; i < pc.command_count; ++i) {
+        DebugCommand command = commands[i];
+        if (command_hits_pixel(command, pixel_center)) {
+            out_color = color_from_u32(command.color);
+        }
+    }
+
+    imageStore(out_image, pixel, out_color);
+}

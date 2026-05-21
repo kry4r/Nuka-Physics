@@ -11,8 +11,14 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/platform_contract.hpp"
+#include "render/vulkan_renderer.hpp"
 
 namespace nuka::app {
+
+enum class SceneDemoRenderBackend {
+    Vulkan,
+    HeadlessReference
+};
 
 struct SceneDemoOptions {
     std::string input_path;
@@ -26,6 +32,7 @@ struct SceneDemoOptions {
     float view_scale = 180.0f;
     math::Vec3 view_center = {0.0f, 0.0f, 0.0f};
     phi::BackendSelectionPolicy physics_backend_policy = phi::BackendSelectionPolicy::PreferCuda;
+    SceneDemoRenderBackend render_backend = SceneDemoRenderBackend::Vulkan;
 };
 
 struct SceneDemoResult {
@@ -39,6 +46,12 @@ struct SceneDemoResult {
     float simulated_time_seconds = 0.0f;
     phi::PhysicsBackend physics_backend = phi::PhysicsBackend::CpuReference;
     bool production_physics_backend = false;
+    SceneDemoRenderBackend render_backend = SceneDemoRenderBackend::HeadlessReference;
+    bool production_render_backend = false;
+    uint32_t vulkan_render_width = 0;
+    uint32_t vulkan_render_height = 0;
+    uint32_t vulkan_physical_device_count = 0;
+    std::string vulkan_selected_device_name;
     uint32_t cuda_broadphase_pair_count = 0;
     uint32_t cuda_contact_manifold_count = 0;
     uint32_t cuda_contact_point_count = 0;

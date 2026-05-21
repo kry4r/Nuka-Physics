@@ -41,6 +41,10 @@ int main(int argc, char** argv) {
                       ? "cuda"
                       : "cpu-reference")
                   << " production_backend=" << (result.production_physics_backend ? "true" : "false")
+                  << " render_backend=" << (result.render_backend == nuka::app::SceneDemoRenderBackend::Vulkan
+                      ? "vulkan"
+                      : "headless-reference")
+                  << " production_render=" << (result.production_render_backend ? "true" : "false")
                   << " cuda_rows=" << result.cuda_constraint_row_count
                   << " cuda_joint_blocks=" << result.cuda_joint_constraint_count
                   << " cuda_drive_blocks=" << result.cuda_drive_constraint_count

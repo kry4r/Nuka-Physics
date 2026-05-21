@@ -10,6 +10,7 @@
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
 #include "phi/platform_contract.hpp"
+#include "render/vulkan_renderer.hpp"
 #include "runtime/world_stepper.hpp"
 #include "scene/scene_pipeline.hpp"
 
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -141,6 +143,66 @@ void FitRasterViewXY(const DebugDrawList& commands, DebugRasterOptions& options)
         0.0f
     };
     options.view_scale = std::min(options.view_scale, std::min(scale_x, scale_y));
+}
+
+render::VulkanRgba8 ToVulkanColor(Rgba8 color) {
+    return {color.r, color.g, color.b, color.a};
+}
+
+render::VulkanDebugDrawCommandType ToVulkanCommandType(DrawCommandType type) {
+    switch (type) {
+    case DrawCommandType::Line:
+        return render::VulkanDebugDrawCommandType::Line;
+    case DrawCommandType::Sphere:
+        return render::VulkanDebugDrawCommandType::Sphere;
+    case DrawCommandType::Capsule:
+        return render::VulkanDebugDrawCommandType::Capsule;
+    case DrawCommandType::Box:
+        return render::VulkanDebugDrawCommandType::Box;
+    case DrawCommandType::AABB:
+        return render::VulkanDebugDrawCommandType::AABB;
+    case DrawCommandType::Frame:
+        return render::VulkanDebugDrawCommandType::Frame;
+    case DrawCommandType::ContactPoint:
+        return render::VulkanDebugDrawCommandType::ContactPoint;
+    }
+    return render::VulkanDebugDrawCommandType::Line;
+}
+
+std::vector<render::VulkanDebugDrawCommand> ToVulkanDebugCommands(
+    const DebugDrawList& commands) {
+    std::vector<render::VulkanDebugDrawCommand> out;
+    out.reserve(commands.CommandCount());
+    for (const auto& command : commands.Commands()) {
+        render::VulkanDebugDrawCommand vulkan_command;
+        vulkan_command.type = ToVulkanCommandType(command.type);
+        vulkan_command.position = command.position;
+        vulkan_command.end = command.end;
+        vulkan_command.size = command.size;
+        vulkan_command.radius = command.radius;
+        vulkan_command.half_height = command.half_height;
+        vulkan_command.color = command.color;
+        out.push_back(vulkan_command);
+    }
+    return out;
+}
+
+bool WriteVulkanPpm(const std::string& path,
+                    uint32_t width,
+                    uint32_t height,
+                    const std::vector<render::VulkanRgba8>& pixels) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        return false;
+    }
+
+    out << "P6\n" << width << " " << height << "\n255\n";
+    for (const auto& pixel : pixels) {
+        out.put(static_cast<char>(pixel.r));
+        out.put(static_cast<char>(pixel.g));
+        out.put(static_cast<char>(pixel.b));
+    }
+    return out.good();
 }
 
 #if defined(NUKA_HAS_CUDA_RUNTIME)
@@ -263,14 +325,44 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     if (options.auto_fit_view) {
         FitRasterViewXY(commands, raster_options);
     }
-    const DebugRasterImage image = RasterizeDebugDrawList(commands, raster_options);
 
     std::filesystem::path output_path(options.output_path);
     if (const auto parent = output_path.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
     }
-    if (!image.WritePpm(options.output_path)) {
-        throw std::runtime_error("Failed to write scene demo image: " + options.output_path);
+
+    size_t non_background_pixel_count = 0;
+    if (options.render_backend == SceneDemoRenderBackend::Vulkan) {
+        render::VulkanOffscreenOptions vulkan_options;
+        vulkan_options.width = raster_options.width;
+        vulkan_options.height = raster_options.height;
+        vulkan_options.view_scale = raster_options.view_scale;
+        vulkan_options.view_center = raster_options.view_center;
+        vulkan_options.background = ToVulkanColor(raster_options.background);
+        const auto vulkan_result =
+            render::RenderDebugDrawListVulkan(ToVulkanDebugCommands(commands),
+                                              vulkan_options);
+        if (!WriteVulkanPpm(options.output_path,
+                            vulkan_result.width,
+                            vulkan_result.height,
+                            vulkan_result.pixels)) {
+            throw std::runtime_error("Failed to write scene demo image: " + options.output_path);
+        }
+        result.render_backend = SceneDemoRenderBackend::Vulkan;
+        result.production_render_backend = vulkan_result.production_backend;
+        result.vulkan_render_width = vulkan_result.width;
+        result.vulkan_render_height = vulkan_result.height;
+        result.vulkan_physical_device_count = vulkan_result.physical_device_count;
+        result.vulkan_selected_device_name = vulkan_result.selected_device_name;
+        non_background_pixel_count = vulkan_result.non_background_pixel_count;
+    } else {
+        const DebugRasterImage image = RasterizeDebugDrawList(commands, raster_options);
+        if (!image.WritePpm(options.output_path)) {
+            throw std::runtime_error("Failed to write scene demo image: " + options.output_path);
+        }
+        result.render_backend = SceneDemoRenderBackend::HeadlessReference;
+        result.production_render_backend = false;
+        non_background_pixel_count = image.NonBackgroundPixelCount();
     }
 
     result.body_count = compiled.physics.body_count;
@@ -278,7 +370,7 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     result.camera_count = compiled.render.camera_count;
     result.light_count = compiled.render.light_count;
     result.debug_command_count = static_cast<uint32_t>(commands.CommandCount());
-    result.non_background_pixel_count = image.NonBackgroundPixelCount();
+    result.non_background_pixel_count = non_background_pixel_count;
     result.simulation_steps = options.simulation_steps;
     result.simulated_time_seconds = options.dt * static_cast<float>(options.simulation_steps);
     result.body_world_poses.reserve(compiled.graph.NodeCount());

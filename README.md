@@ -57,8 +57,8 @@ cmake --build build --config Release
 # Or directly with CTest
 ctest --test-dir build -C Release --output-on-failure
 
-# CUDA production-path runtime and timing checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaStepTiming|CudaContactTiming|CudaSolverTiming|CudaSceneDemoTiming"
+# CUDA production physics and Vulkan production rendering checks
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaStepTiming|CudaContactTiming|CudaSolverTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -75,10 +75,11 @@ backend selection layer, and on this workstation advances the scene through the
 CUDA production path: device world upload, fixed-step integration, CUDA
 broadphase/contact generation, and CUDA joint/contact/drive constraint solving.
 It then synchronizes the simulated body poses back into render/debug views,
-generates physics debug overlays, and writes a deterministic PPM image for quick
-validation or CI artifacts. The CLI prints backend, CUDA constraint row counts,
-joint/drive/contact block counts, and maximum position error so global demo
-runs prove more than file output.
+generates physics debug overlays, renders those overlays through the Vulkan
+offscreen compute renderer, and writes a deterministic PPM image for quick
+validation or CI artifacts. The CLI prints physics backend, render backend,
+CUDA constraint row counts, joint/drive/contact block counts, and maximum
+position error so global demo runs prove more than file output.
 
 ## Architecture
 
@@ -88,7 +89,7 @@ The engine is organized into layered modules:
 |-------|---------|-------------|
 | **Core** | `math`, `core` | Spatial algebra, vectors, quaternions, transforms |
 | **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline, MJCF/URDF/USD importers |
-| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies |
+| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies, Vulkan offscreen rendering |
 | **Runtime** | `runtime`, `rigid`, `articulation` | World containers, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
@@ -108,8 +109,8 @@ For detailed architecture documentation see:
 - **Testing**: Google Test
 - **Physics backend**: CUDA preferred by default via PHI backend selection;
   CPU reference is kept for validation/orchestration only
-- **Rendering backend**: Vulkan production backend with headless debug raster
-  output for CI artifacts
+- **Rendering backend**: Vulkan production backend with offscreen debug-render
+  output for CI artifacts; CPU raster output is reference-only
 - **CI**: GitHub Actions
 
 ## Project Structure

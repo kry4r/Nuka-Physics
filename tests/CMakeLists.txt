@@ -200,6 +200,7 @@ gtest_discover_tests(nuka_regression_test)
 add_executable(nuka_perf_test
     perf/test_step_timing.cpp
     perf/test_render_demo_timing.cpp
+    perf/test_vulkan_scene_demo_timing.cpp
 )
 
 target_link_libraries(nuka_perf_test

@@ -1,9 +1,9 @@
 # Imported Scene Debug Render Demo
 
 `nuka_scene_demo` is the current runnable rendering demonstration for the engine.
-It is intentionally headless so it can run in CI while still exercising the same
-scene and debug visualization command source that the Vulkan production viewport
-will consume.
+It runs without a window, but the default rendering path is Vulkan: the demo
+uses a swapchain-free offscreen compute pass, reads back the image, and writes a
+PPM artifact for CI and inspection.
 
 ## Pipeline
 
@@ -19,19 +19,19 @@ will consume.
 5. Synchronize simulated body poses into `SceneGraph` and `RenderScene` with
    `scene::ApplyRuntimeStateToCompiledScene()`.
 6. Generate debug overlays with `app::BuildDebugVisualization()`.
-7. Rasterize the `DebugDrawList` with `app::RasterizeDebugDrawList()`.
-8. Write a binary PPM image artifact.
+7. Convert the `DebugDrawList` to render-layer debug commands and rasterize it
+   with `render::RenderDebugDrawListVulkan()` into an offscreen Vulkan storage
+   image.
+8. Read back the Vulkan image and write a binary PPM artifact.
 
-The headless rasterizer uses an X/Y physics-plane projection for debug output.
-`SceneDemoOptions` defaults to auto-fitting the view to the generated debug draw
-bounds so simulated bodies remain visible after large vertical motion. Tests also
-cover a fixed-view path to prove the PPM bytes change when runtime body poses
-change.
-
-The production rendering backend is Vulkan. The headless PPM output is a
-deterministic regression artifact, not the long-term interactive renderer.
+The Vulkan offscreen renderer uses an X/Y physics-plane projection for debug
+output and currently supports line, sphere, capsule, box, AABB, and contact
+point debug primitives. `SceneDemoOptions` defaults to auto-fitting the view to
+the generated debug draw bounds so simulated bodies remain visible after large
+vertical motion. The CPU headless rasterizer remains available as an explicit
+reference artifact path, but it is not the default production render backend.
 The same synchronized `SceneGraph` / `RenderScene` state is the handoff point
-for the Vulkan viewport.
+for the future Vulkan viewport.
 
 The demo currently supports `.xml`, `.urdf`, text `.usd`, and `.usda` inputs.
 Binary `.usd`, `.usdc`, and `.usdz` still route through the isolated USD adapter
@@ -41,19 +41,21 @@ added.
 ## Run
 
 ```powershell
-cmake --build build2 --config Release --target nuka_scene_demo
-.\build2\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
-.\build2\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
+cmake --build build --config Release --target nuka_scene_demo
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
 ```
 
 The output image shows collision bodies, AABBs, joint axes, and centers of mass
-after fixed-step CUDA simulation on this workstation. The CLI prints the
-selected backend plus CUDA constraint row counts, joint/drive/contact block
-counts, and maximum position error. The default CLI and API settings run 60
-steps at `dt=1/60`, and the optional final arguments override step count and
-time step. The tests under `tests/apps/test_scene_demo.cpp` verify default CUDA
-backend selection, simulated pose handoff, and simulation-sensitive raster
-output. `tests/perf/test_cuda_scene_demo_timing.cpp` runs both
+after fixed-step CUDA simulation and Vulkan offscreen rendering on this
+workstation. The CLI prints the physics backend, render backend, CUDA
+constraint row counts, joint/drive/contact block counts, and maximum position
+error. The default CLI and API settings run 60 steps at `dt=1/60`, and the
+optional final arguments override step count and time step. The tests under
+`tests/apps/test_scene_demo.cpp` verify default CUDA backend selection, Vulkan
+rendering selection, simulated pose handoff, and simulation-sensitive raster
+output. `tests/perf/test_cuda_scene_demo_timing.cpp` and
+`tests/perf/test_vulkan_scene_demo_timing.cpp` run both
 `examples/scenes/complete_robot.xml` and `examples/scenes/complete_robot.usda`
-through import, cook, CUDA simulation, render/debug synchronization, and PPM
-artifact output under a one-second timing budget.
+through import, cook, CUDA simulation, render/debug synchronization, Vulkan
+artifact output, and one-second timing budgets.

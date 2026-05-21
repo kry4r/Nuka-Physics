@@ -64,6 +64,28 @@ add_library(nuka_render STATIC
     render/vulkan_renderer.cpp
 )
 
+find_program(GLSLC_EXECUTABLE glslc HINTS "$ENV{VULKAN_SDK}/Bin")
+if(NOT GLSLC_EXECUTABLE)
+    message(FATAL_ERROR "glslc not found; Vulkan offscreen renderer requires the Vulkan SDK shader compiler")
+endif()
+
+set(NUKA_DEBUG_DRAW_COMP "${CMAKE_CURRENT_SOURCE_DIR}/render/shaders/debug_draw.comp")
+set(NUKA_DEBUG_DRAW_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/shaders/debug_draw.comp.spv")
+add_custom_command(
+    OUTPUT "${NUKA_DEBUG_DRAW_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_DEBUG_DRAW_COMP}" -o "${NUKA_DEBUG_DRAW_SPV}"
+    DEPENDS "${NUKA_DEBUG_DRAW_COMP}"
+    VERBATIM
+)
+
+add_custom_target(nuka_render_shaders DEPENDS "${NUKA_DEBUG_DRAW_SPV}")
+add_dependencies(nuka_render nuka_render_shaders)
+target_compile_definitions(nuka_render
+    PRIVATE
+        NUKA_VULKAN_DEBUG_DRAW_SPV="${NUKA_DEBUG_DRAW_SPV}"
+)
+
 target_include_directories(nuka_render
     PUBLIC
         ${CMAKE_SOURCE_DIR}/src
