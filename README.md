@@ -16,8 +16,8 @@ reinforcement learning, and real-time applications.
 - CUDA batched world state for parallel environments sharing one cooked
   `WorldTemplate`, including GPU-resident batched broadphase, contact
   generation, contact solve for plane/box/sphere contact scenes, cooked joint
-  projection, and velocity drive solve; CPU batching remains
-  reference/orchestration metadata
+  projection, velocity drive solve, and batched CUDA IMU/lidar observation
+  queries; CPU batching remains reference/orchestration metadata
 - CUDA is the preferred/default production physics backend through the PHI
   (Platform Hardware Interface) backend selection layer
 - Vulkan is the required production rendering backend; the current headless PPM
@@ -63,7 +63,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -102,7 +102,7 @@ The engine is organized into layered modules:
 | **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, batched contact/joint/drive solve, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
-| **Sensors** | `sensor` | CUDA IMU/state and lidar query path, plus CPU reference helpers |
+| **Sensors** | `sensor` | CUDA single-world and batched IMU/state and lidar query paths, plus CPU reference helpers |
 | **PHI** | `phi` | GPU abstraction layer (CUDA backend) |
 | **Apps** | `apps`, `debug_draw` | Debug draw command buffers and compiled-scene visualization overlays |
 

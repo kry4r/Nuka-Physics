@@ -1613,16 +1613,32 @@ math::Vec3* BatchedDeviceWorld::DeviceLinearVelocities() {
     return static_cast<math::Vec3*>(linear_velocities_.Data());
 }
 
+const math::Vec3* BatchedDeviceWorld::DeviceLinearVelocities() const {
+    return static_cast<const math::Vec3*>(linear_velocities_.Data());
+}
+
 math::Vec3* BatchedDeviceWorld::DeviceAngularVelocities() {
     return static_cast<math::Vec3*>(angular_velocities_.Data());
+}
+
+const math::Vec3* BatchedDeviceWorld::DeviceAngularVelocities() const {
+    return static_cast<const math::Vec3*>(angular_velocities_.Data());
 }
 
 math::Vec3* BatchedDeviceWorld::DeviceForces() {
     return static_cast<math::Vec3*>(forces_.Data());
 }
 
+const math::Vec3* BatchedDeviceWorld::DeviceForces() const {
+    return static_cast<const math::Vec3*>(forces_.Data());
+}
+
 math::Vec3* BatchedDeviceWorld::DeviceTorques() {
     return static_cast<math::Vec3*>(torques_.Data());
+}
+
+const math::Vec3* BatchedDeviceWorld::DeviceTorques() const {
+    return static_cast<const math::Vec3*>(torques_.Data());
 }
 
 const float* BatchedDeviceWorld::DeviceInvMasses() const {

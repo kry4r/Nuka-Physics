@@ -5,6 +5,7 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "runtime/gpu/batched_device_world.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
@@ -16,6 +17,11 @@ struct CudaImuSample {
     math::Vec3 position = math::Vec3::Zero();
     math::Vec3 angular_velocity = math::Vec3::Zero();
     math::Vec3 linear_acceleration = math::Vec3::Zero();
+};
+
+struct BatchedCudaBodyRequest {
+    uint32_t instance_index = 0;
+    scene::BodyId body_id = scene::kInvalidBody;
 };
 
 class CudaImuResult {
@@ -45,6 +51,16 @@ struct CudaLidarOptions {
     float horizontal_fov_radians = 0.0f;
 };
 
+struct BatchedCudaLidarOptions {
+    uint32_t instance_index = 0;
+    math::Vec3 origin = math::Vec3::Zero();
+    math::Vec3 direction = math::Vec3::UnitX();
+    math::Vec3 up = math::Vec3::UnitY();
+    uint32_t ray_count = 0;
+    float range = 100.0f;
+    float horizontal_fov_radians = 0.0f;
+};
+
 class CudaLidarResult {
 public:
     CudaLidarResult() = default;
@@ -63,10 +79,43 @@ private:
     phi::Buffer depths_;
 };
 
+class BatchedCudaLidarResult {
+public:
+    BatchedCudaLidarResult() = default;
+    BatchedCudaLidarResult(uint32_t query_count,
+                           uint32_t total_ray_count,
+                           phi::Buffer ray_offsets,
+                           phi::Buffer depths);
+
+    BatchedCudaLidarResult(const BatchedCudaLidarResult&) = delete;
+    BatchedCudaLidarResult& operator=(const BatchedCudaLidarResult&) = delete;
+    BatchedCudaLidarResult(BatchedCudaLidarResult&&) noexcept = default;
+    BatchedCudaLidarResult& operator=(BatchedCudaLidarResult&&) noexcept = default;
+
+    uint32_t QueryCount() const { return query_count_; }
+    uint32_t TotalRayCount() const { return total_ray_count_; }
+    std::vector<uint32_t> DownloadRayOffsets() const;
+    std::vector<float> DownloadDepths() const;
+
+private:
+    uint32_t query_count_ = 0;
+    uint32_t total_ray_count_ = 0;
+    phi::Buffer ray_offsets_;
+    phi::Buffer depths_;
+};
+
 CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
                                  const std::vector<scene::BodyId>& body_ids);
 
 CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_world,
                                      const CudaLidarOptions& options);
+
+CudaImuResult QueryBatchedCudaImuSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaBodyRequest>& body_requests);
+
+BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaLidarOptions>& options);
 
 } // namespace nuka::sensor::gpu

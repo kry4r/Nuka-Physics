@@ -7,9 +7,11 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace nuka::sensor::gpu {
 
@@ -117,6 +119,35 @@ __global__ void QueryImuKernel(uint32_t sample_count,
         sample.position = poses[body_id].position;
         sample.angular_velocity = angular_velocities[body_id];
         sample.linear_acceleration = Scale(forces[body_id], inv_masses[body_id]);
+    }
+    samples[index] = sample;
+}
+
+__global__ void QueryBatchedImuKernel(uint32_t sample_count,
+                                      const BatchedCudaBodyRequest* body_requests,
+                                      uint32_t instance_count,
+                                      uint32_t body_count_per_instance,
+                                      const math::Transform* poses,
+                                      const math::Vec3* angular_velocities,
+                                      const math::Vec3* forces,
+                                      const float* inv_masses,
+                                      CudaImuSample* samples) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= sample_count) {
+        return;
+    }
+
+    CudaImuSample sample;
+    const BatchedCudaBodyRequest request = body_requests[index];
+    if (request.instance_index < instance_count
+        && request.body_id < body_count_per_instance
+        && request.body_id != kInvalidBody) {
+        const uint32_t flat_body =
+            request.instance_index * body_count_per_instance + request.body_id;
+        sample.position = poses[flat_body].position;
+        sample.angular_velocity = angular_velocities[flat_body];
+        sample.linear_acceleration =
+            Scale(forces[flat_body], inv_masses[request.body_id]);
     }
     samples[index] = sample;
 }
@@ -287,6 +318,98 @@ __global__ void QueryLidarKernel(uint32_t ray_count,
     depths[ray_index] = nearest;
 }
 
+__device__ uint32_t FindBatchedLidarQueryIndex(uint32_t flat_ray,
+                                               uint32_t query_count,
+                                               const uint32_t* ray_offsets) {
+    for (uint32_t query_index = 0; query_index < query_count; ++query_index) {
+        if (flat_ray >= ray_offsets[query_index] && flat_ray < ray_offsets[query_index + 1u]) {
+            return query_index;
+        }
+    }
+    return query_count;
+}
+
+__global__ void QueryBatchedLidarKernel(
+    uint32_t total_ray_count,
+    uint32_t query_count,
+    const BatchedCudaLidarOptions* options,
+    const uint32_t* ray_offsets,
+    uint32_t instance_count,
+    uint32_t body_count_per_instance,
+    uint32_t shape_count_per_instance,
+    const scene::ShapeType* shape_types,
+    const scene::BodyId* shape_body_ids,
+    const math::Transform* shape_local_transforms,
+    const math::Vec3* shape_half_extents,
+    const float* shape_radii,
+    const math::Transform* poses,
+    float* depths) {
+    const uint32_t flat_ray = blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat_ray >= total_ray_count) {
+        return;
+    }
+
+    const uint32_t query_index = FindBatchedLidarQueryIndex(flat_ray, query_count, ray_offsets);
+    if (query_index >= query_count) {
+        return;
+    }
+
+    const BatchedCudaLidarOptions query = options[query_index];
+    const uint32_t local_ray = flat_ray - ray_offsets[query_index];
+    const math::Vec3 ray_direction =
+        RayDirectionForIndex(query.direction,
+                             query.up,
+                             local_ray,
+                             query.ray_count,
+                             query.horizontal_fov_radians);
+    float nearest = query.range;
+
+    if (query.instance_index < instance_count) {
+        for (uint32_t shape_index = 0; shape_index < shape_count_per_instance; ++shape_index) {
+            const scene::BodyId local_body = shape_body_ids[shape_index];
+            if (local_body == kInvalidBody || local_body >= body_count_per_instance) {
+                continue;
+            }
+            const uint32_t flat_body =
+                query.instance_index * body_count_per_instance + local_body;
+            const math::Transform shape_world =
+                Compose(poses[flat_body], shape_local_transforms[shape_index]);
+
+            float hit = query.range;
+            bool did_hit = false;
+            const auto type = shape_types[shape_index];
+            if (type == scene::ShapeType::Sphere) {
+                did_hit = RaySphere(query.origin,
+                                    ray_direction,
+                                    shape_world.position,
+                                    shape_radii[shape_index],
+                                    nearest,
+                                    &hit);
+            } else if (type == scene::ShapeType::Plane) {
+                did_hit = RayPlane(query.origin,
+                                   ray_direction,
+                                   shape_world.position.y,
+                                   nearest,
+                                   &hit);
+            } else {
+                const math::Vec3 half_extents = shape_half_extents[shape_index];
+                did_hit = RayAabb(query.origin,
+                                  ray_direction,
+                                  Sub(shape_world.position, half_extents),
+                                  Add(shape_world.position, half_extents),
+                                  nearest,
+                                  &hit);
+            }
+
+            if (did_hit && hit < nearest) {
+                nearest = hit;
+            }
+        }
+    }
+
+    depths[flat_ray] = nearest;
+}
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -328,6 +451,23 @@ CudaLidarResult::CudaLidarResult(uint32_t ray_count, phi::Buffer depths)
 
 std::vector<float> CudaLidarResult::DownloadDepths() const {
     return DownloadVector<float>(depths_, ray_count_);
+}
+
+BatchedCudaLidarResult::BatchedCudaLidarResult(uint32_t query_count,
+                                               uint32_t total_ray_count,
+                                               phi::Buffer ray_offsets,
+                                               phi::Buffer depths)
+    : query_count_(query_count)
+    , total_ray_count_(total_ray_count)
+    , ray_offsets_(std::move(ray_offsets))
+    , depths_(std::move(depths)) {}
+
+std::vector<uint32_t> BatchedCudaLidarResult::DownloadRayOffsets() const {
+    return DownloadVector<uint32_t>(ray_offsets_, query_count_ + 1u);
+}
+
+std::vector<float> BatchedCudaLidarResult::DownloadDepths() const {
+    return DownloadVector<float>(depths_, total_ray_count_);
 }
 
 CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
@@ -389,6 +529,85 @@ CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_wor
     }
 
     return CudaLidarResult(options.ray_count, std::move(depth_buffer));
+}
+
+CudaImuResult QueryBatchedCudaImuSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaBodyRequest>& body_requests) {
+    if (!batch.HasUploadedState()) {
+        throw std::runtime_error(
+            "QueryBatchedCudaImuSensor requires uploaded BatchedDeviceWorld state");
+    }
+
+    const uint32_t sample_count = static_cast<uint32_t>(body_requests.size());
+    auto request_buffer = UploadVector(body_requests);
+    phi::Buffer sample_buffer(sample_count * sizeof(CudaImuSample), phi::MemoryKind::Device);
+
+    if (sample_count > 0u) {
+        constexpr uint32_t kBlockSize = 128u;
+        const uint32_t grid = (sample_count + kBlockSize - 1u) / kBlockSize;
+        QueryBatchedImuKernel<<<grid, kBlockSize>>>(
+            sample_count,
+            static_cast<const BatchedCudaBodyRequest*>(request_buffer.Data()),
+            batch.InstanceCount(),
+            batch.BodyCountPerInstance(),
+            batch.DevicePoses(),
+            batch.DeviceAngularVelocities(),
+            batch.DeviceForces(),
+            batch.DeviceInvMasses(),
+            static_cast<CudaImuSample*>(sample_buffer.Data()));
+        CheckCuda(cudaGetLastError(), "QueryBatchedImuKernel launch");
+        CheckCuda(cudaDeviceSynchronize(), "QueryBatchedImuKernel synchronize");
+    }
+
+    return CudaImuResult(sample_count, std::move(sample_buffer));
+}
+
+BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaLidarOptions>& options) {
+    if (!batch.HasUploadedState() || !batch.HasUploadedShapeTables()) {
+        throw std::runtime_error(
+            "QueryBatchedCudaLidarSensor requires uploaded BatchedDeviceWorld state and shape tables");
+    }
+
+    std::vector<uint32_t> ray_offsets(options.size() + 1u, 0u);
+    for (size_t index = 0; index < options.size(); ++index) {
+        ray_offsets[index + 1u] = ray_offsets[index] + options[index].ray_count;
+    }
+
+    const uint32_t query_count = static_cast<uint32_t>(options.size());
+    const uint32_t total_ray_count = ray_offsets.back();
+    auto option_buffer = UploadVector(options);
+    auto offset_buffer = UploadVector(ray_offsets);
+    phi::Buffer depth_buffer(total_ray_count * sizeof(float), phi::MemoryKind::Device);
+
+    if (total_ray_count > 0u) {
+        constexpr uint32_t kBlockSize = 128u;
+        const uint32_t grid = (total_ray_count + kBlockSize - 1u) / kBlockSize;
+        QueryBatchedLidarKernel<<<grid, kBlockSize>>>(
+            total_ray_count,
+            query_count,
+            static_cast<const BatchedCudaLidarOptions*>(option_buffer.Data()),
+            static_cast<const uint32_t*>(offset_buffer.Data()),
+            batch.InstanceCount(),
+            batch.BodyCountPerInstance(),
+            batch.ShapeCountPerInstance(),
+            batch.DeviceShapeTypes(),
+            batch.DeviceShapeBodyIds(),
+            batch.DeviceShapeLocalTransforms(),
+            batch.DeviceShapeHalfExtents(),
+            batch.DeviceShapeRadii(),
+            batch.DevicePoses(),
+            static_cast<float*>(depth_buffer.Data()));
+        CheckCuda(cudaGetLastError(), "QueryBatchedLidarKernel launch");
+        CheckCuda(cudaDeviceSynchronize(), "QueryBatchedLidarKernel synchronize");
+    }
+
+    return BatchedCudaLidarResult(query_count,
+                                  total_ray_count,
+                                  std::move(offset_buffer),
+                                  std::move(depth_buffer));
 }
 
 } // namespace nuka::sensor::gpu

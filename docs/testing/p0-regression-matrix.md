@@ -41,6 +41,8 @@ All tests in this matrix must pass on every commit before merge.
 | CudaConstraintSolver/AppliesWorldAnchoredVelocityActuatorOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA actuator assembly drives a joint whose parent is the static world anchor | CUDA |
 | CudaSensor/SamplesImuFromDeviceWorldState | `tests/sensor/test_cuda_sensors.cpp` | Verifies CUDA IMU/state samples read pose, angular velocity, and acceleration from GPU-resident `DeviceWorld` buffers and match CPU reference values | CUDA, CPU reference |
 | CudaSensor/LidarReturnsNearestSphereHitAndMaxRangeMisses | `tests/sensor/test_cuda_sensors.cpp` | Verifies CUDA lidar rays hit cooked sphere geometry and return max range for misses without using the CPU lidar placeholder | CUDA |
+| CudaSensor/SamplesBatchedImuFromBatchedDeviceWorldState | `tests/sensor/test_cuda_sensors.cpp` | Verifies batched CUDA IMU/state samples read flattened per-instance body state from `BatchedDeviceWorld` without CPU sensor fallback | CUDA |
+| CudaSensor/BatchedLidarQueriesStayWithinEachInstance | `tests/sensor/test_cuda_sensors.cpp` | Verifies batched CUDA lidar fans only scan the requested instance's cooked shape rows and do not hit geometry from another environment | CUDA |
 
 ## Import Regression Tests
 
@@ -118,6 +120,7 @@ All tests in this matrix must pass on every commit before merge.
 | CudaBatchTiming/BatchedRigidIntegrationUnderOneSecond | `tests/perf/test_cuda_batch_timing.cpp` | 120 CUDA rigid integration steps over 256 instances sharing one 32-body cooked template | Wall time | < 1000 ms |
 | CudaBatchContactTiming/BatchedContactSolveUnderOneSecond | `tests/perf/test_cuda_batch_contact_timing.cpp` | 60 CUDA batched integration/contact/PGS passes over 128 plane-box environments sharing one cooked template | Wall time | < 1000 ms |
 | CudaBatchJointDriveTiming/BatchedJointDriveSolveUnderOneSecond | `tests/perf/test_cuda_batch_joint_drive_timing.cpp` | 60 CUDA batched integration/joint projection/velocity-drive PGS passes over 128 two-body environments sharing one cooked template | Wall time | < 1000 ms |
+| CudaBatchSensorTiming/BatchedImuAndLidarQueriesUnderOneSecond | `tests/perf/test_cuda_batch_sensor_timing.cpp` | 60 batched CUDA IMU/lidar observation passes over 128 environments with 128 body requests and 8192 lidar rays per pass | Wall time | < 1000 ms |
 | CudaContactTiming/BroadphaseAndContactGenerationUnderOneSecond | `tests/perf/test_cuda_contact_timing.cpp` | 60 CUDA broadphase/contact passes over 256 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
 | CudaSolverTiming/ContactAssemblyAndPgsUnderOneSecond | `tests/perf/test_cuda_solver_timing.cpp` | 30 CUDA broadphase/contact/constraint assembly/PGS passes over 128 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
 | CudaSensorTiming/ImuAndLidarQueriesUnderOneSecond | `tests/perf/test_cuda_sensor_timing.cpp` | 60 CUDA IMU and lidar query passes over 256 cooked sensor targets and 512 lidar rays | Wall time | < 1000 ms |

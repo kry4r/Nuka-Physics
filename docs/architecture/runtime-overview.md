@@ -131,8 +131,17 @@ rows against the batched device state. `StepBatchedCudaWorld()` can now run
 batched rigid integration, contact generation/solve, joint anchor projection,
 and velocity drive solve in one CUDA pipeline. This currently covers
 plane/box/sphere contact scenes plus cooked revolute/fixed-style joint rows and
-velocity drive rows; batched sensors and render synchronization remain the next
-CUDA-first follow-on stages rather than CPU fallbacks.
+velocity drive rows.
+
+Batched sensor queries reuse the same flattened state layout. IMU/state requests
+carry `(instance_index, body_id)` pairs and read pose, angular velocity, force,
+and shared inverse mass from CUDA buffers. Lidar queries carry one fan
+configuration per environment, flatten rays into one device launch, and only
+scan the shared shape rows for the requested instance, so observations do not
+cross environment boundaries. Result downloads remain validation/tooling
+boundaries; production observation flow is CUDA-resident. GPU-to-Vulkan batched
+render synchronization remains the next CUDA-first follow-on stage rather than
+a CPU simulation fallback.
 
 ## Scene Integration
 
@@ -285,6 +294,12 @@ uploaded once per template and assembled into per-instance constraint blocks by
 CUDA kernels. Mutable pose, velocity, force, and torque are uploaded per
 flattened body. `DownloadState()` is a validation and tooling boundary; the
 production path keeps batched state resident for the next CUDA stage.
+
+`sensor::gpu::QueryBatchedCudaImuSensor()` and
+`sensor::gpu::QueryBatchedCudaLidarSensor()` extend the same container into the
+parallel observation path expected by robotics/RL workloads. The APIs keep the
+backend selection layer intact while making CUDA the default production path on
+this workstation.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production

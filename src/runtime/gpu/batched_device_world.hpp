@@ -239,9 +239,13 @@ public:
     math::Transform* DevicePoses();
     const math::Transform* DevicePoses() const;
     math::Vec3* DeviceLinearVelocities();
+    const math::Vec3* DeviceLinearVelocities() const;
     math::Vec3* DeviceAngularVelocities();
+    const math::Vec3* DeviceAngularVelocities() const;
     math::Vec3* DeviceForces();
+    const math::Vec3* DeviceForces() const;
     math::Vec3* DeviceTorques();
+    const math::Vec3* DeviceTorques() const;
     const float* DeviceInvMasses() const;
     const math::Vec3* DeviceInvInertias() const;
     const scene::ShapeType* DeviceShapeTypes() const;
