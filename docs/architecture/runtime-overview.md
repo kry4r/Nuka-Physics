@@ -108,9 +108,20 @@ and `force_limit` as the clamp.
 
 ### BatchContext / BatchScheduler
 
-Manages multiple `WorldInstance` objects that share a common `WorldTemplate`.
-The `BatchScheduler` orchestrates parallel stepping of instances, enabling
-domain-randomized training and large-scale evaluation scenarios.
+`BatchContext` and `BatchScheduler` describe how multiple `WorldInstance`
+objects share a common `WorldTemplate`. They remain CPU-side orchestration and
+reference metadata; they are not the production execution path.
+
+`runtime::gpu::BatchedDeviceWorld` is the CUDA production container for
+multi-environment rigid integration. It uploads one shared template's body
+inverse mass and inverse inertia tables, flattens per-instance pose, velocity,
+force, and torque arrays into GPU buffers, and launches one CUDA thread per
+flattened body. `StepBatchedCudaWorld()` maps `flat_index %
+body_count_per_instance` back to the shared template body row so each instance
+uses the same cooked physical parameters while mutating independent state. This
+is the first Isaac Lab-style parallel-environment path; contact, constraint,
+sensor, and render synchronization batching should extend this layout instead
+of falling back to CPU stepping.
 
 ## Scene Integration
 
@@ -247,6 +258,20 @@ descriptors into device queries after the CUDA step/solve sequence. Lidar is
 currently a deterministic direct ray loop over cooked shape tables, with the API
 kept narrow so a later BVH or hardware ray tracing acceleration path can replace
 the implementation without changing demos or tests.
+
+### CUDA BatchedDeviceWorld
+
+`runtime::gpu::BatchedDeviceWorld` stores multi-instance mutable state as
+structure-of-arrays buffers laid out by instance-major order:
+
+```text
+flat_body = instance_index * body_count_per_instance + body_index
+```
+
+Template data such as inverse mass and inverse inertia is uploaded once and
+indexed by `body_index`. Mutable pose, velocity, force, and torque are uploaded
+per flattened body. `DownloadState()` is a validation and tooling boundary; the
+production path keeps batched state resident for the next CUDA stage.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production

@@ -231,6 +231,7 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_phi_test)
 
     add_executable(nuka_cuda_runtime_test
+        runtime/test_cuda_batched_world.cpp
         runtime/test_cuda_device_world.cpp
         runtime/test_cuda_world_stepper.cpp
         runtime/test_cuda_contacts.cpp
@@ -262,6 +263,7 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_cuda_sensor_test)
 
     add_executable(nuka_cuda_perf_test
+        perf/test_cuda_batch_timing.cpp
         perf/test_cuda_contact_timing.cpp
         perf/test_cuda_scene_demo_timing.cpp
         perf/test_cuda_sensor_timing.cpp
