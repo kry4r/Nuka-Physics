@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
+#include "render/render_scene.hpp"
 
 #include <cstdint>
 #include <string>
@@ -76,6 +77,10 @@ VulkanRendererReport ProbeVulkanRenderer();
 
 VulkanOffscreenReport RenderDebugDrawListVulkan(
     const std::vector<VulkanDebugDrawCommand>& commands,
+    const VulkanOffscreenOptions& options = {});
+
+VulkanOffscreenReport RenderSceneVulkan(
+    const RenderScene& scene,
     const VulkanOffscreenOptions& options = {});
 
 } // namespace nuka::render

@@ -336,5 +336,15 @@ for artifact generation and regression checks. This offscreen path is deliberate
 decoupled from windowing so CI can validate real Vulkan rendering while the
 future interactive viewport reuses the same render/debug handoff.
 
+`render::RenderSceneVulkan()` is the executable RenderScene-facing Vulkan entry
+point. It consumes synchronized `RenderScene` mesh instances and material records,
+maps material base color/alpha into RGBA8 command colors, converts current
+sphere/capsule/box-like mesh proxies into the same offscreen Vulkan renderer, and
+returns pixels plus command counts for regression tests and benchmarks. This is
+the stable app-level API for materialized scene rendering; the current
+implementation still uses the compute offscreen raster path internally, so the
+remaining renderer work is replacing that adapter with a graphics pipeline that
+adds instancing, real mesh draws, lighting, shadows, and direct presentation.
+
 The existing CPU headless debug rasterizer is still useful for deterministic
 reference artifacts, but it is not the default production renderer target.

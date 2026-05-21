@@ -38,8 +38,12 @@ point debug primitives. `SceneDemoOptions` defaults to auto-fitting the view to
 the generated debug draw bounds so simulated bodies remain visible after large
 vertical motion. The CPU headless rasterizer remains available as an explicit
 reference artifact path, but it is not the default production render backend.
-The same synchronized `SceneGraph` / `RenderScene` state is the handoff point
-for the future Vulkan viewport.
+The same synchronized `SceneGraph` / `RenderScene` state can now also be sent
+directly to `render::RenderSceneVulkan()`, which renders material-colored mesh
+instances through the Vulkan offscreen path. This is still a compute offscreen
+adapter rather than the final instanced graphics pipeline with lighting and
+shadows, but app-level callers already have a real `RenderScene` Vulkan entry
+point instead of only debug overlays.
 
 The demo currently supports `.xml`, `.urdf`, text `.usd`, and `.usda` inputs.
 Binary `.usd`, `.usdc`, and `.usdz` still route through the isolated USD adapter
@@ -69,6 +73,8 @@ output. `tests/perf/test_cuda_scene_demo_timing.cpp` and
 through import, cook, CUDA simulation, render/debug synchronization, Vulkan
 artifact output, and one-second timing budgets.
 `tests/perf/test_batched_vulkan_scene_demo_timing.cpp` adds the same global
-workflow for eight CUDA batched environments rendered through Vulkan. Remaining
-renderer work is richer Vulkan instancing/material/shadow support and replacing
+workflow for eight CUDA batched environments rendered through Vulkan.
+`tests/perf/test_vulkan_renderscene_timing.cpp` separately covers the material
+`RenderScene` Vulkan entry point with 128 mesh instances. Remaining renderer
+work is richer Vulkan instancing/material/shadow support and replacing
 PPM/readback-oriented synchronization with direct interactive GPU presentation.

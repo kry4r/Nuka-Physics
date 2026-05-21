@@ -202,12 +202,14 @@ add_executable(nuka_perf_test
     perf/test_render_demo_timing.cpp
     perf/test_vulkan_scene_demo_timing.cpp
     perf/test_batched_vulkan_scene_demo_timing.cpp
+    perf/test_vulkan_renderscene_timing.cpp
 )
 
 target_link_libraries(nuka_perf_test
     PRIVATE
         nuka_runtime
         nuka_debug_draw
+        nuka_render
         nuka_scene_pipeline
         nuka_import
         nuka_solver

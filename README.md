@@ -20,8 +20,10 @@ reinforcement learning, and real-time applications.
   queries; CPU batching remains reference/orchestration metadata
 - CUDA is the preferred/default production physics backend through the PHI
   (Platform Hardware Interface) backend selection layer
-- Vulkan is the required production rendering backend; the current headless PPM
-  debug rasterizer remains a deterministic CI/reference artifact path
+- Vulkan is the required production rendering backend; it now has executable
+  offscreen paths for both physics debug commands and materialized `RenderScene`
+  mesh instances, while the headless CPU PPM rasterizer remains a deterministic
+  CI/reference artifact path
 - Debug draw and visualization utilities for collision proxies, AABBs, joints, contacts, centers of mass, and constraint errors
 
 ## Quick Start
@@ -63,7 +65,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming|BatchedVulkanSceneDemoTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming|BatchedVulkanSceneDemoTiming|VulkanRenderSceneTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -105,7 +107,7 @@ The engine is organized into layered modules:
 |-------|---------|-------------|
 | **Core** | `math`, `core` | Spatial algebra, vectors, quaternions, transforms |
 | **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline, MJCF/URDF/USD importers |
-| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies, Vulkan offscreen rendering |
+| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies, Vulkan offscreen debug and RenderScene rendering |
 | **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, batched contact/joint/drive solve, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
@@ -125,8 +127,9 @@ For detailed architecture documentation see:
 - **Testing**: Google Test
 - **Physics backend**: CUDA preferred by default via PHI backend selection;
   CPU reference is kept for validation/orchestration only
-- **Rendering backend**: Vulkan production backend with offscreen debug-render
-  output for CI artifacts; CPU raster output is reference-only
+- **Rendering backend**: Vulkan production backend with offscreen debug and
+  RenderScene material output for CI artifacts; CPU raster output is
+  reference-only
 - **CI**: GitHub Actions
 
 ## Project Structure
