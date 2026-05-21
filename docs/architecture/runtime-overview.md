@@ -71,6 +71,16 @@ buffers. Host downloads are limited to validation reports, regression checks,
 and timing tests; the intended production path keeps broadphase and contact
 data resident for the upcoming CUDA constraint assembly and solver stage.
 
+`solver::gpu::SolveCudaConstraints()` extends that resident path through
+constraint assembly and deterministic PGS. It consumes device contact manifolds,
+cooked joint tables, and cooked actuator tables, builds contact/joint/drive
+constraint blocks into CUDA buffers, precomputes row effective mass, applies
+friction and restitution in the velocity solve, and performs contact plus joint
+position projection against CUDA pose buffers. `SolveCudaConstraintBlocks()` is
+kept as a validation/tooling entry for uploading a small host-authored row set
+into the same device solver; production scenes should enter through
+`DeviceWorld` plus device contact results.
+
 Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
 projection uses authoring anchors instead of assuming every joint is body-center
 to body-center. Revolute joints currently map to the five-row maximal-coordinate
@@ -202,10 +212,12 @@ actuator counts next to the device allocations. It also owns mutable state
 buffers for poses, linear velocities, angular velocities, forces, and torques.
 Shape type, body binding, local transform, half extent, and radius tables are
 also uploaded so CUDA kernels can build world-space collision proxies without
-returning to CPU-side cooked data. Tests use compact summary downloads for
-upload integrity and full state/contact readbacks for CPU-reference differential
-validation. Full state readback is a validation and tooling boundary; production
-stepping keeps state on the GPU.
+returning to CPU-side cooked data. Joint type, parent/child body, axis, frame,
+actuator type, actuator joint id, gain, and force-limit tables are uploaded for
+CUDA constraint assembly. Tests use compact summary downloads for upload
+integrity and full state/contact/constraint readbacks for CPU-reference
+differential validation. Full readback is a validation and tooling boundary;
+production stepping keeps state on the GPU.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production

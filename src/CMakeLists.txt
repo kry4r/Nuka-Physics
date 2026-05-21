@@ -302,6 +302,7 @@ if(CMAKE_CUDA_COMPILER)
         constraint/gpu/contact_generation.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
+        solver/gpu/cuda_constraint_solver.cu
     )
 
     target_include_directories(nuka_runtime_gpu

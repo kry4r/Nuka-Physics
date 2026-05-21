@@ -21,6 +21,11 @@ All tests in this matrix must pass on every commit before merge.
 | CudaContacts/GeneratesAabbsPairsAndPlaneBoxContactOnDevice | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA AABB generation, deterministic broadphase pair output, plane-box contact generation, and CPU-reference report parity | CUDA, CPU reference |
 | CudaContacts/GeneratesSphereSphereContactOnDevice | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA narrowphase emits a sphere-sphere contact manifold with deterministic normal and penetration | CUDA |
 | CudaContacts/EmitsDeterministicPairOrderFromDeviceBroadphase | `tests/runtime/test_cuda_contacts.cpp` | Verifies CUDA broadphase compacts overlapping pairs in deterministic slot order | CUDA |
+| CudaConstraintSolver/SolvesPlaneBoxContactOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA assembles contact rows and solves normal impulses plus position correction against a static plane | CUDA |
+| CudaConstraintSolver/FrictionImpulseIsClampedByNormalImpulseOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA PGS clamps tangent impulses by friction times accumulated normal impulse | CUDA |
+| CudaConstraintSolver/RestitutionBouncesAlongContactNormalOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies CUDA PGS applies restitution along the contact normal | CUDA |
+| CudaConstraintSolver/AppliesCookedVelocityActuatorOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies cooked actuator tables assemble CUDA drive rows and update angular velocity | CUDA |
+| CudaConstraintSolver/ProjectsCookedJointAnchorsOnDevice | `tests/runtime/test_cuda_solver.cpp` | Verifies cooked joint tables assemble CUDA joint rows and project child anchors on device | CUDA |
 
 ## Import Regression Tests
 
@@ -93,6 +98,7 @@ All tests in this matrix must pass on every commit before merge.
 | RenderDemoTiming/ImportedSceneDebugViewUnderOneSecond | `tests/perf/test_render_demo_timing.cpp` | Import, compile, simulate 60 fixed steps, overlay, and rasterize example MJCF scene | Wall time | < 1000 ms |
 | CudaStepTiming/RigidIntegrationKernelUnderOneSecond | `tests/perf/test_cuda_step_timing.cpp` | 240 CUDA rigid integration steps over 4096 cooked dynamic bodies | Wall time | < 1000 ms |
 | CudaContactTiming/BroadphaseAndContactGenerationUnderOneSecond | `tests/perf/test_cuda_contact_timing.cpp` | 60 CUDA broadphase/contact passes over 256 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
+| CudaSolverTiming/ContactAssemblyAndPgsUnderOneSecond | `tests/perf/test_cuda_solver_timing.cpp` | 30 CUDA broadphase/contact/constraint assembly/PGS passes over 128 cooked dynamic boxes and a static plane | Wall time | < 1000 ms |
 
 ## Reference Comparison Tool
 

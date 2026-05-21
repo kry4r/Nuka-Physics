@@ -399,6 +399,14 @@ CudaContactReport CudaContactResult::DownloadReport() const {
     return report;
 }
 
+const constraint::ContactManifold* CudaContactResult::DeviceManifolds() const {
+    return static_cast<const constraint::ContactManifold*>(manifolds_.Data());
+}
+
+const CudaContactReport* CudaContactResult::DeviceReport() const {
+    return static_cast<const CudaContactReport*>(report_.Data());
+}
+
 CudaContactResult GenerateCudaContacts(
     const runtime::gpu::DeviceWorld& device_world,
     const collision::gpu::CudaBroadphaseResult& broadphase) {

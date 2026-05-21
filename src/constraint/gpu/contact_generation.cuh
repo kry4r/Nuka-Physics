@@ -34,6 +34,10 @@ public:
     CudaContactReport DownloadReport() const;
     std::vector<constraint::ContactManifold> DownloadManifolds() const;
 
+    uint32_t PairSlotCount() const { return pair_slot_count_; }
+    const constraint::ContactManifold* DeviceManifolds() const;
+    const CudaContactReport* DeviceReport() const;
+
 private:
     uint32_t pair_slot_count_ = 0;
     phi::Buffer manifolds_;

@@ -54,7 +54,14 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
                          phi::Buffer shape_local_transforms,
                          phi::Buffer shape_half_extents,
                          phi::Buffer shape_radii,
+                         phi::Buffer joint_types,
+                         phi::Buffer joint_parent_bodies,
                          phi::Buffer joint_child_bodies,
+                         phi::Buffer joint_axes,
+                         phi::Buffer joint_parent_frames,
+                         phi::Buffer joint_child_frames,
+                         phi::Buffer actuator_types,
+                         phi::Buffer actuator_joint_ids,
                          phi::Buffer actuator_gains,
                          phi::Buffer actuator_force_limits)
     : body_count_(body_count)
@@ -69,7 +76,14 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
     , shape_local_transforms_(std::move(shape_local_transforms))
     , shape_half_extents_(std::move(shape_half_extents))
     , shape_radii_(std::move(shape_radii))
+    , joint_types_(std::move(joint_types))
+    , joint_parent_bodies_(std::move(joint_parent_bodies))
     , joint_child_bodies_(std::move(joint_child_bodies))
+    , joint_axes_(std::move(joint_axes))
+    , joint_parent_frames_(std::move(joint_parent_frames))
+    , joint_child_frames_(std::move(joint_child_frames))
+    , actuator_types_(std::move(actuator_types))
+    , actuator_joint_ids_(std::move(actuator_joint_ids))
     , actuator_gains_(std::move(actuator_gains))
     , actuator_force_limits_(std::move(actuator_force_limits)) {}
 
@@ -82,7 +96,14 @@ std::size_t DeviceWorld::DeviceBytes() const {
         + shape_local_transforms_.Size()
         + shape_half_extents_.Size()
         + shape_radii_.Size()
+        + joint_types_.Size()
+        + joint_parent_bodies_.Size()
         + joint_child_bodies_.Size()
+        + joint_axes_.Size()
+        + joint_parent_frames_.Size()
+        + joint_child_frames_.Size()
+        + actuator_types_.Size()
+        + actuator_joint_ids_.Size()
         + actuator_gains_.Size()
         + actuator_force_limits_.Size()
         + state_poses_.Size()
@@ -243,6 +264,46 @@ const float* DeviceWorld::DeviceShapeRadii() const {
     return static_cast<const float*>(shape_radii_.Data());
 }
 
+const scene::JointType* DeviceWorld::DeviceJointTypes() const {
+    return static_cast<const scene::JointType*>(joint_types_.Data());
+}
+
+const scene::BodyId* DeviceWorld::DeviceJointParentBodies() const {
+    return static_cast<const scene::BodyId*>(joint_parent_bodies_.Data());
+}
+
+const scene::BodyId* DeviceWorld::DeviceJointChildBodies() const {
+    return static_cast<const scene::BodyId*>(joint_child_bodies_.Data());
+}
+
+const math::Vec3* DeviceWorld::DeviceJointAxes() const {
+    return static_cast<const math::Vec3*>(joint_axes_.Data());
+}
+
+const math::Transform* DeviceWorld::DeviceJointParentFrames() const {
+    return static_cast<const math::Transform*>(joint_parent_frames_.Data());
+}
+
+const math::Transform* DeviceWorld::DeviceJointChildFrames() const {
+    return static_cast<const math::Transform*>(joint_child_frames_.Data());
+}
+
+const scene::ActuatorType* DeviceWorld::DeviceActuatorTypes() const {
+    return static_cast<const scene::ActuatorType*>(actuator_types_.Data());
+}
+
+const scene::JointId* DeviceWorld::DeviceActuatorJointIds() const {
+    return static_cast<const scene::JointId*>(actuator_joint_ids_.Data());
+}
+
+const float* DeviceWorld::DeviceActuatorGains() const {
+    return static_cast<const float*>(actuator_gains_.Data());
+}
+
+const float* DeviceWorld::DeviceActuatorForceLimits() const {
+    return static_cast<const float*>(actuator_force_limits_.Data());
+}
+
 DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
     const auto shape_types =
         DefaultedCopy(world_template.shape_table.types,
@@ -264,6 +325,46 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         DefaultedCopy(world_template.shape_table.radii,
                       world_template.shape_count,
                       0.5f);
+    const auto joint_types =
+        DefaultedCopy(world_template.joint_table.types,
+                      world_template.joint_count,
+                      scene::JointType::Revolute);
+    const auto joint_parent_bodies =
+        DefaultedCopy(world_template.joint_table.parent_bodies,
+                      world_template.joint_count,
+                      scene::kInvalidBody);
+    const auto joint_child_bodies =
+        DefaultedCopy(world_template.joint_table.child_bodies,
+                      world_template.joint_count,
+                      scene::kInvalidBody);
+    const auto joint_axes =
+        DefaultedCopy(world_template.joint_table.axes,
+                      world_template.joint_count,
+                      math::Vec3::UnitZ());
+    const auto joint_parent_frames =
+        DefaultedCopy(world_template.joint_table.parent_frames,
+                      world_template.joint_count,
+                      math::Transform::Identity());
+    const auto joint_child_frames =
+        DefaultedCopy(world_template.joint_table.child_frames,
+                      world_template.joint_count,
+                      math::Transform::Identity());
+    const auto actuator_types =
+        DefaultedCopy(world_template.actuator_table.types,
+                      world_template.actuator_count,
+                      scene::ActuatorType::Motor);
+    const auto actuator_joint_ids =
+        DefaultedCopy(world_template.actuator_table.joint_ids,
+                      world_template.actuator_count,
+                      scene::kInvalidJoint);
+    const auto actuator_gains =
+        DefaultedCopy(world_template.actuator_table.gains,
+                      world_template.actuator_count,
+                      0.0f);
+    const auto actuator_force_limits =
+        DefaultedCopy(world_template.actuator_table.force_limits,
+                      world_template.actuator_count,
+                      1.0e6f);
 
     return DeviceWorld(
         world_template.body_count,
@@ -278,9 +379,16 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         UploadVector(shape_local_transforms),
         UploadVector(shape_half_extents),
         UploadVector(shape_radii),
-        UploadVector(world_template.joint_table.child_bodies),
-        UploadVector(world_template.actuator_table.gains),
-        UploadVector(world_template.actuator_table.force_limits));
+        UploadVector(joint_types),
+        UploadVector(joint_parent_bodies),
+        UploadVector(joint_child_bodies),
+        UploadVector(joint_axes),
+        UploadVector(joint_parent_frames),
+        UploadVector(joint_child_frames),
+        UploadVector(actuator_types),
+        UploadVector(actuator_joint_ids),
+        UploadVector(actuator_gains),
+        UploadVector(actuator_force_limits));
 }
 
 void UploadDeviceState(DeviceWorld& device_world, const WorldInstance& instance) {

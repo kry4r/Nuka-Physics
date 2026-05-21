@@ -117,16 +117,38 @@ Release regression suite passes 211/211 on the local CUDA/Vulkan workstation.
 
 ### Task 5: CUDA Constraint Assembly and Solver
 
+**Status:** Completed in the current iteration. CUDA now assembles contact,
+joint, and drive constraint blocks from device-resident contact results and
+cooked `DeviceWorld` tables, then runs deterministic PGS velocity iterations
+plus contact/joint position projection on CUDA pose and velocity buffers.
+Host-authored block upload is retained for validation-only differential tests.
+
 **Files:**
 - Create: `src/solver/gpu/cuda_constraint_solver.cuh`
 - Create: `src/solver/gpu/cuda_constraint_solver.cu`
 - Create: `tests/runtime/test_cuda_solver.cpp`
+- Create: `tests/perf/test_cuda_solver_timing.cpp`
+- Modify: `src/runtime/gpu/device_world.hpp`
+- Modify: `src/runtime/gpu/device_world.cu`
+- Modify: `src/constraint/gpu/contact_generation.cuh`
+- Modify: `src/constraint/gpu/contact_generation.cu`
 - Modify: `src/CMakeLists.txt`
 - Modify: `tests/CMakeLists.txt`
+- Modify: `docs/architecture/runtime-overview.md`
+- Modify: `docs/testing/p0-regression-matrix.md`
+- Modify: `README.md`
 
 **Scope:** Assemble contact, friction, restitution, joint, and actuator rows into device-resident solver buffers and run deterministic PGS iterations on CUDA.
 
 **Validation:** Compare resting contact, friction, restitution, joint projection, and velocity drive scenes against CPU reference metrics. Report constraint error, penetration, energy drift, solver iteration count, and GPU timing.
+
+Current validation commands:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure -R "CudaConstraintSolver|CudaContacts|CudaWorldStepper|CudaDeviceWorld|CudaStepTiming|CudaContactTiming|CudaSolverTiming"
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
 
 ### Task 6: End-to-End CUDA Scene Demo and Benchmark
 

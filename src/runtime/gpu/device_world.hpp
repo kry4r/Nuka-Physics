@@ -64,7 +64,14 @@ public:
                 phi::Buffer shape_local_transforms,
                 phi::Buffer shape_half_extents,
                 phi::Buffer shape_radii,
+                phi::Buffer joint_types,
+                phi::Buffer joint_parent_bodies,
                 phi::Buffer joint_child_bodies,
+                phi::Buffer joint_axes,
+                phi::Buffer joint_parent_frames,
+                phi::Buffer joint_child_frames,
+                phi::Buffer actuator_types,
+                phi::Buffer actuator_joint_ids,
                 phi::Buffer actuator_gains,
                 phi::Buffer actuator_force_limits);
 
@@ -99,6 +106,16 @@ public:
     const math::Transform* DeviceShapeLocalTransforms() const;
     const math::Vec3* DeviceShapeHalfExtents() const;
     const float* DeviceShapeRadii() const;
+    const scene::JointType* DeviceJointTypes() const;
+    const scene::BodyId* DeviceJointParentBodies() const;
+    const scene::BodyId* DeviceJointChildBodies() const;
+    const math::Vec3* DeviceJointAxes() const;
+    const math::Transform* DeviceJointParentFrames() const;
+    const math::Transform* DeviceJointChildFrames() const;
+    const scene::ActuatorType* DeviceActuatorTypes() const;
+    const scene::JointId* DeviceActuatorJointIds() const;
+    const float* DeviceActuatorGains() const;
+    const float* DeviceActuatorForceLimits() const;
 
 private:
     uint32_t body_count_ = 0;
@@ -114,7 +131,14 @@ private:
     phi::Buffer shape_local_transforms_;
     phi::Buffer shape_half_extents_;
     phi::Buffer shape_radii_;
+    phi::Buffer joint_types_;
+    phi::Buffer joint_parent_bodies_;
     phi::Buffer joint_child_bodies_;
+    phi::Buffer joint_axes_;
+    phi::Buffer joint_parent_frames_;
+    phi::Buffer joint_child_frames_;
+    phi::Buffer actuator_types_;
+    phi::Buffer actuator_joint_ids_;
     phi::Buffer actuator_gains_;
     phi::Buffer actuator_force_limits_;
     phi::Buffer state_poses_;
