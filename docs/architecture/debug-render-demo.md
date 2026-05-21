@@ -11,7 +11,8 @@ PPM artifact for CI and inspection.
 2. Compile it with `scene::BuildCompiledScene()`.
 3. Resolve the physics backend through PHI. On this workstation the default
    policy selects the CUDA production path; CPU remains reference-only for
-   explicit validation runs.
+   explicit validation runs and is rejected unless the caller also enables
+   `allow_cpu_reference_validation`.
 4. Advance the compiled `PhysicsWorld` instance on CUDA by uploading the cooked
    `WorldTemplate` and mutable `WorldInstance` into `DeviceWorld`, then running
    fixed-step integration, CUDA broadphase, CUDA contact generation, and CUDA

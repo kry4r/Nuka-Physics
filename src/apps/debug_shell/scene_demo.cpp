@@ -384,6 +384,14 @@ void StepCompiledSceneCpuReference(scene::CompiledScene& compiled,
                                             compiled);
 }
 
+void RequireExplicitCpuReferenceValidation(const SceneDemoOptions& options) {
+    if (!options.allow_cpu_reference_validation) {
+        throw std::runtime_error(
+            "CPU physics is reference-only; set allow_cpu_reference_validation "
+            "when intentionally running validation instead of CUDA production");
+    }
+}
+
 } // namespace
 
 SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
@@ -402,12 +410,17 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     phi::BackendSelectionRequest backend_request;
     backend_request.policy = options.physics_backend_policy;
     const auto backend_selection = phi::ResolvePhysicsBackend(backend_request);
+    if (backend_selection.selected_backend == phi::PhysicsBackend::CpuReference) {
+        RequireExplicitCpuReferenceValidation(options);
+    }
     result.physics_backend = backend_selection.selected_backend;
     result.production_physics_backend = backend_selection.production_backend;
 #else
-    if (options.physics_backend_policy == phi::BackendSelectionPolicy::ForceCuda) {
+    if (options.physics_backend_policy == phi::BackendSelectionPolicy::ForceCuda ||
+        options.physics_backend_policy == phi::BackendSelectionPolicy::PreferCuda) {
         throw std::runtime_error("CUDA physics backend selected, but nuka_runtime_gpu is not built");
     }
+    RequireExplicitCpuReferenceValidation(options);
     result.physics_backend = phi::PhysicsBackend::CpuReference;
     result.production_physics_backend = false;
 #endif

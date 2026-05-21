@@ -33,6 +33,13 @@ selection layer: the default policy resolves to CUDA when a device is available,
 while the CPU path is explicitly marked as reference-only for deterministic
 validation, differential checks, and host-side debugging.
 
+High-level production APIs are not allowed to silently fall back to CPU
+simulation. `SceneDemoOptions` therefore keeps `PreferCuda` as the default and
+requires callers that intentionally run the CPU reference path to set both
+`physics_backend_policy = ForceCpuReference` and
+`allow_cpu_reference_validation = true`. This keeps the API selection layer
+visible without weakening the full-GPU production requirement.
+
 `runtime::StepWorldInstance()` is the current fixed-step CPU reference stepper.
 It advances a `WorldInstance` against its `WorldTemplate` by converting each
 body row into the rigid `BodyState`, applying gravity and accumulated
@@ -181,7 +188,9 @@ sensor sampling before downloading the final state for `SceneGraph` /
 commands, runs `render::RenderDebugDrawListVulkan()` into an offscreen storage
 image, reads back the RGBA8 pixels, and writes the PPM artifact from the Vulkan
 image. The CPU headless rasterizer remains an explicit reference path. Explicit
-CPU physics selection remains a reference-validation path only.
+CPU physics selection remains a reference-validation path only and must opt in
+through `allow_cpu_reference_validation`; default production runs reject CPU
+physics instead of silently falling back.
 
 `ExportBatchedImportedSceneDebugView()` extends that global workflow to multiple
 environments. It imports/cooks one scene, creates offset `WorldInstance` copies,

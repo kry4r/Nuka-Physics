@@ -19,7 +19,9 @@ reinforcement learning, and real-time applications.
   projection, velocity drive solve, and batched CUDA IMU/lidar observation
   queries; CPU batching remains reference/orchestration metadata
 - CUDA is the preferred/default production physics backend through the PHI
-  (Platform Hardware Interface) backend selection layer
+  (Platform Hardware Interface) backend selection layer; high-level production
+  APIs reject silent CPU fallback, and CPU stepping must be explicitly enabled
+  as a validation/reference run
 - Vulkan is the required production rendering backend; it now has executable
   offscreen paths for both physics debug commands and materialized `RenderScene`
   mesh instances, while the headless CPU PPM rasterizer remains a deterministic
@@ -93,6 +95,12 @@ CUDA constraint row counts, joint/drive/contact block counts, sensor sample
 counts, and maximum position error so global demo runs prove more than file
 output.
 
+CPU simulation is not a production fallback. To run the imported-scene demo
+against the CPU reference stepper for differential validation, callers must set
+both `physics_backend_policy = ForceCpuReference` and
+`allow_cpu_reference_validation = true`; otherwise the app rejects CPU physics
+selection.
+
 When the optional final `instance_count` argument is greater than one, the CLI
 runs the batched imported-scene workflow: one cooked template is reused across
 multiple CUDA `BatchedDeviceWorld` instances, fixed-step contacts/joints/drives
@@ -126,7 +134,8 @@ For detailed architecture documentation see:
 - **Build System**: CMake
 - **Testing**: Google Test
 - **Physics backend**: CUDA preferred by default via PHI backend selection;
-  CPU reference is kept for validation/orchestration only
+  CPU reference is kept for validation/orchestration only and requires explicit
+  opt-in at app/API boundaries
 - **Rendering backend**: Vulkan production backend with offscreen debug and
   RenderScene material output for CI artifacts; CPU raster output is
   reference-only

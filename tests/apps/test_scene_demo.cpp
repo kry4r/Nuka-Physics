@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -199,6 +200,46 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     EXPECT_GT(result.non_background_pixel_count, 0u);
     ASSERT_EQ(result.body_world_poses.size(), 2u);
     EXPECT_NE(result.body_world_poses[1].position.z, 0.5f);
+    EXPECT_TRUE(std::filesystem::exists(output_path));
+
+    std::filesystem::remove(output_path);
+}
+
+TEST(SceneDemo, ForceCpuReferenceRequiresExplicitReferenceValidation) {
+    const auto output_path = TempPpmPath("nuka_scene_demo_cpu_reference_rejected.ppm");
+    std::filesystem::remove(output_path);
+
+    nuka::app::SceneDemoOptions options;
+    options.input_path = "tests/data/minimal_scene.usda";
+    options.output_path = output_path.string();
+    options.width = 96;
+    options.height = 72;
+    options.simulation_steps = 2u;
+    options.physics_backend_policy = nuka::phi::BackendSelectionPolicy::ForceCpuReference;
+
+    EXPECT_THROW(nuka::app::ExportImportedSceneDebugView(options), std::runtime_error);
+    EXPECT_FALSE(std::filesystem::exists(output_path));
+}
+
+TEST(SceneDemo, CanRunExplicitCpuReferenceValidationPath) {
+    const auto output_path = TempPpmPath("nuka_scene_demo_cpu_reference_validation.ppm");
+    std::filesystem::remove(output_path);
+
+    nuka::app::SceneDemoOptions options;
+    options.input_path = "tests/data/minimal_scene.usda";
+    options.output_path = output_path.string();
+    options.width = 96;
+    options.height = 72;
+    options.simulation_steps = 2u;
+    options.physics_backend_policy = nuka::phi::BackendSelectionPolicy::ForceCpuReference;
+    options.allow_cpu_reference_validation = true;
+
+    const auto result = nuka::app::ExportImportedSceneDebugView(options);
+
+    EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::CpuReference);
+    EXPECT_FALSE(result.production_physics_backend);
+    EXPECT_EQ(result.simulation_steps, options.simulation_steps);
+    EXPECT_GT(result.non_background_pixel_count, 0u);
     EXPECT_TRUE(std::filesystem::exists(output_path));
 
     std::filesystem::remove(output_path);

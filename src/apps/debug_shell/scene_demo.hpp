@@ -32,6 +32,7 @@ struct SceneDemoOptions {
     float view_scale = 180.0f;
     math::Vec3 view_center = {0.0f, 0.0f, 0.0f};
     phi::BackendSelectionPolicy physics_backend_policy = phi::BackendSelectionPolicy::PreferCuda;
+    bool allow_cpu_reference_validation = false;
     SceneDemoRenderBackend render_backend = SceneDemoRenderBackend::Vulkan;
 };
 
