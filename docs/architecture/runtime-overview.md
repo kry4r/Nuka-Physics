@@ -113,15 +113,24 @@ objects share a common `WorldTemplate`. They remain CPU-side orchestration and
 reference metadata; they are not the production execution path.
 
 `runtime::gpu::BatchedDeviceWorld` is the CUDA production container for
-multi-environment rigid integration. It uploads one shared template's body
-inverse mass and inverse inertia tables, flattens per-instance pose, velocity,
-force, and torque arrays into GPU buffers, and launches one CUDA thread per
-flattened body. `StepBatchedCudaWorld()` maps `flat_index %
+multi-environment stepping. It uploads one shared template's body inverse mass,
+inverse inertia, and shape tables, flattens per-instance pose, velocity, force,
+and torque arrays into GPU buffers, and launches one CUDA thread per flattened
+body for rigid integration. `StepBatchedCudaWorld()` maps `flat_index %
 body_count_per_instance` back to the shared template body row so each instance
-uses the same cooked physical parameters while mutating independent state. This
-is the first Isaac Lab-style parallel-environment path; contact, constraint,
-sensor, and render synchronization batching should extend this layout instead
-of falling back to CPU stepping.
+uses the same cooked physical parameters while mutating independent state.
+
+The batched CUDA contact path extends the same layout through broadphase,
+narrowphase, and contact solving. `BuildBatchedCudaBroadphase()` generates AABBs
+for `instance_count * shape_count_per_instance` shapes and pair slots only
+inside each instance, so environments never collide with one another.
+`GenerateBatchedCudaContacts()` emits contact manifolds with a local
+`instance_index`, and `SolveBatchedCudaContactConstraints()` assembles contact
+blocks using flattened body ids before solving PGS rows against the batched
+device state. This currently covers plane, box-style, and sphere contact
+scenes; batched joint/drive assembly, batched sensors, and render
+synchronization remain the next CUDA-first follow-on stages rather than CPU
+fallbacks.
 
 ## Scene Integration
 

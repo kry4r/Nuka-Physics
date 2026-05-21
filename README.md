@@ -14,7 +14,9 @@ reinforcement learning, and real-time applications.
 - Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
 - Isolated USD stage adapter with explicit `.usd`/`.usda`/`.usdc`/`.usdz` routing and an OpenUSD SDK backend boundary for binary USD/USDZ
 - CUDA batched world state for parallel environments sharing one cooked
-  `WorldTemplate`; CPU batching remains reference/orchestration metadata
+  `WorldTemplate`, including GPU-resident batched broadphase, contact
+  generation, and contact solve for plane/box/sphere contact scenes; CPU
+  batching remains reference/orchestration metadata
 - CUDA is the preferred/default production physics backend through the PHI
   (Platform Hardware Interface) backend selection layer
 - Vulkan is the required production rendering backend; the current headless PPM
@@ -60,7 +62,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -96,7 +98,7 @@ The engine is organized into layered modules:
 | **Core** | `math`, `core` | Spatial algebra, vectors, quaternions, transforms |
 | **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline, MJCF/URDF/USD importers |
 | **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies, Vulkan offscreen rendering |
-| **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, integrator, joint drives |
+| **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, batched contact solve, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
 | **Sensors** | `sensor` | CUDA IMU/state and lidar query path, plus CPU reference helpers |

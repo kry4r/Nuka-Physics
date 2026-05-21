@@ -264,6 +264,7 @@ if(CMAKE_CUDA_COMPILER)
 
     add_executable(nuka_cuda_perf_test
         perf/test_cuda_batch_timing.cpp
+        perf/test_cuda_batch_contact_timing.cpp
         perf/test_cuda_contact_timing.cpp
         perf/test_cuda_scene_demo_timing.cpp
         perf/test_cuda_sensor_timing.cpp
