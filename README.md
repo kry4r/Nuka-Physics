@@ -9,7 +9,8 @@ reinforcement learning, and real-time applications.
 - Iterative constraint solver (PGS) for contacts and joints
 - Articulated body support (revolute, prismatic, fixed joints) with PD drives
 - Collision detection: broadphase (sweep-and-prune) and narrow-phase (GJK/SAT)
-- Sensor simulation: IMU, lidar, force/torque
+- Sensor simulation: CUDA IMU/state and lidar query kernels on GPU-resident
+  scenes, with CPU sensor helpers kept as reference-only validation code
 - Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
 - Isolated USD stage adapter with explicit `.usd`/`.usda`/`.usdc`/`.usdz` routing and an OpenUSD SDK backend boundary for binary USD/USDZ
 - Batched simulation via WorldTemplate/Instance for parallel environments
@@ -58,7 +59,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaStepTiming|CudaContactTiming|CudaSolverTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -74,12 +75,16 @@ The demo imports MJCF/URDF/USD text scenes, compiles them into
 backend selection layer, and on this workstation advances the scene through the
 CUDA production path: device world upload, fixed-step integration, CUDA
 broadphase/contact generation, and CUDA joint/contact/drive constraint solving.
+Imported IMU/frame-pose sensors are sampled from that same CUDA `DeviceWorld`;
+lidar depth queries use CUDA ray kernels against cooked sphere, box-style, and
+plane geometry.
 It then synchronizes the simulated body poses back into render/debug views,
 generates physics debug overlays, renders those overlays through the Vulkan
 offscreen compute renderer, and writes a deterministic PPM image for quick
 validation or CI artifacts. The CLI prints physics backend, render backend,
-CUDA constraint row counts, joint/drive/contact block counts, and maximum
-position error so global demo runs prove more than file output.
+CUDA constraint row counts, joint/drive/contact block counts, sensor sample
+counts, and maximum position error so global demo runs prove more than file
+output.
 
 ## Architecture
 
@@ -93,7 +98,7 @@ The engine is organized into layered modules:
 | **Runtime** | `runtime`, `rigid`, `articulation` | World containers, integrator, joint drives |
 | **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
 | **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
-| **Sensors** | `sensor` | IMU, lidar, force/torque sensor simulation |
+| **Sensors** | `sensor` | CUDA IMU/state and lidar query path, plus CPU reference helpers |
 | **PHI** | `phi` | GPU abstraction layer (CUDA backend) |
 | **Apps** | `apps`, `debug_draw` | Debug draw command buffers and compiled-scene visualization overlays |
 

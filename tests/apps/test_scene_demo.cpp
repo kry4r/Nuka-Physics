@@ -186,6 +186,16 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     EXPECT_EQ(result.cuda_solver_velocity_iterations, 10u);
     EXPECT_EQ(result.cuda_solver_position_iterations, 4u);
     EXPECT_GE(result.cuda_max_position_error, 0.0f);
+    EXPECT_EQ(result.cuda_imu_sample_count, 1u);
+    EXPECT_NEAR(result.cuda_first_imu_position.x,
+                result.body_world_poses[1].position.x,
+                1.0e-5f);
+    EXPECT_NEAR(result.cuda_first_imu_position.y,
+                result.body_world_poses[1].position.y,
+                1.0e-5f);
+    EXPECT_NEAR(result.cuda_first_imu_position.z,
+                result.body_world_poses[1].position.z,
+                1.0e-5f);
     EXPECT_GT(result.non_background_pixel_count, 0u);
     ASSERT_EQ(result.body_world_poses.size(), 2u);
     EXPECT_NE(result.body_world_poses[1].position.z, 0.5f);

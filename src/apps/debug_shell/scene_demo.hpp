@@ -63,6 +63,10 @@ struct SceneDemoResult {
     uint32_t cuda_solver_velocity_iterations = 0;
     uint32_t cuda_solver_position_iterations = 0;
     float cuda_max_position_error = 0.0f;
+    uint32_t cuda_imu_sample_count = 0;
+    math::Vec3 cuda_first_imu_position = math::Vec3::Zero();
+    math::Vec3 cuda_first_imu_angular_velocity = math::Vec3::Zero();
+    math::Vec3 cuda_first_imu_linear_acceleration = math::Vec3::Zero();
     std::vector<math::Transform> body_world_poses;
 };
 

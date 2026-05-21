@@ -19,6 +19,7 @@
 #include "constraint/gpu/contact_generation.cuh"
 #include "runtime/gpu/cuda_world_stepper.hpp"
 #include "runtime/gpu/device_world.hpp"
+#include "sensor/gpu/cuda_sensors.cuh"
 #include "solver/gpu/cuda_constraint_solver.cuh"
 #endif
 
@@ -245,6 +246,31 @@ void StepCompiledSceneCuda(scene::CompiledScene& compiled,
         result.cuda_solver_velocity_iterations = solver_report.velocity_iterations;
         result.cuda_solver_position_iterations = solver_report.position_iterations;
         result.cuda_max_position_error = solver_report.max_position_error;
+    }
+
+    std::vector<scene::BodyId> imu_body_ids;
+    const auto& sensor_table = compiled.physics.sensor_table;
+    imu_body_ids.reserve(sensor_table.types.size());
+    for (uint32_t sensor_index = 0;
+         sensor_index < static_cast<uint32_t>(sensor_table.types.size());
+         ++sensor_index) {
+        const auto type = sensor_table.types[sensor_index];
+        const scene::BodyId body_id = sensor_table.attached_bodies[sensor_index];
+        if ((type == scene::SensorType::Imu || type == scene::SensorType::FramePose) &&
+            body_id != scene::kInvalidBody) {
+            imu_body_ids.push_back(body_id);
+        }
+    }
+    if (!imu_body_ids.empty()) {
+        const auto imu_result = sensor::gpu::QueryCudaImuSensor(device_world, imu_body_ids);
+        const auto imu_samples = imu_result.DownloadSamples();
+        result.cuda_imu_sample_count = imu_result.SampleCount();
+        if (!imu_samples.empty()) {
+            result.cuda_first_imu_position = imu_samples.front().position;
+            result.cuda_first_imu_angular_velocity = imu_samples.front().angular_velocity;
+            result.cuda_first_imu_linear_acceleration =
+                imu_samples.front().linear_acceleration;
+        }
     }
 
     const auto state = device_world.DownloadState();

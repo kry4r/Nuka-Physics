@@ -246,9 +246,25 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
+    add_executable(nuka_cuda_sensor_test
+        sensor/test_cuda_sensors.cpp
+    )
+
+    target_link_libraries(nuka_cuda_sensor_test
+        PRIVATE
+            nuka_sensor_gpu
+            nuka_sensor
+            nuka_runtime_gpu
+            nuka_runtime
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_cuda_sensor_test)
+
     add_executable(nuka_cuda_perf_test
         perf/test_cuda_contact_timing.cpp
         perf/test_cuda_scene_demo_timing.cpp
+        perf/test_cuda_sensor_timing.cpp
         perf/test_cuda_solver_timing.cpp
         perf/test_cuda_step_timing.cpp
     )
@@ -256,6 +272,8 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_cuda_perf_test
         PRIVATE
             nuka_debug_draw
+            nuka_sensor_gpu
+            nuka_sensor
             nuka_runtime_gpu
             nuka_runtime
             GTest::gtest_main

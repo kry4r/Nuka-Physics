@@ -338,8 +338,24 @@ if(CMAKE_CUDA_COMPILER)
             nuka_phi
     )
 
+    add_library(nuka_sensor_gpu STATIC
+        sensor/gpu/cuda_sensors.cu
+    )
+
+    target_include_directories(nuka_sensor_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_sensor_gpu
+        PUBLIC
+            nuka_runtime_gpu
+            nuka_sensor
+    )
+
     target_link_libraries(nuka_debug_draw
         PUBLIC
+            nuka_sensor_gpu
             nuka_runtime_gpu
     )
 

@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
                   << " cuda_drive_blocks=" << result.cuda_drive_constraint_count
                   << " cuda_contact_blocks=" << result.cuda_contact_constraint_count
                   << " cuda_max_error=" << result.cuda_max_position_error
+                  << " cuda_imu_samples=" << result.cuda_imu_sample_count
                   << " debug_commands=" << result.debug_command_count
                   << " lit_pixels=" << result.non_background_pixel_count << '\n';
     } catch (const std::exception& ex) {

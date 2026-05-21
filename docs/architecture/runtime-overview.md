@@ -53,14 +53,13 @@ same reporting contract while moving broadphase, narrowphase, constraint
 assembly, solver iterations, and integration into CUDA-resident
 buffers/kernels.
 
-`runtime::gpu::StepCudaWorld()` is the first CUDA production stepper stage. It
-operates on `DeviceWorld` state buffers and launches a fixed-step rigid
-integration kernel for gravity, external forces/torques, linear/angular
-velocity updates, pose integration, and accumulator clearing. Current
-differential tests compare the CUDA result against the CPU reference for
-free-fall and forced-body scenes with contacts disabled. The next stepper stages
-must keep that CPU path as validation-only while extending CUDA execution to
-broadphase, contact generation, constraint assembly, and PGS solving.
+`runtime::gpu::StepCudaWorld()` operates on `DeviceWorld` state buffers and
+launches a fixed-step rigid integration kernel for gravity, external
+forces/torques, linear/angular velocity updates, pose integration, and
+accumulator clearing. Differential tests compare the CUDA result against the CPU
+reference for free-fall and forced-body scenes with contacts disabled. The CPU
+path remains validation-only while CUDA carries the production broadphase,
+contact generation, constraint assembly, PGS solving, and sensor query stages.
 
 `collision::gpu::BuildCudaBroadphase()` and
 `constraint::gpu::GenerateCudaContacts()` are the current CUDA collision stage.
@@ -87,6 +86,15 @@ are solved the same way as the CPU reference path: invalid bodies contribute
 zero inverse mass and inertia but the valid body still receives velocity and
 position corrections. This is required for MJCF-style world-hinged bodies and
 for imported actuators attached to those joints.
+
+`sensor::gpu::QueryCudaImuSensor()` and `sensor::gpu::QueryCudaLidarSensor()`
+are the CUDA production sensor entry points. They consume the same
+CUDA-resident `DeviceWorld` that simulation updates, so IMU/state samples read
+pose, angular velocity, force, and inverse mass from device buffers and lidar
+casts deterministic fan rays against cooked sphere, box-style, and plane
+geometry without invoking the CPU sensor helpers. Result downloads are compact
+validation/report boundaries for tests, demos, and tooling; CPU `sensor`
+queries remain reference-only helpers.
 
 Cooked joints preserve parent and child frames from `SceneIR`, so runtime joint
 projection uses authoring anchors instead of assuming every joint is body-center
@@ -135,9 +143,10 @@ physics state.
 `nuka_scene_demo` is the current runnable imported-scene debug render path. It
 imports a scene, builds the compiled runtime views, resolves the physics backend
 through PHI, and on this workstation runs fixed-step CUDA integration,
-broadphase/contact generation, and constraint solving before downloading the
-final state for `SceneGraph` / `RenderScene` synchronization. The default render
-path converts the resulting `DebugDrawList` into render-layer Vulkan debug
+broadphase/contact generation, constraint solving, and imported IMU/frame-pose
+sensor sampling before downloading the final state for `SceneGraph` /
+`RenderScene` synchronization. The default render path converts the resulting
+`DebugDrawList` into render-layer Vulkan debug
 commands, runs `render::RenderDebugDrawListVulkan()` into an offscreen storage
 image, reads back the RGBA8 pixels, and writes the PPM artifact from the Vulkan
 image. The CPU headless rasterizer remains an explicit reference path. Explicit
@@ -196,7 +205,8 @@ Each simulation step follows this pipeline:
    for eccentric anchors. Static bodies keep zero inverse mass/inertia and do
    not move.
 9. **Velocity integration** -- advance positions and orientations.
-10. **Sensor update** -- read joint states, compute IMU/lidar readings.
+10. **Sensor update** -- sample IMU/state and lidar through CUDA sensor kernels
+    from GPU-resident runtime buffers; CPU sensors are reference-only.
 
 ## PHI Layer
 
@@ -229,6 +239,14 @@ CUDA constraint assembly. Tests use compact summary downloads for upload
 integrity and full state/contact/constraint readbacks for CPU-reference
 differential validation. Full readback is a validation and tooling boundary;
 production stepping keeps state on the GPU.
+
+CUDA sensors reuse the mutable `DeviceWorld` state instead of introducing a
+separate CPU-side sensor graph in the hot path. Scene import and cooking still
+own sensor descriptors and body attachments; runtime code translates those
+descriptors into device queries after the CUDA step/solve sequence. Lidar is
+currently a deterministic direct ray loop over cooked shape tables, with the API
+kept narrow so a later BVH or hardware ray tracing acceleration path can replace
+the implementation without changing demos or tests.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production
