@@ -183,6 +183,16 @@ image, reads back the RGBA8 pixels, and writes the PPM artifact from the Vulkan
 image. The CPU headless rasterizer remains an explicit reference path. Explicit
 CPU physics selection remains a reference-validation path only.
 
+`ExportBatchedImportedSceneDebugView()` extends that global workflow to multiple
+environments. It imports/cooks one scene, creates offset `WorldInstance` copies,
+uploads them into CUDA `BatchedDeviceWorld`, runs fixed-step batched
+contacts/joints/drives and batched IMU/frame-pose observations on CUDA, then
+downloads the final flattened state only as the debug/render synchronization
+boundary. Each environment is converted back through `SceneGraph` /
+`RenderScene` debug overlays and the combined debug command stream is rendered
+through Vulkan. This keeps the API/backend selection layer visible while making
+CUDA the required production physics path for the batched demo.
+
 ## Domain Modules
 
 ### Rigid Body (`runtime/rigid/`)
@@ -300,6 +310,11 @@ production path keeps batched state resident for the next CUDA stage.
 parallel observation path expected by robotics/RL workloads. The APIs keep the
 backend selection layer intact while making CUDA the default production path on
 this workstation.
+
+The current batched render handoff downloads final pose/observation summaries
+for Vulkan debug visualization and CI artifacts. The remaining renderer-facing
+work is richer Vulkan instancing/material/shadow support and direct interactive
+GPU handoff paths that avoid final image/readback-oriented synchronization.
 
 The build exposes `NK_CUDA_ARCHITECTURES`, defaulting to `native`, and forces
 `CMAKE_CUDA_ARCHITECTURES` from that cache variable. This keeps production

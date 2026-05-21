@@ -24,6 +24,14 @@ PPM artifact for CI and inspection.
    image.
 8. Read back the Vulkan image and write a binary PPM artifact.
 
+The same executable also has a batched mode when the optional final
+`instance_count` CLI argument is greater than one. In that mode it imports and
+cooks one scene, creates offset copies of the runtime instance, uploads them
+into CUDA `BatchedDeviceWorld`, runs batched contacts/joints/drives and batched
+IMU/frame-pose observations on CUDA, then renders the combined multi-environment
+debug view through Vulkan. CPU work in this path is limited to import/cooking,
+host orchestration, and the final debug/render synchronization boundary.
+
 The Vulkan offscreen renderer uses an X/Y physics-plane projection for debug
 output and currently supports line, sphere, capsule, box, AABB, and contact
 point debug primitives. `SceneDemoOptions` defaults to auto-fitting the view to
@@ -44,6 +52,7 @@ added.
 cmake --build build --config Release --target nuka_scene_demo
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_batched_debug.ppm 640 360 60 0.0166667 8
 ```
 
 The output image shows collision bodies, AABBs, joint axes, and centers of mass
@@ -59,3 +68,7 @@ output. `tests/perf/test_cuda_scene_demo_timing.cpp` and
 `examples/scenes/complete_robot.xml` and `examples/scenes/complete_robot.usda`
 through import, cook, CUDA simulation, render/debug synchronization, Vulkan
 artifact output, and one-second timing budgets.
+`tests/perf/test_batched_vulkan_scene_demo_timing.cpp` adds the same global
+workflow for eight CUDA batched environments rendered through Vulkan. Remaining
+renderer work is richer Vulkan instancing/material/shadow support and replacing
+PPM/readback-oriented synchronization with direct interactive GPU presentation.

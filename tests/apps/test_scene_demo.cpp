@@ -204,6 +204,51 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     std::filesystem::remove(output_path);
 }
 
+TEST(SceneDemo, ExportsBatchedCudaVulkanSceneDebugViewToPpm) {
+    const auto output_path = TempPpmPath("nuka_scene_demo_batched_cuda_vulkan.ppm");
+    std::filesystem::remove(output_path);
+
+    nuka::app::BatchedSceneDemoOptions options;
+    options.input_path = "examples/scenes/complete_robot.usda";
+    options.output_path = output_path.string();
+    options.width = 220;
+    options.height = 140;
+    options.instance_count = 4u;
+    options.instance_spacing = {2.0f, 0.0f, 0.0f};
+    options.simulation_steps = 8u;
+    options.dt = 1.0f / 120.0f;
+
+    const auto result = nuka::app::ExportBatchedImportedSceneDebugView(options);
+
+    EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
+    EXPECT_TRUE(result.production_physics_backend);
+    EXPECT_EQ(result.render_backend, nuka::app::SceneDemoRenderBackend::Vulkan);
+    EXPECT_TRUE(result.production_render_backend);
+    EXPECT_EQ(result.vulkan_render_width, options.width);
+    EXPECT_EQ(result.vulkan_render_height, options.height);
+    EXPECT_EQ(result.instance_count, options.instance_count);
+    EXPECT_EQ(result.body_count_per_instance, 2u);
+    EXPECT_EQ(result.total_body_count, 8u);
+    EXPECT_EQ(result.simulation_steps, options.simulation_steps);
+    EXPECT_EQ(result.cuda_batched_simulated_step_count, options.simulation_steps);
+    EXPECT_GE(result.cuda_batched_joint_constraint_count, options.instance_count);
+    EXPECT_GE(result.cuda_batched_drive_constraint_count, options.instance_count);
+    EXPECT_GE(result.cuda_batched_constraint_row_count, options.instance_count * 6u);
+    EXPECT_EQ(result.cuda_batched_imu_sample_count, options.instance_count);
+    EXPECT_GT(result.debug_command_count, 0u);
+    EXPECT_GT(result.non_background_pixel_count, 0u);
+    EXPECT_TRUE(std::filesystem::exists(output_path));
+    ASSERT_EQ(result.body_world_poses_by_instance.size(), options.instance_count);
+    ASSERT_EQ(result.body_world_poses_by_instance[0].size(), 2u);
+    ASSERT_EQ(result.body_world_poses_by_instance[1].size(), 2u);
+    EXPECT_NE(result.body_world_poses_by_instance[0][1].position.z, 0.5f);
+    EXPECT_NEAR(result.body_world_poses_by_instance[1][0].position.x,
+                result.body_world_poses_by_instance[0][0].position.x + 2.0f,
+                1.0e-5f);
+
+    std::filesystem::remove(output_path);
+}
+
 TEST(SceneDemo, RenderedImageChangesWhenSimulationChangesRuntimePose) {
     const auto initial_path = TempPpmPath("nuka_scene_demo_initial.ppm");
     const auto simulated_path = TempPpmPath("nuka_scene_demo_simulated_pixels.ppm");

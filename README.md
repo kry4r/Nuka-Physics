@@ -63,7 +63,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 
 # CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming"
+ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming|BatchedVulkanSceneDemoTiming"
 ```
 
 ### Imported Scene Debug Render Demo
@@ -72,6 +72,7 @@ ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaD
 cmake --build build --config Release --target nuka_scene_demo
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_batched_debug.ppm 640 360 60 0.0166667 8
 ```
 
 The demo imports MJCF/URDF/USD text scenes, compiles them into
@@ -89,6 +90,12 @@ validation or CI artifacts. The CLI prints physics backend, render backend,
 CUDA constraint row counts, joint/drive/contact block counts, sensor sample
 counts, and maximum position error so global demo runs prove more than file
 output.
+
+When the optional final `instance_count` argument is greater than one, the CLI
+runs the batched imported-scene workflow: one cooked template is reused across
+multiple CUDA `BatchedDeviceWorld` instances, fixed-step contacts/joints/drives
+and batched IMU observations run on CUDA, and the final multi-environment debug
+view is rendered through Vulkan into a single PPM artifact.
 
 ## Architecture
 
