@@ -20,6 +20,11 @@ enum class SceneDemoRenderBackend {
     HeadlessReference
 };
 
+enum class SceneDemoOutputMode {
+    DebugOverlay,
+    RenderSceneMaterial
+};
+
 struct SceneDemoOptions {
     std::string input_path;
     std::string output_path = "nuka_scene_demo.ppm";
@@ -34,6 +39,7 @@ struct SceneDemoOptions {
     phi::BackendSelectionPolicy physics_backend_policy = phi::BackendSelectionPolicy::PreferCuda;
     bool allow_cpu_reference_validation = false;
     SceneDemoRenderBackend render_backend = SceneDemoRenderBackend::Vulkan;
+    SceneDemoOutputMode output_mode = SceneDemoOutputMode::DebugOverlay;
 };
 
 struct SceneDemoResult {
@@ -42,12 +48,14 @@ struct SceneDemoResult {
     uint32_t camera_count = 0;
     uint32_t light_count = 0;
     uint32_t debug_command_count = 0;
+    uint32_t render_scene_command_count = 0;
     size_t non_background_pixel_count = 0;
     uint32_t simulation_steps = 0;
     float simulated_time_seconds = 0.0f;
     phi::PhysicsBackend physics_backend = phi::PhysicsBackend::CpuReference;
     bool production_physics_backend = false;
     SceneDemoRenderBackend render_backend = SceneDemoRenderBackend::HeadlessReference;
+    SceneDemoOutputMode output_mode = SceneDemoOutputMode::DebugOverlay;
     bool production_render_backend = false;
     uint32_t vulkan_render_width = 0;
     uint32_t vulkan_render_height = 0;

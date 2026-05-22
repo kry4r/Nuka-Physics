@@ -183,14 +183,16 @@ imports a scene, builds the compiled runtime views, resolves the physics backend
 through PHI, and on this workstation runs fixed-step CUDA integration,
 broadphase/contact generation, constraint solving, and imported IMU/frame-pose
 sensor sampling before downloading the final state for `SceneGraph` /
-`RenderScene` synchronization. The default render path converts the resulting
-`DebugDrawList` into render-layer Vulkan debug
-commands, runs `render::RenderDebugDrawListVulkan()` into an offscreen storage
-image, reads back the RGBA8 pixels, and writes the PPM artifact from the Vulkan
-image. The CPU headless rasterizer remains an explicit reference path. Explicit
-CPU physics selection remains a reference-validation path only and must opt in
-through `allow_cpu_reference_validation`; default production runs reject CPU
-physics instead of silently falling back.
+`RenderScene` synchronization. The default `debug` render output converts the
+resulting `DebugDrawList` into render-layer Vulkan debug commands, runs
+`render::RenderDebugDrawListVulkan()` into an offscreen storage image, reads
+back the RGBA8 pixels, and writes the PPM artifact from the Vulkan image. The
+explicit `renderscene` output mode instead sends the synchronized material
+`RenderScene` directly through `render::RenderSceneVulkan()` after the same CUDA
+simulation step. The CPU headless rasterizer remains an explicit reference path.
+Explicit CPU physics selection remains a reference-validation path only and must
+opt in through `allow_cpu_reference_validation`; default production runs reject
+CPU physics instead of silently falling back.
 
 `ExportBatchedImportedSceneDebugView()` extends that global workflow to multiple
 environments. It imports/cooks one scene, creates offset `WorldInstance` copies,

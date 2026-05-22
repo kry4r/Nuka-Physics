@@ -4,36 +4,90 @@
 
 #include "apps/debug_shell/scene_demo.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+
+namespace {
+
+std::string Lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+bool IsOutputModeArgument(const std::string& value) {
+    const std::string mode = Lowercase(value);
+    return mode == "debug" || mode == "renderscene";
+}
+
+nuka::app::SceneDemoOutputMode ParseOutputMode(const std::string& value) {
+    const std::string mode = Lowercase(value);
+    if (mode == "debug") {
+        return nuka::app::SceneDemoOutputMode::DebugOverlay;
+    }
+    if (mode == "renderscene") {
+        return nuka::app::SceneDemoOutputMode::RenderSceneMaterial;
+    }
+    throw std::invalid_argument("output mode must be 'debug' or 'renderscene'");
+}
+
+const char* OutputModeName(nuka::app::SceneDemoOutputMode mode) {
+    switch (mode) {
+    case nuka::app::SceneDemoOutputMode::DebugOverlay:
+        return "debug";
+    case nuka::app::SceneDemoOutputMode::RenderSceneMaterial:
+        return "renderscene";
+    }
+    return "debug";
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: nuka_scene_demo <scene.xml|scene.usda|scene.usd|scene.urdf> <output.ppm> [width height] [simulation_steps dt] [instance_count]\n";
+        std::cerr << "Usage: nuka_scene_demo <scene.xml|scene.usda|scene.usd|scene.urdf> <output.ppm> [width height] [simulation_steps dt] [instance_count] [debug|renderscene]\n";
         return 2;
     }
 
-    nuka::app::SceneDemoOptions options;
-    options.input_path = argv[1];
-    options.output_path = argv[2];
-    if (argc >= 5) {
-        options.width = static_cast<uint32_t>(std::stoul(argv[3]));
-        options.height = static_cast<uint32_t>(std::stoul(argv[4]));
-    }
-    if (argc >= 6) {
-        options.simulation_steps = static_cast<uint32_t>(std::stoul(argv[5]));
-    }
-    if (argc >= 7) {
-        options.dt = std::stof(argv[6]);
-    }
-    uint32_t instance_count = 1u;
-    if (argc >= 8) {
-        instance_count = static_cast<uint32_t>(std::stoul(argv[7]));
-    }
-
     try {
+        nuka::app::SceneDemoOptions options;
+        options.input_path = argv[1];
+        options.output_path = argv[2];
+        if (argc >= 5) {
+            options.width = static_cast<uint32_t>(std::stoul(argv[3]));
+            options.height = static_cast<uint32_t>(std::stoul(argv[4]));
+        }
+        if (argc >= 6) {
+            options.simulation_steps = static_cast<uint32_t>(std::stoul(argv[5]));
+        }
+        if (argc >= 7) {
+            options.dt = std::stof(argv[6]);
+        }
+
+        uint32_t instance_count = 1u;
+        if (argc >= 8) {
+            const std::string arg7 = argv[7];
+            if (IsOutputModeArgument(arg7)) {
+                options.output_mode = ParseOutputMode(arg7);
+            } else {
+                instance_count = static_cast<uint32_t>(std::stoul(arg7));
+            }
+        }
+        if (argc >= 9) {
+            options.output_mode = ParseOutputMode(argv[8]);
+        }
+
         if (instance_count > 1u) {
+            if (options.output_mode == nuka::app::SceneDemoOutputMode::RenderSceneMaterial) {
+                throw std::invalid_argument(
+                    "renderscene output mode is currently supported only for single-scene demo runs");
+            }
+
             nuka::app::BatchedSceneDemoOptions batched_options;
             batched_options.input_path = options.input_path;
             batched_options.output_path = options.output_path;
@@ -57,6 +111,7 @@ int main(int argc, char** argv) {
                       << " total_bodies=" << result.total_body_count
                       << " sim_steps=" << result.simulation_steps
                       << " sim_time=" << result.simulated_time_seconds
+                      << " output_mode=debug"
                       << " backend=" << (result.physics_backend == nuka::phi::PhysicsBackend::Cuda
                           ? "cuda"
                           : "cpu-reference")
@@ -84,6 +139,7 @@ int main(int argc, char** argv) {
                   << " lights=" << result.light_count
                   << " sim_steps=" << result.simulation_steps
                   << " sim_time=" << result.simulated_time_seconds
+                  << " output_mode=" << OutputModeName(result.output_mode)
                   << " backend=" << (result.physics_backend == nuka::phi::PhysicsBackend::Cuda
                       ? "cuda"
                       : "cpu-reference")
@@ -99,6 +155,7 @@ int main(int argc, char** argv) {
                   << " cuda_max_error=" << result.cuda_max_position_error
                   << " cuda_imu_samples=" << result.cuda_imu_sample_count
                   << " debug_commands=" << result.debug_command_count
+                  << " renderscene_commands=" << result.render_scene_command_count
                   << " lit_pixels=" << result.non_background_pixel_count << '\n';
     } catch (const std::exception& ex) {
         std::cerr << "nuka_scene_demo: " << ex.what() << '\n';

@@ -151,7 +151,6 @@ gtest_discover_tests(nuka_sensor_test)
 # --- Debug draw tests ------------------------------------------------------
 add_executable(nuka_debug_draw_test
     apps/test_debug_draw_list.cpp
-    apps/test_scene_demo.cpp
 )
 
 target_link_libraries(nuka_debug_draw_test
@@ -164,6 +163,21 @@ target_link_libraries(nuka_debug_draw_test
 )
 
 gtest_discover_tests(nuka_debug_draw_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(nuka_scene_demo_test
+    apps/test_scene_demo.cpp
+)
+
+target_link_libraries(nuka_scene_demo_test
+    PRIVATE
+        nuka_debug_draw
+        nuka_scene_pipeline
+        nuka_import
+        nuka_constraint
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_scene_demo_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # --- Batch context tests ---------------------------------------------------
 add_executable(nuka_batch_test

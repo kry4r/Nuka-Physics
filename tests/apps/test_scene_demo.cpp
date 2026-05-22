@@ -205,6 +205,34 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     std::filesystem::remove(output_path);
 }
 
+TEST(SceneDemo, ExportsUsdSceneRenderSceneVulkanMaterialViewToPpm) {
+    const auto output_path = TempPpmPath("nuka_scene_demo_renderscene_material.ppm");
+    std::filesystem::remove(output_path);
+
+    nuka::app::SceneDemoOptions options;
+    options.input_path = "examples/scenes/complete_robot.usda";
+    options.output_path = output_path.string();
+    options.width = 160;
+    options.height = 120;
+    options.simulation_steps = 8u;
+    options.dt = 1.0f / 120.0f;
+    options.output_mode = nuka::app::SceneDemoOutputMode::RenderSceneMaterial;
+
+    const auto result = nuka::app::ExportImportedSceneDebugView(options);
+
+    EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
+    EXPECT_TRUE(result.production_physics_backend);
+    EXPECT_EQ(result.render_backend, nuka::app::SceneDemoRenderBackend::Vulkan);
+    EXPECT_TRUE(result.production_render_backend);
+    EXPECT_EQ(result.output_mode, nuka::app::SceneDemoOutputMode::RenderSceneMaterial);
+    EXPECT_EQ(result.render_scene_command_count, result.mesh_instance_count);
+    EXPECT_EQ(result.debug_command_count, 0u);
+    EXPECT_GT(result.non_background_pixel_count, 0u);
+    EXPECT_TRUE(std::filesystem::exists(output_path));
+
+    std::filesystem::remove(output_path);
+}
+
 TEST(SceneDemo, ForceCpuReferenceRequiresExplicitReferenceValidation) {
     const auto output_path = TempPpmPath("nuka_scene_demo_cpu_reference_rejected.ppm");
     std::filesystem::remove(output_path);

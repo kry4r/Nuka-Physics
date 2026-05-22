@@ -19,10 +19,12 @@ PPM artifact for CI and inspection.
    contact/joint/drive PGS solving.
 5. Synchronize simulated body poses into `SceneGraph` and `RenderScene` with
    `scene::ApplyRuntimeStateToCompiledScene()`.
-6. Generate debug overlays with `app::BuildDebugVisualization()`.
-7. Convert the `DebugDrawList` to render-layer debug commands and rasterize it
-   with `render::RenderDebugDrawListVulkan()` into an offscreen Vulkan storage
-   image.
+6. Generate debug overlays with `app::BuildDebugVisualization()` for the default
+   `debug` output mode, or keep the synchronized `RenderScene` mesh/material
+   view for the explicit `renderscene` output mode.
+7. Rasterize either the `DebugDrawList` with `render::RenderDebugDrawListVulkan()`
+   or the material mesh view with `render::RenderSceneVulkan()` into an offscreen
+   Vulkan storage image.
 8. Read back the Vulkan image and write a binary PPM artifact.
 
 The same executable also has a batched mode when the optional final
@@ -58,21 +60,25 @@ cmake --build build --config Release --target nuka_scene_demo
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_batched_debug.ppm 640 360 60 0.0166667 8
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_material.ppm 640 360 60 0.0166667 renderscene
 ```
 
-The output image shows collision bodies, AABBs, joint axes, and centers of mass
-after fixed-step CUDA simulation and Vulkan offscreen rendering on this
-workstation. The CLI prints the physics backend, render backend, CUDA
-constraint row counts, joint/drive/contact block counts, and maximum position
-error. The default CLI and API settings run 60 steps at `dt=1/60`, and the
-optional final arguments override step count and time step. The tests under
+The default `debug` output image shows collision bodies, AABBs, joint axes, and
+centers of mass after fixed-step CUDA simulation and Vulkan offscreen rendering
+on this workstation. The explicit `renderscene` output image renders the
+synchronized material mesh instances after the same CUDA simulation step. The
+CLI prints the physics backend, render backend, output mode, CUDA constraint row
+counts, joint/drive/contact block counts, and maximum position error. The
+default CLI and API settings run 60 steps at `dt=1/60`, and the optional final
+arguments override step count, time step, instance count, and output mode. The
+tests under
 `tests/apps/test_scene_demo.cpp` verify default CUDA backend selection, Vulkan
 rendering selection, simulated pose handoff, and simulation-sensitive raster
 output. `tests/perf/test_cuda_scene_demo_timing.cpp` and
 `tests/perf/test_vulkan_scene_demo_timing.cpp` run both
 `examples/scenes/complete_robot.xml` and `examples/scenes/complete_robot.usda`
 through import, cook, CUDA simulation, render/debug synchronization, Vulkan
-artifact output, and one-second timing budgets.
+artifact output, material `RenderScene` output, and one-second timing budgets.
 `tests/perf/test_batched_vulkan_scene_demo_timing.cpp` adds the same global
 workflow for eight CUDA batched environments rendered through Vulkan.
 `tests/perf/test_vulkan_renderscene_timing.cpp` separately covers the material

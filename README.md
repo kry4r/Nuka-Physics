@@ -77,6 +77,7 @@ cmake --build build --config Release --target nuka_scene_demo
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
 .\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_batched_debug.ppm 640 360 60 0.0166667 8
+.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_material.ppm 640 360 60 0.0166667 renderscene
 ```
 
 The demo imports MJCF/URDF/USD text scenes, compiles them into
@@ -93,7 +94,9 @@ offscreen compute renderer, and writes a deterministic PPM image for quick
 validation or CI artifacts. The CLI prints physics backend, render backend,
 CUDA constraint row counts, joint/drive/contact block counts, sensor sample
 counts, and maximum position error so global demo runs prove more than file
-output.
+output. The optional `renderscene` output mode keeps the same import and CUDA
+simulation path but renders the synchronized material `RenderScene` mesh
+instances through Vulkan instead of physics debug overlays.
 
 CPU simulation is not a production fallback. To run the imported-scene demo
 against the CPU reference stepper for differential validation, callers must set

@@ -442,14 +442,17 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     input.scene_graph = &compiled.graph;
     input.physics_world = &compiled.physics;
 
-    const DebugDrawList commands = BuildDebugVisualization(input);
+    DebugDrawList commands;
+    if (options.output_mode == SceneDemoOutputMode::DebugOverlay) {
+        commands = BuildDebugVisualization(input);
+    }
 
     DebugRasterOptions raster_options;
     raster_options.width = options.width;
     raster_options.height = options.height;
     raster_options.view_scale = options.view_scale;
     raster_options.view_center = options.view_center;
-    if (options.auto_fit_view) {
+    if (options.auto_fit_view && options.output_mode == SceneDemoOutputMode::DebugOverlay) {
         FitRasterViewXY(commands, raster_options);
     }
 
@@ -466,9 +469,10 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
         vulkan_options.view_scale = raster_options.view_scale;
         vulkan_options.view_center = raster_options.view_center;
         vulkan_options.background = ToVulkanColor(raster_options.background);
-        const auto vulkan_result =
-            render::RenderDebugDrawListVulkan(ToVulkanDebugCommands(commands),
-                                              vulkan_options);
+        const auto vulkan_result = options.output_mode == SceneDemoOutputMode::RenderSceneMaterial
+            ? render::RenderSceneVulkan(compiled.render, vulkan_options)
+            : render::RenderDebugDrawListVulkan(ToVulkanDebugCommands(commands),
+                                                vulkan_options);
         if (!WriteVulkanPpm(options.output_path,
                             vulkan_result.width,
                             vulkan_result.height,
@@ -481,8 +485,15 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
         result.vulkan_render_height = vulkan_result.height;
         result.vulkan_physical_device_count = vulkan_result.physical_device_count;
         result.vulkan_selected_device_name = vulkan_result.selected_device_name;
+        if (options.output_mode == SceneDemoOutputMode::RenderSceneMaterial) {
+            result.render_scene_command_count = vulkan_result.command_count;
+        }
         non_background_pixel_count = vulkan_result.non_background_pixel_count;
     } else {
+        if (options.output_mode == SceneDemoOutputMode::RenderSceneMaterial) {
+            throw std::runtime_error(
+                "RenderScene material output requires the Vulkan renderer");
+        }
         const DebugRasterImage image = RasterizeDebugDrawList(commands, raster_options);
         if (!image.WritePpm(options.output_path)) {
             throw std::runtime_error("Failed to write scene demo image: " + options.output_path);
@@ -497,6 +508,7 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     result.camera_count = compiled.render.camera_count;
     result.light_count = compiled.render.light_count;
     result.debug_command_count = static_cast<uint32_t>(commands.CommandCount());
+    result.output_mode = options.output_mode;
     result.non_background_pixel_count = non_background_pixel_count;
     result.simulation_steps = options.simulation_steps;
     result.simulated_time_seconds = options.dt * static_cast<float>(options.simulation_steps);
