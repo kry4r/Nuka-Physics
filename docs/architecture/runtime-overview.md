@@ -150,6 +150,31 @@ boundaries; production observation flow is CUDA-resident. GPU-to-Vulkan batched
 render synchronization remains the next CUDA-first follow-on stage rather than
 a CPU simulation fallback.
 
+### CUDA Particle / Deformable Foundation
+
+`runtime::gpu::CudaParticleWorld` is the CUDA-resident foundation for the
+soft-body, deformable, cloth, and particle-fluid branch of the physics engine.
+It uploads particle positions, velocities, inverse masses, radii, and phase ids
+as structure-of-arrays PHI device buffers. `StepCudaParticleWorld()` keeps the
+hot path on CUDA: particles integrate under gravity, resolve analytic rigid
+plane and sphere boundary contacts, and accumulate diagnostics without invoking
+the CPU rigid stepper.
+
+This module deliberately starts at the data-residency and coupling boundary the
+full solver needs. The report download is a compact validation boundary with
+particle count, contact count, maximum pre-solve penetration, residual
+penetration after projection, max speed, kinetic energy, simulated step count,
+and kernel-launch count. Tests use those invariants to prove the new branch is
+not just an upload shell. The next coupling stage should replace analytic
+sphere/plane inputs with cooked `DeviceWorld` shape tables, then accumulate
+bidirectional impulses into rigid body buffers so robot links can physically
+interact with deformables and fluids on the GPU.
+
+`nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
+constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
+plane+sphere coupling, and prints compact solver diagnostics plus a sampled
+particle state. It intentionally does not depend on Vulkan or CPU simulation.
+
 ## Scene Integration
 
 Imported and programmatic scenes flow through `scene::BuildCompiledScene()`,
@@ -299,6 +324,17 @@ descriptors into device queries after the CUDA step/solve sequence. Lidar is
 currently a deterministic direct ray loop over cooked shape tables, with the API
 kept narrow so a later BVH or hardware ray tracing acceleration path can replace
 the implementation without changing demos or tests.
+
+### CUDA ParticleWorld
+
+`runtime::gpu::CudaParticleWorld` is the first production CUDA container outside
+the maximal-coordinate rigid body path. It is designed to become the shared
+state container for cloth vertices, deformable particles, and SPH-style fluid
+particles. Phase ids are uploaded now so later kernels can distinguish material
+or solver families without changing the buffer layout. The current kernels
+resolve one-way analytic rigid coupling on CUDA and expose diagnostics for
+global solver health; CPU only uploads authored/reference state and downloads
+compact reports for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
 

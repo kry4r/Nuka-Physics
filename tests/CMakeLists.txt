@@ -250,6 +250,7 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_cuda_runtime_test
         runtime/test_cuda_batched_world.cpp
         runtime/test_cuda_device_world.cpp
+        runtime/test_cuda_particle_world.cpp
         runtime/test_cuda_world_stepper.cpp
         runtime/test_cuda_contacts.cpp
         runtime/test_cuda_solver.cpp
@@ -285,6 +286,7 @@ if(CMAKE_CUDA_COMPILER)
         perf/test_cuda_batch_joint_drive_timing.cpp
         perf/test_cuda_batch_sensor_timing.cpp
         perf/test_cuda_contact_timing.cpp
+        perf/test_cuda_particle_coupling_timing.cpp
         perf/test_cuda_scene_demo_timing.cpp
         perf/test_cuda_sensor_timing.cpp
         perf/test_cuda_solver_timing.cpp

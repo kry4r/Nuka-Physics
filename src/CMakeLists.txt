@@ -323,6 +323,7 @@ if(CMAKE_CUDA_COMPILER)
         collision/gpu/broadphase.cu
         constraint/gpu/contact_generation.cu
         runtime/gpu/batched_device_world.cu
+        runtime/gpu/cuda_particle_world.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
         solver/gpu/cuda_constraint_solver.cu
@@ -364,4 +365,20 @@ if(CMAKE_CUDA_COMPILER)
         PUBLIC
             NUKA_HAS_CUDA_RUNTIME=1
     )
+
+    add_executable(nuka_cuda_particle_demo
+        apps/cuda_particle_demo/main.cpp
+    )
+
+    target_include_directories(nuka_cuda_particle_demo
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_cuda_particle_demo
+        PRIVATE
+            nuka_runtime_gpu
+    )
+
+    nuka_set_warnings(nuka_cuda_particle_demo)
 endif()
