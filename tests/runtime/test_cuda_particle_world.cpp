@@ -810,6 +810,30 @@ TEST(CudaParticleWorld, IteratesDeviceWorldCouplingRowsWithCudaScheduler) {
     EXPECT_EQ(report.kernel_launch_count, 8u);
     EXPECT_GT(report.coupling_row_solver_impulse_count, 0u);
     EXPECT_GT(report.coupling_row_solver_impulse_magnitude, 0.0f);
+    EXPECT_EQ(report.coupling_row_solver_diagnostic_slot_count, 3u);
+    EXPECT_GT(report.coupling_row_solver_max_iteration_normal_delta_impulse, 0.0f);
+    EXPECT_GE(report.coupling_row_solver_max_iteration_tangent_delta_impulse, 0.0f);
+    EXPECT_GE(report.coupling_row_solver_max_residual, 0.0f);
+
+    const float first_delta =
+        report.coupling_row_solver_iteration_normal_delta_impulses[0] +
+        report.coupling_row_solver_iteration_tangent_delta_impulses[0];
+    const float last_delta =
+        report.coupling_row_solver_iteration_normal_delta_impulses[2] +
+        report.coupling_row_solver_iteration_tangent_delta_impulses[2];
+    EXPECT_GT(first_delta, 0.0f);
+    EXPECT_LE(last_delta, first_delta + 1.0e-5f);
+    EXPECT_LE(report.coupling_row_solver_iteration_max_residuals[2],
+              report.coupling_row_solver_iteration_max_residuals[0] + 1.0e-5f);
+    for (uint32_t iteration = 0u; iteration < 3u; ++iteration) {
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_normal_delta_impulses[iteration]));
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_tangent_delta_impulses[iteration]));
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_max_residuals[iteration]));
+        EXPECT_GE(report.coupling_row_solver_iteration_max_residuals[iteration], 0.0f);
+    }
 
     for (uint32_t slot = 0u; slot < 2u; ++slot) {
         const auto& row = rows.rows[slot];
@@ -821,6 +845,75 @@ TEST(CudaParticleWorld, IteratesDeviceWorldCouplingRowsWithCudaScheduler) {
         EXPECT_LE(std::abs(row.tangent_impulse_1),
                   options.friction * row.normal_impulse + 1.0e-5f);
     }
+}
+
+TEST(CudaParticleWorld, RecordsMultiStepRowSolverDiagnosticsBeforeFixedSlotCap) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord floor_box_body;
+    floor_box_body.name = "floor_many_scheduler_rows_link";
+    floor_box_body.mass = 4.0f;
+    floor_box_body.inertia = {1.0f, 1.0f, 1.0f};
+    floor_box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    scene.AddRigidBody(std::move(floor_box_body));
+
+    scene::CollisionShapeRecord floor_box;
+    floor_box.body_id = 0u;
+    floor_box.type = scene::ShapeType::Box;
+    floor_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(floor_box));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.0f, 0.34f, 0.0f}};
+    particles.velocities = {{0.0f, -1.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {16u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 2u;
+    options.friction = 0.25f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+    options.solve_coupling_rows_on_cuda = true;
+    options.coupling_row_solver_iterations = 3u;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+
+    EXPECT_EQ(report.coupling_row_solver_iteration_count,
+              options.step_count * options.coupling_row_solver_iterations);
+    EXPECT_EQ(report.coupling_row_solver_diagnostic_slot_count,
+              options.step_count * options.coupling_row_solver_iterations);
+    EXPECT_GT(report.coupling_row_solver_iteration_normal_delta_impulses[0], 0.0f);
+    for (uint32_t slot = 0u;
+         slot < report.coupling_row_solver_diagnostic_slot_count;
+         ++slot) {
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_normal_delta_impulses[slot]));
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_tangent_delta_impulses[slot]));
+        EXPECT_TRUE(std::isfinite(
+            report.coupling_row_solver_iteration_max_residuals[slot]));
+        EXPECT_GE(report.coupling_row_solver_iteration_max_residuals[slot], 0.0f);
+    }
+
+    auto capped_device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+    options.step_count = 3u;
+    const auto capped_report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        capped_device_particles, device_world, options);
+
+    EXPECT_GT(capped_report.coupling_row_solver_iteration_count,
+              runtime::gpu::kCudaParticleRowSolverDiagnosticSlots);
+    EXPECT_EQ(capped_report.coupling_row_solver_diagnostic_slot_count,
+              runtime::gpu::kCudaParticleRowSolverDiagnosticSlots);
 }
 
 TEST(CudaParticleWorld, SolvesDeviceWorldCouplingFrictionRowsOnCuda) {

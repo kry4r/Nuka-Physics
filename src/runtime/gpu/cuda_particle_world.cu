@@ -45,7 +45,26 @@ struct CouplingRowDiagnostics {
     float force_magnitude;
     float torque_magnitude;
     float max_normal_impulse;
+    float max_row_residual;
 };
+
+__device__ void ResetCouplingRowSolverReport(CudaParticleStepReport* report) {
+    report->coupling_row_solver_launch_count = 0u;
+    report->coupling_row_solver_iteration_count = 0u;
+    report->coupling_row_solver_impulse_count = 0u;
+    report->coupling_row_solver_impulse_magnitude = 0.0f;
+    report->coupling_row_solver_friction_impulse_count = 0u;
+    report->coupling_row_solver_friction_impulse_magnitude = 0.0f;
+    report->coupling_row_solver_diagnostic_slot_count = 0u;
+    report->coupling_row_solver_max_iteration_normal_delta_impulse = 0.0f;
+    report->coupling_row_solver_max_iteration_tangent_delta_impulse = 0.0f;
+    report->coupling_row_solver_max_residual = 0.0f;
+    for (uint32_t slot = 0u; slot < kCudaParticleRowSolverDiagnosticSlots; ++slot) {
+        report->coupling_row_solver_iteration_normal_delta_impulses[slot] = 0.0f;
+        report->coupling_row_solver_iteration_tangent_delta_impulses[slot] = 0.0f;
+        report->coupling_row_solver_iteration_max_residuals[slot] = 0.0f;
+    }
+}
 
 __device__ math::Vec3 MakeVec3(float x, float y, float z) {
     math::Vec3 result;
@@ -182,6 +201,36 @@ __device__ math::Vec3 ApplyInverseInertia(math::Vec3 angular_impulse,
     return MakeVec3(angular_impulse.x * inv_inertia.x,
                     angular_impulse.y * inv_inertia.y,
                     angular_impulse.z * inv_inertia.z);
+}
+
+__device__ float CouplingRowNormalVelocity(
+    const CudaParticleCouplingConstraintRow& row,
+    math::Vec3 particle_velocity,
+    math::Vec3 body_linear_velocity,
+    math::Vec3 body_angular_velocity) {
+    return Dot(row.particle_linear_jacobian, particle_velocity) +
+        Dot(row.body_linear_jacobian, body_linear_velocity) +
+        Dot(row.body_angular_jacobian, body_angular_velocity);
+}
+
+__device__ float CouplingRowTangentVelocity(math::Vec3 tangent,
+                                            math::Vec3 body_angular_jacobian,
+                                            math::Vec3 particle_velocity,
+                                            math::Vec3 body_linear_velocity,
+                                            math::Vec3 body_angular_velocity) {
+    return Dot(tangent, particle_velocity) +
+        Dot(Scale(tangent, -1.0f), body_linear_velocity) +
+        Dot(body_angular_jacobian, body_angular_velocity);
+}
+
+__device__ float CouplingProjectedRowResidual(float velocity_error,
+                                              float effective_mass,
+                                              float impulse,
+                                              float lower_limit,
+                                              float upper_limit) {
+    const float projected_impulse =
+        Clamp(impulse + effective_mass * velocity_error, lower_limit, upper_limit);
+    return fabsf(projected_impulse - impulse);
 }
 
 __device__ math::Vec3 ApplyCouplingVelocityImpulse(
@@ -475,18 +524,14 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
-        report->coupling_row_solver_launch_count = 0u;
-        report->coupling_row_solver_iteration_count = 0u;
-        report->coupling_row_solver_impulse_count = 0u;
-        report->coupling_row_solver_impulse_magnitude = 0.0f;
-        report->coupling_row_solver_friction_impulse_count = 0u;
-        report->coupling_row_solver_friction_impulse_magnitude = 0.0f;
+        ResetCouplingRowSolverReport(report);
     }
 }
 
 __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     uint32_t particle_count,
     const ParticleDiagnostics* diagnostics,
+    bool reset_row_solver_report,
     CudaParticleStepReport* report) {
     __shared__ uint32_t shared_contacts[256];
     __shared__ uint32_t shared_impulse_contacts[256];
@@ -613,12 +658,9 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
-        report->coupling_row_solver_launch_count = 0u;
-        report->coupling_row_solver_iteration_count = 0u;
-        report->coupling_row_solver_impulse_count = 0u;
-        report->coupling_row_solver_impulse_magnitude = 0.0f;
-        report->coupling_row_solver_friction_impulse_count = 0u;
-        report->coupling_row_solver_friction_impulse_magnitude = 0.0f;
+        if (reset_row_solver_report) {
+            ResetCouplingRowSolverReport(report);
+        }
     }
 }
 
@@ -1257,15 +1299,14 @@ __global__ void SolveParticleCouplingRowsKernel(
                 row.tangent_impulse_1 = tangent_impulse1;
             }
 
-            const float jv =
-                Dot(row.particle_linear_jacobian, particle_velocity) +
-                Dot(row.body_linear_jacobian, body_linear_velocity) +
-                Dot(row.body_angular_jacobian, body_angular_velocity);
+            const float jv = CouplingRowNormalVelocity(
+                row, particle_velocity, body_linear_velocity, body_angular_velocity);
 
             const float old_impulse = row.normal_impulse;
             const float lambda = row.effective_mass * (row.rhs - jv);
             const float new_impulse = fmaxf(old_impulse + lambda, 0.0f);
             const float delta = new_impulse - old_impulse;
+            float max_row_residual = 0.0f;
 
             row.normal_impulse = new_impulse;
 
@@ -1335,10 +1376,12 @@ __global__ void SolveParticleCouplingRowsKernel(
                     row.tangent_impulse_1 = clamped_warm_tangent_impulse1;
                 }
 
-                float tangent_jv =
-                    Dot(row.tangent0, particle_velocity) +
-                    Dot(Scale(row.tangent0, -1.0f), body_linear_velocity) +
-                    Dot(row.body_tangent_angular_jacobian0, body_angular_velocity);
+                float tangent_jv = CouplingRowTangentVelocity(
+                    row.tangent0,
+                    row.body_tangent_angular_jacobian0,
+                    particle_velocity,
+                    body_linear_velocity,
+                    body_angular_velocity);
                 float old_tangent_impulse = row.tangent_impulse_0;
                 float tangent_lambda = row.tangent_effective_mass0 * (-tangent_jv);
                 float new_tangent_impulse =
@@ -1367,11 +1410,26 @@ __global__ void SolveParticleCouplingRowsKernel(
                     friction_magnitude += fabsf(tangent_delta);
                     friction_angular_magnitude += sqrtf(LengthSq(body_angular_delta));
                 }
+                tangent_jv = CouplingRowTangentVelocity(
+                    row.tangent0,
+                    row.body_tangent_angular_jacobian0,
+                    particle_velocity,
+                    body_linear_velocity,
+                    body_angular_velocity);
+                max_row_residual = fmaxf(
+                    max_row_residual,
+                    CouplingProjectedRowResidual(-tangent_jv,
+                                                 row.tangent_effective_mass0,
+                                                 new_tangent_impulse,
+                                                 -friction_limit,
+                                                 friction_limit));
 
-                tangent_jv =
-                    Dot(row.tangent1, particle_velocity) +
-                    Dot(Scale(row.tangent1, -1.0f), body_linear_velocity) +
-                    Dot(row.body_tangent_angular_jacobian1, body_angular_velocity);
+                tangent_jv = CouplingRowTangentVelocity(
+                    row.tangent1,
+                    row.body_tangent_angular_jacobian1,
+                    particle_velocity,
+                    body_linear_velocity,
+                    body_angular_velocity);
                 old_tangent_impulse = row.tangent_impulse_1;
                 tangent_lambda = row.tangent_effective_mass1 * (-tangent_jv);
                 new_tangent_impulse =
@@ -1400,6 +1458,19 @@ __global__ void SolveParticleCouplingRowsKernel(
                     friction_magnitude += fabsf(tangent_delta);
                     friction_angular_magnitude += sqrtf(LengthSq(body_angular_delta));
                 }
+                tangent_jv = CouplingRowTangentVelocity(
+                    row.tangent1,
+                    row.body_tangent_angular_jacobian1,
+                    particle_velocity,
+                    body_linear_velocity,
+                    body_angular_velocity);
+                max_row_residual = fmaxf(
+                    max_row_residual,
+                    CouplingProjectedRowResidual(-tangent_jv,
+                                                 row.tangent_effective_mass1,
+                                                 new_tangent_impulse,
+                                                 -friction_limit,
+                                                 friction_limit));
 
                 if (friction_magnitude > 0.0f) {
                     diag.friction_impulse_count = 1u;
@@ -1452,6 +1523,16 @@ __global__ void SolveParticleCouplingRowsKernel(
             diag.torque_magnitude =
                 sqrtf(LengthSq(row.body_angular_jacobian)) * new_impulse * inv_dt;
             diag.max_normal_impulse = new_impulse;
+            const float solved_normal_velocity = CouplingRowNormalVelocity(
+                row, particle_velocity, body_linear_velocity, body_angular_velocity);
+            max_row_residual =
+                fmaxf(max_row_residual,
+                      CouplingProjectedRowResidual(row.rhs - solved_normal_velocity,
+                                                  row.effective_mass,
+                                                  new_impulse,
+                                                  0.0f,
+                                                  3.402823466e+38f));
+            diag.max_row_residual = max_row_residual;
         }
 
         diagnostics[row_index] = diag;
@@ -1463,6 +1544,7 @@ __global__ void SolveParticleCouplingRowsKernel(
 __global__ void ReduceCouplingRowDiagnosticsKernel(
     uint32_t row_count,
     const CouplingRowDiagnostics* diagnostics,
+    uint32_t iteration_index,
     CudaParticleStepReport* report) {
     __shared__ uint32_t shared_impulse_counts[256];
     __shared__ uint32_t shared_friction_impulse_counts[256];
@@ -1472,6 +1554,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
     __shared__ float shared_force_magnitudes[256];
     __shared__ float shared_torque_magnitudes[256];
     __shared__ float shared_max_normal_impulses[256];
+    __shared__ float shared_max_row_residuals[256];
 
     const uint32_t tid = threadIdx.x;
     uint32_t impulse_count = 0u;
@@ -1482,6 +1565,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
     float force_magnitude = 0.0f;
     float torque_magnitude = 0.0f;
     float max_normal_impulse = 0.0f;
+    float max_row_residual = 0.0f;
 
     for (uint32_t index = tid; index < row_count; index += blockDim.x) {
         const CouplingRowDiagnostics diag = diagnostics[index];
@@ -1493,6 +1577,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
         force_magnitude += diag.force_magnitude;
         torque_magnitude += diag.torque_magnitude;
         max_normal_impulse = fmaxf(max_normal_impulse, diag.max_normal_impulse);
+        max_row_residual = fmaxf(max_row_residual, diag.max_row_residual);
     }
 
     shared_impulse_counts[tid] = impulse_count;
@@ -1503,6 +1588,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
     shared_force_magnitudes[tid] = force_magnitude;
     shared_torque_magnitudes[tid] = torque_magnitude;
     shared_max_normal_impulses[tid] = max_normal_impulse;
+    shared_max_row_residuals[tid] = max_row_residual;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
@@ -1520,6 +1606,9 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
             shared_max_normal_impulses[tid] =
                 fmaxf(shared_max_normal_impulses[tid],
                       shared_max_normal_impulses[tid + stride]);
+            shared_max_row_residuals[tid] =
+                fmaxf(shared_max_row_residuals[tid],
+                      shared_max_row_residuals[tid + stride]);
         }
         __syncthreads();
     }
@@ -1538,6 +1627,27 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
         report->coupling_torque_magnitude += shared_torque_magnitudes[0];
         report->max_coupling_normal_impulse =
             fmaxf(report->max_coupling_normal_impulse, shared_max_normal_impulses[0]);
+        report->coupling_row_solver_max_iteration_normal_delta_impulse =
+            fmaxf(report->coupling_row_solver_max_iteration_normal_delta_impulse,
+                  shared_impulse_magnitudes[0]);
+        report->coupling_row_solver_max_iteration_tangent_delta_impulse =
+            fmaxf(report->coupling_row_solver_max_iteration_tangent_delta_impulse,
+                  shared_friction_impulse_magnitudes[0]);
+        report->coupling_row_solver_max_residual =
+            fmaxf(report->coupling_row_solver_max_residual,
+                  shared_max_row_residuals[0]);
+        if (iteration_index < kCudaParticleRowSolverDiagnosticSlots) {
+            report->coupling_row_solver_iteration_normal_delta_impulses
+                [iteration_index] = shared_impulse_magnitudes[0];
+            report->coupling_row_solver_iteration_tangent_delta_impulses
+                [iteration_index] = shared_friction_impulse_magnitudes[0];
+            report->coupling_row_solver_iteration_max_residuals[iteration_index] =
+                shared_max_row_residuals[0];
+            report->coupling_row_solver_diagnostic_slot_count =
+                report->coupling_row_solver_diagnostic_slot_count > iteration_index
+                    ? report->coupling_row_solver_diagnostic_slot_count
+                    : iteration_index + 1u;
+        }
     }
 }
 
@@ -1856,6 +1966,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         ReduceParticleDiagnosticsWithRigidKernel<<<1u, kBlockSize>>>(
             particle_world.ParticleCount(),
             static_cast<const ParticleDiagnostics*>(diagnostics.Data()),
+            step == 0u,
             static_cast<CudaParticleStepReport*>(report_buffer.Data()));
         CheckCuda(cudaGetLastError(), "ReduceParticleDiagnosticsWithRigidKernel launch");
         ++report.kernel_launch_count;
@@ -1885,6 +1996,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
                 ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
                     coupling_row_count,
                     static_cast<const CouplingRowDiagnostics*>(row_diagnostics.Data()),
+                    step * row_solver_iterations + iteration,
                     static_cast<CudaParticleStepReport*>(report_buffer.Data()));
                 CheckCuda(cudaGetLastError(), "ReduceCouplingRowDiagnosticsKernel launch");
                 ++report.kernel_launch_count;

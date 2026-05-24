@@ -211,6 +211,12 @@ int main() {
               << friction_row_report.coupling_row_solver_friction_impulse_count
               << " row_solver_friction_impulse_magnitude="
               << friction_row_report.coupling_row_solver_friction_impulse_magnitude
+              << " row_solver_max_iteration_normal_delta="
+              << friction_row_report.coupling_row_solver_max_iteration_normal_delta_impulse
+              << " row_solver_max_iteration_tangent_delta="
+              << friction_row_report.coupling_row_solver_max_iteration_tangent_delta_impulse
+              << " row_solver_max_residual="
+              << friction_row_report.coupling_row_solver_max_residual
               << " tangent_warm_starts="
               << friction_second_report.coupling_tangent_warm_start_count
               << " tangent_warm_start_impulse_magnitude="
@@ -468,6 +474,22 @@ int main() {
               << " row_solver_total_impulse_magnitude="
               << (corner_first_report.coupling_row_solver_impulse_magnitude +
                   corner_report.coupling_row_solver_impulse_magnitude)
+              << " row_solver_diagnostic_slots="
+              << corner_report.coupling_row_solver_diagnostic_slot_count
+              << " row_solver_max_iteration_normal_delta="
+              << corner_report.coupling_row_solver_max_iteration_normal_delta_impulse
+              << " row_solver_max_iteration_tangent_delta="
+              << corner_report.coupling_row_solver_max_iteration_tangent_delta_impulse
+              << " row_solver_max_residual="
+              << corner_report.coupling_row_solver_max_residual
+              << " row_solver_iteration0_normal_delta="
+              << corner_report.coupling_row_solver_iteration_normal_delta_impulses[0]
+              << " row_solver_iteration2_normal_delta="
+              << corner_report.coupling_row_solver_iteration_normal_delta_impulses[2]
+              << " row_solver_iteration0_residual="
+              << corner_report.coupling_row_solver_iteration_max_residuals[0]
+              << " row_solver_iteration2_residual="
+              << corner_report.coupling_row_solver_iteration_max_residuals[2]
               << " slots_per_particle=" << corner_coupling_state.slot_count_per_particle
               << " row0_active=" << corner_rows.rows[0].active
               << " row1_active=" << corner_rows.rows[1].active
@@ -543,6 +565,14 @@ int main() {
     const float corner_cached_normal_impulse_sum =
         corner_coupling_state.normal_impulses[0] +
         corner_coupling_state.normal_impulses[1];
+    const bool corner_diagnostics_finite =
+        std::isfinite(corner_report.coupling_row_solver_max_iteration_normal_delta_impulse) &&
+        std::isfinite(corner_report.coupling_row_solver_max_iteration_tangent_delta_impulse) &&
+        std::isfinite(corner_report.coupling_row_solver_max_residual) &&
+        std::isfinite(corner_report.coupling_row_solver_iteration_normal_delta_impulses[0]) &&
+        std::isfinite(corner_report.coupling_row_solver_iteration_normal_delta_impulses[2]) &&
+        std::isfinite(corner_report.coupling_row_solver_iteration_max_residuals[0]) &&
+        std::isfinite(corner_report.coupling_row_solver_iteration_max_residuals[2]);
 
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
@@ -596,6 +626,11 @@ int main() {
                    corner_report.coupling_torque_magnitude > 0.0f &&
                    corner_report.coupling_row_solver_launch_count == 3u &&
                    corner_report.coupling_row_solver_iteration_count == 3u &&
+                   corner_report.coupling_row_solver_diagnostic_slot_count == 3u &&
+                   corner_report.coupling_row_solver_max_iteration_normal_delta_impulse > 0.0f &&
+                   corner_report.coupling_row_solver_max_iteration_tangent_delta_impulse >= 0.0f &&
+                   corner_report.coupling_row_solver_max_residual >= 0.0f &&
+                   corner_diagnostics_finite &&
                    corner_row_impulses >= 2u &&
                    corner_row_impulse_magnitude > 0.0f &&
                    corner_coupling_state.slot_count_per_particle ==

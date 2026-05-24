@@ -502,6 +502,9 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     runtime::gpu::CudaParticleStepReport report;
     uint64_t row_solver_impulse_count = 0;
     float row_solver_impulse_magnitude = 0.0f;
+    float row_solver_max_normal_delta = 0.0f;
+    float row_solver_max_tangent_delta = 0.0f;
+    float row_solver_max_residual = 0.0f;
     uint64_t warm_start_count = 0;
     float coupling_force_magnitude = 0.0f;
     float coupling_torque_magnitude = 0.0f;
@@ -511,6 +514,15 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
             device_particles, device_world, options);
         row_solver_impulse_count += report.coupling_row_solver_impulse_count;
         row_solver_impulse_magnitude += report.coupling_row_solver_impulse_magnitude;
+        row_solver_max_normal_delta =
+            std::max(row_solver_max_normal_delta,
+                     report.coupling_row_solver_max_iteration_normal_delta_impulse);
+        row_solver_max_tangent_delta =
+            std::max(row_solver_max_tangent_delta,
+                     report.coupling_row_solver_max_iteration_tangent_delta_impulse);
+        row_solver_max_residual =
+            std::max(row_solver_max_residual,
+                     report.coupling_row_solver_max_residual);
         warm_start_count += report.coupling_warm_start_count;
         coupling_force_magnitude += report.coupling_force_magnitude;
         coupling_torque_magnitude += report.coupling_torque_magnitude;
@@ -531,6 +543,17 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     EXPECT_EQ(report.kernel_launch_count, 8u);
     EXPECT_GT(row_solver_impulse_count, 0u);
     EXPECT_GT(row_solver_impulse_magnitude, 0.0f);
+    EXPECT_EQ(report.coupling_row_solver_diagnostic_slot_count, 3u);
+    EXPECT_GT(row_solver_max_normal_delta, 0.0f);
+    EXPECT_GE(row_solver_max_tangent_delta, 0.0f);
+    EXPECT_GE(row_solver_max_residual, 0.0f);
+    EXPECT_TRUE(std::isfinite(row_solver_max_normal_delta));
+    EXPECT_TRUE(std::isfinite(row_solver_max_tangent_delta));
+    EXPECT_TRUE(std::isfinite(row_solver_max_residual));
+    EXPECT_LE(report.coupling_row_solver_iteration_normal_delta_impulses[2],
+              report.coupling_row_solver_iteration_normal_delta_impulses[0] + 1.0e-5f);
+    EXPECT_LE(report.coupling_row_solver_iteration_max_residuals[2],
+              report.coupling_row_solver_iteration_max_residuals[0] + 1.0e-5f);
     EXPECT_EQ(coupling_state.slot_count_per_particle,
               runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
     ASSERT_EQ(coupling_state.normal_impulses.size(),

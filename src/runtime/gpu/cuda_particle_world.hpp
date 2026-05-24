@@ -25,6 +25,7 @@ using CudaParticleState = CudaParticleSet;
 
 inline constexpr uint32_t kInvalidCudaParticleCouplingShape = 0xffffffffu;
 inline constexpr uint32_t kCudaParticleCouplingSlotsPerParticle = 4u;
+inline constexpr uint32_t kCudaParticleRowSolverDiagnosticSlots = 8u;
 
 struct CudaParticleCouplingState {
     uint32_t slot_count_per_particle = kCudaParticleCouplingSlotsPerParticle;
@@ -112,6 +113,16 @@ struct CudaParticleStepReport {
     float coupling_row_solver_impulse_magnitude = 0.0f;
     uint32_t coupling_row_solver_friction_impulse_count = 0;
     float coupling_row_solver_friction_impulse_magnitude = 0.0f;
+    uint32_t coupling_row_solver_diagnostic_slot_count = 0;
+    float coupling_row_solver_max_iteration_normal_delta_impulse = 0.0f;
+    float coupling_row_solver_max_iteration_tangent_delta_impulse = 0.0f;
+    float coupling_row_solver_max_residual = 0.0f;
+    float coupling_row_solver_iteration_normal_delta_impulses
+        [kCudaParticleRowSolverDiagnosticSlots] = {};
+    float coupling_row_solver_iteration_tangent_delta_impulses
+        [kCudaParticleRowSolverDiagnosticSlots] = {};
+    float coupling_row_solver_iteration_max_residuals
+        [kCudaParticleRowSolverDiagnosticSlots] = {};
 };
 
 struct CudaParticleDeviceWorldCouplingOptions {

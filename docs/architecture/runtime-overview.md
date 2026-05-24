@@ -219,11 +219,19 @@ projected into the new tangent basis and clamped by the cached normal impulse.
 `coupling_row_solver_impulse_magnitude`,
 `coupling_row_solver_friction_impulse_count`, and
 `coupling_row_solver_friction_impulse_magnitude` identify the CUDA row-solver
-source. `coupling_tangent_warm_start_count` and
+source. The report also exposes bounded per-step row-scheduler diagnostics:
+`coupling_row_solver_diagnostic_slot_count`,
+`coupling_row_solver_max_iteration_normal_delta_impulse`,
+`coupling_row_solver_max_iteration_tangent_delta_impulse`,
+`coupling_row_solver_max_residual`, and the fixed-size
+`coupling_row_solver_iteration_*` arrays record the first solver sweeps in a
+`StepCudaParticlesAgainstDeviceWorld` call. The residual is a finite projected
+row residual proxy after each row solve, useful for observing trend and
+regressions; it is not yet a global island convergence proof.
+`coupling_tangent_warm_start_count` and
 `coupling_tangent_warm_start_impulse_magnitude` expose the persistent friction
-cache separately from the aggregate warm-start magnitude. Compliance,
-convergence/residual metrics beyond impulse magnitudes, and a unified
-rigid/cloth/deformable/fluid row buffer remain follow-on solver work;
+cache separately from the aggregate warm-start magnitude. Compliance/XPBD and a
+unified rigid/cloth/deformable/fluid row buffer remain follow-on solver work;
 cross-particle writes into shared rigid bodies still use atomics until that
 scheduler owns global coloring or island batching.
 
@@ -234,11 +242,11 @@ coupling with CUDA row-solver rigid linear/angular impulse feedback and prints
 compact solver diagnostics, row-solver launch/impulse counts, warm-start/cache
 values, force/torque magnitudes, and sampled particle/rigid state. It also runs
 a cooked box friction-row comparison that prints tangent impulses, the Coulomb
-limit, no-friction vs friction tangential velocity, and second-step tangent
-warm-start diagnostics, plus a cooked two-box corner case that leaves two
-active cache slots and two active coupling rows on
-one particle, making the rigid/deformable coupling state and row-scheduler
-iteration diagnostics visible outside unit tests. It
+limit, no-friction vs friction tangential velocity, max normal/tangent delta,
+max row residual, and second-step tangent warm-start diagnostics, plus a cooked
+two-box corner case that leaves two active cache slots and two active coupling
+rows on one particle, making the rigid/deformable coupling state, per-sweep
+delta impulse, and row residual diagnostics visible outside unit tests. It
 intentionally does not depend on Vulkan or CPU simulation.
 
 ## Scene Integration
@@ -410,10 +418,12 @@ cooked shape indices for warm-start diagnostics and is included in the container
 device-memory accounting. A parallel per-slot coupling-row buffer stores the
 constraint-space data needed by a later reusable solver: active flag,
 particle/shape/body ids, normal, contact point, linear/angular Jacobians, rhs,
-position error, effective mass, and accumulated normal impulse. The step report
-includes active cache slots, row-solver launch/impulse diagnostics, and
-coupling force/torque magnitudes, while tests and demos can download the row
-buffer as a validation boundary. CPU only uploads authored/reference state and
+position error, effective mass, tangent basis/effective masses, friction, and
+accumulated normal/tangent impulses. The step report includes active cache
+slots, row-solver launch/impulse diagnostics, per-sweep delta impulse/residual
+proxies, and coupling force/torque magnitudes, while tests and demos can
+download the row buffer as a validation boundary. CPU only uploads
+authored/reference state and
 downloads compact reports or row snapshots for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
