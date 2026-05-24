@@ -254,7 +254,7 @@ TEST(CudaParticleCouplingTiming, DeviceWorldBoxRigidImpulseCouplingUnderOneSecon
         const float y = 0.251f + static_cast<float>((index / 64u) % 16u) * 0.0001f;
         const float z = static_cast<float>(index / (64u * 16u)) * 0.006f - 0.02f;
         particles.positions.push_back({x, y, z});
-        particles.velocities.push_back({0.0f, -0.05f, 0.0f});
+        particles.velocities.push_back({0.05f, -0.05f, 0.0f});
         particles.inv_masses.push_back(1.0f);
         particles.radii.push_back(0.004f);
         particles.phases.push_back(index % 4u);
@@ -268,20 +268,26 @@ TEST(CudaParticleCouplingTiming, DeviceWorldBoxRigidImpulseCouplingUnderOneSecon
     options.gravity = math::Vec3::Zero();
     options.dt = 1.0f / 240.0f;
     options.step_count = 1u;
-    options.friction = 0.02f;
+    options.friction = 0.2f;
     options.restitution = 0.0f;
     options.accumulate_rigid_impulses = true;
 
     runtime::gpu::CudaParticleStepReport report;
     uint64_t row_solver_impulse_count = 0;
+    uint64_t row_solver_friction_impulse_count = 0;
     float row_solver_impulse_magnitude = 0.0f;
+    float row_solver_friction_impulse_magnitude = 0.0f;
     float row_solver_angular_impulse_magnitude = 0.0f;
     const auto start = std::chrono::high_resolution_clock::now();
     for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
         report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
             device_particles, device_world, options);
         row_solver_impulse_count += report.coupling_row_solver_impulse_count;
+        row_solver_friction_impulse_count +=
+            report.coupling_row_solver_friction_impulse_count;
         row_solver_impulse_magnitude += report.coupling_row_solver_impulse_magnitude;
+        row_solver_friction_impulse_magnitude +=
+            report.coupling_row_solver_friction_impulse_magnitude;
         row_solver_angular_impulse_magnitude += report.rigid_angular_impulse_magnitude;
     }
     const auto end = std::chrono::high_resolution_clock::now();
@@ -293,6 +299,8 @@ TEST(CudaParticleCouplingTiming, DeviceWorldBoxRigidImpulseCouplingUnderOneSecon
     EXPECT_EQ(report.coupling_row_solver_launch_count, 1u);
     EXPECT_GT(row_solver_impulse_count, 0u);
     EXPECT_GT(row_solver_impulse_magnitude, 0.0f);
+    EXPECT_GT(row_solver_friction_impulse_count, 0u);
+    EXPECT_GT(row_solver_friction_impulse_magnitude, 0.0f);
     EXPECT_GT(row_solver_angular_impulse_magnitude, 0.0f);
 
     const auto rigid_state = device_world.DownloadState();

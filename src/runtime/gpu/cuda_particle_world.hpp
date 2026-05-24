@@ -42,10 +42,19 @@ struct CudaParticleCouplingConstraintRow {
     math::Vec3 particle_linear_jacobian = math::Vec3::Zero();
     math::Vec3 body_linear_jacobian = math::Vec3::Zero();
     math::Vec3 body_angular_jacobian = math::Vec3::Zero();
+    math::Vec3 tangent0 = math::Vec3::Zero();
+    math::Vec3 tangent1 = math::Vec3::Zero();
+    math::Vec3 body_tangent_angular_jacobian0 = math::Vec3::Zero();
+    math::Vec3 body_tangent_angular_jacobian1 = math::Vec3::Zero();
     float rhs = 0.0f;
     float position_error = 0.0f;
     float effective_mass = 0.0f;
+    float tangent_effective_mass0 = 0.0f;
+    float tangent_effective_mass1 = 0.0f;
+    float friction = 0.0f;
     float normal_impulse = 0.0f;
+    float tangent_impulse_0 = 0.0f;
+    float tangent_impulse_1 = 0.0f;
 };
 
 struct CudaParticleCouplingRowsState {
@@ -98,6 +107,8 @@ struct CudaParticleStepReport {
     uint32_t coupling_row_solver_launch_count = 0;
     uint32_t coupling_row_solver_impulse_count = 0;
     float coupling_row_solver_impulse_magnitude = 0.0f;
+    uint32_t coupling_row_solver_friction_impulse_count = 0;
+    float coupling_row_solver_friction_impulse_magnitude = 0.0f;
 };
 
 struct CudaParticleDeviceWorldCouplingOptions {

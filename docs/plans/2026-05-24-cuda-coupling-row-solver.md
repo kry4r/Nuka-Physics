@@ -98,7 +98,7 @@ Print row solver launches, impulse count, and impulse magnitude in `nuka_cuda_pa
 
 **Step 3: Documentation**
 
-Document that coupling rows now have an executing CUDA normal-solver path. Explicitly leave friction rows, compliance, and unified rigid/cloth/deformable/fluid row iteration as follow-on work.
+Document that coupling rows now have an executing CUDA normal-solver path. Tangent friction rows have since moved into the CUDA coupling row solver; tangent warm-start, compliance, and unified rigid/cloth/deformable/fluid row iteration remain follow-on work.
 
 **Step 4: Verification**
 

@@ -119,22 +119,25 @@ git commit -m "physics: add cuda particle coupling foundation"
   error, effective mass, and accumulated normal impulse. This is the assembly
   surface for the coupling row solver and the later unified coupling solver.
 - CUDA cooked particle/rigid coupling rows now execute normal velocity impulses
-  in `SolveParticleCouplingRowsKernel` by default. The contact kernel still
-  performs position projection for this stage, but it skips direct velocity
-  impulse application when row solving is enabled; the row solver consumes
-  assembled rows, clamps accumulated normal impulse, updates particle velocity,
-  atomically updates rigid linear/angular velocity, and reports row-solver
-  launch/impulse diagnostics. The row solver now sweeps each particle's fixed
-  coupling slots in one CUDA thread, so one particle with multiple active
-  cooked contacts accumulates every row into its velocity deterministically at
-  the particle scope.
+  and two tangent friction sub-rows in `SolveParticleCouplingRowsKernel` by
+  default. The contact kernel still performs position projection for this
+  stage, but it skips direct velocity impulse application when row solving is
+  enabled; the row solver consumes assembled rows, clamps accumulated normal
+  impulse, clamps tangent impulses to `friction * normal_impulse`, updates
+  particle velocity, atomically updates rigid linear/angular velocity, and
+  reports row-solver launch/normal/friction impulse diagnostics. The row solver
+  now sweeps each particle's fixed coupling slots in one CUDA thread, so one
+  particle with multiple active cooked contacts accumulates every row into its
+  velocity deterministically at the particle scope.
 - `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
-  capsule, and two-box corner coupling, including row-solver launch/impulse
-  counts plus row-level effective mass, position error, and normal impulse
-  diagnostics, so single-particle multi-contact cache behavior is visible
-  outside unit tests.
+  capsule, and two-box corner coupling, plus a cooked box friction-row
+  comparison that exposes tangent impulse, Coulomb limit, and tangential speed
+  reduction outside unit tests.
 - `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
   tracks the added cache/report path under the existing one-second CUDA budget.
+- `CudaParticleCouplingTiming.DeviceWorldBoxRigidImpulseCouplingUnderOneSecond`
+  now includes tangential motion and friction-row impulse accumulation under the
+  existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
   tracks the multi-slot contact-cache, force/torque diagnostic, and row-solver
   impulse path with thousands of particles under the same one-second CUDA
@@ -142,9 +145,9 @@ git commit -m "physics: add cuda particle coupling foundation"
 
 ## Follow-On Tasks
 
-1. Extend the current CUDA normal coupling row solver with tangent/friction
-   rows, compliance/XPBD-style softness, warm-start iteration across multiple
-   rows, and convergence diagnostics.
+1. Extend the current CUDA coupling row solver with tangent warm-start,
+   compliance/XPBD-style softness, multi-iteration convergence diagnostics, and
+   persistent friction state across frames.
 2. Promote the fixed per-particle coupling rows into a reusable
    coupling-constraint solve scheduler shared by rigid/cloth/deformable/fluid
    constraints, including global coloring or island batching for deterministic

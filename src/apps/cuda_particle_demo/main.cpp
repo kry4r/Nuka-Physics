@@ -8,6 +8,7 @@
 #include "scene/cooker.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <iostream>
 #include <utility>
 
@@ -132,6 +133,69 @@ int main() {
     coupling_options.restitution = 0.0f;
     coupling_options.accumulate_rigid_impulses = true;
     coupling_options.enable_coupling_warm_start = true;
+
+    runtime::gpu::CudaParticleSet friction_particles;
+    friction_particles.positions = {{0.53f, 0.195f, 0.0f}};
+    friction_particles.velocities = {{0.30f, -0.30f, 0.0f}};
+    friction_particles.inv_masses = {1.0f};
+    friction_particles.radii = {0.02f};
+    friction_particles.phases = {5u};
+    auto no_friction_particles =
+        runtime::gpu::UploadCudaParticleWorld(friction_particles);
+    auto friction_row_particles =
+        runtime::gpu::UploadCudaParticleWorld(friction_particles);
+
+    auto friction_reference_world = runtime::BuildWorld(scene::CookScene(coupled_scene));
+    auto no_friction_device_world =
+        runtime::gpu::UploadDeviceWorld(friction_reference_world.template_view);
+    runtime::gpu::UploadDeviceState(no_friction_device_world, friction_reference_world.instance);
+
+    auto friction_world = runtime::BuildWorld(scene::CookScene(coupled_scene));
+    auto friction_device_world =
+        runtime::gpu::UploadDeviceWorld(friction_world.template_view);
+    runtime::gpu::UploadDeviceState(friction_device_world, friction_world.instance);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions no_friction_options =
+        coupling_options;
+    no_friction_options.friction = 0.0f;
+    no_friction_options.enable_coupling_warm_start = false;
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions friction_row_options =
+        no_friction_options;
+    friction_row_options.friction = 0.75f;
+
+    const auto no_friction_row_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            no_friction_particles,
+            no_friction_device_world,
+            no_friction_options);
+    const auto friction_row_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            friction_row_particles,
+            friction_device_world,
+            friction_row_options);
+    const auto no_friction_state = no_friction_particles.DownloadState();
+    const auto friction_row_state = friction_row_particles.DownloadState();
+    const auto friction_rows = friction_row_particles.DownloadCouplingRows();
+    const auto& friction_row = friction_rows.rows.front();
+    const float friction_limit =
+        friction_row_options.friction * friction_row.normal_impulse;
+
+    std::cout << "deviceworld_box_friction_rows contacts="
+              << friction_row_report.contact_count
+              << " row_solver_launches="
+              << friction_row_report.coupling_row_solver_launch_count
+              << " row_solver_normal_impulses="
+              << friction_row_report.coupling_row_solver_impulse_count
+              << " row_solver_friction_impulses="
+              << friction_row_report.coupling_row_solver_friction_impulse_count
+              << " row_solver_friction_impulse_magnitude="
+              << friction_row_report.coupling_row_solver_friction_impulse_magnitude
+              << " tangent0_impulse=" << friction_row.tangent_impulse_0
+              << " tangent1_impulse=" << friction_row.tangent_impulse_1
+              << " friction_limit=" << friction_limit
+              << " no_friction_vx=" << no_friction_state.velocities.front().x
+              << " friction_vx=" << friction_row_state.velocities.front().x
+              << "\n";
 
     const auto coupling_first_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
@@ -407,6 +471,12 @@ int main() {
     const auto coupling_angular_impulse_magnitude =
         coupling_first_report.rigid_angular_impulse_magnitude +
         coupling_report.rigid_angular_impulse_magnitude;
+    const bool friction_row_limit_ok =
+        std::fabs(friction_row.tangent_impulse_0) <= friction_limit + 1.0e-5f &&
+        std::fabs(friction_row.tangent_impulse_1) <= friction_limit + 1.0e-5f;
+    const bool friction_row_reduced_tangent_speed =
+        std::fabs(friction_row_state.velocities.front().x) <
+        std::fabs(no_friction_state.velocities.front().x);
 
     const auto box_rigid_impulses =
         box_first_report.rigid_impulse_count + box_report.rigid_impulse_count;
@@ -450,6 +520,15 @@ int main() {
                    coupling_row_impulse_magnitude > 0.0f &&
                    coupling_report.coupling_force_magnitude > 0.0f &&
                    coupling_report.coupling_torque_magnitude > 0.0f &&
+                   friction_row_report.contact_count > 0u &&
+                   friction_row_report.coupling_row_solver_launch_count > 0u &&
+                   friction_row_report.coupling_row_solver_impulse_count > 0u &&
+                   friction_row_report.coupling_row_solver_friction_impulse_count > 0u &&
+                   friction_row_report.coupling_row_solver_friction_impulse_magnitude > 0.0f &&
+                   friction_row.active &&
+                   friction_row.normal_impulse > 0.0f &&
+                   friction_row_limit_ok &&
+                   friction_row_reduced_tangent_speed &&
                    box_report.contact_count > 0u &&
                    box_rigid_impulses > 0u &&
                    box_report.coupling_active_slot_count > 0u &&

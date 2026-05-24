@@ -744,6 +744,80 @@ TEST(CudaParticleWorld, AccumulatesMultipleCudaCouplingRowsIntoOneParticleVeloci
                 1.0e-4f);
 }
 
+TEST(CudaParticleWorld, SolvesDeviceWorldCouplingFrictionRowsOnCuda) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord box_body;
+    box_body.name = "friction_row_robot_link";
+    box_body.mass = 2.0f;
+    box_body.inertia = {0.75f, 0.75f, 0.75f};
+    box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = 0u;
+    box_shape.type = scene::ShapeType::Box;
+    box_shape.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.0f, 0.34f, 0.0f}};
+    particles.velocities = {{1.0f, -2.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {13u};
+
+    runtime::BuiltWorld no_friction_world;
+    auto no_friction_device_world = UploadScene(scene, no_friction_world);
+    auto no_friction_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions no_friction_options;
+    no_friction_options.gravity = math::Vec3::Zero();
+    no_friction_options.dt = 1.0f / 120.0f;
+    no_friction_options.step_count = 1u;
+    no_friction_options.friction = 0.0f;
+    no_friction_options.restitution = 0.0f;
+    no_friction_options.accumulate_rigid_impulses = true;
+    no_friction_options.solve_coupling_rows_on_cuda = true;
+
+    const auto no_friction_report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        no_friction_particles, no_friction_device_world, no_friction_options);
+    const auto no_friction_state = no_friction_particles.DownloadState();
+
+    runtime::BuiltWorld friction_world;
+    auto friction_device_world = UploadScene(scene, friction_world);
+    auto friction_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+    auto friction_options = no_friction_options;
+    friction_options.friction = 0.75f;
+
+    const auto friction_report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        friction_particles, friction_device_world, friction_options);
+    const auto friction_state = friction_particles.DownloadState();
+    const auto friction_rows = friction_particles.DownloadCouplingRows();
+
+    ASSERT_EQ(no_friction_state.velocities.size(), 1u);
+    ASSERT_EQ(friction_state.velocities.size(), 1u);
+    ASSERT_GE(friction_rows.rows.size(), 1u);
+    const auto& row = friction_rows.rows[0];
+
+    EXPECT_EQ(no_friction_report.coupling_row_solver_launch_count, 1u);
+    EXPECT_EQ(friction_report.coupling_row_solver_launch_count, 1u);
+    EXPECT_EQ(friction_report.coupling_row_solver_friction_impulse_count, 1u);
+    EXPECT_GT(friction_report.coupling_row_solver_friction_impulse_magnitude, 0.0f);
+    EXPECT_TRUE(row.active);
+    EXPECT_GT(row.normal_impulse, 0.0f);
+    EXPECT_FLOAT_EQ(row.friction, friction_options.friction);
+    EXPECT_NEAR(row.tangent0.Length(), 1.0f, 1.0e-4f);
+    EXPECT_NEAR(row.tangent1.Length(), 1.0f, 1.0e-4f);
+    EXPECT_GT(std::abs(row.tangent_impulse_0), 0.0f);
+    EXPECT_LE(std::abs(row.tangent_impulse_0),
+              friction_options.friction * row.normal_impulse + 1.0e-5f);
+    EXPECT_LE(std::abs(row.tangent_impulse_1),
+              friction_options.friction * row.normal_impulse + 1.0e-5f);
+    EXPECT_LT(std::abs(friction_state.velocities[0].x),
+              std::abs(no_friction_state.velocities[0].x));
+}
+
 TEST(CudaParticleWorld, ReportsNoRowSolverDiagnosticsWhenCudaRowSolverDisabled) {
     scene::SceneIR scene;
 
