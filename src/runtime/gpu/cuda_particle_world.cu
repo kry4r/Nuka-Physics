@@ -24,6 +24,7 @@ struct ParticleDiagnostics {
     float speed_sq;
     float kinetic_energy;
     float rigid_impulse_magnitude;
+    float rigid_angular_impulse_magnitude;
 };
 
 __device__ math::Vec3 MakeVec3(float x, float y, float z) {
@@ -115,6 +116,13 @@ __device__ void AddVelocityAtomic(math::Vec3* velocities, uint32_t body_id, math
     atomicAdd(&velocities[body_id].x, delta.x);
     atomicAdd(&velocities[body_id].y, delta.y);
     atomicAdd(&velocities[body_id].z, delta.z);
+}
+
+__device__ math::Vec3 ApplyInverseInertia(math::Vec3 angular_impulse,
+                                          math::Vec3 inv_inertia) {
+    return MakeVec3(angular_impulse.x * inv_inertia.x,
+                    angular_impulse.y * inv_inertia.y,
+                    angular_impulse.z * inv_inertia.z);
 }
 
 __device__ float SolvePlane(const CudaParticlePlaneCollider& plane,
@@ -315,6 +323,7 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
         report->max_speed = sqrtf(shared_speed_sq[0]);
         report->kinetic_energy = shared_energy[0];
         report->rigid_impulse_magnitude = 0.0f;
+        report->rigid_angular_impulse_magnitude = 0.0f;
     }
 }
 
@@ -329,6 +338,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     __shared__ float shared_speed_sq[256];
     __shared__ float shared_energy[256];
     __shared__ float shared_impulse_magnitude[256];
+    __shared__ float shared_angular_impulse_magnitude[256];
 
     const uint32_t tid = threadIdx.x;
     uint32_t contact_count = 0u;
@@ -338,6 +348,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     float max_speed_sq = 0.0f;
     float kinetic_energy = 0.0f;
     float impulse_magnitude = 0.0f;
+    float angular_impulse_magnitude = 0.0f;
 
     for (uint32_t index = tid; index < particle_count; index += blockDim.x) {
         const ParticleDiagnostics diag = diagnostics[index];
@@ -348,6 +359,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         max_speed_sq = fmaxf(max_speed_sq, diag.speed_sq);
         kinetic_energy += diag.kinetic_energy;
         impulse_magnitude += diag.rigid_impulse_magnitude;
+        angular_impulse_magnitude += diag.rigid_angular_impulse_magnitude;
     }
 
     shared_contacts[tid] = contact_count;
@@ -357,6 +369,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     shared_speed_sq[tid] = max_speed_sq;
     shared_energy[tid] = kinetic_energy;
     shared_impulse_magnitude[tid] = impulse_magnitude;
+    shared_angular_impulse_magnitude[tid] = angular_impulse_magnitude;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
@@ -370,6 +383,8 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
                 fmaxf(shared_speed_sq[tid], shared_speed_sq[tid + stride]);
             shared_energy[tid] += shared_energy[tid + stride];
             shared_impulse_magnitude[tid] += shared_impulse_magnitude[tid + stride];
+            shared_angular_impulse_magnitude[tid] +=
+                shared_angular_impulse_magnitude[tid + stride];
         }
         __syncthreads();
     }
@@ -383,6 +398,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         report->max_speed = sqrtf(shared_speed_sq[0]);
         report->kinetic_energy = shared_energy[0];
         report->rigid_impulse_magnitude = shared_impulse_magnitude[0];
+        report->rigid_angular_impulse_magnitude = shared_angular_impulse_magnitude[0];
     }
 }
 
@@ -407,6 +423,7 @@ __device__ float DeviceWorldShapeResidual(scene::ShapeType shape_type,
 
 __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        scene::BodyId body_id,
+                                       math::Transform body_transform,
                                        math::Transform shape_transform,
                                        float shape_radius,
                                        float body_inv_mass,
@@ -416,11 +433,14 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        float restitution,
                                        bool accumulate_rigid_impulses,
                                        math::Vec3* rigid_velocities,
+                                       math::Vec3* rigid_angular_velocities,
+                                       const math::Vec3* rigid_inv_inertias,
                                        math::Vec3* position,
                                        math::Vec3* velocity,
                                        uint32_t* contact_count,
                                        uint32_t* impulse_count,
-                                       float* impulse_magnitude) {
+                                       float* impulse_magnitude,
+                                       float* angular_impulse_magnitude) {
     math::Vec3 normal = MakeVec3(0.0f, 1.0f, 0.0f);
     float penetration = 0.0f;
 
@@ -443,34 +463,57 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
         return 0.0f;
     }
 
+    const math::Vec3 contact_point = *position;
     *position = Add(*position, Scale(normal, penetration));
 
+    const math::Vec3 lever_arm = Sub(contact_point, body_transform.position);
+    const math::Vec3 body_angular_velocity =
+        (accumulate_rigid_impulses && body_inv_mass > 0.0f)
+            ? rigid_angular_velocities[body_id]
+            : MakeVec3(0.0f, 0.0f, 0.0f);
     const math::Vec3 rigid_velocity =
         (accumulate_rigid_impulses && body_inv_mass > 0.0f)
-            ? rigid_velocities[body_id]
+            ? Add(rigid_velocities[body_id], Cross(body_angular_velocity, lever_arm))
             : MakeVec3(0.0f, 0.0f, 0.0f);
+    const math::Vec3 angular_jacobian = Cross(lever_arm, normal);
+    const math::Vec3 inv_inertia =
+        (accumulate_rigid_impulses && body_inv_mass > 0.0f)
+            ? rigid_inv_inertias[body_id]
+            : MakeVec3(0.0f, 0.0f, 0.0f);
+    const float angular_effective_inv_mass =
+        Dot(angular_jacobian, ApplyInverseInertia(angular_jacobian, inv_inertia));
+    const float total_inv_mass = fmaxf(
+        particle_inv_mass + body_inv_mass + angular_effective_inv_mass,
+        1.0e-6f);
     const float relative_normal_speed = Dot(Sub(*velocity, rigid_velocity), normal);
     if (relative_normal_speed < 0.0f) {
         const float impulse = -(1.0f + restitution) * relative_normal_speed
-            / fmaxf(particle_inv_mass + body_inv_mass, 1.0e-6f);
+            / total_inv_mass;
         *velocity = Add(*velocity, Scale(normal, impulse * particle_inv_mass));
 
         if (accumulate_rigid_impulses && body_inv_mass > 0.0f) {
-            AddVelocityAtomic(rigid_velocities, body_id, Scale(normal, -impulse * body_inv_mass));
+            const math::Vec3 rigid_linear_delta = Scale(normal, -impulse * body_inv_mass);
+            const math::Vec3 rigid_angular_delta =
+                ApplyInverseInertia(Scale(angular_jacobian, -impulse), inv_inertia);
+            AddVelocityAtomic(rigid_velocities, body_id, rigid_linear_delta);
+            AddVelocityAtomic(rigid_angular_velocities, body_id, rigid_angular_delta);
             ++(*impulse_count);
             *impulse_magnitude += fabsf(impulse);
+            *angular_impulse_magnitude += sqrtf(LengthSq(rigid_angular_delta));
         }
     } else if (relative_normal_speed < 1.0e-5f) {
-        const float effective_mass =
-            1.0f / fmaxf(particle_inv_mass + body_inv_mass, 1.0e-6f);
+        const float effective_mass = 1.0f / total_inv_mass;
         const float positional_impulse = penetration * effective_mass;
         if (accumulate_rigid_impulses && body_inv_mass > 0.0f) {
-            AddVelocityAtomic(
-                rigid_velocities,
-                body_id,
-                Scale(normal, -(positional_impulse * body_inv_mass)));
+            const math::Vec3 rigid_linear_delta =
+                Scale(normal, -(positional_impulse * body_inv_mass));
+            const math::Vec3 rigid_angular_delta =
+                ApplyInverseInertia(Scale(angular_jacobian, -positional_impulse), inv_inertia);
+            AddVelocityAtomic(rigid_velocities, body_id, rigid_linear_delta);
+            AddVelocityAtomic(rigid_angular_velocities, body_id, rigid_angular_delta);
             ++(*impulse_count);
             *impulse_magnitude += fabsf(positional_impulse);
+            *angular_impulse_magnitude += sqrtf(LengthSq(rigid_angular_delta));
         }
     }
 
@@ -488,7 +531,9 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
     uint32_t shape_count,
     const math::Transform* body_poses,
     math::Vec3* body_linear_velocities,
+    math::Vec3* body_angular_velocities,
     const float* body_inv_masses,
+    const math::Vec3* body_inv_inertias,
     const scene::ShapeType* shape_types,
     const scene::BodyId* shape_body_ids,
     const math::Transform* shape_local_transforms,
@@ -531,15 +576,18 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         uint32_t contact_count = 0u;
         uint32_t impulse_count = 0u;
         float impulse_magnitude = 0.0f;
+        float angular_impulse_magnitude = 0.0f;
         for (uint32_t shape_index = 0u; shape_index < shape_count; ++shape_index) {
             const scene::BodyId body_id = shape_body_ids[shape_index];
+            const math::Transform body_transform = body_poses[body_id];
             const math::Transform shape_transform =
-                Compose(body_poses[body_id], shape_local_transforms[shape_index]);
+                Compose(body_transform, shape_local_transforms[shape_index]);
             const float body_inv_mass = body_inv_masses[body_id];
             max_penetration = fmaxf(
                 max_penetration,
                 SolveDeviceWorldShape(shape_types[shape_index],
                                       body_id,
+                                      body_transform,
                                       shape_transform,
                                       shape_radii[shape_index],
                                       body_inv_mass,
@@ -549,11 +597,14 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                       restitution,
                                       accumulate_rigid_impulses,
                                       body_linear_velocities,
+                                      body_angular_velocities,
+                                      body_inv_inertias,
                                       &position,
                                       &velocity,
                                       &contact_count,
                                       &impulse_count,
-                                      &impulse_magnitude));
+                                      &impulse_magnitude,
+                                      &angular_impulse_magnitude));
         }
 
         float max_residual = 0.0f;
@@ -575,6 +626,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         diag.max_penetration = max_penetration;
         diag.max_penetration_after_solve = max_residual;
         diag.rigid_impulse_magnitude = impulse_magnitude;
+        diag.rigid_angular_impulse_magnitude = angular_impulse_magnitude;
 
         particle_positions[particle_index] = position;
         particle_velocities[particle_index] = velocity;
@@ -797,7 +849,9 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             device_world.ShapeCount(),
             device_world.DevicePoses(),
             device_world.DeviceLinearVelocities(),
+            device_world.DeviceAngularVelocities(),
             device_world.DeviceInvMasses(),
+            device_world.DeviceInvInertias(),
             device_world.DeviceShapeTypes(),
             device_world.DeviceShapeBodyIds(),
             device_world.DeviceShapeLocalTransforms(),

@@ -24,12 +24,13 @@ runtime::gpu::DeviceWorld BuildDeviceSphereWorld(runtime::BuiltWorld& world) {
     sphere_body.name = "coupled_sphere";
     sphere_body.mass = 8.0f;
     sphere_body.inertia = {1.0f, 1.0f, 1.0f};
-    sphere_body.local_transform.position = {0.0f, 0.12f, 0.0f};
+    sphere_body.local_transform.position = {0.0f, 0.0f, 0.0f};
     const auto body_id = scene.AddRigidBody(std::move(sphere_body));
 
     scene::CollisionShapeRecord sphere;
     sphere.body_id = body_id;
     sphere.type = scene::ShapeType::Sphere;
+    sphere.local_transform.position = {0.0f, 0.12f, 0.0f};
     sphere.radius = 0.18f;
     scene.AddCollisionShape(std::move(sphere));
 
@@ -138,9 +139,10 @@ TEST(CudaParticleCouplingTiming, DeviceWorldRigidImpulseCouplingUnderOneSecond) 
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     EXPECT_EQ(report.particle_count, kParticleCount);
-    EXPECT_GT(report.contact_count, 0u);
     const auto rigid_state = device_world.DownloadState();
     ASSERT_FALSE(rigid_state.linear_velocities.empty());
+    ASSERT_FALSE(rigid_state.angular_velocities.empty());
     EXPECT_LT(rigid_state.linear_velocities[0].x, 0.0f);
+    EXPECT_GT(std::abs(rigid_state.angular_velocities[0].z), 1.0e-4f);
     EXPECT_LT(ms, 1000) << "CUDA DeviceWorld particle coupling took " << ms << " ms";
 }

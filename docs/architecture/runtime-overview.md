@@ -169,14 +169,15 @@ those invariants to prove the new branch is not just an upload shell.
 `StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
 tables and mutable rigid state directly on CUDA, currently for plane and sphere
 shapes. When requested, particle contacts atomically accumulate velocity
-impulses into dynamic rigid bodies so robot links can physically interact with
+and angular velocity impulses into dynamic rigid bodies using the contact offset
+and cooked inverse inertia. This lets robot links physically interact with
 deformables and fluids without a CPU stepping detour.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
 plane+sphere coupling, then runs cooked `DeviceWorld` sphere coupling with
-rigid impulse feedback and prints compact solver diagnostics plus sampled
-particle/rigid state. It intentionally does not depend on Vulkan or CPU
+rigid linear/angular impulse feedback and prints compact solver diagnostics plus
+sampled particle/rigid state. It intentionally does not depend on Vulkan or CPU
 simulation.
 
 ## Scene Integration
@@ -338,11 +339,11 @@ particles. Phase ids are uploaded now so later kernels can distinguish material
 or solver families without changing the buffer layout. The current kernels
 resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere coupling
 on CUDA. The cooked path reads body poses, shape body bindings, shape local
-transforms, radii, inverse masses, and mutable rigid velocities from the same
-device buffers used by the rigid solver, then writes particle corrections and
-rigid velocity impulses without returning to the CPU. CPU only uploads
-authored/reference state and downloads compact reports for tests, benchmarks,
-and tooling.
+transforms, radii, inverse masses, inverse inertias, and mutable rigid
+linear/angular velocities from the same device buffers used by the rigid solver,
+then writes particle corrections plus rigid linear/angular velocity impulses
+without returning to the CPU. CPU only uploads authored/reference state and
+downloads compact reports for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
 

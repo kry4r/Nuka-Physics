@@ -276,3 +276,50 @@ TEST(CudaParticleWorld, AccumulatesImpulseIntoDynamicSphereBodyOnDevice) {
     EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
     EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
 }
+
+TEST(CudaParticleWorld, OffCenterParticleImpulseChangesRigidAngularVelocity) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord sphere_body;
+    sphere_body.name = "off_center_robot_link";
+    sphere_body.mass = 2.0f;
+    sphere_body.inertia = {0.5f, 0.5f, 0.5f};
+    sphere_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto sphere_body_id = scene.AddRigidBody(std::move(sphere_body));
+
+    scene::CollisionShapeRecord sphere;
+    sphere.body_id = sphere_body_id;
+    sphere.type = scene::ShapeType::Sphere;
+    sphere.local_transform.position = {0.0f, 0.2f, 0.0f};
+    sphere.radius = 0.5f;
+    scene.AddCollisionShape(std::move(sphere));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.4f, 0.2f, 0.0f}};
+    particles.velocities = {{-2.0f, 0.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {3u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto rigid_state = device_world.DownloadState();
+
+    ASSERT_EQ(rigid_state.angular_velocities.size(), 1u);
+    EXPECT_EQ(report.contact_count, 1u);
+    EXPECT_EQ(report.rigid_impulse_count, 1u);
+    EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
+    EXPECT_GT(std::abs(rigid_state.angular_velocities[sphere_body_id].z), 1.0e-4f);
+}

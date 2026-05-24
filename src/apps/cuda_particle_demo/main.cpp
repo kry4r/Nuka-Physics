@@ -74,12 +74,13 @@ int main() {
     sphere_body.name = "cuda_coupled_robot_link";
     sphere_body.mass = 4.0f;
     sphere_body.inertia = {1.0f, 1.0f, 1.0f};
-    sphere_body.local_transform.position = {0.0f, 0.18f, 0.0f};
+    sphere_body.local_transform.position = {0.0f, 0.0f, 0.0f};
     const auto body_id = coupled_scene.AddRigidBody(std::move(sphere_body));
 
     scene::CollisionShapeRecord sphere_shape;
     sphere_shape.body_id = body_id;
     sphere_shape.type = scene::ShapeType::Sphere;
+    sphere_shape.local_transform.position = {0.0f, 0.18f, 0.0f};
     sphere_shape.radius = 0.18f;
     coupled_scene.AddCollisionShape(std::move(sphere_shape));
 
@@ -114,15 +115,22 @@ int main() {
     std::cout << "deviceworld_coupling contacts=" << coupling_report.contact_count
               << " rigid_impulses=" << coupling_report.rigid_impulse_count
               << " rigid_impulse_magnitude=" << coupling_report.rigid_impulse_magnitude
+              << " rigid_angular_impulse_magnitude="
+              << coupling_report.rigid_angular_impulse_magnitude
               << " residual=" << coupling_report.max_penetration_after_solve
               << " body_velocity=("
               << rigid_state.linear_velocities[body_id].x << ", "
               << rigid_state.linear_velocities[body_id].y << ", "
-              << rigid_state.linear_velocities[body_id].z << ")\n";
+              << rigid_state.linear_velocities[body_id].z << ")"
+              << " body_angular_velocity=("
+              << rigid_state.angular_velocities[body_id].x << ", "
+              << rigid_state.angular_velocities[body_id].y << ", "
+              << rigid_state.angular_velocities[body_id].z << ")\n";
 
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
-                   coupling_report.rigid_impulse_count > 0u
+                   coupling_report.rigid_impulse_count > 0u &&
+                   coupling_report.rigid_angular_impulse_magnitude > 0.0f
                ? 0
                : 1;
 }

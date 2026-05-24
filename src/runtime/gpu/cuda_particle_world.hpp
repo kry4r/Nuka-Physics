@@ -58,6 +58,7 @@ struct CudaParticleStepReport {
     float max_speed = 0.0f;
     float kinetic_energy = 0.0f;
     float rigid_impulse_magnitude = 0.0f;
+    float rigid_angular_impulse_magnitude = 0.0f;
 };
 
 struct CudaParticleDeviceWorldCouplingOptions {
