@@ -165,9 +165,10 @@ full solver needs. The report download is a compact validation boundary with
 particle count, contact count, maximum pre-solve penetration, residual
 penetration after projection, max speed, kinetic energy, simulated step count,
 rigid impulse count, rigid impulse magnitude, persistent coupling warm-start
-count/magnitude, maximum cached coupling normal impulse, and kernel-launch
-count. Tests use those invariants to prove the new branch is not just an upload
-shell.
+count/magnitude, active coupling cache slot count, maximum cached coupling
+normal impulse, coupling force/torque magnitudes derived from normal impulses,
+and kernel-launch count. Tests use those invariants to prove the new branch is
+not just an upload shell.
 `StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
 tables and mutable rigid state directly on CUDA, currently for plane, sphere,
 box, and capsule shapes. When requested, particle contacts atomically accumulate
@@ -180,16 +181,22 @@ and preserves the dynamic contact invariant that particle normal speed is
 measured relative to the rigid contact point rather than the world frame. This
 lets common robot link capsules physically interact with deformables and fluids
 without a CPU stepping detour. The coupling path also owns per-particle
-CUDA-resident normal impulse and shape-index caches. The cache is initialized on
-upload, updated by the coupling kernel, reused as a warm-start diagnostic on the
-next contact with the same cooked shape, and cleared on the device when contact
-separates so stale constraint impulses do not leak into later steps.
+CUDA-resident normal impulse and shape-index caches. Each particle now reserves
+four cooked-shape coupling slots, so one particle can warm start multiple rigid
+contacts such as a robot-link corner rather than overwriting a single cache
+entry. The cache is initialized on upload, updated by the coupling kernel,
+reused as a warm-start diagnostic on the next contact with the same cooked
+shape, and cleared on the device when contact separates so stale constraint
+impulses do not leak into later steps.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
 plane+sphere coupling, then runs cooked `DeviceWorld` sphere, box, and capsule
 coupling with rigid linear/angular impulse feedback and prints compact solver
-diagnostics, warm-start/cache values, and sampled particle/rigid state. It
+diagnostics, warm-start/cache values, force/torque magnitudes, and sampled
+particle/rigid state. It also runs a cooked two-box corner case that leaves two
+active cache slots on one particle, making the rigid/deformable coupling state
+visible outside unit tests. It
 intentionally does not depend on Vulkan or CPU simulation.
 
 ## Scene Integration
@@ -355,10 +362,13 @@ shape local transforms, half extents, radii, capsule half heights, inverse
 masses, inverse inertias, and mutable rigid linear/angular velocities from the
 same device buffers used by the rigid solver, then writes particle corrections
 plus rigid linear/angular velocity impulses without returning to the CPU. A
-per-particle CUDA coupling cache stores normal impulse and cooked shape index
-for warm-start diagnostics and is included in the container device-memory
-accounting. CPU only uploads authored/reference state and downloads compact
-reports for tests, benchmarks, and tooling.
+fixed four-slot per-particle CUDA coupling cache stores normal impulses and
+cooked shape indices for warm-start diagnostics and is included in the container
+device-memory accounting. The step report includes active cache slots plus
+coupling force/torque magnitudes, giving the later reusable constraint assembly
+path concrete GPU-resident diagnostics to promote. CPU only uploads
+authored/reference state and downloads compact reports for tests, benchmarks,
+and tooling.
 
 ### CUDA BatchedDeviceWorld
 
@@ -368,6 +378,12 @@ structure-of-arrays buffers laid out by instance-major order:
 ```text
 flat_body = instance_index * body_count_per_instance + body_index
 ```
+
+The joint/drive-only batched step path now uses direct fixed-layout CUDA block
+assembly plus one solver thread per instance. This avoids the older single
+thread over all environments while preserving the same cooked joint and actuator
+row semantics, which keeps the robot/RL batch workflow inside the CUDA physics
+backend instead of relying on CPU stepping or serial GPU control flow.
 
 Template data such as inverse mass and inverse inertia is uploaded once and
 indexed by `body_index`. Shared shape, joint, and actuator tables are also

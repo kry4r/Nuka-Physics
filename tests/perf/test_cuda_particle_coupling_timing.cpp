@@ -62,6 +62,41 @@ runtime::gpu::DeviceWorld BuildDeviceBoxWorld(runtime::BuiltWorld& world) {
     return device_world;
 }
 
+runtime::gpu::DeviceWorld BuildDeviceCornerBoxWorld(runtime::BuiltWorld& world) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord floor_body;
+    floor_body.name = "coupled_corner_floor";
+    floor_body.mass = 8.0f;
+    floor_body.inertia = {1.5f, 1.5f, 1.5f};
+    floor_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto floor_body_id = scene.AddRigidBody(std::move(floor_body));
+
+    scene::CollisionShapeRecord floor_box;
+    floor_box.body_id = floor_body_id;
+    floor_box.type = scene::ShapeType::Box;
+    floor_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(floor_box));
+
+    scene::RigidBodyRecord side_body;
+    side_body.name = "coupled_corner_side";
+    side_body.mass = 8.0f;
+    side_body.inertia = {1.5f, 1.5f, 1.5f};
+    side_body.local_transform.position = {0.36f, 0.10f, 0.0f};
+    const auto side_body_id = scene.AddRigidBody(std::move(side_body));
+
+    scene::CollisionShapeRecord side_box;
+    side_box.body_id = side_body_id;
+    side_box.type = scene::ShapeType::Box;
+    side_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(side_box));
+
+    world = runtime::BuildWorld(scene::CookScene(scene));
+    auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
+    runtime::gpu::UploadDeviceState(device_world, world.instance);
+    return device_world;
+}
+
 runtime::gpu::DeviceWorld BuildDeviceCapsuleWorld(runtime::BuiltWorld& world) {
     scene::SceneIR scene;
 
@@ -352,7 +387,77 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     EXPECT_GT(report.coupling_warm_start_count, 0u);
     EXPECT_GT(report.coupling_warm_start_impulse_magnitude, 0.0f);
     EXPECT_GT(report.max_coupling_normal_impulse, 0.0f);
-    ASSERT_EQ(coupling_state.normal_impulses.size(), kParticleCount);
+    EXPECT_GT(report.coupling_active_slot_count, 0u);
+    EXPECT_GT(report.coupling_force_magnitude, 0.0f);
+    EXPECT_GT(report.coupling_torque_magnitude, 0.0f);
+    EXPECT_EQ(coupling_state.slot_count_per_particle,
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(coupling_state.normal_impulses.size(),
+              kParticleCount *
+                  static_cast<size_t>(runtime::gpu::kCudaParticleCouplingSlotsPerParticle));
     EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
     EXPECT_LT(ms, 1000) << "CUDA DeviceWorld warm-start coupling took " << ms << " ms";
+}
+
+TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) {
+    constexpr uint32_t kParticleCount = 2048u;
+    constexpr uint32_t kIterationCount = 60u;
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions.reserve(kParticleCount);
+    particles.velocities.reserve(kParticleCount);
+    particles.inv_masses.reserve(kParticleCount);
+    particles.radii.reserve(kParticleCount);
+    particles.phases.reserve(kParticleCount);
+
+    for (uint32_t index = 0; index < kParticleCount; ++index) {
+        const float z = static_cast<float>(index % 64u) * 0.0002f - 0.0064f;
+        const float x = 0.05f + static_cast<float>((index / 64u) % 8u) * 0.0003f;
+        const float y = 0.34f + static_cast<float>(index / (64u * 8u)) * 0.00005f;
+        particles.positions.push_back({x, y, z});
+        particles.velocities.push_back({0.05f, -0.05f, 0.0f});
+        particles.inv_masses.push_back(1.0f);
+        particles.radii.push_back(0.1f);
+        particles.phases.push_back(index % 4u);
+    }
+
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+    runtime::BuiltWorld world;
+    auto device_world = BuildDeviceCornerBoxWorld(world);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = {0.0f, -9.81f, 0.0f};
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+
+    runtime::gpu::CudaParticleStepReport report;
+    const auto start = std::chrono::high_resolution_clock::now();
+    for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
+        report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            device_particles, device_world, options);
+    }
+    const auto end = std::chrono::high_resolution_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    const auto coupling_state = device_particles.DownloadCouplingState();
+
+    EXPECT_EQ(report.particle_count, kParticleCount);
+    EXPECT_GE(report.contact_count, kParticleCount * 2u);
+    EXPECT_GE(report.coupling_active_slot_count, kParticleCount * 2u);
+    EXPECT_GT(report.coupling_warm_start_count, 0u);
+    EXPECT_GT(report.coupling_force_magnitude, 0.0f);
+    EXPECT_GT(report.coupling_torque_magnitude, 0.0f);
+    EXPECT_EQ(coupling_state.slot_count_per_particle,
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(coupling_state.normal_impulses.size(),
+              kParticleCount *
+                  static_cast<size_t>(runtime::gpu::kCudaParticleCouplingSlotsPerParticle));
+    EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
+    EXPECT_GT(coupling_state.normal_impulses[1], 0.0f);
+    EXPECT_EQ(coupling_state.shape_indices[0], 0u);
+    EXPECT_EQ(coupling_state.shape_indices[1], 1u);
+    EXPECT_LT(ms, 1000) << "CUDA DeviceWorld multi-slot coupling took " << ms << " ms";
 }

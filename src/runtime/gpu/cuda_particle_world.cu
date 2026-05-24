@@ -19,6 +19,7 @@ namespace {
 struct ParticleDiagnostics {
     uint32_t contact_count;
     uint32_t rigid_impulse_count;
+    uint32_t coupling_active_slot_count;
     uint32_t coupling_warm_start_count;
     float max_penetration;
     float max_penetration_after_solve;
@@ -28,6 +29,8 @@ struct ParticleDiagnostics {
     float rigid_angular_impulse_magnitude;
     float coupling_warm_start_impulse_magnitude;
     float max_coupling_normal_impulse;
+    float coupling_force_magnitude;
+    float coupling_torque_magnitude;
 };
 
 __device__ math::Vec3 MakeVec3(float x, float y, float z) {
@@ -147,6 +150,26 @@ __device__ math::Vec3 ApplyInverseInertia(math::Vec3 angular_impulse,
     return MakeVec3(angular_impulse.x * inv_inertia.x,
                     angular_impulse.y * inv_inertia.y,
                     angular_impulse.z * inv_inertia.z);
+}
+
+__device__ uint32_t FindCouplingSlot(uint32_t shape_index,
+                                     const uint32_t* stored_shape_indices) {
+    if (stored_shape_indices == nullptr) {
+        return kInvalidCudaParticleCouplingShape;
+    }
+
+    uint32_t free_slot = kInvalidCudaParticleCouplingShape;
+    for (uint32_t slot = 0u; slot < kCudaParticleCouplingSlotsPerParticle; ++slot) {
+        const uint32_t stored_shape = stored_shape_indices[slot];
+        if (stored_shape == shape_index) {
+            return slot;
+        }
+        if (stored_shape == kInvalidCudaParticleCouplingShape &&
+            free_slot == kInvalidCudaParticleCouplingShape) {
+            free_slot = slot;
+        }
+    }
+    return free_slot;
 }
 
 __device__ float SolvePlane(const CudaParticlePlaneCollider& plane,
@@ -297,42 +320,55 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
                                                 const ParticleDiagnostics* diagnostics,
                                                 CudaParticleStepReport* report) {
     __shared__ uint32_t shared_contacts[256];
+    __shared__ uint32_t shared_active_slots[256];
     __shared__ float shared_penetration[256];
     __shared__ float shared_residual[256];
     __shared__ float shared_speed_sq[256];
     __shared__ float shared_energy[256];
     __shared__ float shared_coupling_impulse[256];
+    __shared__ float shared_coupling_force[256];
+    __shared__ float shared_coupling_torque[256];
 
     const uint32_t tid = threadIdx.x;
     uint32_t contact_count = 0u;
+    uint32_t active_slot_count = 0u;
     float max_penetration = 0.0f;
     float max_residual = 0.0f;
     float max_speed_sq = 0.0f;
     float kinetic_energy = 0.0f;
     float max_coupling_impulse = 0.0f;
+    float coupling_force = 0.0f;
+    float coupling_torque = 0.0f;
 
     for (uint32_t index = tid; index < particle_count; index += blockDim.x) {
         const ParticleDiagnostics diag = diagnostics[index];
         contact_count += diag.contact_count;
+        active_slot_count += diag.coupling_active_slot_count;
         max_penetration = fmaxf(max_penetration, diag.max_penetration);
         max_residual = fmaxf(max_residual, diag.max_penetration_after_solve);
         max_speed_sq = fmaxf(max_speed_sq, diag.speed_sq);
         kinetic_energy += diag.kinetic_energy;
         max_coupling_impulse =
             fmaxf(max_coupling_impulse, diag.max_coupling_normal_impulse);
+        coupling_force += diag.coupling_force_magnitude;
+        coupling_torque += diag.coupling_torque_magnitude;
     }
 
     shared_contacts[tid] = contact_count;
+    shared_active_slots[tid] = active_slot_count;
     shared_penetration[tid] = max_penetration;
     shared_residual[tid] = max_residual;
     shared_speed_sq[tid] = max_speed_sq;
     shared_energy[tid] = kinetic_energy;
     shared_coupling_impulse[tid] = max_coupling_impulse;
+    shared_coupling_force[tid] = coupling_force;
+    shared_coupling_torque[tid] = coupling_torque;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             shared_contacts[tid] += shared_contacts[tid + stride];
+            shared_active_slots[tid] += shared_active_slots[tid + stride];
             shared_penetration[tid] =
                 fmaxf(shared_penetration[tid], shared_penetration[tid + stride]);
             shared_residual[tid] = fmaxf(shared_residual[tid], shared_residual[tid + stride]);
@@ -342,6 +378,8 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
             shared_coupling_impulse[tid] =
                 fmaxf(shared_coupling_impulse[tid],
                       shared_coupling_impulse[tid + stride]);
+            shared_coupling_force[tid] += shared_coupling_force[tid + stride];
+            shared_coupling_torque[tid] += shared_coupling_torque[tid + stride];
         }
         __syncthreads();
     }
@@ -356,9 +394,12 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
         report->kinetic_energy = shared_energy[0];
         report->rigid_impulse_magnitude = 0.0f;
         report->rigid_angular_impulse_magnitude = 0.0f;
+        report->coupling_active_slot_count = shared_active_slots[0];
         report->coupling_warm_start_count = 0u;
         report->coupling_warm_start_impulse_magnitude = 0.0f;
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
+        report->coupling_force_magnitude = shared_coupling_force[0];
+        report->coupling_torque_magnitude = shared_coupling_torque[0];
     }
 }
 
@@ -368,6 +409,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     CudaParticleStepReport* report) {
     __shared__ uint32_t shared_contacts[256];
     __shared__ uint32_t shared_impulse_contacts[256];
+    __shared__ uint32_t shared_active_slots[256];
     __shared__ uint32_t shared_warm_start_contacts[256];
     __shared__ float shared_penetration[256];
     __shared__ float shared_residual[256];
@@ -377,10 +419,13 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     __shared__ float shared_angular_impulse_magnitude[256];
     __shared__ float shared_warm_start_magnitude[256];
     __shared__ float shared_coupling_impulse[256];
+    __shared__ float shared_coupling_force[256];
+    __shared__ float shared_coupling_torque[256];
 
     const uint32_t tid = threadIdx.x;
     uint32_t contact_count = 0u;
     uint32_t impulse_count = 0u;
+    uint32_t active_slot_count = 0u;
     uint32_t warm_start_count = 0u;
     float max_penetration = 0.0f;
     float max_residual = 0.0f;
@@ -390,11 +435,14 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     float angular_impulse_magnitude = 0.0f;
     float warm_start_magnitude = 0.0f;
     float max_coupling_impulse = 0.0f;
+    float coupling_force = 0.0f;
+    float coupling_torque = 0.0f;
 
     for (uint32_t index = tid; index < particle_count; index += blockDim.x) {
         const ParticleDiagnostics diag = diagnostics[index];
         contact_count += diag.contact_count;
         impulse_count += diag.rigid_impulse_count;
+        active_slot_count += diag.coupling_active_slot_count;
         warm_start_count += diag.coupling_warm_start_count;
         max_penetration = fmaxf(max_penetration, diag.max_penetration);
         max_residual = fmaxf(max_residual, diag.max_penetration_after_solve);
@@ -405,10 +453,13 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         warm_start_magnitude += diag.coupling_warm_start_impulse_magnitude;
         max_coupling_impulse =
             fmaxf(max_coupling_impulse, diag.max_coupling_normal_impulse);
+        coupling_force += diag.coupling_force_magnitude;
+        coupling_torque += diag.coupling_torque_magnitude;
     }
 
     shared_contacts[tid] = contact_count;
     shared_impulse_contacts[tid] = impulse_count;
+    shared_active_slots[tid] = active_slot_count;
     shared_warm_start_contacts[tid] = warm_start_count;
     shared_penetration[tid] = max_penetration;
     shared_residual[tid] = max_residual;
@@ -418,12 +469,15 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     shared_angular_impulse_magnitude[tid] = angular_impulse_magnitude;
     shared_warm_start_magnitude[tid] = warm_start_magnitude;
     shared_coupling_impulse[tid] = max_coupling_impulse;
+    shared_coupling_force[tid] = coupling_force;
+    shared_coupling_torque[tid] = coupling_torque;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             shared_contacts[tid] += shared_contacts[tid + stride];
             shared_impulse_contacts[tid] += shared_impulse_contacts[tid + stride];
+            shared_active_slots[tid] += shared_active_slots[tid + stride];
             shared_warm_start_contacts[tid] += shared_warm_start_contacts[tid + stride];
             shared_penetration[tid] =
                 fmaxf(shared_penetration[tid], shared_penetration[tid + stride]);
@@ -439,6 +493,8 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
             shared_coupling_impulse[tid] =
                 fmaxf(shared_coupling_impulse[tid],
                       shared_coupling_impulse[tid + stride]);
+            shared_coupling_force[tid] += shared_coupling_force[tid + stride];
+            shared_coupling_torque[tid] += shared_coupling_torque[tid + stride];
         }
         __syncthreads();
     }
@@ -453,9 +509,12 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         report->kinetic_energy = shared_energy[0];
         report->rigid_impulse_magnitude = shared_impulse_magnitude[0];
         report->rigid_angular_impulse_magnitude = shared_angular_impulse_magnitude[0];
+        report->coupling_active_slot_count = shared_active_slots[0];
         report->coupling_warm_start_count = shared_warm_start_contacts[0];
         report->coupling_warm_start_impulse_magnitude = shared_warm_start_magnitude[0];
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
+        report->coupling_force_magnitude = shared_coupling_force[0];
+        report->coupling_torque_magnitude = shared_coupling_torque[0];
     }
 }
 
@@ -524,10 +583,13 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        bool enable_coupling_warm_start,
                                        float* stored_normal_impulse,
                                        uint32_t* stored_shape_index,
+                                       bool* touched_slot,
                                        uint32_t* warm_start_count,
                                        float* warm_start_magnitude,
                                        float* max_coupling_normal_impulse,
-                                       bool* touched_coupling_cache) {
+                                       float* force_magnitude,
+                                       float* torque_magnitude,
+                                       float dt) {
     math::Vec3 normal = MakeVec3(0.0f, 1.0f, 0.0f);
     float penetration = 0.0f;
 
@@ -680,10 +742,17 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
     if (stored_normal_impulse != nullptr && stored_shape_index != nullptr) {
         *stored_normal_impulse = accumulated_normal_impulse;
         *stored_shape_index = shape_index;
+        if (touched_slot != nullptr) {
+            *touched_slot = true;
+        }
         *max_coupling_normal_impulse =
             fmaxf(*max_coupling_normal_impulse, accumulated_normal_impulse);
-        *touched_coupling_cache = true;
     }
+
+    const float inv_dt = dt > 0.0f ? 1.0f / dt : 0.0f;
+    *force_magnitude += accumulated_normal_impulse * inv_dt;
+    *torque_magnitude += sqrtf(LengthSq(angular_jacobian)) *
+        accumulated_normal_impulse * inv_dt;
 
     ApplyFriction(normal, friction, velocity);
     ++(*contact_count);
@@ -755,14 +824,18 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         float angular_impulse_magnitude = 0.0f;
         float warm_start_magnitude = 0.0f;
         float max_coupling_normal_impulse = 0.0f;
-        bool touched_coupling_cache = false;
-        float* stored_normal_impulse =
+        float force_magnitude = 0.0f;
+        float torque_magnitude = 0.0f;
+        bool touched_slots[kCudaParticleCouplingSlotsPerParticle] = {};
+        float* stored_normal_impulses =
             coupling_normal_impulses != nullptr
-                ? &coupling_normal_impulses[particle_index]
+                ? &coupling_normal_impulses[
+                      particle_index * kCudaParticleCouplingSlotsPerParticle]
                 : nullptr;
-        uint32_t* stored_shape_index =
+        uint32_t* stored_shape_indices =
             coupling_shape_indices != nullptr
-                ? &coupling_shape_indices[particle_index]
+                ? &coupling_shape_indices[
+                      particle_index * kCudaParticleCouplingSlotsPerParticle]
                 : nullptr;
         for (uint32_t shape_index = 0u; shape_index < shape_count; ++shape_index) {
             const scene::BodyId body_id = shape_body_ids[shape_index];
@@ -770,6 +843,22 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
             const math::Transform shape_transform =
                 Compose(body_transform, shape_local_transforms[shape_index]);
             const float body_inv_mass = body_inv_masses[body_id];
+            const uint32_t coupling_slot =
+                FindCouplingSlot(shape_index, stored_shape_indices);
+            float* stored_normal_impulse =
+                (stored_normal_impulses != nullptr &&
+                 coupling_slot != kInvalidCudaParticleCouplingShape)
+                    ? &stored_normal_impulses[coupling_slot]
+                    : nullptr;
+            uint32_t* stored_shape_index =
+                (stored_shape_indices != nullptr &&
+                 coupling_slot != kInvalidCudaParticleCouplingShape)
+                    ? &stored_shape_indices[coupling_slot]
+                    : nullptr;
+            bool* touched_slot =
+                coupling_slot != kInvalidCudaParticleCouplingShape
+                    ? &touched_slots[coupling_slot]
+                    : nullptr;
             max_penetration = fmaxf(
                 max_penetration,
                 SolveDeviceWorldShape(shape_types[shape_index],
@@ -798,16 +887,25 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                       enable_coupling_warm_start,
                                       stored_normal_impulse,
                                       stored_shape_index,
+                                      touched_slot,
                                       &warm_start_count,
                                       &warm_start_magnitude,
                                       &max_coupling_normal_impulse,
-                                      &touched_coupling_cache));
+                                      &force_magnitude,
+                                      &torque_magnitude,
+                                      dt));
         }
 
-        if (!touched_coupling_cache && stored_normal_impulse != nullptr &&
-            stored_shape_index != nullptr) {
-            *stored_normal_impulse = 0.0f;
-            *stored_shape_index = kInvalidCudaParticleCouplingShape;
+        uint32_t active_slot_count = 0u;
+        if (stored_normal_impulses != nullptr && stored_shape_indices != nullptr) {
+            for (uint32_t slot = 0u; slot < kCudaParticleCouplingSlotsPerParticle; ++slot) {
+                if (touched_slots[slot]) {
+                    ++active_slot_count;
+                } else {
+                    stored_normal_impulses[slot] = 0.0f;
+                    stored_shape_indices[slot] = kInvalidCudaParticleCouplingShape;
+                }
+            }
         }
 
         float max_residual = 0.0f;
@@ -828,6 +926,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
 
         diag.contact_count = contact_count;
         diag.rigid_impulse_count = impulse_count;
+        diag.coupling_active_slot_count = active_slot_count;
         diag.coupling_warm_start_count = warm_start_count;
         diag.max_penetration = max_penetration;
         diag.max_penetration_after_solve = max_residual;
@@ -835,6 +934,8 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         diag.rigid_angular_impulse_magnitude = angular_impulse_magnitude;
         diag.coupling_warm_start_impulse_magnitude = warm_start_magnitude;
         diag.max_coupling_normal_impulse = max_coupling_normal_impulse;
+        diag.coupling_force_magnitude = force_magnitude;
+        diag.coupling_torque_magnitude = torque_magnitude;
 
         particle_positions[particle_index] = position;
         particle_velocities[particle_index] = velocity;
@@ -925,8 +1026,10 @@ CudaParticleState CudaParticleWorld::DownloadState() const {
 
 CudaParticleCouplingState CudaParticleWorld::DownloadCouplingState() const {
     CudaParticleCouplingState state;
-    state.normal_impulses = DownloadVector<float>(coupling_normal_impulses_, particle_count_);
-    state.shape_indices = DownloadVector<uint32_t>(coupling_shape_indices_, particle_count_);
+    state.slot_count_per_particle = kCudaParticleCouplingSlotsPerParticle;
+    const uint32_t slot_count = particle_count_ * kCudaParticleCouplingSlotsPerParticle;
+    state.normal_impulses = DownloadVector<float>(coupling_normal_impulses_, slot_count);
+    state.shape_indices = DownloadVector<uint32_t>(coupling_shape_indices_, slot_count);
     return state;
 }
 
@@ -989,9 +1092,11 @@ CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
     }
 
     const uint32_t particle_count = static_cast<uint32_t>(count);
-    std::vector<float> coupling_impulses(count, 0.0f);
+    const size_t coupling_slot_count =
+        count * static_cast<size_t>(kCudaParticleCouplingSlotsPerParticle);
+    std::vector<float> coupling_impulses(coupling_slot_count, 0.0f);
     std::vector<uint32_t> coupling_shape_indices(
-        count, kInvalidCudaParticleCouplingShape);
+        coupling_slot_count, kInvalidCudaParticleCouplingShape);
 
     return CudaParticleWorld(particle_count,
                              UploadVector(particles.positions),

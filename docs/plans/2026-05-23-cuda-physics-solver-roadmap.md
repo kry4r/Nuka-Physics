@@ -110,19 +110,24 @@ git commit -m "physics: add cuda particle coupling foundation"
 - CUDA particle/DeviceWorld coupling now supports cooked plane, sphere, box, and
   capsule shapes with rigid linear/angular impulse feedback.
 - `CudaParticleWorld` owns CUDA-resident per-particle coupling normal impulse
-  and shape-index caches. The cooked coupling kernel writes the cache, reports
-  warm-start count/magnitude on the next same-shape contact, and clears stale
-  cache entries when contact separates.
+  and shape-index caches with four cooked-shape slots per particle. The cooked
+  coupling kernel writes each touched slot, reports active slot count,
+  warm-start count/magnitude, force magnitude, and torque magnitude, and clears
+  stale cache entries when contact separates.
 - `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
-  and capsule coupling, so the behavior is visible outside unit tests.
+  capsule, and two-box corner coupling, so single-particle multi-contact cache
+  behavior is visible outside unit tests.
 - `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
   tracks the added cache/report path under the existing one-second CUDA budget.
+- `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
+  tracks the multi-slot contact-cache and force/torque diagnostic path with
+  thousands of particles under the same one-second CUDA budget.
 
 ## Follow-On Tasks
 
-1. Promote the per-particle coupling cache into a reusable coupling-constraint
-   assembly path that can store multiple contacts per particle and expose
-   force/torque diagnostics.
+1. Promote the fixed per-particle coupling slots into a reusable
+   coupling-constraint assembly path shared by rigid/cloth/deformable/fluid
+   constraints, including friction rows and constraint-space Jacobians.
 2. Add cloth/deformable constraints: distance, bending, volume/shape matching,
    and XPBD-style compliance.
 3. Add particle-fluid constraints: density estimate, pressure/viscosity solve,

@@ -304,8 +304,12 @@ TEST(CudaParticleWorld, PersistsDeviceWorldCouplingNormalImpulseForWarmStart) {
     auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
 
     const auto initial_coupling = device_particles.DownloadCouplingState();
-    ASSERT_EQ(initial_coupling.normal_impulses.size(), 1u);
-    ASSERT_EQ(initial_coupling.shape_indices.size(), 1u);
+    EXPECT_EQ(initial_coupling.slot_count_per_particle,
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(initial_coupling.normal_impulses.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(initial_coupling.shape_indices.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
     EXPECT_FLOAT_EQ(initial_coupling.normal_impulses[0], 0.0f);
     EXPECT_EQ(initial_coupling.shape_indices[0],
               runtime::gpu::kInvalidCudaParticleCouplingShape);
@@ -323,12 +327,17 @@ TEST(CudaParticleWorld, PersistsDeviceWorldCouplingNormalImpulseForWarmStart) {
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
     const auto stored_after_first = device_particles.DownloadCouplingState();
 
-    ASSERT_EQ(stored_after_first.normal_impulses.size(), 1u);
-    ASSERT_EQ(stored_after_first.shape_indices.size(), 1u);
+    ASSERT_EQ(stored_after_first.normal_impulses.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(stored_after_first.shape_indices.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
     EXPECT_EQ(first_report.contact_count, 1u);
+    EXPECT_EQ(first_report.coupling_active_slot_count, 1u);
     EXPECT_EQ(first_report.coupling_warm_start_count, 0u);
     EXPECT_FLOAT_EQ(first_report.coupling_warm_start_impulse_magnitude, 0.0f);
     EXPECT_GT(first_report.max_coupling_normal_impulse, 0.0f);
+    EXPECT_GT(first_report.coupling_force_magnitude, 0.0f);
+    EXPECT_GT(first_report.coupling_torque_magnitude, 0.0f);
     EXPECT_GT(stored_after_first.normal_impulses[0], 0.0f);
     EXPECT_EQ(stored_after_first.shape_indices[0], 0u);
 
@@ -337,6 +346,7 @@ TEST(CudaParticleWorld, PersistsDeviceWorldCouplingNormalImpulseForWarmStart) {
     const auto stored_after_second = device_particles.DownloadCouplingState();
 
     EXPECT_EQ(second_report.contact_count, 1u);
+    EXPECT_EQ(second_report.coupling_active_slot_count, 1u);
     EXPECT_EQ(second_report.coupling_warm_start_count, 1u);
     EXPECT_GT(second_report.coupling_warm_start_impulse_magnitude, 0.0f);
     EXPECT_GT(second_report.max_coupling_normal_impulse, 0.0f);
@@ -383,8 +393,10 @@ TEST(CudaParticleWorld, ClearsDeviceWorldCouplingImpulseWhenContactSeparates) {
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
     auto coupling_state = device_particles.DownloadCouplingState();
 
-    ASSERT_EQ(coupling_state.normal_impulses.size(), 1u);
-    ASSERT_EQ(coupling_state.shape_indices.size(), 1u);
+    ASSERT_EQ(coupling_state.normal_impulses.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(coupling_state.shape_indices.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
     EXPECT_EQ(first_report.contact_count, 1u);
     EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
     EXPECT_EQ(coupling_state.shape_indices[0], 0u);
@@ -394,11 +406,102 @@ TEST(CudaParticleWorld, ClearsDeviceWorldCouplingImpulseWhenContactSeparates) {
     coupling_state = device_particles.DownloadCouplingState();
 
     EXPECT_EQ(second_report.contact_count, 0u);
+    EXPECT_EQ(second_report.coupling_active_slot_count, 0u);
     EXPECT_EQ(second_report.coupling_warm_start_count, 0u);
     EXPECT_FLOAT_EQ(second_report.coupling_warm_start_impulse_magnitude, 0.0f);
-    EXPECT_FLOAT_EQ(coupling_state.normal_impulses[0], 0.0f);
-    EXPECT_EQ(coupling_state.shape_indices[0],
-              runtime::gpu::kInvalidCudaParticleCouplingShape);
+    for (uint32_t slot = 0; slot < runtime::gpu::kCudaParticleCouplingSlotsPerParticle; ++slot) {
+        EXPECT_FLOAT_EQ(coupling_state.normal_impulses[slot], 0.0f);
+        EXPECT_EQ(coupling_state.shape_indices[slot],
+                  runtime::gpu::kInvalidCudaParticleCouplingShape);
+    }
+}
+
+TEST(CudaParticleWorld, StoresMultipleDeviceWorldCouplingSlotsForOneParticle) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord floor_box_body;
+    floor_box_body.name = "floor_like_robot_link";
+    floor_box_body.mass = 4.0f;
+    floor_box_body.inertia = {1.0f, 1.0f, 1.0f};
+    floor_box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto floor_body_id = scene.AddRigidBody(std::move(floor_box_body));
+
+    scene::CollisionShapeRecord floor_box;
+    floor_box.body_id = floor_body_id;
+    floor_box.type = scene::ShapeType::Box;
+    floor_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(floor_box));
+
+    scene::RigidBodyRecord side_box_body;
+    side_box_body.name = "side_wall_robot_link";
+    side_box_body.mass = 4.0f;
+    side_box_body.inertia = {1.0f, 1.0f, 1.0f};
+    side_box_body.local_transform.position = {0.36f, 0.10f, 0.0f};
+    const auto side_body_id = scene.AddRigidBody(std::move(side_box_body));
+
+    scene::CollisionShapeRecord side_box;
+    side_box.body_id = side_body_id;
+    side_box.type = scene::ShapeType::Box;
+    side_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(side_box));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.05f, 0.34f, 0.0f}};
+    particles.velocities = {{0.05f, -0.05f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {10u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = {0.0f, -9.81f, 0.0f};
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+
+    const auto first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto first_coupling = device_particles.DownloadCouplingState();
+    const auto first_rigid_state = device_world.DownloadState();
+
+    ASSERT_EQ(first_coupling.normal_impulses.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(first_coupling.shape_indices.size(),
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    ASSERT_EQ(first_rigid_state.linear_velocities.size(), 2u);
+    ASSERT_EQ(first_rigid_state.angular_velocities.size(), 2u);
+
+    EXPECT_EQ(first_report.contact_count, 2u);
+    EXPECT_EQ(first_report.coupling_active_slot_count, 2u);
+    EXPECT_EQ(first_report.coupling_warm_start_count, 0u);
+    EXPECT_GT(first_report.coupling_force_magnitude, 0.0f);
+    EXPECT_GT(first_report.coupling_torque_magnitude, 0.0f);
+    EXPECT_GT(first_coupling.normal_impulses[0], 0.0f);
+    EXPECT_GT(first_coupling.normal_impulses[1], 0.0f);
+    EXPECT_EQ(first_coupling.shape_indices[0], 0u);
+    EXPECT_EQ(first_coupling.shape_indices[1], 1u);
+    EXPECT_LT(first_rigid_state.linear_velocities[floor_body_id].y, 0.0f);
+    EXPECT_GT(first_rigid_state.linear_velocities[side_body_id].x, 0.0f);
+    EXPECT_GT(std::abs(first_rigid_state.angular_velocities[floor_body_id].z), 1.0e-4f);
+
+    const auto second_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto second_coupling = device_particles.DownloadCouplingState();
+
+    EXPECT_EQ(second_report.contact_count, 2u);
+    EXPECT_EQ(second_report.coupling_active_slot_count, 2u);
+    EXPECT_EQ(second_report.coupling_warm_start_count, 2u);
+    EXPECT_GT(second_report.coupling_warm_start_impulse_magnitude, 0.0f);
+    EXPECT_GT(second_report.coupling_force_magnitude, 0.0f);
+    EXPECT_GT(second_report.coupling_torque_magnitude, 0.0f);
+    EXPECT_EQ(second_coupling.shape_indices[0], 0u);
+    EXPECT_EQ(second_coupling.shape_indices[1], 1u);
 }
 
 TEST(CudaParticleWorld, OffCenterParticleImpulseChangesRigidAngularVelocity) {

@@ -24,8 +24,10 @@ struct CudaParticleSet {
 using CudaParticleState = CudaParticleSet;
 
 inline constexpr uint32_t kInvalidCudaParticleCouplingShape = 0xffffffffu;
+inline constexpr uint32_t kCudaParticleCouplingSlotsPerParticle = 4u;
 
 struct CudaParticleCouplingState {
+    uint32_t slot_count_per_particle = kCudaParticleCouplingSlotsPerParticle;
     std::vector<float> normal_impulses;
     std::vector<uint32_t> shape_indices;
 };
@@ -66,9 +68,12 @@ struct CudaParticleStepReport {
     float kinetic_energy = 0.0f;
     float rigid_impulse_magnitude = 0.0f;
     float rigid_angular_impulse_magnitude = 0.0f;
+    uint32_t coupling_active_slot_count = 0;
     uint32_t coupling_warm_start_count = 0;
     float coupling_warm_start_impulse_magnitude = 0.0f;
     float max_coupling_normal_impulse = 0.0f;
+    float coupling_force_magnitude = 0.0f;
+    float coupling_torque_magnitude = 0.0f;
 };
 
 struct CudaParticleDeviceWorldCouplingOptions {
