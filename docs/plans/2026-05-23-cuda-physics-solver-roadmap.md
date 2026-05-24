@@ -117,26 +117,41 @@ git commit -m "physics: add cuda particle coupling foundation"
 - Each coupling slot now also owns a CUDA-resident constraint row record with
   particle/shape/body ids, normal, contact point, Jacobian terms, rhs, position
   error, effective mass, and accumulated normal impulse. This is the assembly
-  surface for the later unified coupling solver; the current kernel still owns
-  the direct projection/impulse solve.
+  surface for the coupling row solver and the later unified coupling solver.
+- CUDA cooked particle/rigid coupling rows now execute normal velocity impulses
+  in `SolveParticleCouplingRowsKernel` by default. The contact kernel still
+  performs position projection for this stage, but it skips direct velocity
+  impulse application when row solving is enabled; the row solver consumes
+  assembled rows, clamps accumulated normal impulse, updates particle velocity,
+  atomically updates rigid linear/angular velocity, and reports row-solver
+  launch/impulse diagnostics. The row solver now sweeps each particle's fixed
+  coupling slots in one CUDA thread, so one particle with multiple active
+  cooked contacts accumulates every row into its velocity deterministically at
+  the particle scope.
 - `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
-  capsule, and two-box corner coupling, including row-level effective mass,
-  position error, and normal impulse diagnostics, so single-particle
-  multi-contact cache behavior is visible outside unit tests.
+  capsule, and two-box corner coupling, including row-solver launch/impulse
+  counts plus row-level effective mass, position error, and normal impulse
+  diagnostics, so single-particle multi-contact cache behavior is visible
+  outside unit tests.
 - `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
   tracks the added cache/report path under the existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
-  tracks the multi-slot contact-cache and force/torque diagnostic path with
-  thousands of particles under the same one-second CUDA budget.
+  tracks the multi-slot contact-cache, force/torque diagnostic, and row-solver
+  impulse path with thousands of particles under the same one-second CUDA
+  budget.
 
 ## Follow-On Tasks
 
-1. Promote the fixed per-particle coupling rows into a reusable
-   coupling-constraint solve path shared by rigid/cloth/deformable/fluid
-   constraints, including friction rows, compliance, and row iteration.
-2. Add cloth/deformable constraints: distance, bending, volume/shape matching,
+1. Extend the current CUDA normal coupling row solver with tangent/friction
+   rows, compliance/XPBD-style softness, warm-start iteration across multiple
+   rows, and convergence diagnostics.
+2. Promote the fixed per-particle coupling rows into a reusable
+   coupling-constraint solve scheduler shared by rigid/cloth/deformable/fluid
+   constraints, including global coloring or island batching for deterministic
+   cross-particle writes into shared rigid bodies.
+3. Add cloth/deformable constraints: distance, bending, volume/shape matching,
    and XPBD-style compliance.
-3. Add particle-fluid constraints: density estimate, pressure/viscosity solve,
+4. Add particle-fluid constraints: density estimate, pressure/viscosity solve,
    boundary coupling, and diagnostics.
-4. Add batched particle worlds for robot/RL workloads that match
+5. Add batched particle worlds for robot/RL workloads that match
    `BatchedDeviceWorld` instance-major layout.

@@ -133,7 +133,8 @@ int main() {
     coupling_options.accumulate_rigid_impulses = true;
     coupling_options.enable_coupling_warm_start = true;
 
-    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+    const auto coupling_first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
         device_coupled_particles,
         device_world,
         coupling_options);
@@ -156,6 +157,18 @@ int main() {
               << " coupling_torque=" << coupling_report.coupling_torque_magnitude
               << " warm_start_impulse_magnitude="
               << coupling_report.coupling_warm_start_impulse_magnitude
+              << " row_solver_launches="
+              << coupling_report.coupling_row_solver_launch_count
+              << " row_solver_impulses="
+              << coupling_report.coupling_row_solver_impulse_count
+              << " row_solver_impulse_magnitude="
+              << coupling_report.coupling_row_solver_impulse_magnitude
+              << " row_solver_total_impulses="
+              << (coupling_first_report.coupling_row_solver_impulse_count +
+                  coupling_report.coupling_row_solver_impulse_count)
+              << " row_solver_total_impulse_magnitude="
+              << (coupling_first_report.coupling_row_solver_impulse_magnitude +
+                  coupling_report.coupling_row_solver_impulse_magnitude)
               << " max_coupling_normal_impulse="
               << coupling_report.max_coupling_normal_impulse
               << " slots_per_particle=" << coupling_state.slot_count_per_particle
@@ -178,7 +191,8 @@ int main() {
     box_particles.phases = {2u};
     auto device_box_particles = runtime::gpu::UploadCudaParticleWorld(box_particles);
 
-    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+    const auto box_first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
         device_box_particles,
         device_world,
         coupling_options);
@@ -201,6 +215,18 @@ int main() {
               << " coupling_torque=" << box_report.coupling_torque_magnitude
               << " warm_start_impulse_magnitude="
               << box_report.coupling_warm_start_impulse_magnitude
+              << " row_solver_launches="
+              << box_report.coupling_row_solver_launch_count
+              << " row_solver_impulses="
+              << box_report.coupling_row_solver_impulse_count
+              << " row_solver_impulse_magnitude="
+              << box_report.coupling_row_solver_impulse_magnitude
+              << " row_solver_total_impulses="
+              << (box_first_report.coupling_row_solver_impulse_count +
+                  box_report.coupling_row_solver_impulse_count)
+              << " row_solver_total_impulse_magnitude="
+              << (box_first_report.coupling_row_solver_impulse_magnitude +
+                  box_report.coupling_row_solver_impulse_magnitude)
               << " max_coupling_normal_impulse="
               << box_report.max_coupling_normal_impulse
               << " slots_per_particle=" << box_coupling_state.slot_count_per_particle
@@ -224,7 +250,8 @@ int main() {
     auto device_capsule_particles =
         runtime::gpu::UploadCudaParticleWorld(capsule_particles);
 
-    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+    const auto capsule_first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
         device_capsule_particles,
         device_world,
         coupling_options);
@@ -247,6 +274,18 @@ int main() {
               << " coupling_torque=" << capsule_report.coupling_torque_magnitude
               << " warm_start_impulse_magnitude="
               << capsule_report.coupling_warm_start_impulse_magnitude
+              << " row_solver_launches="
+              << capsule_report.coupling_row_solver_launch_count
+              << " row_solver_impulses="
+              << capsule_report.coupling_row_solver_impulse_count
+              << " row_solver_impulse_magnitude="
+              << capsule_report.coupling_row_solver_impulse_magnitude
+              << " row_solver_total_impulses="
+              << (capsule_first_report.coupling_row_solver_impulse_count +
+                  capsule_report.coupling_row_solver_impulse_count)
+              << " row_solver_total_impulse_magnitude="
+              << (capsule_first_report.coupling_row_solver_impulse_magnitude +
+                  capsule_report.coupling_row_solver_impulse_magnitude)
               << " max_coupling_normal_impulse="
               << capsule_report.max_coupling_normal_impulse
               << " slots_per_particle=" << capsule_coupling_state.slot_count_per_particle
@@ -303,7 +342,8 @@ int main() {
     runtime::gpu::CudaParticleDeviceWorldCouplingOptions corner_options = coupling_options;
     corner_options.gravity = {0.0f, -9.81f, 0.0f};
 
-    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+    const auto corner_first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
         device_corner_particles,
         corner_device_world,
         corner_options);
@@ -322,6 +362,18 @@ int main() {
               << " warm_starts=" << corner_report.coupling_warm_start_count
               << " coupling_force=" << corner_report.coupling_force_magnitude
               << " coupling_torque=" << corner_report.coupling_torque_magnitude
+              << " row_solver_launches="
+              << corner_report.coupling_row_solver_launch_count
+              << " row_solver_impulses="
+              << corner_report.coupling_row_solver_impulse_count
+              << " row_solver_impulse_magnitude="
+              << corner_report.coupling_row_solver_impulse_magnitude
+              << " row_solver_total_impulses="
+              << (corner_first_report.coupling_row_solver_impulse_count +
+                  corner_report.coupling_row_solver_impulse_count)
+              << " row_solver_total_impulse_magnitude="
+              << (corner_first_report.coupling_row_solver_impulse_magnitude +
+                  corner_report.coupling_row_solver_impulse_magnitude)
               << " slots_per_particle=" << corner_coupling_state.slot_count_per_particle
               << " row0_active=" << corner_rows.rows[0].active
               << " row1_active=" << corner_rows.rows[1].active
@@ -344,28 +396,80 @@ int main() {
               << corner_rigid_state.linear_velocities[corner_side_id].y << ", "
               << corner_rigid_state.linear_velocities[corner_side_id].z << ")\n";
 
+    const auto coupling_rigid_impulses =
+        coupling_first_report.rigid_impulse_count + coupling_report.rigid_impulse_count;
+    const auto coupling_row_impulses =
+        coupling_first_report.coupling_row_solver_impulse_count +
+        coupling_report.coupling_row_solver_impulse_count;
+    const auto coupling_row_impulse_magnitude =
+        coupling_first_report.coupling_row_solver_impulse_magnitude +
+        coupling_report.coupling_row_solver_impulse_magnitude;
+    const auto coupling_angular_impulse_magnitude =
+        coupling_first_report.rigid_angular_impulse_magnitude +
+        coupling_report.rigid_angular_impulse_magnitude;
+
+    const auto box_rigid_impulses =
+        box_first_report.rigid_impulse_count + box_report.rigid_impulse_count;
+    const auto box_row_impulses =
+        box_first_report.coupling_row_solver_impulse_count +
+        box_report.coupling_row_solver_impulse_count;
+    const auto box_row_impulse_magnitude =
+        box_first_report.coupling_row_solver_impulse_magnitude +
+        box_report.coupling_row_solver_impulse_magnitude;
+    const auto box_angular_impulse_magnitude =
+        box_first_report.rigid_angular_impulse_magnitude +
+        box_report.rigid_angular_impulse_magnitude;
+
+    const auto capsule_rigid_impulses =
+        capsule_first_report.rigid_impulse_count + capsule_report.rigid_impulse_count;
+    const auto capsule_row_impulses =
+        capsule_first_report.coupling_row_solver_impulse_count +
+        capsule_report.coupling_row_solver_impulse_count;
+    const auto capsule_row_impulse_magnitude =
+        capsule_first_report.coupling_row_solver_impulse_magnitude +
+        capsule_report.coupling_row_solver_impulse_magnitude;
+    const auto capsule_angular_impulse_magnitude =
+        capsule_first_report.rigid_angular_impulse_magnitude +
+        capsule_report.rigid_angular_impulse_magnitude;
+
+    const auto corner_row_impulses =
+        corner_first_report.coupling_row_solver_impulse_count +
+        corner_report.coupling_row_solver_impulse_count;
+    const auto corner_row_impulse_magnitude =
+        corner_first_report.coupling_row_solver_impulse_magnitude +
+        corner_report.coupling_row_solver_impulse_magnitude;
+
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
-                   coupling_report.rigid_impulse_count > 0u &&
+                   coupling_rigid_impulses > 0u &&
                    coupling_report.coupling_active_slot_count > 0u &&
                    coupling_report.coupling_warm_start_count > 0u &&
-                   coupling_report.rigid_angular_impulse_magnitude > 0.0f &&
+                   coupling_angular_impulse_magnitude > 0.0f &&
+                   coupling_report.coupling_row_solver_launch_count > 0u &&
+                   coupling_row_impulses > 0u &&
+                   coupling_row_impulse_magnitude > 0.0f &&
                    coupling_report.coupling_force_magnitude > 0.0f &&
                    coupling_report.coupling_torque_magnitude > 0.0f &&
                    box_report.contact_count > 0u &&
-                   box_report.rigid_impulse_count > 0u &&
+                   box_rigid_impulses > 0u &&
                    box_report.coupling_active_slot_count > 0u &&
                    box_report.coupling_warm_start_count > 0u &&
                    box_report.max_penetration_after_solve <= 1.0e-4f &&
-                   box_report.rigid_angular_impulse_magnitude > 0.0f &&
+                   box_angular_impulse_magnitude > 0.0f &&
+                   box_report.coupling_row_solver_launch_count > 0u &&
+                   box_row_impulses > 0u &&
+                   box_row_impulse_magnitude > 0.0f &&
                    box_report.coupling_force_magnitude > 0.0f &&
                    box_report.coupling_torque_magnitude > 0.0f &&
                    capsule_report.contact_count > 0u &&
-                   capsule_report.rigid_impulse_count > 0u &&
+                   capsule_rigid_impulses > 0u &&
                    capsule_report.coupling_active_slot_count > 0u &&
                    capsule_report.coupling_warm_start_count > 0u &&
                    capsule_report.max_penetration_after_solve <= 1.0e-4f &&
-                   capsule_report.rigid_angular_impulse_magnitude > 0.0f &&
+                   capsule_angular_impulse_magnitude > 0.0f &&
+                   capsule_report.coupling_row_solver_launch_count > 0u &&
+                   capsule_row_impulses > 0u &&
+                   capsule_row_impulse_magnitude > 0.0f &&
                    capsule_report.coupling_force_magnitude > 0.0f &&
                    capsule_report.coupling_torque_magnitude > 0.0f &&
                    corner_report.contact_count >= 2u &&
@@ -373,6 +477,9 @@ int main() {
                    corner_report.coupling_warm_start_count >= 2u &&
                    corner_report.coupling_force_magnitude > 0.0f &&
                    corner_report.coupling_torque_magnitude > 0.0f &&
+                   corner_report.coupling_row_solver_launch_count > 0u &&
+                   corner_row_impulses >= 2u &&
+                   corner_row_impulse_magnitude > 0.0f &&
                    corner_coupling_state.slot_count_per_particle ==
                        runtime::gpu::kCudaParticleCouplingSlotsPerParticle &&
                    corner_rows.rows.size() >=
