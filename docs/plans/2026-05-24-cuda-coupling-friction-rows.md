@@ -21,6 +21,11 @@ two tangent sub-rows whose impulses are clamped by `friction * normal_impulse`.
   tangent rows using the updated particle velocity and rigid velocity. Tangent
   impulses are clamped to the Coulomb interval
   `[-friction * normal_impulse, friction * normal_impulse]`.
+- On a same-shape warm start, the assembly kernel projects the previous tangent
+  impulse vector into the current tangent basis. The row solver pre-applies the
+  cached normal and tangent impulses on the GPU before solving correction rows,
+  so friction cache state affects the current particle/rigid velocities instead
+  of remaining a host-visible diagnostic only.
 - CPU remains orchestration and validation only: it launches kernels and can
   download compact rows/reports for tests, demos, and benchmarks.
 
@@ -30,14 +35,16 @@ two tangent sub-rows whose impulses are clamped by `friction * normal_impulse`.
   friction disabled and enabled. The friction-enabled path must reduce particle
   tangential speed, report CUDA friction-row impulses, and expose non-zero
   tangent row impulse data in downloaded coupling rows.
+- Add a runtime test that steps the same contact twice and verifies persistent
+  tangent warm-start count/magnitude plus stable downloaded tangent impulse
+  state across frames.
 - Extend the CUDA particle coupling timing checks to accumulate friction-row
-  evidence under the existing one-second budgets.
+  and tangent warm-start evidence under the existing one-second budgets.
 - Extend `nuka_cuda_particle_demo` and the P0 regression matrix so the solver
   path is visible outside unit tests.
 
 ## Follow-On
 
-- Warm-start tangent impulses across frames.
 - Move the fixed per-particle coupling record into a general row buffer shared
   by rigid, cloth, deformable, and fluid constraints.
 - Add graph coloring or island batching for deterministic cross-particle writes

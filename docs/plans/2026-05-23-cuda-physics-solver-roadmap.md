@@ -138,6 +138,9 @@ git commit -m "physics: add cuda particle coupling foundation"
 - `CudaParticleCouplingTiming.DeviceWorldBoxRigidImpulseCouplingUnderOneSecond`
   now includes tangential motion and friction-row impulse accumulation under the
   existing one-second CUDA budget.
+- `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
+  now runs with tangential motion and friction so it covers persistent tangent
+  warm-start counts and magnitudes under the existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
   tracks the multi-slot contact-cache, force/torque diagnostic, and row-solver
   impulse path with thousands of particles under the same one-second CUDA
@@ -145,9 +148,10 @@ git commit -m "physics: add cuda particle coupling foundation"
 
 ## Follow-On Tasks
 
-1. Extend the current CUDA coupling row solver with tangent warm-start,
-   compliance/XPBD-style softness, multi-iteration convergence diagnostics, and
-   persistent friction state across frames.
+1. Extend the current CUDA coupling row solver with compliance/XPBD-style
+   softness, multi-iteration convergence diagnostics, and a shared row scheduler
+   that can iterate warm-started normal/tangent friction rows across constraint
+   families.
 2. Promote the fixed per-particle coupling rows into a reusable
    coupling-constraint solve scheduler shared by rigid/cloth/deformable/fluid
    constraints, including global coloring or island batching for deterministic

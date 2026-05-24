@@ -100,7 +100,9 @@ struct CudaParticleStepReport {
     float rigid_angular_impulse_magnitude = 0.0f;
     uint32_t coupling_active_slot_count = 0;
     uint32_t coupling_warm_start_count = 0;
+    uint32_t coupling_tangent_warm_start_count = 0;
     float coupling_warm_start_impulse_magnitude = 0.0f;
+    float coupling_tangent_warm_start_impulse_magnitude = 0.0f;
     float max_coupling_normal_impulse = 0.0f;
     float coupling_force_magnitude = 0.0f;
     float coupling_torque_magnitude = 0.0f;

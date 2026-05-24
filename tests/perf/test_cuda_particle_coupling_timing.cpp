@@ -392,7 +392,7 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
         const float y = 0.251f + static_cast<float>((index / 64u) % 16u) * 0.0001f;
         const float z = static_cast<float>(index / (64u * 16u)) * 0.006f - 0.02f;
         particles.positions.push_back({x, y, z});
-        particles.velocities.push_back({0.0f, -0.02f, 0.0f});
+        particles.velocities.push_back({0.03f, -0.02f, 0.0f});
         particles.inv_masses.push_back(1.0f);
         particles.radii.push_back(0.004f);
         particles.phases.push_back(index % 4u);
@@ -406,7 +406,7 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     options.gravity = math::Vec3::Zero();
     options.dt = 1.0f / 240.0f;
     options.step_count = 1u;
-    options.friction = 0.0f;
+    options.friction = 0.25f;
     options.restitution = 0.0f;
     options.accumulate_rigid_impulses = true;
     options.enable_coupling_warm_start = true;
@@ -415,7 +415,9 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     uint64_t row_solver_impulse_count = 0;
     float row_solver_impulse_magnitude = 0.0f;
     uint64_t warm_start_count = 0;
+    uint64_t tangent_warm_start_count = 0;
     float warm_start_impulse_magnitude = 0.0f;
+    float tangent_warm_start_impulse_magnitude = 0.0f;
     const auto start = std::chrono::high_resolution_clock::now();
     for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
         report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
@@ -423,7 +425,10 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
         row_solver_impulse_count += report.coupling_row_solver_impulse_count;
         row_solver_impulse_magnitude += report.coupling_row_solver_impulse_magnitude;
         warm_start_count += report.coupling_warm_start_count;
+        tangent_warm_start_count += report.coupling_tangent_warm_start_count;
         warm_start_impulse_magnitude += report.coupling_warm_start_impulse_magnitude;
+        tangent_warm_start_impulse_magnitude +=
+            report.coupling_tangent_warm_start_impulse_magnitude;
     }
     const auto end = std::chrono::high_resolution_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -432,7 +437,9 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     EXPECT_EQ(report.particle_count, kParticleCount);
     EXPECT_GT(report.contact_count, 0u);
     EXPECT_GT(warm_start_count, 0u);
+    EXPECT_GT(tangent_warm_start_count, 0u);
     EXPECT_GT(warm_start_impulse_magnitude, 0.0f);
+    EXPECT_GT(tangent_warm_start_impulse_magnitude, 0.0f);
     EXPECT_GT(report.max_coupling_normal_impulse, 0.0f);
     EXPECT_GT(report.coupling_active_slot_count, 0u);
     EXPECT_GT(report.coupling_force_magnitude, 0.0f);

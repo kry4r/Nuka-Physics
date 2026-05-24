@@ -21,6 +21,7 @@ struct ParticleDiagnostics {
     uint32_t rigid_impulse_count;
     uint32_t coupling_active_slot_count;
     uint32_t coupling_warm_start_count;
+    uint32_t coupling_tangent_warm_start_count;
     float max_penetration;
     float max_penetration_after_solve;
     float speed_sq;
@@ -28,6 +29,7 @@ struct ParticleDiagnostics {
     float rigid_impulse_magnitude;
     float rigid_angular_impulse_magnitude;
     float coupling_warm_start_impulse_magnitude;
+    float coupling_tangent_warm_start_impulse_magnitude;
     float max_coupling_normal_impulse;
     float coupling_force_magnitude;
     float coupling_torque_magnitude;
@@ -179,6 +181,39 @@ __device__ math::Vec3 ApplyInverseInertia(math::Vec3 angular_impulse,
     return MakeVec3(angular_impulse.x * inv_inertia.x,
                     angular_impulse.y * inv_inertia.y,
                     angular_impulse.z * inv_inertia.z);
+}
+
+__device__ math::Vec3 ApplyCouplingVelocityImpulse(
+    math::Vec3 particle_linear_jacobian,
+    math::Vec3 body_linear_jacobian,
+    math::Vec3 body_angular_jacobian,
+    float impulse,
+    float particle_inv_mass,
+    float body_inv_mass,
+    math::Vec3 inv_inertia,
+    scene::BodyId body_id,
+    math::Vec3* particle_velocity,
+    math::Vec3* body_linear_velocity,
+    math::Vec3* body_angular_velocity,
+    math::Vec3* body_linear_velocities,
+    math::Vec3* body_angular_velocities) {
+    if (fabsf(impulse) <= 1.0e-12f) {
+        return MakeVec3(0.0f, 0.0f, 0.0f);
+    }
+
+    const math::Vec3 particle_delta =
+        Scale(particle_linear_jacobian, particle_inv_mass * impulse);
+    const math::Vec3 body_linear_delta =
+        Scale(body_linear_jacobian, body_inv_mass * impulse);
+    const math::Vec3 body_angular_delta =
+        ApplyInverseInertia(Scale(body_angular_jacobian, impulse), inv_inertia);
+
+    *particle_velocity = Add(*particle_velocity, particle_delta);
+    AddVelocityAtomic(body_linear_velocities, body_id, body_linear_delta);
+    AddVelocityAtomic(body_angular_velocities, body_id, body_angular_delta);
+    *body_linear_velocity = Add(*body_linear_velocity, body_linear_delta);
+    *body_angular_velocity = Add(*body_angular_velocity, body_angular_delta);
+    return body_angular_delta;
 }
 
 __device__ uint32_t FindCouplingSlot(uint32_t shape_index,
@@ -433,7 +468,9 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
         report->rigid_angular_impulse_magnitude = 0.0f;
         report->coupling_active_slot_count = shared_active_slots[0];
         report->coupling_warm_start_count = 0u;
+        report->coupling_tangent_warm_start_count = 0u;
         report->coupling_warm_start_impulse_magnitude = 0.0f;
+        report->coupling_tangent_warm_start_impulse_magnitude = 0.0f;
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
@@ -453,6 +490,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     __shared__ uint32_t shared_impulse_contacts[256];
     __shared__ uint32_t shared_active_slots[256];
     __shared__ uint32_t shared_warm_start_contacts[256];
+    __shared__ uint32_t shared_tangent_warm_start_contacts[256];
     __shared__ float shared_penetration[256];
     __shared__ float shared_residual[256];
     __shared__ float shared_speed_sq[256];
@@ -460,6 +498,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     __shared__ float shared_impulse_magnitude[256];
     __shared__ float shared_angular_impulse_magnitude[256];
     __shared__ float shared_warm_start_magnitude[256];
+    __shared__ float shared_tangent_warm_start_magnitude[256];
     __shared__ float shared_coupling_impulse[256];
     __shared__ float shared_coupling_force[256];
     __shared__ float shared_coupling_torque[256];
@@ -469,6 +508,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     uint32_t impulse_count = 0u;
     uint32_t active_slot_count = 0u;
     uint32_t warm_start_count = 0u;
+    uint32_t tangent_warm_start_count = 0u;
     float max_penetration = 0.0f;
     float max_residual = 0.0f;
     float max_speed_sq = 0.0f;
@@ -476,6 +516,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     float impulse_magnitude = 0.0f;
     float angular_impulse_magnitude = 0.0f;
     float warm_start_magnitude = 0.0f;
+    float tangent_warm_start_magnitude = 0.0f;
     float max_coupling_impulse = 0.0f;
     float coupling_force = 0.0f;
     float coupling_torque = 0.0f;
@@ -486,6 +527,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         impulse_count += diag.rigid_impulse_count;
         active_slot_count += diag.coupling_active_slot_count;
         warm_start_count += diag.coupling_warm_start_count;
+        tangent_warm_start_count += diag.coupling_tangent_warm_start_count;
         max_penetration = fmaxf(max_penetration, diag.max_penetration);
         max_residual = fmaxf(max_residual, diag.max_penetration_after_solve);
         max_speed_sq = fmaxf(max_speed_sq, diag.speed_sq);
@@ -493,6 +535,8 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         impulse_magnitude += diag.rigid_impulse_magnitude;
         angular_impulse_magnitude += diag.rigid_angular_impulse_magnitude;
         warm_start_magnitude += diag.coupling_warm_start_impulse_magnitude;
+        tangent_warm_start_magnitude +=
+            diag.coupling_tangent_warm_start_impulse_magnitude;
         max_coupling_impulse =
             fmaxf(max_coupling_impulse, diag.max_coupling_normal_impulse);
         coupling_force += diag.coupling_force_magnitude;
@@ -503,6 +547,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     shared_impulse_contacts[tid] = impulse_count;
     shared_active_slots[tid] = active_slot_count;
     shared_warm_start_contacts[tid] = warm_start_count;
+    shared_tangent_warm_start_contacts[tid] = tangent_warm_start_count;
     shared_penetration[tid] = max_penetration;
     shared_residual[tid] = max_residual;
     shared_speed_sq[tid] = max_speed_sq;
@@ -510,6 +555,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
     shared_impulse_magnitude[tid] = impulse_magnitude;
     shared_angular_impulse_magnitude[tid] = angular_impulse_magnitude;
     shared_warm_start_magnitude[tid] = warm_start_magnitude;
+    shared_tangent_warm_start_magnitude[tid] = tangent_warm_start_magnitude;
     shared_coupling_impulse[tid] = max_coupling_impulse;
     shared_coupling_force[tid] = coupling_force;
     shared_coupling_torque[tid] = coupling_torque;
@@ -521,6 +567,8 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
             shared_impulse_contacts[tid] += shared_impulse_contacts[tid + stride];
             shared_active_slots[tid] += shared_active_slots[tid + stride];
             shared_warm_start_contacts[tid] += shared_warm_start_contacts[tid + stride];
+            shared_tangent_warm_start_contacts[tid] +=
+                shared_tangent_warm_start_contacts[tid + stride];
             shared_penetration[tid] =
                 fmaxf(shared_penetration[tid], shared_penetration[tid + stride]);
             shared_residual[tid] = fmaxf(shared_residual[tid], shared_residual[tid + stride]);
@@ -532,6 +580,8 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
                 shared_angular_impulse_magnitude[tid + stride];
             shared_warm_start_magnitude[tid] +=
                 shared_warm_start_magnitude[tid + stride];
+            shared_tangent_warm_start_magnitude[tid] +=
+                shared_tangent_warm_start_magnitude[tid + stride];
             shared_coupling_impulse[tid] =
                 fmaxf(shared_coupling_impulse[tid],
                       shared_coupling_impulse[tid + stride]);
@@ -553,7 +603,11 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         report->rigid_angular_impulse_magnitude = shared_angular_impulse_magnitude[0];
         report->coupling_active_slot_count = shared_active_slots[0];
         report->coupling_warm_start_count = shared_warm_start_contacts[0];
+        report->coupling_tangent_warm_start_count =
+            shared_tangent_warm_start_contacts[0];
         report->coupling_warm_start_impulse_magnitude = shared_warm_start_magnitude[0];
+        report->coupling_tangent_warm_start_impulse_magnitude =
+            shared_tangent_warm_start_magnitude[0];
         report->max_coupling_normal_impulse = shared_coupling_impulse[0];
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
@@ -622,20 +676,22 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        math::Vec3* rigid_angular_velocities,
                                        const math::Vec3* rigid_inv_inertias,
                                        math::Vec3* position,
-                                        math::Vec3* velocity,
-                                        uint32_t* contact_count,
-                                        uint32_t* impulse_count,
-                                        float* impulse_magnitude,
-                                        float* angular_impulse_magnitude,
-                                        bool solve_coupling_rows_on_cuda,
-                                        bool enable_coupling_warm_start,
-                                        float* stored_normal_impulse,
-                                        uint32_t* stored_shape_index,
+                                       math::Vec3* velocity,
+                                       uint32_t* contact_count,
+                                       uint32_t* impulse_count,
+                                       float* impulse_magnitude,
+                                       float* angular_impulse_magnitude,
+                                       bool solve_coupling_rows_on_cuda,
+                                       bool enable_coupling_warm_start,
+                                       float* stored_normal_impulse,
+                                       uint32_t* stored_shape_index,
                                        bool* touched_slot,
                                        CudaParticleCouplingConstraintRow* coupling_row,
                                        uint32_t particle_index,
                                        uint32_t* warm_start_count,
+                                       uint32_t* tangent_warm_start_count,
                                        float* warm_start_magnitude,
+                                       float* tangent_warm_start_magnitude,
                                        float* max_coupling_normal_impulse,
                                        float* force_magnitude,
                                        float* torque_magnitude,
@@ -762,6 +818,8 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
         1.0e-6f);
 
     float accumulated_normal_impulse = 0.0f;
+    float accumulated_tangent_impulse0 = 0.0f;
+    float accumulated_tangent_impulse1 = 0.0f;
     if (enable_coupling_warm_start &&
         stored_shape_index != nullptr &&
         stored_normal_impulse != nullptr &&
@@ -770,6 +828,28 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
         accumulated_normal_impulse = *stored_normal_impulse;
         ++(*warm_start_count);
         *warm_start_magnitude += accumulated_normal_impulse;
+        if (coupling_row != nullptr && coupling_row->active &&
+            coupling_row->shape_index == shape_index) {
+            const math::Vec3 stored_tangent_impulse = Add(
+                Scale(coupling_row->tangent0, coupling_row->tangent_impulse_0),
+                Scale(coupling_row->tangent1, coupling_row->tangent_impulse_1));
+            accumulated_tangent_impulse0 = Clamp(
+                Dot(stored_tangent_impulse, tangent0),
+                -fmaxf(friction, 0.0f) * accumulated_normal_impulse,
+                fmaxf(friction, 0.0f) * accumulated_normal_impulse);
+            accumulated_tangent_impulse1 = Clamp(
+                Dot(stored_tangent_impulse, tangent1),
+                -fmaxf(friction, 0.0f) * accumulated_normal_impulse,
+                fmaxf(friction, 0.0f) * accumulated_normal_impulse);
+            const float tangent_warm_start =
+                fabsf(accumulated_tangent_impulse0) +
+                fabsf(accumulated_tangent_impulse1);
+            if (tangent_warm_start > 0.0f) {
+                ++(*tangent_warm_start_count);
+                *tangent_warm_start_magnitude += tangent_warm_start;
+                *warm_start_magnitude += tangent_warm_start;
+            }
+        }
     }
 
     const float relative_normal_speed = Dot(relative_velocity, normal);
@@ -835,6 +915,8 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
         row.tangent_effective_mass1 = 1.0f / tangent1_effective_inv_mass;
         row.friction = fmaxf(friction, 0.0f);
         row.normal_impulse = accumulated_normal_impulse;
+        row.tangent_impulse_0 = accumulated_tangent_impulse0;
+        row.tangent_impulse_1 = accumulated_tangent_impulse1;
         *coupling_row = row;
     }
 
@@ -923,9 +1005,11 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         uint32_t contact_count = 0u;
         uint32_t impulse_count = 0u;
         uint32_t warm_start_count = 0u;
+        uint32_t tangent_warm_start_count = 0u;
         float impulse_magnitude = 0.0f;
         float angular_impulse_magnitude = 0.0f;
         float warm_start_magnitude = 0.0f;
+        float tangent_warm_start_magnitude = 0.0f;
         float max_coupling_normal_impulse = 0.0f;
         float force_magnitude = 0.0f;
         float torque_magnitude = 0.0f;
@@ -1004,7 +1088,9 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                       coupling_row,
                                       particle_index,
                                       &warm_start_count,
+                                      &tangent_warm_start_count,
                                       &warm_start_magnitude,
+                                      &tangent_warm_start_magnitude,
                                       &max_coupling_normal_impulse,
                                       &force_magnitude,
                                       &torque_magnitude,
@@ -1046,11 +1132,14 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
         diag.rigid_impulse_count = impulse_count;
         diag.coupling_active_slot_count = active_slot_count;
         diag.coupling_warm_start_count = warm_start_count;
+        diag.coupling_tangent_warm_start_count = tangent_warm_start_count;
         diag.max_penetration = max_penetration;
         diag.max_penetration_after_solve = max_residual;
         diag.rigid_impulse_magnitude = impulse_magnitude;
         diag.rigid_angular_impulse_magnitude = angular_impulse_magnitude;
         diag.coupling_warm_start_impulse_magnitude = warm_start_magnitude;
+        diag.coupling_tangent_warm_start_impulse_magnitude =
+            tangent_warm_start_magnitude;
         diag.max_coupling_normal_impulse = max_coupling_normal_impulse;
         diag.coupling_force_magnitude = force_magnitude;
         diag.coupling_torque_magnitude = torque_magnitude;
@@ -1100,6 +1189,67 @@ __global__ void SolveParticleCouplingRowsKernel(
 
             math::Vec3 body_linear_velocity = body_linear_velocities[body_id];
             math::Vec3 body_angular_velocity = body_angular_velocities[body_id];
+            const float warm_started_normal_impulse = row.normal_impulse;
+            const float warm_started_tangent_impulse0 = row.tangent_impulse_0;
+            const float warm_started_tangent_impulse1 = row.tangent_impulse_1;
+            row.normal_impulse = 0.0f;
+            row.tangent_impulse_0 = 0.0f;
+            row.tangent_impulse_1 = 0.0f;
+
+            ApplyCouplingVelocityImpulse(row.particle_linear_jacobian,
+                                         row.body_linear_jacobian,
+                                         row.body_angular_jacobian,
+                                         warm_started_normal_impulse,
+                                         particle_inv_mass,
+                                         body_inv_mass,
+                                         inv_inertia,
+                                         body_id,
+                                         &particle_velocity,
+                                         &body_linear_velocity,
+                                         &body_angular_velocity,
+                                         body_linear_velocities,
+                                         body_angular_velocities);
+            row.normal_impulse = warm_started_normal_impulse;
+
+            if (row.friction > 0.0f && warm_started_normal_impulse > 0.0f) {
+                const float friction_limit =
+                    row.friction * warm_started_normal_impulse;
+                const float tangent_impulse0 = Clamp(warm_started_tangent_impulse0,
+                                                     -friction_limit,
+                                                     friction_limit);
+                const float tangent_impulse1 = Clamp(warm_started_tangent_impulse1,
+                                                     -friction_limit,
+                                                     friction_limit);
+                ApplyCouplingVelocityImpulse(row.tangent0,
+                                             Scale(row.tangent0, -1.0f),
+                                             row.body_tangent_angular_jacobian0,
+                                             tangent_impulse0,
+                                             particle_inv_mass,
+                                             body_inv_mass,
+                                             inv_inertia,
+                                             body_id,
+                                             &particle_velocity,
+                                             &body_linear_velocity,
+                                             &body_angular_velocity,
+                                             body_linear_velocities,
+                                             body_angular_velocities);
+                row.tangent_impulse_0 = tangent_impulse0;
+                ApplyCouplingVelocityImpulse(row.tangent1,
+                                             Scale(row.tangent1, -1.0f),
+                                             row.body_tangent_angular_jacobian1,
+                                             tangent_impulse1,
+                                             particle_inv_mass,
+                                             body_inv_mass,
+                                             inv_inertia,
+                                             body_id,
+                                             &particle_velocity,
+                                             &body_linear_velocity,
+                                             &body_angular_velocity,
+                                             body_linear_velocities,
+                                             body_angular_velocities);
+                row.tangent_impulse_1 = tangent_impulse1;
+            }
+
             const float jv =
                 Dot(row.particle_linear_jacobian, particle_velocity) +
                 Dot(row.body_linear_jacobian, body_linear_velocity) +
@@ -1113,18 +1263,20 @@ __global__ void SolveParticleCouplingRowsKernel(
             row.normal_impulse = new_impulse;
 
             if (fabsf(delta) > 1.0e-12f) {
-                const math::Vec3 particle_delta =
-                    Scale(row.particle_linear_jacobian, particle_inv_mass * delta);
-                const math::Vec3 body_linear_delta =
-                    Scale(row.body_linear_jacobian, body_inv_mass * delta);
-                const math::Vec3 body_angular_delta =
-                    ApplyInverseInertia(Scale(row.body_angular_jacobian, delta), inv_inertia);
-
-                particle_velocity = Add(particle_velocity, particle_delta);
-                AddVelocityAtomic(body_linear_velocities, body_id, body_linear_delta);
-                AddVelocityAtomic(body_angular_velocities, body_id, body_angular_delta);
-                body_linear_velocity = Add(body_linear_velocity, body_linear_delta);
-                body_angular_velocity = Add(body_angular_velocity, body_angular_delta);
+                const math::Vec3 body_angular_delta = ApplyCouplingVelocityImpulse(
+                    row.particle_linear_jacobian,
+                    row.body_linear_jacobian,
+                    row.body_angular_jacobian,
+                    delta,
+                    particle_inv_mass,
+                    body_inv_mass,
+                    inv_inertia,
+                    body_id,
+                    &particle_velocity,
+                    &body_linear_velocity,
+                    &body_angular_velocity,
+                    body_linear_velocities,
+                    body_angular_velocities);
 
                 diag.impulse_count = 1u;
                 diag.impulse_magnitude = fabsf(delta);
@@ -1135,6 +1287,46 @@ __global__ void SolveParticleCouplingRowsKernel(
             float friction_angular_magnitude = 0.0f;
             if (row.friction > 0.0f && new_impulse > 0.0f) {
                 const float friction_limit = row.friction * new_impulse;
+                const float clamped_warm_tangent_impulse0 =
+                    Clamp(row.tangent_impulse_0, -friction_limit, friction_limit);
+                const float warm_tangent_delta0 =
+                    clamped_warm_tangent_impulse0 - row.tangent_impulse_0;
+                if (fabsf(warm_tangent_delta0) > 1.0e-12f) {
+                    ApplyCouplingVelocityImpulse(row.tangent0,
+                                                 Scale(row.tangent0, -1.0f),
+                                                 row.body_tangent_angular_jacobian0,
+                                                 warm_tangent_delta0,
+                                                 particle_inv_mass,
+                                                 body_inv_mass,
+                                                 inv_inertia,
+                                                 body_id,
+                                                 &particle_velocity,
+                                                 &body_linear_velocity,
+                                                 &body_angular_velocity,
+                                                 body_linear_velocities,
+                                                 body_angular_velocities);
+                    row.tangent_impulse_0 = clamped_warm_tangent_impulse0;
+                }
+                const float clamped_warm_tangent_impulse1 =
+                    Clamp(row.tangent_impulse_1, -friction_limit, friction_limit);
+                const float warm_tangent_delta1 =
+                    clamped_warm_tangent_impulse1 - row.tangent_impulse_1;
+                if (fabsf(warm_tangent_delta1) > 1.0e-12f) {
+                    ApplyCouplingVelocityImpulse(row.tangent1,
+                                                 Scale(row.tangent1, -1.0f),
+                                                 row.body_tangent_angular_jacobian1,
+                                                 warm_tangent_delta1,
+                                                 particle_inv_mass,
+                                                 body_inv_mass,
+                                                 inv_inertia,
+                                                 body_id,
+                                                 &particle_velocity,
+                                                 &body_linear_velocity,
+                                                 &body_angular_velocity,
+                                                 body_linear_velocities,
+                                                 body_angular_velocities);
+                    row.tangent_impulse_1 = clamped_warm_tangent_impulse1;
+                }
 
                 float tangent_jv =
                     Dot(row.tangent0, particle_velocity) +
@@ -1150,19 +1342,21 @@ __global__ void SolveParticleCouplingRowsKernel(
                 row.tangent_impulse_0 = new_tangent_impulse;
 
                 if (fabsf(tangent_delta) > 1.0e-12f) {
-                    const math::Vec3 particle_delta =
-                        Scale(row.tangent0, particle_inv_mass * tangent_delta);
-                    const math::Vec3 body_linear_delta =
-                        Scale(row.tangent0, -body_inv_mass * tangent_delta);
-                    const math::Vec3 body_angular_delta = ApplyInverseInertia(
-                        Scale(row.body_tangent_angular_jacobian0, tangent_delta),
-                        inv_inertia);
-
-                    particle_velocity = Add(particle_velocity, particle_delta);
-                    AddVelocityAtomic(body_linear_velocities, body_id, body_linear_delta);
-                    AddVelocityAtomic(body_angular_velocities, body_id, body_angular_delta);
-                    body_linear_velocity = Add(body_linear_velocity, body_linear_delta);
-                    body_angular_velocity = Add(body_angular_velocity, body_angular_delta);
+                    const math::Vec3 body_angular_delta =
+                        ApplyCouplingVelocityImpulse(
+                            row.tangent0,
+                            Scale(row.tangent0, -1.0f),
+                            row.body_tangent_angular_jacobian0,
+                            tangent_delta,
+                            particle_inv_mass,
+                            body_inv_mass,
+                            inv_inertia,
+                            body_id,
+                            &particle_velocity,
+                            &body_linear_velocity,
+                            &body_angular_velocity,
+                            body_linear_velocities,
+                            body_angular_velocities);
                     friction_magnitude += fabsf(tangent_delta);
                     friction_angular_magnitude += sqrtf(LengthSq(body_angular_delta));
                 }
@@ -1181,19 +1375,21 @@ __global__ void SolveParticleCouplingRowsKernel(
                 row.tangent_impulse_1 = new_tangent_impulse;
 
                 if (fabsf(tangent_delta) > 1.0e-12f) {
-                    const math::Vec3 particle_delta =
-                        Scale(row.tangent1, particle_inv_mass * tangent_delta);
-                    const math::Vec3 body_linear_delta =
-                        Scale(row.tangent1, -body_inv_mass * tangent_delta);
-                    const math::Vec3 body_angular_delta = ApplyInverseInertia(
-                        Scale(row.body_tangent_angular_jacobian1, tangent_delta),
-                        inv_inertia);
-
-                    particle_velocity = Add(particle_velocity, particle_delta);
-                    AddVelocityAtomic(body_linear_velocities, body_id, body_linear_delta);
-                    AddVelocityAtomic(body_angular_velocities, body_id, body_angular_delta);
-                    body_linear_velocity = Add(body_linear_velocity, body_linear_delta);
-                    body_angular_velocity = Add(body_angular_velocity, body_angular_delta);
+                    const math::Vec3 body_angular_delta =
+                        ApplyCouplingVelocityImpulse(
+                            row.tangent1,
+                            Scale(row.tangent1, -1.0f),
+                            row.body_tangent_angular_jacobian1,
+                            tangent_delta,
+                            particle_inv_mass,
+                            body_inv_mass,
+                            inv_inertia,
+                            body_id,
+                            &particle_velocity,
+                            &body_linear_velocity,
+                            &body_angular_velocity,
+                            body_linear_velocities,
+                            body_angular_velocities);
                     friction_magnitude += fabsf(tangent_delta);
                     friction_angular_magnitude += sqrtf(LengthSq(body_angular_delta));
                 }
@@ -1202,6 +1398,41 @@ __global__ void SolveParticleCouplingRowsKernel(
                     diag.friction_impulse_count = 1u;
                     diag.friction_impulse_magnitude = friction_magnitude;
                     diag.angular_impulse_magnitude += friction_angular_magnitude;
+                }
+            } else if (row.friction > 0.0f) {
+                const float tangent_delta0 = -row.tangent_impulse_0;
+                if (fabsf(tangent_delta0) > 1.0e-12f) {
+                    ApplyCouplingVelocityImpulse(row.tangent0,
+                                                 Scale(row.tangent0, -1.0f),
+                                                 row.body_tangent_angular_jacobian0,
+                                                 tangent_delta0,
+                                                 particle_inv_mass,
+                                                 body_inv_mass,
+                                                 inv_inertia,
+                                                 body_id,
+                                                 &particle_velocity,
+                                                 &body_linear_velocity,
+                                                 &body_angular_velocity,
+                                                 body_linear_velocities,
+                                                 body_angular_velocities);
+                    row.tangent_impulse_0 = 0.0f;
+                }
+                const float tangent_delta1 = -row.tangent_impulse_1;
+                if (fabsf(tangent_delta1) > 1.0e-12f) {
+                    ApplyCouplingVelocityImpulse(row.tangent1,
+                                                 Scale(row.tangent1, -1.0f),
+                                                 row.body_tangent_angular_jacobian1,
+                                                 tangent_delta1,
+                                                 particle_inv_mass,
+                                                 body_inv_mass,
+                                                 inv_inertia,
+                                                 body_id,
+                                                 &particle_velocity,
+                                                 &body_linear_velocity,
+                                                 &body_angular_velocity,
+                                                 body_linear_velocities,
+                                                 body_angular_velocities);
+                    row.tangent_impulse_1 = 0.0f;
                 }
             }
 

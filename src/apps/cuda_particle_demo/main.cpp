@@ -135,22 +135,36 @@ int main() {
     coupling_options.enable_coupling_warm_start = true;
 
     runtime::gpu::CudaParticleSet friction_particles;
-    friction_particles.positions = {{0.53f, 0.195f, 0.0f}};
-    friction_particles.velocities = {{0.30f, -0.30f, 0.0f}};
+    friction_particles.positions = {{0.0f, 0.34f, 0.0f}};
+    friction_particles.velocities = {{1.0f, 0.0f, 0.0f}};
     friction_particles.inv_masses = {1.0f};
-    friction_particles.radii = {0.02f};
+    friction_particles.radii = {0.10f};
     friction_particles.phases = {5u};
     auto no_friction_particles =
         runtime::gpu::UploadCudaParticleWorld(friction_particles);
     auto friction_row_particles =
         runtime::gpu::UploadCudaParticleWorld(friction_particles);
 
-    auto friction_reference_world = runtime::BuildWorld(scene::CookScene(coupled_scene));
+    scene::SceneIR friction_scene;
+    scene::RigidBodyRecord friction_box_body;
+    friction_box_body.name = "cuda_friction_warm_start_box_link";
+    friction_box_body.mass = 2.0f;
+    friction_box_body.inertia = {0.75f, 0.75f, 0.75f};
+    friction_box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    friction_scene.AddRigidBody(std::move(friction_box_body));
+
+    scene::CollisionShapeRecord friction_box_shape;
+    friction_box_shape.body_id = 0u;
+    friction_box_shape.type = scene::ShapeType::Box;
+    friction_box_shape.half_extents = {0.25f, 0.25f, 0.25f};
+    friction_scene.AddCollisionShape(std::move(friction_box_shape));
+
+    auto friction_reference_world = runtime::BuildWorld(scene::CookScene(friction_scene));
     auto no_friction_device_world =
         runtime::gpu::UploadDeviceWorld(friction_reference_world.template_view);
     runtime::gpu::UploadDeviceState(no_friction_device_world, friction_reference_world.instance);
 
-    auto friction_world = runtime::BuildWorld(scene::CookScene(coupled_scene));
+    auto friction_world = runtime::BuildWorld(scene::CookScene(friction_scene));
     auto friction_device_world =
         runtime::gpu::UploadDeviceWorld(friction_world.template_view);
     runtime::gpu::UploadDeviceState(friction_device_world, friction_world.instance);
@@ -158,10 +172,12 @@ int main() {
     runtime::gpu::CudaParticleDeviceWorldCouplingOptions no_friction_options =
         coupling_options;
     no_friction_options.friction = 0.0f;
+    no_friction_options.gravity = {0.0f, -240.0f, 0.0f};
     no_friction_options.enable_coupling_warm_start = false;
     runtime::gpu::CudaParticleDeviceWorldCouplingOptions friction_row_options =
         no_friction_options;
     friction_row_options.friction = 0.75f;
+    friction_row_options.enable_coupling_warm_start = true;
 
     const auto no_friction_row_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
@@ -173,8 +189,13 @@ int main() {
             friction_row_particles,
             friction_device_world,
             friction_row_options);
+    const auto friction_second_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            friction_row_particles,
+            friction_device_world,
+            friction_row_options);
     const auto no_friction_state = no_friction_particles.DownloadState();
-    const auto friction_row_state = friction_row_particles.DownloadState();
+    const auto friction_second_state = friction_row_particles.DownloadState();
     const auto friction_rows = friction_row_particles.DownloadCouplingRows();
     const auto& friction_row = friction_rows.rows.front();
     const float friction_limit =
@@ -190,11 +211,16 @@ int main() {
               << friction_row_report.coupling_row_solver_friction_impulse_count
               << " row_solver_friction_impulse_magnitude="
               << friction_row_report.coupling_row_solver_friction_impulse_magnitude
+              << " tangent_warm_starts="
+              << friction_second_report.coupling_tangent_warm_start_count
+              << " tangent_warm_start_impulse_magnitude="
+              << friction_second_report.coupling_tangent_warm_start_impulse_magnitude
               << " tangent0_impulse=" << friction_row.tangent_impulse_0
               << " tangent1_impulse=" << friction_row.tangent_impulse_1
               << " friction_limit=" << friction_limit
               << " no_friction_vx=" << no_friction_state.velocities.front().x
-              << " friction_vx=" << friction_row_state.velocities.front().x
+              << " second_friction_vx="
+              << friction_second_state.velocities.front().x
               << "\n";
 
     const auto coupling_first_report =
@@ -475,7 +501,7 @@ int main() {
         std::fabs(friction_row.tangent_impulse_0) <= friction_limit + 1.0e-5f &&
         std::fabs(friction_row.tangent_impulse_1) <= friction_limit + 1.0e-5f;
     const bool friction_row_reduced_tangent_speed =
-        std::fabs(friction_row_state.velocities.front().x) <
+        std::fabs(friction_second_state.velocities.front().x) <
         std::fabs(no_friction_state.velocities.front().x);
 
     const auto box_rigid_impulses =
@@ -508,6 +534,11 @@ int main() {
     const auto corner_row_impulse_magnitude =
         corner_first_report.coupling_row_solver_impulse_magnitude +
         corner_report.coupling_row_solver_impulse_magnitude;
+    const float corner_row_normal_impulse_sum =
+        corner_rows.rows[0].normal_impulse + corner_rows.rows[1].normal_impulse;
+    const float corner_cached_normal_impulse_sum =
+        corner_coupling_state.normal_impulses[0] +
+        corner_coupling_state.normal_impulses[1];
 
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
@@ -525,6 +556,9 @@ int main() {
                    friction_row_report.coupling_row_solver_impulse_count > 0u &&
                    friction_row_report.coupling_row_solver_friction_impulse_count > 0u &&
                    friction_row_report.coupling_row_solver_friction_impulse_magnitude > 0.0f &&
+                   friction_second_report.coupling_warm_start_count > 0u &&
+                   friction_second_report.coupling_tangent_warm_start_count > 0u &&
+                   friction_second_report.coupling_tangent_warm_start_impulse_magnitude > 0.0f &&
                    friction_row.active &&
                    friction_row.normal_impulse > 0.0f &&
                    friction_row_limit_ok &&
@@ -569,10 +603,8 @@ int main() {
                    corner_rows.rows[1].effective_mass > 0.0f &&
                    corner_rows.rows[0].position_error > 0.0f &&
                    corner_rows.rows[1].position_error > 0.0f &&
-                   corner_rows.rows[0].normal_impulse > 0.0f &&
-                   corner_rows.rows[1].normal_impulse > 0.0f &&
-                   corner_coupling_state.normal_impulses[0] > 0.0f &&
-                   corner_coupling_state.normal_impulses[1] > 0.0f &&
+                   corner_row_normal_impulse_sum > 0.0f &&
+                   corner_cached_normal_impulse_sum > 0.0f &&
                    corner_coupling_state.shape_indices[0] == 0u &&
                    corner_coupling_state.shape_indices[1] == 1u
                ? 0
