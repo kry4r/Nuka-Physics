@@ -54,6 +54,7 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
                          phi::Buffer shape_local_transforms,
                          phi::Buffer shape_half_extents,
                          phi::Buffer shape_radii,
+                         phi::Buffer shape_half_heights,
                          phi::Buffer joint_types,
                          phi::Buffer joint_parent_bodies,
                          phi::Buffer joint_child_bodies,
@@ -76,6 +77,7 @@ DeviceWorld::DeviceWorld(uint32_t body_count,
     , shape_local_transforms_(std::move(shape_local_transforms))
     , shape_half_extents_(std::move(shape_half_extents))
     , shape_radii_(std::move(shape_radii))
+    , shape_half_heights_(std::move(shape_half_heights))
     , joint_types_(std::move(joint_types))
     , joint_parent_bodies_(std::move(joint_parent_bodies))
     , joint_child_bodies_(std::move(joint_child_bodies))
@@ -96,6 +98,7 @@ std::size_t DeviceWorld::DeviceBytes() const {
         + shape_local_transforms_.Size()
         + shape_half_extents_.Size()
         + shape_radii_.Size()
+        + shape_half_heights_.Size()
         + joint_types_.Size()
         + joint_parent_bodies_.Size()
         + joint_child_bodies_.Size()
@@ -144,7 +147,11 @@ DeviceWorldSummary DeviceWorld::DownloadSummary() const {
 
     if (shape_count_ > 0) {
         const auto body_ids = DownloadVector<scene::BodyId>(shape_body_ids_, shape_count_);
+        const auto radii = DownloadVector<float>(shape_radii_, shape_count_);
+        const auto half_heights = DownloadVector<float>(shape_half_heights_, shape_count_);
         summary.first_shape_body_id = body_ids.front();
+        summary.first_shape_radius = radii.front();
+        summary.first_shape_half_height = half_heights.front();
     }
 
     if (joint_count_ > 0) {
@@ -280,6 +287,10 @@ const float* DeviceWorld::DeviceShapeRadii() const {
     return static_cast<const float*>(shape_radii_.Data());
 }
 
+const float* DeviceWorld::DeviceShapeHalfHeights() const {
+    return static_cast<const float*>(shape_half_heights_.Data());
+}
+
 const scene::JointType* DeviceWorld::DeviceJointTypes() const {
     return static_cast<const scene::JointType*>(joint_types_.Data());
 }
@@ -341,6 +352,10 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         DefaultedCopy(world_template.shape_table.radii,
                       world_template.shape_count,
                       0.5f);
+    const auto shape_half_heights =
+        DefaultedCopy(world_template.shape_table.half_heights,
+                      world_template.shape_count,
+                      0.5f);
     const auto joint_types =
         DefaultedCopy(world_template.joint_table.types,
                       world_template.joint_count,
@@ -395,6 +410,7 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         UploadVector(shape_local_transforms),
         UploadVector(shape_half_extents),
         UploadVector(shape_radii),
+        UploadVector(shape_half_heights),
         UploadVector(joint_types),
         UploadVector(joint_parent_bodies),
         UploadVector(joint_child_bodies),

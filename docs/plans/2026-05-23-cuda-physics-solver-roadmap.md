@@ -18,7 +18,7 @@ The CUDA physics core must progress as a coherent system:
 
 1. Rigid robot dynamics stay on the existing `DeviceWorld` and `BatchedDeviceWorld` paths.
 2. Particle/deformable/fluid state receives a CUDA-resident container, upload/download validation boundary, integration kernel, coupling kernels, and diagnostics.
-3. Coupling starts with analytic rigid plane/sphere colliders, then moves to cooked `DeviceWorld` shape tables so robot bodies can couple to deformables and fluids without CPU stepping. Current cooked-shape coverage includes plane, sphere, and box; capsule remains next.
+3. Coupling starts with analytic rigid plane/sphere colliders, then moves to cooked `DeviceWorld` shape tables so robot bodies can couple to deformables and fluids without CPU stepping. Current cooked-shape coverage includes plane, sphere, box, and capsule.
 4. Solver reports must expose invariants: contact count, max penetration, kinetic energy, max speed, kernel launches, and later constraint residuals.
 5. Every stage requires regression tests, benchmark coverage, architecture docs, and a commit.
 
@@ -75,7 +75,7 @@ Expected: all `CudaParticleWorld` tests pass.
 
 **Step 4: Add benchmark coverage**
 
-Create a benchmark that steps thousands of CUDA particles against plane/sphere rigid colliders for repeated substeps, plus cooked `DeviceWorld` sphere and box coupling with rigid impulse feedback.
+Create a benchmark that steps thousands of CUDA particles against plane/sphere rigid colliders for repeated substeps, plus cooked `DeviceWorld` sphere, box, and capsule coupling with rigid impulse feedback.
 
 Run:
 
@@ -107,8 +107,7 @@ git commit -m "physics: add cuda particle coupling foundation"
 
 ## Follow-On Tasks
 
-1. Extend cooked `DeviceWorld` coupling from plane/sphere/box to capsule shapes, then route robot link collision shapes through the same particle coupling entry point.
-2. Promote the current linear/angular velocity feedback into a reusable coupling-constraint assembly path with persistent warm-start impulses and force/torque diagnostics.
-3. Add cloth/deformable constraints: distance, bending, volume/shape matching, and XPBD-style compliance.
-4. Add particle-fluid constraints: density estimate, pressure/viscosity solve, boundary coupling, and diagnostics.
-5. Add batched particle worlds for robot/RL workloads that match `BatchedDeviceWorld` instance-major layout.
+1. Promote the current linear/angular velocity feedback into a reusable coupling-constraint assembly path with persistent warm-start impulses and force/torque diagnostics.
+2. Add cloth/deformable constraints: distance, bending, volume/shape matching, and XPBD-style compliance.
+3. Add particle-fluid constraints: density estimate, pressure/viscosity solve, boundary coupling, and diagnostics.
+4. Add batched particle worlds for robot/RL workloads that match `BatchedDeviceWorld` instance-major layout.

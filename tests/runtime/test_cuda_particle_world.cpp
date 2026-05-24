@@ -429,3 +429,67 @@ TEST(CudaParticleWorld, ReportsInteriorCookedBoxPenetrationToNearestFace) {
     EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
     EXPECT_EQ(report.contact_count, 1u);
 }
+
+TEST(CudaParticleWorld, CouplesAgainstCookedCapsuleShapeFromDeviceWorld) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord capsule_body;
+    capsule_body.name = "robot_link_capsule";
+    capsule_body.mass = 2.0f;
+    capsule_body.inertia = {0.75f, 0.75f, 0.75f};
+    capsule_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto capsule_body_id = scene.AddRigidBody(std::move(capsule_body));
+
+    scene::CollisionShapeRecord capsule_shape;
+    capsule_shape.body_id = capsule_body_id;
+    capsule_shape.type = scene::ShapeType::Capsule;
+    capsule_shape.radius = 0.20f;
+    capsule_shape.half_height = 0.50f;
+    scene.AddCollisionShape(std::move(capsule_shape));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.15f, 0.30f, 0.0f}};
+    particles.velocities = {{-2.0f, 0.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.05f};
+    particles.phases = {6u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto particle_state = device_particles.DownloadState();
+    const auto rigid_state = device_world.DownloadState();
+
+    ASSERT_EQ(particle_state.positions.size(), 1u);
+    ASSERT_EQ(rigid_state.linear_velocities.size(), 1u);
+    ASSERT_EQ(rigid_state.angular_velocities.size(), 1u);
+    EXPECT_NEAR(particle_state.positions[0].x, 0.25f, 1.0e-4f);
+    EXPECT_NEAR(particle_state.positions[0].y, 0.30f, 1.0e-4f);
+    EXPECT_GT(particle_state.velocities[0].x, -2.0f);
+    EXPECT_LT(rigid_state.linear_velocities[capsule_body_id].x, 0.0f);
+
+    const float contact_y = 0.30f;
+    const float rigid_contact_normal_speed =
+        rigid_state.linear_velocities[capsule_body_id].x -
+        rigid_state.angular_velocities[capsule_body_id].z * contact_y;
+    EXPECT_NEAR(particle_state.velocities[0].x - rigid_contact_normal_speed,
+                0.0f,
+                1.0e-4f);
+    EXPECT_GT(std::abs(rigid_state.angular_velocities[capsule_body_id].z), 1.0e-4f);
+    EXPECT_EQ(report.contact_count, 1u);
+    EXPECT_EQ(report.rigid_impulse_count, 1u);
+    EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
+    EXPECT_GT(report.rigid_angular_impulse_magnitude, 0.0f);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+}

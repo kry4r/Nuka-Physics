@@ -25,6 +25,8 @@ struct DeviceWorldSummary {
     math::Vec3 first_body_position = math::Vec3::Zero();
     float second_body_inv_mass = 0.0f;
     scene::BodyId first_shape_body_id = 0;
+    float first_shape_radius = 0.0f;
+    float first_shape_half_height = 0.0f;
     scene::BodyId first_joint_child_body = 0;
     float first_actuator_gain = 0.0f;
     float first_actuator_force_limit = 0.0f;
@@ -64,6 +66,7 @@ public:
                 phi::Buffer shape_local_transforms,
                 phi::Buffer shape_half_extents,
                 phi::Buffer shape_radii,
+                phi::Buffer shape_half_heights,
                 phi::Buffer joint_types,
                 phi::Buffer joint_parent_bodies,
                 phi::Buffer joint_child_bodies,
@@ -110,6 +113,7 @@ public:
     const math::Transform* DeviceShapeLocalTransforms() const;
     const math::Vec3* DeviceShapeHalfExtents() const;
     const float* DeviceShapeRadii() const;
+    const float* DeviceShapeHalfHeights() const;
     const scene::JointType* DeviceJointTypes() const;
     const scene::BodyId* DeviceJointParentBodies() const;
     const scene::BodyId* DeviceJointChildBodies() const;
@@ -135,6 +139,7 @@ private:
     phi::Buffer shape_local_transforms_;
     phi::Buffer shape_half_extents_;
     phi::Buffer shape_radii_;
+    phi::Buffer shape_half_heights_;
     phi::Buffer joint_types_;
     phi::Buffer joint_parent_bodies_;
     phi::Buffer joint_child_bodies_;

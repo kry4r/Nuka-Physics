@@ -27,8 +27,9 @@ TEST(CudaDeviceWorld, UploadsCookedRuntimeTablesAndDownloadsSummary) {
 
     scene::CollisionShapeRecord shape;
     shape.body_id = child_id;
-    shape.type = scene::ShapeType::Box;
-    shape.half_extents = {0.5f, 0.25f, 0.75f};
+    shape.type = scene::ShapeType::Capsule;
+    shape.radius = 0.125f;
+    shape.half_height = 0.75f;
     scene.AddCollisionShape(std::move(shape));
 
     scene::JointRecord joint;
@@ -60,6 +61,8 @@ TEST(CudaDeviceWorld, UploadsCookedRuntimeTablesAndDownloadsSummary) {
     EXPECT_FLOAT_EQ(summary.first_body_position.z, 3.0f);
     EXPECT_FLOAT_EQ(summary.second_body_inv_mass, 0.5f);
     EXPECT_EQ(summary.first_shape_body_id, child_id);
+    EXPECT_FLOAT_EQ(summary.first_shape_radius, 0.125f);
+    EXPECT_FLOAT_EQ(summary.first_shape_half_height, 0.75f);
     EXPECT_EQ(summary.first_joint_child_body, child_id);
     EXPECT_FLOAT_EQ(summary.first_actuator_gain, 7.0f);
     EXPECT_FLOAT_EQ(summary.first_actuator_force_limit, 11.0f);

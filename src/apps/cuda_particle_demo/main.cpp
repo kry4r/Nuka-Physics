@@ -97,6 +97,20 @@ int main() {
     box_shape.half_extents = {0.15f, 0.18f, 0.15f};
     coupled_scene.AddCollisionShape(std::move(box_shape));
 
+    scene::RigidBodyRecord capsule_body;
+    capsule_body.name = "cuda_coupled_capsule_link";
+    capsule_body.mass = 4.0f;
+    capsule_body.inertia = {1.0f, 1.0f, 1.0f};
+    capsule_body.local_transform.position = {0.90f, 0.0f, 0.0f};
+    const auto capsule_body_id = coupled_scene.AddRigidBody(std::move(capsule_body));
+
+    scene::CollisionShapeRecord capsule_shape;
+    capsule_shape.body_id = capsule_body_id;
+    capsule_shape.type = scene::ShapeType::Capsule;
+    capsule_shape.radius = 0.16f;
+    capsule_shape.half_height = 0.32f;
+    coupled_scene.AddCollisionShape(std::move(capsule_shape));
+
     auto world = runtime::BuildWorld(scene::CookScene(coupled_scene));
     auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
     runtime::gpu::UploadDeviceState(device_world, world.instance);
@@ -170,6 +184,37 @@ int main() {
               << box_rigid_state.angular_velocities[box_body_id].y << ", "
               << box_rigid_state.angular_velocities[box_body_id].z << ")\n";
 
+    runtime::gpu::CudaParticleSet capsule_particles;
+    capsule_particles.positions = {{1.02f, 0.22f, 0.0f}};
+    capsule_particles.velocities = {{-0.4f, 0.0f, 0.0f}};
+    capsule_particles.inv_masses = {1.0f};
+    capsule_particles.radii = {0.02f};
+    capsule_particles.phases = {3u};
+    auto device_capsule_particles =
+        runtime::gpu::UploadCudaParticleWorld(capsule_particles);
+
+    const auto capsule_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            device_capsule_particles,
+            device_world,
+            coupling_options);
+    const auto capsule_rigid_state = device_world.DownloadState();
+
+    std::cout << "deviceworld_capsule_coupling contacts=" << capsule_report.contact_count
+              << " rigid_impulses=" << capsule_report.rigid_impulse_count
+              << " rigid_impulse_magnitude=" << capsule_report.rigid_impulse_magnitude
+              << " rigid_angular_impulse_magnitude="
+              << capsule_report.rigid_angular_impulse_magnitude
+              << " residual=" << capsule_report.max_penetration_after_solve
+              << " body_velocity=("
+              << capsule_rigid_state.linear_velocities[capsule_body_id].x << ", "
+              << capsule_rigid_state.linear_velocities[capsule_body_id].y << ", "
+              << capsule_rigid_state.linear_velocities[capsule_body_id].z << ")"
+              << " body_angular_velocity=("
+              << capsule_rigid_state.angular_velocities[capsule_body_id].x << ", "
+              << capsule_rigid_state.angular_velocities[capsule_body_id].y << ", "
+              << capsule_rigid_state.angular_velocities[capsule_body_id].z << ")\n";
+
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
                    coupling_report.rigid_impulse_count > 0u &&
@@ -177,7 +222,11 @@ int main() {
                    box_report.contact_count > 0u &&
                    box_report.rigid_impulse_count > 0u &&
                    box_report.max_penetration_after_solve <= 1.0e-4f &&
-                   box_report.rigid_angular_impulse_magnitude > 0.0f
+                   box_report.rigid_angular_impulse_magnitude > 0.0f &&
+                   capsule_report.contact_count > 0u &&
+                   capsule_report.rigid_impulse_count > 0u &&
+                   capsule_report.max_penetration_after_solve <= 1.0e-4f &&
+                   capsule_report.rigid_angular_impulse_magnitude > 0.0f
                ? 0
                : 1;
 }

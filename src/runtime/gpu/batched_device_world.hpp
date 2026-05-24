@@ -62,6 +62,15 @@ struct BatchedDeviceState {
     std::vector<math::Vec3> torques;
 };
 
+struct BatchedShapeTables {
+    std::vector<scene::ShapeType> types;
+    std::vector<scene::BodyId> body_ids;
+    std::vector<math::Transform> local_transforms;
+    std::vector<math::Vec3> half_extents;
+    std::vector<float> radii;
+    std::vector<float> half_heights;
+};
+
 struct CudaBatchedContactManifold {
     uint32_t instance_index = 0;
     uint32_t body_a = ~0u;
@@ -199,6 +208,7 @@ public:
                        phi::Buffer shape_local_transforms,
                        phi::Buffer shape_half_extents,
                        phi::Buffer shape_radii,
+                       phi::Buffer shape_half_heights,
                        phi::Buffer joint_types,
                        phi::Buffer joint_parent_bodies,
                        phi::Buffer joint_child_bodies,
@@ -235,6 +245,7 @@ public:
     bool HasUploadedActuatorTables() const;
 
     BatchedDeviceState DownloadState() const;
+    BatchedShapeTables DownloadShapeTables() const;
 
     math::Transform* DevicePoses();
     const math::Transform* DevicePoses() const;
@@ -253,6 +264,7 @@ public:
     const math::Transform* DeviceShapeLocalTransforms() const;
     const math::Vec3* DeviceShapeHalfExtents() const;
     const float* DeviceShapeRadii() const;
+    const float* DeviceShapeHalfHeights() const;
     const scene::JointType* DeviceJointTypes() const;
     const scene::BodyId* DeviceJointParentBodies() const;
     const scene::BodyId* DeviceJointChildBodies() const;
@@ -278,6 +290,7 @@ private:
     phi::Buffer shape_local_transforms_;
     phi::Buffer shape_half_extents_;
     phi::Buffer shape_radii_;
+    phi::Buffer shape_half_heights_;
     phi::Buffer joint_types_;
     phi::Buffer joint_parent_bodies_;
     phi::Buffer joint_child_bodies_;

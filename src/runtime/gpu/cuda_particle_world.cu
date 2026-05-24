@@ -427,6 +427,7 @@ __device__ float DeviceWorldShapeResidual(scene::ShapeType shape_type,
                                           math::Transform shape_transform,
                                           math::Vec3 shape_half_extents,
                                           float shape_radius,
+                                          float shape_half_height,
                                           float particle_radius,
                                           math::Vec3 position) {
     if (shape_type == scene::ShapeType::Plane) {
@@ -450,6 +451,14 @@ __device__ float DeviceWorldShapeResidual(scene::ShapeType shape_type,
         return ClampNonNegative(particle_radius - distance);
     }
 
+    if (shape_type == scene::ShapeType::Capsule) {
+        const math::Vec3 local_position = InverseTransformPoint(shape_transform, position);
+        const float clamped_y = Clamp(local_position.y, -shape_half_height, shape_half_height);
+        const math::Vec3 closest = MakeVec3(0.0f, clamped_y, 0.0f);
+        const float distance = sqrtf(LengthSq(Sub(local_position, closest)));
+        return ClampNonNegative(shape_radius + particle_radius - distance);
+    }
+
     return 0.0f;
 }
 
@@ -459,6 +468,7 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        math::Transform shape_transform,
                                        math::Vec3 shape_half_extents,
                                        float shape_radius,
+                                       float shape_half_height,
                                        float body_inv_mass,
                                        float particle_inv_mass,
                                        float particle_radius,
@@ -521,6 +531,31 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
             penetration = particle_radius + fmaxf(min_axis_depth, 0.0f);
             normal = NormalizeOr(TransformDirection(shape_transform, local_normal),
                                  MakeVec3(0.0f, 1.0f, 0.0f));
+        }
+    } else if (shape_type == scene::ShapeType::Capsule) {
+        const math::Vec3 local_position = InverseTransformPoint(shape_transform, *position);
+        const float clamped_y = Clamp(local_position.y, -shape_half_height, shape_half_height);
+        const math::Vec3 closest = MakeVec3(0.0f, clamped_y, 0.0f);
+        const math::Vec3 local_delta = Sub(local_position, closest);
+        const float distance_sq = LengthSq(local_delta);
+
+        if (distance_sq > 1.0e-12f) {
+            const float distance = sqrtf(distance_sq);
+            penetration = shape_radius + particle_radius - distance;
+            normal = NormalizeOr(TransformDirection(shape_transform, local_delta),
+                                 MakeVec3(1.0f, 0.0f, 0.0f));
+        } else {
+            math::Vec3 local_normal = MakeVec3(local_position.x, 0.0f, local_position.z);
+            if (LengthSq(local_normal) <= 1.0e-12f) {
+                if (fabsf(local_position.y) > shape_half_height) {
+                    local_normal = MakeVec3(0.0f, local_position.y >= 0.0f ? 1.0f : -1.0f, 0.0f);
+                } else {
+                    local_normal = MakeVec3(1.0f, 0.0f, 0.0f);
+                }
+            }
+            penetration = shape_radius + particle_radius;
+            normal = NormalizeOr(TransformDirection(shape_transform, local_normal),
+                                 MakeVec3(1.0f, 0.0f, 0.0f));
         }
     } else {
         return 0.0f;
@@ -606,6 +641,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
     const math::Transform* shape_local_transforms,
     const math::Vec3* shape_half_extents,
     const float* shape_radii,
+    const float* shape_half_heights,
     math::Vec3 gravity,
     float dt,
     float friction,
@@ -635,6 +671,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                          shape_transform,
                                          shape_half_extents[shape_index],
                                          shape_radii[shape_index],
+                                         shape_half_heights[shape_index],
                                          particle_radius,
                                          position));
         }
@@ -660,6 +697,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                       shape_transform,
                                       shape_half_extents[shape_index],
                                       shape_radii[shape_index],
+                                      shape_half_heights[shape_index],
                                       body_inv_mass,
                                       particle_inv_mass,
                                       particle_radius,
@@ -688,6 +726,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                          shape_transform,
                                          shape_half_extents[shape_index],
                                          shape_radii[shape_index],
+                                         shape_half_heights[shape_index],
                                          particle_radius,
                                          position));
         }
@@ -928,6 +967,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             device_world.DeviceShapeLocalTransforms(),
             device_world.DeviceShapeHalfExtents(),
             device_world.DeviceShapeRadii(),
+            device_world.DeviceShapeHalfHeights(),
             options.gravity,
             options.dt,
             options.friction,

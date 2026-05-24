@@ -168,20 +168,23 @@ rigid impulse count, rigid impulse magnitude, and kernel-launch count. Tests use
 those invariants to prove the new branch is not just an upload shell.
 `StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
 tables and mutable rigid state directly on CUDA, currently for plane, sphere,
-and box shapes. When requested, particle contacts atomically accumulate velocity
-and angular velocity impulses into dynamic rigid bodies using the contact offset
-and cooked inverse inertia. Box coupling supports face projection from cooked
-half extents, reports interior penetration to the nearest face, and preserves
-the dynamic contact invariant that particle normal speed is measured relative to
-the rigid contact point rather than the world frame. This lets robot links
-physically interact with deformables and fluids without a CPU stepping detour.
+box, and capsule shapes. When requested, particle contacts atomically accumulate
+velocity and angular velocity impulses into dynamic rigid bodies using the
+contact offset and cooked inverse inertia. Box coupling supports face projection
+from cooked half extents and reports interior penetration to the nearest face.
+Capsule coupling reads cooked radius and half-height tables, treats the capsule
+axis as local Y, projects particles against the closest point on the segment,
+and preserves the dynamic contact invariant that particle normal speed is
+measured relative to the rigid contact point rather than the world frame. This
+lets common robot link capsules physically interact with deformables and fluids
+without a CPU stepping detour.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
-plane+sphere coupling, then runs cooked `DeviceWorld` sphere and box coupling
-with rigid linear/angular impulse feedback and prints compact solver diagnostics
-plus sampled particle/rigid state. It intentionally does not depend on Vulkan or
-CPU simulation.
+plane+sphere coupling, then runs cooked `DeviceWorld` sphere, box, and capsule
+coupling with rigid linear/angular impulse feedback and prints compact solver
+diagnostics plus sampled particle/rigid state. It intentionally does not depend
+on Vulkan or CPU simulation.
 
 ## Scene Integration
 
@@ -340,12 +343,12 @@ the maximal-coordinate rigid body path. It is designed to become the shared
 state container for cloth vertices, deformable particles, and SPH-style fluid
 particles. Phase ids are uploaded now so later kernels can distinguish material
 or solver families without changing the buffer layout. The current kernels
-resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere/box
-coupling on CUDA. The cooked path reads body poses, shape body bindings, shape
-local transforms, half extents, radii, inverse masses, inverse inertias, and
-mutable rigid linear/angular velocities from the same device buffers used by the
-rigid solver, then writes particle corrections plus rigid linear/angular
-velocity impulses without returning to the CPU. CPU only uploads
+resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere/box/
+capsule coupling on CUDA. The cooked path reads body poses, shape body bindings,
+shape local transforms, half extents, radii, capsule half heights, inverse
+masses, inverse inertias, and mutable rigid linear/angular velocities from the
+same device buffers used by the rigid solver, then writes particle corrections
+plus rigid linear/angular velocity impulses without returning to the CPU. CPU only uploads
 authored/reference state and downloads compact reports for tests, benchmarks,
 and tooling.
 
@@ -361,9 +364,13 @@ flat_body = instance_index * body_count_per_instance + body_index
 Template data such as inverse mass and inverse inertia is uploaded once and
 indexed by `body_index`. Shared shape, joint, and actuator tables are also
 uploaded once per template and assembled into per-instance constraint blocks by
-CUDA kernels. Mutable pose, velocity, force, and torque are uploaded per
-flattened body. `DownloadState()` is a validation and tooling boundary; the
-production path keeps batched state resident for the next CUDA stage.
+CUDA kernels. The shared shape table includes type, body binding, local
+transform, half extents, radii, and capsule half heights so batched robot/RL
+scenes keep the same cooked geometry metadata as single `DeviceWorld` scenes.
+Mutable pose, velocity, force, and torque are uploaded per flattened body.
+`DownloadState()` and `DownloadShapeTables()` are validation and tooling
+boundaries; the production path keeps batched state resident for the next CUDA
+stage.
 
 `StepBatchedCudaWorld()` keeps contact-enabled scenes on the full GPU
 broadphase/contact/constraint path. For joint/drive-only robot workloads it uses

@@ -211,6 +211,36 @@ TEST(CudaBatchedWorld, UploadsSharedShapeTablesForBatchedContacts) {
     EXPECT_TRUE(batch.HasUploadedShapeTables());
 }
 
+TEST(CudaBatchedWorld, UploadsSharedCapsuleHalfHeightsForBatchedShapeTables) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord link;
+    link.name = "capsule_link";
+    link.mass = 1.0f;
+    const auto link_body = scene.AddRigidBody(std::move(link));
+
+    scene::CollisionShapeRecord capsule;
+    capsule.body_id = link_body;
+    capsule.type = scene::ShapeType::Capsule;
+    capsule.radius = 0.18f;
+    capsule.half_height = 0.42f;
+    scene.AddCollisionShape(std::move(capsule));
+
+    auto world = runtime::BuildWorld(scene::CookScene(scene));
+    std::vector<runtime::WorldInstance> instances(2, world.instance);
+
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(world.template_view, instances);
+    const auto shape_tables = batch.DownloadShapeTables();
+
+    EXPECT_TRUE(batch.HasUploadedShapeTables());
+    ASSERT_EQ(shape_tables.types.size(), 1u);
+    ASSERT_EQ(shape_tables.radii.size(), 1u);
+    ASSERT_EQ(shape_tables.half_heights.size(), 1u);
+    EXPECT_EQ(shape_tables.types[0], scene::ShapeType::Capsule);
+    EXPECT_FLOAT_EQ(shape_tables.radii[0], 0.18f);
+    EXPECT_FLOAT_EQ(shape_tables.half_heights[0], 0.42f);
+}
+
 TEST(CudaBatchedWorld, GeneratesContactsPerInstanceWithoutCrossPairs) {
     const auto fixture = BuildPlaneBoxScene();
     auto world = runtime::BuildWorld(scene::CookScene(fixture.scene));

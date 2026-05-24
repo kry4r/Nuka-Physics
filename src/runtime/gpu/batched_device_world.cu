@@ -1762,6 +1762,7 @@ BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
                                        phi::Buffer shape_local_transforms,
                                        phi::Buffer shape_half_extents,
                                        phi::Buffer shape_radii,
+                                       phi::Buffer shape_half_heights,
                                        phi::Buffer joint_types,
                                        phi::Buffer joint_parent_bodies,
                                        phi::Buffer joint_child_bodies,
@@ -1789,6 +1790,7 @@ BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
     , shape_local_transforms_(std::move(shape_local_transforms))
     , shape_half_extents_(std::move(shape_half_extents))
     , shape_radii_(std::move(shape_radii))
+    , shape_half_heights_(std::move(shape_half_heights))
     , joint_types_(std::move(joint_types))
     , joint_parent_bodies_(std::move(joint_parent_bodies))
     , joint_child_bodies_(std::move(joint_child_bodies))
@@ -1828,7 +1830,8 @@ bool BatchedDeviceWorld::HasUploadedShapeTables() const {
         && shape_body_ids_.Size() == shape_count * sizeof(scene::BodyId)
         && shape_local_transforms_.Size() == shape_count * sizeof(math::Transform)
         && shape_half_extents_.Size() == shape_count * sizeof(math::Vec3)
-        && shape_radii_.Size() == shape_count * sizeof(float);
+        && shape_radii_.Size() == shape_count * sizeof(float)
+        && shape_half_heights_.Size() == shape_count * sizeof(float);
 }
 
 bool BatchedDeviceWorld::HasUploadedJointTables() const {
@@ -1874,6 +1877,24 @@ BatchedDeviceState BatchedDeviceWorld::DownloadState() const {
     state.forces = DownloadVector<math::Vec3>(forces_, total_body_count);
     state.torques = DownloadVector<math::Vec3>(torques_, total_body_count);
     return state;
+}
+
+BatchedShapeTables BatchedDeviceWorld::DownloadShapeTables() const {
+    BatchedShapeTables tables;
+    if (shape_count_per_instance_ == 0u) {
+        return tables;
+    }
+
+    tables.types = DownloadVector<scene::ShapeType>(shape_types_, shape_count_per_instance_);
+    tables.body_ids = DownloadVector<scene::BodyId>(shape_body_ids_, shape_count_per_instance_);
+    tables.local_transforms =
+        DownloadVector<math::Transform>(shape_local_transforms_, shape_count_per_instance_);
+    tables.half_extents =
+        DownloadVector<math::Vec3>(shape_half_extents_, shape_count_per_instance_);
+    tables.radii = DownloadVector<float>(shape_radii_, shape_count_per_instance_);
+    tables.half_heights =
+        DownloadVector<float>(shape_half_heights_, shape_count_per_instance_);
+    return tables;
 }
 
 math::Transform* BatchedDeviceWorld::DevicePoses() {
@@ -1942,6 +1963,10 @@ const math::Vec3* BatchedDeviceWorld::DeviceShapeHalfExtents() const {
 
 const float* BatchedDeviceWorld::DeviceShapeRadii() const {
     return static_cast<const float*>(shape_radii_.Data());
+}
+
+const float* BatchedDeviceWorld::DeviceShapeHalfHeights() const {
+    return static_cast<const float*>(shape_half_heights_.Data());
 }
 
 const scene::JointType* BatchedDeviceWorld::DeviceJointTypes() const {
@@ -2041,6 +2066,8 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
                       math::Vec3::Zero());
     const auto shape_radii =
         DefaultedCopy(world_template.shape_table.radii, shape_count, 0.0f);
+    const auto shape_half_heights =
+        DefaultedCopy(world_template.shape_table.half_heights, shape_count, 0.0f);
     const auto joint_types =
         DefaultedCopy(world_template.joint_table.types,
                       joint_count,
@@ -2094,6 +2121,7 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
                               UploadVector(shape_local_transforms),
                               UploadVector(shape_half_extents),
                               UploadVector(shape_radii),
+                              UploadVector(shape_half_heights),
                               UploadVector(joint_types),
                               UploadVector(joint_parent_bodies),
                               UploadVector(joint_child_bodies),
