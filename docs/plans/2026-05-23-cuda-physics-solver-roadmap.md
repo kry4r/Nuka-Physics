@@ -114,9 +114,15 @@ git commit -m "physics: add cuda particle coupling foundation"
   coupling kernel writes each touched slot, reports active slot count,
   warm-start count/magnitude, force magnitude, and torque magnitude, and clears
   stale cache entries when contact separates.
+- Each coupling slot now also owns a CUDA-resident constraint row record with
+  particle/shape/body ids, normal, contact point, Jacobian terms, rhs, position
+  error, effective mass, and accumulated normal impulse. This is the assembly
+  surface for the later unified coupling solver; the current kernel still owns
+  the direct projection/impulse solve.
 - `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
-  capsule, and two-box corner coupling, so single-particle multi-contact cache
-  behavior is visible outside unit tests.
+  capsule, and two-box corner coupling, including row-level effective mass,
+  position error, and normal impulse diagnostics, so single-particle
+  multi-contact cache behavior is visible outside unit tests.
 - `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
   tracks the added cache/report path under the existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
@@ -125,9 +131,9 @@ git commit -m "physics: add cuda particle coupling foundation"
 
 ## Follow-On Tasks
 
-1. Promote the fixed per-particle coupling slots into a reusable
-   coupling-constraint assembly path shared by rigid/cloth/deformable/fluid
-   constraints, including friction rows and constraint-space Jacobians.
+1. Promote the fixed per-particle coupling rows into a reusable
+   coupling-constraint solve path shared by rigid/cloth/deformable/fluid
+   constraints, including friction rows, compliance, and row iteration.
 2. Add cloth/deformable constraints: distance, bending, volume/shape matching,
    and XPBD-style compliance.
 3. Add particle-fluid constraints: density estimate, pressure/viscosity solve,

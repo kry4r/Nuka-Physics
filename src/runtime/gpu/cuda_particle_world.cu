@@ -172,6 +172,14 @@ __device__ uint32_t FindCouplingSlot(uint32_t shape_index,
     return free_slot;
 }
 
+__device__ CudaParticleCouplingConstraintRow MakeInactiveCouplingRow() {
+    CudaParticleCouplingConstraintRow row{};
+    row.active = false;
+    row.shape_index = kInvalidCudaParticleCouplingShape;
+    row.body_id = scene::kInvalidBody;
+    return row;
+}
+
 __device__ float SolvePlane(const CudaParticlePlaneCollider& plane,
                             float radius,
                             math::Vec3* position,
@@ -584,6 +592,8 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
                                        float* stored_normal_impulse,
                                        uint32_t* stored_shape_index,
                                        bool* touched_slot,
+                                       CudaParticleCouplingConstraintRow* coupling_row,
+                                       uint32_t particle_index,
                                        uint32_t* warm_start_count,
                                        float* warm_start_magnitude,
                                        float* max_coupling_normal_impulse,
@@ -693,6 +703,7 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
     const float total_inv_mass = fmaxf(
         particle_inv_mass + body_inv_mass + angular_effective_inv_mass,
         1.0e-6f);
+    const float effective_mass = 1.0f / total_inv_mass;
 
     float accumulated_normal_impulse = 0.0f;
     if (enable_coupling_warm_start &&
@@ -723,7 +734,6 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
             *angular_impulse_magnitude += sqrtf(LengthSq(rigid_angular_delta));
         }
     } else if (relative_normal_speed < 1.0e-5f) {
-        const float effective_mass = 1.0f / total_inv_mass;
         const float positional_impulse = penetration * effective_mass;
         accumulated_normal_impulse += positional_impulse;
         if (accumulate_rigid_impulses && body_inv_mass > 0.0f) {
@@ -737,6 +747,26 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
             *impulse_magnitude += fabsf(positional_impulse);
             *angular_impulse_magnitude += sqrtf(LengthSq(rigid_angular_delta));
         }
+    }
+
+    if (coupling_row != nullptr) {
+        CudaParticleCouplingConstraintRow row{};
+        row.active = true;
+        row.particle_index = particle_index;
+        row.shape_index = shape_index;
+        row.body_id = body_id;
+        row.normal = normal;
+        row.contact_point = contact_point;
+        row.particle_linear_jacobian = normal;
+        row.body_linear_jacobian = Scale(normal, -1.0f);
+        row.body_angular_jacobian = Scale(angular_jacobian, -1.0f);
+        row.rhs = relative_normal_speed < 0.0f
+            ? -(1.0f + restitution) * relative_normal_speed
+            : penetration;
+        row.position_error = penetration;
+        row.effective_mass = effective_mass;
+        row.normal_impulse = accumulated_normal_impulse;
+        *coupling_row = row;
     }
 
     if (stored_normal_impulse != nullptr && stored_shape_index != nullptr) {
@@ -785,6 +815,7 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
     bool enable_coupling_warm_start,
     float* coupling_normal_impulses,
     uint32_t* coupling_shape_indices,
+    CudaParticleCouplingConstraintRow* coupling_rows,
     ParticleDiagnostics* diagnostics) {
     const uint32_t particle_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (particle_index >= particle_count) {
@@ -837,6 +868,10 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                 ? &coupling_shape_indices[
                       particle_index * kCudaParticleCouplingSlotsPerParticle]
                 : nullptr;
+        CudaParticleCouplingConstraintRow* stored_rows =
+            coupling_rows != nullptr
+                ? &coupling_rows[particle_index * kCudaParticleCouplingSlotsPerParticle]
+                : nullptr;
         for (uint32_t shape_index = 0u; shape_index < shape_count; ++shape_index) {
             const scene::BodyId body_id = shape_body_ids[shape_index];
             const math::Transform body_transform = body_poses[body_id];
@@ -858,6 +893,11 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
             bool* touched_slot =
                 coupling_slot != kInvalidCudaParticleCouplingShape
                     ? &touched_slots[coupling_slot]
+                    : nullptr;
+            CudaParticleCouplingConstraintRow* coupling_row =
+                (stored_rows != nullptr &&
+                 coupling_slot != kInvalidCudaParticleCouplingShape)
+                    ? &stored_rows[coupling_slot]
                     : nullptr;
             max_penetration = fmaxf(
                 max_penetration,
@@ -888,6 +928,8 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                                       stored_normal_impulse,
                                       stored_shape_index,
                                       touched_slot,
+                                      coupling_row,
+                                      particle_index,
                                       &warm_start_count,
                                       &warm_start_magnitude,
                                       &max_coupling_normal_impulse,
@@ -904,6 +946,9 @@ __global__ void IntegrateAndCoupleParticlesAgainstDeviceWorldKernel(
                 } else {
                     stored_normal_impulses[slot] = 0.0f;
                     stored_shape_indices[slot] = kInvalidCudaParticleCouplingShape;
+                    if (stored_rows != nullptr) {
+                        stored_rows[slot] = MakeInactiveCouplingRow();
+                    }
                 }
             }
         }
@@ -983,7 +1028,8 @@ CudaParticleWorld::CudaParticleWorld(uint32_t particle_count,
                                      phi::Buffer radii,
                                      phi::Buffer phases,
                                      phi::Buffer coupling_normal_impulses,
-                                     phi::Buffer coupling_shape_indices)
+                                     phi::Buffer coupling_shape_indices,
+                                     phi::Buffer coupling_rows)
     : particle_count_(particle_count)
     , positions_(std::move(positions))
     , velocities_(std::move(velocities))
@@ -991,7 +1037,8 @@ CudaParticleWorld::CudaParticleWorld(uint32_t particle_count,
     , radii_(std::move(radii))
     , phases_(std::move(phases))
     , coupling_normal_impulses_(std::move(coupling_normal_impulses))
-    , coupling_shape_indices_(std::move(coupling_shape_indices)) {}
+    , coupling_shape_indices_(std::move(coupling_shape_indices))
+    , coupling_rows_(std::move(coupling_rows)) {}
 
 std::size_t CudaParticleWorld::DeviceBytes() const {
     return positions_.Size() +
@@ -1000,7 +1047,8 @@ std::size_t CudaParticleWorld::DeviceBytes() const {
            radii_.Size() +
            phases_.Size() +
            coupling_normal_impulses_.Size() +
-           coupling_shape_indices_.Size();
+           coupling_shape_indices_.Size() +
+           coupling_rows_.Size();
 }
 
 bool CudaParticleWorld::HasUploadedState() const {
@@ -1011,7 +1059,8 @@ bool CudaParticleWorld::HasUploadedState() const {
             radii_.Data() != nullptr &&
             phases_.Data() != nullptr &&
             coupling_normal_impulses_.Data() != nullptr &&
-            coupling_shape_indices_.Data() != nullptr);
+            coupling_shape_indices_.Data() != nullptr &&
+            coupling_rows_.Data() != nullptr);
 }
 
 CudaParticleState CudaParticleWorld::DownloadState() const {
@@ -1030,6 +1079,14 @@ CudaParticleCouplingState CudaParticleWorld::DownloadCouplingState() const {
     const uint32_t slot_count = particle_count_ * kCudaParticleCouplingSlotsPerParticle;
     state.normal_impulses = DownloadVector<float>(coupling_normal_impulses_, slot_count);
     state.shape_indices = DownloadVector<uint32_t>(coupling_shape_indices_, slot_count);
+    return state;
+}
+
+CudaParticleCouplingRowsState CudaParticleWorld::DownloadCouplingRows() const {
+    CudaParticleCouplingRowsState state;
+    state.slot_count_per_particle = kCudaParticleCouplingSlotsPerParticle;
+    const uint32_t slot_count = particle_count_ * kCudaParticleCouplingSlotsPerParticle;
+    state.rows = DownloadVector<CudaParticleCouplingConstraintRow>(coupling_rows_, slot_count);
     return state;
 }
 
@@ -1077,6 +1134,14 @@ const uint32_t* CudaParticleWorld::DeviceCouplingShapeIndices() const {
     return static_cast<const uint32_t*>(coupling_shape_indices_.Data());
 }
 
+CudaParticleCouplingConstraintRow* CudaParticleWorld::DeviceCouplingRows() {
+    return static_cast<CudaParticleCouplingConstraintRow*>(coupling_rows_.Data());
+}
+
+const CudaParticleCouplingConstraintRow* CudaParticleWorld::DeviceCouplingRows() const {
+    return static_cast<const CudaParticleCouplingConstraintRow*>(coupling_rows_.Data());
+}
+
 CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
     const auto count = particles.positions.size();
     if (particles.velocities.size() != count ||
@@ -1097,6 +1162,11 @@ CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
     std::vector<float> coupling_impulses(coupling_slot_count, 0.0f);
     std::vector<uint32_t> coupling_shape_indices(
         coupling_slot_count, kInvalidCudaParticleCouplingShape);
+    std::vector<CudaParticleCouplingConstraintRow> coupling_rows(coupling_slot_count);
+    for (auto& row : coupling_rows) {
+        row.shape_index = kInvalidCudaParticleCouplingShape;
+        row.body_id = scene::kInvalidBody;
+    }
 
     return CudaParticleWorld(particle_count,
                              UploadVector(particles.positions),
@@ -1105,7 +1175,8 @@ CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
                              UploadVector(particles.radii),
                              UploadVector(particles.phases),
                              UploadVector(coupling_impulses),
-                             UploadVector(coupling_shape_indices));
+                             UploadVector(coupling_shape_indices),
+                             UploadVector(coupling_rows));
 }
 
 CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
@@ -1217,6 +1288,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             options.enable_coupling_warm_start,
             particle_world.DeviceCouplingNormalImpulses(),
             particle_world.DeviceCouplingShapeIndices(),
+            particle_world.DeviceCouplingRows(),
             static_cast<ParticleDiagnostics*>(diagnostics.Data()));
         CheckCuda(cudaGetLastError(),
                   "IntegrateAndCoupleParticlesAgainstDeviceWorldKernel launch");

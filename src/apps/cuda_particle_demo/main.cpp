@@ -314,6 +314,7 @@ int main() {
             corner_options);
     const auto corner_coupling_state =
         device_corner_particles.DownloadCouplingState();
+    const auto corner_rows = device_corner_particles.DownloadCouplingRows();
     const auto corner_rigid_state = corner_device_world.DownloadState();
 
     std::cout << "deviceworld_corner_multislot contacts=" << corner_report.contact_count
@@ -322,6 +323,14 @@ int main() {
               << " coupling_force=" << corner_report.coupling_force_magnitude
               << " coupling_torque=" << corner_report.coupling_torque_magnitude
               << " slots_per_particle=" << corner_coupling_state.slot_count_per_particle
+              << " row0_active=" << corner_rows.rows[0].active
+              << " row1_active=" << corner_rows.rows[1].active
+              << " row0_effective_mass=" << corner_rows.rows[0].effective_mass
+              << " row1_effective_mass=" << corner_rows.rows[1].effective_mass
+              << " row0_position_error=" << corner_rows.rows[0].position_error
+              << " row1_position_error=" << corner_rows.rows[1].position_error
+              << " row0_normal_impulse=" << corner_rows.rows[0].normal_impulse
+              << " row1_normal_impulse=" << corner_rows.rows[1].normal_impulse
               << " cached_slot0_impulse=" << corner_coupling_state.normal_impulses[0]
               << " cached_slot1_impulse=" << corner_coupling_state.normal_impulses[1]
               << " cached_slot0_shape=" << corner_coupling_state.shape_indices[0]
@@ -366,6 +375,16 @@ int main() {
                    corner_report.coupling_torque_magnitude > 0.0f &&
                    corner_coupling_state.slot_count_per_particle ==
                        runtime::gpu::kCudaParticleCouplingSlotsPerParticle &&
+                   corner_rows.rows.size() >=
+                       runtime::gpu::kCudaParticleCouplingSlotsPerParticle &&
+                   corner_rows.rows[0].active &&
+                   corner_rows.rows[1].active &&
+                   corner_rows.rows[0].effective_mass > 0.0f &&
+                   corner_rows.rows[1].effective_mass > 0.0f &&
+                   corner_rows.rows[0].position_error > 0.0f &&
+                   corner_rows.rows[1].position_error > 0.0f &&
+                   corner_rows.rows[0].normal_impulse > 0.0f &&
+                   corner_rows.rows[1].normal_impulse > 0.0f &&
                    corner_coupling_state.normal_impulses[0] > 0.0f &&
                    corner_coupling_state.normal_impulses[1] > 0.0f &&
                    corner_coupling_state.shape_indices[0] == 0u &&

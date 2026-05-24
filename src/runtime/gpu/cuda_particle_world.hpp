@@ -32,6 +32,27 @@ struct CudaParticleCouplingState {
     std::vector<uint32_t> shape_indices;
 };
 
+struct CudaParticleCouplingConstraintRow {
+    bool active = false;
+    uint32_t particle_index = 0;
+    uint32_t shape_index = kInvalidCudaParticleCouplingShape;
+    scene::BodyId body_id = scene::kInvalidBody;
+    math::Vec3 normal = math::Vec3::Zero();
+    math::Vec3 contact_point = math::Vec3::Zero();
+    math::Vec3 particle_linear_jacobian = math::Vec3::Zero();
+    math::Vec3 body_linear_jacobian = math::Vec3::Zero();
+    math::Vec3 body_angular_jacobian = math::Vec3::Zero();
+    float rhs = 0.0f;
+    float position_error = 0.0f;
+    float effective_mass = 0.0f;
+    float normal_impulse = 0.0f;
+};
+
+struct CudaParticleCouplingRowsState {
+    uint32_t slot_count_per_particle = kCudaParticleCouplingSlotsPerParticle;
+    std::vector<CudaParticleCouplingConstraintRow> rows;
+};
+
 struct CudaParticlePlaneCollider {
     bool enabled = true;
     math::Vec3 normal = math::Vec3::UnitY();
@@ -96,7 +117,8 @@ public:
                       phi::Buffer radii,
                       phi::Buffer phases,
                       phi::Buffer coupling_normal_impulses,
-                      phi::Buffer coupling_shape_indices);
+                      phi::Buffer coupling_shape_indices,
+                      phi::Buffer coupling_rows);
 
     CudaParticleWorld(const CudaParticleWorld&) = delete;
     CudaParticleWorld& operator=(const CudaParticleWorld&) = delete;
@@ -108,6 +130,7 @@ public:
     bool HasUploadedState() const;
     CudaParticleState DownloadState() const;
     CudaParticleCouplingState DownloadCouplingState() const;
+    CudaParticleCouplingRowsState DownloadCouplingRows() const;
 
     math::Vec3* DevicePositions();
     const math::Vec3* DevicePositions() const;
@@ -120,6 +143,8 @@ public:
     const float* DeviceCouplingNormalImpulses() const;
     uint32_t* DeviceCouplingShapeIndices();
     const uint32_t* DeviceCouplingShapeIndices() const;
+    CudaParticleCouplingConstraintRow* DeviceCouplingRows();
+    const CudaParticleCouplingConstraintRow* DeviceCouplingRows() const;
 
 private:
     uint32_t particle_count_ = 0;
@@ -130,6 +155,7 @@ private:
     phi::Buffer phases_;
     phi::Buffer coupling_normal_impulses_;
     phi::Buffer coupling_shape_indices_;
+    phi::Buffer coupling_rows_;
 };
 
 CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles);

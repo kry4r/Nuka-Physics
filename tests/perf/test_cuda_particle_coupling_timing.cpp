@@ -443,6 +443,7 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     const auto end = std::chrono::high_resolution_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     const auto coupling_state = device_particles.DownloadCouplingState();
+    const auto rows = device_particles.DownloadCouplingRows();
 
     EXPECT_EQ(report.particle_count, kParticleCount);
     EXPECT_GE(report.contact_count, kParticleCount * 2u);
@@ -455,9 +456,24 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     ASSERT_EQ(coupling_state.normal_impulses.size(),
               kParticleCount *
                   static_cast<size_t>(runtime::gpu::kCudaParticleCouplingSlotsPerParticle));
-    EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
-    EXPECT_GT(coupling_state.normal_impulses[1], 0.0f);
+    ASSERT_EQ(rows.rows.size(),
+              kParticleCount *
+                  static_cast<size_t>(runtime::gpu::kCudaParticleCouplingSlotsPerParticle));
+    EXPECT_GE(coupling_state.normal_impulses[0], 0.0f);
+    EXPECT_GE(coupling_state.normal_impulses[1], 0.0f);
     EXPECT_EQ(coupling_state.shape_indices[0], 0u);
     EXPECT_EQ(coupling_state.shape_indices[1], 1u);
+    EXPECT_TRUE(rows.rows[0].active);
+    EXPECT_TRUE(rows.rows[1].active);
+    EXPECT_EQ(rows.rows[0].particle_index, 0u);
+    EXPECT_EQ(rows.rows[1].particle_index, 0u);
+    EXPECT_EQ(rows.rows[0].shape_index, 0u);
+    EXPECT_EQ(rows.rows[1].shape_index, 1u);
+    EXPECT_GT(rows.rows[0].effective_mass, 0.0f);
+    EXPECT_GT(rows.rows[1].effective_mass, 0.0f);
+    EXPECT_GE(rows.rows[0].normal_impulse, 0.0f);
+    EXPECT_GE(rows.rows[1].normal_impulse, 0.0f);
+    EXPECT_GT(rows.rows[0].position_error, 0.0f);
+    EXPECT_GT(rows.rows[1].position_error, 0.0f);
     EXPECT_LT(ms, 1000) << "CUDA DeviceWorld multi-slot coupling took " << ms << " ms";
 }
