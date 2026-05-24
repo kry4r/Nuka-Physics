@@ -277,6 +277,130 @@ TEST(CudaParticleWorld, AccumulatesImpulseIntoDynamicSphereBodyOnDevice) {
     EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
 }
 
+TEST(CudaParticleWorld, PersistsDeviceWorldCouplingNormalImpulseForWarmStart) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord box_body;
+    box_body.name = "warm_start_robot_link";
+    box_body.mass = 4.0f;
+    box_body.inertia = {1.0f, 1.0f, 1.0f};
+    const auto box_body_id = scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_body_id;
+    box_shape.type = scene::ShapeType::Box;
+    box_shape.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.05f, 0.34f, 0.0f}};
+    particles.velocities = {{0.0f, -0.05f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {8u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    const auto initial_coupling = device_particles.DownloadCouplingState();
+    ASSERT_EQ(initial_coupling.normal_impulses.size(), 1u);
+    ASSERT_EQ(initial_coupling.shape_indices.size(), 1u);
+    EXPECT_FLOAT_EQ(initial_coupling.normal_impulses[0], 0.0f);
+    EXPECT_EQ(initial_coupling.shape_indices[0],
+              runtime::gpu::kInvalidCudaParticleCouplingShape);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = {0.0f, -9.81f, 0.0f};
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+
+    const auto first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto stored_after_first = device_particles.DownloadCouplingState();
+
+    ASSERT_EQ(stored_after_first.normal_impulses.size(), 1u);
+    ASSERT_EQ(stored_after_first.shape_indices.size(), 1u);
+    EXPECT_EQ(first_report.contact_count, 1u);
+    EXPECT_EQ(first_report.coupling_warm_start_count, 0u);
+    EXPECT_FLOAT_EQ(first_report.coupling_warm_start_impulse_magnitude, 0.0f);
+    EXPECT_GT(first_report.max_coupling_normal_impulse, 0.0f);
+    EXPECT_GT(stored_after_first.normal_impulses[0], 0.0f);
+    EXPECT_EQ(stored_after_first.shape_indices[0], 0u);
+
+    const auto second_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto stored_after_second = device_particles.DownloadCouplingState();
+
+    EXPECT_EQ(second_report.contact_count, 1u);
+    EXPECT_EQ(second_report.coupling_warm_start_count, 1u);
+    EXPECT_GT(second_report.coupling_warm_start_impulse_magnitude, 0.0f);
+    EXPECT_GT(second_report.max_coupling_normal_impulse, 0.0f);
+    EXPECT_EQ(stored_after_second.shape_indices[0], 0u);
+    EXPECT_GT(stored_after_second.normal_impulses[0], 0.0f);
+}
+
+TEST(CudaParticleWorld, ClearsDeviceWorldCouplingImpulseWhenContactSeparates) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord sphere_body;
+    sphere_body.name = "separating_robot_link";
+    sphere_body.mass = 3.0f;
+    sphere_body.inertia = {1.0f, 1.0f, 1.0f};
+    const auto sphere_body_id = scene.AddRigidBody(std::move(sphere_body));
+
+    scene::CollisionShapeRecord sphere;
+    sphere.body_id = sphere_body_id;
+    sphere.type = scene::ShapeType::Sphere;
+    sphere.radius = 0.5f;
+    scene.AddCollisionShape(std::move(sphere));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.4f, 0.0f, 0.0f}};
+    particles.velocities = {{-3.0f, 0.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {9u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 30.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 1.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+
+    const auto first_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    auto coupling_state = device_particles.DownloadCouplingState();
+
+    ASSERT_EQ(coupling_state.normal_impulses.size(), 1u);
+    ASSERT_EQ(coupling_state.shape_indices.size(), 1u);
+    EXPECT_EQ(first_report.contact_count, 1u);
+    EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
+    EXPECT_EQ(coupling_state.shape_indices[0], 0u);
+
+    const auto second_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    coupling_state = device_particles.DownloadCouplingState();
+
+    EXPECT_EQ(second_report.contact_count, 0u);
+    EXPECT_EQ(second_report.coupling_warm_start_count, 0u);
+    EXPECT_FLOAT_EQ(second_report.coupling_warm_start_impulse_magnitude, 0.0f);
+    EXPECT_FLOAT_EQ(coupling_state.normal_impulses[0], 0.0f);
+    EXPECT_EQ(coupling_state.shape_indices[0],
+              runtime::gpu::kInvalidCudaParticleCouplingShape);
+}
+
 TEST(CudaParticleWorld, OffCenterParticleImpulseChangesRigidAngularVelocity) {
     scene::SceneIR scene;
 

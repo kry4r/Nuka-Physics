@@ -301,3 +301,58 @@ TEST(CudaParticleCouplingTiming, DeviceWorldCapsuleRigidImpulseCouplingUnderOneS
     EXPECT_GT(std::abs(rigid_state.angular_velocities[0].z), 1.0e-4f);
     EXPECT_LT(ms, 1000) << "CUDA DeviceWorld capsule particle coupling took " << ms << " ms";
 }
+
+TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) {
+    constexpr uint32_t kParticleCount = 4096u;
+    constexpr uint32_t kIterationCount = 60u;
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions.reserve(kParticleCount);
+    particles.velocities.reserve(kParticleCount);
+    particles.inv_masses.reserve(kParticleCount);
+    particles.radii.reserve(kParticleCount);
+    particles.phases.reserve(kParticleCount);
+
+    for (uint32_t index = 0; index < kParticleCount; ++index) {
+        const float x = 0.04f + static_cast<float>(index % 64u) * 0.002f;
+        const float y = 0.251f + static_cast<float>((index / 64u) % 16u) * 0.0001f;
+        const float z = static_cast<float>(index / (64u * 16u)) * 0.006f - 0.02f;
+        particles.positions.push_back({x, y, z});
+        particles.velocities.push_back({0.0f, -0.02f, 0.0f});
+        particles.inv_masses.push_back(1.0f);
+        particles.radii.push_back(0.004f);
+        particles.phases.push_back(index % 4u);
+    }
+
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+    runtime::BuiltWorld world;
+    auto device_world = BuildDeviceBoxWorld(world);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+
+    runtime::gpu::CudaParticleStepReport report;
+    const auto start = std::chrono::high_resolution_clock::now();
+    for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
+        report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            device_particles, device_world, options);
+    }
+    const auto end = std::chrono::high_resolution_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    const auto coupling_state = device_particles.DownloadCouplingState();
+
+    EXPECT_EQ(report.particle_count, kParticleCount);
+    EXPECT_GT(report.contact_count, 0u);
+    EXPECT_GT(report.coupling_warm_start_count, 0u);
+    EXPECT_GT(report.coupling_warm_start_impulse_magnitude, 0.0f);
+    EXPECT_GT(report.max_coupling_normal_impulse, 0.0f);
+    ASSERT_EQ(coupling_state.normal_impulses.size(), kParticleCount);
+    EXPECT_GT(coupling_state.normal_impulses[0], 0.0f);
+    EXPECT_LT(ms, 1000) << "CUDA DeviceWorld warm-start coupling took " << ms << " ms";
+}

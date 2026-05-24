@@ -131,20 +131,32 @@ int main() {
     coupling_options.friction = 0.0f;
     coupling_options.restitution = 0.0f;
     coupling_options.accumulate_rigid_impulses = true;
+    coupling_options.enable_coupling_warm_start = true;
 
+    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        device_coupled_particles,
+        device_world,
+        coupling_options);
     const auto coupling_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
             device_coupled_particles,
             device_world,
             coupling_options);
+    const auto coupling_state = device_coupled_particles.DownloadCouplingState();
     const auto rigid_state = device_world.DownloadState();
 
     std::cout << "deviceworld_coupling contacts=" << coupling_report.contact_count
               << " rigid_impulses=" << coupling_report.rigid_impulse_count
+              << " warm_starts=" << coupling_report.coupling_warm_start_count
               << " rigid_impulse_magnitude=" << coupling_report.rigid_impulse_magnitude
               << " rigid_angular_impulse_magnitude="
               << coupling_report.rigid_angular_impulse_magnitude
+              << " warm_start_impulse_magnitude="
+              << coupling_report.coupling_warm_start_impulse_magnitude
+              << " max_coupling_normal_impulse="
+              << coupling_report.max_coupling_normal_impulse
               << " residual=" << coupling_report.max_penetration_after_solve
+              << " cached_impulse=" << coupling_state.normal_impulses.front()
               << " body_velocity=("
               << rigid_state.linear_velocities[body_id].x << ", "
               << rigid_state.linear_velocities[body_id].y << ", "
@@ -162,19 +174,30 @@ int main() {
     box_particles.phases = {2u};
     auto device_box_particles = runtime::gpu::UploadCudaParticleWorld(box_particles);
 
+    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        device_box_particles,
+        device_world,
+        coupling_options);
     const auto box_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
             device_box_particles,
             device_world,
             coupling_options);
+    const auto box_coupling_state = device_box_particles.DownloadCouplingState();
     const auto box_rigid_state = device_world.DownloadState();
 
     std::cout << "deviceworld_box_coupling contacts=" << box_report.contact_count
               << " rigid_impulses=" << box_report.rigid_impulse_count
+              << " warm_starts=" << box_report.coupling_warm_start_count
               << " rigid_impulse_magnitude=" << box_report.rigid_impulse_magnitude
               << " rigid_angular_impulse_magnitude="
               << box_report.rigid_angular_impulse_magnitude
+              << " warm_start_impulse_magnitude="
+              << box_report.coupling_warm_start_impulse_magnitude
+              << " max_coupling_normal_impulse="
+              << box_report.max_coupling_normal_impulse
               << " residual=" << box_report.max_penetration_after_solve
+              << " cached_impulse=" << box_coupling_state.normal_impulses.front()
               << " body_velocity=("
               << box_rigid_state.linear_velocities[box_body_id].x << ", "
               << box_rigid_state.linear_velocities[box_body_id].y << ", "
@@ -193,19 +216,30 @@ int main() {
     auto device_capsule_particles =
         runtime::gpu::UploadCudaParticleWorld(capsule_particles);
 
+    (void)runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+        device_capsule_particles,
+        device_world,
+        coupling_options);
     const auto capsule_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
             device_capsule_particles,
             device_world,
             coupling_options);
+    const auto capsule_coupling_state = device_capsule_particles.DownloadCouplingState();
     const auto capsule_rigid_state = device_world.DownloadState();
 
     std::cout << "deviceworld_capsule_coupling contacts=" << capsule_report.contact_count
               << " rigid_impulses=" << capsule_report.rigid_impulse_count
+              << " warm_starts=" << capsule_report.coupling_warm_start_count
               << " rigid_impulse_magnitude=" << capsule_report.rigid_impulse_magnitude
               << " rigid_angular_impulse_magnitude="
               << capsule_report.rigid_angular_impulse_magnitude
+              << " warm_start_impulse_magnitude="
+              << capsule_report.coupling_warm_start_impulse_magnitude
+              << " max_coupling_normal_impulse="
+              << capsule_report.max_coupling_normal_impulse
               << " residual=" << capsule_report.max_penetration_after_solve
+              << " cached_impulse=" << capsule_coupling_state.normal_impulses.front()
               << " body_velocity=("
               << capsule_rigid_state.linear_velocities[capsule_body_id].x << ", "
               << capsule_rigid_state.linear_velocities[capsule_body_id].y << ", "
@@ -218,13 +252,16 @@ int main() {
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
                    coupling_report.rigid_impulse_count > 0u &&
+                   coupling_report.coupling_warm_start_count > 0u &&
                    coupling_report.rigid_angular_impulse_magnitude > 0.0f &&
                    box_report.contact_count > 0u &&
                    box_report.rigid_impulse_count > 0u &&
+                   box_report.coupling_warm_start_count > 0u &&
                    box_report.max_penetration_after_solve <= 1.0e-4f &&
                    box_report.rigid_angular_impulse_magnitude > 0.0f &&
                    capsule_report.contact_count > 0u &&
                    capsule_report.rigid_impulse_count > 0u &&
+                   capsule_report.coupling_warm_start_count > 0u &&
                    capsule_report.max_penetration_after_solve <= 1.0e-4f &&
                    capsule_report.rigid_angular_impulse_magnitude > 0.0f
                ? 0

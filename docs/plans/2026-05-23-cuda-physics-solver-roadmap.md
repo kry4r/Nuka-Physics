@@ -105,9 +105,27 @@ git add docs src tests
 git commit -m "physics: add cuda particle coupling foundation"
 ```
 
+## Current Progress
+
+- CUDA particle/DeviceWorld coupling now supports cooked plane, sphere, box, and
+  capsule shapes with rigid linear/angular impulse feedback.
+- `CudaParticleWorld` owns CUDA-resident per-particle coupling normal impulse
+  and shape-index caches. The cooked coupling kernel writes the cache, reports
+  warm-start count/magnitude on the next same-shape contact, and clears stale
+  cache entries when contact separates.
+- `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
+  and capsule coupling, so the behavior is visible outside unit tests.
+- `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
+  tracks the added cache/report path under the existing one-second CUDA budget.
+
 ## Follow-On Tasks
 
-1. Promote the current linear/angular velocity feedback into a reusable coupling-constraint assembly path with persistent warm-start impulses and force/torque diagnostics.
-2. Add cloth/deformable constraints: distance, bending, volume/shape matching, and XPBD-style compliance.
-3. Add particle-fluid constraints: density estimate, pressure/viscosity solve, boundary coupling, and diagnostics.
-4. Add batched particle worlds for robot/RL workloads that match `BatchedDeviceWorld` instance-major layout.
+1. Promote the per-particle coupling cache into a reusable coupling-constraint
+   assembly path that can store multiple contacts per particle and expose
+   force/torque diagnostics.
+2. Add cloth/deformable constraints: distance, bending, volume/shape matching,
+   and XPBD-style compliance.
+3. Add particle-fluid constraints: density estimate, pressure/viscosity solve,
+   boundary coupling, and diagnostics.
+4. Add batched particle worlds for robot/RL workloads that match
+   `BatchedDeviceWorld` instance-major layout.

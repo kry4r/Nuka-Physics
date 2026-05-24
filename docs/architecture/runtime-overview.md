@@ -164,8 +164,10 @@ This module deliberately starts at the data-residency and coupling boundary the
 full solver needs. The report download is a compact validation boundary with
 particle count, contact count, maximum pre-solve penetration, residual
 penetration after projection, max speed, kinetic energy, simulated step count,
-rigid impulse count, rigid impulse magnitude, and kernel-launch count. Tests use
-those invariants to prove the new branch is not just an upload shell.
+rigid impulse count, rigid impulse magnitude, persistent coupling warm-start
+count/magnitude, maximum cached coupling normal impulse, and kernel-launch
+count. Tests use those invariants to prove the new branch is not just an upload
+shell.
 `StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
 tables and mutable rigid state directly on CUDA, currently for plane, sphere,
 box, and capsule shapes. When requested, particle contacts atomically accumulate
@@ -177,14 +179,18 @@ axis as local Y, projects particles against the closest point on the segment,
 and preserves the dynamic contact invariant that particle normal speed is
 measured relative to the rigid contact point rather than the world frame. This
 lets common robot link capsules physically interact with deformables and fluids
-without a CPU stepping detour.
+without a CPU stepping detour. The coupling path also owns per-particle
+CUDA-resident normal impulse and shape-index caches. The cache is initialized on
+upload, updated by the coupling kernel, reused as a warm-start diagnostic on the
+next contact with the same cooked shape, and cleared on the device when contact
+separates so stale constraint impulses do not leak into later steps.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
 plane+sphere coupling, then runs cooked `DeviceWorld` sphere, box, and capsule
 coupling with rigid linear/angular impulse feedback and prints compact solver
-diagnostics plus sampled particle/rigid state. It intentionally does not depend
-on Vulkan or CPU simulation.
+diagnostics, warm-start/cache values, and sampled particle/rigid state. It
+intentionally does not depend on Vulkan or CPU simulation.
 
 ## Scene Integration
 
@@ -348,9 +354,11 @@ capsule coupling on CUDA. The cooked path reads body poses, shape body bindings,
 shape local transforms, half extents, radii, capsule half heights, inverse
 masses, inverse inertias, and mutable rigid linear/angular velocities from the
 same device buffers used by the rigid solver, then writes particle corrections
-plus rigid linear/angular velocity impulses without returning to the CPU. CPU only uploads
-authored/reference state and downloads compact reports for tests, benchmarks,
-and tooling.
+plus rigid linear/angular velocity impulses without returning to the CPU. A
+per-particle CUDA coupling cache stores normal impulse and cooked shape index
+for warm-start diagnostics and is included in the container device-memory
+accounting. CPU only uploads authored/reference state and downloads compact
+reports for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
 
