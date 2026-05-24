@@ -5,6 +5,7 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "runtime/gpu/device_world.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,10 +52,21 @@ struct CudaParticleStepReport {
     uint32_t simulated_step_count = 0;
     uint32_t kernel_launch_count = 0;
     uint32_t contact_count = 0;
+    uint32_t rigid_impulse_count = 0;
     float max_penetration = 0.0f;
     float max_penetration_after_solve = 0.0f;
     float max_speed = 0.0f;
     float kinetic_energy = 0.0f;
+    float rigid_impulse_magnitude = 0.0f;
+};
+
+struct CudaParticleDeviceWorldCouplingOptions {
+    math::Vec3 gravity = {0.0f, -9.81f, 0.0f};
+    float dt = 1.0f / 60.0f;
+    uint32_t step_count = 1u;
+    float friction = 0.0f;
+    float restitution = 0.0f;
+    bool accumulate_rigid_impulses = true;
 };
 
 class CudaParticleWorld {
@@ -99,5 +111,10 @@ CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles);
 CudaParticleStepReport StepCudaParticleWorld(
     CudaParticleWorld& particle_world,
     const CudaParticleStepOptions& options = {});
+
+CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
+    CudaParticleWorld& particle_world,
+    DeviceWorld& device_world,
+    const CudaParticleDeviceWorldCouplingOptions& options = {});
 
 } // namespace nuka::runtime::gpu

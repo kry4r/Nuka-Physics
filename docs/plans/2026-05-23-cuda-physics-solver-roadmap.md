@@ -107,8 +107,8 @@ git commit -m "physics: add cuda particle coupling foundation"
 
 ## Follow-On Tasks
 
-1. Replace analytic sphere coupling with cooked `DeviceWorld` sphere/box/plane shape coupling.
-2. Add bidirectional impulse accumulation from particle contacts back into rigid body buffers.
+1. Extend cooked `DeviceWorld` coupling from plane/sphere to box and capsule shapes, then route robot link collision shapes through the same particle coupling entry point.
+2. Move from velocity-only rigid feedback to impulse/force accumulation that also updates angular velocity through contact offsets and inverse inertia.
 3. Add cloth/deformable constraints: distance, bending, volume/shape matching, and XPBD-style compliance.
 4. Add particle-fluid constraints: density estimate, pressure/viscosity solve, boundary coupling, and diagnostics.
 5. Add batched particle worlds for robot/RL workloads that match `BatchedDeviceWorld` instance-major layout.

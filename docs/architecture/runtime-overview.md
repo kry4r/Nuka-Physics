@@ -164,16 +164,20 @@ This module deliberately starts at the data-residency and coupling boundary the
 full solver needs. The report download is a compact validation boundary with
 particle count, contact count, maximum pre-solve penetration, residual
 penetration after projection, max speed, kinetic energy, simulated step count,
-and kernel-launch count. Tests use those invariants to prove the new branch is
-not just an upload shell. The next coupling stage should replace analytic
-sphere/plane inputs with cooked `DeviceWorld` shape tables, then accumulate
-bidirectional impulses into rigid body buffers so robot links can physically
-interact with deformables and fluids on the GPU.
+rigid impulse count, rigid impulse magnitude, and kernel-launch count. Tests use
+those invariants to prove the new branch is not just an upload shell.
+`StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
+tables and mutable rigid state directly on CUDA, currently for plane and sphere
+shapes. When requested, particle contacts atomically accumulate velocity
+impulses into dynamic rigid bodies so robot links can physically interact with
+deformables and fluids without a CPU stepping detour.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
-plane+sphere coupling, and prints compact solver diagnostics plus a sampled
-particle state. It intentionally does not depend on Vulkan or CPU simulation.
+plane+sphere coupling, then runs cooked `DeviceWorld` sphere coupling with
+rigid impulse feedback and prints compact solver diagnostics plus sampled
+particle/rigid state. It intentionally does not depend on Vulkan or CPU
+simulation.
 
 ## Scene Integration
 
@@ -332,9 +336,13 @@ the maximal-coordinate rigid body path. It is designed to become the shared
 state container for cloth vertices, deformable particles, and SPH-style fluid
 particles. Phase ids are uploaded now so later kernels can distinguish material
 or solver families without changing the buffer layout. The current kernels
-resolve one-way analytic rigid coupling on CUDA and expose diagnostics for
-global solver health; CPU only uploads authored/reference state and downloads
-compact reports for tests, benchmarks, and tooling.
+resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere coupling
+on CUDA. The cooked path reads body poses, shape body bindings, shape local
+transforms, radii, inverse masses, and mutable rigid velocities from the same
+device buffers used by the rigid solver, then writes particle corrections and
+rigid velocity impulses without returning to the CPU. CPU only uploads
+authored/reference state and downloads compact reports for tests, benchmarks,
+and tooling.
 
 ### CUDA BatchedDeviceWorld
 

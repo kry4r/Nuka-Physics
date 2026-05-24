@@ -3,10 +3,14 @@
 // ---------------------------------------------------------------------------
 
 #include "runtime/gpu/cuda_particle_world.hpp"
+#include "runtime/gpu/device_world.hpp"
+#include "runtime/world_builder.hpp"
+#include "scene/cooker.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 using namespace nuka;
@@ -29,6 +33,13 @@ runtime::gpu::CudaParticleSet BuildParticleSet() {
     particles.radii = {0.05f, 0.1f, 0.15f};
     particles.phases = {1u, 2u, 3u};
     return particles;
+}
+
+runtime::gpu::DeviceWorld UploadScene(scene::SceneIR scene, runtime::BuiltWorld& world) {
+    world = runtime::BuildWorld(scene::CookScene(scene));
+    auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
+    runtime::gpu::UploadDeviceState(device_world, world.instance);
+    return device_world;
 }
 
 } // namespace
@@ -165,5 +176,103 @@ TEST(CudaParticleWorld, SolvesSphereCouplingAndBoundsPenetration) {
 
     EXPECT_EQ(report.contact_count, 1u);
     EXPECT_NEAR(report.max_penetration, 1.1f, 1.0e-4f);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+}
+
+TEST(CudaParticleWorld, CouplesAgainstCookedPlaneShapeFromDeviceWorld) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord ground;
+    ground.name = "raised_ground";
+    ground.is_static = true;
+    ground.local_transform.position = {0.0f, 0.25f, 0.0f};
+    const auto ground_id = scene.AddRigidBody(std::move(ground));
+
+    scene::CollisionShapeRecord plane;
+    plane.body_id = ground_id;
+    plane.type = scene::ShapeType::Plane;
+    scene.AddCollisionShape(std::move(plane));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.0f, 0.2f, 0.0f}};
+    particles.velocities = {{0.0f, -1.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.05f};
+    particles.phases = {1u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = false;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto particle_state = device_particles.DownloadState();
+
+    ASSERT_EQ(particle_state.positions.size(), 1u);
+    EXPECT_NEAR(particle_state.positions[0].y, 0.3f, 1.0e-4f);
+    EXPECT_GE(particle_state.velocities[0].y, -1.0e-5f);
+    EXPECT_EQ(report.contact_count, 1u);
+    EXPECT_GT(report.max_penetration, 0.05f);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+    EXPECT_EQ(report.rigid_impulse_count, 0u);
+}
+
+TEST(CudaParticleWorld, AccumulatesImpulseIntoDynamicSphereBodyOnDevice) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord sphere_body;
+    sphere_body.name = "robot_link_sphere";
+    sphere_body.mass = 1.0f;
+    sphere_body.inertia = {1.0f, 1.0f, 1.0f};
+    sphere_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto sphere_body_id = scene.AddRigidBody(std::move(sphere_body));
+
+    scene::CollisionShapeRecord sphere;
+    sphere.body_id = sphere_body_id;
+    sphere.type = scene::ShapeType::Sphere;
+    sphere.radius = 0.5f;
+    scene.AddCollisionShape(std::move(sphere));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.4f, 0.0f, 0.0f}};
+    particles.velocities = {{-2.0f, 0.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {2u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto particle_state = device_particles.DownloadState();
+    const auto rigid_state = device_world.DownloadState();
+
+    ASSERT_EQ(particle_state.positions.size(), 1u);
+    ASSERT_EQ(rigid_state.linear_velocities.size(), 1u);
+    EXPECT_NEAR(particle_state.positions[0].x, 0.6f, 1.0e-4f);
+    EXPECT_GT(particle_state.velocities[0].x, -2.0f);
+    EXPECT_LT(particle_state.velocities[0].x, 0.0f);
+    EXPECT_LT(rigid_state.linear_velocities[sphere_body_id].x, -0.9f);
+    EXPECT_EQ(report.contact_count, 1u);
+    EXPECT_EQ(report.rigid_impulse_count, 1u);
+    EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
     EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
 }
