@@ -1748,6 +1748,17 @@ CudaParticleCouplingRowsState CudaParticleWorld::DownloadCouplingRows() const {
     return state;
 }
 
+CudaConstraintRowBufferView CudaParticleWorld::ConstraintRowBuffer() {
+    CudaConstraintRowBufferView view;
+    view.kind = CudaConstraintRowBufferKind::ParticleRigidCoupling;
+    view.device_rows = coupling_rows_.Data();
+    view.row_count = particle_count_ * kCudaParticleCouplingSlotsPerParticle;
+    view.owner_count = particle_count_;
+    view.rows_per_owner = kCudaParticleCouplingSlotsPerParticle;
+    view.row_stride_bytes = sizeof(CudaParticleCouplingConstraintRow);
+    return view;
+}
+
 math::Vec3* CudaParticleWorld::DevicePositions() {
     return static_cast<math::Vec3*>(positions_.Data());
 }
@@ -1910,13 +1921,14 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             "StepCudaParticlesAgainstDeviceWorld requires uploaded DeviceWorld state");
     }
 
+    const CudaConstraintRowBufferView row_buffer = particle_world.ConstraintRowBuffer();
+    CudaParticleCouplingConstraintRow* coupling_rows =
+        static_cast<CudaParticleCouplingConstraintRow*>(row_buffer.device_rows);
     phi::Buffer diagnostics(
         particle_world.ParticleCount() * sizeof(ParticleDiagnostics),
         phi::MemoryKind::Device);
-    const uint32_t coupling_row_count =
-        particle_world.ParticleCount() * kCudaParticleCouplingSlotsPerParticle;
     phi::Buffer row_diagnostics(
-        coupling_row_count * sizeof(CouplingRowDiagnostics),
+        row_buffer.row_count * sizeof(CouplingRowDiagnostics),
         phi::MemoryKind::Device);
     phi::Buffer report_buffer(sizeof(CudaParticleStepReport), phi::MemoryKind::Device);
     const uint32_t row_solver_iterations = options.solve_coupling_rows_on_cuda
@@ -1957,7 +1969,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             options.enable_coupling_warm_start,
             particle_world.DeviceCouplingNormalImpulses(),
             particle_world.DeviceCouplingShapeIndices(),
-            particle_world.DeviceCouplingRows(),
+            coupling_rows,
             static_cast<ParticleDiagnostics*>(diagnostics.Data()));
         CheckCuda(cudaGetLastError(),
                   "IntegrateAndCoupleParticlesAgainstDeviceWorldKernel launch");
@@ -1977,7 +1989,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
 
                 SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
                     particle_world.ParticleCount(),
-                    particle_world.DeviceCouplingRows(),
+                    coupling_rows,
                     particle_world.DeviceVelocities(),
                     particle_world.DeviceInvMasses(),
                     device_world.DeviceLinearVelocities(),
@@ -1994,7 +2006,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
                 ++report.coupling_row_solver_launch_count;
 
                 ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
-                    coupling_row_count,
+                    row_buffer.row_count,
                     static_cast<const CouplingRowDiagnostics*>(row_diagnostics.Data()),
                     step * row_solver_iterations + iteration,
                     static_cast<CudaParticleStepReport*>(report_buffer.Data()));

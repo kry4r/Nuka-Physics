@@ -5,6 +5,7 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstddef>
@@ -161,6 +162,7 @@ public:
     CudaParticleState DownloadState() const;
     CudaParticleCouplingState DownloadCouplingState() const;
     CudaParticleCouplingRowsState DownloadCouplingRows() const;
+    CudaConstraintRowBufferView ConstraintRowBuffer();
 
     math::Vec3* DevicePositions();
     const math::Vec3* DevicePositions() const;

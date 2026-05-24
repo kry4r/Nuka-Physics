@@ -192,6 +192,12 @@ and accumulated tangent impulses. The cache and row records are initialized on
 upload, updated by the coupling kernel, reused as warm-start state on the next
 contact with the same cooked shape, and cleared on the device when contact
 separates so stale constraint impulses do not leak into later steps.
+`CudaConstraintRowBufferView` exposes this storage as the first scheduler-facing
+CUDA row-buffer view, including the row family, device pointer, row count, owner
+count, rows per owner, and row stride. The current particle/rigid row solver
+consumes that view for assembly, row-solver sweeps, and diagnostics reduction
+instead of reaching back through the particle-world-specific row pointer at each
+launch site.
 
 The cooked particle/rigid coupling path now executes normal velocity impulses
 and tangent friction impulses through `SolveParticleCouplingRowsKernel` after
@@ -231,9 +237,10 @@ regressions; it is not yet a global island convergence proof.
 `coupling_tangent_warm_start_count` and
 `coupling_tangent_warm_start_impulse_magnitude` expose the persistent friction
 cache separately from the aggregate warm-start magnitude. Compliance/XPBD and a
-unified rigid/cloth/deformable/fluid row buffer remain follow-on solver work;
-cross-particle writes into shared rigid bodies still use atomics until that
-scheduler owns global coloring or island batching.
+global row buffer that serves rigid contacts, joints, drives, robot
+articulations, cloth/deformables, particle fluids, and rigid-soft/fluid coupling
+remain follow-on solver work; cross-particle writes into shared rigid bodies
+still use atomics until that scheduler owns global coloring or island batching.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
@@ -416,14 +423,17 @@ without returning to the CPU. A
 fixed four-slot per-particle CUDA coupling cache stores normal impulses and
 cooked shape indices for warm-start diagnostics and is included in the container
 device-memory accounting. A parallel per-slot coupling-row buffer stores the
-constraint-space data needed by a later reusable solver: active flag,
+constraint-space data now consumed through the first reusable scheduler-facing
+view: active flag,
 particle/shape/body ids, normal, contact point, linear/angular Jacobians, rhs,
 position error, effective mass, tangent basis/effective masses, friction, and
-accumulated normal/tangent impulses. The step report includes active cache
-slots, row-solver launch/impulse diagnostics, per-sweep delta impulse/residual
-proxies, and coupling force/torque magnitudes, while tests and demos can
-download the row buffer as a validation boundary. CPU only uploads
-authored/reference state and
+accumulated normal/tangent impulses. `ConstraintRowBuffer()` returns the
+type-erased CUDA view over those rows so the current solver/reducer path already
+uses row-family metadata, row count, owner count, rows per owner, and stride from
+the scheduler boundary. The step report includes active cache slots, row-solver
+launch/impulse diagnostics, per-sweep delta impulse/residual proxies, and
+coupling force/torque magnitudes, while tests and demos can download the row
+buffer as a validation boundary. CPU only uploads authored/reference state and
 downloads compact reports or row snapshots for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
