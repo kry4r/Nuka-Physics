@@ -157,3 +157,20 @@ Focused result: 11/11 tests passed. The new
 `CudaBatchJointDriveTiming.BatchedJointDriveSolveUnderOneSecond` benchmark ran
 128 two-body CUDA environments for 60 steps and completed under the 1000 ms
 threshold in the focused CTest run.
+
+**2026-05-24 follow-up performance fix:** Full-suite verification later exposed
+that the no-contact batched joint/drive step path could exceed the 1000 ms gate
+because it reassembled solver buffers, synchronized, and downloaded reports on
+every fixed step. The runtime now uses a dedicated joint/drive-only CUDA path
+that assembles cooked joint/actuator blocks once on device, reuses them across
+the repeated step loop, fuses the velocity/position iterations into one device
+kernel per step, and downloads the report only at the validation boundary.
+Focused verification after the fix:
+
+```powershell
+ctest --test-dir C:\Softwares\code\nuka-physics\build -C Release --output-on-failure -R "Cuda(BatchedWorld|BatchContactTiming|BatchJointDriveTiming|ParticleWorld|ParticleCouplingTiming|ConstraintSolver|Solver|Sensor|StepTiming)"
+```
+
+Result: 38/38 tests passed, with
+`CudaBatchJointDriveTiming.BatchedJointDriveSolveUnderOneSecond` completing in
+about 0.55 s in the focused CTest run.

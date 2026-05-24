@@ -1344,6 +1344,141 @@ __global__ void SolveBatchedJointPositionIterationKernel(
     report->max_position_error = max_error;
 }
 
+__global__ void SolveBatchedJointDriveStepKernel(
+    uint32_t total_body_count,
+    uint32_t body_count_per_instance,
+    constraint::ConstraintBlock* blocks,
+    const uint32_t* block_count,
+    const float* inv_masses,
+    const math::Vec3* inv_inertias,
+    math::Transform* poses,
+    math::Vec3* linear_velocities,
+    math::Vec3* angular_velocities,
+    uint32_t velocity_iterations,
+    uint32_t position_iterations,
+    float slop,
+    float baumgarte,
+    CudaBatchedConstraintSolverReport* report) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) {
+        return;
+    }
+
+    const uint32_t count = *block_count;
+    for (uint32_t block_index = 0; block_index < count; ++block_index) {
+        constraint::ConstraintBlock block = blocks[block_index];
+        for (uint32_t row = 0; row < block.row_count; ++row) {
+            block.effective_mass[row] =
+                ComputeEffectiveMass(block,
+                                     row,
+                                     total_body_count,
+                                     body_count_per_instance,
+                                     inv_masses,
+                                     inv_inertias);
+            block.impulse[row] = 0.0f;
+        }
+        blocks[block_index] = block;
+    }
+
+    for (uint32_t iter = 0; iter < velocity_iterations; ++iter) {
+        for (uint32_t block_index = 0; block_index < count; ++block_index) {
+            constraint::ConstraintBlock block = blocks[block_index];
+            for (uint32_t row = 0; row < block.row_count; ++row) {
+                const float jv =
+                    ComputeJv(block, row, total_body_count, linear_velocities, angular_velocities);
+                const float lambda = block.effective_mass[row] * (block.rhs[row] - jv);
+                const float old_impulse = block.impulse[row];
+                const float new_impulse =
+                    fminf(fmaxf(old_impulse + lambda,
+                                block.lower_limit[row]),
+                          block.upper_limit[row]);
+                block.impulse[row] = new_impulse;
+                const float delta = new_impulse - old_impulse;
+                if (fabsf(delta) > 1.0e-12f) {
+                    ApplyImpulse(block,
+                                 row,
+                                 delta,
+                                 total_body_count,
+                                 body_count_per_instance,
+                                 inv_masses,
+                                 inv_inertias,
+                                 linear_velocities,
+                                 angular_velocities);
+                }
+            }
+            blocks[block_index] = block;
+        }
+    }
+
+    float max_position_error = report->max_position_error;
+    const math::Vec3 axes[3] = {UnitX(), UnitY(), UnitZ()};
+    for (uint32_t iter = 0; iter < position_iterations; ++iter) {
+        for (uint32_t block_index = 0; block_index < count; ++block_index) {
+            const constraint::ConstraintBlock block = blocks[block_index];
+            if (block.type != constraint::ConstraintType::Joint) {
+                continue;
+            }
+
+            for (uint32_t axis_index = 0; axis_index < 3u; ++axis_index) {
+                const math::Vec3 axis = axes[axis_index];
+                const math::Transform pose_a = BodyPose(block.body_a, total_body_count, poses);
+                const math::Transform pose_b = BodyPose(block.body_b, total_body_count, poses);
+                const math::Vec3 r_a = Rotate(pose_a.rotation, block.anchor_local_a);
+                const math::Vec3 r_b = Rotate(pose_b.rotation, block.anchor_local_b);
+                const math::Vec3 error =
+                    Sub(Add(pose_a.position, r_a), Add(pose_b.position, r_b));
+                const float row_error = Dot(error, axis);
+                max_position_error = fmaxf(max_position_error, fabsf(row_error));
+                const float correction = baumgarte * row_error;
+                if (fabsf(correction) <= slop) {
+                    continue;
+                }
+
+                const math::Vec3 linear_a = Neg(axis);
+                const math::Vec3 linear_b = axis;
+                const math::Vec3 angular_a = Neg(Cross(r_a, axis));
+                const math::Vec3 angular_b = Cross(r_b, axis);
+                const float effective_mass = JointRowMass(linear_a,
+                                                          angular_a,
+                                                          linear_b,
+                                                          angular_b,
+                                                          block.body_a,
+                                                          block.body_b,
+                                                          total_body_count,
+                                                          body_count_per_instance,
+                                                          inv_masses,
+                                                          inv_inertias);
+                if (effective_mass <= 0.0f) {
+                    continue;
+                }
+
+                const float position_impulse = correction * effective_mass;
+                ApplyPositionCorrection(block.body_a,
+                                        total_body_count,
+                                        body_count_per_instance,
+                                        linear_a,
+                                        angular_a,
+                                        position_impulse,
+                                        inv_masses,
+                                        inv_inertias,
+                                        poses);
+                ApplyPositionCorrection(block.body_b,
+                                        total_body_count,
+                                        body_count_per_instance,
+                                        linear_b,
+                                        angular_b,
+                                        position_impulse,
+                                        inv_masses,
+                                        inv_inertias,
+                                        poses);
+            }
+        }
+    }
+
+    report->velocity_iterations = velocity_iterations;
+    report->position_iterations = position_iterations;
+    report->max_position_error = max_position_error;
+}
+
 __global__ void SetBatchedSolverIterationReportKernel(
     uint32_t velocity_iterations,
     uint32_t position_iterations,
@@ -1370,6 +1505,146 @@ void ValidateInstanceShape(const WorldTemplate& world_template,
         throw std::invalid_argument(
             "UploadBatchedDeviceWorld requires every instance to match the shared template body count");
     }
+}
+
+bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
+                                       const CudaBatchedWorldStepOptions& options,
+                                       CudaBatchedWorldStepReport* report) {
+    if (options.enable_contacts || (!options.enable_joints && !options.enable_drives)) {
+        return false;
+    }
+    if (options.enable_joints && !batch.HasUploadedJointTables()) {
+        throw std::runtime_error(
+            "StepBatchedCudaWorld requires uploaded batched joint tables");
+    }
+    if (options.enable_drives
+        && (!batch.HasUploadedJointTables() || !batch.HasUploadedActuatorTables())) {
+        throw std::runtime_error(
+            "StepBatchedCudaWorld requires uploaded batched actuator tables");
+    }
+
+    const uint32_t joint_capacity = options.enable_joints ? batch.TotalJointCount() : 0u;
+    const uint32_t actuator_capacity = options.enable_drives ? batch.TotalActuatorCount() : 0u;
+    const uint32_t block_capacity = joint_capacity + actuator_capacity;
+    if (block_capacity == 0u) {
+        return false;
+    }
+
+    phi::Buffer blocks(block_capacity * sizeof(constraint::ConstraintBlock),
+                       phi::MemoryKind::Device);
+    phi::Buffer block_count(sizeof(uint32_t), phi::MemoryKind::Device);
+    phi::Buffer solver_report(sizeof(CudaBatchedConstraintSolverReport),
+                              phi::MemoryKind::Device);
+
+    ClearBatchedSolverReportKernel<<<1, 1>>>(
+        static_cast<uint32_t*>(block_count.Data()),
+        static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
+    CheckCuda(cudaGetLastError(), "ClearBatchedSolverReportKernel launch");
+
+    constexpr uint32_t kBlockSize = 128u;
+    if (options.enable_joints && batch.TotalJointCount() > 0u) {
+        const uint32_t joint_blocks =
+            (batch.TotalJointCount() + kBlockSize - 1u) / kBlockSize;
+        AssembleBatchedJointBlocksKernel<<<joint_blocks, kBlockSize>>>(
+            batch.TotalJointCount(),
+            batch.JointCountPerInstance(),
+            batch.BodyCountPerInstance(),
+            batch.DeviceJointTypes(),
+            batch.DeviceJointParentBodies(),
+            batch.DeviceJointChildBodies(),
+            batch.DeviceJointAxes(),
+            batch.DeviceJointParentFrames(),
+            batch.DeviceJointChildFrames(),
+            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<uint32_t*>(block_count.Data()));
+        CheckCuda(cudaGetLastError(), "AssembleBatchedJointBlocksKernel launch");
+    }
+
+    if (options.enable_drives && batch.TotalActuatorCount() > 0u) {
+        const uint32_t drive_blocks =
+            (batch.TotalActuatorCount() + kBlockSize - 1u) / kBlockSize;
+        AssembleBatchedDriveBlocksKernel<<<drive_blocks, kBlockSize>>>(
+            batch.TotalActuatorCount(),
+            batch.ActuatorCountPerInstance(),
+            batch.JointCountPerInstance(),
+            batch.BodyCountPerInstance(),
+            batch.DeviceActuatorJointIds(),
+            batch.DeviceActuatorTypes(),
+            batch.DeviceActuatorGains(),
+            batch.DeviceActuatorForceLimits(),
+            batch.DeviceJointParentBodies(),
+            batch.DeviceJointChildBodies(),
+            batch.DeviceJointAxes(),
+            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<uint32_t*>(block_count.Data()));
+        CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksKernel launch");
+    }
+
+    FinalizeBatchedSolverReportKernel<<<1, 1>>>(
+        static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+        static_cast<const uint32_t*>(block_count.Data()),
+        static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
+    CheckCuda(cudaGetLastError(), "FinalizeBatchedSolverReportKernel launch");
+
+    CudaBatchedConstraintSolverReport setup_report;
+    solver_report.CopyToHost(&setup_report, sizeof(setup_report));
+    report->joint_constraint_count =
+        setup_report.joint_constraint_count * options.step_count;
+    report->drive_constraint_count =
+        setup_report.drive_constraint_count * options.step_count;
+    report->constraint_block_count =
+        setup_report.constraint_block_count * options.step_count;
+    report->constraint_row_count =
+        setup_report.constraint_row_count * options.step_count;
+    report->solver_iterations_used =
+        (options.solver_velocity_iterations + options.solver_position_iterations)
+        * options.step_count;
+
+    constexpr uint32_t kBodyBlockSize = 128u;
+    const uint32_t body_blocks =
+        (batch.TotalBodyCount() + kBodyBlockSize - 1u) / kBodyBlockSize;
+    for (uint32_t step = 0; step < options.step_count; ++step) {
+        IntegrateBatchedRigidBodiesKernel<<<body_blocks, kBodyBlockSize>>>(
+            batch.TotalBodyCount(),
+            batch.BodyCountPerInstance(),
+            batch.DevicePoses(),
+            batch.DeviceLinearVelocities(),
+            batch.DeviceAngularVelocities(),
+            batch.DeviceForces(),
+            batch.DeviceTorques(),
+            batch.DeviceInvMasses(),
+            batch.DeviceInvInertias(),
+            options.gravity,
+            options.dt,
+            options.clear_forces_after_step);
+        CheckCuda(cudaGetLastError(), "IntegrateBatchedRigidBodiesKernel launch");
+        ++report->kernel_launch_count;
+
+        SolveBatchedJointDriveStepKernel<<<1, 1>>>(
+            batch.TotalBodyCount(),
+            batch.BodyCountPerInstance(),
+            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<const uint32_t*>(block_count.Data()),
+            batch.DeviceInvMasses(),
+            batch.DeviceInvInertias(),
+            batch.DevicePoses(),
+            batch.DeviceLinearVelocities(),
+            batch.DeviceAngularVelocities(),
+            options.solver_velocity_iterations,
+            options.solver_position_iterations,
+            options.solver_slop,
+            options.solver_baumgarte,
+            static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
+        CheckCuda(cudaGetLastError(), "SolveBatchedJointDriveStepKernel launch");
+    }
+
+    CheckCuda(cudaDeviceSynchronize(), "StepBatchedJointDriveOnlyFastPath synchronize");
+    CudaBatchedConstraintSolverReport final_report;
+    solver_report.CopyToHost(&final_report, sizeof(final_report));
+    report->max_constraint_error =
+        std::max(report->max_constraint_error, final_report.max_position_error);
+    report->simulated_step_count = options.step_count;
+    return true;
 }
 
 } // namespace
@@ -2161,6 +2436,10 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
     if (!batch.HasUploadedState()) {
         throw std::runtime_error(
             "StepBatchedCudaWorld requires uploaded BatchedDeviceWorld state");
+    }
+
+    if (StepBatchedJointDriveOnlyFastPath(batch, options, &report)) {
+        return report;
     }
 
     constexpr uint32_t kBlockSize = 128;

@@ -323,3 +323,109 @@ TEST(CudaParticleWorld, OffCenterParticleImpulseChangesRigidAngularVelocity) {
     EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
     EXPECT_GT(std::abs(rigid_state.angular_velocities[sphere_body_id].z), 1.0e-4f);
 }
+
+TEST(CudaParticleWorld, CouplesAgainstCookedBoxShapeFromDeviceWorld) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord box_body;
+    box_body.name = "robot_link_box";
+    box_body.mass = 2.0f;
+    box_body.inertia = {0.75f, 0.75f, 0.75f};
+    box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto box_body_id = scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_body_id;
+    box_shape.type = scene::ShapeType::Box;
+    box_shape.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.2f, 0.34f, 0.0f}};
+    particles.velocities = {{0.0f, -2.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {4u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto particle_state = device_particles.DownloadState();
+    const auto rigid_state = device_world.DownloadState();
+
+    ASSERT_EQ(particle_state.positions.size(), 1u);
+    ASSERT_EQ(rigid_state.linear_velocities.size(), 1u);
+    ASSERT_EQ(rigid_state.angular_velocities.size(), 1u);
+    EXPECT_NEAR(particle_state.positions[0].y, 0.35f, 1.0e-4f);
+    EXPECT_GT(particle_state.velocities[0].y, -2.0f);
+    EXPECT_LT(rigid_state.linear_velocities[box_body_id].y, 0.0f);
+
+    const float contact_x = 0.2f;
+    const float rigid_contact_normal_speed =
+        rigid_state.linear_velocities[box_body_id].y +
+        rigid_state.angular_velocities[box_body_id].z * contact_x;
+    EXPECT_NEAR(particle_state.velocities[0].y - rigid_contact_normal_speed,
+                0.0f,
+                1.0e-4f);
+    EXPECT_GT(std::abs(rigid_state.angular_velocities[box_body_id].z), 1.0e-4f);
+    EXPECT_EQ(report.contact_count, 1u);
+    EXPECT_EQ(report.rigid_impulse_count, 1u);
+    EXPECT_GT(report.rigid_impulse_magnitude, 0.0f);
+    EXPECT_GT(report.rigid_angular_impulse_magnitude, 0.0f);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+}
+
+TEST(CudaParticleWorld, ReportsInteriorCookedBoxPenetrationToNearestFace) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord box_body;
+    box_body.name = "static_box_boundary";
+    box_body.is_static = true;
+    const auto box_body_id = scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_body_id;
+    box_shape.type = scene::ShapeType::Box;
+    box_shape.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(box_shape));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.2f, 0.0f, 0.0f}};
+    particles.velocities = {{0.0f, 0.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.05f};
+    particles.phases = {5u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 1u;
+    options.friction = 0.0f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = false;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto particle_state = device_particles.DownloadState();
+
+    ASSERT_EQ(particle_state.positions.size(), 1u);
+    EXPECT_NEAR(particle_state.positions[0].x, 0.3f, 1.0e-4f);
+    EXPECT_GE(report.max_penetration, 0.099f);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+    EXPECT_EQ(report.contact_count, 1u);
+}

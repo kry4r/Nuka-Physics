@@ -167,18 +167,21 @@ penetration after projection, max speed, kinetic energy, simulated step count,
 rigid impulse count, rigid impulse magnitude, and kernel-launch count. Tests use
 those invariants to prove the new branch is not just an upload shell.
 `StepCudaParticlesAgainstDeviceWorld()` consumes cooked `DeviceWorld` shape
-tables and mutable rigid state directly on CUDA, currently for plane and sphere
-shapes. When requested, particle contacts atomically accumulate velocity
+tables and mutable rigid state directly on CUDA, currently for plane, sphere,
+and box shapes. When requested, particle contacts atomically accumulate velocity
 and angular velocity impulses into dynamic rigid bodies using the contact offset
-and cooked inverse inertia. This lets robot links physically interact with
-deformables and fluids without a CPU stepping detour.
+and cooked inverse inertia. Box coupling supports face projection from cooked
+half extents, reports interior penetration to the nearest face, and preserves
+the dynamic contact invariant that particle normal speed is measured relative to
+the rigid contact point rather than the world frame. This lets robot links
+physically interact with deformables and fluids without a CPU stepping detour.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
-plane+sphere coupling, then runs cooked `DeviceWorld` sphere coupling with
-rigid linear/angular impulse feedback and prints compact solver diagnostics plus
-sampled particle/rigid state. It intentionally does not depend on Vulkan or CPU
-simulation.
+plane+sphere coupling, then runs cooked `DeviceWorld` sphere and box coupling
+with rigid linear/angular impulse feedback and prints compact solver diagnostics
+plus sampled particle/rigid state. It intentionally does not depend on Vulkan or
+CPU simulation.
 
 ## Scene Integration
 
@@ -337,13 +340,14 @@ the maximal-coordinate rigid body path. It is designed to become the shared
 state container for cloth vertices, deformable particles, and SPH-style fluid
 particles. Phase ids are uploaded now so later kernels can distinguish material
 or solver families without changing the buffer layout. The current kernels
-resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere coupling
-on CUDA. The cooked path reads body poses, shape body bindings, shape local
-transforms, radii, inverse masses, inverse inertias, and mutable rigid
-linear/angular velocities from the same device buffers used by the rigid solver,
-then writes particle corrections plus rigid linear/angular velocity impulses
-without returning to the CPU. CPU only uploads authored/reference state and
-downloads compact reports for tests, benchmarks, and tooling.
+resolve analytic rigid coupling and cooked `DeviceWorld` plane/sphere/box
+coupling on CUDA. The cooked path reads body poses, shape body bindings, shape
+local transforms, half extents, radii, inverse masses, inverse inertias, and
+mutable rigid linear/angular velocities from the same device buffers used by the
+rigid solver, then writes particle corrections plus rigid linear/angular
+velocity impulses without returning to the CPU. CPU only uploads
+authored/reference state and downloads compact reports for tests, benchmarks,
+and tooling.
 
 ### CUDA BatchedDeviceWorld
 
@@ -360,6 +364,14 @@ uploaded once per template and assembled into per-instance constraint blocks by
 CUDA kernels. Mutable pose, velocity, force, and torque are uploaded per
 flattened body. `DownloadState()` is a validation and tooling boundary; the
 production path keeps batched state resident for the next CUDA stage.
+
+`StepBatchedCudaWorld()` keeps contact-enabled scenes on the full GPU
+broadphase/contact/constraint path. For joint/drive-only robot workloads it uses
+a dedicated CUDA path that assembles the cooked joint and actuator constraint
+blocks once on device, then reuses those blocks across fixed steps while running
+integration and PGS/projection kernels without per-step host report downloads.
+The report is read back once at the validation boundary, preserving the full GPU
+hot path for repeated articulated robot stepping.
 
 `sensor::gpu::QueryBatchedCudaImuSensor()` and
 `sensor::gpu::QueryBatchedCudaLidarSensor()` extend the same container into the

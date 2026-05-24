@@ -40,6 +40,28 @@ runtime::gpu::DeviceWorld BuildDeviceSphereWorld(runtime::BuiltWorld& world) {
     return device_world;
 }
 
+runtime::gpu::DeviceWorld BuildDeviceBoxWorld(runtime::BuiltWorld& world) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord box_body;
+    box_body.name = "coupled_box";
+    box_body.mass = 8.0f;
+    box_body.inertia = {1.5f, 1.5f, 1.5f};
+    box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    const auto body_id = scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box;
+    box.body_id = body_id;
+    box.type = scene::ShapeType::Box;
+    box.half_extents = {0.2f, 0.25f, 0.2f};
+    scene.AddCollisionShape(std::move(box));
+
+    world = runtime::BuildWorld(scene::CookScene(scene));
+    auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
+    runtime::gpu::UploadDeviceState(device_world, world.instance);
+    return device_world;
+}
+
 } // namespace
 
 TEST(CudaParticleCouplingTiming, PlaneAndSphereCouplingUnderOneSecond) {
@@ -145,4 +167,59 @@ TEST(CudaParticleCouplingTiming, DeviceWorldRigidImpulseCouplingUnderOneSecond) 
     EXPECT_LT(rigid_state.linear_velocities[0].x, 0.0f);
     EXPECT_GT(std::abs(rigid_state.angular_velocities[0].z), 1.0e-4f);
     EXPECT_LT(ms, 1000) << "CUDA DeviceWorld particle coupling took " << ms << " ms";
+}
+
+TEST(CudaParticleCouplingTiming, DeviceWorldBoxRigidImpulseCouplingUnderOneSecond) {
+    constexpr uint32_t kParticleCount = 4096u;
+    constexpr uint32_t kIterationCount = 60u;
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions.reserve(kParticleCount);
+    particles.velocities.reserve(kParticleCount);
+    particles.inv_masses.reserve(kParticleCount);
+    particles.radii.reserve(kParticleCount);
+    particles.phases.reserve(kParticleCount);
+
+    for (uint32_t index = 0; index < kParticleCount; ++index) {
+        const float x = 0.04f + static_cast<float>(index % 64u) * 0.002f;
+        const float y = 0.251f + static_cast<float>((index / 64u) % 16u) * 0.0001f;
+        const float z = static_cast<float>(index / (64u * 16u)) * 0.006f - 0.02f;
+        particles.positions.push_back({x, y, z});
+        particles.velocities.push_back({0.0f, -0.05f, 0.0f});
+        particles.inv_masses.push_back(1.0f);
+        particles.radii.push_back(0.004f);
+        particles.phases.push_back(index % 4u);
+    }
+
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+    runtime::BuiltWorld world;
+    auto device_world = BuildDeviceBoxWorld(world);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.02f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+
+    runtime::gpu::CudaParticleStepReport report;
+    const auto start = std::chrono::high_resolution_clock::now();
+    for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
+        report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            device_particles, device_world, options);
+    }
+    const auto end = std::chrono::high_resolution_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    EXPECT_EQ(report.particle_count, kParticleCount);
+    EXPECT_GT(report.contact_count, 0u);
+    EXPECT_LE(report.max_penetration_after_solve, 1.0e-4f);
+
+    const auto rigid_state = device_world.DownloadState();
+    ASSERT_FALSE(rigid_state.linear_velocities.empty());
+    ASSERT_FALSE(rigid_state.angular_velocities.empty());
+    EXPECT_LT(rigid_state.linear_velocities[0].y, 0.0f);
+    EXPECT_GT(std::abs(rigid_state.angular_velocities[0].z), 1.0e-4f);
+    EXPECT_LT(ms, 1000) << "CUDA DeviceWorld box particle coupling took " << ms << " ms";
 }

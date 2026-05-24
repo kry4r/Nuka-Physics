@@ -84,6 +84,19 @@ int main() {
     sphere_shape.radius = 0.18f;
     coupled_scene.AddCollisionShape(std::move(sphere_shape));
 
+    scene::RigidBodyRecord box_body;
+    box_body.name = "cuda_coupled_box_link";
+    box_body.mass = 4.0f;
+    box_body.inertia = {1.0f, 1.0f, 1.0f};
+    box_body.local_transform.position = {0.45f, 0.0f, 0.0f};
+    const auto box_body_id = coupled_scene.AddRigidBody(std::move(box_body));
+
+    scene::CollisionShapeRecord box_shape;
+    box_shape.body_id = box_body_id;
+    box_shape.type = scene::ShapeType::Box;
+    box_shape.half_extents = {0.15f, 0.18f, 0.15f};
+    coupled_scene.AddCollisionShape(std::move(box_shape));
+
     auto world = runtime::BuildWorld(scene::CookScene(coupled_scene));
     auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
     runtime::gpu::UploadDeviceState(device_world, world.instance);
@@ -127,10 +140,44 @@ int main() {
               << rigid_state.angular_velocities[body_id].y << ", "
               << rigid_state.angular_velocities[body_id].z << ")\n";
 
+    runtime::gpu::CudaParticleSet box_particles;
+    box_particles.positions = {{0.53f, 0.195f, 0.0f}};
+    box_particles.velocities = {{0.0f, -0.4f, 0.0f}};
+    box_particles.inv_masses = {1.0f};
+    box_particles.radii = {0.02f};
+    box_particles.phases = {2u};
+    auto device_box_particles = runtime::gpu::UploadCudaParticleWorld(box_particles);
+
+    const auto box_report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
+            device_box_particles,
+            device_world,
+            coupling_options);
+    const auto box_rigid_state = device_world.DownloadState();
+
+    std::cout << "deviceworld_box_coupling contacts=" << box_report.contact_count
+              << " rigid_impulses=" << box_report.rigid_impulse_count
+              << " rigid_impulse_magnitude=" << box_report.rigid_impulse_magnitude
+              << " rigid_angular_impulse_magnitude="
+              << box_report.rigid_angular_impulse_magnitude
+              << " residual=" << box_report.max_penetration_after_solve
+              << " body_velocity=("
+              << box_rigid_state.linear_velocities[box_body_id].x << ", "
+              << box_rigid_state.linear_velocities[box_body_id].y << ", "
+              << box_rigid_state.linear_velocities[box_body_id].z << ")"
+              << " body_angular_velocity=("
+              << box_rigid_state.angular_velocities[box_body_id].x << ", "
+              << box_rigid_state.angular_velocities[box_body_id].y << ", "
+              << box_rigid_state.angular_velocities[box_body_id].z << ")\n";
+
     return report.max_penetration_after_solve <= 1.0e-4f &&
                    coupling_report.contact_count > 0u &&
                    coupling_report.rigid_impulse_count > 0u &&
-                   coupling_report.rigid_angular_impulse_magnitude > 0.0f
+                   coupling_report.rigid_angular_impulse_magnitude > 0.0f &&
+                   box_report.contact_count > 0u &&
+                   box_report.rigid_impulse_count > 0u &&
+                   box_report.max_penetration_after_solve <= 1.0e-4f &&
+                   box_report.rigid_angular_impulse_magnitude > 0.0f
                ? 0
                : 1;
 }
