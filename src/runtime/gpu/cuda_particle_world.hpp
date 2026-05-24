@@ -107,6 +107,7 @@ struct CudaParticleStepReport {
     float coupling_force_magnitude = 0.0f;
     float coupling_torque_magnitude = 0.0f;
     uint32_t coupling_row_solver_launch_count = 0;
+    uint32_t coupling_row_solver_iteration_count = 0;
     uint32_t coupling_row_solver_impulse_count = 0;
     float coupling_row_solver_impulse_magnitude = 0.0f;
     uint32_t coupling_row_solver_friction_impulse_count = 0;
@@ -122,6 +123,7 @@ struct CudaParticleDeviceWorldCouplingOptions {
     bool accumulate_rigid_impulses = true;
     bool enable_coupling_warm_start = true;
     bool solve_coupling_rows_on_cuda = true;
+    uint32_t coupling_row_solver_iterations = 1u;
 };
 
 class CudaParticleWorld {

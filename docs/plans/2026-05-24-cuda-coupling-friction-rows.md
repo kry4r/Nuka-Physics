@@ -45,6 +45,14 @@ two tangent sub-rows whose impulses are clamped by `friction * normal_impulse`.
 
 ## Follow-On
 
+- The fixed per-particle coupling row solver now supports a configurable
+  multi-sweep CUDA scheduler through
+  `CudaParticleDeviceWorldCouplingOptions::coupling_row_solver_iterations`.
+  Each sweep is a row-solver launch plus a diagnostics reduction launch. The
+  first sweep pre-applies cross-frame cached normal/tangent impulses; later
+  sweeps solve incremental corrections against the already-updated device
+  velocities. `CudaParticleStepReport` exposes both launch count and scheduler
+  iteration count.
 - Move the fixed per-particle coupling record into a general row buffer shared
   by rigid, cloth, deformable, and fluid constraints.
 - Add graph coloring or island batching for deterministic cross-particle writes

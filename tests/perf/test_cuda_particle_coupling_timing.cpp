@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <utility>
@@ -418,6 +419,9 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     uint64_t tangent_warm_start_count = 0;
     float warm_start_impulse_magnitude = 0.0f;
     float tangent_warm_start_impulse_magnitude = 0.0f;
+    float max_coupling_normal_impulse = 0.0f;
+    float coupling_force_magnitude = 0.0f;
+    float coupling_torque_magnitude = 0.0f;
     const auto start = std::chrono::high_resolution_clock::now();
     for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
         report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
@@ -429,6 +433,10 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
         warm_start_impulse_magnitude += report.coupling_warm_start_impulse_magnitude;
         tangent_warm_start_impulse_magnitude +=
             report.coupling_tangent_warm_start_impulse_magnitude;
+        max_coupling_normal_impulse =
+            std::max(max_coupling_normal_impulse, report.max_coupling_normal_impulse);
+        coupling_force_magnitude += report.coupling_force_magnitude;
+        coupling_torque_magnitude += report.coupling_torque_magnitude;
     }
     const auto end = std::chrono::high_resolution_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -440,10 +448,10 @@ TEST(CudaParticleCouplingTiming, DeviceWorldWarmStartDiagnosticsUnderOneSecond) 
     EXPECT_GT(tangent_warm_start_count, 0u);
     EXPECT_GT(warm_start_impulse_magnitude, 0.0f);
     EXPECT_GT(tangent_warm_start_impulse_magnitude, 0.0f);
-    EXPECT_GT(report.max_coupling_normal_impulse, 0.0f);
+    EXPECT_GT(max_coupling_normal_impulse, 0.0f);
     EXPECT_GT(report.coupling_active_slot_count, 0u);
-    EXPECT_GT(report.coupling_force_magnitude, 0.0f);
-    EXPECT_GT(report.coupling_torque_magnitude, 0.0f);
+    EXPECT_GT(coupling_force_magnitude, 0.0f);
+    EXPECT_GT(coupling_torque_magnitude, 0.0f);
     EXPECT_EQ(report.coupling_row_solver_launch_count, 1u);
     EXPECT_GT(row_solver_impulse_count, 0u);
     EXPECT_GT(row_solver_impulse_magnitude, 0.0f);
@@ -489,16 +497,23 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     options.restitution = 0.0f;
     options.accumulate_rigid_impulses = true;
     options.enable_coupling_warm_start = true;
+    options.coupling_row_solver_iterations = 3u;
 
     runtime::gpu::CudaParticleStepReport report;
     uint64_t row_solver_impulse_count = 0;
     float row_solver_impulse_magnitude = 0.0f;
+    uint64_t warm_start_count = 0;
+    float coupling_force_magnitude = 0.0f;
+    float coupling_torque_magnitude = 0.0f;
     const auto start = std::chrono::high_resolution_clock::now();
     for (uint32_t iteration = 0; iteration < kIterationCount; ++iteration) {
         report = runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
             device_particles, device_world, options);
         row_solver_impulse_count += report.coupling_row_solver_impulse_count;
         row_solver_impulse_magnitude += report.coupling_row_solver_impulse_magnitude;
+        warm_start_count += report.coupling_warm_start_count;
+        coupling_force_magnitude += report.coupling_force_magnitude;
+        coupling_torque_magnitude += report.coupling_torque_magnitude;
     }
     const auto end = std::chrono::high_resolution_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -508,10 +523,12 @@ TEST(CudaParticleCouplingTiming, DeviceWorldMultiSlotDiagnosticsUnderOneSecond) 
     EXPECT_EQ(report.particle_count, kParticleCount);
     EXPECT_GE(report.contact_count, kParticleCount * 2u);
     EXPECT_GE(report.coupling_active_slot_count, kParticleCount * 2u);
-    EXPECT_GT(report.coupling_warm_start_count, 0u);
-    EXPECT_GT(report.coupling_force_magnitude, 0.0f);
-    EXPECT_GT(report.coupling_torque_magnitude, 0.0f);
-    EXPECT_EQ(report.coupling_row_solver_launch_count, 1u);
+    EXPECT_GT(warm_start_count, 0u);
+    EXPECT_GT(coupling_force_magnitude, 0.0f);
+    EXPECT_GT(coupling_torque_magnitude, 0.0f);
+    EXPECT_EQ(report.coupling_row_solver_launch_count, 3u);
+    EXPECT_EQ(report.coupling_row_solver_iteration_count, 3u);
+    EXPECT_EQ(report.kernel_launch_count, 8u);
     EXPECT_GT(row_solver_impulse_count, 0u);
     EXPECT_GT(row_solver_impulse_magnitude, 0.0f);
     EXPECT_EQ(coupling_state.slot_count_per_particle,

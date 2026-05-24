@@ -129,10 +129,18 @@ git commit -m "physics: add cuda particle coupling foundation"
   now sweeps each particle's fixed coupling slots in one CUDA thread, so one
   particle with multiple active cooked contacts accumulates every row into its
   velocity deterministically at the particle scope.
+- `CudaParticleDeviceWorldCouplingOptions::coupling_row_solver_iterations`
+  configures multiple CUDA row-solver sweeps per fixed step. Each sweep launches
+  the row solver and a row diagnostic reduction; the first sweep pre-applies
+  cross-frame cached normal/tangent impulses, while later sweeps solve
+  incremental corrections against the already-updated device velocities.
+  `CudaParticleStepReport` now exposes both row-solver launch count and
+  scheduler iteration count.
 - `nuka_cuda_particle_demo` prints warm-start/cache diagnostics for sphere, box,
   capsule, and two-box corner coupling, plus a cooked box friction-row
   comparison that exposes tangent impulse, Coulomb limit, and tangential speed
-  reduction outside unit tests.
+  reduction outside unit tests. The two-box corner scenario now prints the
+  configured row-scheduler iteration count and kernel-launch budget.
 - `CudaParticleCouplingTiming.DeviceWorldWarmStartDiagnosticsUnderOneSecond`
   tracks the added cache/report path under the existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldBoxRigidImpulseCouplingUnderOneSecond`
@@ -142,16 +150,14 @@ git commit -m "physics: add cuda particle coupling foundation"
   now runs with tangential motion and friction so it covers persistent tangent
   warm-start counts and magnitudes under the existing one-second CUDA budget.
 - `CudaParticleCouplingTiming.DeviceWorldMultiSlotDiagnosticsUnderOneSecond`
-  tracks the multi-slot contact-cache, force/torque diagnostic, and row-solver
-  impulse path with thousands of particles under the same one-second CUDA
-  budget.
+  tracks the multi-slot contact-cache, force/torque diagnostic, and three-sweep
+  CUDA row-solver scheduler path with thousands of particles under the same
+  one-second CUDA budget.
 
 ## Follow-On Tasks
 
-1. Extend the current CUDA coupling row solver with compliance/XPBD-style
-   softness, multi-iteration convergence diagnostics, and a shared row scheduler
-   that can iterate warm-started normal/tangent friction rows across constraint
-   families.
+1. Extend the current CUDA coupling row scheduler with compliance/XPBD-style
+   softness and convergence/residual diagnostics beyond impulse magnitudes.
 2. Promote the fixed per-particle coupling rows into a reusable
    coupling-constraint solve scheduler shared by rigid/cloth/deformable/fluid
    constraints, including global coloring or island batching for deterministic

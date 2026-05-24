@@ -431,6 +431,7 @@ int main() {
 
     runtime::gpu::CudaParticleDeviceWorldCouplingOptions corner_options = coupling_options;
     corner_options.gravity = {0.0f, -9.81f, 0.0f};
+    corner_options.coupling_row_solver_iterations = 3u;
 
     const auto corner_first_report =
         runtime::gpu::StepCudaParticlesAgainstDeviceWorld(
@@ -454,6 +455,9 @@ int main() {
               << " coupling_torque=" << corner_report.coupling_torque_magnitude
               << " row_solver_launches="
               << corner_report.coupling_row_solver_launch_count
+              << " row_solver_iterations="
+              << corner_report.coupling_row_solver_iteration_count
+              << " kernel_launches=" << corner_report.kernel_launch_count
               << " row_solver_impulses="
               << corner_report.coupling_row_solver_impulse_count
               << " row_solver_impulse_magnitude="
@@ -590,7 +594,8 @@ int main() {
                    corner_report.coupling_warm_start_count >= 2u &&
                    corner_report.coupling_force_magnitude > 0.0f &&
                    corner_report.coupling_torque_magnitude > 0.0f &&
-                   corner_report.coupling_row_solver_launch_count > 0u &&
+                   corner_report.coupling_row_solver_launch_count == 3u &&
+                   corner_report.coupling_row_solver_iteration_count == 3u &&
                    corner_row_impulses >= 2u &&
                    corner_row_impulse_magnitude > 0.0f &&
                    corner_coupling_state.slot_count_per_particle ==

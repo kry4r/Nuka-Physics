@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -475,6 +476,7 @@ __global__ void ReduceParticleDiagnosticsKernel(uint32_t particle_count,
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
         report->coupling_row_solver_launch_count = 0u;
+        report->coupling_row_solver_iteration_count = 0u;
         report->coupling_row_solver_impulse_count = 0u;
         report->coupling_row_solver_impulse_magnitude = 0.0f;
         report->coupling_row_solver_friction_impulse_count = 0u;
@@ -612,6 +614,7 @@ __global__ void ReduceParticleDiagnosticsWithRigidKernel(
         report->coupling_force_magnitude = shared_coupling_force[0];
         report->coupling_torque_magnitude = shared_coupling_torque[0];
         report->coupling_row_solver_launch_count = 0u;
+        report->coupling_row_solver_iteration_count = 0u;
         report->coupling_row_solver_impulse_count = 0u;
         report->coupling_row_solver_impulse_magnitude = 0.0f;
         report->coupling_row_solver_friction_impulse_count = 0u;
@@ -1167,6 +1170,7 @@ __global__ void SolveParticleCouplingRowsKernel(
     float* coupling_normal_impulses,
     uint32_t* coupling_shape_indices,
     float dt,
+    bool apply_cached_impulses,
     CouplingRowDiagnostics* diagnostics) {
     const uint32_t particle_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (particle_index >= particle_count) {
@@ -1189,35 +1193,38 @@ __global__ void SolveParticleCouplingRowsKernel(
 
             math::Vec3 body_linear_velocity = body_linear_velocities[body_id];
             math::Vec3 body_angular_velocity = body_angular_velocities[body_id];
-            const float warm_started_normal_impulse = row.normal_impulse;
-            const float warm_started_tangent_impulse0 = row.tangent_impulse_0;
-            const float warm_started_tangent_impulse1 = row.tangent_impulse_1;
-            row.normal_impulse = 0.0f;
-            row.tangent_impulse_0 = 0.0f;
-            row.tangent_impulse_1 = 0.0f;
+            const float cached_normal_impulse = row.normal_impulse;
+            const float cached_tangent_impulse0 = row.tangent_impulse_0;
+            const float cached_tangent_impulse1 = row.tangent_impulse_1;
+            if (apply_cached_impulses) {
+                row.normal_impulse = 0.0f;
+                row.tangent_impulse_0 = 0.0f;
+                row.tangent_impulse_1 = 0.0f;
 
-            ApplyCouplingVelocityImpulse(row.particle_linear_jacobian,
-                                         row.body_linear_jacobian,
-                                         row.body_angular_jacobian,
-                                         warm_started_normal_impulse,
-                                         particle_inv_mass,
-                                         body_inv_mass,
-                                         inv_inertia,
-                                         body_id,
-                                         &particle_velocity,
-                                         &body_linear_velocity,
-                                         &body_angular_velocity,
-                                         body_linear_velocities,
-                                         body_angular_velocities);
-            row.normal_impulse = warm_started_normal_impulse;
+                ApplyCouplingVelocityImpulse(row.particle_linear_jacobian,
+                                             row.body_linear_jacobian,
+                                             row.body_angular_jacobian,
+                                             cached_normal_impulse,
+                                             particle_inv_mass,
+                                             body_inv_mass,
+                                             inv_inertia,
+                                             body_id,
+                                             &particle_velocity,
+                                             &body_linear_velocity,
+                                             &body_angular_velocity,
+                                             body_linear_velocities,
+                                             body_angular_velocities);
+                row.normal_impulse = cached_normal_impulse;
+            }
 
-            if (row.friction > 0.0f && warm_started_normal_impulse > 0.0f) {
+            if (apply_cached_impulses && row.friction > 0.0f &&
+                cached_normal_impulse > 0.0f) {
                 const float friction_limit =
-                    row.friction * warm_started_normal_impulse;
-                const float tangent_impulse0 = Clamp(warm_started_tangent_impulse0,
+                    row.friction * cached_normal_impulse;
+                const float tangent_impulse0 = Clamp(cached_tangent_impulse0,
                                                      -friction_limit,
                                                      friction_limit);
-                const float tangent_impulse1 = Clamp(warm_started_tangent_impulse1,
+                const float tangent_impulse1 = Clamp(cached_tangent_impulse1,
                                                      -friction_limit,
                                                      friction_limit);
                 ApplyCouplingVelocityImpulse(row.tangent0,
@@ -1802,9 +1809,14 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         coupling_row_count * sizeof(CouplingRowDiagnostics),
         phi::MemoryKind::Device);
     phi::Buffer report_buffer(sizeof(CudaParticleStepReport), phi::MemoryKind::Device);
+    const uint32_t row_solver_iterations = options.solve_coupling_rows_on_cuda
+        ? std::max(options.coupling_row_solver_iterations, 1u)
+        : 0u;
 
     constexpr uint32_t kBlockSize = 256u;
     const uint32_t block_count =
+        (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
+    const uint32_t row_block_count =
         (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0u; step < options.step_count; ++step) {
@@ -1849,42 +1861,46 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         ++report.kernel_launch_count;
 
         if (options.solve_coupling_rows_on_cuda) {
-            const uint32_t row_block_count =
-                (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
-            SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
-                particle_world.ParticleCount(),
-                particle_world.DeviceCouplingRows(),
-                particle_world.DeviceVelocities(),
-                particle_world.DeviceInvMasses(),
-                device_world.DeviceLinearVelocities(),
-                device_world.DeviceAngularVelocities(),
-                device_world.DeviceInvMasses(),
-                device_world.DeviceInvInertias(),
-                particle_world.DeviceCouplingNormalImpulses(),
-                particle_world.DeviceCouplingShapeIndices(),
-                options.dt,
-                static_cast<CouplingRowDiagnostics*>(row_diagnostics.Data()));
-            CheckCuda(cudaGetLastError(), "SolveParticleCouplingRowsKernel launch");
-            ++report.kernel_launch_count;
-            ++report.coupling_row_solver_launch_count;
+            for (uint32_t iteration = 0u; iteration < row_solver_iterations; ++iteration) {
+                const bool apply_cached_impulses = iteration == 0u;
 
-            ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
-                coupling_row_count,
-                static_cast<const CouplingRowDiagnostics*>(row_diagnostics.Data()),
-                static_cast<CudaParticleStepReport*>(report_buffer.Data()));
-            CheckCuda(cudaGetLastError(), "ReduceCouplingRowDiagnosticsKernel launch");
-            ++report.kernel_launch_count;
+                SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
+                    particle_world.ParticleCount(),
+                    particle_world.DeviceCouplingRows(),
+                    particle_world.DeviceVelocities(),
+                    particle_world.DeviceInvMasses(),
+                    device_world.DeviceLinearVelocities(),
+                    device_world.DeviceAngularVelocities(),
+                    device_world.DeviceInvMasses(),
+                    device_world.DeviceInvInertias(),
+                    particle_world.DeviceCouplingNormalImpulses(),
+                    particle_world.DeviceCouplingShapeIndices(),
+                    options.dt,
+                    apply_cached_impulses,
+                    static_cast<CouplingRowDiagnostics*>(row_diagnostics.Data()));
+                CheckCuda(cudaGetLastError(), "SolveParticleCouplingRowsKernel launch");
+                ++report.kernel_launch_count;
+                ++report.coupling_row_solver_launch_count;
+
+                ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
+                    coupling_row_count,
+                    static_cast<const CouplingRowDiagnostics*>(row_diagnostics.Data()),
+                    static_cast<CudaParticleStepReport*>(report_buffer.Data()));
+                CheckCuda(cudaGetLastError(), "ReduceCouplingRowDiagnosticsKernel launch");
+                ++report.kernel_launch_count;
+            }
         }
     }
 
     CheckCuda(cudaDeviceSynchronize(), "StepCudaParticlesAgainstDeviceWorld synchronize");
     report_buffer.CopyToHost(&report, sizeof(CudaParticleStepReport));
     report.simulated_step_count = options.step_count;
-    report.kernel_launch_count = options.solve_coupling_rows_on_cuda
-        ? options.step_count * 4u
-        : options.step_count * 2u;
+    report.kernel_launch_count =
+        options.step_count * (2u + row_solver_iterations * 2u);
     report.coupling_row_solver_launch_count =
-        options.solve_coupling_rows_on_cuda ? options.step_count : 0u;
+        options.step_count * row_solver_iterations;
+    report.coupling_row_solver_iteration_count =
+        options.step_count * row_solver_iterations;
     return report;
 }
 

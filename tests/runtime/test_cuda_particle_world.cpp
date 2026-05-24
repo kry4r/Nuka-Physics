@@ -744,6 +744,85 @@ TEST(CudaParticleWorld, AccumulatesMultipleCudaCouplingRowsIntoOneParticleVeloci
                 1.0e-4f);
 }
 
+TEST(CudaParticleWorld, IteratesDeviceWorldCouplingRowsWithCudaScheduler) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord floor_box_body;
+    floor_box_body.name = "floor_scheduler_row_link";
+    floor_box_body.mass = 4.0f;
+    floor_box_body.inertia = {1.0f, 1.0f, 1.0f};
+    floor_box_body.local_transform.position = {0.0f, 0.0f, 0.0f};
+    scene.AddRigidBody(std::move(floor_box_body));
+
+    scene::CollisionShapeRecord floor_box;
+    floor_box.body_id = 0u;
+    floor_box.type = scene::ShapeType::Box;
+    floor_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(floor_box));
+
+    scene::RigidBodyRecord side_box_body;
+    side_box_body.name = "side_scheduler_row_link";
+    side_box_body.mass = 4.0f;
+    side_box_body.inertia = {1.0f, 1.0f, 1.0f};
+    side_box_body.local_transform.position = {0.36f, 0.10f, 0.0f};
+    scene.AddRigidBody(std::move(side_box_body));
+
+    scene::CollisionShapeRecord side_box;
+    side_box.body_id = 1u;
+    side_box.type = scene::ShapeType::Box;
+    side_box.half_extents = {0.25f, 0.25f, 0.25f};
+    scene.AddCollisionShape(std::move(side_box));
+
+    runtime::BuiltWorld world;
+    auto device_world = UploadScene(std::move(scene), world);
+
+    runtime::gpu::CudaParticleSet particles;
+    particles.positions = {{0.05f, 0.34f, 0.0f}};
+    particles.velocities = {{0.25f, -1.0f, 0.0f}};
+    particles.inv_masses = {1.0f};
+    particles.radii = {0.1f};
+    particles.phases = {15u};
+    auto device_particles = runtime::gpu::UploadCudaParticleWorld(particles);
+
+    runtime::gpu::CudaParticleDeviceWorldCouplingOptions options;
+    options.gravity = math::Vec3::Zero();
+    options.dt = 1.0f / 240.0f;
+    options.step_count = 1u;
+    options.friction = 0.5f;
+    options.restitution = 0.0f;
+    options.accumulate_rigid_impulses = true;
+    options.enable_coupling_warm_start = true;
+    options.solve_coupling_rows_on_cuda = true;
+    options.coupling_row_solver_iterations = 3u;
+
+    const auto report =
+        runtime::gpu::StepCudaParticlesAgainstDeviceWorld(device_particles, device_world, options);
+    const auto rows = device_particles.DownloadCouplingRows();
+
+    ASSERT_GE(rows.rows.size(), 2u);
+    ASSERT_TRUE(rows.rows[0].active);
+    ASSERT_TRUE(rows.rows[1].active);
+
+    EXPECT_EQ(report.contact_count, 2u);
+    EXPECT_EQ(report.coupling_active_slot_count, 2u);
+    EXPECT_EQ(report.coupling_row_solver_launch_count, 3u);
+    EXPECT_EQ(report.coupling_row_solver_iteration_count, 3u);
+    EXPECT_EQ(report.kernel_launch_count, 8u);
+    EXPECT_GT(report.coupling_row_solver_impulse_count, 0u);
+    EXPECT_GT(report.coupling_row_solver_impulse_magnitude, 0.0f);
+
+    for (uint32_t slot = 0u; slot < 2u; ++slot) {
+        const auto& row = rows.rows[slot];
+        EXPECT_EQ(row.particle_index, 0u);
+        EXPECT_EQ(row.shape_index, slot);
+        EXPECT_GE(row.normal_impulse, 0.0f);
+        EXPECT_LE(std::abs(row.tangent_impulse_0),
+                  options.friction * row.normal_impulse + 1.0e-5f);
+        EXPECT_LE(std::abs(row.tangent_impulse_1),
+                  options.friction * row.normal_impulse + 1.0e-5f);
+    }
+}
+
 TEST(CudaParticleWorld, SolvesDeviceWorldCouplingFrictionRowsOnCuda) {
     scene::SceneIR scene;
 

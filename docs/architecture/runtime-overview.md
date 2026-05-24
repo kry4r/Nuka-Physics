@@ -197,29 +197,35 @@ The cooked particle/rigid coupling path now executes normal velocity impulses
 and tangent friction impulses through `SolveParticleCouplingRowsKernel` after
 the contact assembly/projection kernel. With `solve_coupling_rows_on_cuda`
 enabled by default, the contact kernel assembles solver-ready rows and leaves
-velocity correction to the row solver. The current kernel launches one
-row-solver thread per particle and walks that particle's fixed coupling slots
-in order, so multi-contact particles accumulate every row into a single
-particle velocity update instead of racing between row threads. It recomputes
-`Jv`, clamps accumulated normal impulse, solves two tangent sub-rows per active
-slot, clamps their impulses to `friction * normal_impulse`, updates particle
-velocities, atomically applies rigid linear/angular velocity deltas, updates the
-warm-start cache, and reduces row-solver diagnostics into the step report. When
-the same shape remains in contact, cached normal and tangent impulses are
-pre-applied on the GPU before correction rows are solved; tangent cache values
-are projected into the new tangent basis and clamped by the cached normal
-impulse.
+velocity correction to the row solver. `coupling_row_solver_iterations` controls
+how many CUDA row-solver sweeps run per fixed step; each sweep is a
+`SolveParticleCouplingRowsKernel` launch followed by a reduction launch, so the
+kernel boundary is the current global synchronization point. The current kernel
+launches one row-solver thread per particle and walks that particle's fixed
+coupling slots in order, so multi-contact particles accumulate every row into a
+single particle velocity update instead of racing between row threads. It
+recomputes `Jv`, clamps accumulated normal impulse, solves two tangent sub-rows
+per active slot, clamps their impulses to `friction * normal_impulse`, updates
+particle velocities, atomically applies rigid linear/angular velocity deltas,
+updates the warm-start cache, and reduces row-solver diagnostics into the step
+report. When the same shape remains in contact, cached normal and tangent
+impulses are pre-applied on the GPU only during the first sweep of a fixed step;
+later sweeps use the accumulated row impulses already applied to device
+velocities and solve incremental corrections. Tangent cache values are
+projected into the new tangent basis and clamped by the cached normal impulse.
 `rigid_impulse_count` remains the public normal-row aggregate, while
-`coupling_row_solver_launch_count`, `coupling_row_solver_impulse_count`,
+`coupling_row_solver_launch_count`,
+`coupling_row_solver_iteration_count`, `coupling_row_solver_impulse_count`,
 `coupling_row_solver_impulse_magnitude`,
 `coupling_row_solver_friction_impulse_count`, and
 `coupling_row_solver_friction_impulse_magnitude` identify the CUDA row-solver
 source. `coupling_tangent_warm_start_count` and
 `coupling_tangent_warm_start_impulse_magnitude` expose the persistent friction
-cache separately from the aggregate warm-start magnitude. Compliance and a
-unified iterative rigid/cloth/deformable/fluid row scheduler remain follow-on
-solver work; cross-particle writes into shared rigid bodies still use atomics
-until that scheduler owns global coloring or island batching.
+cache separately from the aggregate warm-start magnitude. Compliance,
+convergence/residual metrics beyond impulse magnitudes, and a unified
+rigid/cloth/deformable/fluid row buffer remain follow-on solver work;
+cross-particle writes into shared rigid bodies still use atomics until that
+scheduler owns global coloring or island batching.
 
 `nuka_cuda_particle_demo` is the runnable physics-only demo for this branch. It
 constructs a particle set, uploads it to `CudaParticleWorld`, runs CUDA
@@ -231,8 +237,8 @@ a cooked box friction-row comparison that prints tangent impulses, the Coulomb
 limit, no-friction vs friction tangential velocity, and second-step tangent
 warm-start diagnostics, plus a cooked two-box corner case that leaves two
 active cache slots and two active coupling rows on
-one particle, making the rigid/deformable coupling state visible outside unit
-tests. It
+one particle, making the rigid/deformable coupling state and row-scheduler
+iteration diagnostics visible outside unit tests. It
 intentionally does not depend on Vulkan or CPU simulation.
 
 ## Scene Integration
