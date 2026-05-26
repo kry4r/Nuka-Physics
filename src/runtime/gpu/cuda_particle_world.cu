@@ -37,6 +37,7 @@ struct ParticleDiagnostics {
 };
 
 struct CouplingRowDiagnostics {
+    uint32_t active_row_count;
     uint32_t impulse_count;
     uint32_t friction_impulse_count;
     float impulse_magnitude;
@@ -46,6 +47,27 @@ struct CouplingRowDiagnostics {
     float torque_magnitude;
     float max_normal_impulse;
     float max_row_residual;
+};
+
+struct ParticleRigidCouplingSchedulerInput {
+    CudaConstraintRowBufferView row_buffer;
+    CudaConstraintRowSchedulerConfig config;
+    uint32_t particle_count = 0u;
+    CudaParticleCouplingConstraintRow* rows = nullptr;
+    math::Vec3* particle_velocities = nullptr;
+    const float* particle_inv_masses = nullptr;
+    math::Vec3* body_linear_velocities = nullptr;
+    math::Vec3* body_angular_velocities = nullptr;
+    const float* body_inv_masses = nullptr;
+    const math::Vec3* body_inv_inertias = nullptr;
+    float* coupling_normal_impulses = nullptr;
+    uint32_t* coupling_shape_indices = nullptr;
+    float dt = 0.0f;
+    uint32_t diagnostic_iteration_base = 0u;
+    CouplingRowDiagnostics* diagnostics = nullptr;
+    CudaParticleStepReport* report = nullptr;
+    uint32_t* host_kernel_launch_count = nullptr;
+    uint32_t* host_solver_launch_count = nullptr;
 };
 
 __device__ void ResetCouplingRowSolverReport(CudaParticleStepReport* report) {
@@ -64,6 +86,7 @@ __device__ void ResetCouplingRowSolverReport(CudaParticleStepReport* report) {
         report->coupling_row_solver_iteration_tangent_delta_impulses[slot] = 0.0f;
         report->coupling_row_solver_iteration_max_residuals[slot] = 0.0f;
     }
+    report->coupling_scheduler_report = CudaConstraintRowSchedulerReport{};
 }
 
 __device__ math::Vec3 MakeVec3(float x, float y, float z) {
@@ -1229,6 +1252,7 @@ __global__ void SolveParticleCouplingRowsKernel(
         CudaParticleCouplingConstraintRow row = rows[row_index];
 
         if (row.active && row.particle_index == particle_index) {
+            diag.active_row_count = 1u;
             const scene::BodyId body_id = row.body_id;
             const float body_inv_mass = body_inv_masses[body_id];
             const math::Vec3 inv_inertia = body_inv_inertias[body_id];
@@ -1546,8 +1570,10 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
     const CouplingRowDiagnostics* diagnostics,
     uint32_t iteration_index,
     CudaParticleStepReport* report) {
+    const CudaConstraintRowSchedulerReport scheduler = report->coupling_scheduler_report;
     __shared__ uint32_t shared_impulse_counts[256];
     __shared__ uint32_t shared_friction_impulse_counts[256];
+    __shared__ uint32_t shared_active_row_counts[256];
     __shared__ float shared_impulse_magnitudes[256];
     __shared__ float shared_friction_impulse_magnitudes[256];
     __shared__ float shared_angular_impulse_magnitudes[256];
@@ -1559,6 +1585,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
     const uint32_t tid = threadIdx.x;
     uint32_t impulse_count = 0u;
     uint32_t friction_impulse_count = 0u;
+    uint32_t active_row_count = 0u;
     float impulse_magnitude = 0.0f;
     float friction_impulse_magnitude = 0.0f;
     float angular_impulse_magnitude = 0.0f;
@@ -1569,6 +1596,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
 
     for (uint32_t index = tid; index < row_count; index += blockDim.x) {
         const CouplingRowDiagnostics diag = diagnostics[index];
+        active_row_count += diag.active_row_count;
         impulse_count += diag.impulse_count;
         friction_impulse_count += diag.friction_impulse_count;
         impulse_magnitude += diag.impulse_magnitude;
@@ -1582,6 +1610,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
 
     shared_impulse_counts[tid] = impulse_count;
     shared_friction_impulse_counts[tid] = friction_impulse_count;
+    shared_active_row_counts[tid] = active_row_count;
     shared_impulse_magnitudes[tid] = impulse_magnitude;
     shared_friction_impulse_magnitudes[tid] = friction_impulse_magnitude;
     shared_angular_impulse_magnitudes[tid] = angular_impulse_magnitude;
@@ -1596,6 +1625,7 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
             shared_impulse_counts[tid] += shared_impulse_counts[tid + stride];
             shared_friction_impulse_counts[tid] +=
                 shared_friction_impulse_counts[tid + stride];
+            shared_active_row_counts[tid] += shared_active_row_counts[tid + stride];
             shared_impulse_magnitudes[tid] += shared_impulse_magnitudes[tid + stride];
             shared_friction_impulse_magnitudes[tid] +=
                 shared_friction_impulse_magnitudes[tid + stride];
@@ -1648,6 +1678,24 @@ __global__ void ReduceCouplingRowDiagnosticsKernel(
                     ? report->coupling_row_solver_diagnostic_slot_count
                     : iteration_index + 1u;
         }
+        CudaConstraintRowSchedulerIterationReport iteration_report;
+        iteration_report.active_row_count = shared_active_row_counts[0];
+        iteration_report.normal_impulse_count = shared_impulse_counts[0];
+        iteration_report.tangent_impulse_count = shared_friction_impulse_counts[0];
+        iteration_report.normal_delta_impulse_magnitude =
+            shared_impulse_magnitudes[0];
+        iteration_report.tangent_delta_impulse_magnitude =
+            shared_friction_impulse_magnitudes[0];
+        iteration_report.max_normal_delta_impulse = shared_impulse_magnitudes[0];
+        iteration_report.max_tangent_delta_impulse =
+            shared_friction_impulse_magnitudes[0];
+        iteration_report.max_residual = shared_max_row_residuals[0];
+        iteration_report.diagnostic_slot_count =
+            report->coupling_row_solver_diagnostic_slot_count;
+        CudaConstraintRowSchedulerReport updated_scheduler = scheduler;
+        AccumulateCudaConstraintRowSchedulerIteration(updated_scheduler,
+                                                     iteration_report);
+        report->coupling_scheduler_report = updated_scheduler;
     }
 }
 
@@ -1751,6 +1799,8 @@ CudaParticleCouplingRowsState CudaParticleWorld::DownloadCouplingRows() const {
 CudaConstraintRowBufferView CudaParticleWorld::ConstraintRowBuffer() {
     CudaConstraintRowBufferView view;
     view.kind = CudaConstraintRowBufferKind::ParticleRigidCoupling;
+    view.layout = CudaConstraintRowLayout::ParticleRigidCouplingSlot;
+    view.schedule_mode = CudaConstraintRowScheduleMode::OwnerSerialSweep;
     view.device_rows = coupling_rows_.Data();
     view.row_count = particle_count_ * kCudaParticleCouplingSlotsPerParticle;
     view.owner_count = particle_count_;
@@ -1901,6 +1951,64 @@ CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
     return report;
 }
 
+void RunCudaParticleRigidCouplingScheduler(
+    const ParticleRigidCouplingSchedulerInput& input) {
+    if (input.config.iterations == 0u ||
+        input.row_buffer.kind != CudaConstraintRowBufferKind::ParticleRigidCoupling ||
+        input.row_buffer.layout != CudaConstraintRowLayout::ParticleRigidCouplingSlot ||
+        input.row_buffer.schedule_mode !=
+            CudaConstraintRowScheduleMode::OwnerSerialSweep ||
+        input.row_buffer.row_count == 0u ||
+        input.particle_count == 0u ||
+        input.rows == nullptr ||
+        input.report == nullptr) {
+        return;
+    }
+
+    constexpr uint32_t kBlockSize = 256u;
+    const uint32_t row_block_count =
+        (input.particle_count + kBlockSize - 1u) / kBlockSize;
+
+    for (uint32_t iteration = 0u; iteration < input.config.iterations; ++iteration) {
+        const bool apply_cached_impulses =
+            input.config.enable_warm_start && iteration == 0u;
+
+        SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
+            input.particle_count,
+            input.rows,
+            input.particle_velocities,
+            input.particle_inv_masses,
+            input.body_linear_velocities,
+            input.body_angular_velocities,
+            input.body_inv_masses,
+            input.body_inv_inertias,
+            input.coupling_normal_impulses,
+            input.coupling_shape_indices,
+            input.dt,
+            apply_cached_impulses,
+            input.diagnostics);
+        CheckCuda(cudaGetLastError(), "SolveParticleCouplingRowsKernel launch");
+        if (input.host_kernel_launch_count != nullptr) {
+            ++(*input.host_kernel_launch_count);
+        }
+        if (input.host_solver_launch_count != nullptr) {
+            ++(*input.host_solver_launch_count);
+        }
+
+        if (input.config.reduce_diagnostics) {
+            ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
+                input.row_buffer.row_count,
+                input.diagnostics,
+                input.diagnostic_iteration_base + iteration,
+                input.report);
+            CheckCuda(cudaGetLastError(), "ReduceCouplingRowDiagnosticsKernel launch");
+            if (input.host_kernel_launch_count != nullptr) {
+                ++(*input.host_kernel_launch_count);
+            }
+        }
+    }
+}
+
 CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
     CudaParticleWorld& particle_world,
     DeviceWorld& device_world,
@@ -1937,8 +2045,6 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
 
     constexpr uint32_t kBlockSize = 256u;
     const uint32_t block_count =
-        (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
-    const uint32_t row_block_count =
         (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0u; step < options.step_count; ++step) {
@@ -1984,35 +2090,35 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         ++report.kernel_launch_count;
 
         if (options.solve_coupling_rows_on_cuda) {
-            for (uint32_t iteration = 0u; iteration < row_solver_iterations; ++iteration) {
-                const bool apply_cached_impulses = iteration == 0u;
+            CudaConstraintRowSchedulerConfig scheduler_config;
+            scheduler_config.iterations = row_solver_iterations;
+            scheduler_config.enable_warm_start = options.enable_coupling_warm_start;
+            scheduler_config.reduce_diagnostics = true;
 
-                SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
-                    particle_world.ParticleCount(),
-                    coupling_rows,
-                    particle_world.DeviceVelocities(),
-                    particle_world.DeviceInvMasses(),
-                    device_world.DeviceLinearVelocities(),
-                    device_world.DeviceAngularVelocities(),
-                    device_world.DeviceInvMasses(),
-                    device_world.DeviceInvInertias(),
-                    particle_world.DeviceCouplingNormalImpulses(),
-                    particle_world.DeviceCouplingShapeIndices(),
-                    options.dt,
-                    apply_cached_impulses,
-                    static_cast<CouplingRowDiagnostics*>(row_diagnostics.Data()));
-                CheckCuda(cudaGetLastError(), "SolveParticleCouplingRowsKernel launch");
-                ++report.kernel_launch_count;
-                ++report.coupling_row_solver_launch_count;
-
-                ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
-                    row_buffer.row_count,
-                    static_cast<const CouplingRowDiagnostics*>(row_diagnostics.Data()),
-                    step * row_solver_iterations + iteration,
-                    static_cast<CudaParticleStepReport*>(report_buffer.Data()));
-                CheckCuda(cudaGetLastError(), "ReduceCouplingRowDiagnosticsKernel launch");
-                ++report.kernel_launch_count;
-            }
+            ParticleRigidCouplingSchedulerInput scheduler_input;
+            scheduler_input.row_buffer = row_buffer;
+            scheduler_input.config = scheduler_config;
+            scheduler_input.particle_count = particle_world.ParticleCount();
+            scheduler_input.rows = coupling_rows;
+            scheduler_input.particle_velocities = particle_world.DeviceVelocities();
+            scheduler_input.particle_inv_masses = particle_world.DeviceInvMasses();
+            scheduler_input.body_linear_velocities = device_world.DeviceLinearVelocities();
+            scheduler_input.body_angular_velocities = device_world.DeviceAngularVelocities();
+            scheduler_input.body_inv_masses = device_world.DeviceInvMasses();
+            scheduler_input.body_inv_inertias = device_world.DeviceInvInertias();
+            scheduler_input.coupling_normal_impulses =
+                particle_world.DeviceCouplingNormalImpulses();
+            scheduler_input.coupling_shape_indices =
+                particle_world.DeviceCouplingShapeIndices();
+            scheduler_input.dt = options.dt;
+            scheduler_input.diagnostic_iteration_base = step * row_solver_iterations;
+            scheduler_input.diagnostics =
+                static_cast<CouplingRowDiagnostics*>(row_diagnostics.Data());
+            scheduler_input.report = static_cast<CudaParticleStepReport*>(report_buffer.Data());
+            scheduler_input.host_kernel_launch_count = &report.kernel_launch_count;
+            scheduler_input.host_solver_launch_count =
+                &report.coupling_row_solver_launch_count;
+            RunCudaParticleRigidCouplingScheduler(scheduler_input);
         }
     }
 
@@ -2024,6 +2130,19 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
     report.coupling_row_solver_launch_count =
         options.step_count * row_solver_iterations;
     report.coupling_row_solver_iteration_count =
+        options.step_count * row_solver_iterations;
+    CudaConstraintRowSchedulerConfig report_scheduler_config;
+    report_scheduler_config.iterations = row_solver_iterations;
+    report_scheduler_config.enable_warm_start = options.enable_coupling_warm_start;
+    report_scheduler_config.reduce_diagnostics = options.solve_coupling_rows_on_cuda;
+    SetCudaConstraintRowSchedulerMetadata(report.coupling_scheduler_report,
+                                          row_buffer,
+                                          report_scheduler_config);
+    report.coupling_scheduler_report.executed_iterations =
+        options.step_count * row_solver_iterations;
+    report.coupling_scheduler_report.solver_launch_count =
+        options.step_count * row_solver_iterations;
+    report.coupling_scheduler_report.diagnostic_launch_count =
         options.step_count * row_solver_iterations;
     return report;
 }

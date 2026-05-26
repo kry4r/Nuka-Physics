@@ -124,6 +124,7 @@ struct CudaParticleStepReport {
         [kCudaParticleRowSolverDiagnosticSlots] = {};
     float coupling_row_solver_iteration_max_residuals
         [kCudaParticleRowSolverDiagnosticSlots] = {};
+    CudaConstraintRowSchedulerReport coupling_scheduler_report;
 };
 
 struct CudaParticleDeviceWorldCouplingOptions {

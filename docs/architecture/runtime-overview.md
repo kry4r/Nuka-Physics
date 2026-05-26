@@ -193,11 +193,14 @@ upload, updated by the coupling kernel, reused as warm-start state on the next
 contact with the same cooked shape, and cleared on the device when contact
 separates so stale constraint impulses do not leak into later steps.
 `CudaConstraintRowBufferView` exposes this storage as the first scheduler-facing
-CUDA row-buffer view, including the row family, device pointer, row count, owner
-count, rows per owner, and row stride. The current particle/rigid row solver
-consumes that view for assembly, row-solver sweeps, and diagnostics reduction
-instead of reaching back through the particle-world-specific row pointer at each
-launch site.
+CUDA row-buffer view, including the row family, row layout, scheduling mode,
+device pointer, row count, owner count, rows per owner, and row stride. The
+current particle/rigid row solver consumes that view through
+`CudaConstraintRowSchedulerConfig` and the particle/rigid scheduler envelope for
+assembly, row-solver sweeps, and diagnostics reduction instead of reaching back
+through the particle-world-specific row pointer at each launch site. The
+particle/rigid schedule mode is still an owner-serial sweep: one CUDA thread
+owns a particle and walks that particle's fixed coupling slots.
 
 The cooked particle/rigid coupling path now executes normal velocity impulses
 and tangent friction impulses through `SolveParticleCouplingRowsKernel` after
@@ -234,6 +237,14 @@ source. The report also exposes bounded per-step row-scheduler diagnostics:
 `StepCudaParticlesAgainstDeviceWorld` call. The residual is a finite projected
 row residual proxy after each row solve, useful for observing trend and
 regressions; it is not yet a global island convergence proof.
+`CudaParticleStepReport::coupling_scheduler_report` mirrors these diagnostics in
+the reusable scheduler vocabulary: row kind/layout, schedule mode, owner count,
+row count, rows per owner, configured/executed iterations, solver and diagnostic
+launch counts, active rows, normal/tangent impulse counts, delta impulse
+magnitudes, and max residual. That report is the current adapter between the
+fixed particle/rigid slot solver and the later shared CUDA scheduler for rigid
+contacts, joints, drives, articulation, cloth/deformable, particle-fluid, and
+rigid-soft/fluid rows.
 `coupling_tangent_warm_start_count` and
 `coupling_tangent_warm_start_impulse_magnitude` expose the persistent friction
 cache separately from the aggregate warm-start magnitude. Compliance/XPBD and a
@@ -429,12 +440,13 @@ particle/shape/body ids, normal, contact point, linear/angular Jacobians, rhs,
 position error, effective mass, tangent basis/effective masses, friction, and
 accumulated normal/tangent impulses. `ConstraintRowBuffer()` returns the
 type-erased CUDA view over those rows so the current solver/reducer path already
-uses row-family metadata, row count, owner count, rows per owner, and stride from
-the scheduler boundary. The step report includes active cache slots, row-solver
-launch/impulse diagnostics, per-sweep delta impulse/residual proxies, and
-coupling force/torque magnitudes, while tests and demos can download the row
-buffer as a validation boundary. CPU only uploads authored/reference state and
-downloads compact reports or row snapshots for tests, benchmarks, and tooling.
+uses row-family metadata, row layout, schedule mode, row count, owner count,
+rows per owner, and stride from the scheduler boundary. The step report includes
+active cache slots, row-solver launch/impulse diagnostics, scheduler-level
+row-buffer metadata, per-sweep delta impulse/residual proxies, and coupling
+force/torque magnitudes, while tests and demos can download the row buffer as a
+validation boundary. CPU only uploads authored/reference state and downloads
+compact reports or row snapshots for tests, benchmarks, and tooling.
 
 ### CUDA BatchedDeviceWorld
 

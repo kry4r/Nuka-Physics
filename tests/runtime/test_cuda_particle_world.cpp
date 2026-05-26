@@ -650,6 +650,10 @@ TEST(CudaParticleWorld, ExposesCudaConstraintRowBufferViewForScheduler) {
 
     EXPECT_EQ(row_buffer.kind,
               runtime::gpu::CudaConstraintRowBufferKind::ParticleRigidCoupling);
+    EXPECT_EQ(row_buffer.layout,
+              runtime::gpu::CudaConstraintRowLayout::ParticleRigidCouplingSlot);
+    EXPECT_EQ(row_buffer.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::OwnerSerialSweep);
     EXPECT_EQ(row_buffer.device_rows,
               static_cast<void*>(device_particles.DeviceCouplingRows()));
     EXPECT_EQ(row_buffer.owner_count, device_particles.ParticleCount());
@@ -879,12 +883,49 @@ TEST(CudaParticleWorld, IteratesDeviceWorldCouplingRowsWithCudaScheduler) {
     EXPECT_EQ(report.coupling_row_solver_launch_count, 3u);
     EXPECT_EQ(report.coupling_row_solver_iteration_count, 3u);
     EXPECT_EQ(report.kernel_launch_count, 8u);
+    EXPECT_EQ(report.coupling_scheduler_report.row_kind,
+              runtime::gpu::CudaConstraintRowBufferKind::ParticleRigidCoupling);
+    EXPECT_EQ(report.coupling_scheduler_report.row_layout,
+              runtime::gpu::CudaConstraintRowLayout::ParticleRigidCouplingSlot);
+    EXPECT_EQ(report.coupling_scheduler_report.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::OwnerSerialSweep);
+    EXPECT_EQ(report.coupling_scheduler_report.owner_count, 1u);
+    EXPECT_EQ(report.coupling_scheduler_report.row_count,
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    EXPECT_EQ(report.coupling_scheduler_report.rows_per_owner,
+              runtime::gpu::kCudaParticleCouplingSlotsPerParticle);
+    EXPECT_EQ(report.coupling_scheduler_report.configured_iterations, 3u);
+    EXPECT_EQ(report.coupling_scheduler_report.executed_iterations, 3u);
+    EXPECT_EQ(report.coupling_scheduler_report.solver_launch_count, 3u);
+    EXPECT_EQ(report.coupling_scheduler_report.diagnostic_launch_count, 3u);
+    EXPECT_EQ(report.coupling_scheduler_report.active_row_count, 2u);
     EXPECT_GT(report.coupling_row_solver_impulse_count, 0u);
     EXPECT_GT(report.coupling_row_solver_impulse_magnitude, 0.0f);
     EXPECT_EQ(report.coupling_row_solver_diagnostic_slot_count, 3u);
     EXPECT_GT(report.coupling_row_solver_max_iteration_normal_delta_impulse, 0.0f);
     EXPECT_GE(report.coupling_row_solver_max_iteration_tangent_delta_impulse, 0.0f);
     EXPECT_GE(report.coupling_row_solver_max_residual, 0.0f);
+    EXPECT_EQ(report.coupling_scheduler_report.normal_impulse_count,
+              report.coupling_row_solver_impulse_count);
+    EXPECT_EQ(report.coupling_scheduler_report.tangent_impulse_count,
+              report.coupling_row_solver_friction_impulse_count);
+    EXPECT_EQ(report.coupling_scheduler_report.diagnostic_slot_count,
+              report.coupling_row_solver_diagnostic_slot_count);
+    EXPECT_NEAR(report.coupling_scheduler_report.normal_delta_impulse_magnitude,
+                report.coupling_row_solver_impulse_magnitude,
+                1.0e-5f);
+    EXPECT_NEAR(report.coupling_scheduler_report.tangent_delta_impulse_magnitude,
+                report.coupling_row_solver_friction_impulse_magnitude,
+                1.0e-5f);
+    EXPECT_NEAR(report.coupling_scheduler_report.max_normal_delta_impulse,
+                report.coupling_row_solver_max_iteration_normal_delta_impulse,
+                1.0e-5f);
+    EXPECT_NEAR(report.coupling_scheduler_report.max_tangent_delta_impulse,
+                report.coupling_row_solver_max_iteration_tangent_delta_impulse,
+                1.0e-5f);
+    EXPECT_NEAR(report.coupling_scheduler_report.max_residual,
+                report.coupling_row_solver_max_residual,
+                1.0e-5f);
 
     const float first_delta =
         report.coupling_row_solver_iteration_normal_delta_impulses[0] +

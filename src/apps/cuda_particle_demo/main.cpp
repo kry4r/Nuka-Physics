@@ -463,6 +463,24 @@ int main() {
               << corner_report.coupling_row_solver_launch_count
               << " row_solver_iterations="
               << corner_report.coupling_row_solver_iteration_count
+              << " scheduler_kind="
+              << static_cast<uint32_t>(corner_report.coupling_scheduler_report.row_kind)
+              << " scheduler_layout="
+              << static_cast<uint32_t>(corner_report.coupling_scheduler_report.row_layout)
+              << " scheduler_mode="
+              << static_cast<uint32_t>(corner_report.coupling_scheduler_report.schedule_mode)
+              << " scheduler_rows="
+              << corner_report.coupling_scheduler_report.row_count
+              << " scheduler_owners="
+              << corner_report.coupling_scheduler_report.owner_count
+              << " scheduler_active_rows="
+              << corner_report.coupling_scheduler_report.active_row_count
+              << " scheduler_launches="
+              << corner_report.coupling_scheduler_report.solver_launch_count
+              << " scheduler_diagnostic_launches="
+              << corner_report.coupling_scheduler_report.diagnostic_launch_count
+              << " scheduler_max_residual="
+              << corner_report.coupling_scheduler_report.max_residual
               << " kernel_launches=" << corner_report.kernel_launch_count
               << " row_solver_impulses="
               << corner_report.coupling_row_solver_impulse_count
@@ -626,6 +644,15 @@ int main() {
                    corner_report.coupling_torque_magnitude > 0.0f &&
                    corner_report.coupling_row_solver_launch_count == 3u &&
                    corner_report.coupling_row_solver_iteration_count == 3u &&
+                   corner_report.coupling_scheduler_report.row_kind ==
+                       runtime::gpu::CudaConstraintRowBufferKind::ParticleRigidCoupling &&
+                   corner_report.coupling_scheduler_report.row_layout ==
+                       runtime::gpu::CudaConstraintRowLayout::ParticleRigidCouplingSlot &&
+                   corner_report.coupling_scheduler_report.schedule_mode ==
+                       runtime::gpu::CudaConstraintRowScheduleMode::OwnerSerialSweep &&
+                   corner_report.coupling_scheduler_report.active_row_count >= 2u &&
+                   corner_report.coupling_scheduler_report.solver_launch_count == 3u &&
+                   corner_report.coupling_scheduler_report.diagnostic_launch_count == 3u &&
                    corner_report.coupling_row_solver_diagnostic_slot_count == 3u &&
                    corner_report.coupling_row_solver_max_iteration_normal_delta_impulse > 0.0f &&
                    corner_report.coupling_row_solver_max_iteration_tangent_delta_impulse >= 0.0f &&
