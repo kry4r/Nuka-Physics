@@ -6,6 +6,7 @@
 #include "constraint/constraint_block.hpp"
 #include "constraint/gpu/contact_generation.cuh"
 #include "phi/buffer.hpp"
+#include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
@@ -29,6 +30,7 @@ struct CudaConstraintSolverReport {
     uint32_t velocity_iterations = 0;
     uint32_t position_iterations = 0;
     float max_position_error = 0.0f;
+    runtime::gpu::CudaConstraintRowSchedulerReport row_scheduler_report;
 };
 
 class CudaConstraintSolverResult {
@@ -46,6 +48,7 @@ public:
 
     CudaConstraintSolverReport DownloadReport() const;
     std::vector<constraint::ConstraintBlock> DownloadBlocks() const;
+    runtime::gpu::CudaConstraintRowBufferView ConstraintRowBuffer() const;
 
     const constraint::ConstraintBlock* DeviceBlocks() const;
     const uint32_t* DeviceBlockCount() const;

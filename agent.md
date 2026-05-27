@@ -18,6 +18,9 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 - Prefer complete feature slices, reusable integration/runtime checks, scene-level validation, demos, benchmarks, and diagnostics.
 - Unit tests can still be useful for stable low-level contracts, but they are secondary to integrated CUDA runtime evidence for this project.
 - Avoid isolated trivial tests that do not exercise meaningful engine behavior or robot/world workflows.
+- Do not spend iterations polishing small test details at the expense of the platform mainline.
+- Each iteration should name one primary functional objective first, implement that objective coherently, then use existing integrated tests/benchmarks/docs to validate it.
+- When a test assertion becomes a distraction, prefer checking that it protects the main functional objective and either simplify it or move on after the core behavior is covered.
 
 ## Robot Simulation Focus
 

@@ -16,6 +16,31 @@ namespace {
 
 constexpr uint32_t kInvalidBody = ~0u;
 constexpr float kHugeLimit = 1.0e6f;
+constexpr uint32_t kRigidConstraintSchedulerDiagnosticSlots = 4u;
+
+using runtime::gpu::AccumulateCudaConstraintRowSchedulerIteration;
+using runtime::gpu::CudaConstraintRowBufferKind;
+using runtime::gpu::CudaConstraintRowBufferView;
+using runtime::gpu::CudaConstraintRowLayout;
+using runtime::gpu::CudaConstraintRowSchedulerConfig;
+using runtime::gpu::CudaConstraintRowSchedulerIterationReport;
+using runtime::gpu::CudaConstraintRowSchedulerReport;
+using runtime::gpu::CudaConstraintRowScheduleMode;
+using runtime::gpu::SetCudaConstraintRowSchedulerMetadata;
+
+struct RigidConstraintBlockSchedulerInput {
+    CudaConstraintRowBufferView row_buffer;
+    CudaConstraintRowSchedulerConfig config;
+    uint32_t body_count = 0u;
+    uint32_t block_capacity = 0u;
+    constraint::ConstraintBlock* blocks = nullptr;
+    const uint32_t* block_count = nullptr;
+    const float* inv_masses = nullptr;
+    const math::Vec3* inv_inertias = nullptr;
+    math::Vec3* linear_velocities = nullptr;
+    math::Vec3* angular_velocities = nullptr;
+    CudaConstraintSolverReport* report = nullptr;
+};
 
 __device__ math::Vec3 MakeVec3(float x, float y, float z) {
     math::Vec3 v;
@@ -158,6 +183,27 @@ __device__ float TotalNormalImpulse(constraint::ConstraintBlock block) {
         impulse += fmaxf(block.impulse[row], 0.0f);
     }
     return impulse;
+}
+
+__device__ bool IsNormalImpulseRow(constraint::ConstraintBlock block, uint32_t row) {
+    if (row >= block.row_count) {
+        return false;
+    }
+    if (block.type == constraint::ConstraintType::Contact) {
+        return row < ContactNormalRowCount(block);
+    }
+    return true;
+}
+
+__device__ float ProjectedRowResidual(float velocity_error,
+                                      float effective_mass,
+                                      float impulse,
+                                      float lower_limit,
+                                      float upper_limit) {
+    const float projected_impulse =
+        fminf(fmaxf(impulse + effective_mass * velocity_error, lower_limit),
+              upper_limit);
+    return fabsf(projected_impulse - impulse);
 }
 
 __device__ float BodyInvMass(uint32_t body, uint32_t body_count, const float* inv_masses) {
@@ -480,6 +526,7 @@ __global__ void ClearAssemblyKernel(uint32_t* block_count,
     report->velocity_iterations = 0u;
     report->position_iterations = 0u;
     report->max_position_error = 0.0f;
+    report->row_scheduler_report = CudaConstraintRowSchedulerReport{};
 }
 
 __global__ void AssembleContactBlocksKernel(uint32_t pair_slot_count,
@@ -620,15 +667,27 @@ __global__ void SolveVelocityIterationKernel(uint32_t body_count,
                                              const float* inv_masses,
                                              const math::Vec3* inv_inertias,
                                              math::Vec3* linear_velocities,
-                                             math::Vec3* angular_velocities) {
+                                             math::Vec3* angular_velocities,
+                                             uint32_t iteration_index,
+                                             CudaConstraintSolverReport* report) {
     if (threadIdx.x != 0u || blockIdx.x != 0u) {
         return;
     }
 
     const uint32_t count = *block_count;
+    uint32_t active_row_count = 0u;
+    uint32_t normal_impulse_count = 0u;
+    uint32_t tangent_impulse_count = 0u;
+    float normal_delta_impulse_magnitude = 0.0f;
+    float tangent_delta_impulse_magnitude = 0.0f;
+    float max_normal_delta_impulse = 0.0f;
+    float max_tangent_delta_impulse = 0.0f;
+    float max_residual = 0.0f;
+
     for (uint32_t block_index = 0; block_index < count; ++block_index) {
         constraint::ConstraintBlock block = blocks[block_index];
         for (uint32_t row = 0; row < block.row_count; ++row) {
+            ++active_row_count;
             const float jv = ComputeJv(block,
                                        row,
                                        body_count,
@@ -657,9 +716,60 @@ __global__ void SolveVelocityIterationKernel(uint32_t body_count,
                              linear_velocities,
                              angular_velocities);
             }
+            const bool tangent_row = IsContactFrictionRow(block, row);
+            const float abs_delta = fabsf(delta);
+            if (abs_delta > 0.0f) {
+                if (tangent_row) {
+                    ++tangent_impulse_count;
+                    tangent_delta_impulse_magnitude += abs_delta;
+                    max_tangent_delta_impulse =
+                        fmaxf(max_tangent_delta_impulse, abs_delta);
+                } else if (IsNormalImpulseRow(block, row)) {
+                    ++normal_impulse_count;
+                    normal_delta_impulse_magnitude += abs_delta;
+                    max_normal_delta_impulse =
+                        fmaxf(max_normal_delta_impulse, abs_delta);
+                }
+            }
+            const float solved_jv = ComputeJv(block,
+                                             row,
+                                             body_count,
+                                             linear_velocities,
+                                             angular_velocities);
+            max_residual =
+                fmaxf(max_residual,
+                      ProjectedRowResidual(block.rhs[row] - solved_jv,
+                                           block.effective_mass[row],
+                                           new_impulse,
+                                           lower_limit,
+                                           upper_limit));
         }
         blocks[block_index] = block;
     }
+
+    CudaConstraintRowSchedulerIterationReport iteration_report;
+    iteration_report.active_row_count = active_row_count;
+    iteration_report.normal_impulse_count = normal_impulse_count;
+    iteration_report.tangent_impulse_count = tangent_impulse_count;
+    iteration_report.diagnostic_slot_count =
+        iteration_index < kRigidConstraintSchedulerDiagnosticSlots
+            ? iteration_index + 1u
+            : kRigidConstraintSchedulerDiagnosticSlots;
+    iteration_report.normal_delta_impulse_magnitude =
+        normal_delta_impulse_magnitude;
+    iteration_report.tangent_delta_impulse_magnitude =
+        tangent_delta_impulse_magnitude;
+    iteration_report.max_normal_delta_impulse = max_normal_delta_impulse;
+    iteration_report.max_tangent_delta_impulse = max_tangent_delta_impulse;
+    iteration_report.max_residual = max_residual;
+    CudaConstraintRowSchedulerReport updated_scheduler =
+        report->row_scheduler_report;
+    AccumulateCudaConstraintRowSchedulerIteration(updated_scheduler,
+                                                 iteration_report);
+    updated_scheduler.executed_iterations = iteration_index + 1u;
+    updated_scheduler.solver_launch_count = iteration_index + 1u;
+    updated_scheduler.diagnostic_launch_count = iteration_index + 1u;
+    report->row_scheduler_report = updated_scheduler;
 }
 
 __global__ void SolveContactPositionIterationKernel(uint32_t body_count,
@@ -798,6 +908,18 @@ __global__ void SetIterationReportKernel(uint32_t velocity_iterations,
     report->position_iterations = position_iterations;
 }
 
+__global__ void SetRigidSchedulerMetadataKernel(
+    CudaConstraintRowBufferView row_buffer,
+    CudaConstraintRowSchedulerConfig config,
+    CudaConstraintSolverReport* report) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) {
+        return;
+    }
+    SetCudaConstraintRowSchedulerMetadata(report->row_scheduler_report,
+                                          row_buffer,
+                                          config);
+}
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -814,6 +936,57 @@ std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
     return values;
 }
 
+void RunCudaRigidConstraintBlockScheduler(
+    const RigidConstraintBlockSchedulerInput& input) {
+    if (input.row_buffer.kind != CudaConstraintRowBufferKind::RigidConstraintBlock ||
+        input.row_buffer.layout != CudaConstraintRowLayout::ConstraintBlock ||
+        input.row_buffer.schedule_mode != CudaConstraintRowScheduleMode::GlobalRowSweep ||
+        input.block_capacity == 0u ||
+        input.body_count == 0u ||
+        input.blocks == nullptr ||
+        input.block_count == nullptr ||
+        input.report == nullptr) {
+        return;
+    }
+
+    constexpr uint32_t kBlockSize = 128u;
+    const uint32_t blocks_grid =
+        (input.block_capacity + kBlockSize - 1u) / kBlockSize;
+    PrecomputeBlocksKernel<<<blocks_grid, kBlockSize>>>(
+        input.body_count,
+        input.blocks,
+        input.block_count,
+        input.inv_masses,
+        input.inv_inertias,
+        input.linear_velocities,
+        input.angular_velocities);
+    CheckCuda(cudaGetLastError(), "PrecomputeBlocksKernel launch");
+
+    SetRigidSchedulerMetadataKernel<<<1, 1>>>(
+        input.row_buffer,
+        input.config,
+        input.report);
+    CheckCuda(cudaGetLastError(), "SetRigidSchedulerMetadataKernel launch");
+
+    if (input.config.iterations == 0u) {
+        return;
+    }
+
+    for (uint32_t iter = 0; iter < input.config.iterations; ++iter) {
+        SolveVelocityIterationKernel<<<1, 1>>>(
+            input.body_count,
+            input.blocks,
+            input.block_count,
+            input.inv_masses,
+            input.inv_inertias,
+            input.linear_velocities,
+            input.angular_velocities,
+            iter,
+            input.report);
+        CheckCuda(cudaGetLastError(), "SolveVelocityIterationKernel launch");
+    }
+}
+
 void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
                       uint32_t block_capacity,
                       phi::Buffer& blocks,
@@ -824,29 +997,36 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
         return;
     }
 
-    constexpr uint32_t kBlockSize = 128u;
-    const uint32_t blocks_grid = (block_capacity + kBlockSize - 1u) / kBlockSize;
-    PrecomputeBlocksKernel<<<blocks_grid, kBlockSize>>>(
-        device_world.BodyCount(),
-        static_cast<constraint::ConstraintBlock*>(blocks.Data()),
-        static_cast<const uint32_t*>(block_count.Data()),
-        device_world.DeviceInvMasses(),
-        device_world.DeviceInvInertias(),
-        device_world.DeviceLinearVelocities(),
-        device_world.DeviceAngularVelocities());
-    CheckCuda(cudaGetLastError(), "PrecomputeBlocksKernel launch");
+    CudaConstraintRowBufferView row_buffer;
+    row_buffer.kind = CudaConstraintRowBufferKind::RigidConstraintBlock;
+    row_buffer.layout = CudaConstraintRowLayout::ConstraintBlock;
+    row_buffer.schedule_mode = CudaConstraintRowScheduleMode::GlobalRowSweep;
+    row_buffer.device_rows = blocks.Data();
+    row_buffer.row_count =
+        block_capacity * constraint::ConstraintBlock::kMaxRows;
+    row_buffer.owner_count = block_capacity;
+    row_buffer.rows_per_owner = constraint::ConstraintBlock::kMaxRows;
+    row_buffer.row_stride_bytes = sizeof(constraint::ConstraintBlock);
 
-    for (uint32_t iter = 0; iter < config.velocity_iterations; ++iter) {
-        SolveVelocityIterationKernel<<<1, 1>>>(
-            device_world.BodyCount(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
-            static_cast<const uint32_t*>(block_count.Data()),
-            device_world.DeviceInvMasses(),
-            device_world.DeviceInvInertias(),
-            device_world.DeviceLinearVelocities(),
-            device_world.DeviceAngularVelocities());
-        CheckCuda(cudaGetLastError(), "SolveVelocityIterationKernel launch");
-    }
+    CudaConstraintRowSchedulerConfig scheduler_config;
+    scheduler_config.iterations = config.velocity_iterations;
+    scheduler_config.enable_warm_start = true;
+    scheduler_config.reduce_diagnostics = true;
+
+    RigidConstraintBlockSchedulerInput scheduler_input;
+    scheduler_input.row_buffer = row_buffer;
+    scheduler_input.config = scheduler_config;
+    scheduler_input.body_count = device_world.BodyCount();
+    scheduler_input.block_capacity = block_capacity;
+    scheduler_input.blocks = static_cast<constraint::ConstraintBlock*>(blocks.Data());
+    scheduler_input.block_count = static_cast<const uint32_t*>(block_count.Data());
+    scheduler_input.inv_masses = device_world.DeviceInvMasses();
+    scheduler_input.inv_inertias = device_world.DeviceInvInertias();
+    scheduler_input.linear_velocities = device_world.DeviceLinearVelocities();
+    scheduler_input.angular_velocities = device_world.DeviceAngularVelocities();
+    scheduler_input.report =
+        static_cast<CudaConstraintSolverReport*>(report.Data());
+    RunCudaRigidConstraintBlockScheduler(scheduler_input);
 
     for (uint32_t iter = 0; iter < config.position_iterations; ++iter) {
         SolveContactPositionIterationKernel<<<1, 1>>>(
@@ -909,6 +1089,21 @@ std::vector<constraint::ConstraintBlock> CudaConstraintSolverResult::DownloadBlo
         block_count = block_capacity_;
     }
     return DownloadVector<constraint::ConstraintBlock>(blocks_, block_count);
+}
+
+runtime::gpu::CudaConstraintRowBufferView
+CudaConstraintSolverResult::ConstraintRowBuffer() const {
+    runtime::gpu::CudaConstraintRowBufferView view;
+    view.kind = runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock;
+    view.layout = runtime::gpu::CudaConstraintRowLayout::ConstraintBlock;
+    view.schedule_mode =
+        runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep;
+    view.device_rows = const_cast<void*>(blocks_.Data());
+    view.row_count = block_capacity_ * constraint::ConstraintBlock::kMaxRows;
+    view.owner_count = block_capacity_;
+    view.rows_per_owner = constraint::ConstraintBlock::kMaxRows;
+    view.row_stride_bytes = sizeof(constraint::ConstraintBlock);
+    return view;
 }
 
 const constraint::ConstraintBlock* CudaConstraintSolverResult::DeviceBlocks() const {

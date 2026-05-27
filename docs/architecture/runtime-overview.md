@@ -85,7 +85,17 @@ friction and restitution in the velocity solve, and performs contact plus joint
 position projection against CUDA pose buffers. `SolveCudaConstraintBlocks()` is
 kept as a validation/tooling entry for uploading a small host-authored row set
 into the same device solver; production scenes should enter through
-`DeviceWorld` plus device contact results.
+`DeviceWorld` plus device contact results. The rigid solver now exposes its
+device `ConstraintBlock` storage through `CudaConstraintRowBufferView` as
+`RigidConstraintBlock` rows with `ConstraintBlock` layout and `GlobalRowSweep`
+scheduling. `CudaConstraintSolverReport::row_scheduler_report` records the same
+scheduler vocabulary used by the particle/rigid coupling path: configured and
+executed velocity sweeps, active rows, normal/tangent impulse counts, delta
+impulse magnitudes, row stride metadata, and a finite projected residual proxy.
+This is still a serial global sweep inside the velocity kernel, but it gives
+rigid contacts, cooked joints, and cooked drives a real CUDA scheduler envelope
+before island/coloring and compact global row buffers replace the current
+`ConstraintBlock` owner layout.
 
 CUDA joint and drive assembly accepts single-ended joints where either parent or
 child is `scene::kInvalidBody`. Those rows represent a static world anchor and
@@ -139,6 +149,21 @@ batched rigid integration, contact generation/solve, joint anchor projection,
 and velocity drive solve in one CUDA pipeline. This currently covers
 plane/box/sphere contact scenes plus cooked revolute/fixed-style joint rows and
 velocity drive rows.
+
+The batched constraint solver now reports the same scheduler-facing
+`RigidConstraintBlock` row-buffer vocabulary as the single-world rigid solver.
+`CudaBatchedConstraintSolverResult::ConstraintRowBuffer()` exposes the device
+`ConstraintBlock` array as `ConstraintBlock` layout with `GlobalRowSweep`
+scheduling, and both direct solves and `StepBatchedCudaWorld()` aggregate
+`row_scheduler_report` metadata for configured/executed velocity sweeps, active
+rows, normal/tangent impulse counts, delta impulse magnitudes, and a finite
+projected residual proxy. The generic batched path records those diagnostics per
+velocity sweep; the instance-parallel joint/drive fast path keeps its current
+fused solve kernel and adds a post-solve CUDA diagnostic scan over the resident
+blocks, so it exposes scheduler coverage without yet providing per-iteration
+convergence slots. This keeps batched contact, joint, and drive scenes on the
+same scheduler contract that later island/coloring and global row-buffer work
+will replace internally.
 
 Batched sensor queries reuse the same flattened state layout. IMU/state requests
 carry `(instance_index, body_id)` pairs and read pose, angular velocity, force,
@@ -242,9 +267,10 @@ the reusable scheduler vocabulary: row kind/layout, schedule mode, owner count,
 row count, rows per owner, configured/executed iterations, solver and diagnostic
 launch counts, active rows, normal/tangent impulse counts, delta impulse
 magnitudes, and max residual. That report is the current adapter between the
-fixed particle/rigid slot solver and the later shared CUDA scheduler for rigid
-contacts, joints, drives, articulation, cloth/deformable, particle-fluid, and
-rigid-soft/fluid rows.
+fixed particle/rigid slot solver and the shared CUDA scheduler vocabulary also
+used by rigid `ConstraintBlock` contact/joint/drive solves. Articulation,
+cloth/deformable, particle-fluid, and rigid-soft/fluid rows still need to move
+into that scheduler surface.
 `coupling_tangent_warm_start_count` and
 `coupling_tangent_warm_start_impulse_magnitude` expose the persistent friction
 cache separately from the aggregate warm-start magnitude. Compliance/XPBD and a

@@ -10,6 +10,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/world_instance.hpp"
 #include "runtime/world_template.hpp"
 #include "scene/canonical_types.hpp"
@@ -50,6 +51,7 @@ struct CudaBatchedWorldStepReport {
     uint32_t constraint_row_count = 0;
     uint32_t solver_iterations_used = 0;
     float max_constraint_error = 0.0f;
+    CudaConstraintRowSchedulerReport row_scheduler_report;
 };
 
 struct BatchedDeviceState {
@@ -104,6 +106,7 @@ struct CudaBatchedConstraintSolverReport {
     uint32_t velocity_iterations = 0;
     uint32_t position_iterations = 0;
     float max_position_error = 0.0f;
+    CudaConstraintRowSchedulerReport row_scheduler_report;
 };
 
 class CudaBatchedBroadphaseResult {
@@ -185,6 +188,7 @@ public:
     CudaBatchedConstraintSolverResult& operator=(CudaBatchedConstraintSolverResult&&) noexcept = default;
 
     CudaBatchedConstraintSolverReport DownloadReport() const;
+    CudaConstraintRowBufferView ConstraintRowBuffer() const;
 
 private:
     uint32_t block_capacity_ = 0;

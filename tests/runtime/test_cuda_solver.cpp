@@ -218,10 +218,45 @@ TEST(CudaConstraintSolver, SolvesPlaneBoxContactOnDevice) {
     config.position_iterations = 4u;
     auto result = solver::gpu::SolveCudaConstraints(device_world, &contacts, config);
     const auto report = result.DownloadReport();
+    const auto row_buffer = result.ConstraintRowBuffer();
     const auto state = device_world.DownloadState();
 
     EXPECT_EQ(report.contact_constraint_count, 1u);
     EXPECT_GE(report.constraint_row_count, 3u);
+    EXPECT_EQ(row_buffer.kind,
+              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+    EXPECT_EQ(row_buffer.layout,
+              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+    EXPECT_EQ(row_buffer.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+    EXPECT_NE(row_buffer.device_rows, nullptr);
+    EXPECT_EQ(row_buffer.owner_count,
+              report.contact_constraint_count +
+                  report.joint_constraint_count +
+                  report.drive_constraint_count);
+    EXPECT_EQ(row_buffer.rows_per_owner,
+              constraint::ConstraintBlock::kMaxRows);
+    EXPECT_EQ(row_buffer.row_stride_bytes,
+              sizeof(constraint::ConstraintBlock));
+    EXPECT_EQ(report.row_scheduler_report.row_kind,
+              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.row_layout,
+              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+    EXPECT_EQ(report.row_scheduler_report.owner_count, row_buffer.owner_count);
+    EXPECT_EQ(report.row_scheduler_report.row_count, row_buffer.row_count);
+    EXPECT_EQ(report.row_scheduler_report.configured_iterations,
+              config.velocity_iterations);
+    EXPECT_EQ(report.row_scheduler_report.executed_iterations,
+              config.velocity_iterations);
+    EXPECT_EQ(report.row_scheduler_report.solver_launch_count,
+              config.velocity_iterations);
+    EXPECT_GE(report.row_scheduler_report.active_row_count,
+              report.constraint_row_count);
+    EXPECT_GT(report.row_scheduler_report.normal_impulse_count, 0u);
+    EXPECT_GT(report.row_scheduler_report.normal_delta_impulse_magnitude, 0.0f);
+    EXPECT_TRUE(std::isfinite(report.row_scheduler_report.max_residual));
     EXPECT_GE(state.linear_velocities[scene.box_body].y, -1.0e-5f);
     EXPECT_GT(state.poses[scene.box_body].position.y, 0.48f);
 }
@@ -338,5 +373,20 @@ TEST(CudaConstraintSolver, AppliesWorldAnchoredVelocityActuatorOnDevice) {
     EXPECT_EQ(report.joint_constraint_count, 1u);
     EXPECT_EQ(report.drive_constraint_count, 1u);
     EXPECT_GE(report.constraint_row_count, 6u);
+    EXPECT_EQ(report.row_scheduler_report.row_kind,
+              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.row_layout,
+              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+    EXPECT_EQ(report.row_scheduler_report.owner_count, 2u);
+    EXPECT_EQ(report.row_scheduler_report.configured_iterations,
+              config.velocity_iterations);
+    EXPECT_EQ(report.row_scheduler_report.executed_iterations,
+              config.velocity_iterations);
+    EXPECT_GE(report.row_scheduler_report.active_row_count,
+              report.constraint_row_count);
+    EXPECT_GT(report.row_scheduler_report.normal_impulse_count, 0u);
+    EXPECT_TRUE(std::isfinite(report.row_scheduler_report.max_residual));
     EXPECT_NEAR(state.angular_velocities[scene.child_body].z, 4.0f, 1.0e-4f);
 }

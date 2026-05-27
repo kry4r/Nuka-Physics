@@ -19,6 +19,7 @@ namespace {
 
 constexpr uint32_t kInvalidBody = ~0u;
 constexpr float kHugeLimit = 1.0e6f;
+constexpr uint32_t kBatchedConstraintSchedulerDiagnosticSlots = 4u;
 
 template <typename T>
 phi::Buffer UploadVector(const std::vector<T>& values) {
@@ -36,6 +37,72 @@ std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
         buffer.CopyToHost(values.data(), values.size() * sizeof(T));
     }
     return values;
+}
+
+CudaConstraintRowBufferView MakeBatchedRigidConstraintRowBuffer(
+    void* device_rows,
+    uint32_t block_capacity) {
+    CudaConstraintRowBufferView row_buffer;
+    row_buffer.kind = CudaConstraintRowBufferKind::RigidConstraintBlock;
+    row_buffer.layout = CudaConstraintRowLayout::ConstraintBlock;
+    row_buffer.schedule_mode = CudaConstraintRowScheduleMode::GlobalRowSweep;
+    row_buffer.device_rows = device_rows;
+    row_buffer.row_count =
+        block_capacity * constraint::ConstraintBlock::kMaxRows;
+    row_buffer.owner_count = block_capacity;
+    row_buffer.rows_per_owner = constraint::ConstraintBlock::kMaxRows;
+    row_buffer.row_stride_bytes = sizeof(constraint::ConstraintBlock);
+    return row_buffer;
+}
+
+CudaConstraintRowSchedulerConfig MakeBatchedConstraintRowSchedulerConfig(
+    uint32_t velocity_iterations) {
+    CudaConstraintRowSchedulerConfig config;
+    config.iterations = velocity_iterations;
+    config.enable_warm_start = true;
+    config.reduce_diagnostics = true;
+    return config;
+}
+
+void AccumulateBatchedStepSchedulerReport(
+    CudaConstraintRowSchedulerReport& aggregate,
+    const CudaConstraintRowSchedulerReport& step) {
+    if (step.row_kind == CudaConstraintRowBufferKind::Unknown) {
+        return;
+    }
+    if (aggregate.row_kind == CudaConstraintRowBufferKind::Unknown) {
+        aggregate = step;
+        return;
+    }
+
+    aggregate.row_kind = step.row_kind;
+    aggregate.row_layout = step.row_layout;
+    aggregate.schedule_mode = step.schedule_mode;
+    aggregate.owner_count = step.owner_count;
+    aggregate.row_count = step.row_count;
+    aggregate.rows_per_owner = step.rows_per_owner;
+    aggregate.row_stride_bytes = step.row_stride_bytes;
+    aggregate.configured_iterations = step.configured_iterations;
+    aggregate.executed_iterations += step.executed_iterations;
+    aggregate.solver_launch_count += step.solver_launch_count;
+    aggregate.diagnostic_launch_count += step.diagnostic_launch_count;
+    aggregate.active_row_count += step.active_row_count;
+    aggregate.normal_impulse_count += step.normal_impulse_count;
+    aggregate.tangent_impulse_count += step.tangent_impulse_count;
+    aggregate.diagnostic_slot_count =
+        std::max(aggregate.diagnostic_slot_count, step.diagnostic_slot_count);
+    aggregate.normal_delta_impulse_magnitude +=
+        step.normal_delta_impulse_magnitude;
+    aggregate.tangent_delta_impulse_magnitude +=
+        step.tangent_delta_impulse_magnitude;
+    aggregate.max_normal_delta_impulse =
+        std::max(aggregate.max_normal_delta_impulse,
+                 step.max_normal_delta_impulse);
+    aggregate.max_tangent_delta_impulse =
+        std::max(aggregate.max_tangent_delta_impulse,
+                 step.max_tangent_delta_impulse);
+    aggregate.max_residual =
+        std::max(aggregate.max_residual, step.max_residual);
 }
 
 template <typename T>
@@ -433,6 +500,28 @@ __device__ float TotalNormalImpulse(constraint::ConstraintBlock block) {
         impulse += fmaxf(block.impulse[row], 0.0f);
     }
     return impulse;
+}
+
+__device__ bool IsBatchedNormalImpulseRow(constraint::ConstraintBlock block,
+                                          uint32_t row) {
+    if (row >= block.row_count) {
+        return false;
+    }
+    if (block.type == constraint::ConstraintType::Contact) {
+        return row < ContactNormalRowCount(block);
+    }
+    return true;
+}
+
+__device__ float BatchedProjectedRowResidual(float velocity_error,
+                                             float effective_mass,
+                                             float impulse,
+                                             float lower_limit,
+                                             float upper_limit) {
+    const float projected_impulse =
+        fminf(fmaxf(impulse + effective_mass * velocity_error, lower_limit),
+              upper_limit);
+    return fabsf(projected_impulse - impulse);
 }
 
 __device__ constraint::ConstraintBlock BuildBatchedContactBlock(
@@ -1006,6 +1095,7 @@ __global__ void ClearBatchedSolverReportKernel(uint32_t* block_count,
     report->velocity_iterations = 0u;
     report->position_iterations = 0u;
     report->max_position_error = 0.0f;
+    report->row_scheduler_report = CudaConstraintRowSchedulerReport{};
 }
 
 __global__ void AssembleBatchedContactBlocksKernel(
@@ -1279,15 +1369,27 @@ __global__ void SolveBatchedVelocityIterationKernel(uint32_t total_body_count,
                                                     const float* inv_masses,
                                                     const math::Vec3* inv_inertias,
                                                     math::Vec3* linear_velocities,
-                                                    math::Vec3* angular_velocities) {
+                                                    math::Vec3* angular_velocities,
+                                                    uint32_t iteration_index,
+                                                    CudaBatchedConstraintSolverReport* report) {
     if (threadIdx.x != 0u || blockIdx.x != 0u) {
         return;
     }
 
     const uint32_t count = *block_count;
+    uint32_t active_row_count = 0u;
+    uint32_t normal_impulse_count = 0u;
+    uint32_t tangent_impulse_count = 0u;
+    float normal_delta_impulse_magnitude = 0.0f;
+    float tangent_delta_impulse_magnitude = 0.0f;
+    float max_normal_delta_impulse = 0.0f;
+    float max_tangent_delta_impulse = 0.0f;
+    float max_residual = 0.0f;
+
     for (uint32_t block_index = 0; block_index < count; ++block_index) {
         constraint::ConstraintBlock block = blocks[block_index];
         for (uint32_t row = 0; row < block.row_count; ++row) {
+            ++active_row_count;
             const float jv =
                 ComputeJv(block, row, total_body_count, linear_velocities, angular_velocities);
             const float lambda = block.effective_mass[row] * (block.rhs[row] - jv);
@@ -1314,9 +1416,130 @@ __global__ void SolveBatchedVelocityIterationKernel(uint32_t total_body_count,
                              linear_velocities,
                              angular_velocities);
             }
+            const bool tangent_row = IsContactFrictionRow(block, row);
+            const float abs_delta = fabsf(delta);
+            if (abs_delta > 0.0f) {
+                if (tangent_row) {
+                    ++tangent_impulse_count;
+                    tangent_delta_impulse_magnitude += abs_delta;
+                    max_tangent_delta_impulse =
+                        fmaxf(max_tangent_delta_impulse, abs_delta);
+                } else if (IsBatchedNormalImpulseRow(block, row)) {
+                    ++normal_impulse_count;
+                    normal_delta_impulse_magnitude += abs_delta;
+                    max_normal_delta_impulse =
+                        fmaxf(max_normal_delta_impulse, abs_delta);
+                }
+            }
+            const float solved_jv =
+                ComputeJv(block, row, total_body_count, linear_velocities, angular_velocities);
+            max_residual =
+                fmaxf(max_residual,
+                      BatchedProjectedRowResidual(block.rhs[row] - solved_jv,
+                                                  block.effective_mass[row],
+                                                  new_impulse,
+                                                  lower_limit,
+                                                  upper_limit));
         }
         blocks[block_index] = block;
     }
+
+    CudaConstraintRowSchedulerIterationReport iteration_report;
+    iteration_report.active_row_count = active_row_count;
+    iteration_report.normal_impulse_count = normal_impulse_count;
+    iteration_report.tangent_impulse_count = tangent_impulse_count;
+    iteration_report.diagnostic_slot_count =
+        iteration_index < kBatchedConstraintSchedulerDiagnosticSlots
+            ? iteration_index + 1u
+            : kBatchedConstraintSchedulerDiagnosticSlots;
+    iteration_report.normal_delta_impulse_magnitude =
+        normal_delta_impulse_magnitude;
+    iteration_report.tangent_delta_impulse_magnitude =
+        tangent_delta_impulse_magnitude;
+    iteration_report.max_normal_delta_impulse = max_normal_delta_impulse;
+    iteration_report.max_tangent_delta_impulse = max_tangent_delta_impulse;
+    iteration_report.max_residual = max_residual;
+    CudaConstraintRowSchedulerReport updated_scheduler =
+        report->row_scheduler_report;
+    AccumulateCudaConstraintRowSchedulerIteration(updated_scheduler,
+                                                 iteration_report);
+    updated_scheduler.executed_iterations = iteration_index + 1u;
+    updated_scheduler.solver_launch_count = iteration_index + 1u;
+    updated_scheduler.diagnostic_launch_count = iteration_index + 1u;
+    report->row_scheduler_report = updated_scheduler;
+}
+
+__global__ void ReduceBatchedFixedBlockSchedulerDiagnosticsKernel(
+    uint32_t total_body_count,
+    uint32_t block_capacity,
+    const constraint::ConstraintBlock* blocks,
+    const math::Vec3* linear_velocities,
+    const math::Vec3* angular_velocities,
+    uint32_t executed_iterations,
+    uint32_t diagnostic_launch_count,
+    CudaBatchedConstraintSolverReport* report) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) {
+        return;
+    }
+
+    CudaConstraintRowSchedulerIterationReport iteration_report;
+    for (uint32_t block_index = 0; block_index < block_capacity; ++block_index) {
+        const constraint::ConstraintBlock block = blocks[block_index];
+        for (uint32_t row = 0u; row < block.row_count; ++row) {
+            ++iteration_report.active_row_count;
+            const bool tangent_row = IsContactFrictionRow(block, row);
+            const float impulse = block.impulse[row];
+            const float abs_impulse = fabsf(impulse);
+            if (abs_impulse > 0.0f) {
+                if (tangent_row) {
+                    ++iteration_report.tangent_impulse_count;
+                    iteration_report.tangent_delta_impulse_magnitude +=
+                        abs_impulse;
+                    iteration_report.max_tangent_delta_impulse =
+                        fmaxf(iteration_report.max_tangent_delta_impulse,
+                              abs_impulse);
+                } else if (IsBatchedNormalImpulseRow(block, row)) {
+                    ++iteration_report.normal_impulse_count;
+                    iteration_report.normal_delta_impulse_magnitude +=
+                        abs_impulse;
+                    iteration_report.max_normal_delta_impulse =
+                        fmaxf(iteration_report.max_normal_delta_impulse,
+                              abs_impulse);
+                }
+            }
+
+            float lower_limit = block.lower_limit[row];
+            float upper_limit = block.upper_limit[row];
+            if (tangent_row) {
+                const float max_friction =
+                    fmaxf(block.friction, 0.0f) * TotalNormalImpulse(block);
+                lower_limit = -max_friction;
+                upper_limit = max_friction;
+            }
+            const float solved_jv =
+                ComputeJv(block, row, total_body_count, linear_velocities, angular_velocities);
+            iteration_report.max_residual = fmaxf(
+                iteration_report.max_residual,
+                BatchedProjectedRowResidual(block.rhs[row] - solved_jv,
+                                            block.effective_mass[row],
+                                            impulse,
+                                            lower_limit,
+                                            upper_limit));
+        }
+    }
+
+    iteration_report.diagnostic_slot_count =
+        executed_iterations < kBatchedConstraintSchedulerDiagnosticSlots
+            ? executed_iterations
+            : kBatchedConstraintSchedulerDiagnosticSlots;
+
+    CudaConstraintRowSchedulerReport scheduler =
+        report->row_scheduler_report;
+    AccumulateCudaConstraintRowSchedulerIteration(scheduler, iteration_report);
+    scheduler.executed_iterations = executed_iterations;
+    scheduler.solver_launch_count = executed_iterations;
+    scheduler.diagnostic_launch_count = diagnostic_launch_count;
+    report->row_scheduler_report = scheduler;
 }
 
 __global__ void SolveBatchedContactPositionIterationKernel(
@@ -1692,6 +1915,18 @@ __global__ void SetBatchedSolverIterationReportKernel(
     report->position_iterations = position_iterations;
 }
 
+__global__ void SetBatchedSchedulerMetadataKernel(
+    CudaConstraintRowBufferView row_buffer,
+    CudaConstraintRowSchedulerConfig config,
+    CudaBatchedConstraintSolverReport* report) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u) {
+        return;
+    }
+    SetCudaConstraintRowSchedulerMetadata(report->row_scheduler_report,
+                                          row_buffer,
+                                          config);
+}
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -1750,6 +1985,15 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         nullptr,
         static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
     CheckCuda(cudaGetLastError(), "ClearBatchedSolverReportKernel launch");
+    const auto row_buffer =
+        MakeBatchedRigidConstraintRowBuffer(blocks.Data(), block_capacity);
+    const auto scheduler_config =
+        MakeBatchedConstraintRowSchedulerConfig(options.solver_velocity_iterations);
+    SetBatchedSchedulerMetadataKernel<<<1, 1>>>(
+        row_buffer,
+        scheduler_config,
+        static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
+    CheckCuda(cudaGetLastError(), "SetBatchedSchedulerMetadataKernel launch");
 
     constexpr uint32_t kBlockSize = 128u;
     if (options.enable_joints && batch.TotalJointCount() > 0u) {
@@ -1808,6 +2052,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
     report->solver_iterations_used =
         (options.solver_velocity_iterations + options.solver_position_iterations)
         * options.step_count;
+    report->row_scheduler_report = setup_report.row_scheduler_report;
 
     constexpr uint32_t kBodyBlockSize = 128u;
     const uint32_t body_blocks =
@@ -1850,9 +2095,23 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
             options.solver_baumgarte,
             static_cast<float*>(max_position_errors.Data()));
         CheckCuda(cudaGetLastError(), "SolveBatchedJointDriveStepKernel launch");
+
+        ReduceBatchedFixedBlockSchedulerDiagnosticsKernel<<<1, 1>>>(
+            batch.TotalBodyCount(),
+            block_capacity,
+            static_cast<const constraint::ConstraintBlock*>(blocks.Data()),
+            batch.DeviceLinearVelocities(),
+            batch.DeviceAngularVelocities(),
+            options.solver_velocity_iterations * (step + 1u),
+            step + 1u,
+            static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
+        CheckCuda(cudaGetLastError(),
+                  "ReduceBatchedFixedBlockSchedulerDiagnosticsKernel launch");
     }
 
     CheckCuda(cudaDeviceSynchronize(), "StepBatchedJointDriveOnlyFastPath synchronize");
+    solver_report.CopyToHost(&setup_report, sizeof(setup_report));
+    report->row_scheduler_report = setup_report.row_scheduler_report;
     const auto position_errors =
         DownloadVector<float>(max_position_errors, batch.InstanceCount());
     for (float position_error : position_errors) {
@@ -1964,6 +2223,12 @@ CudaBatchedConstraintSolverReport CudaBatchedConstraintSolverResult::DownloadRep
         report_.CopyToHost(&report, sizeof(report));
     }
     return report;
+}
+
+CudaConstraintRowBufferView
+CudaBatchedConstraintSolverResult::ConstraintRowBuffer() const {
+    return MakeBatchedRigidConstraintRowBuffer(const_cast<void*>(blocks_.Data()),
+                                              block_capacity_);
 }
 
 BatchedDeviceWorld::BatchedDeviceWorld(uint32_t instance_count,
@@ -2577,6 +2842,16 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     CheckCuda(cudaGetLastError(), "FinalizeBatchedSolverReportKernel launch");
 
     if (block_capacity > 0u) {
+        const auto row_buffer =
+            MakeBatchedRigidConstraintRowBuffer(blocks.Data(), block_capacity);
+        const auto scheduler_config =
+            MakeBatchedConstraintRowSchedulerConfig(config.velocity_iterations);
+        SetBatchedSchedulerMetadataKernel<<<1, 1>>>(
+            row_buffer,
+            scheduler_config,
+            static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
+        CheckCuda(cudaGetLastError(), "SetBatchedSchedulerMetadataKernel launch");
+
         const uint32_t blocks_grid = (block_capacity + kBlockSize - 1u) / kBlockSize;
         PrecomputeBatchedBlocksKernel<<<blocks_grid, kBlockSize>>>(
             batch.TotalBodyCount(),
@@ -2598,7 +2873,9 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
                 batch.DeviceInvMasses(),
                 batch.DeviceInvInertias(),
                 batch.DeviceLinearVelocities(),
-                batch.DeviceAngularVelocities());
+                batch.DeviceAngularVelocities(),
+                iter,
+                static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
             CheckCuda(cudaGetLastError(), "SolveBatchedVelocityIterationKernel launch");
         }
 
@@ -2738,6 +3015,8 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
                     solver_report.velocity_iterations + solver_report.position_iterations;
                 report.max_constraint_error =
                     std::max(report.max_constraint_error, solver_report.max_position_error);
+                AccumulateBatchedStepSchedulerReport(report.row_scheduler_report,
+                                                     solver_report.row_scheduler_report);
                 continue;
             }
 
@@ -2756,6 +3035,8 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
                 solver_report.velocity_iterations + solver_report.position_iterations;
             report.max_constraint_error =
                 std::max(report.max_constraint_error, solver_report.max_position_error);
+            AccumulateBatchedStepSchedulerReport(report.row_scheduler_report,
+                                                 solver_report.row_scheduler_report);
         }
     }
 

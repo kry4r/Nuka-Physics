@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -99,5 +100,19 @@ TEST(CudaBatchJointDriveTiming, BatchedJointDriveSolveUnderOneSecond) {
     EXPECT_EQ(report.joint_constraint_count, kInstanceCount * kStepCount);
     EXPECT_EQ(report.drive_constraint_count, kInstanceCount * kStepCount);
     EXPECT_GE(report.constraint_row_count, kInstanceCount * kStepCount * 6u);
+    EXPECT_EQ(report.row_scheduler_report.row_kind,
+              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.row_layout,
+              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+    EXPECT_EQ(report.row_scheduler_report.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+    EXPECT_EQ(report.row_scheduler_report.configured_iterations,
+              options.solver_velocity_iterations);
+    EXPECT_EQ(report.row_scheduler_report.executed_iterations,
+              options.solver_velocity_iterations * kStepCount);
+    EXPECT_GE(report.row_scheduler_report.active_row_count,
+              report.constraint_row_count / kStepCount);
+    EXPECT_GT(report.row_scheduler_report.normal_impulse_count, 0u);
+    EXPECT_TRUE(std::isfinite(report.row_scheduler_report.max_residual));
     EXPECT_LT(ms, 1000) << "CUDA batched joint/drive solve took " << ms << " ms";
 }

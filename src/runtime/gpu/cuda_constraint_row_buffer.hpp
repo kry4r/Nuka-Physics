@@ -11,6 +11,7 @@ namespace nuka::runtime::gpu {
 enum class CudaConstraintRowBufferKind : uint32_t {
     Unknown = 0u,
     ParticleRigidCoupling = 1u,
+    RigidConstraintBlock = 2u,
 };
 
 enum class CudaConstraintRowLayout : uint32_t {

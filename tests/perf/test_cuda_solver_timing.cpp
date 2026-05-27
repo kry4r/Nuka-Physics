@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <utility>
 
 using namespace nuka;
@@ -73,13 +74,20 @@ TEST(CudaSolverTiming, ContactAssemblyAndPgsUnderOneSecond) {
     config.position_iterations = 2u;
 
     solver::gpu::CudaConstraintSolverReport last_report;
+    uint32_t observed_normal_impulse_count = 0u;
+    float observed_normal_delta_impulse_magnitude = 0.0f;
     const auto start = std::chrono::high_resolution_clock::now();
     for (int iteration = 0; iteration < kIterationCount; ++iteration) {
         auto broadphase = collision::gpu::BuildCudaBroadphase(device_world);
         auto contacts = constraint::gpu::GenerateCudaContacts(device_world, broadphase);
         auto result = solver::gpu::SolveCudaConstraints(device_world, &contacts, config);
+        const auto report = result.DownloadReport();
+        observed_normal_impulse_count +=
+            report.row_scheduler_report.normal_impulse_count;
+        observed_normal_delta_impulse_magnitude +=
+            report.row_scheduler_report.normal_delta_impulse_magnitude;
         if (iteration == kIterationCount - 1) {
-            last_report = result.DownloadReport();
+            last_report = report;
         }
     }
     const auto end = std::chrono::high_resolution_clock::now();
@@ -89,5 +97,20 @@ TEST(CudaSolverTiming, ContactAssemblyAndPgsUnderOneSecond) {
     EXPECT_GE(last_report.constraint_row_count, static_cast<uint32_t>(kBoxCount * 3));
     EXPECT_EQ(last_report.velocity_iterations, config.velocity_iterations);
     EXPECT_EQ(last_report.position_iterations, config.position_iterations);
+    EXPECT_EQ(last_report.row_scheduler_report.row_kind,
+              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+    EXPECT_EQ(last_report.row_scheduler_report.row_layout,
+              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+    EXPECT_EQ(last_report.row_scheduler_report.schedule_mode,
+              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+    EXPECT_EQ(last_report.row_scheduler_report.configured_iterations,
+              config.velocity_iterations);
+    EXPECT_EQ(last_report.row_scheduler_report.executed_iterations,
+              config.velocity_iterations);
+    EXPECT_GE(last_report.row_scheduler_report.active_row_count,
+              last_report.constraint_row_count);
+    EXPECT_GT(observed_normal_impulse_count, 0u);
+    EXPECT_GT(observed_normal_delta_impulse_magnitude, 0.0f);
+    EXPECT_TRUE(std::isfinite(last_report.row_scheduler_report.max_residual));
     EXPECT_LT(ms, 1000) << "CUDA contact solver pipeline took " << ms << " ms";
 }
