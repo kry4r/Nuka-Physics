@@ -7,7 +7,7 @@
 #include "phi/capabilities.hpp"
 #include "phi/device.hpp"
 #include "phi/buffer.hpp"
-#include "phi/stream.hpp"
+#include "phi/owned_stream.hpp"
 
 #include <cstring>
 #include <vector>
@@ -62,20 +62,20 @@ TEST(PhiBuffer, MoveSemantics) {
     EXPECT_EQ(a.Size(), 0u);
 }
 
-// ---- Stream --------------------------------------------------------------
+// ---- Owned stream --------------------------------------------------------
 
-TEST(PhiStream, CreateAndSync) {
-    nuka::phi::Stream stream;
-    EXPECT_NE(stream.NativeHandle(), nullptr);
+TEST(PhiOwnedStream, CreateAndSync) {
+    nuka::phi::OwnedStream stream;
+    EXPECT_NE(stream.Native(), nullptr);
     EXPECT_NO_THROW(stream.Synchronize());
 }
 
-TEST(PhiStream, MoveSemantics) {
-    nuka::phi::Stream a;
-    void* handle = a.NativeHandle();
+TEST(PhiOwnedStream, MoveSemantics) {
+    nuka::phi::OwnedStream a;
+    auto* handle = a.Native();
     EXPECT_NE(handle, nullptr);
 
-    nuka::phi::Stream b(std::move(a));
-    EXPECT_EQ(b.NativeHandle(), handle);
-    EXPECT_EQ(a.NativeHandle(), nullptr);
+    nuka::phi::OwnedStream b(std::move(a));
+    EXPECT_EQ(b.Native(), handle);
+    EXPECT_EQ(a.Native(), nullptr);
 }

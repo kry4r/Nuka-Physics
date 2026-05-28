@@ -29,6 +29,7 @@ using runtime::gpu::CudaConstraintRowScheduleMode;
 using runtime::gpu::SetCudaConstraintRowSchedulerMetadata;
 
 struct RigidConstraintBlockSchedulerInput {
+    cudaStream_t stream = nullptr;
     CudaConstraintRowBufferView row_buffer;
     CudaConstraintRowSchedulerConfig config;
     uint32_t body_count = 0u;
@@ -952,7 +953,7 @@ void RunCudaRigidConstraintBlockScheduler(
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t blocks_grid =
         (input.block_capacity + kBlockSize - 1u) / kBlockSize;
-    PrecomputeBlocksKernel<<<blocks_grid, kBlockSize>>>(
+    PrecomputeBlocksKernel<<<blocks_grid, kBlockSize, 0, input.stream>>>(
         input.body_count,
         input.blocks,
         input.block_count,
@@ -962,7 +963,7 @@ void RunCudaRigidConstraintBlockScheduler(
         input.angular_velocities);
     CheckCuda(cudaGetLastError(), "PrecomputeBlocksKernel launch");
 
-    SetRigidSchedulerMetadataKernel<<<1, 1>>>(
+    SetRigidSchedulerMetadataKernel<<<1, 1, 0, input.stream>>>(
         input.row_buffer,
         input.config,
         input.report);
@@ -973,7 +974,7 @@ void RunCudaRigidConstraintBlockScheduler(
     }
 
     for (uint32_t iter = 0; iter < input.config.iterations; ++iter) {
-        SolveVelocityIterationKernel<<<1, 1>>>(
+        SolveVelocityIterationKernel<<<1, 1, 0, input.stream>>>(
             input.body_count,
             input.blocks,
             input.block_count,
@@ -992,6 +993,7 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
                       phi::Buffer& blocks,
                       phi::Buffer& block_count,
                       phi::Buffer& report,
+                      cudaStream_t stream,
                       const CudaConstraintSolverConfig& config) {
     if (block_capacity == 0u || device_world.BodyCount() == 0u) {
         return;
@@ -1014,6 +1016,7 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
     scheduler_config.reduce_diagnostics = true;
 
     RigidConstraintBlockSchedulerInput scheduler_input;
+    scheduler_input.stream = stream;
     scheduler_input.row_buffer = row_buffer;
     scheduler_input.config = scheduler_config;
     scheduler_input.body_count = device_world.BodyCount();
@@ -1029,7 +1032,7 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
     RunCudaRigidConstraintBlockScheduler(scheduler_input);
 
     for (uint32_t iter = 0; iter < config.position_iterations; ++iter) {
-        SolveContactPositionIterationKernel<<<1, 1>>>(
+        SolveContactPositionIterationKernel<<<1, 1, 0, stream>>>(
             device_world.BodyCount(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
             static_cast<const uint32_t*>(block_count.Data()),
@@ -1041,7 +1044,7 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
             static_cast<CudaConstraintSolverReport*>(report.Data()));
         CheckCuda(cudaGetLastError(), "SolveContactPositionIterationKernel launch");
 
-        SolveJointPositionIterationKernel<<<1, 1>>>(
+        SolveJointPositionIterationKernel<<<1, 1, 0, stream>>>(
             device_world.BodyCount(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
             static_cast<const uint32_t*>(block_count.Data()),
@@ -1054,7 +1057,7 @@ void RunSolverKernels(runtime::gpu::DeviceWorld& device_world,
         CheckCuda(cudaGetLastError(), "SolveJointPositionIterationKernel launch");
     }
 
-    SetIterationReportKernel<<<1, 1>>>(
+    SetIterationReportKernel<<<1, 1, 0, stream>>>(
         config.velocity_iterations,
         config.position_iterations,
         static_cast<CudaConstraintSolverReport*>(report.Data()));
@@ -1115,9 +1118,12 @@ const uint32_t* CudaConstraintSolverResult::DeviceBlockCount() const {
 }
 
 CudaConstraintSolverResult SolveCudaConstraints(
+    const phi::DeviceContext& context,
     runtime::gpu::DeviceWorld& device_world,
     const constraint::gpu::CudaContactResult* contacts,
     const CudaConstraintSolverConfig& config) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error(
             "SolveCudaConstraints requires UploadDeviceState before solving");
@@ -1131,7 +1137,7 @@ CudaConstraintSolverResult SolveCudaConstraints(
     phi::Buffer block_count(sizeof(uint32_t), phi::MemoryKind::Device);
     phi::Buffer report(sizeof(CudaConstraintSolverReport), phi::MemoryKind::Device);
 
-    ClearAssemblyKernel<<<1, 1>>>(
+    ClearAssemblyKernel<<<1, 1, 0, stream>>>(
         static_cast<uint32_t*>(block_count.Data()),
         static_cast<CudaConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "ClearAssemblyKernel launch");
@@ -1140,7 +1146,7 @@ CudaConstraintSolverResult SolveCudaConstraints(
     if (contacts != nullptr && contacts->PairSlotCount() > 0u) {
         const uint32_t contact_blocks =
             (contacts->PairSlotCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleContactBlocksKernel<<<contact_blocks, kBlockSize>>>(
+        AssembleContactBlocksKernel<<<contact_blocks, kBlockSize, 0, stream>>>(
             contacts->PairSlotCount(),
             contacts->DeviceManifolds(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
@@ -1150,7 +1156,7 @@ CudaConstraintSolverResult SolveCudaConstraints(
 
     if (device_world.JointCount() > 0u) {
         const uint32_t joint_blocks = (device_world.JointCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleJointBlocksKernel<<<joint_blocks, kBlockSize>>>(
+        AssembleJointBlocksKernel<<<joint_blocks, kBlockSize, 0, stream>>>(
             device_world.JointCount(),
             device_world.DeviceJointTypes(),
             device_world.DeviceJointParentBodies(),
@@ -1166,7 +1172,7 @@ CudaConstraintSolverResult SolveCudaConstraints(
     if (device_world.ActuatorCount() > 0u) {
         const uint32_t actuator_blocks =
             (device_world.ActuatorCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleDriveBlocksKernel<<<actuator_blocks, kBlockSize>>>(
+        AssembleDriveBlocksKernel<<<actuator_blocks, kBlockSize, 0, stream>>>(
             device_world.ActuatorCount(),
             device_world.JointCount(),
             device_world.DeviceActuatorJointIds(),
@@ -1181,14 +1187,14 @@ CudaConstraintSolverResult SolveCudaConstraints(
         CheckCuda(cudaGetLastError(), "AssembleDriveBlocksKernel launch");
     }
 
-    FinalizeAssemblyReportKernel<<<1, 1>>>(
+    FinalizeAssemblyReportKernel<<<1, 1, 0, stream>>>(
         static_cast<constraint::ConstraintBlock*>(blocks.Data()),
         static_cast<const uint32_t*>(block_count.Data()),
         static_cast<CudaConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "FinalizeAssemblyReportKernel launch");
 
-    RunSolverKernels(device_world, block_capacity, blocks, block_count, report, config);
-    CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    RunSolverKernels(device_world, block_capacity, blocks, block_count, report, stream, config);
+    context.stream.Synchronize();
 
     return CudaConstraintSolverResult(block_capacity,
                                       std::move(blocks),
@@ -1197,9 +1203,12 @@ CudaConstraintSolverResult SolveCudaConstraints(
 }
 
 CudaConstraintSolverResult SolveCudaConstraintBlocks(
+    const phi::DeviceContext& context,
     runtime::gpu::DeviceWorld& device_world,
     const std::vector<constraint::ConstraintBlock>& host_blocks,
     const CudaConstraintSolverConfig& config) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error(
             "SolveCudaConstraintBlocks requires UploadDeviceState before solving");
@@ -1217,7 +1226,7 @@ CudaConstraintSolverResult SolveCudaConstraintBlocks(
     }
     block_count.CopyFromHost(&block_capacity, sizeof(block_capacity));
 
-    ClearAssemblyKernel<<<1, 1>>>(
+    ClearAssemblyKernel<<<1, 1, 0, stream>>>(
         static_cast<uint32_t*>(block_count.Data()),
         static_cast<CudaConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "ClearAssemblyKernel launch");
@@ -1226,19 +1235,35 @@ CudaConstraintSolverResult SolveCudaConstraintBlocks(
                             host_blocks.size() * sizeof(constraint::ConstraintBlock));
         block_count.CopyFromHost(&block_capacity, sizeof(block_capacity));
     }
-    FinalizeAssemblyReportKernel<<<1, 1>>>(
+    FinalizeAssemblyReportKernel<<<1, 1, 0, stream>>>(
         static_cast<constraint::ConstraintBlock*>(blocks.Data()),
         static_cast<const uint32_t*>(block_count.Data()),
         static_cast<CudaConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "FinalizeAssemblyReportKernel launch");
 
-    RunSolverKernels(device_world, block_capacity, blocks, block_count, report, config);
-    CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    RunSolverKernels(device_world, block_capacity, blocks, block_count, report, stream, config);
+    context.stream.Synchronize();
 
     return CudaConstraintSolverResult(block_capacity,
                                       std::move(blocks),
                                       std::move(block_count),
                                       std::move(report));
+}
+
+CudaConstraintSolverResult SolveCudaConstraints(
+    runtime::gpu::DeviceWorld& device_world,
+    const constraint::gpu::CudaContactResult* contacts,
+    const CudaConstraintSolverConfig& config) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return SolveCudaConstraints(context, device_world, contacts, config);
+}
+
+CudaConstraintSolverResult SolveCudaConstraintBlocks(
+    runtime::gpu::DeviceWorld& device_world,
+    const std::vector<constraint::ConstraintBlock>& host_blocks,
+    const CudaConstraintSolverConfig& config) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return SolveCudaConstraintBlocks(context, device_world, host_blocks, config);
 }
 
 } // namespace nuka::solver::gpu

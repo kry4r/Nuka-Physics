@@ -470,8 +470,11 @@ std::vector<float> BatchedCudaLidarResult::DownloadDepths() const {
     return DownloadVector<float>(depths_, total_ray_count_);
 }
 
-CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
+CudaImuResult QueryCudaImuSensor(const phi::DeviceContext& context,
+                                 const runtime::gpu::DeviceWorld& device_world,
                                  const std::vector<scene::BodyId>& body_ids) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error("QueryCudaImuSensor requires uploaded DeviceWorld state");
     }
@@ -483,7 +486,7 @@ CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
     if (sample_count > 0u) {
         constexpr uint32_t kBlockSize = 128u;
         const uint32_t grid = (sample_count + kBlockSize - 1u) / kBlockSize;
-        QueryImuKernel<<<grid, kBlockSize>>>(
+        QueryImuKernel<<<grid, kBlockSize, 0, stream>>>(
             sample_count,
             static_cast<const scene::BodyId*>(body_id_buffer.Data()),
             device_world.BodyCount(),
@@ -493,14 +496,23 @@ CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
             device_world.DeviceInvMasses(),
             static_cast<CudaImuSample*>(sample_buffer.Data()));
         CheckCuda(cudaGetLastError(), "QueryImuKernel launch");
-        CheckCuda(cudaDeviceSynchronize(), "QueryImuKernel synchronize");
+        context.stream.Synchronize();
     }
 
     return CudaImuResult(sample_count, std::move(sample_buffer));
 }
 
-CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_world,
+CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
+                                 const std::vector<scene::BodyId>& body_ids) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return QueryCudaImuSensor(context, device_world, body_ids);
+}
+
+CudaLidarResult QueryCudaLidarSensor(const phi::DeviceContext& context,
+                                     const runtime::gpu::DeviceWorld& device_world,
                                      const CudaLidarOptions& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error("QueryCudaLidarSensor requires uploaded DeviceWorld state");
     }
@@ -509,7 +521,7 @@ CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_wor
     if (options.ray_count > 0u) {
         constexpr uint32_t kBlockSize = 128u;
         const uint32_t grid = (options.ray_count + kBlockSize - 1u) / kBlockSize;
-        QueryLidarKernel<<<grid, kBlockSize>>>(
+        QueryLidarKernel<<<grid, kBlockSize, 0, stream>>>(
             options.ray_count,
             options.origin,
             options.direction,
@@ -525,15 +537,24 @@ CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_wor
             device_world.DevicePoses(),
             static_cast<float*>(depth_buffer.Data()));
         CheckCuda(cudaGetLastError(), "QueryLidarKernel launch");
-        CheckCuda(cudaDeviceSynchronize(), "QueryLidarKernel synchronize");
+        context.stream.Synchronize();
     }
 
     return CudaLidarResult(options.ray_count, std::move(depth_buffer));
 }
 
+CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_world,
+                                     const CudaLidarOptions& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return QueryCudaLidarSensor(context, device_world, options);
+}
+
 CudaImuResult QueryBatchedCudaImuSensor(
+    const phi::DeviceContext& context,
     const runtime::gpu::BatchedDeviceWorld& batch,
     const std::vector<BatchedCudaBodyRequest>& body_requests) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!batch.HasUploadedState()) {
         throw std::runtime_error(
             "QueryBatchedCudaImuSensor requires uploaded BatchedDeviceWorld state");
@@ -546,7 +567,7 @@ CudaImuResult QueryBatchedCudaImuSensor(
     if (sample_count > 0u) {
         constexpr uint32_t kBlockSize = 128u;
         const uint32_t grid = (sample_count + kBlockSize - 1u) / kBlockSize;
-        QueryBatchedImuKernel<<<grid, kBlockSize>>>(
+        QueryBatchedImuKernel<<<grid, kBlockSize, 0, stream>>>(
             sample_count,
             static_cast<const BatchedCudaBodyRequest*>(request_buffer.Data()),
             batch.InstanceCount(),
@@ -557,15 +578,25 @@ CudaImuResult QueryBatchedCudaImuSensor(
             batch.DeviceInvMasses(),
             static_cast<CudaImuSample*>(sample_buffer.Data()));
         CheckCuda(cudaGetLastError(), "QueryBatchedImuKernel launch");
-        CheckCuda(cudaDeviceSynchronize(), "QueryBatchedImuKernel synchronize");
+        context.stream.Synchronize();
     }
 
     return CudaImuResult(sample_count, std::move(sample_buffer));
 }
 
+CudaImuResult QueryBatchedCudaImuSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaBodyRequest>& body_requests) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return QueryBatchedCudaImuSensor(context, batch, body_requests);
+}
+
 BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
+    const phi::DeviceContext& context,
     const runtime::gpu::BatchedDeviceWorld& batch,
     const std::vector<BatchedCudaLidarOptions>& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!batch.HasUploadedState() || !batch.HasUploadedShapeTables()) {
         throw std::runtime_error(
             "QueryBatchedCudaLidarSensor requires uploaded BatchedDeviceWorld state and shape tables");
@@ -585,7 +616,7 @@ BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
     if (total_ray_count > 0u) {
         constexpr uint32_t kBlockSize = 128u;
         const uint32_t grid = (total_ray_count + kBlockSize - 1u) / kBlockSize;
-        QueryBatchedLidarKernel<<<grid, kBlockSize>>>(
+        QueryBatchedLidarKernel<<<grid, kBlockSize, 0, stream>>>(
             total_ray_count,
             query_count,
             static_cast<const BatchedCudaLidarOptions*>(option_buffer.Data()),
@@ -601,13 +632,20 @@ BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
             batch.DevicePoses(),
             static_cast<float*>(depth_buffer.Data()));
         CheckCuda(cudaGetLastError(), "QueryBatchedLidarKernel launch");
-        CheckCuda(cudaDeviceSynchronize(), "QueryBatchedLidarKernel synchronize");
+        context.stream.Synchronize();
     }
 
     return BatchedCudaLidarResult(query_count,
                                   total_ray_count,
                                   std::move(offset_buffer),
                                   std::move(depth_buffer));
+}
+
+BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaLidarOptions>& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return QueryBatchedCudaLidarSensor(context, batch, options);
 }
 
 } // namespace nuka::sensor::gpu

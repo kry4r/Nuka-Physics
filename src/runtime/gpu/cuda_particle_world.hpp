@@ -5,6 +5,7 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/gpu/device_world.hpp"
 
@@ -191,12 +192,23 @@ private:
     phi::Buffer coupling_rows_;
 };
 
+CudaParticleWorld UploadCudaParticleWorld(const phi::DeviceContext& context,
+                                          const CudaParticleSet& particles);
 CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles);
 
+CudaParticleStepReport StepCudaParticleWorld(
+    const phi::DeviceContext& context,
+    CudaParticleWorld& particle_world,
+    const CudaParticleStepOptions& options = {});
 CudaParticleStepReport StepCudaParticleWorld(
     CudaParticleWorld& particle_world,
     const CudaParticleStepOptions& options = {});
 
+CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
+    const phi::DeviceContext& context,
+    CudaParticleWorld& particle_world,
+    DeviceWorld& device_world,
+    const CudaParticleDeviceWorldCouplingOptions& options = {});
 CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
     CudaParticleWorld& particle_world,
     DeviceWorld& device_world,

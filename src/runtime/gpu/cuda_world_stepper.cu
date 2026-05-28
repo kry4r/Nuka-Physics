@@ -93,8 +93,11 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 } // namespace
 
-CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
+CudaWorldStepReport StepCudaWorld(const phi::DeviceContext& context,
+                                  DeviceWorld& device_world,
                                   const CudaWorldStepOptions& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     CudaWorldStepReport report;
     report.body_count = device_world.BodyCount();
 
@@ -112,7 +115,7 @@ CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
         (device_world.BodyCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0; step < options.step_count; ++step) {
-        IntegrateRigidBodiesKernel<<<block_count, kBlockSize>>>(
+        IntegrateRigidBodiesKernel<<<block_count, kBlockSize, 0, stream>>>(
             device_world.BodyCount(),
             device_world.DevicePoses(),
             device_world.DeviceLinearVelocities(),
@@ -129,9 +132,15 @@ CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
         ++report.kernel_launch_count;
     }
 
-    CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    context.stream.Synchronize();
     report.simulated_step_count = options.step_count;
     return report;
+}
+
+CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
+                                  const CudaWorldStepOptions& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return StepCudaWorld(context, device_world, options);
 }
 
 } // namespace nuka::runtime::gpu

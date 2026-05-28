@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
@@ -23,6 +24,9 @@ struct CudaWorldStepReport {
     uint32_t kernel_launch_count = 0;
 };
 
+CudaWorldStepReport StepCudaWorld(const phi::DeviceContext& context,
+                                  DeviceWorld& device_world,
+                                  const CudaWorldStepOptions& options = {});
 CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
                                   const CudaWorldStepOptions& options = {});
 

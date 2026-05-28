@@ -6,6 +6,7 @@
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
@@ -49,6 +50,8 @@ private:
     phi::Buffer pair_count_;
 };
 
+CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
+                                         const runtime::gpu::DeviceWorld& device_world);
 CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device_world);
 
 } // namespace nuka::collision::gpu

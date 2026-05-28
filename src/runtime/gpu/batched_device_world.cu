@@ -1949,6 +1949,7 @@ void ValidateInstanceShape(const WorldTemplate& world_template,
 
 bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
                                        const CudaBatchedWorldStepOptions& options,
+                                       cudaStream_t stream,
                                        CudaBatchedWorldStepReport* report) {
     if (options.enable_contacts || (!options.enable_joints && !options.enable_drives)) {
         return false;
@@ -1976,12 +1977,13 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
                               phi::MemoryKind::Device);
     phi::Buffer max_position_errors(batch.InstanceCount() * sizeof(float),
                                     phi::MemoryKind::Device);
-    CheckCuda(cudaMemset(max_position_errors.Data(),
-                         0,
-                         batch.InstanceCount() * sizeof(float)),
+    CheckCuda(cudaMemsetAsync(max_position_errors.Data(),
+                              0,
+                              batch.InstanceCount() * sizeof(float),
+                              stream),
               "StepBatchedJointDriveOnlyFastPath clear position errors");
 
-    ClearBatchedSolverReportKernel<<<1, 1>>>(
+    ClearBatchedSolverReportKernel<<<1, 1, 0, stream>>>(
         nullptr,
         static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
     CheckCuda(cudaGetLastError(), "ClearBatchedSolverReportKernel launch");
@@ -1989,7 +1991,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         MakeBatchedRigidConstraintRowBuffer(blocks.Data(), block_capacity);
     const auto scheduler_config =
         MakeBatchedConstraintRowSchedulerConfig(options.solver_velocity_iterations);
-    SetBatchedSchedulerMetadataKernel<<<1, 1>>>(
+    SetBatchedSchedulerMetadataKernel<<<1, 1, 0, stream>>>(
         row_buffer,
         scheduler_config,
         static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
@@ -1999,7 +2001,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
     if (options.enable_joints && batch.TotalJointCount() > 0u) {
         const uint32_t joint_blocks =
             (batch.TotalJointCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedJointBlocksDirectKernel<<<joint_blocks, kBlockSize>>>(
+        AssembleBatchedJointBlocksDirectKernel<<<joint_blocks, kBlockSize, 0, stream>>>(
             batch.TotalJointCount(),
             batch.JointCountPerInstance(),
             batch.BodyCountPerInstance(),
@@ -2016,7 +2018,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
     if (options.enable_drives && batch.TotalActuatorCount() > 0u) {
         const uint32_t drive_blocks =
             (batch.TotalActuatorCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedDriveBlocksDirectKernel<<<drive_blocks, kBlockSize>>>(
+        AssembleBatchedDriveBlocksDirectKernel<<<drive_blocks, kBlockSize, 0, stream>>>(
             batch.TotalActuatorCount(),
             batch.ActuatorCountPerInstance(),
             batch.JointCountPerInstance(),
@@ -2033,7 +2035,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksDirectKernel launch");
     }
 
-    FinalizeBatchedFixedBlockReportKernel<<<1, 1>>>(
+    FinalizeBatchedFixedBlockReportKernel<<<1, 1, 0, stream>>>(
         block_capacity,
         static_cast<const constraint::ConstraintBlock*>(blocks.Data()),
         static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
@@ -2060,7 +2062,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
     const uint32_t instance_blocks =
         (batch.InstanceCount() + kBodyBlockSize - 1u) / kBodyBlockSize;
     for (uint32_t step = 0; step < options.step_count; ++step) {
-        IntegrateBatchedRigidBodiesKernel<<<body_blocks, kBodyBlockSize>>>(
+        IntegrateBatchedRigidBodiesKernel<<<body_blocks, kBodyBlockSize, 0, stream>>>(
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
             batch.DevicePoses(),
@@ -2076,7 +2078,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         CheckCuda(cudaGetLastError(), "IntegrateBatchedRigidBodiesKernel launch");
         ++report->kernel_launch_count;
 
-        SolveBatchedJointDriveStepKernel<<<instance_blocks, kBodyBlockSize>>>(
+        SolveBatchedJointDriveStepKernel<<<instance_blocks, kBodyBlockSize, 0, stream>>>(
             batch.InstanceCount(),
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
@@ -2096,7 +2098,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
             static_cast<float*>(max_position_errors.Data()));
         CheckCuda(cudaGetLastError(), "SolveBatchedJointDriveStepKernel launch");
 
-        ReduceBatchedFixedBlockSchedulerDiagnosticsKernel<<<1, 1>>>(
+        ReduceBatchedFixedBlockSchedulerDiagnosticsKernel<<<1, 1, 0, stream>>>(
             batch.TotalBodyCount(),
             block_capacity,
             static_cast<const constraint::ConstraintBlock*>(blocks.Data()),
@@ -2109,7 +2111,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
                   "ReduceBatchedFixedBlockSchedulerDiagnosticsKernel launch");
     }
 
-    CheckCuda(cudaDeviceSynchronize(), "StepBatchedJointDriveOnlyFastPath synchronize");
+    CheckCuda(cudaStreamSynchronize(stream), "StepBatchedJointDriveOnlyFastPath synchronize");
     solver_report.CopyToHost(&setup_report, sizeof(setup_report));
     report->row_scheduler_report = setup_report.row_scheduler_report;
     const auto position_errors =
@@ -2491,8 +2493,10 @@ const float* BatchedDeviceWorld::DeviceActuatorForceLimits() const {
 }
 
 BatchedDeviceWorld UploadBatchedDeviceWorld(
+    const phi::DeviceContext& context,
     const WorldTemplate& world_template,
     const std::vector<WorldInstance>& instances) {
+    phi::ScopedDeviceGuard guard(context.device_id);
     for (const auto& instance : instances) {
         ValidateInstanceShape(world_template, instance);
     }
@@ -2620,8 +2624,18 @@ BatchedDeviceWorld UploadBatchedDeviceWorld(
                               UploadVector(torques));
 }
 
+BatchedDeviceWorld UploadBatchedDeviceWorld(
+    const WorldTemplate& world_template,
+    const std::vector<WorldInstance>& instances) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return UploadBatchedDeviceWorld(context, world_template, instances);
+}
+
 CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
+    const phi::DeviceContext& context,
     const BatchedDeviceWorld& batch) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!batch.HasUploadedState() || !batch.HasUploadedShapeTables()) {
         throw std::runtime_error(
             "BuildBatchedCudaBroadphase requires uploaded batched state and shape tables");
@@ -2641,9 +2655,11 @@ CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
                                       phi::MemoryKind::Device);
     phi::Buffer active_flags(total_pair_slot_count * sizeof(uint8_t), phi::MemoryKind::Device);
     phi::Buffer pair_count(sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemset(pair_count.Data(), 0, sizeof(uint32_t)), "cudaMemset batched pair count");
+    CheckCuda(cudaMemsetAsync(pair_count.Data(), 0, sizeof(uint32_t), stream),
+              "cudaMemsetAsync batched pair count");
 
     if (total_shape_count == 0u) {
+        context.stream.Synchronize();
         return CudaBatchedBroadphaseResult(instance_count,
                                           shape_count,
                                           pair_slot_count,
@@ -2656,7 +2672,7 @@ CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
 
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t shape_blocks = (total_shape_count + kBlockSize - 1u) / kBlockSize;
-    GenerateBatchedAabbsKernel<<<shape_blocks, kBlockSize>>>(
+    GenerateBatchedAabbsKernel<<<shape_blocks, kBlockSize, 0, stream>>>(
         total_shape_count,
         shape_count,
         batch.BodyCountPerInstance(),
@@ -2672,7 +2688,7 @@ CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
     if (total_pair_slot_count > 0u) {
         const uint32_t pair_blocks =
             (total_pair_slot_count + kBlockSize - 1u) / kBlockSize;
-        GenerateBatchedPairSlotsKernel<<<pair_blocks, kBlockSize>>>(
+        GenerateBatchedPairSlotsKernel<<<pair_blocks, kBlockSize, 0, stream>>>(
             total_pair_slot_count,
             pair_slot_count,
             shape_count,
@@ -2684,6 +2700,7 @@ CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
         CheckCuda(cudaGetLastError(), "GenerateBatchedPairSlotsKernel launch");
     }
 
+    context.stream.Synchronize();
     return CudaBatchedBroadphaseResult(instance_count,
                                       shape_count,
                                       pair_slot_count,
@@ -2694,9 +2711,18 @@ CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
                                       std::move(pair_count));
 }
 
+CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
+    const BatchedDeviceWorld& batch) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return BuildBatchedCudaBroadphase(context, batch);
+}
+
 CudaBatchedContactResult GenerateBatchedCudaContacts(
+    const phi::DeviceContext& context,
     const BatchedDeviceWorld& batch,
     const CudaBatchedBroadphaseResult& broadphase) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!batch.HasUploadedState() || !batch.HasUploadedShapeTables()) {
         throw std::runtime_error(
             "GenerateBatchedCudaContacts requires uploaded batched state and shape tables");
@@ -2707,20 +2733,21 @@ CudaBatchedContactResult GenerateBatchedCudaContacts(
         phi::MemoryKind::Device);
     phi::Buffer report(sizeof(CudaBatchedContactReport), phi::MemoryKind::Device);
 
-    InitializeBatchedContactReportKernel<<<1, 1>>>(
+    InitializeBatchedContactReportKernel<<<1, 1, 0, stream>>>(
         batch.InstanceCount(),
         broadphase.DevicePairCount(),
         static_cast<CudaBatchedContactReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "InitializeBatchedContactReportKernel launch");
 
     if (broadphase.TotalPairSlotCount() == 0u) {
+        context.stream.Synchronize();
         return CudaBatchedContactResult(0u, std::move(manifolds), std::move(report));
     }
 
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t blocks =
         (broadphase.TotalPairSlotCount() + kBlockSize - 1u) / kBlockSize;
-    GenerateBatchedContactsKernel<<<blocks, kBlockSize>>>(
+    GenerateBatchedContactsKernel<<<blocks, kBlockSize, 0, stream>>>(
         broadphase.TotalPairSlotCount(),
         batch.ShapeCountPerInstance(),
         batch.BodyCountPerInstance(),
@@ -2737,25 +2764,37 @@ CudaBatchedContactResult GenerateBatchedCudaContacts(
         static_cast<CudaBatchedContactManifold*>(manifolds.Data()));
     CheckCuda(cudaGetLastError(), "GenerateBatchedContactsKernel launch");
 
-    CountBatchedContactsKernel<<<blocks, kBlockSize>>>(
+    CountBatchedContactsKernel<<<blocks, kBlockSize, 0, stream>>>(
         broadphase.TotalPairSlotCount(),
         static_cast<CudaBatchedContactManifold*>(manifolds.Data()),
         static_cast<CudaBatchedContactReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "CountBatchedContactsKernel launch");
 
+    context.stream.Synchronize();
     return CudaBatchedContactResult(broadphase.TotalPairSlotCount(),
                                    std::move(manifolds),
                                    std::move(report));
 }
 
+CudaBatchedContactResult GenerateBatchedCudaContacts(
+    const BatchedDeviceWorld& batch,
+    const CudaBatchedBroadphaseResult& broadphase) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return GenerateBatchedCudaContacts(context, batch, broadphase);
+}
+
 namespace {
 
 CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
+    const phi::DeviceContext& context,
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult* contacts,
     bool include_joints,
     bool include_drives,
     const CudaBatchedConstraintSolverConfig& config) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    (void)guard;
+    const cudaStream_t stream = context.stream.Native();
     if (!batch.HasUploadedState()) {
         throw std::runtime_error(
             "SolveBatchedCudaConstraints requires uploaded batched state");
@@ -2779,7 +2818,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     phi::Buffer block_count(sizeof(uint32_t), phi::MemoryKind::Device);
     phi::Buffer report(sizeof(CudaBatchedConstraintSolverReport), phi::MemoryKind::Device);
 
-    ClearBatchedSolverReportKernel<<<1, 1>>>(
+    ClearBatchedSolverReportKernel<<<1, 1, 0, stream>>>(
         static_cast<uint32_t*>(block_count.Data()),
         static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "ClearBatchedSolverReportKernel launch");
@@ -2788,7 +2827,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     if (contacts != nullptr && contacts->TotalPairSlotCount() > 0u) {
         const uint32_t contact_blocks =
             (contacts->TotalPairSlotCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedContactBlocksKernel<<<contact_blocks, kBlockSize>>>(
+        AssembleBatchedContactBlocksKernel<<<contact_blocks, kBlockSize, 0, stream>>>(
             contacts->TotalPairSlotCount(),
             batch.BodyCountPerInstance(),
             contacts->DeviceManifolds(),
@@ -2800,7 +2839,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     if (include_joints && batch.TotalJointCount() > 0u) {
         const uint32_t joint_blocks =
             (batch.TotalJointCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedJointBlocksKernel<<<joint_blocks, kBlockSize>>>(
+        AssembleBatchedJointBlocksKernel<<<joint_blocks, kBlockSize, 0, stream>>>(
             batch.TotalJointCount(),
             batch.JointCountPerInstance(),
             batch.BodyCountPerInstance(),
@@ -2818,7 +2857,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     if (include_drives && batch.TotalActuatorCount() > 0u) {
         const uint32_t drive_blocks =
             (batch.TotalActuatorCount() + kBlockSize - 1u) / kBlockSize;
-        AssembleBatchedDriveBlocksKernel<<<drive_blocks, kBlockSize>>>(
+        AssembleBatchedDriveBlocksKernel<<<drive_blocks, kBlockSize, 0, stream>>>(
             batch.TotalActuatorCount(),
             batch.ActuatorCountPerInstance(),
             batch.JointCountPerInstance(),
@@ -2835,7 +2874,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
         CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksKernel launch");
     }
 
-    FinalizeBatchedSolverReportKernel<<<1, 1>>>(
+    FinalizeBatchedSolverReportKernel<<<1, 1, 0, stream>>>(
         static_cast<constraint::ConstraintBlock*>(blocks.Data()),
         static_cast<const uint32_t*>(block_count.Data()),
         static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
@@ -2846,14 +2885,14 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             MakeBatchedRigidConstraintRowBuffer(blocks.Data(), block_capacity);
         const auto scheduler_config =
             MakeBatchedConstraintRowSchedulerConfig(config.velocity_iterations);
-        SetBatchedSchedulerMetadataKernel<<<1, 1>>>(
+        SetBatchedSchedulerMetadataKernel<<<1, 1, 0, stream>>>(
             row_buffer,
             scheduler_config,
             static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
         CheckCuda(cudaGetLastError(), "SetBatchedSchedulerMetadataKernel launch");
 
         const uint32_t blocks_grid = (block_capacity + kBlockSize - 1u) / kBlockSize;
-        PrecomputeBatchedBlocksKernel<<<blocks_grid, kBlockSize>>>(
+        PrecomputeBatchedBlocksKernel<<<blocks_grid, kBlockSize, 0, stream>>>(
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
             static_cast<constraint::ConstraintBlock*>(blocks.Data()),
@@ -2865,7 +2904,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
         CheckCuda(cudaGetLastError(), "PrecomputeBatchedBlocksKernel launch");
 
         for (uint32_t iter = 0; iter < config.velocity_iterations; ++iter) {
-            SolveBatchedVelocityIterationKernel<<<1, 1>>>(
+            SolveBatchedVelocityIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
                 static_cast<constraint::ConstraintBlock*>(blocks.Data()),
@@ -2880,7 +2919,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
         }
 
         for (uint32_t iter = 0; iter < config.position_iterations; ++iter) {
-            SolveBatchedContactPositionIterationKernel<<<1, 1>>>(
+            SolveBatchedContactPositionIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
                 static_cast<constraint::ConstraintBlock*>(blocks.Data()),
@@ -2893,7 +2932,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
                 static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
             CheckCuda(cudaGetLastError(), "SolveBatchedContactPositionIterationKernel launch");
 
-            SolveBatchedJointPositionIterationKernel<<<1, 1>>>(
+            SolveBatchedJointPositionIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
                 static_cast<constraint::ConstraintBlock*>(blocks.Data()),
@@ -2908,12 +2947,12 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
         }
     }
 
-    SetBatchedSolverIterationReportKernel<<<1, 1>>>(
+    SetBatchedSolverIterationReportKernel<<<1, 1, 0, stream>>>(
         config.velocity_iterations,
         config.position_iterations,
         static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "SetBatchedSolverIterationReportKernel launch");
-    CheckCuda(cudaDeviceSynchronize(), "SolveBatchedCudaConstraints synchronize");
+    context.stream.Synchronize();
 
     return CudaBatchedConstraintSolverResult(block_capacity,
                                             std::move(blocks),
@@ -2924,26 +2963,48 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
 } // namespace
 
 CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
+    const phi::DeviceContext& context,
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult& contacts,
     const CudaBatchedConstraintSolverConfig& config) {
-    return SolveBatchedCudaConstraintsImpl(batch, &contacts, false, false, config);
+    return SolveBatchedCudaConstraintsImpl(context, batch, &contacts, false, false, config);
 }
 
 CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
+    const phi::DeviceContext& context,
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult* contacts,
     const CudaBatchedConstraintSolverConfig& config) {
-    return SolveBatchedCudaConstraintsImpl(batch,
+    return SolveBatchedCudaConstraintsImpl(context,
+                                           batch,
                                            contacts,
                                            true,
                                            config.velocity_iterations > 0u,
                                            config);
 }
 
+CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult& contacts,
+    const CudaBatchedConstraintSolverConfig& config) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return SolveBatchedCudaContactConstraints(context, batch, contacts, config);
+}
+
+CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult* contacts,
+    const CudaBatchedConstraintSolverConfig& config) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return SolveBatchedCudaConstraints(context, batch, contacts, config);
+}
+
 CudaBatchedWorldStepReport StepBatchedCudaWorld(
+    const phi::DeviceContext& context,
     BatchedDeviceWorld& batch,
     const CudaBatchedWorldStepOptions& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     CudaBatchedWorldStepReport report;
     report.instance_count = batch.InstanceCount();
     report.body_count_per_instance = batch.BodyCountPerInstance();
@@ -2959,7 +3020,7 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
             "StepBatchedCudaWorld requires uploaded BatchedDeviceWorld state");
     }
 
-    if (StepBatchedJointDriveOnlyFastPath(batch, options, &report)) {
+    if (StepBatchedJointDriveOnlyFastPath(batch, options, stream, &report)) {
         return report;
     }
 
@@ -2967,7 +3028,7 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
     const uint32_t block_count = (batch.TotalBodyCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0; step < options.step_count; ++step) {
-        IntegrateBatchedRigidBodiesKernel<<<block_count, kBlockSize>>>(
+        IntegrateBatchedRigidBodiesKernel<<<block_count, kBlockSize, 0, stream>>>(
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
             batch.DevicePoses(),
@@ -2992,9 +3053,10 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
             config.baumgarte = options.solver_baumgarte;
 
             if (options.enable_contacts) {
-                auto broadphase = BuildBatchedCudaBroadphase(batch);
-                auto contacts = GenerateBatchedCudaContacts(batch, broadphase);
-                auto solver = SolveBatchedCudaConstraintsImpl(batch,
+                auto broadphase = BuildBatchedCudaBroadphase(context, batch);
+                auto contacts = GenerateBatchedCudaContacts(context, batch, broadphase);
+                auto solver = SolveBatchedCudaConstraintsImpl(context,
+                                                              batch,
                                                               &contacts,
                                                               options.enable_joints,
                                                               options.enable_drives,
@@ -3020,7 +3082,8 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
                 continue;
             }
 
-            auto solver = SolveBatchedCudaConstraintsImpl(batch,
+            auto solver = SolveBatchedCudaConstraintsImpl(context,
+                                                          batch,
                                                           nullptr,
                                                           options.enable_joints,
                                                           options.enable_drives,
@@ -3040,9 +3103,16 @@ CudaBatchedWorldStepReport StepBatchedCudaWorld(
         }
     }
 
-    CheckCuda(cudaDeviceSynchronize(), "IntegrateBatchedRigidBodiesKernel synchronize");
+    context.stream.Synchronize();
     report.simulated_step_count = options.step_count;
     return report;
+}
+
+CudaBatchedWorldStepReport StepBatchedCudaWorld(
+    BatchedDeviceWorld& batch,
+    const CudaBatchedWorldStepOptions& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return StepBatchedCudaWorld(context, batch, options);
 }
 
 } // namespace nuka::runtime::gpu

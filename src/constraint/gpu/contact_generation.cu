@@ -408,8 +408,11 @@ const CudaContactReport* CudaContactResult::DeviceReport() const {
 }
 
 CudaContactResult GenerateCudaContacts(
+    const phi::DeviceContext& context,
     const runtime::gpu::DeviceWorld& device_world,
     const collision::gpu::CudaBroadphaseResult& broadphase) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error(
             "GenerateCudaContacts requires UploadDeviceState before generating CUDA contacts");
@@ -420,18 +423,19 @@ CudaContactResult GenerateCudaContacts(
         phi::MemoryKind::Device);
     phi::Buffer report(sizeof(CudaContactReport), phi::MemoryKind::Device);
 
-    InitializeContactReportKernel<<<1, 1>>>(
+    InitializeContactReportKernel<<<1, 1, 0, stream>>>(
         broadphase.DevicePairCount(),
         static_cast<CudaContactReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "InitializeContactReportKernel launch");
 
     if (broadphase.PairSlotCount() == 0u) {
+        context.stream.Synchronize();
         return CudaContactResult(0u, std::move(manifolds), std::move(report));
     }
 
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t blocks = (broadphase.PairSlotCount() + kBlockSize - 1u) / kBlockSize;
-    GenerateContactsKernel<<<blocks, kBlockSize>>>(
+    GenerateContactsKernel<<<blocks, kBlockSize, 0, stream>>>(
         broadphase.PairSlotCount(),
         broadphase.DevicePairs(),
         broadphase.DevicePairActiveFlags(),
@@ -444,15 +448,23 @@ CudaContactResult GenerateCudaContacts(
         device_world.DeviceShapeRadii(),
         static_cast<constraint::ContactManifold*>(manifolds.Data()));
     CheckCuda(cudaGetLastError(), "GenerateContactsKernel launch");
-    CountGeneratedContactKernel<<<blocks, kBlockSize>>>(
+    CountGeneratedContactKernel<<<blocks, kBlockSize, 0, stream>>>(
         broadphase.PairSlotCount(),
         static_cast<constraint::ContactManifold*>(manifolds.Data()),
         static_cast<CudaContactReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "CountGeneratedContactKernel launch");
 
+    context.stream.Synchronize();
     return CudaContactResult(broadphase.PairSlotCount(),
                              std::move(manifolds),
                              std::move(report));
+}
+
+CudaContactResult GenerateCudaContacts(
+    const runtime::gpu::DeviceWorld& device_world,
+    const collision::gpu::CudaBroadphaseResult& broadphase) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return GenerateCudaContacts(context, device_world, broadphase);
 }
 
 } // namespace nuka::constraint::gpu

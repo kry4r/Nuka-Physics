@@ -5,6 +5,7 @@
 #include "runtime/gpu/device_world.hpp"
 
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 namespace nuka::runtime::gpu {
@@ -211,12 +212,19 @@ DeviceState DeviceWorld::DownloadState() const {
     return state;
 }
 
-void DeviceWorld::UploadState(const WorldInstance& instance) {
+void DeviceWorld::UploadState(const phi::DeviceContext& context,
+                              const WorldInstance& instance) {
+    phi::ScopedDeviceGuard guard(context.device_id);
     state_poses_ = UploadVector(instance.poses);
     state_linear_velocities_ = UploadVector(instance.linear_velocities);
     state_angular_velocities_ = UploadVector(instance.angular_velocities);
     state_forces_ = UploadVector(instance.forces);
     state_torques_ = UploadVector(instance.torques);
+}
+
+void DeviceWorld::UploadState(const WorldInstance& instance) {
+    auto context = phi::MakeDefaultDeviceContext();
+    UploadState(context, instance);
 }
 
 math::Transform* DeviceWorld::DevicePoses() {
@@ -331,7 +339,9 @@ const float* DeviceWorld::DeviceActuatorForceLimits() const {
     return static_cast<const float*>(actuator_force_limits_.Data());
 }
 
-DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
+DeviceWorld UploadDeviceWorld(const phi::DeviceContext& context,
+                              const WorldTemplate& world_template) {
+    phi::ScopedDeviceGuard guard(context.device_id);
     const auto shape_types =
         DefaultedCopy(world_template.shape_table.types,
                       world_template.shape_count,
@@ -423,8 +433,20 @@ DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
         UploadVector(actuator_force_limits));
 }
 
+DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return UploadDeviceWorld(context, world_template);
+}
+
+void UploadDeviceState(const phi::DeviceContext& context,
+                       DeviceWorld& device_world,
+                       const WorldInstance& instance) {
+    device_world.UploadState(context, instance);
+}
+
 void UploadDeviceState(DeviceWorld& device_world, const WorldInstance& instance) {
-    device_world.UploadState(instance);
+    auto context = phi::MakeDefaultDeviceContext();
+    UploadDeviceState(context, device_world, instance);
 }
 
 } // namespace nuka::runtime::gpu

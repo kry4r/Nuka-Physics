@@ -6,6 +6,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/world_instance.hpp"
 #include "runtime/world_template.hpp"
 #include "scene/canonical_types.hpp"
@@ -94,6 +95,7 @@ public:
     DeviceStateSnapshot DownloadStateSnapshot() const;
     DeviceState DownloadState() const;
 
+    void UploadState(const phi::DeviceContext& context, const WorldInstance& instance);
     void UploadState(const WorldInstance& instance);
 
     math::Transform* DevicePoses();
@@ -157,7 +159,12 @@ private:
     phi::Buffer state_torques_;
 };
 
+DeviceWorld UploadDeviceWorld(const phi::DeviceContext& context,
+                              const WorldTemplate& world_template);
 DeviceWorld UploadDeviceWorld(const WorldTemplate& world_template);
+void UploadDeviceState(const phi::DeviceContext& context,
+                       DeviceWorld& device_world,
+                       const WorldInstance& instance);
 void UploadDeviceState(DeviceWorld& device_world, const WorldInstance& instance);
 
 } // namespace nuka::runtime::gpu

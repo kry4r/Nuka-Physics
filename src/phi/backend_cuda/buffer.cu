@@ -1,14 +1,12 @@
 // ---------------------------------------------------------------------------
-// PHI CUDA backend – Buffer and Stream implementation
+// PHI CUDA backend - Buffer implementation
 // ---------------------------------------------------------------------------
 
 #include "phi/buffer.hpp"
-#include "phi/stream.hpp"
 
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace nuka::phi {
 
@@ -100,55 +98,6 @@ void Buffer::CopyToHost(void* dst, size_t bytes) const {
         throw std::runtime_error(std::string("CopyToHost failed: ") +
                                  cudaGetErrorString(err));
     }
-}
-
-// ===========================================================================
-// Stream
-// ===========================================================================
-
-Stream::Stream() {
-    cudaStream_t stream = nullptr;
-    cudaError_t err = cudaStreamCreate(&stream);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("cudaStreamCreate failed: ") +
-                                 cudaGetErrorString(err));
-    }
-    handle_ = static_cast<void*>(stream);
-}
-
-Stream::~Stream() {
-    if (handle_) {
-        cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
-    }
-}
-
-Stream::Stream(Stream&& other) noexcept : handle_(other.handle_) {
-    other.handle_ = nullptr;
-}
-
-Stream& Stream::operator=(Stream&& other) noexcept {
-    if (this != &other) {
-        if (handle_) {
-            cudaStreamDestroy(static_cast<cudaStream_t>(handle_));
-        }
-        handle_ = other.handle_;
-        other.handle_ = nullptr;
-    }
-    return *this;
-}
-
-void Stream::Synchronize() {
-    if (handle_) {
-        cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(handle_));
-        if (err != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") +
-                                     cudaGetErrorString(err));
-        }
-    }
-}
-
-void* Stream::NativeHandle() {
-    return handle_;
 }
 
 } // namespace nuka::phi

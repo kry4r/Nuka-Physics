@@ -5,6 +5,7 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/batched_device_world.hpp"
 #include "runtime/gpu/device_world.hpp"
 
@@ -104,16 +105,30 @@ private:
     phi::Buffer depths_;
 };
 
+CudaImuResult QueryCudaImuSensor(const phi::DeviceContext& context,
+                                 const runtime::gpu::DeviceWorld& device_world,
+                                 const std::vector<scene::BodyId>& body_ids);
 CudaImuResult QueryCudaImuSensor(const runtime::gpu::DeviceWorld& device_world,
                                  const std::vector<scene::BodyId>& body_ids);
 
+CudaLidarResult QueryCudaLidarSensor(const phi::DeviceContext& context,
+                                     const runtime::gpu::DeviceWorld& device_world,
+                                     const CudaLidarOptions& options);
 CudaLidarResult QueryCudaLidarSensor(const runtime::gpu::DeviceWorld& device_world,
                                      const CudaLidarOptions& options);
 
 CudaImuResult QueryBatchedCudaImuSensor(
+    const phi::DeviceContext& context,
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaBodyRequest>& body_requests);
+CudaImuResult QueryBatchedCudaImuSensor(
     const runtime::gpu::BatchedDeviceWorld& batch,
     const std::vector<BatchedCudaBodyRequest>& body_requests);
 
+BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
+    const phi::DeviceContext& context,
+    const runtime::gpu::BatchedDeviceWorld& batch,
+    const std::vector<BatchedCudaLidarOptions>& options);
 BatchedCudaLidarResult QueryBatchedCudaLidarSensor(
     const runtime::gpu::BatchedDeviceWorld& batch,
     const std::vector<BatchedCudaLidarOptions>& options);

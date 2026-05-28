@@ -6,6 +6,7 @@
 #include "constraint/constraint_block.hpp"
 #include "constraint/gpu/contact_generation.cuh"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/gpu/device_world.hpp"
 
@@ -61,10 +62,20 @@ private:
 };
 
 CudaConstraintSolverResult SolveCudaConstraints(
+    const phi::DeviceContext& context,
+    runtime::gpu::DeviceWorld& device_world,
+    const constraint::gpu::CudaContactResult* contacts,
+    const CudaConstraintSolverConfig& config = {});
+CudaConstraintSolverResult SolveCudaConstraints(
     runtime::gpu::DeviceWorld& device_world,
     const constraint::gpu::CudaContactResult* contacts,
     const CudaConstraintSolverConfig& config = {});
 
+CudaConstraintSolverResult SolveCudaConstraintBlocks(
+    const phi::DeviceContext& context,
+    runtime::gpu::DeviceWorld& device_world,
+    const std::vector<constraint::ConstraintBlock>& blocks,
+    const CudaConstraintSolverConfig& config = {});
 CudaConstraintSolverResult SolveCudaConstraintBlocks(
     runtime::gpu::DeviceWorld& device_world,
     const std::vector<constraint::ConstraintBlock>& blocks,

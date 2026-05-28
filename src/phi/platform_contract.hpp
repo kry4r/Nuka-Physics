@@ -26,8 +26,6 @@ struct PlatformContract {
     int cuda_device_id = 0;
 };
 
-PlatformContract GetPlatformContract();
-
 struct BackendSelectionRequest {
     BackendSelectionPolicy policy = BackendSelectionPolicy::PreferCuda;
     int cuda_device_id = 0;
@@ -41,5 +39,7 @@ struct BackendSelectionResult {
 };
 
 BackendSelectionResult ResolvePhysicsBackend(const BackendSelectionRequest& request);
+BackendSelectionResult ResolvePhysicsBackend(const BackendSelectionRequest& request,
+                                             const PlatformContract& contract);
 
 } // namespace nuka::phi

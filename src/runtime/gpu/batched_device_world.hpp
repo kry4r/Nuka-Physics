@@ -10,6 +10,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/world_instance.hpp"
 #include "runtime/world_template.hpp"
@@ -313,26 +314,51 @@ private:
 };
 
 BatchedDeviceWorld UploadBatchedDeviceWorld(
+    const phi::DeviceContext& context,
+    const WorldTemplate& world_template,
+    const std::vector<WorldInstance>& instances);
+BatchedDeviceWorld UploadBatchedDeviceWorld(
     const WorldTemplate& world_template,
     const std::vector<WorldInstance>& instances);
 
 CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
+    const phi::DeviceContext& context,
+    const BatchedDeviceWorld& batch);
+CudaBatchedBroadphaseResult BuildBatchedCudaBroadphase(
     const BatchedDeviceWorld& batch);
 
+CudaBatchedContactResult GenerateBatchedCudaContacts(
+    const phi::DeviceContext& context,
+    const BatchedDeviceWorld& batch,
+    const CudaBatchedBroadphaseResult& broadphase);
 CudaBatchedContactResult GenerateBatchedCudaContacts(
     const BatchedDeviceWorld& batch,
     const CudaBatchedBroadphaseResult& broadphase);
 
+CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
+    const phi::DeviceContext& context,
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult& contacts,
+    const CudaBatchedConstraintSolverConfig& config = {});
 CudaBatchedConstraintSolverResult SolveBatchedCudaContactConstraints(
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult& contacts,
     const CudaBatchedConstraintSolverConfig& config = {});
 
 CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
+    const phi::DeviceContext& context,
+    BatchedDeviceWorld& batch,
+    const CudaBatchedContactResult* contacts,
+    const CudaBatchedConstraintSolverConfig& config = {});
+CudaBatchedConstraintSolverResult SolveBatchedCudaConstraints(
     BatchedDeviceWorld& batch,
     const CudaBatchedContactResult* contacts,
     const CudaBatchedConstraintSolverConfig& config = {});
 
+CudaBatchedWorldStepReport StepBatchedCudaWorld(
+    const phi::DeviceContext& context,
+    BatchedDeviceWorld& batch,
+    const CudaBatchedWorldStepOptions& options = {});
 CudaBatchedWorldStepReport StepBatchedCudaWorld(
     BatchedDeviceWorld& batch,
     const CudaBatchedWorldStepOptions& options = {});

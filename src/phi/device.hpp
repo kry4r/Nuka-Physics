@@ -19,7 +19,8 @@ int GetDeviceCount();
 /// Return information about the specified device (default: device 0).
 DeviceInfo GetDeviceInfo(int device_id = 0);
 
-/// Set the active CUDA device for the calling thread.
+/// Set the active CUDA device for the calling thread. Prefer ScopedDeviceGuard
+/// from phi/device_context.hpp at engine entry points.
 void SetDevice(int device_id);
 
 } // namespace nuka::phi

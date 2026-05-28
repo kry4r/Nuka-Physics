@@ -6,6 +6,7 @@
 #include "collision/gpu/broadphase.cuh"
 #include "constraint/contact_manifold.hpp"
 #include "phi/buffer.hpp"
+#include "phi/device_context.hpp"
 #include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
@@ -44,6 +45,10 @@ private:
     phi::Buffer report_;
 };
 
+CudaContactResult GenerateCudaContacts(
+    const phi::DeviceContext& context,
+    const runtime::gpu::DeviceWorld& device_world,
+    const collision::gpu::CudaBroadphaseResult& broadphase);
 CudaContactResult GenerateCudaContacts(
     const runtime::gpu::DeviceWorld& device_world,
     const collision::gpu::CudaBroadphaseResult& broadphase);

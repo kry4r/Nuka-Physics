@@ -8,6 +8,7 @@
 #include "runtime/world_stepper.hpp"
 #include "scene/cooker.hpp"
 
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <cmath>
 #include <stdexcept>
@@ -82,6 +83,44 @@ TEST(CudaWorldStepper, IntegratesGravityForceAndVelocityOnDevice) {
     EXPECT_FLOAT_EQ(snapshot.first_body_position.y, -0.5f);
     EXPECT_FLOAT_EQ(snapshot.first_body_position.z, 3.0f);
     EXPECT_EQ(snapshot.first_force, math::Vec3::Zero());
+}
+
+TEST(CudaWorldStepper, UsesCallerOwnedStreamFromDeviceContext) {
+    scene::SceneIR scene;
+
+    scene::RigidBodyRecord body;
+    body.name = "body";
+    body.mass = 1.0f;
+    body.local_transform.position = {0.0f, 4.0f, 0.0f};
+    scene.AddRigidBody(std::move(body));
+
+    const auto blob = scene::CookScene(scene);
+    auto world = runtime::BuildWorld(blob);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    {
+        const auto context = phi::MakeDeviceContext(0, stream);
+        auto device_world = runtime::gpu::UploadDeviceWorld(context, world.template_view);
+        runtime::gpu::UploadDeviceState(context, device_world, world.instance);
+
+        runtime::gpu::CudaWorldStepOptions options;
+        options.gravity = {0.0f, -10.0f, 0.0f};
+        options.dt = 0.25f;
+        options.step_count = 2;
+        options.clear_forces_after_step = true;
+
+        const auto report = runtime::gpu::StepCudaWorld(context, device_world, options);
+        const auto snapshot = device_world.DownloadStateSnapshot();
+
+        EXPECT_EQ(report.simulated_step_count, 2u);
+        EXPECT_EQ(report.kernel_launch_count, 2u);
+        EXPECT_FLOAT_EQ(snapshot.first_linear_velocity.y, -5.0f);
+        EXPECT_FLOAT_EQ(snapshot.first_body_position.y, 2.125f);
+        EXPECT_EQ(cudaStreamQuery(stream), cudaSuccess);
+    }
+    EXPECT_EQ(cudaStreamQuery(stream), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 TEST(CudaWorldStepper, MatchesCpuReferenceForFreeFallAndForces) {

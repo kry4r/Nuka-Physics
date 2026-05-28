@@ -9,6 +9,7 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "phi/device_context.hpp"
 #include "phi/platform_contract.hpp"
 #include "render/vulkan_renderer.hpp"
 #include "runtime/world_stepper.hpp"
@@ -296,11 +297,13 @@ std::vector<sensor::gpu::BatchedCudaBodyRequest> BuildBatchedImuRequests(
 }
 
 void StepCompiledSceneCuda(scene::CompiledScene& compiled,
+                           const phi::DeviceContext& context,
                            const SceneDemoOptions& options,
                            SceneDemoResult& result) {
     auto& runtime_world = compiled.physics.runtime_world;
-    auto device_world = runtime::gpu::UploadDeviceWorld(runtime_world.template_view);
-    runtime::gpu::UploadDeviceState(device_world, runtime_world.instance);
+    auto device_world =
+        runtime::gpu::UploadDeviceWorld(context, runtime_world.template_view);
+    runtime::gpu::UploadDeviceState(context, device_world, runtime_world.instance);
 
     runtime::gpu::CudaWorldStepOptions integration_options;
     integration_options.gravity = options.gravity;
@@ -315,12 +318,13 @@ void StepCompiledSceneCuda(scene::CompiledScene& compiled,
     solver_config.baumgarte = 0.2f;
 
     for (uint32_t step = 0; step < options.simulation_steps; ++step) {
-        runtime::gpu::StepCudaWorld(device_world, integration_options);
-        auto broadphase = collision::gpu::BuildCudaBroadphase(device_world);
-        auto contacts = constraint::gpu::GenerateCudaContacts(device_world, broadphase);
+        runtime::gpu::StepCudaWorld(context, device_world, integration_options);
+        auto broadphase = collision::gpu::BuildCudaBroadphase(context, device_world);
+        auto contacts =
+            constraint::gpu::GenerateCudaContacts(context, device_world, broadphase);
         const auto contact_report = contacts.DownloadReport();
         auto solver_result =
-            solver::gpu::SolveCudaConstraints(device_world, &contacts, solver_config);
+            solver::gpu::SolveCudaConstraints(context, device_world, &contacts, solver_config);
         const auto solver_report = solver_result.DownloadReport();
 
         result.cuda_broadphase_pair_count = contact_report.pair_count;
@@ -350,7 +354,8 @@ void StepCompiledSceneCuda(scene::CompiledScene& compiled,
         }
     }
     if (!imu_body_ids.empty()) {
-        const auto imu_result = sensor::gpu::QueryCudaImuSensor(device_world, imu_body_ids);
+        const auto imu_result =
+            sensor::gpu::QueryCudaImuSensor(context, device_world, imu_body_ids);
         const auto imu_samples = imu_result.DownloadSamples();
         result.cuda_imu_sample_count = imu_result.SampleCount();
         if (!imu_samples.empty()) {
@@ -413,6 +418,8 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     if (backend_selection.selected_backend == phi::PhysicsBackend::CpuReference) {
         RequireExplicitCpuReferenceValidation(options);
     }
+    const auto device_context =
+        phi::MakeDeviceContext(backend_selection.cuda_device_id, nullptr);
     result.physics_backend = backend_selection.selected_backend;
     result.production_physics_backend = backend_selection.production_backend;
 #else
@@ -428,7 +435,7 @@ SceneDemoResult ExportImportedSceneDebugView(const SceneDemoOptions& options) {
     if (options.simulation_steps > 0) {
         if (result.physics_backend == phi::PhysicsBackend::Cuda) {
 #if defined(NUKA_HAS_CUDA_RUNTIME)
-            StepCompiledSceneCuda(compiled, options, result);
+            StepCompiledSceneCuda(compiled, device_context, options, result);
 #else
             throw std::runtime_error("CUDA physics backend selected, but nuka_runtime_gpu is not built");
 #endif
@@ -552,11 +559,14 @@ BatchedSceneDemoResult ExportBatchedImportedSceneDebugView(
         throw std::runtime_error(
             "Batched scene demo requires CUDA production physics; CPU is reference-only");
     }
+    const auto device_context =
+        phi::MakeDeviceContext(backend_selection.cuda_device_id, nullptr);
 
     auto instances = BuildOffsetInstances(runtime_world.instance,
                                           options.instance_count,
                                           options.instance_spacing);
-    auto batch = runtime::gpu::UploadBatchedDeviceWorld(runtime_world.template_view,
+    auto batch = runtime::gpu::UploadBatchedDeviceWorld(device_context,
+                                                        runtime_world.template_view,
                                                         instances);
 
     runtime::gpu::CudaBatchedWorldStepOptions step_options;
@@ -572,14 +582,16 @@ BatchedSceneDemoResult ExportBatchedImportedSceneDebugView(
     step_options.solver_slop = 0.005f;
     step_options.solver_baumgarte = 0.2f;
 
-    const auto step_report = runtime::gpu::StepBatchedCudaWorld(batch, step_options);
+    const auto step_report =
+        runtime::gpu::StepBatchedCudaWorld(device_context, batch, step_options);
 
     const auto imu_requests = BuildBatchedImuRequests(compiled.physics.sensor_table,
                                                       options.instance_count);
     sensor::gpu::CudaImuResult imu_result;
     std::vector<sensor::gpu::CudaImuSample> imu_samples;
     if (!imu_requests.empty()) {
-        imu_result = sensor::gpu::QueryBatchedCudaImuSensor(batch, imu_requests);
+        imu_result =
+            sensor::gpu::QueryBatchedCudaImuSensor(device_context, batch, imu_requests);
         imu_samples = imu_result.DownloadSamples();
     }
 

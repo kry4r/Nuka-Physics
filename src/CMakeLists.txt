@@ -322,8 +322,11 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     add_library(nuka_phi STATIC
+        phi/device_context.cpp
+        phi/platform_contract.cpp
         phi/backend_cuda/device.cu
         phi/backend_cuda/buffer.cu
+        phi/backend_cuda/owned_stream.cu
     )
 
     target_include_directories(nuka_phi
@@ -338,7 +341,8 @@ if(CMAKE_CUDA_COMPILER)
 
     # Use CUDA-compatible warning flags (not the generic nuka_set_warnings)
     target_compile_options(nuka_phi PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /WX>
+        $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4 /permissive- /WX /wd4819>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
     )
 
     add_library(nuka_runtime_gpu STATIC

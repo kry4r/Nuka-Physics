@@ -50,6 +50,7 @@ struct CouplingRowDiagnostics {
 };
 
 struct ParticleRigidCouplingSchedulerInput {
+    cudaStream_t stream = nullptr;
     CudaConstraintRowBufferView row_buffer;
     CudaConstraintRowSchedulerConfig config;
     uint32_t particle_count = 0u;
@@ -1861,7 +1862,9 @@ const CudaParticleCouplingConstraintRow* CudaParticleWorld::DeviceCouplingRows()
     return static_cast<const CudaParticleCouplingConstraintRow*>(coupling_rows_.Data());
 }
 
-CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
+CudaParticleWorld UploadCudaParticleWorld(const phi::DeviceContext& context,
+                                          const CudaParticleSet& particles) {
+    phi::ScopedDeviceGuard guard(context.device_id);
     const auto count = particles.positions.size();
     if (particles.velocities.size() != count ||
         particles.inv_masses.size() != count ||
@@ -1898,8 +1901,16 @@ CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
                              UploadVector(coupling_rows));
 }
 
-CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
+CudaParticleWorld UploadCudaParticleWorld(const CudaParticleSet& particles) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return UploadCudaParticleWorld(context, particles);
+}
+
+CudaParticleStepReport StepCudaParticleWorld(const phi::DeviceContext& context,
+                                             CudaParticleWorld& particle_world,
                                              const CudaParticleStepOptions& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     CudaParticleStepReport report;
     report.particle_count = particle_world.ParticleCount();
 
@@ -1922,7 +1933,7 @@ CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
         (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0u; step < options.step_count; ++step) {
-        IntegrateAndCoupleParticlesKernel<<<block_count, kBlockSize>>>(
+        IntegrateAndCoupleParticlesKernel<<<block_count, kBlockSize, 0, stream>>>(
             particle_world.ParticleCount(),
             particle_world.DevicePositions(),
             particle_world.DeviceVelocities(),
@@ -1936,7 +1947,7 @@ CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
         CheckCuda(cudaGetLastError(), "IntegrateAndCoupleParticlesKernel launch");
         ++report.kernel_launch_count;
 
-        ReduceParticleDiagnosticsKernel<<<1u, kBlockSize>>>(
+        ReduceParticleDiagnosticsKernel<<<1u, kBlockSize, 0, stream>>>(
             particle_world.ParticleCount(),
             static_cast<const ParticleDiagnostics*>(diagnostics.Data()),
             static_cast<CudaParticleStepReport*>(report_buffer.Data()));
@@ -1944,11 +1955,17 @@ CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
         ++report.kernel_launch_count;
     }
 
-    CheckCuda(cudaDeviceSynchronize(), "StepCudaParticleWorld synchronize");
+    context.stream.Synchronize();
     report_buffer.CopyToHost(&report, sizeof(CudaParticleStepReport));
     report.simulated_step_count = options.step_count;
     report.kernel_launch_count = options.step_count * 2u;
     return report;
+}
+
+CudaParticleStepReport StepCudaParticleWorld(CudaParticleWorld& particle_world,
+                                             const CudaParticleStepOptions& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return StepCudaParticleWorld(context, particle_world, options);
 }
 
 void RunCudaParticleRigidCouplingScheduler(
@@ -1973,7 +1990,7 @@ void RunCudaParticleRigidCouplingScheduler(
         const bool apply_cached_impulses =
             input.config.enable_warm_start && iteration == 0u;
 
-        SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize>>>(
+        SolveParticleCouplingRowsKernel<<<row_block_count, kBlockSize, 0, input.stream>>>(
             input.particle_count,
             input.rows,
             input.particle_velocities,
@@ -1996,7 +2013,7 @@ void RunCudaParticleRigidCouplingScheduler(
         }
 
         if (input.config.reduce_diagnostics) {
-            ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize>>>(
+            ReduceCouplingRowDiagnosticsKernel<<<1u, kBlockSize, 0, input.stream>>>(
                 input.row_buffer.row_count,
                 input.diagnostics,
                 input.diagnostic_iteration_base + iteration,
@@ -2010,9 +2027,12 @@ void RunCudaParticleRigidCouplingScheduler(
 }
 
 CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
+    const phi::DeviceContext& context,
     CudaParticleWorld& particle_world,
     DeviceWorld& device_world,
     const CudaParticleDeviceWorldCouplingOptions& options) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     CudaParticleStepReport report;
     report.particle_count = particle_world.ParticleCount();
 
@@ -2048,7 +2068,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         (particle_world.ParticleCount() + kBlockSize - 1u) / kBlockSize;
 
     for (uint32_t step = 0u; step < options.step_count; ++step) {
-        IntegrateAndCoupleParticlesAgainstDeviceWorldKernel<<<block_count, kBlockSize>>>(
+        IntegrateAndCoupleParticlesAgainstDeviceWorldKernel<<<block_count, kBlockSize, 0, stream>>>(
             particle_world.ParticleCount(),
             particle_world.DevicePositions(),
             particle_world.DeviceVelocities(),
@@ -2081,7 +2101,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
                   "IntegrateAndCoupleParticlesAgainstDeviceWorldKernel launch");
         ++report.kernel_launch_count;
 
-        ReduceParticleDiagnosticsWithRigidKernel<<<1u, kBlockSize>>>(
+        ReduceParticleDiagnosticsWithRigidKernel<<<1u, kBlockSize, 0, stream>>>(
             particle_world.ParticleCount(),
             static_cast<const ParticleDiagnostics*>(diagnostics.Data()),
             step == 0u,
@@ -2096,6 +2116,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
             scheduler_config.reduce_diagnostics = true;
 
             ParticleRigidCouplingSchedulerInput scheduler_input;
+            scheduler_input.stream = stream;
             scheduler_input.row_buffer = row_buffer;
             scheduler_input.config = scheduler_config;
             scheduler_input.particle_count = particle_world.ParticleCount();
@@ -2122,7 +2143,7 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
         }
     }
 
-    CheckCuda(cudaDeviceSynchronize(), "StepCudaParticlesAgainstDeviceWorld synchronize");
+    context.stream.Synchronize();
     report_buffer.CopyToHost(&report, sizeof(CudaParticleStepReport));
     report.simulated_step_count = options.step_count;
     report.kernel_launch_count =
@@ -2145,6 +2166,14 @@ CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
     report.coupling_scheduler_report.diagnostic_launch_count =
         options.step_count * row_solver_iterations;
     return report;
+}
+
+CudaParticleStepReport StepCudaParticlesAgainstDeviceWorld(
+    CudaParticleWorld& particle_world,
+    DeviceWorld& device_world,
+    const CudaParticleDeviceWorldCouplingOptions& options) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return StepCudaParticlesAgainstDeviceWorld(context, particle_world, device_world, options);
 }
 
 } // namespace nuka::runtime::gpu

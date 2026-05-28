@@ -299,7 +299,14 @@ if(CMAKE_CUDA_COMPILER)
 
     add_executable(nuka_phi_test
         phi/test_capabilities.cpp
+        phi/test_device_context_per_handle.cpp
         phi/test_platform_contract.cpp
+        phi/test_stream_view_external.cpp
+    )
+
+    set_source_files_properties(
+        phi/test_stream_view_external.cpp
+        PROPERTIES LANGUAGE CUDA
     )
 
     target_link_libraries(nuka_phi_test

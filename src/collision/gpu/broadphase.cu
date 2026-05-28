@@ -252,7 +252,10 @@ std::vector<collision::CollisionPair> CudaBroadphaseResult::DownloadPairs() cons
     return active_pairs;
 }
 
-CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device_world) {
+CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
+                                         const runtime::gpu::DeviceWorld& device_world) {
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
     if (!device_world.HasUploadedState()) {
         throw std::runtime_error(
             "BuildCudaBroadphase requires UploadDeviceState before generating CUDA AABBs");
@@ -268,9 +271,11 @@ CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device
                       phi::MemoryKind::Device);
     phi::Buffer active_flags(pair_slot_count * sizeof(uint8_t), phi::MemoryKind::Device);
     phi::Buffer pair_count(sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemset(pair_count.Data(), 0, sizeof(uint32_t)), "cudaMemset pair count");
+    CheckCuda(cudaMemsetAsync(pair_count.Data(), 0, sizeof(uint32_t), stream),
+              "cudaMemsetAsync pair count");
 
     if (shape_count == 0u) {
+        context.stream.Synchronize();
         return CudaBroadphaseResult(0, 0,
                                     std::move(aabbs),
                                     std::move(pairs),
@@ -280,7 +285,7 @@ CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device
 
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t shape_blocks = (shape_count + kBlockSize - 1u) / kBlockSize;
-    GenerateAabbsKernel<<<shape_blocks, kBlockSize>>>(
+    GenerateAabbsKernel<<<shape_blocks, kBlockSize, 0, stream>>>(
         shape_count,
         device_world.DevicePoses(),
         device_world.DeviceShapeBodyIds(),
@@ -292,7 +297,7 @@ CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device
     CheckCuda(cudaGetLastError(), "GenerateAabbsKernel launch");
 
     if (pair_slot_count > 0u) {
-        GeneratePairSlotsKernel<<<shape_blocks, kBlockSize>>>(
+        GeneratePairSlotsKernel<<<shape_blocks, kBlockSize, 0, stream>>>(
             shape_count,
             static_cast<const collision::AABB*>(aabbs.Data()),
             static_cast<collision::CollisionPair*>(pairs.Data()),
@@ -301,12 +306,18 @@ CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device
         CheckCuda(cudaGetLastError(), "GeneratePairSlotsKernel launch");
     }
 
+    context.stream.Synchronize();
     return CudaBroadphaseResult(shape_count,
                                 pair_slot_count,
                                 std::move(aabbs),
                                 std::move(pairs),
                                 std::move(active_flags),
                                 std::move(pair_count));
+}
+
+CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device_world) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return BuildCudaBroadphase(context, device_world);
 }
 
 } // namespace nuka::collision::gpu
