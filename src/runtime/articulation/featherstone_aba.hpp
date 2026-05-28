@@ -10,6 +10,12 @@ namespace nuka::runtime::articulation {
 
 class FeatherstoneAba {
 public:
+    static void ApplyPositionDrives(const phi::DeviceContext& context,
+                                    ArticulationDeviceState state,
+                                    const float* drive_targets,
+                                    const float* drive_stiffness,
+                                    const float* drive_damping,
+                                    const float* drive_force_limits);
     static void ComputeAccelerations(const phi::DeviceContext& context,
                                      ArticulationDeviceState state,
                                      float gravity_z);

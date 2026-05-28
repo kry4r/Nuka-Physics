@@ -51,6 +51,8 @@ struct UsdPrim {
     std::string body_path;
     std::string axis_token = "Z";
     std::string nuka_type;
+    bool has_initial_position = false;
+    float initial_position = 0.0f;
     float lower_limit = -3.14159f;
     float upper_limit = 3.14159f;
     float gain = 1.0f;
@@ -213,6 +215,9 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseTokenValue(line, "nuka:type", prim.nuka_type);
     (void)ParseFloatValue(line, "physics:lowerLimit", prim.lower_limit);
     (void)ParseFloatValue(line, "physics:upperLimit", prim.upper_limit);
+    if (ParseFloatValue(line, "nuka:initialPosition", prim.initial_position)) {
+        prim.has_initial_position = true;
+    }
     (void)ParseFloatValue(line, "nuka:gain", prim.gain);
     (void)ParseFloatValue(line, "nuka:forceLimit", prim.force_limit);
     (void)ParseFloatValue(line, "nuka:sampleRate", prim.sample_rate_hz);
@@ -466,6 +471,9 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         joint.parent_body = parent_it->second;
         joint.child_body = child_it->second;
         joint.axis = AxisFromUsdToken(prim.axis_token);
+        if (prim.has_initial_position) {
+            joint.initial_position = prim.initial_position;
+        }
         joint.lower_limit = prim.lower_limit;
         joint.upper_limit = prim.upper_limit;
         const scene::JointId joint_id = scene.AddJoint(std::move(joint));

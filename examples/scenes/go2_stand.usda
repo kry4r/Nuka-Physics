@@ -42,7 +42,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.678
         float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
-        double3 xformOp:translate = (0.1934, 0.0465, 0.445)
+        double3 xformOp:translate = (0.1934, 0.0465, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -53,7 +53,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 1.152
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
-        double3 xformOp:translate = (0.1934, 0.142, 0.445)
+        double3 xformOp:translate = (0, 0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -64,7 +64,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.241352
         float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
-        double3 xformOp:translate = (0.1934, 0.142, 0.232)
+        double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Sphere "fl_foot_collision" (
@@ -82,7 +82,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.678
         float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
-        double3 xformOp:translate = (0.1934, -0.0465, 0.445)
+        double3 xformOp:translate = (0.1934, -0.0465, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -93,7 +93,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 1.152
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
-        double3 xformOp:translate = (0.1934, -0.142, 0.445)
+        double3 xformOp:translate = (0, -0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -104,7 +104,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.241352
         float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
-        double3 xformOp:translate = (0.1934, -0.142, 0.232)
+        double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Sphere "fr_foot_collision" (
@@ -122,7 +122,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.678
         float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
-        double3 xformOp:translate = (-0.1934, 0.0465, 0.445)
+        double3 xformOp:translate = (-0.1934, 0.0465, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -133,7 +133,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 1.152
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
-        double3 xformOp:translate = (-0.1934, 0.142, 0.445)
+        double3 xformOp:translate = (0, 0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -144,7 +144,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.241352
         float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
-        double3 xformOp:translate = (-0.1934, 0.142, 0.232)
+        double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Sphere "rl_foot_collision" (
@@ -162,7 +162,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.678
         float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
-        double3 xformOp:translate = (-0.1934, -0.0465, 0.445)
+        double3 xformOp:translate = (-0.1934, -0.0465, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -173,7 +173,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 1.152
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
-        double3 xformOp:translate = (-0.1934, -0.142, 0.445)
+        double3 xformOp:translate = (0, -0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
@@ -184,7 +184,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.241352
         float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
-        double3 xformOp:translate = (-0.1934, -0.142, 0.232)
+        double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Sphere "rr_foot_collision" (
@@ -202,6 +202,7 @@ def Xform "World"
         token physics:axis = "X"
         float physics:lowerLimit = -1.0472
         float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
     }
     def PhysicsRevoluteJoint "fl_thigh_joint"
     {
@@ -210,6 +211,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -1.5708
         float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
     }
     def PhysicsRevoluteJoint "fl_calf_joint"
     {
@@ -218,6 +220,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -2.7227
         float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
     }
 
     def PhysicsRevoluteJoint "fr_hip_joint"
@@ -227,6 +230,7 @@ def Xform "World"
         token physics:axis = "X"
         float physics:lowerLimit = -1.0472
         float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
     }
     def PhysicsRevoluteJoint "fr_thigh_joint"
     {
@@ -235,6 +239,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -1.5708
         float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
     }
     def PhysicsRevoluteJoint "fr_calf_joint"
     {
@@ -243,6 +248,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -2.7227
         float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
     }
 
     def PhysicsRevoluteJoint "rl_hip_joint"
@@ -252,6 +258,7 @@ def Xform "World"
         token physics:axis = "X"
         float physics:lowerLimit = -1.0472
         float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
     }
     def PhysicsRevoluteJoint "rl_thigh_joint"
     {
@@ -260,6 +267,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -1.5708
         float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
     }
     def PhysicsRevoluteJoint "rl_calf_joint"
     {
@@ -268,6 +276,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -2.7227
         float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
     }
 
     def PhysicsRevoluteJoint "rr_hip_joint"
@@ -277,6 +286,7 @@ def Xform "World"
         token physics:axis = "X"
         float physics:lowerLimit = -1.0472
         float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
     }
     def PhysicsRevoluteJoint "rr_thigh_joint"
     {
@@ -285,6 +295,7 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -1.5708
         float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
     }
     def PhysicsRevoluteJoint "rr_calf_joint"
     {
@@ -293,6 +304,92 @@ def Xform "World"
         token physics:axis = "Y"
         float physics:lowerLimit = -2.7227
         float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
+    }
+
+    def NukaActuator "fl_hip_hold"
+    {
+        rel nuka:joint = </World/fl_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fl_thigh_hold"
+    {
+        rel nuka:joint = </World/fl_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fl_calf_hold"
+    {
+        rel nuka:joint = </World/fl_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_hip_hold"
+    {
+        rel nuka:joint = </World/fr_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_thigh_hold"
+    {
+        rel nuka:joint = </World/fr_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_calf_hold"
+    {
+        rel nuka:joint = </World/fr_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_hip_hold"
+    {
+        rel nuka:joint = </World/rl_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_thigh_hold"
+    {
+        rel nuka:joint = </World/rl_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_calf_hold"
+    {
+        rel nuka:joint = </World/rl_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_hip_hold"
+    {
+        rel nuka:joint = </World/rr_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_thigh_hold"
+    {
+        rel nuka:joint = </World/rr_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_calf_hold"
+    {
+        rel nuka:joint = </World/rr_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
     }
 
     def Camera "track"

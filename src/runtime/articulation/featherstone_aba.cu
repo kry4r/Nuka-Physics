@@ -540,6 +540,25 @@ __global__ void IntegrateArticulationKernel(ArticulationDeviceState state, float
     state.q[link] += state.qdot[link] * dt;
 }
 
+__global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
+                                         const float* drive_targets,
+                                         const float* drive_stiffness,
+                                         const float* drive_damping,
+                                         const float* drive_force_limits) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count ||
+        state.joint_type[link] == ArticulationJointType::Fixed) {
+        return;
+    }
+    float tau = drive_stiffness[link] * (drive_targets[link] - state.q[link]) -
+                drive_damping[link] * state.qdot[link];
+    const float limit = drive_force_limits[link];
+    if (limit > 0.0f) {
+        tau = fminf(fmaxf(tau, -limit), limit);
+    }
+    state.tau[link] = tau;
+}
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -569,6 +588,32 @@ void LaunchFeatherstoneAbaKernels(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "AbaPass3AccelerationKernel launch");
 }
 
+void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
+                                     ArticulationDeviceState state,
+                                     const float* drive_targets,
+                                     const float* drive_stiffness,
+                                     const float* drive_damping,
+                                     const float* drive_force_limits) {
+    if (state.total_link_count == 0u ||
+        drive_targets == nullptr ||
+        drive_stiffness == nullptr ||
+        drive_damping == nullptr ||
+        drive_force_limits == nullptr) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    const uint32_t blocks = (state.total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+    ApplyPositionDriveKernel<<<blocks, kAbaBlockSize, 0u, stream>>>(
+        state,
+        drive_targets,
+        drive_stiffness,
+        drive_damping,
+        drive_force_limits);
+    CheckCuda(cudaGetLastError(), "ApplyPositionDriveKernel launch");
+}
+
 void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
                                         ArticulationDeviceState state,
                                         float dt) {
@@ -581,6 +626,20 @@ void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
     const uint32_t blocks = (state.total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
     IntegrateArticulationKernel<<<blocks, kAbaBlockSize, 0u, stream>>>(state, dt);
     CheckCuda(cudaGetLastError(), "IntegrateArticulationKernel launch");
+}
+
+void FeatherstoneAba::ApplyPositionDrives(const phi::DeviceContext& context,
+                                          ArticulationDeviceState state,
+                                          const float* drive_targets,
+                                          const float* drive_stiffness,
+                                          const float* drive_damping,
+                                          const float* drive_force_limits) {
+    LaunchApplyPositionDriveKernels(context,
+                                    state,
+                                    drive_targets,
+                                    drive_stiffness,
+                                    drive_damping,
+                                    drive_force_limits);
 }
 
 void FeatherstoneAba::ComputeAccelerations(const phi::DeviceContext& context,

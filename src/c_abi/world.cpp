@@ -8,6 +8,7 @@
 #include "scene/cooker.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -68,6 +69,85 @@ void SampleInvariants(WorldRecord& record, uint32_t step_index) {
                                     &record.last_invariant_violations);
 }
 
+float ClampDriveLimit(float limit) {
+    return limit > 0.0f ? limit : 0.0f;
+}
+
+float DefaultDriveDamping(float stiffness) {
+    return 2.0f * std::sqrt(std::max(stiffness, 0.0f));
+}
+
+void BuildHoldDriveTargets(WorldRecord& record) {
+    const auto link_count = record.articulation_host.TotalLinkCount();
+    record.drive_targets_host.assign(link_count, 0.0f);
+    record.drive_stiffness_host.assign(link_count, 0.0f);
+    record.drive_damping_host.assign(link_count, 0.0f);
+    record.drive_force_limits_host.assign(link_count, 0.0f);
+    if (link_count == 0u) {
+        return;
+    }
+
+    record.drive_targets_host = record.articulation_host.q;
+
+    const auto& actuator_table = record.world.template_view.actuator_table;
+    const auto& joint_table = record.world.template_view.joint_table;
+    for (uint32_t actuator = 0u;
+         actuator < record.world.template_view.actuator_count;
+         ++actuator) {
+        if (actuator >= actuator_table.joint_ids.size() ||
+            actuator >= actuator_table.types.size() ||
+            actuator_table.types[actuator] != scene::ActuatorType::Position) {
+            continue;
+        }
+        const scene::JointId joint = actuator_table.joint_ids[actuator];
+        if (joint >= joint_table.child_bodies.size()) {
+            continue;
+        }
+        const scene::BodyId child_body = joint_table.child_bodies[joint];
+        auto link_it = std::find(record.articulation_host.link_body.begin(),
+                                 record.articulation_host.link_body.end(),
+                                 child_body);
+        if (link_it == record.articulation_host.link_body.end()) {
+            continue;
+        }
+        const uint32_t link = static_cast<uint32_t>(
+            std::distance(record.articulation_host.link_body.begin(), link_it));
+        if (link >= link_count ||
+            record.articulation_host.joint_type[link] ==
+                runtime::articulation::ArticulationJointType::Fixed) {
+            continue;
+        }
+        const float gain = actuator < actuator_table.gains.size()
+            ? std::max(actuator_table.gains[actuator], 0.0f)
+            : 0.0f;
+        const float force_limit = actuator < actuator_table.force_limits.size()
+            ? ClampDriveLimit(actuator_table.force_limits[actuator])
+            : 0.0f;
+        if (gain > 0.0f) {
+            record.drive_stiffness_host[link] = gain;
+            record.drive_damping_host[link] = DefaultDriveDamping(gain);
+        }
+        if (force_limit > 0.0f) {
+            record.drive_force_limits_host[link] = force_limit;
+        }
+    }
+}
+
+void UploadHoldDriveTargets(WorldRecord& record) {
+    const auto upload = [](const std::vector<float>& values, phi::Buffer* out) {
+        if (values.empty()) {
+            *out = phi::Buffer();
+            return;
+        }
+        *out = phi::Buffer(values.size() * sizeof(float), phi::MemoryKind::Device);
+        out->CopyFromHost(values.data(), values.size() * sizeof(float));
+    };
+    upload(record.drive_targets_host, &record.drive_targets_device);
+    upload(record.drive_stiffness_host, &record.drive_stiffness_device);
+    upload(record.drive_damping_host, &record.drive_damping_device);
+    upload(record.drive_force_limits_host, &record.drive_force_limits_device);
+}
+
 nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
     if (step_count == 0u) {
         return NUKA_RESULT_OK;
@@ -86,6 +166,13 @@ nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
     }
 
     for (uint32_t step = 0u; step < step_count; ++step) {
+        runtime::articulation::FeatherstoneAba::ApplyPositionDrives(
+            record.device->context,
+            record.articulation_device.View(),
+            static_cast<const float*>(record.drive_targets_device.Data()),
+            static_cast<const float*>(record.drive_stiffness_device.Data()),
+            static_cast<const float*>(record.drive_damping_device.Data()),
+            static_cast<const float*>(record.drive_force_limits_device.Data()));
         runtime::articulation::FeatherstoneAba::ComputeAccelerations(
             record.device->context,
             record.articulation_device.View(),
@@ -172,6 +259,8 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                 record->world.template_view.articulations,
                 record->world.template_view.body_table);
         nuka::c_abi::SyncHostToInstance(record->articulation_host, &record->world.instance);
+        nuka::c_abi::BuildHoldDriveTargets(*record);
+        nuka::c_abi::UploadHoldDriveTargets(*record);
         nuka::c_abi::SampleInvariants(*record, record->simulated_step_count);
         if (!record->world.template_view.articulations.empty()) {
             record->articulation_device =

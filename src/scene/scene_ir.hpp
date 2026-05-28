@@ -52,6 +52,7 @@ struct JointRecord {
     float damping                          = 0.0f;
     float armature                         = 0.0f;
     float stiffness                        = 0.0f;
+    float initial_position                 = 0.0f;
 };
 
 struct SensorRecord {

@@ -27,6 +27,14 @@ struct WorldRecord {
     runtime::WorldStepOptions step_options;
     runtime::articulation::ArticulationHostState articulation_host;
     runtime::articulation::ArticulationDeviceBuffers articulation_device;
+    std::vector<float> drive_targets_host;
+    std::vector<float> drive_stiffness_host;
+    std::vector<float> drive_damping_host;
+    std::vector<float> drive_force_limits_host;
+    phi::Buffer drive_targets_device;
+    phi::Buffer drive_stiffness_device;
+    phi::Buffer drive_damping_device;
+    phi::Buffer drive_force_limits_device;
     phi::Buffer joint_position_buffer;
     phi::Buffer joint_velocity_buffer;
     uint32_t simulated_step_count = 0u;

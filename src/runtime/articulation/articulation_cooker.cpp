@@ -158,6 +158,7 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
                 topology.joint_axes.push_back(math::Vec3::UnitZ());
                 topology.parent_frames.push_back(math::Transform::Identity());
                 topology.child_frames.push_back(math::Transform::Identity());
+                topology.initial_positions.push_back(0.0f);
                 topology.joint_dampings.push_back(0.0f);
                 topology.joint_armatures.push_back(0.0f);
             } else {
@@ -175,6 +176,8 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
                     FrameOrIdentity(blob.joints.parent_frames, incoming_joint));
                 topology.child_frames.push_back(
                     FrameOrIdentity(blob.joints.child_frames, incoming_joint));
+                topology.initial_positions.push_back(
+                    FloatOrDefault(blob.joints.initial_positions, incoming_joint, 0.0f));
                 topology.joint_dampings.push_back(
                     FloatOrDefault(blob.joints.dampings, incoming_joint, 0.0f));
                 topology.joint_armatures.push_back(

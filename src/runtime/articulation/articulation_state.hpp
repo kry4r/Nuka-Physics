@@ -92,6 +92,7 @@ struct ArticulationCookedTopology {
     std::vector<math::Transform> child_frames;
     std::vector<math::Transform> local_poses;
     std::vector<math::Transform> inertial_frames;
+    std::vector<float> initial_positions;
     std::vector<float> joint_dampings;
     std::vector<float> joint_armatures;
     std::vector<float> masses;

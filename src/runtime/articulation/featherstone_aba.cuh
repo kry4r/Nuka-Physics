@@ -10,6 +10,12 @@ namespace nuka::runtime::articulation {
 void LaunchFeatherstoneAbaKernels(const phi::DeviceContext& context,
                                   ArticulationDeviceState state,
                                   float gravity_z);
+void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
+                                     ArticulationDeviceState state,
+                                     const float* drive_targets,
+                                     const float* drive_stiffness,
+                                     const float* drive_damping,
+                                     const float* drive_force_limits);
 void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
                                         ArticulationDeviceState state,
                                         float dt);

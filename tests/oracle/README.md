@@ -72,19 +72,21 @@ Generate the 5 s Go2 stand trajectory with:
 
 ```bash
 python3 tools/oracle/generate_mjx_golden.py \
-  --model .nuka-assets/mujoco_menagerie/unitree_go2/go2_mjx.xml \
+  --model examples/scenes/go2_stand.usda \
   --mode stand-trajectory \
   --steps 1200 \
   --dt 0.004166666666666667 \
   --out /tmp/go2_stand_5s.bin
 ```
 
-The 5 s stand trajectory uses a JIT-compiled `mjx.step` rollout and writes
-through a temporary file before atomically replacing the requested output path,
-so interrupted owner runs do not leave a partial candidate at the target path.
-Prefer a CUDA-enabled owner oracle environment for the approved golden run when
-available; the CPU JAX path is acceptable for candidate generation if it
-finishes locally.
+For ASCII USD stand scenes, the generator converts the authored v0.1 USD
+articulation into a temporary fixed-base MJCF, then uses MJX forward dynamics
+plus the same semi-implicit Euler update and explicit position-hold torque
+contract as the C ABI demo path. The script writes through a temporary file
+before atomically replacing the requested output path, so interrupted owner
+runs do not leave a partial candidate at the target path. Prefer a CUDA-enabled
+owner oracle environment for the approved golden run when available; the CPU
+JAX path is acceptable for candidate generation if it finishes locally.
 
 Validate the stand-trajectory candidate with:
 
@@ -93,8 +95,14 @@ python3 tools/oracle/validate_golden_candidate.py \
   --path /tmp/go2_stand_5s.bin \
   --kind joint-trajectory \
   --samples 1200 \
-  --model-name go2_mjx.xml
+  --model-name go2_stand.usda
 ```
+
+As of the current p07 implementation, the USD-derived stand candidate preflight
+passes against the CUDA C ABI demo trajectory when generated from
+`examples/scenes/go2_stand.usda`. AI agents still must not move
+`/tmp/go2_stand_5s.bin` into `tests/oracle/golden/**`; the owner must inspect
+and add the approved binary through Git LFS.
 
 Diff two candidate trajectories with:
 

@@ -306,10 +306,16 @@ ArticulationHostState BuildArticulationHostState(
             result.link_u_spatial.emplace_back();
             result.joint_motion_subspace.emplace_back();
             const scene::BodyId body = topology.link_bodies[local_link];
+            const math::Transform parent_frame =
+                local_link < topology.parent_frames.size()
+                    ? topology.parent_frames[local_link]
+                    : math::Transform::Identity();
             result.link_pose.push_back(PoseForBody(bodies, body));
             result.link_local_pose.push_back(LocalPoseForBody(bodies, body));
             result.link_inertial_frame.push_back(inertial_frame);
-            result.q.push_back(0.0f);
+            result.q.push_back(local_link < topology.initial_positions.size()
+                ? topology.initial_positions[local_link]
+                : 0.0f);
             result.qdot.push_back(0.0f);
             result.qddot.push_back(0.0f);
             result.tau.push_back(0.0f);
@@ -318,10 +324,6 @@ ArticulationHostState BuildArticulationHostState(
             result.joint_diagonal.push_back(0.0f);
             result.joint_force.push_back(0.0f);
             result.joint_axis.push_back(topology.joint_axes[local_link]);
-            const math::Transform parent_frame =
-                local_link < topology.parent_frames.size()
-                    ? topology.parent_frames[local_link]
-                    : math::Transform::Identity();
             result.parent_offset.push_back(parent_frame.position);
             result.joint_type.push_back(topology.joint_types[local_link]);
             result.parent_link.push_back(topology.parent_links[local_link]);

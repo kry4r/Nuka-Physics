@@ -32,6 +32,7 @@ struct CookedJointTable {
     std::vector<float>      upper_limits;
     std::vector<float>      dampings;
     std::vector<float>      armatures;
+    std::vector<float>      initial_positions;
 };
 
 struct CookedShapeTable {
