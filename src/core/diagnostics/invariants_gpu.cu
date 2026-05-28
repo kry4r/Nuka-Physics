@@ -1,0 +1,203 @@
+// ---------------------------------------------------------------------------
+// nuka::core::diagnostics - CUDA invariant reductions
+// ---------------------------------------------------------------------------
+
+#include "core/diagnostics/invariants_gpu.cuh"
+
+#include "phi/buffer.hpp"
+
+#include <cuda_runtime.h>
+
+#include <stdexcept>
+#include <string>
+
+namespace nuka::core::diagnostics::gpu {
+
+namespace {
+
+struct DeviceReductionSlot {
+    float energy = 0.0f;
+    math::Vec3 linear_momentum = {};
+    math::Vec3 angular_momentum = {};
+    uint32_t nan_inf_count = 0;
+    float max_speed = 0.0f;
+    float max_position_abs = 0.0f;
+};
+
+__device__ bool IsFinite(float value) {
+    return isfinite(value) != 0;
+}
+
+__device__ bool IsFinite(math::Vec3 value) {
+    return IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z);
+}
+
+__device__ bool IsFinite(math::Quat value) {
+    return IsFinite(value.w) && IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z);
+}
+
+__device__ float AbsMax(math::Vec3 value) {
+    return fmaxf(fabsf(value.x), fmaxf(fabsf(value.y), fabsf(value.z)));
+}
+
+__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
+    math::Vec3 result;
+    result.x = a.x + b.x;
+    result.y = a.y + b.y;
+    result.z = a.z + b.z;
+    return result;
+}
+
+__device__ float Dot(math::Vec3 a, math::Vec3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
+    math::Vec3 result;
+    result.x = a.y * b.z - a.z * b.y;
+    result.y = a.z * b.x - a.x * b.z;
+    result.z = a.x * b.y - a.y * b.x;
+    return result;
+}
+
+__global__ void ComputeRigidBodyInvariantKernel(
+    uint32_t body_count,
+    const math::Transform* poses,
+    const math::Vec3* linear_velocities,
+    const math::Vec3* angular_velocities,
+    const float* inverse_masses,
+    const math::Vec3* inverse_inertias,
+    math::Vec3 gravity,
+    DeviceReductionSlot* out_slot) {
+    extern __shared__ DeviceReductionSlot shared[];
+    const uint32_t tid = threadIdx.x;
+    DeviceReductionSlot local;
+
+    for (uint32_t index = tid; index < body_count; index += blockDim.x) {
+        const math::Transform pose = poses[index];
+        const math::Vec3 linear_velocity = linear_velocities[index];
+        const math::Vec3 angular_velocity = angular_velocities[index];
+        const float inv_mass = inverse_masses[index];
+        const math::Vec3 inv_inertia = inverse_inertias[index];
+
+        if (!IsFinite(pose.position) || !IsFinite(pose.rotation) ||
+            !IsFinite(linear_velocity) || !IsFinite(angular_velocity) ||
+            !IsFinite(inv_mass) || !IsFinite(inv_inertia)) {
+            ++local.nan_inf_count;
+            continue;
+        }
+
+        local.max_speed = fmaxf(local.max_speed,
+                                sqrtf(linear_velocity.x * linear_velocity.x +
+                                      linear_velocity.y * linear_velocity.y +
+                                      linear_velocity.z * linear_velocity.z));
+        local.max_position_abs = fmaxf(local.max_position_abs, AbsMax(pose.position));
+
+        if (inv_mass <= 0.0f) {
+            continue;
+        }
+
+        const float mass = 1.0f / inv_mass;
+        math::Vec3 momentum;
+        momentum.x = linear_velocity.x * mass;
+        momentum.y = linear_velocity.y * mass;
+        momentum.z = linear_velocity.z * mass;
+        local.linear_momentum = Add(local.linear_momentum, momentum);
+        local.angular_momentum = Add(local.angular_momentum, Cross(pose.position, momentum));
+
+        const float speed_sq = linear_velocity.x * linear_velocity.x +
+                               linear_velocity.y * linear_velocity.y +
+                               linear_velocity.z * linear_velocity.z;
+        local.energy += 0.5f * mass * speed_sq - mass * Dot(gravity, pose.position);
+
+        if (inv_inertia.x > 0.0f) {
+            local.energy += 0.5f * angular_velocity.x * angular_velocity.x / inv_inertia.x;
+        }
+        if (inv_inertia.y > 0.0f) {
+            local.energy += 0.5f * angular_velocity.y * angular_velocity.y / inv_inertia.y;
+        }
+        if (inv_inertia.z > 0.0f) {
+            local.energy += 0.5f * angular_velocity.z * angular_velocity.z / inv_inertia.z;
+        }
+    }
+
+    shared[tid] = local;
+    __syncthreads();
+
+    for (uint32_t offset = blockDim.x / 2u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) {
+            shared[tid].energy += shared[tid + offset].energy;
+            shared[tid].linear_momentum =
+                Add(shared[tid].linear_momentum, shared[tid + offset].linear_momentum);
+            shared[tid].angular_momentum =
+                Add(shared[tid].angular_momentum, shared[tid + offset].angular_momentum);
+            shared[tid].nan_inf_count += shared[tid + offset].nan_inf_count;
+            shared[tid].max_speed =
+                fmaxf(shared[tid].max_speed, shared[tid + offset].max_speed);
+            shared[tid].max_position_abs =
+                fmaxf(shared[tid].max_position_abs, shared[tid + offset].max_position_abs);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) {
+        out_slot[0] = shared[0];
+    }
+}
+
+void CheckCuda(cudaError_t result, const char* operation) {
+    if (result != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + " failed: " +
+                                 cudaGetErrorString(result));
+    }
+}
+
+} // namespace
+
+void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
+                                       uint32_t body_count,
+                                       const math::Transform* poses,
+                                       const math::Vec3* linear_velocities,
+                                       const math::Vec3* angular_velocities,
+                                       const float* inverse_masses,
+                                       const math::Vec3* inverse_inertias,
+                                       math::Vec3 gravity,
+                                       DeviceInvariantSnapshot* out_snapshot) {
+    if (out_snapshot == nullptr) {
+        throw std::runtime_error("ComputeRigidBodyInvariantSnapshot requires output storage");
+    }
+    *out_snapshot = {};
+    if (body_count == 0u) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    phi::Buffer reduction(sizeof(DeviceReductionSlot), phi::MemoryKind::Device);
+    const cudaStream_t stream = context.stream.Native();
+    constexpr uint32_t kBlockSize = 256u;
+    ComputeRigidBodyInvariantKernel<<<1u,
+                                      kBlockSize,
+                                      kBlockSize * sizeof(DeviceReductionSlot),
+                                      stream>>>(
+        body_count,
+        poses,
+        linear_velocities,
+        angular_velocities,
+        inverse_masses,
+        inverse_inertias,
+        gravity,
+        static_cast<DeviceReductionSlot*>(reduction.Data()));
+    CheckCuda(cudaGetLastError(), "ComputeRigidBodyInvariantKernel launch");
+    context.stream.Synchronize();
+
+    DeviceReductionSlot host_slot;
+    reduction.CopyToHost(&host_slot, sizeof(host_slot));
+    out_snapshot->energy = host_slot.energy;
+    out_snapshot->linear_momentum = host_slot.linear_momentum;
+    out_snapshot->angular_momentum = host_slot.angular_momentum;
+    out_snapshot->nan_inf_count = host_slot.nan_inf_count;
+    out_snapshot->max_speed = host_slot.max_speed;
+    out_snapshot->max_position_abs = host_slot.max_position_abs;
+}
+
+} // namespace nuka::core::diagnostics::gpu

@@ -7,10 +7,24 @@
 #include "scene/cooked_blob.hpp"
 
 #include <cstdint>
+#include <memory>
+
+namespace nuka::core::diagnostics {
+struct InvariantConfig;
+class InvariantSampler;
+class TraceSink;
+} // namespace nuka::core::diagnostics
 
 namespace nuka::runtime {
 
 struct PhysicsWorld {
+    PhysicsWorld();
+    ~PhysicsWorld();
+    PhysicsWorld(const PhysicsWorld& other);
+    PhysicsWorld& operator=(const PhysicsWorld& other);
+    PhysicsWorld(PhysicsWorld&& other) noexcept;
+    PhysicsWorld& operator=(PhysicsWorld&& other) noexcept;
+
     uint32_t body_count = 0;
     uint32_t joint_count = 0;
     uint32_t shape_count = 0;
@@ -24,6 +38,16 @@ struct PhysicsWorld {
     scene::CookedSensorTable sensor_table;
 
     BuiltWorld runtime_world;
+
+    void ConfigureInvariantSampling(const core::diagnostics::InvariantConfig& config);
+    void SetInvariantTraceSink(core::diagnostics::TraceSink* sink);
+    core::diagnostics::InvariantSampler* InvariantSampler();
+    const core::diagnostics::InvariantSampler* InvariantSampler() const;
+    core::diagnostics::TraceSink* InvariantTraceSink() const;
+
+private:
+    std::unique_ptr<core::diagnostics::InvariantSampler> invariant_sampler_;
+    core::diagnostics::TraceSink* invariant_trace_sink_ = nullptr;
 };
 
 PhysicsWorld BuildPhysicsWorld(const scene::CookedBlob& blob);

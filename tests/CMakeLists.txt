@@ -29,6 +29,24 @@ target_link_libraries(nuka_math_test
 
 gtest_discover_tests(nuka_math_test)
 
+# --- v0.1 e2e foundation tests --------------------------------------------
+add_executable(nuka_v01_foundation_e2e_test
+    e2e/test_v01_foundation_pipeline.cpp
+)
+
+target_compile_definitions(nuka_v01_foundation_e2e_test
+    PRIVATE
+        NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+target_link_libraries(nuka_v01_foundation_e2e_test
+    PRIVATE
+        nuka_runtime
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_v01_foundation_e2e_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- Scene tests -----------------------------------------------------------
 add_executable(nuka_scene_test
     scene/test_scene_ir.cpp

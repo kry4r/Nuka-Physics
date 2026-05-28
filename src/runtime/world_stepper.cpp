@@ -4,6 +4,8 @@
 
 #include "runtime/world_stepper.hpp"
 
+#include "core/diagnostics/invariants.hpp"
+#include "core/diagnostics/trace_sink.hpp"
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "constraint/contact_builder.hpp"
@@ -542,6 +544,14 @@ bool AppendDriveConstraint(const WorldTemplate& world_template,
 WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
                                   WorldInstance& instance,
                                   const WorldStepOptions& options) {
+    return StepWorldInstance(world_template, instance, options, nullptr, nullptr);
+}
+
+WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
+                                  WorldInstance& instance,
+                                  const WorldStepOptions& options,
+                                  core::diagnostics::InvariantSampler* invariant_sampler,
+                                  core::diagnostics::TraceSink* trace_sink) {
     WorldStepReport report;
     if (options.dt <= 0.0f || options.step_count == 0) {
         return report;
@@ -654,6 +664,26 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
         }
 
         ++report.simulated_step_count;
+        if (invariant_sampler != nullptr) {
+            std::vector<core::diagnostics::InvariantSample> samples;
+            const core::diagnostics::InvariantWorldView view{
+                &world_template,
+                &instance,
+                &report,
+                options.gravity
+            };
+            invariant_sampler->Sample(view, report.simulated_step_count, &samples);
+            for (const auto& sample : samples) {
+                if (trace_sink != nullptr) {
+                    trace_sink->OnSample(sample);
+                }
+                if (sample.which == core::diagnostics::Invariant::NanInf &&
+                    sample.violation &&
+                    invariant_sampler->Config().abort_on_nan) {
+                    throw std::runtime_error("V2 invariant violation: NaN/Inf detected");
+                }
+            }
+        }
     }
 
     return report;

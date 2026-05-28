@@ -1,0 +1,39 @@
+name: double_pendulum
+description: Two-link articulated smoke scene for V2 bounded energy and joint range checks.
+steps: 1000
+dt: 0.004166667
+gravity: [0.0, -9.81, 0.0]
+scene:
+  bodies:
+    - name: base
+      static: true
+      position: [0.0, 0.0, 0.0]
+    - name: upper_link
+      mass: 1.0
+      inertia: [0.2, 0.2, 0.2]
+      position: [0.0, -0.5, 0.0]
+    - name: lower_link
+      mass: 1.0
+      inertia: [0.2, 0.2, 0.2]
+      position: [0.0, -1.5, 0.0]
+  joints:
+    - name: shoulder
+      type: revolute
+      parent: base
+      child: upper_link
+      axis: [0.0, 0.0, 1.0]
+      lower: -1.2
+      upper: 1.2
+    - name: elbow
+      type: revolute
+      parent: upper_link
+      child: lower_link
+      axis: [0.0, 0.0, 1.0]
+      lower: -1.4
+      upper: 1.4
+expected:
+  energy_drift_rel_max: 0.02
+  momentum_drift_abs_max: 1000.0
+  constraint_residual_abs_max: 0.001
+  joint_range_slop_rad: 0.0001
+  nan_inf_allowed: false

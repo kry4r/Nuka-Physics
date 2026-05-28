@@ -47,6 +47,8 @@ nuka_set_warnings(nuka_scene)
 # nuka_runtime – Runtime containers, world building, rigid body integration
 # ---------------------------------------------------------------------------
 add_library(nuka_runtime STATIC
+    core/diagnostics/invariants.cpp
+    core/diagnostics/trace_sink.cpp
     runtime/world_builder.cpp
     runtime/physics_world.cpp
     runtime/world_stepper.cpp
@@ -346,6 +348,7 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     add_library(nuka_runtime_gpu STATIC
+        core/diagnostics/invariants_gpu.cu
         collision/gpu/broadphase.cu
         constraint/gpu/contact_generation.cu
         runtime/gpu/batched_device_world.cu

@@ -1,0 +1,19 @@
+name: single_falling_box
+description: Conservative single rigid box used for v0.1 V2 invariant smoke validation.
+steps: 1000
+dt: 0.004166667
+gravity: [0.0, -9.81, 0.0]
+scene:
+  bodies:
+    - name: box
+      mass: 1.0
+      inertia: [1.0, 1.0, 1.0]
+      position: [0.0, 5.0, 0.0]
+      shape:
+        type: box
+        half_extents: [0.5, 0.5, 0.5]
+expected:
+  energy_drift_rel_max: 0.02
+  momentum_drift_abs_max: 1000.0
+  constraint_residual_abs_max: 0.001
+  nan_inf_allowed: false

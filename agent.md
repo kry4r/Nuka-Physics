@@ -15,6 +15,9 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 
 - Use design -> implementation -> integrated validation as the normal workflow for substantial physics work.
 - Do not default to strict TDD or spend most of the session writing narrow unit tests.
+- For the v0.1 phase sequence, do not add new narrow unit tests just to satisfy
+  individual phase work. Fold validation into a larger e2e/integration test that
+  can cover multiple phases and meaningful CUDA/runtime physics behavior.
 - Prefer complete feature slices, reusable integration/runtime checks, scene-level validation, demos, benchmarks, and diagnostics.
 - Unit tests can still be useful for stable low-level contracts, but they are secondary to integrated CUDA runtime evidence for this project.
 - Avoid isolated trivial tests that do not exercise meaningful engine behavior or robot/world workflows.

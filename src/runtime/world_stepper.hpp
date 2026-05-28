@@ -9,6 +9,11 @@
 
 #include <cstdint>
 
+namespace nuka::core::diagnostics {
+class InvariantSampler;
+class TraceSink;
+} // namespace nuka::core::diagnostics
+
 namespace nuka::runtime {
 
 struct WorldStepOptions {
@@ -39,5 +44,10 @@ struct WorldStepReport {
 WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
                                   WorldInstance& instance,
                                   const WorldStepOptions& options = {});
+WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
+                                  WorldInstance& instance,
+                                  const WorldStepOptions& options,
+                                  core::diagnostics::InvariantSampler* invariant_sampler,
+                                  core::diagnostics::TraceSink* trace_sink);
 
 } // namespace nuka::runtime
