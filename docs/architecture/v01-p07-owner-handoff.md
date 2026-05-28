@@ -32,6 +32,14 @@ As of this handoff, the gate is blocked by:
 Build, p07 ctest, physics-smell lint, MJX Python deps, Git LFS, MuJoCo assets,
 and downstream `find_package(nuka)` have passed in the strict gate.
 
+Current local C++20 `<expected>` probe results:
+
+| Compiler | Version | `-std=c++20 <expected>` |
+| --- | --- | --- |
+| `/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++` | GCC 14.3.0 | fails |
+| `/usr/bin/g++` | GCC 9.4.0 | fails; no `-std=c++20` |
+| `/usr/bin/g++-10` | GCC 10.5.0 | fails |
+
 ## Candidate Golden Files
 
 Candidate files are staged outside protected storage:
@@ -101,6 +109,19 @@ ctest --test-dir build-cuda128 \
    - explicitly approve changing the public wrapper contract to C++23, or
    - explicitly approve an `std::expected` shim/alternative.
 4. Re-run the strict gate command above.
+
+## Push Status
+
+Local branch `v01-foundation-refactor` is ready to push with all outgoing commit
+messages containing `[skip ci]` and author `kry4r <nidhogxt@outlook.com>`.
+The push is currently blocked by local workstation access rather than by the
+repository contents:
+
+- Direct HTTPS reaches GitHub but fails because the configured VS Code
+  credential helper socket is unavailable and GitHub rejects anonymous write
+  access.
+- Temporary proxy
+  `http://192.168.2.185:7897` fails with `No route to host`.
 
 v0.3 must not begin until the strict gate passes and v0.1 p07 is committed as
 closed.
