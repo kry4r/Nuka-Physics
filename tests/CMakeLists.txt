@@ -294,6 +294,10 @@ target_compile_definitions(nuka_oracle_test
 
 target_link_libraries(nuka_oracle_test
     PRIVATE
+        nuka_runtime
+        nuka_import
+        $<$<TARGET_EXISTS:nuka_articulation_gpu>:nuka_articulation_gpu>
+        $<$<TARGET_EXISTS:nuka_phi>:nuka_phi>
         GTest::gtest_main
 )
 
