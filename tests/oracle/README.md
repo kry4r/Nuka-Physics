@@ -61,4 +61,12 @@ Human owner flow:
 
 1. Inspect candidate output.
 2. Add approved binaries to `tests/oracle/golden/` through Git LFS.
-3. Run `ctest --test-dir build-cuda128 --output-on-failure`.
+3. Run the p07/v0.1 local close gate:
+
+```bash
+python3 tools/oracle/v01_exit_gate.py --build-dir build-cuda128
+```
+
+The gate is intentionally strict. It fails until the owner-provided goldens,
+MJX Python environment, Git LFS, and `<expected>`-capable C++20 toolchain are
+all available.
