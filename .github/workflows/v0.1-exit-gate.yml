@@ -1,0 +1,46 @@
+name: v0.1 exit gate
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  p07_exit_gate:
+    runs-on: [self-hosted, linux, cuda]
+    env:
+      CUDA_ROOT: /opt/cuda-12.8-root/usr/local/cuda-12.8
+      BUILD_DIR: build-cuda128
+      ORACLE_PYTHON: .nuka-oracle-venv/bin/python
+      CC: /root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-gcc
+      CXX: /root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Add local tool paths
+        run: |
+          echo "/root/.nuka-toolchain-gcc14/bin" >> "$GITHUB_PATH"
+          echo "/root/miniconda3/bin" >> "$GITHUB_PATH"
+          echo "/root/.local/bin" >> "$GITHUB_PATH"
+          echo "${{ github.workspace }}/.nuka-oracle-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Verify runner toolchain
+        run: |
+          test -x "$CC"
+          test -x "$CXX"
+          test -x "$ORACLE_PYTHON"
+          test -d "$CUDA_ROOT"
+          git lfs version
+
+      - name: Configure CUDA build
+        run: |
+          cmake -S . -B "$BUILD_DIR" \
+            -DNK_BUILD_TESTS=ON \
+            -DNK_REQUIRE_CUDA=ON \
+            -DNK_PHYSICS_BACKEND=CUDA \
+            -DCUDAToolkit_ROOT="$CUDA_ROOT"
+
+      - name: Run strict v0.1 p07 gate
+        run: |
+          python3 tools/oracle/v01_exit_gate.py \
+            --build-dir "$BUILD_DIR" \
+            --python "$ORACLE_PYTHON"
