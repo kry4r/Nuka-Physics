@@ -12,12 +12,25 @@ import argparse
 import struct
 from pathlib import Path
 
-import mujoco
 import numpy as np
 
 
 KIND_RANDOM_QACC = 1
 KIND_JOINT_TRAJECTORY = 2
+
+
+def _load_mjx_deps():
+    try:
+        import jax
+        import jax.numpy as jnp
+        import mujoco
+        from mujoco import mjx
+    except ImportError as error:
+        raise SystemExit(
+            "generate_mjx_golden.py requires the owner-provided MJX environment "
+            "(jax, mujoco, and mujoco.mjx)"
+        ) from error
+    return jax, jnp, mujoco, mjx
 
 
 def _write_header(out,
@@ -41,7 +54,9 @@ def _write_header(out,
 
 
 def generate_random_samples(model_path: Path, out_path: Path, sample_count: int) -> None:
+    jax, jnp, mujoco, mjx = _load_mjx_deps()
     model = mujoco.MjModel.from_xml_path(str(model_path))
+    mjx_model = mjx.put_model(model)
     rng = np.random.default_rng(seed=42)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as out:
@@ -53,15 +68,16 @@ def generate_random_samples(model_path: Path, out_path: Path, sample_count: int)
                       model.nv,
                       model.nv)
         for _ in range(sample_count):
-            data = mujoco.MjData(model)
             qpos = rng.uniform(-0.2, 0.2, model.nq).astype(np.float32)
             qvel = rng.uniform(-0.5, 0.5, model.nv).astype(np.float32)
             tau = rng.uniform(-2.0, 2.0, model.nv).astype(np.float32)
-            data.qpos[:] = qpos
-            data.qvel[:] = qvel
-            data.qfrc_applied[:] = tau
-            mujoco.mj_forward(model, data)
-            qacc = np.asarray(data.qacc, dtype=np.float32)
+            data = mjx.make_data(mjx_model).replace(
+                qpos=jnp.asarray(qpos),
+                qvel=jnp.asarray(qvel),
+                qfrc_applied=jnp.asarray(tau),
+            )
+            data = mjx.forward(mjx_model, data)
+            qacc = np.asarray(jax.device_get(data.qacc), dtype=np.float32)
             out.write(qpos.tobytes())
             out.write(qvel.tobytes())
             out.write(tau.tobytes())
@@ -72,9 +88,11 @@ def generate_stand_trajectory(model_path: Path,
                               out_path: Path,
                               step_count: int,
                               dt: float) -> None:
+    jax, _, mujoco, mjx = _load_mjx_deps()
     model = mujoco.MjModel.from_xml_path(str(model_path))
     model.opt.timestep = dt
-    data = mujoco.MjData(model)
+    mjx_model = mjx.put_model(model)
+    data = mjx.make_data(mjx_model)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as out:
         _write_header(out,
@@ -85,10 +103,10 @@ def generate_stand_trajectory(model_path: Path,
                       model.nv,
                       model.nv)
         for _ in range(step_count):
-            mujoco.mj_step(model, data)
-            qpos = np.asarray(data.qpos, dtype=np.float32)
-            qvel = np.asarray(data.qvel, dtype=np.float32)
-            qacc = np.asarray(data.qacc, dtype=np.float32)
+            data = mjx.step(mjx_model, data)
+            qpos = np.asarray(jax.device_get(data.qpos), dtype=np.float32)
+            qvel = np.asarray(jax.device_get(data.qvel), dtype=np.float32)
+            qacc = np.asarray(jax.device_get(data.qacc), dtype=np.float32)
             out.write(qpos.tobytes())
             out.write(qvel.tobytes())
             out.write(qacc.tobytes())
