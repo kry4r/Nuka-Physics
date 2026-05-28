@@ -58,3 +58,12 @@ scope_definitions:
     include:
       - "src/include/nuka/**/*.hpp"
       - "src/include/nuka/**/*.h"
+
+generated_file_headers:
+  - id: generated_do_not_edit_header
+    description: "generated codegen outputs must carry the DO-NOT-EDIT header"
+    include:
+      - "src/codegen/generated/**/*.cu"
+      - "src/codegen/generated/**/*.cuh"
+      - "src/codegen/generated/**/*.hpp"
+    first_line_regex: '^// GENERATED — DO NOT EDIT$'

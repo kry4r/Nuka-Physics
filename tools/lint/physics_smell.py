@@ -86,6 +86,7 @@ def _scope_files(scope: dict, selected_files: set[Path] | None) -> list[Path]:
 def _load_patterns(selected_pattern: str | None) -> tuple[list[Pattern], dict]:
     config = _load_yaml(PATTERNS_PATH)
     raw_patterns = config.get("patterns", [])
+    generated_header_ids = [item["id"] for item in config.get("generated_file_headers", [])]
     patterns: list[Pattern] = []
     for raw in raw_patterns:
         if selected_pattern is not None and raw["id"] != selected_pattern:
@@ -100,7 +101,9 @@ def _load_patterns(selected_pattern: str | None) -> tuple[list[Pattern], dict]:
             )
         )
     if selected_pattern is not None and not patterns:
-        known = ", ".join(item["id"] for item in raw_patterns)
+        if selected_pattern in generated_header_ids:
+            return [], config.get("scope_definitions", {})
+        known = ", ".join([item["id"] for item in raw_patterns] + generated_header_ids)
         raise SystemExit(f"unknown pattern '{selected_pattern}'. Known patterns: {known}")
     return patterns, config.get("scope_definitions", {})
 
@@ -150,8 +153,51 @@ def _scan_file(path: Path, pattern: Pattern) -> list[Violation]:
     return violations
 
 
+def _scan_generated_headers(
+    config: dict,
+    selected_pattern: str | None,
+    selected_files: set[Path] | None,
+) -> list[Violation]:
+    violations: list[Violation] = []
+    for rule in config.get("generated_file_headers", []):
+        if selected_pattern is not None and rule["id"] != selected_pattern:
+            continue
+        includes = rule.get("include", [])
+        first_line_regex = rule.get("first_line_regex")
+        if not first_line_regex:
+            raise SystemExit(f"generated header rule {rule.get('id', '<unknown>')} missing first_line_regex")
+        regex = re.compile(first_line_regex)
+        files: set[Path] = set()
+        for pattern in includes:
+            files.update(path for path in REPO_ROOT.glob(pattern) if path.is_file())
+        rel_files = {_relative(path) for path in files}
+        if selected_files is not None:
+            rel_files = {path for path in rel_files if path in selected_files}
+
+        for path in sorted(rel_files):
+            full_path = REPO_ROOT / path
+            try:
+                first_line = full_path.read_text(encoding="utf-8").splitlines()[0]
+            except IndexError:
+                first_line = ""
+            except UnicodeDecodeError:
+                first_line = full_path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            if not regex.fullmatch(first_line):
+                violations.append(
+                    Violation(
+                        path=path,
+                        line=1,
+                        pattern_id=rule["id"],
+                        description=rule["description"],
+                        matched_text=first_line,
+                    )
+                )
+    return violations
+
+
 def scan(selected_pattern: str | None, selected_files: list[str] | None) -> list[Violation]:
     patterns, scopes = _load_patterns(selected_pattern)
+    config = _load_yaml(PATTERNS_PATH)
     selected_paths = None
     if selected_files is not None:
         selected_paths = {_relative((REPO_ROOT / item).resolve()) for item in selected_files}
@@ -163,6 +209,7 @@ def scan(selected_pattern: str | None, selected_files: list[str] | None) -> list
             raise SystemExit(f"pattern {pattern.id} references missing scope {pattern.scope}")
         for path in _scope_files(scopes[pattern.scope], selected_paths):
             violations.extend(_scan_file(path, pattern))
+    violations.extend(_scan_generated_headers(config, selected_pattern, selected_paths))
 
     return [violation for violation in violations if not _allowed(violation, allowlist)]
 

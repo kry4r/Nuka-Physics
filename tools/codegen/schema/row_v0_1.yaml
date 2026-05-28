@@ -1,0 +1,68 @@
+# Meta-schema for Universal Row IR v0.1. Validates row class definitions.
+schema_version: "0.1"
+
+required_fields:
+  - row_class_id
+  - row_class_name
+  - body_count_mode
+  - body_count
+  - jacobian_kind
+  - max_rows_per_block
+  - supports_friction
+  - supports_compliance
+  - default_gradient_mode
+  - default_recompute_mode
+  - forward_evaluator
+  - constraint_kind
+
+field_types:
+  row_class_id: uint32
+  row_class_name: string
+  body_count_mode: enum
+  body_count: nullable_uint32
+  jacobian_kind: enum
+  max_rows_per_block: uint32
+  supports_friction: bool
+  supports_compliance: bool
+  default_gradient_mode: enum
+  default_recompute_mode: enum
+  forward_evaluator: object
+  constraint_kind: enum
+
+enums:
+  body_count_mode:
+    - fixed
+    - variable
+  jacobian_kind:
+    - maximal_6vec
+    - featherstone_chain_scalar
+    - mixed
+  default_gradient_mode:
+    - dense_adjoint
+    - stop_grad_on_event
+    - ift_at_convergence
+    - none
+  default_recompute_mode:
+    - tape
+    - checkpoint
+    - recompute_always
+  constraint_kind:
+    - equality
+    - unilateral
+    - unilateral_with_friction
+
+forward_evaluator:
+  required_fields:
+    - input_fields
+    - output_fields
+    - body_index_field
+    - jacobian_field
+    - inner_loop_strategy
+    - warm_start
+
+flags_bitfield:
+  - Equality
+  - Unilateral
+  - Friction
+  - Coupled
+  - GradActive

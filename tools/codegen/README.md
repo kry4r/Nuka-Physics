@@ -24,8 +24,28 @@ Regenerate all codegen outputs with:
 python tools/codegen/regen.py
 ```
 
-Phase 2 creates `tools/codegen/regen.py`; until then this command is the
-reserved interface.
+The generator validates the meta-schema and every row class YAML before writing
+outputs. Schema errors print compiler-style diagnostics with the YAML path and
+line number.
+
+Generated outputs are:
+
+```text
+src/codegen/generated/maximal_contact_forward.cu
+src/codegen/generated/maximal_joint_forward.cu
+src/codegen/generated/maximal_drive_forward.cu
+src/codegen/generated/featherstone_contact_forward.cu
+src/codegen/generated/row_dispatch.cu
+src/codegen/generated/row_class_registry.hpp
+```
+
+Use alternate paths only for tests:
+
+```bash
+python tools/codegen/regen.py \
+  --classes-dir /tmp/row-ir \
+  --output-dir /tmp/generated
+```
 
 ## DO-NOT-EDIT Header
 
@@ -45,5 +65,16 @@ project workflow.
 
 ## Build Wiring
 
-CMake uses `add_custom_command` to regenerate kernels whenever the row IR YAML
-changes. The generated sources are then compiled as normal CUDA inputs.
+CMake exposes the `nuka_codegen` target and wires it into the default build.
+Changes to `tools/codegen/classes/*.yaml`, the schema, templates, or
+`tools/codegen/regen.py` regenerate the files above. The generated CUDA sources
+compile into `nuka_codegen_generated`, and `nuka_codegen_test` verifies the
+round trip.
+
+Useful validation commands:
+
+```bash
+cmake --build build --target nuka_codegen
+ctest --test-dir build -R CodegenRoundtrip --output-on-failure
+python tools/lint/physics_smell.py
+```

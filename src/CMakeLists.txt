@@ -299,6 +299,28 @@ nuka_set_warnings(nuka_scene_demo)
 # nuka_phi – Physics Hardware Interface (CUDA backend)
 # ---------------------------------------------------------------------------
 if(CMAKE_CUDA_COMPILER)
+    set_source_files_properties(
+        ${NUKA_CODEGEN_OUTPUTS}
+        PROPERTIES GENERATED TRUE
+    )
+
+    add_library(nuka_codegen_generated STATIC
+        ${NUKA_CODEGEN_GENERATED_SOURCES}
+        ${NUKA_CODEGEN_GENERATED_HEADERS}
+    )
+
+    add_dependencies(nuka_codegen_generated nuka_codegen)
+
+    target_include_directories(nuka_codegen_generated
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_codegen_generated
+        PUBLIC
+            CUDA::cudart
+    )
+
     add_library(nuka_phi STATIC
         phi/backend_cuda/device.cu
         phi/backend_cuda/buffer.cu

@@ -1,0 +1,36 @@
+row_class_id: 1
+row_class_name: MaximalJointRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+  joint_rows: variable_1_to_6

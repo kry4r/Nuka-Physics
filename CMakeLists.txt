@@ -56,6 +56,44 @@ endif()
 find_package(Vulkan REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+set(NUKA_CODEGEN_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/src/codegen/generated")
+set(NUKA_CODEGEN_GENERATED_SOURCES
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
+)
+set(NUKA_CODEGEN_GENERATED_HEADERS
+    "${NUKA_CODEGEN_OUTPUT_DIR}/row_class_registry.hpp"
+)
+set(NUKA_CODEGEN_OUTPUTS
+    ${NUKA_CODEGEN_GENERATED_SOURCES}
+    ${NUKA_CODEGEN_GENERATED_HEADERS}
+)
+file(GLOB NUKA_ROW_IR_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/tools/codegen/classes/*.yaml"
+)
+file(GLOB NUKA_ROW_TEMPLATES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/tools/codegen/templates/*.j2"
+)
+add_custom_command(
+    OUTPUT ${NUKA_CODEGEN_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${NUKA_CODEGEN_OUTPUT_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/codegen/regen.py"
+    DEPENDS
+        ${NUKA_ROW_IR_FILES}
+        ${NUKA_ROW_TEMPLATES}
+        "${CMAKE_SOURCE_DIR}/tools/codegen/schema/row_v0_1.yaml"
+        "${CMAKE_SOURCE_DIR}/tools/codegen/regen.py"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Regenerating row class CUDA kernels from IR"
+    VERBATIM
+)
+add_custom_target(nuka_codegen ALL
+    DEPENDS ${NUKA_CODEGEN_OUTPUTS}
+)
+
 add_custom_target(nuka_run_lint
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/lint/physics_smell.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

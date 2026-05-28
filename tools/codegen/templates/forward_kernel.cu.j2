@@ -1,0 +1,51 @@
+// GENERATED — DO NOT EDIT
+// ============================================================
+// Source: {{ source_yaml_path }}
+// Regenerate: python tools/codegen/regen.py
+// ============================================================
+
+#include "codegen/generated/row_class_registry.hpp"
+
+#include <cstdint>
+
+namespace nuka::solver::generated {
+
+__global__ void {{ class_name | snake_case }}_forward_kernel(
+    const Row* __restrict__ rows,
+{% for f in forward_evaluator.input_fields %}
+    const {{ field_cuda_type(f) }}* __restrict__ {{ f }}_data,
+{% endfor %}
+{% for f in forward_evaluator.output_fields %}
+    {{ field_cuda_type(f) }}* __restrict__ {{ f }}_out,
+{% endfor %}
+    uint32_t row_count)
+{
+    const uint32_t row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row_idx >= row_count) {
+        return;
+    }
+
+    const Row& row = rows[row_idx];
+    if (row.row_class_id != {{ row_class_id }}u) {
+        return;
+    }
+
+{% for f in forward_evaluator.input_fields %}
+    (void){{ f }}_data;
+{% endfor %}
+{% for f in forward_evaluator.output_fields %}
+    (void){{ f }}_out;
+{% endfor %}
+    (void)row;
+
+    // Behavior-equivalent row update is wired in Phase 5 with the CSR migration
+    // diff-test bridge. Phase 2 deliberately emits compile/linkable stubs only.
+{% if forward_evaluator.inner_loop_strategy == "row_serial_jacobi" %}
+    // Reserved strategy: body-segmented serial Jacobi per row.
+{% endif %}
+{% if supports_friction %}
+    // Reserved friction model: {{ forward_evaluator.get("friction_pyramid_sides", 0) }}-side friction pyramid.
+{% endif %}
+}
+
+} // namespace nuka::solver::generated

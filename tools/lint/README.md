@@ -17,6 +17,8 @@ The current pattern set lives in `tools/lint/banned_patterns.yaml`:
   multiple row classes.
 - `exception_across_c_abi`: `throw` in C ABI implementation files.
 - `stl_in_public_header`: STL containers or strings in public wrapper headers.
+- `generated_do_not_edit_header`: generated codegen outputs under
+  `src/codegen/generated/` must start with `// GENERATED — DO NOT EDIT`.
 
 ## Usage
 

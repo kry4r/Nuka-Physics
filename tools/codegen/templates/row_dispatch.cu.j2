@@ -1,0 +1,50 @@
+// GENERATED — DO NOT EDIT
+// ============================================================
+// Source: tools/codegen/classes/*.yaml
+// Regenerate: python tools/codegen/regen.py
+// ============================================================
+
+#include "codegen/generated/row_class_registry.hpp"
+
+#include <cstdint>
+
+namespace nuka::solver::generated {
+
+const char* RowClassName(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+    case {{ row.row_class_id }}u:
+        return "{{ row.row_class_name }}";
+{% endfor %}
+    default:
+        return "Unknown";
+    }
+}
+
+const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+    case {{ row.row_class_id }}u:
+        return "{{ row.class_name | snake_case }}_forward_kernel";
+{% endfor %}
+    default:
+        return nullptr;
+    }
+}
+
+uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+    case {{ row.row_class_id }}u:
+        return {{ row.max_rows_per_block }}u;
+{% endfor %}
+    default:
+        return 0u;
+    }
+}
+
+bool IsKnownRowClass(uint32_t row_class_id) noexcept {
+    return RowClassForwardKernelSymbol(row_class_id) != nullptr;
+}
+
+} // namespace nuka::solver::generated

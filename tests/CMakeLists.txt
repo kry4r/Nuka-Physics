@@ -277,6 +277,26 @@ endif()
 
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
+    add_executable(nuka_codegen_test
+        codegen/test_codegen_roundtrip.cpp
+    )
+
+    add_dependencies(nuka_codegen_test nuka_codegen)
+
+    target_compile_definitions(nuka_codegen_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NUKA_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+    )
+
+    target_link_libraries(nuka_codegen_test
+        PRIVATE
+            nuka_codegen_generated
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_codegen_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_phi_test
         phi/test_capabilities.cpp
         phi/test_platform_contract.cpp
