@@ -56,6 +56,17 @@ validates joint-space Featherstone dynamics rather than contact solve behavior.
 Use `--batch-size N` only if the default all-samples batch is too large for the
 local MJX/JAX runtime.
 
+Validate a random-sample candidate before asking the owner to move it into the
+protected golden directory:
+
+```bash
+python3 tools/oracle/validate_golden_candidate.py \
+  --path /tmp/featherstone_go2_random_sample.bin \
+  --kind random-qacc \
+  --samples 1000 \
+  --model-name go2_mjx.xml
+```
+
 Generate the 5 s Go2 stand trajectory with:
 
 ```bash
@@ -70,6 +81,16 @@ python3 tools/oracle/generate_mjx_golden.py \
 The 5 s stand trajectory uses `mjx.step` and can be slow on a CPU-only JAX
 runtime. Prefer a CUDA-enabled owner oracle environment for the approved golden
 run.
+
+Validate the stand-trajectory candidate with:
+
+```bash
+python3 tools/oracle/validate_golden_candidate.py \
+  --path /tmp/go2_stand_5s.bin \
+  --kind joint-trajectory \
+  --samples 1200 \
+  --model-name go2_mjx.xml
+```
 
 Diff two candidate trajectories with:
 
