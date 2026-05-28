@@ -91,11 +91,11 @@ TEST(CudaBatchContactTiming, BatchedContactSolveUnderOneSecond) {
     EXPECT_EQ(report.contact_constraint_count, kInstanceCount * kStepCount);
     EXPECT_GE(report.constraint_row_count, kInstanceCount * kStepCount * 3u);
     EXPECT_EQ(report.row_scheduler_report.row_kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.row_layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_EQ(report.row_scheduler_report.configured_iterations,
               options.solver_velocity_iterations);
     EXPECT_EQ(report.row_scheduler_report.executed_iterations,

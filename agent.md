@@ -7,6 +7,7 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 - Prioritize CUDA backend solvers, GPU-resident data structures, robot rigid-body constraints, rigid-soft-fluid coupling, diagnostics, benchmarks, demos, and documentation.
 - Preserve the API/backend selection layer, but CUDA is the default production physics path.
 - Keep CPU code limited to import/cook, host orchestration, reference validation, or fallback scaffolding. Do not let CPU simulation become the main architecture.
+- Production solver logic must live in CUDA/GPU code paths. C++ solver-facing files may prepare data, own host-side adapters, call CUDA kernels, or run explicit reference validation only; they must not contain the primary PGS/TGS/row-iteration simulation loop.
 - Do not expand Vulkan rendering unless it is directly needed for physics validation, debug visualization, or demo boundaries.
 - Do not treat passing unit tests as completion. Report progress against GPU data residency, solver invariants, robot/coupling coverage, benchmarks, demos/docs, and remaining platform risks.
 - Avoid framing work as a minimum loop or small demo. Choose coherent slices that move the platform toward full simulator capability.

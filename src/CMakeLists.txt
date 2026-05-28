@@ -167,6 +167,8 @@ nuka_set_warnings(nuka_collision)
 # ---------------------------------------------------------------------------
 add_library(nuka_constraint STATIC
     constraint/contact_builder.cpp
+    constraint/row_buffers.cpp
+    constraint/row_builder.cpp
 )
 
 target_include_directories(nuka_constraint
@@ -185,6 +187,7 @@ nuka_set_warnings(nuka_constraint)
 # nuka_solver – Iterative rigid body constraint solver (PGS)
 # ---------------------------------------------------------------------------
 add_library(nuka_solver STATIC
+    solver/diff_test_bridge.cpp
     solver/rigid_solver.cpp
 )
 
@@ -355,7 +358,6 @@ if(CMAKE_CUDA_COMPILER)
         runtime/gpu/cuda_particle_world.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
-        solver/gpu/cuda_constraint_solver.cu
     )
 
     target_include_directories(nuka_runtime_gpu
@@ -366,7 +368,35 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_runtime_gpu
         PUBLIC
             nuka_runtime
+            nuka_solver
             nuka_phi
+    )
+
+    add_library(nuka_row_solver_gpu STATIC
+        solver/gpu/row_scheduler.cu
+        solver/gpu/row_solver.cu
+    )
+
+    target_include_directories(nuka_row_solver_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_row_solver_gpu
+        PUBLIC
+            nuka_constraint
+            nuka_phi
+    )
+
+    target_compile_definitions(nuka_solver
+        PUBLIC
+            NUKA_HAS_CUDA_RUNTIME=1
+    )
+
+    target_link_libraries(nuka_solver
+        PUBLIC
+            nuka_phi
+            nuka_row_solver_gpu
     )
 
     add_library(nuka_sensor_gpu STATIC

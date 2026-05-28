@@ -20,6 +20,40 @@ namespace {
 constexpr uint32_t kInvalidBody = ~0u;
 constexpr float kHugeLimit = 1.0e6f;
 constexpr uint32_t kBatchedConstraintSchedulerDiagnosticSlots = 4u;
+constexpr uint32_t kBatchedMaxRowsPerGroup = 6u;
+
+enum class BatchedRowGroupType : uint8_t {
+    Contact,
+    Joint,
+    Drive
+};
+
+struct BatchedRowGroup {
+    BatchedRowGroupType type = BatchedRowGroupType::Contact;
+    uint32_t body_a = kInvalidBody;
+    uint32_t body_b = kInvalidBody;
+    uint32_t row_count = 0u;
+
+    math::Vec3 jacobian_linear_a[kBatchedMaxRowsPerGroup];
+    math::Vec3 jacobian_angular_a[kBatchedMaxRowsPerGroup];
+    math::Vec3 jacobian_linear_b[kBatchedMaxRowsPerGroup];
+    math::Vec3 jacobian_angular_b[kBatchedMaxRowsPerGroup];
+
+    float rhs[kBatchedMaxRowsPerGroup] = {};
+    float position_error[kBatchedMaxRowsPerGroup] = {};
+    float lower_limit[kBatchedMaxRowsPerGroup] = {};
+    float upper_limit[kBatchedMaxRowsPerGroup] = {};
+    float impulse[kBatchedMaxRowsPerGroup] = {};
+    float effective_mass[kBatchedMaxRowsPerGroup] = {};
+    float friction = 0.5f;
+    float restitution = 0.0f;
+    uint32_t normal_row_count = 0u;
+    uint32_t first_friction_row = 0u;
+    uint32_t friction_row_count = 0u;
+
+    math::Vec3 anchor_local_a;
+    math::Vec3 anchor_local_b;
+};
 
 template <typename T>
 phi::Buffer UploadVector(const std::vector<T>& values) {
@@ -43,15 +77,14 @@ CudaConstraintRowBufferView MakeBatchedRigidConstraintRowBuffer(
     void* device_rows,
     uint32_t block_capacity) {
     CudaConstraintRowBufferView row_buffer;
-    row_buffer.kind = CudaConstraintRowBufferKind::RigidConstraintBlock;
-    row_buffer.layout = CudaConstraintRowLayout::ConstraintBlock;
-    row_buffer.schedule_mode = CudaConstraintRowScheduleMode::GlobalRowSweep;
+    row_buffer.kind = CudaConstraintRowBufferKind::UniversalRowCsr;
+    row_buffer.layout = CudaConstraintRowLayout::UniversalRowCsr;
+    row_buffer.schedule_mode = CudaConstraintRowScheduleMode::IslandColoredSweep;
     row_buffer.device_rows = device_rows;
-    row_buffer.row_count =
-        block_capacity * constraint::ConstraintBlock::kMaxRows;
+    row_buffer.row_count = block_capacity * kBatchedMaxRowsPerGroup;
     row_buffer.owner_count = block_capacity;
-    row_buffer.rows_per_owner = constraint::ConstraintBlock::kMaxRows;
-    row_buffer.row_stride_bytes = sizeof(constraint::ConstraintBlock);
+    row_buffer.rows_per_owner = kBatchedMaxRowsPerGroup;
+    row_buffer.row_stride_bytes = sizeof(BatchedRowGroup);
     return row_buffer;
 }
 
@@ -475,25 +508,25 @@ __device__ void GenerateBoxBoxContact(uint32_t instance_index,
     AddSinglePointManifold(instance_index, body_a, body_b, position, normal, penetration, manifold);
 }
 
-__device__ void ClearBlock(constraint::ConstraintBlock* block) {
-    *block = constraint::ConstraintBlock{};
+__device__ void ClearBlock(BatchedRowGroup* block) {
+    *block = BatchedRowGroup{};
 }
 
-__device__ uint32_t ContactNormalRowCount(constraint::ConstraintBlock block) {
-    if (block.type != constraint::ConstraintType::Contact) {
+__device__ uint32_t ContactNormalRowCount(BatchedRowGroup block) {
+    if (block.type != BatchedRowGroupType::Contact) {
         return 0u;
     }
     return block.normal_row_count > 0u ? block.normal_row_count : block.row_count;
 }
 
-__device__ bool IsContactFrictionRow(constraint::ConstraintBlock block, uint32_t row) {
-    return block.type == constraint::ConstraintType::Contact
+__device__ bool IsContactFrictionRow(BatchedRowGroup block, uint32_t row) {
+    return block.type == BatchedRowGroupType::Contact
         && block.friction_row_count > 0u
         && row >= block.first_friction_row
         && row < block.first_friction_row + block.friction_row_count;
 }
 
-__device__ float TotalNormalImpulse(constraint::ConstraintBlock block) {
+__device__ float TotalNormalImpulse(BatchedRowGroup block) {
     float impulse = 0.0f;
     const uint32_t normal_rows = ContactNormalRowCount(block);
     for (uint32_t row = 0; row < normal_rows; ++row) {
@@ -502,12 +535,12 @@ __device__ float TotalNormalImpulse(constraint::ConstraintBlock block) {
     return impulse;
 }
 
-__device__ bool IsBatchedNormalImpulseRow(constraint::ConstraintBlock block,
+__device__ bool IsBatchedNormalImpulseRow(BatchedRowGroup block,
                                           uint32_t row) {
     if (row >= block.row_count) {
         return false;
     }
-    if (block.type == constraint::ConstraintType::Contact) {
+    if (block.type == BatchedRowGroupType::Contact) {
         return row < ContactNormalRowCount(block);
     }
     return true;
@@ -524,18 +557,18 @@ __device__ float BatchedProjectedRowResidual(float velocity_error,
     return fabsf(projected_impulse - impulse);
 }
 
-__device__ constraint::ConstraintBlock BuildBatchedContactBlock(
+__device__ BatchedRowGroup BuildBatchedContactBlock(
     const CudaBatchedContactManifold& manifold,
     uint32_t body_count_per_instance) {
-    constraint::ConstraintBlock block;
+    BatchedRowGroup block;
     ClearBlock(&block);
-    block.type = constraint::ConstraintType::Contact;
+    block.type = BatchedRowGroupType::Contact;
     block.body_a = FlattenBody(manifold.instance_index, body_count_per_instance, manifold.body_a);
     block.body_b = FlattenBody(manifold.instance_index, body_count_per_instance, manifold.body_b);
     block.normal_row_count =
-        manifold.point_count < constraint::ConstraintBlock::kMaxRows - 2u
+        manifold.point_count < kBatchedMaxRowsPerGroup - 2u
             ? manifold.point_count
-            : constraint::ConstraintBlock::kMaxRows - 2u;
+            : kBatchedMaxRowsPerGroup - 2u;
     block.first_friction_row = block.normal_row_count;
     block.friction_row_count = block.normal_row_count > 0u ? 2u : 0u;
     block.row_count = block.normal_row_count + block.friction_row_count;
@@ -573,7 +606,7 @@ __device__ constraint::ConstraintBlock BuildBatchedContactBlock(
     return block;
 }
 
-__device__ constraint::ConstraintBlock BuildBatchedRevoluteBlock(uint32_t instance_index,
+__device__ BatchedRowGroup BuildBatchedRevoluteBlock(uint32_t instance_index,
                                                                  uint32_t body_count_per_instance,
                                                                  uint32_t parent,
                                                                  uint32_t child,
@@ -581,9 +614,9 @@ __device__ constraint::ConstraintBlock BuildBatchedRevoluteBlock(uint32_t instan
                                                                  math::Transform parent_frame,
                                                                  math::Transform child_frame,
                                                                  bool fixed_joint) {
-    constraint::ConstraintBlock block;
+    BatchedRowGroup block;
     ClearBlock(&block);
-    block.type = constraint::ConstraintType::Joint;
+    block.type = BatchedRowGroupType::Joint;
     block.body_a = FlattenBody(instance_index, body_count_per_instance, parent);
     block.body_b = FlattenBody(instance_index, body_count_per_instance, child);
     block.row_count = fixed_joint ? 6u : 5u;
@@ -621,7 +654,7 @@ __device__ constraint::ConstraintBlock BuildBatchedRevoluteBlock(uint32_t instan
     return block;
 }
 
-__device__ constraint::ConstraintBlock BuildBatchedDriveBlock(uint32_t instance_index,
+__device__ BatchedRowGroup BuildBatchedDriveBlock(uint32_t instance_index,
                                                               uint32_t body_count_per_instance,
                                                               uint32_t child,
                                                               uint32_t parent,
@@ -629,9 +662,9 @@ __device__ constraint::ConstraintBlock BuildBatchedDriveBlock(uint32_t instance_
                                                               scene::ActuatorType type,
                                                               float gain,
                                                               float force_limit) {
-    constraint::ConstraintBlock block;
+    BatchedRowGroup block;
     ClearBlock(&block);
-    block.type = constraint::ConstraintType::Drive;
+    block.type = BatchedRowGroupType::Drive;
     block.body_a = FlattenBody(instance_index, body_count_per_instance, child);
     block.body_b = FlattenBody(instance_index, body_count_per_instance, parent);
     block.row_count = 1u;
@@ -680,7 +713,7 @@ __device__ math::Transform BodyPose(uint32_t flat_body,
     return transform;
 }
 
-__device__ float ComputeJv(constraint::ConstraintBlock block,
+__device__ float ComputeJv(BatchedRowGroup block,
                            uint32_t row,
                            uint32_t total_body_count,
                            const math::Vec3* linear_velocities,
@@ -697,7 +730,7 @@ __device__ float ComputeJv(constraint::ConstraintBlock block,
     return jv;
 }
 
-__device__ float ComputeEffectiveMass(constraint::ConstraintBlock block,
+__device__ float ComputeEffectiveMass(BatchedRowGroup block,
                                       uint32_t row,
                                       uint32_t total_body_count,
                                       uint32_t body_count_per_instance,
@@ -759,7 +792,7 @@ __device__ float JointRowMass(math::Vec3 linear_a,
     return diag > 1.0e-12f ? 1.0f / diag : 0.0f;
 }
 
-__device__ void ApplyImpulse(constraint::ConstraintBlock block,
+__device__ void ApplyImpulse(BatchedRowGroup block,
                              uint32_t row,
                              float delta_impulse,
                              uint32_t total_body_count,
@@ -1102,7 +1135,7 @@ __global__ void AssembleBatchedContactBlocksKernel(
     uint32_t total_pair_slot_count,
     uint32_t body_count_per_instance,
     const CudaBatchedContactManifold* manifolds,
-    constraint::ConstraintBlock* blocks,
+    BatchedRowGroup* blocks,
     uint32_t* block_count) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= total_pair_slot_count || manifolds[slot].point_count == 0u) {
@@ -1122,7 +1155,7 @@ __global__ void AssembleBatchedJointBlocksKernel(uint32_t total_joint_count,
                                                  const math::Vec3* joint_axes,
                                                  const math::Transform* joint_parent_frames,
                                                  const math::Transform* joint_child_frames,
-                                                 constraint::ConstraintBlock* blocks,
+                                                 BatchedRowGroup* blocks,
                                                  uint32_t* block_count) {
     const uint32_t flat_joint = blockIdx.x * blockDim.x + threadIdx.x;
     if (flat_joint >= total_joint_count || joint_count_per_instance == 0u) {
@@ -1160,7 +1193,7 @@ __global__ void AssembleBatchedDriveBlocksKernel(uint32_t total_actuator_count,
                                                  const scene::BodyId* joint_parent_bodies,
                                                  const scene::BodyId* joint_child_bodies,
                                                  const math::Vec3* joint_axes,
-                                                 constraint::ConstraintBlock* blocks,
+                                                 BatchedRowGroup* blocks,
                                                  uint32_t* block_count) {
     const uint32_t flat_actuator = blockIdx.x * blockDim.x + threadIdx.x;
     if (flat_actuator >= total_actuator_count || actuator_count_per_instance == 0u) {
@@ -1201,13 +1234,13 @@ __global__ void AssembleBatchedJointBlocksDirectKernel(
     const math::Vec3* joint_axes,
     const math::Transform* joint_parent_frames,
     const math::Transform* joint_child_frames,
-    constraint::ConstraintBlock* blocks) {
+    BatchedRowGroup* blocks) {
     const uint32_t flat_joint = blockIdx.x * blockDim.x + threadIdx.x;
     if (flat_joint >= total_joint_count || joint_count_per_instance == 0u) {
         return;
     }
 
-    constraint::ConstraintBlock block;
+    BatchedRowGroup block;
     ClearBlock(&block);
 
     const uint32_t instance_index = flat_joint / joint_count_per_instance;
@@ -1242,13 +1275,13 @@ __global__ void AssembleBatchedDriveBlocksDirectKernel(
     const scene::BodyId* joint_parent_bodies,
     const scene::BodyId* joint_child_bodies,
     const math::Vec3* joint_axes,
-    constraint::ConstraintBlock* blocks) {
+    BatchedRowGroup* blocks) {
     const uint32_t flat_actuator = blockIdx.x * blockDim.x + threadIdx.x;
     if (flat_actuator >= total_actuator_count || actuator_count_per_instance == 0u) {
         return;
     }
 
-    constraint::ConstraintBlock block;
+    BatchedRowGroup block;
     ClearBlock(&block);
 
     const uint32_t instance_index = flat_actuator / actuator_count_per_instance;
@@ -1273,7 +1306,7 @@ __global__ void AssembleBatchedDriveBlocksDirectKernel(
 }
 
 __global__ void FinalizeBatchedSolverReportKernel(
-    const constraint::ConstraintBlock* blocks,
+    const BatchedRowGroup* blocks,
     const uint32_t* block_count,
     CudaBatchedConstraintSolverReport* report) {
     const uint32_t count = *block_count;
@@ -1284,11 +1317,11 @@ __global__ void FinalizeBatchedSolverReportKernel(
     report->drive_constraint_count = 0u;
     for (uint32_t index = 0; index < count; ++index) {
         report->constraint_row_count += blocks[index].row_count;
-        if (blocks[index].type == constraint::ConstraintType::Contact) {
+        if (blocks[index].type == BatchedRowGroupType::Contact) {
             ++report->contact_constraint_count;
-        } else if (blocks[index].type == constraint::ConstraintType::Joint) {
+        } else if (blocks[index].type == BatchedRowGroupType::Joint) {
             ++report->joint_constraint_count;
-        } else if (blocks[index].type == constraint::ConstraintType::Drive) {
+        } else if (blocks[index].type == BatchedRowGroupType::Drive) {
             ++report->drive_constraint_count;
         }
     }
@@ -1296,7 +1329,7 @@ __global__ void FinalizeBatchedSolverReportKernel(
 
 __global__ void FinalizeBatchedFixedBlockReportKernel(
     uint32_t block_capacity,
-    const constraint::ConstraintBlock* blocks,
+    const BatchedRowGroup* blocks,
     CudaBatchedConstraintSolverReport* report) {
     if (threadIdx.x != 0u || blockIdx.x != 0u) {
         return;
@@ -1308,17 +1341,17 @@ __global__ void FinalizeBatchedFixedBlockReportKernel(
     report->joint_constraint_count = 0u;
     report->drive_constraint_count = 0u;
     for (uint32_t index = 0; index < block_capacity; ++index) {
-        const constraint::ConstraintBlock block = blocks[index];
+        const BatchedRowGroup block = blocks[index];
         if (block.row_count == 0u) {
             continue;
         }
         ++report->constraint_block_count;
         report->constraint_row_count += block.row_count;
-        if (block.type == constraint::ConstraintType::Contact) {
+        if (block.type == BatchedRowGroupType::Contact) {
             ++report->contact_constraint_count;
-        } else if (block.type == constraint::ConstraintType::Joint) {
+        } else if (block.type == BatchedRowGroupType::Joint) {
             ++report->joint_constraint_count;
-        } else if (block.type == constraint::ConstraintType::Drive) {
+        } else if (block.type == BatchedRowGroupType::Drive) {
             ++report->drive_constraint_count;
         }
     }
@@ -1326,7 +1359,7 @@ __global__ void FinalizeBatchedFixedBlockReportKernel(
 
 __global__ void PrecomputeBatchedBlocksKernel(uint32_t total_body_count,
                                               uint32_t body_count_per_instance,
-                                              constraint::ConstraintBlock* blocks,
+                                              BatchedRowGroup* blocks,
                                               const uint32_t* block_count,
                                               const float* inv_masses,
                                               const math::Vec3* inv_inertias,
@@ -1337,7 +1370,7 @@ __global__ void PrecomputeBatchedBlocksKernel(uint32_t total_body_count,
         return;
     }
 
-    constraint::ConstraintBlock block = blocks[block_index];
+    BatchedRowGroup block = blocks[block_index];
     for (uint32_t row = 0; row < block.row_count; ++row) {
         block.effective_mass[row] =
             ComputeEffectiveMass(block,
@@ -1346,7 +1379,7 @@ __global__ void PrecomputeBatchedBlocksKernel(uint32_t total_body_count,
                                  body_count_per_instance,
                                  inv_masses,
                                  inv_inertias);
-        if (block.type == constraint::ConstraintType::Contact
+        if (block.type == BatchedRowGroupType::Contact
             && row < ContactNormalRowCount(block)
             && block.restitution > 0.0f) {
             const float jv = ComputeJv(block,
@@ -1364,7 +1397,7 @@ __global__ void PrecomputeBatchedBlocksKernel(uint32_t total_body_count,
 
 __global__ void SolveBatchedVelocityIterationKernel(uint32_t total_body_count,
                                                     uint32_t body_count_per_instance,
-                                                    constraint::ConstraintBlock* blocks,
+                                                    BatchedRowGroup* blocks,
                                                     const uint32_t* block_count,
                                                     const float* inv_masses,
                                                     const math::Vec3* inv_inertias,
@@ -1387,7 +1420,7 @@ __global__ void SolveBatchedVelocityIterationKernel(uint32_t total_body_count,
     float max_residual = 0.0f;
 
     for (uint32_t block_index = 0; block_index < count; ++block_index) {
-        constraint::ConstraintBlock block = blocks[block_index];
+        BatchedRowGroup block = blocks[block_index];
         for (uint32_t row = 0; row < block.row_count; ++row) {
             ++active_row_count;
             const float jv =
@@ -1472,7 +1505,7 @@ __global__ void SolveBatchedVelocityIterationKernel(uint32_t total_body_count,
 __global__ void ReduceBatchedFixedBlockSchedulerDiagnosticsKernel(
     uint32_t total_body_count,
     uint32_t block_capacity,
-    const constraint::ConstraintBlock* blocks,
+    const BatchedRowGroup* blocks,
     const math::Vec3* linear_velocities,
     const math::Vec3* angular_velocities,
     uint32_t executed_iterations,
@@ -1484,7 +1517,7 @@ __global__ void ReduceBatchedFixedBlockSchedulerDiagnosticsKernel(
 
     CudaConstraintRowSchedulerIterationReport iteration_report;
     for (uint32_t block_index = 0; block_index < block_capacity; ++block_index) {
-        const constraint::ConstraintBlock block = blocks[block_index];
+        const BatchedRowGroup block = blocks[block_index];
         for (uint32_t row = 0u; row < block.row_count; ++row) {
             ++iteration_report.active_row_count;
             const bool tangent_row = IsContactFrictionRow(block, row);
@@ -1545,7 +1578,7 @@ __global__ void ReduceBatchedFixedBlockSchedulerDiagnosticsKernel(
 __global__ void SolveBatchedContactPositionIterationKernel(
     uint32_t total_body_count,
     uint32_t body_count_per_instance,
-    constraint::ConstraintBlock* blocks,
+    BatchedRowGroup* blocks,
     const uint32_t* block_count,
     const float* inv_masses,
     const math::Vec3* inv_inertias,
@@ -1560,8 +1593,8 @@ __global__ void SolveBatchedContactPositionIterationKernel(
     float max_error = 0.0f;
     const uint32_t count = *block_count;
     for (uint32_t block_index = 0; block_index < count; ++block_index) {
-        const constraint::ConstraintBlock block = blocks[block_index];
-        if (block.type != constraint::ConstraintType::Contact) {
+        const BatchedRowGroup block = blocks[block_index];
+        if (block.type != BatchedRowGroupType::Contact) {
             continue;
         }
         const uint32_t normal_rows = ContactNormalRowCount(block);
@@ -1602,7 +1635,7 @@ __global__ void SolveBatchedContactPositionIterationKernel(
 __global__ void SolveBatchedJointPositionIterationKernel(
     uint32_t total_body_count,
     uint32_t body_count_per_instance,
-    const constraint::ConstraintBlock* blocks,
+    const BatchedRowGroup* blocks,
     const uint32_t* block_count,
     const float* inv_masses,
     const math::Vec3* inv_inertias,
@@ -1618,8 +1651,8 @@ __global__ void SolveBatchedJointPositionIterationKernel(
     const math::Vec3 axes[3] = {UnitX(), UnitY(), UnitZ()};
     const uint32_t count = *block_count;
     for (uint32_t block_index = 0; block_index < count; ++block_index) {
-        const constraint::ConstraintBlock block = blocks[block_index];
-        if (block.type != constraint::ConstraintType::Joint) {
+        const BatchedRowGroup block = blocks[block_index];
+        if (block.type != BatchedRowGroupType::Joint) {
             continue;
         }
 
@@ -1684,10 +1717,10 @@ __device__ void PrecomputeBatchedJointDriveBlock(
     uint32_t block_index,
     uint32_t total_body_count,
     uint32_t body_count_per_instance,
-    constraint::ConstraintBlock* blocks,
+    BatchedRowGroup* blocks,
     const float* inv_masses,
     const math::Vec3* inv_inertias) {
-    constraint::ConstraintBlock block = blocks[block_index];
+    BatchedRowGroup block = blocks[block_index];
     if (block.row_count == 0u) {
         return;
     }
@@ -1709,12 +1742,12 @@ __device__ void SolveBatchedJointDriveVelocityBlock(
     uint32_t block_index,
     uint32_t total_body_count,
     uint32_t body_count_per_instance,
-    constraint::ConstraintBlock* blocks,
+    BatchedRowGroup* blocks,
     const float* inv_masses,
     const math::Vec3* inv_inertias,
     math::Vec3* linear_velocities,
     math::Vec3* angular_velocities) {
-    constraint::ConstraintBlock block = blocks[block_index];
+    BatchedRowGroup block = blocks[block_index];
     if (block.row_count == 0u) {
         return;
     }
@@ -1749,14 +1782,14 @@ __device__ float ProjectBatchedJointDrivePositionBlock(
     uint32_t block_index,
     uint32_t total_body_count,
     uint32_t body_count_per_instance,
-    const constraint::ConstraintBlock* blocks,
+    const BatchedRowGroup* blocks,
     const float* inv_masses,
     const math::Vec3* inv_inertias,
     math::Transform* poses,
     float slop,
     float baumgarte) {
-    const constraint::ConstraintBlock block = blocks[block_index];
-    if (block.row_count == 0u || block.type != constraint::ConstraintType::Joint) {
+    const BatchedRowGroup block = blocks[block_index];
+    if (block.row_count == 0u || block.type != BatchedRowGroupType::Joint) {
         return 0.0f;
     }
 
@@ -1825,7 +1858,7 @@ __global__ void SolveBatchedJointDriveStepKernel(
     uint32_t joint_count_per_instance,
     uint32_t actuator_count_per_instance,
     uint32_t joint_capacity,
-    constraint::ConstraintBlock* blocks,
+    BatchedRowGroup* blocks,
     const float* inv_masses,
     const math::Vec3* inv_inertias,
     math::Transform* poses,
@@ -1971,7 +2004,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         return false;
     }
 
-    phi::Buffer blocks(block_capacity * sizeof(constraint::ConstraintBlock),
+    phi::Buffer blocks(block_capacity * sizeof(BatchedRowGroup),
                        phi::MemoryKind::Device);
     phi::Buffer solver_report(sizeof(CudaBatchedConstraintSolverReport),
                               phi::MemoryKind::Device);
@@ -2011,7 +2044,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
             batch.DeviceJointAxes(),
             batch.DeviceJointParentFrames(),
             batch.DeviceJointChildFrames(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()));
+            static_cast<BatchedRowGroup*>(blocks.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedJointBlocksDirectKernel launch");
     }
 
@@ -2031,13 +2064,13 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
             batch.DeviceJointParentBodies(),
             batch.DeviceJointChildBodies(),
             batch.DeviceJointAxes(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()));
+            static_cast<BatchedRowGroup*>(blocks.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksDirectKernel launch");
     }
 
     FinalizeBatchedFixedBlockReportKernel<<<1, 1, 0, stream>>>(
         block_capacity,
-        static_cast<const constraint::ConstraintBlock*>(blocks.Data()),
+        static_cast<const BatchedRowGroup*>(blocks.Data()),
         static_cast<CudaBatchedConstraintSolverReport*>(solver_report.Data()));
     CheckCuda(cudaGetLastError(), "FinalizeBatchedFixedBlockReportKernel launch");
 
@@ -2085,7 +2118,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
             options.enable_joints ? batch.JointCountPerInstance() : 0u,
             options.enable_drives ? batch.ActuatorCountPerInstance() : 0u,
             joint_capacity,
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<BatchedRowGroup*>(blocks.Data()),
             batch.DeviceInvMasses(),
             batch.DeviceInvInertias(),
             batch.DevicePoses(),
@@ -2101,7 +2134,7 @@ bool StepBatchedJointDriveOnlyFastPath(BatchedDeviceWorld& batch,
         ReduceBatchedFixedBlockSchedulerDiagnosticsKernel<<<1, 1, 0, stream>>>(
             batch.TotalBodyCount(),
             block_capacity,
-            static_cast<const constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<const BatchedRowGroup*>(blocks.Data()),
             batch.DeviceLinearVelocities(),
             batch.DeviceAngularVelocities(),
             options.solver_velocity_iterations * (step + 1u),
@@ -2813,7 +2846,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
     const uint32_t joint_capacity = include_joints ? batch.TotalJointCount() : 0u;
     const uint32_t actuator_capacity = include_drives ? batch.TotalActuatorCount() : 0u;
     const uint32_t block_capacity = contact_capacity + joint_capacity + actuator_capacity;
-    phi::Buffer blocks(block_capacity * sizeof(constraint::ConstraintBlock),
+    phi::Buffer blocks(block_capacity * sizeof(BatchedRowGroup),
                        phi::MemoryKind::Device);
     phi::Buffer block_count(sizeof(uint32_t), phi::MemoryKind::Device);
     phi::Buffer report(sizeof(CudaBatchedConstraintSolverReport), phi::MemoryKind::Device);
@@ -2831,7 +2864,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             contacts->TotalPairSlotCount(),
             batch.BodyCountPerInstance(),
             contacts->DeviceManifolds(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<BatchedRowGroup*>(blocks.Data()),
             static_cast<uint32_t*>(block_count.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedContactBlocksKernel launch");
     }
@@ -2849,7 +2882,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             batch.DeviceJointAxes(),
             batch.DeviceJointParentFrames(),
             batch.DeviceJointChildFrames(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<BatchedRowGroup*>(blocks.Data()),
             static_cast<uint32_t*>(block_count.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedJointBlocksKernel launch");
     }
@@ -2869,13 +2902,13 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             batch.DeviceJointParentBodies(),
             batch.DeviceJointChildBodies(),
             batch.DeviceJointAxes(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<BatchedRowGroup*>(blocks.Data()),
             static_cast<uint32_t*>(block_count.Data()));
         CheckCuda(cudaGetLastError(), "AssembleBatchedDriveBlocksKernel launch");
     }
 
     FinalizeBatchedSolverReportKernel<<<1, 1, 0, stream>>>(
-        static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+        static_cast<BatchedRowGroup*>(blocks.Data()),
         static_cast<const uint32_t*>(block_count.Data()),
         static_cast<CudaBatchedConstraintSolverReport*>(report.Data()));
     CheckCuda(cudaGetLastError(), "FinalizeBatchedSolverReportKernel launch");
@@ -2895,7 +2928,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
         PrecomputeBatchedBlocksKernel<<<blocks_grid, kBlockSize, 0, stream>>>(
             batch.TotalBodyCount(),
             batch.BodyCountPerInstance(),
-            static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+            static_cast<BatchedRowGroup*>(blocks.Data()),
             static_cast<const uint32_t*>(block_count.Data()),
             batch.DeviceInvMasses(),
             batch.DeviceInvInertias(),
@@ -2907,7 +2940,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             SolveBatchedVelocityIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
-                static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+                static_cast<BatchedRowGroup*>(blocks.Data()),
                 static_cast<const uint32_t*>(block_count.Data()),
                 batch.DeviceInvMasses(),
                 batch.DeviceInvInertias(),
@@ -2922,7 +2955,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             SolveBatchedContactPositionIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
-                static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+                static_cast<BatchedRowGroup*>(blocks.Data()),
                 static_cast<const uint32_t*>(block_count.Data()),
                 batch.DeviceInvMasses(),
                 batch.DeviceInvInertias(),
@@ -2935,7 +2968,7 @@ CudaBatchedConstraintSolverResult SolveBatchedCudaConstraintsImpl(
             SolveBatchedJointPositionIterationKernel<<<1, 1, 0, stream>>>(
                 batch.TotalBodyCount(),
                 batch.BodyCountPerInstance(),
-                static_cast<constraint::ConstraintBlock*>(blocks.Data()),
+                static_cast<BatchedRowGroup*>(blocks.Data()),
                 static_cast<const uint32_t*>(block_count.Data()),
                 batch.DeviceInvMasses(),
                 batch.DeviceInvInertias(),

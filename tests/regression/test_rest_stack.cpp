@@ -4,7 +4,7 @@
 
 #include "solver/rigid_solver.hpp"
 #include "runtime/rigid/integrator.hpp"
-#include "constraint/constraint_block.hpp"
+#include "constraint/row_buffers.hpp"
 #include "math/vec3.hpp"
 
 #include <gtest/gtest.h>
@@ -51,39 +51,31 @@ StackResult RunRestStackRegression() {
     bodies[1].force            = {0.0f, 0.0f, 0.0f};
     bodies[1].torque           = {0.0f, 0.0f, 0.0f};
 
-    // Contact 1: bottom box vs ground (body_b = ~0u means static world)
-    constraint::ConstraintBlock ground_contact{};
-    ground_contact.type       = constraint::ConstraintType::Contact;
-    ground_contact.body_a     = 0;
-    ground_contact.body_b     = ~0u;
-    ground_contact.row_count  = 1;
-    ground_contact.jacobian_linear_a[0]  = {0.0f, -1.0f, 0.0f};
-    ground_contact.jacobian_angular_a[0] = math::Vec3::Zero();
-    ground_contact.jacobian_linear_b[0]  = {0.0f,  1.0f, 0.0f};
-    ground_contact.jacobian_angular_b[0] = math::Vec3::Zero();
-    ground_contact.rhs[0]          = 0.0f;
-    ground_contact.lower_limit[0]  = 0.0f;
-    ground_contact.upper_limit[0]  = 1e6f;
+    constraint::RowBuffers rows;
+    constraint::Row row;
+    row.row_class_id = constraint::kMaximalContactRowClassId;
+    row.lower = 0.0f;
+    row.upper = constraint::kRowHugeLimit;
+    row.flags = constraint::row_flags::Unilateral;
+    constraint::RowMaterial material;
+    material.kind = constraint::RowKind::Contact;
+    material.normal_row_count = 1u;
 
-    // Contact 2: top box vs bottom box
-    constraint::ConstraintBlock stack_contact{};
-    stack_contact.type       = constraint::ConstraintType::Contact;
-    stack_contact.body_a     = 1;
-    stack_contact.body_b     = 0;
-    stack_contact.row_count  = 1;
-    stack_contact.jacobian_linear_a[0]  = {0.0f, -1.0f, 0.0f};
-    stack_contact.jacobian_angular_a[0] = math::Vec3::Zero();
-    stack_contact.jacobian_linear_b[0]  = {0.0f,  1.0f, 0.0f};
-    stack_contact.jacobian_angular_b[0] = math::Vec3::Zero();
-    stack_contact.rhs[0]          = 0.0f;
-    stack_contact.lower_limit[0]  = 0.0f;
-    stack_contact.upper_limit[0]  = 1e6f;
+    material.group_id = 0u;
+    rows.AddRow(row,
+                {0u, constraint::kInvalidBodyIndex},
+                {{0.0f, 1.0f, 0.0f}, math::Vec3::Zero()},
+                {{0.0f, -1.0f, 0.0f}, math::Vec3::Zero()},
+                material);
 
-    std::vector<constraint::ConstraintBlock> blocks;
-    blocks.push_back(ground_contact);
-    blocks.push_back(stack_contact);
+    material.group_id = 1u;
+    rows.AddRow(row,
+                {1u, 0u},
+                {{0.0f, 1.0f, 0.0f}, math::Vec3::Zero()},
+                {{0.0f, -1.0f, 0.0f}, math::Vec3::Zero()},
+                material);
 
-    auto result = solver::SolveConstraints(blocks, bodies);
+    auto result = solver::SolveConstraints(rows, bodies);
 
     return {result.max_penetration, bodies[1].position.y, bodies[0].position.y};
 }

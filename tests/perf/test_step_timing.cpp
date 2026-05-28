@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "runtime/rigid/integrator.hpp"
-#include "constraint/constraint_block.hpp"
+#include "constraint/row_buffers.hpp"
 #include "math/vec3.hpp"
 #include "runtime/world_builder.hpp"
 #include "runtime/world_stepper.hpp"
@@ -90,7 +90,7 @@ TEST(StepTiming, ContactMaterialSolveUnderOneSecond) {
     constexpr int step_count = 120;
 
     std::vector<BodyState> bodies(body_count);
-    std::vector<constraint::ConstraintBlock> contacts(body_count);
+    constraint::RowBuffers contacts;
 
     for (int i = 0; i < body_count; ++i) {
         bodies[i].inv_mass = 1.0f;
@@ -101,26 +101,39 @@ TEST(StepTiming, ContactMaterialSolveUnderOneSecond) {
             0.5f
         };
 
-        auto& contact = contacts[i];
-        contact.type = constraint::ConstraintType::Contact;
-        contact.body_a = static_cast<uint32_t>(i);
-        contact.body_b = ~0u;
-        contact.row_count = 3;
-        contact.normal_row_count = 1;
-        contact.first_friction_row = 1;
-        contact.friction_row_count = 2;
-        contact.friction = 0.6f;
-        contact.restitution = 0.1f;
+        constraint::RowMaterial material;
+        material.kind = constraint::RowKind::Contact;
+        material.group_id = contacts.RowCount();
+        material.normal_row_count = 1u;
+        material.first_friction_row = material.group_id + 1u;
+        material.friction_row_count = 2u;
+        material.friction = 0.6f;
+        material.restitution = 0.1f;
 
-        contact.jacobian_linear_a[0] = {0.0f, 1.0f, 0.0f};
-        contact.jacobian_linear_b[0] = {0.0f, -1.0f, 0.0f};
-        contact.lower_limit[0] = 0.0f;
-        contact.upper_limit[0] = 1e6f;
+        constraint::Row row;
+        row.row_class_id = constraint::kMaximalContactRowClassId;
+        row.lower = 0.0f;
+        row.upper = constraint::kRowHugeLimit;
+        row.flags = constraint::row_flags::Unilateral;
+        contacts.AddRow(row,
+                        {static_cast<uint32_t>(i), constraint::kInvalidBodyIndex},
+                        {{0.0f, 1.0f, 0.0f}, math::Vec3::Zero()},
+                        {{0.0f, -1.0f, 0.0f}, math::Vec3::Zero()},
+                        material);
 
-        contact.jacobian_linear_a[1] = {1.0f, 0.0f, 0.0f};
-        contact.jacobian_linear_b[1] = {-1.0f, 0.0f, 0.0f};
-        contact.jacobian_linear_a[2] = {0.0f, 0.0f, 1.0f};
-        contact.jacobian_linear_b[2] = {0.0f, 0.0f, -1.0f};
+        constraint::Row friction_row;
+        friction_row.row_class_id = constraint::kMaximalContactRowClassId;
+        friction_row.flags = constraint::row_flags::Friction;
+        contacts.AddRow(friction_row,
+                        {static_cast<uint32_t>(i), constraint::kInvalidBodyIndex},
+                        {{1.0f, 0.0f, 0.0f}, math::Vec3::Zero()},
+                        {{-1.0f, 0.0f, 0.0f}, math::Vec3::Zero()},
+                        material);
+        contacts.AddRow(friction_row,
+                        {static_cast<uint32_t>(i), constraint::kInvalidBodyIndex},
+                        {{0.0f, 0.0f, 1.0f}, math::Vec3::Zero()},
+                        {{0.0f, 0.0f, -1.0f}, math::Vec3::Zero()},
+                        material);
     }
 
     solver::SolverConfig config{};
@@ -249,6 +262,9 @@ TEST(StepTiming, RuntimeJointDrivePipelineUnderOneSecond) {
     options.solver_slop = 0.0f;
 
     runtime::WorldStepReport last_report;
+    last_report = runtime::StepWorldInstance(world.template_view,
+                                             world.instance,
+                                             options);
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr int step_count = 120;

@@ -42,21 +42,21 @@ TEST(JointProjection, StaticAnchorPullsDynamicAnchorOntoPivot) {
     bodies.push_back(MakeBody(0.0f, Vec3::Zero(), {0.0f, 0.0f, 0.0f}));
     bodies.push_back(MakeBody(1.0f, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f, 0.0f}));
 
-    auto joint = nuka::runtime::articulation::BuildRevoluteConstraint(
-        0, 1,
+    nuka::constraint::RowBuffers rows;
+    nuka::runtime::articulation::AppendRevoluteRows(
+        &rows,
+        0u, 1u,
         Vec3::UnitZ(),
         Transform(Vec3::Zero(), Quat::Identity()),
         Transform(Vec3::Zero(), Quat::Identity()),
         -3.14f, 3.14f);
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks{joint};
     nuka::solver::SolverConfig config{};
     config.velocity_iterations = 0;
     config.position_iterations = 12;
     config.baumgarte = 0.5f;
     config.slop = 0.0f;
 
-    nuka::solver::SolveConstraints(blocks, bodies, config);
+    nuka::solver::SolveConstraints(rows, bodies, config);
 
     EXPECT_NEAR(bodies[0].position.y, 0.0f, 1e-6f);
     EXPECT_LT(Distance(WorldAnchor(bodies[0], Vec3::Zero()),
@@ -69,21 +69,21 @@ TEST(JointProjection, MassWeightedCorrectionMovesLightBodyMore) {
     bodies.push_back(MakeBody(0.1f, Vec3::Zero(), {0.0f, 0.0f, 0.0f}));
     bodies.push_back(MakeBody(1.0f, Vec3::Zero(), {0.0f, 1.0f, 0.0f}));
 
-    auto joint = nuka::runtime::articulation::BuildRevoluteConstraint(
-        0, 1,
+    nuka::constraint::RowBuffers rows;
+    nuka::runtime::articulation::AppendRevoluteRows(
+        &rows,
+        0u, 1u,
         Vec3::UnitZ(),
         Transform(Vec3::Zero(), Quat::Identity()),
         Transform(Vec3::Zero(), Quat::Identity()),
         -3.14f, 3.14f);
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks{joint};
     nuka::solver::SolverConfig config{};
     config.velocity_iterations = 0;
     config.position_iterations = 1;
     config.baumgarte = 1.0f;
     config.slop = 0.0f;
 
-    nuka::solver::SolveConstraints(blocks, bodies, config);
+    nuka::solver::SolveConstraints(rows, bodies, config);
 
     const float heavy_body_motion = std::abs(bodies[0].position.y);
     const float light_body_motion = std::abs(1.0f - bodies[1].position.y);
@@ -104,21 +104,21 @@ TEST(JointProjection, EccentricAnchorProjectionUsesAngularInertia) {
     const float initial_gap = Distance(WorldAnchor(bodies[0], parent_anchor),
                                        WorldAnchor(bodies[1], child_anchor));
 
-    auto joint = nuka::runtime::articulation::BuildRevoluteConstraint(
-        0, 1,
+    nuka::constraint::RowBuffers rows;
+    nuka::runtime::articulation::AppendRevoluteRows(
+        &rows,
+        0u, 1u,
         Vec3::UnitZ(),
         Transform(parent_anchor, Quat::Identity()),
         Transform(child_anchor, Quat::Identity()),
         -3.14f, 3.14f);
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks{joint};
     nuka::solver::SolverConfig config{};
     config.velocity_iterations = 0;
     config.position_iterations = 1;
     config.baumgarte = 1.0f;
     config.slop = 0.0f;
 
-    nuka::solver::SolveConstraints(blocks, bodies, config);
+    nuka::solver::SolveConstraints(rows, bodies, config);
 
     const float final_gap = Distance(WorldAnchor(bodies[0], parent_anchor),
                                      WorldAnchor(bodies[1], child_anchor));

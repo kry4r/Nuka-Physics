@@ -12,12 +12,14 @@ enum class CudaConstraintRowBufferKind : uint32_t {
     Unknown = 0u,
     ParticleRigidCoupling = 1u,
     RigidConstraintBlock = 2u,
+    UniversalRowCsr = 3u,
 };
 
 enum class CudaConstraintRowLayout : uint32_t {
     Unknown = 0u,
     ParticleRigidCouplingSlot = 1u,
     ConstraintBlock = 2u,
+    UniversalRowCsr = 3u,
 };
 
 enum class CudaConstraintRowScheduleMode : uint32_t {

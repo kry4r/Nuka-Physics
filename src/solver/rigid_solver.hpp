@@ -3,7 +3,7 @@
 // nuka::solver – Iterative rigid body constraint solver (PGS)
 // ---------------------------------------------------------------------------
 
-#include "constraint/constraint_block.hpp"
+#include "constraint/row_buffers.hpp"
 #include "runtime/rigid/body_state.hpp"
 
 #include <cstdint>
@@ -25,7 +25,7 @@ struct SolverConfig {
 
 /// Solve a set of constraints for the given body states using PGS.
 SolveResult SolveConstraints(
-    std::vector<constraint::ConstraintBlock>& blocks,
+    constraint::RowBuffers& rows,
     std::vector<runtime::rigid::BodyState>& bodies,
     const SolverConfig& config = {}
 );

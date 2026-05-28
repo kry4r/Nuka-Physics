@@ -123,38 +123,39 @@ void AppendContactPoints(std::span<const constraint::ContactManifold> manifolds,
     }
 }
 
-void AppendConstraintErrors(std::span<const constraint::ConstraintBlock> constraints,
+void AppendConstraintErrors(const constraint::RowBuffers& rows,
                             const scene::SceneGraph& graph,
                             float error_scale,
                             DebugDrawList& list) {
-    for (const auto& block : constraints) {
-        const bool has_a = block.body_a < graph.NodeCount();
-        const bool has_b = block.body_b < graph.NodeCount();
+    for (uint32_t row_index = 0; row_index < rows.RowCount(); ++row_index) {
+        const auto body_pair = rows.BodiesForRow(row_index);
+        const bool has_a = body_pair.body_a < graph.NodeCount();
+        const bool has_b = body_pair.body_b < graph.NodeCount();
         if (!has_a && !has_b) {
             continue;
         }
 
         const math::Vec3 origin = has_a
-            ? BodyWorldPosition(graph, block.body_a)
-            : BodyWorldPosition(graph, block.body_b);
+            ? BodyWorldPosition(graph, body_pair.body_a)
+            : BodyWorldPosition(graph, body_pair.body_b);
 
-        for (uint32_t row = 0; row < block.row_count && row < constraint::ConstraintBlock::kMaxRows; ++row) {
-            math::Vec3 direction = has_a ? block.jacobian_linear_a[row] : block.jacobian_linear_b[row];
-            if (direction.LengthSq() < 1e-12f) {
-                direction = has_a ? block.jacobian_angular_a[row] : block.jacobian_angular_b[row];
-            }
-            if (direction.LengthSq() < 1e-12f) {
-                continue;
-            }
-
-            const float magnitude = block.rhs[row] != 0.0f ? block.rhs[row] : block.impulse[row];
-            if (magnitude == 0.0f) {
-                continue;
-            }
-
-            const math::Vec3 endpoint = origin + direction.Normalized() * (magnitude * error_scale);
-            list.AddLine(origin, endpoint, kConstraintErrorColor);
+        const auto jacobian = rows.JacobianForRowBody(row_index, has_a ? 0u : 1u);
+        math::Vec3 direction = jacobian.linear;
+        if (direction.LengthSq() < 1e-12f) {
+            direction = jacobian.angular;
         }
+        if (direction.LengthSq() < 1e-12f) {
+            continue;
+        }
+
+        const auto& row = rows.rows[row_index];
+        const float magnitude = row.rhs != 0.0f ? row.rhs : row.lambda;
+        if (magnitude == 0.0f) {
+            continue;
+        }
+
+        const math::Vec3 endpoint = origin + direction.Normalized() * (magnitude * error_scale);
+        list.AddLine(origin, endpoint, kConstraintErrorColor);
     }
 }
 
@@ -192,8 +193,10 @@ DebugDrawList BuildDebugVisualization(const DebugVisualizationInput& input,
         AppendContactPoints(input.contact_manifolds, list);
     }
 
-    if (options.draw_constraint_errors && input.scene_graph != nullptr) {
-        AppendConstraintErrors(input.constraint_blocks,
+    if (options.draw_constraint_errors &&
+        input.scene_graph != nullptr &&
+        input.constraint_rows != nullptr) {
+        AppendConstraintErrors(*input.constraint_rows,
                                *input.scene_graph,
                                options.constraint_error_scale,
                                list);

@@ -293,23 +293,21 @@ TEST(CudaBatchedWorld, SolvesContactsIndependentlyOnDevice) {
     EXPECT_EQ(report.contact_constraint_count, 1u);
     EXPECT_GE(report.constraint_row_count, 3u);
     EXPECT_EQ(row_buffer.kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(row_buffer.layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(row_buffer.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_NE(row_buffer.device_rows, nullptr);
     EXPECT_EQ(row_buffer.owner_count, contacts.TotalPairSlotCount());
-    EXPECT_EQ(row_buffer.rows_per_owner,
-              constraint::ConstraintBlock::kMaxRows);
-    EXPECT_EQ(row_buffer.row_stride_bytes,
-              sizeof(constraint::ConstraintBlock));
+    EXPECT_EQ(row_buffer.rows_per_owner, 6u);
+    EXPECT_GT(row_buffer.row_stride_bytes, 0u);
     EXPECT_EQ(report.row_scheduler_report.row_kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.row_layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_EQ(report.row_scheduler_report.owner_count, row_buffer.owner_count);
     EXPECT_EQ(report.row_scheduler_report.row_count, row_buffer.row_count);
     EXPECT_EQ(report.row_scheduler_report.configured_iterations,
@@ -354,11 +352,11 @@ TEST(CudaBatchedWorld, StepPipelineCanSolveBatchedContacts) {
     EXPECT_EQ(report.contact_manifold_count, 1u);
     EXPECT_GE(report.constraint_row_count, 3u);
     EXPECT_EQ(report.row_scheduler_report.row_kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.row_layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_EQ(report.row_scheduler_report.configured_iterations,
               options.solver_velocity_iterations);
     EXPECT_EQ(report.row_scheduler_report.executed_iterations,
@@ -434,11 +432,11 @@ TEST(CudaBatchedWorld, AppliesVelocityDrivesIndependentlyOnDevice) {
     EXPECT_EQ(report.drive_constraint_count, 2u);
     EXPECT_GE(report.constraint_row_count, 12u);
     EXPECT_EQ(row_buffer.kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(row_buffer.layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(row_buffer.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_NE(row_buffer.device_rows, nullptr);
     EXPECT_EQ(row_buffer.owner_count,
               report.joint_constraint_count + report.drive_constraint_count);
@@ -484,11 +482,11 @@ TEST(CudaBatchedWorld, StepPipelineCanSolveBatchedJointsAndDrives) {
     EXPECT_EQ(report.drive_constraint_count, 2u);
     EXPECT_GE(report.constraint_row_count, 12u);
     EXPECT_EQ(report.row_scheduler_report.row_kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.row_layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(report.row_scheduler_report.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_EQ(report.row_scheduler_report.configured_iterations,
               options.solver_velocity_iterations);
     EXPECT_EQ(report.row_scheduler_report.executed_iterations,

@@ -59,15 +59,13 @@ ArmResult RunTwoLinkArmRegression() {
     // Frame B: joint anchor in body 1's local frame is at (-0.5, 0, 0)
     math::Transform frame_b({-0.5f, 0.0f, 0.0f}, math::Quat::Identity());
 
-    auto joint_block = runtime::articulation::BuildRevoluteConstraint(
-        0, 1,
-        {0.0f, 0.0f, 1.0f},  // revolute axis = Z
+    constraint::RowBuffers rows;
+    runtime::articulation::AppendRevoluteRows(
+        &rows,
+        0u, 1u,
+        {0.0f, 0.0f, 1.0f},
         frame_a, frame_b,
-        -3.14f, 3.14f
-    );
-
-    std::vector<constraint::ConstraintBlock> blocks;
-    blocks.push_back(joint_block);
+        -3.14f, 3.14f);
 
     // Apply gravity and step bodies
     const math::Vec3 gravity{0.0f, -9.81f, 0.0f};
@@ -81,7 +79,7 @@ ArmResult RunTwoLinkArmRegression() {
         }
 
         // Solve joint constraint
-        solver::SolveConstraints(blocks, bodies);
+        solver::SolveConstraints(rows, bodies);
     }
 
     // Compute the world-space joint anchor point from each body's perspective

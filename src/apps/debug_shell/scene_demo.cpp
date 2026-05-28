@@ -12,6 +12,7 @@
 #include "phi/device_context.hpp"
 #include "phi/platform_contract.hpp"
 #include "render/vulkan_renderer.hpp"
+#include "runtime/articulation/joint_constraints.hpp"
 #include "runtime/world_stepper.hpp"
 #include "scene/scene_pipeline.hpp"
 
@@ -22,7 +23,8 @@
 #include "runtime/gpu/cuda_world_stepper.hpp"
 #include "runtime/gpu/device_world.hpp"
 #include "sensor/gpu/cuda_sensors.cuh"
-#include "solver/gpu/cuda_constraint_solver.cuh"
+#include "constraint/row_builder.hpp"
+#include "solver/gpu/row_solver.cuh"
 #endif
 
 #include <algorithm>
@@ -258,6 +260,139 @@ bool WriteVulkanPpm(const std::string& path,
 }
 
 #if defined(NUKA_HAS_CUDA_RUNTIME)
+math::Transform FrameOrIdentity(const std::vector<math::Transform>& frames,
+                                uint32_t index) {
+    if (index < frames.size()) {
+        return frames[index];
+    }
+    return math::Transform::Identity();
+}
+
+math::Vec3 AxisOrDefault(const runtime::WorldTemplate& world_template,
+                         uint32_t joint_index) {
+    if (joint_index < world_template.joint_table.axes.size()) {
+        return world_template.joint_table.axes[joint_index];
+    }
+    return math::Vec3::UnitZ();
+}
+
+float LimitOrDefault(const std::vector<float>& limits,
+                     uint32_t index,
+                     float fallback) {
+    if (index < limits.size()) {
+        return limits[index];
+    }
+    return fallback;
+}
+
+float ForceLimitOrDefault(const runtime::WorldTemplate& world_template,
+                          uint32_t actuator_index) {
+    if (actuator_index < world_template.actuator_table.force_limits.size() &&
+        world_template.actuator_table.force_limits[actuator_index] > 0.0f) {
+        return world_template.actuator_table.force_limits[actuator_index];
+    }
+    return constraint::kRowHugeLimit;
+}
+
+float TargetVelocity(scene::ActuatorType type, float gain) {
+    if (type == scene::ActuatorType::Velocity ||
+        type == scene::ActuatorType::Motor ||
+        type == scene::ActuatorType::Force) {
+        return gain;
+    }
+    return 0.0f;
+}
+
+bool AppendSceneJointRows(const runtime::WorldTemplate& world_template,
+                          uint32_t joint_index,
+                          constraint::RowBuffers& rows) {
+    if (joint_index >= world_template.joint_table.parent_bodies.size() ||
+        joint_index >= world_template.joint_table.child_bodies.size()) {
+        return false;
+    }
+
+    const uint32_t parent = world_template.joint_table.parent_bodies[joint_index];
+    const uint32_t child = world_template.joint_table.child_bodies[joint_index];
+    const scene::JointType type = joint_index < world_template.joint_table.types.size()
+        ? world_template.joint_table.types[joint_index]
+        : scene::JointType::Revolute;
+    const math::Transform parent_frame =
+        FrameOrIdentity(world_template.joint_table.parent_frames, joint_index);
+    const math::Transform child_frame =
+        FrameOrIdentity(world_template.joint_table.child_frames, joint_index);
+
+    if (type == scene::JointType::Fixed) {
+        constraint::AppendFixedRows(&rows, parent, child, parent_frame, child_frame);
+        return true;
+    }
+
+    constraint::AppendRevoluteRows(
+        &rows,
+        parent,
+        child,
+        AxisOrDefault(world_template, joint_index),
+        parent_frame,
+        child_frame,
+        LimitOrDefault(world_template.joint_table.lower_limits,
+                       joint_index,
+                       -3.14159f),
+        LimitOrDefault(world_template.joint_table.upper_limits,
+                       joint_index,
+                       3.14159f));
+    return true;
+}
+
+bool AppendSceneDriveRow(const runtime::WorldTemplate& world_template,
+                         uint32_t actuator_index,
+                         constraint::RowBuffers& rows) {
+    if (actuator_index >= world_template.actuator_table.joint_ids.size()) {
+        return false;
+    }
+    const scene::JointId joint_id =
+        world_template.actuator_table.joint_ids[actuator_index];
+    if (joint_id >= world_template.joint_count ||
+        joint_id >= world_template.joint_table.parent_bodies.size() ||
+        joint_id >= world_template.joint_table.child_bodies.size()) {
+        return false;
+    }
+
+    const scene::ActuatorType type =
+        actuator_index < world_template.actuator_table.types.size()
+            ? world_template.actuator_table.types[actuator_index]
+            : scene::ActuatorType::Motor;
+    const float gain = actuator_index < world_template.actuator_table.gains.size()
+        ? world_template.actuator_table.gains[actuator_index]
+        : 0.0f;
+    constraint::AppendDriveRow(
+        &rows,
+        world_template.joint_table.child_bodies[joint_id],
+        world_template.joint_table.parent_bodies[joint_id],
+        AxisOrDefault(world_template, joint_id),
+        TargetVelocity(type, gain),
+        ForceLimitOrDefault(world_template, actuator_index));
+    return true;
+}
+
+void BuildSceneRows(const runtime::WorldTemplate& world_template,
+                    std::span<const constraint::ContactManifold> manifolds,
+                    constraint::RowBuffers& rows,
+                    uint32_t& joint_count,
+                    uint32_t& drive_count) {
+    constraint::BuildContactRows(manifolds, &rows);
+    for (uint32_t joint_index = 0; joint_index < world_template.joint_count; ++joint_index) {
+        if (AppendSceneJointRows(world_template, joint_index, rows)) {
+            ++joint_count;
+        }
+    }
+    for (uint32_t actuator_index = 0;
+         actuator_index < world_template.actuator_count;
+         ++actuator_index) {
+        if (AppendSceneDriveRow(world_template, actuator_index, rows)) {
+            ++drive_count;
+        }
+    }
+}
+
 void OffsetWorldInstance(runtime::WorldInstance& instance, math::Vec3 offset) {
     for (auto& pose : instance.poses) {
         pose.position += offset;
@@ -311,7 +446,7 @@ void StepCompiledSceneCuda(scene::CompiledScene& compiled,
     integration_options.step_count = 1u;
     integration_options.clear_forces_after_step = true;
 
-    solver::gpu::CudaConstraintSolverConfig solver_config;
+    solver::gpu::RowSolveConfig solver_config;
     solver_config.velocity_iterations = 10u;
     solver_config.position_iterations = 4u;
     solver_config.slop = 0.005f;
@@ -323,18 +458,54 @@ void StepCompiledSceneCuda(scene::CompiledScene& compiled,
         auto contacts =
             constraint::gpu::GenerateCudaContacts(context, device_world, broadphase);
         const auto contact_report = contacts.DownloadReport();
-        auto solver_result =
-            solver::gpu::SolveCudaConstraints(context, device_world, &contacts, solver_config);
-        const auto solver_report = solver_result.DownloadReport();
+        auto host_state = device_world.DownloadState();
+        std::vector<runtime::rigid::BodyState> bodies(host_state.body_count);
+        for (uint32_t body = 0; body < host_state.body_count; ++body) {
+            bodies[body].position = host_state.poses[body].position;
+            bodies[body].orientation = host_state.poses[body].rotation;
+            bodies[body].linear_velocity = host_state.linear_velocities[body];
+            bodies[body].angular_velocity = host_state.angular_velocities[body];
+            if (body < runtime_world.template_view.body_table.inv_masses.size()) {
+                bodies[body].inv_mass =
+                    runtime_world.template_view.body_table.inv_masses[body];
+            }
+            if (body < runtime_world.template_view.body_table.inv_inertias.size()) {
+                bodies[body].inv_inertia =
+                    runtime_world.template_view.body_table.inv_inertias[body];
+            }
+        }
+        constraint::RowBuffers rows;
+        uint32_t joint_count = 0u;
+        uint32_t drive_count = 0u;
+        const auto manifolds = contacts.DownloadManifolds();
+        BuildSceneRows(runtime_world.template_view,
+                       std::span<const constraint::ContactManifold>(
+                           manifolds.data(),
+                           manifolds.size()),
+                       rows,
+                       joint_count,
+                       drive_count);
+        const auto solver_report =
+            solver::gpu::SolveRows(context, rows, bodies, solver_config);
+        for (uint32_t body = 0; body < host_state.body_count; ++body) {
+            host_state.poses[body].position = bodies[body].position;
+            host_state.poses[body].rotation = bodies[body].orientation;
+            host_state.linear_velocities[body] = bodies[body].linear_velocity;
+            host_state.angular_velocities[body] = bodies[body].angular_velocity;
+        }
+        runtime_world.instance.poses = host_state.poses;
+        runtime_world.instance.linear_velocities = host_state.linear_velocities;
+        runtime_world.instance.angular_velocities = host_state.angular_velocities;
+        runtime::gpu::UploadDeviceState(context, device_world, runtime_world.instance);
 
         result.cuda_broadphase_pair_count = contact_report.pair_count;
         result.cuda_contact_manifold_count = contact_report.contact_manifold_count;
         result.cuda_contact_point_count = contact_report.contact_point_count;
-        result.cuda_constraint_block_count = solver_report.constraint_block_count;
-        result.cuda_constraint_row_count = solver_report.constraint_row_count;
-        result.cuda_contact_constraint_count = solver_report.contact_constraint_count;
-        result.cuda_joint_constraint_count = solver_report.joint_constraint_count;
-        result.cuda_drive_constraint_count = solver_report.drive_constraint_count;
+        result.cuda_constraint_block_count = solver_report.color_count;
+        result.cuda_constraint_row_count = solver_report.row_count;
+        result.cuda_contact_constraint_count = contact_report.contact_manifold_count;
+        result.cuda_joint_constraint_count = joint_count;
+        result.cuda_drive_constraint_count = drive_count;
         result.cuda_solver_velocity_iterations = solver_report.velocity_iterations;
         result.cuda_solver_position_iterations = solver_report.position_iterations;
         result.cuda_max_position_error = solver_report.max_position_error;

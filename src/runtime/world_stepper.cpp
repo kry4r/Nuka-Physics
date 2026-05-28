@@ -9,6 +9,7 @@
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "constraint/contact_builder.hpp"
+#include "constraint/row_builder.hpp"
 #include "runtime/articulation/joint_constraints.hpp"
 #include "runtime/rigid/integrator.hpp"
 #include "solver/rigid_solver.hpp"
@@ -407,31 +408,9 @@ float RelativeAngularVelocityAlongAxis(const std::vector<rigid::BodyState>& bodi
     return (omega_a - omega_b).Dot(normalized_axis);
 }
 
-constraint::ConstraintBlock BuildFixedConstraint(uint32_t body_a,
-                                                 uint32_t body_b,
-                                                 math::Transform parent_frame,
-                                                 math::Transform child_frame) {
-    auto block = articulation::BuildRevoluteConstraint(body_a,
-                                                       body_b,
-                                                       math::Vec3::UnitZ(),
-                                                       parent_frame,
-                                                       child_frame,
-                                                       -3.14159f,
-                                                       3.14159f);
-    block.row_count = 6;
-    block.jacobian_linear_a[5] = math::Vec3::Zero();
-    block.jacobian_angular_a[5] = math::Vec3::UnitZ();
-    block.jacobian_linear_b[5] = math::Vec3::Zero();
-    block.jacobian_angular_b[5] = -math::Vec3::UnitZ();
-    block.rhs[5] = 0.0f;
-    block.lower_limit[5] = -1.0e6f;
-    block.upper_limit[5] = 1.0e6f;
-    return block;
-}
-
 bool AppendJointConstraint(const WorldTemplate& world_template,
                            uint32_t joint_index,
-                           std::vector<constraint::ConstraintBlock>& blocks) {
+                           constraint::RowBuffers* rows) {
     if (joint_index >= world_template.joint_table.parent_bodies.size()
         || joint_index >= world_template.joint_table.child_bodies.size()) {
         return false;
@@ -452,19 +431,20 @@ bool AppendJointConstraint(const WorldTemplate& world_template,
         || type == scene::JointType::Prismatic
         || type == scene::JointType::Spherical
         || type == scene::JointType::Free) {
-        blocks.push_back(articulation::BuildRevoluteConstraint(
+        articulation::AppendRevoluteRows(
+            rows,
             parent,
             child,
             axis,
             parent_frame,
             child_frame,
             JointLowerLimitOrDefault(world_template, joint_index),
-            JointUpperLimitOrDefault(world_template, joint_index)));
+            JointUpperLimitOrDefault(world_template, joint_index));
         return true;
     }
 
     if (type == scene::JointType::Fixed) {
-        blocks.push_back(BuildFixedConstraint(parent, child, parent_frame, child_frame));
+        constraint::AppendFixedRows(rows, parent, child, parent_frame, child_frame);
         return true;
     }
 
@@ -502,7 +482,7 @@ float DriveForceLimitOrDefault(const WorldTemplate& world_template, uint32_t act
 bool AppendDriveConstraint(const WorldTemplate& world_template,
                            const std::vector<rigid::BodyState>& bodies,
                            uint32_t actuator_index,
-                           std::vector<constraint::ConstraintBlock>& blocks) {
+                           constraint::RowBuffers* rows) {
     if (actuator_index >= world_template.actuator_table.joint_ids.size()) {
         return false;
     }
@@ -531,11 +511,12 @@ bool AppendDriveConstraint(const WorldTemplate& world_template,
 
     const float current_velocity =
         RelativeAngularVelocityAlongAxis(bodies, child, parent, axis);
-    blocks.push_back(articulation::BuildDriveConstraint(child,
-                                                        parent,
-                                                        axis,
-                                                        drive,
-                                                        current_velocity));
+    articulation::AppendDriveRow(rows,
+                                 child,
+                                 parent,
+                                 axis,
+                                 drive,
+                                 current_velocity);
     return true;
 }
 
@@ -563,6 +544,11 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
         instance.poses.size()
     });
 
+    std::vector<core::diagnostics::InvariantSample> invariant_samples;
+    if (invariant_sampler != nullptr && invariant_sampler->Config().enabled) {
+        invariant_samples.reserve(static_cast<size_t>(core::diagnostics::Invariant::_Count));
+    }
+
     for (uint32_t step = 0; step < options.step_count; ++step) {
         auto bodies = LoadBodyStates(world_template, instance, body_count);
 
@@ -571,11 +557,11 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
             rigid::IntegrateForces(body, options.dt);
         }
 
-        std::vector<constraint::ConstraintBlock> blocks;
+        constraint::RowBuffers rows;
 
         if (world_template.joint_count > 0u) {
             for (uint32_t joint_index = 0; joint_index < world_template.joint_count; ++joint_index) {
-                if (AppendJointConstraint(world_template, joint_index, blocks)) {
+                if (AppendJointConstraint(world_template, joint_index, &rows)) {
                     ++report.joint_constraint_count;
                 }
             }
@@ -585,7 +571,7 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
             for (uint32_t actuator_index = 0;
                  actuator_index < world_template.actuator_count;
                  ++actuator_index) {
-                if (AppendDriveConstraint(world_template, bodies, actuator_index, blocks)) {
+                if (AppendDriveConstraint(world_template, bodies, actuator_index, &rows)) {
                     ++report.drive_constraint_count;
                 }
             }
@@ -610,22 +596,7 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
                 GenerateContact(shapes[pair.body_a], shapes[pair.body_b], bodies, manifolds);
             }
 
-            auto contact_blocks = constraint::BuildContactConstraints(manifolds);
-
-            for (auto& block : contact_blocks) {
-                for (uint32_t row = 0; row < block.normal_row_count; ++row) {
-                    block.lower_limit[row] = 0.0f;
-                    block.upper_limit[row] = 1.0e6f;
-                }
-                for (uint32_t row = block.first_friction_row;
-                     row < block.first_friction_row + block.friction_row_count
-                     && row < constraint::ConstraintBlock::kMaxRows;
-                     ++row) {
-                    block.lower_limit[row] = 0.0f;
-                    block.upper_limit[row] = 0.0f;
-                }
-            }
-            blocks.insert(blocks.end(), contact_blocks.begin(), contact_blocks.end());
+            constraint::BuildContactRows(manifolds, &rows);
             report.broadphase_pair_count += static_cast<uint32_t>(broadphase.GetPairs().size());
             report.contact_manifold_count += static_cast<uint32_t>(manifolds.size());
             for (const auto& manifold : manifolds) {
@@ -633,20 +604,16 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
             }
         }
 
-        if (!blocks.empty()) {
-            uint32_t row_count = 0;
-            for (const auto& block : blocks) {
-                row_count += block.row_count;
-            }
+        if (rows.RowCount() > 0u) {
             solver::SolverConfig solver_config;
             solver_config.velocity_iterations = options.solver_velocity_iterations;
             solver_config.position_iterations = options.solver_position_iterations;
             solver_config.slop = options.solver_slop;
             solver_config.baumgarte = options.solver_baumgarte;
-            const auto solve_result = solver::SolveConstraints(blocks, bodies, solver_config);
+            const auto solve_result = solver::SolveConstraints(rows, bodies, solver_config);
 
-            report.constraint_block_count += static_cast<uint32_t>(blocks.size());
-            report.constraint_row_count += row_count;
+            report.constraint_block_count += rows.RowCount() > 0u ? 1u : 0u;
+            report.constraint_row_count += rows.RowCount();
             report.solver_iterations_used += solve_result.iterations_used;
             report.max_constraint_error = std::max(report.max_constraint_error,
                                                    solve_result.max_penetration);
@@ -664,16 +631,16 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
         }
 
         ++report.simulated_step_count;
-        if (invariant_sampler != nullptr) {
-            std::vector<core::diagnostics::InvariantSample> samples;
+        if (invariant_sampler != nullptr && invariant_sampler->Config().enabled) {
+            invariant_samples.clear();
             const core::diagnostics::InvariantWorldView view{
                 &world_template,
                 &instance,
                 &report,
                 options.gravity
             };
-            invariant_sampler->Sample(view, report.simulated_step_count, &samples);
-            for (const auto& sample : samples) {
+            invariant_sampler->Sample(view, report.simulated_step_count, &invariant_samples);
+            for (const auto& sample : invariant_samples) {
                 if (trace_sink != nullptr) {
                     trace_sink->OnSample(sample);
                 }

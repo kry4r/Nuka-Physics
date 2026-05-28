@@ -5,7 +5,6 @@
 
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
-#include "constraint/constraint_block.hpp"
 #include "constraint/contact_manifold.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"

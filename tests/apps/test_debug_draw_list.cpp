@@ -4,8 +4,8 @@
 
 #include "apps/debug_shell/debug_draw.hpp"
 #include "apps/debug_shell/debug_visualization.hpp"
-#include "constraint/constraint_block.hpp"
 #include "constraint/contact_manifold.hpp"
+#include "constraint/row_buffers.hpp"
 #include "scene/scene_pipeline.hpp"
 
 #include <gtest/gtest.h>
@@ -267,21 +267,21 @@ TEST(DebugVisualization, EmitsContactsAndConstraintErrors) {
     point.penetration = 0.02f;
     manifold.AddPoint(point);
 
-    nuka::constraint::ConstraintBlock constraint;
-    constraint.type = nuka::constraint::ConstraintType::Joint;
-    constraint.body_a = 1u;
-    constraint.row_count = 1u;
-    constraint.jacobian_linear_a[0] = Vec3::UnitX();
-    constraint.rhs[0] = 0.25f;
+    nuka::constraint::RowBuffers rows;
+    nuka::constraint::Row row;
+    row.row_class_id = nuka::constraint::kMaximalJointRowClassId;
+    row.rhs = 0.25f;
+    rows.AddRow(row,
+                {1u, nuka::constraint::kInvalidBodyIndex},
+                {Vec3::UnitX(), Vec3::Zero()},
+                {-Vec3::UnitX(), Vec3::Zero()});
 
     std::vector<nuka::constraint::ContactManifold> contacts = {manifold};
-    std::vector<nuka::constraint::ConstraintBlock> constraints = {constraint};
 
     auto input = MakeVisualizationInput(compiled);
     input.contact_manifolds = std::span<const nuka::constraint::ContactManifold>(
         contacts.data(), contacts.size());
-    input.constraint_blocks = std::span<const nuka::constraint::ConstraintBlock>(
-        constraints.data(), constraints.size());
+    input.constraint_rows = &rows;
 
     auto options = DisabledVisualizationOptions();
     options.draw_contact_points = true;

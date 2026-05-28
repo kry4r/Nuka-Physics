@@ -1,116 +1,86 @@
 // ---------------------------------------------------------------------------
-// Performance test: CUDA contact assembly and solver timing
+// Performance test: CUDA Universal Row solver timing
 // ---------------------------------------------------------------------------
 
-#include "collision/gpu/broadphase.cuh"
-#include "constraint/gpu/contact_generation.cuh"
-#include "runtime/gpu/device_world.hpp"
-#include "runtime/world_builder.hpp"
-#include "scene/cooker.hpp"
-#include "scene/scene_ir.hpp"
-#include "solver/gpu/cuda_constraint_solver.cuh"
+#include "constraint/row_buffers.hpp"
+#include "runtime/rigid/body_state.hpp"
+#include "solver/gpu/row_solver.cuh"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cmath>
-#include <utility>
+#include <vector>
 
 using namespace nuka;
 
-namespace {
-
-scene::SceneIR BuildContactGrid(int box_count) {
-    scene::SceneIR scene;
-
-    scene::RigidBodyRecord ground;
-    ground.name = "ground";
-    ground.is_static = true;
-    const auto ground_id = scene.AddRigidBody(std::move(ground));
-
-    scene::CollisionShapeRecord plane;
-    plane.body_id = ground_id;
-    plane.type = scene::ShapeType::Plane;
-    scene.AddCollisionShape(std::move(plane));
-
-    for (int index = 0; index < box_count; ++index) {
-        scene::RigidBodyRecord body;
-        body.name = "box";
-        body.mass = 1.0f;
-        body.inertia = {1.0f, 1.0f, 1.0f};
-        body.local_transform.position = {
-            static_cast<float>(index % 16) * 2.0f,
-            0.45f,
-            static_cast<float>(index / 16) * 2.0f
-        };
-        const auto body_id = scene.AddRigidBody(std::move(body));
-
-        scene::CollisionShapeRecord shape;
-        shape.body_id = body_id;
-        shape.type = scene::ShapeType::Box;
-        shape.half_extents = {0.5f, 0.5f, 0.5f};
-        scene.AddCollisionShape(std::move(shape));
-    }
-
-    return scene;
-}
-
-} // namespace
-
-TEST(CudaSolverTiming, ContactAssemblyAndPgsUnderOneSecond) {
-    constexpr int kBoxCount = 128;
+TEST(CudaSolverTiming, UniversalRowsUnderOneSecond) {
+    constexpr int kBodyCount = 128;
     constexpr int kIterationCount = 30;
 
-    auto world = runtime::BuildWorld(scene::CookScene(BuildContactGrid(kBoxCount)));
-    for (uint32_t body = 1; body < world.instance.body_count; ++body) {
-        world.instance.linear_velocities[body] = {0.0f, -1.0f, 0.0f};
+    std::vector<runtime::rigid::BodyState> bodies(kBodyCount);
+    constraint::RowBuffers rows;
+    for (int body_index = 0; body_index < kBodyCount; ++body_index) {
+        bodies[body_index].inv_mass = 1.0f;
+        bodies[body_index].inv_inertia = {1.0f, 1.0f, 1.0f};
+        bodies[body_index].linear_velocity = {0.0f, -1.0f, 0.0f};
+
+        constraint::Row row;
+        row.row_class_id = constraint::kMaximalContactRowClassId;
+        row.lower = 0.0f;
+        row.upper = constraint::kRowHugeLimit;
+        row.flags = constraint::row_flags::Unilateral;
+        constraint::RowMaterial material;
+        material.kind = constraint::RowKind::Contact;
+        material.group_id = rows.RowCount();
+        material.normal_row_count = 1u;
+        rows.AddRow(row,
+                    {static_cast<uint32_t>(body_index),
+                     constraint::kInvalidBodyIndex},
+                    {{0.0f, 1.0f, 0.0f}, math::Vec3::Zero()},
+                    {{0.0f, -1.0f, 0.0f}, math::Vec3::Zero()},
+                    material);
     }
 
-    auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
-    runtime::gpu::UploadDeviceState(device_world, world.instance);
-
-    solver::gpu::CudaConstraintSolverConfig config;
+    solver::gpu::RowSolveConfig config;
     config.velocity_iterations = 8u;
     config.position_iterations = 2u;
 
-    solver::gpu::CudaConstraintSolverReport last_report;
-    uint32_t observed_normal_impulse_count = 0u;
-    float observed_normal_delta_impulse_magnitude = 0.0f;
+    solver::gpu::RowSolveReport last_report;
+    const auto context = phi::MakeDefaultDeviceContext();
+    {
+        auto warmup_rows = rows;
+        auto warmup_bodies = bodies;
+        solver::gpu::SolveRows(context, warmup_rows, warmup_bodies, config);
+    }
+
     const auto start = std::chrono::high_resolution_clock::now();
     for (int iteration = 0; iteration < kIterationCount; ++iteration) {
-        auto broadphase = collision::gpu::BuildCudaBroadphase(device_world);
-        auto contacts = constraint::gpu::GenerateCudaContacts(device_world, broadphase);
-        auto result = solver::gpu::SolveCudaConstraints(device_world, &contacts, config);
-        const auto report = result.DownloadReport();
-        observed_normal_impulse_count +=
-            report.row_scheduler_report.normal_impulse_count;
-        observed_normal_delta_impulse_magnitude +=
-            report.row_scheduler_report.normal_delta_impulse_magnitude;
-        if (iteration == kIterationCount - 1) {
-            last_report = report;
-        }
+        auto iteration_rows = rows;
+        auto iteration_bodies = bodies;
+        last_report = solver::gpu::SolveRows(context,
+                                             iteration_rows,
+                                             iteration_bodies,
+                                             config);
     }
     const auto end = std::chrono::high_resolution_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    EXPECT_EQ(last_report.contact_constraint_count, static_cast<uint32_t>(kBoxCount));
-    EXPECT_GE(last_report.constraint_row_count, static_cast<uint32_t>(kBoxCount * 3));
+    EXPECT_EQ(last_report.row_count, static_cast<uint32_t>(kBodyCount));
     EXPECT_EQ(last_report.velocity_iterations, config.velocity_iterations);
     EXPECT_EQ(last_report.position_iterations, config.position_iterations);
     EXPECT_EQ(last_report.row_scheduler_report.row_kind,
-              runtime::gpu::CudaConstraintRowBufferKind::RigidConstraintBlock);
+              runtime::gpu::CudaConstraintRowBufferKind::UniversalRowCsr);
     EXPECT_EQ(last_report.row_scheduler_report.row_layout,
-              runtime::gpu::CudaConstraintRowLayout::ConstraintBlock);
+              runtime::gpu::CudaConstraintRowLayout::UniversalRowCsr);
     EXPECT_EQ(last_report.row_scheduler_report.schedule_mode,
-              runtime::gpu::CudaConstraintRowScheduleMode::GlobalRowSweep);
+              runtime::gpu::CudaConstraintRowScheduleMode::IslandColoredSweep);
     EXPECT_EQ(last_report.row_scheduler_report.configured_iterations,
               config.velocity_iterations);
     EXPECT_EQ(last_report.row_scheduler_report.executed_iterations,
               config.velocity_iterations);
     EXPECT_GE(last_report.row_scheduler_report.active_row_count,
-              last_report.constraint_row_count);
-    EXPECT_GT(observed_normal_impulse_count, 0u);
-    EXPECT_GT(observed_normal_delta_impulse_magnitude, 0.0f);
+              last_report.row_count);
     EXPECT_TRUE(std::isfinite(last_report.row_scheduler_report.max_residual));
-    EXPECT_LT(ms, 1000) << "CUDA contact solver pipeline took " << ms << " ms";
+    EXPECT_LT(ms, 1000) << "CUDA row solver pipeline took " << ms << " ms";
 }

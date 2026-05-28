@@ -1,120 +1,75 @@
 // ---------------------------------------------------------------------------
-// Tests: Joint limit enforcement in solver
+// Tests: bounded joint row behavior in the GPU row solver
 // ---------------------------------------------------------------------------
 
-#include "solver/rigid_solver.hpp"
-#include "constraint/constraint_block.hpp"
 #include "runtime/rigid/body_state.hpp"
+#include "solver/rigid_solver.hpp"
 
 #include <gtest/gtest.h>
+
 #include <cmath>
 
-TEST(JointLimit, VelocityClampedByLimit) {
-    // Two bodies connected by a joint constraint with velocity limits.
-    // Body A is spinning; the joint limit should reduce its velocity.
-    std::vector<nuka::runtime::rigid::BodyState> bodies(2);
+namespace {
 
-    // Body A: dynamic, spinning fast around Z
+nuka::constraint::RowBuffers BuildAngularLimitRow(float lower, float upper) {
+    nuka::constraint::RowBuffers rows;
+    nuka::constraint::Row row;
+    row.row_class_id = nuka::constraint::kMaximalJointRowClassId;
+    row.lower = lower;
+    row.upper = upper;
+    row.flags = nuka::constraint::row_flags::Equality;
+    nuka::constraint::RowMaterial material;
+    material.kind = nuka::constraint::RowKind::Joint;
+    rows.AddRow(row,
+                {0u, 1u},
+                {nuka::math::Vec3::Zero(), {0.0f, 0.0f, 1.0f}},
+                {nuka::math::Vec3::Zero(), {0.0f, 0.0f, -1.0f}},
+                material);
+    return rows;
+}
+
+std::vector<nuka::runtime::rigid::BodyState> BuildBodies(float angular_z) {
+    std::vector<nuka::runtime::rigid::BodyState> bodies(2);
     bodies[0].inv_mass = 1.0f;
     bodies[0].inv_inertia = {1.0f, 1.0f, 1.0f};
-    bodies[0].angular_velocity = {0.0f, 0.0f, 10.0f}; // fast spin
+    bodies[0].angular_velocity = {0.0f, 0.0f, angular_z};
+    return bodies;
+}
 
-    // Body B: static anchor
-    bodies[1].inv_mass = 0.0f; // infinite mass
-    bodies[1].inv_inertia = {0.0f, 0.0f, 0.0f};
+} // namespace
 
-    // Build a joint constraint that limits relative angular velocity around Z
-    nuka::constraint::ConstraintBlock joint{};
-    joint.type = nuka::constraint::ConstraintType::Joint;
-    joint.body_a = 0;
-    joint.body_b = 1;
-    joint.row_count = 1;
-
-    // Angular constraint around Z axis
-    joint.jacobian_linear_a[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_a[0] = {0.0f, 0.0f, 1.0f};
-    joint.jacobian_linear_b[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_b[0] = {0.0f, 0.0f, -1.0f};
-    joint.rhs[0] = 0.0f;         // target relative angular velocity = 0
-    joint.lower_limit[0] = -5.0f; // impulse limits
-    joint.upper_limit[0] = 5.0f;
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks;
-    blocks.push_back(joint);
+TEST(JointLimit, VelocityClampedByLimit) {
+    auto bodies = BuildBodies(10.0f);
+    auto rows = BuildAngularLimitRow(-5.0f, 5.0f);
 
     nuka::solver::SolverConfig config{};
-    config.velocity_iterations = 20;
-    config.position_iterations = 0;
+    config.velocity_iterations = 20u;
+    config.position_iterations = 0u;
 
-    nuka::solver::SolveConstraints(blocks, bodies, config);
+    nuka::solver::SolveConstraints(rows, bodies, config);
 
-    // The solver should have reduced body A's angular velocity around Z
     EXPECT_LT(std::abs(bodies[0].angular_velocity.z), 10.0f);
 }
 
 TEST(JointLimit, ImpulseStaysWithinLimits) {
-    std::vector<nuka::runtime::rigid::BodyState> bodies(2);
-    bodies[0].inv_mass = 1.0f;
-    bodies[0].inv_inertia = {1.0f, 1.0f, 1.0f};
-    bodies[0].angular_velocity = {0.0f, 0.0f, 100.0f}; // very fast
-
-    bodies[1].inv_mass = 0.0f;
-    bodies[1].inv_inertia = {0.0f, 0.0f, 0.0f};
-
-    nuka::constraint::ConstraintBlock joint{};
-    joint.type = nuka::constraint::ConstraintType::Joint;
-    joint.body_a = 0;
-    joint.body_b = 1;
-    joint.row_count = 1;
-
-    joint.jacobian_linear_a[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_a[0] = {0.0f, 0.0f, 1.0f};
-    joint.jacobian_linear_b[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_b[0] = {0.0f, 0.0f, -1.0f};
-    joint.rhs[0] = 0.0f;
-    joint.lower_limit[0] = -2.0f;
-    joint.upper_limit[0] = 2.0f;
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks;
-    blocks.push_back(joint);
+    auto bodies = BuildBodies(100.0f);
+    auto rows = BuildAngularLimitRow(-2.0f, 2.0f);
 
     nuka::solver::SolverConfig config{};
-    config.velocity_iterations = 10;
-    config.position_iterations = 0;
+    config.velocity_iterations = 10u;
+    config.position_iterations = 0u;
 
-    nuka::solver::SolveConstraints(blocks, bodies, config);
+    nuka::solver::SolveConstraints(rows, bodies, config);
 
-    // Accumulated impulse should be clamped within limits
-    EXPECT_GE(blocks[0].impulse[0], -2.0f);
-    EXPECT_LE(blocks[0].impulse[0], 2.0f);
+    EXPECT_GE(rows.rows[0].lambda, -2.0f);
+    EXPECT_LE(rows.rows[0].lambda, 2.0f);
 }
 
 TEST(JointLimit, ZeroVelocityProducesNoImpulse) {
-    std::vector<nuka::runtime::rigid::BodyState> bodies(2);
-    bodies[0].inv_mass = 1.0f;
-    bodies[0].inv_inertia = {1.0f, 1.0f, 1.0f};
-    // Zero velocity -- already satisfied
+    auto bodies = BuildBodies(0.0f);
+    auto rows = BuildAngularLimitRow(-10.0f, 10.0f);
 
-    bodies[1].inv_mass = 0.0f;
-    bodies[1].inv_inertia = {0.0f, 0.0f, 0.0f};
+    nuka::solver::SolveConstraints(rows, bodies);
 
-    nuka::constraint::ConstraintBlock joint{};
-    joint.type = nuka::constraint::ConstraintType::Joint;
-    joint.body_a = 0;
-    joint.body_b = 1;
-    joint.row_count = 1;
-    joint.jacobian_linear_a[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_a[0] = {0.0f, 0.0f, 1.0f};
-    joint.jacobian_linear_b[0]  = nuka::math::Vec3::Zero();
-    joint.jacobian_angular_b[0] = {0.0f, 0.0f, -1.0f};
-    joint.rhs[0] = 0.0f;
-    joint.lower_limit[0] = -10.0f;
-    joint.upper_limit[0] = 10.0f;
-
-    std::vector<nuka::constraint::ConstraintBlock> blocks;
-    blocks.push_back(joint);
-
-    nuka::solver::SolveConstraints(blocks, bodies);
-
-    EXPECT_NEAR(blocks[0].impulse[0], 0.0f, 1e-6f);
+    EXPECT_NEAR(rows.rows[0].lambda, 0.0f, 1.0e-6f);
 }

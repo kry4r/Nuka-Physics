@@ -4,8 +4,8 @@
 // ---------------------------------------------------------------------------
 
 #include "apps/debug_shell/debug_draw.hpp"
-#include "constraint/constraint_block.hpp"
 #include "constraint/contact_manifold.hpp"
+#include "constraint/row_buffers.hpp"
 #include "render/render_scene.hpp"
 #include "runtime/physics_world.hpp"
 #include "scene/scene_graph.hpp"
@@ -32,7 +32,7 @@ struct DebugVisualizationInput {
     const scene::SceneGraph* scene_graph = nullptr;
     const runtime::PhysicsWorld* physics_world = nullptr;
     std::span<const constraint::ContactManifold> contact_manifolds = {};
-    std::span<const constraint::ConstraintBlock> constraint_blocks = {};
+    const constraint::RowBuffers* constraint_rows = nullptr;
 };
 
 DebugDrawList BuildDebugVisualization(const DebugVisualizationInput& input,

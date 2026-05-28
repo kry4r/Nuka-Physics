@@ -45,7 +45,10 @@ target_link_libraries(nuka_v01_foundation_e2e_test
         GTest::gtest_main
 )
 
-gtest_discover_tests(nuka_v01_foundation_e2e_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+gtest_discover_tests(nuka_v01_foundation_e2e_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES RUN_SERIAL TRUE
+)
 
 # --- Scene tests -----------------------------------------------------------
 add_executable(nuka_scene_test
@@ -110,7 +113,7 @@ gtest_discover_tests(nuka_collision_test)
 # --- Constraint tests ------------------------------------------------------
 add_executable(nuka_constraint_test
     constraint/test_contact_manifold.cpp
-    constraint/test_constraint_block.cpp
+    constraint/test_csr_row_layout.cpp
 )
 
 target_link_libraries(nuka_constraint_test
@@ -127,6 +130,7 @@ add_executable(nuka_solver_test
     solver/test_contact_material.cpp
     solver/test_joint_limit.cpp
     solver/test_joint_projection.cpp
+    solver/test_row_scheduler_bridge.cpp
 )
 
 target_link_libraries(nuka_solver_test
