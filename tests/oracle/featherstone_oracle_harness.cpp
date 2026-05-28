@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <string_view>
@@ -19,6 +20,15 @@ namespace {
 
 std::filesystem::path SourcePath(const char* relative_path) {
     return std::filesystem::path(NUKA_SOURCE_DIR) / relative_path;
+}
+
+std::filesystem::path GoldenPath(const char* filename) {
+    if (const char* golden_dir = std::getenv("NUKA_GOLDEN_DIR")) {
+        if (golden_dir[0] != '\0') {
+            return std::filesystem::path(golden_dir) / filename;
+        }
+    }
+    return SourcePath("tests/oracle/golden") / filename;
 }
 
 std::vector<float> ComputeCudaAbaQddot(const std::filesystem::path& model_path,
@@ -87,9 +97,9 @@ void ExpectRandomSampleGoldenMatchesCuda(const std::filesystem::path& model_path
 } // namespace
 
 TEST(FeatherstoneOracle, GoldenFilesAreOwnerProvided) {
-    const auto go2 = SourcePath("tests/oracle/golden/featherstone_go2_random_sample.bin");
-    const auto h1 = SourcePath("tests/oracle/golden/featherstone_h1_random_sample.bin");
-    const auto stand = SourcePath("tests/oracle/golden/go2_stand_5s.bin");
+    const auto go2 = GoldenPath("featherstone_go2_random_sample.bin");
+    const auto h1 = GoldenPath("featherstone_h1_random_sample.bin");
+    const auto stand = GoldenPath("go2_stand_5s.bin");
     if (!std::filesystem::exists(go2) ||
         !std::filesystem::exists(h1) ||
         !std::filesystem::exists(stand)) {
@@ -100,8 +110,10 @@ TEST(FeatherstoneOracle, GoldenFilesAreOwnerProvided) {
         const auto golden = nuka::tests::oracle::LoadGoldenTrajectory(path);
         EXPECT_GT(golden.sample_count, 0u) << path;
         EXPECT_GT(golden.qpos_count, 0u) << path;
-        EXPECT_GT(golden.qvel_count, 0u) << path;
-        EXPECT_GT(golden.qacc_count, 0u) << path;
+        if (golden.kind == nuka::tests::oracle::GoldenKind::RandomQacc) {
+            EXPECT_GT(golden.qvel_count, 0u) << path;
+            EXPECT_GT(golden.qacc_count, 0u) << path;
+        }
         EXPECT_EQ(golden.payload.size(),
                   static_cast<size_t>(golden.sample_count) * golden.RecordFloatCount())
             << path;
@@ -109,8 +121,8 @@ TEST(FeatherstoneOracle, GoldenFilesAreOwnerProvided) {
 }
 
 TEST(FeatherstoneOracle, RandomSampleGoldenShapeMatchesV1Contract) {
-    const auto go2 = SourcePath("tests/oracle/golden/featherstone_go2_random_sample.bin");
-    const auto h1 = SourcePath("tests/oracle/golden/featherstone_h1_random_sample.bin");
+    const auto go2 = GoldenPath("featherstone_go2_random_sample.bin");
+    const auto h1 = GoldenPath("featherstone_h1_random_sample.bin");
     if (!std::filesystem::exists(go2) || !std::filesystem::exists(h1)) {
         GTEST_SKIP() << "v0.1 random-sample golden files are owner-protected and not present";
     }
@@ -129,9 +141,9 @@ TEST(FeatherstoneOracle, RandomSampleGoldensMatchCudaAba) {
     const auto h1_model =
         SourcePath(".nuka-assets/mujoco_menagerie/unitree_h1/h1.xml");
     const auto go2_golden =
-        SourcePath("tests/oracle/golden/featherstone_go2_random_sample.bin");
+        GoldenPath("featherstone_go2_random_sample.bin");
     const auto h1_golden =
-        SourcePath("tests/oracle/golden/featherstone_h1_random_sample.bin");
+        GoldenPath("featherstone_h1_random_sample.bin");
 
     if (!std::filesystem::exists(go2_model) || !std::filesystem::exists(h1_model)) {
         GTEST_SKIP() << "MuJoCo Menagerie Go2/H1 assets are not available";

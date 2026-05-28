@@ -84,6 +84,16 @@ def _write_header(out,
     out.write(encoded)
 
 
+def _disable_unconstrained_dynamics_terms(mujoco, model) -> None:
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_LIMIT)
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EQUALITY)
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_FRICTIONLOSS)
+    model.geom_contype[:] = 0
+    model.geom_conaffinity[:] = 0
+
+
 def generate_random_samples(model_path: Path,
                             out_path: Path,
                             sample_count: int,
@@ -92,9 +102,7 @@ def generate_random_samples(model_path: Path,
     with tempfile.TemporaryDirectory(prefix="nuka_mjx_fixed_base_") as tmp:
         fixed_model_path = _fixed_base_model_xml(model_path, Path(tmp))
         model = mujoco.MjModel.from_xml_path(str(fixed_model_path))
-        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
-        model.geom_contype[:] = 0
-        model.geom_conaffinity[:] = 0
+        _disable_unconstrained_dynamics_terms(mujoco, model)
         mjx_model = mjx.put_model(model)
         rng = np.random.default_rng(seed=42)
         nuka_dofs = model.nv + 1
@@ -156,9 +164,7 @@ def generate_stand_trajectory(model_path: Path,
         fixed_model_path = _fixed_base_model_xml(model_path, Path(tmp))
         model = mujoco.MjModel.from_xml_path(str(fixed_model_path))
         model.opt.timestep = dt
-        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
-        model.geom_contype[:] = 0
-        model.geom_conaffinity[:] = 0
+        _disable_unconstrained_dynamics_terms(mujoco, model)
         mjx_model = mjx.put_model(model)
         data = mjx.make_data(mjx_model)
 

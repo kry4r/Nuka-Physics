@@ -50,9 +50,10 @@ python3 tools/oracle/generate_mjx_golden.py \
 ```
 
 The random-sample generator removes the floating base and actuator blocks,
-disables contact in MJX, and evaluates samples through a JIT-batched
-`mjx.forward` call. This matches the current CUDA ABA oracle harness, which
-validates joint-space Featherstone dynamics rather than contact solve behavior.
+disables MJX constraint/contact/limit/equality/frictionloss terms, and evaluates
+samples through a JIT-batched `mjx.forward` call. This matches the current CUDA
+ABA oracle harness, which validates unconstrained joint-space Featherstone
+dynamics rather than contact or joint-limit solve behavior.
 Use `--batch-size N` only if the default all-samples batch is too large for the
 local MJX/JAX runtime.
 
@@ -122,6 +123,39 @@ python3 tools/oracle/v01_exit_gate.py \
 The gate is intentionally strict. It fails until the owner-provided goldens,
 MJX Python environment, Git LFS, and `<expected>`-capable C++20 toolchain are
 all available.
+
+Before moving candidates into the protected golden directory, the owner can run
+the C++ oracle tests against a separate candidate directory. The random-qacc
+candidates must pass the CUDA ABA preflight before approval:
+
+```bash
+mkdir -p /tmp/nuka_owner_candidates
+cp /tmp/featherstone_go2_random_sample.bin /tmp/nuka_owner_candidates/
+cp /tmp/featherstone_h1_random_sample.bin /tmp/nuka_owner_candidates/
+NUKA_GOLDEN_DIR=/tmp/nuka_owner_candidates \
+  ctest --test-dir build-cuda128 \
+  -R 'FeatherstoneOracle' \
+  --output-on-failure -j1
+```
+
+The Go2 stand trajectory can be preflighted the same way after the owner
+settles the model contract between `examples/scenes/go2_stand.usda` and the MJX
+oracle source:
+
+```bash
+cp /tmp/go2_stand_5s.bin /tmp/nuka_owner_candidates/
+NUKA_GOLDEN_DIR=/tmp/nuka_owner_candidates \
+  ctest --test-dir build-cuda128 \
+  -R 'Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance' \
+  --output-on-failure -j1
+```
+
+If that stand preflight reports a trajectory mismatch, do not approve the
+candidate golden. It means the engine demo scene and the MJX oracle model are
+not yet the same dynamics contract.
+
+This override is only for owner preflight. The strict v0.1 gate still requires
+the approved files at `tests/oracle/golden/**`.
 
 On this workstation, downstream `find_package(nuka)` checks must use the
 isolated CUDA 12.8 package root, not the system CUDA 11.x installation:

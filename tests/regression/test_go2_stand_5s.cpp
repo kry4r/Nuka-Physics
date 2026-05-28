@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
@@ -15,6 +16,15 @@ namespace {
 
 std::filesystem::path SourcePath(const char* relative_path) {
     return std::filesystem::path(NUKA_SOURCE_DIR) / relative_path;
+}
+
+std::filesystem::path GoldenPath(const char* filename) {
+    if (const char* golden_dir = std::getenv("NUKA_GOLDEN_DIR")) {
+        if (golden_dir[0] != '\0') {
+            return std::filesystem::path(golden_dir) / filename;
+        }
+    }
+    return SourcePath("tests/oracle/golden") / filename;
 }
 
 std::vector<float> DownloadJointPositions(nuka_world_handle world) {
@@ -125,7 +135,7 @@ TEST(Go2Stand, CAbiStepsFiveSecondsAndIsDeterministic) {
 }
 
 TEST(Go2Stand, OwnerGoldenTrajectoryMatchesWithinTolerance) {
-    const auto golden_path = SourcePath("tests/oracle/golden/go2_stand_5s.bin");
+    const auto golden_path = GoldenPath("go2_stand_5s.bin");
     if (!std::filesystem::exists(golden_path)) {
         GTEST_SKIP() << "v0.1 Go2 stand golden trajectory is owner-protected and not present";
     }
