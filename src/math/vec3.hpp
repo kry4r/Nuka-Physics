@@ -5,6 +5,12 @@
 
 #include <cmath>
 
+#if defined(__CUDACC__)
+#define NUKA_MATH_HD __host__ __device__
+#else
+#define NUKA_MATH_HD
+#endif
+
 namespace nuka::math {
 
 struct Vec3 {
@@ -13,49 +19,49 @@ struct Vec3 {
     float z = 0.0f;
 
     // -- constructors -------------------------------------------------------
-    constexpr Vec3() = default;
-    constexpr Vec3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
+    NUKA_MATH_HD constexpr Vec3() = default;
+    NUKA_MATH_HD constexpr Vec3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
 
     // -- arithmetic ---------------------------------------------------------
-    constexpr Vec3 operator+(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr Vec3 operator+(const Vec3& rhs) const {
         return {x + rhs.x, y + rhs.y, z + rhs.z};
     }
-    constexpr Vec3 operator-(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr Vec3 operator-(const Vec3& rhs) const {
         return {x - rhs.x, y - rhs.y, z - rhs.z};
     }
-    constexpr Vec3 operator-() const {
+    NUKA_MATH_HD constexpr Vec3 operator-() const {
         return {-x, -y, -z};
     }
-    constexpr Vec3 operator*(float s) const {
+    NUKA_MATH_HD constexpr Vec3 operator*(float s) const {
         return {x * s, y * s, z * s};
     }
-    constexpr Vec3 operator/(float s) const {
+    NUKA_MATH_HD constexpr Vec3 operator/(float s) const {
         return {x / s, y / s, z / s};
     }
 
-    constexpr Vec3& operator+=(const Vec3& rhs) {
+    NUKA_MATH_HD constexpr Vec3& operator+=(const Vec3& rhs) {
         x += rhs.x; y += rhs.y; z += rhs.z;
         return *this;
     }
-    constexpr Vec3& operator-=(const Vec3& rhs) {
+    NUKA_MATH_HD constexpr Vec3& operator-=(const Vec3& rhs) {
         x -= rhs.x; y -= rhs.y; z -= rhs.z;
         return *this;
     }
-    constexpr Vec3& operator*=(float s) {
+    NUKA_MATH_HD constexpr Vec3& operator*=(float s) {
         x *= s; y *= s; z *= s;
         return *this;
     }
-    constexpr Vec3& operator/=(float s) {
+    NUKA_MATH_HD constexpr Vec3& operator/=(float s) {
         x /= s; y /= s; z /= s;
         return *this;
     }
 
     // -- products -----------------------------------------------------------
-    constexpr float Dot(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr float Dot(const Vec3& rhs) const {
         return x * rhs.x + y * rhs.y + z * rhs.z;
     }
 
-    constexpr Vec3 Cross(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr Vec3 Cross(const Vec3& rhs) const {
         return {
             y * rhs.z - z * rhs.y,
             z * rhs.x - x * rhs.z,
@@ -64,7 +70,7 @@ struct Vec3 {
     }
 
     // -- length / normalisation ---------------------------------------------
-    constexpr float LengthSq() const { return Dot(*this); }
+    NUKA_MATH_HD constexpr float LengthSq() const { return Dot(*this); }
 
     inline float Length() const { return std::sqrt(LengthSq()); }
 
@@ -75,21 +81,23 @@ struct Vec3 {
     }
 
     // -- comparison ---------------------------------------------------------
-    constexpr bool operator==(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr bool operator==(const Vec3& rhs) const {
         return x == rhs.x && y == rhs.y && z == rhs.z;
     }
-    constexpr bool operator!=(const Vec3& rhs) const {
+    NUKA_MATH_HD constexpr bool operator!=(const Vec3& rhs) const {
         return !(*this == rhs);
     }
 
     // -- named constants ----------------------------------------------------
-    static constexpr Vec3 Zero()  { return {0.0f, 0.0f, 0.0f}; }
-    static constexpr Vec3 UnitX() { return {1.0f, 0.0f, 0.0f}; }
-    static constexpr Vec3 UnitY() { return {0.0f, 1.0f, 0.0f}; }
-    static constexpr Vec3 UnitZ() { return {0.0f, 0.0f, 1.0f}; }
+    NUKA_MATH_HD static constexpr Vec3 Zero()  { return {0.0f, 0.0f, 0.0f}; }
+    NUKA_MATH_HD static constexpr Vec3 UnitX() { return {1.0f, 0.0f, 0.0f}; }
+    NUKA_MATH_HD static constexpr Vec3 UnitY() { return {0.0f, 1.0f, 0.0f}; }
+    NUKA_MATH_HD static constexpr Vec3 UnitZ() { return {0.0f, 0.0f, 1.0f}; }
 };
 
 // scalar * vec (commutative convenience)
-constexpr Vec3 operator*(float s, const Vec3& v) { return v * s; }
+NUKA_MATH_HD constexpr Vec3 operator*(float s, const Vec3& v) { return v * s; }
 
 } // namespace nuka::math
+
+#undef NUKA_MATH_HD

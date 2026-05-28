@@ -208,6 +208,8 @@ nuka_set_warnings(nuka_solver)
 # nuka_articulation – Articulation graphs and joint drives
 # ---------------------------------------------------------------------------
 add_library(nuka_articulation STATIC
+    runtime/articulation/articulation_state.cpp
+    runtime/articulation/articulation_cooker.cpp
     runtime/articulation/joint_constraints.cpp
 )
 
@@ -219,6 +221,7 @@ target_include_directories(nuka_articulation
 target_link_libraries(nuka_articulation
     PUBLIC
         nuka_constraint
+        nuka_scene
 )
 
 nuka_set_warnings(nuka_articulation)
@@ -350,6 +353,12 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
     )
 
+    target_link_libraries(nuka_articulation
+        PUBLIC
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
         collision/gpu/broadphase.cu
@@ -399,6 +408,28 @@ if(CMAKE_CUDA_COMPILER)
             nuka_row_solver_gpu
     )
 
+    add_library(nuka_articulation_gpu STATIC
+        runtime/articulation/featherstone_aba.cu
+        runtime/articulation/articulation_jacobian.cu
+    )
+
+    target_include_directories(nuka_articulation_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_articulation_gpu
+        PUBLIC
+            nuka_articulation
+            nuka_phi
+            CUDA::cudart
+    )
+
+    target_link_libraries(nuka_runtime
+        PUBLIC
+            nuka_articulation_gpu
+    )
+
     add_library(nuka_sensor_gpu STATIC
         sensor/gpu/cuda_sensors.cu
     )
@@ -440,4 +471,22 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     nuka_set_warnings(nuka_cuda_particle_demo)
+
+    add_executable(nuka_aba_cuda_probe
+        ${CMAKE_SOURCE_DIR}/tools/reference/aba_cuda_probe.cpp
+    )
+
+    target_include_directories(nuka_aba_cuda_probe
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_aba_cuda_probe
+        PRIVATE
+            nuka_articulation_gpu
+            nuka_import
+            nuka_runtime
+    )
+
+    nuka_set_warnings(nuka_aba_cuda_probe)
 endif()

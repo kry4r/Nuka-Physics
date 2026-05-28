@@ -41,11 +41,7 @@ __device__ float AbsMax(math::Vec3 value) {
 }
 
 __device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    math::Vec3 result;
-    result.x = a.x + b.x;
-    result.y = a.y + b.y;
-    result.z = a.z + b.z;
-    return result;
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
 __device__ float Dot(math::Vec3 a, math::Vec3 b) {
@@ -53,11 +49,11 @@ __device__ float Dot(math::Vec3 a, math::Vec3 b) {
 }
 
 __device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    math::Vec3 result;
-    result.x = a.y * b.z - a.z * b.y;
-    result.y = a.z * b.x - a.x * b.z;
-    result.z = a.x * b.y - a.y * b.x;
-    return result;
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
 }
 
 __global__ void ComputeRigidBodyInvariantKernel(
@@ -98,10 +94,11 @@ __global__ void ComputeRigidBodyInvariantKernel(
         }
 
         const float mass = 1.0f / inv_mass;
-        math::Vec3 momentum;
-        momentum.x = linear_velocity.x * mass;
-        momentum.y = linear_velocity.y * mass;
-        momentum.z = linear_velocity.z * mass;
+        const math::Vec3 momentum = {
+            linear_velocity.x * mass,
+            linear_velocity.y * mass,
+            linear_velocity.z * mass
+        };
         local.linear_momentum = Add(local.linear_momentum, momentum);
         local.angular_momentum = Add(local.angular_momentum, Cross(pose.position, momentum));
 

@@ -99,8 +99,7 @@ scene::SceneIR LoadUrdf(const std::string& path) {
             if (auto* origin = inertial->FirstChildElement("origin")) {
                 const char* xyz = origin->Attribute("xyz");
                 if (xyz) {
-                    const math::Vec3 pos = ParseVec3(xyz);
-                    rec.local_transform = math::Transform{pos, math::Quat::Identity()};
+                    rec.inertial_transform.position = ParseVec3(xyz);
                 }
             }
 

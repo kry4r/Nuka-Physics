@@ -10,6 +10,11 @@
 #include "collision/dynamic_broadphase.hpp"
 #include "constraint/contact_builder.hpp"
 #include "constraint/row_builder.hpp"
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+#include "phi/device_context.hpp"
+#include "runtime/articulation/articulation_state.hpp"
+#include "runtime/articulation/featherstone_aba.hpp"
+#endif
 #include "runtime/articulation/joint_constraints.hpp"
 #include "runtime/rigid/integrator.hpp"
 #include "solver/rigid_solver.hpp"
@@ -520,6 +525,58 @@ bool AppendDriveConstraint(const WorldTemplate& world_template,
     return true;
 }
 
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+void SyncArticulationInstanceToHost(const WorldInstance& instance,
+                                    articulation::ArticulationHostState* host_state) {
+    if (host_state == nullptr) {
+        return;
+    }
+    if (instance.articulation_q.size() == host_state->q.size()) {
+        host_state->q = instance.articulation_q;
+    }
+    if (instance.articulation_qdot.size() == host_state->qdot.size()) {
+        host_state->qdot = instance.articulation_qdot;
+    }
+    if (instance.articulation_qddot.size() == host_state->qddot.size()) {
+        host_state->qddot = instance.articulation_qddot;
+    }
+    if (instance.articulation_tau.size() == host_state->tau.size()) {
+        host_state->tau = instance.articulation_tau;
+    }
+}
+
+void SyncArticulationHostToInstance(const articulation::ArticulationHostState& host_state,
+                                    WorldInstance* instance) {
+    if (instance == nullptr) {
+        return;
+    }
+    instance->articulation_q = host_state.q;
+    instance->articulation_qdot = host_state.qdot;
+    instance->articulation_qddot = host_state.qddot;
+    instance->articulation_tau = host_state.tau;
+}
+
+void StepArticulationsOnCuda(const WorldTemplate& world_template,
+                             WorldInstance& instance,
+                             float gravity_z,
+                             float dt) {
+    if (world_template.articulations.empty()) {
+        return;
+    }
+
+    auto host_state = articulation::BuildArticulationHostState(world_template.articulations,
+                                                               world_template.body_table);
+    SyncArticulationInstanceToHost(instance, &host_state);
+    auto context = phi::MakeDefaultDeviceContext();
+    auto device_state = articulation::UploadArticulationState(context, host_state);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, device_state.View(), gravity_z);
+    articulation::FeatherstoneAba::Integrate(context, device_state.View(), dt);
+    context.stream.Synchronize();
+    articulation::DownloadArticulationState(device_state, &host_state);
+    SyncArticulationHostToInstance(host_state, &instance);
+}
+#endif
+
 } // namespace
 
 WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
@@ -550,6 +607,15 @@ WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
     }
 
     for (uint32_t step = 0; step < options.step_count; ++step) {
+#if defined(NUKA_HAS_CUDA_RUNTIME)
+        StepArticulationsOnCuda(world_template, instance, options.gravity.z, options.dt);
+#elif !defined(NUKA_HAS_CUDA_RUNTIME)
+        if (!world_template.articulations.empty()) {
+            throw std::runtime_error(
+                "StepWorldInstance requires CUDA Featherstone ABA for articulations");
+        }
+#endif
+
         auto bodies = LoadBodyStates(world_template, instance, body_count);
 
         for (auto& body : bodies) {

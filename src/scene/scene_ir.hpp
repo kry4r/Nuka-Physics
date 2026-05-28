@@ -20,6 +20,7 @@ struct RigidBodyRecord {
     BodyId id                              = kInvalidBody;
     BodyId parent_id                       = kInvalidBody;
     math::Transform local_transform        = math::Transform::Identity();
+    math::Transform inertial_transform     = math::Transform::Identity();
     float mass                             = 1.0f;
     math::Vec3 inertia                     = {1.0f, 1.0f, 1.0f};
     bool is_static                         = false;
@@ -49,6 +50,7 @@ struct JointRecord {
     float lower_limit                      = -3.14159f;
     float upper_limit                      =  3.14159f;
     float damping                          = 0.0f;
+    float armature                         = 0.0f;
     float stiffness                        = 0.0f;
 };
 

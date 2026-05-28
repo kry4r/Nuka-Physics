@@ -24,6 +24,7 @@ def Xform "World"
         bool physics:rigidBodyEnabled = true
         bool physics:kinematicEnabled = true
         float physics:mass = 0
+        double3 physics:diagonalInertia = (0, 0, 0)
         double3 xformOp:translate = (0, 0, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
@@ -41,6 +42,7 @@ def Xform "World"
     {
         bool physics:rigidBodyEnabled = true
         float physics:mass = 0.5
+        double3 physics:diagonalInertia = (0.05, 0.05, 0.01)
         double3 xformOp:translate = (0, 0, 0.5)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 

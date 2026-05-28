@@ -19,6 +19,10 @@ struct WorldInstance {
     std::vector<math::Vec3>      angular_velocities;
     std::vector<math::Vec3>      forces;
     std::vector<math::Vec3>      torques;
+    std::vector<float>           articulation_q;
+    std::vector<float>           articulation_qdot;
+    std::vector<float>           articulation_qddot;
+    std::vector<float>           articulation_tau;
 };
 
 } // namespace nuka::runtime

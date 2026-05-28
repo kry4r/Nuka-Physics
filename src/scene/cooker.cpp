@@ -24,12 +24,20 @@ CookedBlob CookScene(const SceneIR& scene) {
     const auto& bodies = scene.Bodies();
     blob.body_count = static_cast<uint32_t>(bodies.size());
     blob.bodies.poses.reserve(bodies.size());
+    blob.bodies.local_poses.reserve(bodies.size());
+    blob.bodies.inertial_frames.reserve(bodies.size());
+    blob.bodies.masses.reserve(bodies.size());
+    blob.bodies.inertias.reserve(bodies.size());
     blob.bodies.inv_masses.reserve(bodies.size());
     blob.bodies.inv_inertias.reserve(bodies.size());
     blob.bodies.is_static.reserve(bodies.size());
 
     for (const auto& b : bodies) {
         blob.bodies.poses.push_back(ResolveWorldTransform(scene, b.id));
+        blob.bodies.local_poses.push_back(b.local_transform);
+        blob.bodies.inertial_frames.push_back(b.inertial_transform);
+        blob.bodies.masses.push_back(b.is_static ? 0.0f : b.mass);
+        blob.bodies.inertias.push_back(b.is_static ? math::Vec3::Zero() : b.inertia);
 
         if (b.is_static) {
             blob.bodies.inv_masses.push_back(0.0f);
@@ -56,6 +64,8 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.joints.child_frames.reserve(joints.size());
     blob.joints.lower_limits.reserve(joints.size());
     blob.joints.upper_limits.reserve(joints.size());
+    blob.joints.dampings.reserve(joints.size());
+    blob.joints.armatures.reserve(joints.size());
 
     for (const auto& j : joints) {
         blob.joints.types.push_back(j.type);
@@ -66,6 +76,8 @@ CookedBlob CookScene(const SceneIR& scene) {
         blob.joints.child_frames.push_back(j.child_frame);
         blob.joints.lower_limits.push_back(j.lower_limit);
         blob.joints.upper_limits.push_back(j.upper_limit);
+        blob.joints.dampings.push_back(j.damping);
+        blob.joints.armatures.push_back(j.armature);
     }
 
     const auto& shapes = scene.Shapes();

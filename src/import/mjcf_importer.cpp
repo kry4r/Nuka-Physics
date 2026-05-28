@@ -21,12 +21,6 @@ namespace nuka::import {
 
 namespace {
 
-struct MjcfParseContext {
-    std::unordered_map<std::string, scene::BodyId> body_ids;
-    std::unordered_map<std::string, scene::JointId> joint_ids;
-    std::unordered_map<std::string, scene::MaterialId> material_ids;
-};
-
 math::Vec3 ParseVec3(const char* text) {
     math::Vec3 v{};
     if (!text) {
@@ -37,6 +31,16 @@ math::Vec3 ParseVec3(const char* text) {
     return v;
 }
 
+math::Quat ParseQuat(const char* text) {
+    math::Quat q = math::Quat::Identity();
+    if (!text) {
+        return q;
+    }
+    std::istringstream ss(text);
+    ss >> q.w >> q.x >> q.y >> q.z;
+    return q.Normalized();
+}
+
 void ParseRange(const char* text, float& lower, float& upper) {
     if (!text) {
         return;
@@ -44,6 +48,37 @@ void ParseRange(const char* text, float& lower, float& upper) {
     std::istringstream ss(text);
     ss >> lower >> upper;
 }
+
+struct MjcfJointDefaults {
+    scene::JointType type = scene::JointType::Revolute;
+    math::Vec3 axis = {0.0f, 1.0f, 0.0f};
+    float lower_limit = -3.14159f;
+    float upper_limit = 3.14159f;
+    float damping = 0.0f;
+    float armature = 0.0f;
+};
+
+struct MjcfGeneralDefaults {
+    float gain = 1.0f;
+    float force_limit = 0.0f;
+};
+
+struct MjcfDefaultClass {
+    MjcfJointDefaults joint;
+    MjcfGeneralDefaults general;
+};
+
+struct MjcfDefaults {
+    MjcfDefaultClass root;
+    std::unordered_map<std::string, MjcfDefaultClass> classes;
+};
+
+struct MjcfParseContext {
+    std::unordered_map<std::string, scene::BodyId> body_ids;
+    std::unordered_map<std::string, scene::JointId> joint_ids;
+    std::unordered_map<std::string, scene::MaterialId> material_ids;
+    MjcfDefaults defaults;
+};
 
 scene::ShapeType MjcfGeomType(const char* type_str) {
     if (!type_str) {
@@ -86,6 +121,76 @@ scene::JointType MjcfJointType(const char* type_str) {
         return scene::JointType::Free;
     }
     return scene::JointType::Revolute;
+}
+
+const MjcfDefaultClass& DefaultClassOrRoot(const MjcfDefaults& defaults,
+                                           const char* class_name) {
+    if (class_name) {
+        const auto it = defaults.classes.find(class_name);
+        if (it != defaults.classes.end()) {
+            return it->second;
+        }
+    }
+    return defaults.root;
+}
+
+void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defaults) {
+    if (joint_elem == nullptr || defaults == nullptr) {
+        return;
+    }
+    if (joint_elem->Attribute("type")) {
+        defaults->joint.type = MjcfJointType(joint_elem->Attribute("type"));
+    }
+    if (const char* axis = joint_elem->Attribute("axis")) {
+        defaults->joint.axis = ParseVec3(axis);
+    }
+    ParseRange(joint_elem->Attribute("range"),
+               defaults->joint.lower_limit,
+               defaults->joint.upper_limit);
+    joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
+    joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
+}
+
+void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* defaults) {
+    if (general_elem == nullptr || defaults == nullptr) {
+        return;
+    }
+    general_elem->QueryFloatAttribute("gear", &defaults->general.gain);
+    ParseRange(general_elem->Attribute("forcerange"),
+               defaults->general.force_limit,
+               defaults->general.force_limit);
+}
+
+void ParseDefaultElement(tinyxml2::XMLElement* default_elem,
+                         const MjcfDefaultClass& inherited,
+                         MjcfDefaults* defaults) {
+    if (default_elem == nullptr || defaults == nullptr) {
+        return;
+    }
+
+    MjcfDefaultClass current = inherited;
+    ApplyJointDefault(default_elem->FirstChildElement("joint"), &current);
+    ApplyGeneralDefault(default_elem->FirstChildElement("general"), &current);
+
+    if (const char* class_name = default_elem->Attribute("class")) {
+        defaults->classes[class_name] = current;
+    } else {
+        defaults->root = current;
+    }
+
+    for (auto* child = default_elem->FirstChildElement("default");
+         child != nullptr;
+         child = child->NextSiblingElement("default")) {
+        ParseDefaultElement(child, current, defaults);
+    }
+}
+
+void ParseDefaults(tinyxml2::XMLElement* mujoco, MjcfParseContext& context) {
+    for (auto* default_elem = mujoco->FirstChildElement("default");
+         default_elem != nullptr;
+         default_elem = default_elem->NextSiblingElement("default")) {
+        ParseDefaultElement(default_elem, context.defaults.root, &context.defaults);
+    }
 }
 
 scene::SensorType MjcfSensorType(const std::string& tag) {
@@ -154,20 +259,34 @@ scene::JointId ResolveJoint(const char* name, const MjcfParseContext& context) {
 void ParseBody(tinyxml2::XMLElement* body_elem,
                scene::BodyId parent_id,
                scene::SceneIR& scene,
-               MjcfParseContext& context) {
+               MjcfParseContext& context,
+               const char* inherited_child_class) {
 
     const char* name_attr = body_elem->Attribute("name");
     const std::string body_name = name_attr ? name_attr : "unnamed";
+    const char* child_class = body_elem->Attribute("childclass");
+    if (!child_class) {
+        child_class = inherited_child_class;
+    }
 
     scene::RigidBodyRecord rec;
     rec.name = body_name;
     rec.parent_id = parent_id;
     if (const char* pos_attr = body_elem->Attribute("pos")) {
-        rec.local_transform = math::Transform{ParseVec3(pos_attr), math::Quat::Identity()};
+        rec.local_transform.position = ParseVec3(pos_attr);
+    }
+    if (const char* quat_attr = body_elem->Attribute("quat")) {
+        rec.local_transform.rotation = ParseQuat(quat_attr);
     }
 
     if (auto* inertial = body_elem->FirstChildElement("inertial")) {
         inertial->QueryFloatAttribute("mass", &rec.mass);
+        if (const char* pos = inertial->Attribute("pos")) {
+            rec.inertial_transform.position = ParseVec3(pos);
+        }
+        if (const char* quat = inertial->Attribute("quat")) {
+            rec.inertial_transform.rotation = ParseQuat(quat);
+        }
         if (const char* diag = inertial->Attribute("diaginertia")) {
             rec.inertia = ParseVec3(diag);
         }
@@ -193,7 +312,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         }
 
         if (const char* pos = geom->Attribute("pos")) {
-            shape.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+            shape.local_transform.position = ParseVec3(pos);
+        }
+        if (const char* quat = geom->Attribute("quat")) {
+            shape.local_transform.rotation = ParseQuat(quat);
         }
 
         if (const char* size_attr = geom->Attribute("size")) {
@@ -218,13 +340,27 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
          joint = joint->NextSiblingElement("joint")) {
 
         const char* jname = joint->Attribute("name");
+        const char* joint_class = joint->Attribute("class");
+        const MjcfDefaultClass& defaults =
+            DefaultClassOrRoot(context.defaults, joint_class ? joint_class : child_class);
         scene::JointRecord jrec;
         jrec.name = jname ? jname : "unnamed_joint";
         jrec.parent_body = parent_id;
         jrec.child_body = body_id;
-        jrec.type = MjcfJointType(joint->Attribute("type"));
+        jrec.type = defaults.joint.type;
+        jrec.axis = defaults.joint.axis;
+        jrec.lower_limit = defaults.joint.lower_limit;
+        jrec.upper_limit = defaults.joint.upper_limit;
+        jrec.damping = defaults.joint.damping;
+        jrec.armature = defaults.joint.armature;
+        if (joint->Attribute("type")) {
+            jrec.type = MjcfJointType(joint->Attribute("type"));
+        }
         if (const char* axis_attr = joint->Attribute("axis")) {
             jrec.axis = ParseVec3(axis_attr);
+        }
+        if (const char* pos_attr = joint->Attribute("pos")) {
+            jrec.parent_frame.position = ParseVec3(pos_attr);
         }
         ParseRange(joint->Attribute("range"), jrec.lower_limit, jrec.upper_limit);
 
@@ -240,7 +376,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         record.name = camera->Attribute("name") ? camera->Attribute("name") : "camera";
         record.attached_body = body_id;
         if (const char* pos = camera->Attribute("pos")) {
-            record.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+            record.local_transform.position = ParseVec3(pos);
+        }
+        if (const char* quat = camera->Attribute("quat")) {
+            record.local_transform.rotation = ParseQuat(quat);
         }
         camera->QueryFloatAttribute("fovy", &record.vertical_fov_degrees);
         scene.AddCamera(std::move(record));
@@ -249,7 +388,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     for (auto* child = body_elem->FirstChildElement("body");
          child != nullptr;
          child = child->NextSiblingElement("body")) {
-        ParseBody(child, body_id, scene, context);
+        ParseBody(child, body_id, scene, context, child_class);
     }
 }
 
@@ -264,7 +403,10 @@ void ParseLights(tinyxml2::XMLElement* worldbody, scene::SceneIR& scene) {
         light->QueryBoolAttribute("directional", &directional);
         record.type = directional ? scene::LightType::Directional : scene::LightType::Point;
         if (const char* pos = light->Attribute("pos")) {
-            record.local_transform = math::Transform{ParseVec3(pos), math::Quat::Identity()};
+            record.local_transform.position = ParseVec3(pos);
+        }
+        if (const char* quat = light->Attribute("quat")) {
+            record.local_transform.rotation = ParseQuat(quat);
         }
         if (const char* diffuse = light->Attribute("diffuse")) {
             record.color = ParseVec3(diffuse);
@@ -288,6 +430,10 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
 
         scene::ActuatorRecord record;
         record.name = actuator->Attribute("name") ? actuator->Attribute("name") : "actuator";
+        const MjcfDefaultClass& defaults =
+            DefaultClassOrRoot(context.defaults, actuator->Attribute("class"));
+        record.gain = defaults.general.gain;
+        record.force_limit = defaults.general.force_limit;
         const std::string tag = actuator->Name() ? actuator->Name() : "";
         if (tag == "position") {
             record.type = scene::ActuatorType::Position;
@@ -354,13 +500,14 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     scene::SceneIR scene;
     MjcfParseContext context;
 
+    ParseDefaults(mujoco, context);
     ParseMaterials(mujoco, scene, context);
     ParseLights(worldbody, scene);
 
     for (auto* body = worldbody->FirstChildElement("body");
          body != nullptr;
          body = body->NextSiblingElement("body")) {
-        ParseBody(body, scene::kInvalidBody, scene, context);
+        ParseBody(body, scene::kInvalidBody, scene, context, nullptr);
     }
 
     ParseActuators(mujoco, scene, context);

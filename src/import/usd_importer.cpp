@@ -32,6 +32,7 @@ struct UsdPrim {
     bool rigid_body_enabled = false;
     bool kinematic_enabled = false;
     float mass = 1.0f;
+    math::Vec3 diagonal_inertia = {1.0f, 1.0f, 1.0f};
     math::Vec3 translate = math::Vec3::Zero();
     float cube_size = 1.0f;
     float radius = 0.5f;
@@ -187,6 +188,7 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseBoolValue(line, "physics:rigidBodyEnabled", prim.rigid_body_enabled);
     (void)ParseBoolValue(line, "physics:kinematicEnabled", prim.kinematic_enabled);
     (void)ParseFloatValue(line, "physics:mass", prim.mass);
+    (void)ParseVec3Value(line, "physics:diagonalInertia", prim.diagonal_inertia);
     (void)ParseVec3Value(line, "xformOp:translate", prim.translate);
     (void)ParseFloatValue(line, "double size", prim.cube_size);
     (void)ParseFloatValue(line, "float size", prim.cube_size);
@@ -417,6 +419,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         body.parent_id = FindNearestBodyAncestor(prim.parent_path, body_map);
         body.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
         body.mass = prim.mass;
+        body.inertia = prim.diagonal_inertia;
         body.is_static = prim.kinematic_enabled || prim.mass <= 0.0f;
         const scene::BodyId body_id = scene.AddRigidBody(std::move(body));
         body_map[prim.path] = body_id;

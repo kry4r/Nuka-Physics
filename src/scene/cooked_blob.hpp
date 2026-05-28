@@ -12,6 +12,10 @@ namespace nuka::scene {
 
 struct CookedBodyTable {
     std::vector<math::Transform> poses;       // initial pose per body
+    std::vector<math::Transform> local_poses; // body frame relative to parent
+    std::vector<math::Transform> inertial_frames; // COM/principal inertia frame in body
+    std::vector<float>           masses;       // mass, 0 for static
+    std::vector<math::Vec3>      inertias;     // diagonal inertia in body frame
     std::vector<float>           inv_masses;   // 1/mass, 0 for static
     std::vector<math::Vec3>      inv_inertias; // diagonal inverse inertia
     std::vector<uint8_t>         is_static;    // flags
@@ -26,6 +30,8 @@ struct CookedJointTable {
     std::vector<math::Transform> child_frames;
     std::vector<float>      lower_limits;
     std::vector<float>      upper_limits;
+    std::vector<float>      dampings;
+    std::vector<float>      armatures;
 };
 
 struct CookedShapeTable {

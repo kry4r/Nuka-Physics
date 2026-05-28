@@ -4,8 +4,10 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/cooked_blob.hpp"
+#include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace nuka::runtime {
 
@@ -20,6 +22,7 @@ struct WorldTemplate {
     scene::CookedJointTable joint_table;
     scene::CookedShapeTable shape_table;
     scene::CookedActuatorTable actuator_table;
+    std::vector<articulation::ArticulationCookedTopology> articulations;
 };
 
 } // namespace nuka::runtime

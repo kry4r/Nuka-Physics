@@ -50,6 +50,8 @@ TEST(UsdImporter, ParsesRigidBodyNamesAndMass) {
     EXPECT_EQ(scene.GetBody(1).name, "link1");
     EXPECT_TRUE(scene.GetBody(0).is_static);
     EXPECT_FLOAT_EQ(scene.GetBody(1).mass, 0.5f);
+    EXPECT_FLOAT_EQ(scene.GetBody(1).inertia.x, 0.05f);
+    EXPECT_FLOAT_EQ(scene.GetBody(1).inertia.z, 0.01f);
 }
 
 TEST(UsdImporter, ParsesUsdPhysicsJoint) {

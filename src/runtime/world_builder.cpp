@@ -4,6 +4,8 @@
 
 #include "runtime/world_builder.hpp"
 
+#include "runtime/articulation/articulation_cooker.hpp"
+
 namespace nuka::runtime {
 
 BuiltWorld BuildWorld(const scene::CookedBlob& blob) {
@@ -19,6 +21,7 @@ BuiltWorld BuildWorld(const scene::CookedBlob& blob) {
     tmpl.joint_table   = blob.joints;
     tmpl.shape_table   = blob.shapes;
     tmpl.actuator_table = blob.actuators;
+    tmpl.articulations = articulation::CookArticulations(blob);
 
     // --- Instance: initialise mutable state ---
     auto& inst        = result.instance;
@@ -28,6 +31,12 @@ BuiltWorld BuildWorld(const scene::CookedBlob& blob) {
     inst.angular_velocities.resize(blob.body_count, math::Vec3::Zero());
     inst.forces.resize(blob.body_count, math::Vec3::Zero());
     inst.torques.resize(blob.body_count, math::Vec3::Zero());
+    const auto articulation_state =
+        articulation::BuildArticulationHostState(tmpl.articulations, tmpl.body_table);
+    inst.articulation_q = articulation_state.q;
+    inst.articulation_qdot = articulation_state.qdot;
+    inst.articulation_qddot = articulation_state.qddot;
+    inst.articulation_tau = articulation_state.tau;
 
     // --- Batch: single template, single instance ---
     result.batch.template_count = 1;

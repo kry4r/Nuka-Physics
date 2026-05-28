@@ -19,6 +19,8 @@ struct ArticulationLink {
     math::Vec3 joint_axis = {0, 0, 1};
     math::Transform parent_frame = math::Transform::Identity();
     math::Transform child_frame = math::Transform::Identity();
+    float mass = 0.0f;
+    math::Vec3 diagonal_inertia = math::Vec3::Zero();
 };
 
 struct ArticulationGraph {

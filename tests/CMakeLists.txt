@@ -39,9 +39,21 @@ target_compile_definitions(nuka_v01_foundation_e2e_test
         NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
+if(TARGET nuka_aba_cuda_probe)
+    add_dependencies(nuka_v01_foundation_e2e_test nuka_aba_cuda_probe)
+    target_compile_definitions(nuka_v01_foundation_e2e_test
+        PRIVATE
+            NUKA_ABA_CUDA_PROBE="$<TARGET_FILE:nuka_aba_cuda_probe>"
+            NUKA_ORACLE_PYTHON="${CMAKE_SOURCE_DIR}/.nuka-oracle-venv/bin/python"
+    )
+endif()
+
 target_link_libraries(nuka_v01_foundation_e2e_test
     PRIVATE
         nuka_runtime
+        nuka_import
+        $<$<TARGET_EXISTS:nuka_articulation_gpu>:nuka_articulation_gpu>
+        $<$<TARGET_EXISTS:nuka_phi>:nuka_phi>
         GTest::gtest_main
 )
 
@@ -352,6 +364,7 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_runtime_gpu
             nuka_runtime
+            nuka_articulation_gpu
             GTest::gtest_main
     )
 
