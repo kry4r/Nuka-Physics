@@ -9,6 +9,7 @@ and add the resulting files with Git LFS.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import struct
@@ -110,7 +111,8 @@ def generate_random_samples(model_path: Path,
         forward_batch = jax.jit(jax.vmap(forward_one))
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("wb") as out:
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        with tmp_path.open("wb") as out:
             _write_header(out,
                           model_path.name,
                           KIND_RANDOM_QACC,
@@ -142,6 +144,7 @@ def generate_random_samples(model_path: Path,
                     qacc,
                 ), axis=1)
                 out.write(records.astype("<f4", copy=False).tobytes())
+        os.replace(tmp_path, out_path)
 
 
 def generate_stand_trajectory(model_path: Path,
@@ -158,8 +161,23 @@ def generate_stand_trajectory(model_path: Path,
         model.geom_conaffinity[:] = 0
         mjx_model = mjx.put_model(model)
         data = mjx.make_data(mjx_model)
+
+        def step_once(current, _):
+            next_data = mjx.step(mjx_model, current)
+            return next_data, next_data.qpos
+
+        @jax.jit
+        def rollout(initial):
+            _, qpos = jax.lax.scan(step_once, initial, None, length=step_count)
+            return qpos
+
+        qpos = np.asarray(jax.device_get(rollout(data)), dtype=np.float32)
+        root = np.zeros((step_count, 1), dtype=np.float32)
+        records = np.concatenate((root, qpos), axis=1)
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("wb") as out:
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        with tmp_path.open("wb") as out:
             _write_header(out,
                           model_path.name,
                           KIND_JOINT_TRAJECTORY,
@@ -167,10 +185,8 @@ def generate_stand_trajectory(model_path: Path,
                           model.nq + 1,
                           0,
                           0)
-            for _ in range(step_count):
-                data = mjx.step(mjx_model, data)
-                qpos = np.asarray(jax.device_get(data.qpos), dtype=np.float32)
-                out.write(_nuka_qpos(qpos).tobytes())
+            out.write(records.astype("<f4", copy=False).tobytes())
+        os.replace(tmp_path, out_path)
 
 
 def main() -> int:

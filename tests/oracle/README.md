@@ -78,9 +78,12 @@ python3 tools/oracle/generate_mjx_golden.py \
   --out /tmp/go2_stand_5s.bin
 ```
 
-The 5 s stand trajectory uses `mjx.step` and can be slow on a CPU-only JAX
-runtime. Prefer a CUDA-enabled owner oracle environment for the approved golden
-run.
+The 5 s stand trajectory uses a JIT-compiled `mjx.step` rollout and writes
+through a temporary file before atomically replacing the requested output path,
+so interrupted owner runs do not leave a partial candidate at the target path.
+Prefer a CUDA-enabled owner oracle environment for the approved golden run when
+available; the CPU JAX path is acceptable for candidate generation if it
+finishes locally.
 
 Validate the stand-trajectory candidate with:
 
