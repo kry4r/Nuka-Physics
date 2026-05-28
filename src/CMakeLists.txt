@@ -474,6 +474,10 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(nuka PUBLIC stdc++)
+    endif()
+
     set_target_properties(nuka PROPERTIES
         OUTPUT_NAME nuka
         VERSION ${PROJECT_VERSION}

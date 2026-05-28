@@ -123,6 +123,71 @@ def check_git_lfs() -> bool:
     return False
 
 
+def check_find_package(build_dir: Path) -> bool:
+    with tempfile.TemporaryDirectory(prefix="nuka_find_package_") as tmp:
+        root = Path(tmp)
+        install_dir = root / "install"
+        sample_dir = root / "downstream"
+        sample_build = sample_dir / "build"
+        sample_dir.mkdir()
+        (sample_dir / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.24)\n"
+            "project(nuka_downstream_check LANGUAGES C)\n"
+            "find_package(nuka REQUIRED)\n"
+            "add_executable(check main.c)\n"
+            "target_link_libraries(check PRIVATE nuka::nuka)\n"
+        )
+        (sample_dir / "main.c").write_text(
+            "#include <nuka/nuka.h>\n"
+            "int main(void) {\n"
+            "    nuka_version_t v = nuka_get_version();\n"
+            "    return (v.major == 0 && v.minor == 1) ? 0 : 1;\n"
+            "}\n"
+        )
+
+        if not run(
+            "install nuka package",
+            [
+                "cmake",
+                "--install",
+                str(build_dir),
+                "--prefix",
+                str(install_dir),
+            ],
+        ):
+            return False
+        if not run(
+            "configure downstream find_package(nuka)",
+            [
+                "cmake",
+                "-S",
+                str(sample_dir),
+                "-B",
+                str(sample_build),
+                f"-DCMAKE_PREFIX_PATH={install_dir}",
+                f"-DCUDAToolkit_ROOT={CUDA_ROOT}",
+            ],
+        ):
+            return False
+        if not run(
+            "build downstream find_package(nuka)",
+            ["cmake", "--build", str(sample_build), "--", "-j2"],
+        ):
+            return False
+
+        env = _env()
+        env["LD_LIBRARY_PATH"] = (
+            f"{install_dir / 'lib'}:{CUDA_ROOT / 'lib64'}:"
+            f"{env.get('LD_LIBRARY_PATH', '')}"
+        )
+        result = subprocess.run([str(sample_build / "check")], env=env, cwd=sample_dir)
+        if result.returncode == 0:
+            print("PASS: downstream find_package(nuka) executable runs")
+            return True
+        print(f"FAIL: downstream find_package(nuka) executable exited {result.returncode}")
+        return False
+
+
 def run_engine_trajectory_diff(build_dir: Path) -> bool:
     demo = build_dir / "src/nuka_go2_stand_demo"
     golden = ROOT / "tests/oracle/golden/go2_stand_5s.bin"
@@ -208,6 +273,7 @@ def main() -> int:
         ),
     ))
     checks.append(("physics smell", run("physics smell", [sys.executable, "tools/lint/physics_smell.py", "--time"])))
+    checks.append(("find_package(nuka)", check_find_package(build_dir)))
     checks.append(("Go2 MJX trajectory diff", run_engine_trajectory_diff(build_dir)))
 
     failed = [name for name, ok in checks if not ok]

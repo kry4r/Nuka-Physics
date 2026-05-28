@@ -16,16 +16,19 @@ Golden files use a little-endian binary envelope:
 - UTF-8 model name bytes
 - float32 payload
 
-For random qacc samples, each record is:
+For random qacc samples, each record is aligned to Nuka's fixed-root
+articulation layout. The first slot is the fixed root link and remains zero;
+the remaining slots are the MJX fixed-base joint coordinates:
 
 ```text
-qpos[qpos_count], qvel[qvel_count], tau[qvel_count], qacc[qacc_count]
+root_zero + qpos, root_zero + qvel, root_zero + tau, root_zero + qacc
 ```
 
-For Go2 stand trajectories, each record is:
+For Go2 stand trajectories, each record currently matches the C ABI demo
+trajectory payload:
 
 ```text
-qpos[qpos_count], qvel[qvel_count], qacc[qacc_count]
+root_zero + qpos
 ```
 
 Generate candidate random-sample files with:
@@ -36,6 +39,20 @@ python3 tools/oracle/generate_mjx_golden.py \
   --mode random-qacc \
   --out /tmp/featherstone_go2_random_sample.bin
 ```
+
+Generate the H1 random-sample file with:
+
+```bash
+python3 tools/oracle/generate_mjx_golden.py \
+  --model .nuka-assets/mujoco_menagerie/unitree_h1/h1.xml \
+  --mode random-qacc \
+  --out /tmp/featherstone_h1_random_sample.bin
+```
+
+The random-sample generator removes the floating base and actuator blocks, then
+disables contact in MJX before calling `mjx.forward`. This matches the current
+CUDA ABA oracle harness, which validates joint-space Featherstone dynamics
+rather than contact solve behavior.
 
 Generate the 5 s Go2 stand trajectory with:
 
@@ -64,9 +81,23 @@ Human owner flow:
 3. Run the p07/v0.1 local close gate:
 
 ```bash
-python3 tools/oracle/v01_exit_gate.py --build-dir build-cuda128
+PATH=/root/.nuka-toolchain-gcc14/bin:/root/miniconda3/bin:/root/.local/bin:$PATH \
+CC=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-gcc \
+CXX=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++ \
+python3 tools/oracle/v01_exit_gate.py \
+  --build-dir build-cuda128 \
+  --python .nuka-oracle-venv/bin/python
 ```
 
 The gate is intentionally strict. It fails until the owner-provided goldens,
 MJX Python environment, Git LFS, and `<expected>`-capable C++20 toolchain are
 all available.
+
+On this workstation, downstream `find_package(nuka)` checks must use the
+isolated CUDA 12.8 package root, not the system CUDA 11.x installation:
+
+```bash
+cmake -S /path/to/downstream -B /path/to/downstream/build \
+  -DCMAKE_PREFIX_PATH=/path/to/nuka/install \
+  -DCUDAToolkit_ROOT=/opt/cuda-12.8-root/usr/local/cuda-12.8
+```
