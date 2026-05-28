@@ -123,6 +123,50 @@ def check_git_lfs() -> bool:
     return False
 
 
+def check_golden_lfs_attributes(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    result = subprocess.run(
+        ["git", "check-attr", "filter", "diff", "merge", "text", "--", str(relative)],
+        cwd=ROOT,
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"FAIL: git check-attr failed for {relative}")
+        if result.stderr:
+            print(result.stderr.strip().splitlines()[-1])
+        return False
+
+    attrs: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(": ", 2)
+        if len(parts) == 3:
+            attrs[parts[1]] = parts[2]
+
+    expected = {
+        "filter": "lfs",
+        "diff": "lfs",
+        "merge": "lfs",
+        "text": "unset",
+    }
+    mismatches = [
+        f"{name}={attrs.get(name, 'missing')}"
+        for name, value in expected.items()
+        if attrs.get(name) != value
+    ]
+    if mismatches:
+        print(
+            f"FAIL: {relative} is not covered by Git LFS attributes "
+            f"({', '.join(mismatches)})"
+        )
+        return False
+
+    print(f"PASS: {relative} has Git LFS attributes")
+    return True
+
+
 def check_find_package(build_dir: Path) -> bool:
     with tempfile.TemporaryDirectory(prefix="nuka_find_package_") as tmp:
         root = Path(tmp)
@@ -254,6 +298,7 @@ def main() -> int:
     for asset in REQUIRED_ASSETS:
         checks.append((str(asset.relative_to(ROOT)), check_file(asset)))
     for golden in REQUIRED_GOLDENS:
+        checks.append((f"{golden.relative_to(ROOT)} LFS attributes", check_golden_lfs_attributes(golden)))
         checks.append((str(golden.relative_to(ROOT)), check_file(golden)))
 
     checks.append(("build", run("build", ["cmake", "--build", str(build_dir), "--", "-j2"])))
