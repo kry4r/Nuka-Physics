@@ -167,6 +167,39 @@ def check_golden_lfs_attributes(path: Path) -> bool:
     return True
 
 
+def check_golden_lfs_pointer(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    if not path.exists():
+        print(f"SKIP: cannot verify Git LFS pointer for missing {relative}")
+        return True
+
+    result = subprocess.run(
+        ["git", "show", f":{relative}"],
+        cwd=ROOT,
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        print(f"FAIL: {relative} is present but is not tracked in the Git index")
+        if result.stderr:
+            print(result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1])
+        return False
+
+    blob = result.stdout
+    required_markers = (
+        b"version https://git-lfs.github.com/spec/v1\n",
+        b"oid sha256:",
+        b"\nsize ",
+    )
+    if all(marker in blob for marker in required_markers):
+        print(f"PASS: {relative} is tracked as a Git LFS pointer")
+        return True
+
+    print(f"FAIL: {relative} is tracked as a regular Git blob, not a Git LFS pointer")
+    return False
+
+
 def check_find_package(build_dir: Path) -> bool:
     with tempfile.TemporaryDirectory(prefix="nuka_find_package_") as tmp:
         root = Path(tmp)
@@ -299,6 +332,7 @@ def main() -> int:
         checks.append((str(asset.relative_to(ROOT)), check_file(asset)))
     for golden in REQUIRED_GOLDENS:
         checks.append((f"{golden.relative_to(ROOT)} LFS attributes", check_golden_lfs_attributes(golden)))
+        checks.append((f"{golden.relative_to(ROOT)} LFS pointer", check_golden_lfs_pointer(golden)))
         checks.append((str(golden.relative_to(ROOT)), check_file(golden)))
 
     checks.append(("build", run("build", ["cmake", "--build", str(build_dir), "--", "-j2"])))
