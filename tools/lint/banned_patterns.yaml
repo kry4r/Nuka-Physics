@@ -1,0 +1,60 @@
+patterns:
+  - id: float_atomic_add
+    description: "atomicAdd on float/double breaks D1 strong determinism"
+    regex: '\batomicAdd\s*\(\s*[^,)]+,\s*[^,)]+\s*\)'
+    scope: physics_path
+    severity: error
+
+  - id: hot_path_cuda_malloc
+    description: "cudaMalloc / cudaMallocAsync in per-step kernels = hot-path allocation"
+    regex: '\b(cudaMalloc|cudaMallocAsync)\s*\('
+    scope: hot_path
+    severity: error
+
+  - id: shared_mem_cross_row_class
+    description: "__shared__ memory spanning multiple row classes within one dispatch is a determinism risk"
+    regex: '__shared__\s+\w+\s+\w+\[.*\];.*//\s*ROW_CLASS:\s*\*'
+    scope: physics_path
+    severity: error
+
+  - id: exception_across_c_abi
+    description: "throw across extern \"C\" boundary is undefined behavior"
+    regex: 'throw\s+'
+    scope: c_abi_files
+    severity: error
+
+  - id: stl_in_public_header
+    description: "std::vector / std::string / std::map etc. in public C++20 wrapper headers fragments ABI"
+    regex: '\b(std::vector|std::string|std::map|std::unordered_map)\b'
+    scope: public_headers
+    severity: error
+
+scope_definitions:
+  physics_path:
+    include:
+      - "src/solver/**/*.cu"
+      - "src/solver/**/*.cuh"
+      - "src/constraint/**/*.cu"
+      - "src/runtime/**/*.cu"
+    exclude:
+      - "src/**/reference/**"
+      - "tests/**"
+
+  hot_path:
+    include:
+      - "src/solver/**/*.cu"
+      - "src/constraint/**/*.cu"
+      - "src/runtime/gpu/**/*.cu"
+    exclude:
+      - "src/runtime/world_builder.cpp"
+      - "src/import/**"
+
+  c_abi_files:
+    include:
+      - "src/c_abi/**/*.cpp"
+      - "src/c_abi/**/*.hpp"
+
+  public_headers:
+    include:
+      - "src/include/nuka/**/*.hpp"
+      - "src/include/nuka/**/*.h"

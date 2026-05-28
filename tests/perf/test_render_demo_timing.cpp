@@ -19,6 +19,7 @@ TEST(RenderDemoTiming, ImportedSceneDebugViewUnderOneSecond) {
     options.output_path = output_path.string();
     options.width = 320;
     options.height = 180;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto start = std::chrono::steady_clock::now();
     const auto result = nuka::app::ExportImportedSceneDebugView(options);

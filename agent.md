@@ -62,3 +62,16 @@ cmd.exe /d /s /c ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Au
 
 - After every commit, push that commit immediately.
 - If no remote is configured, report that as the blocker instead of leaving the commit silently local.
+
+## Current v0.1 Focus
+
+- Prioritize CUDA physics, row infrastructure, diagnostics, Featherstone, and C ABI work.
+- Vulkan-specific validation is deferred unless a phase explicitly requires it for physics evidence.
+- Record deferred Vulkan work in docs/architecture/vulkan-deferred.md instead of blocking physics progress on Vulkan driver or render timing issues.
+- Do not install or modify system Vulkan/NVIDIA driver components during v0.1 physics work.
+
+## AI-Protected Files
+
+See docs/architecture/ai-agent-boundary.md. Do not edit files in these categories
+without explicit owner request. If you believe an AI-protected file needs to change,
+surface the proposal in a comment for the human owner rather than editing.

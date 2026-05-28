@@ -23,6 +23,7 @@ void RunCudaSceneDemoTiming(const char* input_path, const char* artifact_name) {
     options.height = 180;
     options.simulation_steps = 60u;
     options.dt = 1.0f / 120.0f;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto start = std::chrono::steady_clock::now();
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
@@ -33,6 +34,9 @@ void RunCudaSceneDemoTiming(const char* input_path, const char* artifact_name) {
 
     EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
     EXPECT_TRUE(result.production_physics_backend);
+    EXPECT_EQ(result.render_backend,
+              nuka::app::SceneDemoRenderBackend::HeadlessReference);
+    EXPECT_FALSE(result.production_render_backend);
     EXPECT_GT(result.debug_command_count, 0u);
     EXPECT_GT(result.non_background_pixel_count, 0u);
     EXPECT_GE(result.cuda_constraint_block_count, 1u);

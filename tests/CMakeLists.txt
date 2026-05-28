@@ -177,6 +177,13 @@ target_link_libraries(nuka_scene_demo_test
         GTest::gtest_main
 )
 
+if(NK_BUILD_VULKAN_VALIDATION)
+    target_compile_definitions(nuka_scene_demo_test
+        PRIVATE
+            NUKA_ENABLE_VULKAN_VALIDATION_TESTS=1
+    )
+endif()
+
 gtest_discover_tests(nuka_scene_demo_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # --- Batch context tests ---------------------------------------------------
@@ -213,10 +220,6 @@ gtest_discover_tests(nuka_regression_test)
 # --- Performance tests -----------------------------------------------------
 add_executable(nuka_perf_test
     perf/test_step_timing.cpp
-    perf/test_render_demo_timing.cpp
-    perf/test_vulkan_scene_demo_timing.cpp
-    perf/test_batched_vulkan_scene_demo_timing.cpp
-    perf/test_vulkan_renderscene_timing.cpp
 )
 
 target_link_libraries(nuka_perf_test
@@ -231,6 +234,46 @@ target_link_libraries(nuka_perf_test
 )
 
 gtest_discover_tests(nuka_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+if(NK_BUILD_DEMO_TIMING_VALIDATION)
+    add_executable(nuka_demo_timing_test
+        perf/test_render_demo_timing.cpp
+    )
+
+    target_link_libraries(nuka_demo_timing_test
+        PRIVATE
+            nuka_runtime
+            nuka_debug_draw
+            nuka_render
+            nuka_scene_pipeline
+            nuka_import
+            nuka_solver
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_demo_timing_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+if(NK_BUILD_VULKAN_VALIDATION)
+    add_executable(nuka_vulkan_perf_test
+        perf/test_vulkan_scene_demo_timing.cpp
+        perf/test_batched_vulkan_scene_demo_timing.cpp
+        perf/test_vulkan_renderscene_timing.cpp
+    )
+
+    target_link_libraries(nuka_vulkan_perf_test
+        PRIVATE
+            nuka_runtime
+            nuka_debug_draw
+            nuka_render
+            nuka_scene_pipeline
+            nuka_import
+            nuka_solver
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_vulkan_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
@@ -280,18 +323,17 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_sensor_test)
 
-    add_executable(nuka_cuda_perf_test
-        perf/test_cuda_batch_timing.cpp
-        perf/test_cuda_batch_contact_timing.cpp
-        perf/test_cuda_batch_joint_drive_timing.cpp
-        perf/test_cuda_batch_sensor_timing.cpp
-        perf/test_cuda_contact_timing.cpp
-        perf/test_cuda_particle_coupling_timing.cpp
-        perf/test_cuda_scene_demo_timing.cpp
-        perf/test_cuda_sensor_timing.cpp
-        perf/test_cuda_solver_timing.cpp
-        perf/test_cuda_step_timing.cpp
-    )
+add_executable(nuka_cuda_perf_test
+    perf/test_cuda_batch_timing.cpp
+    perf/test_cuda_batch_contact_timing.cpp
+    perf/test_cuda_batch_joint_drive_timing.cpp
+    perf/test_cuda_batch_sensor_timing.cpp
+    perf/test_cuda_contact_timing.cpp
+    perf/test_cuda_particle_coupling_timing.cpp
+    perf/test_cuda_sensor_timing.cpp
+    perf/test_cuda_solver_timing.cpp
+    perf/test_cuda_step_timing.cpp
+)
 
     target_link_libraries(nuka_cuda_perf_test
         PRIVATE
@@ -304,17 +346,37 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_cuda_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    if(NK_BUILD_DEMO_TIMING_VALIDATION)
+        add_executable(nuka_cuda_scene_demo_perf_test
+            perf/test_cuda_scene_demo_timing.cpp
+        )
+
+        target_link_libraries(nuka_cuda_scene_demo_perf_test
+            PRIVATE
+                nuka_debug_draw
+                nuka_sensor_gpu
+                nuka_sensor
+                nuka_runtime_gpu
+                nuka_runtime
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_cuda_scene_demo_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endif()
 endif()
 
 # --- Vulkan renderer tests -------------------------------------------------
-add_executable(nuka_render_test
-    render/test_vulkan_backend.cpp
-)
+if(NK_BUILD_VULKAN_VALIDATION)
+    add_executable(nuka_render_test
+        render/test_vulkan_backend.cpp
+    )
 
-target_link_libraries(nuka_render_test
-    PRIVATE
-        nuka_render
-        GTest::gtest_main
-)
+    target_link_libraries(nuka_render_test
+        PRIVATE
+            nuka_render
+            GTest::gtest_main
+    )
 
-gtest_discover_tests(nuka_render_test)
+    gtest_discover_tests(nuka_render_test)
+endif()

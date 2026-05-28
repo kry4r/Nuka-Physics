@@ -10,6 +10,9 @@ project(nuka-physics
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_EXTENSIONS OFF)
 
 # Guard against in-source builds
 include(cmake/PreventInSourceBuilds.cmake)
@@ -21,6 +24,8 @@ include(cmake/Warnings.cmake)
 # Options
 # ---------------------------------------------------------------------------
 option(NK_BUILD_TESTS "Build unit / smoke tests" ON)
+option(NK_BUILD_VULKAN_VALIDATION "Build Vulkan-specific validation and timing tests" OFF)
+option(NK_BUILD_DEMO_TIMING_VALIDATION "Build scene demo render timing tests" OFF)
 option(NK_REQUIRE_CUDA "Require CUDA support for the preferred production physics backend" ON)
 set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend")
 set_property(CACHE NK_PHYSICS_BACKEND PROPERTY STRINGS CUDA CPU_REFERENCE)
@@ -34,6 +39,11 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if(NK_CUDA_ARCHITECTURES STREQUAL "native"
+       AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 11.8)
+        set(NK_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures for production physics kernels" FORCE)
+        message(STATUS "CUDA ${CMAKE_CUDA_COMPILER_VERSION} does not support native Ada targets; using sm_86")
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES "${NK_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures to build" FORCE)
     message(STATUS "CUDA enabled for preferred physics backend: ${CMAKE_CUDA_COMPILER}")
 else()
@@ -44,6 +54,13 @@ else()
 endif()
 
 find_package(Vulkan REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+add_custom_target(nuka_run_lint
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/lint/physics_smell.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Running physics-smell lint"
+)
 
 # ---------------------------------------------------------------------------
 # Third-party dependencies

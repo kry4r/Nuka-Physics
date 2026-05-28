@@ -37,16 +37,6 @@ math::Vec3 ParseVec3(const char* text) {
     return v;
 }
 
-float FirstFloat(const char* text, float fallback = 0.0f) {
-    if (!text) {
-        return fallback;
-    }
-    float value = fallback;
-    std::istringstream ss(text);
-    ss >> value;
-    return value;
-}
-
 void ParseRange(const char* text, float& lower, float& upper) {
     if (!text) {
         return;

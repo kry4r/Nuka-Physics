@@ -70,6 +70,18 @@ ctest --test-dir build -C Release --output-on-failure
 ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming|BatchedVulkanSceneDemoTiming|VulkanRenderSceneTiming"
 ```
 
+### Contributing / Lint
+
+Physics-smell lint is part of the v0.1 guardrail layer:
+
+```bash
+python tools/lint/physics_smell.py
+cmake --build build --target nuka_run_lint
+```
+
+See [Physics-Smell Lint](tools/lint/README.md) for the banned patterns, scoped
+allowlist, and extension rules.
+
 ### Imported Scene Debug Render Demo
 
 ```powershell

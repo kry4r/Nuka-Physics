@@ -224,6 +224,8 @@ int main() {
               << " tangent0_impulse=" << friction_row.tangent_impulse_0
               << " tangent1_impulse=" << friction_row.tangent_impulse_1
               << " friction_limit=" << friction_limit
+              << " no_friction_contacts="
+              << no_friction_row_report.contact_count
               << " no_friction_vx=" << no_friction_state.velocities.front().x
               << " second_friction_vx="
               << friction_second_state.velocities.front().x

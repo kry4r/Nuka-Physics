@@ -62,6 +62,7 @@ TEST(SceneDemo, ExportsMjcfSceneDebugViewToPpm) {
     options.output_path = output_path.string();
     options.width = 160;
     options.height = 120;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
@@ -94,6 +95,7 @@ TEST(SceneDemo, ExportsUsdSceneThroughSamePipeline) {
     options.output_path = output_path.string();
     options.width = 160;
     options.height = 120;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
@@ -115,6 +117,7 @@ TEST(SceneDemo, ExportsUsdExampleSceneThroughSamePipeline) {
     options.output_path = output_path.string();
     options.width = 160;
     options.height = 120;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
@@ -141,6 +144,7 @@ TEST(SceneDemo, SimulatesImportedSceneBeforeRendering) {
     options.simulation_steps = 10;
     options.dt = 0.01f;
     options.gravity = {0.0f, -9.81f, 0.0f};
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
@@ -168,17 +172,15 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     options.height = 120;
     options.simulation_steps = 8;
     options.dt = 1.0f / 120.0f;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
     EXPECT_EQ(result.physics_backend, nuka::phi::PhysicsBackend::Cuda);
     EXPECT_TRUE(result.production_physics_backend);
-    EXPECT_EQ(result.render_backend, nuka::app::SceneDemoRenderBackend::Vulkan);
-    EXPECT_TRUE(result.production_render_backend);
-    EXPECT_EQ(result.vulkan_render_width, options.width);
-    EXPECT_EQ(result.vulkan_render_height, options.height);
-    EXPECT_GE(result.vulkan_physical_device_count, 1u);
-    EXPECT_FALSE(result.vulkan_selected_device_name.empty());
+    EXPECT_EQ(result.render_backend,
+              nuka::app::SceneDemoRenderBackend::HeadlessReference);
+    EXPECT_FALSE(result.production_render_backend);
     EXPECT_EQ(result.cuda_broadphase_pair_count, 1u);
     EXPECT_GE(result.cuda_constraint_block_count, 1u);
     EXPECT_GE(result.cuda_constraint_row_count, 5u);
@@ -205,6 +207,7 @@ TEST(SceneDemo, DefaultsImportedSceneSimulationToCudaBackendWhenAvailable) {
     std::filesystem::remove(output_path);
 }
 
+#if defined(NUKA_ENABLE_VULKAN_VALIDATION_TESTS)
 TEST(SceneDemo, ExportsUsdSceneRenderSceneVulkanMaterialViewToPpm) {
     const auto output_path = TempPpmPath("nuka_scene_demo_renderscene_material.ppm");
     std::filesystem::remove(output_path);
@@ -232,6 +235,7 @@ TEST(SceneDemo, ExportsUsdSceneRenderSceneVulkanMaterialViewToPpm) {
 
     std::filesystem::remove(output_path);
 }
+#endif
 
 TEST(SceneDemo, ForceCpuReferenceRequiresExplicitReferenceValidation) {
     const auto output_path = TempPpmPath("nuka_scene_demo_cpu_reference_rejected.ppm");
@@ -244,6 +248,7 @@ TEST(SceneDemo, ForceCpuReferenceRequiresExplicitReferenceValidation) {
     options.height = 72;
     options.simulation_steps = 2u;
     options.physics_backend_policy = nuka::phi::BackendSelectionPolicy::ForceCpuReference;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     EXPECT_THROW(nuka::app::ExportImportedSceneDebugView(options), std::runtime_error);
     EXPECT_FALSE(std::filesystem::exists(output_path));
@@ -261,6 +266,7 @@ TEST(SceneDemo, CanRunExplicitCpuReferenceValidationPath) {
     options.simulation_steps = 2u;
     options.physics_backend_policy = nuka::phi::BackendSelectionPolicy::ForceCpuReference;
     options.allow_cpu_reference_validation = true;
+    options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
 
     const auto result = nuka::app::ExportImportedSceneDebugView(options);
 
@@ -273,6 +279,7 @@ TEST(SceneDemo, CanRunExplicitCpuReferenceValidationPath) {
     std::filesystem::remove(output_path);
 }
 
+#if defined(NUKA_ENABLE_VULKAN_VALIDATION_TESTS)
 TEST(SceneDemo, ExportsBatchedCudaVulkanSceneDebugViewToPpm) {
     const auto output_path = TempPpmPath("nuka_scene_demo_batched_cuda_vulkan.ppm");
     std::filesystem::remove(output_path);
@@ -317,6 +324,7 @@ TEST(SceneDemo, ExportsBatchedCudaVulkanSceneDebugViewToPpm) {
 
     std::filesystem::remove(output_path);
 }
+#endif
 
 TEST(SceneDemo, RenderedImageChangesWhenSimulationChangesRuntimePose) {
     const auto initial_path = TempPpmPath("nuka_scene_demo_initial.ppm");
@@ -330,6 +338,7 @@ TEST(SceneDemo, RenderedImageChangesWhenSimulationChangesRuntimePose) {
     initial_options.width = 160;
     initial_options.height = 120;
     initial_options.simulation_steps = 0;
+    initial_options.render_backend = nuka::app::SceneDemoRenderBackend::HeadlessReference;
     initial_options.auto_fit_view = false;
     initial_options.view_center = {0.0f, -0.025f, 0.0f};
     initial_options.view_scale = 900.0f;
