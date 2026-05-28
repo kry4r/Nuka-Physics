@@ -64,6 +64,10 @@ cmd.exe /d /s /c ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Au
 
 ## Git Workflow
 
+- Use `kry4r <nidhogxt@outlook.com>` for local git `user.name` and
+  `user.email` before creating commits.
+- Include `[skip ci]` in commit messages so pushes do not trigger GitHub
+  Actions unless the human owner explicitly asks for CI.
 - After every commit, push that commit immediately.
 - If no remote is configured, report that as the blocker instead of leaving the commit silently local.
 
