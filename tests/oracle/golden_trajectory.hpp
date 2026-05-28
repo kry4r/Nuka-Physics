@@ -56,6 +56,13 @@ inline uint32_t ReadU32(std::ifstream& in, const char* field) {
     return value;
 }
 
+inline void WriteU32(std::ofstream& out, uint32_t value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    if (!out) {
+        throw std::runtime_error("failed to write golden trajectory header");
+    }
+}
+
 inline GoldenTrajectory LoadGoldenTrajectory(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -115,6 +122,45 @@ inline GoldenTrajectory LoadGoldenTrajectory(const std::filesystem::path& path) 
         throw std::runtime_error("golden trajectory payload has trailing bytes");
     }
     return result;
+}
+
+inline void WriteGoldenTrajectory(const std::filesystem::path& path,
+                                  const GoldenTrajectory& trajectory) {
+    const size_t record_floats = trajectory.RecordFloatCount();
+    const size_t expected_floats =
+        static_cast<size_t>(trajectory.sample_count) * record_floats;
+    if (trajectory.sample_count == 0u ||
+        record_floats == 0u ||
+        trajectory.payload.size() != expected_floats) {
+        throw std::runtime_error("invalid golden trajectory shape");
+    }
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("failed to open golden trajectory for writing: " +
+                                 path.string());
+    }
+
+    out.write("NUKAGOLD", 8);
+    WriteU32(out, 1u);
+    WriteU32(out, static_cast<uint32_t>(trajectory.kind));
+    WriteU32(out, trajectory.sample_count);
+    WriteU32(out, trajectory.qpos_count);
+    WriteU32(out, trajectory.qvel_count);
+    WriteU32(out, trajectory.qacc_count);
+    if (trajectory.model_name.size() > 4096u) {
+        throw std::runtime_error("golden model name is too large");
+    }
+    WriteU32(out, static_cast<uint32_t>(trajectory.model_name.size()));
+    out.write(trajectory.model_name.data(),
+              static_cast<std::streamsize>(trajectory.model_name.size()));
+    out.write(reinterpret_cast<const char*>(trajectory.payload.data()),
+              static_cast<std::streamsize>(trajectory.payload.size() * sizeof(float)));
+    if (!out) {
+        throw std::runtime_error("failed to write golden trajectory payload");
+    }
 }
 
 } // namespace nuka::tests::oracle

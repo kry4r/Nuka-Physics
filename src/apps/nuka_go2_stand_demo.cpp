@@ -1,12 +1,15 @@
 #include "nuka/nuka.h"
+#include "oracle/golden_trajectory.hpp"
 
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -61,11 +64,58 @@ int WritePpmSanityFrame(const char* output_path, const std::vector<float>& joint
     return out ? 0 : 1;
 }
 
+std::vector<float> DownloadJointPositions(nuka_world_handle world) {
+    nuka_buffer_view_t view{};
+    const nuka_result_t result =
+        nuka_world_get_buffer_view(world, NUKA_FIELD_JOINT_POSITION, &view);
+    if (result != NUKA_RESULT_OK || view.device_ptr == nullptr) {
+        throw std::runtime_error("nuka_world_get_buffer_view failed");
+    }
+
+    std::vector<float> joint_positions(view.element_count);
+    if (!joint_positions.empty()) {
+        const cudaError_t cuda_result =
+            cudaMemcpy(joint_positions.data(),
+                       view.device_ptr,
+                       joint_positions.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        if (cuda_result != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(cuda_result));
+        }
+    }
+    return joint_positions;
+}
+
+void AppendTrajectoryRecord(std::vector<float>* payload,
+                            const std::vector<float>& joint_positions) {
+    if (payload == nullptr) {
+        return;
+    }
+    payload->insert(payload->end(), joint_positions.begin(), joint_positions.end());
+}
+
+void WriteTrajectory(const char* path,
+                     const char* scene_path,
+                     uint32_t step_count,
+                     uint32_t joint_count,
+                     const std::vector<float>& payload) {
+    nuka::tests::oracle::GoldenTrajectory trajectory;
+    trajectory.kind = nuka::tests::oracle::GoldenKind::JointTrajectory;
+    trajectory.sample_count = step_count;
+    trajectory.qpos_count = joint_count;
+    trajectory.qvel_count = 0u;
+    trajectory.qacc_count = 0u;
+    trajectory.model_name = scene_path;
+    trajectory.payload = payload;
+    nuka::tests::oracle::WriteGoldenTrajectory(path, trajectory);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const char* scene_path = argc > 1 ? argv[1] : DefaultGo2Scene();
     const char* output_path = argc > 2 ? argv[2] : DefaultPpmOutput();
+    const char* trajectory_path = argc > 3 ? argv[3] : nullptr;
 
     nuka_device_desc_t device_desc{};
     device_desc.gpu_index = 0u;
@@ -91,8 +141,30 @@ int main(int argc, char** argv) {
     }
 
     constexpr uint32_t kStepCount = 1200u;
+    std::vector<float> trajectory_payload;
+    std::vector<float> joint_positions;
     const auto start = std::chrono::steady_clock::now();
-    result = nuka_world_step_n(world, kStepCount);
+    if (trajectory_path != nullptr) {
+        for (uint32_t step = 0u; step < kStepCount; ++step) {
+            result = nuka_world_step(world);
+            if (result != NUKA_RESULT_OK) {
+                break;
+            }
+            try {
+                joint_positions = DownloadJointPositions(world);
+            } catch (const std::exception& error) {
+                nuka_world_destroy(world);
+                nuka_device_destroy(device);
+                std::fprintf(stderr,
+                             "nuka_go2_stand_demo: trajectory readback failed: %s\n",
+                             error.what());
+                return 1;
+            }
+            AppendTrajectoryRecord(&trajectory_payload, joint_positions);
+        }
+    } else {
+        result = nuka_world_step_n(world, kStepCount);
+    }
     const auto end = std::chrono::steady_clock::now();
     if (result != NUKA_RESULT_OK) {
         nuka_world_destroy(world);
@@ -100,28 +172,14 @@ int main(int argc, char** argv) {
         return Fail("nuka_world_step_n", result);
     }
 
-    nuka_buffer_view_t joint_position_view{};
-    result = nuka_world_get_buffer_view(world,
-                                        NUKA_FIELD_JOINT_POSITION,
-                                        &joint_position_view);
-    if (result != NUKA_RESULT_OK || joint_position_view.device_ptr == nullptr) {
-        nuka_world_destroy(world);
-        nuka_device_destroy(device);
-        return Fail("nuka_world_get_buffer_view", result);
-    }
-
-    std::vector<float> joint_positions(joint_position_view.element_count);
-    cudaError_t cuda_result =
-        cudaMemcpy(joint_positions.data(),
-                   joint_position_view.device_ptr,
-                   joint_positions.size() * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-    if (cuda_result != cudaSuccess) {
+    try {
+        joint_positions = DownloadJointPositions(world);
+    } catch (const std::exception& error) {
         nuka_world_destroy(world);
         nuka_device_destroy(device);
         std::fprintf(stderr,
-                     "nuka_go2_stand_demo: cudaMemcpy failed: %s\n",
-                     cudaGetErrorString(cuda_result));
+                     "nuka_go2_stand_demo: final readback failed: %s\n",
+                     error.what());
         return 1;
     }
 
@@ -140,6 +198,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("Go2 stand demo wrote %s\n", output_path);
+    if (trajectory_path != nullptr) {
+        try {
+            WriteTrajectory(trajectory_path,
+                            scene_path,
+                            kStepCount,
+                            static_cast<uint32_t>(joint_positions.size()),
+                            trajectory_payload);
+        } catch (const std::exception& error) {
+            nuka_world_destroy(world);
+            nuka_device_destroy(device);
+            std::fprintf(stderr,
+                         "nuka_go2_stand_demo: trajectory write failed: %s\n",
+                         error.what());
+            return 1;
+        }
+        std::printf("Go2 stand demo wrote trajectory %s\n", trajectory_path);
+    }
 
     nuka_world_destroy(world);
     nuka_device_destroy(device);

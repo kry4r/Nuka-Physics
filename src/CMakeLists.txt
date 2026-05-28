@@ -563,6 +563,7 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(nuka_go2_stand_demo
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src/include
+            ${CMAKE_SOURCE_DIR}/tests
     )
 
     target_link_libraries(nuka_go2_stand_demo
