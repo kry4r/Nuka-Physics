@@ -9,9 +9,9 @@ and add the resulting files with Git LFS.
 from __future__ import annotations
 
 import argparse
-import struct
 import re
 import shutil
+import struct
 import tempfile
 from pathlib import Path
 
@@ -83,7 +83,10 @@ def _write_header(out,
     out.write(encoded)
 
 
-def generate_random_samples(model_path: Path, out_path: Path, sample_count: int) -> None:
+def generate_random_samples(model_path: Path,
+                            out_path: Path,
+                            sample_count: int,
+                            batch_size: int) -> None:
     jax, jnp, mujoco, mjx = _load_mjx_deps()
     with tempfile.TemporaryDirectory(prefix="nuka_mjx_fixed_base_") as tmp:
         fixed_model_path = _fixed_base_model_xml(model_path, Path(tmp))
@@ -94,6 +97,18 @@ def generate_random_samples(model_path: Path, out_path: Path, sample_count: int)
         mjx_model = mjx.put_model(model)
         rng = np.random.default_rng(seed=42)
         nuka_dofs = model.nv + 1
+        batch_size = sample_count if batch_size <= 0 else batch_size
+
+        def forward_one(qpos, qvel, tau):
+            data = mjx.make_data(mjx_model).replace(
+                qpos=qpos,
+                qvel=qvel,
+                qfrc_applied=tau,
+            )
+            return mjx.forward(mjx_model, data).qacc
+
+        forward_batch = jax.jit(jax.vmap(forward_one))
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("wb") as out:
             _write_header(out,
@@ -103,21 +118,30 @@ def generate_random_samples(model_path: Path, out_path: Path, sample_count: int)
                           nuka_dofs,
                           nuka_dofs,
                           nuka_dofs)
-            for _ in range(sample_count):
-                qpos = rng.uniform(-0.2, 0.2, model.nq).astype(np.float32)
-                qvel = rng.uniform(-0.5, 0.5, model.nv).astype(np.float32)
-                tau = rng.uniform(-2.0, 2.0, model.nv).astype(np.float32)
-                data = mjx.make_data(mjx_model).replace(
-                    qpos=jnp.asarray(qpos),
-                    qvel=jnp.asarray(qvel),
-                    qfrc_applied=jnp.asarray(tau),
-                )
-                data = mjx.forward(mjx_model, data)
-                qacc = np.asarray(jax.device_get(data.qacc), dtype=np.float32)
-                out.write(_nuka_qpos(qpos).tobytes())
-                out.write(_nuka_qvel(qvel).tobytes())
-                out.write(_nuka_tau(tau).tobytes())
-                out.write(_nuka_qvel(qacc).tobytes())
+            for start in range(0, sample_count, batch_size):
+                count = min(batch_size, sample_count - start)
+                qpos = rng.uniform(-0.2, 0.2, (count, model.nq)).astype(np.float32)
+                qvel = rng.uniform(-0.5, 0.5, (count, model.nv)).astype(np.float32)
+                tau = rng.uniform(-2.0, 2.0, (count, model.nv)).astype(np.float32)
+                qacc = np.asarray(
+                    jax.device_get(
+                        forward_batch(jnp.asarray(qpos),
+                                      jnp.asarray(qvel),
+                                      jnp.asarray(tau))),
+                    dtype=np.float32)
+
+                root = np.zeros((count, 1), dtype=np.float32)
+                records = np.concatenate((
+                    root,
+                    qpos,
+                    root,
+                    qvel,
+                    root,
+                    tau,
+                    root,
+                    qacc,
+                ), axis=1)
+                out.write(records.astype("<f4", copy=False).tobytes())
 
 
 def generate_stand_trajectory(model_path: Path,
@@ -159,9 +183,15 @@ def main() -> int:
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--steps", default=1200, type=int)
     parser.add_argument("--dt", default=1.0 / 240.0, type=float)
+    parser.add_argument(
+        "--batch-size",
+        default=0,
+        type=int,
+        help="random-qacc JIT batch size; <=0 uses one batch for all samples",
+    )
     args = parser.parse_args()
     if args.mode == "random-qacc":
-        generate_random_samples(args.model, args.out, args.samples)
+        generate_random_samples(args.model, args.out, args.samples, args.batch_size)
     else:
         generate_stand_trajectory(args.model, args.out, args.steps, args.dt)
     print(f"wrote {args.out}")

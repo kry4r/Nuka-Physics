@@ -49,10 +49,12 @@ python3 tools/oracle/generate_mjx_golden.py \
   --out /tmp/featherstone_h1_random_sample.bin
 ```
 
-The random-sample generator removes the floating base and actuator blocks, then
-disables contact in MJX before calling `mjx.forward`. This matches the current
-CUDA ABA oracle harness, which validates joint-space Featherstone dynamics
-rather than contact solve behavior.
+The random-sample generator removes the floating base and actuator blocks,
+disables contact in MJX, and evaluates samples through a JIT-batched
+`mjx.forward` call. This matches the current CUDA ABA oracle harness, which
+validates joint-space Featherstone dynamics rather than contact solve behavior.
+Use `--batch-size N` only if the default all-samples batch is too large for the
+local MJX/JAX runtime.
 
 Generate the 5 s Go2 stand trajectory with:
 
@@ -64,6 +66,10 @@ python3 tools/oracle/generate_mjx_golden.py \
   --dt 0.004166666666666667 \
   --out /tmp/go2_stand_5s.bin
 ```
+
+The 5 s stand trajectory uses `mjx.step` and can be slow on a CPU-only JAX
+runtime. Prefer a CUDA-enabled owner oracle environment for the approved golden
+run.
 
 Diff two candidate trajectories with:
 
