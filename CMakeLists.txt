@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(nuka-physics
     VERSION 0.1.0
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # ---------------------------------------------------------------------------
@@ -13,12 +13,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Guard against in-source builds
 include(cmake/PreventInSourceBuilds.cmake)
 
 # Compiler-warning helper
 include(cmake/Warnings.cmake)
+include(CMakePackageConfigHelpers)
+include(CheckCXXSourceCompiles)
 
 # ---------------------------------------------------------------------------
 # Options
@@ -30,6 +33,12 @@ option(NK_REQUIRE_CUDA "Require CUDA support for the preferred production physic
 set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend")
 set_property(CACHE NK_PHYSICS_BACKEND PROPERTY STRINGS CUDA CPU_REFERENCE)
 set(NK_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures for production physics kernels")
+
+check_cxx_source_compiles(
+    "#include <expected>
+int main() { std::expected<int, int> value = 1; return *value == 1 ? 0 : 1; }"
+    NUKA_HAS_STD_EXPECTED
+)
 
 # ---------------------------------------------------------------------------
 # CUDA-preferred physics backend and Vulkan renderer backend
@@ -130,7 +139,26 @@ endif()
 # ---------------------------------------------------------------------------
 add_subdirectory(src)
 
+configure_package_config_file(
+    "${CMAKE_SOURCE_DIR}/cmake/nukaConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/nukaConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/nuka
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/nukaConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
 if(NK_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/nukaConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/nukaConfigVersion.cmake"
+    DESTINATION lib/cmake/nuka
+)

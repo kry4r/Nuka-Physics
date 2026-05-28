@@ -4,6 +4,7 @@
 add_library(nuka_core STATIC
     core/version.cpp
 )
+set_target_properties(nuka_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_core
     PUBLIC
@@ -30,6 +31,7 @@ add_library(nuka_scene STATIC
     scene/cooker.cpp
     scene/scene_graph.cpp
 )
+set_target_properties(nuka_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_scene
     PUBLIC
@@ -55,10 +57,16 @@ add_library(nuka_runtime STATIC
     runtime/rigid/integrator.cpp
     runtime/batch_scheduler.cpp
 )
+set_target_properties(nuka_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_runtime
     PUBLIC
         ${CMAKE_SOURCE_DIR}/src
+)
+
+set(NUKA_PUBLIC_HEADERS
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.h
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
 )
 
 add_library(nuka_render STATIC
@@ -128,6 +136,7 @@ add_library(nuka_import STATIC
     import/usd_stage_adapter.cpp
     import/usd_importer.cpp
 )
+set_target_properties(nuka_import PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_import
     PUBLIC
@@ -149,6 +158,7 @@ add_library(nuka_collision STATIC
     collision/query.cpp
     collision/dynamic_broadphase.cpp
 )
+set_target_properties(nuka_collision PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_collision
     PUBLIC
@@ -170,6 +180,7 @@ add_library(nuka_constraint STATIC
     constraint/row_buffers.cpp
     constraint/row_builder.cpp
 )
+set_target_properties(nuka_constraint PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_constraint
     PUBLIC
@@ -190,6 +201,7 @@ add_library(nuka_solver STATIC
     solver/diff_test_bridge.cpp
     solver/rigid_solver.cpp
 )
+set_target_properties(nuka_solver PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_solver
     PUBLIC
@@ -212,6 +224,7 @@ add_library(nuka_articulation STATIC
     runtime/articulation/articulation_cooker.cpp
     runtime/articulation/joint_constraints.cpp
 )
+set_target_properties(nuka_articulation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(nuka_articulation
     PUBLIC
@@ -316,6 +329,7 @@ if(CMAKE_CUDA_COMPILER)
         ${NUKA_CODEGEN_GENERATED_SOURCES}
         ${NUKA_CODEGEN_GENERATED_HEADERS}
     )
+    set_target_properties(nuka_codegen_generated PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     add_dependencies(nuka_codegen_generated nuka_codegen)
 
@@ -336,6 +350,7 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/buffer.cu
         phi/backend_cuda/owned_stream.cu
     )
+    set_target_properties(nuka_phi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_phi
         PUBLIC
@@ -368,6 +383,7 @@ if(CMAKE_CUDA_COMPILER)
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
     )
+    set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_runtime_gpu
         PUBLIC
@@ -385,6 +401,7 @@ if(CMAKE_CUDA_COMPILER)
         solver/gpu/row_scheduler.cu
         solver/gpu/row_solver.cu
     )
+    set_target_properties(nuka_row_solver_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_row_solver_gpu
         PUBLIC
@@ -412,6 +429,7 @@ if(CMAKE_CUDA_COMPILER)
         runtime/articulation/featherstone_aba.cu
         runtime/articulation/articulation_jacobian.cu
     )
+    set_target_properties(nuka_articulation_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_articulation_gpu
         PUBLIC
@@ -428,6 +446,54 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_runtime
         PUBLIC
             nuka_articulation_gpu
+    )
+
+    add_library(nuka SHARED
+        c_abi/device.cpp
+        c_abi/world.cpp
+        c_abi/buffer.cpp
+        c_abi/error.cpp
+    )
+
+    target_include_directories(nuka
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/include>
+            $<INSTALL_INTERFACE:include>
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka
+        PRIVATE
+            nuka_core
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_phi
+        PUBLIC
+            CUDA::cudart
+    )
+
+    set_target_properties(nuka PROPERTIES
+        OUTPUT_NAME nuka
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+        PUBLIC_HEADER "${NUKA_PUBLIC_HEADERS}"
+    )
+
+    nuka_set_warnings(nuka)
+
+    install(TARGETS nuka
+        EXPORT nukaTargets
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+        PUBLIC_HEADER DESTINATION include/nuka
+    )
+
+    install(EXPORT nukaTargets
+        FILE nukaTargets.cmake
+        NAMESPACE nuka::
+        DESTINATION lib/cmake/nuka
     )
 
     add_library(nuka_sensor_gpu STATIC
@@ -489,4 +555,21 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     nuka_set_warnings(nuka_aba_cuda_probe)
+
+    add_executable(nuka_go2_stand_demo
+        apps/nuka_go2_stand_demo.cpp
+    )
+
+    target_include_directories(nuka_go2_stand_demo
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/include
+    )
+
+    target_link_libraries(nuka_go2_stand_demo
+        PRIVATE
+            nuka
+            CUDA::cudart
+    )
+
+    nuka_set_warnings(nuka_go2_stand_demo)
 endif()

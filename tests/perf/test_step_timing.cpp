@@ -140,6 +140,12 @@ TEST(StepTiming, ContactMaterialSolveUnderOneSecond) {
     config.velocity_iterations = 12;
     config.position_iterations = 0;
 
+    {
+        auto warmup_contacts = contacts;
+        auto warmup_bodies = bodies;
+        (void)solver::SolveConstraints(warmup_contacts, warmup_bodies, config);
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int step = 0; step < step_count; ++step) {
@@ -198,6 +204,16 @@ TEST(StepTiming, RuntimeContactPipelineUnderOneSecond) {
     options.solver_position_iterations = 4;
 
     runtime::WorldStepReport last_report;
+    {
+        auto warmup_world = runtime::BuildWorld(scene::CookScene(scene));
+        for (uint32_t body_id = 1; body_id < warmup_world.instance.body_count; ++body_id) {
+            warmup_world.instance.linear_velocities[body_id] = {0.2f, -1.0f, 0.1f};
+        }
+        (void)runtime::StepWorldInstance(warmup_world.template_view,
+                                         warmup_world.instance,
+                                         options);
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr int step_count = 120;

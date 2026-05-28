@@ -92,6 +92,7 @@ private:
     float baseline_energy_ = 0.0f;
     math::Vec3 baseline_linear_momentum_ = math::Vec3::Zero();
     math::Vec3 baseline_angular_momentum_ = math::Vec3::Zero();
+    uint32_t observed_step_count_ = 0;
 };
 
 } // namespace nuka::core::diagnostics

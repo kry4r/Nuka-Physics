@@ -62,6 +62,55 @@ gtest_discover_tests(nuka_v01_foundation_e2e_test
     PROPERTIES RUN_SERIAL TRUE
 )
 
+if(TARGET nuka)
+    add_executable(nuka_c_abi_create_step_destroy_test
+        c_abi/test_create_step_destroy.c
+    )
+
+    target_include_directories(nuka_c_abi_create_step_destroy_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/include
+    )
+
+    target_link_libraries(nuka_c_abi_create_step_destroy_test
+        PRIVATE
+            nuka
+    )
+
+    add_test(NAME CAbi.CreateStepDestroy
+             COMMAND nuka_c_abi_create_step_destroy_test)
+    set_tests_properties(CAbi.CreateStepDestroy
+        PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    if(NUKA_HAS_STD_EXPECTED)
+        add_executable(nuka_cpp_wrapper_raii_test
+            c_abi/test_cpp_wrapper_raii.cpp
+        )
+
+        target_compile_definitions(nuka_cpp_wrapper_raii_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_cpp_wrapper_raii_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_cpp_wrapper_raii_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_cpp_wrapper_raii_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    else()
+        message(STATUS "Skipping nuka.hpp RAII test: compiler standard library has no <expected>")
+    endif()
+endif()
+
 # --- Scene tests -----------------------------------------------------------
 add_executable(nuka_scene_test
     scene/test_scene_ir.cpp
@@ -234,10 +283,37 @@ target_link_libraries(nuka_batch_test
 gtest_discover_tests(nuka_batch_test)
 
 # --- Regression tests ------------------------------------------------------
+add_executable(nuka_oracle_test
+    oracle/featherstone_oracle_harness.cpp
+)
+
+target_compile_definitions(nuka_oracle_test
+    PRIVATE
+        NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+target_link_libraries(nuka_oracle_test
+    PRIVATE
+        GTest::gtest_main
+)
+
+target_include_directories(nuka_oracle_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests
+)
+
+gtest_discover_tests(nuka_oracle_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_executable(nuka_regression_test
     regression/test_free_fall.cpp
+    regression/test_go2_stand_5s.cpp
     regression/test_rest_stack.cpp
     regression/test_two_link_arm.cpp
+)
+
+target_compile_definitions(nuka_regression_test
+    PRIVATE
+        NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
 target_link_libraries(nuka_regression_test
@@ -246,7 +322,14 @@ target_link_libraries(nuka_regression_test
         nuka_articulation
         nuka_collision
         nuka_runtime
+        $<$<TARGET_EXISTS:nuka>:nuka>
         GTest::gtest_main
+)
+
+target_include_directories(nuka_regression_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests
+        ${CMAKE_SOURCE_DIR}/src/include
 )
 
 gtest_discover_tests(nuka_regression_test)

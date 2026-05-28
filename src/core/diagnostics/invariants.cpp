@@ -233,12 +233,13 @@ void InvariantSampler::Sample(const phi::DeviceContext&,
 }
 
 void InvariantSampler::Sample(const InvariantWorldView& view,
-                              uint32_t step_index,
+                              uint32_t,
                               std::vector<InvariantSample>* out_violations) {
     if (!cfg_.enabled) {
         return;
     }
-    if (step_index % cfg_.sample_every_steps != 0u) {
+    const uint32_t observed_step = ++observed_step_count_;
+    if (observed_step % cfg_.sample_every_steps != 0u) {
         return;
     }
 
@@ -253,7 +254,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
     const float energy_drift = RelativeDrift(snapshot.energy, baseline_energy_);
     AppendSample(cfg_,
                  Invariant::Energy,
-                 step_index,
+                 observed_step,
                  energy_drift,
                  cfg_.thresholds.energy_drift_rel,
                  energy_drift > cfg_.thresholds.energy_drift_rel,
@@ -263,7 +264,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
         Length(snapshot.linear_momentum - baseline_linear_momentum_);
     AppendSample(cfg_,
                  Invariant::LinearMomentum,
-                 step_index,
+                 observed_step,
                  linear_momentum_drift,
                  cfg_.thresholds.momentum_drift_abs,
                  linear_momentum_drift > cfg_.thresholds.momentum_drift_abs,
@@ -273,7 +274,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
         Length(snapshot.angular_momentum - baseline_angular_momentum_);
     AppendSample(cfg_,
                  Invariant::AngularMomentum,
-                 step_index,
+                 observed_step,
                  angular_momentum_drift,
                  cfg_.thresholds.momentum_drift_abs,
                  angular_momentum_drift > cfg_.thresholds.momentum_drift_abs,
@@ -283,7 +284,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
         view.step_report != nullptr ? view.step_report->max_constraint_error : 0.0f;
     AppendSample(cfg_,
                  Invariant::ConstraintResidual,
-                 step_index,
+                 observed_step,
                  residual,
                  cfg_.thresholds.constraint_residual_abs,
                  residual > cfg_.thresholds.constraint_residual_abs,
@@ -291,7 +292,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
 
     AppendSample(cfg_,
                  Invariant::JointRange,
-                 step_index,
+                 observed_step,
                  snapshot.max_joint_excursion,
                  cfg_.thresholds.joint_range_slop_rad,
                  snapshot.max_joint_excursion > cfg_.thresholds.joint_range_slop_rad,
@@ -299,7 +300,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
 
     AppendSample(cfg_,
                  Invariant::NanInf,
-                 step_index,
+                 observed_step,
                  static_cast<float>(snapshot.nan_inf_count),
                  0.0f,
                  snapshot.nan_inf_count > 0u,
@@ -307,7 +308,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
 
     AppendSample(cfg_,
                  Invariant::VelocityEnvelope,
-                 step_index,
+                 observed_step,
                  snapshot.max_speed,
                  cfg_.thresholds.velocity_max,
                  snapshot.max_speed > cfg_.thresholds.velocity_max,
@@ -315,7 +316,7 @@ void InvariantSampler::Sample(const InvariantWorldView& view,
 
     AppendSample(cfg_,
                  Invariant::PositionEnvelope,
-                 step_index,
+                 observed_step,
                  snapshot.max_position_abs,
                  cfg_.thresholds.position_max,
                  snapshot.max_position_abs > cfg_.thresholds.position_max,
@@ -327,6 +328,7 @@ void InvariantSampler::Reset() {
     baseline_energy_ = 0.0f;
     baseline_linear_momentum_ = math::Vec3::Zero();
     baseline_angular_momentum_ = math::Vec3::Zero();
+    observed_step_count_ = 0;
 }
 
 } // namespace nuka::core::diagnostics
