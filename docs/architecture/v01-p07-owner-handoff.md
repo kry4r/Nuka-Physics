@@ -120,6 +120,8 @@ repository contents:
 - Direct HTTPS reaches GitHub but fails because the configured VS Code
   credential helper socket is unavailable and GitHub rejects anonymous write
   access.
+- Temporary SSH push using local keys fails with `Permission denied
+  (publickey)`, and the configured SSH agent socket cannot list identities.
 - Temporary proxy
   `http://192.168.2.185:7897` fails with `No route to host`.
 
