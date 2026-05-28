@@ -165,6 +165,30 @@ not yet the same dynamics contract.
 This override is only for owner preflight. The strict v0.1 gate still requires
 the approved files at `tests/oracle/golden/**`.
 
+Current owner handoff status:
+
+- `/tmp/nuka_owner_candidates/featherstone_go2_random_sample.bin`
+- `/tmp/nuka_owner_candidates/featherstone_h1_random_sample.bin`
+- `/tmp/nuka_owner_candidates/go2_stand_5s.bin`
+
+These three candidates validate with `tools/oracle/validate_golden_candidate.py`
+and pass:
+
+```bash
+NUKA_GOLDEN_DIR=/tmp/nuka_owner_candidates \
+PATH=/root/miniconda3/bin:/root/.local/bin:$PATH \
+ctest --test-dir build-cuda128 \
+  -R 'FeatherstoneOracle|Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance' \
+  --output-on-failure -j1
+```
+
+The remaining strict local gate blocker outside protected golden files is the
+p07 C++20 wrapper requirement for `std::expected`: on this workstation,
+`/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++` reports
+`std::expected` as C++23-only when compiled with `-std=c++20`. Do not silently
+switch the public wrapper contract to C++23 or add a shim without owner/spec
+approval.
+
 On this workstation, downstream `find_package(nuka)` checks must use the
 isolated CUDA 12.8 package root, not the system CUDA 11.x installation:
 
