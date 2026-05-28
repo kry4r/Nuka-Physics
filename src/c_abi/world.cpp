@@ -55,6 +55,19 @@ void DownloadDeviceStateToInstance(WorldRecord& record) {
     SyncHostToInstance(record.articulation_host, &record.world.instance);
 }
 
+void SampleInvariants(WorldRecord& record, uint32_t step_index) {
+    record.last_invariant_violations.clear();
+    const core::diagnostics::InvariantWorldView view{
+        &record.world.template_view,
+        &record.world.instance,
+        nullptr,
+        record.step_options.gravity,
+    };
+    record.invariant_sampler.Sample(view,
+                                    step_index,
+                                    &record.last_invariant_violations);
+}
+
 nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
     if (step_count == 0u) {
         return NUKA_RESULT_OK;
@@ -83,6 +96,8 @@ nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
     }
     record.device->context.stream.Synchronize();
     DownloadDeviceStateToInstance(record);
+    record.simulated_step_count += step_count;
+    SampleInvariants(record, record.simulated_step_count);
     return NUKA_RESULT_OK;
 }
 
@@ -157,6 +172,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                 record->world.template_view.articulations,
                 record->world.template_view.body_table);
         nuka::c_abi::SyncHostToInstance(record->articulation_host, &record->world.instance);
+        nuka::c_abi::SampleInvariants(*record, record->simulated_step_count);
         if (!record->world.template_view.articulations.empty()) {
             record->articulation_device =
                 nuka::runtime::articulation::UploadArticulationState(
@@ -214,12 +230,31 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
     if (out_count == nullptr) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    if (nuka::c_abi::WorldTable().Get(world) == nullptr) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    (void)out_array;
-    (void)array_capacity;
-    *out_count = 0u;
+    if (array_capacity > 0u && out_array == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+
+    const auto& violations = record->last_invariant_violations;
+    *out_count = static_cast<uint32_t>(violations.size());
+    if (out_array == nullptr || array_capacity == 0u || violations.empty()) {
+        return NUKA_RESULT_OK;
+    }
+
+    const uint32_t copy_count =
+        std::min(array_capacity, static_cast<uint32_t>(violations.size()));
+    auto* out = static_cast<nuka_invariant_violation_t*>(out_array);
+    for (uint32_t index = 0u; index < copy_count; ++index) {
+        const auto& violation = violations[index];
+        out[index].invariant = static_cast<uint32_t>(violation.which);
+        out[index].step = violation.step_index;
+        out[index].env_id = violation.env_id;
+        out[index].value = violation.value;
+        out[index].threshold = violation.threshold;
+    }
     return NUKA_RESULT_OK;
 }
 

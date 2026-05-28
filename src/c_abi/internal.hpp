@@ -2,6 +2,7 @@
 
 #include "nuka/nuka.h"
 
+#include "core/diagnostics/invariants.hpp"
 #include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
@@ -28,6 +29,17 @@ struct WorldRecord {
     runtime::articulation::ArticulationDeviceBuffers articulation_device;
     phi::Buffer joint_position_buffer;
     phi::Buffer joint_velocity_buffer;
+    uint32_t simulated_step_count = 0u;
+    core::diagnostics::InvariantSampler invariant_sampler{
+        core::diagnostics::InvariantConfig{
+            true,
+            1u,
+            {},
+            true,
+            true,
+        }
+    };
+    std::vector<core::diagnostics::InvariantSample> last_invariant_violations;
     std::vector<float> empty_float_storage;
 };
 

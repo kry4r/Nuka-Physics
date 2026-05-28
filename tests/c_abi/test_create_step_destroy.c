@@ -30,6 +30,21 @@ int main(void) {
     assert(view.element_count > 0u);
     assert(view.element_stride_bytes == sizeof(float));
 
+    uint32_t violation_count = 0u;
+    assert(nuka_world_get_last_invariant_violations(world,
+                                                    &violation_count,
+                                                    0,
+                                                    0u) == NUKA_RESULT_OK);
+    nuka_invariant_violation_t first_violation;
+    assert(nuka_world_get_last_invariant_violations(world,
+                                                    &violation_count,
+                                                    &first_violation,
+                                                    1u) == NUKA_RESULT_OK);
+    assert(nuka_world_get_last_invariant_violations(world,
+                                                    &violation_count,
+                                                    0,
+                                                    1u) == NUKA_RESULT_INVALID_ARG);
+
     nuka_world_destroy(world);
     nuka_device_destroy(device);
     return 0;

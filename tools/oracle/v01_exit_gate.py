@@ -58,7 +58,10 @@ def check_file(path: Path) -> bool:
 
 
 def check_expected_header() -> bool:
-    compiler = shutil.which("g++-10") or shutil.which("g++")
+    env = _env()
+    compiler = env.get("CXX") or shutil.which("g++-10", path=env.get("PATH")) or shutil.which(
+        "g++", path=env.get("PATH")
+    )
     if compiler is None:
         print("FAIL: no C++ compiler found for <expected> probe")
         return False
@@ -67,7 +70,7 @@ def check_expected_header() -> bool:
         [compiler, "-std=c++20", "-x", "c++", "-", "-c", "-o", os.devnull],
         input=source,
         text=True,
-        env=_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -80,7 +83,7 @@ def check_expected_header() -> bool:
     return False
 
 
-def check_python_deps() -> bool:
+def check_python_deps(python: str) -> bool:
     code = (
         "import jax\n"
         "import mujoco\n"
@@ -88,7 +91,7 @@ def check_python_deps() -> bool:
         "print('MJX deps available')\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code],
+        [python, "-c", code],
         env=_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -171,12 +174,17 @@ def run_engine_trajectory_diff(build_dir: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", default="build-cuda128", type=Path)
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Python interpreter with jax, mujoco, and mujoco.mjx installed",
+    )
     args = parser.parse_args()
     build_dir = args.build_dir if args.build_dir.is_absolute() else ROOT / args.build_dir
 
     checks: list[tuple[str, bool]] = []
     checks.append(("C++20 <expected>", check_expected_header()))
-    checks.append(("MJX Python deps", check_python_deps()))
+    checks.append(("MJX Python deps", check_python_deps(args.python)))
     checks.append(("Git LFS", check_git_lfs()))
     for asset in REQUIRED_ASSETS:
         checks.append((str(asset.relative_to(ROOT)), check_file(asset)))
