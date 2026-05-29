@@ -496,6 +496,20 @@ add_executable(nuka_cuda_perf_test
 
     gtest_discover_tests(nuka_cuda_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- Perf timing infrastructure contract test (Task 3.1.1) -------------
+    add_executable(nuka_perf_timing_test
+        perf/test_perf_timing.cu
+    )
+
+    target_link_libraries(nuka_perf_timing_test
+        PRIVATE
+            nuka_core
+            CUDA::cudart
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_perf_timing_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     if(NK_BUILD_DEMO_TIMING_VALIDATION)
         add_executable(nuka_cuda_scene_demo_perf_test
             perf/test_cuda_scene_demo_timing.cpp

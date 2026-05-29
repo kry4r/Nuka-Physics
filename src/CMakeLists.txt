@@ -3,6 +3,7 @@
 # ---------------------------------------------------------------------------
 add_library(nuka_core STATIC
     core/version.cpp
+    core/perf/perf_recorder.cpp
 )
 set_target_properties(nuka_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
