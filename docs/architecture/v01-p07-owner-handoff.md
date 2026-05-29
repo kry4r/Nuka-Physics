@@ -39,6 +39,7 @@ Current local C++20 `<expected>` probe results:
 
 | Compiler | Version | `-std=c++20 <expected>` |
 | --- | --- | --- |
+| `/root/.nuka-toolchain/bin/x86_64-conda-linux-gnu-g++` | GCC 15.2.0 | fails; `std::expected` is C++23-only |
 | `/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++` | GCC 14.3.0 | fails |
 | `/usr/bin/g++` | GCC 9.4.0 | fails; no `-std=c++20` |
 | `/usr/bin/g++-10` | GCC 10.5.0 | fails |

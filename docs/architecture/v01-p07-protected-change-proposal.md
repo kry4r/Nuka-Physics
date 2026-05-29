@@ -104,6 +104,14 @@ The p07 public C++ wrapper currently includes `<expected>` and returns
 `std::expected`. The strict gate compiles this probe with `-std=c++20`, but the
 available local standard libraries reject it.
 
+Current local probes show:
+
+- `/root/.nuka-toolchain/bin/x86_64-conda-linux-gnu-g++` GCC 15.2.0 rejects
+  `std::expected` in `-std=c++20` and reports it as C++23-only.
+- `/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++` GCC 14.3.0
+  rejects `std::expected` in `-std=c++20`.
+- `/usr/bin/g++-10` has no `<expected>` header.
+
 Owner decision required:
 
 - provide a C++20 toolchain or standard library where `std::expected` compiles
@@ -123,9 +131,12 @@ PATH=/root/.nuka-toolchain-gcc14/bin:/root/miniconda3/bin:/root/.local/bin:$PATH
 CC=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-gcc \
 CXX=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++ \
 python3 tools/oracle/v01_exit_gate.py \
-  --build-dir build-cuda128 \
-  --python .nuka-oracle-venv/bin/python
+  --build-dir build-cuda128
 ```
+
+The gate auto-selects `.nuka-oracle-venv/bin/python` when present for the MJX
+dependency check. Passing `--python .nuka-oracle-venv/bin/python` remains
+equivalent.
 
 Do not begin v0.3 until this strict gate passes and v0.1 p07 is committed
 closed with `[skip ci]` in the commit message.
