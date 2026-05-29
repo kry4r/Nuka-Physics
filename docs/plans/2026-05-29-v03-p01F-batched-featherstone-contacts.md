@@ -43,7 +43,7 @@ New stepper `StepBatchedArticulatedWorld`; all state device-resident across step
 | 3 | ABA pass 2 — articulated inertia + bias (leaf→root) | `AbaPass2ArticulatedInertiaKernel` (exists) | `featherstone_aba` |
 | 4 | ABA pass 3 — joint accelerations (root→leaf) | `AbaPass3AccelerationKernel` (exists) | `featherstone_aba` |
 | 5 | velocity sub-step `qdot += qddot·dt` | `IntegrateArticulationKernel` (vel-only) | `integrator` |
-| 6 | foot-shape world poses (from `link_pose`) | small FK-to-shape kernel (new) | `buffer_mgmt` |
+| 6 | **FK → world link poses** (compose `link_xup` chain), then foot-shape world poses | NEW FK kernel + FK-to-shape kernel | `buffer_mgmt` |
 | 7 | broadphase (feet vs ground, per env) | `BuildBatchedCudaBroadphase` (exists) | `contact_generation` |
 | 8 | narrow-phase → manifolds | `GenerateBatchedCudaContacts` (exists) | `contact_generation` |
 | 9 | full-chain contact Jacobians (foot→root) | `ComputeContactChainJacobians` (new) | `row_builder` |
@@ -186,3 +186,9 @@ Keep `StepWorldGpu` (single-env Featherstone, `world.cpp:151`) untouched (oracle
   (deterministic) — verify before relying on it in the D1 path.
 - **Warp-per-articulation budget gap** — p01-F stays thread-per-articulation; 80 µs ABA / 1000 µs `step_total` budget lines are
   **Wave-3 targets, not p01-F gates.**
+- **`link_pose` is NOT FK-updated by ABA (found in T3).** `AbaPass1KinematicsKernel` writes only `link_xup` (spatial
+  parent→child transforms); `link_pose` is **cook-time static (rest pose)**. The contact path **must run a real FK pass each
+  step** composing the `link_xup` chain (root→leaf) into up-to-date **world** link poses BEFORE both contact detection (T2) and
+  the chain Jacobian (T3 reads world axes/origins from those poses). This FK kernel is part of T2's deliverable (stage 6) and is
+  run by T6 ahead of stages 7–13. The legacy `ComputeLinkPointJacobianKernel` uses `joint_axis` un-rotated (latent local↔world
+  bug, left intact); the new T3 chain kernel rotates `joint_axis` to world via `link_pose.rotation`.
