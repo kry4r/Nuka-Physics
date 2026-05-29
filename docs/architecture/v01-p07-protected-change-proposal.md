@@ -31,9 +31,9 @@ python3 tools/oracle/v01_owner_preflight.py \
 ```
 
 That helper is read-only with respect to `tests/oracle/golden/**`. It validates
-candidate shapes, runs the CUDA oracle preflight against `NUKA_GOLDEN_DIR`, and
-reports the current C++20 `<expected>` toolchain status. The equivalent manual
-commands are:
+candidate SHA-256 values and shapes, runs the CUDA oracle preflight against
+`NUKA_GOLDEN_DIR`, and reports the current C++20 `<expected>` toolchain status.
+The equivalent manual commands are:
 
 ```bash
 python3 tools/oracle/validate_golden_candidate.py \

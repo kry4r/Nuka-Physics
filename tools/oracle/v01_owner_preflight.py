@@ -10,6 +10,7 @@ directory via `NUKA_GOLDEN_DIR`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -28,6 +29,7 @@ GOLDEN_SPECS = (
         ("--qvel-count", "13"),
         ("--qacc-count", "13"),
         ("--model-name", "go2_mjx.xml"),
+        ("--sha256", "1b0fb3e3a453ac40e4aee13953943dd868004da6d71c5a1f1f40a9853860046f"),
     ),
     (
         "featherstone_h1_random_sample.bin",
@@ -37,6 +39,7 @@ GOLDEN_SPECS = (
         ("--qvel-count", "20"),
         ("--qacc-count", "20"),
         ("--model-name", "h1.xml"),
+        ("--sha256", "0368ded305da6ec3f61b66823dc65396a7328861a1a9939323878de0d488a14e"),
     ),
     (
         "go2_stand_5s.bin",
@@ -46,6 +49,7 @@ GOLDEN_SPECS = (
         ("--qvel-count", "0"),
         ("--qacc-count", "0"),
         ("--model-name", "go2_stand.usda"),
+        ("--sha256", "8630566e67958545c102d3e8f0dcbf4112d1ca527edcbb682e99efd26ec6ddb3"),
     ),
 )
 
@@ -72,6 +76,25 @@ def run(label: str, cmd: list[str], *, env: dict[str, str] | None = None) -> boo
         return True
     print(f"FAIL: {label} exited {result.returncode}", flush=True)
     return False
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def split_spec(spec: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], str]:
+    validate_args: list[tuple[str, str]] = []
+    expected_hash = ""
+    for key, value in spec:
+        if key == "--sha256":
+            expected_hash = value
+        else:
+            validate_args.append((key, value))
+    return validate_args, expected_hash
 
 
 def check_expected_header(cxx: str | None) -> bool:
@@ -102,12 +125,22 @@ def check_candidate_files(candidate_dir: Path) -> bool:
             print(f"FAIL: missing candidate {path}")
             ok = False
             continue
+        validate_args, expected_hash = split_spec(list(spec))
+        actual_hash = sha256_file(path)
+        if actual_hash != expected_hash:
+            print(
+                f"FAIL: {path} sha256 mismatch: "
+                f"got {actual_hash}, expected {expected_hash}"
+            )
+            ok = False
+            continue
+        print(f"PASS: {path} sha256={actual_hash}")
         cmd = [
             sys.executable,
             "tools/oracle/validate_golden_candidate.py",
             "--path",
             str(path),
-            *_flatten(tuple(spec)),
+            *_flatten(tuple(validate_args)),
         ]
         ok = run(f"validate {filename}", cmd) and ok
     return ok

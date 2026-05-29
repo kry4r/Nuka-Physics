@@ -143,10 +143,10 @@ python3 tools/oracle/v01_owner_preflight.py \
 ```
 
 The helper above is read-only with respect to `tests/oracle/golden/**`. It
-validates candidate file contracts, runs the CUDA oracle preflight against
-`NUKA_GOLDEN_DIR`, and reports whether the local C++20 `<expected>` toolchain
-contract is still blocking the strict p07 gate. The equivalent manual CUDA
-oracle preflight is:
+validates candidate SHA-256 values and file contracts, runs the CUDA oracle
+preflight against `NUKA_GOLDEN_DIR`, and reports whether the local C++20
+`<expected>` toolchain contract is still blocking the strict p07 gate. The
+equivalent manual CUDA oracle preflight is:
 
 ```bash
 mkdir -p /tmp/nuka_owner_candidates
