@@ -19,6 +19,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CUDA_ROOT = Path("/opt/cuda-12.8-root/usr/local/cuda-12.8")
+TOOLCHAIN_ROOT = Path("/root/.nuka-toolchain-gcc14")
+TOOLCHAIN_BIN = TOOLCHAIN_ROOT / "bin"
+TOOLCHAIN_CC = TOOLCHAIN_BIN / "x86_64-conda-linux-gnu-gcc"
+TOOLCHAIN_CXX = TOOLCHAIN_BIN / "x86_64-conda-linux-gnu-g++"
 REQUIRED_GOLDENS = (
     ROOT / "tests/oracle/golden/featherstone_go2_random_sample.bin",
     ROOT / "tests/oracle/golden/featherstone_h1_random_sample.bin",
@@ -32,9 +36,14 @@ REQUIRED_ASSETS = (
 
 def _env() -> dict[str, str]:
     env = os.environ.copy()
-    env["PATH"] = f"/root/miniconda3/bin:/root/.local/bin:{env.get('PATH', '')}"
-    env.setdefault("CC", "/usr/bin/gcc-10")
-    env.setdefault("CXX", "/usr/bin/g++-10")
+    env["PATH"] = (
+        f"{TOOLCHAIN_BIN}:/root/miniconda3/bin:/root/.local/bin:"
+        f"{env.get('PATH', '')}"
+    )
+    if TOOLCHAIN_CC.exists():
+        env.setdefault("CC", str(TOOLCHAIN_CC))
+    if TOOLCHAIN_CXX.exists():
+        env.setdefault("CXX", str(TOOLCHAIN_CXX))
     return env
 
 
