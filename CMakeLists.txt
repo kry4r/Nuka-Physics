@@ -34,11 +34,25 @@ set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend
 set_property(CACHE NK_PHYSICS_BACKEND PROPERTY STRINGS CUDA CPU_REFERENCE)
 set(NK_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures for production physics kernels")
 
+# Probe the project's nuka::expected wrapper contract under the configured C++
+# standard (C++20). libstdc++ only exposes std::expected at C++23, so nuka.hpp
+# ships a C++20 fallback in nuka/expected.hpp; this confirms that wrapper builds
+# before enabling the RAII wrapper test.
+set(CMAKE_REQUIRED_INCLUDES "${CMAKE_SOURCE_DIR}/src/include")
 check_cxx_source_compiles(
-    "#include <expected>
-int main() { std::expected<int, int> value = 1; return *value == 1 ? 0 : 1; }"
-    NUKA_HAS_STD_EXPECTED
+    "#include <nuka/expected.hpp>
+struct E { int code; };
+int main() {
+    nuka::expected<int, E> ok = 1;
+    if (!ok.has_value() || *ok != 1) return 1;
+    nuka::expected<int, E> bad = nuka::unexpected(E{2});
+    if (bad.has_value() || bad.error().code != 2) return 1;
+    nuka::expected<void, E> done{};
+    return done.has_value() ? 0 : 1;
+}"
+    NUKA_HAS_EXPECTED_WRAPPER
 )
+unset(CMAKE_REQUIRED_INCLUDES)
 
 # ---------------------------------------------------------------------------
 # CUDA-preferred physics backend and Vulkan renderer backend
