@@ -126,12 +126,19 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                           phi::MemoryKind::Device);
 
     // Zero the persistent lambda buffer for a clean cold start (determinism +
-    // a defined warm-start seed on the first step).
+    // a defined warm-start seed on the first step). Also zero the contact-point
+    // readback buffer so a CONTACT_POINTS query BEFORE the first Step() returns
+    // defined (all-zero == no contacts) data rather than uninitialized memory;
+    // every Step() overwrites it.
     phi::ScopedDeviceGuard guard(context_.device_id);
     CheckCuda(cudaMemsetAsync(lambda_.Data(), 0,
                               static_cast<size_t>(slot_count_) * 3u * sizeof(float),
                               context_.stream.Native()),
               "BatchedArticulatedWorld lambda memset");
+    CheckCuda(cudaMemsetAsync(contact_point_.Data(), 0,
+                              static_cast<size_t>(slot_count_) * sizeof(Vec3),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld contact_point memset");
     context_.stream.Synchronize();
 }
 
