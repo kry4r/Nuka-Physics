@@ -684,6 +684,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
                                                   uint32_t dof_stride,
                                                   float dt,
                                                   float friction_coefficient,
+                                                  float baumgarte_max_velocity,
                                                   float* inout_lambda) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -787,8 +788,9 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
             }
             const float* const jn =
                 normal_jacobian + static_cast<size_t>(slot_base + s) * dof_stride;
-            const float bias =
-                kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f);
+            const float bias = fminf(
+                kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f),
+                baumgarte_max_velocity);
             float jv = 0.0f;
             for (uint32_t k = 0u; k < dof; ++k) {
                 jv += jn[k] * qdot_work[k];
@@ -874,8 +876,9 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
         }
         const float* const jn =
             normal_jacobian + static_cast<size_t>(slot_base + s) * dof_stride;
-        const float bias =
-            kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f);
+        const float bias = fminf(
+            kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f),
+            baumgarte_max_velocity);
         float jv = 0.0f;
         for (uint32_t k = 0u; k < dof; ++k) {
             jv += jn[k] * qdot_work[k];
@@ -1170,7 +1173,8 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  uint32_t dof_stride,
                                  float dt,
                                  float* inout_lambda,
-                                 float friction_coefficient) {
+                                 float friction_coefficient,
+                                 float baumgarte_max_velocity) {
     if (state.articulation_count == 0u || env_count == 0u || dof_stride == 0u) {
         return;
     }
@@ -1202,6 +1206,7 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
         dof_stride,
         dt,
         friction_coefficient,
+        baumgarte_max_velocity,
         inout_lambda);
     CheckCuda(cudaGetLastError(), "SolveArticulatedContactRowsKernel launch");
 }

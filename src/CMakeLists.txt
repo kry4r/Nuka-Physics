@@ -430,6 +430,7 @@ if(CMAKE_CUDA_COMPILER)
         runtime/articulation/featherstone_aba.cu
         runtime/articulation/articulation_jacobian.cu
         runtime/articulation/articulation_contacts.cu
+        runtime/gpu/batched_articulated_world.cu
     )
     set_target_properties(nuka_articulation_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -441,6 +442,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_articulation_gpu
         PUBLIC
             nuka_articulation
+            nuka_core
             nuka_phi
             CUDA::cudart
     )

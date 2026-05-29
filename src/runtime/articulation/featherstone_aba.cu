@@ -540,6 +540,29 @@ __global__ void IntegrateArticulationKernel(ArticulationDeviceState state, float
     state.q[link] += state.qdot[link] * dt;
 }
 
+// Split halves of IntegrateArticulationKernel. The arithmetic of each half is
+// textually identical to the combined kernel above, so running velocity then
+// position is bit-for-bit equal to the combined Integrate (the batched stepper
+// needs the contact solve to sit between the two halves). The single-env path
+// keeps using the combined kernel; these are additive.
+__global__ void IntegrateVelocityArticulationKernel(ArticulationDeviceState state,
+                                                    float dt) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) {
+        return;
+    }
+    state.qdot[link] += state.qddot[link] * dt;
+}
+
+__global__ void IntegratePositionArticulationKernel(ArticulationDeviceState state,
+                                                    float dt) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) {
+        return;
+    }
+    state.q[link] += state.qdot[link] * dt;
+}
+
 __global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
                                          const float* drive_targets,
                                          const float* drive_stiffness,
@@ -628,6 +651,34 @@ void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "IntegrateArticulationKernel launch");
 }
 
+void LaunchIntegrateVelocityArticulationKernels(const phi::DeviceContext& context,
+                                                ArticulationDeviceState state,
+                                                float dt) {
+    if (state.total_link_count == 0u || dt <= 0.0f) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    const uint32_t blocks = (state.total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+    IntegrateVelocityArticulationKernel<<<blocks, kAbaBlockSize, 0u, stream>>>(state, dt);
+    CheckCuda(cudaGetLastError(), "IntegrateVelocityArticulationKernel launch");
+}
+
+void LaunchIntegratePositionArticulationKernels(const phi::DeviceContext& context,
+                                                ArticulationDeviceState state,
+                                                float dt) {
+    if (state.total_link_count == 0u || dt <= 0.0f) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    const uint32_t blocks = (state.total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+    IntegratePositionArticulationKernel<<<blocks, kAbaBlockSize, 0u, stream>>>(state, dt);
+    CheckCuda(cudaGetLastError(), "IntegratePositionArticulationKernel launch");
+}
+
 void FeatherstoneAba::ApplyPositionDrives(const phi::DeviceContext& context,
                                           ArticulationDeviceState state,
                                           const float* drive_targets,
@@ -652,6 +703,18 @@ void FeatherstoneAba::Integrate(const phi::DeviceContext& context,
                                 ArticulationDeviceState state,
                                 float dt) {
     LaunchIntegrateArticulationKernels(context, state, dt);
+}
+
+void FeatherstoneAba::IntegrateVelocity(const phi::DeviceContext& context,
+                                        ArticulationDeviceState state,
+                                        float dt) {
+    LaunchIntegrateVelocityArticulationKernels(context, state, dt);
+}
+
+void FeatherstoneAba::IntegratePosition(const phi::DeviceContext& context,
+                                        ArticulationDeviceState state,
+                                        float dt) {
+    LaunchIntegratePositionArticulationKernels(context, state, dt);
 }
 
 } // namespace nuka::runtime::articulation
