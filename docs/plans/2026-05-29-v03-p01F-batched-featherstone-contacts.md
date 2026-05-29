@@ -58,6 +58,16 @@ New stepper `StepBatchedArticulatedWorld`; all state device-resident across step
 
 ## 2. Contact ↔ ABA coupling (the new part)
 
+> **Design principle — base-inclusive, DOF-parameterized from the start (NOT fixed-base-then-bolt-on).** The Jacobian chain
+> length, the joint-space inertia `M` dimension, and the solve/apply span are ALL keyed on the articulation's *actual* DOF
+> count **including the base joint's DOFs** — never hardcoded to Go2's 12 leg DOFs or a leg-only chain. A fixed base = a base
+> joint with 0 DOF; a floating base = a base joint with 6 DOF. This makes T8 (floating base) "enable the Free joint type + cook
+> + scene" rather than a rewrite of T3/T4/T5. Concretely: `jacobian_chain_scalar` stride and the per-articulation `M` block are
+> sized from a per-articulation `dof_count` (base-inclusive), and T3/T4/T5 must compile/run identically for dof∈{12 (fixed),
+> 18 (6-DOF base)}. Rationale (advisor): a floating base changes the *contents* of the three hardest kernels, and ground
+> reaction propagating to a movable base — the physically essential behaviour — isn't even exercised on a pinned base, so a
+> leg-only design would force a rebuild at T8.
+
 1. **Detect in maximal coords, reuse pipeline.** Run only `BuildBatchedCudaBroadphase` + `GenerateBatchedCudaContacts`
    (`batched_device_world.cu:2667,2753`) on Go2 feet vs ground. Do **not** call `SolveBatchedCudaConstraints*` /
    `BatchedRowGroup` (atomics → breaks D1).
@@ -92,19 +102,34 @@ Deps in [...]; effort S/M/L; each task has an integrated check (per `agent.md`: 
   cook N× (deterministic memcpy-with-offset) over cooking an N-skeleton scene (slower, order-fragile). Disjoint. **M.**
   *Check:* upload 4096 replicas, run existing ABA 100 steps, assert all 4096 `q` bit-identical to single-env trajectory.
 - **T2 — Foot-shape world pose + reuse broadphase/narrow-phase for feet.** [T1] new `articulation_contacts.{cu,hpp}` (FK-to-shape
-  only) + thin `BatchedShapeTables` adapter (feet + ground). Shares new file w/ T4/T5 (serialize); disjoint from T3. **M.**
-  *Check:* drop 4096 Go2 so feet penetrate ground; manifold count >0 per env, points at foot/ground interface.
+  only) + thin `BatchedShapeTables` adapter. **NOTE (confirmed):** `examples/scenes/go2_stand.usda` has **no ground/plane
+  collider** (only the Go2 base cube + 4 foot spheres + leg colliders) — T2 **must add a ground plane** to the batched shape
+  tables (a static half-space/plane at z=0) so feet have something to contact. Shares new file w/ T4/T5 (serialize); disjoint
+  from T3. **M.**
+  *Check:* drop 4096 Go2 so feet penetrate the added ground; manifold count >0 per env, points at foot/ground interface.
 - **T3 — Full-chain contact Jacobian.** [T1] (∥ with T2) `articulation_jacobian.cu/.hpp`: add `ComputeContactChainJacobians`;
   leave existing single-link kernel intact. Disjoint from T2. **M.**
   *Check:* apply known vertical foot force, verify projected joint torques match an analytic 3-link leg (sign+magnitude).
 - **T4 — CRBA joint-space inertia M + effective mass.** [T1,T3] `articulation_contacts.{cu,hpp}` (serialize w/ T2,T5):
-  `ComputeArticulationInertiaM` + `ComputeContactEffectiveMass`; per-articulation `M`/`M⁻¹` scratch (deterministic, no atomics).
-  May add additive YAML field + `regen.py` (emitter only) — likely unnecessary (`effective_mass` already in YAML). **L.**
-  *Check:* compare `M` for one leg vs a CPU reference to ~1e-4.
+  `ComputeArticulationInertiaM` (CRBA) + `ComputeContactEffectiveMass`. `M` is **`dof_count`×`dof_count` (base-inclusive)**, not
+  a hardcoded 12; per-articulation `M`/`M⁻¹` (or factorization) scratch. **Determinism is the hard part:** the dense symmetric
+  solve/inverse must use a **fixed pivot order LDLT/Cholesky, no atomics** — this is the single riskiest kernel (advisor). May
+  add additive YAML field + `regen.py` (emitter only) — likely unnecessary (`effective_mass` already in YAML). **L.**
+  *Check (extended):* (a) `M` for one leg vs a CPU reference ≤1e-4; (b) **`M⁻¹`/solve bit-exact across two runs** (determinism,
+  not just assembly); (c) conditioning sane near singular leg configs (no NaN/Inf when a leg straightens). **Documented fallback:**
+  if the dense inverse is a bottleneck or a determinism headache, switch to the O(n) ABA articulated-impulse method (reuses
+  Pass-2 articulated inertias already computed) — noted in §6.
 - **T5 — Assemble + PGS-solve articulated contact/limit rows + apply Δqdot.** [T2,T3,T4] `articulation_contacts.{cu,hpp}`:
   `AssembleArticulatedContactRows`, `SolveArticulatedContactRowsKernel` (block-per-articulation, fixed order, warm-start,
-  friction), `ApplyJointSpaceImpulses`. **L.**
-  *Check:* single Go2 on ground reaches static rest (feet in contact, qddot→0, finite), penetration < slop.
+  friction), `ApplyJointSpaceImpulses`. **Warm-start matching rule:** carry λ across steps by a stable row identity (contact
+  link + manifold-point slot index); when a foot makes/breaks contact and row counts change, unmatched rows start at λ=0
+  (mismatch hurts convergence only, not determinism — specify the matching explicitly). **L.**
+  *Check (correctness, NOT just determinism — advisor #2):* there is **no contacts-on oracle** (the MJX golden is fixed-base,
+  contacts-off), and the headline "4096 envs identical" check only proves replication+determinism (a uniform bug passes). So
+  T5 must assert against an independent reference: **(a) hand-computed static equilibrium** — a single Go2 standing on the
+  ground, total foot normal reaction ≈ total weight (per-foot ≈ weight/4 for a symmetric stance), and the per-joint hold
+  torques match an analytic leg static-balance to a sane tolerance; **(b) optional** MJX/Pinocchio **contacts-on** Go2
+  comparison if feasible. Plus: feet reach static rest (qddot→0, finite), penetration < slop.
 - **T6 — Batched articulated stepper.** [T1–T5] new `batched_articulated_world.{cu,hpp}` (`StepBatchedArticulatedWorld`)
   composing stages 1–15, contacts gated. Disjoint (new files). **M.**
   *Check:* 4096-env Go2 steps 1000×, all finite, feet contact ground per env; per-kernel timings via `PerfRecorder`.
@@ -112,11 +137,14 @@ Deps in [...]; effort S/M/L; each task has an integrated check (per `agent.md`: 
   fields). See §4. Disjoint from T1–T6. **M.**
   *Check:* `World::CreateFromScene(go2, 4096, dt)` + `StepN` works; `env_count==1` still routes to unchanged Featherstone path,
   oracle passes.
-- **T8 — Floating (6-DOF) base. [REQUIRED for p04 locomotion — not optional]** [T1–T7] add a `Free` joint type / 6-chained-DOF
-  root in the enum + cooker + ABA, isolated so it cannot perturb the fixed-base oracle numerics. Without it the base is pinned
-  and the robot cannot locomote (only stand). **L.**
-  *Check:* a single free-base Go2 under gravity falls/contacts ground physically; with leg drives can support its own weight;
-  fixed-base oracle still bit-exact.
+- **T8 — Floating (6-DOF) base. [REQUIRED for p04 locomotion — not optional]** [T1–T7] Because T3/T4/T5 are already
+  base-inclusive/DOF-parameterized (§2 principle), T8 is **"enable the 6-DOF base," not a rewrite of the coupling kernels:**
+  add a `Free` (6-DOF) joint type to the enum (`articulation_state.hpp:18`), stop the cooker forcing the root `Fixed`
+  (`articulation_cooker.cpp:157`) when the scene marks the base dynamic, handle the 6-DOF base joint in the ABA passes +
+  integrate, and provide a floating-base Go2 scene. Isolated so the fixed-base oracle (base 0-DOF) is untouched. Without it the
+  base is pinned and the robot can only stand, not locomote. **L.**
+  *Check:* a single free-base Go2 under gravity falls and its feet contact the ground physically; with leg drives it supports
+  its own weight (base height stable); the fixed-base single-env oracle is still bit-exact.
 
 **Critical path:** T1 → T3 → T4 → T5 → T6 → T7 → T8. T2 ∥ T3 after T1.
 **GENERATED/protected:** only T4 *might* touch `featherstone_contact.yaml` + `regen.py`; never hand-edit `src/codegen/generated/*`.
@@ -140,7 +168,9 @@ Keep `StepWorldGpu` (single-env Featherstone, `world.cpp:151`) untouched (oracle
   path), (b) finite bounded `q`, (c) ≥1 active foot contact at rest per env, (d) all 4096 env states identical (replicated
   determinism).
 - **Oracle no-regression (structural):** `test_go2_stand_5s.cpp` MJX-golden (≤1e-4) + determinism replay pass unchanged.
-- **V2 energy invariant:** passive (drives+contacts off) conserves/dissipates monotonically; contacts-on must not inject energy.
+- **V2 energy invariant:** passive (drives+contacts off) conserves/dissipates monotonically. **With contacts on, assert energy
+  *bounded*, not monotonic** — the row solver's Baumgarte stabilization (`baumgarte=0.2`) legitimately adds energy via position
+  correction, so a "no energy injected" check would false-fail (advisor).
 - **D1 strong determinism:** two identically-stepped 4096-env worlds produce bit-identical `q`/`qdot` — guaranteed by the
   block-per-articulation, no-atomics, fixed-order solve; assert explicitly.
 
