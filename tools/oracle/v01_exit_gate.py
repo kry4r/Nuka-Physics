@@ -23,6 +23,7 @@ TOOLCHAIN_ROOT = Path("/root/.nuka-toolchain-gcc14")
 TOOLCHAIN_BIN = TOOLCHAIN_ROOT / "bin"
 TOOLCHAIN_CC = TOOLCHAIN_BIN / "x86_64-conda-linux-gnu-gcc"
 TOOLCHAIN_CXX = TOOLCHAIN_BIN / "x86_64-conda-linux-gnu-g++"
+ORACLE_PYTHON = ROOT / ".nuka-oracle-venv/bin/python"
 REQUIRED_GOLDENS = (
     ROOT / "tests/oracle/golden/featherstone_go2_random_sample.bin",
     ROOT / "tests/oracle/golden/featherstone_h1_random_sample.bin",
@@ -45,6 +46,12 @@ def _env() -> dict[str, str]:
     if TOOLCHAIN_CXX.exists():
         env.setdefault("CXX", str(TOOLCHAIN_CXX))
     return env
+
+
+def default_python() -> str:
+    if ORACLE_PYTHON.exists():
+        return str(ORACLE_PYTHON)
+    return sys.executable
 
 
 def run(label: str, cmd: list[str], *, cwd: Path = ROOT) -> bool:
@@ -327,7 +334,7 @@ def main() -> int:
     parser.add_argument("--build-dir", default="build-cuda128", type=Path)
     parser.add_argument(
         "--python",
-        default=sys.executable,
+        default=default_python(),
         help="Python interpreter with jax, mujoco, and mujoco.mjx installed",
     )
     args = parser.parse_args()

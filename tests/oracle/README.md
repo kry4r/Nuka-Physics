@@ -124,13 +124,16 @@ PATH=/root/.nuka-toolchain-gcc14/bin:/root/miniconda3/bin:/root/.local/bin:$PATH
 CC=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-gcc \
 CXX=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++ \
 python3 tools/oracle/v01_exit_gate.py \
-  --build-dir build-cuda128 \
-  --python .nuka-oracle-venv/bin/python
+  --build-dir build-cuda128
 ```
 
 The gate is intentionally strict. It fails until the owner-provided goldens,
 MJX Python environment, Git LFS, and `<expected>`-capable C++20 toolchain are
 all available.
+
+When `.nuka-oracle-venv/bin/python` exists, the gate uses it automatically for
+the MJX dependency check. `--python .nuka-oracle-venv/bin/python` can still be
+passed explicitly if needed.
 
 Before moving candidates into the protected golden directory, the owner can run
 the C++ oracle tests against a separate candidate directory. The random-qacc

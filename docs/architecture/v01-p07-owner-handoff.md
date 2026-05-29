@@ -13,9 +13,12 @@ PATH=/root/.nuka-toolchain-gcc14/bin:/root/miniconda3/bin:/root/.local/bin:$PATH
 CC=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-gcc \
 CXX=/root/.nuka-toolchain-gcc14/bin/x86_64-conda-linux-gnu-g++ \
 python3 tools/oracle/v01_exit_gate.py \
-  --build-dir build-cuda128 \
-  --python .nuka-oracle-venv/bin/python
+  --build-dir build-cuda128
 ```
+
+The gate now auto-selects `.nuka-oracle-venv/bin/python` when that repository
+local oracle environment exists. Passing `--python .nuka-oracle-venv/bin/python`
+is still valid and equivalent.
 
 As of this handoff, the gate is blocked by:
 
