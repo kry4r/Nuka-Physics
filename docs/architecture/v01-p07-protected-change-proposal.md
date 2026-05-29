@@ -25,6 +25,17 @@ Current candidate files are outside protected storage:
 Owner preflight:
 
 ```bash
+python3 tools/oracle/v01_owner_preflight.py \
+  --candidate-dir /tmp/nuka_owner_candidates \
+  --build-dir build-cuda128
+```
+
+That helper is read-only with respect to `tests/oracle/golden/**`. It validates
+candidate shapes, runs the CUDA oracle preflight against `NUKA_GOLDEN_DIR`, and
+reports the current C++20 `<expected>` toolchain status. The equivalent manual
+commands are:
+
+```bash
 python3 tools/oracle/validate_golden_candidate.py \
   --path /tmp/nuka_owner_candidates/featherstone_go2_random_sample.bin \
   --kind random-qacc \

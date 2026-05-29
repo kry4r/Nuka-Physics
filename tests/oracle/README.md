@@ -137,6 +137,18 @@ the C++ oracle tests against a separate candidate directory. The random-qacc
 candidates must pass the CUDA ABA preflight before approval:
 
 ```bash
+python3 tools/oracle/v01_owner_preflight.py \
+  --candidate-dir /tmp/nuka_owner_candidates \
+  --build-dir build-cuda128
+```
+
+The helper above is read-only with respect to `tests/oracle/golden/**`. It
+validates candidate file contracts, runs the CUDA oracle preflight against
+`NUKA_GOLDEN_DIR`, and reports whether the local C++20 `<expected>` toolchain
+contract is still blocking the strict p07 gate. The equivalent manual CUDA
+oracle preflight is:
+
+```bash
 mkdir -p /tmp/nuka_owner_candidates
 cp /tmp/featherstone_go2_random_sample.bin /tmp/nuka_owner_candidates/
 cp /tmp/featherstone_h1_random_sample.bin /tmp/nuka_owner_candidates/
