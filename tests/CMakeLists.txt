@@ -543,6 +543,28 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_articulation_inertia_m_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- Articulated contact rows + block-PGS solve (p01-F T5) --------------
+    add_executable(nuka_articulation_contact_rows_test
+        runtime/test_articulation_contact_rows.cpp
+    )
+
+    target_compile_definitions(nuka_articulation_contact_rows_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_articulation_contact_rows_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_articulation_contact_rows_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_cuda_sensor_test
         sensor/test_cuda_sensors.cpp
     )

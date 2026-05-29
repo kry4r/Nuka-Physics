@@ -153,6 +153,181 @@ void ComputeContactEffectiveMass(const phi::DeviceContext& context,
                                  uint32_t dof_stride,
                                  float* out_effective_mass);
 
+// ---------------------------------------------------------------------------
+// p01-F T5 -- articulated contact rows + block-PGS solve (contact<->ABA coupling)
+// ---------------------------------------------------------------------------
+//
+// The genuinely new coupling: turn the detected foot contacts (T2) into
+// constraint rows that carry their chain Jacobian (T3) and effective mass (T4),
+// then solve them per-articulation with a projected Gauss-Seidel (PGS) and apply
+// the resulting joint-space impulse Delta_qdot = M^-1 J^T lambda straight back
+// into the joint velocities. The solve+apply are FUSED (one kernel), one block
+// per articulation, single lane, fixed iteration count, fixed row order, no
+// atomics => D1-strong-deterministic (bit-identical across runs and replicas).
+//
+//  AssembleArticulatedContactRows -- gathers, per ACTIVE detected contact
+//    (link != kInvalidLink), its dof-wide chain-Jacobian row, m_eff, world
+//    normal, penetration depth, and owning articulation. Builds a per-contact
+//    orthonormal tangent basis (t1,t2) from the normal (branch-stable, so the
+//    same normal always yields the same basis => friction stays deterministic),
+//    and emits ONE normal row plus TWO friction tangent rows per active contact.
+//    Output is a fixed-stride env-major ArticulatedContactRow buffer (length
+//    env_count * kMaxFootContactsPerEnv), trailing/inactive slots marked
+//    row_type == kRowInactive so the solver skips them.
+//
+//    Scope deferral: a kRowJointLimit row TYPE is scaffolded in the enum, but NO
+//    limit rows are emitted -- ArticulationDeviceState carries no joint lower/
+//    upper limit fields, so there is no data to drive them. T6/a later task adds
+//    limit data + emission.
+//
+//  SolveArticulatedContactRowsKernel -- block-per-articulation fused PGS.
+//    Seeds a working joint-velocity vector qdot_work from state.qdot (which at
+//    call time holds qdot_free = the post-velocity-integration joint velocity),
+//    runs kContactSolverIterations sweeps over the rows in fixed order (all
+//    normal rows of the articulation's contacts, then the friction rows), and
+//    for each row i:
+//        jv    = dot(J_i, qdot_work)          (over the articulation's dof cols)
+//        delta = m_eff_i * (b_i - jv)         (row_solver.cu:289 convention:
+//                                              lambda = m_eff*(rhs - jv))
+//        new   = clamp(lambda_i + delta, lower, upper)
+//        qdot_work += (M^-1 tile) . (J_i^T * (new - lambda_i)); lambda_i = new
+//    NORMAL row:  b_i = kBaumgarteBeta/dt * max(depth_i - kPenetrationSlop, 0)
+//                 (positional bias; restitution = 0), lower=0, upper=+inf.
+//    FRICTION row: b_i = 0, lower=-mu*sum_lambda_n, upper=+mu*sum_lambda_n with
+//                 mu = kContactFriction and sum_lambda_n the contact's
+//                 accumulated normal impulse (Coulomb cone, mirroring
+//                 row_solver.cu:293-301). Finally writes qdot_work back into
+//                 state.qdot for every DOF of the articulation. The dof column ->
+//                 global qdot index map is the SAME base-inclusive prefix-sum
+//                 convention as T3's dof_index / T4's LocalDofIndex, so J_i,
+//                 M^-1 and the joint velocities all share one column ordering.
+//
+//  Warm-start: SolveArticulatedContactRowsKernel can be seeded from a persisted
+//    per-slot lambda buffer (keyed by the fixed contact slot
+//    [env*kMaxFootContactsPerEnv + slot] and row type) to accelerate convergence
+//    across steps. Warm-start affects CONVERGENCE ONLY -- never determinism or
+//    correctness. A cold start (all-zero lambda, the default when warm_start is
+//    null) is fully acceptable and is NOT a defect; the determinism gate runs
+//    cold so two runs are trivially comparable.
+// ---------------------------------------------------------------------------
+
+// PGS sweep count. The normal and friction rows of a bent Go2 leg are strongly
+// coupled (Jn.M^-1.Jt^T is O(1)), which slows Gauss-Seidel; a sticking contact
+// needs ~40 sweeps to drive the tangential foot velocity to ~0. 48 clears that
+// with margin (resting-contact stick residual ~3e-3 m/s) while staying cheap at
+// one block per articulation; fixed count + fixed row order keeps the solve D1.
+constexpr uint32_t kContactSolverIterations = 48u;
+
+// Baumgarte positional-stabilization coefficient (fraction of penetration error
+// fed back as a target separating velocity per step). 0.2 is the standard mild
+// value -- large enough to arrest penetration growth, small enough not to inject
+// excessive energy.
+constexpr float kBaumgarteBeta = 0.2f;
+
+// Penetration allowance (m): depth below this is not corrected, so a resting
+// contact does not jitter about exactly zero penetration.
+constexpr float kPenetrationSlop = 1.0e-4f;
+
+// Coulomb friction coefficient applied at every foot contact (mu). 0.8 is a
+// typical rubber-on-hard-ground value and matches the Go2 foot material intent.
+constexpr float kContactFriction = 0.8f;
+
+// Constraint-row type tag. kRowJointLimit is scaffolded but never emitted (no
+// joint-limit data exists in ArticulationDeviceState yet -- see the doc above).
+enum class ContactRowType : uint32_t {
+    kRowInactive = 0u,    // empty / trailing slot; solver skips it.
+    kRowNormal = 1u,      // contact normal (non-penetration) row.
+    kRowFriction1 = 2u,   // first friction tangent row.
+    kRowFriction2 = 3u,   // second friction tangent row.
+    kRowJointLimit = 4u,  // SCAFFOLD ONLY -- never emitted.
+};
+
+// One assembled contact's full row set, stored env-major at fixed stride
+// kMaxFootContactsPerEnv (slot == the T2 contact slot within the env). The
+// normal + two friction rows share the contact's geometry; the solver reads the
+// dof-wide jacobian/normal/tangent slices through the contact's owning
+// articulation tile. Padding columns of the jacobians are zero.
+struct ArticulatedContactRow {
+    ContactRowType row_type = ContactRowType::kRowInactive;
+    uint32_t articulation = ~0u;   // owning global articulation index.
+    uint32_t contact_link = ~0u;   // global link index of the contact.
+    float effective_mass = 0.0f;   // normal-row m_eff (= 1/(Jn M^-1 Jn^T)).
+    float effective_mass_t1 = 0.0f;  // friction tangent-1 m_eff.
+    float effective_mass_t2 = 0.0f;  // friction tangent-2 m_eff.
+    float depth = 0.0f;            // penetration depth (>0 active).
+    math::Vec3 normal{};           // world contact normal (unit).
+    math::Vec3 tangent1{};         // world friction tangent 1 (unit, n-perp).
+    math::Vec3 tangent2{};         // world friction tangent 2 (= n x t1).
+};
+
+// Maximum DOFs per articulation supported by the on-thread PGS working vectors.
+// 6-DOF floating base + 12 revolute = 18 (matches the factorization's cap).
+constexpr uint32_t kMaxContactSolverDof = 18u;
+
+// Assemble the per-active-contact row set from the T2/T3/T4 outputs. Inputs are
+// the detection buffers (env-major, fixed stride kMaxFootContactsPerEnv) plus the
+// chain Jacobians (one dof_stride-wide normal row per contact slot from
+// ComputeContactChainJacobians fed the contact NORMAL) and the per-contact normal
+// m_eff (from ComputeContactEffectiveMass). `out_rows` is a device buffer of
+// length env_count * kMaxFootContactsPerEnv. `out_tangent_jacobian` is a device
+// buffer of length env_count * kMaxFootContactsPerEnv * 2 * dof_stride: the two
+// friction-tangent chain-Jacobian rows per slot, which the caller fills by
+// re-running ComputeContactChainJacobians with the tangent directions as the
+// "normal" (so the assembled tangent rows reuse the proven J builder). `dof_stride`
+// must equal max_dof. One thread per contact slot. No atomics.
+void AssembleArticulatedContactRows(const phi::DeviceContext& context,
+                                    ArticulationDeviceState state,
+                                    const uint32_t* contact_link,
+                                    const math::Vec3* contact_normal,
+                                    const float* contact_depth,
+                                    const float* normal_effective_mass,
+                                    const float* tangent1_effective_mass,
+                                    const float* tangent2_effective_mass,
+                                    uint32_t env_count,
+                                    uint32_t dof_stride,
+                                    ArticulatedContactRow* out_rows);
+
+// Builds the per-contact friction tangent directions (t1,t2) from each active
+// contact's world normal, written env-major at fixed stride
+// kMaxFootContactsPerEnv. Inactive/empty slots get zero vectors. Deterministic
+// branch-stable basis (fixed reference axis). The caller feeds out_tangent1 /
+// out_tangent2 to ComputeContactChainJacobians as the contact "normal" to obtain
+// the tangent chain-Jacobian rows. One thread per contact slot.
+void ComputeContactTangentBasis(const phi::DeviceContext& context,
+                                const uint32_t* contact_link,
+                                const math::Vec3* contact_normal,
+                                uint32_t env_count,
+                                math::Vec3* out_tangent1,
+                                math::Vec3* out_tangent2);
+
+// Fused block-per-articulation PGS solve + joint-space impulse apply. Reads the
+// assembled rows and the per-contact normal / tangent chain Jacobians (each a
+// [env_count*kMaxFootContactsPerEnv*dof_stride] buffer, row-major per slot) plus
+// the per-articulation M^-1 tiles (stride max_dof*max_dof, dof_stride == max_dof).
+// Modifies state.qdot IN PLACE: on entry qdot holds qdot_free, on exit qdot holds
+// the post-contact joint velocity. `dt` is the integration step (drives the
+// Baumgarte bias). `inout_lambda` (optional, may be null) is the warm-start /
+// persisted impulse buffer, length env_count*kMaxFootContactsPerEnv*3 (normal,
+// tangent1, tangent2 per slot); when null the solve cold-starts at zero. On
+// return it holds this step's converged impulses for the next step's warm start.
+// `friction_coefficient` (default kContactFriction) is the Coulomb mu used by the
+// friction-cone clamp; passing 0 makes the friction rows inert (a frictionless
+// baseline) and a material-specific value will drive per-contact friction in T6.
+// It is a uniform scalar, so threading it preserves D1 determinism.
+// One block per articulation, single lane, fixed order, no atomics => D1.
+void SolveArticulatedContactRows(const phi::DeviceContext& context,
+                                 ArticulationDeviceState state,
+                                 const ArticulatedContactRow* rows,
+                                 const float* normal_jacobian,
+                                 const float* tangent1_jacobian,
+                                 const float* tangent2_jacobian,
+                                 const float* inertia_M_inv,
+                                 uint32_t env_count,
+                                 uint32_t dof_stride,
+                                 float dt,
+                                 float* inout_lambda,
+                                 float friction_coefficient = kContactFriction);
+
 // (B) Detect foot-vs-ground contacts. One thread per environment; each env
 // inspects its `foot_count` feet (device buffer of FootShape, length foot_count,
 // shared across all envs) against the half-space z = ground_height (normal +Z).
