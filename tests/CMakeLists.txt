@@ -457,6 +457,28 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
+    # --- Batched N-articulation replication (p01-F T1) ---------------------
+    add_executable(nuka_batched_articulation_replication_test
+        runtime/test_batched_articulation_replication.cpp
+    )
+
+    target_compile_definitions(nuka_batched_articulation_replication_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_batched_articulation_replication_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_articulation_replication_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_cuda_sensor_test
         sensor/test_cuda_sensors.cpp
     )

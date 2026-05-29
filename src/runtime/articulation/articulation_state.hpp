@@ -183,6 +183,12 @@ LinkSpatialInertia MakeSpatialInertia(float mass,
 ArticulationHostState BuildArticulationHostState(
     const std::vector<ArticulationCookedTopology>& topologies,
     const scene::CookedBodyTable& bodies);
+// Tiles one cooked host state into `env_count` independent copies. Replica e's
+// links/DOFs are appended after replica e-1's (deterministic order), so the
+// existing per-articulation Featherstone ABA kernels step all replicas in
+// parallel. See the implementation for the local-vs-global index reasoning.
+ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState& base,
+                                                     uint32_t env_count);
 ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& context,
                                                   const ArticulationHostState& host_state);
 ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& host_state);

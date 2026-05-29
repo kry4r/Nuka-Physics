@@ -336,6 +336,105 @@ ArticulationHostState BuildArticulationHostState(
     return result;
 }
 
+namespace {
+
+// Appends `env_count` copies of `source` to `target`. Pure value tiling: used
+// for every array whose entries carry no cross-replica index (inertia, poses,
+// q/qdot, joint metadata, parent_link, link_body, ...).
+template <typename T>
+void TileConcat(const std::vector<T>& source, uint32_t env_count, std::vector<T>* target) {
+    target->reserve(source.size() * env_count);
+    for (uint32_t env = 0u; env < env_count; ++env) {
+        target->insert(target->end(), source.begin(), source.end());
+    }
+}
+
+// Appends `env_count` copies of `source`, adding `env * stride` to each entry of
+// replica `env`. Used for the only two arrays that hold replica-relative indices:
+// link_to_articulation (stride = articulation count) and articulation_link_offset
+// (stride = total link count).
+void TileConcatOffset(const std::vector<uint32_t>& source,
+                      uint32_t env_count,
+                      uint32_t stride,
+                      std::vector<uint32_t>* target) {
+    target->reserve(source.size() * env_count);
+    for (uint32_t env = 0u; env < env_count; ++env) {
+        const uint32_t delta = env * stride;
+        for (const uint32_t value : source) {
+            target->push_back(value + delta);
+        }
+    }
+}
+
+} // namespace
+
+ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState& base,
+                                                     uint32_t env_count) {
+    if (env_count == 0u) {
+        return ArticulationHostState{};
+    }
+    if (env_count == 1u) {
+        return base;
+    }
+
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t base_articulation_count = base.ArticulationCount();
+
+    ArticulationHostState result;
+
+    // Topology metadata is per-articulation local data (root_body, link_bodies,
+    // parent_links are all articulation-relative). The kernels never read it and
+    // UploadArticulationState does not upload it, so plain replication is correct.
+    TileConcat(base.articulations, env_count, &result.articulations);
+
+    // --- Per-link / per-DOF state arrays: plain value tiling --------------------
+    // None of these carry a cross-replica index, so concatenation in replica order
+    // is correct. parent_link is articulation-LOCAL: the ABA kernels compute the
+    // global parent as `articulation_link_offset[artic] + parent_link[link]`
+    // (featherstone_aba.cu:388-390, 452-465, 505-509), so the stored values stay
+    // unchanged and the ~0u root sentinel is preserved automatically. link_body
+    // indexes the (un-replicated) CookedBodyTable and is read only at build time,
+    // never by the kernels, so it is also copied as-is.
+    TileConcat(base.link_inertia, env_count, &result.link_inertia);
+    TileConcat(base.link_velocity, env_count, &result.link_velocity);
+    TileConcat(base.link_acceleration, env_count, &result.link_acceleration);
+    TileConcat(base.link_xup, env_count, &result.link_xup);
+    TileConcat(base.link_velocity_bias, env_count, &result.link_velocity_bias);
+    TileConcat(base.link_articulated_inertia, env_count, &result.link_articulated_inertia);
+    TileConcat(base.link_bias_force, env_count, &result.link_bias_force);
+    TileConcat(base.link_u_spatial, env_count, &result.link_u_spatial);
+    TileConcat(base.joint_motion_subspace, env_count, &result.joint_motion_subspace);
+    TileConcat(base.link_pose, env_count, &result.link_pose);
+    TileConcat(base.link_local_pose, env_count, &result.link_local_pose);
+    TileConcat(base.link_inertial_frame, env_count, &result.link_inertial_frame);
+    TileConcat(base.q, env_count, &result.q);
+    TileConcat(base.qdot, env_count, &result.qdot);
+    TileConcat(base.qddot, env_count, &result.qddot);
+    TileConcat(base.tau, env_count, &result.tau);
+    TileConcat(base.joint_damping, env_count, &result.joint_damping);
+    TileConcat(base.joint_armature, env_count, &result.joint_armature);
+    TileConcat(base.joint_diagonal, env_count, &result.joint_diagonal);
+    TileConcat(base.joint_force, env_count, &result.joint_force);
+    TileConcat(base.joint_axis, env_count, &result.joint_axis);
+    TileConcat(base.parent_offset, env_count, &result.parent_offset);
+    TileConcat(base.joint_type, env_count, &result.joint_type);
+    TileConcat(base.parent_link, env_count, &result.parent_link);
+    TileConcat(base.link_body, env_count, &result.link_body);
+
+    // --- Index arrays: tile with a per-replica offset ---------------------------
+    // link_to_articulation must point at the replica's own articulations.
+    TileConcatOffset(base.link_to_articulation, env_count, base_articulation_count,
+                     &result.link_to_articulation);
+    // articulation_link_offset is the global start of each articulation's link
+    // block; replica e's links begin at e * base_link_count.
+    TileConcatOffset(base.articulation_link_offset, env_count, base_link_count,
+                     &result.articulation_link_offset);
+    // articulation_link_count is a count (no index), so plain tiling.
+    TileConcat(base.articulation_link_count, env_count, &result.articulation_link_count);
+
+    return result;
+}
+
 ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& context,
                                                   const ArticulationHostState& host_state) {
     phi::ScopedDeviceGuard guard(context.device_id);
