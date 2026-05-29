@@ -74,29 +74,58 @@ def check_file(path: Path) -> bool:
 
 
 def check_expected_header() -> bool:
+    """Compile and run a probe against the project's nuka::expected wrapper
+    under -std=c++20.
+
+    libstdc++ only exposes std::expected at C++23 (the <expected> header is
+    present but empty under C++20), so the wrapper ships a C++20 fallback in
+    nuka/expected.hpp. This gate validates that wrapper contract -- success,
+    unexpected/error, and the void specialization -- rather than probing raw
+    std::expected.
+    """
     env = _env()
     compiler = env.get("CXX") or shutil.which("g++-10", path=env.get("PATH")) or shutil.which(
         "g++", path=env.get("PATH")
     )
     if compiler is None:
-        print("FAIL: no C++ compiler found for <expected> probe")
+        print("FAIL: no C++ compiler found for nuka::expected wrapper probe")
         return False
-    source = '#include <expected>\nint main(){std::expected<int,int> x=1;return *x==1?0:1;}\n'
-    result = subprocess.run(
-        [compiler, "-std=c++20", "-x", "c++", "-", "-c", "-o", os.devnull],
-        input=source,
-        text=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    source = (
+        "#include <nuka/expected.hpp>\n"
+        "struct E { int code; const char* message() const { return \"err\"; } };\n"
+        "int main() {\n"
+        "    nuka::expected<int, E> ok = 1;\n"
+        "    if (!ok.has_value() || *ok != 1) return 1;\n"
+        "    nuka::expected<int, E> bad = nuka::unexpected(E{2});\n"
+        "    if (bad.has_value() || bad.error().code != 2) return 1;\n"
+        "    nuka::expected<void, E> done{};\n"
+        "    if (!done.has_value()) return 1;\n"
+        "    nuka::expected<void, E> fail = nuka::unexpected(E{3});\n"
+        "    return (!fail.has_value() && fail.error().code == 3) ? 0 : 1;\n"
+        "}\n"
     )
-    if result.returncode == 0:
-        print(f"PASS: {compiler} supports <expected>")
-        return True
-    print(f"FAIL: {compiler} does not support <expected>")
-    if result.stderr:
-        print(result.stderr.strip().splitlines()[-1])
-    return False
+    include_dir = ROOT / "src/include"
+    with tempfile.TemporaryDirectory(prefix="nuka_expected_probe_") as tmp:
+        binary = Path(tmp) / "probe"
+        compile_result = subprocess.run(
+            [compiler, "-std=c++20", f"-I{include_dir}", "-x", "c++", "-", "-o", str(binary)],
+            input=source,
+            text=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if compile_result.returncode != 0:
+            print(f"FAIL: {compiler} cannot compile nuka::expected wrapper under -std=c++20")
+            if compile_result.stderr:
+                print(compile_result.stderr.strip().splitlines()[-1])
+            return False
+        run_result = subprocess.run([str(binary)], env=env)
+        if run_result.returncode == 0:
+            print(f"PASS: {compiler} compiles and runs nuka::expected wrapper under -std=c++20")
+            return True
+        print(f"FAIL: nuka::expected wrapper probe exited {run_result.returncode}")
+        return False
 
 
 def check_python_deps(python: str) -> bool:
@@ -341,7 +370,7 @@ def main() -> int:
     build_dir = args.build_dir if args.build_dir.is_absolute() else ROOT / args.build_dir
 
     checks: list[tuple[str, bool]] = []
-    checks.append(("C++20 <expected>", check_expected_header()))
+    checks.append(("C++20 nuka::expected wrapper", check_expected_header()))
     checks.append(("MJX Python deps", check_python_deps(args.python)))
     checks.append(("Git LFS", check_git_lfs()))
     for asset in REQUIRED_ASSETS:

@@ -82,7 +82,7 @@ if(TARGET nuka)
     set_tests_properties(CAbi.CreateStepDestroy
         PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    if(NUKA_HAS_STD_EXPECTED)
+    if(NUKA_HAS_EXPECTED_WRAPPER)
         add_executable(nuka_cpp_wrapper_raii_test
             c_abi/test_cpp_wrapper_raii.cpp
         )
@@ -107,7 +107,7 @@ if(TARGET nuka)
         gtest_discover_tests(nuka_cpp_wrapper_raii_test
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     else()
-        message(STATUS "Skipping nuka.hpp RAII test: compiler standard library has no <expected>")
+        message(STATUS "Skipping nuka.hpp RAII test: nuka::expected wrapper failed to compile")
     endif()
 endif()
 
