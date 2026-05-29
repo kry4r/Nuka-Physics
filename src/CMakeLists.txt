@@ -429,6 +429,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka_articulation_gpu STATIC
         runtime/articulation/featherstone_aba.cu
         runtime/articulation/articulation_jacobian.cu
+        runtime/articulation/articulation_contacts.cu
     )
     set_target_properties(nuka_articulation_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
