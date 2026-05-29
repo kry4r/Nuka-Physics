@@ -58,6 +58,101 @@ void UpdateWorldLinkPoses(const phi::DeviceContext& context,
                           ArticulationDeviceState state,
                           math::Transform* out_world_pose);
 
+// ---------------------------------------------------------------------------
+// p01-F T4 -- joint-space inertia M (CRBA) + factorization + contact m_eff
+// ---------------------------------------------------------------------------
+//
+// Three GPU passes (one block / single lane per articulation, mirroring the
+// Featherstone ABA kernels -- fixed loop order, no atomics => D1-deterministic,
+// bit-identical across runs and replicas by construction).
+//
+//  (1) ComputeArticulationInertiaM -- the dense symmetric reduced-coordinate
+//      joint-space inertia M (dof x dof) via the Composite Rigid Body Algorithm:
+//      composite-rigid-body inertias accumulated leaf->root through link_xup
+//      (reusing the ABA Pass-2 spatial algebra without the articulated-inertia
+//      reduction), then for each non-fixed joint i, F = Ic_i S_i and
+//        M[i][i] = S_i^T F,  M[i][j] = M[j][i] = S_j^T (X^T-propagated F)
+//      for every non-fixed ancestor j. Output one row-major tile per
+//      articulation, stride `max_dof * max_dof`.
+//
+//  (2) FactorArticulationInertiaM -- per-articulation unpivoted LDL^T of the
+//      leading dof x dof block of M (M is SPD for positive masses), then form
+//      the explicit inverse M^-1 (solve against identity columns). The inverse
+//      tile lets the apply-step solve M y = J^T and form dqdot = M^-1 J^T lambda
+//      directly. joint_armature[link] is folded into the diagonal (reflected
+//      rotor inertia, matching ABA Pass-2) plus a tiny floor epsilon so a
+//      near-singular leg config never produces NaN/Inf.
+//
+//  (3) ComputeContactEffectiveMass -- for each contact's dof_stride-wide chain
+//      Jacobian J (from ComputeContactChainJacobians), m_eff = 1 / (J M^-1 J^T)
+//      with the denominator clamped to a tiny epsilon (the straightened-leg
+//      J ~ 0 config yields large-but-finite positive m_eff, never 0 or Inf).
+//      Generic in J, so a later task reuses it for friction-tangent rows.
+// ---------------------------------------------------------------------------
+
+// DOF columns contributed by a joint type. Single source of truth shared with
+// the chain Jacobian (Revolute=Prismatic=1, Fixed=0, future FloatingBase=6) so
+// M's local dof indexing matches J's columns exactly.
+uint32_t ArticulationJointDofCount(ArticulationJointType type);
+
+// Per-articulation base-inclusive DOF count (prefix sum over the articulation's
+// links). This is the M tile's leading block size and must equal the chain
+// Jacobian's `dof_stride` for the same articulation.
+uint32_t ArticulationDofCount(const ArticulationHostState& host, uint32_t articulation);
+
+// Diagonal floor / regularization epsilon folded into M's diagonal alongside
+// joint_armature. Tied to the ABA Pass-2 kMinDiagonal; negligible against
+// mass-matrix entries (order kg.m^2) but keeps LDL^T finite at degenerate poses.
+constexpr float kInertiaDiagonalEpsilon = 1.0e-6f;
+
+// Denominator floor for the effective-mass reciprocal. At a straightened leg the
+// vertical-force chain Jacobian collapses (J M^-1 J^T -> 0); clamping here yields
+// a large-but-finite positive m_eff instead of an Inf.
+constexpr float kEffectiveMassDenomEpsilon = 1.0e-9f;
+
+// (1) Dense symmetric joint-space inertia M per articulation via CRBA. One block
+// per articulation. Requires ABA Pass-1 to have run (link_xup,
+// joint_motion_subspace current). `composite_inertia_scratch` is a device buffer
+// of length state.total_link_count (LinkSpatialInertia, i.e. 36 floats each):
+// the kernel seeds it from state.link_inertia and mutates it in place (so the
+// ABA articulated-inertia buffer is left untouched). `out_inertia_M` is a device
+// buffer of length state.articulation_count * max_dof * max_dof floats; each
+// articulation's tile is row-major with stride max_dof*max_dof, zero-padded
+// beyond its leading dof_count x dof_count block. `max_dof` must be >= every
+// articulation's DOF count (and equal to the chain Jacobian's dof_stride).
+void ComputeArticulationInertiaM(const phi::DeviceContext& context,
+                                 ArticulationDeviceState state,
+                                 uint32_t max_dof,
+                                 LinkSpatialInertia* composite_inertia_scratch,
+                                 float* out_inertia_M);
+
+// (2) Per-articulation LDL^T factorization of M's leading block and explicit
+// inverse. `inertia_M` is the buffer ComputeArticulationInertiaM filled (read
+// only). `out_inertia_M_inv` is a device buffer of the same layout/length; each
+// tile holds the symmetric M^-1 in its leading dof_count x dof_count block,
+// zero-padded beyond. One block per articulation.
+void FactorArticulationInertiaM(const phi::DeviceContext& context,
+                                ArticulationDeviceState state,
+                                uint32_t max_dof,
+                                const float* inertia_M,
+                                float* out_inertia_M_inv);
+
+// (3) Per-contact effective mass m_eff = 1 / (J M^-1 J^T). `chain_jacobian` is
+// the [contact_count * dof_stride] buffer from ComputeContactChainJacobians;
+// `inertia_M_inv` is the per-articulation inverse from FactorArticulationInertiaM
+// with the SAME stride (max_dof == dof_stride). One thread per contact; each
+// contact selects its articulation's M^-1 tile via
+// link_to_articulation[contact_link]. `out_effective_mass` is a device buffer of
+// length contact_count. Invalid/empty contacts (link out of range) write 0.
+void ComputeContactEffectiveMass(const phi::DeviceContext& context,
+                                 ArticulationDeviceState state,
+                                 const uint32_t* contact_link_indices,
+                                 const float* chain_jacobian,
+                                 const float* inertia_M_inv,
+                                 uint32_t contact_count,
+                                 uint32_t dof_stride,
+                                 float* out_effective_mass);
+
 // (B) Detect foot-vs-ground contacts. One thread per environment; each env
 // inspects its `foot_count` feet (device buffer of FootShape, length foot_count,
 // shared across all envs) against the half-space z = ground_height (normal +Z).
