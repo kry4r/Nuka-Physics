@@ -99,6 +99,17 @@ public:
     // Device-state view (q, qdot, ... live here). Stable for the object's life.
     articulation::ArticulationDeviceState View() { return device_.View(); }
 
+    // Zero-copy device-buffer accessors for the per-step contact outputs. Stable
+    // for the object's life (the buffers are allocated once and reused each Step;
+    // their CONTENTS are overwritten every Step). Layout is env-major at fixed
+    // stride kMaxFootContactsPerEnv (slot_count == env_count * that). Used by the
+    // C ABI readback surface to expose contacts without a host round-trip.
+    const phi::Buffer& ContactPointBuffer() const { return contact_point_; }
+    const phi::Buffer& ContactDepthBuffer() const { return contact_depth_; }
+    const phi::Buffer& ContactLinkBuffer() const { return contact_link_; }
+    // Number of contact slots = env_count * kMaxFootContactsPerEnv.
+    uint32_t SlotCount() const { return slot_count_; }
+
     // Downloads the current device state into `host` (q, qdot, ...).
     void Download(articulation::ArticulationHostState* host) const;
 

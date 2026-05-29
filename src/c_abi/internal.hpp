@@ -7,6 +7,7 @@
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
 #include "runtime/articulation/articulation_state.hpp"
+#include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "runtime/world_stepper.hpp"
 
@@ -38,6 +39,21 @@ struct WorldRecord {
     phi::Buffer joint_position_buffer;
     phi::Buffer joint_velocity_buffer;
     uint32_t simulated_step_count = 0u;
+
+    // --- Multi-env batched articulated path (p01-F T7) --------------------
+    // When env_count > 1 the world is driven through the batched articulated-
+    // with-contacts step path (T6) instead of the single-env Featherstone
+    // sequence. `batched` is null for the single-env (env_count == 1) oracle
+    // path, which stays byte-for-byte unchanged. The replicated drive buffers
+    // tile the base hold drives across all envs (link-major, length
+    // env_count * base_link_count) as BatchedArticulatedStepParams requires.
+    uint32_t env_count = 1u;
+    std::unique_ptr<runtime::gpu::BatchedArticulatedWorld> batched;
+    runtime::gpu::BatchedArticulatedStepParams batched_step_params;
+    phi::Buffer batched_drive_targets_device;
+    phi::Buffer batched_drive_stiffness_device;
+    phi::Buffer batched_drive_damping_device;
+    phi::Buffer batched_drive_force_limits_device;
     core::diagnostics::InvariantSampler invariant_sampler{
         core::diagnostics::InvariantConfig{
             true,

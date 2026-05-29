@@ -106,6 +106,31 @@ if(TARGET nuka)
 
         gtest_discover_tests(nuka_cpp_wrapper_raii_test
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+        # --- Multi-env C ABI surface (p01-F T7) ---------------------------
+        add_executable(nuka_multi_env_world_test
+            c_abi/test_multi_env_world.cpp
+        )
+
+        target_compile_definitions(nuka_multi_env_world_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_multi_env_world_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_multi_env_world_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_multi_env_world_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     else()
         message(STATUS "Skipping nuka.hpp RAII test: nuka::expected wrapper failed to compile")
     endif()
