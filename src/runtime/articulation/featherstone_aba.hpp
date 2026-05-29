@@ -22,6 +22,17 @@ public:
     static void Integrate(const phi::DeviceContext& context,
                           ArticulationDeviceState state,
                           float dt);
+    // Split halves of Integrate(): IntegrateVelocity does qdot += qddot*dt,
+    // IntegratePosition does q += qdot*dt. Running velocity then position is
+    // bit-for-bit equal to the combined Integrate(); the batched stepper uses
+    // the split so the contact solve sits between the two halves. The single-env
+    // path keeps using the combined Integrate().
+    static void IntegrateVelocity(const phi::DeviceContext& context,
+                                  ArticulationDeviceState state,
+                                  float dt);
+    static void IntegratePosition(const phi::DeviceContext& context,
+                                  ArticulationDeviceState state,
+                                  float dt);
 };
 
 } // namespace nuka::runtime::articulation

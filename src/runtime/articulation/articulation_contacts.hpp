@@ -35,6 +35,7 @@
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
+#include <limits>
 
 namespace nuka::runtime::articulation {
 
@@ -314,6 +315,12 @@ void ComputeContactTangentBasis(const phi::DeviceContext& context,
 // friction-cone clamp; passing 0 makes the friction rows inert (a frictionless
 // baseline) and a material-specific value will drive per-contact friction in T6.
 // It is a uniform scalar, so threading it preserves D1 determinism.
+// `baumgarte_max_velocity` (default +inf == non-binding, so committed T5 calls
+// are unaffected bit-for-bit) caps the normal-row positional bias at
+// min(kBaumgarteBeta/dt*max(depth-slop,0), baumgarte_max_velocity); a finite
+// tuned value prevents large-penetration one-step velocity transients. It is a
+// uniform scalar applied identically at every normal-row bias site, so it
+// preserves D1 determinism.
 // One block per articulation, single lane, fixed order, no atomics => D1.
 void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  ArticulationDeviceState state,
@@ -326,7 +333,9 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  uint32_t dof_stride,
                                  float dt,
                                  float* inout_lambda,
-                                 float friction_coefficient = kContactFriction);
+                                 float friction_coefficient = kContactFriction,
+                                 float baumgarte_max_velocity =
+                                     std::numeric_limits<float>::infinity());
 
 // (B) Detect foot-vs-ground contacts. One thread per environment; each env
 // inspects its `foot_count` feet (device buffer of FootShape, length foot_count,
