@@ -4,6 +4,9 @@
 
 #include "runtime/gpu/batched_device_world.hpp"
 
+#include "math/cuda_vec_ops.cuh"
+#include "phi/buffer_transfer.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -55,23 +58,11 @@ struct BatchedRowGroup {
     math::Vec3 anchor_local_b;
 };
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
-
-template <typename T>
-std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
-    std::vector<T> values(count);
-    if (!values.empty()) {
-        buffer.CopyToHost(values.data(), values.size() * sizeof(T));
-    }
-    return values;
-}
+// UploadVector / DownloadVector(buf, count) now come from the shared host
+// buffer-transfer header (phi/buffer_transfer.hpp); the former local copies were
+// byte-identical. The batched-specific DefaultedCopy helper below stays local.
+using ::nuka::phi::DownloadVector;
+using ::nuka::phi::UploadVector;
 
 CudaConstraintRowBufferView MakeBatchedRigidConstraintRowBuffer(
     void* device_rows,
@@ -149,76 +140,40 @@ std::vector<T> DefaultedCopy(const std::vector<T>& values, uint32_t count, T fal
     return result;
 }
 
-__host__ __device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    math::Vec3 v;
-    v.x = x;
-    v.y = y;
-    v.z = z;
-    return v;
+// Small-vector / quaternion primitives now come from the shared device math
+// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
+// copies (MakeVec3 is __host__ __device__ in both). The two normalization
+// variants used here are pinned to the exact recipes from the migration plan's
+// §1.1 table via the thin forwarders below:
+//   Normalize(Vec3)  -> NormalizeSqrt(., 1e-8f, UnitY())   (sqrt, `<`, fallback +Y)
+//   NormalizeQuat    -> QuatNormalizeSqrtLt(., 1e-8f)      (sqrtf, `<` strict)
+// `Rotate` -> RotateShort and `Mul` -> QuatMul (renamed at call sites). Buffer
+// helpers come from phi/buffer_transfer.hpp.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::Dot;
+using mg::Length;
+using mg::MakeQuat;
+using mg::MakeVec3;
+using mg::Neg;
+using mg::QuatMul;
+using mg::RotateShort;
+using mg::Scale;
+using mg::Sub;
+using mg::UnitX;
+using mg::UnitY;
+using mg::UnitZ;
+using mg::ZeroVec3;
+
+// Forwarders that pin the file's normalization variants to the shared library
+// (preserving every call site verbatim; the duplicated float recipe is removed).
+__forceinline__ __device__ math::Vec3 Normalize(math::Vec3 v) {
+    return mg::NormalizeSqrt(v, 1.0e-8f, UnitY());
 }
 
-__device__ math::Vec3 ZeroVec3() {
-    return MakeVec3(0.0f, 0.0f, 0.0f);
-}
-
-__device__ math::Vec3 UnitX() {
-    return MakeVec3(1.0f, 0.0f, 0.0f);
-}
-
-__device__ math::Vec3 UnitY() {
-    return MakeVec3(0.0f, 1.0f, 0.0f);
-}
-
-__device__ math::Vec3 UnitZ() {
-    return MakeVec3(0.0f, 0.0f, 1.0f);
-}
-
-__device__ math::Quat MakeQuat(float w, float x, float y, float z) {
-    math::Quat q;
-    q.w = w;
-    q.x = x;
-    q.y = y;
-    q.z = z;
-    return q;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-
-__device__ math::Vec3 Neg(math::Vec3 v) {
-    return MakeVec3(-v.x, -v.y, -v.z);
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return MakeVec3(v.x * s, v.y * s, v.z * s);
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x);
-}
-
-__device__ float Length(math::Vec3 v) {
-    return sqrtf(Dot(v, v));
-}
-
-__device__ math::Vec3 Normalize(math::Vec3 v) {
-    const float length = Length(v);
-    if (length < 1.0e-8f) {
-        return UnitY();
-    }
-    return Scale(v, 1.0f / length);
+__forceinline__ __device__ math::Quat NormalizeQuat(math::Quat q) {
+    return mg::QuatNormalizeSqrtLt(q, 1.0e-8f);
 }
 
 __device__ math::Vec3 ChooseTangent(math::Vec3 normal) {
@@ -226,29 +181,6 @@ __device__ math::Vec3 ChooseTangent(math::Vec3 normal) {
         return Normalize(Cross(normal, UnitX()));
     }
     return Normalize(Cross(normal, UnitY()));
-}
-
-__device__ math::Vec3 Rotate(math::Quat q, math::Vec3 v) {
-    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
-    const math::Vec3 t = Scale(Cross(qv, v), 2.0f);
-    return Add(Add(v, Scale(t, q.w)), Cross(qv, t));
-}
-
-__device__ math::Quat Mul(math::Quat a, math::Quat b) {
-    return MakeQuat(
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w);
-}
-
-__device__ math::Quat NormalizeQuat(math::Quat q) {
-    const float norm = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
-    if (norm < 1.0e-8f) {
-        return MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
-    }
-    const float inv_norm = 1.0f / norm;
-    return MakeQuat(q.w * inv_norm, q.x * inv_norm, q.y * inv_norm, q.z * inv_norm);
 }
 
 __device__ math::Quat FromAxisAngle(math::Vec3 axis, float angle) {
@@ -262,13 +194,13 @@ __device__ math::Quat FromAxisAngle(math::Vec3 axis, float angle) {
 }
 
 __device__ math::Vec3 TransformPoint(math::Transform transform, math::Vec3 point) {
-    return Add(Rotate(transform.rotation, point), transform.position);
+    return Add(RotateShort(transform.rotation, point), transform.position);
 }
 
 __device__ math::Transform Compose(math::Transform a, math::Transform b) {
     math::Transform result;
     result.position = TransformPoint(a, b.position);
-    result.rotation = Mul(a.rotation, b.rotation);
+    result.rotation = QuatMul(a.rotation, b.rotation);
     return result;
 }
 
@@ -841,7 +773,7 @@ __device__ void ApplyAngularCorrection(math::Transform* pose,
         return;
     }
     const math::Quat dq = FromAxisAngle(Scale(angular_delta, 1.0f / angle), angle);
-    pose->rotation = NormalizeQuat(Mul(dq, pose->rotation));
+    pose->rotation = NormalizeQuat(QuatMul(dq, pose->rotation));
 }
 
 __device__ void ApplyPositionCorrection(uint32_t flat_body,
@@ -1660,8 +1592,8 @@ __global__ void SolveBatchedJointPositionIterationKernel(
             const math::Vec3 axis = axes[axis_index];
             const math::Transform pose_a = BodyPose(block.body_a, total_body_count, poses);
             const math::Transform pose_b = BodyPose(block.body_b, total_body_count, poses);
-            const math::Vec3 r_a = Rotate(pose_a.rotation, block.anchor_local_a);
-            const math::Vec3 r_b = Rotate(pose_b.rotation, block.anchor_local_b);
+            const math::Vec3 r_a = RotateShort(pose_a.rotation, block.anchor_local_a);
+            const math::Vec3 r_b = RotateShort(pose_b.rotation, block.anchor_local_b);
             const math::Vec3 error =
                 Sub(Add(pose_a.position, r_a), Add(pose_b.position, r_b));
             const float row_error = Dot(error, axis);
@@ -1799,8 +1731,8 @@ __device__ float ProjectBatchedJointDrivePositionBlock(
         const math::Vec3 axis = axes[axis_index];
         const math::Transform pose_a = BodyPose(block.body_a, total_body_count, poses);
         const math::Transform pose_b = BodyPose(block.body_b, total_body_count, poses);
-        const math::Vec3 r_a = Rotate(pose_a.rotation, block.anchor_local_a);
-        const math::Vec3 r_b = Rotate(pose_b.rotation, block.anchor_local_b);
+        const math::Vec3 r_a = RotateShort(pose_a.rotation, block.anchor_local_a);
+        const math::Vec3 r_b = RotateShort(pose_b.rotation, block.anchor_local_b);
         const math::Vec3 error =
             Sub(Add(pose_a.position, r_a), Add(pose_b.position, r_b));
         const float row_error = Dot(error, axis);

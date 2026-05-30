@@ -4,6 +4,9 @@
 
 #include "sensor/gpu/cuda_sensors.cuh"
 
+#include "math/cuda_vec_ops.cuh"
+#include "phi/buffer_transfer.hpp"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -19,84 +22,32 @@ namespace {
 
 constexpr uint32_t kInvalidBody = ~0u;
 
-__device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    math::Vec3 v;
-    v.x = x;
-    v.y = y;
-    v.z = z;
-    return v;
-}
-
-__device__ math::Quat MakeQuat(float w, float x, float y, float z) {
-    math::Quat q;
-    q.w = w;
-    q.x = x;
-    q.y = y;
-    q.z = z;
-    return q;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return MakeVec3(v.x * s, v.y * s, v.z * s);
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x);
-}
-
-__device__ float LengthSq(math::Vec3 v) {
-    return Dot(v, v);
-}
-
-__device__ float Length(math::Vec3 v) {
-    return sqrtf(LengthSq(v));
-}
-
-__device__ math::Vec3 Normalize(math::Vec3 v) {
-    const float length = Length(v);
-    if (length < 1.0e-8f) {
-        return MakeVec3(1.0f, 0.0f, 0.0f);
-    }
-    return Scale(v, 1.0f / length);
-}
-
-__device__ math::Vec3 Rotate(math::Quat q, math::Vec3 v) {
-    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
-    const math::Vec3 t = Scale(Cross(qv, v), 2.0f);
-    return Add(Add(v, Scale(t, q.w)), Cross(qv, t));
-}
-
-__device__ math::Quat Mul(math::Quat a, math::Quat b) {
-    return MakeQuat(
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w);
-}
+// Small-vector / quaternion primitives now come from the shared device math
+// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
+// copies. The former local `Normalize` maps to NormalizeSqrt(., 1e-8f,
+// MakeVec3(1,0,0)); `Rotate` -> RotateShort; `Mul` -> QuatMul (renamed at call
+// sites below). Buffer helpers come from phi/buffer_transfer.hpp.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::Dot;
+using mg::Length;
+using mg::LengthSq;
+using mg::MakeQuat;
+using mg::MakeVec3;
+using mg::QuatMul;
+using mg::RotateShort;
+using mg::Scale;
+using mg::Sub;
 
 __device__ math::Vec3 TransformPoint(math::Transform transform, math::Vec3 point) {
-    return Add(Rotate(transform.rotation, point), transform.position);
+    return Add(RotateShort(transform.rotation, point), transform.position);
 }
 
 __device__ math::Transform Compose(math::Transform a, math::Transform b) {
     math::Transform result;
     result.position = TransformPoint(a, b.position);
-    result.rotation = Mul(a.rotation, b.rotation);
+    result.rotation = QuatMul(a.rotation, b.rotation);
     return result;
 }
 
@@ -240,12 +191,12 @@ __device__ math::Vec3 RayDirectionForIndex(math::Vec3 forward,
                                            uint32_t index,
                                            uint32_t ray_count,
                                            float horizontal_fov) {
-    const math::Vec3 f = Normalize(forward);
+    const math::Vec3 f = mg::NormalizeSqrt(forward, 1.0e-8f, MakeVec3(1.0f, 0.0f, 0.0f));
     math::Vec3 right = Cross(f, up);
     if (LengthSq(right) < 1.0e-8f) {
         right = MakeVec3(0.0f, 0.0f, 1.0f);
     }
-    right = Normalize(right);
+    right = mg::NormalizeSqrt(right, 1.0e-8f, MakeVec3(1.0f, 0.0f, 0.0f));
 
     if (ray_count <= 1u || horizontal_fov <= 0.0f) {
         return f;
@@ -254,7 +205,8 @@ __device__ math::Vec3 RayDirectionForIndex(math::Vec3 forward,
     const float normalized =
         (static_cast<float>(index) / static_cast<float>(ray_count - 1u)) * 2.0f - 1.0f;
     const float angle = normalized * horizontal_fov * 0.5f;
-    return Normalize(Add(Scale(f, cosf(angle)), Scale(right, sinf(angle))));
+    return mg::NormalizeSqrt(Add(Scale(f, cosf(angle)), Scale(right, sinf(angle))),
+                             1.0e-8f, MakeVec3(1.0f, 0.0f, 0.0f));
 }
 
 __global__ void QueryLidarKernel(uint32_t ray_count,
@@ -417,23 +369,11 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
-
-template <typename T>
-std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
-    std::vector<T> values(count);
-    if (!values.empty()) {
-        buffer.CopyToHost(values.data(), values.size() * sizeof(T));
-    }
-    return values;
-}
+// UploadVector / DownloadVector(buf, count) now come from the shared host
+// buffer-transfer header (phi/buffer_transfer.hpp); the former local copies were
+// byte-identical.
+using ::nuka::phi::DownloadVector;
+using ::nuka::phi::UploadVector;
 
 } // namespace
 

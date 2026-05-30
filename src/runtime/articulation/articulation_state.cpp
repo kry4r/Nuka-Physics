@@ -4,6 +4,8 @@
 
 #include "runtime/articulation/articulation_state.hpp"
 
+#include "phi/buffer_transfer.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -12,25 +14,13 @@ namespace nuka::runtime::articulation {
 
 namespace {
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
-
-template <typename T>
-void DownloadVector(const phi::Buffer& buffer, std::vector<T>* out) {
-    if (out == nullptr) {
-        return;
-    }
-    out->resize(buffer.Size() / sizeof(T));
-    if (!out->empty()) {
-        buffer.CopyToHost(out->data(), out->size() * sizeof(T));
-    }
-}
+// UploadVector and the out-param DownloadVector(buffer, vector<T>* out) now come
+// from the shared host buffer-transfer header (phi/buffer_transfer.hpp). The
+// out-param form is the DIVERGENT OVERLOAD (sizes by Buffer::Size()/sizeof(T),
+// null-safe) used only here; the shared header provides it as a distinct
+// overload. Both bodies are byte-identical to the former local copies.
+using ::nuka::phi::DownloadVector;
+using ::nuka::phi::UploadVector;
 
 float MassForBody(const scene::CookedBodyTable& bodies,
                   const ArticulationCookedTopology& topology,

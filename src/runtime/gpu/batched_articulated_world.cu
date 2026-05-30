@@ -13,6 +13,7 @@
 #include "runtime/gpu/batched_articulated_world.hpp"
 
 #include "core/perf/timing.hpp"
+#include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 
@@ -54,6 +55,28 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     if (max_dof == 0u || max_dof > articulation::kMaxContactSolverDof) {
         throw std::runtime_error(
             "BatchedArticulatedWorld: max_dof out of range");
+    }
+    // Review fix #1 (float-neutral hardening): the M / M^-1 / Jacobian scratch is
+    // sized as a flat [.. * max_dof * max_dof] / [.. * max_dof] tile, and every
+    // T1..T5 kernel indexes it with the per-articulation DOF stride. That is only
+    // correct if max_dof EQUALS each articulation's actual DOF count -- a mere
+    // `<= kMaxContactSolverDof` bound would silently produce a wrong M^-1 on a
+    // future heterogeneous batch (articulations with differing DOF). Assert exact
+    // equality for every articulation here, at construction, where both numbers
+    // are in scope.
+    for (uint32_t articulation_index = 0u; articulation_index < host.ArticulationCount();
+         ++articulation_index) {
+        const uint32_t actual_dof =
+            articulation::ArticulationDofCount(host, articulation_index);
+        if (actual_dof != max_dof) {
+            throw std::runtime_error(
+                "BatchedArticulatedWorld: max_dof (" + std::to_string(max_dof) +
+                ") must equal every articulation's DOF count; articulation " +
+                std::to_string(articulation_index) + " has " +
+                std::to_string(actual_dof) +
+                " DOF. Heterogeneous-DOF batches are not supported by the shared "
+                "max_dof-strided M/Jacobian scratch.");
+        }
     }
     // env == articulation in the 1-articulation-per-env replication design.
     env_count_ = articulation_count_;

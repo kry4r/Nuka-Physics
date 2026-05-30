@@ -4,6 +4,9 @@
 
 #include "collision/gpu/broadphase.cuh"
 
+#include "math/cuda_vec_ops.cuh"
+#include "phi/buffer_transfer.hpp"
+
 #include <cuda_runtime.h>
 
 #include <cfloat>
@@ -16,64 +19,29 @@ namespace nuka::collision::gpu {
 
 namespace {
 
-__device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    math::Vec3 v;
-    v.x = x;
-    v.y = y;
-    v.z = z;
-    return v;
-}
-
-__device__ math::Quat MakeQuat(float w, float x, float y, float z) {
-    math::Quat q;
-    q.w = w;
-    q.x = x;
-    q.y = y;
-    q.z = z;
-    return q;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return MakeVec3(v.x * s, v.y * s, v.z * s);
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x);
-}
-
-__device__ math::Vec3 Rotate(math::Quat q, math::Vec3 v) {
-    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
-    const math::Vec3 t = Scale(Cross(qv, v), 2.0f);
-    return Add(Add(v, Scale(t, q.w)), Cross(qv, t));
-}
+// Small-vector / quaternion primitives now come from the shared device math
+// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
+// copies; `Rotate` -> RotateShort and `Mul` -> QuatMul (used by the file-local
+// TransformPoint / Compose below). Buffer helpers come from
+// phi/buffer_transfer.hpp.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::MakeQuat;
+using mg::MakeVec3;
+using mg::QuatMul;
+using mg::RotateShort;
+using mg::Scale;
+using mg::Sub;
 
 __device__ math::Vec3 TransformPoint(math::Transform transform, math::Vec3 point) {
-    return Add(Rotate(transform.rotation, point), transform.position);
-}
-
-__device__ math::Quat Mul(math::Quat a, math::Quat b) {
-    return MakeQuat(
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w);
+    return Add(RotateShort(transform.rotation, point), transform.position);
 }
 
 __device__ math::Transform Compose(math::Transform a, math::Transform b) {
     math::Transform result;
     result.position = TransformPoint(a, b.position);
-    result.rotation = Mul(a.rotation, b.rotation);
+    result.rotation = QuatMul(a.rotation, b.rotation);
     return result;
 }
 
@@ -184,14 +152,9 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-template <typename T>
-std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
-    std::vector<T> values(count);
-    if (!values.empty()) {
-        buffer.CopyToHost(values.data(), values.size() * sizeof(T));
-    }
-    return values;
-}
+// DownloadVector(buf, count) now comes from the shared host buffer-transfer
+// header (phi/buffer_transfer.hpp); the former local copy was byte-identical.
+using ::nuka::phi::DownloadVector;
 
 } // namespace
 

@@ -4,7 +4,9 @@
 
 #include "solver/gpu/row_solver.cuh"
 
+#include "math/cuda_vec_ops.cuh"
 #include "phi/buffer.hpp"
+#include "phi/buffer_transfer.hpp"
 #include "solver/gpu/row_scheduler.cuh"
 
 #include <cuda_runtime.h>
@@ -32,72 +34,24 @@ struct DeviceRowBuffers {
     uint32_t jacobian_data_count = 0u;
 };
 
-__device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    math::Vec3 v;
-    v.x = x;
-    v.y = y;
-    v.z = z;
-    return v;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return MakeVec3(v.x * s, v.y * s, v.z * s);
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b);
-
-__device__ float Length(math::Vec3 v) {
-    return sqrtf(Dot(v, v));
-}
-
-__device__ math::Quat MakeQuat(float w, float x, float y, float z) {
-    math::Quat q;
-    q.w = w;
-    q.x = x;
-    q.y = y;
-    q.z = z;
-    return q;
-}
-
-__device__ math::Quat Normalize(math::Quat q) {
-    const float norm = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
-    if (norm <= 1.0e-12f) {
-        return MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
-    }
-    const float inv_norm = 1.0f / norm;
-    return MakeQuat(q.w * inv_norm,
-                    q.x * inv_norm,
-                    q.y * inv_norm,
-                    q.z * inv_norm);
-}
-
-__device__ math::Quat Multiply(math::Quat lhs, math::Quat rhs) {
-    return MakeQuat(
-        lhs.w * rhs.w - lhs.x * rhs.x - lhs.y * rhs.y - lhs.z * rhs.z,
-        lhs.w * rhs.x + lhs.x * rhs.w + lhs.y * rhs.z - lhs.z * rhs.y,
-        lhs.w * rhs.y - lhs.x * rhs.z + lhs.y * rhs.w + lhs.z * rhs.x,
-        lhs.w * rhs.z + lhs.x * rhs.y - lhs.y * rhs.x + lhs.z * rhs.w);
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.y * b.z - a.z * b.y,
-                    a.z * b.x - a.x * b.z,
-                    a.x * b.y - a.y * b.x);
-}
-
-__device__ math::Vec3 Rotate(math::Quat q, math::Vec3 v) {
-    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
-    const math::Vec3 t = Scale(Cross(qv, v), 2.0f);
-    return Add(Add(v, Scale(t, q.w)), Cross(qv, t));
-}
+// Small-vector / quaternion primitives now come from the shared device math
+// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
+// copies. The former local quaternion `Normalize` maps to
+// QuatNormalizeSqrtLe(., 1e-12f); `Multiply` -> QuatMul; `Rotate` -> RotateShort
+// (renamed at call sites). The former forward-declared local `Dot` is dropped;
+// the shared Dot is used instead. UploadVector comes from
+// phi/buffer_transfer.hpp.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::Dot;
+using mg::Length;
+using mg::MakeQuat;
+using mg::MakeVec3;
+using mg::QuatMul;
+using mg::RotateShort;
+using mg::Scale;
+using mg::Sub;
 
 __device__ void ApplyAngularPositionCorrection(runtime::rigid::BodyState& body,
                                                math::Vec3 angular_jacobian,
@@ -116,7 +70,7 @@ __device__ void ApplyAngularPositionCorrection(runtime::rigid::BodyState& body,
     const float sine = sinf(half_angle);
     const math::Quat dq =
         MakeQuat(cosf(half_angle), axis.x * sine, axis.y * sine, axis.z * sine);
-    body.orientation = Normalize(Multiply(dq, body.orientation));
+    body.orientation = mg::QuatNormalizeSqrtLe(QuatMul(dq, body.orientation), 1.0e-12f);
 }
 
 __device__ uint32_t UMin(uint32_t a, uint32_t b) {
@@ -125,10 +79,6 @@ __device__ uint32_t UMin(uint32_t a, uint32_t b) {
 
 __device__ uint32_t UMax(uint32_t a, uint32_t b) {
     return a > b ? a : b;
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
 __device__ bool ValidBody(uint32_t body, uint32_t body_count) {
@@ -347,8 +297,8 @@ __device__ float SolvePositionRow(DeviceRowBuffers rows,
             orientation_b = bodies[body_b].orientation;
         }
         const auto& anchor = rows.anchors[row_index];
-        const math::Vec3 r_a = Rotate(orientation_a, anchor.local_a);
-        const math::Vec3 r_b = Rotate(orientation_b, anchor.local_b);
+        const math::Vec3 r_a = RotateShort(orientation_a, anchor.local_a);
+        const math::Vec3 r_b = RotateShort(orientation_b, anchor.local_b);
         error = Dot(Sub(Add(position_a, r_a), Add(position_b, r_b)), axis);
         angular_a = Scale(Cross(r_a, axis), -1.0f);
         angular_b = Cross(r_b, axis);
@@ -485,9 +435,9 @@ __global__ void SolveRowsSweepKernel(DeviceRowBuffers rows,
                         }
                         const auto& anchor = rows.anchors[row_index];
                         const math::Vec3 r_a =
-                            Rotate(orientation_a, anchor.local_a);
+                            RotateShort(orientation_a, anchor.local_a);
                         const math::Vec3 r_b =
-                            Rotate(orientation_b, anchor.local_b);
+                            RotateShort(orientation_b, anchor.local_b);
                         max_error = fmaxf(
                             max_error,
                             fabsf(Dot(Sub(Add(position_a, r_a),
@@ -509,14 +459,10 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
+// UploadVector now comes from the shared host buffer-transfer header
+// (phi/buffer_transfer.hpp); the former local copy was byte-identical.
+// (The separate UploadToScratch helper below is out of scope and stays local.)
+using ::nuka::phi::UploadVector;
 
 struct RowSolverScratch {
     int device_id = -1;
