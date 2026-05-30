@@ -4,6 +4,8 @@
 
 #include "runtime/articulation/articulation_jacobian.hpp"
 
+#include "math/cuda_vec_ops.cuh"
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -13,21 +15,16 @@ namespace nuka::runtime::articulation {
 
 namespace {
 
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
+// Sub / Cross / Dot / NormalizeOrUp now come from the shared device math library
+// (math/cuda_vec_ops.cuh); the bodies are bit-identical (NormalizeOrUp uses the
+// same rsqrtf, 1e-10, fallback +Z recipe). The file-local ContactNormalOrDefault
+// and RotateByQuat (differently named / defensive-normalize variants, not in the
+// shared inventory) stay local.
+namespace mg = ::nuka::math::gpu;
+using mg::Cross;
+using mg::Dot;
+using mg::NormalizeOrUp;
+using mg::Sub;
 
 __device__ math::Vec3 ContactNormalOrDefault(const math::Vec3* points, uint32_t index) {
     const math::Vec3 point = points[index];
@@ -35,16 +32,6 @@ __device__ math::Vec3 ContactNormalOrDefault(const math::Vec3* points, uint32_t 
     if (length_sq > 1.0e-10f) {
         const float inv_length = rsqrtf(length_sq);
         return {point.x * inv_length, point.y * inv_length, point.z * inv_length};
-    }
-    return {0.0f, 0.0f, 1.0f};
-}
-
-// Normalizes a contact normal, falling back to +Z for a degenerate input.
-__device__ math::Vec3 NormalizeOrUp(math::Vec3 normal) {
-    const float length_sq = Dot(normal, normal);
-    if (length_sq > 1.0e-10f) {
-        const float inv_length = rsqrtf(length_sq);
-        return {normal.x * inv_length, normal.y * inv_length, normal.z * inv_length};
     }
     return {0.0f, 0.0f, 1.0f};
 }

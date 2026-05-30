@@ -4,6 +4,8 @@
 
 #include "runtime/articulation/articulation_contacts.hpp"
 
+#include "math/cuda_spatial_ops.cuh"
+#include "math/cuda_vec_ops.cuh"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 
@@ -32,62 +34,31 @@ __device__ math::Vec3 ScaleVec(math::Vec3 v, float s) {
     return {v.x * s, v.y * s, v.z * s};
 }
 
-__device__ float Dot3(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+// Dot3 / Cross3 / MakeQuat / QuatIdentity / QuatMul now come from the shared
+// device math library (math/cuda_vec_ops.cuh); the bodies are bit-identical.
+// NormalizeOrUpLocal maps to the shared NormalizeOrUp (rsqrtf, 1e-10, fallback
+// +Z) and QuatNormalize maps to QuatNormalizeRsqrt(., 1e-12f) -- both via thin
+// forwarders that keep the local call-site names verbatim. The file-local
+// AddVec / ScaleVec (differently named, not in the shared inventory) stay local.
+namespace mg = ::nuka::math::gpu;
+using mg::MakeQuat;
+using mg::QuatIdentity;
+using mg::QuatMul;
+
+__forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
+    return mg::Dot(a, b);
 }
 
-__device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
+__forceinline__ __device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
+    return mg::Cross(a, b);
 }
 
-// Normalizes a contact normal, falling back to +Z for a degenerate input.
-// Mirrors articulation_jacobian.cu's NormalizeOrUp (local copy to keep edits
-// scoped to this TU).
-__device__ math::Vec3 NormalizeOrUpLocal(math::Vec3 normal) {
-    const float length_sq = Dot3(normal, normal);
-    if (length_sq > 1.0e-10f) {
-        const float inv_length = rsqrtf(length_sq);
-        return {normal.x * inv_length, normal.y * inv_length, normal.z * inv_length};
-    }
-    return {0.0f, 0.0f, 1.0f};
+__forceinline__ __device__ math::Vec3 NormalizeOrUpLocal(math::Vec3 normal) {
+    return mg::NormalizeOrUp(normal);
 }
 
-// math::Quat's constructors are host-only constexpr, so the device path builds
-// quaternions by mutating a default-constructed value (field assignment is
-// device-legal) rather than via brace/Identity()/operator* construction.
-__device__ math::Quat MakeQuat(float w, float x, float y, float z) {
-    math::Quat q;
-    q.w = w;
-    q.x = x;
-    q.y = y;
-    q.z = z;
-    return q;
-}
-
-__device__ math::Quat QuatIdentity() {
-    return MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
-}
-
-// Hamilton product this = a * b (w-first), mirroring math::Quat::operator*.
-__device__ math::Quat QuatMul(math::Quat a, math::Quat b) {
-    return MakeQuat(
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w);
-}
-
-__device__ math::Quat QuatNormalize(math::Quat q) {
-    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    if (norm_sq <= 1.0e-12f) {
-        return QuatIdentity();
-    }
-    const float inv_norm = rsqrtf(norm_sq);
-    return MakeQuat(q.w * inv_norm, q.x * inv_norm, q.y * inv_norm, q.z * inv_norm);
+__forceinline__ __device__ math::Quat QuatNormalize(math::Quat q) {
+    return mg::QuatNormalizeRsqrt(q, 1.0e-12f);
 }
 
 // Unit quaternion for a rotation of `angle` about `axis`, mirroring
@@ -263,66 +234,37 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
 
 constexpr float kMinDiagonal = 1.0e-6f;
 
-__device__ float Dot6Local(const float* a, const float* b) {
-    float sum = 0.0f;
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        sum += a[i] * b[i];
-    }
-    return sum;
+// The *Local spatial helpers are byte-identical to the shared library symbols
+// (math/cuda_spatial_ops.cuh). Dot6Local / Copy36Local / Mat66MulVec6Local map
+// 1:1 to the shared names; the two Transform*Local helpers read only
+// transform.X, so they forward to the shared raw-float* versions (§1.3). Thin
+// __forceinline__ forwarders keep every *Local call site verbatim.
+__forceinline__ __device__ float Dot6Local(const float* a, const float* b) {
+    return mg::Dot6(a, b);
 }
 
-__device__ void Copy36Local(const float* src, float* dst) {
-    for (uint32_t i = 0u; i < 36u; ++i) {
-        dst[i] = src[i];
-    }
+__forceinline__ __device__ void Copy36Local(const float* src, float* dst) {
+    mg::Copy36(src, dst);
 }
 
-__device__ void Mat66MulVec6Local(const float* matrix, const float* vector, float* out) {
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        float value = 0.0f;
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            value += matrix[row * 6u + col] * vector[col];
-        }
-        out[row] = value;
-    }
+__forceinline__ __device__ void Mat66MulVec6Local(const float* matrix,
+                                                  const float* vector,
+                                                  float* out) {
+    mg::Mat66MulVec6(matrix, vector, out);
 }
 
-// parent_delta = X^T * child_inertia * X (composite-inertia push to parent).
-__device__ void TransformInertiaToParentLocal(const LinkSpatialTransform& transform,
-                                              const float* child_inertia,
-                                              float* parent_delta) {
-    float temp[36];
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            float value = 0.0f;
-            for (uint32_t k = 0u; k < 6u; ++k) {
-                value += child_inertia[row * 6u + k] * transform.X[k * 6u + col];
-            }
-            temp[row * 6u + col] = value;
-        }
-    }
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            float value = 0.0f;
-            for (uint32_t k = 0u; k < 6u; ++k) {
-                value += transform.X[k * 6u + row] * temp[k * 6u + col];
-            }
-            parent_delta[row * 6u + col] = value;
-        }
-    }
+__forceinline__ __device__ void TransformInertiaToParentLocal(
+    const LinkSpatialTransform& transform,
+    const float* child_inertia,
+    float* parent_delta) {
+    mg::TransformInertiaToParent(transform.X, child_inertia, parent_delta);
 }
 
-// out = X^T * in (push a spatial force from this link's frame to its parent).
-__device__ void TransformForceTransposeLocal(const LinkSpatialTransform& transform,
-                                            const float* in,
-                                            float* out) {
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        float value = 0.0f;
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            value += transform.X[col * 6u + row] * in[col];
-        }
-        out[row] = value;
-    }
+__forceinline__ __device__ void TransformForceTransposeLocal(
+    const LinkSpatialTransform& transform,
+    const float* in,
+    float* out) {
+    mg::TransformForceTranspose(transform.X, in, out);
 }
 
 __device__ uint32_t JointDofCountDevice(ArticulationJointType type) {

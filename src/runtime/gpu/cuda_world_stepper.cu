@@ -4,6 +4,8 @@
 
 #include "runtime/gpu/cuda_world_stepper.hpp"
 
+#include "math/cuda_vec_ops.cuh"
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -13,29 +15,13 @@ namespace nuka::runtime::gpu {
 
 namespace {
 
-__device__ math::Vec3 ZeroVec3() {
-    math::Vec3 v;
-    v.x = 0.0f;
-    v.y = 0.0f;
-    v.z = 0.0f;
-    return v;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    math::Vec3 result;
-    result.x = a.x + b.x;
-    result.y = a.y + b.y;
-    result.z = a.z + b.z;
-    return result;
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    math::Vec3 result;
-    result.x = v.x * s;
-    result.y = v.y * s;
-    result.z = v.z * s;
-    return result;
-}
+// ZeroVec3 / Add / Scale now come from the shared device math library
+// (math/cuda_vec_ops.cuh); the former field-assignment local copies were
+// bit-identical to the shared brace-init bodies.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Scale;
+using mg::ZeroVec3;
 
 __global__ void IntegrateRigidBodiesKernel(uint32_t body_count,
                                            math::Transform* poses,

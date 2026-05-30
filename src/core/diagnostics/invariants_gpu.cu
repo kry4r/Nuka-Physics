@@ -4,6 +4,7 @@
 
 #include "core/diagnostics/invariants_gpu.cuh"
 
+#include "math/cuda_vec_ops.cuh"
 #include "phi/buffer.hpp"
 
 #include <cuda_runtime.h>
@@ -40,21 +41,12 @@ __device__ float AbsMax(math::Vec3 value) {
     return fmaxf(fabsf(value.x), fmaxf(fabsf(value.y), fabsf(value.z)));
 }
 
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
-}
+// Vec3 Add/Dot/Cross now come from the shared device math library
+// (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local copies.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::Dot;
 
 __global__ void ComputeRigidBodyInvariantKernel(
     uint32_t body_count,

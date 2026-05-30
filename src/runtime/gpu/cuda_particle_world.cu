@@ -4,6 +4,9 @@
 
 #include "runtime/gpu/cuda_particle_world.hpp"
 
+#include "math/cuda_vec_ops.cuh"
+#include "phi/buffer_transfer.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -90,48 +93,23 @@ __device__ void ResetCouplingRowSolverReport(CudaParticleStepReport* report) {
     report->coupling_scheduler_report = CudaConstraintRowSchedulerReport{};
 }
 
-__device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    math::Vec3 result;
-    result.x = x;
-    result.y = y;
-    result.z = z;
-    return result;
-}
-
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-
-__device__ math::Vec3 Sub(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return MakeVec3(v.x * s, v.y * s, v.z * s);
-}
-
-__device__ float Dot(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ float LengthSq(math::Vec3 v) {
-    return Dot(v, v);
-}
-
-__device__ math::Vec3 NormalizeOr(math::Vec3 v, math::Vec3 fallback) {
-    const float len_sq = LengthSq(v);
-    if (len_sq <= 1.0e-12f) {
-        return fallback;
-    }
-    return Scale(v, rsqrtf(len_sq));
-}
-
-__device__ math::Vec3 Cross(math::Vec3 a, math::Vec3 b) {
-    return MakeVec3(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x);
-}
+// Small-vector / quaternion primitives now come from the shared device math
+// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
+// copies. The former local `NormalizeOr` (eps 1e-12, `<=`, rsqrtf, caller
+// fallback) maps to the shared NormalizeOr of identical recipe; `Rotate` ->
+// RotateShort and `Mul` -> QuatMul (renamed at call sites). Buffer helpers come
+// from phi/buffer_transfer.hpp.
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Cross;
+using mg::Dot;
+using mg::LengthSq;
+using mg::MakeVec3;
+using mg::NormalizeOr;
+using mg::QuatMul;
+using mg::RotateShort;
+using mg::Scale;
+using mg::Sub;
 
 __device__ math::Vec3 ChooseTangent(math::Vec3 normal) {
     const math::Vec3 axis =
@@ -151,12 +129,6 @@ __device__ math::Vec3 ChooseContactTangent(math::Vec3 normal,
     return ChooseTangent(normal);
 }
 
-__device__ math::Vec3 Rotate(math::Quat q, math::Vec3 v) {
-    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
-    const math::Vec3 t = Scale(Cross(qv, v), 2.0f);
-    return Add(Add(v, Scale(t, q.w)), Cross(qv, t));
-}
-
 __device__ math::Quat Conjugate(math::Quat q) {
     math::Quat result;
     result.w = q.w;
@@ -166,31 +138,22 @@ __device__ math::Quat Conjugate(math::Quat q) {
     return result;
 }
 
-__device__ math::Quat Mul(math::Quat a, math::Quat b) {
-    math::Quat result;
-    result.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
-    result.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
-    result.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
-    result.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
-    return result;
-}
-
 __device__ math::Vec3 TransformPoint(math::Transform transform, math::Vec3 point) {
-    return Add(Rotate(transform.rotation, point), transform.position);
+    return Add(RotateShort(transform.rotation, point), transform.position);
 }
 
 __device__ math::Vec3 InverseTransformPoint(math::Transform transform, math::Vec3 point) {
-    return Rotate(Conjugate(transform.rotation), Sub(point, transform.position));
+    return RotateShort(Conjugate(transform.rotation), Sub(point, transform.position));
 }
 
 __device__ math::Vec3 TransformDirection(math::Transform transform, math::Vec3 direction) {
-    return Rotate(transform.rotation, direction);
+    return RotateShort(transform.rotation, direction);
 }
 
 __device__ math::Transform Compose(math::Transform a, math::Transform b) {
     math::Transform result;
     result.position = TransformPoint(a, b.position);
-    result.rotation = Mul(a.rotation, b.rotation);
+    result.rotation = QuatMul(a.rotation, b.rotation);
     return result;
 }
 
@@ -696,7 +659,7 @@ __device__ float DeviceWorldShapeResidual(scene::ShapeType shape_type,
                                           float particle_radius,
                                           math::Vec3 position) {
     if (shape_type == scene::ShapeType::Plane) {
-        const math::Vec3 normal = Rotate(shape_transform.rotation, MakeVec3(0.0f, 1.0f, 0.0f));
+        const math::Vec3 normal = RotateShort(shape_transform.rotation, MakeVec3(0.0f, 1.0f, 0.0f));
         const float signed_distance = Dot(Sub(position, shape_transform.position), normal);
         return ClampNonNegative(particle_radius - signed_distance);
     }
@@ -769,7 +732,7 @@ __device__ float SolveDeviceWorldShape(scene::ShapeType shape_type,
     float penetration = 0.0f;
 
     if (shape_type == scene::ShapeType::Plane) {
-        normal = NormalizeOr(Rotate(shape_transform.rotation, MakeVec3(0.0f, 1.0f, 0.0f)),
+        normal = NormalizeOr(RotateShort(shape_transform.rotation, MakeVec3(0.0f, 1.0f, 0.0f)),
                              MakeVec3(0.0f, 1.0f, 0.0f));
         const float signed_distance = Dot(Sub(*position, shape_transform.position), normal);
         penetration = particle_radius - signed_distance;
@@ -1708,23 +1671,12 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
-
-template <typename T>
-std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
-    std::vector<T> values(count);
-    if (count > 0u) {
-        buffer.CopyToHost(values.data(), count * sizeof(T));
-    }
-    return values;
-}
+// UploadVector / DownloadVector(buf, count) now come from the shared host
+// buffer-transfer header (phi/buffer_transfer.hpp); the former local copies were
+// byte-identical (the shared form guards on values.size()==count, equivalent to
+// the former count>0 guard, copying the same byte count).
+using ::nuka::phi::DownloadVector;
+using ::nuka::phi::UploadVector;
 
 } // namespace
 

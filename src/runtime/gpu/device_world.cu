@@ -4,6 +4,8 @@
 
 #include "runtime/gpu/device_world.hpp"
 
+#include "phi/buffer_transfer.hpp"
+
 #include <algorithm>
 #include <utility>
 #include <vector>
@@ -12,14 +14,11 @@ namespace nuka::runtime::gpu {
 
 namespace {
 
-template <typename T>
-phi::Buffer UploadVector(const std::vector<T>& values) {
-    phi::Buffer buffer(values.size() * sizeof(T), phi::MemoryKind::Device);
-    if (!values.empty()) {
-        buffer.CopyFromHost(values.data(), values.size() * sizeof(T));
-    }
-    return buffer;
-}
+// UploadVector / DownloadVector(buf, count) now come from the shared host
+// buffer-transfer header (phi/buffer_transfer.hpp); the former local copies were
+// byte-identical. DefaultedCopy is DeviceWorld-specific and stays local.
+using ::nuka::phi::DownloadVector;
+using ::nuka::phi::UploadVector;
 
 template <typename T>
 std::vector<T> DefaultedCopy(const std::vector<T>& values, uint32_t count, T fallback) {
@@ -30,15 +29,6 @@ std::vector<T> DefaultedCopy(const std::vector<T>& values, uint32_t count, T fal
         result[index] = values[index];
     }
     return result;
-}
-
-template <typename T>
-std::vector<T> DownloadVector(const phi::Buffer& buffer, uint32_t count) {
-    std::vector<T> values(count);
-    if (!values.empty()) {
-        buffer.CopyToHost(values.data(), values.size() * sizeof(T));
-    }
-    return values;
 }
 
 } // namespace

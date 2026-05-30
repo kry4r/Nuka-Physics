@@ -5,6 +5,9 @@
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "runtime/articulation/featherstone_aba.cuh"
 
+#include "math/cuda_spatial_ops.cuh"
+#include "math/cuda_vec_ops.cuh"
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -22,63 +25,39 @@ struct Mat3 {
     float m[9];
 };
 
-__device__ math::Vec3 MakeVec3(float x, float y, float z) {
-    return {x, y, z};
+// Small-vector and spatial (6-vector / 6x6) primitives now come from the shared
+// device math libraries (math/cuda_vec_ops.cuh, math/cuda_spatial_ops.cuh).
+// Bodies are bit-identical to the former local copies (the loop counters are the
+// same fixed 0..6 / 0..36 integer ranges, which never touch the float
+// accumulation order). Name-matched symbols are pulled in directly; symbols that
+// differ only in name (Dot3->Dot, Cross3->Cross) or signature (the Transform*
+// helpers take const float* X per the §1.3 decoupling; SubtractOuterProduct36
+// takes the min-diagonal as a parameter) are routed via thin __forceinline__
+// forwarders that keep every call site verbatim. QuatNormalizeForward maps to
+// QuatNormalizeForwardRsqrt(., 1e-24f).
+namespace mg = ::nuka::math::gpu;
+using mg::Add;
+using mg::Add6InPlace;
+using mg::Copy36;
+using mg::Dot6;
+using mg::MakeVec3;
+using mg::Mat66MulVec6;
+using mg::Scale;
+using mg::Zero6;
+using mg::Zero36;
+
+__forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
+    return mg::Dot(a, b);
 }
 
-__device__ math::Vec3 Add(math::Vec3 a, math::Vec3 b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
+__forceinline__ __device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
+    return mg::Cross(a, b);
 }
 
-__device__ math::Vec3 Scale(math::Vec3 v, float s) {
-    return {v.x * s, v.y * s, v.z * s};
-}
-
-__device__ float Dot3(math::Vec3 a, math::Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
-}
-
-__device__ void Zero6(float* value) {
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        value[i] = 0.0f;
-    }
-}
-
-__device__ void Zero36(float* value) {
-    for (uint32_t i = 0u; i < 36u; ++i) {
-        value[i] = 0.0f;
-    }
-}
-
-__device__ float Dot6(const float* a, const float* b) {
-    float sum = 0.0f;
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-
-__device__ void Add6InPlace(float* lhs, const float* rhs) {
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        lhs[i] += rhs[i];
-    }
-}
-
-__device__ void SubtractOuterProduct36(float* matrix, const float* u, float diagonal) {
-    const float inv_diagonal = 1.0f / fmaxf(diagonal, kMinDiagonal);
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            matrix[row * 6u + col] -= u[row] * u[col] * inv_diagonal;
-        }
-    }
+__forceinline__ __device__ void SubtractOuterProduct36(float* matrix,
+                                                       const float* u,
+                                                       float diagonal) {
+    mg::SubtractOuterProduct36(matrix, u, diagonal, kMinDiagonal);
 }
 
 __device__ Mat3 Mat3Transpose(const Mat3& matrix) {
@@ -197,99 +176,33 @@ __device__ LinkSpatialTransform MakeMotionTransform(const Mat3& rotation,
     return transform;
 }
 
-__device__ void TransformMotion(const LinkSpatialTransform& transform,
-                                const float* in,
-                                float* out) {
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        float value = 0.0f;
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            value += transform.X[row * 6u + col] * in[col];
-        }
-        out[row] = value;
-    }
+// The Transform* helpers read only transform.X (a float[36]); the shared library
+// versions take that raw pointer (§1.3 T8b decoupling). These thin forwarders
+// keep every call site -- f(transform, ...) -- verbatim while routing to the
+// shared, byte-identical bodies.
+__forceinline__ __device__ void TransformMotion(const LinkSpatialTransform& transform,
+                                                const float* in,
+                                                float* out) {
+    mg::TransformMotion(transform.X, in, out);
 }
 
-__device__ void TransformForceTranspose(const LinkSpatialTransform& transform,
-                                        const float* in,
-                                        float* out) {
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        float value = 0.0f;
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            value += transform.X[col * 6u + row] * in[col];
-        }
-        out[row] = value;
-    }
+__forceinline__ __device__ void TransformForceTranspose(const LinkSpatialTransform& transform,
+                                                        const float* in,
+                                                        float* out) {
+    mg::TransformForceTranspose(transform.X, in, out);
 }
 
-__device__ void TransformInertiaToParent(const LinkSpatialTransform& transform,
-                                         const float* child_inertia,
-                                         float* parent_delta) {
-    float temp[36];
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            float value = 0.0f;
-            for (uint32_t k = 0u; k < 6u; ++k) {
-                value += child_inertia[row * 6u + k] * transform.X[k * 6u + col];
-            }
-            temp[row * 6u + col] = value;
-        }
-    }
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            float value = 0.0f;
-            for (uint32_t k = 0u; k < 6u; ++k) {
-                value += transform.X[k * 6u + row] * temp[k * 6u + col];
-            }
-            parent_delta[row * 6u + col] = value;
-        }
-    }
+__forceinline__ __device__ void TransformInertiaToParent(const LinkSpatialTransform& transform,
+                                                         const float* child_inertia,
+                                                         float* parent_delta) {
+    mg::TransformInertiaToParent(transform.X, child_inertia, parent_delta);
 }
 
-__device__ void Mat66MulVec6(const float* matrix, const float* vector, float* out) {
-    for (uint32_t row = 0u; row < 6u; ++row) {
-        float value = 0.0f;
-        for (uint32_t col = 0u; col < 6u; ++col) {
-            value += matrix[row * 6u + col] * vector[col];
-        }
-        out[row] = value;
-    }
-}
-
-__device__ void Copy36(const float* src, float* dst) {
-    for (uint32_t i = 0u; i < 36u; ++i) {
-        dst[i] = src[i];
-    }
-}
-
-__device__ void MotionCross(const float* lhs, const float* rhs, float* out) {
-    const math::Vec3 lw = MakeVec3(lhs[0], lhs[1], lhs[2]);
-    const math::Vec3 lv = MakeVec3(lhs[3], lhs[4], lhs[5]);
-    const math::Vec3 rw = MakeVec3(rhs[0], rhs[1], rhs[2]);
-    const math::Vec3 rv = MakeVec3(rhs[3], rhs[4], rhs[5]);
-    const math::Vec3 angular = Cross3(lw, rw);
-    const math::Vec3 linear = Add(Cross3(lw, rv), Cross3(lv, rw));
-    out[0] = angular.x;
-    out[1] = angular.y;
-    out[2] = angular.z;
-    out[3] = linear.x;
-    out[4] = linear.y;
-    out[5] = linear.z;
-}
-
-__device__ void ForceCross(const float* motion, const float* force, float* out) {
-    const math::Vec3 w = MakeVec3(motion[0], motion[1], motion[2]);
-    const math::Vec3 v = MakeVec3(motion[3], motion[4], motion[5]);
-    const math::Vec3 n = MakeVec3(force[0], force[1], force[2]);
-    const math::Vec3 f = MakeVec3(force[3], force[4], force[5]);
-    const math::Vec3 angular = Add(Cross3(w, n), Cross3(v, f));
-    const math::Vec3 linear = Cross3(w, f);
-    out[0] = angular.x;
-    out[1] = angular.y;
-    out[2] = angular.z;
-    out[3] = linear.x;
-    out[4] = linear.y;
-    out[5] = linear.z;
-}
+// Mat66MulVec6 / Copy36 / MotionCross / ForceCross are name- and signature-
+// identical to the shared library symbols (pulled in via `using` below); the
+// former local copies are removed.
+using mg::ForceCross;
+using mg::MotionCross;
 
 __device__ void MotionSubspaceForJoint(ArticulationJointType type,
                                        math::Vec3 axis,
@@ -748,24 +661,11 @@ __device__ math::Quat QuatMulForward(math::Quat a, math::Quat b) {
     return out;
 }
 
-__device__ math::Quat QuatNormalizeForward(math::Quat q) {
-    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    if (norm_sq < 1.0e-24f) {
-        // Identity constructed by field assignment (math::Quat::Identity() is a
-        // constexpr __host__ helper and cannot be called from __device__ code).
-        math::Quat identity;
-        identity.w = 1.0f;
-        identity.x = 0.0f;
-        identity.y = 0.0f;
-        identity.z = 0.0f;
-        return identity;
-    }
-    const float inv = rsqrtf(norm_sq);
-    q.w *= inv;
-    q.x *= inv;
-    q.y *= inv;
-    q.z *= inv;
-    return q;
+// QuatNormalizeForward maps to the shared QuatNormalizeForwardRsqrt with eps
+// 1e-24f (norm_sq, strict `<`, rsqrtf in-place). Body is byte-identical; the
+// forwarder keeps the call site verbatim.
+__forceinline__ __device__ math::Quat QuatNormalizeForward(math::Quat q) {
+    return mg::QuatNormalizeForwardRsqrt(q, 1.0e-24f);
 }
 
 // T8a: floating-base velocity update. One block per articulation, lane 0.
