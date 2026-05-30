@@ -80,6 +80,8 @@ def Xform "World"
         )
         {
             double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -120,6 +122,8 @@ def Xform "World"
         )
         {
             double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -160,6 +164,8 @@ def Xform "World"
         )
         {
             double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -200,6 +206,8 @@ def Xform "World"
         )
         {
             double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
