@@ -154,6 +154,36 @@ public:
         };
     }
 
+    // Convenience writer for the per-env PD drive targets (batched/multi-env
+    // path only). `host_targets` is `count` host-side floats laid out env-major
+    // exactly like NUKA_FIELD_JOINT_POSITION (float[env_count*base_link_count],
+    // index env*base_link_count + link); `count` must equal the DRIVE_TARGET
+    // view element_count. Copies host -> the live device target buffer, which
+    // the next Step()/StepN() reads. For a zero-copy CUDA-tensor write, fetch
+    // GetBufferView(NUKA_FIELD_DRIVE_TARGET) and write device_ptr directly.
+    nuka::expected<void, Error> SetDriveTargets(const float* host_targets,
+                                                size_t count) const noexcept {
+        if (host_targets == nullptr && count != 0u) {
+            return nuka::unexpected(Error(NUKA_RESULT_INVALID_ARG));
+        }
+        nuka_buffer_view_t view{};
+        const nuka_result_t result =
+            nuka_world_get_buffer_view(h_, NUKA_FIELD_DRIVE_TARGET, &view);
+        if (result != NUKA_RESULT_OK) {
+            return nuka::unexpected(Error(result));
+        }
+        if (view.device_ptr == nullptr || count != view.element_count) {
+            return nuka::unexpected(Error(NUKA_RESULT_INVALID_ARG));
+        }
+        const cudaError_t copy = cudaMemcpy(view.device_ptr, host_targets,
+                                            count * sizeof(float),
+                                            cudaMemcpyHostToDevice);
+        if (copy != cudaSuccess) {
+            return nuka::unexpected(Error(NUKA_RESULT_CUDA_ERROR));
+        }
+        return nuka::expected<void, Error>{};
+    }
+
 private:
     explicit World(nuka_world_handle handle) noexcept : h_(handle) {}
 

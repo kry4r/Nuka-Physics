@@ -23,10 +23,17 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
 
     try {
         // --- Multi-env batched path (env_count > 1) -----------------------
-        // Serve the batched device buffers zero-copy (env-major). q/qdot have
-        // length env_count * base_link_count; CONTACT_POINTS exposes the per-step
-        // detected contact points (env-major, fixed stride kMaxFootContactsPerEnv
-        // per env). No host round-trip / RefreshWorldBuffers on this arm.
+        // Serve the batched device buffers zero-copy (env-major). All of q/qdot/
+        // drive-targets have length env_count * base_link_count and the IDENTICAL
+        // env-major layout (index env*base_link_count + link). ARTICULATION_LINK_POSE
+        // exposes the live per-link world pose (math::Transform, 7 floats). No host
+        // round-trip / RefreshWorldBuffers on this arm.
+        //
+        // Layout reference (env-major; base_link_count = state.total_link_count /
+        // env_count; the articulation ROOT/base is local link 0, so env e's base is
+        // element e*base_link_count). math::Transform = {Vec3 position(px,py,pz),
+        // Quat rotation(qw,qx,qy,qz)} == 7 contiguous floats / 28 bytes, NO padding;
+        // NOTE the quaternion order is w,x,y,z (w FIRST), not the common xyzw.
         if (record->batched != nullptr) {
             auto& batched = *record->batched;
             if (field == NUKA_FIELD_JOINT_POSITION) {
@@ -41,6 +48,43 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const auto state = batched.View();
                 out->device_ptr = state.qdot;
                 out->element_count = state.total_link_count;
+                out->element_stride_bytes = sizeof(float);
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_ARTICULATION_LINK_POSE) {
+                // Live per-link WORLD pose, refreshed each Step by the batched
+                // pipeline's UpdateWorldLinkPoses (stage 4). element_count ==
+                // env_count * base_link_count; the base/root of env e is element
+                // e*base_link_count (root == local link 0). Each element is a
+                // math::Transform = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
+                // CAVEAT: UpdateWorldLinkPoses runs from the PRE-integrate q (stage
+                // 4) while q itself is advanced at stage 11 with no later FK, so
+                // after Step() returns link_pose reflects the PREVIOUS step's q
+                // (one-step lag vs JOINT_POSITION). Before the first Step it is the
+                // cooked rest pose (not the assembled FK pose). Both are intrinsic
+                // to the validated T6 step and intentionally not "fixed" here.
+                const auto state = batched.View();
+                out->device_ptr = state.link_pose;
+                out->element_count = state.total_link_count;
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(sizeof(nuka::math::Transform));
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_DRIVE_TARGET) {
+                // WRITABLE view aliasing the live per-env PD drive-target buffer
+                // that batched_step_params.drive_targets points at. Writing it in
+                // place (device-to-device or host-to-device) is picked up by the
+                // NEXT nuka_world_step. Same layout as JOINT_POSITION: float[
+                // env_count*base_link_count], env-major. Only actuated links (those
+                // with non-zero drive stiffness) act on their target.
+                if (record->batched_drive_targets_device.Size() == 0u) {
+                    return NUKA_RESULT_NOT_SUPPORTED;
+                }
+                out->device_ptr = record->batched_drive_targets_device.Data();
+                out->element_count =
+                    record->batched_drive_targets_device.Size() / sizeof(float);
                 out->element_stride_bytes = sizeof(float);
                 out->dtype = 0u;
                 return NUKA_RESULT_OK;
