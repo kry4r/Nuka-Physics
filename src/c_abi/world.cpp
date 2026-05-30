@@ -158,12 +158,24 @@ void UploadHoldDriveTargets(WorldRecord& record) {
 // feet engage the ground with contacts ACTIVE from the first step. The detection
 // convention is depth = (ground_height + radius) - foot_world_z, so a contact
 // fires only for depth > 0; ground = min_foot_bottom_z + kRestFootPenetration
-// places the lowest foot kRestFootPenetration metres below the surface. The value
-// is a gentle few-cm seat (well within the T6-validated stable regime, which ran
-// the Go2 stance >0.1 m penetrated and resolved it) -- large enough that the
-// non-penetration rows are non-trivially active, small enough that the one-step
-// correction transient stays bounded at dt=1/240.
-constexpr float kRestFootPenetration = 0.03f;
+// places the lowest foot kRestFootPenetration metres below the surface.
+//
+// Value = 0.002 m, matching the C++ standing test's SeatGround (test_go2_pd_standing
+// .cpp). This was 0.03 m; sim-val #42 ISOLATED the seating depth as the cause of a
+// floating-base PD-stance instability on this very stepper, via a clean A/B (only
+// this constant changed; same gains/pose/dt): the floating Go2 PD crouch COLLAPSES at
+// 0.03 m for dt>=0.002 (surviving only at dt=0.001) but HOLDS at 0.002 m for EVERY dt
+// incl. the natural training dt 0.005 (probe: max tilt <0.8 deg / 6 s). The causal
+// variable (penetration depth) is isolated; the MECHANISM is only inferred (the
+// deeper initial seat plausibly injects a larger startup contact-correction
+// transient) and NOT fully pinned -- the dt-dependence of the 0.03 m collapse is
+// non-monotonic -- so we anchor to the empirical result + the validated C++ seat, not
+// to a mechanism. (T6 only proved the contact solve RESOLVES a deep >0.1 m
+// penetration toward zero over a few steps; it never validated long-horizon
+// floating-base PD stance stability, so "T6-validated" did not license 0.03 m here.)
+// 0.002 m still fires the lowest-foot contact (depth 0.002 > 0); uniform scalar =>
+// D1 determinism preserved.
+constexpr float kRestFootPenetration = 0.002f;
 
 // Finite Baumgarte velocity cap (m/s) for the batched normal-row positional bias.
 // Matches the T6 production choice: bounds the one-step velocity transient at
