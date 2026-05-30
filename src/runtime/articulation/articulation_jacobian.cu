@@ -158,17 +158,50 @@ __global__ void ComputeContactChainJacobianKernel(
                 dof_index += JointDofCount(state.joint_type[k]);
             }
 
-            const math::Vec3 axis_world =
-                RotateByQuat(state.link_pose[link].rotation, state.joint_axis[link]);
-            float entry = 0.0f;
-            if (type == ArticulationJointType::Prismatic) {
-                entry = Dot(axis_world, normal);
-            } else {  // Revolute
-                const math::Vec3 lever = Sub(point, state.link_pose[link].position);
-                entry = Dot(Cross(axis_world, lever), normal);
-            }
-            if (dof_index < dof_stride) {
-                out_row[dof_index] = entry;
+            if (type == ArticulationJointType::FloatingBase) {
+                // T8b: floating-base root contributes 6 columns (dof_index 0..5),
+                // omega-first [omega(0:2), lin(3:5)] in the SAME body frame and at
+                // the SAME origin as link_velocity[root] (verified against the T8a
+                // ABA / pose integrator). Read the LIVE base pose directly so R and
+                // the origin match exactly the frame link_velocity[root] references.
+                //   base spatial velocity v = [omega_body; vlin_body]  (body frame)
+                //   contact-point world vel = (R*omega)x(point-origin) + R*vlin
+                //   J_d[k] = d . d(point vel)/d v_k
+                // angular column k: axis_world = R*e_k (k-th column of R);
+                //   entry = dot( cross(axis_world, point-origin), d )  (== Revolute)
+                // linear column k:  entry = dot( R*e_k, d )            (== Prismatic)
+                const math::Quat base_rot = state.base_pose[articulation].rotation;
+                const math::Vec3 base_origin = state.base_pose[articulation].position;
+                const math::Vec3 lever = Sub(point, base_origin);
+                const math::Vec3 ex = RotateByQuat(base_rot, {1.0f, 0.0f, 0.0f});
+                const math::Vec3 ey = RotateByQuat(base_rot, {0.0f, 1.0f, 0.0f});
+                const math::Vec3 ez = RotateByQuat(base_rot, {0.0f, 0.0f, 1.0f});
+                const float ang[3] = {Dot(Cross(ex, lever), normal),
+                                      Dot(Cross(ey, lever), normal),
+                                      Dot(Cross(ez, lever), normal)};
+                const float lin[3] = {Dot(ex, normal), Dot(ey, normal),
+                                      Dot(ez, normal)};
+                for (uint32_t b = 0u; b < 3u; ++b) {
+                    if (dof_index + b < dof_stride) {
+                        out_row[dof_index + b] = ang[b];
+                    }
+                    if (dof_index + 3u + b < dof_stride) {
+                        out_row[dof_index + 3u + b] = lin[b];
+                    }
+                }
+            } else {
+                const math::Vec3 axis_world =
+                    RotateByQuat(state.link_pose[link].rotation, state.joint_axis[link]);
+                float entry = 0.0f;
+                if (type == ArticulationJointType::Prismatic) {
+                    entry = Dot(axis_world, normal);
+                } else {  // Revolute
+                    const math::Vec3 lever = Sub(point, state.link_pose[link].position);
+                    entry = Dot(Cross(axis_world, lever), normal);
+                }
+                if (dof_index < dof_stride) {
+                    out_row[dof_index] = entry;
+                }
             }
         }
 
