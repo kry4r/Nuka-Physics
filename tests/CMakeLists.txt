@@ -682,6 +682,24 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_articulated_world_perf_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- Parameterized perf-harness CLI (v0.3 p01 Wave-2 #4) ----------------
+    # NOT a gtest: a standalone CLI that drives the real batched articulated
+    # stepper over a chosen env count / step count and prints the engine
+    # PerfRecorder JSON (schema_version + per_tag + gpu/n_envs/steps) to stdout.
+    # This is the `--harness` binary tools/perf/run_perf_baseline.py invokes.
+    add_executable(nuka_perf_harness
+        ${CMAKE_SOURCE_DIR}/tools/perf/perf_harness.cpp
+    )
+
+    target_link_libraries(nuka_perf_harness
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+    )
+
     add_executable(nuka_cuda_sensor_test
         sensor/test_cuda_sensors.cpp
     )

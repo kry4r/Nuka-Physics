@@ -222,20 +222,32 @@ def main(argv=None):
         )
 
     sweep = []
+    device_gpu = None
     for n, command in zip(env_counts, commands):
         print(f"[N={n}] running: {' '.join(command)}", file=sys.stderr)
         payload = run_harness(command)
-        sweep.append(
-            {
-                "n_envs": n,
-                "steps": args.steps,
-                "per_tag": payload["per_tag"],
-            }
-        )
+        # Prefer the device-reported GPU name (read by the harness via
+        # cudaGetDeviceProperties) over the fixed DEFAULT_GPU constant, so the
+        # baseline records the hardware that was actually measured. Take it from
+        # the first payload that carries it.
+        if device_gpu is None and isinstance(payload.get("gpu"), str):
+            device_gpu = payload["gpu"]
+        entry = {
+            "n_envs": n,
+            "steps": args.steps,
+            "per_tag": payload["per_tag"],
+        }
+        # Self-document the warm-up provenance when the harness reports it (the
+        # harness default is max(100, steps/20), so this is not simply 0).
+        if isinstance(payload.get("warmup"), int):
+            entry["warmup"] = payload["warmup"]
+        sweep.append(entry)
 
     baseline = {
         "schema_version": 1,
-        "gpu": DEFAULT_GPU,
+        # Device-reported name when the harness supplied it; otherwise the
+        # fixed dev-box default.
+        "gpu": device_gpu if device_gpu is not None else DEFAULT_GPU,
         "gpu_label": args.gpu_label,
         "timestamp_utc": timestamp_utc,
         "scene": args.scene,
