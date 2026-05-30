@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "nuka"
+version = "0.3.0"
+description = "Nuka physics engine -- nanobind binding with zero-copy DLPack torch interop"
+requires-python = ">=3.8"
+readme = "README.md"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+# scikit-build-core drives the CMakeLists.txt next to this pyproject.
+cmake.version = ">=3.18"
+build-dir = "build/{wheel_tag}"
+# Map the `nuka/` source package + the compiled _nuka_ext into the wheel.
+wheel.packages = ["nuka"]
+# Ninja generator (installed in the env).
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+# Pin the C++ compiler to the engine's g++-10 so the ABI matches.
+CMAKE_CXX_COMPILER = "g++-10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
