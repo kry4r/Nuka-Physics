@@ -636,6 +636,29 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_floating_base_contact_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
+    add_executable(nuka_go2_pd_standing_test
+        runtime/test_go2_pd_standing.cpp
+    )
+
+    target_compile_definitions(nuka_go2_pd_standing_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_go2_pd_standing_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_go2_pd_standing_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Batched articulated-with-contacts step path (p01-F T6) -------------
     add_executable(nuka_batched_articulated_world_test
         runtime/test_batched_articulated_world.cpp
