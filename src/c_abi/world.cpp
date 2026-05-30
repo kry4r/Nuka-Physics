@@ -328,9 +328,23 @@ nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
             record.device->context,
             record.articulation_device.View(),
             record.step_options.gravity.z);
+        // T8a: floating-base velocity integrate before the joint integrate (uses
+        // the same pre-step acceleration). No-op for fixed/kinematic roots, so
+        // the fixed-base single-env path is byte-for-byte unchanged.
+        runtime::articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
+            record.device->context,
+            record.articulation_device.View(),
+            record.step_options.dt,
+            record.step_options.gravity.z);
         runtime::articulation::FeatherstoneAba::Integrate(record.device->context,
                                                           record.articulation_device.View(),
                                                           record.step_options.dt);
+        // T8a: floating-base pose integrate after the joint integrate, using the
+        // just-updated base spatial velocity. No-op for fixed/kinematic roots.
+        runtime::articulation::FeatherstoneAba::IntegrateFloatingBasePose(
+            record.device->context,
+            record.articulation_device.View(),
+            record.step_options.dt);
     }
     record.device->context.stream.Synchronize();
     DownloadDeviceStateToInstance(record);

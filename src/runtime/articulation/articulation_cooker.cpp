@@ -153,8 +153,19 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
 
             const uint32_t incoming_joint = child_joint[body];
             if (incoming_joint == scene::kInvalidJoint) {
+                // T8a: this body is the articulation ROOT (no incoming joint).
+                // A movable root (non-static AND positive mass) cooks to a
+                // free-floating 6-DOF base; a kinematic / mass-0 root keeps
+                // cooking Fixed exactly as before (so the go2_stand oracle and
+                // every existing fixed-base scene are byte-for-byte unchanged).
+                const bool root_is_static =
+                    body < blob.bodies.is_static.size() && blob.bodies.is_static[body] != 0u;
+                const bool root_is_floating =
+                    !root_is_static && BodyMass(blob, body) > 0.0f;
                 topology.parent_links.push_back(scene::kInvalidBody);
-                topology.joint_types.push_back(ArticulationJointType::Fixed);
+                topology.joint_types.push_back(root_is_floating
+                    ? ArticulationJointType::FloatingBase
+                    : ArticulationJointType::Fixed);
                 topology.joint_axes.push_back(math::Vec3::UnitZ());
                 topology.parent_frames.push_back(math::Transform::Identity());
                 topology.child_frames.push_back(math::Transform::Identity());

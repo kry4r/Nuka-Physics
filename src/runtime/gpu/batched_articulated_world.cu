@@ -167,6 +167,14 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     {
         NUKA_CUDA_TIME(perf_, "integrator", stream);
         articulation::FeatherstoneAba::IntegrateVelocity(context_, state, params.dt);
+        // T8a: floating-base velocity integrate (link_velocity[root] += real
+        // base accel * dt, where the real accel subtracts the gravity seed from
+        // the apparent accel stored in link_acceleration[root]). No-op for
+        // fixed/kinematic roots, so byte-safe for fixed-base scenes; placed
+        // alongside the joint velocity-integrate (pre-contact half).
+        articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, state,
+                                                                     params.dt,
+                                                                     params.gravity_z);
     }
 
     // -- 4. Refresh world poses, copy into state.link_pose. -----------------
@@ -296,6 +304,12 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     {
         NUKA_CUDA_TIME(perf_, "integrator", stream);
         articulation::FeatherstoneAba::IntegratePosition(context_, state, params.dt);
+        // T8a: floating-base pose integrate (advance base_pose[articulation]).
+        // No-op for fixed/kinematic roots; placed alongside the joint
+        // position-integrate (post-contact half) so the base pose reflects the
+        // post-contact velocity, matching the joint DOFs.
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, state,
+                                                                 params.dt);
     }
 }
 

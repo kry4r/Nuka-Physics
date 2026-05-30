@@ -176,8 +176,18 @@ __global__ void UpdateWorldLinkPosesKernel(ArticulationDeviceState state,
         const math::Transform relative = RelativeTransform(state, link);
         const uint32_t parent_local = state.parent_link[link];
         if (parent_local == kInvalidLink) {
-            // Root: world = identity o relative = relative.
-            out_world_pose[link] = relative;
+            // T8a: a FloatingBase root MOVES, so seed the FK from its LIVE world
+            // pose (base_pose[articulation], integrated each step) rather than the
+            // cook-time static relative transform. This is what makes the contact
+            // pipeline's world poses (and T8b's Jacobians) correct on a moving
+            // base. Gated on the floating type: a fixed/kinematic root keeps
+            // seeding from `relative` exactly as before (byte-identical).
+            if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
+                out_world_pose[link] = state.base_pose[articulation];
+            } else {
+                // Root: world = identity o relative = relative.
+                out_world_pose[link] = relative;
+            }
         } else {
             out_world_pose[link] =
                 ComposeTransform(out_world_pose[offset + parent_local], relative);
@@ -322,6 +332,8 @@ __device__ uint32_t JointDofCountDevice(ArticulationJointType type) {
             return 1u;
         case ArticulationJointType::Fixed:
             return 0u;
+        case ArticulationJointType::FloatingBase:
+            return 6u;  // T8a: free-floating root contributes 6 DOF.
     }
     return 0u;
 }
@@ -1008,6 +1020,8 @@ uint32_t ArticulationJointDofCount(ArticulationJointType type) {
             return 1u;
         case ArticulationJointType::Fixed:
             return 0u;
+        case ArticulationJointType::FloatingBase:
+            return 6u;  // T8a: free-floating root contributes 6 DOF.
     }
     return 0u;
 }

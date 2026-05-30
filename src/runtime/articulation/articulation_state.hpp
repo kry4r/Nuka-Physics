@@ -19,6 +19,14 @@ enum class ArticulationJointType : uint8_t {
     Revolute = 0,
     Prismatic = 1,
     Fixed = 2,
+    // T8a: free-floating 6-DOF base. Only valid on an articulation ROOT
+    // (parent_link == kInvalidLink). A floating root does NOT use the scalar
+    // q[root]/qdot[root]/qddot[root] slots: its 6-DOF spatial velocity lives in
+    // link_velocity[root], its spatial acceleration in link_acceleration[root],
+    // and its live world pose in the per-articulation base_pose buffer (the
+    // static link_pose stays cook-time constant). All ABA / FK handling of this
+    // type is gated so the fixed-base path stays byte-for-byte identical.
+    FloatingBase = 3,
 };
 
 struct LinkSpatialInertia {
@@ -62,6 +70,10 @@ struct ArticulationDeviceState {
     math::Transform* link_pose = nullptr;
     math::Transform* link_local_pose = nullptr;
     math::Transform* link_inertial_frame = nullptr;
+    // T8a: LIVE per-articulation root (base) world pose. Sized articulation_count.
+    // For a FloatingBase root this is integrated every step and seeds the FK root;
+    // for a fixed/kinematic root it is never read or written (cook pose is used).
+    math::Transform* base_pose = nullptr;
     float* q = nullptr;
     float* qdot = nullptr;
     float* qddot = nullptr;
@@ -113,6 +125,8 @@ struct ArticulationHostState {
     std::vector<math::Transform> link_pose;
     std::vector<math::Transform> link_local_pose;
     std::vector<math::Transform> link_inertial_frame;
+    // T8a: live per-articulation base pose (size == ArticulationCount()).
+    std::vector<math::Transform> base_pose;
     std::vector<float> q;
     std::vector<float> qdot;
     std::vector<float> qddot;
@@ -152,6 +166,7 @@ struct ArticulationDeviceBuffers {
     phi::Buffer link_pose;
     phi::Buffer link_local_pose;
     phi::Buffer link_inertial_frame;
+    phi::Buffer base_pose;  // T8a: live root pose, per articulation.
     phi::Buffer q;
     phi::Buffer qdot;
     phi::Buffer qddot;

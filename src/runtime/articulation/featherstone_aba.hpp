@@ -33,6 +33,22 @@ public:
     static void IntegratePosition(const phi::DeviceContext& context,
                                   ArticulationDeviceState state,
                                   float dt);
+    // T8a: floating-base integrators. For a FloatingBase root (parent ==
+    // kInvalidLink), IntegrateFloatingBaseVelocity does
+    // link_velocity[root] += link_acceleration[root]*dt (the 6-DOF base spatial
+    // velocity); IntegrateFloatingBasePose advances base_pose[articulation]
+    // (position from the body-frame linear velocity rotated to world, orientation
+    // via a normalized first-order quaternion update). Both are no-ops for fixed/
+    // kinematic roots, so callers may invoke them unconditionally. Placed
+    // analogously to the velocity/position split: velocity pre-contact, pose
+    // post-contact.
+    static void IntegrateFloatingBaseVelocity(const phi::DeviceContext& context,
+                                              ArticulationDeviceState state,
+                                              float dt,
+                                              float gravity_z);
+    static void IntegrateFloatingBasePose(const phi::DeviceContext& context,
+                                          ArticulationDeviceState state,
+                                          float dt);
 };
 
 } // namespace nuka::runtime::articulation
