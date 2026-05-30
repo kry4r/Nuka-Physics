@@ -131,6 +131,31 @@ if(TARGET nuka)
 
         gtest_discover_tests(nuka_multi_env_world_test
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+        # --- Per-env drive-target write + q/qd/base read C ABI (sim-val #33) --
+        add_executable(nuka_drive_target_io_test
+            c_abi/test_drive_target_io.cpp
+        )
+
+        target_compile_definitions(nuka_drive_target_io_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_drive_target_io_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_drive_target_io_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_drive_target_io_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     else()
         message(STATUS "Skipping nuka.hpp RAII test: nuka::expected wrapper failed to compile")
     endif()
