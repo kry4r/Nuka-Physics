@@ -39,6 +39,33 @@ public:
         }
     }
 
+    // Detail-gated timer: when `is_detail` is true the scope only arms if the
+    // recorder has fine-grained ("detail") instrumentation enabled. With detail
+    // OFF this constructs NO CUDA events and issues NO cudaEventRecord /
+    // cudaEventSynchronize -- it is a true no-op, so the production step path pays
+    // nothing for these deep per-sub-stage timers when profiling is disabled.
+    ScopedCudaTimer(PerfRecorder& recorder, const char* tag, cudaStream_t stream,
+                    bool is_detail)
+        : recorder_(recorder), tag_(tag), stream_(stream) {
+        if (is_detail && !recorder.DetailEnabled()) {
+            armed_ = false;  // disabled: no events created, no work issued.
+            return;
+        }
+        if (cudaEventCreate(&start_) != cudaSuccess) {
+            start_ = nullptr;
+        }
+        if (cudaEventCreate(&stop_) != cudaSuccess) {
+            stop_ = nullptr;
+        }
+        if (start_ != nullptr) {
+            if (cudaEventRecord(start_, stream_) != cudaSuccess) {
+                armed_ = false;
+            }
+        } else {
+            armed_ = false;
+        }
+    }
+
     ~ScopedCudaTimer() {
         if (armed_ && stop_ != nullptr) {
             if (cudaEventRecord(stop_, stream_) == cudaSuccess &&
@@ -81,5 +108,13 @@ private:
 #define NUKA_CUDA_TIME(recorder, tag, stream)                                 \
     ::nuka::core::perf::ScopedCudaTimer NUKA_UNIQUE_NAME(nuka_cuda_timer_)(    \
         (recorder), (tag), (stream))
+
+// Fine-grained ("detail") variant: the scope is a true no-op (no CUDA events,
+// no syncs) unless `recorder.DetailEnabled()` is set. Use this for the deep
+// per-sub-stage breakdown so the production step path pays nothing when
+// profiling is disabled.
+#define NUKA_CUDA_TIME_DETAIL(recorder, tag, stream)                          \
+    ::nuka::core::perf::ScopedCudaTimer NUKA_UNIQUE_NAME(nuka_cuda_timer_)(    \
+        (recorder), (tag), (stream), true)
 
 } // namespace nuka::core::perf
