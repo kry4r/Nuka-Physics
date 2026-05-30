@@ -590,6 +590,29 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_articulation_contact_rows_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
+    add_executable(nuka_floating_base_aba_test
+        runtime/test_floating_base_aba.cpp
+    )
+
+    target_compile_definitions(nuka_floating_base_aba_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_floating_base_aba_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_floating_base_aba_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Batched articulated-with-contacts step path (p01-F T6) -------------
     add_executable(nuka_batched_articulated_world_test
         runtime/test_batched_articulated_world.cpp

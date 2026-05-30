@@ -315,6 +315,78 @@ __device__ void GravityAcceleration(float gravity_z, float* out) {
     out[5] = -gravity_z;
 }
 
+// T8a helpers --------------------------------------------------------------
+
+// Rotates a world-frame vector into a body frame given the body's world
+// orientation quaternion: v_body = R(q)^T v_world. Uses the same w-first
+// Hamilton convention as math::Quat; v' = v + 2*(-w)*(qv x v) + 2*qv x (qv x v)
+// for the conjugate rotation, written out directly to stay __device__.
+__device__ math::Vec3 RotateByQuatInverse(math::Quat q, math::Vec3 v) {
+    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (norm_sq > 1.0e-12f) {
+        const float inv = rsqrtf(norm_sq);
+        q.w *= inv;
+        q.x *= inv;
+        q.y *= inv;
+        q.z *= inv;
+    }
+    // Conjugate (inverse for a unit quaternion) negates the vector part.
+    const math::Vec3 qv = MakeVec3(-q.x, -q.y, -q.z);
+    const math::Vec3 t = Scale(Cross3(qv, v), 2.0f);
+    return Add(v, Add(Scale(t, q.w), Cross3(qv, t)));
+}
+
+// Deterministic fixed-pivot (unpivoted) 6x6 LDL^T solve of A x = b, with A SPD.
+// Mirrors FactorArticulationInertiaMKernel's LDL^T + kMinDiagonal floor exactly
+// (no atomics, fixed order) so determinism (D1) holds. A is overwritten with its
+// factor in local scratch; A itself (caller's buffer) is untouched.
+__device__ void Solve6x6Ldlt(const float* matrix, const float* rhs, float* out) {
+    float a[36];
+    for (uint32_t i = 0u; i < 36u; ++i) {
+        a[i] = matrix[i];
+    }
+    float d[6];
+    for (uint32_t j = 0u; j < 6u; ++j) {
+        float djj = a[j * 6u + j];
+        for (uint32_t k = 0u; k < j; ++k) {
+            djj -= a[j * 6u + k] * a[j * 6u + k] * d[k];
+        }
+        if (djj < kMinDiagonal) {
+            djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
+        }
+        d[j] = djj;
+        for (uint32_t i = j + 1u; i < 6u; ++i) {
+            float lij = a[i * 6u + j];
+            for (uint32_t k = 0u; k < j; ++k) {
+                lij -= a[i * 6u + k] * a[j * 6u + k] * d[k];
+            }
+            a[i * 6u + j] = lij / djj;
+        }
+    }
+    // Forward solve L y = b.
+    float y[6];
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        float value = rhs[i];
+        for (uint32_t k = 0u; k < i; ++k) {
+            value -= a[i * 6u + k] * y[k];
+        }
+        y[i] = value;
+    }
+    // Diagonal solve D z = y.
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        y[i] /= d[i];
+    }
+    // Backward solve L^T x = z.
+    for (uint32_t ii = 6u; ii > 0u; --ii) {
+        const uint32_t i = ii - 1u;
+        float value = y[i];
+        for (uint32_t k = i + 1u; k < 6u; ++k) {
+            value -= a[k * 6u + i] * out[k];
+        }
+        out[i] = value;
+    }
+}
+
 __device__ void CopySpatialInertia(const LinkSpatialInertia& src,
                                    LinkArticulatedInertia* dst) {
     for (uint32_t i = 0u; i < 36u; ++i) {
@@ -377,6 +449,39 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
     const uint32_t count = state.articulation_link_count[articulation];
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
+
+        // T8a: free-floating root. Its 6-DOF spatial velocity IS state held in
+        // link_velocity[root] (integrated each step), so Pass-1 must NOT recompute
+        // and clobber it with the scalar-qdot formula (which would zero it). The
+        // root frame is the base body frame; xup[root] is identity (no parent
+        // joint), the subspace is conceptually I6 (handled by branching, not
+        // stored), velocity_bias = 0, and the bias force is the pure gyroscopic
+        // term p = v x* (I v) computed from the PRESERVED velocity.
+        if (state.parent_link[link] == kInvalidLink &&
+            state.joint_type[link] == ArticulationJointType::FloatingBase) {
+            state.link_xup[link] = MakeMotionTransform(Mat3Identity(),
+                                                       MakeVec3(0.0f, 0.0f, 0.0f));
+            Zero6(state.joint_motion_subspace[link].s);
+            CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
+
+            float velocity[6];
+            SpatialToArray(state.link_velocity[link], velocity);
+
+            float velocity_bias[6];
+            Zero6(velocity_bias);
+            ArrayToSpatial(velocity_bias, &state.link_velocity_bias[link]);
+
+            float inertia_velocity[6];
+            Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
+            float bias_force[6];
+            ForceCross(velocity, inertia_velocity, bias_force);
+            ArrayToForce(bias_force, &state.link_bias_force[link]);
+            state.joint_diagonal[link] = 0.0f;
+            state.joint_force[link] = 0.0f;
+            Zero6(state.link_u_spatial[link].p);
+            continue;
+        }
+
         state.link_xup[link] = JointTransform(state, link);
         MotionSubspaceForJoint(state.joint_type[link],
                                state.joint_axis[link],
@@ -430,6 +535,21 @@ __global__ void AbaPass2ArticulatedInertiaKernel(ArticulationDeviceState state) 
     const uint32_t count = state.articulation_link_count[articulation];
     for (uint32_t reverse = count; reverse > 0u; --reverse) {
         const uint32_t link = offset + reverse - 1u;
+
+        // T8a: free-floating root. Children have already accumulated their
+        // reduced articulated inertia into Ia[root] and their bias force into
+        // bias_force[root] (the leaf->root order guarantees the root is last).
+        // The base 6x6 articulated inertia is Ia[root] itself: there is no scalar
+        // joint U/D rank-1 reduction and (as for any root) no parent propagation.
+        // Pass-3 solves a_base = Ia[root]^-1 (-p[root]) directly.
+        if (state.parent_link[link] == kInvalidLink &&
+            state.joint_type[link] == ArticulationJointType::FloatingBase) {
+            Zero6(state.link_u_spatial[link].p);
+            state.joint_diagonal[link] = 0.0f;
+            state.joint_force[link] = 0.0f;
+            continue;
+        }
+
         float u_spatial[6];
         Mat66MulVec6(state.link_articulated_I[link].Ia,
                      state.joint_motion_subspace[link].s,
@@ -501,6 +621,46 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
     const uint32_t count = state.articulation_link_count[articulation];
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
+
+        // T8a: free-floating root. Treat the base as a 6-DOF joint (S = I6) with
+        // the world (parent) acceleration seeded to the Featherstone gravity
+        // pseudo-acceleration a_grav = GravityAcceleration(gravity_z) (the same
+        // (0,0,-gravity_z) the FIXED base propagates to its children). For the
+        // 6-DOF base joint:
+        //   qddot_0 = (Ia)^-1 (-p_0)  -  a_grav            (base generalized accel)
+        //   a_0     = a_grav + qddot_0 = (Ia)^-1 (-p_0)    (SPATIAL accel for kids)
+        // so:
+        //   * link_acceleration[root] stores the APPARENT spatial accel a_0 =
+        //     (Ia)^-1(-p): this is what the existing child TransformMotion
+        //     propagation consumes, and it is the gravity-frame accel (at rest in
+        //     free fall a_0 = 0, so the legs feel zero apparent accel and stay
+        //     put -- physically a free-falling robot's joints do not move).
+        //   * the base VELOCITY is integrated with the REAL accel qddot_0 =
+        //     a_0 - a_grav (computed in IntegrateFloatingBaseVelocityKernel, which
+        //     re-derives a_grav from gravity_z + base_pose), so at rest the base
+        //     falls at the real g (qddot_0 = -a_grav = (0,0,gravity_z)).
+        // Gravity thus enters exactly ONCE, with the CORRECT sign for both the
+        // base free-fall and the children -- verified by the free-fall test
+        // (a_base ~ (0,0,gravity_z), CoM drop ~ 1/2 |g| t^2). p_0 carries ONLY the
+        // velocity-product / children bias force (no gravity), so in zero-g
+        // a_0 = (Ia)^-1(-p) is pure momentum coupling.
+        if (state.parent_link[link] == kInvalidLink &&
+            state.joint_type[link] == ArticulationJointType::FloatingBase) {
+            float neg_p[6];
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                neg_p[i] = -state.link_bias_force[link].p[i];
+            }
+            float a_free[6];
+            Zero6(a_free);
+            Solve6x6Ldlt(state.link_articulated_I[link].Ia, neg_p, a_free);
+            // a_0 (apparent spatial accel) = (Ia)^-1(-p), NO gravity seed: children
+            // propagate from this, and the velocity integrator subtracts a_grav.
+            ArrayToAccel(a_free, &state.link_acceleration[link]);
+            state.qddot[link] = 0.0f;
+            (void)gravity_z;
+            continue;
+        }
+
         float parent_accel[6];
         const uint32_t parent = state.parent_link[link];
         if (parent != kInvalidLink) {
@@ -561,6 +721,121 @@ __global__ void IntegratePositionArticulationKernel(ArticulationDeviceState stat
         return;
     }
     state.q[link] += state.qdot[link] * dt;
+}
+
+// T8a: forward quaternion rotation v' = R(q) v (w-first Hamilton), __device__.
+__device__ math::Vec3 RotateByQuatForward(math::Quat q, math::Vec3 v) {
+    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (norm_sq > 1.0e-12f) {
+        const float inv = rsqrtf(norm_sq);
+        q.w *= inv;
+        q.x *= inv;
+        q.y *= inv;
+        q.z *= inv;
+    }
+    const math::Vec3 qv = MakeVec3(q.x, q.y, q.z);
+    const math::Vec3 t = Scale(Cross3(qv, v), 2.0f);
+    return Add(v, Add(Scale(t, q.w), Cross3(qv, t)));
+}
+
+// T8a: Hamilton quaternion product (w-first), __device__.
+__device__ math::Quat QuatMulForward(math::Quat a, math::Quat b) {
+    math::Quat out;
+    out.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    out.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    out.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    out.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    return out;
+}
+
+__device__ math::Quat QuatNormalizeForward(math::Quat q) {
+    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (norm_sq < 1.0e-24f) {
+        // Identity constructed by field assignment (math::Quat::Identity() is a
+        // constexpr __host__ helper and cannot be called from __device__ code).
+        math::Quat identity;
+        identity.w = 1.0f;
+        identity.x = 0.0f;
+        identity.y = 0.0f;
+        identity.z = 0.0f;
+        return identity;
+    }
+    const float inv = rsqrtf(norm_sq);
+    q.w *= inv;
+    q.x *= inv;
+    q.y *= inv;
+    q.z *= inv;
+    return q;
+}
+
+// T8a: floating-base velocity update. One block per articulation, lane 0.
+// link_acceleration[root] holds the APPARENT (gravity-frame) spatial accel a_0 =
+// (Ia)^-1(-p) that Pass-3 stored for child propagation. The REAL base
+// generalized acceleration is qddot_0 = a_0 - a_grav, where a_grav is the
+// Featherstone gravity pseudo-acceleration (0,0,-gravity_z) rotated into the
+// base body frame. We integrate the REAL accel so the base falls at the correct
+// signed g (at rest a_0 = 0 => qddot_0 = -a_grav = (0,0,gravity_z) in world).
+// Non-floating roots are left untouched (their scalar DOFs integrate elsewhere).
+__global__ void IntegrateFloatingBaseVelocityKernel(ArticulationDeviceState state,
+                                                    float dt,
+                                                    float gravity_z) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (articulation >= state.articulation_count || lane != 0u) {
+        return;
+    }
+    const uint32_t root = state.articulation_link_offset[articulation];
+    if (state.parent_link[root] != kInvalidLink ||
+        state.joint_type[root] != ArticulationJointType::FloatingBase) {
+        return;
+    }
+    // Body-frame gravity pseudo-accel a_grav: world (0,0,-gravity_z) on the linear
+    // axes, rotated by the inverse base orientation. Angular part is 0.
+    float g_world_arr[6];
+    GravityAcceleration(gravity_z, g_world_arr);
+    const math::Quat base_rot = state.base_pose[articulation].rotation;
+    const math::Vec3 g_body =
+        RotateByQuatInverse(base_rot, MakeVec3(g_world_arr[3], g_world_arr[4],
+                                               g_world_arr[5]));
+    float a_grav[6] = {0.0f, 0.0f, 0.0f, g_body.x, g_body.y, g_body.z};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        const float real_accel = state.link_acceleration[root].a[i] - a_grav[i];
+        state.link_velocity[root].v[i] += real_accel * dt;
+    }
+}
+
+// T8a: floating-base pose update. One block per articulation, lane 0. The base
+// spatial velocity is body-frame [omega(0:3), v_lin(3:6)]:
+//   position += R(base_rot) * v_lin * dt   (rotate body-frame linear vel to world)
+//   base_rot  = normalize(base_rot (x) dq), dq = (1, 0.5*omega*dt)  (first order)
+// Stable first-order quaternion integration with renormalization each step.
+__global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
+                                                float dt) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (articulation >= state.articulation_count || lane != 0u) {
+        return;
+    }
+    const uint32_t root = state.articulation_link_offset[articulation];
+    if (state.parent_link[root] != kInvalidLink ||
+        state.joint_type[root] != ArticulationJointType::FloatingBase) {
+        return;
+    }
+    const float* v = state.link_velocity[root].v;
+    math::Transform pose = state.base_pose[articulation];
+
+    const math::Vec3 v_lin_body = MakeVec3(v[3], v[4], v[5]);
+    const math::Vec3 v_lin_world = RotateByQuatForward(pose.rotation, v_lin_body);
+    pose.position = Add(pose.position, Scale(v_lin_world, dt));
+
+    math::Quat dq;
+    dq.w = 1.0f;
+    dq.x = 0.5f * v[0] * dt;
+    dq.y = 0.5f * v[1] * dt;
+    dq.z = 0.5f * v[2] * dt;
+    pose.rotation = QuatNormalizeForward(QuatMulForward(pose.rotation, dq));
+
+    state.base_pose[articulation] = pose;
 }
 
 __global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
@@ -679,6 +954,39 @@ void LaunchIntegratePositionArticulationKernels(const phi::DeviceContext& contex
     CheckCuda(cudaGetLastError(), "IntegratePositionArticulationKernel launch");
 }
 
+// T8a: floating-base integrators are per-articulation (lane-0) kernels like the
+// ABA Pass kernels, so the grid is articulation_count -- NOT total_link_count.
+// Both kernels early-return for non-floating roots, so launching them
+// unconditionally leaves the fixed-base path byte-for-byte untouched.
+void LaunchIntegrateFloatingBaseVelocityKernels(const phi::DeviceContext& context,
+                                                ArticulationDeviceState state,
+                                                float dt,
+                                                float gravity_z) {
+    if (state.articulation_count == 0u || dt <= 0.0f) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    IntegrateFloatingBaseVelocityKernel<<<state.articulation_count, kAbaBlockSize, 0u, stream>>>(
+        state, dt, gravity_z);
+    CheckCuda(cudaGetLastError(), "IntegrateFloatingBaseVelocityKernel launch");
+}
+
+void LaunchIntegrateFloatingBasePoseKernels(const phi::DeviceContext& context,
+                                            ArticulationDeviceState state,
+                                            float dt) {
+    if (state.articulation_count == 0u || dt <= 0.0f) {
+        return;
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    IntegrateFloatingBasePoseKernel<<<state.articulation_count, kAbaBlockSize, 0u, stream>>>(
+        state, dt);
+    CheckCuda(cudaGetLastError(), "IntegrateFloatingBasePoseKernel launch");
+}
+
 void FeatherstoneAba::ApplyPositionDrives(const phi::DeviceContext& context,
                                           ArticulationDeviceState state,
                                           const float* drive_targets,
@@ -715,6 +1023,19 @@ void FeatherstoneAba::IntegratePosition(const phi::DeviceContext& context,
                                         ArticulationDeviceState state,
                                         float dt) {
     LaunchIntegratePositionArticulationKernels(context, state, dt);
+}
+
+void FeatherstoneAba::IntegrateFloatingBaseVelocity(const phi::DeviceContext& context,
+                                                    ArticulationDeviceState state,
+                                                    float dt,
+                                                    float gravity_z) {
+    LaunchIntegrateFloatingBaseVelocityKernels(context, state, dt, gravity_z);
+}
+
+void FeatherstoneAba::IntegrateFloatingBasePose(const phi::DeviceContext& context,
+                                                ArticulationDeviceState state,
+                                                float dt) {
+    LaunchIntegrateFloatingBasePoseKernels(context, state, dt);
 }
 
 } // namespace nuka::runtime::articulation

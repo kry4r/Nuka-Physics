@@ -80,6 +80,8 @@ __device__ uint32_t JointDofCount(ArticulationJointType type) {
             return 1u;
         case ArticulationJointType::Fixed:
             return 0u;
+        case ArticulationJointType::FloatingBase:
+            return 6u;  // T8a: free-floating root contributes 6 DOF.
     }
     return 0u;
 }

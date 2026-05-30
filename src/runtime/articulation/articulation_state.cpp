@@ -189,6 +189,7 @@ ArticulationDeviceState ArticulationDeviceBuffers::View() {
     state.link_local_pose = static_cast<math::Transform*>(link_local_pose.Data());
     state.link_inertial_frame =
         static_cast<math::Transform*>(link_inertial_frame.Data());
+    state.base_pose = static_cast<math::Transform*>(base_pose.Data());
     state.q = static_cast<float*>(q.Data());
     state.qdot = static_cast<float*>(qdot.Data());
     state.qddot = static_cast<float*>(qddot.Data());
@@ -289,6 +290,20 @@ ArticulationHostState BuildArticulationHostState(
 
         result.articulation_link_offset.push_back(global_offset);
         result.articulation_link_count.push_back(link_count);
+
+        // T8a: seed the live base pose from the root link's cook pose. The root
+        // is local_link 0 (the cooker emits the root first). For a fixed root
+        // this value is never read; for a floating root the first FK before any
+        // integration step must match the static cook seed, so initialize it to
+        // the same pose the FK would otherwise read from link_pose[root].
+        {
+            const scene::BodyId root_body = topology.link_bodies.empty()
+                ? scene::kInvalidBody
+                : topology.link_bodies[0];
+            result.base_pose.push_back(root_body == scene::kInvalidBody
+                ? math::Transform::Identity()
+                : PoseForBody(bodies, root_body));
+        }
 
         for (uint32_t local_link = 0u; local_link < link_count; ++local_link) {
             const float mass = MassForBody(bodies, topology, local_link);
@@ -431,6 +446,9 @@ ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState
                      &result.articulation_link_offset);
     // articulation_link_count is a count (no index), so plain tiling.
     TileConcat(base.articulation_link_count, env_count, &result.articulation_link_count);
+    // base_pose is a per-articulation pose carrying no cross-replica index (the
+    // root's world pose is identical for every replica), so plain value tiling.
+    TileConcat(base.base_pose, env_count, &result.base_pose);
 
     return result;
 }
@@ -453,6 +471,7 @@ ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& cont
     result.link_pose = UploadVector(host_state.link_pose);
     result.link_local_pose = UploadVector(host_state.link_local_pose);
     result.link_inertial_frame = UploadVector(host_state.link_inertial_frame);
+    result.base_pose = UploadVector(host_state.base_pose);
     result.q = UploadVector(host_state.q);
     result.qdot = UploadVector(host_state.qdot);
     result.qddot = UploadVector(host_state.qddot);
@@ -496,6 +515,7 @@ void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
     DownloadVector(device_state.link_pose, &host_state->link_pose);
     DownloadVector(device_state.link_local_pose, &host_state->link_local_pose);
     DownloadVector(device_state.link_inertial_frame, &host_state->link_inertial_frame);
+    DownloadVector(device_state.base_pose, &host_state->base_pose);
     DownloadVector(device_state.q, &host_state->q);
     DownloadVector(device_state.qdot, &host_state->qdot);
     DownloadVector(device_state.qddot, &host_state->qddot);
