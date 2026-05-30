@@ -89,6 +89,49 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 out->dtype = 0u;
                 return NUKA_RESULT_OK;
             }
+            if (field == NUKA_FIELD_LINK_VELOCITY) {
+                // READ-only per-link spatial velocity, env-major, SAME indexing
+                // as ARTICULATION_LINK_POSE (element_count == env_count*
+                // base_link_count; env e's root == element e*base_link_count).
+                // Each element is a LinkSpatialVel == 6 floats [wx,wy,wz, vx,vy,vz]
+                // (omega-first). The ROOT slot is the live floating-base spatial
+                // velocity in the ROOT-LINK BODY frame (already body-local; written
+                // post-integrate AND post-contact each Step, so no link_pose-style
+                // lag). Non-root slots are Featherstone per-link-local velocities
+                // and are not the policy observation (see nuka.h).
+                const auto state = batched.View();
+                out->device_ptr = state.link_velocity;
+                out->element_count = state.total_link_count;
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(
+                        sizeof(nuka::runtime::articulation::LinkSpatialVel));
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_DRIVE_STIFFNESS ||
+                field == NUKA_FIELD_DRIVE_DAMPING ||
+                field == NUKA_FIELD_DRIVE_FORCE_LIMIT) {
+                // WRITABLE views aliasing the live per-env PD GAIN buffers that
+                // batched_step_params.{drive_stiffness,drive_damping,
+                // drive_force_limits} point at. Writing them in place is picked up
+                // by the NEXT nuka_world_step. Same layout as DRIVE_TARGET:
+                // float[env_count*base_link_count], env-major. Only actuated links
+                // (slots 1..12) use their gains; root/slot-0 is a no-op.
+                const nuka::phi::Buffer& gains =
+                    (field == NUKA_FIELD_DRIVE_STIFFNESS)
+                        ? record->batched_drive_stiffness_device
+                        : (field == NUKA_FIELD_DRIVE_DAMPING)
+                              ? record->batched_drive_damping_device
+                              : record->batched_drive_force_limits_device;
+                if (gains.Size() == 0u) {
+                    return NUKA_RESULT_NOT_SUPPORTED;
+                }
+                out->device_ptr = const_cast<void*>(gains.Data());
+                out->element_count = gains.Size() / sizeof(float);
+                out->element_stride_bytes = sizeof(float);
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
             if (field == NUKA_FIELD_CONTACT_POINTS) {
                 // Vec3 (3 floats) per contact slot; slot_count == env_count *
                 // kMaxFootContactsPerEnv. Inactive slots are zero (see T2 doc).

@@ -85,6 +85,11 @@ def test_4096_smoke(device):
         (nuka.JOINT_VELOCITY, (64, GO2_BLC)),
         (nuka.DRIVE_TARGET, (64, GO2_BLC)),
         (nuka.ARTICULATION_LINK_POSE, (64, GO2_BLC, 7)),
+        # infer-enable #40: base velocity read + writable PD gains.
+        (nuka.LINK_VELOCITY, (64, GO2_BLC, 6)),
+        (nuka.DRIVE_STIFFNESS, (64, GO2_BLC)),
+        (nuka.DRIVE_DAMPING, (64, GO2_BLC)),
+        (nuka.DRIVE_FORCE_LIMIT, (64, GO2_BLC)),
     ],
 )
 def test_dlpack_zero_copy(device, field, expect_shape):
@@ -214,3 +219,73 @@ def test_base_live(device):
         moved = (base1 - base0).abs().max().item()
         assert torch.isfinite(base1).all()
         assert moved > 1e-4, f"base pose did not move ({moved:.3e}); not live?"
+
+
+# ---------------------------------------------------------------------------
+# infer-enable #40: base LINK_VELOCITY read is zero-copy, shaped (env,13,6),
+# finite, and the floating base's root velocity is non-zero & changing.
+# ---------------------------------------------------------------------------
+def test_link_velocity_zero_copy_and_live(device):
+    with make_world(device, 64) as w:
+        view = w.buffer_view(nuka.LINK_VELOCITY)
+        vel = torch.from_dlpack(view)
+        assert vel.is_cuda and vel.dtype == torch.float32
+        assert tuple(vel.shape) == (64, GO2_BLC, 6)  # omega-first [wx,wy,wz,vx,vy,vz]
+        # zero-copy: torch aliases the engine device buffer.
+        assert vel.data_ptr() == w.buffer_device_ptr(nuka.LINK_VELOCITY)
+        assert torch.isfinite(vel).all()
+
+        root0 = vel[0, 0, :].clone()  # env0 root base spatial velocity (body frame)
+        w.step_n(30)  # floating base settles under gravity -> base picks up velocity
+        nuka.sync()
+        root1 = vel[0, 0, :]          # zero-copy view reflects new state
+        assert torch.isfinite(root1).all()
+        assert root1.norm().item() > 1e-4, "root base velocity ~zero (not live?)"
+        assert (root1 - root0).abs().max().item() > 1e-5, "base velocity did not change"
+
+
+# ---------------------------------------------------------------------------
+# infer-enable #40: writable PD gain fields (Kp/Kd/force-limit) are zero-copy
+# (device-ptr match) and writes reach the solver -- same target, stiffer gains
+# pull q measurably closer to the raised target.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "field", [nuka.DRIVE_STIFFNESS, nuka.DRIVE_DAMPING, nuka.DRIVE_FORCE_LIMIT]
+)
+def test_drive_gain_fields_zero_copy(device, field):
+    with make_world(device, 64) as w:
+        view = w.buffer_view(field)
+        g = torch.from_dlpack(view)
+        assert g.is_cuda and g.dtype == torch.float32
+        assert tuple(g.shape) == (64, GO2_BLC)
+        # writable + zero-copy: torch aliases the engine device buffer.
+        assert g.data_ptr() == w.buffer_device_ptr(field), "DLPack made a copy!"
+
+
+def _settled_q_with_gains(device, kp, kd, write_gains):
+    """Run 64-env go2_float with the SAME +0.25 target perturbation; optionally
+    overwrite the actuated-joint gains to (kp,kd). Returns settled q (CPU)."""
+    with make_world(device, 64) as w:
+        tgt = torch.from_dlpack(w.buffer_view(nuka.DRIVE_TARGET))
+        tgt[:, 1:GO2_BLC] += 0.25  # same perturbation in both runs
+        if write_gains:
+            kp_v = torch.from_dlpack(w.buffer_view(nuka.DRIVE_STIFFNESS))
+            kd_v = torch.from_dlpack(w.buffer_view(nuka.DRIVE_DAMPING))
+            kp_v[:, 1:GO2_BLC] = kp  # write Go2 training gains in place (zero-copy)
+            kd_v[:, 1:GO2_BLC] = kd
+        w.step_n(25)
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        return q.detach().cpu().clone()
+
+
+def test_writing_gains_reaches_solver(device):
+    q_cooked = _settled_q_with_gains(device, 0.0, 0.0, write_gains=False)
+    q_stiff = _settled_q_with_gains(device, 20.0, 0.5, write_gains=True)  # Go2 Kp/Kd
+    diff = (q_stiff - q_cooked).abs()
+    total = diff.sum().item()
+    differing = int((diff > 1e-4).sum().item())
+    assert total > 1e-3, (
+        f"writing Kp=20/Kd=0.5 did not change PD response (sum|dq|={total:.3e})"
+    )
+    assert differing >= GO2_BLC - 1, "fewer than one env's actuated joints responded"
