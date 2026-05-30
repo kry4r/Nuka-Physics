@@ -396,12 +396,37 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
         }
     }
 
+    // T8b: floating-base leading 6x6 block. For a free root the motion subspace is
+    // S_base = I6 (six columns), so the leading block of M is exactly the whole-tree
+    // composite spatial inertia in the root/body frame: M[0:6][0:6] = composite[root].I.
+    // (Ic[root] was just accumulated by the leaf->root composite loop above.) This is
+    // the same body-frame, origin-referenced inertia ABA's Solve6x6Ldlt factors in
+    // T8a, less the articulated reduction. Gated on FloatingBase; a fixed root never
+    // enters here so M stays byte-identical for the fixed-base path.
+    const bool floating_root =
+        (count > 0u) &&
+        (state.parent_link[offset] == kInvalidLink) &&
+        (state.joint_type[offset] == ArticulationJointType::FloatingBase);
+    if (floating_root && max_dof >= 6u) {
+        const float* const root_I = composite[offset].I;
+        for (uint32_t r = 0u; r < 6u; ++r) {
+            for (uint32_t c = 0u; c < 6u; ++c) {
+                M[static_cast<size_t>(r) * max_dof + c] = root_I[r * 6u + c];
+            }
+        }
+    }
+
     // For each non-fixed joint i: F = Ic_i S_i (force in i's frame). M[i][i] =
     // S_i^T F. Then walk to the root pushing F up by X^T at each step; at every
     // non-fixed ancestor j, M[i][j] = M[j][i] = S_j^T F (F now in j's frame).
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         if (JointDofCountDevice(state.joint_type[link]) == 0u) {
+            continue;
+        }
+        // T8b: the floating root's leading block is filled above (S_base = I6); skip
+        // it here -- the scalar S_i path is meaningless for the 6-DOF base.
+        if (local == 0u && floating_root) {
             continue;
         }
         const uint32_t dof_i = LocalDofIndex(state, offset, link);
@@ -436,6 +461,22 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
             }
             const uint32_t dof_j = LocalDofIndex(state, offset, walk);
             if (dof_j >= max_dof) {
+                continue;
+            }
+            // T8b: base<->joint coupling. When the up-walk reaches the floating
+            // root, S_base = I6 means the coupling between joint i and base DOF b is
+            // exactly F[b] (F is now expressed in the root/body frame, identical to
+            // link_velocity[root] and the M base block). Write all 6 components and
+            // their symmetric transpose. (link_xup[root] is identity for the floating
+            // root, so F arrives in the root frame unchanged.)
+            if (walk == offset && floating_root) {
+                for (uint32_t b = 0u; b < 6u; ++b) {
+                    if (b >= max_dof) {
+                        break;
+                    }
+                    M[static_cast<size_t>(dof_i) * max_dof + b] = force[b];
+                    M[static_cast<size_t>(b) * max_dof + dof_i] = force[b];
+                }
                 continue;
             }
             const float entry = Dot6Local(state.joint_motion_subspace[walk].s, force);
@@ -708,12 +749,30 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     const uint32_t count = state.articulation_link_count[articulation];
 
     // dof_to_link[k] = global link of the k-th DOF (base-inclusive prefix sum).
+    // T8b: a FloatingBase root expands into its 6 component DOFs (columns 0..5 ->
+    // root link, sub-component 0..5), which live in link_velocity[root].v[0..5]
+    // (omega-first), NOT in state.qdot. dof_to_component[k] tags each working DOF:
+    // a value < 6 is base component k; kInvalidLink marks a scalar joint DOF held
+    // in state.qdot[link]. The expansion is gated on FloatingBase, so a fixed root
+    // yields the exact same one-entry-per-link map as before (byte-identical solve).
     uint32_t dof_to_link[kMaxContactSolverDof];
+    uint32_t dof_to_component[kMaxContactSolverDof];
     uint32_t dof = 0u;
     for (uint32_t local = 0u; local < count && dof < kMaxContactSolverDof; ++local) {
         const uint32_t link = offset + local;
-        if (JointDofCountDevice(state.joint_type[link]) != 0u) {
+        const ArticulationJointType type = state.joint_type[link];
+        if (local == 0u && state.parent_link[link] == kInvalidLink &&
+            type == ArticulationJointType::FloatingBase) {
+            for (uint32_t b = 0u; b < 6u && dof < kMaxContactSolverDof; ++b) {
+                dof_to_link[dof] = link;
+                dof_to_component[dof] = b;
+                ++dof;
+            }
+            continue;
+        }
+        if (JointDofCountDevice(type) != 0u) {
             dof_to_link[dof] = link;
+            dof_to_component[dof] = kInvalidLink;
             ++dof;
         }
     }
@@ -721,10 +780,15 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
         return;
     }
 
-    // Working joint-velocity vector, seeded from qdot_free (current state.qdot).
+    // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
+    // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
     float qdot_work[kMaxContactSolverDof];
     for (uint32_t k = 0u; k < dof; ++k) {
-        qdot_work[k] = state.qdot[dof_to_link[k]];
+        if (dof_to_component[k] != kInvalidLink) {
+            qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
+        } else {
+            qdot_work[k] = state.qdot[dof_to_link[k]];
+        }
     }
 
     const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
@@ -924,9 +988,17 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     }
 #endif
 
-    // Write the corrected joint velocity back for every DOF of the articulation.
+    // Write the corrected velocity back for every DOF of the articulation. Base
+    // DOFs go to link_velocity[root].v[component] -- this is the coupling that makes
+    // contacts push the floating base, and it feeds the post-contact pose
+    // integrator (IntegrateFloatingBasePose reads link_velocity[root]). Scalar joint
+    // DOFs go to state.qdot[link] as before.
     for (uint32_t k = 0u; k < dof; ++k) {
-        state.qdot[dof_to_link[k]] = qdot_work[k];
+        if (dof_to_component[k] != kInvalidLink) {
+            state.link_velocity[dof_to_link[k]].v[dof_to_component[k]] = qdot_work[k];
+        } else {
+            state.qdot[dof_to_link[k]] = qdot_work[k];
+        }
     }
 
     // Persist this step's impulses for the next step's warm start.
