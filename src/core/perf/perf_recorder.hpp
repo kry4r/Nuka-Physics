@@ -46,6 +46,16 @@ public:
     // Clears all recorded tags and samples.
     void Reset();
 
+    // Opt-in fine-grained ("detail") instrumentation gate. OFF by default so the
+    // production step path pays nothing for the deep per-sub-stage timers: a
+    // NUKA_CUDA_TIME_DETAIL scope created against a recorder with detail OFF
+    // creates NO CUDA events and issues NO cudaEventRecord / cudaEventSynchronize
+    // (see ScopedCudaTimer). Profiling harnesses flip it on to capture the full
+    // Σ(sub-stages) breakdown. The coarse canonical-tag scopes (NUKA_CUDA_TIME)
+    // are unaffected by this flag.
+    void SetDetailEnabled(bool enabled) { detail_enabled_ = enabled; }
+    bool DetailEnabled() const { return detail_enabled_; }
+
     // Number of distinct tags recorded.
     std::size_t TagCount() const { return order_.size(); }
 
@@ -78,6 +88,7 @@ private:
                                  double max_us);
 
     std::size_t window_ = kDefaultWindow;
+    bool detail_enabled_ = false;          // gate for NUKA_CUDA_TIME_DETAIL scopes
     std::unordered_map<std::string, TagData> tags_;
     std::vector<std::string> order_;       // insertion order of tags
 };

@@ -174,21 +174,30 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     core::perf::ScopedCudaTimer step_timer(perf_, "step_total", stream);
 
     // -- 1. Position drives -> tau, 2. ABA accelerations -> qddot. -----------
+    // The coarse `featherstone_aba` bucket is kept (canonical tag); the detail
+    // scopes split it into the drive pass and the 3-pass ABA accel solve so the
+    // hotspot wave can attribute the dominant cost. Detail scopes are no-ops
+    // (no CUDA events / syncs) unless Perf().SetDetailEnabled(true).
     {
         NUKA_CUDA_TIME(perf_, "featherstone_aba", stream);
         if (params.drive_targets != nullptr && params.drive_stiffness != nullptr &&
             params.drive_damping != nullptr && params.drive_force_limits != nullptr) {
+            NUKA_CUDA_TIME_DETAIL(perf_, "aba_apply_drives", stream);
             articulation::FeatherstoneAba::ApplyPositionDrives(
                 context_, state, params.drive_targets, params.drive_stiffness,
                 params.drive_damping, params.drive_force_limits);
         }
-        articulation::FeatherstoneAba::ComputeAccelerations(context_, state,
-                                                            params.gravity_z);
+        {
+            NUKA_CUDA_TIME_DETAIL(perf_, "aba_compute_accelerations", stream);
+            articulation::FeatherstoneAba::ComputeAccelerations(context_, state,
+                                                                params.gravity_z);
+        }
     }
 
     // -- 3. Velocity-integrate qdot += qddot*dt. ----------------------------
     {
         NUKA_CUDA_TIME(perf_, "integrator", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "integrate_velocity", stream);
         articulation::FeatherstoneAba::IntegrateVelocity(context_, state, params.dt);
         // T8a: floating-base velocity integrate (link_velocity[root] += real
         // base accel * dt, where the real accel subtracts the gravity seed from
@@ -206,11 +215,13 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // current q each step for the contact geometry to be correct.
     {
         NUKA_CUDA_TIME(perf_, "contact_generation", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "update_world_poses", stream);
         articulation::UpdateWorldLinkPoses(
             context_, state, static_cast<Transform*>(world_pose_.Data()));
     }
     {
         NUKA_CUDA_TIME(perf_, "buffer_mgmt", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "link_pose_refresh_copy", stream);
         phi::ScopedDeviceGuard guard(context_.device_id);
         CheckCuda(cudaMemcpyAsync(
                       state.link_pose, world_pose_.Data(),
@@ -222,6 +233,7 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // -- 5. Detect foot-vs-ground contacts. ---------------------------------
     {
         NUKA_CUDA_TIME(perf_, "contact_generation", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "detect_foot_contacts", stream);
         articulation::DetectFootGroundContacts(
             context_, static_cast<const Transform*>(world_pose_.Data()),
             static_cast<const articulation::FootShape*>(feet_.Data()), foot_count_,
@@ -236,47 +248,60 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // -- 6. Tangent basis + chain Jacobians (normal, t1, t2). ---------------
     {
         NUKA_CUDA_TIME(perf_, "row_builder", stream);
-        articulation::ComputeContactTangentBasis(
-            context_, static_cast<const uint32_t*>(contact_link_.Data()),
-            static_cast<const Vec3*>(contact_normal_.Data()), env_count_,
-            static_cast<Vec3*>(tangent1_.Data()),
-            static_cast<Vec3*>(tangent2_.Data()));
-        articulation::ComputeContactChainJacobians(
-            context_, state,
-            static_cast<const uint32_t*>(contact_link_.Data()),
-            static_cast<const Vec3*>(contact_point_.Data()),
-            static_cast<const Vec3*>(contact_normal_.Data()),
-            slot_count_, max_dof_, static_cast<float*>(jac_normal_.Data()));
-        articulation::ComputeContactChainJacobians(
-            context_, state,
-            static_cast<const uint32_t*>(contact_link_.Data()),
-            static_cast<const Vec3*>(contact_point_.Data()),
-            static_cast<const Vec3*>(tangent1_.Data()),
-            slot_count_, max_dof_, static_cast<float*>(jac_tangent1_.Data()));
-        articulation::ComputeContactChainJacobians(
-            context_, state,
-            static_cast<const uint32_t*>(contact_link_.Data()),
-            static_cast<const Vec3*>(contact_point_.Data()),
-            static_cast<const Vec3*>(tangent2_.Data()),
-            slot_count_, max_dof_, static_cast<float*>(jac_tangent2_.Data()));
+        {
+            NUKA_CUDA_TIME_DETAIL(perf_, "contact_tangent_basis", stream);
+            articulation::ComputeContactTangentBasis(
+                context_, static_cast<const uint32_t*>(contact_link_.Data()),
+                static_cast<const Vec3*>(contact_normal_.Data()), env_count_,
+                static_cast<Vec3*>(tangent1_.Data()),
+                static_cast<Vec3*>(tangent2_.Data()));
+        }
+        {
+            NUKA_CUDA_TIME_DETAIL(perf_, "chain_jacobians", stream);
+            articulation::ComputeContactChainJacobians(
+                context_, state,
+                static_cast<const uint32_t*>(contact_link_.Data()),
+                static_cast<const Vec3*>(contact_point_.Data()),
+                static_cast<const Vec3*>(contact_normal_.Data()),
+                slot_count_, max_dof_, static_cast<float*>(jac_normal_.Data()));
+            articulation::ComputeContactChainJacobians(
+                context_, state,
+                static_cast<const uint32_t*>(contact_link_.Data()),
+                static_cast<const Vec3*>(contact_point_.Data()),
+                static_cast<const Vec3*>(tangent1_.Data()),
+                slot_count_, max_dof_, static_cast<float*>(jac_tangent1_.Data()));
+            articulation::ComputeContactChainJacobians(
+                context_, state,
+                static_cast<const uint32_t*>(contact_link_.Data()),
+                static_cast<const Vec3*>(contact_point_.Data()),
+                static_cast<const Vec3*>(tangent2_.Data()),
+                slot_count_, max_dof_, static_cast<float*>(jac_tangent2_.Data()));
+        }
     }
 
     // -- 7. Joint-space inertia M and its inverse. --------------------------
     {
         NUKA_CUDA_TIME(perf_, "row_builder", stream);
-        articulation::ComputeArticulationInertiaM(
-            context_, state, max_dof_,
-            static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
-            static_cast<float*>(m_.Data()));
-        articulation::FactorArticulationInertiaM(
-            context_, state, max_dof_,
-            static_cast<const float*>(m_.Data()),
-            static_cast<float*>(m_inv_.Data()));
+        {
+            NUKA_CUDA_TIME_DETAIL(perf_, "crba_inertia_m", stream);
+            articulation::ComputeArticulationInertiaM(
+                context_, state, max_dof_,
+                static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
+                static_cast<float*>(m_.Data()));
+        }
+        {
+            NUKA_CUDA_TIME_DETAIL(perf_, "factor_inertia_m_inv", stream);
+            articulation::FactorArticulationInertiaM(
+                context_, state, max_dof_,
+                static_cast<const float*>(m_.Data()),
+                static_cast<float*>(m_inv_.Data()));
+        }
     }
 
     // -- 8. Effective mass for normal + t1 + t2 rows. -----------------------
     {
         NUKA_CUDA_TIME(perf_, "row_builder", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "contact_effective_mass", stream);
         articulation::ComputeContactEffectiveMass(
             context_, state, static_cast<const uint32_t*>(contact_link_.Data()),
             static_cast<const float*>(jac_normal_.Data()),
@@ -297,6 +322,7 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // -- 9. Assemble the contact rows. --------------------------------------
     {
         NUKA_CUDA_TIME(perf_, "row_builder", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "assemble_rows", stream);
         articulation::AssembleArticulatedContactRows(
             context_, state,
             static_cast<const uint32_t*>(contact_link_.Data()),
@@ -312,6 +338,7 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // -- 10. Solve the rows (fused apply Delta_qdot into qdot; lambda carry). -
     {
         NUKA_CUDA_TIME(perf_, "row_solver", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "solve_contact_rows", stream);
         articulation::SolveArticulatedContactRows(
             context_, state,
             static_cast<const articulation::ArticulatedContactRow*>(rows_.Data()),
@@ -326,6 +353,7 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // -- 11. Position-integrate q += qdot*dt. -------------------------------
     {
         NUKA_CUDA_TIME(perf_, "integrator", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "integrate_position", stream);
         articulation::FeatherstoneAba::IntegratePosition(context_, state, params.dt);
         // T8a: floating-base pose integrate (advance base_pose[articulation]).
         // No-op for fixed/kinematic roots; placed alongside the joint
