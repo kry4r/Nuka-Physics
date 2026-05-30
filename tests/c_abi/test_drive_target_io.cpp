@@ -166,7 +166,16 @@ TEST(DriveTargetIo, WriteMovesQTowardTargetAndReadsAreShaped) {
 
     const uint32_t kEnvCount = 16u;
     const uint32_t kSteps = 30u;
-    const float kDelta = 0.30f;  // rad perturbation added to every joint target.
+    // Small NEAR-LINEAR perturbation (rad) added to every joint target. This must
+    // stay small: a large nudge (e.g. +0.30) added to ALL 12 targets at once drives
+    // the planted fixed-base stance into a NONLINEAR contact-conflict regime where
+    // ground reaction pushes a handful of joints (here slots 2,4,8,10) BACKWARD,
+    // away from their raised target -- a property of CONTACT, not of the write path.
+    // The write-sign is what this gate tests, so we perturb in the near-linear band
+    // (sim-val #42 swept it: wrong-sign = 0 at delta <= 0.10 across ground seatings,
+    // and the +0.30 reversals appear only at large amplitude). 0.05 clears the 1e-4
+    // jitter floor on every actuated joint while keeping the response drive-dominated.
+    const float kDelta = 0.05f;
 
     // --- Establish the env-major layout from the q view. -------------------
     std::vector<float> q0;
