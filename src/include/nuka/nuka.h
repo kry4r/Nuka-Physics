@@ -92,7 +92,55 @@ typedef enum nuka_state_field_t {
     //                     convention). These are the only slots that respond to a
     //                     drive-target write and the only meaningful q/qd joint
     //                     entries.
-    NUKA_FIELD_DRIVE_TARGET = 6
+    NUKA_FIELD_DRIVE_TARGET = 6,
+    // READ (batched/multi-env path only). Per-LINK spatial velocity, env-major,
+    // with the SAME indexing as NUKA_FIELD_ARTICULATION_LINK_POSE:
+    // element_count == env_count * base_link_count, env e's base/root is element
+    // e*base_link_count (root == local link 0). Each element is 6 contiguous
+    // floats (24 bytes, element_stride_bytes == 6*sizeof(float)) in OMEGA-FIRST
+    // spatial order: [wx,wy,wz, vx,vy,vz] (angular 0..2, linear 3..5).
+    //
+    // FRAME (read carefully -- this is the load-bearing contract for the policy):
+    //   * ROOT / base slot (e*base_link_count, the floating-base trunk on
+    //     go2_float.usda): the 6-vector is the live base spatial velocity
+    //     expressed in the ROOT-LINK BODY frame -- it is ALREADY BODY-LOCAL, NOT
+    //     world. (Confirmed from the engine's floating-base integrator: the linear
+    //     part v[3..5] is rotated by R(base_rot) to obtain the world translation,
+    //     and the angular part v[0..2] right-multiplies the orientation as a
+    //     body-frame delta-quaternion. So no world->body rotation is needed; a
+    //     policy harness applies only its own fixed axis/scale remap, NOT a
+    //     world->body rotate -- doing both would double-rotate.) This root entry
+    //     is CURRENT after Step(): the floating-base velocity integrate and the
+    //     contact solve both write link_velocity[root] within the same Step, so
+    //     unlike ARTICULATION_LINK_POSE it carries NO one-step lag.
+    //   * NON-ROOT link slots (1..base_link_count-1): engine-internal Featherstone
+    //     per-link velocities expressed in each link's OWN local (Featherstone)
+    //     frame -- NOT body, NOT world. They are populated by the ABA pass and are
+    //     non-zero, but their exact timing/frame is an implementation detail and is
+    //     NOT a defined observation -- do NOT rely on them. They are exposed only
+    //     for index symmetry with ARTICULATION_LINK_POSE; only the ROOT slot is
+    //     meaningful for a floating-base base-velocity observation. (On a FIXED-
+    //     base scene the root carries no free 6-DOF velocity; use go2_float.usda
+    //     for a live base.)
+    NUKA_FIELD_LINK_VELOCITY = 7,
+    // WRITABLE (batched/multi-env path only). The per-env PD drive GAIN buffers
+    // the batched step reads every Step (BatchedArticulatedStepParams::
+    // drive_stiffness / drive_damping / drive_force_limits point straight at them).
+    // The view aliases the live device buffer so a caller may write it IN PLACE
+    // (zero-copy) and the NEXT nuka_world_step picks up the new gains -- IDENTICAL
+    // mechanism and layout to NUKA_FIELD_DRIVE_TARGET: float[env_count *
+    // base_link_count], env-major, index (env*base_link_count + link), stride
+    // sizeof(float). Per-env slot map matches DRIVE_TARGET: slot 0 = ROOT (not an
+    // actuated joint; its gain is a no-op), slots 1..12 = the 12 actuated leg
+    // joints. To drive a trained Go2 policy at its training PD gains, write
+    // STIFFNESS (Kp) = 20 and DAMPING (Kd) = 0.5 on slots 1..12 of every env.
+    //   STIFFNESS: per-joint proportional gain Kp (tau += Kp*(target - q)).
+    //   DAMPING  : per-joint derivative gain   Kd (tau -= Kd*qdot).
+    //   FORCE_LIMIT: per-joint symmetric torque clamp |tau| <= limit (Nm).
+    // Reads return the CURRENT gains (initially the cooked rest-hold gains).
+    NUKA_FIELD_DRIVE_STIFFNESS = 8,
+    NUKA_FIELD_DRIVE_DAMPING = 9,
+    NUKA_FIELD_DRIVE_FORCE_LIMIT = 10
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

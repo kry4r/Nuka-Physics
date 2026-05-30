@@ -188,9 +188,10 @@ FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle ow
                            ? (view.element_stride_bytes / sizeof(float))
                            : 1u;
 
-    if (field == NUKA_FIELD_ARTICULATION_LINK_POSE) {
-        // element_count == total_link_count; each element = 7 floats (Transform).
-        // shape (env_count, base_link_count, 7).
+    // Multi-float-per-link fields (fpe > 1): ARTICULATION_LINK_POSE (7 floats,
+    // Transform) and LINK_VELOCITY (6 floats, omega-first spatial velocity).
+    // element_count == env_count*base_link_count; shape (env, base_link, fpe).
+    if (fpe > 1u) {
         if ((size_t)ec * blc != view.element_count) {
             // Fall back to flat (shouldn't happen for go2).
             size_t shape[1] = {view.element_count * fpe};
@@ -202,7 +203,8 @@ FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle ow
                           nb::dtype<float>(), nb::device::cuda::value, dev_id);
     }
 
-    // q / qd / drive-target (and any future flat per-(env,link) field):
+    // q / qd / drive-target / drive-gains (and any future flat per-(env,link)
+    // field):
     // element_count == env_count*base_link_count, fpe == 1 -> shape (ec, blc).
     if (fpe == 1u && ec > 0u && (size_t)ec * blc == view.element_count) {
         size_t shape[2] = {ec, blc};
@@ -238,6 +240,10 @@ NB_MODULE(_nuka_ext, m) {
         .value("OBSERVATIONS", NUKA_FIELD_OBSERVATIONS)
         .value("CONTACT_POINTS", NUKA_FIELD_CONTACT_POINTS)
         .value("DRIVE_TARGET", NUKA_FIELD_DRIVE_TARGET)
+        .value("LINK_VELOCITY", NUKA_FIELD_LINK_VELOCITY)
+        .value("DRIVE_STIFFNESS", NUKA_FIELD_DRIVE_STIFFNESS)
+        .value("DRIVE_DAMPING", NUKA_FIELD_DRIVE_DAMPING)
+        .value("DRIVE_FORCE_LIMIT", NUKA_FIELD_DRIVE_FORCE_LIMIT)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -289,8 +295,12 @@ NB_MODULE(_nuka_ext, m) {
             },
             nb::arg("field"), nb::rv_policy::reference,
             "Return a zero-copy DLPack-capable CUDA float32 ndarray aliasing the "
-            "engine's live device buffer for `field`. DRIVE_TARGET is writable: "
-            "torch writes in place and the next step() applies the new targets.")
+            "engine's live device buffer for `field`. DRIVE_TARGET / "
+            "DRIVE_STIFFNESS / DRIVE_DAMPING / DRIVE_FORCE_LIMIT are WRITABLE: "
+            "torch writes in place and the next step() applies them. LINK_VELOCITY "
+            "is read-only, shape (env, base_link, 6), omega-first [wx,wy,wz,vx,vy,"
+            "vz]; the root slot is the live base spatial velocity in the root-link "
+            "body frame.")
         // Ergonomic alternative to raw DLPack writes: copy a host/device float
         // array into the DRIVE_TARGET buffer.
         .def(

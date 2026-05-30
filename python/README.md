@@ -91,8 +91,42 @@ binding change.
 | `JOINT_POSITION` | `(env_count, 13)` | no | q; slot 0 root, 1..12 actuated joints |
 | `JOINT_VELOCITY` | `(env_count, 13)` | no | qd |
 | `ARTICULATION_LINK_POSE` | `(env_count, 13, 7)` | no | world pose `[px,py,pz, qw,qx,qy,qz]` (quat **w-first**) |
+| `LINK_VELOCITY` | `(env_count, 13, 6)` | no | spatial velocity `[wx,wy,wz, vx,vy,vz]` (**omega-first**); see frame note below |
 | `DRIVE_TARGET` | `(env_count, 13)` | **yes** | per-env PD targets; next `step()` applies |
+| `DRIVE_STIFFNESS` | `(env_count, 13)` | **yes** | per-joint Kp; next `step()` applies (Go2 policy: 20 on slots 1..12) |
+| `DRIVE_DAMPING` | `(env_count, 13)` | **yes** | per-joint Kd; next `step()` applies (Go2 policy: 0.5 on slots 1..12) |
+| `DRIVE_FORCE_LIMIT` | `(env_count, 13)` | **yes** | per-joint symmetric torque clamp `|tau| <= limit` (Nm) |
 | `OBSERVATIONS` | -- | -- | not served on the batched path (engine returns NOT_SUPPORTED) |
+
+### `LINK_VELOCITY` frame (read carefully -- the policy contract)
+
+The **ROOT slot** (`vel[:, 0, :]`, the floating-base trunk on `go2_float.usda`)
+is the live base spatial velocity expressed in the **root-link BODY frame** --
+it is **already body-local, NOT world**. So a Go2 locomotion observation applies
+only its own fixed axis/scale remap to it, **not** a world->body rotation (doing
+both would double-rotate). It carries **no one-step lag** (unlike
+`ARTICULATION_LINK_POSE`): the floating-base velocity integrate and the contact
+solve both write it within the same `step()`. Order is **omega-first**:
+`[wx,wy,wz, vx,vy,vz]`.
+
+The **non-root slots** (`vel[:, 1:, :]`) are engine-internal Featherstone
+per-link velocities in each link's own local frame; they are non-zero but their
+exact timing/frame is an implementation detail and **not** a defined observation
+-- do not rely on them. They are exposed only for index symmetry with the link
+pose. Use `go2_float.usda` (not the fixed-base `go2_stand`, whose root has no
+free 6-DOF velocity) for a live base.
+
+### Driving a trained policy at its training gains
+
+```python
+kp = torch.from_dlpack(world.buffer_view(nuka.DRIVE_STIFFNESS))  # (env, 13)
+kd = torch.from_dlpack(world.buffer_view(nuka.DRIVE_DAMPING))
+kp[:, 1:13] = 20.0   # Go2 training Kp on the 12 actuated joints (in place)
+kd[:, 1:13] = 0.5    # Go2 training Kd
+vel = torch.from_dlpack(world.buffer_view(nuka.LINK_VELOCITY))    # (env, 13, 6)
+base_vel_body = vel[:, 0, :]   # [wx,wy,wz,vx,vy,vz], root-link body frame
+world.step()   # the next step uses the new gains
+```
 
 ## Layout metadata
 
@@ -108,14 +142,13 @@ export CUDA_VISIBLE_DEVICES=0
 ```
 
 Proves: import nuka+torch together (no ABI crash); DLPack device-ptr match
-(zero-copy); drive write -> q moves sign-correctly after step; bit-exact
-determinism; live floating base on `go2_float`.
+(zero-copy) for q/qd/pose/`DRIVE_TARGET`/`LINK_VELOCITY`/gain fields; drive write
+-> q moves sign-correctly after step; bit-exact determinism; live floating base
+and live root `LINK_VELOCITY` on `go2_float`; writing `DRIVE_STIFFNESS`/
+`DRIVE_DAMPING` (Kp=20/Kd=0.5) reaches the solver.
 
 ## Known C ABI gaps (flagged, not worked around)
 
 * No explicit `base_link_count` accessor -- derived as
   `element_count(JOINT_POSITION) / env_count`.
 * `OBSERVATIONS` is not served on the batched (multi-env) path.
-* Base *velocity* of the floating root is not exposed through the C ABI
-  (`link_velocity[root]` lives in the engine only) -- needed for a real Go2
-  locomotion obs vector. Surfacing it is an engine-side change.

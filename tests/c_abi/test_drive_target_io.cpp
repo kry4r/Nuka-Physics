@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -52,6 +53,17 @@ std::string ScenePath() {
 
 bool SceneAvailable() {
     return std::filesystem::exists(SourcePath("examples/scenes/go2_stand.usda"));
+}
+
+// infer-enable #40: the FLOATING-base Go2 (real free 6-DOF root) used by the
+// new LINK_VELOCITY + writable-gain gates. The fixed-base go2_stand has zero
+// base velocity by construction, so base-velocity must be read off go2_float.
+std::string Go2FloatScenePath() {
+    return SourcePath("examples/scenes/go2_float.usda").string();
+}
+
+bool Go2FloatSceneAvailable() {
+    return std::filesystem::exists(SourcePath("examples/scenes/go2_float.usda"));
 }
 
 struct DeviceGuard {
@@ -82,6 +94,17 @@ struct WorldGuard {
 nuka_result_t CreateWorld(nuka_device_handle device, uint32_t env_count,
                           nuka_world_handle* out) {
     const std::string scene = ScenePath();
+    nuka_world_desc_t desc{};
+    desc.scene_path = scene.c_str();
+    desc.env_count = env_count;
+    desc.fixed_dt = 1.0f / 240.0f;
+    return nuka_world_create_from_scene(device, &desc, out);
+}
+
+// infer-enable #40: floating-base world for the base-velocity + gain gates.
+nuka_result_t CreateFloatWorld(nuka_device_handle device, uint32_t env_count,
+                               nuka_world_handle* out) {
+    const std::string scene = Go2FloatScenePath();
     nuka_world_desc_t desc{};
     desc.scene_path = scene.c_str();
     desc.env_count = env_count;
@@ -371,4 +394,240 @@ TEST(DriveTargetIo, CppWrapperSetDriveTargets) {
     EXPECT_TRUE(AllFinite(q)) << "C++ wrapper SetDriveTargets q non-finite";
     std::printf("[diag] (4) C++ wrapper SetDriveTargets OK: targets=%zu q=%zu\n",
                 targets.size(), q.size());
+}
+
+// ---------------------------------------------------------------------------
+// infer-enable #40 -- LINK_VELOCITY read (floating base) + writable PD gains.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Reads the env0 root-link 6-vector spatial velocity from a LINK_VELOCITY view.
+// LINK_VELOCITY element = 6 floats [wx,wy,wz,vx,vy,vz] (omega-first), env-major,
+// SAME indexing as link pose -> env0 root is element 0.
+std::array<float, 6> RootLinkVelocityEnv0(nuka_world_handle world) {
+    auto lv = DownloadField(world, NUKA_FIELD_LINK_VELOCITY);
+    std::array<float, 6> v{};
+    if (lv.size() >= 6u) {
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            v[i] = lv[i];
+        }
+    }
+    return v;
+}
+
+float L2Norm6(const std::array<float, 6>& v) {
+    float s = 0.0f;
+    for (float x : v) {
+        s += x * x;
+    }
+    return std::sqrt(s);
+}
+
+}  // namespace
+
+// (5) LINK_VELOCITY read: a floating-base Go2 settling under gravity has a
+// non-zero, finite, CHANGING base spatial velocity. Layout/shape (6 floats per
+// link, env_count*base_link_count links) is asserted, mirroring DRIVE_TARGET's
+// layout gate but for the new read field.
+TEST(LinkVelocityIo, FloatingBaseRootVelocityIsNonZeroFiniteChanging) {
+    if (!Go2FloatSceneAvailable()) {
+        GTEST_SKIP() << "go2_float scene is not available";
+    }
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const uint32_t kEnvCount = 16u;
+    WorldGuard world;
+    ASSERT_EQ(CreateFloatWorld(device.handle, kEnvCount, &world.handle),
+              NUKA_RESULT_OK);
+
+    // Layout: element_count == env_count*base_link_count; stride 6 floats.
+    auto q0 = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
+    ASSERT_GT(q0.size(), 0u);
+    nuka_buffer_view_t lvv{};
+    ASSERT_EQ(nuka_world_get_buffer_view(world.handle, NUKA_FIELD_LINK_VELOCITY,
+                                         &lvv),
+              NUKA_RESULT_OK);
+    ASSERT_NE(lvv.device_ptr, nullptr);
+    EXPECT_EQ(lvv.element_count, q0.size());                 // links == q entries.
+    EXPECT_EQ(lvv.element_stride_bytes, 6u * sizeof(float)); // omega-first 6-vec.
+
+    // Whole velocity buffer is finite at rest (before stepping).
+    auto lv_rest = DownloadField(world.handle, NUKA_FIELD_LINK_VELOCITY);
+    ASSERT_EQ(lv_rest.size(), static_cast<size_t>(q0.size()) * 6u);
+    EXPECT_TRUE(AllFinite(lv_rest)) << "LINK_VELOCITY non-finite at rest";
+
+    // Step under gravity; the free trunk picks up downward (and settling) motion.
+    ASSERT_EQ(nuka_world_step_n(world.handle, 20u), NUKA_RESULT_OK);
+    const std::array<float, 6> v_a = RootLinkVelocityEnv0(world.handle);
+    ASSERT_EQ(nuka_world_step_n(world.handle, 10u), NUKA_RESULT_OK);
+    const std::array<float, 6> v_b = RootLinkVelocityEnv0(world.handle);
+
+    auto lv_full = DownloadField(world.handle, NUKA_FIELD_LINK_VELOCITY);
+    EXPECT_TRUE(AllFinite(lv_full)) << "LINK_VELOCITY non-finite after stepping";
+
+    // Non-zero: a falling/settling base has motion (assert the linear part, vz,
+    // is the dominant non-zero -- gravity pushes it; but accept the full norm).
+    const float norm_a = L2Norm6(v_a);
+    const float norm_b = L2Norm6(v_b);
+    EXPECT_GT(norm_a, 1e-4f) << "root base velocity is ~zero (floating base not moving?)";
+
+    // Changing: between two snapshots the base velocity differs (it is being
+    // integrated/contact-corrected each step, not a frozen constant).
+    float delta = 0.0f;
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        delta += std::fabs(v_b[i] - v_a[i]);
+    }
+    EXPECT_GT(delta, 1e-5f) << "root base velocity did not change between snapshots";
+
+    // Document (diagnostic) a NON-root link velocity slot for env0 -- the engine
+    // populates these in ABA Pass-1 (Featherstone-local frame); we report rather
+    // than over-assert, matching the nuka.h doc (root is the policy-relevant one).
+    float nonroot_norm = 0.0f;
+    if (lv_full.size() >= 12u) {  // link 1 of env0 = floats [6..11].
+        for (uint32_t i = 6u; i < 12u; ++i) {
+            nonroot_norm += lv_full[i] * lv_full[i];
+        }
+        nonroot_norm = std::sqrt(nonroot_norm);
+    }
+    std::printf("[diag] (5) LINK_VELOCITY: root|v|_a=%.5f |v|_b=%.5f changed=%.6f "
+                "| root v=[%.4f %.4f %.4f, %.4f %.4f %.4f] | nonroot(link1)|v|=%.5f\n",
+                static_cast<double>(norm_a), static_cast<double>(norm_b),
+                static_cast<double>(delta),
+                static_cast<double>(v_b[0]), static_cast<double>(v_b[1]),
+                static_cast<double>(v_b[2]), static_cast<double>(v_b[3]),
+                static_cast<double>(v_b[4]), static_cast<double>(v_b[5]),
+                static_cast<double>(nonroot_norm));
+}
+
+// (6) Writable PD gains reach the solver: with the SAME drive target, swapping
+// the cooked-soft gains for stiff training gains (Kp=20, Kd=0.5) changes the PD
+// response magnitude. Proves DRIVE_STIFFNESS / DRIVE_DAMPING writes alias the
+// live device buffers batched_step_params reads, exactly like DRIVE_TARGET.
+TEST(DriveGainsIo, WritingStiffnessAndDampingChangesPdResponse) {
+    if (!Go2FloatSceneAvailable()) {
+        GTEST_SKIP() << "go2_float scene is not available";
+    }
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const uint32_t kEnvCount = 16u;
+    const uint32_t kSteps = 25u;
+    const float kDelta = 0.25f;  // raise every joint target by this (same in both).
+
+    // Run with a chosen (Kp,Kd) on slots 1..12; return settled q. The drive
+    // target perturbation is IDENTICAL across runs -- only the gains differ.
+    auto run_with_gains = [&](float kp, float kd, bool write_gains,
+                              std::vector<float>* q_out) {
+        WorldGuard world;
+        ASSERT_EQ(CreateFloatWorld(device.handle, kEnvCount, &world.handle),
+                  NUKA_RESULT_OK);
+        const uint32_t blc =
+            static_cast<uint32_t>(
+                DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION).size() /
+                kEnvCount);
+        ASSERT_GT(blc, 0u);
+
+        // Same target perturbation in every run.
+        auto targets = DownloadField(world.handle, NUKA_FIELD_DRIVE_TARGET);
+        for (float& t : targets) {
+            t += kDelta;
+        }
+        WriteDriveTargets(world.handle, targets);
+
+        if (write_gains) {
+            // Write Kp/Kd on the actuated slots 1..12 of every env via the new
+            // WRITABLE views; root slot 0 left as-is (it is a no-op anyway).
+            nuka_buffer_view_t kv{};
+            nuka_buffer_view_t dv{};
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle,
+                                                 NUKA_FIELD_DRIVE_STIFFNESS, &kv),
+                      NUKA_RESULT_OK);
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle,
+                                                 NUKA_FIELD_DRIVE_DAMPING, &dv),
+                      NUKA_RESULT_OK);
+            ASSERT_NE(kv.device_ptr, nullptr);
+            ASSERT_NE(dv.device_ptr, nullptr);
+            ASSERT_EQ(kv.element_count, targets.size());
+            ASSERT_EQ(dv.element_count, targets.size());
+            ASSERT_EQ(kv.element_stride_bytes, sizeof(float));
+            ASSERT_EQ(dv.element_stride_bytes, sizeof(float));
+            // Stiffness, damping and force-limit must alias THREE DISTINCT device
+            // buffers (and distinct from DRIVE_TARGET) -- otherwise a Kp write
+            // could masquerade as a Kd write. Proves DRIVE_DAMPING specifically
+            // aliases the damping buffer, not just "some gain buffer".
+            nuka_buffer_view_t fv{};
+            nuka_buffer_view_t tv{};
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle,
+                                                 NUKA_FIELD_DRIVE_FORCE_LIMIT, &fv),
+                      NUKA_RESULT_OK);
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle,
+                                                 NUKA_FIELD_DRIVE_TARGET, &tv),
+                      NUKA_RESULT_OK);
+            EXPECT_NE(kv.device_ptr, dv.device_ptr);
+            EXPECT_NE(kv.device_ptr, fv.device_ptr);
+            EXPECT_NE(dv.device_ptr, fv.device_ptr);
+            EXPECT_NE(kv.device_ptr, tv.device_ptr);
+            EXPECT_NE(dv.device_ptr, tv.device_ptr);
+            std::vector<float> kbuf(kv.element_count);
+            std::vector<float> dbuf(dv.element_count);
+            ASSERT_EQ(cudaMemcpy(kbuf.data(), kv.device_ptr,
+                                 kbuf.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(dbuf.data(), dv.device_ptr,
+                                 dbuf.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+            for (uint32_t e = 0u; e < kEnvCount; ++e) {
+                for (uint32_t link = 1u; link < blc; ++link) {
+                    kbuf[e * blc + link] = kp;
+                    dbuf[e * blc + link] = kd;
+                }
+            }
+            ASSERT_EQ(cudaMemcpy(kv.device_ptr, kbuf.data(),
+                                 kbuf.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(dv.device_ptr, dbuf.data(),
+                                 dbuf.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice),
+                      cudaSuccess);
+        }
+
+        ASSERT_EQ(nuka_world_step_n(world.handle, kSteps), NUKA_RESULT_OK);
+        *q_out = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
+    };
+
+    std::vector<float> q_cooked;  // cooked soft gains (no gain write).
+    std::vector<float> q_stiff;   // training gains Kp=20, Kd=0.5.
+    run_with_gains(0.0f, 0.0f, /*write_gains=*/false, &q_cooked);
+    run_with_gains(20.0f, 0.5f, /*write_gains=*/true, &q_stiff);
+    ASSERT_EQ(q_cooked.size(), q_stiff.size());
+    ASSERT_GT(q_cooked.size(), 0u);
+    EXPECT_TRUE(AllFinite(q_cooked));
+    EXPECT_TRUE(AllFinite(q_stiff));
+
+    // The stiffer gains pull q measurably CLOSER to the raised target after the
+    // same steps -> the response MAGNITUDE differs. Sum |q_stiff - q_cooked|
+    // across the actuated joints must exceed solver jitter.
+    double total_diff = 0.0;
+    uint32_t differing = 0u;
+    for (size_t i = 0u; i < q_cooked.size(); ++i) {
+        const float d = std::fabs(q_stiff[i] - q_cooked[i]);
+        total_diff += d;
+        if (d > 1e-4f) {
+            ++differing;
+        }
+    }
+    std::printf("[diag] (6) gains-reach-solver: sum|q_stiff-q_cooked|=%.5f "
+                "joints differing=%u of %zu\n",
+                total_diff, differing, q_cooked.size());
+    EXPECT_GT(total_diff, 1e-3)
+        << "writing Kp=20/Kd=0.5 did not change the PD response (gains never "
+           "reached the solver)";
+    EXPECT_GE(differing, 12u)
+        << "fewer than one env's worth of actuated joints responded to the gain "
+           "change";
 }
