@@ -799,6 +799,32 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_articulated_world_perf_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- 4096-env Go2 per-env-step perf-GATE regression test (p01 T3.1.6) ----
+    # Records the 4096-env per-env-step µs ALWAYS; asserts the §7 gate only on
+    # the designated validation GPU (NUKA_PERF_VALIDATION_GPU), else GTEST_SKIP.
+    # Records-and-skips (green) on the dev RTX 4000 Ada -- no false CI failure.
+    add_executable(nuka_go2_4096env_step_time_test
+        perf/test_go2_4096env_step_time.cpp
+    )
+
+    target_compile_definitions(nuka_go2_4096env_step_time_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_go2_4096env_step_time_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_go2_4096env_step_time_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Parameterized perf-harness CLI (v0.3 p01 Wave-2 #4) ----------------
     # NOT a gtest: a standalone CLI that drives the real batched articulated
     # stepper over a chosen env count / step count and prints the engine
