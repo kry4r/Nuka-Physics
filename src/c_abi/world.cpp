@@ -495,6 +495,15 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
     if (desc->env_count == 0u) {
         return NUKA_RESULT_INVALID_ARG;
     }
+    // p01-W4 determinism level: 0 = D1/Strong (default), 1 = D2/Weak. Reject any
+    // other value defensively (matches this file's INVALID_ARG validation style).
+    if (desc->determinism > 1u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    const auto determinism =
+        (desc->determinism == 1u)
+            ? nuka::runtime::gpu::DeterminismLevel::Weak
+            : nuka::runtime::gpu::DeterminismLevel::Strong;
 
     auto* device_record = nuka::c_abi::DeviceTable().Get(device);
     if (device_record == nullptr) {
@@ -562,7 +571,8 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                     batched_host,
                     feet,
                     max_dof,
-                    ground_height);
+                    ground_height,
+                    determinism);
 
             // Replicate the base hold drives across all envs (link-major).
             record->batched_drive_targets_device =

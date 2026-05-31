@@ -49,6 +49,18 @@
 
 namespace nuka::runtime::gpu {
 
+// p01-W4 runtime determinism level, selected once at world creation.
+//   Strong (D1, the default): the current behavior -- BIT-EXACT across runs and
+//     across replicas (no float atomics, fixed loop/grid order).
+//   Weak   (D2): the reserved escape hatch for future atomic fast-paths. There
+//     is currently NO atomic-beneficial hotspot (every hot kernel is
+//     <<<articulation_count, 32>>> with a per-env warp reduction; no cross-env
+//     ordered reduction an atomic variant would accelerate), so D2 today selects
+//     the SAME kernels as D1 and is behaviorally identical. D2 is NOT held to the
+//     D1 bit-exact bar -- a future atomic variant is free to differ.
+// The plain uint8_t underlying type matches the C ABI nuka_world_desc_t.determinism.
+enum class DeterminismLevel : uint8_t { Strong = 0, Weak = 1 };
+
 // Per-step inputs for the batched articulated step. The drive buffers are device
 // pointers of length state.total_link_count (one drive descriptor per link, the
 // same convention ApplyPositionDrives uses). They may be null only if no drives
@@ -79,11 +91,19 @@ public:
     // articulations, e.g. from ReplicateArticulationHostState) and allocates all
     // scratch sized from the world. `max_dof` must equal every articulation's DOF
     // count and the chain Jacobian dof_stride (precondition shared by T3/T4/T5).
+    // `determinism` (p01-W4) selects the determinism level for this world's Step.
+    // Defaults to Strong (D1) so every existing call site is unchanged and a
+    // zero-initialized C ABI desc maps to the strong/default path. See
+    // DeterminismLevel above for the D1/D2 contract.
     BatchedArticulatedWorld(const phi::DeviceContext& context,
                             const articulation::ArticulationHostState& host,
                             const std::vector<articulation::FootShape>& feet,
                             uint32_t max_dof,
-                            float ground_height);
+                            float ground_height,
+                            DeterminismLevel determinism = DeterminismLevel::Strong);
+
+    // The determinism level this world was created with (p01-W4).
+    DeterminismLevel Determinism() const { return determinism_; }
 
     // Advances one deterministic step in place on the device state, recording
     // per-stage timings under the canonical perf tags. The persistent lambda
@@ -173,6 +193,7 @@ private:
     uint32_t foot_count_ = 0u;
     uint32_t slot_count_ = 0u;
     float ground_height_ = 0.0f;
+    DeterminismLevel determinism_ = DeterminismLevel::Strong;  // p01-W4
 
     // Scratch (allocated once, reused every step).
     phi::Buffer feet_;            // FootShape[foot_count]

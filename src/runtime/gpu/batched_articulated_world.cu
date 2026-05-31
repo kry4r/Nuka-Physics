@@ -92,8 +92,9 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     const articulation::ArticulationHostState& host,
     const std::vector<articulation::FootShape>& feet,
     uint32_t max_dof,
-    float ground_height)
-    : context_(context) {
+    float ground_height,
+    DeterminismLevel determinism)
+    : context_(context), determinism_(determinism) {
     articulation_count_ = host.ArticulationCount();
     if (articulation_count_ == 0u) {
         throw std::runtime_error(
@@ -434,16 +435,31 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
         // joint_damping = params.drive_damping: with m_inv_ = (M+dt*C)^-1 above, the
         // solve applies implicit joint damping (qdot -= dt*(M+dt*C)^-1*(C*qdot)) and
         // the contact rows consistently before the position integrate.
-        articulation::SolveArticulatedContactRows(
-            context_, state,
-            static_cast<const articulation::ArticulatedContactRow*>(rows_.Data()),
-            static_cast<const float*>(jac_normal_.Data()),
-            static_cast<const float*>(jac_tangent1_.Data()),
-            static_cast<const float*>(jac_tangent2_.Data()),
-            static_cast<const float*>(m_inv_.Data()), env_count_, max_dof_,
-            params.dt, static_cast<float*>(lambda_.Data()),
-            params.friction_coefficient, params.baumgarte_max_velocity,
-            params.drive_damping);
+        //
+        // p01-W4 determinism dispatch. This is the ONE site where a D1-vs-D2 split
+        // would eventually live (the contact solve is the only cross-row reduction
+        // in the step). Today BOTH levels call the SAME D1 kernel: a hotspot
+        // analysis established that no current kernel benefits from atomics --
+        // every hot kernel is <<<articulation_count, 32>>> (one warp per env) with
+        // per-env warp reductions, so there is NO cross-env ordered reduction an
+        // atomic fast-path would accelerate. D2 is therefore the WIRED, documented
+        // escape hatch for a future atomic variant; it is NOT held to the D1 bit-
+        // exact bar. The Strong (D1) arm below is byte-for-byte the current call.
+        switch (determinism_) {
+            case DeterminismLevel::Strong:
+            case DeterminismLevel::Weak:
+                articulation::SolveArticulatedContactRows(
+                    context_, state,
+                    static_cast<const articulation::ArticulatedContactRow*>(rows_.Data()),
+                    static_cast<const float*>(jac_normal_.Data()),
+                    static_cast<const float*>(jac_tangent1_.Data()),
+                    static_cast<const float*>(jac_tangent2_.Data()),
+                    static_cast<const float*>(m_inv_.Data()), env_count_, max_dof_,
+                    params.dt, static_cast<float*>(lambda_.Data()),
+                    params.friction_coefficient, params.baumgarte_max_velocity,
+                    params.drive_damping);
+                break;
+        }
     }
 
     // -- 11. Position-integrate q += qdot*dt. -------------------------------

@@ -114,14 +114,23 @@ private:
 class World {
 public:
     static World* create_from_scene(Device* device, const std::string& scene_path,
-                                    uint32_t env_count, float dt) {
+                                    uint32_t env_count, float dt,
+                                    uint32_t determinism) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
+        }
+        if (determinism > 1u) {
+            throw std::runtime_error(
+                "create_from_scene: determinism must be 0 (Strong/D1) or "
+                "1 (Weak/D2)");
         }
         nuka_world_desc_t desc{};
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
         desc.fixed_dt = dt;
+        // p01-W4: 0 = D1/Strong (default), 1 = D2/Weak. Plain uint8_t keeps the
+        // desc C-compatible (the engine maps it to gpu::DeterminismLevel).
+        desc.determinism = static_cast<uint8_t>(determinism);
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -272,6 +281,14 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("__engine_version__") =
         std::to_string(v.major) + "." + std::to_string(v.minor) + "." + std::to_string(v.patch);
 
+    // p01-W4 determinism levels (the int values nuka_world_desc_t.determinism /
+    // World.create_from_scene(determinism=...) accept). STRONG (0, default) is
+    // D1: bit-exact + reproducible. WEAK (1) is D2: the reserved atomic-fast-path
+    // escape hatch -- today it shares the D1 kernels and is NOT held to the D1
+    // bit-exact bar.
+    m.attr("DETERMINISM_STRONG") = uint32_t{0};
+    m.attr("DETERMINISM_WEAK") = uint32_t{1};
+
     // Field enum (kept identical to nuka_state_field_t).
     nb::enum_<nuka_state_field_t>(m, "Field")
         .value("RIGID_BODY_TRANSFORM", NUKA_FIELD_RIGID_BODY_TRANSFORM)
@@ -308,8 +325,14 @@ NB_MODULE(_nuka_ext, m) {
         .def_static("create_from_scene", &World::create_from_scene,
                     nb::arg("device"), nb::arg("scene_path"),
                     nb::arg("env_count"), nb::arg("dt") = 1.0f / 240.0f,
+                    nb::arg("determinism") = uint32_t{0},
                     nb::rv_policy::take_ownership,
-                    "Create a batched world from a USDA scene.")
+                    "Create a batched world from a USDA scene. determinism "
+                    "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
+                    "and reproducible -- the default) or 1 = DETERMINISM_WEAK (D2, "
+                    "the reserved atomic-fast-path escape hatch; today it selects "
+                    "the SAME kernels as D1 and is NOT held to the D1 bit-exact "
+                    "bar).")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
