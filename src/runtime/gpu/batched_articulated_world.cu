@@ -476,6 +476,237 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     }
 }
 
+// p01-W3 timer-free twin of Step()'s body. MUST mirror Step() launch-for-launch
+// in the SAME order (the 200-step byte-exact gate guards the two from drifting).
+// Every device launch routes through the `ctx` PARAMETER -- NOT context_ -- so
+// StepGraph() can swap in a context whose stream is the private capturable graph
+// stream. NO ScopedCudaTimer scopes here: the coarse timers cudaEventSynchronize
+// in their destructors, which would abort a stream capture.
+void BatchedArticulatedWorld::StepKernels(const phi::DeviceContext& ctx,
+                                          const BatchedArticulatedStepParams& params) {
+    const articulation::ArticulationDeviceState state = device_.View();
+    const cudaStream_t stream = ctx.stream.Native();
+
+    // -- 1. Position drives -> tau, 2. ABA accelerations -> qddot. -----------
+    if (params.drive_targets != nullptr && params.drive_stiffness != nullptr &&
+        params.drive_damping != nullptr && params.drive_force_limits != nullptr) {
+        articulation::FeatherstoneAba::ApplyPositionDrives(
+            ctx, state, params.drive_targets, params.drive_stiffness,
+            params.drive_damping, params.drive_force_limits,
+            /*defer_velocity_damping=*/true);
+    }
+    articulation::FeatherstoneAba::ComputeAccelerations(ctx, state, params.gravity_z);
+
+    // -- 3. Velocity-integrate qdot += qddot*dt. ----------------------------
+    articulation::FeatherstoneAba::IntegrateVelocity(ctx, state, params.dt);
+    articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(ctx, state, params.dt,
+                                                                 params.gravity_z);
+
+    // -- 4. Refresh world poses, copy into state.link_pose. -----------------
+    articulation::UpdateWorldLinkPoses(
+        ctx, state, static_cast<Transform*>(world_pose_.Data()));
+    {
+        phi::ScopedDeviceGuard guard(ctx.device_id);
+        CheckCuda(cudaMemcpyAsync(
+                      state.link_pose, world_pose_.Data(),
+                      static_cast<size_t>(total_link_count_) * sizeof(Transform),
+                      cudaMemcpyDeviceToDevice, stream),
+                  "BatchedArticulatedWorld link_pose refresh (graph)");
+    }
+
+    // -- 5. Detect foot-vs-ground contacts. ---------------------------------
+    articulation::DetectFootGroundContacts(
+        ctx, static_cast<const Transform*>(world_pose_.Data()),
+        static_cast<const articulation::FootShape*>(feet_.Data()), foot_count_,
+        env_count_, base_link_count_, ground_height_,
+        static_cast<uint32_t*>(contact_link_.Data()),
+        static_cast<Vec3*>(contact_point_.Data()),
+        static_cast<Vec3*>(contact_normal_.Data()),
+        static_cast<float*>(contact_depth_.Data()),
+        static_cast<uint32_t*>(contact_count_.Data()));
+
+    // -- 6. Tangent basis + chain Jacobians (normal, t1, t2). ---------------
+    articulation::ComputeContactTangentBasis(
+        ctx, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Vec3*>(contact_normal_.Data()), env_count_,
+        static_cast<Vec3*>(tangent1_.Data()),
+        static_cast<Vec3*>(tangent2_.Data()));
+    articulation::ComputeContactChainJacobians(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Vec3*>(contact_point_.Data()),
+        static_cast<const Vec3*>(contact_normal_.Data()),
+        slot_count_, max_dof_, static_cast<float*>(jac_normal_.Data()));
+    articulation::ComputeContactChainJacobians(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Vec3*>(contact_point_.Data()),
+        static_cast<const Vec3*>(tangent1_.Data()),
+        slot_count_, max_dof_, static_cast<float*>(jac_tangent1_.Data()));
+    articulation::ComputeContactChainJacobians(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Vec3*>(contact_point_.Data()),
+        static_cast<const Vec3*>(tangent2_.Data()),
+        slot_count_, max_dof_, static_cast<float*>(jac_tangent2_.Data()));
+
+    // -- 7. Joint-space inertia M and its inverse. --------------------------
+    articulation::ComputeArticulationInertiaM(
+        ctx, state, max_dof_,
+        static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
+        static_cast<float*>(m_.Data()), params.drive_damping, params.dt);
+    articulation::FactorArticulationInertiaM(
+        ctx, state, max_dof_, static_cast<const float*>(m_.Data()),
+        static_cast<float*>(m_inv_.Data()));
+
+    // -- 8. Effective mass for normal + t1 + t2 rows. -----------------------
+    articulation::ComputeContactEffectiveMass(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const float*>(jac_normal_.Data()),
+        static_cast<const float*>(m_inv_.Data()), slot_count_, max_dof_,
+        static_cast<float*>(meff_normal_.Data()));
+    articulation::ComputeContactEffectiveMass(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const float*>(jac_tangent1_.Data()),
+        static_cast<const float*>(m_inv_.Data()), slot_count_, max_dof_,
+        static_cast<float*>(meff_tangent1_.Data()));
+    articulation::ComputeContactEffectiveMass(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const float*>(jac_tangent2_.Data()),
+        static_cast<const float*>(m_inv_.Data()), slot_count_, max_dof_,
+        static_cast<float*>(meff_tangent2_.Data()));
+
+    // -- 9. Assemble the contact rows. --------------------------------------
+    articulation::AssembleArticulatedContactRows(
+        ctx, state, static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Vec3*>(contact_normal_.Data()),
+        static_cast<const float*>(contact_depth_.Data()),
+        static_cast<const float*>(meff_normal_.Data()),
+        static_cast<const float*>(meff_tangent1_.Data()),
+        static_cast<const float*>(meff_tangent2_.Data()),
+        env_count_, max_dof_,
+        static_cast<articulation::ArticulatedContactRow*>(rows_.Data()));
+
+    // -- 10. Solve the rows (fused apply Delta_qdot into qdot; lambda carry). -
+    // D1/D2 dispatch: both levels run the SAME D1 kernel (see Step() for the
+    // hotspot-analysis rationale); kept here so the two bodies stay in lockstep.
+    switch (determinism_) {
+        case DeterminismLevel::Strong:
+        case DeterminismLevel::Weak:
+            articulation::SolveArticulatedContactRows(
+                ctx, state,
+                static_cast<const articulation::ArticulatedContactRow*>(rows_.Data()),
+                static_cast<const float*>(jac_normal_.Data()),
+                static_cast<const float*>(jac_tangent1_.Data()),
+                static_cast<const float*>(jac_tangent2_.Data()),
+                static_cast<const float*>(m_inv_.Data()), env_count_, max_dof_,
+                params.dt, static_cast<float*>(lambda_.Data()),
+                params.friction_coefficient, params.baumgarte_max_velocity,
+                params.drive_damping);
+            break;
+    }
+
+    // -- 11. Position-integrate q += qdot*dt. -------------------------------
+    articulation::FeatherstoneAba::IntegratePosition(ctx, state, params.dt);
+    articulation::FeatherstoneAba::IntegrateFloatingBasePose(ctx, state, params.dt);
+}
+
+namespace {
+
+// True iff two step-param structs are byte-comparable equal in every field that
+// the captured graph bakes as a kernel argument: the four scalars AND the four
+// drive-descriptor BUFFER POINTERS (pointer ADDRESSES are baked; only the buffer
+// CONTENTS may vary between replays). A mismatch in ANY of these forces a
+// re-capture so the replayed graph never uses stale scalars / a moved buffer.
+bool StepParamsMatch(const BatchedArticulatedStepParams& a,
+                     const BatchedArticulatedStepParams& b) {
+    return a.drive_targets == b.drive_targets &&
+           a.drive_stiffness == b.drive_stiffness &&
+           a.drive_damping == b.drive_damping &&
+           a.drive_force_limits == b.drive_force_limits &&
+           a.gravity_z == b.gravity_z && a.dt == b.dt &&
+           a.friction_coefficient == b.friction_coefficient &&
+           a.baumgarte_max_velocity == b.baumgarte_max_velocity;
+}
+
+}  // namespace
+
+void BatchedArticulatedWorld::StepGraph(const BatchedArticulatedStepParams& params) {
+    phi::ScopedDeviceGuard guard(context_.device_id);
+
+    // Lazily create the private, non-blocking capture/replay stream. context_'s
+    // stream is the legacy default stream 0, which cudaStreamBeginCapture rejects.
+    if (graph_stream_ == nullptr) {
+        CheckCuda(cudaStreamCreateWithFlags(&graph_stream_, cudaStreamNonBlocking),
+                  "BatchedArticulatedWorld graph stream create");
+    }
+
+    // Re-capture if the graph is cold or any baked param (scalar OR drive pointer)
+    // changed since capture. The buffer CONTENTS may vary freely between replays.
+    if (!graph_valid_ || !StepParamsMatch(params, captured_params_)) {
+        if (graph_exec_ != nullptr) {
+            CheckCuda(cudaGraphExecDestroy(graph_exec_),
+                      "BatchedArticulatedWorld graphExecDestroy (recapture)");
+            graph_exec_ = nullptr;
+        }
+        if (graph_ != nullptr) {
+            CheckCuda(cudaGraphDestroy(graph_),
+                      "BatchedArticulatedWorld graphDestroy (recapture)");
+            graph_ = nullptr;
+        }
+        graph_valid_ = false;
+
+        // Route every launch onto the private capturable stream by copying the
+        // context (value type) and swapping ONLY its stream view. context_ is
+        // never touched, so Step()'s default-stream behavior is unchanged.
+        phi::DeviceContext capture_ctx = context_;
+        capture_ctx.stream = phi::StreamView{graph_stream_};
+
+        CheckCuda(cudaStreamBeginCapture(graph_stream_,
+                                         cudaStreamCaptureModeThreadLocal),
+                  "BatchedArticulatedWorld stream begin capture");
+        // Capture RECORDS the launches -- it does NOT execute them.
+        StepKernels(capture_ctx, params);
+        CheckCuda(cudaStreamEndCapture(graph_stream_, &graph_),
+                  "BatchedArticulatedWorld stream end capture");
+        CheckCuda(cudaGraphInstantiate(&graph_exec_, graph_, 0),
+                  "BatchedArticulatedWorld graph instantiate");
+        captured_params_ = params;
+        graph_valid_ = true;
+
+        // Capture did NOT advance the state -- launch the freshly instantiated
+        // graph so this StepGraph() call performs one real step (matching Step()).
+        CheckCuda(cudaGraphLaunch(graph_exec_, graph_stream_),
+                  "BatchedArticulatedWorld graph launch (post-capture)");
+        return;
+    }
+
+    // Hot path: replay the cached graph. Buffer contents (e.g. drive targets) may
+    // have changed via the buffer view since the last replay -- that is fine, the
+    // graph reads them by stable pointer.
+    CheckCuda(cudaGraphLaunch(graph_exec_, graph_stream_),
+              "BatchedArticulatedWorld graph launch");
+}
+
+void BatchedArticulatedWorld::GraphStreamSynchronize() const {
+    if (graph_stream_ == nullptr) {
+        return;
+    }
+    phi::ScopedDeviceGuard guard(context_.device_id);
+    CheckCuda(cudaStreamSynchronize(graph_stream_),
+              "BatchedArticulatedWorld graph stream sync");
+}
+
+BatchedArticulatedWorld::~BatchedArticulatedWorld() {
+    phi::ScopedDeviceGuard guard(context_.device_id);
+    if (graph_exec_ != nullptr) {
+        (void)cudaGraphExecDestroy(graph_exec_);
+    }
+    if (graph_ != nullptr) {
+        (void)cudaGraphDestroy(graph_);
+    }
+    if (graph_stream_ != nullptr) {
+        (void)cudaStreamDestroy(graph_stream_);
+    }
+}
+
 void BatchedArticulatedWorld::Reset() {
     const articulation::ArticulationDeviceState state = device_.View();
     const cudaStream_t stream = context_.stream.Native();

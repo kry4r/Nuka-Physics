@@ -43,6 +43,8 @@
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -102,6 +104,13 @@ public:
                             float ground_height,
                             DeterminismLevel determinism = DeterminismLevel::Strong);
 
+    // Destroys the cached CUDA graph / exec / private graph stream (p01-W3) along
+    // with the owned device state. Defined out-of-line in the .cu (CUDA cleanup).
+    ~BatchedArticulatedWorld();
+
+    BatchedArticulatedWorld(const BatchedArticulatedWorld&) = delete;
+    BatchedArticulatedWorld& operator=(const BatchedArticulatedWorld&) = delete;
+
     // The determinism level this world was created with (p01-W4).
     DeterminismLevel Determinism() const { return determinism_; }
 
@@ -110,6 +119,42 @@ public:
     // buffer carries across calls for warm-start (warm-start affects convergence
     // only -- never determinism).
     void Step(const BatchedArticulatedStepParams& params);
+
+    // p01-W3 OPT-IN CUDA-graph step path. Behaviorally and BIT-FOR-BIT identical
+    // to Step() (it replays the EXACT same kernel sequence in the EXACT same
+    // order -- StepKernels(), the timer-free twin of Step()'s body) but amortizes
+    // the per-kernel launch overhead by capturing the launch sequence into a CUDA
+    // graph once and replaying the instantiated graph thereafter.
+    //
+    // The graph bakes the SCALAR params (dt, gravity_z, friction_coefficient,
+    // baumgarte_max_velocity) and the four drive-descriptor BUFFER POINTERS as
+    // kernel arguments at capture time. The buffer CONTENTS may change freely
+    // between replays (the RL use case: constant dt/friction and stable drive
+    // buffers, per-step-varying drive TARGETS written through the buffer view).
+    // If ANY field of `params` (scalar or pointer) differs from the captured
+    // copy, the graph is transparently re-captured. A Reset()/ResetEnvs() only
+    // changes buffer CONTENTS, not the launch structure, so the graph stays valid
+    // across resets.
+    //
+    // Capture + replay run on a PRIVATE, world-owned, non-blocking CUDA stream
+    // (the engine's context_ stream is the legacy default stream 0, which is NOT
+    // capturable). Step()'s default path and context_ are NEVER touched, so the
+    // non-graph behavior is byte-for-byte unchanged. This path issues NO timing
+    // events (the per-tag NUKA_CUDA_TIME breakdown is unavailable under graph
+    // capture, as expected); time it with a wall-clock around a replay + a
+    // GraphStreamSynchronize().
+    //
+    // Orthogonal to the D1/D2 DeterminismLevel: a captured D1 graph is bit-exact.
+    // The caller must ensure no Step() is in flight (Step() runs on the default
+    // stream, StepGraph() on the private stream -- do not interleave without a
+    // sync, exactly as with Step()/Reset() stream ordering).
+    void StepGraph(const BatchedArticulatedStepParams& params);
+
+    // Synchronizes the PRIVATE graph stream (the stream StepGraph() runs on).
+    // Readbacks / wall-clock timing of the graph path MUST sync THIS stream, not
+    // context_.stream (which is the unrelated default stream). No-op if the graph
+    // path has never been used.
+    void GraphStreamSynchronize() const;
 
     // p03 per-env RESET primitive (RL autoreset).
     //
@@ -181,6 +226,19 @@ public:
     std::vector<articulation::ArticulatedContactRow> DownloadRows() const;
 
 private:
+    // p01-W3 timer-free twin of Step()'s body: the EXACT same kernel + D2D-memcpy
+    // launch sequence in the EXACT same order, but with ZERO ScopedCudaTimer
+    // scopes (the coarse NUKA_CUDA_TIME timers cudaEventSynchronize in their
+    // destructors, which aborts a stream capture). Every device launch routes
+    // through the `ctx` PARAMETER (not context_) so StepGraph() can pass a context
+    // whose StreamView points at the private capturable graph stream; Step() calls
+    // it with context_ to preserve its current behavior. Keeping this a separate
+    // method (instead of routing Step() through it) keeps Step()'s per-tag timing
+    // breakdown intact; the mandated 200-step byte-exact gate guards the two
+    // copies from drifting.
+    void StepKernels(const phi::DeviceContext& ctx,
+                     const BatchedArticulatedStepParams& params);
+
     const phi::DeviceContext& context_;
     articulation::ArticulationDeviceBuffers device_;
     core::perf::PerfRecorder perf_;
@@ -223,6 +281,18 @@ private:
     phi::Buffer snapshot_link_velocity_;  // LinkSpatialVel[total_link_count]
     phi::Buffer snapshot_q_;              // float[total_link_count]
     phi::Buffer snapshot_qdot_;           // float[total_link_count]
+
+    // p01-W3 CUDA-graph step state. graph_stream_ is a private, non-blocking
+    // stream created lazily on the first StepGraph() (the engine's context_ stream
+    // is the legacy default stream 0, which is NOT capturable). graph_/graph_exec_
+    // cache the captured + instantiated step. graph_valid_ guards replay;
+    // captured_params_ is the param snapshot the graph baked (re-capture on any
+    // mismatch, scalar OR drive pointer).
+    cudaStream_t graph_stream_ = nullptr;
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
+    bool graph_valid_ = false;
+    BatchedArticulatedStepParams captured_params_{};
 };
 
 } // namespace nuka::runtime::gpu
