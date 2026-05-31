@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """[sim-val] Drive the REAL trained Go2 policy (motion.pt, 48->12) in Nuka.
 
-RESULT (sim-val #41/#42, honest TL;DR -- read before trusting "WALKS")
-----------------------------------------------------------------------
+RESULT (sim-val #41/#42/#43, honest TL;DR)
+------------------------------------------
   * Conventions PROVEN (D0-D3, D5): obs assembly bit-exact to golden, identity
     joint permutation (cooked-q signature), gravity, body-frame velocities.
-  * The policy produces clean, command-tracking WALKING **only when the physics is
-    sub-stepped to dt=0.001** (decimation 20, policy still 50 Hz): +0.49 m/s,
-    dx=+2.95 m / 6 s, two-buffer confirmed, tilt < 7 deg. THIS is the headline --
-    but it is QUALIFIED: it is NOT a native-dt result.
-  * At the NATIVE training dt=0.005 the policy FLAILS (tilt -> 110 deg). This is
-    NOT a convention bug and NOT the #42 penetration bug (the PD *stance* holds
-    rock-solid at dt=0.005 after the #42 fix). A 2x2 gain sweep isolated it to the
-    soft POLICY gains (Kp=20/Kd=0.5): only that corner flails at dt=0.005; raising
-    EITHER Kp or Kd, or sub-stepping to dt=0.001, restores the hold. The precise
-    integration-stability mechanism is OPEN (it is neither "fast targets" -- a
-    static soft-gain hold also flails -- nor a clean damping ratio -- the lowest-
-    zeta (60,0.5) corner holds). So sub-stepping to dt=0.001 is the principled
-    mitigation for the policy's contractually-soft drive, not a swept-under rug.
-  See go2_policy_drive_README.md sections 4-5 for the full characterization.
+  * The policy WALKS at the NATIVE training dt=0.005 (decimation 4, 50 Hz):
+    dx=+2.93 m / 6 s, vx 0.488 ~= cmd 0.5, tilt < 5.4 deg -- SAME quality as the
+    old dt=0.001 sub-step, but at 1x physics cost. NO sub-stepping needed.
+  * This is the #43 fix: the contractually-soft gains (Kp=20/Kd=0.5) previously
+    FLAILED at dt=0.005 (tilt->110 deg) because the explicit -Kd*qdot drive damping
+    is only conditionally stable (instability ~ dt*Kd/m_eff, m_eff shrunk by
+    contact). The engine now applies GENERAL implicit joint damping (the drive
+    defers -Kd*qdot to the constrained-velocity solve, (M+dt*C)^-1), which is
+    unconditionally stable. The module ran at dt=0.001/decim 20 before #43; it now
+    runs at the native dt=0.005/decim 4 (DT/DECIMATION below). The open-loop soft-
+    gain FLOATING static hold still topples at any dt -- that is POSTURAL (the
+    closed-loop policy is what keeps the robot up), NOT a damping/integration bug.
+  See go2_policy_drive_README.md and docs/architecture/2026-05-31-v03-implicit-
+  damping-golden.md for the full characterization.
 
 THE POINT (read before trusting any number)
 --------------------------------------------
@@ -123,32 +123,26 @@ FORCE_LIMIT_URDF = np.array(
     [23.7, 23.7, 35.55] * 4, dtype=np.float32
 )
 
-# timing: the policy rate is 50 Hz (matches training); the PHYSICS dt is decoupled
-# from it via decimation. Training used dt=0.005/decim 4. We run the policy rollout at
-# dt=0.001/decim 20 -- STILL exactly 50 Hz policy control, but the physics is sub-
-# stepped 5x finer. WHY (two distinct findings, do not conflate):
+# timing: the policy rate is 50 Hz (matches training); the PHYSICS dt is decoupled from
+# it via decimation. We run at the NATIVE training config dt=0.005/decim 4 -- after the
+# #43 fix (general implicit joint damping) the contractually-soft gains (Kp=20/Kd=0.5)
+# integrate stably at the native dt, so NO sub-stepping is needed. History (do not
+# conflate the two engine fixes that got us here):
 #
-#   (1) #42 engine fix -- the PD STANCE.  The c_abi/nanobind path used to COLLAPSE the
-#       floating Go2 PD crouch at dt>=0.002 where the C++ test holds it at the same
-#       gains. sim-val #42 ISOLATED the cause to the ground seating depth (clean A/B):
-#       kRestFootPenetration 0.03 m (deep) -> 0.002 m (the validated C++ seat). After
-#       the fix the PD stance holds at EVERY dt incl. native 0.005. This is FIXED in the
-#       engine; it is NOT why we sub-step.
+#   (1) #42 -- the PD STANCE.  The c_abi path collapsed the floating Go2 PD crouch at
+#       dt>=0.002 (ground seating depth kRestFootPenetration 0.03 -> 0.002 m). FIXED;
+#       the PD stance holds at every dt.
 #
-#   (2) The POLICY flail -- a SEPARATE, still-open limit.  Even with #42 fixed, the
-#       learned policy's contractually-SOFT gains (Kp=20/Kd=0.5) do not integrate
-#       stably at the native dt=0.005: the robot flails (tilt->110 deg). A 2x2 static-
-#       hold gain sweep at dt=0.005 isolated this to the soft-gain corner -- (20,0.5)
-#       flails; (20,4), (60,0.5), (60,4) all hold -- so it needs BOTH soft Kp AND soft
-#       Kd, and raising either, OR sub-stepping to dt=0.001, fixes it. The exact
-#       explicit-integration mechanism is unproven (it is neither fast-target-driven
-#       nor a clean damping ratio). Since the policy's Kp/Kd are FIXED by its deploy
-#       contract, we sub-step the physics to dt=0.001 -- a principled, more-accurate
-#       integration config (policy unchanged at 50 Hz) -- so the soft drive integrates
-#       stably and the policy can be evaluated. native_dt_characterization() below runs
-#       the native dt=0.005 explicitly so this harness self-documents the flail.
-DT = 0.001
-DECIMATION = 20  # 0.001 * 20 = 0.020 s -> 50 Hz policy (training cadence), finer physics
+#   (2) #43 -- the POLICY flail.  The soft gains (Kp=20/Kd=0.5) FLAILED at dt=0.005
+#       (tilt->110 deg) because explicit -Kd*qdot drive damping is only conditionally
+#       stable (instability ~ dt*Kd/m_eff, m_eff shrunk by contact). The engine now
+#       DEFERS the damping to the constrained-velocity solve and applies it IMPLICITLY
+#       ((M+dt*C)^-1), which is unconditionally stable. The policy now WALKS at the
+#       native dt=0.005 (dx +2.93 m/6 s, tilt<5.4 deg). NOTE: the open-loop soft-gain
+#       FLOATING static hold still topples at any dt -- that is POSTURAL (the closed-
+#       loop policy keeps it up), NOT a damping/integration bug.
+DT = 0.005
+DECIMATION = 4  # 0.005 * 4 = 0.020 s -> 50 Hz policy = the NATIVE training cadence
 # PD-baseline = the EXACT proven C++ hold: hip splay +-0.1 (FL,FR,RL,RR = +,-,+,-),
 # thigh +0.8, calf -1.5; Kp=60, Kd=4, force 24. The hip splay gives the roll margin
 # the C++ test relies on; a symmetric hip=0 is metastable in roll.
@@ -583,18 +577,30 @@ def write_targets_urdf(w, urdf_from_nuka_slot, target_urdf):
         tgt[:, 1:GO2_BLC] = torch.from_numpy(target_nuka).to(tgt.device)
 
 
-def warm_start(w, urdf_from_nuka_slot, n_steps=200):
+def warm_start(w, urdf_from_nuka_slot, warm_seconds=0.2):
     """The C ABI cannot set initial JOINT_POSITION; the scene cooks to a near-
     symmetric crouch (hip 0, thigh +0.8, calf -1.5), but the policy default is
     ASYMMETRIC (hip +/-0.1, thigh 0.8 front / 1.0 rear). So drive the policy default
-    at the policy gains (Kp=20/Kd=0.5) for n_steps (at dt=0.005 -> ~1.0 s) to bring
-    q toward default and qd -> 0 BEFORE starting the policy loop. NOTE: legged_gym
-    RESETS dof_pos = default exactly at training t=0, but the Nuka C ABI cannot
-    teleport initial q; here we instead HOLD against gravity at the soft policy
-    Kp=20, which settles to a sizeable steady sag (~0.5-0.6 rad on the load-bearing
-    calf, ~ tau_grav/Kp). So the policy takes over from an OFF-default state -- its
-    convergence to stable command-tracking from that offset is a robustness check,
-    not a faithful reproduction of the training reset. Returns (q_urdf, qd_urdf)."""
+    at the policy gains (Kp=20/Kd=0.5) for `warm_seconds` of SIM TIME to bring q
+    toward default and qd -> 0 BEFORE starting the policy loop.
+
+    TIME-BASED (not a fixed step count) ON PURPOSE: the open-loop soft-gain hold of
+    a FLOATING base is posturally unstable (it slowly topples at ANY dt -- it is NOT
+    a damping/integration bug; the closed-loop policy is what keeps the robot up). A
+    dt-independent step count therefore warm-starts 5x longer in wall-clock at the
+    native dt=0.005 (200 steps = 1.0 s) than at the sub-stepped dt=0.001 (0.2 s), and
+    that extra 0.8 s of open-loop hold is enough to topple the start to ~22 deg before
+    the policy ever engages -- a harness artifact, not a physics result. Pinning the
+    warm-up to a fixed 0.2 s of SIM TIME makes the native-dt and sub-stepped rollouts
+    apples-to-apples (both hand the policy the same lightly-sagged upright start).
+
+    NOTE: legged_gym RESETS dof_pos = default exactly at training t=0, but the Nuka
+    C ABI cannot teleport initial q; here we instead HOLD against gravity at the soft
+    policy Kp=20, which settles to a steady sag (~ tau_grav/Kp on the load-bearing
+    calf). So the policy takes over from a mildly OFF-default state -- a robustness
+    check, not a faithful reproduction of the training reset. Returns (q_urdf,
+    qd_urdf)."""
+    n_steps = max(1, int(round(warm_seconds / DT)))
     set_gains_and_targets_default(
         w, urdf_from_nuka_slot, KP, KD, FORCE_LIMIT_URDF, DEFAULT_ANGLES
     )
@@ -794,11 +800,10 @@ def classify(out: dict) -> str:
 # harness does not hide the gap behind the sub-stepped walk above.
 # ---------------------------------------------------------------------------
 def native_dt_characterization(dev, policy, urdf_from_nuka_slot, env_count=64):
-    """At the NATIVE training dt=0.005 (decim 4), show the two SEPARATE facts (do NOT
-    conflate with the dt=0.001 walk): (A) the PD stance HOLDS -> the #42 seating fix
-    works at native dt; (B) the soft-gain POLICY FLAILS -> the open soft-gain explicit-
-    integration limit that forces the dt=0.001 sub-stepping (same stepper, same scene;
-    only the gains/policy differ -- mirrors the 2x2 gain isolation in sim-val #42)."""
+    """At the NATIVE training dt=0.005 (decim 4), confirm BOTH engine fixes hold: (A)
+    the PD stance HOLDS (the #42 seating fix); (B) the soft-gain POLICY now WALKS rather
+    than flailing (the #43 implicit-joint-damping fix). Pre-#43 (B) flailed (tilt->110
+    deg) and forced dt=0.001 sub-stepping; a flail here now would be a REGRESSION."""
     dt_n, dec_n = 0.005, 4
     print("\n" + "-" * 78)
     print(f"NATIVE-DT CHARACTERIZATION @ dt={dt_n} (decim {dec_n}) -- honest self-doc "
@@ -841,7 +846,7 @@ def native_dt_characterization(dev, policy, urdf_from_nuka_slot, env_count=64):
     policy_flail = nan_seen or tilt_max > 35.0 or tilt_f > 35.0
     print(f"  (B) soft-gain POLICY (Kp=20/Kd=0.5) @ native dt: final z={z_f:.3f} m "
           f"tilt={tilt_f:.2f} deg (max {tilt_max:.1f}) -> "
-          f"{'FLAILS  (open soft-gain integration limit -> we sub-step to dt=0.001)' if policy_flail else 'held (!)'}",
+          f"{'FLAILS (REGRESSION -- #43 implicit damping should keep it upright)' if policy_flail else 'WALKS (the #43 implicit-damping fix holds at native dt)'}",
           flush=True)
     return dict(pd_hold=pd_hold, pd_tilt=tilt_pd, policy_flail=policy_flail,
                 policy_tilt_max=tilt_max)

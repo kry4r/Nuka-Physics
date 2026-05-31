@@ -742,14 +742,26 @@ __global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
                                          const float* drive_targets,
                                          const float* drive_stiffness,
                                          const float* drive_damping,
-                                         const float* drive_force_limits) {
+                                         const float* drive_force_limits,
+                                         bool defer_velocity_damping) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count ||
         state.joint_type[link] == ArticulationJointType::Fixed) {
         return;
     }
-    float tau = drive_stiffness[link] * (drive_targets[link] - state.q[link]) -
-                drive_damping[link] * state.qdot[link];
+    // tau = Kp*(target-q) - Kd*qdot. When `defer_velocity_damping` is set the
+    // -Kd*qdot term is OMITTED here and instead applied IMPLICITLY downstream in
+    // the constrained-velocity solve (SolveArticulatedContactRows seeds qdot with
+    // -dt*(M+dt*C)^-1*(C*qdot), C the per-DOF joint-damping diag). Explicit -Kd*qdot
+    // integrated by the semi-implicit Euler step is only conditionally stable
+    // (instability ~ dt*Kd/m_eff, blows up at coarse dt / contact-shrunk m_eff);
+    // the deferred implicit form is unconditionally stable. The batched contact
+    // stepper sets this true; the single-env oracle path leaves it false so its
+    // trajectory (and the go2_stand_5s golden) is byte-for-byte unchanged.
+    float tau = drive_stiffness[link] * (drive_targets[link] - state.q[link]);
+    if (!defer_velocity_damping) {
+        tau -= drive_damping[link] * state.qdot[link];
+    }
     const float limit = drive_force_limits[link];
     if (limit > 0.0f) {
         tau = fminf(fmaxf(tau, -limit), limit);
@@ -791,7 +803,8 @@ void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
                                      const float* drive_targets,
                                      const float* drive_stiffness,
                                      const float* drive_damping,
-                                     const float* drive_force_limits) {
+                                     const float* drive_force_limits,
+                                     bool defer_velocity_damping) {
     if (state.total_link_count == 0u ||
         drive_targets == nullptr ||
         drive_stiffness == nullptr ||
@@ -808,7 +821,8 @@ void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
         drive_targets,
         drive_stiffness,
         drive_damping,
-        drive_force_limits);
+        drive_force_limits,
+        defer_velocity_damping);
     CheckCuda(cudaGetLastError(), "ApplyPositionDriveKernel launch");
 }
 
@@ -892,13 +906,15 @@ void FeatherstoneAba::ApplyPositionDrives(const phi::DeviceContext& context,
                                           const float* drive_targets,
                                           const float* drive_stiffness,
                                           const float* drive_damping,
-                                          const float* drive_force_limits) {
+                                          const float* drive_force_limits,
+                                          bool defer_velocity_damping) {
     LaunchApplyPositionDriveKernels(context,
                                     state,
                                     drive_targets,
                                     drive_stiffness,
                                     drive_damping,
-                                    drive_force_limits);
+                                    drive_force_limits,
+                                    defer_velocity_damping);
 }
 
 void FeatherstoneAba::ComputeAccelerations(const phi::DeviceContext& context,
