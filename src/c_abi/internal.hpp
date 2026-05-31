@@ -7,6 +7,7 @@
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
 #include "runtime/articulation/articulation_state.hpp"
+#include "runtime/articulation/control_mode.hpp"
 #include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "runtime/world_stepper.hpp"
@@ -61,6 +62,11 @@ struct WorldRecord {
     // tile the base hold drives across all envs (link-major, length
     // env_count * base_link_count) as BatchedArticulatedStepParams requires.
     uint32_t env_count = 1u;
+    // v0.5 C-fwd: stage-1 control mode chosen at world creation (default
+    // PDPosition). Non-PD modes require the batched path; the single-env oracle
+    // is PDPosition-only.
+    runtime::articulation::ControlMode control_mode =
+        runtime::articulation::ControlMode::PDPosition;
     std::unique_ptr<runtime::gpu::BatchedArticulatedWorld> batched;
     runtime::gpu::BatchedArticulatedStepParams batched_step_params;
     phi::Buffer batched_drive_targets_device;

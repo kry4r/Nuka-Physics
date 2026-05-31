@@ -14,6 +14,7 @@
 
 #include "core/perf/timing.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
+#include "runtime/articulation/articulation_drives.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 
@@ -93,8 +94,21 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     const std::vector<articulation::FootShape>& feet,
     uint32_t max_dof,
     float ground_height,
-    DeterminismLevel determinism)
-    : context_(context), determinism_(determinism) {
+    DeterminismLevel determinism,
+    articulation::ControlMode control_mode)
+    : context_(context),
+      determinism_(determinism),
+      control_mode_(control_mode) {
+    // v0.5 C-fwd: only PDPosition / Torque / Velocity are implemented this slice.
+    // A reserved enumerator (ComputedTorque / Osc / Actuator) is rejected here
+    // rather than silently mis-actuating.
+    if (!articulation::IsControlModeImplemented(
+            static_cast<uint8_t>(control_mode))) {
+        throw std::invalid_argument(
+            "BatchedArticulatedWorld: control_mode " +
+            std::to_string(static_cast<int>(control_mode)) +
+            " is not implemented (only PDPosition/Torque/Velocity)");
+    }
     articulation_count_ = host.ArticulationCount();
     if (articulation_count_ == 0u) {
         throw std::runtime_error(
@@ -196,6 +210,18 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     lambda_ = phi::Buffer(static_cast<size_t>(slot_count_) * 3u * sizeof(float),
                           phi::MemoryKind::Device);
 
+    // v0.5 C-fwd: non-PD control inputs, always allocated (per-link, env-major)
+    // so the captured graph's baked pointer is stable and a buffer view always
+    // works -- a PD world simply never reads them. Zeroed below for a defined
+    // cold start (e.g. a Torque world stepped before any write applies zero
+    // torque, not garbage).
+    torque_input_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) * sizeof(float),
+        phi::MemoryKind::Device);
+    velocity_target_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) * sizeof(float),
+        phi::MemoryKind::Device);
+
     // Zero the persistent lambda buffer for a clean cold start (determinism +
     // a defined warm-start seed on the first step). Also zero the contact-point
     // readback buffer so a CONTACT_POINTS query BEFORE the first Step() returns
@@ -210,6 +236,14 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                               static_cast<size_t>(slot_count_) * sizeof(Vec3),
                               context_.stream.Native()),
               "BatchedArticulatedWorld contact_point memset");
+    CheckCuda(cudaMemsetAsync(torque_input_.Data(), 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld torque_input memset");
+    CheckCuda(cudaMemsetAsync(velocity_target_.Data(), 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld velocity_target memset");
 
     // p03 reset: snapshot the creation-time AUTHORITATIVE live state (the device
     // state was just seated by UploadArticulationState above with the cooked
@@ -248,6 +282,48 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     context_.stream.Synchronize();
 }
 
+void BatchedArticulatedWorld::ApplyStage1Drives(
+    const phi::DeviceContext& ctx,
+    const articulation::ArticulationDeviceState& state,
+    const BatchedArticulatedStepParams& params) {
+    // HOST-SIDE switch -> zero FP impact on any path. PDPosition calls the legacy
+    // launcher VERBATIM (byte-for-byte unchanged PD trajectory / golden); the new
+    // modes call separate kernels. The control_mode_ is validated at construction,
+    // so the reserved enumerators never reach here -- the default is defensive.
+    switch (control_mode_) {
+        case articulation::ControlMode::PDPosition:
+            if (params.drive_targets != nullptr &&
+                params.drive_stiffness != nullptr &&
+                params.drive_damping != nullptr &&
+                params.drive_force_limits != nullptr) {
+                // defer_velocity_damping=true: the drive emits only the Kp
+                // stiffness torque; the -Kd*qdot damping is applied IMPLICITLY in
+                // the contact solve (general implicit joint damping).
+                articulation::FeatherstoneAba::ApplyPositionDrives(
+                    ctx, state, params.drive_targets, params.drive_stiffness,
+                    params.drive_damping, params.drive_force_limits,
+                    /*defer_velocity_damping=*/true);
+            }
+            break;
+        case articulation::ControlMode::Torque:
+            // tau = clamp(torque_input). The implicit joint damping still runs
+            // downstream (it is a joint property, not a control Kd).
+            articulation::LaunchApplyTorqueDriveKernels(
+                ctx, state, params.torque_input, params.drive_force_limits);
+            break;
+        case articulation::ControlMode::Velocity:
+            // tau = clamp(Kp_v*(velocity_target-qdot)), Kp_v == drive_stiffness.
+            articulation::LaunchApplyVelocityDriveKernels(
+                ctx, state, params.velocity_target, params.drive_stiffness,
+                params.drive_force_limits);
+            break;
+        default:
+            // Unreachable: construction rejects an unimplemented mode. Leave tau
+            // unchanged rather than silently mis-actuate.
+            break;
+    }
+}
+
 void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     const articulation::ArticulationDeviceState state = device_.View();
     const cudaStream_t stream = context_.stream.Native();
@@ -263,18 +339,16 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     // (no CUDA events / syncs) unless Perf().SetDetailEnabled(true).
     {
         NUKA_CUDA_TIME(perf_, "featherstone_aba", stream);
-        if (params.drive_targets != nullptr && params.drive_stiffness != nullptr &&
-            params.drive_damping != nullptr && params.drive_force_limits != nullptr) {
+        {
             NUKA_CUDA_TIME_DETAIL(perf_, "aba_apply_drives", stream);
-            // defer_velocity_damping=true: the drive emits only the Kp stiffness
-            // torque; the -Kd*qdot damping is applied IMPLICITLY in the contact
-            // solve (general implicit joint damping via (M+dt*C)^-1), which is
-            // unconditionally stable -- the explicit form buzzed at the native dt
-            // for soft gains (instability ~ dt*Kd/m_eff, m_eff shrunk by contact).
-            articulation::FeatherstoneAba::ApplyPositionDrives(
-                context_, state, params.drive_targets, params.drive_stiffness,
-                params.drive_damping, params.drive_force_limits,
-                /*defer_velocity_damping=*/true);
+            // v0.5 C-fwd: HOST-SIDE stage-1 control-law dispatch on control_mode_.
+            // PDPosition routes to the UNTOUCHED ApplyPositionDrives launcher
+            // (defer_velocity_damping=true: only the Kp stiffness torque; the
+            // -Kd*qdot damping applied IMPLICITLY in the contact solve via
+            // (M+dt*C)^-1, unconditionally stable). Torque / Velocity route to
+            // their own kernels. StepKernels() (the graph twin) makes the SAME
+            // call so the two bodies stay byte-exact in lockstep.
+            ApplyStage1Drives(context_, state, params);
         }
         {
             NUKA_CUDA_TIME_DETAIL(perf_, "aba_compute_accelerations", stream);
@@ -487,14 +561,10 @@ void BatchedArticulatedWorld::StepKernels(const phi::DeviceContext& ctx,
     const articulation::ArticulationDeviceState state = device_.View();
     const cudaStream_t stream = ctx.stream.Native();
 
-    // -- 1. Position drives -> tau, 2. ABA accelerations -> qddot. -----------
-    if (params.drive_targets != nullptr && params.drive_stiffness != nullptr &&
-        params.drive_damping != nullptr && params.drive_force_limits != nullptr) {
-        articulation::FeatherstoneAba::ApplyPositionDrives(
-            ctx, state, params.drive_targets, params.drive_stiffness,
-            params.drive_damping, params.drive_force_limits,
-            /*defer_velocity_damping=*/true);
-    }
+    // -- 1. Stage-1 control drives -> tau, 2. ABA accelerations -> qddot. -----
+    // v0.5 C-fwd: dispatch on control_mode_, EXACTLY as Step() does (the 200-step
+    // byte-exact graph gate guards the two bodies from drifting).
+    ApplyStage1Drives(ctx, state, params);
     articulation::FeatherstoneAba::ComputeAccelerations(ctx, state, params.gravity_z);
 
     // -- 3. Velocity-integrate qdot += qddot*dt. ----------------------------
@@ -611,16 +681,19 @@ void BatchedArticulatedWorld::StepKernels(const phi::DeviceContext& ctx,
 namespace {
 
 // True iff two step-param structs are byte-comparable equal in every field that
-// the captured graph bakes as a kernel argument: the four scalars AND the four
-// drive-descriptor BUFFER POINTERS (pointer ADDRESSES are baked; only the buffer
-// CONTENTS may vary between replays). A mismatch in ANY of these forces a
-// re-capture so the replayed graph never uses stale scalars / a moved buffer.
+// the captured graph bakes as a kernel argument: the four scalars AND every
+// BUFFER POINTER (the four drive descriptors plus, v0.5 C-fwd, torque_input /
+// velocity_target -- pointer ADDRESSES are baked; only the buffer CONTENTS may
+// vary between replays). A mismatch in ANY of these forces a re-capture so the
+// replayed graph never uses stale scalars / a moved buffer.
 bool StepParamsMatch(const BatchedArticulatedStepParams& a,
                      const BatchedArticulatedStepParams& b) {
     return a.drive_targets == b.drive_targets &&
            a.drive_stiffness == b.drive_stiffness &&
            a.drive_damping == b.drive_damping &&
            a.drive_force_limits == b.drive_force_limits &&
+           a.torque_input == b.torque_input &&
+           a.velocity_target == b.velocity_target &&
            a.gravity_z == b.gravity_z && a.dt == b.dt &&
            a.friction_coefficient == b.friction_coefficient &&
            a.baumgarte_max_velocity == b.baumgarte_max_velocity;

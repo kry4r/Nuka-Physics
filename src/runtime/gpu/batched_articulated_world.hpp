@@ -42,6 +42,7 @@
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
+#include "runtime/articulation/control_mode.hpp"
 
 #include <cuda_runtime.h>
 
@@ -73,6 +74,16 @@ struct BatchedArticulatedStepParams {
     const float* drive_stiffness = nullptr;
     const float* drive_damping = nullptr;
     const float* drive_force_limits = nullptr;
+    // v0.5 C-fwd: per-link control inputs for the non-PD control modes. Same
+    // env-major layout as drive_targets (length state.total_link_count). Only
+    // read by stage 1 when the world's ControlMode selects that mode:
+    //   torque_input    -> Torque mode   (tau = clamp(torque_input))
+    //   velocity_target -> Velocity mode (tau = clamp(Kp_v*(velocity_target-qdot)))
+    // They are always-allocated, zero-filled device buffers (stable pointers for
+    // the captured CUDA graph), so a PD world simply ignores them. nullptr is a
+    // no-op in the new launchers.
+    const float* torque_input = nullptr;
+    const float* velocity_target = nullptr;
     float gravity_z = -9.81f;
     float dt = 1.0f / 240.0f;
     float friction_coefficient = articulation::kContactFriction;
@@ -97,12 +108,22 @@ public:
     // Defaults to Strong (D1) so every existing call site is unchanged and a
     // zero-initialized C ABI desc maps to the strong/default path. See
     // DeterminismLevel above for the D1/D2 contract.
+    // `control_mode` (v0.5 C-fwd) selects the stage-1 control law for this
+    // world's Step, fixed at construction (mirroring `determinism`). Defaults to
+    // PDPosition so every existing call site and a zero-initialized C ABI desc
+    // map to the legacy PD drive (byte-for-byte unchanged). Only PDPosition /
+    // Torque / Velocity are implemented; a reserved enumerator (ComputedTorque /
+    // Osc / Actuator) throws std::invalid_argument rather than silently mis-
+    // actuating. Fixed at construction so the captured CUDA graph never has to
+    // re-key on a per-step mode change (a future setter MUST invalidate the graph).
     BatchedArticulatedWorld(const phi::DeviceContext& context,
                             const articulation::ArticulationHostState& host,
                             const std::vector<articulation::FootShape>& feet,
                             uint32_t max_dof,
                             float ground_height,
-                            DeterminismLevel determinism = DeterminismLevel::Strong);
+                            DeterminismLevel determinism = DeterminismLevel::Strong,
+                            articulation::ControlMode control_mode =
+                                articulation::ControlMode::PDPosition);
 
     // Destroys the cached CUDA graph / exec / private graph stream (p01-W3) along
     // with the owned device state. Defined out-of-line in the .cu (CUDA cleanup).
@@ -113,6 +134,18 @@ public:
 
     // The determinism level this world was created with (p01-W4).
     DeterminismLevel Determinism() const { return determinism_; }
+
+    // The stage-1 control law this world was created with (v0.5 C-fwd).
+    articulation::ControlMode ControlMode() const { return control_mode_; }
+
+    // Zero-copy WRITABLE device buffers for the non-PD control inputs (v0.5
+    // C-fwd). Always allocated (zero-filled) so the C ABI / RL harness can write
+    // them in place and the next Step picks them up. Layout is per-link env-major
+    // (length total_link_count), the SAME as the drive buffers. Stable for the
+    // object's life. Only consulted by stage 1 when ControlMode() selects the
+    // matching mode (Torque -> torque_input, Velocity -> velocity_target).
+    const phi::Buffer& TorqueInputBuffer() const { return torque_input_; }
+    const phi::Buffer& VelocityTargetBuffer() const { return velocity_target_; }
 
     // Advances one deterministic step in place on the device state, recording
     // per-stage timings under the canonical perf tags. The persistent lambda
@@ -239,6 +272,17 @@ private:
     void StepKernels(const phi::DeviceContext& ctx,
                      const BatchedArticulatedStepParams& params);
 
+    // v0.5 C-fwd: HOST-SIDE stage-1 control-law dispatch. PDPosition routes to
+    // the legacy, UNTOUCHED FeatherstoneAba::ApplyPositionDrives (so the PD
+    // instruction / FP order -- and the go2_stand golden -- is byte-for-byte
+    // unchanged); Torque / Velocity route to the new launchers. Called
+    // identically by Step() and StepKernels() so the two bodies stay in lockstep
+    // (the 200-step byte-exact graph gate guards them). No-op (leaves tau as the
+    // prior step left it) if the mode's input pointers are null.
+    void ApplyStage1Drives(const phi::DeviceContext& ctx,
+                           const articulation::ArticulationDeviceState& state,
+                           const BatchedArticulatedStepParams& params);
+
     const phi::DeviceContext& context_;
     articulation::ArticulationDeviceBuffers device_;
     core::perf::PerfRecorder perf_;
@@ -252,6 +296,8 @@ private:
     uint32_t slot_count_ = 0u;
     float ground_height_ = 0.0f;
     DeterminismLevel determinism_ = DeterminismLevel::Strong;  // p01-W4
+    articulation::ControlMode control_mode_ =
+        articulation::ControlMode::PDPosition;  // v0.5 C-fwd
 
     // Scratch (allocated once, reused every step).
     phi::Buffer feet_;            // FootShape[foot_count]
@@ -274,6 +320,13 @@ private:
     phi::Buffer meff_tangent2_;   // float[slot_count]
     phi::Buffer rows_;            // ArticulatedContactRow[slot_count]
     phi::Buffer lambda_;          // float[slot_count * 3] (persistent warm-start)
+
+    // v0.5 C-fwd: always-allocated, zero-filled non-PD control inputs (per-link,
+    // env-major; length total_link_count). Owned here so the captured graph's
+    // baked pointer is stable and a buffer view always succeeds (a PD world just
+    // never reads them).
+    phi::Buffer torque_input_;    // float[total_link_count]
+    phi::Buffer velocity_target_; // float[total_link_count]
 
     // p03 reset: creation-time snapshot of the authoritative live state (device
     // resident, captured in the constructor). reset copies these snapshot->live.
