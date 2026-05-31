@@ -5,16 +5,20 @@ See the package docstring for the contract. The step loop is:
     write actions -> DRIVE_TARGET[:,1:] (URDF order via the permutation)
     -> step_n(decimation) physics steps (hold the PD target)
     -> compose the 48-dim obs ON-GPU (pose is now fresh, post-step)
-    -> reward + termination/truncation
-    -> AUTORESET the terminated|truncated envs via world.reset_envs (LAST).
+    -> reward + termination/truncation (the TERMINAL-transition values)
+    -> AUTORESET the terminated|truncated envs via world.reset_envs, then return
+       the POST-reset obs for those done envs (legged_gym / rl_games Brax
+       convention) -- so the experience buffer pairs a fresh-episode obs with the
+       fresh-episode reward, not a fallen-robot obs.
 
-Resetting last means we never read a base-pose-derived obs in the SAME call that
-reset an env, so the one-step ARTICULATION_LINK_POSE lag never bites: the obs in
-this step's return is from the pre-reset (live, stepped) state, and the reset
-shows up in the obs of the NEXT step (the standard masked-autoreset semantics).
-The returned obs for a reset env is its terminal obs; rl_games / SB3 bootstrap
-from ``info`` if needed (out of scope for v0.3 -- we follow the gymnasium
-autoreset convention of returning the terminal obs).
+The post-reset obs of a done env is recomposed from the engine's restored
+buffers (q / qd / base velocity all back at the creation snapshot). The one term
+that would still be wrong is projected_gravity: it reads the FK-lagged
+ARTICULATION_LINK_POSE root quat, which reset does NOT refresh (it still shows
+the pre-reset/fallen orientation until the next Step's FK). So the done envs'
+gravity slot is taken from the AUTHORITATIVE, un-lagged base_pose view
+(NUKA_FIELD_BASE_POSE, restored directly by reset). Non-done envs keep their
+normal post-step obs (which the golden bit-exact test pins).
 """
 
 from __future__ import annotations
@@ -146,10 +150,14 @@ class NukaGymEnv:
     def reset(self, *, seed: int | None = None, options=None):
         """Reset ALL envs to the creation-time pose and return ``(obs, info)``.
 
-        Composes obs from the creation buffers WITHOUT stepping: right after
-        create / reset-all the ARTICULATION_LINK_POSE view already holds the
-        creation pose (the one-step lag only follows reset_envs of a *running*
-        world), so the gravity-derived obs terms are valid here.
+        ``world.reset()`` restores the authoritative base_pose / q / qd / base
+        velocity for every env. The base-orientation obs term (projected_gravity)
+        is read from the AUTHORITATIVE, un-lagged base_pose view: the FK-lagged
+        ARTICULATION_LINK_POSE root quat is NOT refreshed by reset, so on an
+        already-stepped world its root slot still carries the pre-reset (fallen)
+        orientation until the next Step. Right after create both sources agree
+        (link_pose holds the creation pose), so this is a no-op there; on a stepped
+        world it is what makes the returned reset obs correctly upright.
         """
         if seed is not None:
             self._generator.manual_seed(int(seed))
@@ -159,6 +167,10 @@ class NukaGymEnv:
         self.last_action.zero_()
         self.episode_step.zero_()
         obs = self._obs.compute_obs(self.command, self.last_action)
+        # All base_poses are authoritative-upright after a full reset; take the
+        # gravity term from the un-lagged base_pose view (no-op post-create, fixes
+        # the stale-lag obs on an already-stepped world).
+        obs[:, 6:9] = self._obs.projected_gravity_auth()
         return obs, {}
 
     def step(self, actions: torch.Tensor):
@@ -186,17 +198,39 @@ class NukaGymEnv:
         truncated = self.episode_step >= self.max_episode_length
         info: dict = {}
 
-        # AUTORESET: masked reset of the done envs (LAST -- so we never read a
-        # base-pose-derived obs in the same call that reset an env). The returned
-        # obs above is the terminal obs; the reset shows up next step.
+        # AUTORESET (legged_gym / Brax convention): a vectorized env that
+        # terminates an env must RESET it and return the POST-reset obs for that
+        # env in the SAME step, so the experience buffer pairs the fresh-episode
+        # obs with the fresh-episode reward (not a fallen-robot obs). reward /
+        # terminated / truncated above are the TERMINAL-transition values (correct
+        # -- computed pre-reset); only the returned obs[done] is swapped to the
+        # reset state.
         done = terminated | truncated
         if bool(done.any()):
             done_ids = torch.nonzero(done, as_tuple=False).flatten().to(torch.int32)
+            # Reset the engine's authoritative state for the done envs (q/qd/base
+            # velocity/base_pose restored to the creation snapshot; isolation:
+            # non-done envs are byte-for-byte untouched). reset_envs syncs the
+            # stream, so the torch reads below see the settled post-reset buffers.
             self._world.reset_envs(done_ids.cpu())
-            # Zero the per-env bookkeeping for the reset envs (the silent one:
-            # a fresh env must NOT carry stale action history into its next obs).
+            # Zero the per-env bookkeeping for the reset envs (a fresh env must NOT
+            # carry stale action history into its obs).
             self.last_action[done] = 0.0
             self.episode_step[done] = 0
+
+            # POST-reset obs for the done envs. After reset_envs the engine buffers
+            # for these envs hold the upright init state, so recomposing the obs
+            # gives the correct fresh-episode obs EXCEPT projected_gravity [6:9]:
+            # that term reads the FK-lagged ARTICULATION_LINK_POSE root quat, which
+            # reset does NOT refresh (it still shows the pre-reset/fallen pose until
+            # the next Step's FK). So we recompose with last_action already zeroed,
+            # then overwrite the gravity slot from the AUTHORITATIVE (un-lagged)
+            # base_pose view. Only the done rows are written back into `obs`; the
+            # non-done rows keep their normal post-step obs (golden-pinned).
+            obs_reset = self._obs.compute_obs(self.command, self.last_action)
+            obs_reset[:, 6:9] = self._obs.projected_gravity_auth()
+            obs = obs.clone()
+            obs[done] = obs_reset[done]
 
         return obs, reward, terminated, truncated, info
 

@@ -163,7 +163,28 @@ typedef enum nuka_state_field_t {
     // Reads return the CURRENT gains (initially the cooked rest-hold gains).
     NUKA_FIELD_DRIVE_STIFFNESS = 8,
     NUKA_FIELD_DRIVE_DAMPING = 9,
-    NUKA_FIELD_DRIVE_FORCE_LIMIT = 10
+    NUKA_FIELD_DRIVE_FORCE_LIMIT = 10,
+    // READ (batched/multi-env path only). The engine's AUTHORITATIVE per-env
+    // floating-base ROOT world pose -- the internal base_pose[articulation] buffer
+    // that the floating-base integrator advances each Step and that
+    // nuka_world_reset_envs restores from the creation-time snapshot. element_count
+    // == env_count (ONE Transform per env, NOT per link), element_stride_bytes ==
+    // sizeof(math::Transform) == 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first),
+    // SAME element layout as the ROOT slot of NUKA_FIELD_ARTICULATION_LINK_POSE.
+    //
+    // WHY THIS EXISTS (vs the root slot of ARTICULATION_LINK_POSE): the link_pose
+    // FK runs at stage 4 from the PRE-integrate base, while base_pose is advanced
+    // at stage 11, so after Step() returns ARTICULATION_LINK_POSE[root] is the
+    // PREVIOUS step's base pose (one-step lag). base_pose has NO such lag: it is
+    // current after Step() AND -- the load-bearing property for RL autoreset -- it
+    // is correct IMMEDIATELY after nuka_world_reset_envs with no further step (the
+    // reset writes it directly, whereas the lagged link_pose still shows the
+    // pre-reset/fallen pose until the next Step's FK). A vectorized RL env reads
+    // THIS field for the post-reset base orientation (projected_gravity) of the
+    // just-reset envs. The non-reset envs may keep reading the (validated, golden-
+    // pinned) lagged ARTICULATION_LINK_POSE -- the two intentionally differ by one
+    // integration step during normal stepping.
+    NUKA_FIELD_BASE_POSE = 11
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

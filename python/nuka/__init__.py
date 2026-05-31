@@ -47,6 +47,9 @@ LINK_VELOCITY = Field.LINK_VELOCITY
 DRIVE_STIFFNESS = Field.DRIVE_STIFFNESS
 DRIVE_DAMPING = Field.DRIVE_DAMPING
 DRIVE_FORCE_LIMIT = Field.DRIVE_FORCE_LIMIT
+# p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
+# immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
+BASE_POSE = Field.BASE_POSE
 
 # ARTICULATION_LINK_POSE element = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
 LINK_POSE_FLOATS = 7
@@ -110,6 +113,7 @@ __all__ = [
     "DRIVE_STIFFNESS",
     "DRIVE_DAMPING",
     "DRIVE_FORCE_LIMIT",
+    "BASE_POSE",
     "LINK_POSE_FLOATS",
     "LINK_VELOCITY_FLOATS",
     "torch_stream_ptr",

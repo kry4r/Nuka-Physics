@@ -251,6 +251,13 @@ class Go2ObsBuilder:
         self._pose = torch.from_dlpack(world.buffer_view(nuka.ARTICULATION_LINK_POSE))
         self._vel = torch.from_dlpack(world.buffer_view(nuka.LINK_VELOCITY))
         self._tgt = torch.from_dlpack(world.buffer_view(nuka.DRIVE_TARGET))
+        # AUTHORITATIVE per-env root pose (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
+        # Unlike ARTICULATION_LINK_POSE (root slot is FK-lagged one step), base_pose
+        # is correct IMMEDIATELY after reset_envs -- so the just-reset envs read the
+        # upright orientation here, not the stale fallen quat. Used ONLY for the
+        # post-reset projected_gravity of done envs; the normal per-step obs keeps
+        # reading the lagged (golden-pinned) ARTICULATION_LINK_POSE.
+        self._base_pose = torch.from_dlpack(world.buffer_view(nuka.BASE_POSE))
 
     # -- gain setup (called once at construction / after reset, NOT per step) --
     def apply_pd_gains(self) -> None:
@@ -292,6 +299,21 @@ class Go2ObsBuilder:
     def projected_gravity(self) -> torch.Tensor:
         """(N,3) world [0,0,-1] rotated into the body frame via the base quat."""
         return projected_gravity_body(self.base_quat_wxyz())
+
+    def base_quat_wxyz_auth(self) -> torch.Tensor:
+        """(N,4) root world quaternion (w-first) from the AUTHORITATIVE base_pose
+        view -- correct immediately after reset_envs (no one-step FK lag). Use this
+        for the post-reset orientation of just-reset envs (see env.py autoreset)."""
+        return self._base_pose[:, 3:7]
+
+    def projected_gravity_auth(self) -> torch.Tensor:
+        """(N,3) projected gravity from the AUTHORITATIVE (un-lagged) base quat.
+
+        Correct immediately after reset_envs, so the just-reset envs report the
+        upright orientation (~[0,0,-1]) instead of the stale fallen quat that the
+        FK-lagged ARTICULATION_LINK_POSE root slot still carries until the next
+        Step. Used to patch obs[done, 6:9] in the autoreset path."""
+        return projected_gravity_body(self.base_quat_wxyz_auth())
 
     # -- obs composition (the headline: all torch, zero numpy) --
     def compute_obs(
