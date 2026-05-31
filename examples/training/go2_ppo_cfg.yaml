@@ -1,11 +1,32 @@
 # rl_games (1.6.5) PPO config for Nuka Go2 flat-ground locomotion.
 #
-# Hyperparameters mirror the legged_gym / unitree_rl_gym Go2 recipe documented in
-# docs/plans/2026-05-28-v03-p04-go2-ppo-4096-demo.md (gamma 0.99, tau 0.95,
-# lr 3e-4 adaptive, e_clip 0.2, horizon 24, minibatch 32768, mini_epochs 5,
-# MLP [256,128,64]). ``env_name: nuka_go2`` resolves via the nuka.rl_games
-# adapter (registered on import). ``num_actors`` / ``max_epochs`` /
-# ``minibatch_size`` are overridden by train_go2_ppo.py (esp. for --smoke).
+# Hyperparameters ALIGNED to the official unitree_rl_gym / rsl_rl Go2 recipe
+# (legged_gym/envs/base/legged_robot_config.py LeggedRobotCfgPPO + go2_config.py):
+#   policy:    init_noise_std=1.0 (sigma const-init 0 -> std=exp(0)=1.0),
+#              actor/critic hidden=[512,256,128], activation=elu.
+#   algorithm: entropy_coef=0.01, value_loss_coef=1.0, clip_param=0.2,
+#              num_learning_epochs(mini_epochs)=5, num_mini_batches=4
+#              (-> minibatch = num_envs*horizon/4 = 4096*24/4 = 24576),
+#              learning_rate=1e-3 adaptive, desired_kl(kl_threshold)=0.01,
+#              gamma=0.99, lam(tau)=0.95, max_grad_norm=1.0.
+#   runner:    num_steps_per_env(horizon)=24, max_iterations(max_epochs)=1500.
+#   env:       terminate on base-ground CONTACT only (legged_gym
+#              terminate_after_contacts_on=["base"]); the prior tilt>75 deg kill
+#              over-culled recoverable wobbles and starved the reward signal -- now
+#              base-height only (z<0.18 ~ base touching ground), tilt kill relaxed
+#              to 120 deg (only a genuinely flipped robot, which emits pure-zero
+#              reward forever, is culled). Set via env_config below.
+#
+# RATIONALE (the 1500-epoch collapse this fixes): mean reward stayed ~0 because the
+# only_positive_rewards clamp zeros a cold-start policy whose negatives swamp the
+# tiny velocity-tracking positive; with entropy_coef=0 there was no exploration
+# pressure, so the actor saturated and the value head collapsed to predict 0. The
+# recipe-aligned entropy_coef=0.01 + base-contact-only termination (longer episodes)
+# + the larger [512,256,128] net + lr 1e-3 restore the legged_gym learning regime.
+#
+# ``env_name: nuka_go2`` resolves via the nuka.rl_games adapter (registered on
+# import). ``num_actors`` / ``max_epochs`` / ``minibatch_size`` are overridden by
+# train_go2_ppo.py (esp. for --smoke).
 params:
   seed: 1
 
@@ -29,7 +50,7 @@ params:
           val: 0
         fixed_sigma: True
     mlp:
-      units: [256, 128, 64]
+      units: [512, 256, 128]
       activation: elu
       d2rl: False
       initializer:
@@ -52,26 +73,54 @@ params:
       scale_value: 1.0
     gamma: 0.99
     tau: 0.95
-    learning_rate: 3e-4
+    learning_rate: 1e-3
     lr_schedule: adaptive
-    kl_threshold: 0.008
+    kl_threshold: 0.01
     score_to_win: 100000
     max_epochs: 1500
     save_best_after: 100
     save_frequency: 100
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0.01
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 24
     num_actors: 4096
-    minibatch_size: 32768
+    minibatch_size: 24576
     mini_epochs: 5
-    critic_coef: 2
+    critic_coef: 1.0
     clip_value: True
     bounds_loss_coef: 0.0001
 
     env_config:
       # env_name here is the nuka task selector; the adapter ignores extra keys
       # it doesn't use. device is created+owned by the env (single GPU).
+      #
+      # RANDOM command curriculum (fixed_command=false, the legged_gym default):
+      # Go2LocomotionEnv resamples a per-env velocity command (vx/vy/wyaw in [-1,1],
+      # xy zeroed if |xy|<0.2) on every reset + on the 10 s timer. This is the
+      # recipe-faithful config and it LEARNS A COMMAND-CONDITIONED gait: after 250
+      # epochs the policy tracks vx monotonically across the range -- eval
+      # (cmd vx -> vx_body): -0.5 -> -0.46, 0.0 -> 0.00, +0.5 -> +0.44, +1.0 -> +1.02;
+      # tilt 2-4 deg, 0 terminations over 19200 env-steps.
+      #
+      # ``command`` below is only the INITIAL value (immediately overwritten by the
+      # first resample). ``fixed_command: true`` is an opt-in lever that PINS the
+      # command for the whole run (no resample) -- useful as a reduce-the-problem
+      # baseline; the fixed-[0.5,0,0] config converges to a cleaner single-speed walk
+      # (vx_body 0.46 ~ cmd 0.5, reward ~26) but cannot condition on the command.
+      #
+      # THE FIX THAT MADE EITHER LEARN (was a 1500-epoch collapse: reward==0,
+      # ep_len~22): the gym action space is declared at +-1 (go2_obs.ACTION_SPACE_LIMIT),
+      # NOT +-100 -- rl_games (clip_actions=true) RESCALES the policy's [-1,1] output
+      # onto the action-space bounds, so a +-100 space 100x-amplified the applied
+      # action (measured mean|a|=64) -> joints slammed -> robot tipped in ~21 steps ->
+      # all-negative reward -> only_positive_rewards zeroed it -> value head collapsed.
       command: [0.5, 0.0, 0.0]
+      fixed_command: false
+      # Termination = base-ground contact only (legged_gym terminate_after_contacts_on
+      # =["base"]). base-height z<0.18 ~ base touching ground; tilt kill relaxed to
+      # 120 deg so only a genuinely flipped robot is culled (the 75 deg default
+      # over-killed recoverable wobbles -> short episodes -> starved reward signal).
+      termination_tilt_deg: 120.0
+      termination_height: 0.18

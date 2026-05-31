@@ -107,9 +107,13 @@ class NukaGymEnv:
         self.single_observation_space = spaces.Box(
             low=-G.OBS_CLIP, high=G.OBS_CLIP, shape=(G.GO2_OBS_DIM,), dtype=np.float32
         )
+        # Action space bound is +-1 (G.ACTION_SPACE_LIMIT), NOT the internal +-100
+        # safety clamp: rl_games (clip_actions=True default) RESCALES the policy's
+        # [-1,1] output onto these bounds, so a +-100 space would 100x-amplify the
+        # applied action and collapse training (see go2_obs.ACTION_SPACE_LIMIT).
         self.single_action_space = spaces.Box(
-            low=-G.ACTION_CLIP, high=G.ACTION_CLIP, shape=(G.GO2_ACTION_DIM,),
-            dtype=np.float32,
+            low=-G.ACTION_SPACE_LIMIT, high=G.ACTION_SPACE_LIMIT,
+            shape=(G.GO2_ACTION_DIM,), dtype=np.float32,
         )
         # Batched spaces (cheap insurance for rl_games / SB3 consumers).
         self.observation_space = spaces.Box(
@@ -117,7 +121,7 @@ class NukaGymEnv:
             shape=(self.num_envs, G.GO2_OBS_DIM), dtype=np.float32,
         )
         self.action_space = spaces.Box(
-            low=-G.ACTION_CLIP, high=G.ACTION_CLIP,
+            low=-G.ACTION_SPACE_LIMIT, high=G.ACTION_SPACE_LIMIT,
             shape=(self.num_envs, G.GO2_ACTION_DIM), dtype=np.float32,
         )
 
@@ -164,6 +168,11 @@ class NukaGymEnv:
             self.single_action_space.seed(int(seed))
         self._world.reset()
         nuka.sync()
+        # Overridable hook: rewrite the initial JOINT_POSITION / JOINT_VELOCITY for
+        # ALL envs (legged_gym resets dof_pos to the exact default; the cooked scene
+        # snapshot is a near-symmetric crouch, which for Go2 is metastable in roll).
+        # No-op in the base env; Go2LocomotionEnv teleports to the asymmetric default.
+        self._reset_joint_state(None)
         self.last_action.zero_()
         self.episode_step.zero_()
         obs = self._obs.compute_obs(self.command, self.last_action)
@@ -213,6 +222,14 @@ class NukaGymEnv:
             # non-done envs are byte-for-byte untouched). reset_envs syncs the
             # stream, so the torch reads below see the settled post-reset buffers.
             self._world.reset_envs(done_ids.cpu())
+            # Teleport the done envs' joints to the init pose (same hook as full
+            # reset). reset_envs restores the cooked creation snapshot (metastable
+            # hip=0 crouch); legged_gym instead resets dof_pos to the exact default
+            # on EVERY episode start, incl. autoreset. Without this, ~all training
+            # episodes (every one after the first is an autoreset) start from the
+            # metastable crouch and tip into clamped-negative flailing within ~22
+            # steps before any positive return accrues -> dead value -> PPO collapse.
+            self._reset_joint_state(done)
             # Zero the per-env bookkeeping for the reset envs (a fresh env must NOT
             # carry stale action history into its obs).
             self.last_action[done] = 0.0
@@ -234,7 +251,19 @@ class NukaGymEnv:
 
         return obs, reward, terminated, truncated, info
 
-    # -- overridable reward / termination hooks -----------------------------
+    # -- overridable reset / reward / termination hooks ---------------------
+    def _reset_joint_state(self, mask: "torch.Tensor | None") -> None:
+        """Rewrite the initial JOINT_POSITION / JOINT_VELOCITY after a reset.
+
+        ``mask`` is a (num_envs,) bool tensor selecting which envs to rewrite, or
+        ``None`` for ALL envs (full reset). No-op in the base env (the engine's
+        cooked creation snapshot is kept). Subclasses override to teleport the
+        joints to a task-specific init pose (e.g. the legged_gym default angles).
+        Called AFTER ``world.reset()`` / ``world.reset_envs`` and BEFORE the obs is
+        recomposed, so the returned reset obs reflects the rewritten joint state.
+        """
+        return None
+
     def compute_reward(self) -> torch.Tensor:
         """Minimal reward: forward-velocity command tracking + alive bonus.
 
