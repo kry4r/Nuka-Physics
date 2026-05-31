@@ -99,15 +99,16 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     : context_(context),
       determinism_(determinism),
       control_mode_(control_mode) {
-    // v0.5 C-fwd: only PDPosition / Torque / Velocity are implemented this slice.
-    // A reserved enumerator (ComputedTorque / Osc / Actuator) is rejected here
-    // rather than silently mis-actuating.
+    // v0.5 C-fwd: PDPosition / Torque / Velocity / ComputedTorque / Actuator are
+    // implemented; Osc is reserved (deferred to a post-p03 slice, needs the Phase-3
+    // self-written solver). A reserved enumerator is rejected here rather than
+    // silently mis-actuating.
     if (!articulation::IsControlModeImplemented(
             static_cast<uint8_t>(control_mode))) {
         throw std::invalid_argument(
             "BatchedArticulatedWorld: control_mode " +
             std::to_string(static_cast<int>(control_mode)) +
-            " is not implemented (only PDPosition/Torque/Velocity)");
+            " is not implemented (Osc is deferred to a post-p03 slice)");
     }
     articulation_count_ = host.ArticulationCount();
     if (articulation_count_ == 0u) {
