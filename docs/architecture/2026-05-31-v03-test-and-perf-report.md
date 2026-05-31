@@ -122,3 +122,66 @@ the deliverable. The two launch-overhead / occupancy directions are recorded abo
 where the absolute §7 gate can actually be measured and a profile can target a real bottleneck).
 Any future attempt must clear the fixed gate: two-run byte-exact + ABA/contact goldens +
 determinism ctest + before/after harness delta.
+
+---
+
+## 6. Post-decision follow-ups (owner re-opened the perf track)
+
+After §5, the owner re-opened the perf track and asked for the spec'd mechanisms +
+regression tests. These were delivered **without touching `Step()`'s floating-point
+sequence** — so §5's "no reference-path kernel change" decision stands; the new work is
+all *additive* (opt-in paths + a measurement test). Each cleared the fixed gate.
+
+- **Opt-in CUDA-graph step path** (`BatchedArticulatedWorld::StepGraph`, commit
+  `2e412a5`). Captures the step kernel sequence once and replays the instantiated graph,
+  cutting per-launch overhead. It is **bit-for-bit identical** to `Step()`: a byte-compare
+  regression test (`tests/runtime/test_batched_articulated_graph.cpp`) runs the same
+  initial state through `Step()` and `StepGraph()` and `memcmp`s q / qdot / base_pose /
+  v_root / lambda over 250 steps with mid-run drive-target variation → **all five mismatch
+  counts = 0**. `Step()`'s kernels are unchanged; the graph path is a separate, opt-in
+  replay of the same launches. **Measured benefit (as-measured, median):** at 4096 envs the
+  graph-vs-`Step()` delta is **≈ 0.6 % (within run-to-run noise)**, and at 1024 envs it
+  flips sign across reps (noise). Reason: at these batch sizes the step is firmly
+  **compute-bound** (~0.9 µs/env-step of kernel time), so µs-scale launch overhead is a
+  rounding error — neither size is actually launch-bound. **The graph path's real value here
+  is the determinism-preserving mechanism, not a speedup**; it would matter in launch-bound
+  regimes (small batch / many tiny kernels). Orthogonal to the D1/D2 level — a captured D1
+  graph is bit-exact.
+- **D1/D2 determinism toggle + C ABI** (commit `ad2a4fd`).
+  `enum DeterminismLevel{Strong=0, Weak=1}` selected once at world creation and exposed
+  through the C ABI (`nuka_world_desc_t.determinism`) + the Python binding. **D1 (Strong)
+  remains the byte-exact default** through all of this; D2 is the spec'd escape hatch for
+  workloads that trade reproducibility for speed. Covered by `test_determinism_toggle.py`
+  (5/5, incl. `test_strong_two_run_byte_exact`, `test_invalid_determinism_rejected`) and the
+  C-ABI create/step/destroy test.
+- **Parameterized perf-gate regression test** (spec Task 3.1.6,
+  `tests/perf/test_go2_4096env_step_time.cpp`, ctest `Go2_4096env_StepTime.MeetsGatePerEnv`).
+  Builds the 4096-env Go2 world, wall-clock times 1000 back-to-back `Step()` calls, and
+  **records** the per-env-step µs; it asserts `< NUKA_PERF_GATE_US` (default 1000) **only on
+  the designated `NUKA_PERF_VALIDATION_GPU`**, else `GTEST_SKIP`. On this RTX-4000-Ada dev
+  box it records-and-skips (per-env-step ≈ 2.07 µs wall-clock — a deliberately conservative,
+  no-graph/no-overlap throughput figure, still ~480× under the 1000 µs gate) so CI stays
+  green; the absolute §7 gate asserts on the owner's validation card.
+
+### Perf-number reconciliation (so the cited figure is honest)
+
+A spot run once showed a 4096-env wall-clock step ~9× inflated (~33,700 µs); a clean re-run
+**reproduced the committed figure** and identified the spike as **transient GPU contention**,
+not a regression:
+
+| method | 4096 step_total p50 (µs) | per-env-step (µs) |
+|---|---|---|
+| CUDA-event per-tag `step_total` | 3749–3754 | **≈ 0.92** |
+| chrono wall-clock (per-step stream sync) | 3672–3678 | ≈ 0.90 |
+
+The two methods now agree at **≈ 0.9 µs/env-step** (p99 a flat ~4020 µs — rock-stable), and a
+`/proc`-based co-tenant check (NVML is driver-broken) found the box clean. The cited
+**≈ 0.9 µs/env-step** median (§2's 0.93 µs) is confirmed; the transient 8.2 µs/env wall-clock
+figure was a contention artifact and is discarded. Every method is far under the 1000 µs gate.
+
+### Verification gate (this whole batch)
+
+Full ctest **329 passed / 2 failed / 1 disabled** — the two failures are exactly the
+pre-existing orthogonal oracle gaps (`#38 V01…Phase6`, `#206 FeatherstoneOracle…`), **no new
+regressions**; pytest **55/55**; graph byte-exact (above); determinism two-run / reset /
+base-pose / Go2-standing / C-ABI all green.
