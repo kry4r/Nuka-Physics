@@ -37,6 +37,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cuda_runtime.h>
+
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -545,10 +547,591 @@ TEST(ControlModes, ReservedModeRejectedAtConstruction) {
     const auto context = nuka::phi::MakeDefaultDeviceContext();
     auto cooked = CookGo2();
     const uint32_t max_dof = articulation::ArticulationDofCount(cooked.host, 0u);
+    // Osc (id 4) is the still-reserved Phase-3 mode; ComputedTorque (3) and
+    // Actuator (5) are now IMPLEMENTED, so only Osc must be rejected here.
     EXPECT_THROW(
         gpu::BatchedArticulatedWorld(context, cooked.host, cooked.feet, max_dof,
                                      kGroundFarAway,
                                      gpu::DeterminismLevel::Strong,
-                                     articulation::ControlMode::ComputedTorque),
+                                     articulation::ControlMode::Osc),
         std::invalid_argument);
+}
+
+// ===========================================================================
+// Slice 2: ComputedTorque (inverse-dynamics) + Actuator (DC-motor) control.
+// ===========================================================================
+namespace {
+
+// Reads the device qddot (one float per link) for the single-env world.
+std::vector<float> DownloadQddot(const nuka::phi::DeviceContext& context,
+                                 gpu::BatchedArticulatedWorld& bw,
+                                 uint32_t link_count) {
+    const articulation::ArticulationDeviceState state = bw.View();
+    std::vector<float> qddot(link_count, 0.0f);
+    context.stream.Synchronize();
+    cudaMemcpy(qddot.data(), state.qddot,
+               static_cast<size_t>(link_count) * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    return qddot;
+}
+
+// Scene-derived hold gains + force limits (mirrors DefaultPdModeMatchesUnspecified
+// / the c_abi BuildHoldDriveTargets): per actuated link, Kp = scene gain, the
+// force limit = scene force limit. Used to drive ComputedTorque (Kp/Kd reuse the
+// stiffness/damping buffers; the q_target is the cooked stance).
+struct SceneGains {
+    std::vector<float> stiffness;
+    std::vector<float> damping;
+    std::vector<float> limits;
+};
+
+SceneGains DeriveSceneGains(const articulation::ArticulationHostState& base) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    const auto scene = nuka::import::LoadUsd(scene_path.string());
+    const auto blob = nuka::scene::CookScene(scene);
+    const auto world = nuka::runtime::BuildWorld(blob);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    SceneGains g;
+    g.stiffness.assign(base_link_count, 0.0f);
+    g.damping.assign(base_link_count, 0.0f);
+    g.limits.assign(base_link_count, 0.0f);
+    const auto& actuators = world.template_view.actuator_table;
+    const auto& joints = world.template_view.joint_table;
+    for (uint32_t a = 0u; a < world.template_view.actuator_count; ++a) {
+        if (a >= actuators.joint_ids.size() || a >= actuators.types.size() ||
+            actuators.types[a] != nuka::scene::ActuatorType::Position) {
+            continue;
+        }
+        const auto j = actuators.joint_ids[a];
+        if (j >= joints.child_bodies.size()) {
+            continue;
+        }
+        const auto child_body = joints.child_bodies[j];
+        uint32_t link = kInvalidLink;
+        for (uint32_t l = 0u; l < base_link_count; ++l) {
+            if (base.link_body[l] == child_body) {
+                link = l;
+                break;
+            }
+        }
+        if (link == kInvalidLink ||
+            base.joint_type[link] == articulation::ArticulationJointType::Fixed) {
+            continue;
+        }
+        const float gain =
+            a < actuators.gains.size() ? std::fmax(actuators.gains[a], 0.0f) : 0.0f;
+        const float force_limit = a < actuators.force_limits.size()
+                                      ? std::fmax(actuators.force_limits[a], 0.0f)
+                                      : 0.0f;
+        if (gain > 0.0f) {
+            g.stiffness[link] = gain;
+            g.damping[link] = 2.0f * std::sqrt(gain);
+        }
+        if (force_limit > 0.0f) {
+            g.limits[link] = force_limit;
+        }
+    }
+    return g;
+}
+
+constexpr float kGravityOn = -9.81f;
+// Penetrates the cooked stance feet (~0.031 m) so the base is SUPPORTED -- the
+// ground reaction lets gravity-comp HOLD vs zero-torque BUCKLE. Mirrors the
+// ContactsOnScaleStabilityDeterminismTiming ground in test_batched_articulated.
+constexpr float kGroundStand = 0.31f;
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// ComputedTorque gravity compensation: with Kp=Kd=0 (pure bias compensation),
+// the realized joint qddot is ~0 (tau == bias cancels gravity/Coriolis), so the
+// (fixed-trunk) robot HOLDS its joint angles, while at zero torque the legs sag
+// under gravity. Ground is FAR away (no contacts) so the ONLY joint forcing is
+// gravity vs its compensation -- a clean discriminator (the trunk is fixed-base
+// for this scene, so there is no base free-fall to mask the difference). Two
+// assertions:
+//   (1) qddot ~ a_des == 0 right after a step (the defining ID correctness check);
+//   (2) joint drift over N steps << the zero-torque (Torque mode, zero input)
+//       baseline drift.
+// ---------------------------------------------------------------------------
+TEST(ControlModes, ComputedTorqueGravityCompensationHolds) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    auto& base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    ASSERT_GT(max_dof, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t kSteps = 60u;
+
+    // q_target = the cooked stance; Kp = Kd = 0 (pure gravity/bias comp).
+    std::vector<float> targets = base.q;
+    std::vector<float> zeros(base_link_count, 0.0f);
+    nuka::phi::Buffer tgt_dev = UploadFloats(targets);
+    nuka::phi::Buffer kp_dev = UploadFloats(zeros);   // Kp = 0.
+    nuka::phi::Buffer kd_dev = UploadFloats(zeros);   // Kd = 0.
+
+    // (1) qddot ~ a_des == 0 after one step (the robust ID correctness check).
+    // NO force limits so the clamp cannot leave residue -> the joint qddot must be
+    // FP-close to a_des == 0 (CRBA-M vs ABA-implicit-M differ only in last bits).
+    {
+        gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                        kGroundFarAway,
+                                        gpu::DeterminismLevel::Strong,
+                                        articulation::ControlMode::ComputedTorque);
+        gpu::BatchedArticulatedStepParams params;
+        params.drive_targets = static_cast<const float*>(tgt_dev.Data());
+        params.drive_stiffness = static_cast<const float*>(kp_dev.Data());
+        params.drive_damping = static_cast<const float*>(kd_dev.Data());
+        // drive_force_limits intentionally null -> unclamped exact comp torque.
+        params.gravity_z = kGravityOn;
+        params.dt = kDt;
+        bw.Step(params);
+        const auto qddot = DownloadQddot(context, bw, base_link_count);
+        ASSERT_TRUE(AllFinite(qddot));
+        for (uint32_t l = 0u; l < base_link_count; ++l) {
+            if (base.joint_type[l] == articulation::ArticulationJointType::Fixed) {
+                continue;
+            }
+            EXPECT_LT(std::fabs(qddot[l]), 1.0e-2f)
+                << "ComputedTorque (Kp=Kd=0) joint qddot not ~0 at link " << l
+                << " (qddot=" << qddot[l] << ")";
+        }
+    }
+
+    // (2) Joint drift vs the zero-torque baseline over N steps (ground far away,
+    // so the only forcing is gravity vs its compensation; no contacts).
+    auto stance_drift = [&](articulation::ControlMode mode,
+                            bool comp) -> float {
+        gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                        kGroundFarAway,
+                                        gpu::DeterminismLevel::Strong, mode);
+        gpu::BatchedArticulatedStepParams params;
+        params.gravity_z = kGravityOn;
+        params.dt = kDt;
+        if (comp) {
+            params.drive_targets = static_cast<const float*>(tgt_dev.Data());
+            params.drive_stiffness = static_cast<const float*>(kp_dev.Data());
+            params.drive_damping = static_cast<const float*>(kd_dev.Data());
+            // No force limits -> the exact comp torque is applied.
+        } else {
+            // Torque mode, zero input == zero torque baseline (legs sag).
+            params.torque_input =
+                static_cast<const float*>(bw.TorqueInputBuffer().Data());
+        }
+        for (uint32_t step = 0u; step < kSteps; ++step) {
+            bw.Step(params);
+        }
+        context.stream.Synchronize();
+        articulation::ArticulationHostState dl = base;
+        bw.Download(&dl);
+        EXPECT_TRUE(AllFinite(dl.q));
+        float drift = 0.0f;
+        for (uint32_t l = 0u; l < base_link_count; ++l) {
+            if (base.joint_type[l] == articulation::ArticulationJointType::Fixed) {
+                continue;
+            }
+            drift += std::fabs(dl.q[l] - base.q[l]);
+        }
+        return drift;
+    };
+
+    const float comp_drift =
+        stance_drift(articulation::ControlMode::ComputedTorque, /*comp=*/true);
+    const float zero_drift =
+        stance_drift(articulation::ControlMode::Torque, /*comp=*/false);
+    // Gravity comp holds the joints MUCH better than letting the legs sag.
+    EXPECT_GT(zero_drift, 0.05f) << "zero-torque baseline did not sag";
+    EXPECT_LT(comp_drift, 0.1f * zero_drift)
+        << "ComputedTorque gravity comp did not hold better than zero torque "
+        << "(comp_drift=" << comp_drift << ", zero_drift=" << zero_drift << ")";
+}
+
+// ---------------------------------------------------------------------------
+// ComputedTorque tracking: with Kp>0, Kd=0 (drive_damping null -> NO control Kd
+// AND no orthogonal implicit joint damping) and gravity off, the joint is a pure
+// undamped oscillator qddot = Kp*e about q_target. The position error therefore
+// (a) DECREASES early (the joint accelerates toward the target -- the task's
+// "error decreases / tracks target" requirement) and (b) reaches ~0 at the
+// quarter period (~38 steps for Kp=100, dt=1/240). We assert the MIN error over
+// the run is a small fraction of the initial -- robust against the post-quarter-
+// period overshoot of an undamped law. The defining ID property qddot == a_des =
+// Kp*e is checked exactly in ComputedTorqueGravityCompensationHolds.
+// ---------------------------------------------------------------------------
+TEST(ControlModes, ComputedTorqueTracksTarget) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    auto& base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    ASSERT_GT(max_dof, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t joint = FirstActuatedLink(base);
+    ASSERT_NE(joint, kInvalidLink);
+
+    // Target = stance + an offset on ONE joint. Kp moderate; Kd / drive_damping
+    // LEFT NULL so the law is the undamped oscillator qddot = Kp*e (drive_damping
+    // would double as the implicit joint damping that crushes qdot every step).
+    std::vector<float> targets = base.q;
+    const float kOffset = 0.3f;  // rad.
+    targets[joint] = base.q[joint] + kOffset;
+    std::vector<float> kp(base_link_count, 0.0f);
+    kp[joint] = 100.0f;          // rad/s^2 per rad of error.
+    nuka::phi::Buffer tgt_dev = UploadFloats(targets);
+    nuka::phi::Buffer kp_dev = UploadFloats(kp);
+
+    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                    kGroundFarAway,
+                                    gpu::DeterminismLevel::Strong,
+                                    articulation::ControlMode::ComputedTorque);
+    gpu::BatchedArticulatedStepParams params;
+    params.drive_targets = static_cast<const float*>(tgt_dev.Data());
+    params.drive_stiffness = static_cast<const float*>(kp_dev.Data());
+    // params.drive_damping intentionally null (no control Kd, no implicit damping).
+    params.gravity_z = kGravityOff;
+    params.dt = kDt;
+
+    const float err0 = std::fabs(base.q[joint] - targets[joint]);
+    float min_err = err0;
+    const uint32_t kSteps = 50u;
+    const uint32_t kEarly = 15u;  // before the quarter-period overshoot.
+    for (uint32_t step = 0u; step < kSteps; ++step) {
+        bw.Step(params);
+        context.stream.Synchronize();
+        articulation::ArticulationHostState dl = base;
+        bw.Download(&dl);
+        ASSERT_TRUE(AllFinite(dl.q)) << "q non-finite at step " << step;
+        const float err = std::fabs(dl.q[joint] - targets[joint]);
+        min_err = std::fmin(min_err, err);
+        if (step < kEarly) {
+            // Early phase: the joint moves monotonically TOWARD the target.
+            EXPECT_GT((dl.q[joint] - base.q[joint]) * kOffset, -1e-3f)
+                << "joint moved AWAY from target at early step " << step;
+            EXPECT_LT(err, err0 + 1e-3f)
+                << "error grew above the initial in the early phase at step "
+                << step;
+        }
+    }
+    // The undamped oscillator reaches the target (min error ~0) at the quarter
+    // period within the run -- the joint demonstrably tracked q_target.
+    EXPECT_LT(min_err, 0.15f * err0)
+        << "ComputedTorque did not track the target (err0=" << err0
+        << ", min_err=" << min_err << ")";
+}
+
+// ---------------------------------------------------------------------------
+// Actuator envelope: the deliverable torque is clamped by the DC-motor
+// torque-speed envelope tau_max(qdot) = clamp(tau_stall*(1-|qdot|/qdot_noload),
+// 0, tau_stall). Probe by commanding a large torque and reading qddot:
+//   * at qdot=0 (first step from rest) the FULL tau_stall is delivered;
+//   * at qdot > qdot_noload the deliverable torque (and so qddot from that joint)
+//     is clamped to ~0 -- the envelope ENGAGES. We compare the first-step joint
+//     acceleration (full torque) to a setup whose no-load speed is tiny so the
+//     envelope clamps from the very first non-rest step.
+// ---------------------------------------------------------------------------
+TEST(ControlModes, ActuatorEnvelopeLimitsTorqueAtSpeed) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    auto& base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    ASSERT_GT(max_dof, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t joint = FirstActuatedLink(base);
+    ASSERT_NE(joint, kInvalidLink);
+
+    const float kStall = 10.0f;     // tau_stall (Nm), via drive_force_limits.
+    const float kCmd = 100.0f;      // command FAR above stall so the clamp binds.
+
+    std::vector<float> torque(base_link_count, 0.0f);
+    torque[joint] = kCmd;
+    std::vector<float> limits(base_link_count, 0.0f);
+    limits[joint] = kStall;
+    nuka::phi::Buffer torque_dev = UploadFloats(torque);
+    nuka::phi::Buffer lim_dev = UploadFloats(limits);
+
+    // Run A: no-load speed LARGE (envelope effectively off at the speeds reached)
+    // => full tau_stall every step => qdot keeps rising.
+    // Run B: no-load speed TINY => after the first step |qdot|>qdot_noload so
+    // tau_max collapses to ~0 => qdot stalls near its first-step value.
+    auto run = [&](float qdot_noload, uint32_t steps) -> std::vector<float> {
+        gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                        kGroundFarAway,
+                                        gpu::DeterminismLevel::Strong,
+                                        articulation::ControlMode::Actuator);
+        std::vector<float> noload(base_link_count, 0.0f);
+        noload[joint] = qdot_noload;
+        nuka::phi::Buffer noload_dev = UploadFloats(noload);
+        gpu::BatchedArticulatedStepParams params;
+        params.torque_input = static_cast<const float*>(torque_dev.Data());
+        params.drive_force_limits = static_cast<const float*>(lim_dev.Data());
+        params.actuator_noload_speed =
+            static_cast<const float*>(noload_dev.Data());
+        params.gravity_z = kGravityOff;
+        params.dt = kDt;
+        std::vector<float> qdot_hist;
+        for (uint32_t step = 0u; step < steps; ++step) {
+            bw.Step(params);
+            context.stream.Synchronize();
+            articulation::ArticulationHostState dl = base;
+            bw.Download(&dl);
+            qdot_hist.push_back(dl.qdot[joint]);
+        }
+        return qdot_hist;
+    };
+
+    const uint32_t kSteps = 40u;
+    const auto fast = run(1000.0f, kSteps);   // envelope effectively off.
+    const auto slow = run(0.05f, kSteps);     // envelope clamps after step 0.
+    ASSERT_EQ(fast.size(), kSteps);
+    ASSERT_EQ(slow.size(), kSteps);
+
+    // First step from rest (qdot=0): both deliver the SAME (full tau_stall) torque,
+    // so the first-step qdot is identical (envelope inactive at qdot=0).
+    EXPECT_NEAR(fast[0], slow[0], 1e-4f * std::fabs(fast[0]) + 1e-6f)
+        << "first-step (qdot=0) torque differed -- envelope must be inactive at "
+           "standstill (fast=" << fast[0] << ", slow=" << slow[0] << ")";
+    EXPECT_NE(fast[0], 0.0f);
+
+    // By the final step the LARGE-no-load run has accelerated much further (full
+    // torque every step) than the TINY-no-load run (whose torque collapsed to ~0
+    // once |qdot| passed qdot_noload). The envelope demonstrably limited delivery.
+    EXPECT_GT(std::fabs(fast.back()), 2.0f * std::fabs(slow.back()))
+        << "DC-motor envelope did not limit torque at speed (fast qdot="
+        << fast.back() << ", slow qdot=" << slow.back() << ")";
+    // And the clamped run's velocity stays bounded near the no-load speed region
+    // (it cannot keep accelerating once the envelope shuts the torque off).
+    EXPECT_LT(std::fabs(slow.back()), std::fabs(fast.back()));
+}
+
+// ---------------------------------------------------------------------------
+// D1 two-run byte-exact for the slice-2 modes: same mode, same inputs, N steps
+// -> bit-identical q/qdot (mirrors the slice-1 mode-determinism tests).
+// ---------------------------------------------------------------------------
+namespace {
+
+std::pair<std::vector<float>, std::vector<float>> RunSlice2Mode(
+    const nuka::phi::DeviceContext& context, const CookedGo2& cooked,
+    articulation::ControlMode mode, uint32_t joint, uint32_t steps) {
+    auto base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+
+    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                    kGroundStand,
+                                    gpu::DeterminismLevel::Strong, mode);
+    gpu::BatchedArticulatedStepParams params;
+    params.gravity_z = kGravityOn;
+    params.dt = kDt;
+
+    // Buffers must outlive the loop.
+    nuka::phi::Buffer tgt_dev, kp_dev, kd_dev, lim_dev, torque_dev, noload_dev;
+    if (mode == articulation::ControlMode::ComputedTorque) {
+        const SceneGains g = DeriveSceneGains(base);
+        std::vector<float> targets = base.q;
+        tgt_dev = UploadFloats(targets);
+        kp_dev = UploadFloats(g.stiffness);
+        kd_dev = UploadFloats(g.damping);
+        lim_dev = UploadFloats(g.limits);
+        params.drive_targets = static_cast<const float*>(tgt_dev.Data());
+        params.drive_stiffness = static_cast<const float*>(kp_dev.Data());
+        params.drive_damping = static_cast<const float*>(kd_dev.Data());
+        params.drive_force_limits = static_cast<const float*>(lim_dev.Data());
+    } else {  // Actuator.
+        std::vector<float> torque(base_link_count, 0.0f);
+        std::vector<float> limits(base_link_count, 0.0f);
+        std::vector<float> noload(base_link_count, 0.0f);
+        torque[joint] = 8.0f;
+        limits[joint] = 10.0f;
+        noload[joint] = 2.0f;
+        torque_dev = UploadFloats(torque);
+        lim_dev = UploadFloats(limits);
+        noload_dev = UploadFloats(noload);
+        params.torque_input = static_cast<const float*>(torque_dev.Data());
+        params.drive_force_limits = static_cast<const float*>(lim_dev.Data());
+        params.actuator_noload_speed =
+            static_cast<const float*>(noload_dev.Data());
+    }
+
+    for (uint32_t step = 0u; step < steps; ++step) {
+        bw.Step(params);
+    }
+    context.stream.Synchronize();
+    articulation::ArticulationHostState dl = base;
+    bw.Download(&dl);
+    return {dl.q, dl.qdot};
+}
+
+}  // namespace
+
+TEST(ControlModes, ComputedTorqueModeTwoRunByteExact) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    const uint32_t joint = FirstActuatedLink(cooked.host);
+    ASSERT_NE(joint, kInvalidLink);
+    const auto a = RunSlice2Mode(context, cooked,
+                                 articulation::ControlMode::ComputedTorque, joint, 50u);
+    const auto b = RunSlice2Mode(context, cooked,
+                                 articulation::ControlMode::ComputedTorque, joint, 50u);
+    ASSERT_EQ(a.first.size(), b.first.size());
+    for (size_t i = 0u; i < a.first.size(); ++i) {
+        EXPECT_EQ(a.first[i], b.first[i]) << "q differs run-to-run at " << i;
+        EXPECT_EQ(a.second[i], b.second[i]) << "qdot differs run-to-run at " << i;
+    }
+}
+
+TEST(ControlModes, ActuatorModeTwoRunByteExact) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    const uint32_t joint = FirstActuatedLink(cooked.host);
+    ASSERT_NE(joint, kInvalidLink);
+    const auto a = RunSlice2Mode(context, cooked,
+                                 articulation::ControlMode::Actuator, joint, 50u);
+    const auto b = RunSlice2Mode(context, cooked,
+                                 articulation::ControlMode::Actuator, joint, 50u);
+    ASSERT_EQ(a.first.size(), b.first.size());
+    for (size_t i = 0u; i < a.first.size(); ++i) {
+        EXPECT_EQ(a.first[i], b.first[i]) << "q differs run-to-run at " << i;
+        EXPECT_EQ(a.second[i], b.second[i]) << "qdot differs run-to-run at " << i;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FLOATING-BASE ComputedTorque: exercises the base_dof=6 SCHUR-COMPLEMENT branch
+// (the fixed-base go2_stand scene above only hits base_dof=0, where the joint
+// admittance D is the full M^-1 block). On a free-floating root the effective
+// joint admittance is the Schur complement = the JOINT sub-block of the full-tile
+// physics-M inverse (offset 6), and the kernel solves D*tau_j = a_des - qddot_free
+// against THAT block. The defining ID check holds regardless of base type: with
+// Kp=Kd=0 (pure gravity/bias comp) the realized JOINT qddot ~ a_des == 0 (the base
+// itself still free-falls -- it is unactuated -- but the JOINTS hold). Ground is
+// far away so the only forcing is gravity vs its compensation.
+// ---------------------------------------------------------------------------
+namespace {
+
+CookedGo2 CookGo2Float() {
+    const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
+    const auto scene = nuka::import::LoadUsd(scene_path.string());
+    const auto blob = nuka::scene::CookScene(scene);
+    const auto world = nuka::runtime::BuildWorld(blob);
+
+    CookedGo2 result;
+    result.host = articulation::BuildArticulationHostState(
+        world.template_view.articulations, world.template_view.body_table);
+    const uint32_t link_count = result.host.TotalLinkCount();
+    const auto& shapes = world.template_view.shape_table;
+    for (uint32_t shape = 0u; shape < shapes.types.size(); ++shape) {
+        if (shapes.types[shape] != nuka::scene::ShapeType::Sphere) {
+            continue;
+        }
+        const uint32_t body = shapes.body_ids[shape];
+        uint32_t calf_link = kInvalidLink;
+        for (uint32_t link = 0u; link < link_count; ++link) {
+            if (result.host.link_body[link] == body) {
+                calf_link = link;
+                break;
+            }
+        }
+        if (calf_link == kInvalidLink) {
+            continue;
+        }
+        articulation::FootShape foot;
+        foot.calf_local_link = calf_link;
+        foot.local_offset = shape < shapes.local_transforms.size()
+                                ? shapes.local_transforms[shape].position
+                                : Vec3::Zero();
+        foot.radius = shape < shapes.radii.size() ? shapes.radii[shape] : 0.0f;
+        result.feet.push_back(foot);
+    }
+    return result;
+}
+
+}  // namespace
+
+TEST(ControlModes, ComputedTorqueFloatingBaseGravityComp) {
+    const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "go2_float scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2Float();
+    auto& base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    ASSERT_GT(max_dof, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    // Confirm this scene IS floating base (the root link is a FloatingBase joint),
+    // so the base_dof=6 Schur path is genuinely exercised.
+    bool has_floating_root = false;
+    for (uint32_t l = 0u; l < base_link_count; ++l) {
+        if (base.joint_type[l] == articulation::ArticulationJointType::FloatingBase) {
+            has_floating_root = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(has_floating_root)
+        << "go2_float must have a FloatingBase root for the Schur-path test";
+
+    std::vector<float> targets = base.q;
+    std::vector<float> zeros(base_link_count, 0.0f);
+    nuka::phi::Buffer tgt_dev = UploadFloats(targets);
+    nuka::phi::Buffer kp_dev = UploadFloats(zeros);  // Kp = 0 (pure bias comp).
+    nuka::phi::Buffer kd_dev = UploadFloats(zeros);  // Kd = 0.
+
+    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                    kGroundFarAway,
+                                    gpu::DeterminismLevel::Strong,
+                                    articulation::ControlMode::ComputedTorque);
+    gpu::BatchedArticulatedStepParams params;
+    params.drive_targets = static_cast<const float*>(tgt_dev.Data());
+    params.drive_stiffness = static_cast<const float*>(kp_dev.Data());
+    params.drive_damping = static_cast<const float*>(kd_dev.Data());
+    // No force limits -> the exact (Schur-solved) comp torque is applied.
+    params.gravity_z = kGravityOn;
+    params.dt = kDt;
+    bw.Step(params);
+
+    const auto qddot = DownloadQddot(context, bw, base_link_count);
+    ASSERT_TRUE(AllFinite(qddot));
+    // The JOINT (revolute) accelerations must be ~0 (a_des == 0): the Schur-block
+    // solve makes stage-2 ABA realize qddot_j = a_des_j exactly. The FloatingBase
+    // root DOFs are NOT actuated -- skip them (the base free-falls under gravity).
+    for (uint32_t l = 0u; l < base_link_count; ++l) {
+        if (base.joint_type[l] != articulation::ArticulationJointType::Revolute &&
+            base.joint_type[l] != articulation::ArticulationJointType::Prismatic) {
+            continue;
+        }
+        EXPECT_LT(std::fabs(qddot[l]), 1.0e-2f)
+            << "floating-base ComputedTorque (Kp=Kd=0) JOINT qddot not ~0 at link "
+            << l << " (qddot=" << qddot[l] << ")";
+    }
+
+    // Two-run byte-exactness on the floating-base Schur path (D1).
+    gpu::BatchedArticulatedWorld bw2(context, base, cooked.feet, max_dof,
+                                     kGroundFarAway,
+                                     gpu::DeterminismLevel::Strong,
+                                     articulation::ControlMode::ComputedTorque);
+    bw2.Step(params);
+    const auto qddot2 = DownloadQddot(context, bw2, base_link_count);
+    ASSERT_EQ(qddot.size(), qddot2.size());
+    for (size_t i = 0u; i < qddot.size(); ++i) {
+        EXPECT_EQ(qddot[i], qddot2[i]) << "floating-base qddot differs run-to-run "
+                                       << "at " << i;
+    }
 }

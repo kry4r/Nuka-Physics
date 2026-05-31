@@ -221,6 +221,17 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     velocity_target_ = phi::Buffer(
         static_cast<size_t>(total_link_count_) * sizeof(float),
         phi::MemoryKind::Device);
+    // v0.5 C-fwd slice 2: Actuator no-load speed (always allocated, zero-filled
+    // -> a zero-init Actuator world falls back to the plain force-limit clamp).
+    actuator_noload_speed_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) * sizeof(float),
+        phi::MemoryKind::Device);
+    // ComputedTorque scratch: qddot_free (engine qddot from the early tau=0 ABA).
+    // Allocated for every world (cheap, one float per link); only written/read in
+    // the ComputedTorque path.
+    qddot_free_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) * sizeof(float),
+        phi::MemoryKind::Device);
 
     // Zero the persistent lambda buffer for a clean cold start (determinism +
     // a defined warm-start seed on the first step). Also zero the contact-point
@@ -244,6 +255,14 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                               static_cast<size_t>(total_link_count_) * sizeof(float),
                               context_.stream.Native()),
               "BatchedArticulatedWorld velocity_target memset");
+    CheckCuda(cudaMemsetAsync(actuator_noload_speed_.Data(), 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld actuator_noload_speed memset");
+    CheckCuda(cudaMemsetAsync(qddot_free_.Data(), 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld qddot_free memset");
 
     // p03 reset: snapshot the creation-time AUTHORITATIVE live state (the device
     // state was just seated by UploadArticulationState above with the cooked
@@ -317,9 +336,79 @@ void BatchedArticulatedWorld::ApplyStage1Drives(
                 ctx, state, params.velocity_target, params.drive_stiffness,
                 params.drive_force_limits);
             break;
+        case articulation::ControlMode::ComputedTorque: {
+            // Inverse-dynamics / computed-torque PD. The mass matrix M and the
+            // dynamics bias are NOT available at stage 1 in the normal pipeline
+            // (M is built at stage 7 WITH the dt*C fold; the ABA bias is produced
+            // inside stage-2 ComputeAccelerations). Resolve by running the EXISTING
+            // engine dynamics EARLY this step, for ComputedTorque ONLY:
+            //   (a) zero tau, then a full tau=0 ABA (with the REAL gravity_z so G
+            //       enters). This both populates the kinematics scratch the CRBA
+            //       reads (link_xup, from ABA Pass 1 -- which is NOT yet valid at
+            //       stage 1 of the FIRST step, so the ABA MUST precede the CRBA)
+            //       and produces the engine qddot, snapshot into qddot_free_.
+            //       qddot_free = M^-1*(-bias_aba).
+            //   (b) physics-M CRBA into m_ (joint_damping=nullptr, dt=0 -> NO dt*C
+            //       fold, so M matches the ABA implicit physics inertia), then
+            //       factor m_ -> m_inv_ (the FULL-tile physics inverse, base rows
+            //       included). m_/m_inv_ are consumed here, before stage 7
+            //       overwrites them with the dt*C-folded contact M / its inverse.
+            // The early ABA's scratch (link_bias_force / link_articulated_I /
+            // qddot / link_acceleration) is fully recomputed by the stage-2 ABA,
+            // so this leaves no residue.
+            // The drive kernel then SOLVES D*tau_j = (a_des_j - qddot_free_j) for
+            // the joint torque, where D is the JOINT sub-block of the physics-M
+            // INVERSE (m_inv_): on a FLOATING base the effective joint admittance
+            // is the Schur complement, captured EXACTLY by that inverse sub-block
+            // (NOT M_jj). The exact engine identity is qddot_j = D*tau_j +
+            // qddot_free_j, so stage-2 ABA then yields qddot_j = a_des_j and the
+            // bias (Coriolis, gravity, model joint damping -- all inside
+            // qddot_free) cancels. a_des = Kp*e + Kd*edot (qddot_des=qdot_target=0).
+            // PDPosition never enters here, so its path is byte-identical.
+            phi::ScopedDeviceGuard guard(ctx.device_id);
+            const cudaStream_t stream = ctx.stream.Native();
+            // (a) tau=0 ABA -> qddot_free + fresh kinematics (link_xup) for CRBA.
+            CheckCuda(cudaMemsetAsync(state.tau, 0,
+                                      static_cast<size_t>(total_link_count_) *
+                                          sizeof(float),
+                                      stream),
+                      "ComputedTorque early-ABA tau zero");
+            articulation::FeatherstoneAba::ComputeAccelerations(ctx, state,
+                                                                params.gravity_z);
+            CheckCuda(cudaMemcpyAsync(qddot_free_.Data(), state.qddot,
+                                      static_cast<size_t>(total_link_count_) *
+                                          sizeof(float),
+                                      cudaMemcpyDeviceToDevice, stream),
+                      "ComputedTorque snapshot qddot_free");
+            // (b) physics M (reads the fresh link_xup) + its full-tile inverse.
+            articulation::ComputeArticulationInertiaM(
+                ctx, state, max_dof_,
+                static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
+                static_cast<float*>(m_.Data()),
+                /*joint_damping=*/nullptr, /*dt=*/0.0f);
+            articulation::FactorArticulationInertiaM(
+                ctx, state, max_dof_, static_cast<const float*>(m_.Data()),
+                static_cast<float*>(m_inv_.Data()));
+            // Solve D*tau_j = (a_des - qddot_free) for tau_j (D = joint block of
+            // m_inv_). q_target = drive_targets, Kp = drive_stiffness, Kd =
+            // drive_damping (clamp by drive_force_limits).
+            articulation::LaunchApplyComputedTorqueDriveKernels(
+                ctx, state, max_dof_, static_cast<const float*>(m_inv_.Data()),
+                static_cast<const float*>(qddot_free_.Data()),
+                params.drive_targets, params.drive_stiffness, params.drive_damping,
+                params.drive_force_limits);
+            break;
+        }
+        case articulation::ControlMode::Actuator:
+            // tau = clamp(torque_input, +/- tau_max(qdot)); DC-motor envelope with
+            // tau_stall == drive_force_limits and the new per-link no-load speed.
+            articulation::LaunchApplyActuatorDriveKernels(
+                ctx, state, params.torque_input, params.drive_force_limits,
+                params.actuator_noload_speed);
+            break;
         default:
-            // Unreachable: construction rejects an unimplemented mode. Leave tau
-            // unchanged rather than silently mis-actuate.
+            // Unreachable: construction rejects an unimplemented mode (Osc). Leave
+            // tau unchanged rather than silently mis-actuate.
             break;
     }
 }
@@ -683,9 +772,10 @@ namespace {
 // True iff two step-param structs are byte-comparable equal in every field that
 // the captured graph bakes as a kernel argument: the four scalars AND every
 // BUFFER POINTER (the four drive descriptors plus, v0.5 C-fwd, torque_input /
-// velocity_target -- pointer ADDRESSES are baked; only the buffer CONTENTS may
-// vary between replays). A mismatch in ANY of these forces a re-capture so the
-// replayed graph never uses stale scalars / a moved buffer.
+// velocity_target / actuator_noload_speed -- pointer ADDRESSES are baked; only
+// the buffer CONTENTS may vary between replays). A mismatch in ANY of these
+// forces a re-capture so the replayed graph never uses stale scalars / a moved
+// buffer.
 bool StepParamsMatch(const BatchedArticulatedStepParams& a,
                      const BatchedArticulatedStepParams& b) {
     return a.drive_targets == b.drive_targets &&
@@ -694,6 +784,7 @@ bool StepParamsMatch(const BatchedArticulatedStepParams& a,
            a.drive_force_limits == b.drive_force_limits &&
            a.torque_input == b.torque_input &&
            a.velocity_target == b.velocity_target &&
+           a.actuator_noload_speed == b.actuator_noload_speed &&
            a.gravity_z == b.gravity_z && a.dt == b.dt &&
            a.friction_coefficient == b.friction_coefficient &&
            a.baumgarte_max_velocity == b.baumgarte_max_velocity;

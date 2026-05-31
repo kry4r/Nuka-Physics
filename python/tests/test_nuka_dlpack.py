@@ -66,6 +66,35 @@ def test_world_metadata(device):
         assert w.dt > 0.0
 
 
+# v0.5 C-fwd slice 2: ComputedTorque (3) + Actuator (5) construct, step and expose
+# their control buffers through the binding (the engine forward + determinism are
+# covered by the C++ control-mode tests; this is the Python-binding smoke).
+@pytest.mark.parametrize(
+    "mode, field",
+    [
+        (nuka.CONTROL_MODE_COMPUTED_TORQUE, nuka.DRIVE_TARGET),
+        (nuka.CONTROL_MODE_ACTUATOR, nuka.ACTUATOR_NOLOAD_SPEED),
+    ],
+)
+def test_slice2_control_mode_world_steps(device, mode, field):
+    with nuka.World.create_from_scene(device, SCENE, 64, control_mode=mode) as w:
+        # The mode-specific control buffer is a writable, correctly-shaped view.
+        view = torch.from_dlpack(w.buffer_view(field))
+        assert view.is_cuda
+        assert view.numel() == w.env_count * w.base_link_count
+        view.zero_()  # writable in place.
+        w.step()  # the slice-2 stage-1 law must step without throwing.
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        assert torch.isfinite(q).all()
+
+
+def test_osc_mode_rejected(device):
+    # Osc (4) is the still-reserved Phase-3 mode; construction must reject it.
+    with pytest.raises(Exception):
+        nuka.World.create_from_scene(device, SCENE, 64, control_mode=4)
+
+
 def test_4096_smoke(device):
     with make_world(device, 4096) as w:
         w.step()

@@ -84,6 +84,13 @@ struct BatchedArticulatedStepParams {
     // no-op in the new launchers.
     const float* torque_input = nullptr;
     const float* velocity_target = nullptr;
+    // v0.5 C-fwd slice 2: per-link DC-motor no-load speed for Actuator mode (same
+    // env-major layout, length state.total_link_count). The actuator stall torque
+    // reuses drive_force_limits; this is the speed at which the deliverable torque
+    // falls to 0. <= 0 per link -> plain force-limit clamp (== Torque mode), so a
+    // zero-filled buffer is safe. Always-allocated owned buffer (stable pointer
+    // for the captured graph); only read by stage 1 in Actuator mode.
+    const float* actuator_noload_speed = nullptr;
     float gravity_z = -9.81f;
     float dt = 1.0f / 240.0f;
     float friction_coefficient = articulation::kContactFriction;
@@ -146,6 +153,12 @@ public:
     // matching mode (Torque -> torque_input, Velocity -> velocity_target).
     const phi::Buffer& TorqueInputBuffer() const { return torque_input_; }
     const phi::Buffer& VelocityTargetBuffer() const { return velocity_target_; }
+    // v0.5 C-fwd slice 2: per-link DC-motor no-load speed for Actuator mode.
+    // Always allocated (zero-filled); the C ABI / RL harness writes it in place
+    // and the next Step picks it up. Only consulted by stage 1 in Actuator mode.
+    const phi::Buffer& ActuatorNoloadSpeedBuffer() const {
+        return actuator_noload_speed_;
+    }
 
     // Advances one deterministic step in place on the device state, recording
     // per-stage timings under the canonical perf tags. The persistent lambda
@@ -275,7 +288,11 @@ private:
     // v0.5 C-fwd: HOST-SIDE stage-1 control-law dispatch. PDPosition routes to
     // the legacy, UNTOUCHED FeatherstoneAba::ApplyPositionDrives (so the PD
     // instruction / FP order -- and the go2_stand golden -- is byte-for-byte
-    // unchanged); Torque / Velocity route to the new launchers. Called
+    // unchanged); Torque / Velocity / Actuator route to the new launchers.
+    // ComputedTorque additionally runs the EARLY engine dynamics this step (a
+    // physics-M CRBA into m_ + a tau=0 ABA whose qddot is snapshot into
+    // qddot_free_) so the matvec tau = M*(a_des - qddot_free) can form (stage-2
+    // ABA re-subtracts the same bias -> realized qddot == a_des). Called
     // identically by Step() and StepKernels() so the two bodies stay in lockstep
     // (the 200-step byte-exact graph gate guards them). No-op (leaves tau as the
     // prior step left it) if the mode's input pointers are null.
@@ -327,6 +344,16 @@ private:
     // never reads them).
     phi::Buffer torque_input_;    // float[total_link_count]
     phi::Buffer velocity_target_; // float[total_link_count]
+    phi::Buffer actuator_noload_speed_;  // float[total_link_count] (slice 2)
+
+    // v0.5 C-fwd slice 2: ComputedTorque scratch. qddot_free_ holds the engine
+    // qddot from the EARLY tau=0 ABA pass run at the START of the step (in
+    // ApplyStage1Drives, ComputedTorque case only). The computed-torque matvec
+    // forms tau = M*(a_des - qddot_free); stage-2 ABA re-subtracts the same engine
+    // bias, so it cancels and the realized qddot == a_des. m_ is reused for the
+    // physics-M CRBA tile (consumed by the matvec before stage 7 rewrites it with
+    // the dt*C-folded contact M). Only allocated/used for a ComputedTorque world.
+    phi::Buffer qddot_free_;      // float[total_link_count] (slice 2)
 
     // p03 reset: creation-time snapshot of the authoritative live state (device
     // resident, captured in the constructor). reset copies these snapshot->live.

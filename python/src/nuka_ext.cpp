@@ -124,13 +124,16 @@ public:
                 "create_from_scene: determinism must be 0 (Strong/D1) or "
                 "1 (Weak/D2)");
         }
-        // v0.5 C-fwd: 0 = PDPosition (default), 1 = Torque, 2 = Velocity. 3..5
-        // are reserved enumerators (not yet implemented); anything above is
-        // rejected. Non-PD modes require the batched (env_count > 1) path.
-        if (control_mode > 2u) {
+        // v0.5 C-fwd: 0 = PDPosition (default), 1 = Torque, 2 = Velocity, 3 =
+        // ComputedTorque, 5 = Actuator. 4 (Osc) is a reserved enumerator (Phase-3
+        // solver slice); it and anything above 5 are rejected. Non-PD modes
+        // require the batched (env_count > 1) path. (Mirror the engine's
+        // IsControlModeImplemented set {0,1,2,3,5}.)
+        if (control_mode > 5u || control_mode == 4u) {
             throw std::runtime_error(
                 "create_from_scene: control_mode must be 0 (PDPosition), "
-                "1 (Torque) or 2 (Velocity); 3-5 are reserved/unimplemented");
+                "1 (Torque), 2 (Velocity), 3 (ComputedTorque) or 5 (Actuator); "
+                "4 (Osc) is reserved/unimplemented");
         }
         nuka_world_desc_t desc{};
         desc.scene_path = scene_path.c_str();
@@ -304,12 +307,18 @@ NB_MODULE(_nuka_ext, m) {
     // nuka_world_desc_t.control_mode / World.create_from_scene(control_mode=...)
     // accept). PD_POSITION (0, default) is the legacy PD position drive,
     // byte-for-byte unchanged. TORQUE (1) reads NUKA_FIELD_TORQUE_INPUT; VELOCITY
-    // (2) reads NUKA_FIELD_VELOCITY_TARGET (servo gain == DRIVE_STIFFNESS). 3-5
-    // are reserved for later slices and are rejected. Non-PD modes need the
+    // (2) reads NUKA_FIELD_VELOCITY_TARGET (servo gain == DRIVE_STIFFNESS).
+    // COMPUTED_TORQUE (3) is inverse-dynamics PD (tau = M*(Kp*e - Kd*qdot) + bias,
+    // Kp/Kd == DRIVE_STIFFNESS/DRIVE_DAMPING, target == DRIVE_TARGET). ACTUATOR (5)
+    // is a DC-motor torque-speed envelope on TORQUE_INPUT (tau_stall ==
+    // DRIVE_FORCE_LIMIT, no-load speed == ACTUATOR_NOLOAD_SPEED). Osc (4) is
+    // reserved (Phase-3 solver slice) and is rejected. Non-PD modes need the
     // batched (env_count > 1) path.
     m.attr("CONTROL_MODE_PD_POSITION") = uint32_t{0};
     m.attr("CONTROL_MODE_TORQUE") = uint32_t{1};
     m.attr("CONTROL_MODE_VELOCITY") = uint32_t{2};
+    m.attr("CONTROL_MODE_COMPUTED_TORQUE") = uint32_t{3};
+    m.attr("CONTROL_MODE_ACTUATOR") = uint32_t{5};
 
     // Field enum (kept identical to nuka_state_field_t).
     nb::enum_<nuka_state_field_t>(m, "Field")
@@ -327,6 +336,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("BASE_POSE", NUKA_FIELD_BASE_POSE)
         .value("TORQUE_INPUT", NUKA_FIELD_TORQUE_INPUT)
         .value("VELOCITY_TARGET", NUKA_FIELD_VELOCITY_TARGET)
+        .value("ACTUATOR_NOLOAD_SPEED", NUKA_FIELD_ACTUATOR_NOLOAD_SPEED)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -361,7 +371,12 @@ NB_MODULE(_nuka_ext, m) {
                     "CONTROL_MODE_PD_POSITION (legacy PD drive, byte-for-byte "
                     "unchanged), 1 = CONTROL_MODE_TORQUE (writes Field.TORQUE_INPUT), "
                     "2 = CONTROL_MODE_VELOCITY (writes Field.VELOCITY_TARGET; servo "
-                    "gain == DRIVE_STIFFNESS). Non-PD modes require env_count > 1.")
+                    "gain == DRIVE_STIFFNESS), 3 = CONTROL_MODE_COMPUTED_TORQUE "
+                    "(inverse-dynamics PD on DRIVE_TARGET; gains == "
+                    "DRIVE_STIFFNESS/DRIVE_DAMPING), 5 = CONTROL_MODE_ACTUATOR "
+                    "(DC-motor envelope on Field.TORQUE_INPUT; tau_stall == "
+                    "DRIVE_FORCE_LIMIT, no-load speed == Field.ACTUATOR_NOLOAD_SPEED). "
+                    "Non-PD modes require env_count > 1.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
