@@ -3,6 +3,42 @@
 A high-performance, CUDA-first physics engine designed for robotics simulation,
 reinforcement learning, and real-time applications.
 
+## Showcase — 4096-env Go2 locomotion, trained in-engine
+
+![Go2 walking — batched environments driven by an in-engine PPO policy](docs/media/go2_walk_4096env.gif)
+
+*16 of 4096 batched Go2 environments (debug-skeleton render of the headless
+batched path), driven by a PPO policy trained end-to-end on Nuka.* The same
+cooked `WorldTemplate` runs all 4096 environments on one GPU; the policy was
+trained from scratch with [rl_games](examples/training/) PPO and converges to a
+command-conditioned walking gait (forward-velocity tracking across
+`-0.5 … +1.0 m/s`).
+
+### v0.3 (S1) highlights
+
+- **4096 parallel articulated environments** on a single GPU from one cooked
+  template — GPU-resident broadphase, contact generation, PGS contact/joint
+  solve, Featherstone ABA, and PD drives.
+- **Comfortably under the 1 ms / env-step target** at 4096 envs under strong
+  (D1) determinism on a dev **RTX 4000 Ada** (≈3× below a 4090; the absolute
+  master-plan gate is validated on the owner's RTX 5080 — this box reports
+  relative numbers). Median GPU step time is ≈ 0.93 µs / env-step by in-engine
+  CUDA-event timers. See
+  [the on-box test & perf report](docs/architecture/2026-05-31-v03-test-and-perf-report.md).
+- **Byte-exact strong determinism (D1)** by default — no float atomics, fixed
+  reduction order, bit-identical re-runs — with an **opt-in weak-determinism
+  (D2)** toggle exposed through the C ABI (`nuka_world_desc_t.determinism`) for
+  workloads that trade reproducibility for speed.
+- **Opt-in, bit-exact CUDA-graph step path** (`BatchedArticulatedWorld::StepGraph`)
+  — replays the captured step kernel sequence **bit-for-bit identical** to the
+  reference `Step()` (asserted by a byte-compare regression test), removing
+  per-launch overhead while staying D1-safe. (At 4096-env production batches the
+  step is compute-bound, so the launch-overhead win is within run-to-run noise;
+  the value is the determinism-preserving mechanism, not a speedup.)
+- **In-engine RL stack**: zero-copy PyTorch (DLPack) buffer views, a gymnasium
+  vec-env, an rl_games adapter, and an engine-side per-env reset primitive — see
+  [`examples/training/`](examples/training/).
+
 ## Features
 
 - Rigid body dynamics with symplectic Euler integration

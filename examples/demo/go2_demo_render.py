@@ -215,8 +215,17 @@ def main() -> int:
         T = min(T, args.max_frames)
 
     # PER-ENV walk check (honor the "no flailing env" claim, which the aggregate
-    # capture gate alone does not guarantee): an env is OK iff it advanced forward
-    # (dx>0.1 m) AND stayed upright every frame (base z never collapsed, tilt small).
+    # capture gate alone does not guarantee): an env is OK iff it COMMAND-TRACKS and
+    # stayed upright every frame (base z never collapsed, tilt small). The forward
+    # requirement is COMMAND-CONDITIONAL: an env commanded to walk (cmd_vx >= 0.2)
+    # must advance forward (dx>0.1 m); an env commanded to STAND (cmd_vx < 0.2) must
+    # NOT run away (|dx| bounded) -- so the command-conditioned grid (incl. a
+    # standing env at cmd_vx=0) renders cleanly without falsely red-X'ing the
+    # stander. Backward-compatible with the external-policy capture, whose cmds are
+    # all >= 0.35 (every env hits the cmd_vx>=0.2 "walk" branch -> identical to the
+    # old dx>0.1 gate).
+    WALK_CMD_THRESHOLD = 0.2
+    STAND_DX_ABS_MAX = 1.2
     base_z_all = frames[:, :, 0, 2]                       # (T,N)
     # tilt per frame from base quat z-axis: proj_grav_z = -(1-2(qx^2+qy^2)); tilt
     # via base 'up' world-z component. up_z = 1-2(qx^2+qy^2).
@@ -225,9 +234,13 @@ def main() -> int:
     up_z = 1.0 - 2.0 * (qx * qx + qy * qy)                # (T,N) cos(tilt)
     tilt_max_per_env = np.degrees(np.arccos(np.clip(up_z.min(axis=0), -1.0, 1.0)))
     z_min_per_env = base_z_all.min(axis=0)
-    env_ok = (dx_world > 0.1) & (tilt_max_per_env < 35.0) & (z_min_per_env > 0.18)
+    cmd_vx = cmds[:, 0]
+    is_walk_cmd = cmd_vx >= WALK_CMD_THRESHOLD
+    fwd_ok = np.where(is_walk_cmd, dx_world > 0.1, np.abs(dx_world) < STAND_DX_ABS_MAX)
+    env_ok = fwd_ok & (tilt_max_per_env < 35.0) & (z_min_per_env > 0.18)
     print(f"[render] per-env walk check: {int(env_ok.sum())}/{N} envs OK "
-          f"(dx>0.1m & tilt_max<35deg & z_min>0.18m); "
+          f"(walk-cmd: dx>0.1m; stand-cmd(cmd_vx<{WALK_CMD_THRESHOLD}): "
+          f"|dx|<{STAND_DX_ABS_MAX}m; all: tilt_max<35deg & z_min>0.18m); "
           f"flagged: {np.where(~env_ok)[0].tolist()}")
 
     print(f"[render] npz {args.npz}: T={frames.shape[0]} frames, N={N} envs, "
