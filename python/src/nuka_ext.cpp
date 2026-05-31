@@ -149,14 +149,19 @@ public:
 
     uint32_t env_count() const { return env_count_; }
     uint32_t base_link_count() const { return base_link_count_; }
-    // action_dim == DOF-per-env == element_count(JOINT_POSITION)/env_count ==
-    // base_link_count_ (root slot 0 + actuated joints). It is the inner dim of an
-    // (env, action_dim) drive-target / actions tensor; flattening such a tensor
-    // yields exactly DRIVE_TARGET's element_count. (Slot 0 is the root and is
-    // ignored by the PD drive on a floating base, but it IS part of the buffer
-    // layout, so action_dim includes it -- a (env, action_dim) actions tensor
-    // round-trips through DRIVE_TARGET with no length mismatch.)
-    uint32_t action_dim() const { return base_link_count_; }
+    // action_dim == the number of ACTUATED joint DOFs a policy controls ==
+    // base_link_count_ - 1. The engine's JOINT_POSITION / DRIVE_TARGET buffers are
+    // base_link_count_ wide; slot 0 is the root link, which on a floating base
+    // carries no actuated DOF and is inert under the PD drive (its Kp/Kd are 0).
+    // The actuated joints (12 for Go2) occupy slots [1 .. base_link_count_). A
+    // policy emits an (env, action_dim) tensor (12-wide for Go2) and the
+    // drive/autograd path writes it into DRIVE_TARGET slots [1:], leaving the root
+    // slot untouched -- matching the proven go2_policy_drive harness (GO2_BLC=13,
+    // targets/gains set on slots 1:13). Use `base_link_count` for the raw buffer
+    // width; use `action_dim` for the policy/RL action width.
+    uint32_t action_dim() const {
+        return base_link_count_ > 0u ? base_link_count_ - 1u : 0u;
+    }
     float dt() const { return dt_; }
 
     nuka_world_handle raw() const { return h_; }
@@ -290,11 +295,12 @@ NB_MODULE(_nuka_ext, m) {
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)
         .def_prop_ro("action_dim", &World::action_dim,
-                     "DOF-per-env: the inner dimension of an (env_count, "
-                     "action_dim) actions / drive-target tensor. Equals "
-                     "base_link_count (root slot 0 + actuated joints); a "
-                     "(env_count, action_dim) tensor flattens to exactly "
-                     "DRIVE_TARGET's element_count.")
+                     "Actuated joint DOFs a policy controls (12 for Go2) == "
+                     "base_link_count - 1. The DRIVE_TARGET / JOINT_POSITION "
+                     "buffers are base_link_count wide (slot 0 = the root link, "
+                     "inert under the PD drive); the actuated joints occupy slots "
+                     "[1:]. A policy emits an (env_count, action_dim) tensor and "
+                     "the drive/autograd path writes it into slots [1:].")
         .def_prop_ro("dt", &World::dt)
         // Raw engine device pointer for a field (as a Python int). Lets a test
         // prove DLPack zero-copy: torch tensor.data_ptr() == this value.

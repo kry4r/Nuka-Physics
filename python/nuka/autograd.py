@@ -1,26 +1,31 @@
 """nuka.autograd -- PyTorch ``autograd.Function`` skeleton for a physics step.
 
-This is the **v0.3 forward-only skeleton**. The user-facing surface (the
-``_NukaPhysicsStep.forward`` / ``backward`` signatures and the ``step(world,
-actions)`` convenience) is **LOCKED**: v0.5 fills in the real adjoint by
-replacing only the *body* of ``backward`` (and reading the handles already
-stashed on ``ctx``). No caller code, no signature, and no return arity changes
-between v0.3 and v0.5.
+This is the **v0.3 forward-only skeleton**. The **caller-facing surface is
+LOCKED**; the autograd.Function *internals* are skeleton-stage and will be
+fleshed out (not redesigned at the call site) when v0.5 adds the real adjoint.
 
-What is FROZEN (do not change in v0.5):
-  * ``forward(ctx, world, actions) -> Tensor`` -- the first positional input is
-    the (non-tensor) ``nuka.World``, the second is the actions tensor.
-  * ``backward(ctx, grad_out) -> (None, grad_actions)`` -- the 2-tuple arity
-    mirrors forward's two inputs: ``world`` gets ``None`` (non-differentiable),
-    ``actions`` gets the gradient. v0.5 fills ``grad_actions``.
-  * ``step(world, actions) -> Tensor`` -- the public entry point.
-  * forward writes ``actions`` into the engine's DRIVE_TARGET buffer, steps, and
-    returns a (cloned) post-step state tensor.
+What is FROZEN (the public contract callers and Phase-3 RL code bind to):
+  * ``step(world, actions) -> Tensor`` -- the public entry point. Input order is
+    ``(world, actions)``; ``actions`` is the ``(env_count, action_dim)`` actuated
+    -joint tensor (``action_dim`` = the policy action width, 12 for Go2 -- NOT the
+    raw ``base_link_count`` buffer width).
+  * ``_NukaPhysicsStep.forward(ctx, world, actions)`` input signature -- first
+    positional input is the (non-tensor) ``nuka.World``, second is the actions
+    tensor. forward writes ``actions`` into DRIVE_TARGET slots [1:], steps once.
 
-What v0.5 WILL change (and only this):
-  * ``backward``'s body: replace ``torch.zeros_like(actions)`` with the engine
-    adjoint (e.g. ``world.step_backward(grad_out, ...)``), using ``ctx.world``
-    and ``ctx.saved_tensors``.
+What is NOT yet frozen (skeleton-stage; v0.5 may change these -- callers do not
+depend on them, so this is honest about the lock's limits):
+  * ``backward``'s BODY: v0.3 returns ``torch.zeros_like(actions)``; v0.5 replaces
+    it with the engine adjoint using ``ctx`` + ``grad_out``.
+  * ``forward``'s BODY and ``ctx`` contents: v0.5's adjoint is tape-based
+    (record a differentiable tape / checkpoints, stash a tape handle on ``ctx``),
+    not a single ``world.step()`` -- so forward records more than today's
+    ``{world, actions}``.
+  * the OUTPUT contract: v0.3 returns the cloned post-step actuated JOINT_POSITION
+    ``(env_count, action_dim)``. Locomotion gradients ultimately flow through a
+    richer observation (base velocity / projected gravity, composed in Python),
+    so v0.5 may make ``forward`` multi-output and ``backward`` take ``*grad_outs``.
+    The single-tensor return here is a SKELETON choice, not a frozen contract.
 
 torch is an OPTIONAL dependency of the ``nuka`` package: importing ``nuka`` must
 NOT require torch. This module imports torch at *module import time*, but the
@@ -46,33 +51,46 @@ class _NukaPhysicsStep(torch.autograd.Function):
     @staticmethod
     def forward(ctx, world, actions: "torch.Tensor") -> "torch.Tensor":  # type: ignore[override]
         # --- write actions into the live DRIVE_TARGET device buffer ----------
+        # ``actions`` is (env_count, action_dim) -- the ACTUATED joint targets a
+        # policy emits (12-wide for Go2). The engine DRIVE_TARGET buffer is
+        # base_link_count wide (== action_dim + 1): slot 0 is the root link, which
+        # is inert under the PD drive on a floating base, and the actuated joints
+        # occupy slots [1:]. So we write into ``tgt[:, 1:]`` and leave the root slot
+        # untouched -- exactly matching the proven go2_policy_drive harness.
+        #
         # We use the ZERO-COPY DLPack view + an in-place ``copy_`` rather than
         # ``world.set_drive_targets(...)`` on purpose: ``set_drive_targets``
         # DLPack-exports its argument, and torch REFUSES to ``__dlpack__``-export
         # a tensor that ``requires_grad`` ("use tensor.detach()"). ``copy_`` into
-        # the engine buffer sidesteps that and is a single D2D copy. We
-        # ``.detach()`` the source so an autograd-tracked ``actions`` flows in
-        # cleanly. The actions tensor's shape is (env_count, action_dim); the
-        # DRIVE_TARGET view has the same (env_count, base_link_count) shape.
+        # the engine buffer slice sidesteps that and is a single strided D2D copy.
+        # We ``.detach()`` the source so an autograd-tracked ``actions`` flows in
+        # cleanly. The DRIVE_TARGET view is (env_count, base_link_count); the
+        # slice ``tgt[:, 1:]`` is (env_count, action_dim), matching ``actions``.
         tgt = torch.from_dlpack(world.buffer_view(Field.DRIVE_TARGET))
-        tgt.copy_(actions.detach())
+        tgt[:, 1:].copy_(actions.detach())
 
         # Stash for the v0.5 adjoint. ``world`` is a non-tensor input -> it must
-        # be carried on ``ctx`` directly (not via save_for_backward).
+        # be carried on ``ctx`` directly (not via save_for_backward). (v0.5 will
+        # additionally stash a differentiable-tape / checkpoint handle here -- see
+        # the module docstring; the FORWARD BODY is not frozen, only the public
+        # ``step(world, actions)`` signature is.)
         ctx.world = world
         ctx.save_for_backward(actions)
 
         # --- advance one fixed step -----------------------------------------
         world.step()
 
-        # --- return a post-step state tensor --------------------------------
-        # We CLONE the zero-copy JOINT_POSITION view. Without the clone, the next
-        # world.step() would mutate the engine buffer in place behind torch's
-        # back: torch's version counter would never bump, and downstream autograd
-        # would silently consume corrupted-but-undetected data. The clone makes
-        # the returned tensor a stable snapshot of the post-step state and
-        # removes any in-place / version-counter hazard for the graph.
-        out = torch.from_dlpack(world.buffer_view(Field.JOINT_POSITION)).clone()
+        # --- return the post-step ACTUATED joint positions ------------------
+        # slots [1:] -> (env_count, action_dim), matching the action width. We
+        # CLONE: without it the next world.step() would mutate the engine buffer in
+        # place behind torch's back (the version counter would never bump and
+        # downstream autograd would silently consume corrupted-but-undetected
+        # data). The clone is a stable, contiguous snapshot and removes the
+        # in-place / version-counter hazard for the graph. (v0.5 may return a
+        # richer/multi-tensor observation; see the docstring -- the output contract
+        # is NOT frozen, the caller-facing input signature is.)
+        jp = torch.from_dlpack(world.buffer_view(Field.JOINT_POSITION))
+        out = jp[:, 1:].clone()
         return out
 
     @staticmethod
@@ -95,10 +113,11 @@ def step(world, actions: "torch.Tensor") -> "torch.Tensor":
     """Differentiable physics step (v0.3 forward only; v0.5 completes backward).
 
     Writes ``actions`` (shape ``(world.env_count, world.action_dim)``, CUDA
-    float32) into the world's DRIVE_TARGET buffer, advances one fixed step, and
-    returns a cloned post-step JOINT_POSITION tensor. ``out.backward()`` runs
-    without error; in v0.3 the gradient w.r.t. ``actions`` is all zeros (the
-    skeleton stub). The signature is LOCKED for v0.5.
+    float32 -- the actuated-joint width, 12 for Go2) into DRIVE_TARGET slots [1:],
+    advances one fixed step, and returns the cloned post-step actuated
+    JOINT_POSITION ``(env_count, action_dim)``. ``out.backward()`` runs without
+    error; in v0.3 the gradient w.r.t. ``actions`` is all zeros (the skeleton
+    stub). The caller-facing signature is LOCKED for v0.5.
     """
     return _NukaPhysicsStep.apply(world, actions)
 
