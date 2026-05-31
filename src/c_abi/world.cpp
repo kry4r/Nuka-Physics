@@ -328,31 +328,114 @@ nuka_result_t StepWorldGpu(WorldRecord& record, uint32_t step_count) {
                                                            record.articulation_host);
     }
 
+    // Lazily allocate the single-env implicit joint-damping scratch (M, M^-1,
+    // composite) on the first step, mirroring the lazy articulation_device
+    // upload above. Reused for every step. The single-env path has exactly one
+    // articulation (articulation index 0); max_dof is its DOF count == the M
+    // tile stride. Guarded so a zero-DOF / empty articulation degrades to the
+    // joint_damping==nullptr (no-damping) path rather than allocating zero-size.
+    if (record.single_env_max_dof == 0u) {
+        const uint32_t max_dof =
+            runtime::articulation::ArticulationDofCount(record.articulation_host, 0u);
+        if (max_dof > 0u) {
+            const uint32_t articulation_count =
+                record.articulation_host.ArticulationCount();
+            const uint32_t total_link_count =
+                record.articulation_host.TotalLinkCount();
+            const size_t tile =
+                static_cast<size_t>(max_dof) * max_dof;
+            record.single_env_inertia_m = phi::Buffer(
+                static_cast<size_t>(articulation_count) * tile * sizeof(float),
+                phi::MemoryKind::Device);
+            record.single_env_inertia_m_inv = phi::Buffer(
+                static_cast<size_t>(articulation_count) * tile * sizeof(float),
+                phi::MemoryKind::Device);
+            record.single_env_composite = phi::Buffer(
+                static_cast<size_t>(total_link_count) *
+                    sizeof(runtime::articulation::LinkSpatialInertia),
+                phi::MemoryKind::Device);
+            record.single_env_max_dof = max_dof;
+        }
+    }
+
+    const uint32_t max_dof = record.single_env_max_dof;
+    // drive_damping (the deferred PD Kd = 2*sqrt(Kp), per link) is the per-DOF c_j
+    // for the general implicit joint damping. nullptr when there is no scratch
+    // (zero-DOF articulation) -> the implicit-damping kernels degrade to no-op.
+    const float* const drive_damping_device =
+        (max_dof > 0u)
+            ? static_cast<const float*>(record.drive_damping_device.Data())
+            : nullptr;
+
     for (uint32_t step = 0u; step < step_count; ++step) {
+        // (1) Position drives with the -Kd*qdot velocity damping DEFERRED: the
+        // drive emits only the Kp*(target-q) stiffness torque. The damping is
+        // applied IMPLICITLY in stage (7) below, the same general implicit joint
+        // damping the batched contacts path uses (Option B unification).
         runtime::articulation::FeatherstoneAba::ApplyPositionDrives(
             record.device->context,
             record.articulation_device.View(),
             static_cast<const float*>(record.drive_targets_device.Data()),
             static_cast<const float*>(record.drive_stiffness_device.Data()),
             static_cast<const float*>(record.drive_damping_device.Data()),
-            static_cast<const float*>(record.drive_force_limits_device.Data()));
+            static_cast<const float*>(record.drive_force_limits_device.Data()),
+            /*defer_velocity_damping=*/true);
+        // (2) ABA accelerations -> qddot.
         runtime::articulation::FeatherstoneAba::ComputeAccelerations(
             record.device->context,
             record.articulation_device.View(),
             record.step_options.gravity.z);
-        // T8a: floating-base velocity integrate before the joint integrate (uses
-        // the same pre-step acceleration). No-op for fixed/kinematic roots, so
-        // the fixed-base single-env path is byte-for-byte unchanged.
+        // (3) T8a: floating-base velocity integrate before the joint integrate
+        // (uses the same pre-step acceleration). No-op for fixed/kinematic roots,
+        // so the fixed-base single-env scene is unaffected.
         runtime::articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
             record.device->context,
             record.articulation_device.View(),
             record.step_options.dt,
             record.step_options.gravity.z);
-        runtime::articulation::FeatherstoneAba::Integrate(record.device->context,
-                                                          record.articulation_device.View(),
-                                                          record.step_options.dt);
-        // T8a: floating-base pose integrate after the joint integrate, using the
-        // just-updated base spatial velocity. No-op for fixed/kinematic roots.
+        // (4) Joint velocity integrate qdot += qddot*dt (SPLIT from the combined
+        // Integrate, so the implicit damping sits between velocity and position).
+        runtime::articulation::FeatherstoneAba::IntegrateVelocity(
+            record.device->context,
+            record.articulation_device.View(),
+            record.step_options.dt);
+        if (max_dof > 0u) {
+            // (5) CRBA joint-space inertia M with dt*C folded into the joint
+            // diagonals so the factored inverse below is (M + dt*C)^-1.
+            runtime::articulation::ComputeArticulationInertiaM(
+                record.device->context,
+                record.articulation_device.View(),
+                max_dof,
+                static_cast<runtime::articulation::LinkSpatialInertia*>(
+                    record.single_env_composite.Data()),
+                static_cast<float*>(record.single_env_inertia_m.Data()),
+                drive_damping_device,
+                record.step_options.dt);
+            // (6) Factor M -> (M + dt*C)^-1.
+            runtime::articulation::FactorArticulationInertiaM(
+                record.device->context,
+                record.articulation_device.View(),
+                max_dof,
+                static_cast<const float*>(record.single_env_inertia_m.Data()),
+                static_cast<float*>(record.single_env_inertia_m_inv.Data()));
+            // (7) Apply the general implicit joint damping in place:
+            // qdot -= dt*(M + dt*C)^-1 * (C*qdot). Same scheme as the batched
+            // contacts path, just without any contact rows.
+            runtime::articulation::ApplyImplicitJointDamping(
+                record.device->context,
+                record.articulation_device.View(),
+                static_cast<const float*>(record.single_env_inertia_m_inv.Data()),
+                drive_damping_device,
+                max_dof,
+                record.step_options.dt);
+        }
+        // (8) Joint position integrate q += qdot*dt (SPLIT from Integrate).
+        runtime::articulation::FeatherstoneAba::IntegratePosition(
+            record.device->context,
+            record.articulation_device.View(),
+            record.step_options.dt);
+        // (9) T8a: floating-base pose integrate after the joint integrate, using
+        // the just-updated base spatial velocity. No-op for fixed/kinematic roots.
         runtime::articulation::FeatherstoneAba::IntegrateFloatingBasePose(
             record.device->context,
             record.articulation_device.View(),

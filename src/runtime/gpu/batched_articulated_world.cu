@@ -183,9 +183,15 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
         if (params.drive_targets != nullptr && params.drive_stiffness != nullptr &&
             params.drive_damping != nullptr && params.drive_force_limits != nullptr) {
             NUKA_CUDA_TIME_DETAIL(perf_, "aba_apply_drives", stream);
+            // defer_velocity_damping=true: the drive emits only the Kp stiffness
+            // torque; the -Kd*qdot damping is applied IMPLICITLY in the contact
+            // solve (general implicit joint damping via (M+dt*C)^-1), which is
+            // unconditionally stable -- the explicit form buzzed at the native dt
+            // for soft gains (instability ~ dt*Kd/m_eff, m_eff shrunk by contact).
             articulation::FeatherstoneAba::ApplyPositionDrives(
                 context_, state, params.drive_targets, params.drive_stiffness,
-                params.drive_damping, params.drive_force_limits);
+                params.drive_damping, params.drive_force_limits,
+                /*defer_velocity_damping=*/true);
         }
         {
             NUKA_CUDA_TIME_DETAIL(perf_, "aba_compute_accelerations", stream);
@@ -284,10 +290,14 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
         NUKA_CUDA_TIME(perf_, "row_builder", stream);
         {
             NUKA_CUDA_TIME_DETAIL(perf_, "crba_inertia_m", stream);
+            // Fold dt*C into the joint diagonals so the factored inverse below is
+            // (M + dt*C)^-1 -- the implicit-joint-damping admittance consumed by the
+            // contact solve (drive_damping = the per-DOF c_j; deferred from the drive).
             articulation::ComputeArticulationInertiaM(
                 context_, state, max_dof_,
                 static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
-                static_cast<float*>(m_.Data()));
+                static_cast<float*>(m_.Data()),
+                params.drive_damping, params.dt);
         }
         {
             NUKA_CUDA_TIME_DETAIL(perf_, "factor_inertia_m_inv", stream);
@@ -339,6 +349,9 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
     {
         NUKA_CUDA_TIME(perf_, "row_solver", stream);
         NUKA_CUDA_TIME_DETAIL(perf_, "solve_contact_rows", stream);
+        // joint_damping = params.drive_damping: with m_inv_ = (M+dt*C)^-1 above, the
+        // solve applies implicit joint damping (qdot -= dt*(M+dt*C)^-1*(C*qdot)) and
+        // the contact rows consistently before the position integrate.
         articulation::SolveArticulatedContactRows(
             context_, state,
             static_cast<const articulation::ArticulatedContactRow*>(rows_.Data()),
@@ -347,7 +360,8 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
             static_cast<const float*>(jac_tangent2_.Data()),
             static_cast<const float*>(m_inv_.Data()), env_count_, max_dof_,
             params.dt, static_cast<float*>(lambda_.Data()),
-            params.friction_coefficient, params.baumgarte_max_velocity);
+            params.friction_coefficient, params.baumgarte_max_velocity,
+            params.drive_damping);
     }
 
     // -- 11. Position-integrate q += qdot*dt. -------------------------------

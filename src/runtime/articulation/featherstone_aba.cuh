@@ -15,7 +15,8 @@ void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
                                      const float* drive_targets,
                                      const float* drive_stiffness,
                                      const float* drive_damping,
-                                     const float* drive_force_limits);
+                                     const float* drive_force_limits,
+                                     bool defer_velocity_damping = false);
 void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
                                         ArticulationDeviceState state,
                                         float dt);

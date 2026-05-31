@@ -558,24 +558,59 @@ def generate_stand_trajectory(model_path: Path,
             drive_force_limit = jnp.full((model.nv,), 24.0, dtype=jnp.float32)
         drive_damping = 2.0 * jnp.sqrt(jnp.maximum(drive_stiffness, 0.0))
 
-        def qacc_for(qpos, qvel, tau):
-            data = mjx.make_data(mjx_model).replace(
-                qpos=qpos,
-                qvel=qvel,
-                qfrc_applied=tau,
-            )
-            return mjx.forward(mjx_model, data).qacc
-
         def step_once(current, _):
+            # Implicit joint-damping integration that mirrors Nuka's single-env
+            # C-ABI step (src/c_abi/world.cpp, defer_velocity_damping=true) and the
+            # batched contacts path. The #43 fix moved Nuka from explicit -Kd*qvel
+            # (semi-implicit Euler) to GENERAL IMPLICIT (backward-Euler) joint
+            # damping, so the explicit golden no longer matched; this rebuilds the
+            # MuJoCo/MJX oracle with the SAME scheme. The scheme:
+            #
+            #   (1) drive emits ONLY the Kp stiffness torque, force-limit-clamped
+            #       (the -Kd*qvel damping is DEFERRED, applied implicitly below).
+            #   (2) one mjx.forward with qfrc_applied=tau_stiff yields BOTH the
+            #       stiffness-only acceleration qacc AND the dense joint-space mass
+            #       matrix M (= qM incl. armature, MuJoCo dof order).
+            #   (3) explicit half-step velocity qvel_half = qvel + qacc*dt.
+            #   (4) implicit damping (THE #43 change): solve the backward-Euler
+            #       system (M + dt*C) qvel_next = M*qvel_half, written in the
+            #       equivalent residual form Nuka applies in place,
+            #           qvel_next = qvel_half - dt*(M + dt*C)^-1 * (C*qvel_half),
+            #       with C = diag(drive_damping). This is algebraically identical
+            #       to (M+dt*C)^-1 M qvel_half and matches Nuka's constrained-
+            #       velocity (implicit) joint damping bit-for-bit in scheme.
+            #   (5) position integrate qpos_next = qpos + qvel_next*dt.
+            #
+            # ORDERING: drive_damping (C), qvel, qacc and M (mjx.full_m) are all in
+            # MuJoCo dof order -- the same order the OLD explicit code used C
+            # elementwise against qvel -- so the linear solve is internally
+            # consistent. Only the qpos OUTPUT is remapped to USD joint order via
+            # q_indices (after the scan, line ~591); that remap is unchanged.
             qpos, qvel = current
-            raw_tau = drive_stiffness * (drive_targets - qpos) - drive_damping * qvel
-            tau = jnp.where(
+            # (1) stiffness-only torque, clamped (damping deferred -- matches Nuka's
+            #     defer_velocity_damping=true clamp on the stiffness-only tau).
+            raw_tau = drive_stiffness * (drive_targets - qpos)
+            tau_stiff = jnp.where(
                 drive_force_limit > 0.0,
                 jnp.clip(raw_tau, -drive_force_limit, drive_force_limit),
                 raw_tau,
             )
-            qacc = qacc_for(qpos, qvel, tau)
-            qvel_next = qvel + qacc * dt
+            # (2) single forward: qacc + dense mass matrix M (armature on diagonal).
+            data = mjx.make_data(mjx_model).replace(
+                qpos=qpos,
+                qvel=qvel,
+                qfrc_applied=tau_stiff,
+            )
+            data = mjx.forward(mjx_model, data)
+            qacc = data.qacc
+            M = mjx.full_m(mjx_model, data)
+            # (3) explicit half-step velocity.
+            qvel_half = qvel + qacc * dt
+            # (4) implicit (backward-Euler) joint damping.
+            C = drive_damping
+            M_damped = M + dt * jnp.diag(C)
+            qvel_next = qvel_half - dt * jnp.linalg.solve(M_damped, C * qvel_half)
+            # (5) position integrate.
             qpos_next = qpos + qvel_next * dt
             return (qpos_next, qvel_next), qpos_next
 

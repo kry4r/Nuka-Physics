@@ -40,6 +40,19 @@ struct WorldRecord {
     phi::Buffer joint_velocity_buffer;
     uint32_t simulated_step_count = 0u;
 
+    // --- Single-env implicit joint-damping scratch (Option B unification) ---
+    // The single-env oracle path (StepWorldGpu) now runs the SAME general
+    // implicit joint damping as the batched contacts path. It needs the
+    // per-articulation joint-space inertia M and its inverse (M+dt*C)^-1 plus a
+    // composite-inertia scratch buffer for the CRBA. Allocated lazily on the
+    // first step (mirroring the lazy articulation_device upload) and reused for
+    // every step. `single_env_max_dof` is the articulation's DOF count (== the
+    // M tile stride); 0 until allocated.
+    uint32_t single_env_max_dof = 0u;
+    phi::Buffer single_env_inertia_m;
+    phi::Buffer single_env_inertia_m_inv;
+    phi::Buffer single_env_composite;
+
     // --- Multi-env batched articulated path (p01-F T7) --------------------
     // When env_count > 1 the world is driven through the batched articulated-
     // with-contacts step path (T6) instead of the single-env Featherstone

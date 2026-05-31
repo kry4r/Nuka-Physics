@@ -10,12 +10,19 @@ namespace nuka::runtime::articulation {
 
 class FeatherstoneAba {
 public:
+    // `defer_velocity_damping`: when true, the drive emits ONLY the stiffness
+    // torque Kp*(target-q); the -Kd*qdot damping is deferred and applied IMPLICITLY
+    // in the constrained-velocity solve (general implicit joint damping). The
+    // batched contact stepper sets this true so the soft-gain stance is stable at
+    // the native dt; the single-env oracle path leaves it false (explicit damping,
+    // byte-for-byte unchanged trajectory).
     static void ApplyPositionDrives(const phi::DeviceContext& context,
                                     ArticulationDeviceState state,
                                     const float* drive_targets,
                                     const float* drive_stiffness,
                                     const float* drive_damping,
-                                    const float* drive_force_limits);
+                                    const float* drive_force_limits,
+                                    bool defer_velocity_damping = false);
     static void ComputeAccelerations(const phi::DeviceContext& context,
                                      ArticulationDeviceState state,
                                      float gravity_z);

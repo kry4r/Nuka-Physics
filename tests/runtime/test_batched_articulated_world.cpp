@@ -252,22 +252,62 @@ TEST(BatchedArticulatedWorld, ContactsInactiveMatchesSingleEnvEngineBitExact) {
     const HoldDrives& drives = cooked.drives;  // scene-derived, golden-stable.
 
     // -- Reference: the trusted single-env engine sequence (the same calls
-    //    StepWorldGpu makes): ApplyPositionDrives -> ComputeAccelerations ->
-    //    Integrate(combined). NO contacts, NO link_pose refresh.
+    //    StepWorldGpu makes). BOTH the single-env oracle path AND the batched
+    //    contacts path now use the SAME general implicit joint damping (Option B
+    //    unification): the drive defers the -Kd*qdot term, and it is applied
+    //    implicitly via (M+dt*C)^-1 between the velocity- and position-integrate
+    //    halves. So the reference here mirrors that implicit sequence:
+    //      ApplyPositionDrives(defer=true) -> ComputeAccelerations
+    //      -> IntegrateFloatingBaseVelocity -> IntegrateVelocity (split)
+    //      -> ComputeArticulationInertiaM(damping, dt) -> FactorArticulationInertiaM
+    //      -> ApplyImplicitJointDamping -> IntegratePosition (split)
+    //      -> IntegrateFloatingBasePose.
+    //    NO contacts, NO link_pose refresh. The batched contacts-OFF path runs
+    //    the identical float ops (its contact solve is a no-op when no foot
+    //    fires), so this reference matches it BIT-FOR-BIT.
     auto ref_buffers = articulation::UploadArticulationState(context, base);
     DeviceDrives ref_drives = UploadDrives(drives, 1u);
+    // Single-env implicit-damping scratch (1 articulation), mirroring the
+    // StepWorldGpu WorldRecord scratch: M / M^-1 sized 1*max_dof*max_dof floats,
+    // composite sized total_link_count * LinkSpatialInertia.
+    const size_t ref_tile = static_cast<size_t>(max_dof) * max_dof;
+    nuka::phi::Buffer ref_m(ref_tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    nuka::phi::Buffer ref_m_inv(ref_tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    nuka::phi::Buffer ref_composite(
+        static_cast<size_t>(base.TotalLinkCount()) *
+            sizeof(articulation::LinkSpatialInertia),
+        nuka::phi::MemoryKind::Device);
     std::vector<std::vector<float>> ref_q(kSteps), ref_qdot(kSteps);
     {
         const auto state = ref_buffers.View();
+        const float* const ref_damping =
+            static_cast<const float*>(ref_drives.damping.Data());
         for (uint32_t step = 0u; step < kSteps; ++step) {
             articulation::FeatherstoneAba::ApplyPositionDrives(
                 context, state,
                 static_cast<const float*>(ref_drives.targets.Data()),
                 static_cast<const float*>(ref_drives.stiffness.Data()),
-                static_cast<const float*>(ref_drives.damping.Data()),
-                static_cast<const float*>(ref_drives.force_limits.Data()));
+                ref_damping,
+                static_cast<const float*>(ref_drives.force_limits.Data()),
+                /*defer_velocity_damping=*/true);
             articulation::FeatherstoneAba::ComputeAccelerations(context, state, kGravityZ);
-            articulation::FeatherstoneAba::Integrate(context, state, kDt);
+            articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
+                context, state, kDt, kGravityZ);
+            articulation::FeatherstoneAba::IntegrateVelocity(context, state, kDt);
+            articulation::ComputeArticulationInertiaM(
+                context, state, max_dof,
+                static_cast<articulation::LinkSpatialInertia*>(ref_composite.Data()),
+                static_cast<float*>(ref_m.Data()), ref_damping, kDt);
+            articulation::FactorArticulationInertiaM(
+                context, state, max_dof,
+                static_cast<const float*>(ref_m.Data()),
+                static_cast<float*>(ref_m_inv.Data()));
+            articulation::ApplyImplicitJointDamping(
+                context, state,
+                static_cast<const float*>(ref_m_inv.Data()),
+                ref_damping, max_dof, kDt);
+            articulation::FeatherstoneAba::IntegratePosition(context, state, kDt);
+            articulation::FeatherstoneAba::IntegrateFloatingBasePose(context, state, kDt);
             context.stream.Synchronize();
             articulation::ArticulationHostState dl = base;
             articulation::DownloadArticulationState(ref_buffers, &dl);

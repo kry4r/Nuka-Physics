@@ -297,7 +297,9 @@ __device__ uint32_t LocalDofIndex(const ArticulationDeviceState& state,
 __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
                                                   uint32_t max_dof,
                                                   LinkSpatialInertia* composite,
-                                                  float* out_inertia_M) {
+                                                  float* out_inertia_M,
+                                                  const float* joint_damping,
+                                                  float dt) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -383,6 +385,15 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
         // Reflected rotor inertia + floor (matches ABA Pass-2 diagonal guard).
         diagonal += state.joint_armature[link];
         diagonal += kInertiaDiagonalEpsilon;
+        // General implicit joint viscous damping (opt-in): fold dt*c into the joint
+        // diagonal so the factored inverse becomes (M + dt*C)^-1 -- the unconditionally
+        // stable backward-Euler admittance for the joint-damping term. C is diagonal
+        // (per-DOF c_j = joint_damping[link]); the free floating-base DOFs are skipped
+        // (local==0 floating_root `continue` above) so the base is never damped here.
+        // joint_damping==nullptr (single-env path, unit tests) -> M unchanged.
+        if (joint_damping != nullptr) {
+            diagonal += dt * joint_damping[link];
+        }
         M[static_cast<size_t>(dof_i) * max_dof + dof_i] = diagonal;
 
         uint32_t walk = link;
@@ -680,7 +691,8 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
                                                   float dt,
                                                   float friction_coefficient,
                                                   float baumgarte_max_velocity,
-                                                  float* inout_lambda) {
+                                                  float* inout_lambda,
+                                                  const float* joint_damping) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -736,6 +748,37 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
     const float* const Minv =
         inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
+
+    // -- General implicit joint viscous damping (deferred from the drive). --------
+    // The drive ran with defer_velocity_damping=true (stiffness torque only), and
+    // Minv here is (M + dt*C)^-1 (ComputeArticulationInertiaM folded dt*C into the
+    // joint diagonals). Backward-Euler joint damping is
+    //   (M + dt*C) qdot_{n+1} = M qdot_half
+    //   => qdot_{n+1} = qdot_half - dt*(M + dt*C)^-1 * (C * qdot_half).
+    // C is diagonal (c_j = joint_damping[link] on scalar joint DOFs, 0 on the free
+    // floating-base DOFs). Because (M+dt*C)^-1 is DENSE, damping a leg joint reacts
+    // back onto the floating base through the off-diagonal coupling -- exactly the
+    // coupling a per-joint diagonal velocity-decay cannot reproduce. The subsequent
+    // contact rows use the SAME (M+dt*C)^-1 admittance, so damping and contacts are
+    // co-resolved consistently. Unconditionally stable: replaces the explicit
+    // -Kd*qdot that buzzed at coarse dt. joint_damping==nullptr -> exact prior path.
+    if (joint_damping != nullptr && dt > 0.0f) {
+        float c_qdot[kMaxContactSolverDof];
+        for (uint32_t k = 0u; k < dof; ++k) {
+            const float c = (dof_to_component[k] == kInvalidLink)
+                                ? joint_damping[dof_to_link[k]]
+                                : 0.0f;
+            c_qdot[k] = c * qdot_work[k];  // C * qdot_half (qdot_half = seeded qdot_work)
+        }
+        for (uint32_t r = 0u; r < dof; ++r) {
+            float acc = 0.0f;
+            const float* const minv_row = Minv + static_cast<size_t>(r) * dof_stride;
+            for (uint32_t c = 0u; c < dof; ++c) {
+                acc += minv_row[c] * c_qdot[c];
+            }
+            qdot_work[r] -= dt * acc;
+        }
+    }
 
     // This articulation's contact slots (env-major; env == articulation in the
     // 1-articulation-per-env design). lambda_n[slot] accumulates the normal
@@ -954,6 +997,118 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     }
 }
 
+// ---------------------------------------------------------------------------
+// General standalone implicit joint damping (no contacts).
+// ---------------------------------------------------------------------------
+//
+// The damping-only sibling of SolveArticulatedContactRowsKernel's implicit
+// joint-damping seed. The single-env oracle path (c_abi StepWorldGpu) runs the
+// SAME general implicit joint damping as the batched contacts path, but without
+// any contact rows -- so it needs exactly the seed block (build dof maps, seed
+// qdot_work, apply qdot -= dt*(M+dt*C)^-1*(C*qdot), write back) and nothing
+// else. The float sequence here is a VERBATIM transcription of lines ~712..781
+// + the write-back of SolveArticulatedContactRowsKernel so the single-env path
+// is bit-for-bit identical to the batched contacts-OFF path (where the solve's
+// warm-start / sweeps / final sweep are all no-ops because no contact fires).
+// One block per articulation, single lane, fixed loop order, no atomics => D1.
+__global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
+                                               const float* inertia_M_inv,
+                                               const float* joint_damping,
+                                               uint32_t dof_stride,
+                                               float dt) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (articulation >= state.articulation_count || lane != 0u) {
+        return;
+    }
+
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+
+    // dof_to_link[k] / dof_to_component[k]: built EXACTLY as
+    // SolveArticulatedContactRowsKernel does (base-inclusive prefix sum; a
+    // FloatingBase root expands to 6 component DOFs tagged 0..5 living in
+    // link_velocity[root].v, scalar joints tagged kInvalidLink living in
+    // state.qdot). Gated on FloatingBase, so a fixed root yields the exact
+    // one-entry-per-link map (byte-identical to the solve kernel).
+    uint32_t dof_to_link[kMaxContactSolverDof];
+    uint32_t dof_to_component[kMaxContactSolverDof];
+    uint32_t dof = 0u;
+    for (uint32_t local = 0u; local < count && dof < kMaxContactSolverDof; ++local) {
+        const uint32_t link = offset + local;
+        const ArticulationJointType type = state.joint_type[link];
+        if (local == 0u && state.parent_link[link] == kInvalidLink &&
+            type == ArticulationJointType::FloatingBase) {
+            for (uint32_t b = 0u; b < 6u && dof < kMaxContactSolverDof; ++b) {
+                dof_to_link[dof] = link;
+                dof_to_component[dof] = b;
+                ++dof;
+            }
+            continue;
+        }
+        if (JointDofCountDevice(type) != 0u) {
+            dof_to_link[dof] = link;
+            dof_to_component[dof] = kInvalidLink;
+            ++dof;
+        }
+    }
+    if (dof == 0u || dof_stride == 0u) {
+        return;
+    }
+
+    // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
+    // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
+    float qdot_work[kMaxContactSolverDof];
+    for (uint32_t k = 0u; k < dof; ++k) {
+        if (dof_to_component[k] != kInvalidLink) {
+            qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
+        } else {
+            qdot_work[k] = state.qdot[dof_to_link[k]];
+        }
+    }
+
+    const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
+    const float* const Minv =
+        inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
+
+    // -- General implicit joint viscous damping (deferred from the drive). --------
+    // IDENTICAL float sequence to SolveArticulatedContactRowsKernel's seed: the
+    // drive ran with defer_velocity_damping=true (stiffness torque only), Minv is
+    // (M + dt*C)^-1 (ComputeArticulationInertiaM folded dt*C into the joint
+    // diagonals), and backward-Euler joint damping is
+    //   qdot_{n+1} = qdot_half - dt*(M + dt*C)^-1 * (C * qdot_half).
+    // C is diagonal (c_j = joint_damping[link] on scalar joint DOFs, 0 on the free
+    // floating-base DOFs). joint_damping==nullptr || dt<=0 -> exact prior path.
+    if (joint_damping != nullptr && dt > 0.0f) {
+        float c_qdot[kMaxContactSolverDof];
+        for (uint32_t k = 0u; k < dof; ++k) {
+            const float c = (dof_to_component[k] == kInvalidLink)
+                                ? joint_damping[dof_to_link[k]]
+                                : 0.0f;
+            c_qdot[k] = c * qdot_work[k];  // C * qdot_half (qdot_half = seeded qdot_work)
+        }
+        for (uint32_t r = 0u; r < dof; ++r) {
+            float acc = 0.0f;
+            const float* const minv_row = Minv + static_cast<size_t>(r) * dof_stride;
+            for (uint32_t c = 0u; c < dof; ++c) {
+                acc += minv_row[c] * c_qdot[c];
+            }
+            qdot_work[r] -= dt * acc;
+        }
+    }
+
+    // Write the corrected velocity back for every DOF (same as the solve kernel's
+    // write-back): base DOFs -> link_velocity[root].v[component], scalar joint DOFs
+    // -> state.qdot[link].
+    for (uint32_t k = 0u; k < dof; ++k) {
+        if (dof_to_component[k] != kInvalidLink) {
+            state.link_velocity[dof_to_link[k]].v[dof_to_component[k]] = qdot_work[k];
+        } else {
+            state.qdot[dof_to_link[k]] = qdot_work[k];
+        }
+    }
+}
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -1057,7 +1212,9 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
                                  ArticulationDeviceState state,
                                  uint32_t max_dof,
                                  LinkSpatialInertia* composite_inertia_scratch,
-                                 float* out_inertia_M) {
+                                 float* out_inertia_M,
+                                 const float* joint_damping,
+                                 float dt) {
     if (state.articulation_count == 0u || state.total_link_count == 0u || max_dof == 0u) {
         return;
     }
@@ -1068,8 +1225,12 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
 
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
+    // joint_damping (per-DOF c_j) + dt are optional: non-null folds dt*C into the
+    // joint diagonals so the factored inverse is (M + dt*C)^-1 (implicit joint
+    // damping). null/0 leaves M as the pure CRBA inertia (single-env path + the
+    // ComputeArticulationInertiaM unit tests are byte-for-byte unchanged).
     ComputeArticulationInertiaMKernel<<<state.articulation_count, 32u, 0u, stream>>>(
-        state, max_dof, composite_inertia_scratch, out_inertia_M);
+        state, max_dof, composite_inertia_scratch, out_inertia_M, joint_damping, dt);
     CheckCuda(cudaGetLastError(), "ComputeArticulationInertiaMKernel launch");
 }
 
@@ -1091,6 +1252,33 @@ void FactorArticulationInertiaM(const phi::DeviceContext& context,
     FactorArticulationInertiaMKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state, max_dof, inertia_M, out_inertia_M_inv);
     CheckCuda(cudaGetLastError(), "FactorArticulationInertiaMKernel launch");
+}
+
+void ApplyImplicitJointDamping(const phi::DeviceContext& context,
+                               ArticulationDeviceState state,
+                               const float* inertia_M_inv,
+                               const float* joint_damping,
+                               uint32_t dof_stride,
+                               float dt) {
+    if (state.articulation_count == 0u || dof_stride == 0u) {
+        return;
+    }
+    if (dof_stride > kMaxContactSolverDof) {
+        throw std::runtime_error(
+            "ApplyImplicitJointDamping: dof_stride exceeds kMaxContactSolverDof");
+    }
+    if (inertia_M_inv == nullptr) {
+        throw std::runtime_error(
+            "ApplyImplicitJointDamping requires a device inertia_M_inv buffer");
+    }
+
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    // One block per articulation, single lane (matches the solve kernel launch
+    // shape). joint_damping==nullptr || dt<=0 -> the kernel leaves qdot unchanged.
+    ApplyImplicitJointDampingKernel<<<state.articulation_count, 32u, 0u, stream>>>(
+        state, inertia_M_inv, joint_damping, dof_stride, dt);
+    CheckCuda(cudaGetLastError(), "ApplyImplicitJointDampingKernel launch");
 }
 
 void ComputeContactEffectiveMass(const phi::DeviceContext& context,
@@ -1202,7 +1390,8 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  float dt,
                                  float* inout_lambda,
                                  float friction_coefficient,
-                                 float baumgarte_max_velocity) {
+                                 float baumgarte_max_velocity,
+                                 const float* joint_damping) {
     if (state.articulation_count == 0u || env_count == 0u || dof_stride == 0u) {
         return;
     }
@@ -1235,7 +1424,8 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
         dt,
         friction_coefficient,
         baumgarte_max_velocity,
-        inout_lambda);
+        inout_lambda,
+        joint_damping);
     CheckCuda(cudaGetLastError(), "SolveArticulatedContactRowsKernel launch");
 }
 

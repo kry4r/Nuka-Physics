@@ -121,11 +121,20 @@ constexpr float kEffectiveMassDenomEpsilon = 1.0e-9f;
 // articulation's tile is row-major with stride max_dof*max_dof, zero-padded
 // beyond its leading dof_count x dof_count block. `max_dof` must be >= every
 // articulation's DOF count (and equal to the chain Jacobian's dof_stride).
+// `joint_damping` (optional, per-DOF c_j indexed by global link) + `dt` fold an
+// implicit joint-damping term into M: when non-null the joint diagonals get
+// += dt*c_j, so a subsequent FactorArticulationInertiaM yields (M + dt*C)^-1, the
+// backward-Euler admittance used by the constrained-velocity solve to apply joint
+// damping unconditionally stably. null/0 -> pure CRBA M (unit tests / single-env
+// path unchanged). The free floating-base DOFs are never damped (kernel skips the
+// floating root), matching c_j=0 on the base in the solve.
 void ComputeArticulationInertiaM(const phi::DeviceContext& context,
                                  ArticulationDeviceState state,
                                  uint32_t max_dof,
                                  LinkSpatialInertia* composite_inertia_scratch,
-                                 float* out_inertia_M);
+                                 float* out_inertia_M,
+                                 const float* joint_damping = nullptr,
+                                 float dt = 0.0f);
 
 // (2) Per-articulation LDL^T factorization of M's leading block and explicit
 // inverse. `inertia_M` is the buffer ComputeArticulationInertiaM filled (read
@@ -137,6 +146,25 @@ void FactorArticulationInertiaM(const phi::DeviceContext& context,
                                 uint32_t max_dof,
                                 const float* inertia_M,
                                 float* out_inertia_M_inv);
+
+// General standalone implicit joint damping (no contacts). The damping-only
+// sibling of SolveArticulatedContactRows' implicit-damping seed: applies the
+// SAME backward-Euler joint damping qdot -= dt*(M+dt*C)^-1*(C*qdot) in place,
+// where `inertia_M_inv` is the (M+dt*C)^-1 tile from FactorArticulationInertiaM
+// (fed ComputeArticulationInertiaM the SAME joint_damping + dt). `joint_damping`
+// is the per-DOF c_j indexed by global link (the deferred drive damping). Base
+// (free floating-base) DOFs are never damped (c=0). Used by the single-env
+// oracle path to run the same implicit damping scheme as the batched contacts
+// path WITHOUT any contact rows. `dof_stride` == max_dof. One block per
+// articulation, single lane, fixed loop order, no atomics => D1-deterministic;
+// bit-for-bit identical to the batched contacts-OFF solve. joint_damping==nullptr
+// || dt<=0 -> qdot unchanged.
+void ApplyImplicitJointDamping(const phi::DeviceContext& context,
+                               ArticulationDeviceState state,
+                               const float* inertia_M_inv,
+                               const float* joint_damping,
+                               uint32_t dof_stride,
+                               float dt);
 
 // (3) Per-contact effective mass m_eff = 1 / (J M^-1 J^T). `chain_jacobian` is
 // the [contact_count * dof_stride] buffer from ComputeContactChainJacobians;
@@ -322,6 +350,12 @@ void ComputeContactTangentBasis(const phi::DeviceContext& context,
 // uniform scalar applied identically at every normal-row bias site, so it
 // preserves D1 determinism.
 // One block per articulation, single lane, fixed order, no atomics => D1.
+// `joint_damping` (optional, per-DOF c_j indexed by global link): when non-null
+// AND `inertia_M_inv` was factored from (M + dt*C), the solve first applies implicit
+// joint damping (qdot -= dt*(M+dt*C)^-1 * (C*qdot)) before the contact sweeps, so
+// joint damping and contacts share one consistent (M+dt*C)^-1 admittance. null ->
+// no implicit damping (prior behaviour, bit-for-bit). It is a per-DOF coefficient
+// applied in fixed order with no atomics, so it preserves D1 determinism.
 void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  ArticulationDeviceState state,
                                  const ArticulatedContactRow* rows,
@@ -335,7 +369,8 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
                                  float* inout_lambda,
                                  float friction_coefficient = kContactFriction,
                                  float baumgarte_max_velocity =
-                                     std::numeric_limits<float>::infinity());
+                                     std::numeric_limits<float>::infinity(),
+                                 const float* joint_damping = nullptr);
 
 // (B) Detect foot-vs-ground contacts. One thread per environment; each env
 // inspects its `foot_count` feet (device buffer of FootShape, length foot_count,
