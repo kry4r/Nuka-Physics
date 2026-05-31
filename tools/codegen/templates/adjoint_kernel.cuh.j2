@@ -6,16 +6,28 @@
 //
 // Reverse-mode matched pair for {{ row_class_name }} ({{ default_gradient_mode }}).
 //
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+//   primal  : {{ adjoint_evaluator.grad_output_fields[0] }} = clamp(u, lower, upper)
+{% else %}
 //   primal  : {{ adjoint_evaluator.grad_output_fields[0] }} = clamp(u, -force_limit, +force_limit)
+{% endif %}
 //             where u = {{ adjoint_evaluator.unclamped_expression }}
-//   adjoint : grad_x_i = (du/dx_i) * kClampActive * seed
+//   adjoint : grad_x_i = (du/dx_i) * kInsideBand * seed
 //             for x_i in {{ adjoint_evaluator.grad_input_fields | join(", ") }}
 //
-// The unclamped law `u` is the single source of truth shared by the primal,
-// the saturation test, and the derivative_rules (authored as du/dx_i in the IR).
-// The force-limit clamp is non-smooth at saturation; kClampActive is its
-// sub-gradient indicator (1 strictly inside the band, 0 when saturated), so a
-// saturated drive yields zero gradient on every input/param.
+// The unclamped law `u` is the single source of truth shared by the primal, the
+// in-band test, and the derivative_rules (authored as du/dx_i in the IR).
+{% if adjoint_event_strategy == "stop_grad_on_event" %}
+// EVENT (stop_grad_on_event): the clamp encodes an active-set / friction-cone
+// event. kInsideBand is the stop-gradient indicator -- 1 strictly inside the box
+// (the row was UNCLAMPED, gradient flows), 0 at/over a band edge (the event bit
+// is set, gradient is stopped). The __global__ kernel ADDITIONALLY ANDs the
+// stored Row.event_flag so a row flagged as an event contributes zero gradient.
+{% else %}
+// The clamp is non-smooth at saturation; kInsideBand is its sub-gradient
+// indicator (1 strictly inside the band, 0 when saturated), so a saturated row
+// yields zero gradient on every input/param.
+{% endif %}
 //
 // Both functions are __host__ __device__ so the V3 finite-difference harness
 // (src/codegen/v3_validation) validates the SAME definitions it will run on the
@@ -34,7 +46,12 @@ struct {{ class_name }}AdjInputs {
 {% for f in adjoint_evaluator.grad_input_fields %}
     float {{ f }} = 0.0f;
 {% endfor %}
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    float lower = 0.0f;
+    float upper = 0.0f;
+{% else %}
     float force_limit = 0.0f;
+{% endif %}
 };
 
 // Per-input gradient bundle (vᵀ·∂f/∂x). One entry per grad_input_field.
@@ -50,11 +67,21 @@ __host__ __device__ __forceinline__ float
 {% for f in adjoint_evaluator.grad_input_fields %}
     const float {{ f }} = in.{{ f }};
 {% endfor %}
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    const float lower = in.lower;
+    const float upper = in.upper;
+{% else %}
     const float force_limit = in.force_limit;
+{% endif %}
 {% for f in adjoint_evaluator.grad_input_fields %}
     (void){{ f }};
 {% endfor %}
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    (void)lower;
+    (void)upper;
+{% else %}
     (void)force_limit;
+{% endif %}
     return {{ adjoint_evaluator.unclamped_expression }};
 }
 
@@ -62,30 +89,54 @@ __host__ __device__ __forceinline__ float
 __host__ __device__ __forceinline__ float
 {{ class_name | snake_case }}_forward_eval(const {{ class_name }}AdjInputs& in) {
     const float u = {{ class_name | snake_case }}_unclamped_eval(in);
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    return fminf(fmaxf(u, in.lower), in.upper);
+{% else %}
     if (in.force_limit > 0.0f) {
         return fminf(fmaxf(u, -in.force_limit), in.force_limit);
     }
     return u;
+{% endif %}
 }
 
-// Clamp sub-gradient indicator: 1 strictly inside the force-limit band, else 0.
+{% if adjoint_event_strategy == "stop_grad_on_event" %}
+// Inside-band (stop-gradient) indicator: 1 strictly inside the box [lower, upper]
+// (row UNCLAMPED), 0 at/over a band edge (active-set / friction-cone event).
+{% else %}
+// Clamp sub-gradient indicator: 1 strictly inside the band, else 0.
+{% endif %}
 __host__ __device__ __forceinline__ float
 {{ class_name | snake_case }}_clamp_active(const {{ class_name }}AdjInputs& in) {
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    const float u = {{ class_name | snake_case }}_unclamped_eval(in);
+    return (u <= in.lower || u >= in.upper) ? 0.0f : 1.0f;
+{% else %}
     if (in.force_limit <= 0.0f) {
         return 1.0f;  // no active limit -> always differentiable
     }
     const float u = {{ class_name | snake_case }}_unclamped_eval(in);
     return (u <= -in.force_limit || u >= in.force_limit) ? 0.0f : 1.0f;
+{% endif %}
 }
 
-// Reverse-mode adjoint: grad_x_i = (du/dx_i) * kClampActive * seed,
+// Reverse-mode adjoint: grad_x_i = (du/dx_i) * kInsideBand * seed,
 // with seed = dL/d{{ adjoint_evaluator.grad_output_fields[0] }}.
+{% if adjoint_event_strategy == "stop_grad_on_event" %}
+// kInsideBand here is the stop-gradient on the active-set / friction-cone event:
+// a row clamped at a band edge contributes zero gradient (the event bit). The
+// host pair validates this; the __global__ kernel further ANDs Row.event_flag.
+{% endif %}
 __host__ __device__ __forceinline__ {{ class_name }}AdjGrads
 {{ class_name | snake_case }}_adjoint_eval(const {{ class_name }}AdjInputs& in, float seed) {
 {% for f in adjoint_evaluator.grad_input_fields %}
     const float {{ f }} = in.{{ f }};
 {% endfor %}
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    const float lower = in.lower;
+    const float upper = in.upper;
+{% else %}
     const float force_limit = in.force_limit;
+{% endif %}
     const float kClampActive = {{ class_name | snake_case }}_clamp_active(in);
 
     {{ class_name }}AdjGrads g;
@@ -95,7 +146,12 @@ __host__ __device__ __forceinline__ {{ class_name }}AdjGrads
 {% for f in adjoint_evaluator.grad_input_fields %}
     (void){{ f }};
 {% endfor %}
+{% if adjoint_clamp_strategy == "box_lower_upper" %}
+    (void)lower;
+    (void)upper;
+{% else %}
     (void)force_limit;
+{% endif %}
     return g;
 }
 

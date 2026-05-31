@@ -77,13 +77,13 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
 uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
     switch (row_class_id) {
     case 0u:
-        return 0u;
-    case 1u:
-        return 0u;
-    case 2u:
         return 1u;
+    case 1u:
+        return 2u;
+    case 2u:
+        return 3u;
     case 3u:
-        return 0u;
+        return 4u;
     default:
         return 0u;
     }
@@ -91,8 +91,14 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
 
 const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
     switch (row_class_id) {
+    case 0u:
+        return "maximal_contact_adjoint_kernel";
+    case 1u:
+        return "maximal_joint_adjoint_kernel";
     case 2u:
         return "maximal_drive_adjoint_kernel";
+    case 3u:
+        return "featherstone_contact_adjoint_kernel";
     default:
         return nullptr;
     }

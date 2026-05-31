@@ -468,9 +468,15 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_codegen_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- V3 FD adjoint validation: maximal_drive slice (v0.5 p01) -----------
+    # --- V3 FD adjoint validation: all four base row classes (v0.5 p01) ------
+    # maximal_drive (dense), maximal_joint (dense), maximal_contact +
+    # featherstone_contact (stop_grad_on_event). Each validates the GENERATED
+    # primal/adjoint pair against a central-difference numerical Jacobian.
     add_executable(nuka_adjoint_fd_test
         codegen/test_adjoint_fd_maximal_drive.cpp
+        codegen/test_adjoint_fd_maximal_joint.cpp
+        codegen/test_adjoint_fd_maximal_contact.cpp
+        codegen/test_adjoint_fd_featherstone_contact.cpp
     )
 
     add_dependencies(nuka_adjoint_fd_test nuka_codegen)

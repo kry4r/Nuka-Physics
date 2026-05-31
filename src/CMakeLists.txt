@@ -350,6 +350,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka_codegen_v3_validation STATIC
         codegen/v3_validation/fd_harness.cu
         codegen/v3_validation/numerical_jacobian.cu
+        codegen/v3_validation/box_pgs_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

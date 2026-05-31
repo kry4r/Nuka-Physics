@@ -34,3 +34,46 @@ forward_evaluator:
   inner_loop_strategy: row_serial_jacobi
   warm_start: true
   friction_pyramid_sides: 4
+
+# Reverse-mode (v0.5 stop_grad_on_event -- the ARTICULATED PGS contact row).
+#
+# This is the contact-ROW adjoint ONLY -- the SAME PGS contact-row law as
+# MaximalContactRow, but the constraint Jacobian is the per-articulation CHAIN
+# Jacobian (jac_normal_ / jac_tangent_, the chain_jacobian rows in
+# SolveArticulatedContactRowsKernel) instead of a maximal 6-vector. Once that
+# chain J is contracted into the scalar jv = J·qdot, the single-row update is
+# identical:
+#     u          = lambda + effective_mass * (rhs - jv)            (pre-clamp)
+#     lambda_new = clamp(u, lower, upper)        ([0,+inf) normal / cone friction)
+#
+# NOTE (boundary, see report): this row class's reverse-mode is JUST the contact
+# row adjoint. The ABA forward-dynamics 3-pass reverse (the reverse of the qddot
+# computation that produces qdot_free) is NOT here -- it belongs to v0.5 Phase 2's
+# backward_runner (entry-plan R1). The chain Jacobian enters only as the (lumped)
+# jv contraction at p01; p02's backward expands grad_jv -> grad_qdot_i via the
+# chain J and reduces shared joint DOFs in FIXED ORDER (no float atomics).
+#
+# Adjoint (stop_grad_on_event): identical to MaximalContactRow -- gradient flows
+# only where the row was UNCLAMPED; stop-gradient at the active-set / friction-
+# cone boundary (validated AWAY from the boundary by FD + a zero-AT-boundary
+# check); the __global__ kernel additionally ANDs the row's stored event bit.
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: stop_grad_on_event
+  grad_input_fields:
+    - jv
+    - rhs
+    - lambda
+    - effective_mass
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(rhs - jv); primal is clamp(u, lower, upper).
+  unclamped_expression: >-
+    lambda + effective_mass * (rhs - jv)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band /
+  # stop-grad indicator, which is 0 at the active-set / friction-cone boundary):
+  derivative_rules:
+    jv: "-effective_mass"
+    rhs: "effective_mass"
+    lambda: "1.0f"
+    effective_mass: "(rhs - jv)"

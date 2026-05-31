@@ -82,15 +82,21 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(NUKA_CODEGEN_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/src/codegen/generated")
 set(NUKA_CODEGEN_GENERATED_SOURCES
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_contact_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_class_registry.hpp"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_contact_adjoint.cuh"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cuh"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cuh"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}
