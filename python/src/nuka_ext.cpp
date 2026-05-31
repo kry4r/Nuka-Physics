@@ -74,10 +74,17 @@ using FloatArray = nb::ndarray<nb::pytorch, float>;
 // ---------------------------------------------------------------------------
 class Device {
 public:
-    static Device* create(uint32_t ordinal) {
+    // stream_ptr: optional caller-supplied cudaStream_t (as a uintptr_t). 0 =>
+    // null => the engine creates+owns a default stream. A non-zero value is
+    // adopted verbatim as the device-context stream (see src/c_abi/device.cpp:
+    // when desc.cuda_stream != nullptr the engine skips its OwnedStream and runs
+    // every kernel on the supplied stream) -- this is how a torch
+    // cuda_stream flows in so torch ops + physics share ordering with no
+    // explicit cudaStreamSynchronize.
+    static Device* create(uint32_t ordinal, uintptr_t stream_ptr) {
         nuka_device_desc_t desc{};
         desc.gpu_index = ordinal;
-        desc.cuda_stream = nullptr;
+        desc.cuda_stream = reinterpret_cast<void*>(stream_ptr);
         desc.backend_selection_layer_enabled = 1u;
         nuka_device_handle h = nullptr;
         check(nuka_device_create(&desc, &h), "nuka_device_create");
@@ -142,6 +149,14 @@ public:
 
     uint32_t env_count() const { return env_count_; }
     uint32_t base_link_count() const { return base_link_count_; }
+    // action_dim == DOF-per-env == element_count(JOINT_POSITION)/env_count ==
+    // base_link_count_ (root slot 0 + actuated joints). It is the inner dim of an
+    // (env, action_dim) drive-target / actions tensor; flattening such a tensor
+    // yields exactly DRIVE_TARGET's element_count. (Slot 0 is the root and is
+    // ignored by the PD drive on a floating base, but it IS part of the buffer
+    // layout, so action_dim includes it -- a (env, action_dim) actions tensor
+    // round-trips through DRIVE_TARGET with no length mismatch.)
+    uint32_t action_dim() const { return base_link_count_; }
     float dt() const { return dt_; }
 
     nuka_world_handle raw() const { return h_; }
@@ -248,8 +263,13 @@ NB_MODULE(_nuka_ext, m) {
 
     nb::class_<Device>(m, "Device")
         .def_static("create", &Device::create, nb::arg("ordinal") = 0,
+                    nb::arg("stream_ptr") = uintptr_t{0},
                     nb::rv_policy::take_ownership,
-                    "Create a CUDA device handle for the given ordinal.")
+                    "Create a CUDA device handle for the given ordinal. "
+                    "stream_ptr (uintptr_t, default 0): when non-zero it is the "
+                    "caller-supplied cudaStream_t the engine runs on (e.g. "
+                    "torch.cuda.current_stream().cuda_stream); 0 lets the engine "
+                    "own a default stream. Device.create(0) is unchanged.")
         .def("close", &Device::close, "Destroy the device handle.")
         .def("__enter__", [](Device& d) -> Device& { return d; })
         .def("__exit__",
@@ -269,6 +289,12 @@ NB_MODULE(_nuka_ext, m) {
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)
+        .def_prop_ro("action_dim", &World::action_dim,
+                     "DOF-per-env: the inner dimension of an (env_count, "
+                     "action_dim) actions / drive-target tensor. Equals "
+                     "base_link_count (root slot 0 + actuated joints); a "
+                     "(env_count, action_dim) tensor flattens to exactly "
+                     "DRIVE_TARGET's element_count.")
         .def_prop_ro("dt", &World::dt)
         // Raw engine device pointer for a field (as a Python int). Lets a test
         // prove DLPack zero-copy: torch tensor.data_ptr() == this value.
