@@ -56,7 +56,8 @@ command-conditioned walking gait, independently re-verified; see #3 below.)
 ```bash
 # Python wheel + env
 cd python && /root/miniconda3/envs/nuka-v03/bin/pip install -e . --no-build-isolation
-/root/miniconda3/envs/nuka-v03/bin/python -m pytest python/tests/ -q     # 46 pass
+/root/miniconda3/envs/nuka-v03/bin/python -m pytest python/tests/ -q     # 49 pass
+# (test_ppo_loop_regression.py = the p04-T2 guards locking the exit-#3 action-space fix)
 
 # Demo video (proven policy, exit #6)
 CUDA_VISIBLE_DEVICES=0 examples/demo/render_video.sh                      # -> out/go2_demo/*.mp4
