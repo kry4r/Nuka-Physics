@@ -195,7 +195,11 @@ def discover_joint_permutation(device) -> np.ndarray:
 
 
 def _go2_scene_path() -> str:
-    return "/root/Nuka-Physics/examples/scenes/go2_float.usda"
+    # go2_locomotion.usda is a byte-identical copy of go2_float.usda (the proven
+    # flat-ground floating-base Go2 scene) -- a dedicated, non-symlink locomotion
+    # asset so the training task owns its scene. Identical content => identity
+    # joint permutation => the golden obs-oracle / permutation tests stay green.
+    return "/root/Nuka-Physics/examples/scenes/go2_locomotion.usda"
 
 
 # ---------------------------------------------------------------------------
