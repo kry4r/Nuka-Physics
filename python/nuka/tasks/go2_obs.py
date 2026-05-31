@@ -67,6 +67,20 @@ CMD_SCALE = np.array([2.0, 2.0, 0.25], dtype=np.float32)
 ACTION_SCALE = 0.25
 OBS_CLIP = 100.0
 ACTION_CLIP = 100.0
+# Declared gym action-space half-range (the bound rl_games reads). MUST be 1.0:
+# legged_gym/rsl_rl policies emit an O(1) action that maps DIRECTLY to
+# target_q = default + 0.25*action (no rescale). rl_games, however, defaults to
+# clip_actions=True and RESCALES the policy's [-1,1] output onto the action-space
+# bounds (rescale_actions: scaled = action * (high-low)/2 + (high+low)/2). With a
+# +-100 action space that is a 100x amplification (a policy output ~0.6 -> applied
+# action ~60 -> target_q = default + 15 rad -> the joints slam to the force limit,
+# the robot flails and tips in ~21 steps, every reward step is all-negative ->
+# only_positive_rewards zeros it -> the value head collapses -> PPO dies). Declaring
+# the action space as +-1 makes the rl_games rescale the IDENTITY, so the env
+# receives the policy's true O(1) action (and obs[36:48]=last_action stays in the
+# [-1,1] band the policy was trained on). The internal ACTION_CLIP (100) remains a
+# loose SAFETY clamp on the applied action; it does not define the declared space.
+ACTION_SPACE_LIMIT = 1.0
 
 # PD gains (uniform across the 12 actuated joints) + per-joint-TYPE URDF effort
 # limits (hip/thigh 23.7, calf 35.55) in URDF order.
