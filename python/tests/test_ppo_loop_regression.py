@@ -97,3 +97,44 @@ def test_end_to_end_applied_target_not_amplified(env):
         f"applied PD target delta must be ACTION_SCALE={G.ACTION_SCALE} rad, got "
         f"max {float(delta.max()):.4f} (a value ~25 would mean the +-100 rescale bug regressed)"
     )
+
+
+def test_masked_teleport_reset_is_deterministic_and_isolated():
+    """D1 guard for the new ``_reset_joint_state`` teleport on the MASKED (autoreset)
+    branch -- the path driven on every episode boundary after the first. Teleporting a
+    subset of envs to the legged_gym default must be (a) BYTE-EXACT across two runs from
+    the same input (D1 strong determinism -- non-negotiable for this engine), and (b)
+    per-env ISOLATED (the un-masked envs are not touched). Uses a private env so it does
+    not perturb the module fixture."""
+    e = make_env(N, command=[0.5, 0.0, 0.0], episode_length_s=1.0, seed=0)
+    try:
+        e.reset()
+        q = torch.from_dlpack(e._world.buffer_view(nuka.JOINT_POSITION))
+        q[:, 1:G.GO2_BLC] += 0.37  # scramble all 12 leg joints away from the default
+        nuka.sync()
+        scrambled = q.clone()
+        mask = torch.zeros(N, dtype=torch.bool, device=q.device)
+        mask[0::2] = True  # teleport only the even envs
+
+        e._reset_joint_state(mask); nuka.sync()
+        run1 = torch.from_dlpack(e._world.buffer_view(nuka.JOINT_POSITION)).clone()
+
+        # restore the exact scrambled leg state, repeat -> must be byte-identical.
+        q = torch.from_dlpack(e._world.buffer_view(nuka.JOINT_POSITION))
+        q[:, 1:G.GO2_BLC] = scrambled[:, 1:G.GO2_BLC]
+        nuka.sync()
+        e._reset_joint_state(mask); nuka.sync()
+        run2 = torch.from_dlpack(e._world.buffer_view(nuka.JOINT_POSITION)).clone()
+
+        assert torch.equal(run1, run2), "D1: masked teleport must be byte-exact across runs"
+
+        # isolation: odd (un-masked) envs keep the scrambled value; even envs == default.
+        default_nuka = e._obs.default_angles.index_select(0, e._obs.nuka_slot_for_urdf)
+        assert torch.equal(run1[1::2, 1:G.GO2_BLC], scrambled[1::2, 1:G.GO2_BLC]), \
+            "isolation: un-masked envs must be byte-untouched by a masked teleport"
+        assert torch.allclose(
+            run1[0::2, 1:G.GO2_BLC],
+            default_nuka.unsqueeze(0).expand(run1[0::2].shape[0], -1), atol=1e-6
+        ), "masked envs must hold the legged_gym default angles"
+    finally:
+        e.close()

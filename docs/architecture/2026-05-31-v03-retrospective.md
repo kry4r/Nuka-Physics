@@ -21,7 +21,8 @@ monotonically and stands still on command (independently re-verified):
 | body vx | −0.462 | **+0.002** | +0.467 | +1.032 |
 | tilt | 2.2° | 2.8° | 3.0° | 4.3° |
 
-0 terminations / 14080 env-steps; `last_mean_rewards` 18.4 at 250 epochs. The **cmd-0 →
+0 terminations across the sweep (220 deterministic-μ steps × 64 envs per command);
+`last_mean_rewards` 18.4 at 250 epochs. The **cmd-0 →
 +0.002** stand-still is the discriminator that rules out a degenerate "always walks forward"
 policy. Qualified: tracking is approximate (small rail under/overshoot) and `bounds_loss` is
 untidy — honest, neither breaks the gait.
@@ -105,7 +106,7 @@ determinism ctest stayed green across every change).
 
 ## 6. Metrics summary
 
-- 49/49 python tests; D1 ctest 11/11 (determinism / reset / base-pose / 4096-env). Full Runner
+- 50/50 python tests; D1 ctest 11/11 (determinism / reset / base-pose / 4096-env). Full Runner
   `--smoke` launches clean with healthy losses (c_loss finite, entropy stable, no collapse).
 - Converged policy: 250 epochs, `last_mean_rewards` 18.4, command-conditioned, 0 terminations
   in eval. Checkpoints durable in gitignored `out/go2_policy/`.
