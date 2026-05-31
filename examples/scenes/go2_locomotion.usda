@@ -1,0 +1,424 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Scope "Looks"
+    {
+        def Material "mat_go2"
+        {
+            color3f inputs:diffuseColor = (0.12, 0.18, 0.28)
+            float inputs:roughness = 0.55
+            float inputs:metallic = 0.0
+        }
+    }
+
+    # T8a floating-base variant of go2_stand. IDENTICAL to go2_stand.usda except
+    # this trunk: it is a FREE-FLOATING 6-DOF base (NOT kinematicEnabled, positive
+    # mass), so the cooker emits ArticulationJointType::FloatingBase for the root
+    # and the trunk is integrated by the floating-base ABA path. Trunk mass and
+    # diagonal inertia are the real Unitree Go2 body values from the project URDF
+    # (examples/scenes/go2_stand.urdf: link "base", mass 6.921 kg, inertia diag
+    # (0.107027, 0.0980771, 0.0244531) kg*m^2 about the trunk COM). go2_stand.usda
+    # is left UNTOUCHED as the fixed-base oracle scene.
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 6.921
+        float3 physics:diagonalInertia = (0.107027, 0.0980771, 0.0244531)
+        double3 xformOp:translate = (0, 0, 0.445)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "base_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 0.20
+        }
+    }
+
+    def Xform "fl_hip" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.678
+        float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
+        double3 xformOp:translate = (0.1934, 0.0465, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "fl_thigh" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 1.152
+        float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
+        double3 xformOp:translate = (0, 0.0955, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "fl_calf" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.241352
+        float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
+        double3 xformOp:translate = (0, 0, -0.213)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "fl_foot_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "fr_hip" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.678
+        float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
+        double3 xformOp:translate = (0.1934, -0.0465, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "fr_thigh" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 1.152
+        float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
+        double3 xformOp:translate = (0, -0.0955, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "fr_calf" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.241352
+        float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
+        double3 xformOp:translate = (0, 0, -0.213)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "fr_foot_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "rl_hip" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.678
+        float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
+        double3 xformOp:translate = (-0.1934, 0.0465, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "rl_thigh" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 1.152
+        float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
+        double3 xformOp:translate = (0, 0.0955, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "rl_calf" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.241352
+        float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
+        double3 xformOp:translate = (0, 0, -0.213)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "rl_foot_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "rr_hip" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.678
+        float3 physics:diagonalInertia = (0.00088403, 0.000596003, 0.000479967)
+        double3 xformOp:translate = (-0.1934, -0.0465, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "rr_thigh" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 1.152
+        float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
+        double3 xformOp:translate = (0, -0.0955, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "rr_calf" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.241352
+        float3 physics:diagonalInertia = (0.0014901, 0.00146356, 0.0000531397)
+        double3 xformOp:translate = (0, 0, -0.213)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "rr_foot_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.0175
+            double3 xformOp:translate = (0, 0, -0.213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def PhysicsRevoluteJoint "fl_hip_joint"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/fl_hip>
+        token physics:axis = "X"
+        float physics:lowerLimit = -1.0472
+        float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
+    }
+    def PhysicsRevoluteJoint "fl_thigh_joint"
+    {
+        rel physics:body0 = </World/fl_hip>
+        rel physics:body1 = </World/fl_thigh>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -1.5708
+        float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
+    }
+    def PhysicsRevoluteJoint "fl_calf_joint"
+    {
+        rel physics:body0 = </World/fl_thigh>
+        rel physics:body1 = </World/fl_calf>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -2.7227
+        float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
+    }
+
+    def PhysicsRevoluteJoint "fr_hip_joint"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/fr_hip>
+        token physics:axis = "X"
+        float physics:lowerLimit = -1.0472
+        float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
+    }
+    def PhysicsRevoluteJoint "fr_thigh_joint"
+    {
+        rel physics:body0 = </World/fr_hip>
+        rel physics:body1 = </World/fr_thigh>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -1.5708
+        float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
+    }
+    def PhysicsRevoluteJoint "fr_calf_joint"
+    {
+        rel physics:body0 = </World/fr_thigh>
+        rel physics:body1 = </World/fr_calf>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -2.7227
+        float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
+    }
+
+    def PhysicsRevoluteJoint "rl_hip_joint"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/rl_hip>
+        token physics:axis = "X"
+        float physics:lowerLimit = -1.0472
+        float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
+    }
+    def PhysicsRevoluteJoint "rl_thigh_joint"
+    {
+        rel physics:body0 = </World/rl_hip>
+        rel physics:body1 = </World/rl_thigh>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -1.5708
+        float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
+    }
+    def PhysicsRevoluteJoint "rl_calf_joint"
+    {
+        rel physics:body0 = </World/rl_thigh>
+        rel physics:body1 = </World/rl_calf>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -2.7227
+        float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
+    }
+
+    def PhysicsRevoluteJoint "rr_hip_joint"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/rr_hip>
+        token physics:axis = "X"
+        float physics:lowerLimit = -1.0472
+        float physics:upperLimit = 1.0472
+        float nuka:initialPosition = 0
+    }
+    def PhysicsRevoluteJoint "rr_thigh_joint"
+    {
+        rel physics:body0 = </World/rr_hip>
+        rel physics:body1 = </World/rr_thigh>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -1.5708
+        float physics:upperLimit = 3.4907
+        float nuka:initialPosition = 0.8
+    }
+    def PhysicsRevoluteJoint "rr_calf_joint"
+    {
+        rel physics:body0 = </World/rr_thigh>
+        rel physics:body1 = </World/rr_calf>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -2.7227
+        float physics:upperLimit = -0.83776
+        float nuka:initialPosition = -1.5
+    }
+
+    def NukaActuator "fl_hip_hold"
+    {
+        rel nuka:joint = </World/fl_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fl_thigh_hold"
+    {
+        rel nuka:joint = </World/fl_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fl_calf_hold"
+    {
+        rel nuka:joint = </World/fl_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_hip_hold"
+    {
+        rel nuka:joint = </World/fr_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_thigh_hold"
+    {
+        rel nuka:joint = </World/fr_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "fr_calf_hold"
+    {
+        rel nuka:joint = </World/fr_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_hip_hold"
+    {
+        rel nuka:joint = </World/rl_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_thigh_hold"
+    {
+        rel nuka:joint = </World/rl_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rl_calf_hold"
+    {
+        rel nuka:joint = </World/rl_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_hip_hold"
+    {
+        rel nuka:joint = </World/rr_hip_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_thigh_hold"
+    {
+        rel nuka:joint = </World/rr_thigh_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+    def NukaActuator "rr_calf_hold"
+    {
+        rel nuka:joint = </World/rr_calf_joint>
+        token nuka:type = "position"
+        float nuka:gain = 0.1
+        float nuka:forceLimit = 24
+    }
+
+    def Camera "track"
+    {
+        double3 xformOp:translate = (0.85, -1.45, 0.92)
+        float focalLength = 24
+        float clippingRange:min = 0.01
+        float clippingRange:max = 100
+    }
+
+    def DistantLight "sun"
+    {
+        color3f inputs:color = (1, 0.95, 0.9)
+        float inputs:intensity = 500
+    }
+}
