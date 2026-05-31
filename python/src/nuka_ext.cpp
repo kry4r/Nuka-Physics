@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "nuka/nuka.h"
 
@@ -146,6 +147,14 @@ public:
 
     void step() { check(nuka_world_step(h_), "nuka_world_step"); }
     void step_n(uint32_t n) { check(nuka_world_step_n(h_, n), "nuka_world_step_n"); }
+
+    // p03 RL autoreset. reset() restores ALL envs to the creation-time initial
+    // pose; reset_envs(ids) restores only the listed envs (the masked autoreset
+    // path) and leaves every other env byte-for-byte unchanged.
+    void reset() { check(nuka_world_reset(h_), "nuka_world_reset"); }
+    void reset_envs(const uint32_t* ids, uint32_t count) {
+        check(nuka_world_reset_envs(h_, ids, count), "nuka_world_reset_envs");
+    }
 
     uint32_t env_count() const { return env_count_; }
     uint32_t base_link_count() const { return base_link_count_; }
@@ -291,6 +300,39 @@ NB_MODULE(_nuka_ext, m) {
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
+        .def("reset", &World::reset,
+             "Reset ALL envs to the deterministic creation-time initial pose "
+             "(internal floating-base pose, base/joint velocities, joint "
+             "positions; contact warm-start cleared). GPU-only, D1-deterministic. "
+             "Batched (env_count>1) worlds only.")
+        .def(
+            "reset_envs",
+            [](World& w, nb::object env_ids) {
+                // Accept a 1-D int array (numpy / torch / list) -> host uint32[].
+                // A control-plane call (a few ids); a host round-trip is fine.
+                // `.tolist()` (when present) pulls a CUDA torch tensor to host
+                // python ints uniformly; a plain list/tuple is iterated directly.
+                nb::object seq = env_ids;
+                if (nb::hasattr(env_ids, "tolist")) {
+                    seq = env_ids.attr("tolist")();
+                }
+                std::vector<uint32_t> ids;
+                for (nb::handle item : seq) {
+                    const long long v = nb::cast<long long>(item);
+                    if (v < 0) {
+                        throw std::runtime_error(
+                            "reset_envs: env_id must be non-negative");
+                    }
+                    ids.push_back(static_cast<uint32_t>(v));
+                }
+                w.reset_envs(ids.empty() ? nullptr : ids.data(),
+                             static_cast<uint32_t>(ids.size()));
+            },
+            nb::arg("env_ids"),
+            "Reset only the listed envs to the creation-time initial pose (the "
+            "masked RL autoreset path). env_ids: a 1-D int array (numpy / torch / "
+            "list) of env indices in [0, env_count). Un-listed envs are left "
+            "byte-for-byte unchanged. GPU-only, D1-deterministic.")
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)

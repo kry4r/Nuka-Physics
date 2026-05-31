@@ -56,6 +56,29 @@ void nuka_world_destroy(nuka_world_handle world);
 nuka_result_t nuka_world_step(nuka_world_handle world);
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count);
 
+// p03 per-env RESET (RL autoreset). Restores selected envs to the deterministic
+// creation-time initial state -- the engine's INTERNAL authoritative buffers
+// (floating-base base_pose, base/link spatial velocity, joint q/qd) plus a clear
+// of the carried contact warm-start. A reset written through the writable buffer
+// views (e.g. ARTICULATION_LINK_POSE) is NON-authoritative for a floating base
+// (the integrator overwrites it from base_pose each step), so the reset MUST go
+// through here. GPU-only, D1-deterministic: bit-identical across runs, and
+// reset_envs leaves every un-listed env byte-for-byte unchanged.
+//
+// Only the batched (env_count > 1) path supports reset; the single-env oracle
+// path returns NUKA_RESULT_NOT_SUPPORTED (the RL autoreset path is always
+// batched).
+//
+// nuka_world_reset      -- reset ALL envs to the initial snapshot.
+// nuka_world_reset_envs -- reset only the `count` envs listed in `env_ids`
+//                          (each in [0, env_count); an out-of-range id returns
+//                          NUKA_RESULT_INVALID_ARG and resets nothing). count==0
+//                          (or env_ids==NULL with count==0) is a no-op OK.
+nuka_result_t nuka_world_reset(nuka_world_handle world);
+nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
+                                    const uint32_t* env_ids,
+                                    uint32_t count);
+
 typedef enum nuka_state_field_t {
     NUKA_FIELD_RIGID_BODY_TRANSFORM = 0,
     NUKA_FIELD_ARTICULATION_LINK_POSE = 1,

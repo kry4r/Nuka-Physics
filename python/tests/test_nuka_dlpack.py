@@ -289,3 +289,103 @@ def test_writing_gains_reaches_solver(device):
         f"writing Kp=20/Kd=0.5 did not change PD response (sum|dq|={total:.3e})"
     )
     assert differing >= GO2_BLC - 1, "fewer than one env's actuated joints responded"
+
+
+# ---------------------------------------------------------------------------
+# p03 RL autoreset: World.reset() / World.reset_envs(ids) restore the engine's
+# AUTHORITATIVE internal state (floating-base pose, base/joint velocities, joint
+# positions). The headline gate is that the reset SURVIVES a step: a write
+# through the ARTICULATION_LINK_POSE view alone would be overwritten by the
+# integrator within one step (the bug this primitive fixes), so we assert the
+# reset base pose is still near the initial pose after a step -- via the engine
+# reset, not a view write. Plus per-env isolation, reset-all, and the int-array
+# argument types (list / numpy / torch).
+# ---------------------------------------------------------------------------
+def _base_z(w, env):
+    pose = torch.from_dlpack(w.buffer_view(nuka.ARTICULATION_LINK_POSE))
+    return float(pose[env, 0, 2].item())  # env root link world z (slot 2 = pz)
+
+
+def test_reset_envs_authority_and_isolation(device):
+    with make_world(device, 8) as w:
+        # Capture the creation-time initial base z (before any step) for env 2.
+        nuka.sync()
+        init_z = _base_z(w, 2)
+
+        # Diverge: hold at rest targets and let the floating base settle under
+        # gravity for many steps, well away from the un-stepped init.
+        w.step_n(200)
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        qd = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
+        diverged_q = q.detach().cpu().clone()
+        diverged_qd = qd.detach().cpu().clone()
+        diverged_z2 = _base_z(w, 2)
+        assert abs(diverged_z2 - init_z) > 5e-3, "env did not diverge -- vacuous"
+
+        # Reset env 2 only.
+        w.reset_envs([2])
+        nuka.sync()
+        # Isolation: every OTHER env's q/qd is byte-unchanged from diverged.
+        after_q = q.detach().cpu().clone()
+        after_qd = qd.detach().cpu().clone()
+        blc = w.base_link_count
+        for env in range(w.env_count):
+            if env == 2:
+                continue
+            s = slice(env * blc, (env + 1) * blc)
+            assert torch.equal(after_q.flatten()[s], diverged_q.flatten()[s]), (
+                f"reset_envs perturbed un-listed env {env} (q)"
+            )
+            assert torch.equal(after_qd.flatten()[s], diverged_qd.flatten()[s]), (
+                f"reset_envs perturbed un-listed env {env} (qd)"
+            )
+        # env 2 qd restored to the init (zero).
+        s2 = slice(2 * blc, 3 * blc)
+        assert after_qd.flatten()[s2].abs().max().item() == 0.0, (
+            "reset env 2 qd not restored to the initial zero velocity"
+        )
+
+        # AUTHORITY ACROSS A STEP: one more step; env 2's base z stays near init
+        # (does NOT snap back to the diverged pose). This is the load-bearing gate.
+        w.step()
+        nuka.sync()
+        stepped_z2 = _base_z(w, 2)
+        assert abs(stepped_z2 - init_z) < 5e-3, (
+            f"reset env base z snapped away after a step "
+            f"(stepped={stepped_z2:.4f} init={init_z:.4f})"
+        )
+
+
+def test_reset_all_returns_every_env_to_init(device):
+    with make_world(device, 8) as w:
+        nuka.sync()
+        q0 = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION)).detach().cpu().clone()
+        w.step_n(200)
+        nuka.sync()
+        w.reset()
+        nuka.sync()
+        q1 = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION)).detach().cpu().clone()
+        assert torch.equal(q0, q1), "reset() did not return q to the initial snapshot"
+        qd1 = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
+        assert qd1.abs().max().item() == 0.0, "reset() did not zero qd"
+
+
+@pytest.mark.parametrize(
+    "mk_ids",
+    [
+        lambda: [1, 4],                                  # python list
+        lambda: np.array([1, 4], dtype=np.int64),        # numpy int array
+        lambda: torch.tensor([1, 4], dtype=torch.int32), # torch (CPU) int tensor
+    ],
+    ids=["list", "numpy", "torch"],
+)
+def test_reset_envs_accepts_int_array_types(device, mk_ids):
+    with make_world(device, 8) as w:
+        w.step_n(50)
+        nuka.sync()
+        # Should not raise for any of the accepted 1-D int array types.
+        w.reset_envs(mk_ids())
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        assert torch.isfinite(q).all()
