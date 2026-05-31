@@ -344,6 +344,28 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # --- V3 finite-difference validation harness (v0.5 p01 adjoint slice) ----
+    # Validates each generated reverse-mode adjoint against a central-difference
+    # numerical Jacobian of the SAME generated primal. Slice: maximal_drive.
+    add_library(nuka_codegen_v3_validation STATIC
+        codegen/v3_validation/fd_harness.cu
+        codegen/v3_validation/numerical_jacobian.cu
+    )
+    set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    add_dependencies(nuka_codegen_v3_validation nuka_codegen)
+
+    target_include_directories(nuka_codegen_v3_validation
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_codegen_v3_validation
+        PUBLIC
+            nuka_codegen_generated
+            CUDA::cudart
+    )
+
     add_library(nuka_phi STATIC
         phi/device_context.cpp
         phi/platform_contract.cpp

@@ -47,4 +47,43 @@ bool IsKnownRowClass(uint32_t row_class_id) noexcept {
     return RowClassForwardKernelSymbol(row_class_id) != nullptr;
 }
 
+uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+    case {{ row.row_class_id }}u:
+        return {{ row.gradient_mode_index }}u;
+{% endfor %}
+    default:
+        return 0u;
+    }
+}
+
+uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+    case {{ row.row_class_id }}u:
+        return {{ row.adjoint_kernel_id }}u;
+{% endfor %}
+    default:
+        return 0u;
+    }
+}
+
+const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
+    switch (row_class_id) {
+{% for row in rows %}
+{% if row.has_adjoint %}
+    case {{ row.row_class_id }}u:
+        return "{{ row.class_name | snake_case }}_adjoint_kernel";
+{% endif %}
+{% endfor %}
+    default:
+        return nullptr;
+    }
+}
+
+bool RowClassHasAdjoint(uint32_t row_class_id) noexcept {
+    return RowClassAdjointKernelSymbol(row_class_id) != nullptr;
+}
+
 } // namespace nuka::solver::generated

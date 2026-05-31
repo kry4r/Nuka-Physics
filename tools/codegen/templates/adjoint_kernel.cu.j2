@@ -1,0 +1,60 @@
+// GENERATED — DO NOT EDIT
+// ============================================================
+// Source: {{ source_yaml_path }}
+// Regenerate: python tools/codegen/regen.py
+// ============================================================
+//
+// Reverse-mode adjoint kernel for {{ row_class_name }} ({{ default_gradient_mode }}).
+// One row per thread; each thread reads its inputs + the upstream seed and
+// writes distinct per-input gradient outputs. D1: fixed order, no atomics.
+// The differentiable law + its analytical adjoint live in the paired header
+// (validated against finite differences by src/codegen/v3_validation).
+
+#include "codegen/generated/row_class_registry.hpp"
+#include "codegen/generated/{{ class_name | snake_case }}_adjoint.cuh"
+
+#include <cstdint>
+
+namespace nuka::solver::generated {
+
+__global__ void {{ class_name | snake_case }}_adjoint_kernel(
+    const Row* __restrict__ rows,
+{% for f in adjoint_evaluator.grad_input_fields %}
+    const float* __restrict__ {{ f }}_data,
+{% endfor %}
+    const float* __restrict__ force_limit_data,
+    const float* __restrict__ seed_data,
+{% for f in adjoint_evaluator.grad_input_fields %}
+    float* __restrict__ grad_{{ f }}_out,
+{% endfor %}
+    uint32_t row_count)
+{
+    const uint32_t row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row_idx >= row_count) {
+        return;
+    }
+
+    const Row& row = rows[row_idx];
+    if (row.row_class_id != {{ row_class_id }}u) {
+        return;
+    }
+    if (row.adjoint_kernel_id != {{ adjoint_kernel_id }}u) {
+        return;
+    }
+
+    {{ class_name }}AdjInputs in;
+{% for f in adjoint_evaluator.grad_input_fields %}
+    in.{{ f }} = {{ f }}_data[row_idx];
+{% endfor %}
+    in.force_limit = force_limit_data[row_idx];
+
+    const {{ class_name }}AdjGrads g =
+        {{ class_name | snake_case }}_adjoint_eval(in, seed_data[row_idx]);
+
+{% for f in adjoint_evaluator.grad_input_fields %}
+    grad_{{ f }}_out[row_idx] = g.grad_{{ f }};
+{% endfor %}
+    (void)row;
+}
+
+} // namespace nuka::solver::generated

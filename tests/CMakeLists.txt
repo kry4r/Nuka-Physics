@@ -468,6 +468,21 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_codegen_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- V3 FD adjoint validation: maximal_drive slice (v0.5 p01) -----------
+    add_executable(nuka_adjoint_fd_test
+        codegen/test_adjoint_fd_maximal_drive.cpp
+    )
+
+    add_dependencies(nuka_adjoint_fd_test nuka_codegen)
+
+    target_link_libraries(nuka_adjoint_fd_test
+        PRIVATE
+            nuka_codegen_v3_validation
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_adjoint_fd_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_phi_test
         phi/test_capabilities.cpp
         phi/test_device_context_per_handle.cpp

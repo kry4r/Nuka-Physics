@@ -60,6 +60,24 @@ forward_evaluator:
     - inner_loop_strategy
     - warm_start
 
+# OPTIONAL reverse-mode block. Present only on row classes whose forward-update
+# has a concrete differentiable definition this milestone (v0.5 slice:
+# maximal_drive). When present, regen.py emits a paired primal+adjoint device
+# header and an adjoint kernel; when absent the class keeps a forward-only stub.
+adjoint_evaluator:
+  required_fields:
+    - grad_input_fields      # differentiable inputs x: grad wrt each is emitted
+    - grad_output_fields     # forward output y = f(x); seeds v = dL/dy (single scalar)
+    - unclamped_expression   # C expr for u (the law BEFORE the force-limit clamp)
+    - derivative_rules       # map: grad_input_field -> C expr for du/dx_i
+  # The emitted primal is clamp(u, -force_limit, +force_limit); the single
+  # `unclamped_expression` u is the one source of truth shared by the primal,
+  # the saturation test, and (via the chain rule) the derivative_rules. Each
+  # derivative_rules expression is du/dx_i and is multiplied by `kClampActive`
+  # (1.0f strictly inside the force-limit band, else 0.0f) by the emitter, so
+  # the IR rules stay clamp-agnostic. Expressions may reference any
+  # grad_input_field name and `force_limit`.
+
 flags_bitfield:
   - Equality
   - Unilateral
