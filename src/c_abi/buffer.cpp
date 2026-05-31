@@ -153,19 +153,23 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_TORQUE_INPUT ||
-                field == NUKA_FIELD_VELOCITY_TARGET) {
+                field == NUKA_FIELD_VELOCITY_TARGET ||
+                field == NUKA_FIELD_ACTUATOR_NOLOAD_SPEED) {
                 // v0.5 C-fwd: WRITABLE views aliasing the batched world's owned,
                 // always-allocated control-input buffers (per-link, env-major;
                 // SAME layout as DRIVE_TARGET: float[env_count*base_link_count]).
                 // Writing them in place is picked up by the NEXT nuka_world_step
                 // WHEN the world's control_mode selects the matching mode
-                // (TORQUE_INPUT -> Torque, VELOCITY_TARGET -> Velocity); on a PD
-                // world the buffers exist but are never read. Allocated for every
-                // batched world so the view always succeeds.
+                // (TORQUE_INPUT -> Torque/Actuator, VELOCITY_TARGET -> Velocity,
+                // ACTUATOR_NOLOAD_SPEED -> Actuator); otherwise the buffers exist
+                // but are never read. Allocated for every batched world so the view
+                // always succeeds.
                 const nuka::phi::Buffer& buf =
                     (field == NUKA_FIELD_TORQUE_INPUT)
                         ? batched.TorqueInputBuffer()
-                        : batched.VelocityTargetBuffer();
+                        : (field == NUKA_FIELD_VELOCITY_TARGET)
+                              ? batched.VelocityTargetBuffer()
+                              : batched.ActuatorNoloadSpeedBuffer();
                 if (buf.Size() == 0u) {
                     return NUKA_RESULT_NOT_SUPPORTED;
                 }

@@ -61,10 +61,14 @@ typedef struct nuka_world_desc_t {
     // Stage-1 control mode (v0.5 C-fwd). 0 = PDPosition (the default when the
     // desc is zero-initialized): the legacy PD position drive, BYTE-FOR-BYTE
     // unchanged. 1 = Torque (tau = clamp(NUKA_FIELD_TORQUE_INPUT)). 2 = Velocity
-    // (tau = clamp(drive_stiffness*(NUKA_FIELD_VELOCITY_TARGET - qdot))). Values
-    // 3..5 (ComputedTorque/Osc/Actuator) are RESERVED for later slices and are
-    // rejected with NUKA_RESULT_INVALID_ARG (NOT silently mis-actuated); any
-    // value > 5 is likewise rejected. Non-PD modes require the BATCHED path
+    // (tau = clamp(drive_stiffness*(NUKA_FIELD_VELOCITY_TARGET - qdot))). 3 =
+    // ComputedTorque (inverse-dynamics PD: tau = M*(Kp*(DRIVE_TARGET - q) -
+    // Kd*qdot) + bias, Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING). 5 = Actuator
+    // (DC-motor torque-speed envelope on NUKA_FIELD_TORQUE_INPUT; tau_stall reuses
+    // DRIVE_FORCE_LIMIT, no-load speed is NUKA_FIELD_ACTUATOR_NOLOAD_SPEED). Value
+    // 4 (Osc) is RESERVED for the Phase-3 solver slice and is rejected with
+    // NUKA_RESULT_INVALID_ARG (NOT silently mis-actuated); any value > 5 is
+    // likewise rejected. Non-PD modes require the BATCHED path
     // (env_count > 1); the single-env oracle path supports PDPosition only and
     // returns NUKA_RESULT_NOT_SUPPORTED for a non-PD mode (the golden oracle
     // drive site stays untouched). The implicit joint damping (#43, driven by
@@ -229,7 +233,21 @@ typedef enum nuka_state_field_t {
     // (Kp_v reuses the DRIVE_STIFFNESS buffer). Reads return the CURRENT target
     // (initially all zero). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env
     // path. (Allocated even for a PD world; it is simply never read there.)
-    NUKA_FIELD_VELOCITY_TARGET = 13
+    NUKA_FIELD_VELOCITY_TARGET = 13,
+    // WRITABLE (batched/multi-env path only). v0.5 C-fwd slice 2: the per-env
+    // per-link DC-motor NO-LOAD SPEED buffer the batched step reads every Step
+    // when the world's control_mode is Actuator (5). Same zero-copy aliasing,
+    // layout and slot map as NUKA_FIELD_TORQUE_INPUT. In Actuator mode the
+    // commanded torque (NUKA_FIELD_TORQUE_INPUT) is clamped to the velocity-
+    // dependent DC-motor envelope tau_max(qdot) = clamp(tau_stall*(1 -
+    // |qdot|/qdot_noload), 0, tau_stall), where tau_stall reuses the
+    // DRIVE_FORCE_LIMIT buffer and qdot_noload is THIS buffer. A per-link value
+    // <= 0 disables the speed term (falls back to the plain DRIVE_FORCE_LIMIT
+    // clamp == Torque mode), so an all-zero buffer is safe. Reads return the
+    // CURRENT no-load speeds (initially all zero). Returns
+    // NUKA_RESULT_NOT_SUPPORTED on the single-env path. (Allocated even for a
+    // non-Actuator world; it is simply never read there.)
+    NUKA_FIELD_ACTUATOR_NOLOAD_SPEED = 14
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

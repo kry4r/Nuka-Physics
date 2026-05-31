@@ -34,6 +34,12 @@ from ._nuka_ext import (  # noqa: F401
     __engine_version__,
     DETERMINISM_STRONG,
     DETERMINISM_WEAK,
+    # v0.5 C-fwd stage-1 control modes (the create_from_scene control_mode= ints).
+    CONTROL_MODE_PD_POSITION,
+    CONTROL_MODE_TORQUE,
+    CONTROL_MODE_VELOCITY,
+    CONTROL_MODE_COMPUTED_TORQUE,
+    CONTROL_MODE_ACTUATOR,
 )
 
 # Re-export the field enum members at top level for convenience.
@@ -49,6 +55,10 @@ LINK_VELOCITY = Field.LINK_VELOCITY
 DRIVE_STIFFNESS = Field.DRIVE_STIFFNESS
 DRIVE_DAMPING = Field.DRIVE_DAMPING
 DRIVE_FORCE_LIMIT = Field.DRIVE_FORCE_LIMIT
+# v0.5 C-fwd: writable per-link control inputs for the non-PD control modes.
+TORQUE_INPUT = Field.TORQUE_INPUT
+VELOCITY_TARGET = Field.VELOCITY_TARGET
+ACTUATOR_NOLOAD_SPEED = Field.ACTUATOR_NOLOAD_SPEED
 # p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
 # immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
 BASE_POSE = Field.BASE_POSE
@@ -117,7 +127,15 @@ __all__ = [
     "DRIVE_STIFFNESS",
     "DRIVE_DAMPING",
     "DRIVE_FORCE_LIMIT",
+    "TORQUE_INPUT",
+    "VELOCITY_TARGET",
+    "ACTUATOR_NOLOAD_SPEED",
     "BASE_POSE",
+    "CONTROL_MODE_PD_POSITION",
+    "CONTROL_MODE_TORQUE",
+    "CONTROL_MODE_VELOCITY",
+    "CONTROL_MODE_COMPUTED_TORQUE",
+    "CONTROL_MODE_ACTUATOR",
     "LINK_POSE_FLOATS",
     "LINK_VELOCITY_FLOATS",
     "torch_stream_ptr",
