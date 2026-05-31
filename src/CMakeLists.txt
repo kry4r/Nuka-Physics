@@ -428,6 +428,7 @@ if(CMAKE_CUDA_COMPILER)
 
     add_library(nuka_articulation_gpu STATIC
         runtime/articulation/featherstone_aba.cu
+        runtime/articulation/articulation_drives.cu
         runtime/articulation/articulation_jacobian.cu
         runtime/articulation/articulation_contacts.cu
         runtime/gpu/batched_articulated_world.cu

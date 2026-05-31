@@ -18,6 +18,9 @@ int main(void) {
     world_desc.fixed_dt = 1.0f / 240.0f;
     world_desc.determinism = 0u;  // p01-W4: D1/Strong (every field must be set --
                                   // this C desc is not aggregate-zero-initialized).
+    world_desc.control_mode = 0u;  // v0.5 C-fwd: PDPosition (default). Must be set
+                                   // explicitly -- this desc is not zero-init, so a
+                                   // garbage stack value would be rejected.
 
     nuka_world_handle world = 0;
     assert(nuka_world_create_from_scene(device, &world_desc, &world) == NUKA_RESULT_OK);

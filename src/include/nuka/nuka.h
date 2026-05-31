@@ -58,6 +58,19 @@ typedef struct nuka_world_desc_t {
     // is NOT held to the D1 bit-exact bar. Any value > 1 is rejected with
     // NUKA_RESULT_INVALID_ARG.
     uint8_t determinism;
+    // Stage-1 control mode (v0.5 C-fwd). 0 = PDPosition (the default when the
+    // desc is zero-initialized): the legacy PD position drive, BYTE-FOR-BYTE
+    // unchanged. 1 = Torque (tau = clamp(NUKA_FIELD_TORQUE_INPUT)). 2 = Velocity
+    // (tau = clamp(drive_stiffness*(NUKA_FIELD_VELOCITY_TARGET - qdot))). Values
+    // 3..5 (ComputedTorque/Osc/Actuator) are RESERVED for later slices and are
+    // rejected with NUKA_RESULT_INVALID_ARG (NOT silently mis-actuated); any
+    // value > 5 is likewise rejected. Non-PD modes require the BATCHED path
+    // (env_count > 1); the single-env oracle path supports PDPosition only and
+    // returns NUKA_RESULT_NOT_SUPPORTED for a non-PD mode (the golden oracle
+    // drive site stays untouched). The implicit joint damping (#43, driven by
+    // DRIVE_DAMPING) is a joint property orthogonal to the control law and runs
+    // for every mode.
+    uint8_t control_mode;
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -195,7 +208,28 @@ typedef enum nuka_state_field_t {
     // just-reset envs. The non-reset envs may keep reading the (validated, golden-
     // pinned) lagged ARTICULATION_LINK_POSE -- the two intentionally differ by one
     // integration step during normal stepping.
-    NUKA_FIELD_BASE_POSE = 11
+    NUKA_FIELD_BASE_POSE = 11,
+    // WRITABLE (batched/multi-env path only). The per-env per-link TORQUE input
+    // buffer the batched step reads every Step when the world's control_mode is
+    // Torque (1). Aliases the live device buffer (zero-copy, write IN PLACE and
+    // the NEXT nuka_world_step picks it up). IDENTICAL layout to
+    // NUKA_FIELD_DRIVE_TARGET: float[env_count * base_link_count], env-major,
+    // index (env*base_link_count + link), stride sizeof(float). Per-env slot map
+    // matches DRIVE_TARGET: slot 0 = ROOT (inert), slots 1..N = actuated joints.
+    // The applied torque is clamped to +/- DRIVE_FORCE_LIMIT (when > 0). Reads
+    // return the CURRENT torque input (initially all zero). Returns
+    // NUKA_RESULT_NOT_SUPPORTED on the single-env path. (Allocated even for a PD
+    // world; it is simply never read there.)
+    NUKA_FIELD_TORQUE_INPUT = 12,
+    // WRITABLE (batched/multi-env path only). The per-env per-link VELOCITY
+    // TARGET buffer the batched step reads every Step when the world's
+    // control_mode is Velocity (2). Same zero-copy aliasing, layout and slot map
+    // as NUKA_FIELD_TORQUE_INPUT. The velocity-servo torque is
+    // drive_stiffness*(velocity_target - qdot) clamped to +/- DRIVE_FORCE_LIMIT
+    // (Kp_v reuses the DRIVE_STIFFNESS buffer). Reads return the CURRENT target
+    // (initially all zero). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env
+    // path. (Allocated even for a PD world; it is simply never read there.)
+    NUKA_FIELD_VELOCITY_TARGET = 13
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

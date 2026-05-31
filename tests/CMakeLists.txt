@@ -753,6 +753,29 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_articulated_world_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 C-fwd: Torque & Velocity control modes ------------------------
+    add_executable(nuka_control_modes_test
+        runtime/test_control_modes.cpp
+    )
+
+    target_compile_definitions(nuka_control_modes_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_control_modes_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_control_modes_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- CUDA-graph step capture/replay bit-identical gate (p01-W3) ---------
     add_executable(nuka_batched_articulated_graph_test
         runtime/test_batched_articulated_graph.cpp

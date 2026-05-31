@@ -504,6 +504,22 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         (desc->determinism == 1u)
             ? nuka::runtime::gpu::DeterminismLevel::Weak
             : nuka::runtime::gpu::DeterminismLevel::Strong;
+    // v0.5 C-fwd: stage-1 control mode. 0 = PDPosition (default), 1 = Torque,
+    // 2 = Velocity. 3..5 are reserved enumerators for later slices and any value
+    // above the implemented max is rejected (NOT silently mis-actuated).
+    if (!nuka::runtime::articulation::IsControlModeImplemented(
+            desc->control_mode)) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    const auto control_mode =
+        static_cast<nuka::runtime::articulation::ControlMode>(desc->control_mode);
+    // Non-PD modes require the batched (env_count > 1) path; the single-env
+    // oracle path keeps its drive site untouched (PDPosition only) so the
+    // go2_stand golden trajectory is unaffected.
+    if (control_mode != nuka::runtime::articulation::ControlMode::PDPosition &&
+        desc->env_count <= 1u) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
 
     auto* device_record = nuka::c_abi::DeviceTable().Get(device);
     if (device_record == nullptr) {
@@ -531,6 +547,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         nuka::c_abi::BuildHoldDriveTargets(*record);
         nuka::c_abi::UploadHoldDriveTargets(*record);
         nuka::c_abi::SampleInvariants(*record, record->simulated_step_count);
+        record->control_mode = control_mode;
         if (!record->world.template_view.articulations.empty()) {
             record->articulation_device =
                 nuka::runtime::articulation::UploadArticulationState(
@@ -572,7 +589,8 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                     feet,
                     max_dof,
                     ground_height,
-                    determinism);
+                    determinism,
+                    control_mode);
 
             // Replicate the base hold drives across all envs (link-major).
             record->batched_drive_targets_device =
@@ -598,6 +616,14 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                 record->batched_drive_damping_device.Data());
             params.drive_force_limits = static_cast<const float*>(
                 record->batched_drive_force_limits_device.Data());
+            // v0.5 C-fwd: point at the batched world's OWNED, always-allocated
+            // control-input buffers (the same buffers the TORQUE_INPUT /
+            // VELOCITY_TARGET buffer views alias). Stable pointers => the captured
+            // graph bakes them safely; a PD world simply never reads them.
+            params.torque_input = static_cast<const float*>(
+                record->batched->TorqueInputBuffer().Data());
+            params.velocity_target = static_cast<const float*>(
+                record->batched->VelocityTargetBuffer().Data());
             params.gravity_z = record->step_options.gravity.z;
             params.dt = record->step_options.dt;
             params.friction_coefficient =

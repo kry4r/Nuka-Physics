@@ -115,7 +115,7 @@ class World {
 public:
     static World* create_from_scene(Device* device, const std::string& scene_path,
                                     uint32_t env_count, float dt,
-                                    uint32_t determinism) {
+                                    uint32_t determinism, uint32_t control_mode) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -124,6 +124,14 @@ public:
                 "create_from_scene: determinism must be 0 (Strong/D1) or "
                 "1 (Weak/D2)");
         }
+        // v0.5 C-fwd: 0 = PDPosition (default), 1 = Torque, 2 = Velocity. 3..5
+        // are reserved enumerators (not yet implemented); anything above is
+        // rejected. Non-PD modes require the batched (env_count > 1) path.
+        if (control_mode > 2u) {
+            throw std::runtime_error(
+                "create_from_scene: control_mode must be 0 (PDPosition), "
+                "1 (Torque) or 2 (Velocity); 3-5 are reserved/unimplemented");
+        }
         nuka_world_desc_t desc{};
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
@@ -131,6 +139,9 @@ public:
         // p01-W4: 0 = D1/Strong (default), 1 = D2/Weak. Plain uint8_t keeps the
         // desc C-compatible (the engine maps it to gpu::DeterminismLevel).
         desc.determinism = static_cast<uint8_t>(determinism);
+        // v0.5 C-fwd: stage-1 control mode (0=PDPosition default, 1=Torque,
+        // 2=Velocity). Zero-init default already maps to PDPosition.
+        desc.control_mode = static_cast<uint8_t>(control_mode);
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -289,6 +300,17 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("DETERMINISM_STRONG") = uint32_t{0};
     m.attr("DETERMINISM_WEAK") = uint32_t{1};
 
+    // v0.5 C-fwd stage-1 control modes (the int values
+    // nuka_world_desc_t.control_mode / World.create_from_scene(control_mode=...)
+    // accept). PD_POSITION (0, default) is the legacy PD position drive,
+    // byte-for-byte unchanged. TORQUE (1) reads NUKA_FIELD_TORQUE_INPUT; VELOCITY
+    // (2) reads NUKA_FIELD_VELOCITY_TARGET (servo gain == DRIVE_STIFFNESS). 3-5
+    // are reserved for later slices and are rejected. Non-PD modes need the
+    // batched (env_count > 1) path.
+    m.attr("CONTROL_MODE_PD_POSITION") = uint32_t{0};
+    m.attr("CONTROL_MODE_TORQUE") = uint32_t{1};
+    m.attr("CONTROL_MODE_VELOCITY") = uint32_t{2};
+
     // Field enum (kept identical to nuka_state_field_t).
     nb::enum_<nuka_state_field_t>(m, "Field")
         .value("RIGID_BODY_TRANSFORM", NUKA_FIELD_RIGID_BODY_TRANSFORM)
@@ -303,6 +325,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("DRIVE_DAMPING", NUKA_FIELD_DRIVE_DAMPING)
         .value("DRIVE_FORCE_LIMIT", NUKA_FIELD_DRIVE_FORCE_LIMIT)
         .value("BASE_POSE", NUKA_FIELD_BASE_POSE)
+        .value("TORQUE_INPUT", NUKA_FIELD_TORQUE_INPUT)
+        .value("VELOCITY_TARGET", NUKA_FIELD_VELOCITY_TARGET)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -326,13 +350,18 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("device"), nb::arg("scene_path"),
                     nb::arg("env_count"), nb::arg("dt") = 1.0f / 240.0f,
                     nb::arg("determinism") = uint32_t{0},
+                    nb::arg("control_mode") = uint32_t{0},
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
                     "and reproducible -- the default) or 1 = DETERMINISM_WEAK (D2, "
                     "the reserved atomic-fast-path escape hatch; today it selects "
                     "the SAME kernels as D1 and is NOT held to the D1 bit-exact "
-                    "bar).")
+                    "bar). control_mode (v0.5 C-fwd, default 0): 0 = "
+                    "CONTROL_MODE_PD_POSITION (legacy PD drive, byte-for-byte "
+                    "unchanged), 1 = CONTROL_MODE_TORQUE (writes Field.TORQUE_INPUT), "
+                    "2 = CONTROL_MODE_VELOCITY (writes Field.VELOCITY_TARGET; servo "
+                    "gain == DRIVE_STIFFNESS). Non-PD modes require env_count > 1.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
