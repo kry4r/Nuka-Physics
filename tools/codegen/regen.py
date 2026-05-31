@@ -29,6 +29,10 @@ ALLOWED_ROW_CLASSES = {
     "FeatherstoneContactRow",
 }
 
+# Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).
+_ADJOINT_CLAMP_STRATEGIES = {"symmetric_force_limit", "box_lower_upper"}
+_ADJOINT_EVENT_STRATEGIES = {"subgradient", "stop_grad_on_event"}
+
 
 class CodegenError(Exception):
     """Schema or generation failure with a compiler-style diagnostic."""
@@ -71,6 +75,17 @@ class RowClass:
         context["row_class_name"] = self.row_class_name
         context["source_yaml_path"] = display_path(self.source_path)
         context["has_adjoint"] = self.has_adjoint
+        if self.has_adjoint:
+            adjoint = self.data["adjoint_evaluator"]
+            # Resolve optional strategy selectors to their defaults so the
+            # templates can branch without per-call .get() gymnastics. Absent ->
+            # the maximal_drive defaults (byte-identical regeneration).
+            context["adjoint_clamp_strategy"] = adjoint.get(
+                "clamp_strategy", "symmetric_force_limit"
+            )
+            context["adjoint_event_strategy"] = adjoint.get(
+                "event_strategy", "subgradient"
+            )
         return context
 
 
@@ -260,6 +275,18 @@ def _validate_adjoint_evaluator(row: dict[str, Any], source_map: SourceMap, sche
             raise _diagnostic(source_map.path, line, f"adjoint_evaluator.derivative_rules missing rule for grad input '{field}'")
         if not isinstance(rules[field], str) or not rules[field].strip():
             raise _diagnostic(source_map.path, line, f"adjoint_evaluator.derivative_rules['{field}'] must be a non-empty C expression")
+
+    # OPTIONAL strategy selectors. Absent -> the maximal_drive defaults
+    # (symmetric_force_limit / subgradient) so the original slice is unchanged.
+    clamp_strategy = evaluator.get("clamp_strategy", "symmetric_force_limit")
+    if clamp_strategy not in _ADJOINT_CLAMP_STRATEGIES:
+        allowed = ", ".join(sorted(_ADJOINT_CLAMP_STRATEGIES))
+        raise _diagnostic(source_map.path, line, f"adjoint_evaluator.clamp_strategy must be one of: {allowed}")
+
+    event_strategy = evaluator.get("event_strategy", "subgradient")
+    if event_strategy not in _ADJOINT_EVENT_STRATEGIES:
+        allowed = ", ".join(sorted(_ADJOINT_EVENT_STRATEGIES))
+        raise _diagnostic(source_map.path, line, f"adjoint_evaluator.event_strategy must be one of: {allowed}")
 
 
 def _validate_row(row: dict[str, Any], source_map: SourceMap, schema: dict[str, Any]) -> RowClass:

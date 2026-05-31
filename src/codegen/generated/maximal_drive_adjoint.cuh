@@ -8,14 +8,14 @@
 //
 //   primal  : tau = clamp(u, -force_limit, +force_limit)
 //             where u = drive_stiffness * (drive_target - q) - drive_damping * qdot
-//   adjoint : grad_x_i = (du/dx_i) * kClampActive * seed
+//   adjoint : grad_x_i = (du/dx_i) * kInsideBand * seed
 //             for x_i in q, qdot, drive_target, drive_stiffness, drive_damping
 //
-// The unclamped law `u` is the single source of truth shared by the primal,
-// the saturation test, and the derivative_rules (authored as du/dx_i in the IR).
-// The force-limit clamp is non-smooth at saturation; kClampActive is its
-// sub-gradient indicator (1 strictly inside the band, 0 when saturated), so a
-// saturated drive yields zero gradient on every input/param.
+// The unclamped law `u` is the single source of truth shared by the primal, the
+// in-band test, and the derivative_rules (authored as du/dx_i in the IR).
+// The clamp is non-smooth at saturation; kInsideBand is its sub-gradient
+// indicator (1 strictly inside the band, 0 when saturated), so a saturated row
+// yields zero gradient on every input/param.
 //
 // Both functions are __host__ __device__ so the V3 finite-difference harness
 // (src/codegen/v3_validation) validates the SAME definitions it will run on the
@@ -76,7 +76,7 @@ maximal_drive_forward_eval(const MaximalDriveAdjInputs& in) {
     return u;
 }
 
-// Clamp sub-gradient indicator: 1 strictly inside the force-limit band, else 0.
+// Clamp sub-gradient indicator: 1 strictly inside the band, else 0.
 __host__ __device__ __forceinline__ float
 maximal_drive_clamp_active(const MaximalDriveAdjInputs& in) {
     if (in.force_limit <= 0.0f) {
@@ -86,7 +86,7 @@ maximal_drive_clamp_active(const MaximalDriveAdjInputs& in) {
     return (u <= -in.force_limit || u >= in.force_limit) ? 0.0f : 1.0f;
 }
 
-// Reverse-mode adjoint: grad_x_i = (du/dx_i) * kClampActive * seed,
+// Reverse-mode adjoint: grad_x_i = (du/dx_i) * kInsideBand * seed,
 // with seed = dL/dtau.
 __host__ __device__ __forceinline__ MaximalDriveAdjGrads
 maximal_drive_adjoint_eval(const MaximalDriveAdjInputs& in, float seed) {

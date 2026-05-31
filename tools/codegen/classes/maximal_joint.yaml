@@ -34,3 +34,41 @@ forward_evaluator:
   inner_loop_strategy: row_serial_jacobi
   warm_start: true
   joint_rows: variable_1_to_6
+
+# Reverse-mode (v0.5 dense_adjoint -- the bilateral equality row).
+#
+# Single-row PGS update (the row_serial_jacobi inner step; same canonical form
+# the engine's row solvers use, with the maximal 6-vector constraint Jacobian J
+# already contracted into the scalar jv = J·v):
+#     u          = lambda + effective_mass * (rhs - jv)            (pre-clamp)
+#     lambda_new = clamp(u, lower, upper)
+# For a JOINT (bilateral equality) row the box is effectively unbounded
+# (lower=-HUGE, upper=+HUGE), so the clamp is never active and the adjoint is the
+# pure smooth Jacobian of the linear update -- no event handling.
+#
+# Differentiable inputs : jv (= J·v, the row's velocity contraction), rhs.
+# Differentiable params  : lambda (the warm-started/iterate impulse) and
+#                          effective_mass (m_eff = 1/(J M^-1 J^T)) -- the
+#                          contact/joint analog of the drive's Kp/Kd parameter
+#                          spine. p01 emits grad wrt the LUMPED jv; p02's backward
+#                          expands grad_jv -> grad_v_i via J (see report note).
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - jv
+    - rhs
+    - lambda
+    - effective_mass
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(rhs - jv); emitted primal is clamp(u, lower, upper).
+  unclamped_expression: >-
+    lambda + effective_mass * (rhs - jv)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is identically 1 for an unbounded equality box):
+  derivative_rules:
+    jv: "-effective_mass"
+    rhs: "effective_mass"
+    lambda: "1.0f"
+    effective_mass: "(rhs - jv)"

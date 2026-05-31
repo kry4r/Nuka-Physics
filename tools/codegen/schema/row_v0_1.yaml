@@ -68,15 +68,36 @@ adjoint_evaluator:
   required_fields:
     - grad_input_fields      # differentiable inputs x: grad wrt each is emitted
     - grad_output_fields     # forward output y = f(x); seeds v = dL/dy (single scalar)
-    - unclamped_expression   # C expr for u (the law BEFORE the force-limit clamp)
+    - unclamped_expression   # C expr for u (the law BEFORE the clamp)
     - derivative_rules       # map: grad_input_field -> C expr for du/dx_i
-  # The emitted primal is clamp(u, -force_limit, +force_limit); the single
-  # `unclamped_expression` u is the one source of truth shared by the primal,
-  # the saturation test, and (via the chain rule) the derivative_rules. Each
-  # derivative_rules expression is du/dx_i and is multiplied by `kClampActive`
-  # (1.0f strictly inside the force-limit band, else 0.0f) by the emitter, so
-  # the IR rules stay clamp-agnostic. Expressions may reference any
-  # grad_input_field name and `force_limit`.
+  # The emitted primal is clamp(u, <band>); the single `unclamped_expression` u
+  # is the one source of truth shared by the primal, the saturation/event test,
+  # and (via the chain rule) the derivative_rules. Each derivative_rules
+  # expression is du/dx_i and is multiplied by the inside-the-band indicator by
+  # the emitter, so the IR rules stay clamp-agnostic.
+  #
+  # OPTIONAL strategy selectors (omit -> the v0.5 maximal_drive defaults, which
+  # regenerate byte-identical to the original drive slice):
+  #
+  #   clamp_strategy:                  # how the band is parameterized
+  #     - symmetric_force_limit        # (DEFAULT) band = [-force_limit, +force_limit];
+  #                                    #   the `in` struct carries a `force_limit` field;
+  #                                    #   expressions may reference `force_limit`.
+  #     - box_lower_upper              # band = [lower, upper] (asymmetric box); the `in`
+  #                                    #   struct carries `lower`/`upper` fields; an
+  #                                    #   unbounded side (equality rows) uses a huge
+  #                                    #   sentinel so the clamp is never active.
+  #
+  #   event_strategy:                  # what the inside-band indicator MEANS
+  #     - subgradient                  # (DEFAULT) clamp is non-smooth at saturation; the
+  #                                    #   indicator is the clamp sub-gradient (dense_adjoint).
+  #     - stop_grad_on_event           # the indicator is the stop-gradient on the
+  #                                    #   active-set / friction-cone event boundary; the
+  #                                    #   __global__ kernel additionally ANDs the stored
+  #                                    #   Row.event_flag (stop_grad_on_event row classes).
+  #
+  # Expressions may reference any grad_input_field name plus the clamp-band field(s)
+  # of the selected clamp_strategy (`force_limit`, or `lower`/`upper`).
 
 flags_bitfield:
   - Equality

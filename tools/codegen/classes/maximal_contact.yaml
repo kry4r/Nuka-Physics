@@ -34,3 +34,47 @@ forward_evaluator:
   inner_loop_strategy: row_serial_jacobi
   warm_start: true
   friction_pyramid_sides: 4
+
+# Reverse-mode (v0.5 stop_grad_on_event -- the PGS contact row).
+#
+# Single-row PGS contact update (mirrors SolveArticulatedContactRowsKernel's
+# per-row step in src/runtime/articulation/articulation_contacts.cu, with the
+# maximal 6-vector contact Jacobian J already contracted into jv = J·v):
+#     u          = lambda + effective_mass * (rhs - jv)            (pre-clamp)
+#     lambda_new = clamp(u, lower, upper)
+# The box edges ENCODE the contact events:
+#   * normal row   : [lower, upper] = [0, +inf)   -- the active-set (separation)
+#   * friction row : [lower, upper] = [-mu*lambda_n, +mu*lambda_n] -- the cone
+# (For the engine's normal rows, `bias` folds the Baumgarte term into rhs.)
+#
+# Adjoint (stop_grad_on_event): the gradient flows ONLY where the row was
+# UNCLAMPED (strictly inside the box); at/over a band edge the active-set switch
+# / friction-cone boundary is an event, so the (sub-)gradient is stopped (zero).
+# The host adjoint computes that in-band indicator (validated by the V3 FD
+# harness AWAY from the boundary, plus a separate zero-AT-the-boundary check);
+# the emitted __global__ kernel additionally ANDs the row's stored event bit.
+#
+# Differentiable inputs : jv (= J·v), rhs (the bias/target velocity).
+# Differentiable params  : lambda (iterate impulse), effective_mass
+#                          (m_eff = 1/(J M^-1 J^T)). p01 emits grad wrt the LUMPED
+#                          jv; p02's backward expands grad_jv -> grad_v_i via J.
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: stop_grad_on_event
+  grad_input_fields:
+    - jv
+    - rhs
+    - lambda
+    - effective_mass
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(rhs - jv); primal is clamp(u, lower, upper).
+  unclamped_expression: >-
+    lambda + effective_mass * (rhs - jv)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band /
+  # stop-grad indicator, which is 0 at the active-set / friction-cone boundary):
+  derivative_rules:
+    jv: "-effective_mass"
+    rhs: "effective_mass"
+    lambda: "1.0f"
+    effective_mass: "(rhs - jv)"

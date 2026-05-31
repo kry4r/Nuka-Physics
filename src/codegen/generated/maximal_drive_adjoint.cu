@@ -42,7 +42,7 @@ __global__ void maximal_drive_adjoint_kernel(
     if (row.row_class_id != 2u) {
         return;
     }
-    if (row.adjoint_kernel_id != 1u) {
+    if (row.adjoint_kernel_id != 3u) {
         return;
     }
 
@@ -54,7 +54,7 @@ __global__ void maximal_drive_adjoint_kernel(
     in.drive_damping = drive_damping_data[row_idx];
     in.force_limit = force_limit_data[row_idx];
 
-    const MaximalDriveAdjGrads g =
+    MaximalDriveAdjGrads g =
         maximal_drive_adjoint_eval(in, seed_data[row_idx]);
 
     grad_q_out[row_idx] = g.grad_q;
