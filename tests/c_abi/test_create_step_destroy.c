@@ -16,6 +16,8 @@ int main(void) {
     world_desc.scene_path = "examples/scenes/go2_stand.usda";
     world_desc.env_count = 1u;
     world_desc.fixed_dt = 1.0f / 240.0f;
+    world_desc.determinism = 0u;  // p01-W4: D1/Strong (every field must be set --
+                                  // this C desc is not aggregate-zero-initialized).
 
     nuka_world_handle world = 0;
     assert(nuka_world_create_from_scene(device, &world_desc, &world) == NUKA_RESULT_OK);

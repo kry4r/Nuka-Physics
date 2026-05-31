@@ -32,6 +32,8 @@ from ._nuka_ext import (  # noqa: F401
     World,
     sync,
     __engine_version__,
+    DETERMINISM_STRONG,
+    DETERMINISM_WEAK,
 )
 
 # Re-export the field enum members at top level for convenience.
@@ -102,6 +104,8 @@ __all__ = [
     "Field",
     "sync",
     "__engine_version__",
+    "DETERMINISM_STRONG",
+    "DETERMINISM_WEAK",
     "RIGID_BODY_TRANSFORM",
     "ARTICULATION_LINK_POSE",
     "JOINT_POSITION",

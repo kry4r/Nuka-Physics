@@ -47,6 +47,17 @@ typedef struct nuka_world_desc_t {
     const char* scene_path;
     uint32_t env_count;
     float fixed_dt;
+    // Determinism level (p01-W4). 0 = D1 / Strong (the default when the desc is
+    // zero-initialized): the current behavior, BIT-EXACT and reproducible (no
+    // float atomics, fixed kernel order). 1 = D2 / Weak: the reserved escape
+    // hatch for future atomic fast-paths. NOTE: today no hot kernel benefits
+    // from atomics (every hotspot is <<<articulation_count, 32>>> with per-env
+    // warp reductions -- there is no cross-env ordered reduction an atomic
+    // variant would accelerate), so D2 currently selects the SAME kernels as D1
+    // and is behaviorally identical; it is wired as the documented mechanism and
+    // is NOT held to the D1 bit-exact bar. Any value > 1 is rejected with
+    // NUKA_RESULT_INVALID_ARG.
+    uint8_t determinism;
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
