@@ -217,6 +217,18 @@ FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle ow
                            ? (view.element_stride_bytes / sizeof(float))
                            : 1u;
 
+    // Per-ENV (not per-link) multi-float field: BASE_POSE (7 floats, Transform)
+    // has element_count == env_count -- ONE root pose per env, NOT env_count*blc.
+    // Shape it (env, fpe) so Python reads base_pose[:, 3:7] for the root quat,
+    // directly parallel to ARTICULATION_LINK_POSE[:, 0, 3:7]. Must precede the
+    // generic fpe>1 branch (whose ec*blc==element_count check would fail here and
+    // silently drop BASE_POSE to the flat (env*7,) fallback).
+    if (fpe > 1u && ec > 0u && (size_t)ec == view.element_count) {
+        size_t shape[2] = {ec, fpe};
+        return FloatArray(view.device_ptr, 2, shape, owner, nullptr,
+                          nb::dtype<float>(), nb::device::cuda::value, dev_id);
+    }
+
     // Multi-float-per-link fields (fpe > 1): ARTICULATION_LINK_POSE (7 floats,
     // Transform) and LINK_VELOCITY (6 floats, omega-first spatial velocity).
     // element_count == env_count*base_link_count; shape (env, base_link, fpe).
@@ -273,6 +285,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("DRIVE_STIFFNESS", NUKA_FIELD_DRIVE_STIFFNESS)
         .value("DRIVE_DAMPING", NUKA_FIELD_DRIVE_DAMPING)
         .value("DRIVE_FORCE_LIMIT", NUKA_FIELD_DRIVE_FORCE_LIMIT)
+        .value("BASE_POSE", NUKA_FIELD_BASE_POSE)
         .export_values();
 
     nb::class_<Device>(m, "Device")

@@ -72,6 +72,26 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 out->dtype = 0u;
                 return NUKA_RESULT_OK;
             }
+            if (field == NUKA_FIELD_BASE_POSE) {
+                // AUTHORITATIVE per-env floating-base root world pose: the
+                // internal base_pose[articulation] buffer the integrator advances
+                // (stage 11) and reset_envs restores from the creation snapshot.
+                // element_count == articulation_count == env_count (ONE Transform
+                // per env, NOT per link); each element is a math::Transform == 7
+                // floats [px,py,pz, qw,qx,qy,qz] (quat w-first), the SAME element
+                // layout as ARTICULATION_LINK_POSE's ROOT slot. UNLIKE that field
+                // it carries NO one-step FK lag: it is correct after Step() and --
+                // the property RL autoreset depends on -- correct IMMEDIATELY after
+                // reset_envs with no further step (the lagged ARTICULATION_LINK_POSE
+                // still shows the pre-reset/fallen pose until the next Step's FK).
+                const auto state = batched.View();
+                out->device_ptr = state.base_pose;
+                out->element_count = state.articulation_count;
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(sizeof(nuka::math::Transform));
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
             if (field == NUKA_FIELD_DRIVE_TARGET) {
                 // WRITABLE view aliasing the live per-env PD drive-target buffer
                 // that batched_step_params.drive_targets points at. Writing it in

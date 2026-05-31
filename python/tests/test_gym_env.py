@@ -178,3 +178,66 @@ def test_autoreset_restores_terminated_envs(device):
             f"autoreset q not restored (max|dq|={(q_after - q0).abs().max().item():.3e})"
         )
         assert torch.isfinite(qd_after).all() and torch.isfinite(vel_after).all()
+
+
+# ---------------------------------------------------------------------------
+# EPISODE-BOUNDARY FIX: the SAME-step returned obs[done] is the POST-reset obs
+# ---------------------------------------------------------------------------
+def test_returned_obs_is_post_reset_for_done_envs(device):
+    """legged_gym / Brax convention: when an env terminates, step() returns the
+    POST-reset obs for that env in the SAME call (not the terminal/fallen obs).
+
+    Drive the free-floating Go2 until it tilts/falls (diverging the base
+    orientation far from upright), then force termination on the controlled step
+    and assert the RETURNED obs for the done envs reports:
+      * projected_gravity (obs[:, 6:9]) ~ upright [0,0,-1] (the RESET orientation,
+        NOT the fallen one) -- read from the authoritative un-lagged base_pose;
+      * last_action (obs[:, 36:48]) == 0 (fresh episode, no stale action history).
+    The reference upright gravity is taken from a fresh env's reset() obs so the
+    assertion is independent of the exact seated quaternion."""
+    with _make_env(device, 8) as env:
+        # Upright reference: a fresh reset env's projected_gravity (obs[:, 6:9]).
+        obs0, _ = env.reset()
+        upright_pg = obs0[0, 6:9].detach().cpu().clone()  # ~[0,0,-1]-ish
+
+        # Diverge hard so the base orientation leaves upright (the terminal/fallen
+        # projected_gravity will differ markedly from upright).
+        for _ in range(30):
+            env.step(env.sample_actions())
+
+        # Capture the LIVE (pre-reset) lagged projected_gravity to prove the fallen
+        # orientation really differs from upright (else the test is vacuous).
+        nuka.sync()
+        fallen_pg = env._obs.projected_gravity()[0].detach().cpu().clone()
+        assert (fallen_pg - upright_pg).abs().max().item() > 5e-2, (
+            "base did not leave upright -- test is vacuous "
+            f"(|fallen-upright|={(fallen_pg - upright_pg).abs().max().item():.3e})"
+        )
+
+        # FORCE termination on every env this step (height threshold above live z).
+        live_z = _base_z(env._world, 0)
+        env.termination_height = live_z + 1.0
+        obs, _reward, terminated, _trunc, _info = env.step(
+            torch.ones(8, 12, device="cuda")  # non-zero action -> stale history if kept
+        )
+        assert bool(terminated.all()), "forced termination did not fire on all envs"
+
+        obs_cpu = obs.detach().cpu()
+        # (1) returned obs[done] projected_gravity ~ the upright RESET orientation,
+        # NOT the fallen pre-reset orientation.
+        ret_pg = obs_cpu[:, 6:9]
+        err_upright = (ret_pg - upright_pg).abs().max().item()
+        err_fallen = (ret_pg - fallen_pg).abs().max().item()
+        assert err_upright < 1e-4, (
+            f"returned obs[done] gravity is not the upright reset value "
+            f"(max|diff|={err_upright:.3e})"
+        )
+        assert err_fallen > 5e-2, (
+            "returned obs[done] gravity still matches the FALLEN pre-reset "
+            f"orientation (max|diff|={err_fallen:.3e}) -- the terminal obs leaked"
+        )
+        # (2) last_action slot zeroed for the reset envs (no stale history).
+        assert obs_cpu[:, 36:48].abs().max().item() == 0.0, (
+            "returned obs[done] last_action not zeroed on reset"
+        )
+        assert torch.isfinite(obs).all()
