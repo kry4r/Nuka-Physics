@@ -91,6 +91,39 @@ public:
     // only -- never determinism).
     void Step(const BatchedArticulatedStepParams& params);
 
+    // p03 per-env RESET primitive (RL autoreset).
+    //
+    // Restores the engine's AUTHORITATIVE live state to the creation-time
+    // initial snapshot (captured in the constructor right after the device
+    // state is seated). The snapshot covers exactly the buffers that diverge
+    // across a Step and are NOT recomputed from scratch each step before they
+    // are read:
+    //   base_pose[articulation]   -- internal floating-base world pose (the one
+    //                                the integrator owns; a Python-side write to
+    //                                ARTICULATION_LINK_POSE is non-authoritative,
+    //                                so reset MUST go through here)
+    //   link_velocity[root]       -- base spatial velocity (and the per-link
+    //                                Featherstone velocities, restored wholesale)
+    //   q, qdot                   -- joint positions / velocities
+    // and ZEROES the carried accumulators that would otherwise leak stale data
+    // across a reset:
+    //   qddot, tau                -- (recomputed each step, zeroed for hygiene)
+    //   lambda_                   -- the persistent contact warm-start (the ONLY
+    //                                genuine cross-step accumulator); cleared to
+    //                                the same cold-start zero the constructor set.
+    // link_pose / link_acceleration / the ABA scratch are derived and fully
+    // overwritten each step before they are read, so they are not snapshotted.
+    //
+    // Reset() restores ALL envs (bulk D2D copy + memset). ResetEnvs() restores
+    // only the listed envs via a masked kernel and leaves every other env
+    // BYTE-FOR-BYTE untouched. Both are D1-deterministic: no float atomics, a
+    // fixed per-env / per-lane order, and (for ResetEnvs) one block per listed
+    // env. `env_ids` are HOST uint32 ids in [0, EnvCount()); out-of-range ids
+    // throw. The caller must ensure no Step is in flight (same stream ordering
+    // as Step()).
+    void Reset();
+    void ResetEnvs(const uint32_t* env_ids, uint32_t count);
+
     // Number of replicated environments (== articulation count).
     uint32_t EnvCount() const { return env_count_; }
     uint32_t BaseLinkCount() const { return base_link_count_; }
@@ -162,6 +195,13 @@ private:
     phi::Buffer meff_tangent2_;   // float[slot_count]
     phi::Buffer rows_;            // ArticulatedContactRow[slot_count]
     phi::Buffer lambda_;          // float[slot_count * 3] (persistent warm-start)
+
+    // p03 reset: creation-time snapshot of the authoritative live state (device
+    // resident, captured in the constructor). reset copies these snapshot->live.
+    phi::Buffer snapshot_base_pose_;      // Transform[articulation_count]
+    phi::Buffer snapshot_link_velocity_;  // LinkSpatialVel[total_link_count]
+    phi::Buffer snapshot_q_;              // float[total_link_count]
+    phi::Buffer snapshot_qdot_;           // float[total_link_count]
 };
 
 } // namespace nuka::runtime::gpu

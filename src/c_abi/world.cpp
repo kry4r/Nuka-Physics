@@ -650,6 +650,65 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
     }
 }
 
+nuka_result_t nuka_world_reset(nuka_world_handle world) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    // Reset is a batched-path primitive (the RL autoreset path is always
+    // batched). The single-env oracle path has no per-env state to reset.
+    if (record->batched == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    try {
+        record->batched->Reset();
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
+                                    const uint32_t* env_ids,
+                                    uint32_t count) {
+    if (count > 0u && env_ids == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (record->batched == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    if (count == 0u) {
+        return NUKA_RESULT_OK;
+    }
+    // Bounds-check the ids here so an out-of-range id rejects cleanly (the engine
+    // also guards, but reporting INVALID_ARG without touching any env state is
+    // the friendlier control-plane contract).
+    const uint32_t env_count = record->batched->EnvCount();
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (env_ids[i] >= env_count) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
+    }
+    try {
+        record->batched->ResetEnvs(env_ids, count);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
                                                        uint32_t* out_count,
                                                        void* out_array,

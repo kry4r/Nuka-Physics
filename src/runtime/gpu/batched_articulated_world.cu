@@ -38,6 +38,53 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
+// p03 per-env masked reset. One block per listed env (grid.x == id_count), a
+// fixed lane loop inside the block -> D1-deterministic (no atomics, fixed order)
+// and it ONLY touches the listed envs, so every other env stays byte-for-byte
+// unchanged. Restores the authoritative live buffers from the creation-time
+// snapshot and zeroes the carried accumulators (qddot, tau, the per-env lambda
+// warm-start). All buffers are env-major: env e owns links/DOFs
+// [e*base_link_count, (e+1)*base_link_count); its articulation index == e (the
+// 1-articulation-per-env replication design) so base_pose[e] is the env's root
+// pose; its lambda slots are [e*lambda_stride, (e+1)*lambda_stride).
+__global__ void ResetEnvsKernel(articulation::ArticulationDeviceState state,
+                                 const uint32_t* env_ids,
+                                 uint32_t id_count,
+                                 uint32_t base_link_count,
+                                 uint32_t lambda_stride,
+                                 const Transform* snapshot_base_pose,
+                                 const articulation::LinkSpatialVel* snapshot_link_velocity,
+                                 const float* snapshot_q,
+                                 const float* snapshot_qdot,
+                                 float* lambda) {
+    const uint32_t slot = blockIdx.x;
+    if (slot >= id_count) {
+        return;
+    }
+    const uint32_t env = env_ids[slot];
+    if (env >= state.articulation_count) {
+        return;  // defensive: host rejects OOB ids, but never OOB-write here.
+    }
+    const uint32_t link_begin = env * base_link_count;
+
+    // Per-link / per-DOF live state (lanes cover the env's links in fixed order).
+    for (uint32_t local = threadIdx.x; local < base_link_count; local += blockDim.x) {
+        const uint32_t link = link_begin + local;
+        state.q[link] = snapshot_q[link];
+        state.qdot[link] = snapshot_qdot[link];
+        state.qddot[link] = 0.0f;
+        state.tau[link] = 0.0f;
+        state.link_velocity[link] = snapshot_link_velocity[link];
+    }
+    // Per-articulation root pose + per-env contact warm-start (lane 0 only).
+    if (threadIdx.x == 0u) {
+        state.base_pose[env] = snapshot_base_pose[env];
+    }
+    for (uint32_t i = threadIdx.x; i < lambda_stride; i += blockDim.x) {
+        lambda[env * lambda_stride + i] = 0.0f;
+    }
+}
+
 } // namespace
 
 BatchedArticulatedWorld::BatchedArticulatedWorld(
@@ -162,6 +209,41 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                               static_cast<size_t>(slot_count_) * sizeof(Vec3),
                               context_.stream.Native()),
               "BatchedArticulatedWorld contact_point memset");
+
+    // p03 reset: snapshot the creation-time AUTHORITATIVE live state (the device
+    // state was just seated by UploadArticulationState above with the cooked
+    // initial pose: base_pose at the seated base, q at the default joint angles,
+    // qdot == 0). Captured here, before any Step diverges it, so reset restores
+    // exactly the deterministic initial pose the scene cooked.
+    const articulation::ArticulationDeviceState init = device_.View();
+    snapshot_base_pose_ = phi::Buffer(
+        static_cast<size_t>(articulation_count_) * sizeof(Transform),
+        phi::MemoryKind::Device);
+    snapshot_link_velocity_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) *
+            sizeof(articulation::LinkSpatialVel),
+        phi::MemoryKind::Device);
+    snapshot_q_ = phi::Buffer(static_cast<size_t>(total_link_count_) * sizeof(float),
+                              phi::MemoryKind::Device);
+    snapshot_qdot_ = phi::Buffer(static_cast<size_t>(total_link_count_) * sizeof(float),
+                                 phi::MemoryKind::Device);
+    CheckCuda(cudaMemcpyAsync(snapshot_base_pose_.Data(), init.base_pose,
+                              static_cast<size_t>(articulation_count_) * sizeof(Transform),
+                              cudaMemcpyDeviceToDevice, context_.stream.Native()),
+              "BatchedArticulatedWorld snapshot base_pose");
+    CheckCuda(cudaMemcpyAsync(snapshot_link_velocity_.Data(), init.link_velocity,
+                              static_cast<size_t>(total_link_count_) *
+                                  sizeof(articulation::LinkSpatialVel),
+                              cudaMemcpyDeviceToDevice, context_.stream.Native()),
+              "BatchedArticulatedWorld snapshot link_velocity");
+    CheckCuda(cudaMemcpyAsync(snapshot_q_.Data(), init.q,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, context_.stream.Native()),
+              "BatchedArticulatedWorld snapshot q");
+    CheckCuda(cudaMemcpyAsync(snapshot_qdot_.Data(), init.qdot,
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, context_.stream.Native()),
+              "BatchedArticulatedWorld snapshot qdot");
     context_.stream.Synchronize();
 }
 
@@ -376,6 +458,85 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
         articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, state,
                                                                  params.dt);
     }
+}
+
+void BatchedArticulatedWorld::Reset() {
+    const articulation::ArticulationDeviceState state = device_.View();
+    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(context_.device_id);
+
+    // Bulk snapshot->live restore over the WHOLE buffers (obviously D1: a flat
+    // D2D copy in fixed address order, no atomics). qddot/tau/lambda cleared.
+    CheckCuda(cudaMemcpyAsync(state.base_pose, snapshot_base_pose_.Data(),
+                              static_cast<size_t>(articulation_count_) * sizeof(Transform),
+                              cudaMemcpyDeviceToDevice, stream),
+              "BatchedArticulatedWorld Reset base_pose");
+    CheckCuda(cudaMemcpyAsync(state.link_velocity, snapshot_link_velocity_.Data(),
+                              static_cast<size_t>(total_link_count_) *
+                                  sizeof(articulation::LinkSpatialVel),
+                              cudaMemcpyDeviceToDevice, stream),
+              "BatchedArticulatedWorld Reset link_velocity");
+    CheckCuda(cudaMemcpyAsync(state.q, snapshot_q_.Data(),
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, stream),
+              "BatchedArticulatedWorld Reset q");
+    CheckCuda(cudaMemcpyAsync(state.qdot, snapshot_qdot_.Data(),
+                              static_cast<size_t>(total_link_count_) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, stream),
+              "BatchedArticulatedWorld Reset qdot");
+    CheckCuda(cudaMemsetAsync(state.qddot, 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float), stream),
+              "BatchedArticulatedWorld Reset qddot");
+    CheckCuda(cudaMemsetAsync(state.tau, 0,
+                              static_cast<size_t>(total_link_count_) * sizeof(float), stream),
+              "BatchedArticulatedWorld Reset tau");
+    CheckCuda(cudaMemsetAsync(lambda_.Data(), 0,
+                              static_cast<size_t>(slot_count_) * 3u * sizeof(float), stream),
+              "BatchedArticulatedWorld Reset lambda");
+    context_.stream.Synchronize();
+}
+
+void BatchedArticulatedWorld::ResetEnvs(const uint32_t* env_ids, uint32_t count) {
+    if (count == 0u || env_ids == nullptr) {
+        return;
+    }
+    // Validate host-side so a bad id can never OOB-write into another env.
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (env_ids[i] >= env_count_) {
+            throw std::runtime_error(
+                "BatchedArticulatedWorld::ResetEnvs: env_id " +
+                std::to_string(env_ids[i]) + " out of range (env_count=" +
+                std::to_string(env_count_) + ")");
+        }
+    }
+
+    const articulation::ArticulationDeviceState state = device_.View();
+    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(context_.device_id);
+
+    // Upload the (few) ids to the device. Control-plane call: a small H2D copy.
+    phi::Buffer ids_device(static_cast<size_t>(count) * sizeof(uint32_t),
+                           phi::MemoryKind::Device);
+    CheckCuda(cudaMemcpyAsync(ids_device.Data(), env_ids,
+                              static_cast<size_t>(count) * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, stream),
+              "BatchedArticulatedWorld ResetEnvs ids upload");
+
+    const uint32_t lambda_stride = articulation::kMaxFootContactsPerEnv * 3u;
+    constexpr uint32_t kResetBlock = 64u;  // covers go2's 13 links / 12 lambda.
+    ResetEnvsKernel<<<count, kResetBlock, 0u, stream>>>(
+        state,
+        static_cast<const uint32_t*>(ids_device.Data()),
+        count,
+        base_link_count_,
+        lambda_stride,
+        static_cast<const Transform*>(snapshot_base_pose_.Data()),
+        static_cast<const articulation::LinkSpatialVel*>(snapshot_link_velocity_.Data()),
+        static_cast<const float*>(snapshot_q_.Data()),
+        static_cast<const float*>(snapshot_qdot_.Data()),
+        static_cast<float*>(lambda_.Data()));
+    CheckCuda(cudaGetLastError(), "BatchedArticulatedWorld ResetEnvsKernel launch");
+    context_.stream.Synchronize();
 }
 
 void BatchedArticulatedWorld::Download(articulation::ArticulationHostState* host) const {
