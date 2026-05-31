@@ -46,3 +46,6 @@ _deps/
 # OS
 Thumbs.db
 .DS_Store
+
+# rl_games training output (checkpoints / tb logs)
+runs/
