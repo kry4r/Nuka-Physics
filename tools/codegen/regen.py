@@ -61,11 +61,16 @@ class RowClass:
     def file_stem(self) -> str:
         return snake_case(self.row_class_name.removesuffix("Row"))
 
+    @property
+    def has_adjoint(self) -> bool:
+        return "adjoint_evaluator" in self.data
+
     def template_context(self) -> dict[str, Any]:
         context = dict(self.data)
         context["class_name"] = self.row_class_name.removesuffix("Row")
         context["row_class_name"] = self.row_class_name
         context["source_yaml_path"] = display_path(self.source_path)
+        context["has_adjoint"] = self.has_adjoint
         return context
 
 
@@ -223,6 +228,40 @@ def _validate_forward_evaluator(row: dict[str, Any], source_map: SourceMap, sche
         )
 
 
+def _validate_adjoint_evaluator(row: dict[str, Any], source_map: SourceMap, schema: dict[str, Any]) -> None:
+    """Validate the OPTIONAL adjoint_evaluator block (only if present)."""
+    if "adjoint_evaluator" not in row:
+        return
+
+    line = source_map.line_for("adjoint_evaluator")
+    evaluator = _require_mapping(row["adjoint_evaluator"], source_map.path, line, "adjoint_evaluator")
+    required = schema.get("adjoint_evaluator", {}).get("required_fields", [])
+    if not isinstance(required, list):
+        raise _diagnostic(source_map.path, 1, "schema adjoint_evaluator.required_fields must be a list")
+
+    for field in required:
+        if field not in evaluator:
+            raise _diagnostic(source_map.path, line, f"adjoint_evaluator missing required field '{field}'")
+
+    grad_inputs = _require_list(evaluator["grad_input_fields"], source_map.path, line, "adjoint_evaluator.grad_input_fields")
+    if not grad_inputs or not all(isinstance(item, str) and item for item in grad_inputs):
+        raise _diagnostic(source_map.path, line, "adjoint_evaluator.grad_input_fields must contain non-empty strings")
+
+    grad_outputs = _require_list(evaluator["grad_output_fields"], source_map.path, line, "adjoint_evaluator.grad_output_fields")
+    if len(grad_outputs) != 1 or not all(isinstance(item, str) and item for item in grad_outputs):
+        raise _diagnostic(source_map.path, line, "adjoint_evaluator.grad_output_fields must be a single non-empty string (v0.5 supports one scalar output)")
+
+    if not isinstance(evaluator["unclamped_expression"], str) or not evaluator["unclamped_expression"].strip():
+        raise _diagnostic(source_map.path, line, "adjoint_evaluator.unclamped_expression must be a non-empty string")
+
+    rules = _require_mapping(evaluator["derivative_rules"], source_map.path, line, "adjoint_evaluator.derivative_rules")
+    for field in grad_inputs:
+        if field not in rules:
+            raise _diagnostic(source_map.path, line, f"adjoint_evaluator.derivative_rules missing rule for grad input '{field}'")
+        if not isinstance(rules[field], str) or not rules[field].strip():
+            raise _diagnostic(source_map.path, line, f"adjoint_evaluator.derivative_rules['{field}'] must be a non-empty C expression")
+
+
 def _validate_row(row: dict[str, Any], source_map: SourceMap, schema: dict[str, Any]) -> RowClass:
     required = schema.get("required_fields", [])
     field_types = schema.get("field_types", {})
@@ -259,6 +298,7 @@ def _validate_row(row: dict[str, Any], source_map: SourceMap, schema: dict[str, 
         raise _diagnostic(source_map.path, source_map.line_for("max_rows_per_block"), "max_rows_per_block must be greater than zero")
 
     _validate_forward_evaluator(row, source_map, schema)
+    _validate_adjoint_evaluator(row, source_map, schema)
     return RowClass(data=row, source_path=source_map.path, source_map=source_map)
 
 
@@ -310,23 +350,60 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8", newline="\n")
 
 
+def _gradient_mode_enum(schema: dict[str, Any]) -> list[str]:
+    """Ordered gradient-mode names; index == the uint8 stored in Row.gradient_mode."""
+    modes = schema.get("enums", {}).get("default_gradient_mode", [])
+    if not isinstance(modes, list) or not modes:
+        raise CodegenError("schema enums.default_gradient_mode must be a non-empty list")
+    return [str(mode) for mode in modes]
+
+
 def render(schema: dict[str, Any], rows: list[RowClass], templates_dir: Path, output_dir: Path) -> list[Path]:
     env = _environment(templates_dir)
     forward_template = env.get_template("forward_kernel.cu.j2")
     dispatch_template = env.get_template("row_dispatch.cu.j2")
     registry_template = env.get_template("registry_header.hpp.j2")
+    adjoint_template = env.get_template("adjoint_kernel.cuh.j2")
+    adjoint_kernel_template = env.get_template("adjoint_kernel.cu.j2")
 
-    outputs: list[Path] = []
-    row_contexts = [row.template_context() for row in rows]
+    gradient_modes = _gradient_mode_enum(schema)
+
+    # Assign a stable, non-zero adjoint_kernel_id to each class that emits an
+    # adjoint (id 0 == "no adjoint"); classes without one keep 0.
+    row_contexts: list[dict[str, Any]] = []
+    next_adjoint_id = 1
+    for row in rows:
+        ctx = row.template_context()
+        mode = str(row.data["default_gradient_mode"])
+        ctx["gradient_mode_index"] = gradient_modes.index(mode)
+        if row.has_adjoint:
+            ctx["adjoint_kernel_id"] = next_adjoint_id
+            next_adjoint_id += 1
+        else:
+            ctx["adjoint_kernel_id"] = 0
+        row_contexts.append(ctx)
+
     common = {
         "rows": row_contexts,
         "flags": schema.get("flags_bitfield", []),
+        "gradient_modes": gradient_modes,
     }
 
-    for row in rows:
+    outputs: list[Path] = []
+    for row, ctx in zip(rows, row_contexts):
         output = output_dir / f"{row.file_stem}_forward.cu"
-        _write(output, forward_template.render(**common, **row.template_context()))
+        _write(output, forward_template.render(**common, **ctx))
         outputs.append(output)
+
+        # Reverse-mode pair: emit only for classes carrying an adjoint_evaluator.
+        if row.has_adjoint:
+            header = output_dir / f"{row.file_stem}_adjoint.cuh"
+            _write(header, adjoint_template.render(**common, **ctx))
+            outputs.append(header)
+
+            kernel = output_dir / f"{row.file_stem}_adjoint.cu"
+            _write(kernel, adjoint_kernel_template.render(**common, **ctx))
+            outputs.append(kernel)
 
     dispatch = output_dir / "row_dispatch.cu"
     _write(dispatch, dispatch_template.render(**common))

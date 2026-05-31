@@ -36,3 +36,36 @@ forward_evaluator:
   inner_loop_strategy: row_serial_jacobi
   warm_start: true
   drive_mode: pd_velocity
+
+# Reverse-mode (v0.5 dense_adjoint slice).
+#
+# PD drive law (mirrors ApplyPositionDriveKernel in
+# src/runtime/articulation/featherstone_aba.cu):
+#     u   = drive_stiffness*(drive_target - q) - drive_damping*qdot   (pre-clamp)
+#     tau = clamp(u, -force_limit, +force_limit)
+#
+# Differentiable inputs : q, qdot, drive_target
+# Differentiable params  : drive_stiffness (Kp), drive_damping (Kd)  -- the
+#                          v0.5 parameter-gradient spine.
+# The force-limit clamp is non-smooth at saturation: its (sub-)gradient is the
+# indicator kClampActive (1 strictly inside the band, 0 when saturated). All five
+# partials carry that factor, so a saturated drive contributes zero gradient.
+adjoint_evaluator:
+  grad_input_fields:
+    - q
+    - qdot
+    - drive_target
+    - drive_stiffness
+    - drive_damping
+  grad_output_fields:
+    - tau
+  # u = Kp*(target - q) - Kd*qdot ; emitted primal is clamp(u, -L, +L).
+  unclamped_expression: >-
+    drive_stiffness * (drive_target - q) - drive_damping * qdot
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by kClampActive):
+  derivative_rules:
+    q: "-drive_stiffness"
+    qdot: "-drive_damping"
+    drive_target: "drive_stiffness"
+    drive_stiffness: "(drive_target - q)"
+    drive_damping: "-qdot"

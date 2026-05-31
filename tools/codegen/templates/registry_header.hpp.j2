@@ -22,6 +22,13 @@ enum class RowClassId : uint32_t {
 {% endfor %}
 };
 
+// Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
+enum class GradientMode : uint8_t {
+{% for mode in gradient_modes %}
+    {{ mode }} = {{ loop.index0 }}u,
+{% endfor %}
+};
+
 struct Row {
     uint32_t row_class_id = 0u;
     uint32_t body_count = 0u;
@@ -45,11 +52,19 @@ inline constexpr uint32_t kRowClassCount = {{ rows | length }}u;
 {% for row in rows %}
 inline constexpr uint32_t k{{ row.row_class_name }}Id = {{ row.row_class_id }}u;
 inline constexpr uint32_t k{{ row.row_class_name }}MaxRowsPerBlock = {{ row.max_rows_per_block }}u;
+inline constexpr uint8_t k{{ row.row_class_name }}GradientMode = {{ row.gradient_mode_index }}u;
+inline constexpr uint16_t k{{ row.row_class_name }}AdjointKernelId = {{ row.adjoint_kernel_id }}u;
 {% endfor %}
 
 const char* RowClassName(uint32_t row_class_id) noexcept;
 const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept;
 uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept;
 bool IsKnownRowClass(uint32_t row_class_id) noexcept;
+
+// Reverse-mode lookups (populate Row.gradient_mode / Row.adjoint_kernel_id).
+uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept;
+uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept;
+const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept;
+bool RowClassHasAdjoint(uint32_t row_class_id) noexcept;
 
 } // namespace nuka::solver::generated

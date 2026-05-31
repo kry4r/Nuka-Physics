@@ -1,0 +1,102 @@
+// GENERATED — DO NOT EDIT
+// ============================================================
+// Source: {{ source_yaml_path }}
+// Regenerate: python tools/codegen/regen.py
+// ============================================================
+//
+// Reverse-mode matched pair for {{ row_class_name }} ({{ default_gradient_mode }}).
+//
+//   primal  : {{ adjoint_evaluator.grad_output_fields[0] }} = clamp(u, -force_limit, +force_limit)
+//             where u = {{ adjoint_evaluator.unclamped_expression }}
+//   adjoint : grad_x_i = (du/dx_i) * kClampActive * seed
+//             for x_i in {{ adjoint_evaluator.grad_input_fields | join(", ") }}
+//
+// The unclamped law `u` is the single source of truth shared by the primal,
+// the saturation test, and the derivative_rules (authored as du/dx_i in the IR).
+// The force-limit clamp is non-smooth at saturation; kClampActive is its
+// sub-gradient indicator (1 strictly inside the band, 0 when saturated), so a
+// saturated drive yields zero gradient on every input/param.
+//
+// Both functions are __host__ __device__ so the V3 finite-difference harness
+// (src/codegen/v3_validation) validates the SAME definitions it will run on the
+// device. D1: one row per thread, distinct outputs, no atomics.
+
+#pragma once
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+namespace nuka::solver::generated {
+
+// Differentiable inputs + params for the {{ class_name | snake_case }} law.
+struct {{ class_name }}AdjInputs {
+{% for f in adjoint_evaluator.grad_input_fields %}
+    float {{ f }} = 0.0f;
+{% endfor %}
+    float force_limit = 0.0f;
+};
+
+// Per-input gradient bundle (vᵀ·∂f/∂x). One entry per grad_input_field.
+struct {{ class_name }}AdjGrads {
+{% for f in adjoint_evaluator.grad_input_fields %}
+    float grad_{{ f }} = 0.0f;
+{% endfor %}
+};
+
+// Un-clamped law u (shared interior of primal and adjoint).
+__host__ __device__ __forceinline__ float
+{{ class_name | snake_case }}_unclamped_eval(const {{ class_name }}AdjInputs& in) {
+{% for f in adjoint_evaluator.grad_input_fields %}
+    const float {{ f }} = in.{{ f }};
+{% endfor %}
+    const float force_limit = in.force_limit;
+{% for f in adjoint_evaluator.grad_input_fields %}
+    (void){{ f }};
+{% endfor %}
+    (void)force_limit;
+    return {{ adjoint_evaluator.unclamped_expression }};
+}
+
+// Primal forward-update f(inputs, params) -> {{ adjoint_evaluator.grad_output_fields[0] }}.
+__host__ __device__ __forceinline__ float
+{{ class_name | snake_case }}_forward_eval(const {{ class_name }}AdjInputs& in) {
+    const float u = {{ class_name | snake_case }}_unclamped_eval(in);
+    if (in.force_limit > 0.0f) {
+        return fminf(fmaxf(u, -in.force_limit), in.force_limit);
+    }
+    return u;
+}
+
+// Clamp sub-gradient indicator: 1 strictly inside the force-limit band, else 0.
+__host__ __device__ __forceinline__ float
+{{ class_name | snake_case }}_clamp_active(const {{ class_name }}AdjInputs& in) {
+    if (in.force_limit <= 0.0f) {
+        return 1.0f;  // no active limit -> always differentiable
+    }
+    const float u = {{ class_name | snake_case }}_unclamped_eval(in);
+    return (u <= -in.force_limit || u >= in.force_limit) ? 0.0f : 1.0f;
+}
+
+// Reverse-mode adjoint: grad_x_i = (du/dx_i) * kClampActive * seed,
+// with seed = dL/d{{ adjoint_evaluator.grad_output_fields[0] }}.
+__host__ __device__ __forceinline__ {{ class_name }}AdjGrads
+{{ class_name | snake_case }}_adjoint_eval(const {{ class_name }}AdjInputs& in, float seed) {
+{% for f in adjoint_evaluator.grad_input_fields %}
+    const float {{ f }} = in.{{ f }};
+{% endfor %}
+    const float force_limit = in.force_limit;
+    const float kClampActive = {{ class_name | snake_case }}_clamp_active(in);
+
+    {{ class_name }}AdjGrads g;
+{% for f in adjoint_evaluator.grad_input_fields %}
+    g.grad_{{ f }} = ({{ adjoint_evaluator.derivative_rules[f] }}) * kClampActive * seed;
+{% endfor %}
+{% for f in adjoint_evaluator.grad_input_fields %}
+    (void){{ f }};
+{% endfor %}
+    (void)force_limit;
+    return g;
+}
+
+} // namespace nuka::solver::generated

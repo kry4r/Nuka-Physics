@@ -25,6 +25,14 @@ enum class RowClassId : uint32_t {
     FeatherstoneContactRow = 3u,
 };
 
+// Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
+enum class GradientMode : uint8_t {
+    dense_adjoint = 0u,
+    stop_grad_on_event = 1u,
+    ift_at_convergence = 2u,
+    none = 3u,
+};
+
 struct Row {
     uint32_t row_class_id = 0u;
     uint32_t body_count = 0u;
@@ -47,16 +55,30 @@ struct Row {
 inline constexpr uint32_t kRowClassCount = 4u;
 inline constexpr uint32_t kMaximalContactRowId = 0u;
 inline constexpr uint32_t kMaximalContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kMaximalContactRowGradientMode = 1u;
+inline constexpr uint16_t kMaximalContactRowAdjointKernelId = 0u;
 inline constexpr uint32_t kMaximalJointRowId = 1u;
 inline constexpr uint32_t kMaximalJointRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kMaximalJointRowGradientMode = 0u;
+inline constexpr uint16_t kMaximalJointRowAdjointKernelId = 0u;
 inline constexpr uint32_t kMaximalDriveRowId = 2u;
 inline constexpr uint32_t kMaximalDriveRowMaxRowsPerBlock = 1u;
+inline constexpr uint8_t kMaximalDriveRowGradientMode = 0u;
+inline constexpr uint16_t kMaximalDriveRowAdjointKernelId = 1u;
 inline constexpr uint32_t kFeatherstoneContactRowId = 3u;
 inline constexpr uint32_t kFeatherstoneContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kFeatherstoneContactRowGradientMode = 1u;
+inline constexpr uint16_t kFeatherstoneContactRowAdjointKernelId = 0u;
 
 const char* RowClassName(uint32_t row_class_id) noexcept;
 const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept;
 uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept;
 bool IsKnownRowClass(uint32_t row_class_id) noexcept;
+
+// Reverse-mode lookups (populate Row.gradient_mode / Row.adjoint_kernel_id).
+uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept;
+uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept;
+const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept;
+bool RowClassHasAdjoint(uint32_t row_class_id) noexcept;
 
 } // namespace nuka::solver::generated
