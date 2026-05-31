@@ -10,7 +10,7 @@
 
 Implement gradient checkpointing (master plan path 2) as the diff-sim tape strategy. Memory cap dictates this: S1's 4096 envs × 1000-step episode × 10KB/step would be 40 GB of full tape, unfeasible. Checkpointing every K=50–100 steps reduces this to (1000/K)×state + K×tape ≈ 1 GB; reverse pass recomputes from nearest checkpoint at 2-3× forward cost.
 
-Path 3 (IFT-at-convergence) for guaranteed-convergent subsystems lands in Phase 3 (cuDSS). This phase focuses on the universal checkpointing path.
+Path 3 (IFT-at-convergence) for guaranteed-convergent subsystems lands in Phase 3 (self-written sparse solver). This phase focuses on the universal checkpointing path.
 
 Deliverables:
 

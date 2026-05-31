@@ -1,8 +1,7 @@
 # Nuka Physics v0.7 – Phase 3: Self-Written Sparse Solver — GMRES + AMG Preconditioner
 
-> **Master plan reference:** §2 decision #12 + §8 risk register
-> **Prerequisites:** v0.7 Phase 2 (MINRES + ILU operational)
-> **Blocks:** v2.0 Phase 1 (full cuDSS retirement)
+> **Master plan reference:** §2 decision #12 (self-written from v0.5) + §3 Round 3/13 amendment + §8 risk register
+> **Prerequisites:** v0.7 Phase 2 (MINRES + ILU operational), atop the v0.5 self-written CG + Jacobi/Block-Jacobi core
 > **Exit criteria gate:** v0.7
 > **🔒 HARD CONSTRAINT (project-wide):** GPU-only simulation. No CPU physics simulation in production code paths. See master plan §5.6.
 
@@ -17,7 +16,7 @@ After this phase, the self-written solver suite is **feature-complete** for all 
 - Non-symmetric → GMRES + ILU(0)/AMG (Phase 3)
 - Large stiff systems → AMG-preconditioned Krylov (Phase 3)
 
-cuDSS is still the default in v0.7 (avoiding rocking the boat during S2 development); v2.0 Phase 1 makes self-written the default.
+The self-written solver has been the only sparse backend since v0.5 (no closed-source SDK, ever); this phase completes its method coverage. There is nothing to retire or switch over — the suite is self-written end to end.
 
 ## Tech Stack
 
@@ -37,7 +36,7 @@ cuDSS is still the default in v0.7 (avoiding rocking the boat during S2 developm
 - `tests/diffsim/solver/test_gmres_nonsymmetric.cpp`
 - `tests/diffsim/solver/test_amg_setup.cpp`
 - `tests/diffsim/solver/test_amg_vs_ilu0_stiff.cpp`
-- `tests/diffsim/solver/test_full_suite_vs_cudss.cpp` — comprehensive comparison
+- `tests/diffsim/solver/test_full_suite_vs_dense.cpp` — comprehensive comparison vs a dense reference + cross-method agreement
 - `docs/architecture/sparse-solver-suite.md` — final design + perf characteristics
 
 ## Files to Modify
@@ -151,18 +150,19 @@ Sensible defaults: AUTO routes by matrix symmetry / definiteness detection.
 
 ### Task 7.3.6 — Tests
 
-`tests/diffsim/solver/test_full_suite_vs_cudss.cpp`:
+`tests/diffsim/solver/test_full_suite_vs_dense.cpp`:
 
 ```cpp
 // Sweep matrix types: SPD, symmetric indefinite, non-symmetric
-// Compare self-written suite vs cuDSS on each
-// Assert agreement < 1e-5 on the entire suite
-TEST(FullSuiteVsCudss, AllMatrixTypes) {
+// Compare each self-written backend vs a dense reference solve (Eigen),
+// and cross-check the self-written backends against each other.
+// Assert agreement < 1e-5 on the entire suite.
+TEST(FullSuiteVsDense, AllMatrixTypes) {
     for (auto& mat : test_matrix_zoo()) {
+        auto x_ref = SolveDenseReference(mat);   // Eigen LDLT / PartialPivLU
         for (auto backend : {"self_cg", "self_minres", "self_gmres"}) {
             auto x_self = SolveWith(mat, backend);
-            auto x_cudss = SolveWith(mat, "cudss");
-            EXPECT_LT(RelativeError(x_self, x_cudss), 1e-5);
+            EXPECT_LT(RelativeError(x_self, x_ref), 1e-5);
         }
     }
 }
@@ -182,7 +182,7 @@ TEST(FullSuiteVsCudss, AllMatrixTypes) {
 - GMRES converges on non-symmetric test matrices.
 - AMG setup produces correct coarsening hierarchy.
 - AMG V-cycle reduces residual by expected factor per cycle.
-- Full suite agreement with cuDSS < 1e-5 on the matrix zoo.
+- Full suite agreement with a dense reference (and cross-method) < 1e-5 on the matrix zoo.
 - AMG outperforms ILU(0) on stiff matrices by ≥ 5× total time.
 - Deterministic: bit-exact across runs.
 - D1 contract preserved.
@@ -191,7 +191,7 @@ TEST(FullSuiteVsCudss, AllMatrixTypes) {
 
 1. GMRES backend operational.
 2. AMG preconditioner operational (setup + apply).
-3. Full self-written suite (CG, MINRES, GMRES) agrees with cuDSS within 1e-5.
+3. Full self-written suite (CG, MINRES, GMRES) agrees with a dense reference + cross-method within 1e-5.
 4. AUTO mode correctly routes by matrix structure.
 5. AMG performance benefits demonstrated on stiff systems.
 6. Documentation written (`docs/architecture/sparse-solver-suite.md`).
@@ -200,7 +200,6 @@ TEST(FullSuiteVsCudss, AllMatrixTypes) {
 
 ## What This Phase Does Not Do
 
-- Does not retire cuDSS (that's v2.0 Phase 1). Both coexist; cuDSS still default.
 - Does not implement BiCGStab / IDR (not needed for our problems).
 - Does not implement geometric multigrid (would require mesh hierarchy from physics; AMG suffices).
 - Does not handle complex-valued systems.

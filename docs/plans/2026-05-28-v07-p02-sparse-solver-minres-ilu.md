@@ -1,7 +1,7 @@
 # Nuka Physics v0.7 – Phase 2: Self-Written Sparse Solver — MINRES + ILU(0) Preconditioner
 
-> **Master plan reference:** §2 decision #12 + §8 risk register
-> **Prerequisites:** v0.7 Phase 1 (CG + Jacobi backend in place)
+> **Master plan reference:** §2 decision #12 (self-written from v0.5) + §3 Round 3/13 amendment + §8 risk register
+> **Prerequisites:** v0.5 self-written CG + Jacobi/Block-Jacobi core (IFT) + v0.7 Phase 1 (CG hardened for the general path)
 > **Blocks:** v0.7 Phase 3 (GMRES + AMG round out the suite)
 > **Exit criteria gate:** v0.7
 > **🔒 HARD CONSTRAINT (project-wide):** GPU-only simulation. No CPU physics simulation in production code paths. See master plan §5.6.
@@ -27,7 +27,7 @@ ILU(0) is the workhorse preconditioner for indefinite systems. It runs incomplet
 - `src/diffsim/solver/triangular_solve.cu` — sparse triangular solve (forward / backward sub)
 - `tests/diffsim/solver/test_minres_indefinite.cpp` — solve known indefinite system
 - `tests/diffsim/solver/test_ilu0_factorization.cpp` — known reference factorization
-- `tests/diffsim/solver/test_minres_vs_cudss_indefinite.cpp` — agreement test
+- `tests/diffsim/solver/test_minres_vs_dense_indefinite.cpp` — agreement vs a dense reference solve
 - `tests/diffsim/solver/test_ilu0_vs_jacobi_convergence.cpp` — preconditioner quality comparison
 
 ## Files to Modify
@@ -170,7 +170,7 @@ TEST(Ilu0VsJacobi, FewerIterations) {
 1. `SelfWrittenMinresBackend` operational with both Jacobi and ILU(0) preconditioners.
 2. Indefinite KKT systems solved correctly.
 3. Auto-routing chooses MINRES when indefinite detected.
-4. cuDSS agreement test on indefinite systems within 1e-5.
+4. Dense-reference agreement test on indefinite systems within 1e-5.
 5. ILU(0) outperforms Jacobi on test KKT problems.
 6. Lint + determinism tests pass.
 
@@ -178,5 +178,5 @@ TEST(Ilu0VsJacobi, FewerIterations) {
 
 - No GMRES (Phase 3) — that handles non-symmetric.
 - No AMG (Phase 3) — that's the heavy-weight preconditioner.
-- Does not yet retire cuDSS.
+- No closed-source SDK — extends the self-written core only.
 - No new physics.
