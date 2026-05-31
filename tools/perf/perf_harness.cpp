@@ -42,6 +42,7 @@
 #include "scene/cooker.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -214,11 +215,20 @@ DeviceDrives UploadDrives(const HoldDrives& base, uint32_t env_count) {
 [[noreturn]] void Usage(const char* prog, int code) {
     std::fprintf(stderr,
         "usage: %s --scene <usda> --envs <N> --steps <M>\n"
-        "          [--determinism d1] [--warmup <W>] [--perf-json -]\n"
+        "          [--determinism d1] [--warmup <W>] [--perf-json -] [--graph]\n"
         "\n"
         "Drives the real batched articulated Go2 stepper and prints the\n"
         "engine PerfRecorder JSON (schema_version + per_tag, plus gpu/n_envs/\n"
-        "steps) to STDOUT. All diagnostics go to STDERR.\n",
+        "steps) to STDOUT. All diagnostics go to STDERR.\n"
+        "\n"
+        "  --graph   Use the CUDA-graph replay step path (StepGraph) for the\n"
+        "            measured window. The per-tag NUKA_CUDA_TIME breakdown is\n"
+        "            unavailable under graph capture; the measured window is\n"
+        "            timed with a host wall-clock around each step + a stream\n"
+        "            sync instead, and the chrono step_total stats are emitted.\n"
+        "            For an apples-to-apples delta, the NON-graph path is also\n"
+        "            timed with the SAME chrono method (detail OFF) -- so run\n"
+        "            with and without --graph and compare the chrono numbers.\n",
         prog);
     std::exit(code);
 }
@@ -231,6 +241,7 @@ int main(int argc, char** argv) {
     long steps = 5000;
     long warmup = -1;  // <0 => auto: max(100, steps/20)
     std::string determinism = "d1";
+    bool use_graph = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -255,6 +266,8 @@ int main(int argc, char** argv) {
             // Only stdout ("-") is supported; the value is accepted and
             // ignored so the documented Python contract works verbatim.
             (void)need("--perf-json");
+        } else if (a == "--graph") {
+            use_graph = true;
         } else if (a == "-h" || a == "--help") {
             Usage(argv[0], 0);
         } else {
@@ -336,38 +349,77 @@ int main(int argc, char** argv) {
         params.baumgarte_max_velocity = kBaumgarteMaxVel;
 
         // Warm-up (NOT measured, detail OFF): first-touch allocation, I-cache,
-        // GPU clock ramp.
-        std::fprintf(stderr, "[perf_harness] warmup %u steps...\n",
-                     warmup_count);
+        // GPU clock ramp. For the graph path this also CAPTURES + instantiates the
+        // graph on the first StepGraph() so the measured window is pure replay.
+        std::fprintf(stderr, "[perf_harness] warmup %u steps (%s)...\n",
+                     warmup_count, use_graph ? "graph" : "non-graph");
         for (uint32_t s = 0u; s < warmup_count; ++s) {
-            bw.Step(params);
+            if (use_graph) {
+                bw.StepGraph(params);
+            } else {
+                bw.Step(params);
+            }
+        }
+        if (use_graph) {
+            bw.GraphStreamSynchronize();
         }
         context.stream.Synchronize();
 
-        // Measured window: detail ON, fresh recorder. Both the canonical-tag
-        // stages and the fine-grained sub-stage hotspots are captured.
-        bw.Perf().Reset();
-        bw.Perf().SetDetailEnabled(true);
-        std::fprintf(stderr, "[perf_harness] measuring %u steps (detail on)...\n",
-                     step_count);
-        for (uint32_t s = 0u; s < step_count; ++s) {
-            bw.Step(params);
-        }
-        context.stream.Synchronize();
-
-        // Sanity: step_total must have been recorded exactly once per step.
-        const auto step_stats = bw.Perf().Stats("step_total");
-        if (step_stats.count != step_count) {
-            std::fprintf(stderr,
-                "warning: step_total count=%llu != steps=%u (recorder "
-                "anomaly)\n",
-                static_cast<unsigned long long>(step_stats.count), step_count);
-        }
+        // ---- Chrono-timed measured window (detail OFF, both paths identical). --
+        // The graph path carries no NUKA_CUDA_TIME events, so to compare graph vs.
+        // non-graph apples-to-apples we time BOTH with a host wall-clock around
+        // each step + a per-step stream sync (the same metric). Detail is OFF, so
+        // these chrono numbers are the production (un-inflated) step cost. The
+        // per-step sync makes each sample the genuine whole-step latency.
+        std::vector<double> chrono_us;
+        chrono_us.reserve(step_count);
         std::fprintf(stderr,
-            "[perf_harness] done: step_total p50=%.3f us mean=%.3f us "
-            "(per env-step p50=%.4f us)\n",
-            step_stats.p50_us, step_stats.mean_us,
-            step_stats.p50_us / static_cast<double>(env_count));
+            "[perf_harness] measuring %u steps (%s, chrono whole-step)...\n",
+            step_count, use_graph ? "graph replay" : "non-graph Step");
+        for (uint32_t s = 0u; s < step_count; ++s) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (use_graph) {
+                bw.StepGraph(params);
+                bw.GraphStreamSynchronize();
+            } else {
+                bw.Step(params);
+                context.stream.Synchronize();
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            chrono_us.push_back(
+                std::chrono::duration<double, std::micro>(t1 - t0).count());
+        }
+
+        // p50 / mean over the chrono samples (nearest-rank p50, sorted copy).
+        double chrono_mean = 0.0;
+        for (double v : chrono_us) chrono_mean += v;
+        chrono_mean /= static_cast<double>(chrono_us.size());
+        std::vector<double> sorted = chrono_us;
+        std::sort(sorted.begin(), sorted.end());
+        const double chrono_p50 = sorted[sorted.size() / 2u];
+
+        // For the non-graph path also keep the existing detail-ON per-tag window
+        // so the run_perf_baseline.py JSON contract (per_tag breakdown) is intact.
+        // The graph path cannot produce a per-tag breakdown (no capture-time
+        // events), so its per_tag map is empty -- expected and documented.
+        if (!use_graph) {
+            bw.Perf().Reset();
+            bw.Perf().SetDetailEnabled(true);
+            std::fprintf(stderr,
+                "[perf_harness] detail per-tag window %u steps (detail on)...\n",
+                step_count);
+            for (uint32_t s = 0u; s < step_count; ++s) {
+                bw.Step(params);
+            }
+            context.stream.Synchronize();
+        }
+
+        std::fprintf(stderr,
+            "[perf_harness] done: path=%s chrono step_total p50=%.3f us "
+            "mean=%.3f us (per env-step p50=%.4f us mean=%.4f us)\n",
+            use_graph ? "graph" : "non-graph", chrono_p50, chrono_mean,
+            chrono_p50 / static_cast<double>(env_count),
+            chrono_mean / static_cast<double>(env_count));
 
         // ---- STDOUT: pure JSON, byte-compatible with PerfRecorder.DumpJson()
         // plus run metadata (gpu / n_envs / steps / determinism). The Python
@@ -394,6 +446,21 @@ int main(int argc, char** argv) {
         out += "  \"determinism\": \"";
         out += JsonEscape(determinism);
         out += "\",\n";
+        // p01-W3: graph path flag + chrono whole-step stats (machine-readable, so
+        // the graph-vs-non-graph delta can be diffed). These are the SAME-metric
+        // (detail-OFF wall-clock) numbers for both paths.
+        out += "  \"graph\": ";
+        out += use_graph ? "true" : "false";
+        out += ",\n";
+        out += "  \"chrono_step_total_p50_us\": ";
+        out += std::to_string(chrono_p50);
+        out += ",\n";
+        out += "  \"chrono_step_total_mean_us\": ";
+        out += std::to_string(chrono_mean);
+        out += ",\n";
+        out += "  \"chrono_per_env_step_p50_us\": ";
+        out += std::to_string(chrono_p50 / static_cast<double>(env_count));
+        out += ",\n";
         // Strip the leading "{\n" from DumpJson() and append its body.
         const auto brace = per_tag_json.find('{');
         std::string body = per_tag_json.substr(brace + 1);

@@ -753,6 +753,29 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_articulated_world_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- CUDA-graph step capture/replay bit-identical gate (p01-W3) ---------
+    add_executable(nuka_batched_articulated_graph_test
+        runtime/test_batched_articulated_graph.cpp
+    )
+
+    target_compile_definitions(nuka_batched_articulated_graph_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_batched_articulated_graph_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_articulated_graph_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Fine-grained (detail) timing breakdown harness (v0.3 p01 Wave-2) ----
     add_executable(nuka_batched_articulated_world_perf_test
         runtime/test_batched_articulated_world_perf_detail.cpp
