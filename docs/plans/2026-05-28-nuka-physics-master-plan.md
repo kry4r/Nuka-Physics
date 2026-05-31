@@ -7,6 +7,7 @@
 > **Owner edit log:**
 > - 2026-05-28 – initial draft after design-grilling convergence (13 rounds, 16+ dimensions resolved).
 > - 2026-05-28 – added §5.6 GPU-only simulation hard constraint; project-wide ban on CPU simulation in production paths. Added decision row #35 to §2 summary. Propagated constraint reference into all 16 v0.1 / v0.3 / v0.5 phase specs.
+> - 2026-05-31 – AMENDMENT: dropped cuDSS entirely. v0.5 ships a self-written deterministic sparse linear solver (CG + Jacobi/Block-Jacobi, fixed-order reductions, D1 bit-exact) for the IFT path from the start; MINRES/ILU/GMRES/AMG remain v0.7+ extensions of this core. Reverses the Round 13 "cuDSS de-risks v0.5" reserve (see §3 Round 3/13 + §7). Propagated into v0.5 / v0.7 phase specs.
 
 ---
 
@@ -63,7 +64,7 @@ Phased anchors (strict order, no skipping):
 | 9 | Adjoint kernel pipeline | Codegen (not function pointers, not runtime dispatch) |
 | 10 | Contact discontinuity (diff-sim) | β – stop-gradient at events; α retained as per-env switch |
 | 11 | Diff-sim tape | Checkpointing (K≈50–100) + IFT hybrid; full tape only in debug |
-| 12 | Sparse linear solver | Phase 1: cuDSS (v0.1–v0.5). Phase 2: self-written deterministic CG/MINRES/GMRES + Jacobi/Block-Jacobi/ILU(0)/AMG (post-v0.5) |
+| 12 | Sparse linear solver | Self-written deterministic solver from v0.5 (CG + Jacobi/Block-Jacobi, fixed-order reductions, D1 bit-exact) for the IFT path. v0.7+ extends the same self-written core with MINRES/ILU(0)/GMRES/AMG + factorization. No cuDSS / no closed-source SDK, ever |
 | 13 | Determinism contract | D1 strong (bit-exact); island/coloring v1 must-have; D2 weak as RL training fallback |
 | 14 | Multi-GPU | M1 single-GPU + M2 multi-GPU data-parallel; M3 explicitly out of scope |
 | 15 | Single-env envelope | 80 GB H100; particles<1M, tets<200K, rigids<50K |
@@ -229,12 +230,12 @@ Key insight: agent.md's "reusable CUDA constraint-row scheduler" is exactly the 
 Three options for the required sparse linear solver (IFT reverse solves KKT system):
 
 - Self-written CUDA CG / MINRES / GMRES + preconditioners (full control, deterministic, 4–6 months work).
-- NVIDIA cuDSS (mature, closed-source SDK, deterministic-friendly).
+- NVIDIA cuDSS — **considered and rejected** (closed-source SDK; its reduction order is not bit-exact, which would force the IFT path to D2).
 - Ginkgo / AMGX (open source CUDA sparse libraries).
 
 **Initial recommendation:** cuDSS now + self-written CG fallback for the deterministic deep path.
 
-**Decision (revised in Round 13):** **Phase 1: cuDSS from v0.1 through v0.5.** **Phase 2 (post-v0.5): self-written deterministic CG / MINRES / GMRES + Jacobi / Block-Jacobi / ILU(0) / AMG, fixed-order tree reductions to satisfy D1.** Caller-facing API is stable so the swap is transparent.
+**Decision (amended 2026-05-31; supersedes the Round 13 cuDSS resolution):** **No cuDSS — no closed-source SDK, anywhere, ever.** v0.5 ships a **self-written deterministic CG + Jacobi / Block-Jacobi solver with fixed-order tree reductions (D1 bit-exact)** as the IFT backend from the start; the v0.5 scope (rigid + Featherstone) produces SPD KKT/Schur systems, so CG + Jacobi is the minimal sufficient solver. The broader self-written suite — **MINRES / GMRES + ILU(0) / AMG + factorization** — extends this same core in **v0.7+**. Caller-facing API is stable, so adding methods later is transparent.
 
 **Sub-question 5b extension – IR fields:**
 
@@ -695,7 +696,7 @@ Total to v2.0 ≈ 4.5 years. Plus v3.0 ≈ 5–6 years total.
 | Risk | Probability | Impact | Reserve |
 |---|---|---|---|
 | Featherstone ↔ XPBD coupling instability | Medium | S2 blocks | Semi-implicit Featherstone + soft-contact spring fallback |
-| Self-written sparse solver delays | High | v0.5 delay | Temporarily use cuDSS, self-written long-term |
+| Self-written sparse solver delays | High | v0.5 delay | **Real, accepted risk** (no cuDSS reserve): scope v0.5 to the minimal deterministic CG + Jacobi for IFT, defer MINRES/ILU/GMRES/AMG to v0.7, keep diff-sim episodes short, validate against V3 FD + a dense reference solve |
 | Codegen IR over-engineering | High | v0.1 delay | Strict: "v0.1 IR supports only existing 4 row classes" |
 | Diff-sim long-episode convergence | Medium | v0.5 partial fail | Limit episode length + tunable checkpoint interval + per-row grad skip |
 | D1 strong determinism perf deficit | Medium | v0.3 gate fail | D2 weak mode as training fallback; D1 stays for oracle/debug |
@@ -709,7 +710,7 @@ Total to v2.0 ≈ 4.5 years. Plus v3.0 ≈ 5–6 years total.
 2. **Phase skipping not allowed.** Strict rule confirmed.
 3. **Stagnation triggers accepted.** Reformulated as effort-based instead of time-based: "no progress for 4 weeks → review; 8 weeks → kill switch."
 4. **D1 → D2 RL-training fallback accepted.** Oracle / debug / diff-sim remain D1.
-5. **Self-written solver:** initial decision was no fallback (strict self-write); revised after pushback to: **cuDSS for v0.1–v0.5, self-written replaces cuDSS post-v0.5.** Eliminates v0.5 schedule risk.
+5. **Self-written solver:** initial decision was no fallback (strict self-write); a Round 13 resolution temporarily admitted a closed-SDK reserve. **Amended 2026-05-31 back to strict self-write: the self-written deterministic solver is now IN v0.5 (CG + Jacobi for IFT); no closed-SDK reserve.** The v0.5 schedule risk this re-introduces is **real and accepted** — mitigated by the minimal CG+Jacobi scope (MINRES/ILU/GMRES/AMG deferred to v0.7) + short episodes + FD/dense-reference validation, **not** eliminated.
 6. **No additional risks identified.**
 
 **Pushback on "no calendar time":** Strong AI workflow argument has merit (calendar doesn't reflect AI-accelerated production rate) but the *rhythm* (weekly / monthly / quarterly) and *anti-scope-drift constraints* (no skipping, no "fix later") must remain. Calendar dates dropped; relative rhythm + exit criteria kept; stagnation triggers measured in elapsed-weeks-without-progress (not calendar weeks of total project time). All accepted by user.
@@ -723,7 +724,7 @@ Total to v2.0 ≈ 4.5 years. Plus v3.0 ≈ 5–6 years total.
 - **AI-protected file list (6 categories) accepted.**
 - **physics-smell lint as CI hard fail accepted.**
 - **Five-gate row-class merge requirement accepted.**
-- **Risk register as documented; cuDSS-then-self-write resolution applied.**
+- **Risk register as documented; strict self-write resolution applied (amended 2026-05-31: no closed-SDK reserve; the self-written solver ships in v0.5 and the residual schedule risk is accepted, not eliminated).**
 
 ---
 
@@ -916,7 +917,7 @@ Phases complete when **all** exit criteria pass. No calendar dates. No partial c
 - `torch.autograd.Function` adjoint FD check passing for all base row classes.
 - JAX `custom_vjp` operational.
 - Sim-to-real noise N1 + N2.
-- cuDSS sparse linear solver integrated for IFT.
+- Self-written deterministic sparse linear solver (CG + Jacobi/Block-Jacobi, fixed-order reductions, D1 bit-exact) integrated for IFT — no cuDSS / no closed-source SDK.
 - **Demo: gradient-based system identification on Go2.**
 
 ### v0.7 – S2 Entry
@@ -943,7 +944,6 @@ Phases complete when **all** exit criteria pass. No calendar dates. No partial c
 
 ### v2.0 – S5 Entry
 - 4096-env RGB + semantic + depth pipeline.
-- Self-written CUDA sparse linear solver replaces cuDSS (returns to D1 strict).
 - Differentiable rendering prototype.
 - **Demo: VLA training data generation prototype.**
 
@@ -958,7 +958,7 @@ Phases complete when **all** exit criteria pass. No calendar dates. No partial c
 | Risk | Probability | Impact | Reserve / mitigation |
 |---|---|---|---|
 | Featherstone ↔ XPBD coupling instability | Medium | S2 blocks | Semi-implicit Featherstone + soft-contact spring fallback |
-| Self-written sparse solver delays | High | Diff-sim delay | **Mitigated:** cuDSS v0.1–v0.5, self-written post-v0.5 |
+| Self-written sparse solver delays | High | Diff-sim / v0.5 delay | **Real, accepted (no cuDSS reserve):** v0.5 scoped to minimal deterministic CG + Jacobi for IFT; MINRES/ILU/GMRES/AMG deferred to v0.7; short diff-sim episodes; gradients validated vs V3 FD (<1e-3 rel) + a dense reference solve (Eigen LDLT, <1e-6) |
 | Codegen IR over-engineering | High | v0.1 delay | Hard rule: v0.1 IR supports only existing 4 row classes |
 | Diff-sim long-episode convergence | Medium | v0.5 partial fail | Limit episode length; tunable checkpoint; per-row grad skip |
 | D1 strong determinism misses S1 perf bar | Medium | v0.3 gate fail | D2 weak mode for training; D1 for oracle/debug/diff-sim |
@@ -1003,7 +1003,7 @@ Burnout is the single largest threat. Quarterly external output is the only prot
            ============ v0.3 EXIT ============
                             |
                             v
-   [cuDSS integration]
+   [self-written CG/Jacobi sparse solver]
    [Sim-to-real N1+N2 sensors]
    [PyTorch autograd full + JAX]
                             |
@@ -1019,6 +1019,7 @@ Burnout is the single largest threat. Quarterly external output is the only prot
                             |
                             v
    [Self-written CUDA RT pipeline]
+   [extend self-written solver: MINRES/ILU/GMRES/AMG]
                             |
                             v
            ============ v0.7 EXIT ============
@@ -1037,7 +1038,6 @@ Burnout is the single largest threat. Quarterly external output is the only prot
            ============ v1.5 EXIT ============
                             |
                             v
-   [Self-written sparse solver replaces cuDSS]
    [S5 RGB pipeline + diff rendering]
                             |
                             v

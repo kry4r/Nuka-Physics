@@ -74,7 +74,7 @@ Master plan §8 risks; mark which are mitigated, which remain:
 - ✅ Featherstone ↔ XPBD instability — mitigated by Phase 1 stability work.
 - 🟡 Diff-sim long-episode convergence — partially addressed; long episodes still hit checkpoint limits.
 - 🟡 D1 perf — passes for S1 (Go2), passes for S2 (1× realtime); to be re-verified for S3 (multi-robot).
-- ⏳ Self-written sparse solver — Phase 1-3 of v0.7 + planned full replacement at v2.0 Phase 1. cuDSS still default.
+- ✅ Self-written sparse solver — core shipped v0.5 (CG/Jacobi, D1); extended v0.7 (MINRES/ILU/GMRES/AMG). No closed-source SDK ever.
 - ⏳ Single H100 envelope for S3 — to be stress-tested in v1.5.
 - 🟢 OpenUSD binary path — deferred to v1.5 (low risk).
 

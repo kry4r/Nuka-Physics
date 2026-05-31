@@ -15,7 +15,7 @@ Complete the differentiable simulation user surface and add domain-randomization
 3. JAX `custom_vjp` operational.
 4. Sim-to-real N1 + N2 implemented.
 
-cuDSS integration (already in Phase 3) is the IFT backend; the user-facing path is the PyTorch / JAX autograd hookup.
+the self-written sparse solver (Phase 3) is the IFT backend; the user-facing path is the PyTorch / JAX autograd hookup.
 
 ## Tech Stack
 

@@ -26,7 +26,7 @@ Close v0.5 with three deliverables that together complete the master plan §7 v0
 ### License + governance
 
 - `LICENSE` — Apache 2.0 text
-- `NOTICE` — copyright header + third-party attributions (CUDA, nanobind, cuDSS, PyTorch interop notes)
+- `NOTICE` — copyright header + third-party attributions (CUDA, nanobind, PyTorch interop notes)
 - `CLA.md` — Contributor License Agreement (Apache CLA template, owner-customized)
 - `CONTRIBUTING.md` — contribution flow + CLA signing instructions
 - `CODE_OF_CONDUCT.md` — standard CoC (Contributor Covenant)
@@ -65,7 +65,7 @@ Close v0.5 with three deliverables that together complete the master plan §7 v0
 
 ### Task 5.5.1 — License + governance files
 
-Standard Apache 2.0 license file from <https://www.apache.org/licenses/LICENSE-2.0.txt>. The CLA template from Apache Software Foundation (Individual CLA + Corporate CLA versions). `NOTICE` lists all third-party dependencies (CUDA Toolkit, nanobind, cuDSS, OpenUSD if integrated by then, etc.) with required attribution.
+Standard Apache 2.0 license file from <https://www.apache.org/licenses/LICENSE-2.0.txt>. The CLA template from Apache Software Foundation (Individual CLA + Corporate CLA versions). `NOTICE` lists all third-party dependencies (CUDA Toolkit, nanobind, OpenUSD if integrated by then, etc.) with required attribution. The sparse linear solver is self-written (no closed-source SDK), so it carries no third-party attribution.
 
 CLA-bot setup: a GitHub Action that checks every PR's author has signed the CLA before allowing merge. Free service (cla-assistant.io) or self-hosted.
 
@@ -222,7 +222,7 @@ Move CI from local-only to GitHub Actions:
 
 - [ ] Phase 1: V3 FD adjoint check passes for all v0.1 row classes
 - [ ] Phase 2: tape + checkpointing operational; replay bit-exact
-- [ ] Phase 3: cuDSS integrated; IFT path operational
+- [ ] Phase 3: self-written sparse solver integrated; IFT path operational (D1)
 - [ ] Phase 4: PyTorch autograd complete + JAX custom_vjp; FD agreement
 - [ ] Phase 4: Sim-to-real N1 + N2
 - [ ] Phase 5: License + CLA in place
@@ -252,7 +252,7 @@ Per master plan §7 v0.5:
 3. ✅ `torch.autograd.Function` adjoint FD check passing for all base row classes (Phase 1 + 4).
 4. ✅ JAX `custom_vjp` operational (Phase 4).
 5. ✅ Sim-to-real noise N1 + N2 (Phase 4).
-6. ✅ cuDSS sparse linear solver integrated for IFT (Phase 3).
+6. ✅ Self-written deterministic sparse solver integrated for IFT (Phase 3, D1).
 7. ✅ **Demo: gradient-based system identification on Go2** (Phase 5 Task 5.5.4).
 
 Plus rhythm: ✅ Quarterly external output published (Phase 5 Task 5.5.6).
@@ -261,7 +261,7 @@ Plus rhythm: ✅ Quarterly external output published (Phase 5 Task 5.5.6).
 
 - No soft body or fluid (v0.7).
 - No cross-system coupling rows (v0.7).
-- No self-written sparse solver (v0.7+).
+- No advanced sparse-solver methods yet — the self-written deterministic CG + Jacobi/Block-Jacobi core ships in v0.5 Phase 3 for the IFT path; MINRES/ILU/GMRES/AMG are added in v0.7+.
 - No CUDA RT pipeline (v1.0).
 - No Vulkan/D3D12 interop (v0.7 / v1.0).
 - No sim-to-real real-hardware deployment (v3.0).
