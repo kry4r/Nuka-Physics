@@ -1,0 +1,77 @@
+# rl_games (1.6.5) PPO config for Nuka Go2 flat-ground locomotion.
+#
+# Hyperparameters mirror the legged_gym / unitree_rl_gym Go2 recipe documented in
+# docs/plans/2026-05-28-v03-p04-go2-ppo-4096-demo.md (gamma 0.99, tau 0.95,
+# lr 3e-4 adaptive, e_clip 0.2, horizon 24, minibatch 32768, mini_epochs 5,
+# MLP [256,128,64]). ``env_name: nuka_go2`` resolves via the nuka.rl_games
+# adapter (registered on import). ``num_actors`` / ``max_epochs`` /
+# ``minibatch_size`` are overridden by train_go2_ppo.py (esp. for --smoke).
+params:
+  seed: 1
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [256, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: go2_locomotion
+    full_experiment_name: go2_locomotion
+    env_name: nuka_go2
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 3e-4
+    lr_schedule: adaptive
+    kl_threshold: 0.008
+    score_to_win: 100000
+    max_epochs: 1500
+    save_best_after: 100
+    save_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 24
+    num_actors: 4096
+    minibatch_size: 32768
+    mini_epochs: 5
+    critic_coef: 2
+    clip_value: True
+    bounds_loss_coef: 0.0001
+
+    env_config:
+      # env_name here is the nuka task selector; the adapter ignores extra keys
+      # it doesn't use. device is created+owned by the env (single GPU).
+      command: [0.5, 0.0, 0.0]
