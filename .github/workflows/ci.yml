@@ -1,0 +1,53 @@
+# Public CI for Nuka Physics.
+#
+# WHAT RUNS HERE (CPU-only, GitHub-hosted runners, no GPU required):
+#   * physics-smell lint (tools/lint/physics_smell.py)
+#   * a GPU-free Python smoke: byte-compile the Python sources.
+#
+# WHAT DOES NOT RUN HERE (and why):
+#   The full pipeline requires an NVIDIA GPU and the CUDA 12.8 toolchain:
+#     * the CUDA C++ build (build-cuda128) + `ctest`
+#     * `import nuka` / `pytest python/tests/`  -- the `nuka` package imports the
+#       compiled `_nuka_ext` extension, which only exists in the GPU build, so it
+#       cannot be imported on a hosted CPU runner.
+#     * the 4096-env performance gate (< 1 ms / env-step target).
+#   These require an owner-provisioned CUDA self-hosted runner
+#   (labels: [self-hosted, linux, cuda]) and are therefore GATED / OPTIONAL.
+#   They are NOT run on the default GitHub-hosted runners. See
+#   .github/workflows/v0.1-exit-gate.yml for the self-hosted GPU gate pattern.
+#
+# Note: tools/lint/physics_smell.py is intentionally also run by the existing
+# lint.yml workflow; running it here keeps this public CI self-contained.
+
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  physics-smell-lint:
+    name: physics-smell lint (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install lint deps
+        run: pip install pyyaml
+      - name: Run physics-smell lint
+        run: python tools/lint/physics_smell.py
+
+  python-smoke:
+    name: Python smoke (CPU, GPU-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # GPU-free: byte-compile the Python sources. We intentionally do NOT
+      # `import nuka` or run pytest here, because the `nuka` package loads the
+      # compiled `_nuka_ext` extension that only exists in the CUDA GPU build.
+      - name: Byte-compile Python sources
+        run: |
+          python -m compileall -q python/nuka python/tests
