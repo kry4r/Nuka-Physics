@@ -204,12 +204,25 @@ void BuildContactDelassusSystem(const phi::DeviceContext& context,
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
 
-    // Allocate the owned output buffers (one fresh allocation per build).
-    out_buffers.values = phi::Buffer(
-        static_cast<size_t>(block_count) * kBlockStride * sizeof(float),
-        phi::MemoryKind::Device);
-    out_buffers.block_dim = phi::Buffer(
-        static_cast<size_t>(block_count) * sizeof(uint32_t), phi::MemoryKind::Device);
+    // CALLER-OWNED, REUSABLE output buffers (perf: no per-Run cudaMalloc/free in the
+    // steady state). The previous version allocated fresh `values`/`block_dim` on
+    // EVERY call -- the exit-#8 benchmark showed that alloc/free was the dominant IFT
+    // backward overhead at small n. The IftRunner holds its `delassus_` ContactDelassus-
+    // Buffers across Run calls, so the size-guard below reallocates ONLY when a buffer
+    // is too small to fit the requested block_count and otherwise REUSES the existing
+    // allocation. Numerics are unchanged: the same full-span memset + the same kernel
+    // write the same bytes regardless of whether the buffer is fresh or reused (D1
+    // byte-exact preserved). Tests that pass a fresh empty ContactDelassusBuffers still
+    // get a single (lazy) allocation here.
+    const size_t values_bytes =
+        static_cast<size_t>(block_count) * kBlockStride * sizeof(float);
+    const size_t block_dim_bytes = static_cast<size_t>(block_count) * sizeof(uint32_t);
+    if (out_buffers.values.Size() < values_bytes) {
+        out_buffers.values = phi::Buffer(values_bytes, phi::MemoryKind::Device);
+    }
+    if (out_buffers.block_dim.Size() < block_dim_bytes) {
+        out_buffers.block_dim = phi::Buffer(block_dim_bytes, phi::MemoryKind::Device);
+    }
 
     float* values = static_cast<float*>(out_buffers.values.Data());
     uint32_t* block_dim = static_cast<uint32_t*>(out_buffers.block_dim.Data());

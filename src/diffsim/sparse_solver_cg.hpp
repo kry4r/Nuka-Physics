@@ -22,10 +22,17 @@
 //
 // Preconditioners (both D1):
 //   Jacobi      -- M^-1 = 1/diag(A). Genuine multi-iteration CG on a coupled block.
-//   BlockJacobi -- per-block dense Cholesky (the exact island solve). The
-//                  preconditioned residual z = A^-1 r is the exact correction, so
-//                  CG converges in <= 1 iteration; remaining fixed iterations are
-//                  no-ops guarded against 0/0 NaN by a deterministic residual floor.
+//   BlockJacobi -- per-block dense MODIFIED (pseudo) Cholesky (the exact island
+//                  solve). The preconditioned residual z = A^-1 r is the exact
+//                  correction, so CG converges in <= 1 iteration; remaining fixed
+//                  iterations are no-ops guarded against 0/0 NaN by a deterministic
+//                  residual floor. For a rank-deficient PSD block (a dead row OR an
+//                  oblique null direction) a post-elimination pivot at/below a
+//                  RELATIVE threshold (eps*max_diag, kNullPivotRelEps) is treated as
+//                  a null direction -- safe unit diagonal, zeroed factor column,
+//                  forced-zero solution component -- so the result is FINITE and
+//                  range-space-exact (least-norm on the null space), never NaN.
+//                  Full-rank blocks never trip this branch -> byte-identical factor.
 //
 // NaN guard: with a fixed iteration count, once the residual collapses (esp.
 // BlockJacobi after iter 1) the alpha = rz/(p.Ap) and beta = rz_new/rz_old ratios

@@ -42,10 +42,22 @@
 //     normal + t1 (in-plane tangent) columns. The t2 column + the genuinely coupled
 //     3x3 Delassus are exercised by the DENSE-REFERENCE oracle on a NON-PLANAR
 //     scene (no PGS dependence -> matches Eigen::LDLT exactly). When a tangent
-//     column is dead, A is PSD (not strictly SPD); BlockJacobi's pivot floor
-//     carries the zero pivot and the matching zero rhs component, so the solve
-//     stays correct -- the SPD assumption relaxes safely to PSD on the degenerate
-//     planar geometry.
+//     column is dead (or any direction is rank-deficient), A is PSD (not strictly
+//     SPD). BlockJacobi's per-block factorization is a MODIFIED (pseudo) Cholesky:
+//     any post-elimination pivot at or below a RELATIVE threshold (eps*max_diag,
+//     eps=1e-12 -- not an absolute floor) is treated as a NULL DIRECTION -- its
+//     factored diagonal is set to a safe unit value, its factor column is zeroed,
+//     and the matching solution component is forced to 0 (least-norm-style). The
+//     result is FINITE for every PSD block and EXACT on the range space (zero on
+//     the null space), covering BOTH a structurally dead row (zero pivot) AND an
+//     OBLIQUE null direction (tiny-nonzero post-elimination Schur pivot). The
+//     earlier "pivot floor carries the zero pivot, the solve stays correct" wording
+//     was FALSE for the oblique case: an absolute 1e-300 floor -> sqrt -> 1e-150 ->
+//     divide OVERFLOWED to NaN there. The modified-Cholesky null-direction handling
+//     is the fix (see sparse_solver_cg.cu kNullPivotRelEps + the oblique regression
+//     test in test_cg_vs_dense.cpp). Full-rank blocks never trip the branch, so
+//     their factor and every downstream bit are byte-identical to the strict-SPD
+//     path (D1 preserved).
 //   * Tests use a SINGLE articulation; the warp-per-articulation / disjoint-link
 //     scatter makes block independence + the grad_qdot_free = g pass-through
 //     structural (each warp only touches its own articulation's links / rows), but

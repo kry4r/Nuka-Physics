@@ -340,6 +340,262 @@ double RelErr(double analytic, double numeric) {
     return std::abs(analytic - numeric) / scale;
 }
 
+// ---------------------------------------------------------------------------
+// ADVERSARIAL (reviewer-added, attack A): a FULL-RANK-3 REVOLUTE task Jacobian.
+//
+// The author's primary FD scene (SyntheticArticulation) is PRISMATIC with axes
+// ex/ey/ez, so J == I EXACTLY: the forward's prismatic column branch
+// (col = axis_world) is exercised but the REVOLUTE cross-product branch
+// (col = cross(axis_world, x_task - joint_origin)) is NOT FD-validated, and a J=I
+// hides any transpose / stride error in w = J*g_tau or tau = J^T y (both reduce to
+// componentwise identity). The Go2 smoke is non-FD (rank-2 calf-origin J -> floored
+// A -> fp32-ill-conditioned). This rig closes that gap: 3 REVOLUTE joints with
+// GENERIC, mutually-independent unit axes and generic link origins, and a task point
+// OFFSET from every joint origin, so each column cross(axis, x_task - origin) is
+// nonzero and J is a DENSE, NON-SYMMETRIC, rank-3 matrix (verified det != 0,
+// cond(J) ~ 6, the A=J M^-1 J^T LDL^T pivots all >> the 1e-6 floor -- asserted
+// below from the REAL downloaded tile). max_dof = 6 > ndof = 3 so a hardcoded-stride
+// bug in J[r*max_dof+dof] also surfaces. Because the floor never fires and the
+// forward is exactly linear in Kp/Kd/x_target, a correct adjoint must hit ~float
+// precision (like the prismatic case); a 2x / sign-flipped FD mismatch is a REAL
+// J-contraction bug, not conditioning.
+//
+// Chain: link0,1,2 = REVOLUTE (generic axes), link3 = Fixed end-effector / task.
+// task_link = 3, max_dof = 6, ndof = 3. Same "real kernel, synthetic controlled
+// inputs" philosophy as SyntheticArticulation; identical buffer ownership pattern.
+// ---------------------------------------------------------------------------
+struct RevoluteArticulation {
+    static constexpr uint32_t kLinks = 4u;
+    static constexpr uint32_t kMaxDof = 6u;   // > ndof(3): catches stride bugs.
+    static constexpr uint32_t kNdof = 3u;
+    static constexpr uint32_t kTaskLink = 3u;
+
+    nuka::phi::DeviceContext context = nuka::phi::MakeDefaultDeviceContext();
+
+    nuka::phi::Buffer link_pose_dev;
+    nuka::phi::Buffer joint_axis_dev;
+    nuka::phi::Buffer joint_type_dev;
+    nuka::phi::Buffer parent_link_dev;
+    nuka::phi::Buffer art_link_count_dev;
+    nuka::phi::Buffer art_link_offset_dev;
+    nuka::phi::Buffer q_dev;
+    nuka::phi::Buffer qdot_dev;
+    nuka::phi::Buffer tau_dev;
+
+    nuka::phi::Buffer minv_dev;
+    nuka::phi::Buffer stiff_dev;
+    nuka::phi::Buffer damp_dev;
+    nuka::phi::Buffer target_dev;
+    nuka::phi::Buffer limit_dev;
+
+    float kp = 175.0f;
+    float kd = 9.0f;
+    Vec3 target{};
+
+    // Host copies of the geometry (for the host-side full-rank pivot guard).
+    std::vector<Vec3> origin;  // joint origins == link positions, links 0..2
+    std::vector<Vec3> axis;    // unit joint axes, links 0..2
+    Vec3 x_task{};
+    std::vector<float> minv_host;  // kMaxDof*kMaxDof SPD tile (the REAL device tile)
+
+    RevoluteArticulation() { Build(); }
+
+    template <typename T>
+    static nuka::phi::Buffer Upload(const std::vector<T>& v) {
+        nuka::phi::Buffer b(v.size() * sizeof(T), nuka::phi::MemoryKind::Device);
+        b.CopyFromHost(v.data(), v.size() * sizeof(T));
+        return b;
+    }
+
+    static Vec3 Unit(Vec3 v) {
+        const float n = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        return Vec3{v.x / n, v.y / n, v.z / n};
+    }
+
+    void Build() {
+        // Generic origins (NOT axis-aligned-degenerate). Identity rotations so the
+        // device RotateByQuatDrive(axis) == axis (we feed already-world axes).
+        std::vector<Transform> link_pose(kLinks);
+        link_pose[0].position = Vec3{0.00f, 0.00f, 0.00f};
+        link_pose[1].position = Vec3{0.20f, -0.15f, 0.10f};
+        link_pose[2].position = Vec3{0.05f, 0.30f, -0.20f};
+        link_pose[3].position = Vec3{0.40f, 0.25f, 0.45f};  // task point: offset
+        for (auto& p : link_pose) p.rotation = Quat::Identity();
+        x_task = link_pose[3].position;
+
+        std::vector<Vec3> joint_axis(kLinks);
+        joint_axis[0] = Unit(Vec3{1.0f, 0.2f, 0.1f});
+        joint_axis[1] = Unit(Vec3{0.1f, 1.0f, 0.3f});
+        joint_axis[2] = Unit(Vec3{0.2f, 0.3f, 1.0f});
+        joint_axis[3] = Vec3{0.0f, 0.0f, 0.0f};  // fixed: unused
+
+        origin = {link_pose[0].position, link_pose[1].position, link_pose[2].position};
+        axis = {joint_axis[0], joint_axis[1], joint_axis[2]};
+
+        std::vector<articulation::ArticulationJointType> joint_type(kLinks);
+        joint_type[0] = articulation::ArticulationJointType::Revolute;
+        joint_type[1] = articulation::ArticulationJointType::Revolute;
+        joint_type[2] = articulation::ArticulationJointType::Revolute;
+        joint_type[3] = articulation::ArticulationJointType::Fixed;
+
+        std::vector<uint32_t> parent_link = {kInvalidLink, 0u, 1u, 2u};
+        std::vector<uint32_t> art_link_count = {kLinks};
+        std::vector<uint32_t> art_link_offset = {0u};
+        std::vector<float> q(kLinks, 0.0f);
+        std::vector<float> qdot = {0.7f, -0.4f, 0.3f, 0.0f};  // nonzero -> Kd channel
+        std::vector<float> tau(kLinks, 0.0f);
+
+        link_pose_dev = Upload(link_pose);
+        joint_axis_dev = Upload(joint_axis);
+        joint_type_dev = Upload(joint_type);
+        parent_link_dev = Upload(parent_link);
+        art_link_count_dev = Upload(art_link_count);
+        art_link_offset_dev = Upload(art_link_offset);
+        q_dev = Upload(q);
+        qdot_dev = Upload(qdot);
+        tau_dev = Upload(tau);
+
+        minv_host = MakeSpdTile(kMaxDof, 0x57E9A11u);
+        minv_dev = Upload(minv_host);
+        stiff_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
+        damp_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
+        target_dev = nuka::phi::Buffer(3u * sizeof(float), nuka::phi::MemoryKind::Device);
+        limit_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
+
+        target = Vec3{x_task.x + 0.08f, x_task.y - 0.05f, x_task.z + 0.06f};
+        context.stream.Synchronize();
+    }
+
+    // Build the active 3x3 J (revolute columns) on the host, EXACTLY as the kernel
+    // does (col = cross(axis, x_task - origin)), then the A=J M^-1 J^T LDL^T pivots.
+    // Returns the smallest pivot. A pivot >> 1e-6 means the floor never fires, so
+    // the FD gate is conditioning-clean and a mismatch is unambiguously a bug.
+    double SmallestADiagPivot() const {
+        double J[3][3];
+        for (uint32_t d = 0u; d < kNdof; ++d) {
+            const Vec3 lever{x_task.x - origin[d].x, x_task.y - origin[d].y,
+                             x_task.z - origin[d].z};
+            const Vec3 col{axis[d].y * lever.z - axis[d].z * lever.y,
+                           axis[d].z * lever.x - axis[d].x * lever.z,
+                           axis[d].x * lever.y - axis[d].y * lever.x};
+            J[0][d] = col.x; J[1][d] = col.y; J[2][d] = col.z;
+        }
+        // A = J Minv J^T (Minv: leading 3x3 of the kMaxDof tile, row-major).
+        double Minv[3][3];
+        for (uint32_t r = 0u; r < kNdof; ++r)
+            for (uint32_t c = 0u; c < kNdof; ++c)
+                Minv[r][c] = static_cast<double>(minv_host[r * kMaxDof + c]);
+        double MinvJt[3][3];  // [c][s] = sum_k Minv[c][k] J[s][k]
+        for (uint32_t c = 0u; c < kNdof; ++c)
+            for (uint32_t s = 0u; s < kNdof; ++s) {
+                double a = 0.0;
+                for (uint32_t k = 0u; k < kNdof; ++k) a += Minv[c][k] * J[s][k];
+                MinvJt[c][s] = a;
+            }
+        double A[3][3];
+        for (uint32_t r = 0u; r < kNdof; ++r)
+            for (uint32_t s = 0u; s < kNdof; ++s) {
+                double a = 0.0;
+                for (uint32_t c = 0u; c < kNdof; ++c) a += J[r][c] * MinvJt[c][s];
+                A[r][s] = a;
+            }
+        // LDL^T pivots (same recurrence as the kernel, sans floor).
+        double L[3][3]; double dvec[3];
+        for (uint32_t r = 0u; r < kNdof; ++r)
+            for (uint32_t c = 0u; c < kNdof; ++c) L[r][c] = A[r][c];
+        double min_piv = 1e300;
+        for (uint32_t j = 0u; j < kNdof; ++j) {
+            double djj = L[j][j];
+            for (uint32_t k = 0u; k < j; ++k) djj -= L[j][k] * L[j][k] * dvec[k];
+            dvec[j] = djj;
+            min_piv = std::min(min_piv, djj);
+            for (uint32_t i = j + 1u; i < kNdof; ++i) {
+                double lij = L[i][j];
+                for (uint32_t k = 0u; k < j; ++k) lij -= L[i][k] * L[j][k] * dvec[k];
+                L[i][j] = lij / djj;
+            }
+        }
+        return min_piv;
+    }
+
+    articulation::ArticulationDeviceState State() {
+        articulation::ArticulationDeviceState st{};
+        st.link_pose = static_cast<Transform*>(link_pose_dev.Data());
+        st.joint_axis = static_cast<Vec3*>(joint_axis_dev.Data());
+        st.joint_type =
+            static_cast<articulation::ArticulationJointType*>(joint_type_dev.Data());
+        st.parent_link = static_cast<uint32_t*>(parent_link_dev.Data());
+        st.articulation_link_count = static_cast<uint32_t*>(art_link_count_dev.Data());
+        st.articulation_link_offset = static_cast<uint32_t*>(art_link_offset_dev.Data());
+        st.q = static_cast<float*>(q_dev.Data());
+        st.qdot = static_cast<float*>(qdot_dev.Data());
+        st.tau = static_cast<float*>(tau_dev.Data());
+        st.total_link_count = kLinks;
+        st.articulation_count = 1u;
+        return st;
+    }
+
+    void SetGainsTarget(float kp_, float kd_, const Vec3& tgt) {
+        std::vector<float> stiff(kLinks, 0.0f), damp(kLinks, 0.0f);
+        stiff[kTaskLink] = kp_;
+        damp[kTaskLink] = kd_;
+        stiff_dev.CopyFromHost(stiff.data(), stiff.size() * sizeof(float));
+        damp_dev.CopyFromHost(damp.data(), damp.size() * sizeof(float));
+        std::vector<float> t = {tgt.x, tgt.y, tgt.z};
+        target_dev.CopyFromHost(t.data(), t.size() * sizeof(float));
+    }
+
+    std::vector<float> RunForwardTau(float kp_, float kd_, const Vec3& tgt) {
+        SetGainsTarget(kp_, kd_, tgt);
+        articulation::ArticulationDeviceState st = State();
+        articulation::LaunchApplyOscDriveKernels(
+            context, st, kMaxDof, kTaskLink,
+            static_cast<const float*>(minv_dev.Data()),
+            static_cast<const float*>(target_dev.Data()),
+            static_cast<const float*>(stiff_dev.Data()),
+            static_cast<const float*>(damp_dev.Data()), nullptr);
+        context.stream.Synchronize();
+        std::vector<float> tau(kLinks, 0.0f);
+        cudaMemcpy(tau.data(), tau_dev.Data(), kLinks * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        return tau;
+    }
+
+    struct Grads { float grad_kp = 0.0f; float grad_kd = 0.0f; Vec3 grad_target{}; };
+
+    Grads RunAdjoint(const std::vector<float>& g_tau) {
+        SetGainsTarget(kp, kd, target);
+        nuka::phi::Buffer gtau_dev = Upload(g_tau);
+        nuka::phi::Buffer gkp(sizeof(float), nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer gkd(sizeof(float), nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer gtgt(3u * sizeof(float), nuka::phi::MemoryKind::Device);
+
+        diffsim::OscAdjointParamGrads g;
+        g.grad_kp = static_cast<float*>(gkp.Data());
+        g.grad_kd = static_cast<float*>(gkd.Data());
+        g.grad_target = static_cast<float*>(gtgt.Data());
+
+        articulation::ArticulationDeviceState st = State();
+        diffsim::LaunchOscAdjointGainTarget(
+            context, st, kMaxDof, kTaskLink,
+            static_cast<const float*>(minv_dev.Data()),
+            static_cast<const float*>(target_dev.Data()),
+            static_cast<const float*>(stiff_dev.Data()),
+            static_cast<const float*>(damp_dev.Data()), nullptr,
+            static_cast<const float*>(gtau_dev.Data()), g);
+        context.stream.Synchronize();
+
+        Grads out;
+        cudaMemcpy(&out.grad_kp, gkp.Data(), sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&out.grad_kd, gkd.Data(), sizeof(float), cudaMemcpyDeviceToHost);
+        float tg[3] = {0, 0, 0};
+        cudaMemcpy(tg, gtgt.Data(), 3u * sizeof(float), cudaMemcpyDeviceToHost);
+        out.grad_target = Vec3{tg[0], tg[1], tg[2]};
+        context.stream.Synchronize();
+        return out;
+    }
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -409,6 +665,70 @@ TEST(OscAdjoint, GainTargetMatchesFiniteDifference) {
     EXPECT_LT(RelErr(a.grad_target.x, fd_tx), 1e-3) << "dL/dx_target.x";
     EXPECT_LT(RelErr(a.grad_target.y, fd_ty), 1e-3) << "dL/dx_target.y";
     EXPECT_LT(RelErr(a.grad_target.z, fd_tz), 1e-3) << "dL/dx_target.z";
+}
+
+// ---------------------------------------------------------------------------
+// ADVERSARIAL (reviewer-added, attack A): dL/dKp, dL/dKd, dL/dx_target match
+// central FD of the REAL forward OSC kernel on a FULL-RANK-3 REVOLUTE task whose J
+// is dense + non-symmetric (NOT the identity the prismatic primary test reduces to).
+// This is the gate the prismatic-only validation lacks: it exercises the revolute
+// cross-product J-build branch AND a J-contraction (transpose/stride) bug surfaces
+// here but not on J==I. Conditioning is host-asserted clean (smallest A pivot >>
+// 1e-6 floor), so a mismatch is a real bug, not fp32 ill-conditioning. max_dof=6 >
+// ndof=3 also stresses the J[r*max_dof+dof] stride.
+// ---------------------------------------------------------------------------
+TEST(OscAdjoint, RevoluteFullRankMatchesFiniteDifference) {
+    RevoluteArticulation s;
+
+    // Conditioning guard: with generic axes/origins the revolute J is full rank and
+    // A=J M^-1 J^T is well-conditioned, so the 3x3 LDL^T floor (1e-6) never fires and
+    // the forward is exactly affine in the params -> FD must hit ~float precision.
+    const double min_piv = s.SmallestADiagPivot();
+    std::printf("[OscAdjoint-Rev] smallest A LDL^T pivot = %.4e (floor 1e-6)\n", min_piv);
+    ASSERT_GT(min_piv, 1e-3)
+        << "revolute A is near-degenerate; FD gate would be ill-conditioned (the "
+           "prismatic primary test's well-conditioned precondition is unmet)";
+
+    const std::vector<float> g_tau =
+        MakeGradTau(RevoluteArticulation::kLinks, 0x9E3779B9u);
+    const RevoluteArticulation::Grads a = s.RunAdjoint(g_tau);
+
+    auto loss = [&](float kp, float kd, const Vec3& tgt) {
+        return LossFromTau(g_tau, s.RunForwardTau(kp, kd, tgt));
+    };
+
+    const float dKp = 0.5f;
+    const double fd_kp =
+        (loss(s.kp + dKp, s.kd, s.target) - loss(s.kp - dKp, s.kd, s.target)) /
+        (2.0 * dKp);
+    const float dKd = 0.25f;
+    const double fd_kd =
+        (loss(s.kp, s.kd + dKd, s.target) - loss(s.kp, s.kd - dKd, s.target)) /
+        (2.0 * dKd);
+    const float dT = 1e-3f;
+    Vec3 tpx = s.target, tmx = s.target; tpx.x += dT; tmx.x -= dT;
+    const double fd_tx = (loss(s.kp, s.kd, tpx) - loss(s.kp, s.kd, tmx)) / (2.0 * dT);
+    Vec3 tpy = s.target, tmy = s.target; tpy.y += dT; tmy.y -= dT;
+    const double fd_ty = (loss(s.kp, s.kd, tpy) - loss(s.kp, s.kd, tmy)) / (2.0 * dT);
+    Vec3 tpz = s.target, tmz = s.target; tpz.z += dT; tmz.z -= dT;
+    const double fd_tz = (loss(s.kp, s.kd, tpz) - loss(s.kp, s.kd, tmz)) / (2.0 * dT);
+
+    std::printf("[OscAdjoint-Rev] dL/dKp  analytic=% .6e  FD=% .6e  rel=%.2e\n",
+                a.grad_kp, fd_kp, RelErr(a.grad_kp, fd_kp));
+    std::printf("[OscAdjoint-Rev] dL/dKd  analytic=% .6e  FD=% .6e  rel=%.2e\n",
+                a.grad_kd, fd_kd, RelErr(a.grad_kd, fd_kd));
+    std::printf("[OscAdjoint-Rev] dL/dtx  analytic=% .6e  FD=% .6e  rel=%.2e\n",
+                a.grad_target.x, fd_tx, RelErr(a.grad_target.x, fd_tx));
+    std::printf("[OscAdjoint-Rev] dL/dty  analytic=% .6e  FD=% .6e  rel=%.2e\n",
+                a.grad_target.y, fd_ty, RelErr(a.grad_target.y, fd_ty));
+    std::printf("[OscAdjoint-Rev] dL/dtz  analytic=% .6e  FD=% .6e  rel=%.2e\n",
+                a.grad_target.z, fd_tz, RelErr(a.grad_target.z, fd_tz));
+
+    EXPECT_LT(RelErr(a.grad_kp, fd_kp), 1e-3) << "revolute dL/dKp";
+    EXPECT_LT(RelErr(a.grad_kd, fd_kd), 1e-3) << "revolute dL/dKd";
+    EXPECT_LT(RelErr(a.grad_target.x, fd_tx), 1e-3) << "revolute dL/dx_target.x";
+    EXPECT_LT(RelErr(a.grad_target.y, fd_ty), 1e-3) << "revolute dL/dx_target.y";
+    EXPECT_LT(RelErr(a.grad_target.z, fd_tz), 1e-3) << "revolute dL/dx_target.z";
 }
 
 // ---------------------------------------------------------------------------

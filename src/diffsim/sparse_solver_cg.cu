@@ -40,10 +40,22 @@ constexpr uint32_t kBlockStride = kMaxBlockDim * kMaxBlockDim;  // 144 floats/bl
 // In fp64 the squared residual of a well-formed solve floors well below this only
 // at genuine convergence. Fixed constant => same input => same break => D1.
 __device__ constexpr double kRzFloor = 1.0e-30;
-// Cholesky pivot floor (BlockJacobi). The blocks are SPD by construction (the KKT
-// builder / the test synthesize A = L L^T + n I); this floor only protects against
-// a degenerate/empty pivot and keeps the factorization total + deterministic.
-__device__ constexpr double kPivotFloor = 1.0e-300;
+// RELATIVE null-direction threshold for the per-block modified Cholesky
+// (BlockJacobi). The Delassus blocks are SPD for full-rank contact configurations,
+// but a rank-deficient PSD block (a dead/structurally-zero row OR an OBLIQUE null
+// direction where the post-elimination Schur pivot is tiny-but-nonzero) must not be
+// divided through: the old absolute floor 1e-300 -> sqrt -> 1e-150 -> divide
+// OVERFLOWS to NaN on the oblique case (the nonzero Schur residual blows up). We
+// instead test each post-elimination pivot against eps*max_diagonal: pivots at or
+// below it are treated as NULL DIRECTIONS (factored diagonal set to 1, the column
+// below zeroed, the matching solution component forced to 0 -> least-norm-style),
+// keeping the result FINITE and exact on the range space, zero on the null space.
+// eps = 1e-12 is well above the ~1e-16 relative pivot a near-singular block yields
+// yet far below any full-rank Delassus pivot (O(effective mass)), so full-rank
+// blocks NEVER trip the branch -> their factor (and every downstream bit) is
+// IDENTICAL to before. The compare is a fixed-order data-deterministic threshold
+// test (same input -> same branch) -> D1 byte-exact preserved.
+__device__ constexpr double kNullPivotRelEps = 1.0e-12;
 
 // Fixed-order warp-shuffle butterfly sum over all 32 lanes (inactive lanes carry
 // 0). Steps 16,8,4,2,1 -> lane 0 holds the total; we broadcast it back to every
@@ -66,7 +78,7 @@ __device__ __forceinline__ void SolveOneBlock(
     const float* __restrict__ values, uint32_t n, const float* __restrict__ b_blk,
     float* __restrict__ x_blk, Preconditioner precond, uint32_t max_iter,
     double tol, bool run_to_fixed_iters, double* __restrict__ chol_shared,
-    uint32_t lane) {
+    bool* __restrict__ null_shared, uint32_t lane) {
     const bool active = (lane < n);
 
     // --- Load this lane's matrix row into registers (fp64). Contiguous per-lane
@@ -95,14 +107,45 @@ __device__ __forceinline__ void SolveOneBlock(
     //     into chol_shared[kMaxBlockDim^2]; we keep the lower triangle. ----------
     if (precond == Preconditioner::BlockJacobi) {
         if (lane == 0u) {
-            // Standard column Cholesky, fixed loop order (D1). chol[i*md+j] = L_ij.
+            // Block scale for the relative null-direction threshold: the largest
+            // ORIGINAL diagonal (fixed order). For a PSD Delassus this bounds the
+            // spectrum, so eps*max_diag is a scale-correct null cutoff. (max_diag is
+            // > 0 for any non-empty block since diag(A) >= 0 and a structurally dead
+            // row's diagonal is 0 while a live row's is > 0; if EVERY diagonal were 0
+            // the whole block is null and every component is forced to 0 below.)
+            double max_diag = 0.0;
+            for (uint32_t d = 0u; d < n; ++d) {
+                const double add = static_cast<double>(values[d * kMaxBlockDim + d]);
+                if (add > max_diag) max_diag = add;
+            }
+            const double null_thresh = kNullPivotRelEps * max_diag;
+
+            // Modified (pseudo) column Cholesky for PSD, fixed loop order (D1).
+            // chol[i*md+j] = L_ij. A post-elimination pivot djj <= null_thresh marks
+            // a NULL DIRECTION: we set the factored diagonal to 1 (a safe nonzero so
+            // the triangular solves never divide by ~0), ZERO the column below it
+            // (so the oblique Schur residual never propagates -> the NaN source), and
+            // record null[j]; the solve forces z_j = 0 (least-norm on the range
+            // space). Full-rank blocks never hit this branch, so for them djj, ljj =
+            // sqrt(djj) and every s/ljj are the IDENTICAL ops on the IDENTICAL data
+            // as before -> byte-identical factor.
             for (uint32_t j = 0u; j < n; ++j) {
                 double djj = static_cast<double>(values[j * kMaxBlockDim + j]);
                 for (uint32_t k = 0u; k < j; ++k) {
                     const double ljk = chol_shared[j * kMaxBlockDim + k];
                     djj -= ljk * ljk;
                 }
-                if (djj < kPivotFloor) djj = kPivotFloor;
+                if (djj <= null_thresh) {
+                    // Null direction: do NOT sqrt/divide the tiny (or oblique-residual)
+                    // pivot. Safe unit diagonal + zeroed column => finite L; z_j = 0.
+                    null_shared[j] = true;
+                    chol_shared[j * kMaxBlockDim + j] = 1.0;
+                    for (uint32_t i = j + 1u; i < n; ++i) {
+                        chol_shared[i * kMaxBlockDim + j] = 0.0;
+                    }
+                    continue;
+                }
+                null_shared[j] = false;
                 const double ljj = sqrt(djj);
                 chol_shared[j * kMaxBlockDim + j] = ljj;
                 for (uint32_t i = j + 1u; i < n; ++i) {
@@ -115,7 +158,7 @@ __device__ __forceinline__ void SolveOneBlock(
                 }
             }
         }
-        __syncwarp(0xffffffffu);  // publish L to the whole warp
+        __syncwarp(0xffffffffu);  // publish L + null mask to the whole warp
     }
 
     // Applies the preconditioner: z = M^-1 r. For Jacobi, z_i = r_i / a_ii. For
@@ -137,22 +180,27 @@ __device__ __forceinline__ void SolveOneBlock(
         if (active) rhs[lane] = r_i;
         __syncwarp(0xffffffffu);
         if (lane == 0u) {
-            // Forward solve L y = r  (overwrite rhs with y).
+            // Forward solve L y = r  (overwrite rhs with y). A null row contributes
+            // y_i = 0 (its column was zeroed in the factor and its diagonal is 1, so
+            // the division is finite; forcing 0 is the least-norm choice). Full-rank
+            // rows are never null -> rhs[i] = s / chol[i][i] EXACTLY as before.
             for (uint32_t i = 0u; i < n; ++i) {
                 double s = rhs[i];
                 for (uint32_t k = 0u; k < i; ++k) {
                     s -= chol_shared[i * kMaxBlockDim + k] * rhs[k];
                 }
-                rhs[i] = s / chol_shared[i * kMaxBlockDim + i];
+                rhs[i] = null_shared[i] ? 0.0 : (s / chol_shared[i * kMaxBlockDim + i]);
             }
-            // Back solve L^T z = y (overwrite rhs with z).
+            // Back solve L^T z = y (overwrite rhs with z). z_i = 0 on null rows; the
+            // zeroed factor column means a null row also contributes nothing to the
+            // range-space rows' back-substitution -> finite, range-space-exact.
             for (uint32_t ii = 0u; ii < n; ++ii) {
                 const uint32_t i = n - 1u - ii;
                 double s = rhs[i];
                 for (uint32_t k = i + 1u; k < n; ++k) {
                     s -= chol_shared[k * kMaxBlockDim + i] * rhs[k];
                 }
-                rhs[i] = s / chol_shared[i * kMaxBlockDim + i];
+                rhs[i] = null_shared[i] ? 0.0 : (s / chol_shared[i * kMaxBlockDim + i]);
             }
         }
         __syncwarp(0xffffffffu);
@@ -233,6 +281,10 @@ __global__ void SolveCgKernel(const float* __restrict__ values,
     // solve rhs/z staging. Only BlockJacobi touches it, but it is always allocated
     // (its presence does not affect Jacobi's bit pattern).
     __shared__ double chol_shared[kBlockStride + kMaxBlockDim];
+    // Null-direction mask (BlockJacobi modified Cholesky): null_shared[j] => row j
+    // is a PSD null direction (zeroed column + forced-zero solution component). Only
+    // BlockJacobi writes/reads it; its presence never touches the Jacobi bit pattern.
+    __shared__ bool null_shared[kMaxBlockDim];
 
     const uint32_t n = block_dim[blk];
     const float* __restrict__ values_blk = values + static_cast<size_t>(blk) * kBlockStride;
@@ -247,7 +299,7 @@ __global__ void SolveCgKernel(const float* __restrict__ values,
     }
 
     SolveOneBlock(values_blk, n, b_blk, x_blk, precond, max_iter, tol,
-                  run_to_fixed_iters, chol_shared, lane);
+                  run_to_fixed_iters, chol_shared, null_shared, lane);
 }
 
 void CheckCuda(cudaError_t result, const char* operation) {
