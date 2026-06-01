@@ -708,6 +708,31 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_diffsim_multistep_backward_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend) -
+    # CG-vs-Eigen-LDLT dense cross-check + D1 bit-exact gate. Eigen is linked here
+    # ONLY (nuka_eigen_testonly INTERFACE include dir), never into any production
+    # target.
+    add_executable(nuka_diffsim_cg_solver_test
+        diffsim/test_cg_vs_dense.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_cg_solver_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_diffsim_cg_solver_test
+        PRIVATE
+            nuka_diffsim
+            nuka_core
+            nuka_phi
+            nuka_eigen_testonly
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_cg_solver_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
     add_executable(nuka_floating_base_aba_test
         runtime/test_floating_base_aba.cpp
