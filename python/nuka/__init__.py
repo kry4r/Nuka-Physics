@@ -98,12 +98,23 @@ def torch_stream_ptr() -> int:
 # Instead resolve `nuka.autograd` on first attribute access; `import nuka`
 # (without torch) keeps working, and the torch ImportError surfaces only when
 # autograd is actually used.
-if TYPE_CHECKING:  # for type checkers / IDEs only; no runtime torch import.
+if TYPE_CHECKING:  # for type checkers / IDEs only; no runtime torch/jax import.
     from . import autograd  # noqa: F401
+    from . import jax_frontend  # noqa: F401
+    from . import jax_state_pytree  # noqa: F401
+
+
+# Submodules that pull in an OPTIONAL heavy dep at their own import time and so
+# must stay lazy (resolved on first attribute access) -- NEVER eagerly imported,
+# or `import nuka` would hard-require that dep:
+#   * "autograd"          -> torch
+#   * "jax_frontend"      -> jax + torch (the custom_vjp engine adjoint)
+#   * "jax_state_pytree"  -> jax (the NukaWorldState pytree)
+_LAZY_SUBMODULES = ("autograd", "jax_frontend", "jax_state_pytree")
 
 
 def __getattr__(name: str):
-    if name == "autograd":
+    if name in _LAZY_SUBMODULES:
         import importlib
 
         mod = importlib.import_module("." + name, __name__)
