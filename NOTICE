@@ -1,0 +1,92 @@
+Nuka Physics
+Copyright 2026 The Nuka Physics Authors
+
+This product includes software developed by The Nuka Physics Authors and the
+Nuka Physics open-source community.
+
+This software is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). The notices below are provided for informational purposes only and do not
+modify the License.
+
+================================================================================
+Third-party components SHIPPED with the engine and Python bindings
+================================================================================
+
+CUDA Toolkit
+  NVIDIA Corporation.
+  Used for GPU runtime and compute (the production physics backend).
+  Distributed and used under the NVIDIA CUDA Toolkit End User License Agreement
+  (NVIDIA Software License Agreement). NVIDIA CUDA components are not relicensed
+  by this project and remain subject to the NVIDIA SLA.
+
+Vulkan
+  Used for rendering and via the Vulkan loader.
+  Vulkan is a registered trademark of, and the Vulkan loader/headers are made
+  available by, The Khronos Group Inc., under their respective licenses.
+
+nanobind
+  Copyright (c) Wenzel Jakob and the nanobind contributors.
+  Licensed under the BSD 3-Clause License.
+  Used to build the Python bindings (the `_nuka_ext` C++ extension module).
+
+DLPack
+  Copyright the DLPack contributors.
+  Licensed under the Apache License, Version 2.0.
+  Used for zero-copy tensor interop (PyTorch / JAX) via the DLPack protocol.
+
+Philox4x32-10 counter-based RNG (algorithm)
+  The Philox4x32-10 counter-based pseudo-random number generator used in this
+  project is SELF-IMPLEMENTED; no third-party Philox/Random123 source code is
+  vendored. The algorithm is cited for attribution:
+    John K. Salmon, Mark A. Moraes, Ron O. Dror, and David E. Shaw,
+    "Parallel Random Numbers: As Easy as 1, 2, 3,"
+    Proceedings of the International Conference for High Performance Computing,
+    Networking, Storage and Analysis (SC '11), ACM, 2011.
+
+================================================================================
+Components used at BUILD or TEST time ONLY (NOT shipped in the runtime binary)
+================================================================================
+
+PyTorch / libtorch
+  Copyright The PyTorch / Linux Foundation contributors.
+  Used ONLY at build time to detect the C++11 ABI flag via CMake
+  `find_package(Torch)`. libtorch is NOT linked into the Python extension:
+  the `_nuka_ext` extension links only against libnuka and the CUDA runtime
+  (cudart), not against libtorch. PyTorch is also supported as an OPTIONAL
+  runtime interop target (zero-copy DLPack tensor exchange), but it is not a
+  required dependency of the shipped runtime.
+
+JAX
+  Copyright The JAX Authors / Google LLC.
+  Optional RUNTIME interop target only (zero-copy DLPack tensor exchange).
+  Not a required dependency and not vendored.
+
+Eigen
+  Copyright the Eigen contributors.
+  Licensed under the Mozilla Public License, Version 2.0 (MPL-2.0).
+  TEST-ONLY: used solely as a dense linear-algebra oracle in the test suite for
+  differential validation. The production sparse solver is self-written; Eigen
+  is never present in any production / shipped code path.
+
+GoogleTest
+  Copyright Google LLC.
+  Licensed under the BSD 3-Clause License.
+  TEST-ONLY: the C++ unit/regression test framework.
+
+scikit-build-core
+  Copyright the scikit-build contributors.
+  Build backend only (used to build the Python package / extension); not shipped
+  as a runtime dependency.
+
+nanobind (build backend)
+  In addition to being a shipped binding library (above), nanobind's CMake
+  integration is used as part of the Python build backend.
+
+================================================================================
+Notes
+================================================================================
+
+The `.usda` (text USD) scene parser in this project is hand-written using only
+the C++ standard library. There is NO OpenUSD / tinyusdz dependency, and no USD
+SDK is linked into or shipped with the runtime; therefore no USD attribution is
+included here.
