@@ -67,6 +67,72 @@ nuka_result_t nuka_world_set_sensor_noise(nuka_world_handle world,
 nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world,
                                             nuka_state_field_t sensor_field);
 
+// ---------------------------------------------------------------------------
+// N2 per-episode domain randomization (v0.5 p04 Task 5.4.7).
+//
+// Mirrors the C++ DomainRandomizationConfig. Each [lo, hi] range is sampled ONCE
+// per env per episode-reset to a per-env multiplier / offset that is a PURE
+// FUNCTION of (seed, env_idx, param_idx) via the SAME counter-based Philox the
+// sensor noise uses. There is no mutable sampled state -- the deterministic seed
+// IS the recorded state, so the diff-sim reverse/replay pass re-derives identical
+// values and the backward stays D1 byte-exact two-run.
+//
+// mass / friction are MULTIPLIERS; restitution / armature / gravity are OFFSETS.
+// Apply snapshots a NOMINAL baseline ONCE (first enabled apply) and thereafter
+// computes value = nominal*mult / nominal+offset, so repeated resets re-randomize
+// AROUND nominal (idempotent) rather than compounding a random walk.
+//
+// DEFAULT IS DISABLED (enabled == 0): a world with DR off is byte-unchanged by
+// apply, so V1 oracle scenes stay byte-identical unless DR is explicitly enabled.
+//
+// ENGINE-BUFFER MAPPING (single-env contact-free diff-sim tape):
+//   mass        -> per-link spatial inertia (link_inertia, rebuilt via the SAME
+//                  MakeSpatialInertia path nuka_world_set_link_mass uses). TAPE-
+//                  VISIBLE: changes the contact-free ABA forward + its gradient.
+//   gravity_z   -> step_options.gravity.z (read by nuka_tape_create into
+//                  RolloutParams.gravity_z). TAPE-VISIBLE. NOTE: one world scalar
+//                  -> the same offset applies to all envs (gravity is global).
+//   armature    -> per-DOF joint_armature buffer (host mirror + device). Present
+//                  on the articulation state but INERT in the contact-free tape
+//                  forward (does not enter the tape's ABA + integrate).
+//   friction    -> the batched contact path's scalar friction_coefficient; the
+//                  single-env contact-free tape has no contact solve -> INERT.
+//   restitution -> no engine buffer in the contact-free path -> sampled for RL
+//                  completeness but INERT (applied where a contact buffer exists).
+// ---------------------------------------------------------------------------
+
+typedef struct nuka_domain_randomization_desc_t {
+    float mass_mul_lo;       /* mass multiplier range  [lo, hi] (nominal * mult) */
+    float mass_mul_hi;
+    float friction_mul_lo;   /* friction multiplier range */
+    float friction_mul_hi;
+    float restitution_off_lo; /* restitution OFFSET range (nominal + offset) */
+    float restitution_off_hi;
+    float armature_off_lo;   /* joint armature OFFSET range */
+    float armature_off_hi;
+    float gravity_off_lo;    /* gravity.z OFFSET range (m/s^2) */
+    float gravity_off_hi;
+    uint64_t seed;           /* Philox key; the recorded deterministic state */
+    int enabled;             /* 0 (default) -> apply is a byte no-op */
+} nuka_domain_randomization_desc_t;
+
+// Records the domain-randomization descriptor on the world. A NULL desc (or
+// enabled == 0) disables DR (apply becomes a byte no-op). Recording a desc does
+// NOT sample or apply -- call nuka_world_apply_domain_randomization at episode
+// reset to sample + apply. Returns NUKA_RESULT_NULL_HANDLE for a bad world.
+nuka_result_t nuka_world_set_domain_randomization(
+    nuka_world_handle world, const nuka_domain_randomization_desc_t* desc);
+
+// Samples + applies the stored randomization for ALL envs (call at episode
+// reset). For each env: sample (seed, env_idx, param) -> multiplier/offset, then
+// apply to the engine buffers per the mapping above. On the FIRST enabled apply
+// it snapshots the nominal baseline (per-link mass, gravity.z, per-DOF armature),
+// so the apply is idempotent across resets. DR disabled -> byte no-op returning
+// NUKA_RESULT_OK with nothing touched (oracle safe). Returns
+// NUKA_RESULT_NOT_SUPPORTED for a non-articulated world (no link inertia to
+// scale), NUKA_RESULT_NULL_HANDLE for a bad world. No throw across the boundary.
+nuka_result_t nuka_world_apply_domain_randomization(nuka_world_handle world);
+
 #ifdef __cplusplus
 }
 #endif
