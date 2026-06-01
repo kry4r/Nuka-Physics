@@ -230,6 +230,29 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
             out->dtype = 0u;
             return NUKA_RESULT_OK;
         }
+        if (field == NUKA_FIELD_DRIVE_TARGET) {
+            // WRITABLE single-env PD drive-target buffer. This is the per-step
+            // ACTION the diff-sim tape consumes: nuka_world_step_with_tape
+            // (diffsim.cpp:173-174) reads record->drive_targets_device.Data() as
+            // its action each step, and the production single-env oracle drives
+            // from the SAME buffer (world.cpp:378). Aliasing it here (writable,
+            // device-to-device or host-to-device in place) lets Python set the
+            // tape's per-step action -- the gap that previously returned
+            // NOT_SUPPORTED on the single-env arm (env_count==1 ==> no batched
+            // arm to serve it). Layout: float[base_link_count], link-major; only
+            // actuated links (non-zero drive stiffness) act on their target.
+            // NOTE: record (non-const) ==> Buffer::Data() returns void* directly.
+            if (record->drive_targets_device.Size() == 0u) {
+                return NUKA_RESULT_NOT_SUPPORTED;
+            }
+            out->device_ptr =
+                const_cast<void*>(record->drive_targets_device.Data());
+            out->element_count =
+                record->drive_targets_device.Size() / sizeof(float);
+            out->element_stride_bytes = sizeof(float);
+            out->dtype = 0u;
+            return NUKA_RESULT_OK;
+        }
         return NUKA_RESULT_NOT_SUPPORTED;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

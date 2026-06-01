@@ -30,6 +30,7 @@ from ._nuka_ext import (  # noqa: F401
     Device,
     Field,
     World,
+    Tape,
     sync,
     __engine_version__,
     DETERMINISM_STRONG,
@@ -114,6 +115,7 @@ def __getattr__(name: str):
 __all__ = [
     "Device",
     "World",
+    "Tape",
     "Field",
     "sync",
     "__engine_version__",

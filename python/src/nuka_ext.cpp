@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_diffsim.h"
 
 namespace nb = nanobind;
 
@@ -184,6 +185,25 @@ public:
         check(nuka_world_reset_envs(h_, ids, count), "nuka_world_reset_envs");
     }
 
+    // v0.5 p04 §4 PARAMETER spine: set one articulation link's scalar mass at
+    // runtime (GLOBAL link index in [0, total_link_count)). Rebuilds the link's
+    // 6x6 spatial inertia from the new mass via the SAME affine MakeSpatialInertia
+    // parameterization the mass-gradient adjoint assumes. The Python autograd layer
+    // calls this BEFORE stepping so the sim actually uses the param tensor's value
+    // (otherwise the gradient would be silently wrong). See nuka_diffsim.h.
+    void set_link_mass(uint32_t link_index, float mass) {
+        check(nuka_world_set_link_mass(h_, link_index, mass),
+              "nuka_world_set_link_mass");
+    }
+
+    // v0.5 p04 A4 floating-gradcheck enabler: set the world's uniform gravity
+    // (Z component, m/s^2). NO behavioral change until called (default stays
+    // -9.81); a world that never calls this steps byte-identically. MUST be called
+    // BEFORE nuka_tape_create -- the tape captures gravity_z at create time.
+    void set_gravity_z(float gravity_z) {
+        check(nuka_world_set_gravity_z(h_, gravity_z), "nuka_world_set_gravity_z");
+    }
+
     uint32_t env_count() const { return env_count_; }
     uint32_t base_link_count() const { return base_link_count_; }
     // action_dim == the number of ACTUATED joint DOFs a policy controls ==
@@ -223,6 +243,132 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Tape wrapper (RAII) -- the multi-step differentiable rollout (nuka_diffsim.h).
+// ---------------------------------------------------------------------------
+//
+// Bound for the v0.5 p04 Python autograd layer. The tape records a contact-free
+// PD rollout in place on the world's articulation state; backward() reverses it
+// to per-step action gradients + the per-link mass-parameter gradient.
+//
+// ABI / DLPack note: nuka_tape_backward's C contract is HOST pointers (the engine
+// uploads the seed to device and downloads the grads internally -- the device
+// reduction order is fixed inside the engine, which is where D1 bit-exactness
+// lives). So backward() here accepts a HOST-contiguous seed array and returns
+// HOST grad arrays; the Python autograd layer moves them to CUDA with a plain
+// (deterministic) .cuda() copy. This is NOT a Python-side float reduction over
+// device data -- it is a straight copy of grads the engine already reduced
+// deterministically, so D1 (two-run byte-identity) is preserved. The zero-copy
+// DLPack buffer_view pattern is used for the FORWARD state channels (q'/qd'/
+// v_root') the autograd layer reads from the live engine buffers.
+class Tape {
+public:
+    static Tape* create(World* world, uint32_t checkpoint_interval,
+                        uint32_t max_tape_entries, uint32_t max_checkpoints,
+                        uint32_t recompute_on_backward) {
+        if (world == nullptr) {
+            throw std::runtime_error("Tape.create: null world");
+        }
+        nuka_tape_desc_t desc{};
+        desc.checkpoint_interval = checkpoint_interval;
+        desc.max_tape_entries = max_tape_entries;
+        desc.max_checkpoints = max_checkpoints;
+        desc.recompute_on_backward = recompute_on_backward;
+        nuka_tape_handle h = nullptr;
+        check(nuka_tape_create(world->raw(), &desc, &h), "nuka_tape_create");
+        Tape* t = new Tape(h, world->raw());
+        // Stash the C++ World wrapper so state_view can (a) shape the returned
+        // ndarray with env_count/base_link_count and (b) use the World Python
+        // object as the array's owner (it owns the aliased device buffer).
+        t->world_wrapper_ = world;
+        return t;
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_tape_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~Tape() { destroy(); }
+
+    // Advance the differentiable rollout one contact-free PD step in place,
+    // recording the step (action == the world's current DRIVE_TARGET buffer).
+    void step_with_tape() {
+        check(nuka_world_step_with_tape(world_, h_), "nuka_world_step_with_tape");
+    }
+
+    void reset() { check(nuka_tape_reset(h_), "nuka_tape_reset"); }
+
+    uint32_t step_count() const { return nuka_tape_step_count(h_); }
+    uint32_t link_count() const { return nuka_tape_link_count(h_); }
+
+    // Zero-copy DLPack view into the tape's LIVE differentiable state (the
+    // OBSERVATION side: q / qdot / link_velocity the tape forward evolves in
+    // place). Defined out-of-line below make_array_from_view (the shaping helper
+    // is declared after this class). field: JOINT_POSITION / JOINT_VELOCITY /
+    // LINK_VELOCITY. Returns a FloatArray (zero-copy) exactly like buffer_view.
+    FloatArray state_view(nuka_state_field_t field);
+
+    // Reverse pass. `seed` is a HOST contiguous float array in the layout
+    // [dL/dq'(n) | dL/dqdot'(n) | dL/dv_root'(6n)] (length 8n) or empty -> all-zero
+    // seed. Returns a tuple (grad_actions [step_count, n], grad_parameters [n]) as
+    // HOST numpy float32 arrays. The autograd layer slices/moves them to CUDA.
+    nb::object backward(nb::ndarray<float, nb::c_contig> seed) {
+        const uint32_t n = link_count();
+        const uint32_t steps = step_count();
+        if (n == 0u) {
+            throw std::runtime_error("Tape.backward: empty tape (link_count==0)");
+        }
+        const float* seed_ptr = nullptr;
+        if (seed.size() != 0u) {
+            const size_t want = static_cast<size_t>(8u) * n;  // 2n + 6n
+            if (seed.size() != want) {
+                throw std::runtime_error(
+                    "Tape.backward: seed length " + std::to_string(seed.size()) +
+                    " != 8*link_count (" + std::to_string(want) + ")");
+            }
+            if (seed.device_type() != nb::device::cpu::value) {
+                throw std::runtime_error(
+                    "Tape.backward: seed must be a HOST (CPU) contiguous array");
+            }
+            seed_ptr = seed.data();
+        }
+        // Host output buffers. We allocate with `new[]` + a capsule deleter so the
+        // returned nb::ndarray owns the memory (no dangling).
+        const size_t na = static_cast<size_t>(steps) * n;
+        auto* ga = new float[na == 0u ? 1u : na];
+        auto* gp = new float[n];
+        for (size_t i = 0u; i < na; ++i) ga[i] = 0.0f;
+        for (uint32_t i = 0u; i < n; ++i) gp[i] = 0.0f;
+        nuka_result_t r = nuka_tape_backward(h_, seed_ptr, ga, gp);
+        if (r != NUKA_RESULT_OK) {
+            delete[] ga;
+            delete[] gp;
+            check(r, "nuka_tape_backward");
+        }
+        nb::capsule ga_owner(ga, [](void* p) noexcept { delete[] (float*)p; });
+        nb::capsule gp_owner(gp, [](void* p) noexcept { delete[] (float*)p; });
+        size_t ga_shape[2] = {steps, n};
+        size_t gp_shape[1] = {n};
+        nb::ndarray<nb::numpy, float> ga_arr(ga, 2, ga_shape, ga_owner);
+        nb::ndarray<nb::numpy, float> gp_arr(gp, 1, gp_shape, gp_owner);
+        return nb::make_tuple(ga_arr, gp_arr);
+    }
+
+private:
+    Tape(nuka_tape_handle h, nuka_world_handle w) : h_(h), world_(w) {}
+    nuka_tape_handle h_ = nullptr;
+    nuka_world_handle world_ = nullptr;
+    // The owning C++ World wrapper (set in create()). state_view reads its
+    // env_count/base_link_count for shaping and uses its Python object as the
+    // returned array's owner (the World owns the aliased articulation device
+    // buffer; the Tape only holds a raw handle). Friend so state_view (a member,
+    // defined out-of-line) and create (static) reach it -- both are members so
+    // no friend needed; documented here for clarity.
+    World* world_wrapper_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
 // buffer_view(field) -> zero-copy DLPack-capable nb::ndarray (CUDA, float32)
 // ---------------------------------------------------------------------------
 namespace {
@@ -230,14 +376,18 @@ namespace {
 // Build a CUDA float ndarray aliasing `view.device_ptr` with the per-field
 // natural shape. The returned ndarray is reference-policy (no copy) and `owner`
 // (the Python World object) keeps the engine buffer alive for the array's life.
-FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle owner) {
-    nuka_buffer_view_t view = world->get_view(field);
+// Shape a CUDA float ndarray aliasing `view.device_ptr` given the per-env
+// dimensions (ec == env_count, blc == base_link_count). Factored out of
+// make_view_array verbatim so BOTH World.buffer_view AND Tape.state_view shape
+// identically (q/qd/drive -> (ec,blc); LINK_VELOCITY fpe=6 -> (ec,blc,6);
+// BASE_POSE -> (ec,7)). `owner` keeps the engine buffer alive for the array's
+// life. For single-env tape state, total_link_count == base_link_count so
+// ec*blc == element_count holds and the natural (1,blc) / (1,blc,6) shapes apply.
+FloatArray make_array_from_view(const nuka_buffer_view_t& view, uint32_t ec,
+                                uint32_t blc, nb::handle owner) {
     if (view.dtype != 0u) {
         throw std::runtime_error("buffer_view: non-float32 dtype not supported");
     }
-
-    const uint32_t ec = world->env_count();
-    const uint32_t blc = world->base_link_count();
     const int dev_id = 0;  // CUDA_VISIBLE_DEVICES=0 -> ordinal 0 in this process.
 
     // floats-per-element from the view stride (1 for q/qd/drive; 7 for link pose).
@@ -288,7 +438,41 @@ FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle ow
                       nb::dtype<float>(), nb::device::cuda::value, dev_id);
 }
 
+// World.buffer_view: fetch the live engine buffer view then shape it per-env.
+FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle owner) {
+    nuka_buffer_view_t view = world->get_view(field);
+    return make_array_from_view(view, world->env_count(), world->base_link_count(),
+                                owner);
+}
+
 }  // namespace
+
+// Tape.state_view: a zero-copy DLPack-capable CUDA float32 ndarray aliasing the
+// tape's LIVE differentiable state (q / qdot / link_velocity), shaped per-env via
+// the SAME helper World.buffer_view uses. Defined out-of-line (after the anon-ns
+// helpers) so it can reach make_array_from_view, which is declared below Tape.
+// The owner is the WORLD Python object (nb::find(world_wrapper_)) -- the engine
+// buffer is owned by the World's articulation_device, NOT by the Tape; using the
+// World as owner keeps that buffer alive for the array's life (the Tape holds only
+// a raw handle). For single-env, total_link_count == base_link_count so the
+// (1,n) / (1,n,6) shaping applies.
+FloatArray Tape::state_view(nuka_state_field_t field) {
+    if (world_wrapper_ == nullptr) {
+        throw std::runtime_error("Tape.state_view: tape has no world wrapper");
+    }
+    nuka_buffer_view_t view{};
+    check(nuka_tape_state_view(h_, field, &view), "nuka_tape_state_view");
+    if (view.device_ptr == nullptr) {
+        throw std::runtime_error(
+            "Tape.state_view: engine returned null device_ptr");
+    }
+    // owner = the WORLD Python object (it owns the aliased articulation device
+    // buffer; the Tape holds only a raw handle). Returns the zero-copy FloatArray
+    // straight through the SAME nanobind ndarray caster World.buffer_view uses.
+    nb::object owner = nb::find(world_wrapper_);
+    return make_array_from_view(view, world_wrapper_->env_count(),
+                                world_wrapper_->base_link_count(), owner);
+}
 
 // ---------------------------------------------------------------------------
 // Module
@@ -498,7 +682,84 @@ NB_MODULE(_nuka_ext, m) {
             },
             nb::arg("array"),
             "Copy a 1D contiguous float array (host or CUDA) into the live "
-            "DRIVE_TARGET device buffer; picked up by the next step().");
+            "DRIVE_TARGET device buffer; picked up by the next step().")
+        // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
+        // the autograd layer uses to push a mass param tensor INTO the sim).
+        .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),
+             nb::arg("mass"),
+             "Set one articulation link's scalar mass (GLOBAL link index in "
+             "[0, base_link_count) for single-env). Rebuilds the link's 6x6 spatial "
+             "inertia affinely from the new mass via the SAME MakeSpatialInertia "
+             "parameterization the mass-gradient adjoint assumes; the next step()/"
+             "step_with_tape() reads it fresh. Used by nuka.autograd."
+             "differentiable_step to push a mass param tensor's value into the sim "
+             "BEFORE stepping (so the true d(output)/d(mass) is nonzero). mass > 0; "
+             "an out-of-range index or non-positive mass raises.")
+        // v0.5 p04 A4 enabler: world gravity setter (MUST precede Tape.create).
+        .def("set_gravity_z", &World::set_gravity_z, nb::arg("gravity_z"),
+             "Set the world's uniform gravity Z (m/s^2). Default is -9.81; call "
+             "BEFORE creating a Tape (the tape captures gravity at create time). "
+             "Used by the floating mass-gradcheck, which needs g=0 so the deferred "
+             "floating-base orientation channel is inert. A world that never calls "
+             "this steps byte-identically (default unchanged).");
+
+    // -----------------------------------------------------------------------
+    // Tape -- the multi-step differentiable rollout (nuka_diffsim.h).
+    // -----------------------------------------------------------------------
+    nb::class_<Tape>(m, "Tape")
+        .def_static("create", &Tape::create, nb::arg("world"),
+                    nb::arg("checkpoint_interval") = uint32_t{3},
+                    nb::arg("max_tape_entries") = uint32_t{1024},
+                    nb::arg("max_checkpoints") = uint32_t{128},
+                    nb::arg("recompute_on_backward") = uint32_t{1},
+                    nb::rv_policy::take_ownership,
+                    "Create a differentiable-rollout tape bound to `world`'s "
+                    "articulation state + drive gains + link masses. The world must "
+                    "be articulated and SINGLE-ENV (env_count==1) for the "
+                    "contact-free p02 slice. recompute_on_backward=1 is the "
+                    "checkpointed reverse (memory ~ N/K); 0 is full-tape debug mode "
+                    "(a checkpoint every step). If World.set_gravity_z was called, "
+                    "call it BEFORE this -- gravity is captured here.")
+        .def("step_with_tape", &Tape::step_with_tape,
+             "Advance the differentiable rollout ONE contact-free PD step in place "
+             "on the world's articulation state, recording the step. The action is "
+             "the world's current DRIVE_TARGET buffer (write it via buffer_view "
+             "before each call). NOTE: this runs the differentiable forward, NOT "
+             "the production contact pipeline of World.step().")
+        .def("reset", &Tape::reset,
+             "Clear the recorded rollout (steps + checkpoints) for reuse. Does NOT "
+             "reset the world's articulation state.")
+        .def_prop_ro("step_count", &Tape::step_count,
+                     "Number of forward steps currently recorded.")
+        .def_prop_ro("link_count", &Tape::link_count,
+                     "Per-step action / parameter width == articulation "
+                     "total_link_count (== base_link_count for single-env).")
+        .def("state_view", &Tape::state_view, nb::arg("field"),
+             nb::rv_policy::reference,
+             "Return a zero-copy DLPack-capable CUDA float32 ndarray aliasing the "
+             "tape's LIVE differentiable state for `field` (the OBSERVATION side). "
+             "JOINT_POSITION -> q (1, n); JOINT_VELOCITY -> qdot (1, n); "
+             "LINK_VELOCITY -> per-link spatial velocity (1, n, 6), omega-first "
+             "[wx,wy,wz,vx,vy,vz] (root slot = base spatial velocity in the "
+             "root-link body frame). UNLIKE World.buffer_view's single-env arm "
+             "(which reads the host mirror, NOT updated by step_with_tape and so "
+             "stale 0.0), this reflects the state step_with_tape evolves in place. "
+             "Read-only; write the per-step action via World.buffer_view"
+             "(DRIVE_TARGET).")
+        .def("backward", &Tape::backward, nb::arg("seed"),
+             "Run the reverse pass. `seed` is a HOST (CPU) contiguous float32 array "
+             "in the layout [dL/dq'(n) | dL/dqdot'(n) | dL/dv_root'(6n)] (length "
+             "8*link_count), or an empty array for an all-zero seed. Returns a tuple "
+             "(grad_actions, grad_parameters) of HOST numpy float32 arrays: "
+             "grad_actions is (step_count, link_count) per-step per-link action "
+             "gradient; grad_parameters is (link_count,) the dL/d(link mass) summed "
+             "over steps. Bit-exact across two runs (D1).")
+        .def("destroy", &Tape::destroy, "Destroy the tape.")
+        .def("__enter__", [](Tape& t) -> Tape& { return t; })
+        .def("__exit__",
+             [](Tape& t, nb::object, nb::object, nb::object) { t.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
 
     m.def("sync", []() {
         int rc = cudaDeviceSynchronize();
