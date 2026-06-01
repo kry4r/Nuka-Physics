@@ -759,6 +759,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_diffsim_kkt_build_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p03 R3a: IFT-at-convergence contact gradient ------------------
+    # IFT analytic vs finite-difference through the REAL engine contact step
+    # (< 1e-3 rel, the PRIMARY oracle -- p02 is contact-free so there is no
+    # contact-tape to compare against), vs a dense Eigen::LDLT solve+distribute
+    # reference (< 1e-5, second oracle), and the D1 two-run byte-exact gate.
+    # Eigen is linked test-only.
+    add_executable(nuka_diffsim_ift_backward_test
+        diffsim/test_ift_vs_tape_backward.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_ift_backward_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_diffsim_ift_backward_test
+        PRIVATE
+            nuka_diffsim
+            nuka_articulation_gpu
+            nuka_articulation
+            nuka_core
+            nuka_phi
+            nuka_eigen_testonly
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_ift_backward_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
     add_executable(nuka_floating_base_aba_test
         runtime/test_floating_base_aba.cpp

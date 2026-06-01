@@ -496,6 +496,10 @@ if(CMAKE_CUDA_COMPILER)
         # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
         # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
         diffsim/kkt_builder.cu
+        # v0.5 p03 R3a: IFT-at-convergence contact gradient runner -- backprops
+        # through the converged contact solve in ONE Delassus solve (z = A^-1 J M^-1 g),
+        # distributing grad_qdot_free = g - J^T z and grad_b_c = z. D1, no atomics.
+        diffsim/ift_runner.cu
     )
     set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

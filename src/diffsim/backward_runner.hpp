@@ -52,6 +52,7 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/checkpoint.hpp"
+#include "diffsim/ift_runner.hpp"
 #include "diffsim/recompute_orchestrator.hpp"
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
@@ -60,10 +61,26 @@
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
+#include <memory>
 
 namespace nuka::diffsim {
 
 namespace articulation = nuka::runtime::articulation;
+
+// gradient_mode routing seam (v0.5 p03 R3a). Selects how a step's contact rows
+// (if any) are differentiated. DEFAULT is ContactFree -- the committed p02 path,
+// BYTE-UNCHANGED (the IFT branch is never entered, no IftRunner is constructed).
+// ContactIft routes a step's ACTIVE contact rows through the IFT-at-convergence
+// path (one Delassus solve) BEFORE the contact-free connective adjoint handles
+// the rest: IFT converts the downstream g = dL/dqdot_post into the dL/dqdot_free
+// seed StepBackward already consumes as grad_qdot_out (qdot_free = the
+// post-velocity-integration joint velocity). A full multi-step contact rollout
+// through the C-ABI is a LATER integration; this round provides the seam + a
+// single-contact-step entry (ApplyIftContactSeed) exercised by the FD test.
+enum class GradientMode : uint8_t {
+    ContactFree = 0,  // p02 default: drive -> ABA -> integrate only.
+    ContactIft = 1,   // route active contact rows through the IFT path.
+};
 
 // Output gradient targets for the multi-step backward (caller-owned device
 // buffers). grad_actions: [step_count * total_link_count] floats (the per-step
@@ -100,6 +117,25 @@ public:
     void Run(const Tape& tape, const CheckpointManager& cm,
              const BackwardSeeds& seeds, const BackwardOutputs& out);
 
+    // gradient_mode routing seam (default ContactFree -> p02 path byte-unchanged).
+    // Setting ContactIft enables the IFT contact-gradient branch; the IftRunner is
+    // lazily constructed only when ContactIft is selected (so a ContactFree run
+    // never allocates the CG backend / Delassus buffers -- the p02 tests are
+    // unaffected bit-for-bit).
+    void SetGradientMode(GradientMode mode) { gradient_mode_ = mode; }
+    GradientMode gradient_mode() const { return gradient_mode_; }
+
+    // Single contact-step IFT entry (the seam an integrated rollout dispatches to,
+    // and the entry the FD test exercises directly). Given a converged contact
+    // step's engine buffers (`inputs`) and the downstream cotangent g =
+    // dL/dqdot_post in GLOBAL layout, converts g into the dL/dqdot_free seed
+    // (g - J^T z, written into `grad_qdot_free`) and the contact-row dL/db_c (z,
+    // written into `grad_b_c`). No-op + throws if gradient_mode is ContactFree
+    // (the gate keeps the default path from ever touching IFT state). Enqueues on
+    // the context stream; the caller synchronizes.
+    void ApplyIftContactSeed(const IftContactInputs& inputs, const float* g,
+                             float* grad_qdot_free, float* grad_b_c);
+
 private:
     // The shared inner reverse of one step. `step` indexes the tape; the live
     // orchestrator state must already be at the START of `step`. Snapshots
@@ -113,6 +149,11 @@ private:
     const phi::DeviceContext& context_;
     RecomputeOrchestrator& orch_;
     uint32_t total_link_count_ = 0u;
+
+    // gradient_mode seam state. ContactFree by default; ift_ stays null until the
+    // first ContactIft use (lazy -> the p02 path constructs nothing extra).
+    GradientMode gradient_mode_ = GradientMode::ContactFree;
+    std::unique_ptr<IftRunner> ift_;
 
     // Persistent reverse-pass scratch (sized at construction).
     phi::Buffer q_pre_;          // float[total_link_count]
