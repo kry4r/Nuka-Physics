@@ -96,6 +96,37 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
 // next rollout if desired.
 nuka_result_t nuka_tape_reset(nuka_tape_handle tape);
 
+// Sets the scalar MASS of one articulation link at runtime, reconstructing the
+// link's 6x6 spatial inertia from the new mass via the SAME MakeSpatialInertia
+// parameterization the engine cooked it with -- the link's COM (inertial-frame
+// position) and unit-mass / rotated diagonal inertia tensor are HELD FIXED, so
+// the spatial inertia is AFFINE in mass exactly as the diff-sim mass-gradient
+// adjoint assumes (dI/dmass = MakeSpatialInertia(m+1) - MakeSpatialInertia(m),
+// parallel-axis + COM coupling included). This is the §4 PARAMETER spine's
+// forward write: the Python autograd layer pushes the optimized mass INTO the
+// sim each forward via this setter so the true ∂output/∂mass matches the
+// grad_parameters_out the backward returns (without it the sim would keep the
+// baked mass and the gradient would be silently wrong).
+//
+//   link_index : GLOBAL link index in [0, total_link_count) -- the SAME ordering
+//                BuildArticulationHostState concatenates the articulations and
+//                grad_parameters_out / nuka_tape_link_count report. Returns
+//                NUKA_RESULT_INVALID_ARG for an out-of-range index.
+//   mass       : the new scalar mass (kg). Must be > 0 (a non-positive mass is
+//                rejected with NUKA_RESULT_INVALID_ARG; MakeSpatialInertia's
+//                mass<=0 guard would otherwise zero the inertia).
+//
+// The new spatial inertia is written into the world's live link_inertia device
+// buffer (the SAME buffer the contact-free ABA forward -- and nuka_world_step --
+// reads FRESH each step in AbaPass1's CopySpatialInertia / Mat66MulVec6(I,v));
+// there is no derived/cached inertia to invalidate. The host mirror is updated
+// too so a subsequent download stays consistent. Returns NUKA_RESULT_NOT_SUPPORTED
+// for a non-articulated world. DETERMINISTIC: a host-driven single-link device
+// write, no float atomics, byte-stable. Default behavior is UNCHANGED until
+// called: a world that never calls this setter steps byte-identically.
+nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
+                                       uint32_t link_index, float mass);
+
 // The number of forward steps currently recorded on the tape.
 uint32_t nuka_tape_step_count(nuka_tape_handle tape);
 // The per-step action / parameter width (== articulation total_link_count).
