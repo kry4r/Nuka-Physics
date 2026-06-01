@@ -8,6 +8,7 @@
 #include "math/cuda_vec_ops.cuh"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
+#include "runtime/articulation/articulation_device_helpers.cuh"
 
 #include <cuda_runtime.h>
 
@@ -267,30 +268,17 @@ __forceinline__ __device__ void TransformForceTransposeLocal(
     mg::TransformForceTranspose(transform.X, in, out);
 }
 
-__device__ uint32_t JointDofCountDevice(ArticulationJointType type) {
-    switch (type) {
-        case ArticulationJointType::Revolute:
-        case ArticulationJointType::Prismatic:
-            return 1u;
-        case ArticulationJointType::Fixed:
-            return 0u;
-        case ArticulationJointType::FloatingBase:
-            return 6u;  // T8a: free-floating root contributes 6 DOF.
-    }
-    return 0u;
-}
-
-// Local dof_index of a link: base-inclusive prefix sum of per-joint DOF counts
-// over [offset, link). Mirrors the chain Jacobian's dof_index exactly, so M's
-// rows/cols line up with J's columns.
-__device__ uint32_t LocalDofIndex(const ArticulationDeviceState& state,
-                                  uint32_t offset,
-                                  uint32_t link) {
-    uint32_t index = 0u;
-    for (uint32_t k = offset; k < link; ++k) {
-        index += JointDofCountDevice(state.joint_type[k]);
-    }
-    return index;
+// JointDofCountDevice / LocalDofIndex now come from the shared device helper
+// header (articulation_device_helpers.cuh); the bodies are byte-identical (and
+// integer-only, so no FP-reorder risk). JointDofCountDevice keeps its name, so
+// the file's unqualified JointDofCountDevice(...) call sites resolve directly to
+// the shared (enclosing-namespace) symbol -- no local copy needed. LocalDofIndex
+// is the only differently-named local symbol; a thin __forceinline__ forwarder
+// to LocalDofIndexDevice keeps its call sites verbatim.
+__forceinline__ __device__ uint32_t LocalDofIndex(const ArticulationDeviceState& state,
+                                                  uint32_t offset,
+                                                  uint32_t link) {
+    return LocalDofIndexDevice(state, offset, link);
 }
 
 // (1) Dense symmetric M per articulation via CRBA. One block, single lane.

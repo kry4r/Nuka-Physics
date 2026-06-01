@@ -251,53 +251,11 @@ __device__ math::Vec3 RotateByQuatInverse(math::Quat q, math::Vec3 v) {
 
 // Deterministic fixed-pivot (unpivoted) 6x6 LDL^T solve of A x = b, with A SPD.
 // Mirrors FactorArticulationInertiaMKernel's LDL^T + kMinDiagonal floor exactly
-// (no atomics, fixed order) so determinism (D1) holds. A is overwritten with its
-// factor in local scratch; A itself (caller's buffer) is untouched.
-__device__ void Solve6x6Ldlt(const float* matrix, const float* rhs, float* out) {
-    float a[36];
-    for (uint32_t i = 0u; i < 36u; ++i) {
-        a[i] = matrix[i];
-    }
-    float d[6];
-    for (uint32_t j = 0u; j < 6u; ++j) {
-        float djj = a[j * 6u + j];
-        for (uint32_t k = 0u; k < j; ++k) {
-            djj -= a[j * 6u + k] * a[j * 6u + k] * d[k];
-        }
-        if (djj < kMinDiagonal) {
-            djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
-        }
-        d[j] = djj;
-        for (uint32_t i = j + 1u; i < 6u; ++i) {
-            float lij = a[i * 6u + j];
-            for (uint32_t k = 0u; k < j; ++k) {
-                lij -= a[i * 6u + k] * a[j * 6u + k] * d[k];
-            }
-            a[i * 6u + j] = lij / djj;
-        }
-    }
-    // Forward solve L y = b.
-    float y[6];
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        float value = rhs[i];
-        for (uint32_t k = 0u; k < i; ++k) {
-            value -= a[i * 6u + k] * y[k];
-        }
-        y[i] = value;
-    }
-    // Diagonal solve D z = y.
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        y[i] /= d[i];
-    }
-    // Backward solve L^T x = z.
-    for (uint32_t ii = 6u; ii > 0u; --ii) {
-        const uint32_t i = ii - 1u;
-        float value = y[i];
-        for (uint32_t k = i + 1u; k < 6u; ++k) {
-            value -= a[k * 6u + i] * out[k];
-        }
-        out[i] = value;
-    }
+// (no atomics, fixed order) so determinism (D1) holds. Now routed through the
+// shared mg::Solve6x6Ldlt (byte-identical body, kMinDiagonal parameterized) via
+// a thin __forceinline__ forwarder that keeps the call site verbatim.
+__forceinline__ __device__ void Solve6x6Ldlt(const float* matrix, const float* rhs, float* out) {
+    mg::Solve6x6Ldlt(matrix, rhs, out, kMinDiagonal);
 }
 
 __device__ void CopySpatialInertia(const LinkSpatialInertia& src,
@@ -651,14 +609,12 @@ __device__ math::Vec3 RotateByQuatForward(math::Quat q, math::Vec3 v) {
     return Add(v, Add(Scale(t, q.w), Cross3(qv, t)));
 }
 
-// T8a: Hamilton quaternion product (w-first), __device__.
-__device__ math::Quat QuatMulForward(math::Quat a, math::Quat b) {
-    math::Quat out;
-    out.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
-    out.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
-    out.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
-    out.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
-    return out;
+// T8a: Hamilton quaternion product (w-first), __device__. Now routed through the
+// shared mg::QuatMul: the four per-component expressions are character-identical
+// (MakeQuat assigns its args to the same fields this body did), so the float DAG
+// is byte-identical. The forwarder keeps the call site verbatim.
+__forceinline__ __device__ math::Quat QuatMulForward(math::Quat a, math::Quat b) {
+    return mg::QuatMul(a, b);
 }
 
 // QuatNormalizeForward maps to the shared QuatNormalizeForwardRsqrt with eps
