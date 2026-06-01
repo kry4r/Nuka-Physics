@@ -126,8 +126,8 @@ repository contents:
   access.
 - Temporary SSH push using local keys fails with `Permission denied
   (publickey)`, and the configured SSH agent socket cannot list identities.
-- Temporary proxy
-  `http://192.168.2.185:7897` fails with `No route to host`.
+- A temporary local HTTP proxy also failed to reach GitHub (`No route to
+  host`).
 
 v0.3 must not begin until the strict gate passes and v0.1 p07 is committed as
 closed.
