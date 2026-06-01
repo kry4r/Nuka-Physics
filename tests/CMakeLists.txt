@@ -159,6 +159,31 @@ if(TARGET nuka)
     else()
         message(STATUS "Skipping nuka.hpp RAII test: nuka::expected wrapper failed to compile")
     endif()
+
+    # --- v0.5 p02-B/C: differentiable rollout tape C ABI (runtime coverage) ---
+    add_executable(nuka_diffsim_tape_cabi_test
+        c_abi/test_diffsim_tape.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_tape_cabi_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_diffsim_tape_cabi_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/include
+    )
+
+    target_link_libraries(nuka_diffsim_tape_cabi_test
+        PRIVATE
+            nuka
+            CUDA::cudart
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_tape_cabi_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # --- Scene tests -----------------------------------------------------------
@@ -657,6 +682,30 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_diffsim_aba_reverse_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- v0.5 p02-B/C: multi-step diff-sim (tape/checkpoint/recompute/backward) -
+    add_executable(nuka_diffsim_multistep_backward_test
+        diffsim/test_multistep_backward.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_multistep_backward_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_diffsim_multistep_backward_test
+        PRIVATE
+            nuka_diffsim
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_multistep_backward_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------

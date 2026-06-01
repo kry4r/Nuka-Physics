@@ -68,6 +68,7 @@ target_include_directories(nuka_runtime
 set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
 )
 
 add_library(nuka_render STATIC
@@ -480,9 +481,15 @@ if(CMAKE_CUDA_COMPILER)
     # Contact-free reverse-mode adjoint of drive -> ABA -> integrate. Internal /
     # test-facing C++ API (NOT the tape / C-ABI; that is p02-B). One thread per
     # articulation, atomic-free fixed-order tree accumulation (D1).
+    # p02-B/C: the multi-step tape / checkpoint / recompute orchestrator /
+    # backward runner ride on the p02-A single-step adjoint (step_backward).
     add_library(nuka_diffsim STATIC
         diffsim/step_backward.cu
         diffsim/step_backward_host.cpp
+        diffsim/tape.cu
+        diffsim/checkpoint.cu
+        diffsim/recompute_orchestrator.cu
+        diffsim/backward_runner.cu
     )
     set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -505,6 +512,7 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/world.cpp
         c_abi/buffer.cpp
         c_abi/error.cpp
+        c_abi/diffsim.cpp
     )
 
     target_include_directories(nuka
@@ -521,6 +529,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_import
             nuka_articulation_gpu
+            nuka_diffsim
             nuka_phi
         PUBLIC
             CUDA::cudart
