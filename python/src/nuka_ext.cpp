@@ -25,6 +25,7 @@
 
 #include "nuka/nuka.h"
 #include "nuka/nuka_diffsim.h"
+#include "nuka/nuka_noise.h"
 
 namespace nb = nanobind;
 
@@ -202,6 +203,65 @@ public:
     // BEFORE nuka_tape_create -- the tape captures gravity_z at create time.
     void set_gravity_z(float gravity_z) {
         check(nuka_world_set_gravity_z(h_, gravity_z), "nuka_world_set_gravity_z");
+    }
+
+    // v0.5 p04 N1 sim-to-real sensor noise (Task 5.4.8/5.4.9). Register a noise
+    // descriptor on a per-field basis. kind: 0=NONE (clears), 1=GAUSSIAN
+    // (param1=mean, param2=stddev), 2=POISSON (param1=lambda). Recording resets
+    // that field's per-field sequence counter to 0. See nuka_noise.h.
+    void set_sensor_noise(nuka_state_field_t field, int kind, float param1,
+                          float param2, uint64_t seed) {
+        nuka_sensor_noise_desc_t desc{};
+        desc.kind = static_cast<nuka_noise_kind_t>(kind);
+        desc.param1 = param1;
+        desc.param2 = param2;
+        desc.seed = seed;
+        check(nuka_world_set_sensor_noise(h_, field, &desc),
+              "nuka_world_set_sensor_noise");
+    }
+
+    // Apply the registered noise to `field`'s device buffer in place ONCE, then
+    // advance that field's sequence counter (next apply is independent noise).
+    // NONE / no registered desc -> byte no-op. Non-float-stride field (pose) ->
+    // NUKA_RESULT_NOT_SUPPORTED (raises).
+    void apply_sensor_noise(nuka_state_field_t field) {
+        check(nuka_world_apply_sensor_noise(h_, field),
+              "nuka_world_apply_sensor_noise");
+    }
+
+    // v0.5 p04 N2 per-episode domain randomization (Task 5.4.7/5.4.9). mass /
+    // friction are MULTIPLIER ranges; restitution / armature / gravity are OFFSET
+    // ranges. enabled == 0 -> apply is a byte no-op. See nuka_noise.h.
+    void set_domain_randomization(float mass_mul_lo, float mass_mul_hi,
+                                  float friction_mul_lo, float friction_mul_hi,
+                                  float restitution_off_lo,
+                                  float restitution_off_hi, float armature_off_lo,
+                                  float armature_off_hi, float gravity_off_lo,
+                                  float gravity_off_hi, uint64_t seed,
+                                  int enabled) {
+        nuka_domain_randomization_desc_t desc{};
+        desc.mass_mul_lo = mass_mul_lo;
+        desc.mass_mul_hi = mass_mul_hi;
+        desc.friction_mul_lo = friction_mul_lo;
+        desc.friction_mul_hi = friction_mul_hi;
+        desc.restitution_off_lo = restitution_off_lo;
+        desc.restitution_off_hi = restitution_off_hi;
+        desc.armature_off_lo = armature_off_lo;
+        desc.armature_off_hi = armature_off_hi;
+        desc.gravity_off_lo = gravity_off_lo;
+        desc.gravity_off_hi = gravity_off_hi;
+        desc.seed = seed;
+        desc.enabled = enabled;
+        check(nuka_world_set_domain_randomization(h_, &desc),
+              "nuka_world_set_domain_randomization");
+    }
+
+    // Sample + apply the stored randomization for ALL envs (call at episode
+    // reset, BEFORE Tape.create -- the tape captures gravity at create time and
+    // mass must be in place before the first step). DR disabled -> byte no-op.
+    void apply_domain_randomization() {
+        check(nuka_world_apply_domain_randomization(h_),
+              "nuka_world_apply_domain_randomization");
     }
 
     uint32_t env_count() const { return env_count_; }
@@ -511,6 +571,14 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("CONTROL_MODE_OSC") = uint32_t{4};
     m.attr("CONTROL_MODE_ACTUATOR") = uint32_t{5};
 
+    // v0.5 p04 N1 sim-to-real sensor-noise kinds (the int values
+    // World.set_sensor_noise(kind=...) accepts). NONE (0, default) clears the
+    // field's noise -> apply is a byte no-op. GAUSSIAN (1): param1=mean,
+    // param2=stddev. POISSON (2): param1=lambda. Mirrors nuka_noise_kind_t.
+    m.attr("NOISE_NONE") = int{0};
+    m.attr("NOISE_GAUSSIAN") = int{1};
+    m.attr("NOISE_POISSON") = int{2};
+
     // Field enum (kept identical to nuka_state_field_t).
     nb::enum_<nuka_state_field_t>(m, "Field")
         .value("RIGID_BODY_TRANSFORM", NUKA_FIELD_RIGID_BODY_TRANSFORM)
@@ -701,7 +769,53 @@ NB_MODULE(_nuka_ext, m) {
              "BEFORE creating a Tape (the tape captures gravity at create time). "
              "Used by the floating mass-gradcheck, which needs g=0 so the deferred "
              "floating-base orientation channel is inert. A world that never calls "
-             "this steps byte-identically (default unchanged).");
+             "this steps byte-identically (default unchanged).")
+        // v0.5 p04 N1 sim-to-real sensor noise (Task 5.4.9). Register/clear a
+        // per-field noise descriptor; apply it in place to the live device
+        // buffer. Counter-based (Philox) -> D1 two-run bit-exact.
+        .def("set_sensor_noise", &World::set_sensor_noise, nb::arg("field"),
+             nb::arg("kind"), nb::arg("param1") = 0.0f, nb::arg("param2") = 0.0f,
+             nb::arg("seed") = uint64_t{0},
+             "Register sim-to-real noise on `field`. kind: 0 = NOISE_NONE (clears "
+             "-> apply becomes a byte no-op), 1 = NOISE_GAUSSIAN (param1=mean, "
+             "param2=stddev), 2 = NOISE_POISSON (param1=lambda). Recording resets "
+             "the field's per-field sequence counter to 0. Only float-stride "
+             "fields (q/qd/drive/etc.) are supported by a later apply; a "
+             "non-float-stride field (e.g. ARTICULATION_LINK_POSE) registers OK "
+             "but raises NOT_SUPPORTED on apply. An out-of-range field or unknown "
+             "kind raises.")
+        .def("apply_sensor_noise", &World::apply_sensor_noise, nb::arg("field"),
+             "Apply the registered noise to `field`'s device buffer ONCE, in "
+             "place, then advance that field's sequence counter (so the next "
+             "apply is independent noise across steps). NONE / no registered desc "
+             "-> byte no-op. Non-float-stride field -> raises NOT_SUPPORTED. The "
+             "kernel is async; call nuka.sync() before reading the buffer back.")
+        // v0.5 p04 N2 per-episode domain randomization (Task 5.4.9). mass /
+        // friction are MULTIPLIER ranges; restitution / armature / gravity are
+        // OFFSET ranges. enabled == 0 -> apply is a byte no-op (oracle safe).
+        .def("set_domain_randomization", &World::set_domain_randomization,
+             nb::arg("mass_mul_lo"), nb::arg("mass_mul_hi"),
+             nb::arg("friction_mul_lo"), nb::arg("friction_mul_hi"),
+             nb::arg("restitution_off_lo"), nb::arg("restitution_off_hi"),
+             nb::arg("armature_off_lo"), nb::arg("armature_off_hi"),
+             nb::arg("gravity_off_lo"), nb::arg("gravity_off_hi"),
+             nb::arg("seed") = uint64_t{0}, nb::arg("enabled") = int{1},
+             "Record the per-episode domain-randomization descriptor. mass / "
+             "friction are MULTIPLIER ranges [lo, hi] (nominal * mult); "
+             "restitution / armature / gravity are OFFSET ranges (nominal + "
+             "offset). Each is sampled ONCE per env per episode-reset as a pure "
+             "function of (seed, env_idx, param) via counter-based Philox -> D1 "
+             "two-run bit-exact backward. enabled == 0 (or never set) -> apply is "
+             "a byte no-op. Recording does NOT sample/apply -- call "
+             "apply_domain_randomization at episode reset.")
+        .def("apply_domain_randomization", &World::apply_domain_randomization,
+             "Sample + apply the stored randomization for ALL envs (call at "
+             "episode reset). On the FIRST enabled apply it snapshots a nominal "
+             "baseline (per-link mass, gravity.z, per-DOF armature) so the apply "
+             "is idempotent across resets. DR disabled -> byte no-op. MUST be "
+             "called BEFORE Tape.create (the tape captures gravity at create "
+             "time; mass must be in place before the first step_with_tape). A "
+             "non-articulated world raises NOT_SUPPORTED.");
 
     // -----------------------------------------------------------------------
     // Tape -- the multi-step differentiable rollout (nuka_diffsim.h).
