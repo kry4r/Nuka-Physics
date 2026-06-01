@@ -733,6 +733,32 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_diffsim_cg_solver_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p03 R2: contact KKT (Delassus) builder ------------------------
+    # Builder (A = J M^-1 J^T) vs an INDEPENDENT host Gram recompute (Eigen,
+    # < 1e-5 rel), exact bit-symmetry, the diagonal == 1/effective_mass identity,
+    # and the D1 two-run byte-exact gate. Eigen is linked test-only.
+    add_executable(nuka_diffsim_kkt_build_test
+        diffsim/test_kkt_build.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_kkt_build_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_diffsim_kkt_build_test
+        PRIVATE
+            nuka_diffsim
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            nuka_eigen_testonly
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_kkt_build_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
     add_executable(nuka_floating_base_aba_test
         runtime/test_floating_base_aba.cpp

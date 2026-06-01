@@ -493,6 +493,9 @@ if(CMAKE_CUDA_COMPILER)
         # v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend).
         # Warp-per-articulation batched-dense SPD CG; D1 bit-exact, no atomics.
         diffsim/sparse_solver_cg.cu
+        # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
+        # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
+        diffsim/kkt_builder.cu
     )
     set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
