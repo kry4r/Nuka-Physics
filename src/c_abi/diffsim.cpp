@@ -312,4 +312,102 @@ uint32_t nuka_tape_link_count(nuka_tape_handle tape) {
     return (record != nullptr) ? record->total_link_count : 0u;
 }
 
+nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
+                                       uint32_t link_index, float mass) {
+    WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (world_record->articulation_device.Empty()) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
+    }
+    auto& host = world_record->articulation_host;
+    const uint32_t total_links = host.TotalLinkCount();
+    if (link_index >= total_links || link_index >= host.link_inertia.size()) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    // Reject a non-positive mass: MakeSpatialInertia's mass<=0 guard returns a
+    // ZERO 6x6, which is degenerate for ABA (singular articulated inertia) and
+    // makes the affine dI/dmass parameterization the adjoint assumes inapplicable.
+    if (!(mass > 0.0f)) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    try {
+        // Resolve the GLOBAL link index to its (articulation, local) so we read
+        // the SAME (diagonal_inertia, inertial_frame) the cooker stored -- the
+        // identical source BuildMassParams uses to build dI/dmass. Iterating the
+        // articulations in concatenation order reproduces the global-link layout
+        // BuildArticulationHostState emits.
+        nuka::math::Vec3 diagonal_inertia{0.0f, 0.0f, 0.0f};
+        nuka::math::Transform inertial_frame =
+            nuka::math::Transform::Identity();
+        {
+            uint32_t global = 0u;
+            bool resolved = false;
+            for (const auto& topo : host.articulations) {
+                const uint32_t link_count =
+                    static_cast<uint32_t>(topo.link_bodies.size());
+                if (link_index < global + link_count) {
+                    const uint32_t local = link_index - global;
+                    diagonal_inertia = (local < topo.inertias.size())
+                                           ? topo.inertias[local]
+                                           : nuka::math::Vec3{0.0f, 0.0f, 0.0f};
+                    inertial_frame =
+                        (local < topo.inertial_frames.size())
+                            ? topo.inertial_frames[local]
+                            : nuka::math::Transform::Identity();
+                    resolved = true;
+                    break;
+                }
+                global += link_count;
+            }
+            if (!resolved) {
+                return NUKA_RESULT_INVALID_ARG;
+            }
+        }
+
+        // Reconstruct the link's spatial inertia from the new scalar mass using
+        // the EXACT MakeSpatialInertia parameterization the engine cooked it with:
+        // COM (inertial_frame.position) + the rotated diagonal inertia tensor are
+        // HELD FIXED, only `mass` changes. This is affine in mass and matches the
+        // backward's dI/dmass = MakeSpatialInertia(m+1) - MakeSpatialInertia(m)
+        // (see diffsim::BuildSpatialInertiaMassJacobian). The COM-fixed convention
+        // means dI/dmass is constant -- exactly what the p02 adjoint contracts
+        // grad_I against.
+        const nuka::runtime::articulation::LinkSpatialInertia new_inertia =
+            nuka::runtime::articulation::MakeSpatialInertia(
+                mass, diagonal_inertia, inertial_frame);
+
+        // Update the host mirror (keeps a later DownloadArticulationState /
+        // re-upload consistent) and write the SINGLE link's 6x6 into the live
+        // device link_inertia buffer in place (offset link_index, no realloc).
+        // AbaPass1 reads link_inertia FRESH every step (CopySpatialInertia +
+        // Mat66MulVec6(I, v)), so the write takes effect on the NEXT step; there
+        // is no derived/cached inertia to invalidate. dI/dmass is mass-independent
+        // (affine), so the tape's uploaded slope needs no refresh.
+        host.link_inertia[link_index] = new_inertia;
+
+        const auto& ctx = world_record->device->context;
+        auto* device_inertia =
+            static_cast<nuka::runtime::articulation::LinkSpatialInertia*>(
+                world_record->articulation_device.link_inertia.Data());
+        nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+        cudaError_t copy_status = cudaMemcpyAsync(
+            device_inertia + link_index, &new_inertia,
+            sizeof(nuka::runtime::articulation::LinkSpatialInertia),
+            cudaMemcpyHostToDevice, ctx.stream.Native());
+        if (copy_status != cudaSuccess) {
+            return NUKA_RESULT_INTERNAL;
+        }
+        ctx.stream.Synchronize();
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 }  // extern "C"
