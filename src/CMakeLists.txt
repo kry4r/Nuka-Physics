@@ -490,6 +490,9 @@ if(CMAKE_CUDA_COMPILER)
         diffsim/checkpoint.cu
         diffsim/recompute_orchestrator.cu
         diffsim/backward_runner.cu
+        # v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend).
+        # Warp-per-articulation batched-dense SPD CG; D1 bit-exact, no atomics.
+        diffsim/sparse_solver_cg.cu
     )
     set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
