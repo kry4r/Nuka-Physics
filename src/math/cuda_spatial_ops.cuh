@@ -193,6 +193,69 @@ __forceinline__ __device__ void MotionCross(const float* lhs,
     out[5] = linear.z;
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic fixed-pivot (unpivoted) 6x6 LDL^T solve of A x = b, A SPD.
+// Identical body in:
+//   featherstone_aba.cu     Solve6x6Ldlt
+//   src/diffsim/step_backward.cu  Solve6x6LdltRev
+// (the two differed only in brace style; bodies are arithmetically identical --
+// same kMinDiagonal floor, same fixed loop order -> D1-safe). The `min_diagonal`
+// floor is a parameter so the constant stays a literal at each call site (the
+// callers both pass kMinDiagonal = 1.0e-6f), bit-identical to the inlined form.
+// A is copied into local scratch and factored there; the caller's `matrix`
+// buffer is untouched. NOTE the triple/double products (a*a*d, a*y, a*out) are
+// single inline expressions here exactly as in the originals -- no stored,
+// multiply-used product is introduced, so FMA contraction is preserved.
+__forceinline__ __device__ void Solve6x6Ldlt(const float* __restrict__ matrix,
+                                             const float* __restrict__ rhs,
+                                             float* __restrict__ out,
+                                             float min_diagonal) {
+    float a[36];
+    for (unsigned int i = 0u; i < 36u; ++i) {
+        a[i] = matrix[i];
+    }
+    float d[6];
+    for (unsigned int j = 0u; j < 6u; ++j) {
+        float djj = a[j * 6u + j];
+        for (unsigned int k = 0u; k < j; ++k) {
+            djj -= a[j * 6u + k] * a[j * 6u + k] * d[k];
+        }
+        if (djj < min_diagonal) {
+            djj = min_diagonal;  // SPD floor; guards a degenerate config.
+        }
+        d[j] = djj;
+        for (unsigned int i = j + 1u; i < 6u; ++i) {
+            float lij = a[i * 6u + j];
+            for (unsigned int k = 0u; k < j; ++k) {
+                lij -= a[i * 6u + k] * a[j * 6u + k] * d[k];
+            }
+            a[i * 6u + j] = lij / djj;
+        }
+    }
+    // Forward solve L y = b.
+    float y[6];
+    for (unsigned int i = 0u; i < 6u; ++i) {
+        float value = rhs[i];
+        for (unsigned int k = 0u; k < i; ++k) {
+            value -= a[i * 6u + k] * y[k];
+        }
+        y[i] = value;
+    }
+    // Diagonal solve D z = y.
+    for (unsigned int i = 0u; i < 6u; ++i) {
+        y[i] /= d[i];
+    }
+    // Backward solve L^T x = z.
+    for (unsigned int ii = 6u; ii > 0u; --ii) {
+        const unsigned int i = ii - 1u;
+        float value = y[i];
+        for (unsigned int k = i + 1u; k < 6u; ++k) {
+            value -= a[k * 6u + i] * out[k];
+        }
+        out[i] = value;
+    }
+}
+
 // out = motion x force (force cross).
 __forceinline__ __device__ void ForceCross(const float* motion,
                                            const float* force,

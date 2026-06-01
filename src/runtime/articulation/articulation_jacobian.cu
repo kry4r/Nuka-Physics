@@ -5,6 +5,7 @@
 #include "runtime/articulation/articulation_jacobian.hpp"
 
 #include "math/cuda_vec_ops.cuh"
+#include "runtime/articulation/articulation_device_helpers.cuh"
 
 #include <cuda_runtime.h>
 
@@ -38,39 +39,22 @@ __device__ math::Vec3 ContactNormalOrDefault(const math::Vec3* points, uint32_t 
 
 // Rotates `v` by unit-ish quaternion `q` (w-first). Device-side reimplementation
 // of math::Quat::Rotate, which is host-only. Uses the q*v*q^-1 short form and
-// normalizes defensively so unnormalized poses do not scale the axis.
-__device__ math::Vec3 RotateByQuat(math::Quat q, math::Vec3 v) {
-    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    if (norm_sq > 1.0e-12f) {
-        const float inv_norm = rsqrtf(norm_sq);
-        q.w *= inv_norm;
-        q.x *= inv_norm;
-        q.y *= inv_norm;
-        q.z *= inv_norm;
-    }
-    const math::Vec3 qv{q.x, q.y, q.z};
-    const math::Vec3 t = Cross(qv, v);
-    const math::Vec3 t2{2.0f * t.x, 2.0f * t.y, 2.0f * t.z};
-    const math::Vec3 wt{q.w * t2.x, q.w * t2.y, q.w * t2.z};
-    const math::Vec3 qvt = Cross(qv, t2);
-    return {v.x + wt.x + qvt.x, v.y + wt.y + qvt.y, v.z + wt.z + qvt.z};
+// normalizes defensively so unnormalized poses do not scale the axis. Now routed
+// through the shared mg::RotateByQuatNormalized (byte-identical body) via a thin
+// forwarder that keeps the call site verbatim.
+__forceinline__ __device__ math::Vec3 RotateByQuat(math::Quat q, math::Vec3 v) {
+    return mg::RotateByQuatNormalized(q, v);
 }
 
 // Generalized-coordinate count contributed by a joint of the given type. This
 // is the single source of truth for both the per-contact dof_stride and the
 // dof_index() prefix sum, so the chain Jacobian transparently picks up a future
-// 6-DOF floating-base root without touching the walk logic.
-__device__ uint32_t JointDofCount(ArticulationJointType type) {
-    switch (type) {
-        case ArticulationJointType::Revolute:
-        case ArticulationJointType::Prismatic:
-            return 1u;
-        case ArticulationJointType::Fixed:
-            return 0u;
-        case ArticulationJointType::FloatingBase:
-            return 6u;  // T8a: free-floating root contributes 6 DOF.
-    }
-    return 0u;
+// 6-DOF floating-base root without touching the walk logic. Now routed through
+// the shared JointDofCountDevice (articulation_device_helpers.cuh; byte-identical
+// integer body) via a thin forwarder that keeps the local JointDofCount(...)
+// call sites verbatim.
+__forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
+    return JointDofCountDevice(type);
 }
 
 __global__ void ComputeLinkPointJacobianKernel(

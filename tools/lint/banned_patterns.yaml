@@ -36,6 +36,15 @@ scope_definitions:
       - "src/solver/**/*.cuh"
       - "src/constraint/**/*.cu"
       - "src/runtime/**/*.cu"
+      # v0.5 p04.9 CUDA-commons consolidation: the shared __device__ math/spatial
+      # cores (math/cuda_*_ops.cuh) and the new articulation device-helper header
+      # (runtime/articulation/articulation_device_helpers.cuh) now hold D1-critical
+      # device code that was MOVED OUT of the *.cu TUs (which were already in
+      # physics_path). Add the *.cuh globs so the no-float-atomic ban keeps covering
+      # that code -- otherwise the consolidation would silently move it out from
+      # under the guard (the by-design hole the lint scope must not reopen).
+      - "src/runtime/**/*.cuh"
+      - "src/math/**/*.cuh"
       # v0.5 p03: the diff-sim backward / sparse-solver path is D1-critical (its
       # grad/solve outputs must be two-run byte-exact), so the no-float-atomic ban
       # now covers it too. NOTE: src/diffsim is added to physics_path ONLY (the

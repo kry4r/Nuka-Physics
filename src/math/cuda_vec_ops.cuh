@@ -262,6 +262,34 @@ __forceinline__ __device__ Quat QuatNormalizeForwardRsqrt(Quat q, float eps) {
     return q;
 }
 
+// Rotate a vector by a quaternion, DEFENSIVELY NORMALIZING q first (rsqrtf,
+// branch norm_sq > 1e-12), then the explicit-component q*v*q^-1 short form with
+// the intermediate t2 = 2*(qv x v). Identical body in:
+//   articulation_jacobian.cu  RotateByQuat
+//   articulation_drives.cu     RotateByQuatDrive   (OSC task-Jacobian path)
+// (character-identical; jacobian uses `Cross` via `using mg::Cross`, drives uses
+// the qualified `mg::Cross` -- same symbol). This is a DISTINCT recipe from
+// RotateShort below (which takes an already-normalized q and folds the 2x into t
+// before the second cross, a different float expression) -- the two are kept
+// SEPARATE so neither call site's bytes shift. NormalizeOrUp's contacts copy uses
+// yet another (ScaleVec) form and is intentionally NOT merged here.
+__forceinline__ __device__ Vec3 RotateByQuatNormalized(Quat q, Vec3 v) {
+    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (norm_sq > 1.0e-12f) {
+        const float inv_norm = rsqrtf(norm_sq);
+        q.w *= inv_norm;
+        q.x *= inv_norm;
+        q.y *= inv_norm;
+        q.z *= inv_norm;
+    }
+    const Vec3 qv{q.x, q.y, q.z};
+    const Vec3 t = Cross(qv, v);
+    const Vec3 t2{2.0f * t.x, 2.0f * t.y, 2.0f * t.z};
+    const Vec3 wt{q.w * t2.x, q.w * t2.y, q.w * t2.z};
+    const Vec3 qvt = Cross(qv, t2);
+    return {v.x + wt.x + qvt.x, v.y + wt.y + qvt.y, v.z + wt.z + qvt.z};
+}
+
 // Rotate a vector by a (possibly-unnormalized) quaternion using the
 //   t = 2*(qv x v);  v + w*t + qv x t
 // short form. Identical body in broadphase / contact_generation / sensors /

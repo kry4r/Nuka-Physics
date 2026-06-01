@@ -19,6 +19,7 @@
 
 #include "math/cuda_vec_ops.cuh"                          // Cross/Dot device math
 #include "runtime/articulation/articulation_contacts.hpp"  // kMaxContactSolverDof
+#include "runtime/articulation/articulation_device_helpers.cuh"  // JointDofCount/LocalDofIndex
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cuda_runtime.h>
@@ -44,30 +45,19 @@ void CheckCudaDrive(cudaError_t result, const char* operation) {
     }
 }
 
-// Per-joint DOF count + base-inclusive local dof_index. Bit-identical to the
-// file-local helpers in articulation_contacts.cu (the CRBA tile uses the SAME
-// indexing, so the ComputedTorque matvec's M rows/cols line up with the M built
-// there). Replicated here because those are translation-unit-local.
-__device__ uint32_t JointDofCountDriveDevice(ArticulationJointType type) {
-    switch (type) {
-        case ArticulationJointType::Revolute:
-        case ArticulationJointType::Prismatic:
-            return 1u;
-        case ArticulationJointType::Fixed:
-            return 0u;
-        case ArticulationJointType::FloatingBase:
-            return 6u;
-    }
-    return 0u;
+// Per-joint DOF count + base-inclusive local dof_index. Now routed through the
+// shared device helpers (articulation_device_helpers.cuh; byte-identical
+// integer bodies -- the CRBA tile uses the SAME indexing, so the ComputedTorque
+// matvec's M rows/cols line up with the M built in articulation_contacts.cu).
+// Thin __forceinline__ forwarders keep the local JointDofCountDriveDevice(...) /
+// LocalDofIndexDrive(...) call sites verbatim.
+__forceinline__ __device__ uint32_t JointDofCountDriveDevice(ArticulationJointType type) {
+    return JointDofCountDevice(type);
 }
 
-__device__ uint32_t LocalDofIndexDrive(const ArticulationDeviceState& state,
-                                       uint32_t offset, uint32_t link) {
-    uint32_t index = 0u;
-    for (uint32_t k = offset; k < link; ++k) {
-        index += JointDofCountDriveDevice(state.joint_type[k]);
-    }
-    return index;
+__forceinline__ __device__ uint32_t LocalDofIndexDrive(const ArticulationDeviceState& state,
+                                                       uint32_t offset, uint32_t link) {
+    return LocalDofIndexDevice(state, offset, link);
 }
 
 // Osc task-Jacobian device math. Sub/Cross/Dot come from the shared device math
@@ -77,21 +67,11 @@ __device__ uint32_t LocalDofIndexDrive(const ArticulationDeviceState& state,
 // Jacobian's columns are built with bit-identical geometry to the contact-row J.
 namespace mg = ::nuka::math::gpu;
 
-__device__ math::Vec3 RotateByQuatDrive(math::Quat q, math::Vec3 v) {
-    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    if (norm_sq > 1.0e-12f) {
-        const float inv_norm = rsqrtf(norm_sq);
-        q.w *= inv_norm;
-        q.x *= inv_norm;
-        q.y *= inv_norm;
-        q.z *= inv_norm;
-    }
-    const math::Vec3 qv{q.x, q.y, q.z};
-    const math::Vec3 t = mg::Cross(qv, v);
-    const math::Vec3 t2{2.0f * t.x, 2.0f * t.y, 2.0f * t.z};
-    const math::Vec3 wt{q.w * t2.x, q.w * t2.y, q.w * t2.z};
-    const math::Vec3 qvt = mg::Cross(qv, t2);
-    return {v.x + wt.x + qvt.x, v.y + wt.y + qvt.y, v.z + wt.z + qvt.z};
+// Now routed through the shared mg::RotateByQuatNormalized (byte-identical body,
+// the SAME defensive-normalize q*v*q^-1 recipe jacobian uses) via a thin
+// forwarder that keeps the call site verbatim.
+__forceinline__ __device__ math::Vec3 RotateByQuatDrive(math::Quat q, math::Vec3 v) {
+    return mg::RotateByQuatNormalized(q, v);
 }
 
 // tau = clamp(torque_input). No control Kd; the implicit joint damping (#43)

@@ -78,35 +78,10 @@ __device__ Mat3R Mat3IdentityR() {
 // the forward Solve6x6Ldlt in featherstone_aba.cu (same kMinDiagonal floor, same
 // fixed loop order) so the floating-base reverse stays D1. Used for the adjoint
 // of a_free = Ia^-1 (-p): since Ia is SPD-symmetric, grad_b = Ia^-1 grad_a_free
-// is the SAME solve on the seed.
-__device__ void Solve6x6LdltRev(const float* matrix, const float* rhs, float* out) {
-    float a[36];
-    for (uint32_t i = 0u; i < 36u; ++i) a[i] = matrix[i];
-    float d[6];
-    for (uint32_t j = 0u; j < 6u; ++j) {
-        float djj = a[j * 6u + j];
-        for (uint32_t k = 0u; k < j; ++k) djj -= a[j * 6u + k] * a[j * 6u + k] * d[k];
-        if (djj < kMinDiagonal) djj = kMinDiagonal;
-        d[j] = djj;
-        for (uint32_t i = j + 1u; i < 6u; ++i) {
-            float lij = a[i * 6u + j];
-            for (uint32_t k = 0u; k < j; ++k) lij -= a[i * 6u + k] * a[j * 6u + k] * d[k];
-            a[i * 6u + j] = lij / djj;
-        }
-    }
-    float y[6];
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        float value = rhs[i];
-        for (uint32_t k = 0u; k < i; ++k) value -= a[i * 6u + k] * y[k];
-        y[i] = value;
-    }
-    for (uint32_t i = 0u; i < 6u; ++i) y[i] /= d[i];
-    for (uint32_t ii = 6u; ii > 0u; --ii) {
-        const uint32_t i = ii - 1u;
-        float value = y[i];
-        for (uint32_t k = i + 1u; k < 6u; ++k) value -= a[k * 6u + i] * out[k];
-        out[i] = value;
-    }
+// is the SAME solve on the seed. Now routed through the shared mg::Solve6x6Ldlt
+// (byte-identical body, kMinDiagonal parameterized) via a thin forwarder.
+__forceinline__ __device__ void Solve6x6LdltRev(const float* matrix, const float* rhs, float* out) {
+    mg::Solve6x6Ldlt(matrix, rhs, out, kMinDiagonal);
 }
 
 __device__ Mat3R RotationFromQuatR(math::Quat q) {
