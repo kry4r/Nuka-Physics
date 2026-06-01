@@ -1,6 +1,12 @@
 name: v0.1 exit gate
 
-on: [push, pull_request, workflow_dispatch]
+# Manual-dispatch ONLY. This gate runs on a maintainer-provisioned self-hosted
+# CUDA runner (labels: self-hosted, linux, cuda) and uses host-specific tool
+# paths. It is intentionally NOT triggered by `push` / `pull_request`: on a
+# public repository that would let pull requests execute on the self-hosted GPU
+# runner. The public, GitHub-hosted CI (lint + GPU-free Python smoke) lives in
+# ci.yml; this gate is for maintainers to run on demand.
+on: [workflow_dispatch]
 
 jobs:
   p07_exit_gate:
