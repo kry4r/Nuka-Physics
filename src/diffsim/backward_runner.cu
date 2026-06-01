@@ -67,6 +67,26 @@ BackwardRunner::BackwardRunner(const phi::DeviceContext& context,
     grad_tau_ = ZeroedFloat(context_, n);
 }
 
+void BackwardRunner::ApplyIftContactSeed(const IftContactInputs& inputs,
+                                         const float* g, float* grad_qdot_free,
+                                         float* grad_b_c) {
+    // gradient_mode gate: the default ContactFree path never reaches here, so the
+    // committed p02 backward/multistep tests stay byte-unchanged. Only a caller
+    // that explicitly opted into ContactIft routes contact rows through IFT.
+    if (gradient_mode_ != GradientMode::ContactIft) {
+        throw std::runtime_error(
+            "nuka::diffsim::BackwardRunner::ApplyIftContactSeed: gradient_mode is "
+            "ContactFree (call SetGradientMode(GradientMode::ContactIft) first)");
+    }
+    if (!ift_) {
+        ift_ = std::make_unique<IftRunner>(context_);  // lazy: only on first IFT use
+    }
+    IftContactGrads grads;
+    grads.grad_qdot_free = grad_qdot_free;
+    grads.grad_b_c = grad_b_c;
+    ift_->Run(inputs, g, grads);
+}
+
 void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
                                  const BackwardOutputs& out) {
     const articulation::ArticulationDeviceState state = orch_.State();
