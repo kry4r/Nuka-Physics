@@ -3,6 +3,7 @@
 #include "nuka/nuka.h"
 
 #include "core/diagnostics/invariants.hpp"
+#include "sensor/noise/noise_config.hpp"
 #include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
@@ -84,6 +85,18 @@ struct WorldRecord {
     };
     std::vector<core::diagnostics::InvariantSample> last_invariant_violations;
     std::vector<float> empty_float_storage;
+
+    // --- v0.5 p04 N1: per-sensor-field domain-randomization noise -----------
+    // Fixed array indexed by nuka_state_field_t (0..15). Default is None so a
+    // field with no registered noise is a byte no-op on apply and V1 oracle
+    // scenes stay byte-identical. `noise_seq[f]` is that field's monotonically
+    // advancing per-apply sequence index (the Philox counter seq lane), giving
+    // independent noise across steps; the SAME (seed, seq) replays bit-exact on
+    // the reverse pass (no RNG state to checkpoint -- exit #6). 16 == one past
+    // the max field enum (NUKA_FIELD_TASK_TARGET == 15).
+    static constexpr uint32_t kNoiseFieldCount = 16u;
+    nuka::sensor::noise::SensorNoiseConfig noise_config[kNoiseFieldCount];
+    uint64_t noise_seq[kNoiseFieldCount] = {};
 };
 
 struct BufferRecord {

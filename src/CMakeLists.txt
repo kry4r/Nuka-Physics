@@ -69,6 +69,7 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
 )
 
 add_library(nuka_render STATIC
@@ -522,12 +523,36 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # --- v0.5 p04 N1: sim-to-real sensor noise (counter-based Philox) --------
+    # Self-contained counter-based Philox4x32-10 RNG + in-place Gaussian/Poisson
+    # noise kernels. D1 two-run bit-exact (a sample is a pure function of (seed,
+    # element_idx, seq); no atomics, no thread-order reductions). Separate static
+    # lib mirroring nuka_diffsim; linked into the `nuka` shared lib and the
+    # tests/sensor gtests. Header-only philox.cuh lives alongside.
+    add_library(nuka_sensor_noise STATIC
+        sensor/noise/n1_gaussian.cu
+        sensor/noise/n1_poisson.cu
+    )
+    set_target_properties(nuka_sensor_noise PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_sensor_noise
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_sensor_noise
+        PUBLIC
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka SHARED
         c_abi/device.cpp
         c_abi/world.cpp
         c_abi/buffer.cpp
         c_abi/error.cpp
         c_abi/diffsim.cpp
+        c_abi/noise.cpp
     )
 
     target_include_directories(nuka
@@ -545,6 +570,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_import
             nuka_articulation_gpu
             nuka_diffsim
+            nuka_sensor_noise
             nuka_phi
         PUBLIC
             CUDA::cudart

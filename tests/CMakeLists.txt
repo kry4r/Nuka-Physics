@@ -185,6 +185,31 @@ if(TARGET nuka)
     gtest_discover_tests(nuka_diffsim_tape_cabi_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p04 N1: C-ABI sensor-noise surface (NONE no-op + apply + D1) ----
+    add_executable(nuka_sensor_noise_cabi_test
+        c_abi/test_sensor_noise.cpp
+    )
+
+    target_compile_definitions(nuka_sensor_noise_cabi_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_sensor_noise_cabi_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/include
+    )
+
+    target_link_libraries(nuka_sensor_noise_cabi_test
+        PRIVATE
+            nuka
+            CUDA::cudart
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sensor_noise_cabi_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.5 p04-A0: runtime link-mass setter + C-ABI mass-gradient FD proof --
     # Operations under test are pure C-ABI (set_link_mass / step_with_tape /
     # tape_backward); the internal libs are linked only for setup + reading the
@@ -852,6 +877,25 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_diffsim_osc_adjoint_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- v0.5 p04 N1: sim-to-real sensor noise (Philox Gaussian + Poisson) ---
+    # Launch-level gtests: Philox KAT + D1 two-run memcmp + statistics. Link the
+    # self-contained noise lib directly -- no world/scene needed (fast + robust).
+    add_executable(nuka_sensor_noise_test
+        sensor/test_n1_gaussian.cu
+        sensor/test_n1_poisson.cu
+    )
+
+    target_link_libraries(nuka_sensor_noise_test
+        PRIVATE
+            nuka_sensor_noise
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sensor_noise_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------

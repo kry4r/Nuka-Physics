@@ -45,6 +45,13 @@ scope_definitions:
       # hot_path_cuda_malloc.
       - "src/diffsim/**/*.cu"
       - "src/diffsim/**/*.cuh"
+      # v0.5 p04 N1: the sensor-noise kernels are D1-critical (their noise must
+      # be two-run byte-exact via the counter-based Philox RNG -- no thread-order
+      # dependence, NO float atomicAdd). Same rationale as src/diffsim above; the
+      # noise path is NOT in hot_path (it is applied to a sensor buffer once, not
+      # inside a per-step physics kernel).
+      - "src/sensor/noise/**/*.cu"
+      - "src/sensor/noise/**/*.cuh"
     exclude:
       - "src/**/reference/**"
       - "tests/**"
