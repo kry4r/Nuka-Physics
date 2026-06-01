@@ -127,10 +127,50 @@ nuka_result_t nuka_tape_reset(nuka_tape_handle tape);
 nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
                                        uint32_t link_index, float mass);
 
+// Sets the world's uniform gravity Z component (m/s^2). This is a plain world-
+// property setter (NOT diff-sim math): it mutates step_options.gravity.z, which
+// nuka_tape_create reads into RolloutParams.gravity_z at create time. It exists
+// to enable the p04 A4 FLOATING mass-gradcheck, whose recipe REQUIRES g=0 so the
+// deferred floating-base ORIENTATION channel (a_grav = R(base_rot)^T g) is inert
+// and the finite-difference isolates the velocity channel the adjoint covers.
+//
+// ORDER MATTERS: call this BEFORE nuka_tape_create -- a tape created earlier has
+// already captured the old gravity_z and will not see the change. Default behavior
+// is UNCHANGED until called (gravity stays {0,0,-9.81}); a world that never calls
+// this setter steps byte-identically (both the production stepper and the tape
+// forward). Returns NUKA_RESULT_NULL_HANDLE for a null world. DETERMINISTIC: a
+// host-side scalar write, no device work.
+nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z);
+
 // The number of forward steps currently recorded on the tape.
 uint32_t nuka_tape_step_count(nuka_tape_handle tape);
 // The per-step action / parameter width (== articulation total_link_count).
 uint32_t nuka_tape_link_count(nuka_tape_handle tape);
+
+// Returns a ZERO-COPY device-direct view into the tape's LIVE differentiable
+// state (the orchestrator's ArticulationDeviceState, advanced in place by
+// nuka_world_step_with_tape). This is the OBSERVATION side of the single-env
+// tape: unlike nuka_world_get_buffer_view's single-env arm (which rebuilds from
+// the world's HOST MIRROR, updated only by nuka_world_step / step_n -- NOT by
+// step_with_tape, so it reads stale 0.0 after tape steps), this serves the
+// device pointers the tape forward actually evolves. Mirrors
+// nuka_world_get_buffer_view's contract (null-guards `out`, zeros its fields).
+//   NUKA_FIELD_JOINT_POSITION -> state.q,     element_count == link_count,
+//                                stride sizeof(float).
+//   NUKA_FIELD_JOINT_VELOCITY -> state.qdot,  element_count == link_count,
+//                                stride sizeof(float).
+//   NUKA_FIELD_LINK_VELOCITY  -> state.link_velocity, element_count ==
+//                                link_count, stride == 6*sizeof(float) (a
+//                                LinkSpatialVel, omega-first [wx,wy,wz,vx,vy,vz];
+//                                the root slot is the live base spatial velocity
+//                                in the root-link body frame).
+//   else                      -> NUKA_RESULT_NOT_SUPPORTED.
+// Returns NUKA_RESULT_NULL_HANDLE if the tape is missing, NUKA_RESULT_INVALID_ARG
+// if `out` is null. READ-only (the views back the policy observation; do not
+// write through them -- write the action via the world's DRIVE_TARGET buffer).
+nuka_result_t nuka_tape_state_view(nuka_tape_handle tape,
+                                   nuka_state_field_t field,
+                                   nuka_buffer_view_t* out);
 
 #ifdef __cplusplus
 }

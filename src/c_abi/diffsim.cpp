@@ -312,6 +312,64 @@ uint32_t nuka_tape_link_count(nuka_tape_handle tape) {
     return (record != nullptr) ? record->total_link_count : 0u;
 }
 
+nuka_result_t nuka_tape_state_view(nuka_tape_handle tape,
+                                   nuka_state_field_t field,
+                                   nuka_buffer_view_t* out) {
+    if (out == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    out->device_ptr = nullptr;
+    out->element_count = 0u;
+    out->element_stride_bytes = 0u;
+    out->dtype = 0u;
+
+    TapeRecord* record = TapeTable().Get(tape);
+    if (record == nullptr || !record->orchestrator) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    try {
+        // The orchestrator's live device state -- the SAME pointers
+        // nuka_world_step_with_tape advances in place (StepOnce). Serving them
+        // device-direct here is what makes the tape OBSERVABLE: a fresh view
+        // after step_with_tape reflects the evolved q/qdot/link_velocity (the
+        // host-mirror path in nuka_world_get_buffer_view's single-env arm does
+        // NOT, because step_with_tape never updates the host mirror).
+        const auto state = record->orchestrator->State();
+        if (field == NUKA_FIELD_JOINT_POSITION) {
+            out->device_ptr = static_cast<void*>(state.q);
+            out->element_count = record->total_link_count;
+            out->element_stride_bytes = sizeof(float);
+            out->dtype = 0u;
+            return NUKA_RESULT_OK;
+        }
+        if (field == NUKA_FIELD_JOINT_VELOCITY) {
+            out->device_ptr = static_cast<void*>(state.qdot);
+            out->element_count = record->total_link_count;
+            out->element_stride_bytes = sizeof(float);
+            out->dtype = 0u;
+            return NUKA_RESULT_OK;
+        }
+        if (field == NUKA_FIELD_LINK_VELOCITY) {
+            // Per-link spatial velocity, link-major; each element is a
+            // LinkSpatialVel == 6 floats [wx,wy,wz, vx,vy,vz] (omega-first).
+            // SAME layout/comment as buffer.cpp's batched LINK_VELOCITY branch.
+            out->device_ptr = static_cast<void*>(state.link_velocity);
+            out->element_count = record->total_link_count;
+            out->element_stride_bytes = static_cast<uint32_t>(
+                sizeof(nuka::runtime::articulation::LinkSpatialVel));
+            out->dtype = 0u;
+            return NUKA_RESULT_OK;
+        }
+        return NUKA_RESULT_NOT_SUPPORTED;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
                                        uint32_t link_index, float mass) {
     WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
@@ -408,6 +466,19 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z) {
+    WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    // A plain host-side scalar write to the world's step options. nuka_tape_create
+    // reads step_options.gravity.z into RolloutParams.gravity_z, so this must be
+    // called BEFORE the tape is created to take effect on the differentiable
+    // rollout. No device work; nothing cached/derived to invalidate.
+    world_record->step_options.gravity.z = gravity_z;
+    return NUKA_RESULT_OK;
 }
 
 }  // extern "C"
