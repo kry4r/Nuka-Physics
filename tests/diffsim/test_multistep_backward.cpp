@@ -145,6 +145,66 @@ ChainModel BuildFixedChain() {
 }
 
 // ---------------------------------------------------------------------------
+// A FLOATING-base chain (6-DOF root + 2 revolute links). Mirrors the p02-A FD
+// test's floating model. Used for the multi-step floating grad-vs-FD test that
+// validates the cross-step grad_link_velocity carry + the v_root_pre snapshot.
+// ---------------------------------------------------------------------------
+ChainModel BuildFloatingChain() {
+    articulation::ArticulationCookedTopology topo;
+    topo.root_body = 0u;
+    topo.link_bodies = {0u, 1u, 2u};
+    topo.parent_links = {kInvalidLink, 0u, 1u};
+    topo.joint_types = {articulation::ArticulationJointType::FloatingBase,
+                        articulation::ArticulationJointType::Revolute,
+                        articulation::ArticulationJointType::Revolute};
+    topo.joint_axes = {Vec3::UnitZ(), Vec3::UnitX(), Vec3::UnitY()};
+    topo.parent_frames = {Transform::Identity(),
+                          Transform{Vec3{0.30f, 0.0f, 0.0f}, Quat::Identity()},
+                          Transform{Vec3{0.25f, 0.0f, 0.0f}, Quat::Identity()}};
+    topo.child_frames = {Transform::Identity(), Transform::Identity(),
+                         Transform::Identity()};
+    topo.local_poses = {Transform::Identity(), Transform::Identity(),
+                        Transform::Identity()};
+    topo.inertial_frames = {
+        Transform{Vec3{0.04f, 0.03f, -0.02f}, Quat::Identity()},
+        Transform{Vec3{0.12f, -0.03f, 0.04f}, Quat::Identity()},
+        Transform{Vec3{0.10f, 0.05f, -0.02f}, Quat::Identity()}};
+    topo.initial_positions = {0.0f, 0.30f, -0.45f};
+    topo.joint_dampings = {0.0f, 0.15f, 0.10f};
+    topo.joint_armatures = {0.0f, 0.03f, 0.02f};
+    const std::vector<float> masses = {4.0f, 1.2f, 0.8f};
+    const std::vector<Vec3> inertias = {
+        Vec3{0.08f, 0.07f, 0.05f}, Vec3{0.012f, 0.010f, 0.008f},
+        Vec3{0.008f, 0.007f, 0.005f}};
+    topo.masses = masses;
+    topo.inertias = inertias;
+
+    nuka::scene::CookedBodyTable bodies;
+    bodies.poses = {Transform::Identity(), Transform::Identity(), Transform::Identity()};
+    bodies.local_poses = bodies.poses;
+    bodies.inertial_frames = topo.inertial_frames;
+    bodies.masses = masses;
+    bodies.inertias = inertias;
+    bodies.is_static = {0u, 0u, 0u};  // movable root -> FloatingBase
+
+    ChainModel m;
+    m.host = articulation::BuildArticulationHostState({topo}, bodies);
+    m.link_count = m.host.TotalLinkCount();
+    for (uint32_t i = 0u; i < m.link_count; ++i) {
+        diffsim::LinkMassParams lp;
+        lp.mass = masses[i];
+        lp.diagonal_inertia = inertias[i];
+        lp.inertial_frame = topo.inertial_frames[i];
+        m.mass_params.push_back(lp);
+    }
+    m.dof_links = {1u, 2u};  // revolute DOFs (root is FloatingBase)
+    m.stiffness = {0.0f, 20.0f, 15.0f};
+    m.damping = {0.0f, 1.2f, 0.9f};
+    m.force_limits = {0.0f, 200.0f, 200.0f};
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // Device harness for a contact-free differentiable rollout on a small chain.
 // Owns the device state + orchestrator + tape + checkpoint manager + runner.
 // ---------------------------------------------------------------------------
@@ -182,6 +242,20 @@ public:
     }
     std::vector<float> GetQ() { return Download(State().q, n_); }
     std::vector<float> GetQdot() { return Download(State().qdot, n_); }
+
+    // Floating-base root spatial velocity (6 floats at link_velocity[0]).
+    void SetRootVel(const std::array<float, 6>& v) {
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        cudaMemcpy(State().link_velocity, v.data(), 6u * sizeof(float),
+                   cudaMemcpyHostToDevice);
+    }
+    std::array<float, 6> GetRootVel() {
+        std::array<float, 6> v{};
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        cudaMemcpy(v.data(), State().link_velocity, 6u * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        return v;
+    }
 
     // Drive a recorded rollout: at each step, upload the step's action into a
     // device buffer, capture a checkpoint on the K-cadence, record, StepOnce.
@@ -557,6 +631,152 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
            N, worst_action_rel, worst_mass_score);
     EXPECT_LT(worst_action_rel, 1e-3f);
     EXPECT_LT(worst_mass_score, 1.0f);  // < 1 == every link within abs OR rel tol
+}
+
+// ===========================================================================
+// 3b. MULTI-STEP GRAD vs FD (FLOATING base). Validates the cross-step
+//     grad_link_velocity carry + the per-step v_root_pre snapshot over a real
+//     multi-step rollout: grad_action[k] + grad_mass + d/d(v_root_0) vs
+//     central-difference on a scalar loss over the joint qdot' AND the root
+//     spatial velocity v_root'.
+//
+//     gravity_z = 0 (CRITICAL): the base-orientation channel (a_grav =
+//     R(base_rot)^T g + the quaternion pose integrator) is DEFERRED from p02-A
+//     and NOT differentiated. With gravity on, base tilt would make
+//     d(a_grav)/d(base_rot) a real forward-physics term the analytic grad omits
+//     -> a phantom FD mismatch unrelated to this fix. With g=0, a_grav == 0
+//     identically, so the deferred channel contributes nothing and the rollout
+//     isolates the velocity channel (gyroscopic ForceCross(v, I*v), the LDLT
+//     solve, and the v_root_pre linearization point). A nonzero INITIAL root
+//     angular velocity exercises the gyroscopic term across every step.
+// ===========================================================================
+TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFloatingChain();
+    const float dt = 0.01f, g = 0.0f;  // g=0 -> deferred a_grav channel is inert
+    const uint32_t N = 5u;             // short horizon -> FD truncation stays clean
+    const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
+    const std::vector<float> qd0(model.link_count, 0.0f);
+    // Nonzero root spatial velocity, AMPLIFIED angular part (first 3 comps) so the
+    // root gyroscopic bias is exercised each step.
+    const std::array<float, 6> rootv0 = {1.5f, -1.2f, 1.8f, 0.20f, -0.15f, 0.12f};
+    const auto& dofs = model.dof_links;
+
+    // Fixed (step-independent) action so FD on action[k] of one step is clean.
+    std::vector<std::vector<float>> actions(N, std::vector<float>(model.link_count, 0.0f));
+    const std::vector<float> base_action = {0.0f, 0.40f, -0.30f};
+    for (uint32_t s = 0u; s < N; ++s) actions[s] = base_action;
+
+    // Scalar loss on the FINAL state: joints qdot' + root spatial velocity v_root'.
+    std::vector<float> wqd(model.link_count, 0.0f);
+    wqd[1] = -0.3f; wqd[2] = 0.7f;
+    const std::array<float, 6> wrv = {0.3f, -0.4f, 0.6f, -0.2f, 0.5f, -0.35f};
+
+    diffsim::TapeDesc desc;
+    desc.checkpoint_interval = 2u;  // exercise the recompute path (K < N)
+    desc.max_tape_entries = 64u;
+    desc.max_checkpoints = 32u;
+    desc.recompute_on_backward = 1u;
+
+    // -- Analytic grads via the backward runner. --
+    RolloutHarness h(ctx, model, dt, g, desc);
+    h.SetState(q0, qd0);
+    h.SetRootVel(rootv0);
+    h.Record(actions);
+    auto ga = h.MakeOutputActions(N);
+    auto gm = h.MakeOutputMass();
+    nuka::phi::Buffer bsqd(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    bsqd.CopyFromHost(wqd.data(), wqd.size() * sizeof(float));
+    // grad_link_velocity_final: seed wrv on the root 6-vector (zero elsewhere).
+    std::vector<float> glv(model.link_count * 6u, 0.0f);
+    for (uint32_t i = 0u; i < 6u; ++i) glv[i] = wrv[i];
+    nuka::phi::Buffer bglv(glv.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    bglv.CopyFromHost(glv.data(), glv.size() * sizeof(float));
+    diffsim::BackwardSeeds seeds;
+    seeds.grad_qdot_final = static_cast<const float*>(bsqd.Data());
+    seeds.grad_link_velocity_final = static_cast<const float*>(bglv.Data());
+    diffsim::BackwardOutputs out;
+    out.grad_actions = static_cast<float*>(ga.Data());
+    out.grad_mass = static_cast<float*>(gm.Data());
+    h.Runner().Run(h.Tape(), h.Checkpoints(), seeds, out);
+    const std::vector<float> grad_actions = h.DownloadBuf(ga);  // [N*n]
+    const std::vector<float> grad_mass = h.DownloadBuf(gm);     // [n]
+
+    // -- Central FD: a pure forward roll + loss, with perturbations on action,
+    //    mass, and the initial root velocity. --
+    auto forward_loss = [&](const std::vector<std::vector<float>>& acts,
+                            int mass_link, float mass_delta,
+                            int rootv_comp, float rootv_delta) {
+        ChainModel m = model;
+        if (mass_link >= 0) {
+            const diffsim::LinkMassParams& lp = model.mass_params[mass_link];
+            m.host.link_inertia[mass_link] = articulation::MakeSpatialInertia(
+                lp.mass + mass_delta, lp.diagonal_inertia, lp.inertial_frame);
+        }
+        diffsim::TapeDesc d2 = desc;
+        d2.recompute_on_backward = 0u;
+        RolloutHarness hh(ctx, m, dt, g, d2);
+        hh.SetState(q0, qd0);
+        std::array<float, 6> rv = rootv0;
+        if (rootv_comp >= 0) rv[rootv_comp] += rootv_delta;
+        hh.SetRootVel(rv);
+        nuka::phi::Buffer ab(model.link_count * sizeof(float),
+                             nuka::phi::MemoryKind::Device);
+        for (uint32_t s = 0u; s < N; ++s) {
+            hh.Upload(static_cast<float*>(ab.Data()), acts[s]);
+            hh.Orch().StepOnce(static_cast<const float*>(ab.Data()));
+        }
+        hh.Sync();
+        const std::vector<float> qd = hh.GetQdot();
+        const std::array<float, 6> rvf = hh.GetRootVel();
+        float L = 0.0f;
+        for (uint32_t k : dofs) L += wqd[k] * qd[k];
+        for (uint32_t i = 0u; i < 6u; ++i) L += wrv[i] * rvf[i];
+        return L;
+    };
+
+    const float eps = 1e-3f;
+    // grad_action[k] for each step s, each DOF k.
+    float worst_action_rel = 0.0f;
+    for (uint32_t s = 0u; s < N; ++s) {
+        for (uint32_t k : dofs) {
+            auto perturb = [&](float d) {
+                auto acts = actions;
+                acts[s][k] += d;
+                return forward_loss(acts, -1, 0.0f, -1, 0.0f);
+            };
+            const float fd = (perturb(eps) - perturb(-eps)) / (2.0f * eps);
+            const float an = grad_actions[s * model.link_count + k];
+            const float denom = std::max(1e-3f, std::fabs(an) + std::fabs(fd));
+            const float rel = std::fabs(an - fd) / denom;
+            worst_action_rel = std::max(worst_action_rel, rel);
+        }
+    }
+    // grad_mass for each link (small-magnitude -> abs-OR-rel, same as fixed-base).
+    // NOTE: grad_action + grad_mass are seeded with grad_link_velocity_final=wrv on
+    // the root and the FD loss includes v_root', so they flow back THROUGH every
+    // step's v_root_pre snapshot + the cross-step grad_link_velocity carry. A wrong
+    // snapshot at any step would show here -> this IS the floating carry validation
+    // (the dedicated linearization-point GUARD is the large-dt twin-variant test).
+    const float mass_abs_tol = 5e-3f, mass_rel_tol = 1e-2f;
+    float worst_mass_score = 0.0f;
+    for (uint32_t l = 0u; l < model.link_count; ++l) {
+        auto perturb = [&](float d) { return forward_loss(actions, (int)l, d, -1, 0.0f); };
+        const float fd = (perturb(eps) - perturb(-eps)) / (2.0f * eps);
+        const float an = grad_mass[l];
+        const float abs_err = std::fabs(an - fd);
+        const float denom = std::max(1e-6f, std::fabs(an) + std::fabs(fd));
+        const float rel_err = abs_err / denom;
+        const float score = std::min(abs_err / mass_abs_tol, rel_err / mass_rel_tol);
+        worst_mass_score = std::max(worst_mass_score, score);
+        printf("  [float mass l=%u] analytic=%.5e fd=%.5e abs=%.2e rel=%.2e\n",
+               l, an, fd, abs_err, rel_err);
+    }
+    printf("[multistep grad vs FD FLOATING] N=%u worst_action_rel=%.3e "
+           "worst_mass_score=%.3e\n",
+           N, worst_action_rel, worst_mass_score);
+    EXPECT_LT(worst_action_rel, 3e-3f);
+    EXPECT_LT(worst_mass_score, 1.0f);
 }
 
 // ===========================================================================

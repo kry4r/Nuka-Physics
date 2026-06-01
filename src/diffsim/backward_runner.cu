@@ -58,6 +58,7 @@ BackwardRunner::BackwardRunner(const phi::DeviceContext& context,
     const size_t n = total_link_count_;
     q_pre_ = ZeroedFloat(context_, n);
     qdot_pre_ = ZeroedFloat(context_, n);
+    v_root_pre_ = ZeroedFloat(context_, n * 6u);
     grad_q_ = ZeroedFloat(context_, n);
     grad_qdot_ = ZeroedFloat(context_, n);
     grad_link_vel_ = ZeroedFloat(context_, n * 6u);
@@ -82,6 +83,15 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
         CheckCuda(cudaMemcpyAsync(qdot_pre_.Data(), state.qdot, n * sizeof(float),
                                   cudaMemcpyDeviceToDevice, stream),
                   "snapshot qdot_pre");
+        // Snapshot the PRE-INTEGRATION root spatial velocity. The forward's
+        // IntegrateFloatingBaseVelocity (inside StepOnce below) overwrites
+        // link_velocity[root] in place (v_pre -> v_post); the root gyroscopic
+        // adjoint must linearize at v_pre. Whole-buffer copy (LinkSpatialVel is
+        // float[6], no padding) -> v_root_pre_[link*6 .. +6).
+        CheckCuda(cudaMemcpyAsync(v_root_pre_.Data(), state.link_velocity,
+                                  n * sizeof(articulation::LinkSpatialVel),
+                                  cudaMemcpyDeviceToDevice, stream),
+                  "snapshot v_root_pre");
     }
 
     // 2. Re-run the forward of THIS step: regenerates step-j ABA intermediates
@@ -102,6 +112,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
     StepBackwardInputs in = orch_.ReconstructInputs(tape, step);
     in.q_pre = static_cast<const float*>(q_pre_.Data());
     in.qdot_pre = static_cast<const float*>(qdot_pre_.Data());
+    in.v_root_pre = static_cast<const float*>(v_root_pre_.Data());
 
     StepBackwardGrads g;
     g.grad_q_out = static_cast<float*>(grad_q_.Data());
