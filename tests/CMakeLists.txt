@@ -210,6 +210,42 @@ if(TARGET nuka)
     gtest_discover_tests(nuka_sensor_noise_cabi_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p04 N2: per-episode domain randomization (sampling + apply + D1) -
+    # Reads c_abi/internal.hpp (WorldRecord) for mass/gravity readback + calls
+    # SampleEpisodeRandomization directly (nuka_sensor_noise), so it needs the
+    # src/ include + the runtime libs (same pattern as the mass-setter FD test).
+    if(CMAKE_CUDA_COMPILER)
+        add_executable(nuka_n2_domain_randomization_test
+            sensor/test_n2_domain_randomization.cpp
+        )
+
+        target_compile_definitions(nuka_n2_domain_randomization_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_n2_domain_randomization_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+                ${CMAKE_SOURCE_DIR}/src
+        )
+
+        target_link_libraries(nuka_n2_domain_randomization_test
+            PRIVATE
+                nuka
+                nuka_sensor_noise
+                nuka_runtime
+                nuka_articulation_gpu
+                nuka_core
+                nuka_phi
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_n2_domain_randomization_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endif()
+
     # --- v0.5 p04-A0: runtime link-mass setter + C-ABI mass-gradient FD proof --
     # Operations under test are pure C-ABI (set_link_mass / step_with_tape /
     # tape_backward); the internal libs are linked only for setup + reading the

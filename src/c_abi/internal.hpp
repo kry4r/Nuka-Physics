@@ -97,6 +97,21 @@ struct WorldRecord {
     static constexpr uint32_t kNoiseFieldCount = 16u;
     nuka::sensor::noise::SensorNoiseConfig noise_config[kNoiseFieldCount];
     uint64_t noise_seq[kNoiseFieldCount] = {};
+
+    // --- v0.5 p04 N2: per-episode domain randomization ----------------------
+    // The DR descriptor (default disabled -> apply is a byte no-op, oracle safe).
+    // A per-env multiplier/offset is sampled as a PURE FUNCTION of (seed, env_idx,
+    // param) at apply time (no mutable sampled state to checkpoint), so the
+    // diff-sim backward stays D1 byte-exact two-run with DR on.
+    nuka::sensor::noise::DomainRandomizationConfig dr_config;
+    // NOMINAL baseline, snapshotted ONCE on the first enabled apply so repeated
+    // resets re-randomize AROUND nominal (idempotent) rather than compounding a
+    // random walk. `dr_baseline_captured` guards the one-time snapshot.
+    bool dr_baseline_captured = false;
+    std::vector<float> dr_nominal_link_mass;       // per global link (kg)
+    std::vector<float> dr_nominal_joint_armature;  // per global DOF
+    float dr_nominal_gravity_z = 0.0f;
+    float dr_nominal_friction = 0.0f;  // batched contact path scalar (inert here)
 };
 
 struct BufferRecord {

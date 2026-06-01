@@ -532,6 +532,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka_sensor_noise STATIC
         sensor/noise/n1_gaussian.cu
         sensor/noise/n1_poisson.cu
+        sensor/noise/n2_domain_randomization.cpp
     )
     set_target_properties(nuka_sensor_noise PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

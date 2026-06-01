@@ -40,6 +40,27 @@
 
 #include <cstdint>
 
+// HOST/DEVICE portability. The Philox helpers are __host__ __device__ so the SAME
+// pure function runs in a CUDA kernel (the N1 .cu noise path) AND on the host (the
+// N2 domain-randomization sampling, compiled by the plain C++ toolchain). When
+// this header is included from a non-NVCC translation unit (.cpp), __host__ /
+// __device__ / __forceinline__ are not defined, so map them to empty / inline.
+// <cmath> supplies the sqrtf/logf/cosf/sinf/expf the normal/Poisson host path uses
+// (NVCC injects these via its device math headers; the host needs the explicit
+// include).
+#ifndef __CUDACC__
+#include <cmath>
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __forceinline__
+#define __forceinline__ inline
+#endif
+#endif  // __CUDACC__
+
 namespace nuka::sensor::noise {
 
 // Philox4x32-10 round constants (the canonical Random123 values).
