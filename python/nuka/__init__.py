@@ -39,6 +39,7 @@ from ._nuka_ext import (  # noqa: F401
     CONTROL_MODE_TORQUE,
     CONTROL_MODE_VELOCITY,
     CONTROL_MODE_COMPUTED_TORQUE,
+    CONTROL_MODE_OSC,
     CONTROL_MODE_ACTUATOR,
 )
 
@@ -59,6 +60,8 @@ DRIVE_FORCE_LIMIT = Field.DRIVE_FORCE_LIMIT
 TORQUE_INPUT = Field.TORQUE_INPUT
 VELOCITY_TARGET = Field.VELOCITY_TARGET
 ACTUATOR_NOLOAD_SPEED = Field.ACTUATOR_NOLOAD_SPEED
+# v0.5 C-fwd slice 3: writable per-ENV Osc task target (float3 {x,y,z} per env).
+TASK_TARGET = Field.TASK_TARGET
 # p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
 # immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
 BASE_POSE = Field.BASE_POSE
@@ -130,11 +133,13 @@ __all__ = [
     "TORQUE_INPUT",
     "VELOCITY_TARGET",
     "ACTUATOR_NOLOAD_SPEED",
+    "TASK_TARGET",
     "BASE_POSE",
     "CONTROL_MODE_PD_POSITION",
     "CONTROL_MODE_TORQUE",
     "CONTROL_MODE_VELOCITY",
     "CONTROL_MODE_COMPUTED_TORQUE",
+    "CONTROL_MODE_OSC",
     "CONTROL_MODE_ACTUATOR",
     "LINK_POSE_FLOATS",
     "LINK_VELOCITY_FLOATS",

@@ -21,6 +21,8 @@ int main(void) {
     world_desc.control_mode = 0u;  // v0.5 C-fwd: PDPosition (default). Must be set
                                    // explicitly -- this desc is not zero-init, so a
                                    // garbage stack value would be rejected.
+    world_desc.osc_task_link = 0u;  // v0.5 C-fwd slice 3: Osc task link; unused for
+                                    // PDPosition but set for the non-zero-init desc.
 
     nuka_world_handle world = 0;
     assert(nuka_world_create_from_scene(device, &world_desc, &world) == NUKA_RESULT_OK);

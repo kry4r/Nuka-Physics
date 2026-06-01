@@ -91,6 +91,14 @@ struct BatchedArticulatedStepParams {
     // zero-filled buffer is safe. Always-allocated owned buffer (stable pointer
     // for the captured graph); only read by stage 1 in Actuator mode.
     const float* actuator_noload_speed = nullptr;
+    // v0.5 C-fwd slice 3 (p03 R2): per-ENV operational-space-control TASK TARGET
+    // for Osc mode -- the 3-float world position the chosen task link is driven
+    // toward. Layout is per-ENV (NOT per-link): float[env_count * 3], env-major,
+    // element env*3 = {x,y,z}. Always-allocated owned buffer (stable pointer for
+    // the captured graph); only read by stage 1 in Osc mode. The task link itself
+    // is fixed at world construction (BatchedArticulatedWorld's osc_task_link),
+    // NOT a per-step field, so the captured graph never re-keys on it.
+    const float* task_target = nullptr;
     float gravity_z = -9.81f;
     float dt = 1.0f / 240.0f;
     float friction_coefficient = articulation::kContactFriction;
@@ -118,11 +126,19 @@ public:
     // `control_mode` (v0.5 C-fwd) selects the stage-1 control law for this
     // world's Step, fixed at construction (mirroring `determinism`). Defaults to
     // PDPosition so every existing call site and a zero-initialized C ABI desc
-    // map to the legacy PD drive (byte-for-byte unchanged). Only PDPosition /
-    // Torque / Velocity are implemented; a reserved enumerator (ComputedTorque /
-    // Osc / Actuator) throws std::invalid_argument rather than silently mis-
-    // actuating. Fixed at construction so the captured CUDA graph never has to
-    // re-key on a per-step mode change (a future setter MUST invalidate the graph).
+    // map to the legacy PD drive (byte-for-byte unchanged). ALL six modes
+    // (PDPosition / Torque / Velocity / ComputedTorque / Osc / Actuator) are
+    // implemented; a value ABOVE Actuator throws std::invalid_argument rather than
+    // silently mis-actuating. Fixed at construction so the captured CUDA graph
+    // never has to re-key on a per-step mode change (a future setter MUST
+    // invalidate the graph).
+    // `osc_task_link` (v0.5 C-fwd slice 3, Osc mode only) is the articulation-LOCAL
+    // link index of the operational-space-control task link (the link whose world
+    // position the 3-DOF position task drives toward task_target). Fixed at
+    // construction (world-static, like control_mode) so the captured graph never
+    // re-keys on it. Ignored by every non-Osc mode. Defaults to 0 (the root) --
+    // for a fixed-base scene that yields a zero task Jacobian (no-op), so a caller
+    // MUST pass a real end-effector (e.g. a foot/calf) local index to drive a task.
     BatchedArticulatedWorld(const phi::DeviceContext& context,
                             const articulation::ArticulationHostState& host,
                             const std::vector<articulation::FootShape>& feet,
@@ -130,7 +146,8 @@ public:
                             float ground_height,
                             DeterminismLevel determinism = DeterminismLevel::Strong,
                             articulation::ControlMode control_mode =
-                                articulation::ControlMode::PDPosition);
+                                articulation::ControlMode::PDPosition,
+                            uint32_t osc_task_link = 0u);
 
     // Destroys the cached CUDA graph / exec / private graph stream (p01-W3) along
     // with the owned device state. Defined out-of-line in the .cu (CUDA cleanup).
@@ -159,6 +176,13 @@ public:
     const phi::Buffer& ActuatorNoloadSpeedBuffer() const {
         return actuator_noload_speed_;
     }
+    // v0.5 C-fwd slice 3 (p03 R2): per-ENV operational-space-control task target
+    // for Osc mode (float[env_count * 3], env-major {x,y,z}). Always allocated
+    // (zero-filled); the C ABI / RL harness writes it in place and the next Step
+    // picks it up. Only consulted by stage 1 in Osc mode.
+    const phi::Buffer& TaskTargetBuffer() const { return task_target_; }
+    // The Osc task link (articulation-local index) this world was created with.
+    uint32_t OscTaskLink() const { return osc_task_link_; }
 
     // Advances one deterministic step in place on the device state, recording
     // per-stage timings under the canonical perf tags. The persistent lambda
@@ -315,6 +339,7 @@ private:
     DeterminismLevel determinism_ = DeterminismLevel::Strong;  // p01-W4
     articulation::ControlMode control_mode_ =
         articulation::ControlMode::PDPosition;  // v0.5 C-fwd
+    uint32_t osc_task_link_ = 0u;  // v0.5 C-fwd slice 3 (Osc task link, local idx)
 
     // Scratch (allocated once, reused every step).
     phi::Buffer feet_;            // FootShape[foot_count]
@@ -345,6 +370,7 @@ private:
     phi::Buffer torque_input_;    // float[total_link_count]
     phi::Buffer velocity_target_; // float[total_link_count]
     phi::Buffer actuator_noload_speed_;  // float[total_link_count] (slice 2)
+    phi::Buffer task_target_;            // float[env_count * 3] (slice 3, Osc)
 
     // v0.5 C-fwd slice 2: ComputedTorque scratch. qddot_free_ holds the engine
     // qddot from the EARLY tau=0 ABA pass run at the START of the step (in

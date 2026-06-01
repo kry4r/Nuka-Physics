@@ -10,10 +10,11 @@
 //
 // Slice 1 implements PDPosition (byte-for-byte the legacy path), Torque, and
 // Velocity. Slice 2 ADDS ComputedTorque (inverse-dynamics / computed-torque PD)
-// and Actuator (DC-motor torque-speed envelope). Osc remains a RESERVED
-// enumerator for the Phase-3 solver slice -- the C ABI / the
-// BatchedArticulatedWorld constructor reject Osc (and any value above Actuator)
-// so an unimplemented mode is never silently mis-actuated.
+// and Actuator (DC-motor torque-speed envelope). Slice 3 (p03 R2) ADDS Osc
+// (operational-space control: forward, position-task mode). The C ABI / the
+// BatchedArticulatedWorld constructor reject any value ABOVE Actuator so an
+// unimplemented mode is never silently mis-actuated; ALL six enumerators
+// {0,1,2,3,4,5} are now implemented (the set is contiguous).
 //
 // The dispatch is HOST-SIDE: PDPosition routes to the existing, untouched
 // ApplyPositionDriveKernel (so the PD instruction / FP order -- and thus the
@@ -35,18 +36,17 @@ enum class ControlMode : uint8_t {
     Torque = 1,         // tau = torque_input               (direct torque)
     Velocity = 2,       // tau = Kp_v*(velocity_target-qdot)(velocity servo)
     ComputedTorque = 3, // tau = M*(qddot_des+Kp*e+Kd*edot)+bias (inverse dynamics)
-    Osc = 4,            // RESERVED (Phase-3 solver slice)
+    Osc = 4,            // tau = J^T*Lambda*(Kp*e_x+Kd*edot_x) (operational-space)
     Actuator = 5,       // tau = clamp(torque_cmd, +/-tau_max(qdot)) (DC motor)
 };
 
 // Whether a control mode is IMPLEMENTED. PDPosition/Torque/Velocity (slice 1),
-// ComputedTorque + Actuator (slice 2) are implemented; Osc (4) is still RESERVED
-// for the Phase-3 solver slice and is rejected at the ABI / world-construction
-// boundary rather than silently falling back to PD. The set is non-contiguous
-// ({0,1,2,3,5}), so this is NOT a simple `<= threshold` (Osc=4 is the hole).
+// ComputedTorque + Actuator (slice 2), and Osc (slice 3, p03 R2 -- forward
+// position-task operational-space control) are ALL implemented. The set is now
+// CONTIGUOUS ({0,1,2,3,4,5}), so this is a simple `<= Actuator` bound; only
+// values ABOVE Actuator are rejected at the ABI / world-construction boundary.
 inline constexpr bool IsControlModeImplemented(uint8_t mode) {
-    return mode <= static_cast<uint8_t>(ControlMode::ComputedTorque) ||
-           mode == static_cast<uint8_t>(ControlMode::Actuator);
+    return mode <= static_cast<uint8_t>(ControlMode::Actuator);
 }
 
 } // namespace nuka::runtime::articulation

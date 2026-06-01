@@ -505,9 +505,9 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             ? nuka::runtime::gpu::DeterminismLevel::Weak
             : nuka::runtime::gpu::DeterminismLevel::Strong;
     // v0.5 C-fwd: stage-1 control mode. 0 = PDPosition (default), 1 = Torque,
-    // 2 = Velocity, 3 = ComputedTorque, 5 = Actuator. 4 (Osc) is a reserved
-    // enumerator for the Phase-3 solver slice; it and any value > 5 are rejected
-    // (NOT silently mis-actuated).
+    // 2 = Velocity, 3 = ComputedTorque, 4 = Osc (operational-space control,
+    // forward position task on desc->osc_task_link toward NUKA_FIELD_TASK_TARGET),
+    // 5 = Actuator. Only a value > 5 is rejected (NOT silently mis-actuated).
     if (!nuka::runtime::articulation::IsControlModeImplemented(
             desc->control_mode)) {
         return NUKA_RESULT_INVALID_ARG;
@@ -591,7 +591,8 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                     max_dof,
                     ground_height,
                     determinism,
-                    control_mode);
+                    control_mode,
+                    desc->osc_task_link);  // v0.5 C-fwd slice 3 (Osc task link).
 
             // Replicate the base hold drives across all envs (link-major).
             record->batched_drive_targets_device =
@@ -629,6 +630,10 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             // ACTUATOR_NOLOAD_SPEED view aliases; never read outside Actuator mode).
             params.actuator_noload_speed = static_cast<const float*>(
                 record->batched->ActuatorNoloadSpeedBuffer().Data());
+            // slice 3: Osc per-env task target (owned, always-allocated buffer the
+            // TASK_TARGET view aliases; never read outside Osc mode).
+            params.task_target = static_cast<const float*>(
+                record->batched->TaskTargetBuffer().Data());
             params.gravity_z = record->step_options.gravity.z;
             params.dt = record->step_options.dt;
             params.friction_coefficient =

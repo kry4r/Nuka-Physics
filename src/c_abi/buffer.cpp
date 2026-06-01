@@ -179,6 +179,24 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 out->dtype = 0u;
                 return NUKA_RESULT_OK;
             }
+            if (field == NUKA_FIELD_TASK_TARGET) {
+                // v0.5 C-fwd slice 3: WRITABLE per-ENV (NOT per-link) Osc task
+                // target. element_count == env_count, element_stride_bytes ==
+                // 3*sizeof(float) (a {x,y,z} world target per env). Aliases the
+                // batched world's owned, always-allocated buffer (write IN PLACE;
+                // picked up by the NEXT step WHEN control_mode == Osc, else exists
+                // but is never read). Separate branch from the per-link control
+                // fields because the layout/stride differ.
+                const nuka::phi::Buffer& buf = batched.TaskTargetBuffer();
+                if (buf.Size() == 0u) {
+                    return NUKA_RESULT_NOT_SUPPORTED;
+                }
+                out->device_ptr = const_cast<void*>(buf.Data());
+                out->element_count = buf.Size() / (3u * sizeof(float));
+                out->element_stride_bytes = 3u * sizeof(float);
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
             if (field == NUKA_FIELD_CONTACT_POINTS) {
                 // Vec3 (3 floats) per contact slot; slot_count == env_count *
                 // kMaxFootContactsPerEnv. Inactive slots are zero (see T2 doc).

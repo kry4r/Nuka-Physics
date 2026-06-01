@@ -89,10 +89,30 @@ def test_slice2_control_mode_world_steps(device, mode, field):
         assert torch.isfinite(q).all()
 
 
-def test_osc_mode_rejected(device):
-    # Osc (4) is the still-reserved Phase-3 mode; construction must reject it.
+def test_osc_mode_world_steps(device):
+    # Osc (4, p03 R2): operational-space control, forward position task. The
+    # binding smoke -- the world constructs in Osc mode (with a task link) and
+    # steps without throwing, and the per-ENV TASK_TARGET view is writable and
+    # correctly shaped (env_count x 3, NOT per-link). osc_task_link picks a
+    # non-root link so the task Jacobian is non-trivial.
+    with nuka.World.create_from_scene(
+        device, SCENE, 64, control_mode=nuka.CONTROL_MODE_OSC, osc_task_link=3
+    ) as w:
+        view = torch.from_dlpack(w.buffer_view(nuka.TASK_TARGET))
+        assert view.is_cuda
+        # Per-ENV float3 {x,y,z}: env_count * 3 floats.
+        assert view.numel() == w.env_count * 3
+        view.zero_()  # writable in place.
+        w.step()  # the Osc stage-1 law must step without throwing.
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        assert torch.isfinite(q).all()
+
+
+def test_out_of_range_control_mode_rejected(device):
+    # All six modes {0..5} are implemented; a value above Actuator (5) is rejected.
     with pytest.raises(Exception):
-        nuka.World.create_from_scene(device, SCENE, 64, control_mode=4)
+        nuka.World.create_from_scene(device, SCENE, 64, control_mode=6)
 
 
 def test_4096_smoke(device):
