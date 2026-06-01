@@ -636,6 +636,29 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_articulation_contact_rows_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.5 p02-A: differentiable single-step ABA reverse (FD ladder) -----
+    add_executable(nuka_diffsim_aba_reverse_test
+        diffsim/test_aba_reverse_fd.cpp
+    )
+
+    target_compile_definitions(nuka_diffsim_aba_reverse_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_diffsim_aba_reverse_test
+        PRIVATE
+            nuka_diffsim
+            nuka_runtime
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_diffsim_aba_reverse_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
     add_executable(nuka_floating_base_aba_test
         runtime/test_floating_base_aba.cpp
