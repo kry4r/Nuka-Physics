@@ -4,7 +4,13 @@
 // ---------------------------------------------------------------------------
 //
 // THE forward this whole differentiable rollout is built on. The p02-A adjoint
-// (StepBackward) is the EXACT reverse of ONE contact-free PD step:
+// (StepBackward) is the reverse of ONE contact-free PD step. It is EXACT on the
+// joint channel (q/qdot/tau/mass) AND the floating-base VELOCITY channel (the
+// root spatial velocity v_root', whose gyroscopic bias is linearized at the
+// PRE-integration v_root_pre snapshot). The base-ORIENTATION channel is DEFERRED
+// (NOT differentiated): the a_grav = R(base_rot)^T g dependence on base rotation
+// and the quaternion POSE integrator -- base orientation is held fixed, the
+// supported loss seeds are q'/qdot'/v_root', NOT base_pose'. The step:
 //
 //     tau = clamp(Kp*(target-q) - Kd*qdot)          (ApplyPositionDrives, EXPLICIT
 //                                                     damping: defer_velocity_damping=false)
@@ -22,7 +28,8 @@
 // FD test (rung e / floating) validates against, here for ALL THREE roles:
 // record (the live forward), replay (regenerate a window's intermediates), and
 // the FD oracle. One forward function -> the adjoint it pairs with is the one
-// p02-A proved exact.
+// p02-A FD-validated exact on the joint + floating-VELOCITY channels (the
+// base-orientation channel stays deferred -- see above).
 //
 // The orchestrator owns the per-step drive descriptors (gains / force-limits,
 // rollout-constant) as device buffers, the dt / gravity, and the K-cadence

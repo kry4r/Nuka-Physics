@@ -31,21 +31,29 @@
 // (its intermediates -- link_xup, joint_motion_subspace, link_articulated_I,
 // joint_diagonal, link_u_spatial, joint_force, link_velocity, link_velocity_bias,
 // link_bias_force, link_acceleration, qddot -- persist in the device buffers and
-// are read by the reverse). The caller snapshots the PRE-step q / qdot (the
-// integrators overwrite them in place; the drive + ABA pass-1/2 reverses need the
-// pre-step values).
+// are read by the reverse). The caller snapshots the PRE-step q / qdot AND the
+// PRE-integration root spatial velocity v_root_pre (the integrators overwrite all
+// three in place; the drive + ABA pass-1/2 reverses, and the root gyroscopic
+// adjoint's linearization point, need the pre-step values).
 //
 // COVERAGE (FD-validated, see tests/diffsim/test_aba_reverse_fd.cpp):
 //   * Fixed-base revolute chain: d/d(tau,qdot,q,mass), the EXACT M^-1 cross-check
 //     (~1e-7), integration, and the full drive step d/d(action) + d/d(mass).
-//   * Floating-base root (FloatingBase joint): the VELOCITY channel -- the 6x6
-//     LDLT-solve adjoint at the root, the root gyroscopic pass-1 reverse, and the
-//     floating-base linear-velocity integrator reverse, seeded via
-//     grad_link_velocity_out and FD-validated d/d(tau) + d/d(mass).
-// NOT yet differentiated (a later p02 slice): the base ORIENTATION channel (the
-// a_grav = R(base_rot)^T g dependence + the quaternion POSE integrator -- base
-// orientation is held fixed; supported loss seeds are q'/qdot' and v_root', NOT
-// base_pose'), the prismatic-joint q-channel, and contacts.
+//   * Floating-base root (FloatingBase joint): the VELOCITY channel is EXACT --
+//     the 6x6 LDLT-solve adjoint at the root, the root gyroscopic pass-1 reverse,
+//     and the floating-base linear-velocity integrator reverse, seeded via
+//     grad_link_velocity_out and FD-validated d/d(tau) + d/d(mass) + d/d(v_root).
+//     CRITICAL: the root gyroscopic bias p[root] = ForceCross(v, I*v) is QUADRATIC
+//     in the root spatial velocity v, so its adjoint (and the grad_I[root] ->
+//     grad_mass[root] outer-product path) is linearized at the PRE-integration
+//     v_root (StepBackwardInputs::v_root_pre), NOT the live post-integration value
+//     that IntegrateFloatingBaseVelocity leaves in link_velocity[root]. The
+//     large-dt twin-variant FD test guards this linearization point.
+// NOT differentiated (the base-ORIENTATION channel is DEFERRED, NOT exact): the
+// a_grav = R(base_rot)^T g dependence on base rotation + the quaternion POSE
+// integrator -- base orientation is held fixed; supported loss seeds are q'/qdot'
+// and v_root', NOT base_pose'. Also deferred: the prismatic-joint q-channel and
+// contacts.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
@@ -67,6 +75,16 @@ struct StepBackwardInputs {
     // Pre-step joint state (device, total_link_count).
     const float* q_pre = nullptr;
     const float* qdot_pre = nullptr;
+    // Pre-INTEGRATION root spatial velocity (device, total_link_count*6, one
+    // 6-vector per link -- only the floating root entries are read). Snapshotted
+    // by the caller BEFORE IntegrateFloatingBaseVelocity overwrote the live
+    // link_velocity[root] (v_pre -> v_post). The forward evaluated the root
+    // gyroscopic bias p[root] = ForceCross(v, I*v) at v_pre; that bias is
+    // QUADRATIC in v, so its adjoint (and the grad_I[root] -> grad_mass[root]
+    // path) must linearize at v_pre, NOT the live post-integration value. When
+    // null the root gyroscopic reverse falls back to the live state (legal only
+    // for fixed-base models, which have no floating root).
+    const float* v_root_pre = nullptr;
     // Drive (action) descriptors (device, total_link_count).
     const float* drive_targets = nullptr;    // the ACTION input we differentiate
     const float* drive_stiffness = nullptr;  // Kp

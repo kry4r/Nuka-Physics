@@ -204,6 +204,7 @@ public:
         grad_link_vel_ = MakeDeviceFloat(std::vector<float>(n_ * 6u, 0.0f));
         q_pre_ = MakeDeviceFloat(std::vector<float>(n_, 0.0f));
         qdot_pre_ = MakeDeviceFloat(std::vector<float>(n_, 0.0f));
+        v_root_pre_ = MakeDeviceFloat(std::vector<float>(n_ * 6u, 0.0f));
     }
 
     articulation::ArticulationDeviceState View() { return device_.View(); }
@@ -234,11 +235,25 @@ public:
     // joint pos integrate (the contact-free floating step, matching StepFloating).
     void ForwardFloating(float gravity_z, float dt) {
         articulation::FeatherstoneAba::ComputeAccelerations(ctx_, View(), gravity_z);
+        // Snapshot the PRE-INTEGRATION root spatial velocity: the next kernel
+        // (IntegrateFloatingBaseVelocity) overwrites link_velocity[root] in place
+        // (v_pre -> v_post). The root gyroscopic adjoint must linearize at v_pre,
+        // so StepBackward reads this snapshot (in.v_root_pre), not the live state.
+        SnapshotVRootPre();
         articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(ctx_, View(), dt,
                                                                      gravity_z);
         articulation::FeatherstoneAba::IntegrateVelocity(ctx_, View(), dt);
         articulation::FeatherstoneAba::IntegratePosition(ctx_, View(), dt);
         Sync();
+    }
+    // Copy the live link_velocity buffer (LinkSpatialVel == float[6], no padding)
+    // into the v_root_pre scratch the reverse reads.
+    void SnapshotVRootPre() {
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        ASSERT_EQ(cudaMemcpy(v_root_pre_.Data(), View().link_velocity,
+                             n_ * sizeof(articulation::LinkSpatialVel),
+                             cudaMemcpyDeviceToDevice),
+                  cudaSuccess);
     }
     void SeedGradRootVel(const std::array<float, 6>& s) {
         nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
@@ -315,6 +330,7 @@ public:
         diffsim::StepBackwardInputs in;
         in.q_pre = static_cast<const float*>(q_pre_.Data());
         in.qdot_pre = static_cast<const float*>(qdot_pre_.Data());
+        in.v_root_pre = static_cast<const float*>(v_root_pre_.Data());
         in.dI_dmass = static_cast<const float*>(dI_dmass_.Data());
         in.dt = dt;
         in.gravity_z = gravity_z;
@@ -383,7 +399,7 @@ private:
     articulation::ArticulationDeviceBuffers device_;
     uint32_t n_ = 0u;
     nuka::phi::Buffer dI_dmass_, grad_q_, grad_qdot_, grad_target_, grad_mass_,
-        grad_tau_, grad_qddot_seed_, grad_link_vel_, q_pre_, qdot_pre_;
+        grad_tau_, grad_qddot_seed_, grad_link_vel_, q_pre_, qdot_pre_, v_root_pre_;
 };
 
 float MaxRelErr(const std::vector<float>& a, const std::vector<float>& b,
@@ -872,6 +888,139 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
     EXPECT_LT(e_tau, 3e-3f);
     EXPECT_LT(e_mass, 1.0f);  // score < 1 == every component within abs OR rel tol
     EXPECT_LT(e_rootv, 2e-3f);
+}
+
+// ===========================================================================
+// Rung (c) LARGE-(a_free - a_grav): the LINEARIZATION-POINT regression guard.
+// The root gyroscopic bias p[root] = ForceCross(v, I*v) is QUADRATIC in the root
+// spatial velocity v, so its adjoint (and the grad_I[root] -> grad_mass[root]
+// path) depends on WHERE it is linearized. The forward integrator overwrites
+// link_velocity[root] in place (v_pre -> v_post = v_pre + (a_free-a_grav)*dt),
+// so the reverse MUST read the PRE-integration v_pre (in.v_root_pre), not the
+// live post value. Here we AMPLIFY the root angular velocity and use a LARGE
+// dt=0.05 so |v_post - v_pre| ~ 1-2: if the reverse mistakenly linearized at
+// v_post, d/d(v_root) vs central-FD would be ~4.7e-2 (~8%). With v_root_pre it
+// is the FD noise floor (~1e-3). The error scales O((a_free-a_grav)*dt) -> tiny
+// on the near-free-fall demo (which masked the bug) but large once p03 contacts
+// make (a_free-a_grav) big. This test FAILS if the linearization point regresses.
+// ===========================================================================
+TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFloatingChain();
+    Harness h(ctx, model);
+    const std::vector<uint32_t>& dofs = model.dof_links;  // {1,2}
+    const float g0 = 9.81f, dt = 0.05f;  // LARGE dt -> big |v_post - v_pre|
+    const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
+    const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
+    const std::vector<float> tau0 = {0.0f, 0.50f, -0.30f};
+    // AMPLIFIED root angular velocity (first 3 comps) -> the gyroscopic term
+    // ForceCross(v, I*v) is large and strongly v-dependent.
+    const std::array<float, 6> rootv0 = {3.0f, -2.5f, 4.0f, 0.20f, -0.15f, 0.12f};
+
+    std::vector<float> wqd(h.N(), 0.0f);
+    wqd[1] = 0.7f; wqd[2] = -0.5f;
+    const std::array<float, 6> wrv = {0.3f, -0.4f, 0.6f, -0.2f, 0.5f, -0.35f};
+    auto loss_post = [&]() {
+        const std::vector<float> qd = h.GetQdot();
+        const std::array<float, 6> rv = h.GetRootVel();
+        float s = 0.0f;
+        for (uint32_t k : dofs) s += wqd[k] * qd[k];
+        for (uint32_t i = 0u; i < 6u; ++i) s += wrv[i] * rv[i];
+        return s;
+    };
+    auto set_state = [&]() {
+        h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+    };
+
+    // Sanity: confirm the perturbation regime really is large -- |v_post - v_pre|
+    // on the root must be O(1) for this to discriminate the linearization point.
+    set_state();
+    h.ForwardFloating(g0, dt);
+    const std::array<float, 6> vpost = h.GetRootVel();
+    float dv = 0.0f;
+    for (uint32_t i = 0u; i < 6u; ++i) dv += std::fabs(vpost[i] - rootv0[i]);
+    EXPECT_GT(dv, 0.5f) << "regime not large enough to discriminate v_pre vs v_post";
+
+    // -- Reverse, run TWICE: with the v_pre snapshot (the FIX), and with
+    //    v_root_pre=nullptr (the kernel then falls back to the live POST-
+    //    integration state -- i.e. the BUG). The fix must (a) match FD to the
+    //    noise floor and (b) beat the bug variant by a wide margin. This directly
+    //    encodes the reviewer's "the two variants diverge -> confirms the
+    //    linearization point is the cause", and is immune to FD-floor calibration.
+    auto run_reverse = [&](bool use_v_pre) {
+        set_state();
+        h.ForwardFloating(g0, dt);
+        h.SnapshotPre(q0, qd0);
+        h.ZeroGradSeeds();
+        h.SeedGradQdot(wqd);
+        h.SeedGradRootVel(wrv);
+        auto in = h.MakeInputs(dt, g0);
+        in.has_drive = false; in.has_integrate = true; in.enable_q_channel = false;
+        if (!use_v_pre) in.v_root_pre = nullptr;  // -> live (v_post) fallback = bug
+        h.RunBackward(in, h.MakeGrads());
+        struct R { std::array<float, 6> rootv; std::vector<float> mass; } r;
+        r.rootv = h.GetGradRootVel();
+        r.mass = h.GetGradMass();
+        return r;
+    };
+    const auto fix = run_reverse(/*use_v_pre=*/true);
+    const auto bug = run_reverse(/*use_v_pre=*/false);
+
+    // Central FD on each root spatial-velocity component (the channel that reads
+    // v through the gyroscopic ForceCross(v, I*v) bias).
+    const float eps = 2e-3f;
+    std::array<float, 6> fd_rootv{};
+    for (uint32_t c = 0u; c < 6u; ++c) {
+        auto p_rv = [&](float d) {
+            std::array<float, 6> rv = rootv0; rv[c] += d;
+            h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rv);
+            h.ForwardFloating(g0, dt); return loss_post();
+        };
+        fd_rootv[c] = (p_rv(eps) - p_rv(-eps)) / (2.0f * eps);
+    }
+    // Central FD on the floating-base ROOT mass (the grad_I[root]->grad_mass[root]
+    // path also reads v via w = I*v in the gyroscopic outer product).
+    const float m0 = model.mass_params[0].mass;
+    auto p_mass = [&](float d) {
+        h.SetLinkMass(0u, m0 + d);
+        h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.ForwardFloating(g0, dt);
+        const float lo = loss_post();
+        h.SetLinkMass(0u, m0);
+        return lo;
+    };
+    const float fd_mass_root = (p_mass(eps) - p_mass(-eps)) / (2.0f * eps);
+
+    std::vector<float> frv(fd_rootv.begin(), fd_rootv.end());
+    std::vector<uint32_t> rv_idx = {0u, 1u, 2u, 3u, 4u, 5u};
+    std::vector<float> grv_fix(fix.rootv.begin(), fix.rootv.end());
+    std::vector<float> grv_bug(bug.rootv.begin(), bug.rootv.end());
+    const float e_rootv_fix = MaxRelErr(grv_fix, frv, rv_idx);
+    const float e_rootv_bug = MaxRelErr(grv_bug, frv, rv_idx);
+    // Mass[root] is small-magnitude here (loss weighted on velocities, not mass),
+    // so use ABSOLUTE error vs FD -- relative error is dominated by FD truncation
+    // (same convention as RungC's MaxAbsOrRel). The v_pre variant must be much
+    // closer to FD than the v_post (bug) variant.
+    const float em_fix = std::fabs(fix.mass[0] - fd_mass_root);
+    const float em_bug = std::fabs(bug.mass[0] - fd_mass_root);
+    printf("[rung c large-dt] |dv_root|=%.3f\n"
+           "  d/dv_root  rel-err: v_pre(fix)=%.3e  v_post(bug)=%.3e\n"
+           "  d/dmass[0] abs-err: v_pre(fix)=%.3e  v_post(bug)=%.3e  "
+           "(fd=%.4e gm_fix=%.4e gm_bug=%.4e)\n",
+           dv, e_rootv_fix, e_rootv_bug, em_fix, em_bug,
+           fd_mass_root, fix.mass[0], bug.mass[0]);
+
+    // (a) The v_pre (fix) reverse matches FD to the noise floor on the O(1)
+    //     velocity channel.
+    EXPECT_LT(e_rootv_fix, 5e-3f);
+    // (b) The fix BEATS the v_post (bug) variant by a wide margin on BOTH the
+    //     velocity channel and the gyroscopic mass[root] path -- the divergence
+    //     IS the linearization-point error (~4.7e-2 on d/dv_root if unfixed).
+    EXPECT_GT(e_rootv_bug, 5e-3f) << "regime did not exercise the v-dependence";
+    EXPECT_LT(e_rootv_fix * 4.0f, e_rootv_bug)
+        << "v_pre fix must beat the v_post linearization by a wide margin";
+    EXPECT_LT(em_fix * 2.0f, em_bug)
+        << "v_pre fix must beat v_post on grad_mass[root] gyroscopic path";
 }
 
 // ===========================================================================

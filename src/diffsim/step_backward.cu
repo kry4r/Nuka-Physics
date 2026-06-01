@@ -556,7 +556,17 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
         //   grad_v(root) += the ForceCross + I^T paths -> grad_link_velocity_out[root]
         if (parent == kInvalidLink && jt == ArticulationJointType::FloatingBase) {
             const float* I = state.link_inertia[link].I;
-            const float* v = state.link_velocity[link].v;
+            // The root gyroscopic bias p[root] = ForceCross(v, I*v) is QUADRATIC in
+            // v, so its adjoint AND the grad_I[root]->grad_mass[root] outer-product
+            // path must linearize at the PRE-integration root velocity v_pre. The
+            // forward's IntegrateFloatingBaseVelocity overwrote link_velocity[root]
+            // in place (v_pre -> v_post) BEFORE StepBackward runs, so we read the
+            // caller's v_pre snapshot (in.v_root_pre[link*6 .. +6)) rather than the
+            // clobbered live state. Fall back to the live state only when no
+            // snapshot was provided (fixed-base models never hit this branch).
+            const float* v = (in.v_root_pre != nullptr)
+                                 ? (in.v_root_pre + static_cast<size_t>(link) * 6u)
+                                 : state.link_velocity[link].v;
             // copy I -> Ia
             for (uint32_t i = 0u; i < 36u; ++i) grad_I[local][i] += grad_Ia[local][i];
             // p = ForceCross(v, I*v)

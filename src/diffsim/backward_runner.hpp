@@ -117,6 +117,7 @@ private:
     // Persistent reverse-pass scratch (sized at construction).
     phi::Buffer q_pre_;          // float[total_link_count]
     phi::Buffer qdot_pre_;       // float[total_link_count]
+    phi::Buffer v_root_pre_;     // float[total_link_count*6] (pre-integration root vel)
     phi::Buffer grad_q_;         // float[total_link_count]   (carried seed)
     phi::Buffer grad_qdot_;      // float[total_link_count]   (carried seed)
     phi::Buffer grad_link_vel_;  // float[total_link_count*6] (carried seed)
