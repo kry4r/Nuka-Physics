@@ -95,20 +95,21 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     uint32_t max_dof,
     float ground_height,
     DeterminismLevel determinism,
-    articulation::ControlMode control_mode)
+    articulation::ControlMode control_mode,
+    uint32_t osc_task_link)
     : context_(context),
       determinism_(determinism),
-      control_mode_(control_mode) {
-    // v0.5 C-fwd: PDPosition / Torque / Velocity / ComputedTorque / Actuator are
-    // implemented; Osc is reserved (deferred to a post-p03 slice, needs the Phase-3
-    // self-written solver). A reserved enumerator is rejected here rather than
-    // silently mis-actuating.
+      control_mode_(control_mode),
+      osc_task_link_(osc_task_link) {
+    // v0.5 C-fwd: ALL six modes (PDPosition / Torque / Velocity / ComputedTorque /
+    // Osc / Actuator) are implemented; only a value ABOVE Actuator is rejected here
+    // rather than silently mis-actuating.
     if (!articulation::IsControlModeImplemented(
             static_cast<uint8_t>(control_mode))) {
         throw std::invalid_argument(
             "BatchedArticulatedWorld: control_mode " +
             std::to_string(static_cast<int>(control_mode)) +
-            " is not implemented (Osc is deferred to a post-p03 slice)");
+            " is not implemented (only values 0..Actuator are valid)");
     }
     articulation_count_ = host.ArticulationCount();
     if (articulation_count_ == 0u) {
@@ -227,6 +228,12 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     actuator_noload_speed_ = phi::Buffer(
         static_cast<size_t>(total_link_count_) * sizeof(float),
         phi::MemoryKind::Device);
+    // v0.5 C-fwd slice 3: Osc per-env task target (always allocated, zero-filled;
+    // a zero-init Osc world drives the task link toward the world origin until the
+    // caller writes a real target). Per-ENV layout: float[env_count * 3] {x,y,z}.
+    task_target_ = phi::Buffer(
+        static_cast<size_t>(env_count_) * 3u * sizeof(float),
+        phi::MemoryKind::Device);
     // ComputedTorque scratch: qddot_free (engine qddot from the early tau=0 ABA).
     // Allocated for every world (cheap, one float per link); only written/read in
     // the ComputedTorque path.
@@ -260,6 +267,10 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                               static_cast<size_t>(total_link_count_) * sizeof(float),
                               context_.stream.Native()),
               "BatchedArticulatedWorld actuator_noload_speed memset");
+    CheckCuda(cudaMemsetAsync(task_target_.Data(), 0,
+                              static_cast<size_t>(env_count_) * 3u * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld task_target memset");
     CheckCuda(cudaMemsetAsync(qddot_free_.Data(), 0,
                               static_cast<size_t>(total_link_count_) * sizeof(float),
                               context_.stream.Native()),
@@ -397,6 +408,66 @@ void BatchedArticulatedWorld::ApplyStage1Drives(
                 ctx, state, max_dof_, static_cast<const float*>(m_inv_.Data()),
                 static_cast<const float*>(qddot_free_.Data()),
                 params.drive_targets, params.drive_stiffness, params.drive_damping,
+                params.drive_force_limits);
+            break;
+        }
+        case articulation::ControlMode::Osc: {
+            // v0.5 C-fwd slice 3 (p03 R2): operational-space control, FORWARD,
+            // 3-DOF POSITION task on the world position of osc_task_link_. The law
+            // is tau = J^T*Lambda*(Kp*e_x + Kd*edot_x) with Lambda = (J M^-1 J^T)^-1
+            // (formed as a 3x3 SOLVE, not inverted). It needs three things that are
+            // NOT current at stage 1 in the normal pipeline, so -- for Osc ONLY --
+            // we resolve them EARLY this step, mirroring the ComputedTorque block:
+            //   (a) FRESH link_pose. The chain-Jacobian + x_current read
+            //       state.link_pose, which the pipeline refreshes only at stage 4
+            //       (UpdateWorldLinkPoses + copy). At stage 1 it is one step stale
+            //       (rest pose on step 1), so J and x_current would be geometrically
+            //       wrong. Refresh it HERE from the current q (q is unchanged
+            //       between stage 1 and stage 4, so stage 4 recomputes the identical
+            //       bytes -- no extra divergence, Osc-gated, PD path untouched).
+            //   (b) FRESH link_xup for the CRBA. A tau=0 ABA both populates the
+            //       kinematics scratch the CRBA reads AND is harmless (its accel
+            //       scratch is fully recomputed by the stage-2 ABA). We do NOT keep
+            //       qddot_free: the bounded gravity-off forward OSC needs only the
+            //       physics M^-1, not the bias snapshot (bias/gravity compensation
+            //       is a documented extension, not built here).
+            //   (c) physics M^-1 (joint_damping=null, dt=0 -> NO dt*C fold, matching
+            //       the ABA physics inertia), consumed here before stage 7 rewrites
+            //       m_/m_inv_ with the dt*C-folded contact M / its inverse.
+            phi::ScopedDeviceGuard guard(ctx.device_id);
+            const cudaStream_t stream = ctx.stream.Native();
+            // (a) refresh link_pose from the current q (mirrors stage 4 exactly).
+            articulation::UpdateWorldLinkPoses(
+                ctx, state, static_cast<Transform*>(world_pose_.Data()));
+            CheckCuda(cudaMemcpyAsync(
+                          state.link_pose, world_pose_.Data(),
+                          static_cast<size_t>(total_link_count_) * sizeof(Transform),
+                          cudaMemcpyDeviceToDevice, stream),
+                      "Osc early link_pose refresh");
+            // (b) tau=0 ABA -> fresh kinematics (link_xup) for the CRBA.
+            CheckCuda(cudaMemsetAsync(state.tau, 0,
+                                      static_cast<size_t>(total_link_count_) *
+                                          sizeof(float),
+                                      stream),
+                      "Osc early-ABA tau zero");
+            articulation::FeatherstoneAba::ComputeAccelerations(ctx, state,
+                                                                params.gravity_z);
+            // (c) physics M (reads the fresh link_xup) + its full-tile inverse.
+            articulation::ComputeArticulationInertiaM(
+                ctx, state, max_dof_,
+                static_cast<articulation::LinkSpatialInertia*>(composite_.Data()),
+                static_cast<float*>(m_.Data()),
+                /*joint_damping=*/nullptr, /*dt=*/0.0f);
+            articulation::FactorArticulationInertiaM(
+                ctx, state, max_dof_, static_cast<const float*>(m_.Data()),
+                static_cast<float*>(m_inv_.Data()));
+            // tau = J^T*Lambda*(Kp*(target - x) - Kd*xdot). Kp = drive_stiffness,
+            // Kd = drive_damping (scalar at the task link); task target is per-env
+            // 3 floats; clamp by drive_force_limits.
+            articulation::LaunchApplyOscDriveKernels(
+                ctx, state, max_dof_, osc_task_link_,
+                static_cast<const float*>(m_inv_.Data()), params.task_target,
+                params.drive_stiffness, params.drive_damping,
                 params.drive_force_limits);
             break;
         }

@@ -115,7 +115,8 @@ class World {
 public:
     static World* create_from_scene(Device* device, const std::string& scene_path,
                                     uint32_t env_count, float dt,
-                                    uint32_t determinism, uint32_t control_mode) {
+                                    uint32_t determinism, uint32_t control_mode,
+                                    uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -125,15 +126,15 @@ public:
                 "1 (Weak/D2)");
         }
         // v0.5 C-fwd: 0 = PDPosition (default), 1 = Torque, 2 = Velocity, 3 =
-        // ComputedTorque, 5 = Actuator. 4 (Osc) is a reserved enumerator (Phase-3
-        // solver slice); it and anything above 5 are rejected. Non-PD modes
+        // ComputedTorque, 4 = Osc (operational-space control, forward position
+        // task), 5 = Actuator. Only a value above 5 is rejected. Non-PD modes
         // require the batched (env_count > 1) path. (Mirror the engine's
-        // IsControlModeImplemented set {0,1,2,3,5}.)
-        if (control_mode > 5u || control_mode == 4u) {
+        // IsControlModeImplemented set {0,1,2,3,4,5}.)
+        if (control_mode > 5u) {
             throw std::runtime_error(
                 "create_from_scene: control_mode must be 0 (PDPosition), "
-                "1 (Torque), 2 (Velocity), 3 (ComputedTorque) or 5 (Actuator); "
-                "4 (Osc) is reserved/unimplemented");
+                "1 (Torque), 2 (Velocity), 3 (ComputedTorque), 4 (Osc) or "
+                "5 (Actuator)");
         }
         nuka_world_desc_t desc{};
         desc.scene_path = scene_path.c_str();
@@ -143,8 +144,12 @@ public:
         // desc C-compatible (the engine maps it to gpu::DeterminismLevel).
         desc.determinism = static_cast<uint8_t>(determinism);
         // v0.5 C-fwd: stage-1 control mode (0=PDPosition default, 1=Torque,
-        // 2=Velocity). Zero-init default already maps to PDPosition.
+        // 2=Velocity, 3=ComputedTorque, 4=Osc, 5=Actuator). Zero-init default
+        // already maps to PDPosition.
         desc.control_mode = static_cast<uint8_t>(control_mode);
+        // v0.5 C-fwd slice 3: Osc task link (articulation-local). Read only in Osc
+        // mode; ignored otherwise (zero-init default == root, a no-op task).
+        desc.osc_task_link = osc_task_link;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -311,13 +316,15 @@ NB_MODULE(_nuka_ext, m) {
     // COMPUTED_TORQUE (3) is inverse-dynamics PD (tau = M*(Kp*e - Kd*qdot) + bias,
     // Kp/Kd == DRIVE_STIFFNESS/DRIVE_DAMPING, target == DRIVE_TARGET). ACTUATOR (5)
     // is a DC-motor torque-speed envelope on TORQUE_INPUT (tau_stall ==
-    // DRIVE_FORCE_LIMIT, no-load speed == ACTUATOR_NOLOAD_SPEED). Osc (4) is
-    // reserved (Phase-3 solver slice) and is rejected. Non-PD modes need the
-    // batched (env_count > 1) path.
+    // DRIVE_FORCE_LIMIT, no-load speed == ACTUATOR_NOLOAD_SPEED). OSC (4) is
+    // operational-space control (forward position task on the osc_task_link link
+    // toward Field.TASK_TARGET; task Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING at
+    // the task link). Non-PD modes need the batched (env_count > 1) path.
     m.attr("CONTROL_MODE_PD_POSITION") = uint32_t{0};
     m.attr("CONTROL_MODE_TORQUE") = uint32_t{1};
     m.attr("CONTROL_MODE_VELOCITY") = uint32_t{2};
     m.attr("CONTROL_MODE_COMPUTED_TORQUE") = uint32_t{3};
+    m.attr("CONTROL_MODE_OSC") = uint32_t{4};
     m.attr("CONTROL_MODE_ACTUATOR") = uint32_t{5};
 
     // Field enum (kept identical to nuka_state_field_t).
@@ -337,6 +344,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("TORQUE_INPUT", NUKA_FIELD_TORQUE_INPUT)
         .value("VELOCITY_TARGET", NUKA_FIELD_VELOCITY_TARGET)
         .value("ACTUATOR_NOLOAD_SPEED", NUKA_FIELD_ACTUATOR_NOLOAD_SPEED)
+        .value("TASK_TARGET", NUKA_FIELD_TASK_TARGET)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -361,6 +369,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("env_count"), nb::arg("dt") = 1.0f / 240.0f,
                     nb::arg("determinism") = uint32_t{0},
                     nb::arg("control_mode") = uint32_t{0},
+                    nb::arg("osc_task_link") = uint32_t{0},
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
@@ -373,10 +382,17 @@ NB_MODULE(_nuka_ext, m) {
                     "2 = CONTROL_MODE_VELOCITY (writes Field.VELOCITY_TARGET; servo "
                     "gain == DRIVE_STIFFNESS), 3 = CONTROL_MODE_COMPUTED_TORQUE "
                     "(inverse-dynamics PD on DRIVE_TARGET; gains == "
-                    "DRIVE_STIFFNESS/DRIVE_DAMPING), 5 = CONTROL_MODE_ACTUATOR "
+                    "DRIVE_STIFFNESS/DRIVE_DAMPING), 4 = CONTROL_MODE_OSC "
+                    "(operational-space control, forward position task on the world "
+                    "position of the osc_task_link link toward Field.TASK_TARGET; "
+                    "task gains Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING at the "
+                    "task link), 5 = CONTROL_MODE_ACTUATOR "
                     "(DC-motor envelope on Field.TORQUE_INPUT; tau_stall == "
                     "DRIVE_FORCE_LIMIT, no-load speed == Field.ACTUATOR_NOLOAD_SPEED). "
-                    "Non-PD modes require env_count > 1.")
+                    "Non-PD modes require env_count > 1. osc_task_link (default 0, "
+                    "Osc only): the articulation-local link index of the task link; "
+                    "for a fixed-base scene the root (0) is a no-op, so set a real "
+                    "end-effector (e.g. a foot/calf local link).")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")

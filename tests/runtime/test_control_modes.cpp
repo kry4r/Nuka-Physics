@@ -26,6 +26,7 @@
 // ---------------------------------------------------------------------------
 
 #include "import/usd_importer.hpp"
+#include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
@@ -536,10 +537,12 @@ TEST(ControlModes, DefaultPdModeMatchesUnspecified) {
 }
 
 // ---------------------------------------------------------------------------
-// A reserved/unimplemented control mode is rejected at construction (never
-// silently mis-actuated).
+// An out-of-range control mode is rejected at construction (never silently mis-
+// actuated). All six enumerators {0..5} (PDPosition..Actuator) are now
+// IMPLEMENTED -- Osc (4) was the last hole and is filled by p03 R2 -- so only a
+// value ABOVE Actuator (here a synthetic id 6) must be rejected.
 // ---------------------------------------------------------------------------
-TEST(ControlModes, ReservedModeRejectedAtConstruction) {
+TEST(ControlModes, OutOfRangeModeRejectedAtConstruction) {
     const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "Go2 stand scene is not available";
@@ -547,13 +550,12 @@ TEST(ControlModes, ReservedModeRejectedAtConstruction) {
     const auto context = nuka::phi::MakeDefaultDeviceContext();
     auto cooked = CookGo2();
     const uint32_t max_dof = articulation::ArticulationDofCount(cooked.host, 0u);
-    // Osc (id 4) is the still-reserved Phase-3 mode; ComputedTorque (3) and
-    // Actuator (5) are now IMPLEMENTED, so only Osc must be rejected here.
+    // id 6 is above Actuator (5) -- no such control law exists, so it is rejected.
     EXPECT_THROW(
         gpu::BatchedArticulatedWorld(context, cooked.host, cooked.feet, max_dof,
                                      kGroundFarAway,
                                      gpu::DeterminismLevel::Strong,
-                                     articulation::ControlMode::Osc),
+                                     static_cast<articulation::ControlMode>(6u)),
         std::invalid_argument);
 }
 
@@ -1133,5 +1135,215 @@ TEST(ControlModes, ComputedTorqueFloatingBaseGravityComp) {
     for (size_t i = 0u; i < qddot.size(); ++i) {
         EXPECT_EQ(qddot[i], qddot2[i]) << "floating-base qddot differs run-to-run "
                                        << "at " << i;
+    }
+}
+
+// ===========================================================================
+// Slice 3 (p03 R2): Osc -- operational-space control, FORWARD position task.
+// ===========================================================================
+//
+// The Osc forward law drives the WORLD POSITION of a chosen task link toward a
+// per-env 3-vector target:
+//   tau = J^T*Lambda*(Kp*e_x + Kd*edot_x),  Lambda = (J M^-1 J^T)^-1,
+//   e_x = x_target - x_current,  edot_x = -(J*qdot).
+// With gravity OFF, a fixed-base trunk (base_dof=0, so the joint admittance D is
+// the full M^-1 and J M^-1 J^T * Lambda == I exactly) and Kd / drive_damping = 0,
+// the realized task acceleration is xddot = Kp*e_x -- the controller pushes the
+// task link STRAIGHT toward the target. We verify the cleanest robust invariant:
+// the task-link world position MOVES toward the target (its displacement over the
+// run has a positive projection on e_x, and the task-space error DECREASES).
+// drive_damping is held at 0 so it does not double as the orthogonal implicit
+// joint damping (#43) -- a Kp-only undamped task spring, like ComputedTorqueTracksTarget.
+namespace {
+
+// The Osc task link: a foot/calf link (a real end-effector with a rich task
+// Jacobian, NOT the near-root FirstActuatedLink). Returns its articulation-local
+// index (== global for a single-env world).
+uint32_t OscTaskLink(const CookedGo2& cooked) {
+    return cooked.feet.empty() ? 0u : cooked.feet.front().calf_local_link;
+}
+
+// Downloads one link's world position from the device link_pose buffer. After a
+// Step() link_pose holds the FK pose for that step (the Osc kernel refreshed it
+// at stage 1 from the current q; stage 4 refreshed it again to the same bytes).
+Vec3 DownloadLinkPosition(const nuka::phi::DeviceContext& context,
+                          gpu::BatchedArticulatedWorld& bw, uint32_t link) {
+    const articulation::ArticulationDeviceState state = bw.View();
+    context.stream.Synchronize();
+    nuka::math::Transform t{};
+    cudaMemcpy(&t, state.link_pose + link, sizeof(nuka::math::Transform),
+               cudaMemcpyDeviceToHost);
+    return t.position;
+}
+
+float Dot3(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Osc drives the task link toward the target: the task-link world position moves
+// toward x_target (positive projection on the initial error) and the task-space
+// error |x - x_target| DECREASES over the run.
+// ---------------------------------------------------------------------------
+TEST(ControlModes, OscDrivesTaskTowardTarget) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    auto& base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    ASSERT_GT(max_dof, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t task_link = OscTaskLink(cooked);
+    ASSERT_NE(task_link, 0u) << "no foot/calf task link found";
+
+    // Kp-only task gain on the task link (drive_stiffness reused). drive_damping
+    // = 0 (no control Kd AND no implicit joint damping muddying the response).
+    std::vector<float> stiffness(base_link_count, 0.0f);
+    std::vector<float> damping(base_link_count, 0.0f);
+    const float kKp = 200.0f;  // rad/s^2-ish task gain.
+    stiffness[task_link] = kKp;
+    nuka::phi::Buffer stiff_dev = UploadFloats(stiffness);
+    nuka::phi::Buffer damp_dev = UploadFloats(damping);
+
+    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                    kGroundFarAway,
+                                    gpu::DeterminismLevel::Strong,
+                                    articulation::ControlMode::Osc, task_link);
+    EXPECT_EQ(bw.ControlMode(), articulation::ControlMode::Osc);
+    EXPECT_EQ(bw.OscTaskLink(), task_link);
+
+    // Step once with ZERO stiffness first so the kernel refreshes link_pose to the
+    // live FK pose WITHOUT injecting velocity (Kp=0 => tau=0 => foot stays at rest,
+    // qdot still 0). Reading x_current after this is the cooked rest task position
+    // -- the clean start the directional invariant needs. (Stepping with the REAL
+    // Kp here, while task_target still points at the zeroed origin buffer, would
+    // dump a large origin-ward velocity into qdot before we anchor the target.)
+    std::vector<float> zero_stiff(base_link_count, 0.0f);
+    nuka::phi::Buffer zero_stiff_dev = UploadFloats(zero_stiff);
+    gpu::BatchedArticulatedStepParams warm;
+    warm.gravity_z = kGravityOff;
+    warm.dt = kDt;
+    warm.drive_stiffness = static_cast<const float*>(zero_stiff_dev.Data());
+    warm.drive_damping = static_cast<const float*>(damp_dev.Data());
+    warm.task_target = static_cast<const float*>(bw.TaskTargetBuffer().Data());
+    bw.Step(warm);
+    const Vec3 x0 = DownloadLinkPosition(context, bw, task_link);
+
+    // Target = current task position + a small +X offset. +X is a REACHABLE task
+    // direction for the calf-link origin (the hip/thigh joints sweep it fore/aft).
+    // NOTE the task point is the calf's LINK ORIGIN, so the calf's OWN joint
+    // contributes a zero Jacobian column (cross(axis, x - origin) with x == origin);
+    // J is therefore rank-2 and vertical (+Z) motion of this point lies largely in
+    // the UNREACHABLE left-null space -- the controller correctly tracks only the
+    // reachable subspace (+X/+Y), which is the documented bounded scope. A small +X
+    // offset sits squarely in range(J), so the task tracks cleanly.
+    const Vec3 target{x0.x + 0.05f, x0.y, x0.z};
+    std::vector<float> target_host = {target.x, target.y, target.z};
+    nuka::phi::Buffer target_dev = UploadFloats(target_host);
+
+    gpu::BatchedArticulatedStepParams params;
+    params.gravity_z = kGravityOff;
+    params.dt = kDt;
+    params.drive_stiffness = static_cast<const float*>(stiff_dev.Data());
+    params.drive_damping = static_cast<const float*>(damp_dev.Data());
+    params.task_target = static_cast<const float*>(target_dev.Data());
+
+    const Vec3 e0{target.x - x0.x, target.y - x0.y, target.z - x0.z};
+    const float err0 =
+        std::sqrt(e0.x * e0.x + e0.y * e0.y + e0.z * e0.z);
+    ASSERT_GT(err0, 1e-4f);
+
+    float min_err = err0;
+    Vec3 x_last = x0;
+    const uint32_t kSteps = 25u;  // short horizon: pre-quarter-period (undamped).
+    for (uint32_t step = 0u; step < kSteps; ++step) {
+        bw.Step(params);
+        const Vec3 x = DownloadLinkPosition(context, bw, task_link);
+        ASSERT_TRUE(std::isfinite(x.x) && std::isfinite(x.y) &&
+                    std::isfinite(x.z))
+            << "task position non-finite at step " << step;
+        const Vec3 e{target.x - x.x, target.y - x.y, target.z - x.z};
+        const float err = std::sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+        min_err = std::fmin(min_err, err);
+        x_last = x;
+    }
+
+    // (1) The task link moved TOWARD the target: net displacement projected on the
+    // initial error direction is positive.
+    const Vec3 disp{x_last.x - x0.x, x_last.y - x0.y, x_last.z - x0.z};
+    EXPECT_GT(Dot3(disp, e0), 0.0f)
+        << "task link did not move toward the target (disp.e0="
+        << Dot3(disp, e0) << ")";
+    // (2) The task-space error decreased appreciably (the controller is doing work
+    // toward the target, not just jittering).
+    EXPECT_LT(min_err, 0.9f * err0)
+        << "Osc task error did not decrease (err0=" << err0
+        << ", min_err=" << min_err << ")";
+}
+
+// ---------------------------------------------------------------------------
+// Osc D1 two-run byte-exact: two Osc worlds, same task link / target / gains,
+// N steps -> bit-identical q/qdot (no float atomics, fixed order => D1).
+// ---------------------------------------------------------------------------
+namespace {
+
+std::pair<std::vector<float>, std::vector<float>> RunOscMode(
+    const nuka::phi::DeviceContext& context, const CookedGo2& cooked,
+    uint32_t steps) {
+    auto base = cooked.host;
+    const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
+    const uint32_t base_link_count = base.TotalLinkCount();
+    const uint32_t task_link =
+        cooked.feet.empty() ? 0u : cooked.feet.front().calf_local_link;
+
+    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof,
+                                    kGroundFarAway,
+                                    gpu::DeterminismLevel::Strong,
+                                    articulation::ControlMode::Osc, task_link);
+    std::vector<float> stiffness(base_link_count, 0.0f);
+    std::vector<float> damping(base_link_count, 0.0f);
+    stiffness[task_link] = 200.0f;
+    nuka::phi::Buffer stiff_dev = UploadFloats(stiffness);
+    nuka::phi::Buffer damp_dev = UploadFloats(damping);
+    // A fixed nonzero target (env 0; single env so 3 floats).
+    std::vector<float> target_host = {0.2f, 0.0f, 0.1f};
+    nuka::phi::Buffer target_dev = UploadFloats(target_host);
+
+    gpu::BatchedArticulatedStepParams params;
+    params.gravity_z = kGravityOff;
+    params.dt = kDt;
+    params.drive_stiffness = static_cast<const float*>(stiff_dev.Data());
+    params.drive_damping = static_cast<const float*>(damp_dev.Data());
+    params.task_target = static_cast<const float*>(target_dev.Data());
+
+    for (uint32_t step = 0u; step < steps; ++step) {
+        bw.Step(params);
+    }
+    context.stream.Synchronize();
+    articulation::ArticulationHostState dl = base;
+    bw.Download(&dl);
+    return {dl.q, dl.qdot};
+}
+
+}  // namespace
+
+TEST(ControlModes, OscModeTwoRunByteExact) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    auto cooked = CookGo2();
+    const auto a = RunOscMode(context, cooked, 50u);
+    const auto b = RunOscMode(context, cooked, 50u);
+    ASSERT_EQ(a.first.size(), b.first.size());
+    for (size_t i = 0u; i < a.first.size(); ++i) {
+        EXPECT_EQ(a.first[i], b.first[i]) << "q differs run-to-run at " << i;
+        EXPECT_EQ(a.second[i], b.second[i]) << "qdot differs run-to-run at " << i;
     }
 }

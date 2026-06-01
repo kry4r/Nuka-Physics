@@ -108,4 +108,49 @@ void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
                                      const float* drive_force_limits,
                                      const float* actuator_noload_speed);
 
+// Osc mode (slice 3, p03 R2): operational-space control, FORWARD path, bounded
+// to a 3-DOF POSITION task on the world position of one chosen TASK LINK.
+//   tau = J^T * Lambda * (xddot* + Kp*e_x + Kd*edot_x),     xddot* = 0
+//     Lambda = (J M^-1 J^T)^-1            // 3x3 task-space (operational) inertia
+//     e_x    = x_target - x_current       // task-space position error (world)
+//     edot_x = -xdot_current = -(J*qdot)  // task-space velocity error (target 0)
+// where J is the 3xndof position Jacobian of the task link (the 3 components of
+// the geometric point Jacobian: revolute col = cross(axis_world, x - origin),
+// prismatic col = axis_world -- the SAME geometry ComputeContactChainJacobianKernel
+// uses for a contact row, here taken as the 3 spatial components rather than a
+// single direction dot). x_current is the task link's world position
+// (state.link_pose[task_link].position -- the CALLER must refresh link_pose from
+// the current q THIS step, mirroring stage 4, before this launcher).
+//
+// Lambda is NOT formed explicitly. The kernel forms A = J M^-1 J^T (3x3, SPD on
+// a non-degenerate J), then SOLVES A*y = (Kp*e_x + Kd*edot_x) with a fixed-order
+// 3x3 LDL^T (SPD floor kMinDiagonalDrive -- a degenerate J, e.g. task_link at the
+// root => J==0 => A==0 => floored => y==0 => tau==0, never NaN/Inf), and finally
+// tau_j = J_j^T * y per joint DOF (== J^T Lambda (Kp*e_x+Kd*edot_x)). One block
+// per articulation, lane 0 owns the dense build+solve (fixed order, no float
+// atomics => D1). The floating-base 6 DOFs / fixed joints are never actuated; the
+// clamp is the same |tau| <= drive_force_limits[link].
+//
+// `inertia_M_inv` is the per-articulation full-tile physics-M inverse (stride
+// max_dof*max_dof, LocalDofIndex layout -- the SAME m_inv_ tile ComputedTorque
+// consumes; for a FIXED-base scene the joint sub-block is the full tile). `kp` /
+// `kd` are SCALAR task gains read per articulation from drive_stiffness[task_link]
+// / drive_damping[task_link] (reused, applied to all 3 task DOFs); null kp/kd drop
+// that term. `task_target` is a per-ENV 3-float buffer (x,y,z world target),
+// element env*3. `osc_task_link` is the articulation-LOCAL link index of the task
+// link (global = articulation_link_offset[env] + osc_task_link). Any null required
+// pointer (inertia_M_inv / task_target) is a no-op (tau left as-is). SCOPE: the
+// task Jacobian's floating-base columns are NOT built (fixed-base scenes only --
+// a floating root contributes no task columns here); gravity/bias compensation is
+// NOT added (the law holds the task only under gravity-off / external comp).
+void LaunchApplyOscDriveKernels(const phi::DeviceContext& context,
+                                ArticulationDeviceState state,
+                                uint32_t max_dof,
+                                uint32_t osc_task_link,
+                                const float* inertia_M_inv,
+                                const float* task_target,
+                                const float* kp,
+                                const float* kd,
+                                const float* drive_force_limits);
+
 } // namespace nuka::runtime::articulation

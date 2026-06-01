@@ -66,15 +66,29 @@ typedef struct nuka_world_desc_t {
     // Kd*qdot) + bias, Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING). 5 = Actuator
     // (DC-motor torque-speed envelope on NUKA_FIELD_TORQUE_INPUT; tau_stall reuses
     // DRIVE_FORCE_LIMIT, no-load speed is NUKA_FIELD_ACTUATOR_NOLOAD_SPEED). Value
-    // 4 (Osc) is RESERVED for the Phase-3 solver slice and is rejected with
-    // NUKA_RESULT_INVALID_ARG (NOT silently mis-actuated); any value > 5 is
-    // likewise rejected. Non-PD modes require the BATCHED path
+    // 4 = Osc (operational-space control, FORWARD position-task mode: tau =
+    // J^T*Lambda*(Kp*e_x + Kd*edot_x) driving the world position of the task link
+    // `osc_task_link` toward NUKA_FIELD_TASK_TARGET; Kp/Kd reuse DRIVE_STIFFNESS/
+    // DRIVE_DAMPING at the task link; bounded to a 3-DOF position task on a fixed-
+    // base scene). Any value > 5 is rejected with NUKA_RESULT_INVALID_ARG. Non-PD
+    // modes require the BATCHED path
     // (env_count > 1); the single-env oracle path supports PDPosition only and
     // returns NUKA_RESULT_NOT_SUPPORTED for a non-PD mode (the golden oracle
     // drive site stays untouched). The implicit joint damping (#43, driven by
     // DRIVE_DAMPING) is a joint property orthogonal to the control law and runs
     // for every mode.
     uint8_t control_mode;
+    // v0.5 C-fwd slice 3 (p03 R2): the OSC task link, an articulation-LOCAL link
+    // index (0-based within the cooked articulation; global = env*base_link_count +
+    // osc_task_link). Read ONLY when control_mode == 4 (Osc): it selects the link
+    // whose world position the 3-DOF position task drives toward
+    // NUKA_FIELD_TASK_TARGET. Zero-initialized (== 0, the ROOT) is the default; for
+    // a fixed-base scene the root has a zero task Jacobian (the controller is a
+    // no-op), so an Osc caller MUST set this to a real end-effector (e.g. a Go2
+    // foot/calf local link). Ignored by every non-Osc mode (so a zero-init desc for
+    // a PD/Torque/etc world is unaffected). An index >= the articulation's link
+    // count makes the Osc drive a no-op (tau left unchanged).
+    uint32_t osc_task_link;
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -247,7 +261,20 @@ typedef enum nuka_state_field_t {
     // CURRENT no-load speeds (initially all zero). Returns
     // NUKA_RESULT_NOT_SUPPORTED on the single-env path. (Allocated even for a
     // non-Actuator world; it is simply never read there.)
-    NUKA_FIELD_ACTUATOR_NOLOAD_SPEED = 14
+    NUKA_FIELD_ACTUATOR_NOLOAD_SPEED = 14,
+    // WRITABLE (batched/multi-env path only). v0.5 C-fwd slice 3 (p03 R2): the
+    // per-ENV operational-space-control TASK TARGET buffer the batched step reads
+    // every Step when the world's control_mode is Osc (4). UNLIKE the per-LINK
+    // control-input fields (TORQUE_INPUT / VELOCITY_TARGET / ACTUATOR_NOLOAD_SPEED),
+    // this is per-ENV: element_count == env_count, element_stride_bytes == 3*sizeof
+    // (float) (a float3 {x,y,z} WORLD position per env), index env*3. It is the
+    // world position the task link (the desc's osc_task_link) is driven toward.
+    // Same zero-copy aliasing as the other writable fields (write IN PLACE; the
+    // NEXT nuka_world_step picks it up). Reads return the CURRENT targets (initially
+    // all zero == the world origin). Returns NUKA_RESULT_NOT_SUPPORTED on the
+    // single-env path. (Allocated for every batched world so the view always
+    // succeeds; only read in Osc mode.)
+    NUKA_FIELD_TASK_TARGET = 15
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {
