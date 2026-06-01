@@ -500,6 +500,11 @@ if(CMAKE_CUDA_COMPILER)
         # through the converged contact solve in ONE Delassus solve (z = A^-1 J M^-1 g),
         # distributing grad_qdot_free = g - J^T z and grad_b_c = z. D1, no atomics.
         diffsim/ift_runner.cu
+        # v0.5 p03 R3b: OSC (operational-space control) differentiable adjoint --
+        # reverse-mode gain (Kp,Kd) + task-target gradients of the forward OSC drive
+        # (tau = J^T A^-1 (Kp*e_x+Kd*edot_x)); reuses the forward's 3x3 LDL^T to
+        # apply A^-1. D1, warp-per-articulation, no atomics. (R8/R9.)
+        diffsim/osc_adjoint.cu
     )
     set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
