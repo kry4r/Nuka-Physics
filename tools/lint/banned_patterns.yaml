@@ -36,6 +36,15 @@ scope_definitions:
       - "src/solver/**/*.cuh"
       - "src/constraint/**/*.cu"
       - "src/runtime/**/*.cu"
+      # v0.5 p03: the diff-sim backward / sparse-solver path is D1-critical (its
+      # grad/solve outputs must be two-run byte-exact), so the no-float-atomic ban
+      # now covers it too. NOTE: src/diffsim is added to physics_path ONLY (the
+      # float_atomic_add rule). It is deliberately NOT in hot_path: the IFT
+      # Delassus builder keeps a size-guarded lazy cudaMalloc (allocate-once, reuse
+      # across Run calls) which is not a per-step hot-path alloc and must not trip
+      # hot_path_cuda_malloc.
+      - "src/diffsim/**/*.cu"
+      - "src/diffsim/**/*.cuh"
     exclude:
       - "src/**/reference/**"
       - "tests/**"
