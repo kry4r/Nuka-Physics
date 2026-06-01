@@ -19,10 +19,23 @@ CUDA Toolkit
   (NVIDIA Software License Agreement). NVIDIA CUDA components are not relicensed
   by this project and remain subject to the NVIDIA SLA.
 
+tinyxml2
+  Copyright (c) Lee Thomason and the tinyxml2 contributors.
+  Licensed under the zlib License.
+  Used by the MJCF / URDF scene importers to parse XML. tinyxml2 (v10.0.0,
+  fetched at build time) is compiled and STATICALLY linked into the engine
+  library (libnuka), so it is present in the shipped Python runtime. (The
+  `.usda` text-USD parser is separate and hand-written; see Notes below.)
+
 Vulkan
-  Used for rendering and via the Vulkan loader.
-  Vulkan is a registered trademark of, and the Vulkan loader/headers are made
-  available by, The Khronos Group Inc., under their respective licenses.
+  Used by the OPTIONAL offscreen renderer component (`nuka_render`), which links
+  the Vulkan loader/headers and requires the Vulkan SDK (and its `glslc` shader
+  compiler) to build the C++ engine. Vulkan is NOT linked into the shipped
+  Python extension (`_nuka_ext`) runtime — that links only the engine library
+  and the CUDA runtime (verified: libnuka's dynamic dependencies contain no
+  Vulkan loader and no Vulkan symbols). Vulkan is a registered trademark of, and
+  the Vulkan loader/headers are made available by, The Khronos Group Inc., under
+  their respective licenses.
 
 nanobind
   Copyright (c) Wenzel Jakob and the nanobind contributors.
@@ -49,12 +62,15 @@ Components used at BUILD or TEST time ONLY (NOT shipped in the runtime binary)
 
 PyTorch / libtorch
   Copyright The PyTorch / Linux Foundation contributors.
-  Used ONLY at build time to detect the C++11 ABI flag via CMake
-  `find_package(Torch)`. libtorch is NOT linked into the Python extension:
+  libtorch is NOT linked into the Python extension and is NOT used to build it:
   the `_nuka_ext` extension links only against libnuka and the CUDA runtime
-  (cudart), not against libtorch. PyTorch is also supported as an OPTIONAL
-  runtime interop target (zero-copy DLPack tensor exchange), but it is not a
-  required dependency of the shipped runtime.
+  (cudart) and pins the C++11 ABI explicitly (`_GLIBCXX_USE_CXX11_ABI=1`) rather
+  than detecting it from Torch (verified by inspecting the extension's dynamic
+  dependencies). libtorch IS required by, and linked into, the OPTIONAL C++
+  inference tool under `tools/inference/` (CMake `find_package(Torch)`), which is
+  not part of the Python package. PyTorch is additionally supported as an
+  OPTIONAL runtime interop target (zero-copy DLPack tensor exchange). In none of
+  these roles is PyTorch a required dependency of the shipped Python runtime.
 
 JAX
   Copyright The JAX Authors / Google LLC.
