@@ -476,6 +476,30 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
     )
 
+    # --- v0.5 p02-A: differentiable single-step spine (ABA 3-pass reverse) ----
+    # Contact-free reverse-mode adjoint of drive -> ABA -> integrate. Internal /
+    # test-facing C++ API (NOT the tape / C-ABI; that is p02-B). One thread per
+    # articulation, atomic-free fixed-order tree accumulation (D1).
+    add_library(nuka_diffsim STATIC
+        diffsim/step_backward.cu
+        diffsim/step_backward_host.cpp
+    )
+    set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_diffsim
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_diffsim
+        PUBLIC
+            nuka_articulation_gpu
+            nuka_articulation
+            nuka_core
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka SHARED
         c_abi/device.cpp
         c_abi/world.cpp
