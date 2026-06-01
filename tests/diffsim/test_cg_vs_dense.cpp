@@ -221,4 +221,91 @@ TEST(CgDeterminism, BitExactSameInputs) {
     std::printf("[CgDeterminism] all 4 (precond x fixed) paths byte-identical\n");
 }
 
+// ---------------------------------------------------------------------------
+// MUST-FIX 1 regression (p03 adversarial review): an OBLIQUE rank-deficient PSD
+// block must produce a FINITE, range-space-correct BlockJacobi solution -- NOT a
+// NaN. The old absolute pivot floor (1e-300 -> sqrt -> 1e-150 -> divide) overflowed
+// to NaN on an oblique null direction (a PSD block whose post-elimination Schur
+// pivot is tiny-but-NONZERO, unlike a structurally dead row whose pivot is exactly
+// 0 and happened to stay finite). The modified-Cholesky null-direction handling
+// (kNullPivotRelEps) must keep it finite.
+//
+// We build A = Q diag(lam0, lam1, ~0) Q^T with a NON-axis-aligned rotation Q, so the
+// null direction is OBLIQUE (not a coordinate row). rhs = A y is then guaranteed in
+// range(A), so a correct range-space solve satisfies A x = rhs exactly on the range.
+// We assert (1) every solution component is std::isfinite, and (2) the residual
+// ||A x - rhs|| is small (range-space-correct). We do NOT compare to a Moore-Penrose
+// pseudo-inverse: the modified-Cholesky least-norm solution is pivot-order-dependent
+// and is not exactly A^+ rhs, but it IS an exact solution on the range (which is what
+// the IFT path needs -- the null direction carries zero gradient).
+TEST(CgVsDense, ObliqueRankDeficientBlockIsFiniteAndRangeCorrect) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    constexpr uint32_t n = 3u;
+
+    // Non-axis-aligned orthonormal Q (a rotation built from a fixed generic axis/angle
+    // via Gram-Schmidt on three generic seed vectors -> guaranteed oblique columns).
+    Eigen::Matrix3d M;
+    M << 0.6, 0.2, -0.3,
+         0.1, 0.7,  0.4,
+        -0.5, 0.3,  0.8;
+    Eigen::HouseholderQR<Eigen::Matrix3d> qr(M);
+    Eigen::Matrix3d Q = qr.householderQ();  // orthonormal, oblique (non-axis) columns
+
+    // One tiny eigenvalue along an OBLIQUE direction (Q's 3rd column), two healthy.
+    // lam2 = 1e-9 * lam_max is well below kNullPivotRelEps*max_diag (the null cutoff)
+    // yet NONZERO -- exactly the case the old absolute floor turned into NaN.
+    Eigen::Vector3d lam(21.0, 4.0, 21.0e-9);
+    Eigen::Matrix3d A = Q * lam.asDiagonal() * Q.transpose();
+    A = 0.5 * (A + A.transpose()).eval();  // exact symmetry
+
+    // rhs = A y for a generic y -> rhs in range(A) (the null component of y is killed
+    // by A, so rhs has zero projection on the null direction; a range-space solve is
+    // therefore exact). y picks up all three directions to make the test non-trivial.
+    Eigen::Vector3d y(0.9, -0.4, 1.3);
+    Eigen::Vector3d rhs_vec = A * y;
+
+    // Pack the single block into the device layout.
+    std::vector<float> values(kStride, 0.0f);
+    std::vector<uint32_t> dims(1u, n);
+    std::vector<float> rhs(kMd, 0.0f);
+    for (uint32_t i = 0u; i < n; ++i) {
+        for (uint32_t j = 0u; j < n; ++j)
+            values[i * kMd + j] = static_cast<float>(A(i, j));
+        rhs[i] = static_cast<float>(rhs_vec(i));
+    }
+
+    // BlockJacobi = the modified-Cholesky island solve (the IFT solve path).
+    const std::vector<float> x =
+        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
+
+    // (1) FINITENESS: every active component finite (the NaN lock-out). Padding too.
+    for (uint32_t i = 0u; i < kMd; ++i)
+        ASSERT_TRUE(std::isfinite(x[i]))
+            << "oblique-PSD BlockJacobi produced non-finite x[" << i << "] (the "
+               "MUST-FIX 1 NaN regressed)";
+
+    // (2) RANGE-SPACE CORRECTNESS: ||A x - rhs|| small (A x must reproduce the
+    // in-range rhs). Computed on host in fp64 from the GPU solution.
+    Eigen::Vector3d x_dev;
+    for (uint32_t i = 0u; i < n; ++i) x_dev(i) = static_cast<double>(x[i]);
+    const Eigen::Vector3d resid = A * x_dev - rhs_vec;
+    const double resid_norm = resid.norm();
+    const double rhs_norm = std::max(rhs_vec.norm(), 1.0e-12);
+    std::printf("[CgVsDense] oblique-PSD: lam=(%.3e,%.3e,%.3e) ||Ax-rhs||/||rhs|| = %.3e "
+                "(x finite)\n",
+                lam(0), lam(1), lam(2), resid_norm / rhs_norm);
+    // fp32 store of A + the solve -> a few-eps relative residual on the healthy
+    // directions; 1e-4 is ample headroom and far from a NaN/garbage result.
+    EXPECT_LT(resid_norm, 1.0e-4 * rhs_norm)
+        << "oblique-PSD BlockJacobi solution not range-space-correct";
+
+    // The null component must be SUPPRESSED (least-norm-style): x has no blow-up
+    // along the oblique null direction -- assert it stays O(1), not 1/tiny ~ 1e9.
+    const double null_comp = std::abs(Q.col(2).dot(x_dev));
+    std::printf("[CgVsDense] oblique-PSD: |null-direction component of x| = %.3e\n",
+                null_comp);
+    EXPECT_LT(null_comp, 1.0e2)
+        << "oblique-PSD solution blew up along the null direction (divide-by-tiny)";
+}
+
 }  // namespace
