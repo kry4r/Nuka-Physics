@@ -44,6 +44,18 @@ from ._nuka_ext import (  # noqa: F401
     CONTROL_MODE_ACTUATOR,
 )
 
+# v0.5 p04 Task 5.4.9 sim-to-real noise config (PURE python -- no torch/jax dep,
+# so eager import is safe; see noise.py). GaussianNoise / PoissonNoise wrap the
+# per-field sensor-noise C-ABI; DomainRandomization wraps the per-episode DR.
+from .noise import (  # noqa: F401
+    GaussianNoise,
+    PoissonNoise,
+    DomainRandomization,
+    NOISE_NONE,
+    NOISE_GAUSSIAN,
+    NOISE_POISSON,
+)
+
 # Re-export the field enum members at top level for convenience.
 RIGID_BODY_TRANSFORM = Field.RIGID_BODY_TRANSFORM
 ARTICULATION_LINK_POSE = Field.ARTICULATION_LINK_POSE
@@ -157,6 +169,13 @@ __all__ = [
     "LINK_POSE_FLOATS",
     "LINK_VELOCITY_FLOATS",
     "torch_stream_ptr",
+    # v0.5 p04 Task 5.4.9 sim-to-real noise config (pure-python, eager-safe).
+    "GaussianNoise",
+    "PoissonNoise",
+    "DomainRandomization",
+    "NOISE_NONE",
+    "NOISE_GAUSSIAN",
+    "NOISE_POISSON",
     # NOTE: "autograd" is deliberately NOT in __all__. It is resolved lazily via
     # __getattr__ (PEP 562) so `import nuka` / `nuka.autograd.step(...)` work
     # without eagerly importing torch. Listing it here would make
