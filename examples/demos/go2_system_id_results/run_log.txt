@@ -1,0 +1,36 @@
+==========================================================================
+Nuka v0.5 -- gradient-based system identification (fixed-base Go2)
+contact-free direct-dynamics mass recovery, obs='qdot'
+==========================================================================
+scene      : /root/Nuka-Physics/examples/scenes/go2_system_id.usda
+link index : 2 (thigh)   gravity_z: -9.81
+K (rollout): 30   true_mass: 1.4   start_mass: 0.9
+optimizer  : Adam(lr=0.03)   max_iters: 80   tol: 0.01
+
+action_dim : 12   actions_seq shape: (30, 12) (constant rest-hold PD target)
+grad sanity: dLoss/dmass @ start_mass = -1.389748e-01 (must be nonzero -> OK)
+
+target obs : qdot at true_mass, shape (1, 12), norm 4.062509e+00
+
+Adam descent:
+  iter    0  mass=0.900000  loss=3.376617e-02  rel_err=3.571e-01
+  iter    1  mass=0.930000  loss=2.973150e-02  rel_err=3.357e-01
+  iter    2  mass=0.959931  loss=2.597292e-02  rel_err=3.143e-01
+  iter    3  mass=0.989742  loss=2.249242e-02  rel_err=2.930e-01
+  iter    4  mass=1.019374  loss=1.929061e-02  rel_err=2.719e-01
+  iter   20  mass=1.405878  loss=4.370030e-06  rel_err=4.199e-03
+  iter   40  mass=1.448451  loss=2.951089e-04  rel_err=3.461e-02
+  iter   60  mass=1.379662  loss=5.251106e-05  rel_err=1.453e-02
+  iter   79  mass=1.405160  loss=3.367940e-06  rel_err=3.686e-03
+
+determinism check (D1): re-running the loop ...
+  run #1 length 80, run #2 length 80
+  recovered-mass sequence bit-identical: True
+
+==========================================================================
+RESULT: recovered_mass = 1.400448  true_mass = 1.4  (best-loss iterate @ iter 74)
+        relative error = 3.2015e-04  (tol 0.01)  iters run = 80
+        loss: initial 3.376617e-02 -> best 2.542075e-08 (1328291.4x reduction)
+        (final iterate: mass=1.405160, loss=3.367940e-06 -- last oscillation sample, for reference)
+        determinism (D1): PASS
+==========================================================================
