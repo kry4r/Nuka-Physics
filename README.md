@@ -1,223 +1,186 @@
-# Nuka Physics Engine
+# Nuka Physics
 
-A high-performance, CUDA-first physics engine designed for robotics simulation,
-reinforcement learning, and real-time applications.
+**A GPU-resident, strongly deterministic, differentiable CUDA physics engine for
+robotics and large-scale reinforcement learning.**
 
-## Showcase — 4096-env Go2 locomotion, trained in-engine
+Nuka runs thousands of articulated environments on a single GPU, reproduces
+runs bit-for-bit, and exposes a full **analytical reverse-mode adjoint** through
+its rigid + articulated dynamics — so you can backpropagate a loss through the
+simulator itself, not just sample-estimate it.
+
+## Showcase — 4096-env Go2 locomotion, trained in-engine (v0.3)
 
 ![Go2 walking — batched environments driven by an in-engine PPO policy](docs/media/go2_walk_4096env.gif)
 
 *16 of 4096 batched Go2 environments (debug-skeleton render of the headless
 batched path), driven by a PPO policy trained end-to-end on Nuka.* The same
-cooked `WorldTemplate` runs all 4096 environments on one GPU; the policy was
+cooked world template runs all 4096 environments on one GPU; the policy was
 trained from scratch with [rl_games](examples/training/) PPO and converges to a
 command-conditioned walking gait (forward-velocity tracking across
-`-0.5 … +1.0 m/s`).
+`-0.5 … +1.0 m/s`). **This is a forward-simulation + RL training result** (v0.3),
+not the differentiable path — see
+[docs/examples/go2_locomotion.md](docs/examples/go2_locomotion.md).
 
-### v0.3 (S1) highlights
+## Highlights — what makes Nuka different
 
-- **4096 parallel articulated environments** on a single GPU from one cooked
-  template — GPU-resident broadphase, contact generation, PGS contact/joint
-  solve, Featherstone ABA, and PD drives.
-- **Comfortably under the 1 ms / env-step target** at 4096 envs under strong
-  (D1) determinism on a dev **RTX 4000 Ada** (≈3× below a 4090; the absolute
-  master-plan gate is validated on the owner's RTX 5080 — this box reports
-  relative numbers). Median GPU step time is ≈ 0.93 µs / env-step by in-engine
-  CUDA-event timers. See
-  [the on-box test & perf report](docs/architecture/2026-05-31-v03-test-and-perf-report.md).
-- **Byte-exact strong determinism (D1)** by default — no float atomics, fixed
-  reduction order, bit-identical re-runs — with an **opt-in weak-determinism
-  (D2)** toggle exposed through the C ABI (`nuka_world_desc_t.determinism`) for
-  workloads that trade reproducibility for speed.
-- **Opt-in, bit-exact CUDA-graph step path** (`BatchedArticulatedWorld::StepGraph`)
-  — replays the captured step kernel sequence **bit-for-bit identical** to the
-  reference `Step()` (asserted by a byte-compare regression test), removing
-  per-launch overhead while staying D1-safe. (At 4096-env production batches the
-  step is compute-bound, so the launch-overhead win is within run-to-run noise;
-  the value is the determinism-preserving mechanism, not a speedup.)
-- **In-engine RL stack**: zero-copy PyTorch (DLPack) buffer views, a gymnasium
-  vec-env, an rl_games adapter, and an engine-side per-env reset primitive — see
-  [`examples/training/`](examples/training/).
+1. **Strong (D1) determinism, bit-exact across two runs.** No floating-point
+   atomics, fixed reduction order in every physics path. Re-running a simulation
+   from the same inputs reproduces the result *byte-for-byte*. This is enforced
+   by a physics-smell lint that must pass on every PR.
 
-## Features
+2. **Full analytical reverse-mode adjoint** through rigid + articulated dynamics
+   (Featherstone ABA, reverse-mode), with a recorded tape + gradient
+   checkpointing and an implicit-function-theorem (IFT) contact gradient at
+   convergence. This is a *real* analytical adjoint — not a stop-gradient
+   approximation through contact (Brax) — so gradients are exact and
+   engine-consistent. (Scope honestly stated: floating-base **orientation**-channel
+   and the d/dM, d/dJ contact-derivative channels are deferred to v0.7.)
 
-- Rigid body dynamics with symplectic Euler integration
-- Iterative constraint solver (PGS) for contacts and joints
-- Articulated body support (revolute, prismatic, fixed joints) with PD drives
-- Collision detection: broadphase (sweep-and-prune) and narrow-phase (GJK/SAT)
-- Sensor simulation: CUDA IMU/state and lidar query kernels on GPU-resident
-  scenes, with CPU sensor helpers kept as reference-only validation code
-- Scene import from MJCF, URDF, and USDA/text USD formats with SceneGraph / PhysicsWorld / RenderScene conversion
-- Isolated USD stage adapter with explicit `.usd`/`.usda`/`.usdc`/`.usdz` routing and an OpenUSD SDK backend boundary for binary USD/USDZ
-- CUDA batched world state for parallel environments sharing one cooked
-  `WorldTemplate`, including GPU-resident batched broadphase, contact
-  generation, contact solve for plane/box/sphere contact scenes, cooked joint
-  projection, velocity drive solve, and batched CUDA IMU/lidar observation
-  queries; CPU batching remains reference/orchestration metadata
-- CUDA is the preferred/default production physics backend through the PHI
-  (Platform Hardware Interface) backend selection layer; high-level production
-  APIs reject silent CPU fallback, and CPU stepping must be explicitly enabled
-  as a validation/reference run
-- Vulkan is the required production rendering backend; it now has executable
-  offscreen paths for both physics debug commands and materialized `RenderScene`
-  mesh instances, while the headless CPU PPM rasterizer remains a deterministic
-  CI/reference artifact path
-- Debug draw and visualization utilities for collision proxies, AABBs, joints, contacts, centers of mass, and constraint errors
+3. **Zero-copy PyTorch + JAX interop via DLPack.** Engine buffers alias torch /
+   jax tensors with no copy. Both frontends drive the *same* deterministic engine
+   adjoint, so `jax.grad` and `loss.backward()` produce gradients that **agree to
+   engine round-off** (a tight rel-err < 1e-4 gate; ~1e-6 in practice).
 
-## Quick Start
+4. **Sim-to-real noise, deterministic and replayable.** N1 per-field sensor noise
+   (Gaussian / Poisson) + N2 per-episode domain randomization, both driven by a
+   counter-based Philox4x32-10 RNG — so noise is a pure function of
+   `(seed, index, sequence)`, two-run bit-exact, and re-derived identically on the
+   diff-sim backward. Off by default, so oracle scenes stay byte-identical.
 
-### Prerequisites
+## Quick start
 
-- CMake 3.20+
-- C++20 compiler (MSVC, GCC, or Clang)
-- CUDA Toolkit for the preferred production physics backend
-- Vulkan SDK for the production rendering backend
+Nuka is built and run on **Linux** with **CUDA 12.8** and **g++-10**. A
+CUDA-capable GPU is required for the production physics path. (A `pip install
+nuka-physics` from PyPI is *planned*, not yet published — build from source for
+now.)
 
-### Configure
-
-```powershell
-# PowerShell
-.\scripts\configure.ps1
-
-# Or directly with CMake
-cmake -S . -B build -DNK_BUILD_TESTS=ON
-
-# This workstation defaults to the CUDA production path and native GPU kernels.
-# Override only when intentionally cross-compiling or reproducing another GPU.
-cmake -S . -B build -DNK_BUILD_TESTS=ON -DNK_CUDA_ARCHITECTURES=native
-```
-
-### Build
-
-```powershell
-cmake --build build --config Release
-```
-
-### Test
-
-```powershell
-# PowerShell
-.\scripts\run-tests.ps1
-
-# Or directly with CTest
-ctest --test-dir build -C Release --output-on-failure
-
-# CUDA production physics and Vulkan production rendering checks
-ctest --test-dir build -C Release --output-on-failure -R "CudaWorldStepper|CudaDeviceWorld|CudaBatchedWorld|CudaContacts|CudaConstraintSolver|CudaSensor|CudaStepTiming|CudaBatchTiming|CudaBatchContactTiming|CudaBatchJointDriveTiming|CudaBatchSensorTiming|CudaContactTiming|CudaSolverTiming|CudaSensorTiming|CudaSceneDemoTiming|VulkanRenderer|VulkanSceneDemoTiming|BatchedVulkanSceneDemoTiming|VulkanRenderSceneTiming"
-```
-
-### Contributing / Lint
-
-Physics-smell lint is part of the v0.1 guardrail layer:
+### 1. Build the C++ engine (GPU)
 
 ```bash
-python tools/lint/physics_smell.py
-cmake --build build --target nuka_run_lint
+export CC=gcc-10 CXX=g++-10
+cmake -S . -B build-cuda128 \
+  -DNK_BUILD_TESTS=ON \
+  -DNK_REQUIRE_CUDA=ON \
+  -DNK_PHYSICS_BACKEND=CUDA
+cmake --build build-cuda128 -j
 ```
 
-See [Physics-Smell Lint](tools/lint/README.md) for the banned patterns, scoped
-allowlist, and extension rules.
+Always use the `build-cuda128` directory (never the legacy `build/`). See
+[CONTRIBUTING.md](CONTRIBUTING.md) and [`python/README.md`](python/README.md) for
+the toolchain environment variables.
 
-### Imported Scene Debug Render Demo
+### 2. Install the Python bindings
 
-```powershell
-cmake --build build --config Release --target nuka_scene_demo
-.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.xml out\complete_robot_debug.ppm 640 360 60 0.0166667
-.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_usd_debug.ppm 640 360 60 0.0166667
-.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_batched_debug.ppm 640 360 60 0.0166667 8
-.\build\src\Release\nuka_scene_demo.exe examples\scenes\complete_robot.usda out\complete_robot_material.ppm 640 360 60 0.0166667 renderscene
+```bash
+pip install -e python
 ```
 
-The demo imports MJCF/URDF/USD text scenes, compiles them into
-`SceneGraph`/`PhysicsWorld`/`RenderScene`, resolves physics through the PHI
-backend selection layer, and on this workstation advances the scene through the
-CUDA production path: device world upload, fixed-step integration, CUDA
-broadphase/contact generation, and CUDA joint/contact/drive constraint solving.
-Imported IMU/frame-pose sensors are sampled from that same CUDA `DeviceWorld`;
-lidar depth queries use CUDA ray kernels against cooked sphere, box-style, and
-plane geometry.
-It then synchronizes the simulated body poses back into render/debug views,
-generates physics debug overlays, renders those overlays through the Vulkan
-offscreen compute renderer, and writes a deterministic PPM image for quick
-validation or CI artifacts. The CLI prints physics backend, render backend,
-CUDA constraint row counts, joint/drive/contact block counts, sensor sample
-counts, and maximum position error so global demo runs prove more than file
-output. The optional `renderscene` output mode keeps the same import and CUDA
-simulation path but renders the synchronized material `RenderScene` mesh
-instances through Vulkan instead of physics debug overlays.
+### 3. Backpropagate through the simulator — a link-mass gradient
 
-CPU simulation is not a production fallback. To run the imported-scene demo
-against the CPU reference stepper for differential validation, callers must set
-both `physics_backend_policy = ForceCpuReference` and
-`allow_cpu_reference_validation = true`; otherwise the app rejects CPU physics
-selection.
+The differentiable rollout lives in `nuka.autograd` (it is *not* re-exported at
+the top level, so `import nuka` never hard-requires torch). Pass the parameter
+you want a gradient for as a **torch tensor** via `params=` — calling `.item()`
+on it would sever the autograd graph.
 
-When the optional final `instance_count` argument is greater than one, the CLI
-runs the batched imported-scene workflow: one cooked template is reused across
-multiple CUDA `BatchedDeviceWorld` instances, fixed-step contacts/joints/drives
-and batched IMU observations run on CUDA, and the final multi-environment debug
-view is rendered through Vulkan into a single PPM artifact.
+```python
+import torch
+import nuka
+from nuka.autograd import differentiable_rollout
 
-## Architecture
+scene = "examples/scenes/go2_system_id.usda"   # fixed-base Go2, single env
 
-The engine is organized into layered modules:
+with nuka.Device.create(0) as dev:
+    # SINGLE-ENV, contact-free differentiable path: one fresh world + tape.
+    world = nuka.World.create_from_scene(dev, scene, 1)
+    world.set_gravity_z(-9.81)
+    tape = nuka.Tape.create(
+        world, checkpoint_interval=3, max_tape_entries=4096,
+        max_checkpoints=512, recompute_on_backward=1,
+    )
 
-| Layer | Modules | Description |
-|-------|---------|-------------|
-| **Core** | `math`, `core` | Spatial algebra, vectors, quaternions, transforms |
-| **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline, MJCF/URDF/USD importers |
-| **Rendering** | `render` | RenderScene metadata, materials, cameras, lights, debug proxies, Vulkan offscreen debug and RenderScene rendering |
-| **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, batched contact/joint/drive solve, integrator, joint drives |
-| **Collision** | `collision` | Broadphase, narrow-phase, raycasting |
-| **Constraints** | `constraint`, `solver` | Contact manifolds, constraint blocks, PGS solver |
-| **Sensors** | `sensor` | CUDA single-world and batched IMU/state and lidar query paths, plus CPU reference helpers |
-| **PHI** | `phi` | GPU abstraction layer (CUDA backend) |
-| **Apps** | `apps`, `debug_draw` | Debug draw command buffers and compiled-scene visualization overlays |
+    # The mass of one thigh link (GLOBAL link index 2) as a differentiable leaf.
+    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))
 
-For detailed architecture documentation see:
-- [Runtime Overview](docs/architecture/runtime-overview.md)
-- [Scene Compiler Pipeline](docs/architecture/scene-compiler.md)
-- [Imported Scene Debug Render Demo](docs/architecture/debug-render-demo.md)
+    # A fixed K=30-step rest-hold PD target sequence: (K, action_dim).
+    action_dim = world.base_link_count - 1            # 12 for Go2
+    actions = torch.zeros(30, action_dim, device="cuda")
 
-## Tech Stack
+    # Drive the rollout; observe post-rollout joint velocities (qdot).
+    obs = differentiable_rollout(
+        world, tape, actions,
+        params=mass, param_link_indices=[2], obs="qdot",
+    )
+    loss = obs.pow(2).mean()
+    loss.backward()
 
-- **Language**: C++20
-- **Build System**: CMake
-- **Testing**: Google Test
-- **Physics backend**: CUDA preferred by default via PHI backend selection;
-  CPU reference is kept for validation/orchestration only and requires explicit
-  opt-in at app/API boundaries
-- **Rendering backend**: Vulkan production backend with offscreen debug and
-  RenderScene material output for CI artifacts; CPU raster output is
-  reference-only
-- **CI**: GitHub Actions
-
-## Project Structure
-
+    print("dLoss/dmass =", mass.grad.item())        # read the gradient...
+    tape.destroy()                                   # ...BEFORE destroying the tape
+    world.destroy()
 ```
-nuka-physics/
-  CMakeLists.txt          # Root build file
-  src/                    # Engine source code
-    core/                 # Core utilities
-    math/                 # Spatial math library
-    scene/                # Scene IR and cooker
-    import/               # Format importers
-    runtime/              # World containers and integrator
-    collision/            # Collision detection
-    constraint/           # Constraint blocks
-    solver/               # Iterative solver
-    phi/                  # GPU abstraction
-    sensor/               # Sensor simulation
-    apps/                 # Debug draw and tools
-  examples/               # Runnable imported-scene fixtures
-  tests/                  # Test suite
-    regression/           # Regression tests
-    perf/                 # Performance benchmarks
-  tools/                  # Utility scripts
-  docs/                   # Documentation
-  scripts/                # Build helper scripts
+
+`world.reset()` is **not supported** on this single-env path; build a fresh
+world + tape per evaluation (this is cheap — a few ms). The full worked example
+is the system-ID demo: [docs/examples/system_identification.md](docs/examples/system_identification.md).
+
+### Run the RL locomotion training (forward sim)
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --num_actors 4096
+# fast launch proof:
+CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --smoke
 ```
+
+## Status
+
+**v0.5 — initial public release.** What ships:
+
+- 4096+ parallel articulated environments on a single GPU (v0.3 forward sim).
+- Differentiable simulation through **rigid + articulated (Featherstone)**
+  dynamics: analytical adjoint, tape + gradient checkpointing, IFT-at-convergence
+  contact gradient, parameter (link-mass) and control-mode gradients.
+- Zero-copy PyTorch + JAX (DLPack) interop.
+- Sim-to-real noise N1 (sensor) + N2 (domain randomization).
+- Self-written deterministic sparse solver (CG + Jacobi / Block-Jacobi,
+  fixed-order reductions, D1 bit-exact) for the IFT path — no closed-source SDK.
+
+**Not yet shipped (roadmap):** soft body, fluid, and rigid↔soft↔fluid
+cross-system coupling are **v0.7**; floating-base **orientation**-channel and
+d/dM, d/dJ contact gradients are **v0.7**. See the
+[master plan](docs/plans/2026-05-28-nuka-physics-master-plan.md) §7.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md) — prerequisites, build, hello-world,
+  RL quickstart.
+- Concepts: [architecture](docs/concepts/architecture.md) ·
+  [differentiable simulation](docs/concepts/diff-sim.md) ·
+  [migrating from Isaac Lab](docs/concepts/isaaclab-compat.md)
+- Examples: [Go2 locomotion (v0.3)](docs/examples/go2_locomotion.md) ·
+  [system identification (v0.5)](docs/examples/system_identification.md)
+- Architecture deep-dives: [Runtime overview](docs/architecture/runtime-overview.md) ·
+  [diff-sim tape + checkpointing](docs/architecture/diffsim-tape.md) ·
+  [sim-to-real noise](docs/architecture/sim2real-noise.md) ·
+  [scene compiler](docs/architecture/scene-compiler.md)
+- Launch blog: [Nuka Physics v0.5](docs/blog/2026-06-01-v05-launch.md)
+- [Master plan](docs/plans/2026-05-28-nuka-physics-master-plan.md) — architecture +
+  long-term roadmap (the source of truth for the version plan).
+
+## Scene import
+
+Scenes import from **MJCF** (`.xml`), **URDF**, and **text USD** (`.usda`). The
+`.usda` parser is hand-written using only the C++ standard library — there is no
+OpenUSD SDK dependency and no binary `.usdc` / `.usdz` support. XML is parsed via
+tinyxml2. See [NOTICE](NOTICE).
+
+## Contributing
+
+Contributions are welcome under a signed [Contributor License Agreement](CLA.md)
+(the CLA-assistant bot checks this on every PR). Read
+[CONTRIBUTING.md](CONTRIBUTING.md) for the build, lint, and test gates, and the
+[Code of Conduct](CODE_OF_CONDUCT.md). For security issues, follow
+[SECURITY.md](SECURITY.md).
 
 ## License
 
-TBD
+**Apache License 2.0** with a Contributor License Agreement. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party attributions.
