@@ -703,6 +703,34 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
+    # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
+    # Cooks known meshes' narrow-band SDFs on the host (p07), uploads via
+    # SdfDeviceWorld, launches the shipping p07 sampler kernel through the
+    # uploaded device SparseSdfDevice views, and asserts GPU == host sampler
+    # (near-equal; out-of-band sentinel exact) + D1 two-run byte-identical.
+    # The test holds a __global__, so it is a .cu (CUDA language). Needs both
+    # the repo root (tests/import/sdf_*.hpp) and src on the include path.
+    add_executable(nuka_sdf_device_test
+        runtime/test_sdf_device_upload.cu
+    )
+
+    target_include_directories(nuka_sdf_device_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_sdf_device_test
+        PRIVATE
+            nuka_runtime_gpu
+            nuka_cooker
+            nuka_scene
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sdf_device_test)
+
     # --- v0.7 p04: LBVH vs SAP differential gate + D1 byte-exact -----------
     add_executable(nuka_lbvh_vs_sap_test
         collision/test_lbvh_vs_sap_pair_set.cpp
