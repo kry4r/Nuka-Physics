@@ -311,7 +311,7 @@ struct IftOut {
     std::vector<float> grad_b_c;        // block_count * kMd
 };
 IftOut RunIft(const nuka::phi::DeviceContext& ctx, ContactStep& s,
-              const std::vector<float>& g) {
+              const std::vector<float>& g, bool adaptive_routing = false) {
     const uint32_t n_link = s.view.total_link_count;
     nuka::phi::Buffer g_buf(n_link * sizeof(float), nuka::phi::MemoryKind::Device);
     g_buf.CopyFromHost(g.data(), n_link * sizeof(float));
@@ -335,6 +335,7 @@ IftOut RunIft(const nuka::phi::DeviceContext& ctx, ContactStep& s,
     grads.grad_b_c = static_cast<float*>(gbc_buf.Data());
 
     diffsim::IftRunner runner(ctx);
+    runner.SetAdaptiveRouting(adaptive_routing);
     runner.Run(in, static_cast<const float*>(g_buf.Data()), grads);
     ctx.stream.Synchronize();
 
@@ -692,6 +693,50 @@ TEST(IftContactGradient, D1TwoRunByteExact) {
     EXPECT_EQ(cmp_qf, 0) << "D1 violated: grad_qdot_free differs across two IFT runs";
     EXPECT_EQ(cmp_bc, 0) << "D1 violated: grad_b_c differs across two IFT runs";
     std::printf("[Ift] D1 two-run byte-identical (grad_qdot_free + grad_b_c)\n");
+}
+
+// ---------------------------------------------------------------------------
+// (C2) Perf-gate byte-identity: the default path (adaptive_routing OFF -> skip both
+//      detectors + their two per-solve syncs, solve directly with CG) MUST produce
+//      grads BYTE-IDENTICAL to the ARMED auto-router (SetAdaptiveRouting(true)) on the
+//      bit-symmetric SPD Delassus contact scene -- because the router's non-symmetric
+//      + indefinite detectors are read-only and can never fire here, so its SPD fall-
+//      through runs the SAME CG solve. This MEASURES the byte-identity that commit
+//      60575b3 only argued by construction, AND gives RunAutoRouter() its first end-to-
+//      end coverage (lazy backend construction + flag readback + branch selection).
+//      (The complementary case -- a genuinely indefinite / non-symmetric system routing
+//      through the armed path to MINRES/GMRES -- needs a non-SPD operator at this seam,
+//      which first exists in p11 coupling; deferred there with the rest of the armed
+//      end-to-end coverage.)
+// ---------------------------------------------------------------------------
+TEST(IftContactGradient, AdaptiveRoutingOffEqualsOnByteExact) {
+    const auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    Scene sc = MakeChainScene(/*n_dof=*/3u, /*depth=*/0.02f, /*mu=*/art::kContactFriction);
+    for (auto& v : sc.host.qdot) v = 0.0f;
+    sc.host.qdot[sc.dof_to_link[0]] = 0.04f;
+    sc.host.qdot[sc.dof_to_link[1]] = -0.01f;
+
+    ContactStep s = RunContactStep(ctx, sc.host, sc.link, sc.point, sc.normal,
+                                   sc.depth, sc.dt, sc.mu);
+    std::mt19937 rng(0x1234u);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> g(s.view.total_link_count, 0.0f);
+    for (uint32_t k = 0u; k < s.dof; ++k) g[sc.dof_to_link[k]] = u(rng);
+
+    const IftOut off = RunIft(ctx, s, g, /*adaptive_routing=*/false);
+    const IftOut on = RunIft(ctx, s, g, /*adaptive_routing=*/true);
+    ASSERT_EQ(off.grad_qdot_free.size(), on.grad_qdot_free.size());
+    ASSERT_EQ(off.grad_b_c.size(), on.grad_b_c.size());
+    const int cmp_qf = std::memcmp(off.grad_qdot_free.data(), on.grad_qdot_free.data(),
+                                   off.grad_qdot_free.size() * sizeof(float));
+    const int cmp_bc = std::memcmp(off.grad_b_c.data(), on.grad_b_c.data(),
+                                   off.grad_b_c.size() * sizeof(float));
+    EXPECT_EQ(cmp_qf, 0) << "perf-gate broke byte-identity: grad_qdot_free differs "
+                            "between adaptive-routing OFF (CG) and ON (router SPD branch)";
+    EXPECT_EQ(cmp_bc, 0) << "perf-gate broke byte-identity: grad_b_c differs "
+                            "between adaptive-routing OFF (CG) and ON (router SPD branch)";
+    std::printf("[Ift] perf-gate: adaptive-routing OFF == ON byte-identical "
+                "(SPD detectors no-op -> same CG solve)\n");
 }
 
 // ---------------------------------------------------------------------------
