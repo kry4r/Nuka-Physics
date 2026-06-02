@@ -486,6 +486,11 @@ if(CMAKE_CUDA_COMPILER)
         # header-inline NUKA_SDF_HD function (host tests call it directly); this
         # TU carries the device emission kernel + the host RowBuffers builders.
         collision/sdf_contact.cu
+        # v0.7 p08-C (Channel 2/3): envelope-theorem depth+normal contact-geometry
+        # adjoint of the Newton-summed-SDF contact. Host fp32; differentiates the
+        # p07 trilinear sampler + pose at the FROZEN witness (valley-proof, no
+        # step_curvature). The contact POINT is degenerate -> NOT differentiated.
+        collision/sdf_contact_adjoint.cpp
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -586,6 +591,12 @@ if(CMAKE_CUDA_COMPILER)
         # through the converged contact solve in ONE Delassus solve (z = A^-1 J M^-1 g),
         # distributing grad_qdot_free = g - J^T z and grad_b_c = z. D1, no atomics.
         diffsim/ift_runner.cu
+        # v0.7 p08-C (Channel 1, the §4.B acceptance): SDF-contact IFT d/dM, d/dJ.
+        # The v0.5 ift_runner DEFERRED these channels; §4.B owns them for the
+        # SDF-contact rows. System-level IFT of A lambda = r (A = J M^-1 J^T):
+        # dlambda = A^-1 (dr - dA lambda). Host fp64 reference (the GPU runner
+        # already owns the A^-1 apply); FD-validated by perturb-M/J-and-re-solve.
+        diffsim/sdf_contact_ift.cpp
         # v0.5 p03 R3b: OSC (operational-space control) differentiable adjoint --
         # reverse-mode gain (Kp,Kd) + task-target gradients of the forward OSC drive
         # (tau = J^T A^-1 (Kp*e_x+Kd*edot_x)); reuses the forward's 3x3 LDL^T to
