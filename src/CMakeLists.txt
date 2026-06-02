@@ -41,6 +41,14 @@ target_include_directories(nuka_math
 # SYSTEM include path and by omitting the strict flag set on this TU.
 add_library(nuka_cooker STATIC
     import/cooker/convex_decomposition.cpp
+    # v0.7 p07: narrow-band sparse SDF cooker (HOST CPU; the cooked SDF is a
+    # byte-reproducible golden, so it runs on the deterministic host path rather
+    # than taking the cook-time GPU exception). The runtime query header
+    # (runtime/sdf/sparse_sdf_query.cuh) is CUDA-free and is included here too.
+    import/cooker/sparse_sdf_cooker.cpp
+    # v0.7 p07 seam: the swappable SDF bake backend (CpuSdfBakeBackend now; the
+    # v1.0 GPU backend slots in behind DefaultSdfBakeBackend). Owner 2026-06-02.
+    import/cooker/sdf_bake_backend.cpp
 )
 set_target_properties(nuka_cooker PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

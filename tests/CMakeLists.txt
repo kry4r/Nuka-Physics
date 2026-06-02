@@ -356,6 +356,32 @@ target_link_libraries(nuka_vhacd_test
 
 gtest_discover_tests(nuka_vhacd_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# --- Sparse narrow-band SDF cooker tests (v0.7 p07) ------------------------
+# Cook-time SDF generation (nuka_cooker) + dedup through CookScene (nuka_scene).
+# Pure host/CPU (no GPU needed); samples the cooked SDF on CPU through the same
+# runtime/sdf/sparse_sdf_query.cuh sampler p08 ships on the GPU.
+add_executable(nuka_sparse_sdf_test
+    import/test_sparse_sdf_known_shapes.cpp
+    import/test_sparse_sdf_thin_shell.cpp
+    import/test_sparse_sdf_memory.cpp
+    import/test_sparse_sdf_determinism.cpp
+)
+
+target_include_directories(nuka_sparse_sdf_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_sparse_sdf_test
+    PRIVATE
+        nuka_cooker
+        nuka_scene
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_sparse_sdf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- Collision tests -------------------------------------------------------
 add_executable(nuka_collision_test
     collision/test_raycast.cpp

@@ -67,6 +67,41 @@ struct CookedConvexGeometry {
     uint32_t Count() const { return static_cast<uint32_t>(vertex_counts.size()); }
 };
 
+// Sentinel: a convex-geometry piece that carries no cooked SDF.
+constexpr uint32_t kNoSdf = ~uint32_t(0);
+
+// Cooked sparse narrow-band SDFs (v0.7 p07). One logical SDF per UNIQUE convex
+// geometry piece (deduplicated by content hash). All SDFs' cells are stored
+// flat and concatenated; SDF `s` owns cells [key_offsets[s], +key_counts[s]).
+// Per-SDF cell_keys slice is ASCENDING-sorted so the runtime sampler can binary
+// search it (see runtime/sdf/sparse_sdf_query.cuh). Values + gradients are
+// parallel to keys. Geometry is in MESH-LOCAL frame (origins are local-space).
+//
+// `piece_sdf_indices` maps each CookedConvexGeometry piece -> its SDF index
+// (kNoSdf if no SDF was cooked for that piece). Two identical pieces share one
+// SDF index (dedup), so this vector may contain repeated indices.
+struct CookedSdfTable {
+    // Per-SDF header (parallel arrays; length == sdf_count).
+    std::vector<math::Vec3> origins;       // local-space corner of voxel (0,0,0)
+    std::vector<float>      voxel_sizes;    // edge length per SDF
+    std::vector<uint32_t>   dims_x;         // full grid dims (most cells empty)
+    std::vector<uint32_t>   dims_y;
+    std::vector<uint32_t>   dims_z;
+    std::vector<uint32_t>   key_offsets;    // start into cell_keys/values/gradients
+    std::vector<uint32_t>   key_counts;     // narrow-band cell count for this SDF
+
+    // Flat cell storage (concatenated across all SDFs).
+    std::vector<uint64_t>   cell_keys;      // PackSdfCellKey(i,j,k); sorted per SDF
+    std::vector<float>      cell_values;    // signed distance per cell
+    std::vector<math::Vec3> cell_gradients; // precomputed central-diff gradient
+
+    // Per convex-geometry-piece SDF index (parallel to CookedConvexGeometry
+    // pieces). kNoSdf if no SDF for that piece.
+    std::vector<uint32_t>   piece_sdf_indices;
+
+    uint32_t Count() const { return static_cast<uint32_t>(voxel_sizes.size()); }
+};
+
 struct CookedSensorTable {
     std::vector<SensorType>      types;
     std::vector<BodyId>          attached_bodies;
@@ -118,6 +153,7 @@ struct CookedBlob {
     CookedJointTable joints;
     CookedShapeTable shapes;
     CookedConvexGeometry convex_geometry;  // v0.7 p06: hull geometry for ConvexHull rows
+    CookedSdfTable    sdfs;                 // v0.7 p07: narrow-band SDFs per unique piece
     CookedSensorTable sensors;
     CookedMaterialTable materials;
     CookedCameraTable cameras;
