@@ -172,6 +172,42 @@ nuka_result_t nuka_tape_state_view(nuka_tape_handle tape,
                                    nuka_state_field_t field,
                                    nuka_buffer_view_t* out);
 
+// ---------------------------------------------------------------------------
+// Sparse linear solver backend selection (v0.7 p01)
+// ---------------------------------------------------------------------------
+//
+// The diff-sim / general sparse-solver path solves its SPD systems through the
+// SparseLinearSolver seam. v0.5 shipped exactly one backend -- the self-written
+// deterministic CG (Jacobi / Block-Jacobi preconditioned, D1 bit-exact). v0.7
+// p01 hardens + generalizes that SAME core for larger / worse-conditioned
+// systems; MINRES / GMRES are reserved for later v0.7 phases (they build on this
+// CG core and are NOT YET implemented -> selecting them returns
+// NUKA_RESULT_NOT_SUPPORTED).
+//
+// The default backend is NUKA_SOLVER_BACKEND_SELF_CG; a fresh world already uses
+// it, so calling the setter is only needed to be explicit or (later) to switch.
+typedef enum nuka_sparse_solver_backend_t {
+    NUKA_SOLVER_BACKEND_SELF_CG = 0,      /* self-written CG; default (v0.5) */
+    NUKA_SOLVER_BACKEND_SELF_MINRES = 1,  /* reserved: v0.7 phase 2 (not yet) */
+    NUKA_SOLVER_BACKEND_SELF_GMRES = 2,   /* reserved: v0.7 phase 3 (not yet) */
+} nuka_sparse_solver_backend_t;
+
+// Selects the sparse linear solver backend for `world`'s diff-sim / general
+// solver path. NUKA_SOLVER_BACKEND_SELF_CG is accepted (and is the default);
+// the reserved MINRES / GMRES values return NUKA_RESULT_NOT_SUPPORTED until
+// their phases land; any other value returns NUKA_RESULT_INVALID_ARG. Returns
+// NUKA_RESULT_NULL_HANDLE for a null world. A plain host-side scalar write; no
+// device work. The selection is read at solver-construction time.
+nuka_result_t nuka_world_set_sparse_solver_backend(
+    nuka_world_handle world, nuka_sparse_solver_backend_t backend);
+
+// Reads back the currently selected sparse solver backend into `*out`. Returns
+// NUKA_RESULT_NULL_HANDLE for a null world, NUKA_RESULT_INVALID_ARG if `out` is
+// null. Round-trips the value set by nuka_world_set_sparse_solver_backend (the
+// default is NUKA_SOLVER_BACKEND_SELF_CG).
+nuka_result_t nuka_world_get_sparse_solver_backend(
+    nuka_world_handle world, nuka_sparse_solver_backend_t* out);
+
 #ifdef __cplusplus
 }
 #endif

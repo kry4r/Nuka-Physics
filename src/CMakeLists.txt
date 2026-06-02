@@ -584,6 +584,10 @@ if(CMAKE_CUDA_COMPILER)
         # v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend).
         # Warp-per-articulation batched-dense SPD CG; D1 bit-exact, no atomics.
         diffsim/sparse_solver_cg.cu
+        # v0.7 p01: CG convergence diagnostics host summarizer (the opt-in
+        # side-channel's CPU aggregation; the device side is a header consumed by
+        # sparse_solver_cg.cu). D1: a fixed-order pass, no device work here.
+        diffsim/solver/cg_diagnostics.cpp
         # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
         # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
         diffsim/kkt_builder.cu

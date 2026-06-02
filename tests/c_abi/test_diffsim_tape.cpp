@@ -201,3 +201,54 @@ TEST(DiffsimTapeCAbi, BackwardBitIdenticalAcrossTwoRuns) {
     EXPECT_EQ(mismatches, 0u)
         << "C-ABI tape backward not bit-identical across two runs";
 }
+
+// v0.7 p01: sparse-solver backend selection C ABI round-trip + validation.
+TEST(DiffsimTapeCAbi, SparseSolverBackendSetGetRoundTrip) {
+    // NULL handle is rejected without needing a world / device.
+    nuka_sparse_solver_backend_t got;
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(nullptr,
+                                                   NUKA_SOLVER_BACKEND_SELF_CG),
+              NUKA_RESULT_NULL_HANDLE);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(nullptr, &got),
+              NUKA_RESULT_NULL_HANDLE);
+
+    if (!Go2FloatSceneAvailable()) {
+        GTEST_SKIP() << "go2_float scene is not available (world-backed checks)";
+    }
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+    WorldGuard world;
+    ASSERT_EQ(CreateFloatWorld(device.handle, &world.handle), NUKA_RESULT_OK);
+
+    // Default is SELF_CG (a fresh world already uses the only shipping backend).
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG);
+
+    // Explicit set of SELF_CG round-trips.
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
+                                                   NUKA_SOLVER_BACKEND_SELF_CG),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG);
+
+    // Reserved (later-phase) backends honestly return NOT_SUPPORTED and DO NOT
+    // change the stored selection.
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
+                                                   NUKA_SOLVER_BACKEND_SELF_MINRES),
+              NUKA_RESULT_NOT_SUPPORTED);
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
+                                                   NUKA_SOLVER_BACKEND_SELF_GMRES),
+              NUKA_RESULT_NOT_SUPPORTED);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG) << "rejected set must not mutate";
+
+    // An out-of-range enum is INVALID_ARG; null out-pointer is INVALID_ARG.
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(
+                  world.handle, static_cast<nuka_sparse_solver_backend_t>(99)),
+              NUKA_RESULT_INVALID_ARG);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, nullptr),
+              NUKA_RESULT_INVALID_ARG);
+}

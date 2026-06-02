@@ -998,6 +998,34 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_diffsim_cg_solver_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.7 p01: hardened CG general-path solver tests --------------------
+    # The v0.5 CG solver hardened + generalized for worse-conditioned systems:
+    #   * test_cg_vs_dense          : Eigen-LDLT cross-check on kappa up to ~1e6 +
+    #                                 D1 bit-exact (worse-conditioned coverage).
+    #   * test_cg_convergence_rate  : CG A-norm error vs the kappa-theory bound in
+    #                                 the informative regime + residual-history diag.
+    #   * test_block_jacobi_tuning  : Jacobi-vs-BlockJacobi preconditioner quality
+    #                                 sweep + the host diagnostics summarizer.
+    # Eigen is linked test-only (the approved dense oracle), never a production path.
+    foreach(cg_test
+            test_cg_vs_dense
+            test_cg_convergence_rate
+            test_block_jacobi_tuning)
+        add_executable(nuka_diffsim_${cg_test}
+            diffsim/solver/${cg_test}.cpp)
+        target_compile_definitions(nuka_diffsim_${cg_test}
+            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+        target_link_libraries(nuka_diffsim_${cg_test}
+            PRIVATE
+                nuka_diffsim
+                nuka_core
+                nuka_phi
+                nuka_eigen_testonly
+                GTest::gtest_main)
+        gtest_discover_tests(nuka_diffsim_${cg_test}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endforeach()
+
     # --- v0.5 p03 R2: contact KKT (Delassus) builder ------------------------
     # Builder (A = J M^-1 J^T) vs an INDEPENDENT host Gram recompute (Eigen,
     # < 1e-5 rel), exact bit-symmetry, the diagonal == 1/effective_mass identity,

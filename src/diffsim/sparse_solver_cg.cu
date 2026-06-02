@@ -20,6 +20,7 @@
 //     primitive AND bit-exact -- no perf/D1 tension.
 // ---------------------------------------------------------------------------
 
+#include "diffsim/solver/cg_diagnostics.cuh"
 #include "diffsim/sparse_solver_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
 
@@ -78,8 +79,23 @@ __device__ __forceinline__ void SolveOneBlock(
     const float* __restrict__ values, uint32_t n, const float* __restrict__ b_blk,
     float* __restrict__ x_blk, Preconditioner precond, uint32_t max_iter,
     double tol, bool run_to_fixed_iters, double* __restrict__ chol_shared,
-    bool* __restrict__ null_shared, uint32_t lane) {
+    bool* __restrict__ null_shared, uint32_t lane, const CgConvergenceReport& diag,
+    uint32_t blk) {
     const bool active = (lane < n);
+
+    // Opt-in diagnostics: enabled iff ANY report channel is non-null. When off,
+    // every diag branch below is not-taken on EVERY lane -> the math + stores are
+    // exactly the v0.5 path (byte-identical x; the D1 / no-IFT-regression gate).
+    const bool diag_on = (diag.iters_run != nullptr ||
+                          diag.final_rel_resid != nullptr ||
+                          diag.status != nullptr ||
+                          diag.residual_history != nullptr);
+    // Per-block history row (lane-0 local; null if not requested / off).
+    float* __restrict__ hist =
+        (diag_on && diag.residual_history != nullptr)
+            ? diag.residual_history + static_cast<size_t>(blk) * diag.history_cap
+            : nullptr;
+    CgDiagState diag_state;  // lane-0 trajectory accumulator (unused unless diag_on)
 
     // --- Load this lane's matrix row into registers (fp64). Contiguous per-lane
     //     row read; across the warp the rows tile the block's [stride] span. ----
@@ -234,19 +250,51 @@ __device__ __forceinline__ void SolveOneBlock(
     const double bb = WarpButterflySum(b_i * b_i);
     const double stop = tol * tol * bb;
 
+    // Diagnostics trajectory (lane 0 only; the loop's MATH is identical to v0.5 --
+    // every diag-only computation is gated on diag_on so the off path is byte-exact).
+    // r0_sq == ||b||^2 (x0 = 0 => r0 = b); rz0 is the initial preconditioned residual.
+    if (diag_on && lane == 0u) CgDiagInit(diag_state, bb, rz);
+    uint32_t iters_run = 0u;
+    bool converged = false;
+    double rr_final = bb;  // last observed ||r||^2 (init: pre-loop residual)
+
     for (uint32_t iter = 0u; iter < max_iter; ++iter) {
         const double ap_i = spmv(p_i);
         const double pAp = WarpButterflySum(p_i * ap_i);
 
-        // NaN guard: frozen ratios when the residual collapsed (rz->0) or the
+        // SPD guard: frozen ratios when the residual collapsed (rz->0) or the
         // direction degenerates (pAp->0). alpha=0 => x/r unchanged (fixed point).
-        const double alpha = (rz > kRzFloor && pAp > kRzFloor) ? (rz / pAp) : 0.0;
+        // The guard tripping pre-convergence is the runtime SPD-failure signal.
+        const bool broke_down = !(rz > kRzFloor && pAp > kRzFloor);
+        const double alpha = broke_down ? 0.0 : (rz / pAp);
 
         x_i += alpha * p_i;
         r_i -= alpha * ap_i;
 
         const double rr = WarpButterflySum(r_i * r_i);
-        if (!run_to_fixed_iters && rr <= stop) break;  // deterministic early exit
+        rr_final = rr;
+        iters_run = iter + 1u;
+        const bool now_converged = (!run_to_fixed_iters && rr <= stop);
+
+        // Diagnostics: the preconditioned residual rz_obs (the quantity CG drives to
+        // zero -- the stall test's input) is computed here ONLY when diag_on. ALL
+        // lanes execute apply_precond + the butterfly UNIFORMLY (apply_precond's
+        // BlockJacobi path uses __syncwarp/__shfl, so every lane must reach them in
+        // the same order -- a lane-split would deadlock/UB). Only lane 0 records.
+        // This is a diag-only cost; with diag off the loop math is byte-identical
+        // to v0.5 (this whole block is skipped).
+        if (diag_on) {
+            const double z_obs = apply_precond(r_i);
+            const double rz_obs = WarpButterflySum(r_i * z_obs);
+            if (lane == 0u)
+                CgDiagOnIter(diag_state, rr, rz_obs, broke_down, now_converged, iter,
+                             hist, diag.history_cap);
+        }
+
+        if (now_converged) {  // deterministic early exit
+            converged = true;
+            break;
+        }
 
         z_i = apply_precond(r_i);
         const double rz_new = WarpButterflySum(r_i * z_i);
@@ -254,6 +302,11 @@ __device__ __forceinline__ void SolveOneBlock(
         p_i = z_i + beta * p_i;
         rz = rz_new;
     }
+
+    // Write the opt-in per-block report (lane 0, fixed block slot). No-op channels
+    // (null pointers) are skipped; an all-null report leaves x byte-identical.
+    if (diag_on && lane == 0u)
+        CgDiagFinalize(diag_state, diag, blk, rr_final, iters_run, converged);
 
     // --- Write back: x_blk has exactly kMaxBlockDim slots per block, so the store
     //     MUST be capped at kMaxBlockDim -- lanes >= kMaxBlockDim would clobber the
@@ -271,7 +324,7 @@ __global__ void SolveCgKernel(const float* __restrict__ values,
                               const float* __restrict__ b, float* __restrict__ x,
                               uint32_t block_count, Preconditioner precond,
                               uint32_t max_iter, double tol,
-                              bool run_to_fixed_iters) {
+                              bool run_to_fixed_iters, CgConvergenceReport diag) {
     const uint32_t blk = blockIdx.x;  // one warp/block per articulation
     if (blk >= block_count) return;
     const uint32_t lane = threadIdx.x;  // 0..31
@@ -295,11 +348,17 @@ __global__ void SolveCgKernel(const float* __restrict__ values,
         // Empty articulation: deterministic zero padding, no solve. Capped at
         // kMaxBlockDim (this block owns exactly that many x slots).
         if (lane < kMaxBlockDim) x_blk[lane] = 0.0f;
+        // Deterministic empty-block diagnostics: 0 iters, 0 residual, converged.
+        if (lane == 0u) {
+            if (diag.iters_run != nullptr) diag.iters_run[blk] = 0u;
+            if (diag.final_rel_resid != nullptr) diag.final_rel_resid[blk] = 0.0f;
+            if (diag.status != nullptr) diag.status[blk] = kCgStatusConverged;
+        }
         return;
     }
 
     SolveOneBlock(values_blk, n, b_blk, x_blk, precond, max_iter, tol,
-                  run_to_fixed_iters, chol_shared, null_shared, lane);
+                  run_to_fixed_iters, chol_shared, null_shared, lane, diag, blk);
 }
 
 void CheckCuda(cudaError_t result, const char* operation) {
@@ -328,23 +387,37 @@ void SelfWrittenCgBackend::Solve(const BatchedDenseSpdSystem& system,
     const cudaStream_t stream = context_.stream.Native();
 
     // ONE warp per block; grid over blocks. Mirrors the engine's canonical
-    // <<<count, 32>>> warp-per-articulation idiom.
+    // <<<count, 32>>> warp-per-articulation idiom. params.diagnostics is passed by
+    // value; an all-null report (the default) makes the kernel take the exact v0.5
+    // path -> byte-identical x (the D1 + no-IFT-regression guarantee).
     SolveCgKernel<<<system.block_count, kWarpSize, 0u, stream>>>(
         system.values, system.block_dim, b, x, system.block_count,
         params.preconditioner, params.max_iter, static_cast<double>(params.tol),
-        params.run_to_fixed_iters);
+        params.run_to_fixed_iters, params.diagnostics);
     CheckCuda(cudaGetLastError(), "SolveCgKernel launch");
 }
 
 std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
     std::string_view name, const phi::DeviceContext& context,
     DeterminismLevel determinism) {
-    if (name.empty() || name == "cg" || name == "default") {
+    // v0.7 p01: the self-written CG is the only SHIPPING backend. Accept its v0.5
+    // aliases ("cg"/""/"default") AND the v0.7 canonical key "self_cg" (the C ABI
+    // NUKA_SOLVER_BACKEND_SELF_CG round-trips through this name).
+    if (name.empty() || name == "cg" || name == "default" || name == "self_cg") {
         return std::make_unique<SelfWrittenCgBackend>(context, determinism);
+    }
+    // Forward-looking keys reserved for v0.7 phases 2-3 (MINRES / GMRES build on
+    // this same self-written core). Recognized but NOT YET implemented -> a clear
+    // diagnostic rather than a generic "unknown backend".
+    if (name == "self_minres" || name == "self_gmres") {
+        throw std::invalid_argument(
+            "nuka::diffsim::MakeSparseSolverBackend: backend '" +
+            std::string(name) +
+            "' is reserved for a later v0.7 phase and not yet implemented");
     }
     throw std::invalid_argument(
         "nuka::diffsim::MakeSparseSolverBackend: unknown backend '" +
-        std::string(name) + "' (v0.5 only ships 'cg')");
+        std::string(name) + "' (v0.7 p01 ships 'self_cg' / 'cg')");
 }
 
 }  // namespace nuka::diffsim

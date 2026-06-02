@@ -97,6 +97,60 @@ enum class Preconditioner : uint8_t {
     BlockJacobi = 1,
 };
 
+// ---------------------------------------------------------------------------
+// CgConvergenceReport -- OPT-IN per-block convergence diagnostics (v0.7 p01).
+//
+// A side-channel the general (non-IFT) path uses to observe convergence on
+// larger / worse-conditioned blocks: iterations actually run, the final
+// relative residual ||r||/||b||, and stall / divergence flags. It is written
+// ONLY when SolveParams::diagnostics is non-null; with it null the solve takes
+// the EXACT v0.5 code path and emits byte-identical x (the D1 + no-IFT-regression
+// guarantee). Each field is one fixed device buffer of length block_count,
+// written by lane 0 of each block in fixed block order -> two-run byte-exact.
+//
+// The residual history (optional, separate buffer of block_count * history_cap)
+// records ||r_k||/||b|| at iteration k for the κ-conditioning convergence-rate
+// test; null => not recorded.
+// ---------------------------------------------------------------------------
+struct CgConvergenceReport {
+    // Device uint32_t[block_count]: number of CG iterations the block actually
+    // ran before the deterministic early exit (== max_iter if it never exits).
+    uint32_t* iters_run = nullptr;
+    // Device float[block_count]: final relative residual ||r||/||b|| of the block
+    // (0 for an empty / zero-rhs block, by the deterministic ||b||==0 guard).
+    float* final_rel_resid = nullptr;
+    // Device uint8_t[block_count]: per-block status flags (CgBlockStatus bits).
+    uint8_t* status = nullptr;
+    // OPTIONAL device float[block_count * history_cap]: ||r_k||/||b|| at iter k,
+    // row-major (block-major, stride history_cap). null => not recorded. Entries
+    // past iters_run are left at their pre-initialized sentinel by the kernel
+    // (the kernel only WRITES the iters it runs), so the host must zero/sentinel-
+    // fill this buffer before the solve if it reads untouched tail entries.
+    float* residual_history = nullptr;
+    // Capacity (iterations) of one block's residual_history row. Ignored if
+    // residual_history is null. Writes are capped at history_cap.
+    uint32_t history_cap = 0u;
+};
+
+// Per-block convergence status bit flags (written into CgConvergenceReport.status).
+// Deterministic: each flag is set by a fixed-order data-dependent compare, so the
+// same input yields the same flags across runs.
+enum CgBlockStatus : uint8_t {
+    kCgStatusNone = 0u,
+    // The deterministic relative-residual early exit fired (||r||^2 <= tol^2||b||^2).
+    kCgStatusConverged = 1u << 0,
+    // max_iter was exhausted without hitting tol (a budget-limited solve; on a
+    // worse-conditioned block this is the honest "did not reach tol in budget").
+    kCgStatusMaxIterReached = 1u << 1,
+    // The residual rose above its running minimum by more than a fixed factor at
+    // some iteration (divergence symptom -- should not happen for SPD + true CG,
+    // surfaced so a mis-specified non-SPD system is caught rather than hidden).
+    kCgStatusDiverged = 1u << 2,
+    // The residual stalled: it failed to drop below kStallFactor * previous over a
+    // window, i.e. CG made no useful progress (an ill-conditioned-block symptom).
+    kCgStatusStalled = 1u << 3,
+};
+
 // Solve parameters. With a fixed iteration count the path is bit-exact regardless
 // of `tol`; `tol` only enables a DETERMINISTIC early exit (a fixed-order residual-
 // norm compare -- same input => same residual => same break, so still D1).
@@ -106,6 +160,11 @@ struct SolveParams {
     float tol = 1.0e-6f;              // relative-residual early-exit threshold
     bool run_to_fixed_iters = false;  // true => ignore tol, always run max_iter
                                       //         (the strictest D1 demo path)
+    // OPT-IN convergence diagnostics for the general path. Default (all-null) =>
+    // the EXACT v0.5 path, byte-identical x. Pointers are device buffers the
+    // CALLER owns + sizes to block_count (and block_count*history_cap for the
+    // optional history). See CgConvergenceReport.
+    CgConvergenceReport diagnostics;
 };
 
 // ---------------------------------------------------------------------------
