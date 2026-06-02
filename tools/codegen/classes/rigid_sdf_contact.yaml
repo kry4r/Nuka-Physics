@@ -1,0 +1,51 @@
+row_class_id: 4
+row_class_name: RigidSDFContactRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: true
+supports_compliance: false
+default_gradient_mode: ift_at_convergence
+default_recompute_mode: checkpoint
+constraint_kind: unilateral_with_friction
+
+# v0.7 p08-B (FORWARD ONLY). Contact between two SDF-equipped rigid bodies,
+# detected by Newton's method on the summed field phi_a + phi_b
+# (src/collision/sdf_contact.{hpp,cu}). Once detected, the emitted rows are the
+# SAME maximal contact rows as MaximalContactRow (normal + 2 friction), so the
+# forward_evaluator REUSES the generic unilateral_with_friction lambda-update
+# (single-row PGS: u = lambda + m_eff*(rhs - jv); lambda_new = clamp(u, lo, hi)).
+# What is NEW in p08-B is the contact-DETECTION kernel (the Newton solve), not
+# the row solve -- the PGS solver dispatches on RowKind::Contact, not on
+# row_class_id, so these rows are resolved by the existing path unchanged.
+#
+# The adjoint (analytical IFT-at-convergence: d(contact point)/d(SDF values) and
+# d/d(pose), and the row-update adjoint) is p08-C. The adjoint_evaluator block is
+# DELIBERATELY OMITTED here -- regen.py emits a forward-only stub for this class.
+# default_gradient_mode is set to ift_at_convergence to record p08-B's intent;
+# the row stays forward-only until p08-C adds the adjoint_evaluator.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+  friction_pyramid_sides: 4

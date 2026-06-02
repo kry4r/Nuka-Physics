@@ -47,6 +47,13 @@ inline constexpr uint32_t kMaximalContactRowClassId = 0u;
 inline constexpr uint32_t kMaximalJointRowClassId = 1u;
 inline constexpr uint32_t kMaximalDriveRowClassId = 2u;
 inline constexpr uint32_t kFeatherstoneContactRowClassId = 3u;
+// v0.7 p08-B: SDF (Newton-summed-field) contact rows. These MIRROR the ids in
+// the generated registry (src/codegen/generated/row_class_registry.hpp, the
+// source of truth produced by regen.py); the constants are hand-mirrored here
+// for the same reason ids 0-3 are -- so nuka_constraint need not include the
+// generated header. A codegen-roundtrip test guards that the ids stay in sync.
+inline constexpr uint32_t kRigidSdfContactRowClassId = 4u;
+inline constexpr uint32_t kFeatherstoneSdfContactRowClassId = 5u;
 inline constexpr uint32_t kInvalidBodyIndex = ~0u;
 inline constexpr float kRowHugeLimit = 1.0e6f;
 

@@ -20,6 +20,10 @@ const char* RowClassName(uint32_t row_class_id) noexcept {
         return "MaximalDriveRow";
     case 3u:
         return "FeatherstoneContactRow";
+    case 4u:
+        return "RigidSDFContactRow";
+    case 5u:
+        return "FeatherstoneSDFContactRow";
     default:
         return "Unknown";
     }
@@ -35,6 +39,10 @@ const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
         return "maximal_drive_forward_kernel";
     case 3u:
         return "featherstone_contact_forward_kernel";
+    case 4u:
+        return "rigid_sdf_contact_forward_kernel";
+    case 5u:
+        return "featherstone_sdf_contact_forward_kernel";
     default:
         return nullptr;
     }
@@ -49,6 +57,10 @@ uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
     case 2u:
         return 1u;
     case 3u:
+        return 6u;
+    case 4u:
+        return 6u;
+    case 5u:
         return 6u;
     default:
         return 0u;
@@ -69,6 +81,10 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
         return 0u;
     case 3u:
         return 1u;
+    case 4u:
+        return 2u;
+    case 5u:
+        return 2u;
     default:
         return 0u;
     }
@@ -84,6 +100,10 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
         return 3u;
     case 3u:
         return 4u;
+    case 4u:
+        return 0u;
+    case 5u:
+        return 0u;
     default:
         return 0u;
     }

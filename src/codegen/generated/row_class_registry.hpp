@@ -23,6 +23,8 @@ enum class RowClassId : uint32_t {
     MaximalJointRow = 1u,
     MaximalDriveRow = 2u,
     FeatherstoneContactRow = 3u,
+    RigidSDFContactRow = 4u,
+    FeatherstoneSDFContactRow = 5u,
 };
 
 // Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
@@ -52,7 +54,7 @@ struct Row {
     uint8_t contact_softness = 0u;
 };
 
-inline constexpr uint32_t kRowClassCount = 4u;
+inline constexpr uint32_t kRowClassCount = 6u;
 inline constexpr uint32_t kMaximalContactRowId = 0u;
 inline constexpr uint32_t kMaximalContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kMaximalContactRowGradientMode = 1u;
@@ -69,6 +71,14 @@ inline constexpr uint32_t kFeatherstoneContactRowId = 3u;
 inline constexpr uint32_t kFeatherstoneContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kFeatherstoneContactRowGradientMode = 1u;
 inline constexpr uint16_t kFeatherstoneContactRowAdjointKernelId = 4u;
+inline constexpr uint32_t kRigidSDFContactRowId = 4u;
+inline constexpr uint32_t kRigidSDFContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kRigidSDFContactRowGradientMode = 2u;
+inline constexpr uint16_t kRigidSDFContactRowAdjointKernelId = 0u;
+inline constexpr uint32_t kFeatherstoneSDFContactRowId = 5u;
+inline constexpr uint32_t kFeatherstoneSDFContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kFeatherstoneSDFContactRowGradientMode = 2u;
+inline constexpr uint16_t kFeatherstoneSDFContactRowAdjointKernelId = 0u;
 
 const char* RowClassName(uint32_t row_class_id) noexcept;
 const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept;

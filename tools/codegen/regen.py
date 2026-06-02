@@ -27,6 +27,12 @@ ALLOWED_ROW_CLASSES = {
     "MaximalJointRow",
     "MaximalDriveRow",
     "FeatherstoneContactRow",
+    # v0.7 p08-B: SDF (Newton-summed-field) contact rows (FORWARD only; the
+    # adjoint_evaluator is added in p08-C). Detection is the Newton solve in
+    # src/collision/sdf_contact.*; the row solve reuses the generic
+    # unilateral_with_friction PGS update (RowKind::Contact path).
+    "RigidSDFContactRow",
+    "FeatherstoneSDFContactRow",
 }
 
 # Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).

@@ -1,0 +1,48 @@
+row_class_id: 5
+row_class_name: FeatherstoneSDFContactRow
+
+body_count_mode: variable
+body_count: null
+
+jacobian_kind: mixed
+max_rows_per_block: 6
+
+supports_friction: true
+supports_compliance: false
+default_gradient_mode: ift_at_convergence
+default_recompute_mode: checkpoint
+constraint_kind: unilateral_with_friction
+
+# v0.7 p08-B (FORWARD ONLY). SDF contact where one side is an ARTICULATION link.
+# Detection is the same Newton-summed-SDF solve as RigidSDFContactRow; the only
+# difference (mirroring FeatherstoneContactRow vs MaximalContactRow) is that the
+# articulation-side constraint Jacobian is the per-articulation CHAIN Jacobian
+# (evaluated at the contact point and HELD for the row -- matches the IFT-at-
+# convergence model: contact geometry is frozen at the converged witness, so the
+# chain J is too) instead of a maximal 6-vector. Once the chain J is contracted
+# into the scalar jv = J.qdot, the single-row update is identical to the maximal
+# case, so the forward_evaluator reuses the generic unilateral_with_friction law.
+#
+# The adjoint (IFT-at-convergence over the chain Jacobian + the SDF witness) is
+# p08-C; adjoint_evaluator is DELIBERATELY OMITTED -> forward-only stub.
+forward_evaluator:
+  input_fields:
+    - maximal_body
+    - articulation_id
+    - link_index
+    - jacobian_linear_body
+    - jacobian_angular_body
+    - jacobian_chain_scalar
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+  friction_pyramid_sides: 4
