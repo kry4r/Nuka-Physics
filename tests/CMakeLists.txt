@@ -656,6 +656,8 @@ if(CMAKE_CUDA_COMPILER)
         # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validation.
         codegen/test_adjoint_fd_xpbd_bend.cpp
         codegen/test_adjoint_fd_xpbd_volume.cpp
+        # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validation.
+        codegen/test_adjoint_fd_xpbd_shape_match.cpp
     )
 
     add_dependencies(nuka_adjoint_fd_test nuka_codegen)
@@ -700,6 +702,8 @@ if(CMAKE_CUDA_COMPILER)
         # v0.7 p09-B: XPBD bend (cloth) + volume (tet) sim invariants + grad-C FD.
         runtime/test_xpbd_bend_cloth.cpp
         runtime/test_xpbd_volume_tet.cpp
+        # v0.7 p09-C: XPBD shape-match (cluster) sim + polar dR/dA host-FD.
+        runtime/test_xpbd_shape_match.cpp
     )
 
     target_link_libraries(nuka_cuda_runtime_test

@@ -30,6 +30,8 @@ const char* RowClassName(uint32_t row_class_id) noexcept {
         return "XPBDBendRow";
     case 8u:
         return "XPBDVolumeRow";
+    case 9u:
+        return "XPBDShapeMatchRow";
     default:
         return "Unknown";
     }
@@ -55,6 +57,8 @@ const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
         return "xpbd_bend_forward_kernel";
     case 8u:
         return "xpbd_volume_forward_kernel";
+    case 9u:
+        return "xpbd_shape_match_forward_kernel";
     default:
         return nullptr;
     }
@@ -79,6 +83,8 @@ uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
     case 7u:
         return 6u;
     case 8u:
+        return 6u;
+    case 9u:
         return 6u;
     default:
         return 0u;
@@ -109,6 +115,8 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
         return 0u;
     case 8u:
         return 0u;
+    case 9u:
+        return 0u;
     default:
         return 0u;
     }
@@ -134,6 +142,8 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
         return 6u;
     case 8u:
         return 7u;
+    case 9u:
+        return 8u;
     default:
         return 0u;
     }
@@ -155,6 +165,8 @@ const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
         return "xpbd_bend_adjoint_kernel";
     case 8u:
         return "xpbd_volume_adjoint_kernel";
+    case 9u:
+        return "xpbd_shape_match_adjoint_kernel";
     default:
         return nullptr;
     }

@@ -45,6 +45,15 @@ ALLOWED_ROW_CLASSES = {
     # Bergou quadratic-bending stencil for bend, determinant gradients for volume).
     "XPBDBendRow",
     "XPBDVolumeRow",
+    # v0.7 p09-C: XPBD soft-body SHAPE-MATCHING (id 9) -- the meshless cluster
+    # regularizer (Mueller et al. 2005). Ships a GENUINE dispatchable per-row
+    # adjoint (dense_adjoint), but NOT the scalar XPBD multiplier law of the other
+    # three rows: shape matching is a PER-PARTICLE GOAL PROJECTION (position_new =
+    # position + stiffness*(goal - position)), multilinear in {position, goal,
+    # stiffness}. body_count_mode: variable (the cluster size never enters the
+    # local adjoint). The polar-decomposition dR/dA is downstream geometry,
+    # host-FD validated in the cluster sim test (analog of grad C for volume).
+    "XPBDShapeMatchRow",
 }
 
 # Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).

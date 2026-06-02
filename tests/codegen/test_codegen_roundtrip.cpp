@@ -48,7 +48,7 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
 
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
-    const std::array<const char*, 12> files = {
+    const std::array<const char*, 14> files = {
         "maximal_contact_forward.cu",
         "maximal_joint_forward.cu",
         "maximal_drive_forward.cu",
@@ -60,6 +60,9 @@ TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
         "xpbd_bend_adjoint.cuh",
         "xpbd_volume_forward.cu",
         "xpbd_volume_adjoint.cuh",
+        // v0.7 p09-C: shape-match (id 9) forward + adjoint pair.
+        "xpbd_shape_match_forward.cu",
+        "xpbd_shape_match_adjoint.cuh",
         "row_dispatch.cu",
         "row_class_registry.hpp",
     };
@@ -87,12 +90,13 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::kRowClassCount;
     using nuka::solver::generated::kXPBDBendRowId;
     using nuka::solver::generated::kXPBDDistanceRowId;
+    using nuka::solver::generated::kXPBDShapeMatchRowId;
     using nuka::solver::generated::kXPBDVolumeRowId;
 
     // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A added the
-    // XPBD soft-body distance row (id 6); p09-B adds the XPBD bend (id 7) + volume
-    // (id 8) rows -> 9 total.
-    EXPECT_EQ(kRowClassCount, 9u);
+    // XPBD soft-body distance row (id 6); p09-B added the XPBD bend (id 7) +
+    // volume (id 8) rows; p09-C adds the XPBD shape-match (id 9) row -> 10 total.
+    EXPECT_EQ(kRowClassCount, 10u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
@@ -153,6 +157,27 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     EXPECT_EQ(RowClassGradientMode(kXPBDBendRowId),
               static_cast<uint8_t>(GradientMode::dense_adjoint));
     EXPECT_EQ(RowClassGradientMode(kXPBDVolumeRowId),
+              static_cast<uint8_t>(GradientMode::dense_adjoint));
+
+    // v0.7 p09-C: the XPBD SHAPE-MATCH (id 9) soft row -- the meshless cluster
+    // regularizer (Mueller et al. 2005), the 4th and hardest XPBD row class. It
+    // ships a GENUINE dispatchable per-row adjoint -- exit-crit 6 -- but, unlike
+    // distance/bend/volume, NOT the scalar XPBD multiplier law: shape matching has
+    // no scalar constraint C and no Lagrange multiplier, so its dispatchable
+    // adjoint is the per-particle GOAL PROJECTION
+    // (position_new = position + stiffness*(goal - position)), multilinear in
+    // {position, goal, stiffness} and validated by test_adjoint_fd_xpbd_shape_match.
+    // The polar-decomposition rotation R that builds the goal (and its derivative
+    // dR/dA) is DOWNSTREAM geometry, host-FD validated in the cluster sim test
+    // (test_xpbd_shape_match), the analog of the volume row's grad-C check. This
+    // block is the contract tripwire: RowClassHasAdjoint(9) MUST stay true and the
+    // gradient mode MUST stay dense_adjoint. If the adjoint is ever removed/changed,
+    // this fails consciously rather than silently degrading to a stop-gradient.
+    EXPECT_TRUE(IsKnownRowClass(kXPBDShapeMatchRowId));
+    EXPECT_EQ(kXPBDShapeMatchRowId, 9u);
+    EXPECT_STREQ(RowClassName(kXPBDShapeMatchRowId), "XPBDShapeMatchRow");
+    EXPECT_TRUE(RowClassHasAdjoint(kXPBDShapeMatchRowId));
+    EXPECT_EQ(RowClassGradientMode(kXPBDShapeMatchRowId),
               static_cast<uint8_t>(GradientMode::dense_adjoint));
 
     EXPECT_FALSE(IsKnownRowClass(99u));
