@@ -112,7 +112,23 @@ public:
     void Run(const IftContactInputs& inputs, const float* g,
              const IftContactGrads& grads);
 
+    // Arm the symmetric-indefinite / non-symmetric AUTO-ROUTER inside Run().
+    // DEFAULT false: the validated rigid/articulation contact Delassus A = J M^-1 J^T
+    // is provably bit-symmetric SPD/PSD (mirror-stored; test_kkt_build asserts the
+    // byte-symmetry), so neither detector can ever fire on this path -- running them
+    // (two READ-ONLY kernels + two per-solve cudaStreamSynchronize host round-trips)
+    // would be pure overhead on the diff-sim BACKWARD hot path. p11 (coupling rows,
+    // which CAN assemble a genuinely indefinite / non-symmetric KKT) flips this to
+    // true to arm MINRES/GMRES routing. Toggling does NOT change results on an SPD
+    // batch -- the router's SPD branch is byte-identical to the default CG solve.
+    void SetAdaptiveRouting(bool enable) noexcept { adaptive_routing_ = enable; }
+
 private:
+    // Auto-router body (p02 indefinite -> MINRES, p03-A non-symmetric -> GMRES, else
+    // CG). Reached ONLY when adaptive_routing_ is true; see SetAdaptiveRouting().
+    void RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, float* z,
+                       const SolveParams& params);
+
     const phi::DeviceContext& context_;
     DeterminismLevel determinism_;
     std::unique_ptr<SparseLinearSolver> solver_;       // CG (SPD), the default path
@@ -138,6 +154,11 @@ private:
     phi::Buffer indef_flag_;              // uint32[1] indefinite-detector flag
     phi::Buffer nonsym_flag_;             // uint32[1] non-symmetric-detector flag
     uint32_t capacity_blocks_ = 0u;
+    // Gates the Run() auto-router. false (default) => skip BOTH detectors + their two
+    // per-solve stream syncs and solve directly with CG (zero added cost, byte-
+    // identical on the provably-SPD contact path). See SetAdaptiveRouting(); the named
+    // consumer that flips it on is p11 (coupling rows can assemble non-SPD KKT).
+    bool adaptive_routing_ = false;
 };
 
 }  // namespace nuka::diffsim

@@ -388,17 +388,52 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
     params.tol = 1.0e-6f;
     params.run_to_fixed_iters = false;
 
-    // v0.7 p03-A NON-SYMMETRIC AUTO-ROUTING (runs FIRST, AHEAD of the symmetric
-    // indefinite detector). DetectBatchedNonSymmetric is a READ-ONLY scan: a block is
-    // non-symmetric iff some |A[i][j]-A[j][i]| > relEps*max|entry|. The Delassus
-    // A = J M^-1 J^T is stored BIT-SYMMETRIC (mirror-stored; A[i][j] and A[j][i] are
-    // the SAME float -- see test_kkt_build's memcmp(&aij,&aji)==0), so that difference
-    // is EXACTLY 0.0 and this detector NEVER fires on the contact path -> the flag
-    // stays 0 and the existing symmetric (CG/MINRES) block below runs UNCHANGED ->
-    // byte-identical z (the SYMMETRIC-path no-regression guarantee). It MUST run first
-    // because the indefinite detector is a SYMMETRIC LDLT (Sylvester) -- only
-    // meaningful on a symmetric matrix; gating non-symmetric out first keeps that
-    // precondition. Only a genuinely non-symmetric batch routes to GMRES.
+    // v0.7 PERF GATE: the engine's contact Delassus A = J M^-1 J^T is provably bit-
+    // symmetric SPD/PSD (mirror-stored; test_kkt_build asserts the byte-symmetry), so
+    // the symmetric-indefinite and non-symmetric detectors can NEVER fire on this path.
+    // By default (adaptive_routing_ == false) we therefore SKIP both READ-ONLY detector
+    // kernels AND their two per-solve cudaStreamSynchronize host round-trips and solve
+    // directly with CG -- BYTE-IDENTICAL to the router's SPD branch (same solver_, same
+    // params), minus two host syncs on the diff-sim BACKWARD hot path. p11 (coupling
+    // rows, which CAN assemble a genuinely indefinite / non-symmetric KKT) arms the full
+    // auto-router via SetAdaptiveRouting(true); the router + MINRES/GMRES backends stay
+    // fully wired + unit-tested, one setter-call from active.
+    if (!adaptive_routing_) {
+        solver_->Solve(system, rhs, z, params);
+    } else {
+        RunAutoRouter(system, rhs, z, params);
+    }
+
+    // (4) Distribute: grad_qdot_free = g - J^T z (global scatter), grad_b_c = z.
+    DistributeKernel<<<bc, kWarpSize, 0u, stream>>>(
+        inputs.rows, inputs.jac_normal, inputs.jac_tangent1, inputs.jac_tangent2,
+        z, g, inputs.state, grads.grad_qdot_free, grads.grad_b_c, bc,
+        inputs.dof_stride);
+    CheckCuda(cudaGetLastError(), "DistributeKernel launch");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-router: ARMED ONLY via SetAdaptiveRouting(true) (default OFF -- see the perf
+// gate in Run()). The full solver-suite routing for systems that may NOT be SPD: the
+// p03-A non-symmetric detect runs FIRST (it gates the symmetric-indefinite LDLT test,
+// which is only meaningful on a symmetric matrix); then the p02 indefinite detect; else
+// the CG solve. Each detector is a READ-ONLY scan whose flag is read back with a stream
+// sync. Named consumer = p11 (coupling rows). On a bit-symmetric SPD batch this method
+// is byte-identical to Run()'s default CG solve (every detector flag stays 0).
+// ---------------------------------------------------------------------------
+void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, float* z,
+                              const SolveParams& params) {
+    const cudaStream_t stream = context_.stream.Native();
+
+    // p03-A NON-SYMMETRIC AUTO-ROUTING (runs FIRST, AHEAD of the symmetric indefinite
+    // detector). DetectBatchedNonSymmetric is a READ-ONLY scan: a block is non-symmetric
+    // iff some |A[i][j]-A[j][i]| > relEps*max|entry|. The Delassus A = J M^-1 J^T is
+    // stored BIT-SYMMETRIC (mirror-stored; A[i][j] and A[j][i] are the SAME float -- see
+    // test_kkt_build's memcmp(&aij,&aji)==0), so that difference is EXACTLY 0.0 and this
+    // detector NEVER fires on the contact path. It MUST run first because the indefinite
+    // detector is a SYMMETRIC LDLT (Sylvester) -- only meaningful on a symmetric matrix;
+    // gating non-symmetric out first keeps that precondition. Only a genuinely non-
+    // symmetric batch routes to GMRES.
     if (nonsym_flag_.Size() < sizeof(uint32_t)) {
         nonsym_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
     }
@@ -425,16 +460,15 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
         gp.run_to_fixed_iters = false;
         gmres_solver_->Solve(system, rhs, z, gp);
     } else {
-        // v0.7 p02 SYMMETRIC AUTO-ROUTING (the named consumer of p01's deferral). The
+        // p02 SYMMETRIC AUTO-ROUTING (the named consumer of p01's deferral). The
         // Delassus A = J M^-1 J^T is SPD/PSD for the validated contact scenes, but
         // once unilateral / friction-cone constraints make a KKT block SYMMETRIC
         // INDEFINITE, CG breaks down. DetectBatchedIndefinite is a READ-ONLY pivot
         // test (a negative post-elimination LDLT pivot => indefinite, by Sylvester's
         // law of inertia). It touches NO solver state; for an SPD/PSD batch every
-        // pivot is >= 0 so the flag stays 0 and the EXISTING CG solve below runs
-        // UNCHANGED -> byte-identical z (the SPD-path no-regression guarantee). ONLY a
-        // genuinely indefinite batch routes to MINRES (whole batch, absolute-Jacobi --
-        // the SPD preconditioner indefinite MINRES requires).
+        // pivot is >= 0 so the flag stays 0 and the CG solve below runs -> byte-
+        // identical z. ONLY a genuinely indefinite batch routes to MINRES (whole batch,
+        // absolute-Jacobi -- the SPD preconditioner indefinite MINRES requires).
         if (indef_flag_.Size() < sizeof(uint32_t)) {
             indef_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
         }
@@ -464,13 +498,6 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
             solver_->Solve(system, rhs, z, params);
         }
     }
-
-    // (4) Distribute: grad_qdot_free = g - J^T z (global scatter), grad_b_c = z.
-    DistributeKernel<<<bc, kWarpSize, 0u, stream>>>(
-        inputs.rows, inputs.jac_normal, inputs.jac_tangent1, inputs.jac_tangent2,
-        z, g, inputs.state, grads.grad_qdot_free, grads.grad_b_c, bc,
-        inputs.dof_stride);
-    CheckCuda(cudaGetLastError(), "DistributeKernel launch");
 }
 
 }  // namespace nuka::diffsim
