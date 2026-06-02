@@ -23,8 +23,14 @@ constraint_kind: unilateral_with_friction
 # into the scalar jv = J.qdot, the single-row update is identical to the maximal
 # case, so the forward_evaluator reuses the generic unilateral_with_friction law.
 #
-# The adjoint (IFT-at-convergence over the chain Jacobian + the SDF witness) is
-# p08-C; adjoint_evaluator is DELIBERATELY OMITTED -> forward-only stub.
+# Reverse-mode (p08-C DONE): per-row adjoint_evaluator DELIBERATELY OMITTED -- same
+# decision as RigidSDFContactRow (id4). The SDF-contact reverse mode is the SYSTEM
+# IFT d/dM,d/dJ reference + envelope DEPTH adjoint; the contact normal/point are
+# flat-valley degenerate (no gradient). default_gradient_mode=ift_at_convergence
+# records the TARGET channel; RowClassHasAdjoint(5)==false is the AUTHORITATIVE
+# "no dispatchable adjoint" signal (locked by test_codegen_roundtrip). Engine
+# grounding + backward wiring DEFERRED to p11. A backward consumer MUST gate on
+# RowClassHasAdjoint()==true; false => stop-gradient / hard error, never silent zero.
 forward_evaluator:
   input_fields:
     - maximal_body

@@ -23,11 +23,19 @@ constraint_kind: unilateral_with_friction
 # the row solve -- the PGS solver dispatches on RowKind::Contact, not on
 # row_class_id, so these rows are resolved by the existing path unchanged.
 #
-# The adjoint (analytical IFT-at-convergence: d(contact point)/d(SDF values) and
-# d/d(pose), and the row-update adjoint) is p08-C. The adjoint_evaluator block is
-# DELIBERATELY OMITTED here -- regen.py emits a forward-only stub for this class.
-# default_gradient_mode is set to ift_at_convergence to record p08-B's intent;
-# the row stays forward-only until p08-C adds the adjoint_evaluator.
+# Reverse-mode (p08-C DONE): a per-row adjoint_evaluator is DELIBERATELY OMITTED
+# -- the row-class adjoint is NOT the channel. p08-C built the SDF-contact reverse
+# mode as: (1) SYSTEM-level IFT d/dM,d/dJ host fp64 reference (src/diffsim/
+# sdf_contact_ift.{hpp,cpp}), (2) envelope-theorem DEPTH adjoint (src/collision/
+# sdf_contact_adjoint.{hpp,cpp}). The contact NORMAL and POINT are flat-valley
+# degenerate at convergence (phi_a=-phi_b) -- no gradient is produced for them.
+# default_gradient_mode=ift_at_convergence records the TARGET reverse channel.
+# regen.py therefore emits a FORWARD-ONLY stub: RowClassHasAdjoint(4)==false is the
+# AUTHORITATIVE "no dispatchable adjoint" signal (locked by test_codegen_roundtrip).
+# ENGINE-grounding + backward WIRING of the IFT reference are DEFERRED to p11 (the
+# named consumer: coupling-row adjoint). Any backward consumer MUST gate on
+# RowClassHasAdjoint()==true and treat false as stop-gradient / hard error -- never
+# a silent zero. When p11 wires it, update this comment + the roundtrip test.
 forward_evaluator:
   input_fields:
     - body_a

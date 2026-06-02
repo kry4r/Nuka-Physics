@@ -65,7 +65,9 @@ TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
 }
 
 TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
+    using nuka::solver::generated::GradientMode;
     using nuka::solver::generated::IsKnownRowClass;
+    using nuka::solver::generated::RowClassGradientMode;
     using nuka::solver::generated::RowClassHasAdjoint;
     using nuka::solver::generated::RowClassMaxRowsPerBlock;
     using nuka::solver::generated::RowClassName;
@@ -93,9 +95,20 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     EXPECT_EQ(RowClassMaxRowsPerBlock(kMaximalContactRowId), 6u);
     EXPECT_EQ(RowClassMaxRowsPerBlock(kMaximalDriveRowId), 1u);
     EXPECT_EQ(RowClassMaxRowsPerBlock(kRigidSDFContactRowId), 6u);
-    // p08-B SDF rows are FORWARD-ONLY (the IFT adjoint is p08-C).
+    // SDF-contact rows (id4/id5) are FORWARD-ONLY at the row-class level. p08-C built
+    // the reverse mode as a SYSTEM-level IFT d/dM,d/dJ reference + envelope DEPTH
+    // adjoint (normal/point are flat-valley degenerate); the per-row adjoint was
+    // deliberately NOT added, and engine-grounding + backward WIRING are DEFERRED to
+    // p11. RowClassHasAdjoint()==false is the AUTHORITATIVE "no dispatchable adjoint"
+    // signal -- any backward consumer MUST gate on it (false => stop-gradient / hard
+    // error, never silent zero). gradient_mode records the TARGET channel. This block
+    // is the contract tripwire: when p11 wires the adjoint, update it consciously.
     EXPECT_FALSE(RowClassHasAdjoint(kRigidSDFContactRowId));
     EXPECT_FALSE(RowClassHasAdjoint(kFeatherstoneSDFContactRowId));
+    EXPECT_EQ(RowClassGradientMode(kRigidSDFContactRowId),
+              static_cast<uint8_t>(GradientMode::ift_at_convergence));
+    EXPECT_EQ(RowClassGradientMode(kFeatherstoneSDFContactRowId),
+              static_cast<uint8_t>(GradientMode::ift_at_convergence));
     EXPECT_FALSE(IsKnownRowClass(99u));
 }
 
