@@ -793,6 +793,31 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_sdf_contact_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- p08-C Channel 2/3: envelope-theorem contact-geometry adjoint -------
+    # Cooks box+sphere SDFs, runs the SHIPPING find_sdf_contact_newton, and
+    # FD-validates the envelope depth + normal gradients by RE-RUNNING the descent
+    # under perturbation (cell value / pose). Channel 3: documents the contact
+    # point's valley-degeneracy (no point gradient produced/validated).
+    add_executable(nuka_sdf_contact_adjoint_test
+        collision/test_sdf_contact_adjoint_fd.cpp
+    )
+
+    target_include_directories(nuka_sdf_contact_adjoint_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_sdf_contact_adjoint_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sdf_contact_adjoint_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Batched N-articulation replication (p01-F T1) ---------------------
     add_executable(nuka_batched_articulation_replication_test
         runtime/test_batched_articulation_replication.cpp
@@ -1026,6 +1051,27 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_diffsim_ift_backward_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- v0.7 p08-C Channel 1 (§4.B): SDF-contact IFT d/dM, d/dJ ------------
+    # The §4.B acceptance the v0.5 ift_runner DEFERRED. The FD PERTURBS actual
+    # entries of M^-1 / J and RE-SOLVES the constraint system to convergence with
+    # an INDEPENDENT Eigen LDLT oracle (not the module's own assemble/solve, so a
+    # transpose/index bug is caught), then compares to the analytical IFT
+    # dlambda = A^-1 (dr - dA lambda). Eigen linked test-only.
+    add_executable(nuka_sdf_contact_ift_test
+        diffsim/test_sdf_contact_ift_fd.cpp
+    )
+
+    target_link_libraries(nuka_sdf_contact_ift_test
+        PRIVATE
+            nuka_diffsim
+            nuka_phi
+            nuka_eigen_testonly
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sdf_contact_ift_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- v0.5 p03 R3b: OSC differentiable adjoint (R8 / R9) -----------------
