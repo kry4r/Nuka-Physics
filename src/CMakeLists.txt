@@ -423,6 +423,30 @@ if(CMAKE_CUDA_COMPILER)
             nuka_phi
     )
 
+    # --- v0.7 p04: self-written LBVH rigid broadphase (Karras 2012) ----------
+    # Selectable backend (SAP in nuka_runtime_gpu stays the default). Produces a
+    # compact, deterministically-sorted candidate-pair list whose reduced SET
+    # equals the SAP overlap set. First Thrust user in the tree (CUDA 12.8 bundles
+    # Thrust; included directly, no extra find_package needed). D1-critical:
+    # integer-only atomics, stable_sort_by_key (radix), sorted compact output.
+    add_library(nuka_collision_gpu STATIC
+        collision/broadphase_lbvh.cu
+        collision/lbvh_refit.cu
+    )
+    set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_collision_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_collision_gpu
+        PUBLIC
+            nuka_collision
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka_row_solver_gpu STATIC
         solver/gpu/row_scheduler.cu
         solver/gpu/row_solver.cu

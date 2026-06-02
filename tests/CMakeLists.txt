@@ -651,6 +651,22 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
+    # --- v0.7 p04: LBVH vs SAP differential gate + D1 byte-exact -----------
+    add_executable(nuka_lbvh_vs_sap_test
+        collision/test_lbvh_vs_sap_pair_set.cpp
+    )
+
+    target_link_libraries(nuka_lbvh_vs_sap_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_lbvh_vs_sap_test)
+
     # --- Batched N-articulation replication (p01-F T1) ---------------------
     add_executable(nuka_batched_articulation_replication_test
         runtime/test_batched_articulation_replication.cpp
@@ -1236,6 +1252,7 @@ add_executable(nuka_cuda_perf_test
     perf/test_cuda_sensor_timing.cpp
     perf/test_cuda_solver_timing.cpp
     perf/test_cuda_step_timing.cpp
+    perf/test_lbvh_50k_bodies.cpp
 )
 
     target_link_libraries(nuka_cuda_perf_test
@@ -1245,6 +1262,7 @@ add_executable(nuka_cuda_perf_test
             nuka_sensor
             nuka_runtime_gpu
             nuka_runtime
+            nuka_collision_gpu
             GTest::gtest_main
     )
 
