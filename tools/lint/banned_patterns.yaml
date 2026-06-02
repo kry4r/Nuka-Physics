@@ -61,6 +61,13 @@ scope_definitions:
       # inside a per-step physics kernel).
       - "src/sensor/noise/**/*.cu"
       - "src/sensor/noise/**/*.cuh"
+      # p14a (v0.7): the contact-force readout kernel (sensor/contact_wrench.cu) is
+      # D1-critical -- its per-link wrench must be two-run byte-exact (one thread
+      # per output link, fixed slot order, NO float atomicAdd into the output). Add
+      # all of src/sensor/**/*.cu(h) so any future sensor kernel is guarded too
+      # (the noise-only globs above did NOT cover src/sensor/*.cu at the top level).
+      - "src/sensor/**/*.cu"
+      - "src/sensor/**/*.cuh"
     exclude:
       - "src/**/reference/**"
       - "tests/**"

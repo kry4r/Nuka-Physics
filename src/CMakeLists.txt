@@ -457,6 +457,12 @@ if(CMAKE_CUDA_COMPILER)
         runtime/articulation/articulation_jacobian.cu
         runtime/articulation/articulation_contacts.cu
         runtime/gpu/batched_articulated_world.cu
+        # p14a (v0.7): any-link contact-force readout (per-link wrench + per-slot
+        # force). Pure readback of the solved lambda + stage-4/5 contact geometry;
+        # depends only on nuka_core/nuka_phi + math, so compiling it INTO this lib
+        # (the one that owns the batched world that calls it) avoids any new
+        # inter-library dependency cycle.
+        sensor/contact_wrench.cu
     )
     set_target_properties(nuka_articulation_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

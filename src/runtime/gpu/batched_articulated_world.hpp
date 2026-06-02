@@ -275,8 +275,26 @@ public:
     const phi::Buffer& ContactPointBuffer() const { return contact_point_; }
     const phi::Buffer& ContactDepthBuffer() const { return contact_depth_; }
     const phi::Buffer& ContactLinkBuffer() const { return contact_link_; }
+    // p14a (v0.7) contact-force readout surface. Maintained EAGERLY at the END of
+    // each Step()/StepGraph() (always-queryable, matching how the other per-step
+    // contact buffers are maintained). Stable for the object's life; CONTENTS
+    // overwritten every step.
+    //   ContactNormalBuffer()      -- Vec3[slot_count], world unit normal per slot
+    //                                 (aliases the internal contact_normal_).
+    //   ContactForceBuffer()       -- float[slot_count*3], {Fn,Ft1,Ft2} =
+    //                                 {lambda_n,lambda_t1,lambda_t2}/dt per slot
+    //                                 (contact-basis components).
+    //   LinkContactWrenchBuffer()  -- float[total_link_count*6], per GLOBAL link g:
+    //                                 [g*6+0..2]=world force F, [g*6+3..5]=world
+    //                                 torque tau about the LINK FRAME ORIGIN.
+    const phi::Buffer& ContactNormalBuffer() const { return contact_normal_; }
+    const phi::Buffer& ContactForceBuffer() const { return contact_force_; }
+    const phi::Buffer& LinkContactWrenchBuffer() const { return link_contact_wrench_; }
     // Number of contact slots = env_count * kMaxFootContactsPerEnv.
     uint32_t SlotCount() const { return slot_count_; }
+    // total_link_count == env_count * base_link_count (the wrench buffer's link
+    // index space).
+    uint32_t TotalLinkCount() const { return total_link_count_; }
 
     // Downloads the current device state into `host` (q, qdot, ...).
     void Download(articulation::ArticulationHostState* host) const;
@@ -294,6 +312,11 @@ public:
     std::vector<float> DownloadContactDepth() const;
     std::vector<uint32_t> DownloadContactLink() const;
     std::vector<articulation::ArticulatedContactRow> DownloadRows() const;
+    // p14a: reads back this step's per-slot contact force ({Fn,Ft1,Ft2}/dt per
+    // slot, length slot_count*3) and per-link net contact wrench (length
+    // total_link_count*6, [g*6+0..2]=F, [g*6+3..5]=tau-about-link-origin).
+    std::vector<float> DownloadContactForce() const;
+    std::vector<float> DownloadLinkContactWrench() const;
 
 private:
     // p01-W3 timer-free twin of Step()'s body: the EXACT same kernel + D2D-memcpy
@@ -323,6 +346,15 @@ private:
     void ApplyStage1Drives(const phi::DeviceContext& ctx,
                            const articulation::ArticulationDeviceState& state,
                            const BatchedArticulatedStepParams& params);
+
+    // p14a: eager per-step contact-force readout. Called at the END of BOTH
+    // Step() (with context_) AND StepKernels() (with the `ctx` parameter -- so the
+    // launches are CAPTURED into the graph and the RL / StepGraph() path also
+    // produces the wrench). It reads this step's solved lambda_ + the stage-4/5
+    // contact geometry + world_pose_ (link origins) and fills contact_force_ +
+    // link_contact_wrench_. `dt` is passed through by value (NOT a stored member)
+    // so the captured graph bakes the correct dt used for this step's solve.
+    void ComputeContactWrenchOutputs(const phi::DeviceContext& ctx, float dt);
 
     const phi::DeviceContext& context_;
     articulation::ArticulationDeviceBuffers device_;
@@ -362,6 +394,11 @@ private:
     phi::Buffer meff_tangent2_;   // float[slot_count]
     phi::Buffer rows_;            // ArticulatedContactRow[slot_count]
     phi::Buffer lambda_;          // float[slot_count * 3] (persistent warm-start)
+
+    // p14a (v0.7) contact-force readout buffers (allocated once, OVERWRITTEN by
+    // ComputeContactWrench at the end of every Step()/StepKernels()).
+    phi::Buffer contact_force_;        // float[slot_count * 3] ({Fn,Ft1,Ft2}/dt)
+    phi::Buffer link_contact_wrench_;  // float[total_link_count * 6] (F + tau)
 
     // v0.5 C-fwd: always-allocated, zero-filled non-PD control inputs (per-link,
     // env-major; length total_link_count). Owned here so the captured graph's

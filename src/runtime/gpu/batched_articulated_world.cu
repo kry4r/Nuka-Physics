@@ -17,6 +17,7 @@
 #include "runtime/articulation/articulation_drives.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
+#include "sensor/contact_wrench.hpp"
 
 #include <cuda_runtime.h>
 
@@ -212,6 +213,16 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
     lambda_ = phi::Buffer(static_cast<size_t>(slot_count_) * 3u * sizeof(float),
                           phi::MemoryKind::Device);
 
+    // p14a (v0.7) contact-force readout buffers. contact_force_ mirrors lambda_'s
+    // {n,t1,t2} per-slot layout (scaled by 1/dt). link_contact_wrench_ is the net
+    // per-GLOBAL-link world wrench [F(3), tau(3)]. Both allocated once, OVERWRITTEN
+    // every step by ComputeContactWrenchOutputs.
+    contact_force_ = phi::Buffer(static_cast<size_t>(slot_count_) * 3u * sizeof(float),
+                                 phi::MemoryKind::Device);
+    link_contact_wrench_ = phi::Buffer(
+        static_cast<size_t>(total_link_count_) * 6u * sizeof(float),
+        phi::MemoryKind::Device);
+
     // v0.5 C-fwd: non-PD control inputs, always allocated (per-link, env-major)
     // so the captured graph's baked pointer is stable and a buffer view always
     // works -- a PD world simply never reads them. Zeroed below for a defined
@@ -275,6 +286,17 @@ BatchedArticulatedWorld::BatchedArticulatedWorld(
                               static_cast<size_t>(total_link_count_) * sizeof(float),
                               context_.stream.Native()),
               "BatchedArticulatedWorld qddot_free memset");
+    // p14a: zero the contact-force readout buffers so a buffer-view query BEFORE
+    // the first Step() returns defined (all-zero == no contact force) data; every
+    // Step() overwrites them.
+    CheckCuda(cudaMemsetAsync(contact_force_.Data(), 0,
+                              static_cast<size_t>(slot_count_) * 3u * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld contact_force memset");
+    CheckCuda(cudaMemsetAsync(link_contact_wrench_.Data(), 0,
+                              static_cast<size_t>(total_link_count_) * 6u * sizeof(float),
+                              context_.stream.Native()),
+              "BatchedArticulatedWorld link_contact_wrench memset");
 
     // p03 reset: snapshot the creation-time AUTHORITATIVE live state (the device
     // state was just seated by UploadArticulationState above with the cooked
@@ -483,6 +505,27 @@ void BatchedArticulatedWorld::ApplyStage1Drives(
             // tau unchanged rather than silently mis-actuate.
             break;
     }
+}
+
+void BatchedArticulatedWorld::ComputeContactWrenchOutputs(
+    const phi::DeviceContext& ctx, float dt) {
+    // Pure readback of this step's solved lambda_ + the stage-4/5 contact geometry
+    // + the stage-4 world_pose_ (link origins). world_pose_ (origins) and
+    // contact_point_ are from the SAME stage (4 / 5-from-4); the stage-11 integrate
+    // touches neither, so r = contact_point - origin is the consistent current-step
+    // arm. ONE thread per output link (no atomics, fixed slot order -> D1).
+    nuka::sensor::ComputeContactWrench(
+        ctx,
+        static_cast<const float*>(lambda_.Data()),
+        static_cast<const Vec3*>(contact_point_.Data()),
+        static_cast<const Vec3*>(contact_normal_.Data()),
+        static_cast<const Vec3*>(tangent1_.Data()),
+        static_cast<const Vec3*>(tangent2_.Data()),
+        static_cast<const uint32_t*>(contact_link_.Data()),
+        static_cast<const Transform*>(world_pose_.Data()),
+        env_count_, base_link_count_, articulation::kMaxFootContactsPerEnv, dt,
+        static_cast<float*>(contact_force_.Data()),
+        static_cast<float*>(link_contact_wrench_.Data()));
 }
 
 void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
@@ -709,6 +752,15 @@ void BatchedArticulatedWorld::Step(const BatchedArticulatedStepParams& params) {
         articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, state,
                                                                  params.dt);
     }
+
+    // -- p14a: contact-force readout. Eager (always-queryable), at the END of the
+    // step, AFTER the solve (stage 10) so lambda_ holds this step's converged
+    // impulses. Reads the stage-4/5 geometry the integrate did not disturb. ------
+    {
+        NUKA_CUDA_TIME(perf_, "buffer_mgmt", stream);
+        NUKA_CUDA_TIME_DETAIL(perf_, "contact_wrench_readout", stream);
+        ComputeContactWrenchOutputs(context_, params.dt);
+    }
 }
 
 // p01-W3 timer-free twin of Step()'s body. MUST mirror Step() launch-for-launch
@@ -837,6 +889,14 @@ void BatchedArticulatedWorld::StepKernels(const phi::DeviceContext& ctx,
     // -- 11. Position-integrate q += qdot*dt. -------------------------------
     articulation::FeatherstoneAba::IntegratePosition(ctx, state, params.dt);
     articulation::FeatherstoneAba::IntegrateFloatingBasePose(ctx, state, params.dt);
+
+    // -- p14a: contact-force readout (graph twin of Step()'s tail). Routed through
+    // the `ctx` parameter (NOT context_) so the launches are CAPTURED into the
+    // graph and the StepGraph() / RL path also produces the wrench. dt is BAKED
+    // into the captured kernel args here (StepParamsMatch re-captures on a dt
+    // change), so a replay always divides by the correct dt. NO ScopedCudaTimer
+    // (would abort capture). Keeps Step()/StepKernels() in lockstep. ------------
+    ComputeContactWrenchOutputs(ctx, params.dt);
 }
 
 namespace {
@@ -1048,6 +1108,18 @@ std::vector<articulation::ArticulatedContactRow>
 BatchedArticulatedWorld::DownloadRows() const {
     std::vector<articulation::ArticulatedContactRow> out(slot_count_);
     rows_.CopyToHost(out.data(), out.size() * sizeof(articulation::ArticulatedContactRow));
+    return out;
+}
+
+std::vector<float> BatchedArticulatedWorld::DownloadContactForce() const {
+    std::vector<float> out(static_cast<size_t>(slot_count_) * 3u);
+    contact_force_.CopyToHost(out.data(), out.size() * sizeof(float));
+    return out;
+}
+
+std::vector<float> BatchedArticulatedWorld::DownloadLinkContactWrench() const {
+    std::vector<float> out(static_cast<size_t>(total_link_count_) * 6u);
+    link_contact_wrench_.CopyToHost(out.data(), out.size() * sizeof(float));
     return out;
 }
 

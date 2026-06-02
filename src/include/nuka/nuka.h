@@ -274,13 +274,92 @@ typedef enum nuka_state_field_t {
     // all zero == the world origin). Returns NUKA_RESULT_NOT_SUPPORTED on the
     // single-env path. (Allocated for every batched world so the view always
     // succeeds; only read in Osc mode.)
-    NUKA_FIELD_TASK_TARGET = 15
+    NUKA_FIELD_TASK_TARGET = 15,
+    // READ (batched/multi-env path only). p14a (v0.7): the NET per-LINK contact
+    // WRENCH (force + torque) in the WORLD frame, aggregated over every contact
+    // incident to the link. Maintained EAGERLY on the normal forward path (the
+    // batched Step computes it after the contact solve, so it is always queryable
+    // after a Step -- the MuJoCo-style "net contact force on this body" readout).
+    //
+    // LAYOUT: float[total_link_count * 6], total_link_count == env_count *
+    // base_link_count, indexed by GLOBAL link index g == env*base_link_count +
+    // local_link (the SAME env-major link indexing as ARTICULATION_LINK_POSE /
+    // LINK_VELOCITY). element_count == env_count*base_link_count,
+    // element_stride_bytes == 6*sizeof(float). Per element g:
+    //   [g*6+0 .. g*6+2] = world contact FORCE F (N): sum over the link's contacts
+    //                      of (n*lambda_n + t1*lambda_t1 + t2*lambda_t2)/dt, where
+    //                      lambda is the solved per-contact IMPULSE (N*s) and dt is
+    //                      the step dt (force = impulse/dt). +Z is up; a foot in a
+    //                      stance carries a POSITIVE F_z (the ground pushes up).
+    //   [g*6+3 .. g*6+5] = world contact TORQUE tau (N*m) about the LINK FRAME
+    //                      ORIGIN (NOT the link COM): sum over the link's contacts
+    //                      of (contact_point - link_frame_origin_world) x F_slot.
+    //                      The reference point is the link frame origin
+    //                      (ARTICULATION_LINK_POSE[g].position); a consumer that
+    //                      wants the torque about the COM must shift it by the
+    //                      link's COM offset.
+    // Links with no incident contact this step read all-zero. dt is the dt of the
+    // most-recent Step.
+    //
+    // SCOPE (v0.7 entry): this currently aggregates the RIGID FOOT-VS-GROUND
+    // contacts only -- the sole contact model wired into the per-slot contact array
+    // today. When p08 (SDF) / p11 (coupling) contact rows land they MUST be plumbed
+    // into the same per-slot array for this to remain the FULL net wrench; until
+    // then a link touched only by a not-yet-plumbed contact model reads zero here.
+    // (NUKA_FIELD_CONTACT_NORMAL carries the matching caveat.)
+    // Returns NUKA_RESULT_NOT_SUPPORTED on the single-env path.
+    NUKA_FIELD_LINK_CONTACT_WRENCH = 16,
+    // READ (batched/multi-env path only). p14a (v0.7): per-CONTACT-SLOT world unit
+    // NORMAL. Together with CONTACT_POINTS / CONTACT_FORCE / CONTACT_LINK this is
+    // the per-contact enumeration surface (the mj_contactForce parity: {point,
+    // normal, normal-force, friction-force, link} per contact). Aliases the
+    // engine's internal per-slot contact_normal buffer (zero-copy).
+    //
+    // LAYOUT: identical to CONTACT_POINTS -- Vec3 (3 floats) per contact slot,
+    // slot_count == env_count * kMaxFootContactsPerEnv (4 per env), env-major.
+    // element_count == slot_count, element_stride_bytes == 3*sizeof(float).
+    // INACTIVE slots are zero. (For the current rigid foot-vs-ground detector the
+    // active normal is always world +Z = (0,0,1).) Returns
+    // NUKA_RESULT_NOT_SUPPORTED on the single-env path.
+    NUKA_FIELD_CONTACT_NORMAL = 17,
+    // READ (batched/multi-env path only). p14a (v0.7): per-CONTACT-SLOT contact
+    // FORCE in the CONTACT BASIS -- the {Fn, Ft1, Ft2} = {lambda_n, lambda_t1,
+    // lambda_t2}/dt components (normal force + the two friction-force magnitudes),
+    // i.e. the solved per-slot IMPULSE scaled by 1/dt. Fn is the mj-parity normal
+    // force; (Ft1,Ft2) are the friction-force magnitudes along the contact's two
+    // world friction tangents.
+    //
+    // LAYOUT: 3 floats per contact slot, slot_count == env_count *
+    // kMaxFootContactsPerEnv (4 per env), env-major. element_count == slot_count,
+    // element_stride_bytes == 3*sizeof(float). INACTIVE slots are zero. NOTE: the
+    // tangent BASIS VECTORS (t1,t2) are NOT exposed, so the per-contact world
+    // friction DIRECTION cannot be reconstructed from this field alone -- the net
+    // per-link WORLD friction force is available in LINK_CONTACT_WRENCH (which sums
+    // n*lambda_n + t1*lambda_t1 + t2*lambda_t2 in world). Returns
+    // NUKA_RESULT_NOT_SUPPORTED on the single-env path.
+    NUKA_FIELD_CONTACT_FORCE = 18,
+    // READ (batched/multi-env path only). p14a (v0.7): per-CONTACT-SLOT owning
+    // GLOBAL LINK index (uint32). The CSR-by-link grouping is implicit: slots are
+    // env-major at fixed stride kMaxFootContactsPerEnv (4 per env), and each slot
+    // carries the global link (g == env*base_link_count + local_link) the contact
+    // acts on, so a consumer enumerates contacts and groups them by link via this
+    // field. Aliases the engine's internal per-slot contact_link buffer (zero-copy).
+    //
+    // LAYOUT: 1 uint32 per contact slot, slot_count == env_count *
+    // kMaxFootContactsPerEnv, env-major. element_count == slot_count,
+    // element_stride_bytes == sizeof(uint32_t). dtype == 1 (UINT32) -- the ONLY
+    // field with a non-float32 dtype. INACTIVE slots carry ~0u (0xFFFFFFFF, the
+    // invalid-link sentinel). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env
+    // path.
+    NUKA_FIELD_CONTACT_LINK = 19
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {
     void* device_ptr;
     size_t element_count;
     uint32_t element_stride_bytes;
+    // Element scalar type: 0 == float32 (every field except CONTACT_LINK), 1 ==
+    // uint32 (CONTACT_LINK only -- the per-slot owning global link index).
     uint8_t dtype;
 } nuka_buffer_view_t;
 

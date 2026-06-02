@@ -1003,6 +1003,32 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_go2_pd_standing_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- p14a (v0.7) any-link contact-force readout (LINK_CONTACT_WRENCH +
+    # per-slot CONTACT_FORCE). Synthetic kernel unit test + Go2 stance Sigma F_z =
+    # Mg integration + D1 two-run byte-exact. Same link set as the Go2 PD test
+    # (nuka_articulation_gpu carries the wrench kernel sensor/contact_wrench.cu).
+    add_executable(nuka_link_contact_wrench_test
+        sensor/test_link_contact_wrench.cpp
+    )
+
+    target_compile_definitions(nuka_link_contact_wrench_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_link_contact_wrench_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_link_contact_wrench_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- p03 per-env RESET primitive (RL autoreset) ------------------------
     add_executable(nuka_batched_reset_test
         runtime/test_batched_reset.cpp

@@ -139,6 +139,12 @@ def test_4096_smoke(device):
         (nuka.DRIVE_STIFFNESS, (64, GO2_BLC)),
         (nuka.DRIVE_DAMPING, (64, GO2_BLC)),
         (nuka.DRIVE_FORCE_LIMIT, (64, GO2_BLC)),
+        # p14a (v0.7) contact-force readout. LINK_CONTACT_WRENCH is per-GLOBAL-link
+        # [F(3),tau(3)] -> (env, base_link, 6). CONTACT_NORMAL / CONTACT_FORCE are
+        # per-slot (kMaxFootContactsPerEnv == 4) -> (env, 4, 3).
+        (nuka.LINK_CONTACT_WRENCH, (64, GO2_BLC, 6)),
+        (nuka.CONTACT_NORMAL, (64, 4, 3)),
+        (nuka.CONTACT_FORCE, (64, 4, 3)),
     ],
 )
 def test_dlpack_zero_copy(device, field, expect_shape):
@@ -152,6 +158,22 @@ def test_dlpack_zero_copy(device, field, expect_shape):
         assert tuple(t.shape) == expect_shape
         # THE zero-copy proof: torch aliases the engine device buffer.
         assert t.data_ptr() == w.buffer_device_ptr(field), "DLPack made a copy!"
+
+
+def test_dlpack_zero_copy_contact_link_uint32(device):
+    # p14a: CONTACT_LINK is the ONE non-float32 field (per-slot owning GLOBAL link
+    # index, uint32). torch>=2.6 imports a uint32 CUDA DLPack capsule zero-copy, so
+    # the only difference from the float fields is the dtype assertion.
+    with make_world(device, 64) as w:
+        view = w.buffer_view(nuka.CONTACT_LINK)
+        assert hasattr(view, "__dlpack__")
+        assert hasattr(view, "__dlpack_device__")
+        t = torch.from_dlpack(view)
+        assert t.is_cuda
+        assert t.dtype == torch.uint32
+        assert tuple(t.shape) == (64, 4)  # (env, kMaxFootContactsPerEnv)
+        assert t.data_ptr() == w.buffer_device_ptr(nuka.CONTACT_LINK), \
+            "DLPack made a copy!"
 
 
 # ---------------------------------------------------------------------------
