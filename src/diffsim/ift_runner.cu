@@ -386,7 +386,45 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
     params.max_iter = 64u;
     params.tol = 1.0e-6f;
     params.run_to_fixed_iters = false;
-    solver_->Solve(system, rhs, z, params);
+
+    // v0.7 p02 AUTO-ROUTING (the named consumer of p01's deferral). The Delassus
+    // A = J M^-1 J^T is SPD/PSD for the validated contact scenes, but once
+    // unilateral / friction-cone constraints make a KKT block SYMMETRIC INDEFINITE,
+    // CG breaks down. DetectBatchedIndefinite is a READ-ONLY pivot test (a negative
+    // post-elimination LDLT pivot => indefinite, by Sylvester's law of inertia). It
+    // touches NO solver state; for an SPD/PSD batch every pivot is >= 0 so the flag
+    // stays 0 and the EXISTING CG solve below runs UNCHANGED -> byte-identical z (the
+    // SPD-path no-regression guarantee). ONLY a genuinely indefinite batch routes to
+    // MINRES (whole batch, absolute-Jacobi -- the SPD preconditioner indefinite
+    // MINRES requires).
+    if (indef_flag_.Size() < sizeof(uint32_t)) {
+        indef_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
+    }
+    uint32_t* flag = static_cast<uint32_t*>(indef_flag_.Data());
+    CheckCuda(cudaMemsetAsync(flag, 0, sizeof(uint32_t), stream),
+              "zero indefinite flag");
+    DetectBatchedIndefinite(context_, system, flag);
+    uint32_t indefinite = 0u;
+    CheckCuda(cudaStreamSynchronize(stream), "sync indefinite detect");
+    indef_flag_.CopyToHost(&indefinite, sizeof(uint32_t));
+
+    if (indefinite != 0u) {
+        // Genuinely indefinite KKT: route the whole batch to MINRES (absolute-
+        // Jacobi). Lazily construct the backend (reused across Run calls).
+        if (minres_solver_ == nullptr) {
+            minres_solver_ =
+                MakeSparseSolverBackend("self_minres", context_, determinism_);
+        }
+        SolveParams mp;
+        mp.preconditioner = Preconditioner::Jacobi;  // absolute-Jacobi (SPD precond)
+        mp.max_iter = 128u;  // <= 12-dim blocks; MINRES is exact in <= n fp64 steps
+        mp.tol = 1.0e-7f;
+        mp.run_to_fixed_iters = false;
+        minres_solver_->Solve(system, rhs, z, mp);
+    } else {
+        // SPD/PSD path: the EXISTING CG solve, byte-identical to before p02.
+        solver_->Solve(system, rhs, z, params);
+    }
 
     // (4) Distribute: grad_qdot_free = g - J^T z (global scatter), grad_b_c = z.
     DistributeKernel<<<bc, kWarpSize, 0u, stream>>>(

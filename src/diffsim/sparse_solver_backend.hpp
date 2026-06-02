@@ -187,10 +187,42 @@ public:
 };
 
 // Factory. v0.5's only backend is the self-written CG one ("cg" / "" / "default").
-// v0.7+ registers "csr-minres" etc. here behind the same return type. Throws
+// v0.7 p02 registers "self_minres" / "minres" (symmetric indefinite). Throws
 // std::invalid_argument on an unknown name.
 std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
     std::string_view name, const phi::DeviceContext& context,
     DeterminismLevel determinism = DeterminismLevel::Strong);
+
+// ---------------------------------------------------------------------------
+// DetectBatchedIndefinite -- v0.7 p02 auto-routing detector. READ-ONLY over the
+// batched-dense `system` (reads `values` / `block_dim`; writes ONLY the single
+// uint32 device flag `out_indefinite_flag`, which the caller pre-zeros). Returns
+// true (sets the flag to 1) iff ANY block has a strictly-NEGATIVE post-elimination
+// LDLT pivot -- i.e. the batch is SYMMETRIC INDEFINITE (Sylvester's law of inertia:
+// the signs of the LDLT pivots are the inertia of A). A negative-diagonal-ENTRY
+// scan would MISS saddle-point KKT systems (positive diagonal, indefinite by
+// structure); we therefore compute PIVOTS, not entries.
+//
+// BYTE-SAFETY (the SPD-path guarantee, the load-bearing property): the pivot test
+// is `djj < -relEps*max|diag|` (STRICTLY negative, with a relative margin). For any
+// SPD or PSD block every pivot is >= 0 (a PSD null direction gives djj ~ 0, which
+// the strict-negative test does NOT trip), so the flag stays 0 -> the caller runs
+// the EXISTING CG solve untouched -> byte-identical output. NO FALSE POSITIVES on
+// SPD/PSD. The detector touches NO solver state. One warp per block, lane 0 does the
+// fixed-order symmetric elimination in shared, the flag is a uint32 atomicOr (uint
+// atomics are D1-safe -- order-independent OR). Deterministic.
+//
+// HONEST LIMIT (false NEGATIVES): this is a NO-PIVOTING LDLT, so it can MISS an
+// indefinite block whose leading principal minors are singular (e.g. [[0,c],[c,0]]:
+// both pivots are ~0 -> not flagged, yet eigenvalues are +/-c). That is SAFE for the
+// byte-identity guarantee (a miss only leaves an indefinite system on CG, which is a
+// correctness/convergence issue for that exotic case, NOT an SPD-path regression).
+// For robust routing on such systems, select "self_minres" EXPLICITLY via the
+// backend key -- the auto-router is a convenience, the explicit key is the escape.
+//
+// Enqueues on the context stream; the caller synchronizes + reads the flag back.
+void DetectBatchedIndefinite(const phi::DeviceContext& context,
+                             const BatchedDenseSpdSystem& system,
+                             uint32_t* out_indefinite_flag);
 
 }  // namespace nuka::diffsim

@@ -1026,6 +1026,37 @@ if(CMAKE_CUDA_COMPILER)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endforeach()
 
+    # --- v0.7 p02: self-written MINRES (symmetric indefinite) + ILU(0) ----------
+    #   * test_minres_indefinite          : MINRES solves a known indefinite system
+    #                                       (||Ax-b|| small) + D1 bit-exact.
+    #   * test_minres_vs_dense_indefinite : MINRES vs Eigen FullPivLU on indefinite
+    #                                       blocks (< 1e-5; FullPivLU, NOT LDLT).
+    #   * test_ilu0_factorization         : ILU(0) factor matches a hand reference +
+    #                                       host==device + D1 bit-exact.
+    #   * test_ilu0_vs_jacobi_convergence : ILU(0)-MINRES converges in <= 0.5x iters
+    #                                       vs Jacobi-MINRES on an ill-conditioned
+    #                                       structurally-sparse DEFINITE block.
+    # Eigen is linked test-only (the approved dense oracle), never a production path.
+    foreach(minres_test
+            test_minres_indefinite
+            test_minres_vs_dense_indefinite
+            test_ilu0_factorization
+            test_ilu0_vs_jacobi_convergence)
+        add_executable(nuka_diffsim_${minres_test}
+            diffsim/solver/${minres_test}.cpp)
+        target_compile_definitions(nuka_diffsim_${minres_test}
+            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+        target_link_libraries(nuka_diffsim_${minres_test}
+            PRIVATE
+                nuka_diffsim
+                nuka_core
+                nuka_phi
+                nuka_eigen_testonly
+                GTest::gtest_main)
+        gtest_discover_tests(nuka_diffsim_${minres_test}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endforeach()
+
     # --- v0.5 p03 R2: contact KKT (Delassus) builder ------------------------
     # Builder (A = J M^-1 J^T) vs an INDEPENDENT host Gram recompute (Eigen,
     # < 1e-5 rel), exact bit-symmetry, the diagonal == 1/effective_mass identity,

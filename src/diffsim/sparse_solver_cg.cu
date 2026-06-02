@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/solver/cg_diagnostics.cuh"
+#include "diffsim/solver/minres_backend.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
 
@@ -368,6 +369,88 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
+// v0.7 p02 indefinite detector (read-only): one warp per block, lane 0 runs a
+// fixed-order symmetric LDLT elimination computing the POST-ELIMINATION PIVOTS
+// (Sylvester's law of inertia: their signs = the inertia of A). If any pivot is
+// strictly negative beyond -kEps*max|diag| the block is INDEFINITE -> OR the uint
+// flag (uint atomicOr is order-independent => D1; NOT a float atomic). No solver
+// state is touched; A is read-only. SPD/PSD => all pivots >= 0 => flag never set.
+// INDEFINITE-FLAG threshold: a pivot is "genuinely negative" only if it falls below
+// -kIndefRelEps * max|diag|. This must sit ABOVE the fp32-quantization/roundoff
+// floor of a true-ZERO eigenvalue (a PSD null direction's no-pivoting pivot is a
+// tiny SIGNED roundoff, measured down to ~-1.6e-6 * max|diag| on fp32-quantized PSD
+// blocks) and BELOW a genuinely indefinite pivot (an eigenvalue ~ -O(1)*scale gives
+// a pivot whose LEAST-negative observed value over the indefinite test battery is
+// ~-9.8e-2 * max|diag|). kIndefRelEps = 1e-3 is the clean separation: PSD/PSD-null
+// NEVER trips (no SPD-path false positive -> byte-identical guarantee), every tested
+// indefinite block DOES. See test_minres_vs_dense_indefinite IndefiniteDetectorBytesafe.
+__device__ constexpr double kIndefRelEps = 1.0e-3;
+// NULL-SKIP band: |pivot| <= kNullRelEps * max|diag| is treated as a (PSD) null
+// direction -- skip its column so the elimination does not divide by ~0 / amplify
+// roundoff. Far below kIndefRelEps so it never masks a genuine negative pivot.
+__device__ constexpr double kNullRelEps = 1.0e-7;
+
+__global__ void DetectIndefiniteKernel(const float* __restrict__ values,
+                                       const uint32_t* __restrict__ block_dim,
+                                       uint32_t block_count,
+                                       uint32_t* __restrict__ flag) {
+    const uint32_t blk = blockIdx.x;
+    if (blk >= block_count) return;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t n = block_dim[blk];
+    if (n == 0u) return;
+    if (lane != 0u) return;  // lane 0 does the sequential elimination
+
+    __shared__ double a_sh[kMaxBlockDim * kMaxBlockDim];
+    const float* __restrict__ vb = values + static_cast<size_t>(blk) * kBlockStride;
+    double max_diag = 0.0;
+    for (uint32_t i = 0u; i < n; ++i) {
+        for (uint32_t j = 0u; j < n; ++j)
+            a_sh[i * kMaxBlockDim + j] =
+                static_cast<double>(vb[i * kMaxBlockDim + j]);
+        const double d = a_sh[i * kMaxBlockDim + i];
+        const double ad = (d < 0.0) ? -d : d;
+        if (ad > max_diag) max_diag = ad;
+    }
+    const double scale = (max_diag > 0.0 ? max_diag : 1.0);
+    const double neg_thresh = -kIndefRelEps * scale;  // genuine-indefinite cutoff
+
+    // Symmetric LDLT (no pivoting): pivot d_j = a_jj - sum_{k<j} L_jk^2 d_k, with
+    // L_ij = (a_ij - sum_{k<j} L_ik L_jk d_k) / d_j. The strict-lower of a_sh holds
+    // L_ij after column j is processed. A genuinely NEGATIVE pivot (dj < neg_thresh)
+    // => the block has a negative inertia => INDEFINITE. A near-ZERO pivot
+    // (|dj| <= kNullRelEps*max|diag|, a PSD null direction -- a true-zero eigenvalue
+    // whose fp32-quantized no-pivoting pivot is a tiny SIGNED roundoff) is NOT
+    // indefinite: it sits ABOVE neg_thresh so it never flags, and we skip its column
+    // (treat L_ij in it as 0) so the elimination stays finite. (Detection only; A is
+    // never modified.)
+    const double pos_floor = kNullRelEps * scale;
+    double piv[kMaxBlockDim];
+    bool indefinite = false;
+    for (uint32_t j = 0u; j < n; ++j) {
+        double dj = a_sh[j * kMaxBlockDim + j];
+        for (uint32_t k = 0u; k < j; ++k) {
+            const double ljk = a_sh[j * kMaxBlockDim + k];
+            dj -= ljk * ljk * piv[k];
+        }
+        piv[j] = dj;
+        if (dj < neg_thresh) { indefinite = true; break; }
+        // Near-zero pivot (PSD null direction): leave column's L_ij at 0 (skip).
+        if (dj <= pos_floor) {
+            for (uint32_t i = j + 1u; i < n; ++i)
+                a_sh[i * kMaxBlockDim + j] = 0.0;
+            continue;
+        }
+        for (uint32_t i = j + 1u; i < n; ++i) {
+            double s = a_sh[i * kMaxBlockDim + j];
+            for (uint32_t k = 0u; k < j; ++k)
+                s -= a_sh[i * kMaxBlockDim + k] * a_sh[j * kMaxBlockDim + k] * piv[k];
+            a_sh[i * kMaxBlockDim + j] = s / dj;
+        }
+    }
+    if (indefinite) atomicOr(flag, 1u);
+}
+
 }  // namespace
 
 SelfWrittenCgBackend::SelfWrittenCgBackend(const phi::DeviceContext& context,
@@ -406,10 +489,15 @@ std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
     if (name.empty() || name == "cg" || name == "default" || name == "self_cg") {
         return std::make_unique<SelfWrittenCgBackend>(context, determinism);
     }
-    // Forward-looking keys reserved for v0.7 phases 2-3 (MINRES / GMRES build on
-    // this same self-written core). Recognized but NOT YET implemented -> a clear
-    // diagnostic rather than a generic "unknown backend".
-    if (name == "self_minres" || name == "self_gmres") {
+    // v0.7 p02: the self-written MINRES backend (symmetric INDEFINITE Krylov +
+    // ILU(0) preconditioner) shares this same batched-dense seam. The C ABI
+    // NUKA_SOLVER_BACKEND_SELF_MINRES round-trips through this "self_minres" name.
+    if (name == "self_minres" || name == "minres") {
+        return std::make_unique<SelfWrittenMinresBackend>(context, determinism);
+    }
+    // GMRES (non-symmetric) is the v0.7 phase 3 extension on the same core --
+    // recognized but not yet implemented -> a clear diagnostic.
+    if (name == "self_gmres") {
         throw std::invalid_argument(
             "nuka::diffsim::MakeSparseSolverBackend: backend '" +
             std::string(name) +
@@ -417,7 +505,25 @@ std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
     }
     throw std::invalid_argument(
         "nuka::diffsim::MakeSparseSolverBackend: unknown backend '" +
-        std::string(name) + "' (v0.7 p01 ships 'self_cg' / 'cg')");
+        std::string(name) +
+        "' (v0.7 p02 ships 'self_cg'/'cg' and 'self_minres'/'minres')");
+}
+
+void DetectBatchedIndefinite(const phi::DeviceContext& context,
+                             const BatchedDenseSpdSystem& system,
+                             uint32_t* out_indefinite_flag) {
+    if (system.block_count == 0u || out_indefinite_flag == nullptr) return;
+    if (system.values == nullptr || system.block_dim == nullptr) {
+        throw std::invalid_argument(
+            "nuka::diffsim::DetectBatchedIndefinite: null system pointer");
+    }
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    // One warp per block (lane 0 does the elimination). READ-ONLY over `system`;
+    // writes only the caller-pre-zeroed uint flag. The caller synchronizes + reads.
+    DetectIndefiniteKernel<<<system.block_count, kWarpSize, 0u, stream>>>(
+        system.values, system.block_dim, system.block_count, out_indefinite_flag);
+    CheckCuda(cudaGetLastError(), "DetectIndefiniteKernel launch");
 }
 
 }  // namespace nuka::diffsim

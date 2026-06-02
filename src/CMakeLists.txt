@@ -588,6 +588,13 @@ if(CMAKE_CUDA_COMPILER)
         # side-channel's CPU aggregation; the device side is a header consumed by
         # sparse_solver_cg.cu). D1: a fixed-order pass, no device work here.
         diffsim/solver/cg_diagnostics.cpp
+        # v0.7 p02: self-written MINRES backend (symmetric INDEFINITE Krylov) +
+        # ILU(0) preconditioner (incomplete LU, zero fill-in) + sparse triangular
+        # solve. Warp-per-block on the SAME batched-dense seam as the CG backend;
+        # D1 bit-exact (Lanczos/Givens are fixed-order per-block, no atomics).
+        diffsim/solver/minres_backend.cu
+        diffsim/solver/ilu0_preconditioner.cu
+        diffsim/solver/triangular_solve.cu
         # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
         # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
         diffsim/kkt_builder.cu
