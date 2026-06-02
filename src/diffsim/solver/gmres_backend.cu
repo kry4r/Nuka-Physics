@@ -111,12 +111,24 @@ __device__ __forceinline__ void SolveOneBlockGmres(
 
     // LEFT preconditioner apply z = M^-1 r (this lane's z_i). Jacobi: z_i = r_i/a_ii
     // (non-symmetric A -> the diagonal can have either sign; we keep the SIGNED
-    // diagonal -- left Jacobi for a general matrix, NOT absolute value). The
-    // BlockJacobi key is the reserved hook for ILU(0)/AMG (p03-B); until wired it
-    // falls through to the safe diagonal apply (documented in the header).
+    // diagonal -- left Jacobi for a general matrix, NOT absolute value).
+    //
+    // DEFERRED-AMG SLOT (named consumer = p09/p10/p11 soft/fluid + coupling adjoint).
+    // The non-Jacobi preconditioner keys (ILU(0), AMG) plug in HERE. They are
+    // deliberately NOT wired yet: AMG (algebraic multigrid) is a LARGE-SPARSE-STIFF
+    // preconditioner, but every system that reaches this seam today is a <= 12-dim
+    // dense Delassus block where GMRES is exact in <= n fp64 steps -- AMG would be a
+    // D1-fragile orphan (aggregation order / RAP / smoother coloring) with no consumer
+    // and no way to exercise its "beats ILU0 by >=5x on a STIFF matrix" acceptance
+    // criterion (no stiff system exists until soft/fluid). Per the master plan, AMG is
+    // a v0.7+ suite CAPABILITY (not a phase-pinned deliverable), so it is SEQUENCED to
+    // the phase that first assembles a large sparse adjoint through this same
+    // SparseLinearSolver seam (p09 XPBD / p10 PBF / p11 coupling reverse mode). That
+    // phase sizes the hierarchy against the REAL operator and adds the end-to-end test.
+    // Until then this lambda falls through to the safe signed-diagonal Jacobi apply.
     auto apply_precond = [&](double r_i) -> double {
         if (!active) return 0.0;
-        // Jacobi (and the not-yet-wired ILU0/AMG hook fall back here).
+        // Jacobi (and the deferred ILU0/AMG hook fall back here -- see slot note above).
         double d = a_diag;
         if (d > -kNormFloor && d < kNormFloor) d = 1.0;  // guard near-zero diagonal
         return r_i / d;
