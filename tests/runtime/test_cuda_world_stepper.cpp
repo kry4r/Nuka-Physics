@@ -4,6 +4,7 @@
 
 #include "runtime/gpu/cuda_world_stepper.hpp"
 #include "runtime/gpu/device_world.hpp"
+#include "runtime/soft/xpbd_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "runtime/world_stepper.hpp"
 #include "scene/cooker.hpp"
@@ -11,8 +12,10 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace nuka;
 
@@ -180,6 +183,71 @@ TEST(CudaWorldStepper, MatchesCpuReferenceForFreeFallAndForces) {
         EXPECT_EQ(gpu_state.forces[body_index], math::Vec3::Zero());
         EXPECT_EQ(gpu_state.torques[body_index], math::Vec3::Zero());
     }
+}
+
+// v0.7 p09-A: the additive rigid+XPBD co-step overload must be byte-identical to
+// the rigid-only path when the attached XpbdWorld is EMPTY (inert-when-empty).
+// Runs the same scene + step schedule through both entry points and asserts the
+// rigid pose/velocity/force buffers memcmp identical, plus zero XPBD kernels.
+TEST(CudaWorldStepper, RigidPathByteIdenticalWithEmptyXpbdWorld) {
+    const auto blob = scene::CookScene(BuildTwoBodyScene());
+
+    runtime::gpu::CudaWorldStepOptions options;
+    options.gravity = {0.0f, -9.81f, 0.0f};
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 12;
+    options.clear_forces_after_step = true;
+
+    auto run_rigid_only = [&]() {
+        auto host = runtime::BuildWorld(blob);
+        host.instance.forces[0] = {4.0f, 0.0f, 0.0f};
+        host.instance.torques[1] = {1.0f, 0.0f, 3.0f};
+        auto device_world = runtime::gpu::UploadDeviceWorld(host.template_view);
+        runtime::gpu::UploadDeviceState(device_world, host.instance);
+        runtime::gpu::StepCudaWorld(device_world, options);
+        return device_world.DownloadState();
+    };
+
+    auto run_with_empty_xpbd = [&]() {
+        auto host = runtime::BuildWorld(blob);
+        host.instance.forces[0] = {4.0f, 0.0f, 0.0f};
+        host.instance.torques[1] = {1.0f, 0.0f, 3.0f};
+        auto device_world = runtime::gpu::UploadDeviceWorld(host.template_view);
+        runtime::gpu::UploadDeviceState(device_world, host.instance);
+
+        runtime::soft::XpbdParticleSet empty_particles;  // zero particles.
+        runtime::soft::XpbdConstraintSet empty_constraints;
+        auto xpbd_world = runtime::soft::UploadXpbdWorld(empty_particles, empty_constraints);
+        auto context = phi::MakeDefaultDeviceContext();
+        const auto report =
+            runtime::gpu::StepCudaWorld(context, device_world, xpbd_world, options);
+
+        // No XPBD work was done.
+        EXPECT_EQ(report.xpbd_particle_count, 0u);
+        EXPECT_EQ(report.xpbd_kernel_launch_count, 0u);
+        // The rigid kernel_launch_count is unchanged by the additive overload.
+        EXPECT_EQ(report.kernel_launch_count, options.step_count);
+        return device_world.DownloadState();
+    };
+
+    const auto a = run_rigid_only();
+    const auto b = run_with_empty_xpbd();
+
+    ASSERT_EQ(a.poses.size(), b.poses.size());
+    ASSERT_EQ(a.linear_velocities.size(), b.linear_velocities.size());
+    ASSERT_EQ(a.angular_velocities.size(), b.angular_velocities.size());
+    EXPECT_EQ(std::memcmp(a.poses.data(), b.poses.data(),
+                          a.poses.size() * sizeof(math::Transform)),
+              0)
+        << "rigid poses diverged when an empty XpbdWorld was attached";
+    EXPECT_EQ(std::memcmp(a.linear_velocities.data(), b.linear_velocities.data(),
+                          a.linear_velocities.size() * sizeof(math::Vec3)),
+              0)
+        << "rigid linear velocities diverged when an empty XpbdWorld was attached";
+    EXPECT_EQ(std::memcmp(a.angular_velocities.data(), b.angular_velocities.data(),
+                          a.angular_velocities.size() * sizeof(math::Vec3)),
+              0)
+        << "rigid angular velocities diverged when an empty XpbdWorld was attached";
 }
 
 TEST(CudaWorldStepper, RejectsStepBeforeDeviceStateUpload) {

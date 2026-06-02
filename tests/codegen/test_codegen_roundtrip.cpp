@@ -48,11 +48,13 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
 
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
-    const std::array<const char*, 6> files = {
+    const std::array<const char*, 8> files = {
         "maximal_contact_forward.cu",
         "maximal_joint_forward.cu",
         "maximal_drive_forward.cu",
         "featherstone_contact_forward.cu",
+        "xpbd_distance_forward.cu",
+        "xpbd_distance_adjoint.cuh",
         "row_dispatch.cu",
         "row_class_registry.hpp",
     };
@@ -78,17 +80,21 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::kMaximalJointRowId;
     using nuka::solver::generated::kRigidSDFContactRowId;
     using nuka::solver::generated::kRowClassCount;
+    using nuka::solver::generated::kXPBDDistanceRowId;
 
-    // v0.7 p08-B added the two SDF contact row classes (ids 4/5) -> 6 total.
-    EXPECT_EQ(kRowClassCount, 6u);
+    // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A adds the
+    // XPBD soft-body distance row (id 6) -> 7 total.
+    EXPECT_EQ(kRowClassCount, 7u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
     EXPECT_TRUE(IsKnownRowClass(kFeatherstoneContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kRigidSDFContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kFeatherstoneSDFContactRowId));
+    EXPECT_TRUE(IsKnownRowClass(kXPBDDistanceRowId));
     EXPECT_EQ(kRigidSDFContactRowId, 4u);
     EXPECT_EQ(kFeatherstoneSDFContactRowId, 5u);
+    EXPECT_EQ(kXPBDDistanceRowId, 6u);
     EXPECT_STREQ(RowClassName(kMaximalContactRowId), "MaximalContactRow");
     EXPECT_STREQ(RowClassName(kRigidSDFContactRowId), "RigidSDFContactRow");
     EXPECT_STREQ(RowClassName(kFeatherstoneSDFContactRowId), "FeatherstoneSDFContactRow");
@@ -109,6 +115,19 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
               static_cast<uint8_t>(GradientMode::ift_at_convergence));
     EXPECT_EQ(RowClassGradientMode(kFeatherstoneSDFContactRowId),
               static_cast<uint8_t>(GradientMode::ift_at_convergence));
+
+    // v0.7 p09-A: the XPBD soft-body distance row (id 6) ships a GENUINE
+    // dispatchable per-row adjoint -- this is exit-crit 6 and what distinguishes
+    // it from the FORWARD-ONLY SDF rows above. This block is the contract
+    // tripwire: RowClassHasAdjoint(6) MUST stay true and the gradient mode MUST
+    // stay dense_adjoint. If the XPBD adjoint is ever removed/changed, this fails
+    // consciously rather than silently degrading to a stop-gradient.
+    EXPECT_STREQ(RowClassName(kXPBDDistanceRowId), "XPBDDistanceRow");
+    EXPECT_EQ(RowClassMaxRowsPerBlock(kXPBDDistanceRowId), 6u);
+    EXPECT_TRUE(RowClassHasAdjoint(kXPBDDistanceRowId));
+    EXPECT_EQ(RowClassGradientMode(kXPBDDistanceRowId),
+              static_cast<uint8_t>(GradientMode::dense_adjoint));
+
     EXPECT_FALSE(IsKnownRowClass(99u));
 }
 

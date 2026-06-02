@@ -393,6 +393,8 @@ if(CMAKE_CUDA_COMPILER)
         codegen/v3_validation/fd_harness.cu
         codegen/v3_validation/numerical_jacobian.cu
         codegen/v3_validation/box_pgs_fd.cu
+        # v0.7 p09-A: XPBD distance-row adjoint FD validator (dense_adjoint).
+        codegen/v3_validation/xpbd_distance_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -448,6 +450,10 @@ if(CMAKE_CUDA_COMPILER)
         runtime/gpu/cuda_particle_world.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
+        # v0.7 p09-A: XPBD soft-body distance world (GPU predict/solve/correct).
+        # The first soft path; cuda_world_stepper.cu's additive rigid+soft co-step
+        # overload links against it, so it lives in the same library.
+        runtime/soft/xpbd_world.cu
         # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.

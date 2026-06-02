@@ -1,0 +1,101 @@
+row_class_id: 6
+row_class_name: XPBDDistanceRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.7 p09-A: XPBD (Extended Position-Based Dynamics, Macklin et al. 2016) soft-body
+# DISTANCE constraint -- the foundational vertical slice of the soft path. One
+# constraint between two PARTICLE pseudo-bodies a, b (3-DOF translational point
+# masses; the angular half of the maximal_6vec Jacobian is zero -- particles carry
+# no rotational state). Constraint function and one Gauss-Seidel projection:
+#     C   = |p_a - p_b| - rest_length                 # signed distance error
+#     n   = (p_a - p_b) / |p_a - p_b|                  # grad C wrt p_a (|grad C| = 1)
+#     a~  = compliance_alpha / dt^2                    # XPBD compliance (alpha~)
+#     dl  = (-C - a~*lambda) / (w_a + w_b + a~)        # Lagrange-multiplier delta
+#     p_a += w_a * n * dl ;  p_b -= w_b * n * dl       # position correction
+#     lambda += dl                                     # multiplier accumulation
+# The GPU predict/solve/correct integration loop lives in
+# src/runtime/soft/xpbd_world.{hpp,cu}; this IR governs the row-class registry
+# entry (id 6) and the per-row reverse-mode adjoint emitted by regen.py.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+
+# Reverse-mode (dense_adjoint) -- the LOCAL projection adjoint of ONE distance
+# constraint application, exactly the analog of MaximalJointRow's local adjoint
+# (it is a bilateral EQUALITY row, so the box is unbounded and the clamp is never
+# active -- clamp_strategy=box_lower_upper + event_strategy=subgradient, with the
+# huge sentinel bounds the integration loop stamps into Row.lower/upper).
+#
+# Scalar primal output: lambda_new = lambda + delta_lambda, where the XPBD
+# delta-lambda law is rewritten with effective_mass = 1/(w_a + w_b + alpha_tilde):
+#     u = lambda + effective_mass * (-C - alpha_tilde * lambda)
+# (so lambda_new = clamp(u, lower, upper) = u for the unbounded equality box).
+#
+# Why effective_mass and alpha_tilde are SEPARATE differentiable inputs (mirrors
+# how MaximalJointRow exposes effective_mass = 1/(J M^-1 J^T) rather than M / J):
+# the per-row local adjoint differentiates the projection update treating its
+# reduced scalars (C, lambda, effective_mass, alpha_tilde) as independent inputs.
+# Holding them independent makes u MULTILINEAR (degree <= 1 in each input), so the
+# V3 central-difference Jacobian is exact in real arithmetic (only float32
+# cancellation remains) -- the same property that lets the maximal rows pass the
+# 1e-3 gate. The TOTAL-derivative chain to physical {compliance_alpha, dt, the
+# per-particle inverse masses w_a/w_b} (which couples alpha_tilde through BOTH the
+# numerator and the 1/(.) inside effective_mass) is a DOWNSTREAM concern, NOT
+# p09-A -- it rides on the position/velocity chain (p += w*n*delta) the same way
+# p02 expands MaximalJointRow's grad_jv -> grad_v_i via J. Named downstream
+# consumer of this row-level adjoint: the soft/coupling backward in a later phase.
+#
+# Differentiable inputs:
+#   C              -- signed distance error |p_a-p_b| - rest_length (the constraint)
+#   lambda         -- the warm-started / iterate Lagrange multiplier
+#   effective_mass -- 1/(w_a + w_b + alpha_tilde) (the row's effective inverse mass)
+#   alpha_tilde    -- XPBD compliance alpha~ = compliance_alpha / dt^2
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - C
+    - lambda
+    - effective_mass
+    - alpha_tilde
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(-C - alpha_tilde*lambda); the emitted primal is
+  # clamp(u, lower, upper) (unbounded for this equality row).
+  unclamped_expression: >-
+    lambda + effective_mass * (-C - alpha_tilde * lambda)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is identically 1 for an unbounded equality box):
+  derivative_rules:
+    C: "-effective_mass"
+    lambda: "1.0f - effective_mass * alpha_tilde"
+    effective_mass: "(-C - alpha_tilde * lambda)"
+    alpha_tilde: "-effective_mass * lambda"
