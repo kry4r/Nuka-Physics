@@ -25,11 +25,14 @@
 // a_free = Ia^-1(-p) (STAGE B-float) + the root gyroscopic pass-1 reverse
 // (p = v x* (I v), STAGE D-float) + the floating-base linear velocity integrator
 // reverse (v_root' = v_root + (a_free - a_grav)dt, STAGE A-float), seeded through
-// grad_link_velocity_out. NOT yet differentiated: the base ORIENTATION channel --
-// the q-of-base path through a_grav = R(base_rot)^T g and the quaternion POSE
-// integrator (base_pose is held fixed; the supported loss seeds are on q'/qdot'
-// (joints) and v_root' (root spatial velocity), not on base_pose'). The prismatic
-// joint q-channel is also not wired (revolute-only STAGE E).
+// grad_link_velocity_out. The base ORIENTATION channel is now ALSO differentiated
+// (p08b): STAGE A-pose reverses the quaternion POSE integrator (position' / dq /
+// QuatMul / normalize), and STAGE A-float additionally reverses the gravity-
+// rotation a_grav = R(base_rot)^T g dependence; both accumulate dL/d base_rot_pre,
+// and base_pose' is a supported loss seed (grad_base_pose_out). All orientation
+// reads linearize at the PRE-step base orientation (in.base_pose_pre), mirroring
+// v_root_pre. The prismatic joint q-channel is still not wired (revolute-only
+// STAGE E).
 // ---------------------------------------------------------------------------
 
 #include "diffsim/step_backward.hpp"
@@ -185,6 +188,12 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
     // children's pass-3 reverse; consumed by the root LDLT reverse (STAGE B-float).
     float grad_a_free_root[6];
     Zero6Rev(grad_a_free_root);
+    // Orientation channel (p08b): dL/d base_rot_pre (PRE-step root quaternion),
+    // accumulated from the pose-integrator reverse (STAGE A-pose) AND the gravity-
+    // rotation reverse (STAGE A-float); written out after STAGE A-float.
+    float grad_base_rot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const bool orientation_on =
+        (in.base_pose_pre != nullptr) && (g.grad_base_pose_out != nullptr);
 
     for (uint32_t i = 0u; i < count; ++i) {
         Zero6Rev(grad_accel[i]);
@@ -226,12 +235,80 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
         }
     }
 
+    // --- STAGE A-pose: reverse the quaternion POSE integrator (p08b). --------
+    // Runs BEFORE STAGE A-float so its contributions into grad v_root' (gvr) are
+    // consumed by the velocity-integrator reverse in one pass. Forward (root):
+    //   v_lin_body = v_root'[3:6] ; v_lin_world = R(base_rot_pre) * v_lin_body
+    //   position'  = position_pre + v_lin_world * dt
+    //   dq         = (1, 0.5*v_root'[0]*dt, 0.5*v_root'[1]*dt, 0.5*v_root'[2]*dt)
+    //   rotation'  = normalize(QuatMul(base_rot_pre, dq))
+    // v_root' is the POST-velocity-integrate root velocity, == the live
+    // link_velocity[root] AND the value carried in gvr's seed slot; we read the
+    // live state for the forward operands and accumulate the adjoint into gvr +
+    // grad_base_rot. The seed dL/d{position',rotation'} is in g.grad_base_pose_out.
+    if (orientation_on &&
+        state.joint_type[offset] == ArticulationJointType::FloatingBase &&
+        in.has_integrate && g.grad_link_velocity_out != nullptr) {
+        const uint32_t root = offset;
+        float* gvr = g.grad_link_velocity_out + static_cast<size_t>(root) * 6u;
+        // base_pose_pre: math::Transform (position[3] then quaternion[4]).
+        const math::Transform pose_pre = in.base_pose_pre[articulation];
+        const math::Quat base_rot_pre = pose_pre.rotation;
+        // Seed: grad_base_pose_out[art] = [dL/d position'(3), dL/d rotation'(4)].
+        float* gbp = reinterpret_cast<float*>(g.grad_base_pose_out) +
+                     static_cast<size_t>(articulation) * 7u;
+        const float grad_pos_post[3] = {gbp[0], gbp[1], gbp[2]};
+        const float grad_rot_post[4] = {gbp[3], gbp[4], gbp[5], gbp[6]};
+
+        // Live v_root' (the POST-velocity-integrate root spatial velocity).
+        const float* vroot_post = state.link_velocity[root].v;
+        const math::Vec3 v_lin_body =
+            mg::MakeVec3(vroot_post[3], vroot_post[4], vroot_post[5]);
+
+        // ---- (1) position path: position' = position_pre + v_lin_world*dt ----
+        // grad_position_pre = grad_position' (identity, written out below).
+        // grad_v_lin_world = dt * grad_position'.
+        const float grad_v_lin_world[3] = {
+            dt * grad_pos_post[0], dt * grad_pos_post[1], dt * grad_pos_post[2]};
+        // v_lin_world = RotateByQuatForward(base_rot_pre, v_lin_body):
+        //   -> grad_base_rot (accumulated) + grad_v_lin_body.
+        float grad_v_lin_body[3] = {0.0f, 0.0f, 0.0f};
+        RotateByQuatForward_Rev(base_rot_pre, v_lin_body, grad_v_lin_world,
+                                grad_base_rot, grad_v_lin_body);
+        // v_lin_body = v_root'[3:6] -> add into gvr[3:6] (dL/d v_root' linear).
+        for (uint32_t i = 0u; i < 3u; ++i) gvr[3u + i] += grad_v_lin_body[i];
+
+        // ---- (2) rotation path: rotation' = normalize(QuatMul(base_rot_pre, dq)) -
+        math::Quat dq;
+        dq.w = 1.0f;
+        dq.x = 0.5f * vroot_post[0] * dt;
+        dq.y = 0.5f * vroot_post[1] * dt;
+        dq.z = 0.5f * vroot_post[2] * dt;
+        const math::Quat c = mg::QuatMul(base_rot_pre, dq);  // unnormalized product
+        // normalize adjoint: grad_rot_post -> grad_c.
+        float grad_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        QuatNormalize_Rev(c, grad_rot_post, grad_c);
+        // QuatMul adjoint: grad_c -> grad_base_rot (accumulated) + grad_dq.
+        float grad_dq[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        QuatMul_Rev(base_rot_pre, dq, grad_c, grad_base_rot, grad_dq);
+        // dq.{x,y,z} = 0.5*v_root'[{0,1,2}]*dt ; dq.w const -> no grad to v.
+        for (uint32_t i = 0u; i < 3u; ++i) gvr[i] += 0.5f * dt * grad_dq[1u + i];
+
+        // ---- write the position passthrough now (rotation slot done post-float).
+        gbp[0] = grad_pos_post[0];
+        gbp[1] = grad_pos_post[1];
+        gbp[2] = grad_pos_post[2];
+    }
+
     // --- STAGE A-float: reverse the floating-base velocity integrator. -------
     // forward: v_root'[i] = v_root[i] + (a_free[i] - a_grav[i])*dt
-    // (a_grav depends on base_pose.rotation -- held fixed; base orientation is NOT
-    // differentiated, the supported seed is dL/d v_root').  Seed:
-    // g.grad_link_velocity_out[root] = dL/d v_root'.
+    //   a_grav = [0,0,0, g_body], g_body = R(base_rot_pre)^T g_world,
+    //   g_world = (0,0,-gravity_z). So v_root'[3:6] depends on base_rot_pre through
+    //   -a_grav*dt (the gravity-rotation orientation path, p08b). Seed:
+    // g.grad_link_velocity_out[root] = dL/d v_root' (NOW including the pose
+    // reverse's contribution, since STAGE A-pose ran first).
     //   grad_a_free_root += dt * grad_vroot'      (integrate case)
+    //   grad_a_grav      = -dt * grad_vroot'      (-> grad_base_rot via R^T g)
     //   grad_v_root(pre)  = grad_vroot'           (write back to the same slot)
     // When !has_integrate the floating "output" is the root spatial accel a_free
     // itself (the floating analogue of seeding qddot): seed grad_a_free directly.
@@ -245,6 +322,19 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
                     grad_a_free_root[i] += dt * gvr[i];
                     // grad_v_root(pre) = grad_vroot' (identity); stays in gvr[i].
                 }
+                // Gravity-rotation orientation path: a_grav linear = g_body =
+                // R(base_rot_pre)^T g_world. grad_a_grav[3:6] = -dt*gvr[3:6].
+                if (orientation_on && in.base_pose_pre != nullptr) {
+                    const math::Quat base_rot_pre =
+                        in.base_pose_pre[articulation].rotation;
+                    const float grad_g_body[3] = {
+                        -dt * gvr[3], -dt * gvr[4], -dt * gvr[5]};
+                    // g_body = RotateByQuatInverse(base_rot_pre, g_world).
+                    // g_world is a CONSTANT (fixed gravity) -> no grad_v needed.
+                    const math::Vec3 g_world = mg::MakeVec3(0.0f, 0.0f, -in.gravity_z);
+                    RotateByQuatInverse_Rev(base_rot_pre, g_world, grad_g_body,
+                                            grad_base_rot, /*grad_v=*/nullptr);
+                }
             } else {
                 for (uint32_t i = 0u; i < 6u; ++i) {
                     grad_a_free_root[i] += gvr[i];  // seed dL/d a_free
@@ -252,6 +342,21 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
                 }
             }
         }
+    }
+
+    // --- Write the base-orientation grad (dL/d base_rot_pre) out. -------------
+    // grad_base_rot now holds the full PRE-step orientation cotangent from BOTH
+    // the pose-integrator reverse (STAGE A-pose) and the gravity-rotation reverse
+    // (STAGE A-float). The position slot was written in STAGE A-pose (identity).
+    if (orientation_on &&
+        state.joint_type[offset] == ArticulationJointType::FloatingBase &&
+        in.has_integrate) {
+        float* gbp = reinterpret_cast<float*>(g.grad_base_pose_out) +
+                     static_cast<size_t>(articulation) * 7u;
+        gbp[3] = grad_base_rot[0];
+        gbp[4] = grad_base_rot[1];
+        gbp[5] = grad_base_rot[2];
+        gbp[6] = grad_base_rot[3];
     }
 
     // =======================================================================

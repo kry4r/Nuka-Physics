@@ -49,11 +49,21 @@
 //     v_root (StepBackwardInputs::v_root_pre), NOT the live post-integration value
 //     that IntegrateFloatingBaseVelocity leaves in link_velocity[root]. The
 //     large-dt twin-variant FD test guards this linearization point.
-// NOT differentiated (the base-ORIENTATION channel is DEFERRED, NOT exact): the
-// a_grav = R(base_rot)^T g dependence on base rotation + the quaternion POSE
-// integrator -- base orientation is held fixed; supported loss seeds are q'/qdot'
-// and v_root', NOT base_pose'. Also deferred: the prismatic-joint q-channel and
-// contacts.
+// ORIENTATION channel (p08b -- now EXACT, FD-validated): the base-ORIENTATION
+// channel is differentiated end-to-end. Two coupled forward sites are reversed:
+//   (1) the gravity-rotation a_grav = R(base_rot)^T g in the floating-base
+//       VELOCITY integrator (v_root'[3:6] picks up +R(base_rot_pre)^T g * dt), and
+//   (2) the quaternion POSE integrator: position' = position + R(base_rot_pre) *
+//       v_root'[3:6] * dt ; rotation' = normalize(QuatMul(base_rot_pre, dq)),
+//       dq = (1, 0.5*v_root'[0:3]*dt).
+// CRITICAL: all three orientation reads are at the PRE-step base orientation
+// (StepBackwardInputs::base_pose_pre) -- the pose integrator overwrites
+// base_pose in place (pre->post) BEFORE StepBackward runs, mirroring v_root_pre.
+// base_pose' is now a supported loss seed (StepBackwardGrads::grad_base_pose_out,
+// PER-ARTICULATION: 3 position + 4 quaternion floats). The pose reverse runs
+// BEFORE the velocity reverse so its contribution into grad v_root' (via
+// v_lin_body / omega) is consumed by the velocity-integrator reverse in one pass.
+// Still deferred: the prismatic-joint q-channel and contacts.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
@@ -85,6 +95,17 @@ struct StepBackwardInputs {
     // null the root gyroscopic reverse falls back to the live state (legal only
     // for fixed-base models, which have no floating root).
     const float* v_root_pre = nullptr;
+    // PRE-step base orientation snapshot, per articulation (device,
+    // articulation_count Transforms == articulation_count*7 floats laid out as
+    // math::Transform{Vec3 position; Quat rotation}). Snapshotted by the caller
+    // BEFORE IntegrateFloatingBasePose overwrote the live base_pose (pre->post).
+    // The three orientation reads -- a_grav = R(base_rot)^T g, v_lin_world =
+    // R(base_rot)*v_lin_body, and rotation' = normalize(QuatMul(base_rot, dq)) --
+    // all evaluate at this PRE-step orientation, so the adjoint linearizes here,
+    // NOT at the clobbered live (post) base_pose. When null the orientation channel
+    // is OFF (no a_grav-rotation grad, no pose-integrator reverse) -- the legacy
+    // velocity-only floating behavior, byte-identical.
+    const math::Transform* base_pose_pre = nullptr;
     // Drive (action) descriptors (device, total_link_count).
     const float* drive_targets = nullptr;    // the ACTION input we differentiate
     const float* drive_stiffness = nullptr;  // Kp
@@ -142,6 +163,14 @@ struct StepBackwardGrads {
     // Per-link spatial-velocity adjoint (6 floats/link). in: dL/d v_root' seed
     // on the floating root (zero elsewhere); out: dL/d v_root (pre-step) on root.
     float* grad_link_velocity_out = nullptr;
+    // PER-ARTICULATION base-pose adjoint, articulation_count Transforms (7 floats
+    // each: 3 position + 4 quaternion, matching math::Transform layout). in:
+    // dL/d base_pose' seed (the POST-step base pose); out: dL/d base_pose_pre
+    // (pre-step). Overwritten in place like grad_link_velocity_out. When null (or
+    // base_pose_pre null) the orientation channel is OFF. The position adjoint is
+    // an identity passthrough (position does not feed the step's dynamics); the
+    // rotation adjoint flows through the pose-integrator + a_grav reverse.
+    float* grad_base_pose_out = nullptr;
 };
 
 // Run the single-step reverse. `state` is the device view AFTER the forward step
