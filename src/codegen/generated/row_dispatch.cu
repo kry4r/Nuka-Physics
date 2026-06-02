@@ -26,6 +26,10 @@ const char* RowClassName(uint32_t row_class_id) noexcept {
         return "FeatherstoneSDFContactRow";
     case 6u:
         return "XPBDDistanceRow";
+    case 7u:
+        return "XPBDBendRow";
+    case 8u:
+        return "XPBDVolumeRow";
     default:
         return "Unknown";
     }
@@ -47,6 +51,10 @@ const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
         return "featherstone_sdf_contact_forward_kernel";
     case 6u:
         return "xpbd_distance_forward_kernel";
+    case 7u:
+        return "xpbd_bend_forward_kernel";
+    case 8u:
+        return "xpbd_volume_forward_kernel";
     default:
         return nullptr;
     }
@@ -67,6 +75,10 @@ uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
     case 5u:
         return 6u;
     case 6u:
+        return 6u;
+    case 7u:
+        return 6u;
+    case 8u:
         return 6u;
     default:
         return 0u;
@@ -93,6 +105,10 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
         return 2u;
     case 6u:
         return 0u;
+    case 7u:
+        return 0u;
+    case 8u:
+        return 0u;
     default:
         return 0u;
     }
@@ -114,6 +130,10 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
         return 0u;
     case 6u:
         return 5u;
+    case 7u:
+        return 6u;
+    case 8u:
+        return 7u;
     default:
         return 0u;
     }
@@ -131,6 +151,10 @@ const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
         return "featherstone_contact_adjoint_kernel";
     case 6u:
         return "xpbd_distance_adjoint_kernel";
+    case 7u:
+        return "xpbd_bend_adjoint_kernel";
+    case 8u:
+        return "xpbd_volume_adjoint_kernel";
     default:
         return nullptr;
     }

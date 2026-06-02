@@ -1,0 +1,101 @@
+row_class_id: 8
+row_class_name: XPBDVolumeRow
+
+body_count_mode: fixed
+body_count: 4
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.7 p09-B: XPBD (Macklin et al. 2016) soft-body VOLUME constraint -- one
+# constraint over the FOUR particles of a tetrahedron (p1,p2,p3,p4). The
+# constraint is the (scaled) signed-volume deviation from the rest tet, using the
+# determinant convention
+#     C(p1,p2,p3,p4) = det([p2-p1, p3-p1, p4-p1]) - 6*V_rest
+#                    = (p2-p1) . ((p3-p1) x (p4-p1)) - 6*V_rest
+# i.e. C measures 6x the signed-volume error (the triple product == 6*V). The cook
+# builder computes 6*V_rest with the IDENTICAL triple-product expression on the
+# rest positions, so C == 0 at rest regardless of vertex winding (this is what
+# kills the sign-convention bug -- rest and runtime share one det expression). The
+# analytic position gradients (each is a cross product; Sum_i grad_i = 0 by
+# construction so the constraint conserves linear momentum):
+#     grad_{p2} = (p3-p1) x (p4-p1)
+#     grad_{p3} = (p4-p1) x (p2-p1)
+#     grad_{p4} = (p2-p1) x (p3-p1)
+#     grad_{p1} = -(grad_{p2} + grad_{p3} + grad_{p4})
+# The XPBD generalized projection (denominator generalizes distance's w_a+w_b):
+#     a~  = compliance_alpha / dt^2
+#     dl  = (-C - a~*lambda) / (sum_i w_i*|grad_i|^2 + a~)
+#     p_i += w_i * grad_i * dl   (i = 1..4) ;  lambda += dl
+# The cook-time tet list + rest volumes live in src/runtime/soft/tetmesh_topology.*;
+# the GPU predict/solve/correct loop and the per-row volume solve live in
+# src/runtime/soft/xpbd_world.{hpp,cu}. This IR governs the row-class registry
+# entry (id 8) and the per-row reverse-mode adjoint emitted by regen.py.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+
+# Reverse-mode (dense_adjoint) -- the LOCAL projection adjoint of ONE volume
+# constraint application. IDENTICAL in form to the distance/bend rows: the XPBD
+# delta-lambda law is constraint-TYPE-agnostic once the reduced scalars are held
+# independent. With effective_mass = 1/(sum_i w_i|grad_i|^2 + alpha_tilde):
+#     u = lambda + effective_mass * (-C - alpha_tilde * lambda)
+# (lambda_new = clamp(u, lower, upper) = u for the unbounded equality box).
+#
+# Holding the reduced scalars (C, lambda, effective_mass, alpha_tilde) independent
+# makes u MULTILINEAR, so the V3 central-difference Jacobian is exact in real
+# arithmetic (only float32 cancellation remains). The TOTAL-derivative chain to
+# the geometric inputs (the determinant gradients grad_i, the per-particle inverse
+# masses) rides DOWNSTREAM on the position chain (p_i += w_i*grad_i*dl), exactly as
+# the distance row defers its geometric chain. Named downstream consumer: the
+# soft/coupling backward in a later phase.
+#
+# Differentiable inputs:
+#   C              -- the volume constraint value det(.) - 6*V_rest
+#   lambda         -- the warm-started / iterate Lagrange multiplier
+#   effective_mass -- 1/(sum_i w_i|grad_i|^2 + alpha_tilde) (row's effective inv mass)
+#   alpha_tilde    -- XPBD compliance alpha~ = compliance_alpha / dt^2
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - C
+    - lambda
+    - effective_mass
+    - alpha_tilde
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(-C - alpha_tilde*lambda); the emitted primal is
+  # clamp(u, lower, upper) (unbounded for this equality row).
+  unclamped_expression: >-
+    lambda + effective_mass * (-C - alpha_tilde * lambda)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is identically 1 for an unbounded equality box):
+  derivative_rules:
+    C: "-effective_mass"
+    lambda: "1.0f - effective_mass * alpha_tilde"
+    effective_mass: "(-C - alpha_tilde * lambda)"
+    alpha_tilde: "-effective_mass * lambda"

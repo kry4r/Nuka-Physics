@@ -395,6 +395,9 @@ if(CMAKE_CUDA_COMPILER)
         codegen/v3_validation/box_pgs_fd.cu
         # v0.7 p09-A: XPBD distance-row adjoint FD validator (dense_adjoint).
         codegen/v3_validation/xpbd_distance_fd.cu
+        # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validators.
+        codegen/v3_validation/xpbd_bend_fd.cu
+        codegen/v3_validation/xpbd_volume_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -452,8 +455,15 @@ if(CMAKE_CUDA_COMPILER)
         runtime/gpu/cuda_world_stepper.cu
         # v0.7 p09-A: XPBD soft-body distance world (GPU predict/solve/correct).
         # The first soft path; cuda_world_stepper.cu's additive rigid+soft co-step
-        # overload links against it, so it lives in the same library.
+        # overload links against it, so it lives in the same library. p09-B adds
+        # the bend (id 7) + volume (id 8) GPU solve sweeps in the same TU.
         runtime/soft/xpbd_world.cu
+        # v0.7 p09-B: cook-time HOST topology builders (cloth stretch+bend,
+        # tet edge+volume) -> XpbdConstraintSet the GPU solve iterates. Cook-time
+        # CPU is allowed (same posture as the p06/p07 cookers); the per-step sim
+        # stays GPU-only.
+        runtime/soft/cloth_topology.cpp
+        runtime/soft/tetmesh_topology.cpp
         # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
