@@ -38,11 +38,15 @@
 //   Jacobi      -- M^-1 = 1/diag(A). Right/left choice: we apply LEFT Jacobi
 //                  (z = M^-1 r), the simplest D1 option, shipped now.
 //   BlockJacobi -- reserved hook for ILU(0) (the p02 incomplete-LU factor) and,
-//                  later, the p03-B AMG preconditioner. The apply seam is a single
-//                  lambda `z = M^-1 r`; an ILU0/AMG apply drops in there without
-//                  touching the Arnoldi/Givens machinery. See the .cu apply_precond.
-//                  Not wired to ILU0 yet (Jacobi is the shipped GMRES preconditioner
-//                  this phase); the hook is the named seam p03-B's AMG plugs into.
+//                  later, the AMG preconditioner. The apply seam is a single lambda
+//                  `z = M^-1 r`; an ILU0/AMG apply drops in there without touching the
+//                  Arnoldi/Givens machinery. See the .cu apply_precond DEFERRED-AMG
+//                  SLOT note. Not wired to ILU0/AMG yet (Jacobi is the shipped GMRES
+//                  preconditioner this phase). AMG is a v0.7+ suite CAPABILITY
+//                  SEQUENCED to its named consumer -- the p09/p10/p11 soft/fluid +
+//                  coupling adjoint, the first phase that assembles a large sparse
+//                  STIFF operator through this seam (a <= 12-dim dense Delassus block
+//                  gets zero benefit and can't exercise AMG's acceptance criterion).
 //
 // HONEST SCOPE: GMRES is for NON-SYMMETRIC systems. The engine's KKT/Delassus
 // systems are symmetric (SPD or indefinite) and STAY on CG/MINRES -- ift_runner's
