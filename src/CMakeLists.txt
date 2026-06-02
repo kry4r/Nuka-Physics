@@ -595,6 +595,13 @@ if(CMAKE_CUDA_COMPILER)
         diffsim/solver/minres_backend.cu
         diffsim/solver/ilu0_preconditioner.cu
         diffsim/solver/triangular_solve.cu
+        # v0.7 p03-A: self-written GMRES backend (general NON-SYMMETRIC Krylov,
+        # restarted GMRES(m): Arnoldi + modified Gram-Schmidt + Givens rotations) +
+        # the non-symmetric auto-routing detector. Warp-per-block on the SAME batched-
+        # dense seam as CG/MINRES; D1 bit-exact (MGS/Givens are fixed-order per-block,
+        # no atomics, the Krylov basis lives in shared mem). Jacobi precond; ILU0/AMG
+        # apply hook reserved for p03-B.
+        diffsim/solver/gmres_backend.cu
         # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
         # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
         diffsim/kkt_builder.cu

@@ -188,8 +188,8 @@ nuka_result_t nuka_tape_state_view(nuka_tape_handle tape,
 // it, so calling the setter is only needed to be explicit or (later) to switch.
 typedef enum nuka_sparse_solver_backend_t {
     NUKA_SOLVER_BACKEND_SELF_CG = 0,      /* self-written CG; default (v0.5) */
-    NUKA_SOLVER_BACKEND_SELF_MINRES = 1,  /* reserved: v0.7 phase 2 (not yet) */
-    NUKA_SOLVER_BACKEND_SELF_GMRES = 2,   /* reserved: v0.7 phase 3 (not yet) */
+    NUKA_SOLVER_BACKEND_SELF_MINRES = 1,  /* self-written MINRES (v0.7 p02) */
+    NUKA_SOLVER_BACKEND_SELF_GMRES = 2,   /* self-written GMRES (v0.7 p03-A) */
 } nuka_sparse_solver_backend_t;
 
 // Selects the sparse linear solver backend for `world`'s diff-sim / general

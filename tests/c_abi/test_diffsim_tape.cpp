@@ -246,13 +246,21 @@ TEST(DiffsimTapeCAbi, SparseSolverBackendSetGetRoundTrip) {
                                                    NUKA_SOLVER_BACKEND_SELF_CG),
               NUKA_RESULT_OK);
 
-    // SELF_GMRES remains reserved for v0.7 phase 3 -> NOT_SUPPORTED, no mutation.
+    // v0.7 p03-A: SELF_GMRES is now a SHIPPING backend (self-written general
+    // non-symmetric GMRES); it is accepted and round-trips.
     EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
                                                    NUKA_SOLVER_BACKEND_SELF_GMRES),
-              NUKA_RESULT_NOT_SUPPORTED);
+              NUKA_RESULT_OK);
     EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
               NUKA_RESULT_OK);
-    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG) << "rejected set must not mutate";
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_GMRES);
+    // Restore the default so the rest of the contract checks read SELF_CG.
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
+                                                   NUKA_SOLVER_BACKEND_SELF_CG),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG);
 
     // An out-of-range enum is INVALID_ARG; null out-pointer is INVALID_ARG.
     EXPECT_EQ(nuka_world_set_sparse_solver_backend(

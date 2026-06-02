@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/solver/cg_diagnostics.cuh"
+#include "diffsim/solver/gmres_backend.hpp"
 #include "diffsim/solver/minres_backend.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
@@ -495,18 +496,18 @@ std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
     if (name == "self_minres" || name == "minres") {
         return std::make_unique<SelfWrittenMinresBackend>(context, determinism);
     }
-    // GMRES (non-symmetric) is the v0.7 phase 3 extension on the same core --
-    // recognized but not yet implemented -> a clear diagnostic.
-    if (name == "self_gmres") {
-        throw std::invalid_argument(
-            "nuka::diffsim::MakeSparseSolverBackend: backend '" +
-            std::string(name) +
-            "' is reserved for a later v0.7 phase and not yet implemented");
+    // v0.7 p03-A: the self-written GMRES backend (GENERAL non-symmetric Krylov,
+    // restarted GMRES(m) + Jacobi preconditioner; ILU0/AMG hook reserved) shares the
+    // same batched-dense seam. The C ABI NUKA_SOLVER_BACKEND_SELF_GMRES round-trips
+    // through this "self_gmres" name. Default restart m=30 (Saad's 30-50 band).
+    if (name == "self_gmres" || name == "gmres") {
+        return std::make_unique<SelfWrittenGmresBackend>(context, 30u, determinism);
     }
     throw std::invalid_argument(
         "nuka::diffsim::MakeSparseSolverBackend: unknown backend '" +
         std::string(name) +
-        "' (v0.7 p02 ships 'self_cg'/'cg' and 'self_minres'/'minres')");
+        "' (v0.7 p03 ships 'self_cg'/'cg', 'self_minres'/'minres', "
+        "'self_gmres'/'gmres')");
 }
 
 void DetectBatchedIndefinite(const phi::DeviceContext& context,
