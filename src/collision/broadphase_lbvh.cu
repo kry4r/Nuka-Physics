@@ -284,25 +284,68 @@ LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
     , pair_capacity_(pair_capacity)
     , pairs_(std::move(pairs)) {}
 
+LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
+                                           uint32_t pair_count,
+                                           uint32_t pair_capacity,
+                                           phi::Buffer pairs,
+                                           phi::Buffer nodes)
+    : leaf_count_(leaf_count)
+    , pair_count_(pair_count)
+    , pair_capacity_(pair_capacity)
+    , pairs_(std::move(pairs))
+    , nodes_(std::move(nodes)) {}
+
 const collision::CollisionPair* LbvhBroadphaseResult::DevicePairs() const {
     return static_cast<const collision::CollisionPair*>(pairs_.Data());
 }
+
+const LbvhNode* LbvhBroadphaseResult::DeviceNodes() const {
+    if (nodes_.Size() == 0u) {
+        return nullptr;
+    }
+    return static_cast<const LbvhNode*>(nodes_.Data());
+}
+
+bool LbvhBroadphaseResult::HasNodes() const { return nodes_.Size() != 0u; }
 
 std::vector<collision::CollisionPair> LbvhBroadphaseResult::DownloadPairs() const {
     const uint32_t n = std::min(pair_count_, pair_capacity_);
     return DownloadVector<collision::CollisionPair>(pairs_, n);
 }
 
-LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
-                                         const collision::AABB* device_aabbs,
-                                         uint32_t count,
-                                         uint32_t max_pairs_hint) {
+// Shared build implementation. `retain_nodes` selects whether the built tree is
+// kept in the result (cross-system query) or destroyed (default pair-only path).
+// The compute pipeline is IDENTICAL in both cases -- the flag only affects what
+// the result HOLDS at the end -- so the default path stays byte-identical to p04.
+static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
+                                          const collision::AABB* device_aabbs,
+                                          uint32_t count,
+                                          uint32_t max_pairs_hint,
+                                          bool retain_nodes) {
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
 
     if (count < 2u) {
         // 0 or 1 body => no pairs possible.
         phi::Buffer empty(0u, phi::MemoryKind::Device);
+        if (retain_nodes && count == 1u) {
+            // A 1-leaf tree has a single node (the leaf itself). Retain it so the
+            // cross-system query can still report that one body as a candidate.
+            // The single sorted-index is trivially {0}; reuse InitNodesKernel.
+            phi::Buffer nodes(sizeof(LbvhNode), phi::MemoryKind::Device);
+            phi::Buffer index(sizeof(uint32_t), phi::MemoryKind::Device);
+            CheckCuda(cudaMemsetAsync(index.Data(), 0, sizeof(uint32_t), stream),
+                      "cudaMemsetAsync n=1 index");
+            InitNodesKernel<<<1u, kBlockSize, 0, stream>>>(
+                1u, device_aabbs,
+                static_cast<uint32_t*>(index.Data()),
+                static_cast<LbvhNode*>(nodes.Data()));
+            CheckCuda(cudaGetLastError(), "InitNodesKernel launch (n=1)");
+            context.stream.Synchronize();
+            phi::Buffer empty_pairs(0u, phi::MemoryKind::Device);
+            return LbvhBroadphaseResult(count, 0u, 0u, std::move(empty_pairs),
+                                        std::move(nodes));
+        }
         return LbvhBroadphaseResult(count, 0u, 0u, std::move(empty));
     }
 
@@ -432,7 +475,34 @@ LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
         context.stream.Synchronize();
     }
 
+    if (retain_nodes) {
+        return LbvhBroadphaseResult(count, valid, pair_capacity,
+                                    std::move(d_pairs), std::move(d_nodes));
+    }
     return LbvhBroadphaseResult(count, valid, pair_capacity, std::move(d_pairs));
+}
+
+LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
+                                         const collision::AABB* device_aabbs,
+                                         uint32_t count,
+                                         uint32_t max_pairs_hint) {
+    return BuildLbvhImpl(context, device_aabbs, count, max_pairs_hint,
+                         /*retain_nodes=*/false);
+}
+
+LbvhBroadphaseResult BuildLbvhForQuery(const phi::DeviceContext& context,
+                                       const collision::AABB* device_aabbs,
+                                       uint32_t count,
+                                       uint32_t max_pairs_hint) {
+    return BuildLbvhImpl(context, device_aabbs, count, max_pairs_hint,
+                         /*retain_nodes=*/true);
+}
+
+LbvhBroadphaseResult BuildLbvhForQuery(const collision::AABB* device_aabbs,
+                                       uint32_t count,
+                                       uint32_t max_pairs_hint) {
+    auto context = phi::MakeDefaultDeviceContext();
+    return BuildLbvhForQuery(context, device_aabbs, count, max_pairs_hint);
 }
 
 LbvhBroadphaseResult BuildLbvhBroadphase(const collision::AABB* device_aabbs,

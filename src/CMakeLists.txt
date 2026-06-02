@@ -464,6 +464,12 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka_collision_gpu STATIC
         collision/broadphase_lbvh.cu
         collision/lbvh_refit.cu
+        # v0.7 p05: particle uniform grid (spatial hash) + cross-system query
+        # (particle AABB -> rigid LBVH). D1-deterministic broadphase primitives
+        # feeding the soft/fluid/coupling phases. Same lib as the LBVH (which
+        # the cross-system query traverses); integer-only atomics, sorted output.
+        collision/particle_uniform_grid.cu
+        collision/cross_system_query.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
