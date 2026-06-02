@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
+#include "math/quat.hpp"
 #include "math/cuda_vec_ops.cuh"
 
 #include <cuda_runtime.h>
@@ -290,6 +291,170 @@ __forceinline__ __device__ void ForceCross_Rev(const float* motion, const float*
     grad_motion_inout[3] += g_v.x; grad_motion_inout[4] += g_v.y; grad_motion_inout[5] += g_v.z;
     grad_force_inout[0] += g_n.x; grad_force_inout[1] += g_n.y; grad_force_inout[2] += g_n.z;
     grad_force_inout[3] += g_f.x; grad_force_inout[4] += g_f.y; grad_force_inout[5] += g_f.z;
+}
+
+// ===========================================================================
+// Orientation-channel adjoints (p08b). These mirror the EXACT float DAGs of the
+// forward quaternion ops in featherstone_aba.cu / math/cuda_vec_ops.cuh:
+//   RotateByQuatForward / RotateByQuatInverse  (each NORMALIZES q internally),
+//   QuatMul  (Hamilton, w-first), and QuatNormalizeForwardRsqrt.
+// The adjoint of each forward op is the transpose of its (input-linearized)
+// Jacobian; we accumulate with plain `+=` (single-thread reverse -> D1, no
+// atomics). q is stored as math::Quat (w,x,y,z); grads as 4 floats (gw,gx,gy,gz).
+// ===========================================================================
+
+// --- Quaternion normalize adjoint -------------------------------------------
+// Forward (matching QuatNormalizeForwardRsqrt / the defensive normalize inside
+// RotateByQuat*): qn = q * rsqrt(|q|^2), so |qn| = 1. For a unit-output
+// normalize, the adjoint is the radial projection:
+//   grad_q = (grad_qn - (grad_qn . qn) qn) / |q|
+// where |q| = 1/inv, inv = rsqrt(norm_sq). The eps branch (norm_sq < eps ->
+// identity, derivative 0) is inactive for the unit-ish quaternions in play
+// (mirrors the inactive kMinDiagonal/force-limit clamps elsewhere).
+__forceinline__ __device__ void QuatNormalize_Rev(nuka::math::Quat q_in,
+                                                  const float* grad_qn /*4*/,
+                                                  float* grad_q_inout /*4*/) {
+    const float norm_sq = q_in.w * q_in.w + q_in.x * q_in.x +
+                          q_in.y * q_in.y + q_in.z * q_in.z;
+    if (norm_sq <= 1.0e-12f) return;  // degenerate fallback: zero derivative
+    const float inv = rsqrtf(norm_sq);  // = 1/|q|
+    const float qn[4] = {q_in.w * inv, q_in.x * inv, q_in.y * inv, q_in.z * inv};
+    float dot = 0.0f;
+    for (unsigned int i = 0u; i < 4u; ++i) dot += grad_qn[i] * qn[i];
+    // grad_q = (grad_qn - dot*qn) * inv   (inv == 1/|q|).
+    for (unsigned int i = 0u; i < 4u; ++i) {
+        grad_q_inout[i] += (grad_qn[i] - dot * qn[i]) * inv;
+    }
+}
+
+// --- Quaternion Hamilton product adjoint ------------------------------------
+// Forward QuatMul(a, b) (w-first), c = a (x) b:
+//   c.w = a.w b.w - a.x b.x - a.y b.y - a.z b.z
+//   c.x = a.w b.x + a.x b.w + a.y b.z - a.z b.y
+//   c.y = a.w b.y - a.x b.z + a.y b.w + a.z b.x
+//   c.z = a.w b.z + a.x b.y - a.y b.x + a.z b.w
+// Bilinear -> grad_a[i] = sum_j (dc_j/da_i) g_j; grad_b[i] = sum_j (dc_j/db_i) g_j.
+// Index order (w,x,y,z) = (0,1,2,3). Hand-transposed from the four lines above.
+__forceinline__ __device__ void QuatMul_Rev(nuka::math::Quat a, nuka::math::Quat b,
+                                            const float* g /*4: gw,gx,gy,gz*/,
+                                            float* grad_a_inout /*4*/,
+                                            float* grad_b_inout /*4*/) {
+    const float gw = g[0], gx = g[1], gy = g[2], gz = g[3];
+    // grad_a: coefficients of a.{w,x,y,z} across c.{w,x,y,z}.
+    //   c.w: a.w(+b.w) a.x(-b.x) a.y(-b.y) a.z(-b.z)
+    //   c.x: a.w(+b.x) a.x(+b.w) a.y(+b.z) a.z(-b.y)
+    //   c.y: a.w(+b.y) a.x(-b.z) a.y(+b.w) a.z(+b.x)
+    //   c.z: a.w(+b.z) a.x(+b.y) a.y(-b.x) a.z(+b.w)
+    grad_a_inout[0] += gw * b.w + gx * b.x + gy * b.y + gz * b.z;
+    grad_a_inout[1] += gw * (-b.x) + gx * b.w + gy * (-b.z) + gz * b.y;
+    grad_a_inout[2] += gw * (-b.y) + gx * b.z + gy * b.w + gz * (-b.x);
+    grad_a_inout[3] += gw * (-b.z) + gx * (-b.y) + gy * b.x + gz * b.w;
+    // grad_b: coefficients of b.{w,x,y,z} across c.{w,x,y,z}.
+    //   c.w: b.w(+a.w) b.x(-a.x) b.y(-a.y) b.z(-a.z)
+    //   c.x: b.w(+a.x) b.x(+a.w) b.y(-a.z) b.z(+a.y)
+    //   c.y: b.w(+a.y) b.x(+a.z) b.y(+a.w) b.z(-a.x)
+    //   c.z: b.w(+a.z) b.x(-a.y) b.y(+a.x) b.z(+a.w)
+    grad_b_inout[0] += gw * a.w + gx * a.x + gy * a.y + gz * a.z;
+    grad_b_inout[1] += gw * (-a.x) + gx * a.w + gy * a.z + gz * (-a.y);
+    grad_b_inout[2] += gw * (-a.y) + gx * (-a.z) + gy * a.w + gz * a.x;
+    grad_b_inout[3] += gw * (-a.z) + gx * a.y + gy * (-a.x) + gz * a.w;
+}
+
+// --- Rotate-by-unit-quaternion adjoints (q already normalized) --------------
+// These differentiate the SHORT-FORM body shared by RotateByQuatForward (sign
+// +qv) and RotateByQuatInverse (sign -qv, i.e. conjugate):
+//   forward:  qv = sign*(q.x,q.y,q.z); t = 2*(qv x v); out = v + q.w*t + qv x t
+// w.r.t. v (q held): out = v + q.w*2*(qv x v) + qv x (2*(qv x v)). The cross
+// products are linear in v, so grad_v is the transpose applied to g (cross is
+// antisymmetric: d(a x .)^T g = -a x g, i.e. (.)^T = transpose of skew(a) = -skew(a)).
+// w.r.t. the unit q (gw + gqv where gqv maps to q.x,q.y,q.z with the sign).
+// `sign` = +1 for forward, -1 for inverse/conjugate.
+__forceinline__ __device__ void RotateByUnitQuat_RevUnit(
+        nuka::math::Quat q_unit, nuka::math::Vec3 v, float sign,
+        const float* g_out /*3*/, float* grad_q_unit_inout /*4*/,
+        float* grad_v_inout /*3, may be null*/) {
+    namespace mgq = ::nuka::math::gpu;
+    using nuka::math::Vec3;
+    const Vec3 qv = mgq::MakeVec3(sign * q_unit.x, sign * q_unit.y, sign * q_unit.z);
+    const Vec3 t = mgq::Scale(mgq::Cross(qv, v), 2.0f);
+    const Vec3 g{g_out[0], g_out[1], g_out[2]};
+    // out = v + w*t + cross(qv, t).  Let w = q.w.
+    // ---- grad through cross(qv, t): c2 = qv x t ----
+    //   grad_qv += t x g ;  grad_t += g x qv
+    Vec3 grad_qv = mgq::Cross(t, g);
+    Vec3 grad_t = mgq::Cross(g, qv);
+    // ---- grad through w*t : out += w*t ----
+    float grad_w = mgq::Dot(t, g);
+    // grad_t += w * g
+    grad_t = mgq::Add(grad_t, mgq::Scale(g, q_unit.w));
+    // ---- grad through t = 2*(qv x v) ----
+    //   let c1 = qv x v ; t = 2*c1 ; grad_c1 = 2*grad_t
+    Vec3 grad_c1 = mgq::Scale(grad_t, 2.0f);
+    //   c1 = qv x v : grad_qv += v x grad_c1 ; grad_v += grad_c1 x qv
+    grad_qv = mgq::Add(grad_qv, mgq::Cross(v, grad_c1));
+    Vec3 grad_v = mgq::Cross(grad_c1, qv);
+    // ---- grad through out += v (identity passthrough) ----
+    grad_v = mgq::Add(grad_v, g);
+    // qv = sign * q_unit.xyz  -> grad_q_unit.xyz += sign * grad_qv
+    grad_q_unit_inout[0] += grad_w;
+    grad_q_unit_inout[1] += sign * grad_qv.x;
+    grad_q_unit_inout[2] += sign * grad_qv.y;
+    grad_q_unit_inout[3] += sign * grad_qv.z;
+    if (grad_v_inout != nullptr) {
+        grad_v_inout[0] += grad_v.x;
+        grad_v_inout[1] += grad_v.y;
+        grad_v_inout[2] += grad_v.z;
+    }
+}
+
+// --- Full RotateByQuatForward adjoint (INCLUDES the internal normalize) -------
+// Forward: q_unit = normalize(q_in); out = rotate_short(q_unit, v).  We chain the
+// unit-rotate adjoint (-> grad_q_unit) through the normalize adjoint (-> grad_q_in).
+__forceinline__ __device__ void RotateByQuatForward_Rev(
+        nuka::math::Quat q_in, nuka::math::Vec3 v, const float* g_out /*3*/,
+        float* grad_q_in_inout /*4*/, float* grad_v_inout /*3, may be null*/) {
+    const float norm_sq = q_in.w * q_in.w + q_in.x * q_in.x +
+                          q_in.y * q_in.y + q_in.z * q_in.z;
+    nuka::math::Quat q_unit = q_in;
+    bool normalized = false;
+    if (norm_sq > 1.0e-12f) {
+        const float inv = rsqrtf(norm_sq);
+        q_unit.w *= inv; q_unit.x *= inv; q_unit.y *= inv; q_unit.z *= inv;
+        normalized = true;
+    }
+    float grad_q_unit[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    RotateByUnitQuat_RevUnit(q_unit, v, /*sign=*/1.0f, g_out, grad_q_unit,
+                             grad_v_inout);
+    if (normalized) {
+        QuatNormalize_Rev(q_in, grad_q_unit, grad_q_in_inout);
+    } else {
+        for (unsigned int i = 0u; i < 4u; ++i) grad_q_in_inout[i] += grad_q_unit[i];
+    }
+}
+
+// --- Full RotateByQuatInverse adjoint (INCLUDES the internal normalize) -------
+// Forward (RotateByQuatInverse): q_unit = normalize(q_in); qv = -q_unit.xyz;
+// out = v + q.w*t + qv x t with t = 2*(qv x v) -> the short form with sign=-1.
+__forceinline__ __device__ void RotateByQuatInverse_Rev(
+        nuka::math::Quat q_in, nuka::math::Vec3 v, const float* g_out /*3*/,
+        float* grad_q_in_inout /*4*/, float* grad_v_inout /*3, may be null*/) {
+    const float norm_sq = q_in.w * q_in.w + q_in.x * q_in.x +
+                          q_in.y * q_in.y + q_in.z * q_in.z;
+    nuka::math::Quat q_unit = q_in;
+    bool normalized = false;
+    if (norm_sq > 1.0e-12f) {
+        const float inv = rsqrtf(norm_sq);
+        q_unit.w *= inv; q_unit.x *= inv; q_unit.y *= inv; q_unit.z *= inv;
+        normalized = true;
+    }
+    float grad_q_unit[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    RotateByUnitQuat_RevUnit(q_unit, v, /*sign=*/-1.0f, g_out, grad_q_unit,
+                             grad_v_inout);
+    if (normalized) {
+        QuatNormalize_Rev(q_in, grad_q_unit, grad_q_in_inout);
+    } else {
+        for (unsigned int i = 0u; i < 4u; ++i) grad_q_in_inout[i] += grad_q_unit[i];
+    }
 }
 
 }  // namespace nuka::diffsim

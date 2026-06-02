@@ -205,6 +205,12 @@ public:
         q_pre_ = MakeDeviceFloat(std::vector<float>(n_, 0.0f));
         qdot_pre_ = MakeDeviceFloat(std::vector<float>(n_, 0.0f));
         v_root_pre_ = MakeDeviceFloat(std::vector<float>(n_ * 6u, 0.0f));
+        // p08b orientation channel: per-articulation base-pose snapshot + grad.
+        art_count_ = model.host.articulation_link_offset.size();
+        base_pose_pre_ = nuka::phi::Buffer(
+            art_count_ * sizeof(Transform), nuka::phi::MemoryKind::Device);
+        // grad_base_pose_out: 7 floats per articulation (3 pos + 4 quat).
+        grad_base_pose_ = MakeDeviceFloat(std::vector<float>(art_count_ * 7u, 0.0f));
     }
 
     articulation::ArticulationDeviceState View() { return device_.View(); }
@@ -244,6 +250,12 @@ public:
                                                                      gravity_z);
         articulation::FeatherstoneAba::IntegrateVelocity(ctx_, View(), dt);
         articulation::FeatherstoneAba::IntegratePosition(ctx_, View(), dt);
+        // p08b: snapshot the PRE-POSE-INTEGRATION base orientation, then integrate
+        // the quaternion pose. The orientation adjoint linearizes at base_pose_pre
+        // (the pose kernel overwrites base_pose in place, pre->post), mirroring
+        // v_root_pre. Snapshot must precede the pose kernel.
+        SnapshotBasePosePre();
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(ctx_, View(), dt);
         Sync();
     }
     // Copy the live link_velocity buffer (LinkSpatialVel == float[6], no padding)
@@ -265,6 +277,42 @@ public:
     std::array<float, 6> GetGradRootVel() {
         std::array<float, 6> v{};
         grad_link_vel_.CopyToHost(v.data(), 6u * sizeof(float));
+        return v;
+    }
+
+    // -- p08b orientation-channel helpers (articulation 0) --
+    // Set the live base_pose[0] (position + rotation) for the floating root.
+    void SetBasePose(const Transform& pose) {
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        ASSERT_EQ(cudaMemcpy(View().base_pose, &pose, sizeof(Transform),
+                             cudaMemcpyHostToDevice), cudaSuccess);
+    }
+    Transform GetBasePose() {
+        Transform pose;
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        EXPECT_EQ(cudaMemcpy(&pose, View().base_pose, sizeof(Transform),
+                             cudaMemcpyDeviceToHost), cudaSuccess);
+        return pose;
+    }
+    // Copy the live base_pose buffer into the base_pose_pre snapshot (the reverse
+    // reads in.base_pose_pre); called by ForwardFloating BEFORE the pose kernel.
+    void SnapshotBasePosePre() {
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        ASSERT_EQ(cudaMemcpy(base_pose_pre_.Data(), View().base_pose,
+                             art_count_ * sizeof(Transform),
+                             cudaMemcpyDeviceToDevice),
+                  cudaSuccess);
+    }
+    // Seed grad_base_pose_out[0] = [dL/d position'(3), dL/d rotation'(4)].
+    void SeedGradBasePose(const std::array<float, 7>& s) {
+        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        ASSERT_EQ(cudaMemcpy(grad_base_pose_.Data(), s.data(), 7u * sizeof(float),
+                             cudaMemcpyHostToDevice), cudaSuccess);
+    }
+    // dL/d base_pose_pre (3 pos + 4 quat) for articulation 0, after the reverse.
+    std::array<float, 7> GetGradBasePose() {
+        std::array<float, 7> v{};
+        grad_base_pose_.CopyToHost(v.data(), 7u * sizeof(float));
         return v;
     }
 
@@ -324,6 +372,7 @@ public:
         g.grad_mass_out = static_cast<float*>(grad_mass_.Data());
         g.grad_tau_out = static_cast<float*>(grad_tau_.Data());
         g.grad_link_velocity_out = static_cast<float*>(grad_link_vel_.Data());
+        g.grad_base_pose_out = static_cast<float*>(grad_base_pose_.Data());
         return g;
     }
     diffsim::StepBackwardInputs MakeInputs(float dt, float gravity_z) {
@@ -331,6 +380,8 @@ public:
         in.q_pre = static_cast<const float*>(q_pre_.Data());
         in.qdot_pre = static_cast<const float*>(qdot_pre_.Data());
         in.v_root_pre = static_cast<const float*>(v_root_pre_.Data());
+        in.base_pose_pre =
+            static_cast<const Transform*>(base_pose_pre_.Data());
         in.dI_dmass = static_cast<const float*>(dI_dmass_.Data());
         in.dt = dt;
         in.gravity_z = gravity_z;
@@ -349,6 +400,8 @@ public:
         Upload(static_cast<float*>(grad_tau_.Data()), z);
         Upload(static_cast<float*>(grad_qddot_seed_.Data()), z);
         Upload(static_cast<float*>(grad_link_vel_.Data()), std::vector<float>(n_ * 6u, 0.0f));
+        Upload(static_cast<float*>(grad_base_pose_.Data()),
+               std::vector<float>(art_count_ * 7u, 0.0f));
     }
     void SeedQddot(const std::vector<float>& s) {
         Upload(static_cast<float*>(grad_qddot_seed_.Data()), s);
@@ -398,8 +451,10 @@ private:
     const ChainModel& model_;
     articulation::ArticulationDeviceBuffers device_;
     uint32_t n_ = 0u;
+    size_t art_count_ = 0u;
     nuka::phi::Buffer dI_dmass_, grad_q_, grad_qdot_, grad_target_, grad_mass_,
-        grad_tau_, grad_qddot_seed_, grad_link_vel_, q_pre_, qdot_pre_, v_root_pre_;
+        grad_tau_, grad_qddot_seed_, grad_link_vel_, q_pre_, qdot_pre_, v_root_pre_,
+        base_pose_pre_, grad_base_pose_;
 };
 
 float MaxRelErr(const std::vector<float>& a, const std::vector<float>& b,
@@ -801,6 +856,11 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
     const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
     const std::vector<float> tau0 = {0.0f, 0.50f, -0.30f};
     const std::array<float, 6> rootv0 = {0.10f, -0.05f, 0.08f, 0.20f, -0.15f, 0.12f};
+    // p08b: IntegrateFloatingBasePose mutates base_pose in place; reset the
+    // orientation to its construction-time value before every forward so the FD
+    // loops do not drift the gravity-coupling linearization point (see the LargeDt
+    // variant for the detailed rationale).
+    const Transform bp0 = h.GetBasePose();
 
     // loss = sum_k wqd[k]*qdot'_k + sum_i wrv[i]*v_root'_i
     std::vector<float> wqd(h.N(), 0.0f);
@@ -817,6 +877,7 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
 
     auto set_state = [&]() {
         h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(bp0);
     };
 
     // Reverse: seed grad_qdot' = wqd, grad v_root' = wrv.
@@ -841,6 +902,7 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
         auto p_tau = [&](float d) {
             std::vector<float> t = tau0; t[k] += d;
             h.SetQ(q0); h.SetQdot(qd0); h.SetTau(t); h.SetRootVel(rootv0);
+            h.SetBasePose(bp0);
             h.ForwardFloating(g0, dt); return loss_post();
         };
         fd_tau[k] = (p_tau(eps) - p_tau(-eps)) / (2.0f * eps);
@@ -851,6 +913,7 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
         auto p_rv = [&](float d) {
             std::array<float, 6> rv = rootv0; rv[c] += d;
             h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rv);
+            h.SetBasePose(bp0);
             h.ForwardFloating(g0, dt); return loss_post();
         };
         fd_rootv[c] = (p_rv(eps) - p_rv(-eps)) / (2.0f * eps);
@@ -863,6 +926,7 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
         auto p_mass = [&](float d) {
             h.SetLinkMass(l, m0 + d);
             h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+            h.SetBasePose(bp0);
             h.ForwardFloating(g0, dt);
             const float lo = loss_post();
             h.SetLinkMass(l, m0);
@@ -916,6 +980,13 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
     // AMPLIFIED root angular velocity (first 3 comps) -> the gyroscopic term
     // ForceCross(v, I*v) is large and strongly v-dependent.
     const std::array<float, 6> rootv0 = {3.0f, -2.5f, 4.0f, 0.20f, -0.15f, 0.12f};
+    // p08b: IntegrateFloatingBasePose now mutates base_pose IN PLACE every forward.
+    // The FD loops below re-run ForwardFloating repeatedly without managing the
+    // orientation, so base_pose would DRIFT across iterations (gravity coupling
+    // a_grav = R(base_rot)^T g changes -> contaminated FD reference). Capture the
+    // construction-time orientation and reset it before EVERY forward (mirrors the
+    // q/qdot/tau/rootvel resets), keeping the linearization point fixed.
+    const Transform bp0 = h.GetBasePose();
 
     std::vector<float> wqd(h.N(), 0.0f);
     wqd[1] = 0.7f; wqd[2] = -0.5f;
@@ -930,6 +1001,7 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
     };
     auto set_state = [&]() {
         h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(bp0);
     };
 
     // Sanity: confirm the perturbation regime really is large -- |v_post - v_pre|
@@ -974,6 +1046,7 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
         auto p_rv = [&](float d) {
             std::array<float, 6> rv = rootv0; rv[c] += d;
             h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rv);
+            h.SetBasePose(bp0);
             h.ForwardFloating(g0, dt); return loss_post();
         };
         fd_rootv[c] = (p_rv(eps) - p_rv(-eps)) / (2.0f * eps);
@@ -984,6 +1057,7 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
     auto p_mass = [&](float d) {
         h.SetLinkMass(0u, m0 + d);
         h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(bp0);
         h.ForwardFloating(g0, dt);
         const float lo = loss_post();
         h.SetLinkMass(0u, m0);
@@ -1024,6 +1098,322 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
 }
 
 // ===========================================================================
+// p08b -- ORIENTATION channel. The floating-base backward now differentiates the
+// base ORIENTATION end-to-end: (1) the gravity-rotation a_grav = R(base_rot)^T g
+// in the velocity integrator, and (2) the quaternion POSE integrator (position'
+// = pos + R(base_rot)*v_lin*dt ; rotation' = normalize(QuatMul(base_rot, dq))).
+// We seed a loss on base_pose' and FD-validate d(loss)/d{base_rot_pre (4 quat
+// comps), v_root_pre angular (3), tau}. The base is REORIENTING: non-identity
+// base_rot_pre + nonzero root angular velocity, so the orientation genuinely
+// changes over the step and the channel is exercised. gravity ON.
+// ===========================================================================
+TEST(AbaReverse, RungF_Floating_OrientationChannel) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFloatingChain();
+    Harness h(ctx, model);
+    const std::vector<uint32_t>& dofs = model.dof_links;  // {1,2}
+    const float g0 = 9.81f, dt = 0.02f;
+    const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
+    const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
+    const std::vector<float> tau0 = {0.0f, 0.50f, -0.30f};
+    // Reorienting root: nonzero angular (first 3) + linear (last 3) velocity.
+    const std::array<float, 6> rootv0 = {0.6f, -0.4f, 0.5f, 0.20f, -0.15f, 0.12f};
+    // NON-IDENTITY base orientation (tilt about a generic axis) so the a_grav ->
+    // rotation grad is not in the g||body-z null and the QuatMul path is full-rank.
+    const Transform base_pose0{Vec3{0.5f, -0.3f, 0.2f},
+                               Quat::FromAxisAngle(Vec3{0.3f, 0.6f, -0.2f}, 0.7f)};
+
+    // loss = sum_k wqd[k]*qdot'_k + sum_p wpos[p]*position'_p + sum_r wrot[r]*rotation'_r
+    std::vector<float> wqd(h.N(), 0.0f);
+    wqd[1] = 0.3f; wqd[2] = -0.2f;
+    const std::array<float, 3> wpos = {0.7f, -0.5f, 0.4f};
+    const std::array<float, 4> wrot = {0.6f, -0.45f, 0.35f, -0.55f};
+    auto loss_post = [&]() {
+        const std::vector<float> qd = h.GetQdot();
+        const Transform pose = h.GetBasePose();
+        float s = 0.0f;
+        for (uint32_t k : dofs) s += wqd[k] * qd[k];
+        s += wpos[0] * pose.position.x + wpos[1] * pose.position.y +
+             wpos[2] * pose.position.z;
+        s += wrot[0] * pose.rotation.w + wrot[1] * pose.rotation.x +
+             wrot[2] * pose.rotation.y + wrot[3] * pose.rotation.z;
+        return s;
+    };
+    auto set_state = [&](const Transform& bp) {
+        h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(bp);
+    };
+
+    // -- Reverse: seed grad_qdot' = wqd, grad base_pose' = [wpos, wrot]. --
+    set_state(base_pose0);
+    h.ForwardFloating(g0, dt);
+    h.SnapshotPre(q0, qd0);
+    h.ZeroGradSeeds();
+    h.SeedGradQdot(wqd);
+    h.SeedGradBasePose({wpos[0], wpos[1], wpos[2], wrot[0], wrot[1], wrot[2], wrot[3]});
+    auto in = h.MakeInputs(dt, g0);
+    in.has_drive = false; in.has_integrate = true; in.enable_q_channel = false;
+    h.RunBackward(in, h.MakeGrads());
+    const std::vector<float> grad_tau = h.GetGradTau();
+    const std::array<float, 7> grad_bp = h.GetGradBasePose();  // [pos(3), quat(4)]
+    const std::array<float, 6> grad_rootv = h.GetGradRootVel();
+
+    const float eps = 1e-3f;
+    // FD d/d(base_rot_pre): perturb each of the 4 quaternion components of the
+    // PRE-step base orientation and re-run the forward (the forward reads this as
+    // base_pose[0].rotation for BOTH the a_grav rotate and the pose integrator).
+    std::array<float, 4> fd_brot{};
+    for (uint32_t c = 0u; c < 4u; ++c) {
+        auto p_brot = [&](float d) {
+            Transform bp = base_pose0;
+            float* qc = &bp.rotation.w;  // w,x,y,z contiguous in math::Quat
+            qc[c] += d;
+            set_state(bp);
+            h.ForwardFloating(g0, dt);
+            return loss_post();
+        };
+        fd_brot[c] = (p_brot(eps) - p_brot(-eps)) / (2.0f * eps);
+    }
+    // FD d/d(v_root_pre): all 6 components (angular feeds dq + a_grav-coupled
+    // velocity; linear feeds v_lin_world + the velocity channel).
+    std::array<float, 6> fd_rootv{};
+    for (uint32_t c = 0u; c < 6u; ++c) {
+        auto p_rv = [&](float d) {
+            std::array<float, 6> rv = rootv0; rv[c] += d;
+            h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rv);
+            h.SetBasePose(base_pose0);
+            h.ForwardFloating(g0, dt);
+            return loss_post();
+        };
+        fd_rootv[c] = (p_rv(eps) - p_rv(-eps)) / (2.0f * eps);
+    }
+    // FD d/d(tau).
+    std::vector<float> fd_tau(h.N(), 0.0f);
+    for (uint32_t k : dofs) {
+        auto p_tau = [&](float d) {
+            std::vector<float> t = tau0; t[k] += d;
+            h.SetQ(q0); h.SetQdot(qd0); h.SetTau(t); h.SetRootVel(rootv0);
+            h.SetBasePose(base_pose0);
+            h.ForwardFloating(g0, dt);
+            return loss_post();
+        };
+        fd_tau[k] = (p_tau(eps) - p_tau(-eps)) / (2.0f * eps);
+    }
+
+    // Compare. The base-rotation grad (4 quat comps) is the headline channel.
+    std::vector<float> gbr(grad_bp.begin() + 3, grad_bp.end());  // quat part
+    std::vector<float> fbr(fd_brot.begin(), fd_brot.end());
+    std::vector<uint32_t> q_idx = {0u, 1u, 2u, 3u};
+    const float e_brot = MaxAbsOrRel(gbr, fbr, q_idx, /*abs_tol=*/2e-3f,
+                                     /*rel_tol=*/1e-3f);
+    std::vector<float> grv(grad_rootv.begin(), grad_rootv.end());
+    std::vector<float> frv(fd_rootv.begin(), fd_rootv.end());
+    std::vector<uint32_t> rv_idx = {0u, 1u, 2u, 3u, 4u, 5u};
+    const float e_rootv = MaxAbsOrRel(grv, frv, rv_idx, /*abs_tol=*/2e-3f,
+                                      /*rel_tol=*/1e-3f);
+    const float e_tau = MaxRelErr(grad_tau, fd_tau, dofs);
+    // Position grad is an identity passthrough of the seed (loss-linear) -> exact.
+    const float pos_err = std::fabs(grad_bp[0] - wpos[0]) +
+                          std::fabs(grad_bp[1] - wpos[1]) +
+                          std::fabs(grad_bp[2] - wpos[2]);
+    printf("[rung f orientation] d/d base_rot score=%.3e  d/d v_root score=%.3e  "
+           "d/d tau rel=%.3e  pos passthrough err=%.3e\n"
+           "  grad_brot=[%.4f %.4f %.4f %.4f] fd=[%.4f %.4f %.4f %.4f]\n"
+           "  grad_rootv=[%.4f %.4f %.4f %.4f %.4f %.4f]\n"
+           "  fd_rootv  =[%.4f %.4f %.4f %.4f %.4f %.4f]\n",
+           e_brot, e_rootv, e_tau, pos_err,
+           grad_bp[3], grad_bp[4], grad_bp[5], grad_bp[6],
+           fd_brot[0], fd_brot[1], fd_brot[2], fd_brot[3],
+           grad_rootv[0], grad_rootv[1], grad_rootv[2], grad_rootv[3], grad_rootv[4], grad_rootv[5],
+           fd_rootv[0], fd_rootv[1], fd_rootv[2], fd_rootv[3], fd_rootv[4], fd_rootv[5]);
+    EXPECT_LT(e_brot, 1.0f) << "base-orientation adjoint vs FD (abs OR rel)";
+    EXPECT_LT(e_rootv, 1.0f) << "v_root adjoint vs FD (orientation-coupled)";
+    EXPECT_LT(e_tau, 3e-3f);
+    EXPECT_LT(pos_err, 1e-6f) << "position grad must be an exact identity passthrough";
+}
+
+// ===========================================================================
+// p08b -- ORIENTATION LINEARIZATION-POINT guard (twin variant). All three
+// orientation reads (a_grav rotate, v_lin_world rotate, QuatMul) use the PRE-step
+// base orientation; the pose integrator overwrites base_pose in place (pre->post),
+// so the reverse MUST read in.base_pose_pre, NOT the live (post) base_pose. With a
+// LARGE dt + large angular velocity the post orientation differs from pre by an
+// O(1) rotation, so linearizing at the wrong point misses FD by a wide margin.
+// The fix (snapshot) must match FD AND beat the bug (live-post) variant. Mirrors
+// RungC_Floating_LargeDt_LinearizationPoint for the orientation channel.
+// ===========================================================================
+TEST(AbaReverse, RungF_Floating_OrientationLinearizationPoint) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFloatingChain();
+    Harness h(ctx, model);
+    const std::vector<uint32_t>& dofs = model.dof_links;
+    const float g0 = 9.81f, dt = 0.08f;  // LARGE dt -> big |base_rot_post - pre|
+    const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
+    const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
+    const std::vector<float> tau0 = {0.0f, 0.50f, -0.30f};
+    // AMPLIFIED root angular velocity -> the quaternion rotates substantially.
+    const std::array<float, 6> rootv0 = {5.0f, -4.0f, 6.0f, 0.20f, -0.15f, 0.12f};
+    const Transform base_pose0{Vec3{0.5f, -0.3f, 0.2f},
+                               Quat::FromAxisAngle(Vec3{0.3f, 0.6f, -0.2f}, 0.7f)};
+
+    std::vector<float> wqd(h.N(), 0.0f);
+    wqd[1] = 0.3f; wqd[2] = -0.2f;
+    const std::array<float, 3> wpos = {0.7f, -0.5f, 0.4f};
+    const std::array<float, 4> wrot = {0.6f, -0.45f, 0.35f, -0.55f};
+    auto loss_post = [&]() {
+        const std::vector<float> qd = h.GetQdot();
+        const Transform pose = h.GetBasePose();
+        float s = 0.0f;
+        for (uint32_t k : dofs) s += wqd[k] * qd[k];
+        s += wpos[0] * pose.position.x + wpos[1] * pose.position.y +
+             wpos[2] * pose.position.z;
+        s += wrot[0] * pose.rotation.w + wrot[1] * pose.rotation.x +
+             wrot[2] * pose.rotation.y + wrot[3] * pose.rotation.z;
+        return s;
+    };
+    auto set_state = [&]() {
+        h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(base_pose0);
+    };
+
+    // Sanity: confirm the post orientation really differs from pre by O(1).
+    set_state();
+    h.ForwardFloating(g0, dt);
+    const Transform post = h.GetBasePose();
+    float dq_mag = std::fabs(post.rotation.w - base_pose0.rotation.w) +
+                   std::fabs(post.rotation.x - base_pose0.rotation.x) +
+                   std::fabs(post.rotation.y - base_pose0.rotation.y) +
+                   std::fabs(post.rotation.z - base_pose0.rotation.z);
+    EXPECT_GT(dq_mag, 0.15f) << "regime not large enough to discriminate pre vs post";
+
+    // -- Reverse twice: with the pre snapshot (FIX), and with base_pose_pre
+    //    pointed at the LIVE (post) base_pose (the BUG). --
+    auto run_reverse = [&](bool use_pre) {
+        set_state();
+        h.ForwardFloating(g0, dt);
+        h.SnapshotPre(q0, qd0);
+        h.ZeroGradSeeds();
+        h.SeedGradQdot(wqd);
+        h.SeedGradBasePose({wpos[0], wpos[1], wpos[2], wrot[0], wrot[1], wrot[2], wrot[3]});
+        auto in = h.MakeInputs(dt, g0);
+        in.has_drive = false; in.has_integrate = true; in.enable_q_channel = false;
+        if (!use_pre) {
+            // BUG: linearize at the live POST base_pose instead of the snapshot.
+            in.base_pose_pre =
+                static_cast<const Transform*>(h.View().base_pose);
+        }
+        h.RunBackward(in, h.MakeGrads());
+        return h.GetGradBasePose();
+    };
+    const auto fix = run_reverse(/*use_pre=*/true);
+    const auto bug = run_reverse(/*use_pre=*/false);
+
+    // FD on the 4 quaternion components of the PRE-step base orientation.
+    const float eps = 1e-3f;
+    std::array<float, 4> fd_brot{};
+    for (uint32_t c = 0u; c < 4u; ++c) {
+        auto p_brot = [&](float d) {
+            Transform bp = base_pose0;
+            float* qc = &bp.rotation.w;
+            qc[c] += d;
+            h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+            h.SetBasePose(bp);
+            h.ForwardFloating(g0, dt);
+            return loss_post();
+        };
+        fd_brot[c] = (p_brot(eps) - p_brot(-eps)) / (2.0f * eps);
+    }
+    std::vector<float> fbr(fd_brot.begin(), fd_brot.end());
+    std::vector<float> gfix(fix.begin() + 3, fix.end());
+    std::vector<float> gbug(bug.begin() + 3, bug.end());
+    std::vector<uint32_t> q_idx = {0u, 1u, 2u, 3u};
+    // Use abs-OR-rel (the SAME tolerances as the sibling RungF_OrientationChannel
+    // test on this identical quantity): the quaternion w-derivative here is a
+    // near-zero component (~3e-3) whose central-FD value jitters at the float32
+    // truncation floor (~1e-4 at eps=1e-3), so a bare relative metric flags FD
+    // noise, not a gradient error. The reverse value is stable and lands dead in
+    // the middle of the FD across eps -- the genuine residual is on the O(0.1-0.7)
+    // components, which match to ~5 digits. The post-linearization BUG variant
+    // still corrupts those large components by ~10% (dq_mag=0.609), far above the
+    // abs floor, so the fix-beats-bug discrimination is preserved.
+    const float e_fix = MaxAbsOrRel(gfix, fbr, q_idx, /*abs_tol=*/2e-3f,
+                                    /*rel_tol=*/1e-3f);
+    const float e_bug = MaxAbsOrRel(gbug, fbr, q_idx, /*abs_tol=*/2e-3f,
+                                    /*rel_tol=*/1e-3f);
+    printf("[rung f lin-pt] |dquat|=%.3f  d/d base_rot score (abs-or-rel): "
+           "pre(fix)=%.3e  post(bug)=%.3e\n", dq_mag, e_fix, e_bug);
+    EXPECT_LT(e_fix, 1.0f) << "pre-snapshot orientation adjoint must match FD";
+    EXPECT_GT(e_bug, 1.0f) << "regime did not exercise the orientation lin-point";
+    EXPECT_LT(e_fix * 3.0f, e_bug)
+        << "pre snapshot must beat the live-post linearization by a wide margin";
+}
+
+// ===========================================================================
+// p08b -- ZERO-SEED ORIENTATION INVARIANT. The orientation channel must be a
+// PURE ADDITION gated by the base_pose' cotangent: with base_pose_pre NON-NULL
+// (orientation_on path live) but the grad_base_pose_out seed = 0, the reverse
+// MUST produce grad_v_root / grad_qdot / grad_tau / grad_mass that are
+// BYTE-IDENTICAL to the legacy base_pose_pre = NULL path. This permanently
+// protects the v0.5-shipped velocity channel and forces out any seed-independent
+// structural leak in the orientation reverse. Seeds the velocity channel (wqd +
+// wrv) so the legacy path produces nonzero output to compare against.
+// ===========================================================================
+TEST(AbaReverse, RungF_Floating_ZeroSeedOrientationInvariant) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFloatingChain();
+    Harness h(ctx, model);
+    const float g0 = 9.81f, dt = 0.05f;  // large dt -> exercises orientation paths
+    const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
+    const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
+    const std::vector<float> tau0 = {0.0f, 0.50f, -0.30f};
+    const std::array<float, 6> rootv0 = {0.6f, -0.4f, 0.5f, 0.20f, -0.15f, 0.12f};
+    const Transform base_pose0{Vec3{0.5f, -0.3f, 0.2f},
+                               Quat::FromAxisAngle(Vec3{0.3f, 0.6f, -0.2f}, 0.7f)};
+    std::vector<float> wqd(h.N(), 0.0f);
+    wqd[1] = 0.7f; wqd[2] = -0.5f;
+    const std::array<float, 6> wrv = {0.3f, -0.4f, 0.6f, -0.2f, 0.5f, -0.35f};
+
+    // Run the reverse with the velocity channel seeded (wqd + wrv) and the
+    // base_pose' cotangent left at ZERO. `orient` selects whether base_pose_pre is
+    // passed (orientation_on live) or nulled (legacy velocity-only path).
+    auto run = [&](bool orient) {
+        h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(base_pose0);
+        h.ForwardFloating(g0, dt);
+        h.SnapshotPre(q0, qd0);
+        h.ZeroGradSeeds();              // grad_base_pose_out seed = 0
+        h.SeedGradQdot(wqd);
+        h.SeedGradRootVel(wrv);
+        auto in = h.MakeInputs(dt, g0);
+        in.has_drive = false; in.has_integrate = true; in.enable_q_channel = false;
+        if (!orient) in.base_pose_pre = nullptr;  // legacy: orientation channel OFF
+        auto g = h.MakeGrads();
+        if (!orient) g.grad_base_pose_out = nullptr;
+        h.RunBackward(in, g);
+        std::vector<float> out = h.GetGradTau();
+        const std::vector<float> gm = h.GetGradMass();
+        out.insert(out.end(), gm.begin(), gm.end());
+        const std::vector<float> gqd = h.GetGradQdot();
+        out.insert(out.end(), gqd.begin(), gqd.end());
+        const std::array<float, 6> grv = h.GetGradRootVel();
+        out.insert(out.end(), grv.begin(), grv.end());
+        return out;
+    };
+    const std::vector<float> legacy = run(/*orient=*/false);
+    const std::vector<float> zeroseed = run(/*orient=*/true);
+    ASSERT_EQ(legacy.size(), zeroseed.size());
+    // Byte-identical: the zero-seed orientation path must add EXACTLY nothing to
+    // the velocity channel (grad_v_root / grad_qdot / grad_tau / grad_mass).
+    for (size_t i = 0u; i < legacy.size(); ++i) {
+        uint32_t b1 = 0u, b2 = 0u;
+        std::memcpy(&b1, &legacy[i], sizeof(uint32_t));
+        std::memcpy(&b2, &zeroseed[i], sizeof(uint32_t));
+        EXPECT_EQ(b1, b2) << "zero-seed orientation leaked into velocity channel "
+                             "at flat index " << i;
+    }
+}
+
+// ===========================================================================
 // D1 (floating base): the floating-base reverse (LDLT + new stages) is bit-exact
 // across two runs. Compares grad_tau + grad_mass + grad_link_velocity[0:6].
 // ===========================================================================
@@ -1040,9 +1430,12 @@ TEST(AbaReverse, D1_Floating_TwoRunBitExact) {
     std::vector<float> wqd(h.N(), 0.0f);
     wqd[1] = 0.7f; wqd[2] = -0.5f;
     const std::array<float, 6> wrv = {0.3f, -0.4f, 0.6f, -0.2f, 0.5f, -0.35f};
+    // p08b: reset the in-place-mutated base_pose so both runs start identically.
+    const Transform bp0 = h.GetBasePose();
 
     auto run = [&]() {
         h.SetQ(q0); h.SetQdot(qd0); h.SetTau(tau0); h.SetRootVel(rootv0);
+        h.SetBasePose(bp0);
         h.ForwardFloating(g0, dt);
         h.SnapshotPre(q0, qd0);
         h.ZeroGradSeeds();
