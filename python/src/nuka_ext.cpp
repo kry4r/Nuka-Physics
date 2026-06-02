@@ -70,6 +70,12 @@ void check(nuka_result_t r, const char* what) {
 // the helper is fully GENERIC across fields (a future field works unchanged).
 using FloatArray = nb::ndarray<nb::pytorch, float>;
 
+// p14a: the uint32 sibling for the ONE non-float32 field, CONTACT_LINK (per-slot
+// owning global link index). Same nb::pytorch tag -> torch.from_dlpack yields a
+// zero-copy torch.uint32 CUDA tensor (verified supported on torch>=2.6). Kept a
+// distinct type because nb::ndarray bakes the scalar type into its C++ type.
+using Uint32Array = nb::ndarray<nb::pytorch, uint32_t>;
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -437,9 +443,9 @@ namespace {
 // natural shape. The returned ndarray is reference-policy (no copy) and `owner`
 // (the Python World object) keeps the engine buffer alive for the array's life.
 // Shape a CUDA float ndarray aliasing `view.device_ptr` given the per-env
-// dimensions (ec == env_count, blc == base_link_count). Factored out of
-// make_view_array verbatim so BOTH World.buffer_view AND Tape.state_view shape
-// identically (q/qd/drive -> (ec,blc); LINK_VELOCITY fpe=6 -> (ec,blc,6);
+// dimensions (ec == env_count, blc == base_link_count). Called directly by BOTH
+// World.buffer_view AND Tape.state_view so they shape identically
+// (q/qd/drive -> (ec,blc); LINK_VELOCITY fpe=6 -> (ec,blc,6);
 // BASE_POSE -> (ec,7)). `owner` keeps the engine buffer alive for the array's
 // life. For single-env tape state, total_link_count == base_link_count so
 // ec*blc == element_count holds and the natural (1,blc) / (1,blc,6) shapes apply.
@@ -467,8 +473,29 @@ FloatArray make_array_from_view(const nuka_buffer_view_t& view, uint32_t ec,
                           nb::dtype<float>(), nb::device::cuda::value, dev_id);
     }
 
+    // p14a: per-CONTACT-SLOT multi-float fields (fpe > 1, env-major at the FIXED
+    // slot stride kMaxFootContactsPerEnv == 4): CONTACT_NORMAL / CONTACT_FORCE.
+    // element_count == env_count * 4 (slot_count), NOT env_count*base_link_count,
+    // so the per-link branch below would misroute these to the flat fallback. Shape
+    // (env, slots_per_env, fpe) == (ec, 4, 3) -- the same (env, 4, 3) shape
+    // CONTACT_POINTS gets. Discriminate by element_count being a per-ENV multiple
+    // that is NOT the per-link count (element_count % ec == 0 && != ec*blc). Must
+    // precede the per-link fpe>1 branch. ASSUMES base_link_count !=
+    // kMaxFootContactsPerEnv (4): if an articulation had exactly 4 links a per-slot
+    // field (element_count == env*4) would equal ec*blc and misroute to the
+    // per-link branch -- not the case for go2 (blc=13); revisit if a 4-link
+    // articulation is ever added.
+    if (fpe > 1u && ec > 0u && view.element_count % ec == 0u &&
+        view.element_count != (size_t)ec * blc) {
+        const size_t slots_per_env = view.element_count / ec;
+        size_t shape[3] = {ec, slots_per_env, fpe};
+        return FloatArray(view.device_ptr, 3, shape, owner, nullptr,
+                          nb::dtype<float>(), nb::device::cuda::value, dev_id);
+    }
+
     // Multi-float-per-link fields (fpe > 1): ARTICULATION_LINK_POSE (7 floats,
-    // Transform) and LINK_VELOCITY (6 floats, omega-first spatial velocity).
+    // Transform), LINK_VELOCITY (6 floats, omega-first spatial velocity), and p14a
+    // LINK_CONTACT_WRENCH (6 floats, [F(3), tau(3)] per GLOBAL link).
     // element_count == env_count*base_link_count; shape (env, base_link, fpe).
     if (fpe > 1u) {
         if ((size_t)ec * blc != view.element_count) {
@@ -498,11 +525,23 @@ FloatArray make_array_from_view(const nuka_buffer_view_t& view, uint32_t ec,
                       nb::dtype<float>(), nb::device::cuda::value, dev_id);
 }
 
-// World.buffer_view: fetch the live engine buffer view then shape it per-env.
-FloatArray make_view_array(World* world, nuka_state_field_t field, nb::handle owner) {
-    nuka_buffer_view_t view = world->get_view(field);
-    return make_array_from_view(view, world->env_count(), world->base_link_count(),
-                                owner);
+// p14a: shape a per-CONTACT-SLOT uint32 view (CONTACT_LINK, dtype==1) as a
+// zero-copy CUDA torch.uint32 ndarray, env-major at the fixed slot stride: shape
+// (env, slots_per_env) == (ec, 4). element_count == ec*4 (slot_count), stride ==
+// sizeof(uint32). owner keeps the engine buffer alive. Falls back to flat 1D if
+// the per-env divisibility does not hold (it always does for go2: slot_count ==
+// env_count * kMaxFootContactsPerEnv).
+Uint32Array make_uint32_view(const nuka_buffer_view_t& view, uint32_t ec,
+                             nb::handle owner) {
+    const int dev_id = 0;
+    if (ec > 0u && view.element_count % ec == 0u) {
+        size_t shape[2] = {ec, view.element_count / ec};
+        return Uint32Array(view.device_ptr, 2, shape, owner, nullptr,
+                           nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
+    }
+    size_t shape[1] = {view.element_count};
+    return Uint32Array(view.device_ptr, 1, shape, owner, nullptr,
+                       nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
 }
 
 }  // namespace
@@ -597,6 +636,11 @@ NB_MODULE(_nuka_ext, m) {
         .value("VELOCITY_TARGET", NUKA_FIELD_VELOCITY_TARGET)
         .value("ACTUATOR_NOLOAD_SPEED", NUKA_FIELD_ACTUATOR_NOLOAD_SPEED)
         .value("TASK_TARGET", NUKA_FIELD_TASK_TARGET)
+        // p14a (v0.7) contact-force readout surface (batched/multi-env only).
+        .value("LINK_CONTACT_WRENCH", NUKA_FIELD_LINK_CONTACT_WRENCH)
+        .value("CONTACT_NORMAL", NUKA_FIELD_CONTACT_NORMAL)
+        .value("CONTACT_FORCE", NUKA_FIELD_CONTACT_FORCE)
+        .value("CONTACT_LINK", NUKA_FIELD_CONTACT_LINK)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -711,18 +755,32 @@ NB_MODULE(_nuka_ext, m) {
         // engine buffer stays alive for as long as the returned array does.
         .def(
             "buffer_view",
-            [](nb::handle self, nuka_state_field_t field) {
+            [](nb::handle self, nuka_state_field_t field) -> nb::object {
                 World* w = nb::cast<World*>(self);
-                return make_view_array(w, field, self);
+                // p14a: CONTACT_LINK is the ONE uint32 field (dtype==1); every other
+                // field is float32 (dtype==0). Inspect the engine view's dtype and
+                // build the matching-typed zero-copy ndarray. Both share the
+                // nb::pytorch tag -> torch.from_dlpack(...) yields a CUDA tensor
+                // aliasing the engine buffer (float32 or uint32 respectively).
+                nuka_buffer_view_t view = w->get_view(field);
+                if (view.dtype == 1u) {
+                    return nb::cast(make_uint32_view(view, w->env_count(), self));
+                }
+                return nb::cast(make_array_from_view(
+                    view, w->env_count(), w->base_link_count(), self));
             },
             nb::arg("field"), nb::rv_policy::reference,
-            "Return a zero-copy DLPack-capable CUDA float32 ndarray aliasing the "
-            "engine's live device buffer for `field`. DRIVE_TARGET / "
-            "DRIVE_STIFFNESS / DRIVE_DAMPING / DRIVE_FORCE_LIMIT are WRITABLE: "
-            "torch writes in place and the next step() applies them. LINK_VELOCITY "
-            "is read-only, shape (env, base_link, 6), omega-first [wx,wy,wz,vx,vy,"
-            "vz]; the root slot is the live base spatial velocity in the root-link "
-            "body frame.")
+            "Return a zero-copy DLPack-capable CUDA ndarray aliasing the engine's "
+            "live device buffer for `field` (float32 for every field except "
+            "CONTACT_LINK, which is uint32). DRIVE_TARGET / DRIVE_STIFFNESS / "
+            "DRIVE_DAMPING / DRIVE_FORCE_LIMIT are WRITABLE: torch writes in place "
+            "and the next step() applies them. LINK_VELOCITY is read-only, shape "
+            "(env, base_link, 6), omega-first [wx,wy,wz,vx,vy,vz]; the root slot is "
+            "the live base spatial velocity in the root-link body frame. p14a "
+            "contact-force readout (batched only): LINK_CONTACT_WRENCH (env, "
+            "base_link, 6) [F(3),tau(3)] world, tau about the link frame origin; "
+            "CONTACT_NORMAL / CONTACT_FORCE (env, 4, 3) per-slot; CONTACT_LINK "
+            "(env, 4) uint32 owning global link index.")
         // Ergonomic alternative to raw DLPack writes: copy a host/device float
         // array into the DRIVE_TARGET buffer.
         .def(

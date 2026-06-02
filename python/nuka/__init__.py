@@ -78,6 +78,15 @@ TASK_TARGET = Field.TASK_TARGET
 # p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
 # immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
 BASE_POSE = Field.BASE_POSE
+# p14a (v0.7) contact-force readout (batched/multi-env only). LINK_CONTACT_WRENCH:
+# net per-link world wrench, shape (env, base_link, 6) == [Fx,Fy,Fz, Tx,Ty,Tz],
+# tau about the link frame origin. CONTACT_NORMAL / CONTACT_FORCE: per-slot, shape
+# (env, 4, 3). CONTACT_LINK: per-slot owning GLOBAL link index, shape (env, 4),
+# dtype uint32 (the only non-float32 field).
+LINK_CONTACT_WRENCH = Field.LINK_CONTACT_WRENCH
+CONTACT_NORMAL = Field.CONTACT_NORMAL
+CONTACT_FORCE = Field.CONTACT_FORCE
+CONTACT_LINK = Field.CONTACT_LINK
 
 # ARTICULATION_LINK_POSE element = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
 LINK_POSE_FLOATS = 7
@@ -160,6 +169,10 @@ __all__ = [
     "ACTUATOR_NOLOAD_SPEED",
     "TASK_TARGET",
     "BASE_POSE",
+    "LINK_CONTACT_WRENCH",
+    "CONTACT_NORMAL",
+    "CONTACT_FORCE",
+    "CONTACT_LINK",
     "CONTROL_MODE_PD_POSITION",
     "CONTROL_MODE_TORQUE",
     "CONTROL_MODE_VELOCITY",

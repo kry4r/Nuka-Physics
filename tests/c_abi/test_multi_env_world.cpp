@@ -349,6 +349,18 @@ TEST(MultiEnvWorld, SingleEnvStillSupported) {
     nuka_buffer_view_t view{};
     EXPECT_EQ(nuka_world_get_buffer_view(world.handle, NUKA_FIELD_CONTACT_POINTS, &view),
               NUKA_RESULT_NOT_SUPPORTED);
+    // p14a: the contact-force readout fields are likewise batched-only -- they live
+    // inside the `record->batched != nullptr` arm, so a single-env world falls
+    // through to NUKA_RESULT_NOT_SUPPORTED (buffer.cpp final return). Assert all 4.
+    for (const nuka_state_field_t f :
+         {NUKA_FIELD_LINK_CONTACT_WRENCH, NUKA_FIELD_CONTACT_NORMAL,
+          NUKA_FIELD_CONTACT_FORCE, NUKA_FIELD_CONTACT_LINK}) {
+        nuka_buffer_view_t v{};
+        EXPECT_EQ(nuka_world_get_buffer_view(world.handle, f, &v),
+                  NUKA_RESULT_NOT_SUPPORTED)
+            << "p14a field " << static_cast<int>(f)
+            << " must be NOT_SUPPORTED on the single-env oracle path";
+    }
 
     // Multi-env (env_count=8) q length must be a multiple of the single-env length
     // (same base articulation replicated), confirming env-major layout.

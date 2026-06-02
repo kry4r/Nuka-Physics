@@ -208,6 +208,54 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 out->dtype = 0u;
                 return NUKA_RESULT_OK;
             }
+            if (field == NUKA_FIELD_LINK_CONTACT_WRENCH) {
+                // p14a: net per-LINK world contact wrench. float[total_link_count*6],
+                // env-major by GLOBAL link index g, [g*6+0..2]=F, [g*6+3..5]=tau
+                // about the link frame origin. element_count == total_link_count,
+                // stride == 6*sizeof(float). Maintained eagerly each Step.
+                const nuka::phi::Buffer& wrench = batched.LinkContactWrenchBuffer();
+                out->device_ptr = const_cast<void*>(wrench.Data());
+                out->element_count = batched.TotalLinkCount();
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(wrench.Size() / batched.TotalLinkCount());
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_CONTACT_NORMAL) {
+                // p14a: per-slot world unit normal (Vec3). Aliases the internal
+                // contact_normal_ buffer; SAME layout as CONTACT_POINTS.
+                const nuka::phi::Buffer& normal = batched.ContactNormalBuffer();
+                out->device_ptr = const_cast<void*>(normal.Data());
+                out->element_count = batched.SlotCount();
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(normal.Size() / batched.SlotCount());
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_CONTACT_FORCE) {
+                // p14a: per-slot contact force {Fn,Ft1,Ft2} = lambda/dt (3 floats),
+                // contact-basis components. SAME layout as CONTACT_POINTS.
+                const nuka::phi::Buffer& force = batched.ContactForceBuffer();
+                out->device_ptr = const_cast<void*>(force.Data());
+                out->element_count = batched.SlotCount();
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(force.Size() / batched.SlotCount());
+                out->dtype = 0u;
+                return NUKA_RESULT_OK;
+            }
+            if (field == NUKA_FIELD_CONTACT_LINK) {
+                // p14a: per-slot owning GLOBAL link index (uint32). Aliases the
+                // internal contact_link_ buffer. dtype == 1 (uint32) -- the ONLY
+                // non-float32 field. element_count == slot_count, stride ==
+                // sizeof(uint32). Inactive slots carry ~0u.
+                const nuka::phi::Buffer& link = batched.ContactLinkBuffer();
+                out->device_ptr = const_cast<void*>(link.Data());
+                out->element_count = batched.SlotCount();
+                out->element_stride_bytes =
+                    static_cast<uint32_t>(link.Size() / batched.SlotCount());
+                out->dtype = 1u;  // uint32
+                return NUKA_RESULT_OK;
+            }
             return NUKA_RESULT_NOT_SUPPORTED;
         }
 
