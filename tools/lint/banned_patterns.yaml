@@ -68,6 +68,14 @@ scope_definitions:
       # (the noise-only globs above did NOT cover src/sensor/*.cu at the top level).
       - "src/sensor/**/*.cu"
       - "src/sensor/**/*.cuh"
+      # v0.7 p04: the LBVH rigid broadphase (src/collision/**) is D1-critical --
+      # its compact candidate-pair output must be two-run byte-exact. The only
+      # atomics in the Karras build / bottom-up AABB propagation / refit / pair
+      # append are uint32 (visit-counters + append index); a float atomicAdd
+      # would break D1, so the no-float-atomic ban MUST cover this path. The
+      # pre-p04 scope did NOT include src/collision/**; add it here.
+      - "src/collision/**/*.cu"
+      - "src/collision/**/*.cuh"
     exclude:
       - "src/**/reference/**"
       - "tests/**"

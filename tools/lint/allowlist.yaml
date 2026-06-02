@@ -51,3 +51,28 @@ allowlist:
     pattern: float_atomic_add
     match: "atomicAdd(&report->contact_point_count, manifolds[slot].point_count)"
     reason: "Legacy uint32 diagnostics counter; not a float accumulation path."
+
+  # --- v0.7 p04 LBVH broadphase: all atomics here are uint32 (NOT float). The
+  # no-float-atomic ban regex is type-agnostic, so these legitimate integer
+  # counters need explicit allowlist entries. The float_atomic_add ban itself is
+  # WHY p04 added the src/collision/** glob -- it must still catch any future
+  # FLOAT atomicAdd in this path; these entries only excuse the integer ones.
+  - path: src/collision/gpu/broadphase.cu
+    pattern: float_atomic_add
+    match: "atomicAdd(pair_count, 1u)"
+    reason: "Pre-existing SAP uint32 active-pair counter; surfaced by the p04 src/collision/** glob. Integer, not float."
+
+  - path: src/collision/broadphase_lbvh.cu
+    pattern: float_atomic_add
+    match: "atomicAdd(&visit[node], 1u)"
+    reason: "LBVH bottom-up AABB propagation visit-counter (uint32). Firing order does not affect the order-independent fminf/fmaxf merge result (D1); fenced for visibility. Not a float accumulation."
+
+  - path: src/collision/lbvh_refit.cu
+    pattern: float_atomic_add
+    match: "atomicAdd(&visit[node], 1u)"
+    reason: "LBVH refit visit-counter (uint32), identical scheme to the build's propagation. Not a float accumulation."
+
+  - path: src/collision/lbvh_traversal.cuh
+    pattern: float_atomic_add
+    match: "atomicAdd(out_pair_count, 1u)"
+    reason: "LBVH overlap-query compact-pair append index (uint32). Emit order is nondeterministic but the compact list is stable-sorted before consumption (D1). Not a float accumulation."
