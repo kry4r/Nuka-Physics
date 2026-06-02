@@ -89,6 +89,10 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cu"
+    # v0.7 p08-B: SDF contact rows (ids 4/5). FORWARD ONLY -- no _adjoint.* until
+    # p08-C adds the IFT-at-convergence adjoint_evaluator to their IR.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/rigid_sdf_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_sdf_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS

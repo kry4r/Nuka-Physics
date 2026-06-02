@@ -66,22 +66,36 @@ TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
 
 TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::IsKnownRowClass;
+    using nuka::solver::generated::RowClassHasAdjoint;
     using nuka::solver::generated::RowClassMaxRowsPerBlock;
     using nuka::solver::generated::RowClassName;
     using nuka::solver::generated::kFeatherstoneContactRowId;
+    using nuka::solver::generated::kFeatherstoneSDFContactRowId;
     using nuka::solver::generated::kMaximalContactRowId;
     using nuka::solver::generated::kMaximalDriveRowId;
     using nuka::solver::generated::kMaximalJointRowId;
+    using nuka::solver::generated::kRigidSDFContactRowId;
     using nuka::solver::generated::kRowClassCount;
 
-    EXPECT_EQ(kRowClassCount, 4u);
+    // v0.7 p08-B added the two SDF contact row classes (ids 4/5) -> 6 total.
+    EXPECT_EQ(kRowClassCount, 6u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
     EXPECT_TRUE(IsKnownRowClass(kFeatherstoneContactRowId));
+    EXPECT_TRUE(IsKnownRowClass(kRigidSDFContactRowId));
+    EXPECT_TRUE(IsKnownRowClass(kFeatherstoneSDFContactRowId));
+    EXPECT_EQ(kRigidSDFContactRowId, 4u);
+    EXPECT_EQ(kFeatherstoneSDFContactRowId, 5u);
     EXPECT_STREQ(RowClassName(kMaximalContactRowId), "MaximalContactRow");
+    EXPECT_STREQ(RowClassName(kRigidSDFContactRowId), "RigidSDFContactRow");
+    EXPECT_STREQ(RowClassName(kFeatherstoneSDFContactRowId), "FeatherstoneSDFContactRow");
     EXPECT_EQ(RowClassMaxRowsPerBlock(kMaximalContactRowId), 6u);
     EXPECT_EQ(RowClassMaxRowsPerBlock(kMaximalDriveRowId), 1u);
+    EXPECT_EQ(RowClassMaxRowsPerBlock(kRigidSDFContactRowId), 6u);
+    // p08-B SDF rows are FORWARD-ONLY (the IFT adjoint is p08-C).
+    EXPECT_FALSE(RowClassHasAdjoint(kRigidSDFContactRowId));
+    EXPECT_FALSE(RowClassHasAdjoint(kFeatherstoneSDFContactRowId));
     EXPECT_FALSE(IsKnownRowClass(99u));
 }
 

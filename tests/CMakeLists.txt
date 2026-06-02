@@ -766,6 +766,33 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_particle_grid_test)
 
+    # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
+    # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
+    # find_sdf_contact_newton (the SAME function the device kernel wraps) on the
+    # host; emits RigidSDFContactRow / FeatherstoneSDFContactRow rows and runs
+    # the existing PGS solve (nuka_solver, CUDA) to prove penetrating bodies are
+    # pushed apart. nuka_collision_gpu carries the device kernel + row builders.
+    add_executable(nuka_sdf_contact_test
+        collision/test_sdf_contact.cpp
+    )
+
+    target_include_directories(nuka_sdf_contact_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_sdf_contact_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_solver
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_sdf_contact_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Batched N-articulation replication (p01-F T1) ---------------------
     add_executable(nuka_batched_articulation_replication_test
         runtime/test_batched_articulation_replication.cpp

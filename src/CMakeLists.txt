@@ -482,6 +482,10 @@ if(CMAKE_CUDA_COMPILER)
         # the cross-system query traverses); integer-only atomics, sorted output.
         collision/particle_uniform_grid.cu
         collision/cross_system_query.cu
+        # v0.7 p08-B: Newton-on-summed-SDF contact. find_sdf_contact_newton is a
+        # header-inline NUKA_SDF_HD function (host tests call it directly); this
+        # TU carries the device emission kernel + the host RowBuffers builders.
+        collision/sdf_contact.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -493,6 +497,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_collision_gpu
         PUBLIC
             nuka_collision
+            nuka_constraint
             nuka_phi
             CUDA::cudart
     )
