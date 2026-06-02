@@ -91,3 +91,13 @@ allowlist:
     pattern: float_atomic_add
     match: "atomicAdd(out_truncated, 1u)"
     reason: "Cross-system candidate-cap truncation counter (uint32). Order-independent count; candidate lists use private CSR slices, no append atomic. Not a float accumulation."
+
+  # --- v0.7 p09-A XPBD soft path (src/runtime/soft/**) ---------------------------
+  # The XPBD predict/solve/correct kernels (src/runtime/soft/xpbd_world.cu) are
+  # D1-critical and are ALREADY covered by the physics_path src/runtime/**/*.cu(h)
+  # globs. They are DELIBERATELY allowlist-free: the predict/correct kernels write
+  # distinct per-particle outputs and the distance solve is a single-thread
+  # fixed-order Gauss-Seidel sweep -- NO atomics of any kind (integer or float),
+  # NO hot-path cudaMalloc (all buffers allocated once at upload). New soft code
+  # must keep this property; any atomicAdd here is a real D1 regression and SHOULD
+  # trip the guard, so no blanket exemption is added for src/runtime/soft/**.

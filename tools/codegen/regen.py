@@ -33,6 +33,11 @@ ALLOWED_ROW_CLASSES = {
     # unilateral_with_friction PGS update (RowKind::Contact path).
     "RigidSDFContactRow",
     "FeatherstoneSDFContactRow",
+    # v0.7 p09-A: XPBD soft-body distance constraint (id 6). The FIRST soft row
+    # class; ships a GENUINE dispatchable per-row adjoint (dense_adjoint), the
+    # local projection Jacobian of one distance projection. bend/volume/shape-match
+    # rows (ids 7-9) arrive in p09-B/C and are NOT registered here.
+    "XPBDDistanceRow",
 }
 
 # Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).

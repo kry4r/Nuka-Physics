@@ -129,4 +129,29 @@ CudaWorldStepReport StepCudaWorld(DeviceWorld& device_world,
     return StepCudaWorld(context, device_world, options);
 }
 
+CudaWorldStepReport StepCudaWorld(const phi::DeviceContext& context,
+                                  DeviceWorld& device_world,
+                                  soft::XpbdWorld& xpbd_world,
+                                  const CudaWorldStepOptions& options) {
+    // The rigid step is run UNCHANGED -- bit-for-bit identical to the rigid-only
+    // overload above. The XPBD co-step is purely additive and runs only when the
+    // attached world actually has particles (inert-when-empty).
+    CudaWorldStepReport report = StepCudaWorld(context, device_world, options);
+    report.xpbd_particle_count = xpbd_world.ParticleCount();
+
+    if (xpbd_world.ParticleCount() == 0u || options.dt <= 0.0f ||
+        options.step_count == 0u) {
+        return report;  // no XPBD work: rigid result is byte-identical.
+    }
+
+    soft::XpbdStepOptions xpbd_options;
+    xpbd_options.gravity = options.gravity;
+    xpbd_options.dt = options.dt;
+    xpbd_options.step_count = options.step_count;
+    const soft::XpbdStepReport xpbd_report =
+        soft::StepXpbdWorld(context, xpbd_world, xpbd_options);
+    report.xpbd_kernel_launch_count = xpbd_report.kernel_launch_count;
+    return report;
+}
+
 } // namespace nuka::runtime::gpu

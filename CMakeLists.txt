@@ -93,6 +93,14 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     # p08-C adds the IFT-at-convergence adjoint_evaluator to their IR.
     "${NUKA_CODEGEN_OUTPUT_DIR}/rigid_sdf_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_sdf_contact_forward.cu"
+    # v0.7 p09-A: XPBD soft-body distance row (id 6). Ships a GENUINE dispatchable
+    # per-row adjoint (dense_adjoint), so BOTH the forward and the adjoint kernel
+    # __global__ symbols must be compiled into nuka_codegen_generated (mirror the
+    # maximal rows' _forward.cu + _adjoint.cu pairing -- NOT the forward-only SDF
+    # rows). Omitting the adjoint .cu would leave RowClassAdjointKernelSymbol(6)
+    # advertising an uncompiled symbol (a non-dispatchable orphan).
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS
@@ -101,6 +109,7 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cuh"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cuh"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}
