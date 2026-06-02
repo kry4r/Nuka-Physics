@@ -716,6 +716,32 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
+    # --- v0.7 p09-D: XPBD soft-body COOKER tests (exit-crit 3) -------------
+    # PURE host/CPU: cooks programmatic XpbdSoftBodySpecs and asserts the
+    # returned XpbdConstraintSet (counts + the two param->engine mappings +
+    # two-cook determinism). No device upload / step, so it needs no GPU -- but
+    # it links nuka_runtime_gpu because the cooker + topology builders live
+    # there (the lib is CUDA-language, hence inside the CMAKE_CUDA_COMPILER
+    # guard). nuka:soft:* schema + mapping documented in
+    # docs/architecture/xpbd-soft-schema.md.
+    add_executable(nuka_xpbd_cooker_test
+        import/test_xpbd_cooker.cpp
+    )
+
+    target_include_directories(nuka_xpbd_cooker_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_xpbd_cooker_test
+        PRIVATE
+            nuka_runtime_gpu
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_xpbd_cooker_test)
+
     # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
     # Cooks known meshes' narrow-band SDFs on the host (p07), uploads via
     # SdfDeviceWorld, launches the shipping p07 sampler kernel through the

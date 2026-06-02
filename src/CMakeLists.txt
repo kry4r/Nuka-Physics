@@ -466,6 +466,13 @@ if(CMAKE_CUDA_COMPILER)
         # stays GPU-only.
         runtime/soft/cloth_topology.cpp
         runtime/soft/tetmesh_topology.cpp
+        # v0.7 p09-D: the XPBD soft-body COOKER (programmatic XpbdSoftBodySpec ->
+        # XpbdConstraintSet). THIN cook-time CPU orchestration: maps the authored
+        # material params (the USD MaterialX soft schema) + dispatches to the
+        # topology builders above (and assembles the id9 cluster). Lives in this
+        # library (not nuka_cooker) because it calls the builders here; nuka_cooker
+        # is deliberately CUDA-free, so routing the other way would pull CUDA in.
+        import/cooker/xpbd_cooker.cpp
         # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
