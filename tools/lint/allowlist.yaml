@@ -76,3 +76,18 @@ allowlist:
     pattern: float_atomic_add
     match: "atomicAdd(out_pair_count, 1u)"
     reason: "LBVH overlap-query compact-pair append index (uint32). Emit order is nondeterministic but the compact list is stable-sorted before consumption (D1). Not a float accumulation."
+
+  # --- v0.7 p05 particle grid + cross-system query: both atomics are uint32
+  # TRUNCATION counters (count of particles whose neighbor/candidate list hit the
+  # 16-cap), NOT float accumulation. The COUNT is order-independent (D1); the
+  # per-particle lists themselves use no append atomic (private CSR slices). Same
+  # rationale + same src/collision/** glob as the p04 LBVH entries above.
+  - path: src/collision/particle_uniform_grid.cu
+    pattern: float_atomic_add
+    match: "atomicAdd(out_truncated_count, 1u)"
+    reason: "Particle-grid neighbor-cap truncation counter (uint32). Order-independent count; neighbor lists use private CSR slices, no append atomic. Not a float accumulation."
+
+  - path: src/collision/cross_system_query.cu
+    pattern: float_atomic_add
+    match: "atomicAdd(out_truncated, 1u)"
+    reason: "Cross-system candidate-cap truncation counter (uint32). Order-independent count; candidate lists use private CSR slices, no append atomic. Not a float accumulation."

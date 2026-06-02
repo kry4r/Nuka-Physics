@@ -693,6 +693,25 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_lbvh_vs_sap_test)
 
+    # --- v0.7 p05: particle uniform grid + cross-system broadphase ---------
+    # Correctness vs CPU brute-force + D1 two-run byte-exact for both the
+    # particle neighbor grid and the particle->rigid cross-system query (which
+    # traverses the LBVH retained by BuildLbvhForQuery).
+    add_executable(nuka_particle_grid_test
+        collision/test_particle_grid_correctness.cpp
+        collision/test_particle_grid_determinism.cpp
+        collision/test_cross_system_query.cpp
+    )
+
+    target_link_libraries(nuka_particle_grid_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_particle_grid_test)
+
     # --- Batched N-articulation replication (p01-F T1) ---------------------
     add_executable(nuka_batched_articulation_replication_test
         runtime/test_batched_articulation_replication.cpp
@@ -1279,6 +1298,7 @@ add_executable(nuka_cuda_perf_test
     perf/test_cuda_solver_timing.cpp
     perf/test_cuda_step_timing.cpp
     perf/test_lbvh_50k_bodies.cpp
+    perf/test_1m_particles_grid_perf.cpp
 )
 
     target_link_libraries(nuka_cuda_perf_test
