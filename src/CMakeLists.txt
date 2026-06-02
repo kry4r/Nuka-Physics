@@ -448,6 +448,10 @@ if(CMAKE_CUDA_COMPILER)
         runtime/gpu/cuda_particle_world.cu
         runtime/gpu/device_world.cu
         runtime/gpu/cuda_world_stepper.cu
+        # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
+        # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
+        # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
+        runtime/sdf/sdf_device_world.cu
     )
     set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
