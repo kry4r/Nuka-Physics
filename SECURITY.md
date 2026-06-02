@@ -6,7 +6,7 @@ If you discover a security vulnerability in Nuka Physics, please report it
 **privately**. Do **not** open a public GitHub issue, pull request, or
 discussion for security reports.
 
-Email: **igloo-group@pipeline.sbcc.edu**
+Email: **nidhogxt@outlook.com**
 
 Please include, where possible:
 
