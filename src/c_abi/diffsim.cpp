@@ -481,4 +481,41 @@ nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z)
     return NUKA_RESULT_OK;
 }
 
+nuka_result_t nuka_world_set_sparse_solver_backend(
+    nuka_world_handle world, nuka_sparse_solver_backend_t backend) {
+    WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    switch (backend) {
+        case NUKA_SOLVER_BACKEND_SELF_CG:
+            // The only SHIPPING backend (v0.7 p01 hardened self-written CG). A
+            // plain host scalar write; read at solver-construction time.
+            world_record->sparse_solver_backend =
+                static_cast<uint32_t>(backend);
+            return NUKA_RESULT_OK;
+        case NUKA_SOLVER_BACKEND_SELF_MINRES:
+        case NUKA_SOLVER_BACKEND_SELF_GMRES:
+            // Reserved for later v0.7 phases (built on this same CG core) -- not
+            // yet implemented. Honest NOT_SUPPORTED rather than a silent accept.
+            return NUKA_RESULT_NOT_SUPPORTED;
+        default:
+            return NUKA_RESULT_INVALID_ARG;
+    }
+}
+
+nuka_result_t nuka_world_get_sparse_solver_backend(
+    nuka_world_handle world, nuka_sparse_solver_backend_t* out) {
+    WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (out == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    *out = static_cast<nuka_sparse_solver_backend_t>(
+        world_record->sparse_solver_backend);
+    return NUKA_RESULT_OK;
+}
+
 }  // extern "C"

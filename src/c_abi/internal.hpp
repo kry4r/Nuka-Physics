@@ -42,6 +42,13 @@ struct WorldRecord {
     phi::Buffer joint_velocity_buffer;
     uint32_t simulated_step_count = 0u;
 
+    // --- Sparse solver backend selection (v0.7 p01) -----------------------
+    // Which SparseLinearSolver backend the diff-sim / general solver path uses.
+    // Default 0 == NUKA_SOLVER_BACKEND_SELF_CG (the only shipping backend); the
+    // reserved MINRES/GMRES values are rejected at the setter until their phases
+    // land. Read at solver-construction time. A plain host scalar; no device state.
+    uint32_t sparse_solver_backend = 0u;
+
     // --- Single-env implicit joint-damping scratch (Option B unification) ---
     // The single-env oracle path (StepWorldGpu) now runs the SAME general
     // implicit joint damping as the batched contacts path. It needs the
