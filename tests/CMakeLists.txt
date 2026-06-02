@@ -1057,6 +1057,30 @@ if(CMAKE_CUDA_COMPILER)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endforeach()
 
+    # --- v0.7 p03-A: self-written GMRES (general NON-SYMMETRIC Krylov) -----------
+    #   * test_gmres_nonsymmetric : GMRES vs Eigen PartialPivLU/FullPivLU on
+    #                               genuinely non-symmetric blocks (< 1e-5); the m<n
+    #                               restart-coverage case; the non-symmetric detector
+    #                               byte-safety (symmetric -> 0, non-symmetric -> 1);
+    #                               and the D1 two-run byte-exact gate.
+    # Eigen is linked test-only (the approved dense oracle), never a production path.
+    foreach(gmres_test
+            test_gmres_nonsymmetric)
+        add_executable(nuka_diffsim_${gmres_test}
+            diffsim/solver/${gmres_test}.cpp)
+        target_compile_definitions(nuka_diffsim_${gmres_test}
+            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+        target_link_libraries(nuka_diffsim_${gmres_test}
+            PRIVATE
+                nuka_diffsim
+                nuka_core
+                nuka_phi
+                nuka_eigen_testonly
+                GTest::gtest_main)
+        gtest_discover_tests(nuka_diffsim_${gmres_test}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endforeach()
+
     # --- v0.5 p03 R2: contact KKT (Delassus) builder ------------------------
     # Builder (A = J M^-1 J^T) vs an INDEPENDENT host Gram recompute (Eigen,
     # < 1e-5 rel), exact bit-symmetry, the diagonal == 1/effective_mass identity,

@@ -65,6 +65,7 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/ift_runner.hpp"
+#include "diffsim/solver/gmres_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
 
 #include <cuda_runtime.h>
@@ -387,43 +388,81 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
     params.tol = 1.0e-6f;
     params.run_to_fixed_iters = false;
 
-    // v0.7 p02 AUTO-ROUTING (the named consumer of p01's deferral). The Delassus
-    // A = J M^-1 J^T is SPD/PSD for the validated contact scenes, but once
-    // unilateral / friction-cone constraints make a KKT block SYMMETRIC INDEFINITE,
-    // CG breaks down. DetectBatchedIndefinite is a READ-ONLY pivot test (a negative
-    // post-elimination LDLT pivot => indefinite, by Sylvester's law of inertia). It
-    // touches NO solver state; for an SPD/PSD batch every pivot is >= 0 so the flag
-    // stays 0 and the EXISTING CG solve below runs UNCHANGED -> byte-identical z (the
-    // SPD-path no-regression guarantee). ONLY a genuinely indefinite batch routes to
-    // MINRES (whole batch, absolute-Jacobi -- the SPD preconditioner indefinite
-    // MINRES requires).
-    if (indef_flag_.Size() < sizeof(uint32_t)) {
-        indef_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
+    // v0.7 p03-A NON-SYMMETRIC AUTO-ROUTING (runs FIRST, AHEAD of the symmetric
+    // indefinite detector). DetectBatchedNonSymmetric is a READ-ONLY scan: a block is
+    // non-symmetric iff some |A[i][j]-A[j][i]| > relEps*max|entry|. The Delassus
+    // A = J M^-1 J^T is stored BIT-SYMMETRIC (mirror-stored; A[i][j] and A[j][i] are
+    // the SAME float -- see test_kkt_build's memcmp(&aij,&aji)==0), so that difference
+    // is EXACTLY 0.0 and this detector NEVER fires on the contact path -> the flag
+    // stays 0 and the existing symmetric (CG/MINRES) block below runs UNCHANGED ->
+    // byte-identical z (the SYMMETRIC-path no-regression guarantee). It MUST run first
+    // because the indefinite detector is a SYMMETRIC LDLT (Sylvester) -- only
+    // meaningful on a symmetric matrix; gating non-symmetric out first keeps that
+    // precondition. Only a genuinely non-symmetric batch routes to GMRES.
+    if (nonsym_flag_.Size() < sizeof(uint32_t)) {
+        nonsym_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
     }
-    uint32_t* flag = static_cast<uint32_t*>(indef_flag_.Data());
-    CheckCuda(cudaMemsetAsync(flag, 0, sizeof(uint32_t), stream),
-              "zero indefinite flag");
-    DetectBatchedIndefinite(context_, system, flag);
-    uint32_t indefinite = 0u;
-    CheckCuda(cudaStreamSynchronize(stream), "sync indefinite detect");
-    indef_flag_.CopyToHost(&indefinite, sizeof(uint32_t));
+    uint32_t* ns_flag = static_cast<uint32_t*>(nonsym_flag_.Data());
+    CheckCuda(cudaMemsetAsync(ns_flag, 0, sizeof(uint32_t), stream),
+              "zero non-symmetric flag");
+    DetectBatchedNonSymmetric(context_, system, ns_flag);
+    uint32_t nonsymmetric = 0u;
+    CheckCuda(cudaStreamSynchronize(stream), "sync non-symmetric detect");
+    nonsym_flag_.CopyToHost(&nonsymmetric, sizeof(uint32_t));
 
-    if (indefinite != 0u) {
-        // Genuinely indefinite KKT: route the whole batch to MINRES (absolute-
-        // Jacobi). Lazily construct the backend (reused across Run calls).
-        if (minres_solver_ == nullptr) {
-            minres_solver_ =
-                MakeSparseSolverBackend("self_minres", context_, determinism_);
+    if (nonsymmetric != 0u) {
+        // Genuinely non-symmetric KKT: route the whole batch to GMRES (restarted
+        // GMRES(m), Jacobi precond). Lazily construct the backend (reused across Run
+        // calls). NOTE: never reached on the bit-symmetric Delassus contact path.
+        if (gmres_solver_ == nullptr) {
+            gmres_solver_ =
+                MakeSparseSolverBackend("self_gmres", context_, determinism_);
         }
-        SolveParams mp;
-        mp.preconditioner = Preconditioner::Jacobi;  // absolute-Jacobi (SPD precond)
-        mp.max_iter = 128u;  // <= 12-dim blocks; MINRES is exact in <= n fp64 steps
-        mp.tol = 1.0e-7f;
-        mp.run_to_fixed_iters = false;
-        minres_solver_->Solve(system, rhs, z, mp);
+        SolveParams gp;
+        gp.preconditioner = Preconditioner::Jacobi;
+        gp.max_iter = 128u;  // <= 12-dim blocks; GMRES is exact in <= n fp64 steps
+        gp.tol = 1.0e-7f;
+        gp.run_to_fixed_iters = false;
+        gmres_solver_->Solve(system, rhs, z, gp);
     } else {
-        // SPD/PSD path: the EXISTING CG solve, byte-identical to before p02.
-        solver_->Solve(system, rhs, z, params);
+        // v0.7 p02 SYMMETRIC AUTO-ROUTING (the named consumer of p01's deferral). The
+        // Delassus A = J M^-1 J^T is SPD/PSD for the validated contact scenes, but
+        // once unilateral / friction-cone constraints make a KKT block SYMMETRIC
+        // INDEFINITE, CG breaks down. DetectBatchedIndefinite is a READ-ONLY pivot
+        // test (a negative post-elimination LDLT pivot => indefinite, by Sylvester's
+        // law of inertia). It touches NO solver state; for an SPD/PSD batch every
+        // pivot is >= 0 so the flag stays 0 and the EXISTING CG solve below runs
+        // UNCHANGED -> byte-identical z (the SPD-path no-regression guarantee). ONLY a
+        // genuinely indefinite batch routes to MINRES (whole batch, absolute-Jacobi --
+        // the SPD preconditioner indefinite MINRES requires).
+        if (indef_flag_.Size() < sizeof(uint32_t)) {
+            indef_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
+        }
+        uint32_t* flag = static_cast<uint32_t*>(indef_flag_.Data());
+        CheckCuda(cudaMemsetAsync(flag, 0, sizeof(uint32_t), stream),
+                  "zero indefinite flag");
+        DetectBatchedIndefinite(context_, system, flag);
+        uint32_t indefinite = 0u;
+        CheckCuda(cudaStreamSynchronize(stream), "sync indefinite detect");
+        indef_flag_.CopyToHost(&indefinite, sizeof(uint32_t));
+
+        if (indefinite != 0u) {
+            // Genuinely indefinite KKT: route the whole batch to MINRES (absolute-
+            // Jacobi). Lazily construct the backend (reused across Run calls).
+            if (minres_solver_ == nullptr) {
+                minres_solver_ =
+                    MakeSparseSolverBackend("self_minres", context_, determinism_);
+            }
+            SolveParams mp;
+            mp.preconditioner = Preconditioner::Jacobi;  // absolute-Jacobi (SPD precond)
+            mp.max_iter = 128u;  // <= 12-dim blocks; MINRES exact in <= n fp64 steps
+            mp.tol = 1.0e-7f;
+            mp.run_to_fixed_iters = false;
+            minres_solver_->Solve(system, rhs, z, mp);
+        } else {
+            // SPD/PSD path: the EXISTING CG solve, byte-identical to before p02.
+            solver_->Solve(system, rhs, z, params);
+        }
     }
 
     // (4) Distribute: grad_qdot_free = g - J^T z (global scatter), grad_b_c = z.

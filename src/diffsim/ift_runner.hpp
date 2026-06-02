@@ -121,12 +121,22 @@ private:
     // (all-SPD) contact scenes the detector never fires, so this stays null and the
     // CG path runs byte-identically -- the no-regression guarantee.
     std::unique_ptr<SparseLinearSolver> minres_solver_;
+    // v0.7 p03-A: lazily-constructed GMRES backend, used ONLY when the assembled KKT
+    // is detected genuinely NON-SYMMETRIC. The Delassus A = J M^-1 J^T is stored
+    // BIT-SYMMETRIC (mirror-stored; A[i][j] and A[j][i] are the same float), so the
+    // non-symmetric detector's off-diagonal difference is EXACTLY 0.0 and never fires
+    // on the contact path -> this stays null and the CG/MINRES path runs byte-
+    // identically (the symmetric-path no-regression guarantee). The branch exists so
+    // the auto-router covers the full solver suite if a non-symmetric system ever
+    // reaches this seam.
+    std::unique_ptr<SparseLinearSolver> gmres_solver_;
 
     // Reused intermediates (lazily (re)allocated to the current shape).
     ContactDelassusBuffers delassus_;     // A (values + block_dim)
     phi::Buffer rhs_;                     // J M^-1 g, block-major stride kMaxBlockDim
     phi::Buffer z_;                       // A^-1 rhs,  block-major stride kMaxBlockDim
     phi::Buffer indef_flag_;              // uint32[1] indefinite-detector flag
+    phi::Buffer nonsym_flag_;             // uint32[1] non-symmetric-detector flag
     uint32_t capacity_blocks_ = 0u;
 };
 
