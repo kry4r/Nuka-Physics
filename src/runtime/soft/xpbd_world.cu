@@ -284,6 +284,194 @@ __global__ void SolveVolumeConstraintsKernel(
     }
 }
 
+// --- solve: shape-match (Mueller et al. 2005) ---------------------------------
+// A 3x3 matrix stored ROW-MAJOR as nine floats m[0..8] (m[3*r+c]). Tiny dense
+// helpers used ONLY by the shape-match polar decomposition; kept local so they do
+// not leak into the general math headers. All operate in the single-thread
+// fixed-order solve path (no atomics, deterministic).
+struct Mat3 {
+    float m[9];
+};
+
+__device__ __forceinline__ Mat3 Mat3Zero() {
+    Mat3 a;
+    for (int i = 0; i < 9; ++i) {
+        a.m[i] = 0.0f;
+    }
+    return a;
+}
+
+__device__ __forceinline__ Mat3 Mat3Identity() {
+    Mat3 a = Mat3Zero();
+    a.m[0] = 1.0f;
+    a.m[4] = 1.0f;
+    a.m[8] = 1.0f;
+    return a;
+}
+
+// out = a * b (row-major 3x3 multiply).
+__device__ __forceinline__ Mat3 Mat3Mul(const Mat3& a, const Mat3& b) {
+    Mat3 c;
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                s += a.m[3 * r + k] * b.m[3 * k + col];
+            }
+            c.m[3 * r + col] = s;
+        }
+    }
+    return c;
+}
+
+__device__ __forceinline__ float Mat3Det(const Mat3& a) {
+    return a.m[0] * (a.m[4] * a.m[8] - a.m[5] * a.m[7]) -
+           a.m[1] * (a.m[3] * a.m[8] - a.m[5] * a.m[6]) +
+           a.m[2] * (a.m[3] * a.m[7] - a.m[4] * a.m[6]);
+}
+
+// Inverse-transpose of a: (a^-1)^T = cofactor(a) / det(a). Used by the Higham
+// Newton polar iteration R <- 0.5 (R + R^-T). Returns identity if |det| is below
+// eps (degenerate / rank-deficient cluster -- the iteration then stalls at R and
+// the caller's det-correction guard handles the sign).
+__device__ __forceinline__ Mat3 Mat3InvTranspose(const Mat3& a, float eps) {
+    const float det = Mat3Det(a);
+    if (fabsf(det) < eps) {
+        return Mat3Identity();
+    }
+    const float inv_det = 1.0f / det;
+    // Cofactor matrix C (C[r][c] = cofactor of a[r][c]); (a^-1)^T = C / det.
+    Mat3 c;
+    c.m[0] = (a.m[4] * a.m[8] - a.m[5] * a.m[7]) * inv_det;
+    c.m[1] = -(a.m[3] * a.m[8] - a.m[5] * a.m[6]) * inv_det;
+    c.m[2] = (a.m[3] * a.m[7] - a.m[4] * a.m[6]) * inv_det;
+    c.m[3] = -(a.m[1] * a.m[8] - a.m[2] * a.m[7]) * inv_det;
+    c.m[4] = (a.m[0] * a.m[8] - a.m[2] * a.m[6]) * inv_det;
+    c.m[5] = -(a.m[0] * a.m[7] - a.m[1] * a.m[6]) * inv_det;
+    c.m[6] = (a.m[1] * a.m[5] - a.m[2] * a.m[4]) * inv_det;
+    c.m[7] = -(a.m[0] * a.m[5] - a.m[2] * a.m[3]) * inv_det;
+    c.m[8] = (a.m[0] * a.m[4] - a.m[1] * a.m[3]) * inv_det;
+    return c;
+}
+
+// Orthogonal (rotation) factor R of the polar decomposition A = R S via the
+// Higham Newton iteration R_{k+1} = 0.5 (R_k + R_k^-T), R_0 = A. A FIXED iteration
+// count (kPolarIters) keeps the result byte-stable across runs (D1). The
+// iteration converges to the orthogonal factor carrying the sign of det(A); a
+// non-inverted cluster (det A > 0) yields a proper rotation directly. The
+// det-correction guard flips the last column if a numerical / inverted case
+// produced det(R) < 0, so R is always a proper rotation (det +1).
+__device__ __forceinline__ Mat3 PolarRotation(const Mat3& A) {
+    constexpr int kPolarIters = 24;
+    constexpr float kDetEps = 1.0e-12f;
+    Mat3 R = A;
+    for (int it = 0; it < kPolarIters; ++it) {
+        const Mat3 RinvT = Mat3InvTranspose(R, kDetEps);
+        for (int i = 0; i < 9; ++i) {
+            R.m[i] = 0.5f * (R.m[i] + RinvT.m[i]);
+        }
+    }
+    // Det-correction: ensure a proper rotation (det +1). If the cluster is
+    // inverted (det A < 0) the Newton factor is improper (det -1); flip the
+    // third column to restore det +1 (Kabsch / Mueller det-correct convention).
+    if (Mat3Det(R) < 0.0f) {
+        R.m[2] = -R.m[2];
+        R.m[5] = -R.m[5];
+        R.m[8] = -R.m[8];
+    }
+    return R;
+}
+
+// SINGLE-THREAD fixed-order Gauss-Seidel sweep over all shape-match clusters. For
+// each cluster (Mueller et al. 2005):
+//   c   = (sum_i m_i p_i) / sum_i m_i                 (current centroid)
+//   A   = sum_i m_i (p_i - c) q_i^T,  q_i = x_i^0 - c0 (3x3 covariance; cooked q_i)
+//   R   = polar(A)  (det-corrected proper rotation)
+//   g_i = c + R q_i                                   (shape-matched goal)
+//   p_i += w_i_active * stiffness * (g_i - p_i)        (goal pull; pinned skip)
+// The centroid + covariance sums are SINGLE-THREAD ASCENDING accumulations (no
+// float atomicAdd) -- D1 fixed order. The shape-match WEIGHT m_i (cluster mass)
+// is independent of the dynamics inverse mass w_i; a pinned particle (inv_mass 0)
+// still anchors the cluster shape but its position is held fixed.
+__global__ void SolveShapeMatchConstraintsKernel(
+    uint32_t cluster_count,
+    uint32_t solver_iterations,
+    math::Vec3* __restrict__ positions,
+    const float* __restrict__ inv_masses,
+    const uint32_t* __restrict__ cluster_offset,
+    const uint32_t* __restrict__ cluster_size,
+    const float* __restrict__ stiffness,
+    const math::Vec3* __restrict__ rest_centroid,  // c0 (unused; q_i pre-offset)
+    const uint32_t* __restrict__ particles,        // sum(n_c)
+    const math::Vec3* __restrict__ rest_q,         // q_i = x_i^0 - c0
+    const float* __restrict__ mass) {              // m_i
+    if (blockIdx.x != 0u || threadIdx.x != 0u) {
+        return;
+    }
+    (void)rest_centroid;  // c0 folded into the cooked q_i; kept for completeness.
+
+    for (uint32_t iter = 0u; iter < solver_iterations; ++iter) {
+        for (uint32_t cc = 0u; cc < cluster_count; ++cc) {
+            const uint32_t base = cluster_offset[cc];
+            const uint32_t n = cluster_size[cc];
+            if (n == 0u) {
+                continue;
+            }
+            const float s = stiffness[cc];
+
+            // Current mass-weighted centroid c (fixed-order ascending sum).
+            float mass_sum = 0.0f;
+            math::Vec3 c_acc = MakeVec3(0.0f, 0.0f, 0.0f);
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                const float mi = mass[base + j];
+                mass_sum += mi;
+                c_acc = Add(c_acc, Scale(positions[idx], mi));
+            }
+            if (mass_sum <= 0.0f) {
+                continue;  // degenerate cluster weights.
+            }
+            const math::Vec3 c = Scale(c_acc, 1.0f / mass_sum);
+
+            // Covariance A = sum_i m_i (p_i - c) q_i^T (row-major; fixed order).
+            Mat3 A = Mat3Zero();
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                const float mi = mass[base + j];
+                const math::Vec3 d = Sub(positions[idx], c);  // p_i - c
+                const math::Vec3 q = rest_q[base + j];        // q_i = x_i^0 - c0
+                A.m[0] += mi * d.x * q.x;
+                A.m[1] += mi * d.x * q.y;
+                A.m[2] += mi * d.x * q.z;
+                A.m[3] += mi * d.y * q.x;
+                A.m[4] += mi * d.y * q.y;
+                A.m[5] += mi * d.y * q.z;
+                A.m[6] += mi * d.z * q.x;
+                A.m[7] += mi * d.z * q.y;
+                A.m[8] += mi * d.z * q.z;
+            }
+
+            const Mat3 R = PolarRotation(A);
+
+            // Goal pull: g_i = c + R q_i ; p_i += w_active * s * (g_i - p_i).
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                if (inv_masses[idx] <= 0.0f) {
+                    continue;  // pinned particle: position held fixed.
+                }
+                const math::Vec3 q = rest_q[base + j];
+                const math::Vec3 rq = MakeVec3(
+                    R.m[0] * q.x + R.m[1] * q.y + R.m[2] * q.z,
+                    R.m[3] * q.x + R.m[4] * q.y + R.m[5] * q.z,
+                    R.m[6] * q.x + R.m[7] * q.y + R.m[8] * q.z);
+                const math::Vec3 goal = Add(c, rq);
+                const math::Vec3 p = positions[idx];
+                positions[idx] = Add(p, Scale(Sub(goal, p), s));
+            }
+        }
+    }
+}
+
 // --- correct ------------------------------------------------------------------
 // One thread per particle. Rebuilds the velocity from the corrected position.
 //     v = (p - prev) / dt        (pinned particles keep their stored velocity)
@@ -314,6 +502,7 @@ XpbdWorld::XpbdWorld(uint32_t particle_count,
                      uint32_t distance_constraint_count,
                      uint32_t bend_constraint_count,
                      uint32_t volume_constraint_count,
+                     uint32_t shape_match_cluster_count,
                      phi::Buffer positions,
                      phi::Buffer prev_positions,
                      phi::Buffer velocities,
@@ -330,11 +519,19 @@ XpbdWorld::XpbdWorld(uint32_t particle_count,
                      phi::Buffer volume_particles,
                      phi::Buffer volume_rest_times6,
                      phi::Buffer volume_compliance_alpha,
-                     phi::Buffer volume_lambda)
+                     phi::Buffer volume_lambda,
+                     phi::Buffer shape_match_cluster_offset,
+                     phi::Buffer shape_match_cluster_count_buf,
+                     phi::Buffer shape_match_stiffness,
+                     phi::Buffer shape_match_rest_centroid,
+                     phi::Buffer shape_match_particles,
+                     phi::Buffer shape_match_rest_q,
+                     phi::Buffer shape_match_mass)
     : particle_count_(particle_count)
     , distance_constraint_count_(distance_constraint_count)
     , bend_constraint_count_(bend_constraint_count)
     , volume_constraint_count_(volume_constraint_count)
+    , shape_match_cluster_count_(shape_match_cluster_count)
     , positions_(std::move(positions))
     , prev_positions_(std::move(prev_positions))
     , velocities_(std::move(velocities))
@@ -351,7 +548,14 @@ XpbdWorld::XpbdWorld(uint32_t particle_count,
     , volume_particles_(std::move(volume_particles))
     , volume_rest_times6_(std::move(volume_rest_times6))
     , volume_compliance_alpha_(std::move(volume_compliance_alpha))
-    , volume_lambda_(std::move(volume_lambda)) {}
+    , volume_lambda_(std::move(volume_lambda))
+    , shape_match_cluster_offset_(std::move(shape_match_cluster_offset))
+    , shape_match_cluster_count_buf_(std::move(shape_match_cluster_count_buf))
+    , shape_match_stiffness_(std::move(shape_match_stiffness))
+    , shape_match_rest_centroid_(std::move(shape_match_rest_centroid))
+    , shape_match_particles_(std::move(shape_match_particles))
+    , shape_match_rest_q_(std::move(shape_match_rest_q))
+    , shape_match_mass_(std::move(shape_match_mass)) {}
 
 std::size_t XpbdWorld::DeviceBytes() const {
     return positions_.Size() + prev_positions_.Size() + velocities_.Size() +
@@ -361,7 +565,12 @@ std::size_t XpbdWorld::DeviceBytes() const {
            bend_particles_.Size() + bend_gradients_.Size() +
            bend_compliance_alpha_.Size() + bend_lambda_.Size() +
            volume_particles_.Size() + volume_rest_times6_.Size() +
-           volume_compliance_alpha_.Size() + volume_lambda_.Size();
+           volume_compliance_alpha_.Size() + volume_lambda_.Size() +
+           shape_match_cluster_offset_.Size() +
+           shape_match_cluster_count_buf_.Size() +
+           shape_match_stiffness_.Size() + shape_match_rest_centroid_.Size() +
+           shape_match_particles_.Size() + shape_match_rest_q_.Size() +
+           shape_match_mass_.Size();
 }
 
 bool XpbdWorld::HasUploadedState() const {
@@ -396,6 +605,17 @@ bool XpbdWorld::HasUploadedState() const {
             volume_rest_times6_.Data() == nullptr ||
             volume_compliance_alpha_.Data() == nullptr ||
             volume_lambda_.Data() == nullptr) {
+            return false;
+        }
+    }
+    if (shape_match_cluster_count_ > 0u) {
+        if (shape_match_cluster_offset_.Data() == nullptr ||
+            shape_match_cluster_count_buf_.Data() == nullptr ||
+            shape_match_stiffness_.Data() == nullptr ||
+            shape_match_rest_centroid_.Data() == nullptr ||
+            shape_match_particles_.Data() == nullptr ||
+            shape_match_rest_q_.Data() == nullptr ||
+            shape_match_mass_.Data() == nullptr) {
             return false;
         }
     }
@@ -466,6 +686,27 @@ const float* XpbdWorld::DeviceVolumeComplianceAlpha() const {
 float* XpbdWorld::DeviceVolumeLambda() {
     return static_cast<float*>(volume_lambda_.Data());
 }
+const uint32_t* XpbdWorld::DeviceShapeMatchClusterOffset() const {
+    return static_cast<const uint32_t*>(shape_match_cluster_offset_.Data());
+}
+const uint32_t* XpbdWorld::DeviceShapeMatchClusterCount() const {
+    return static_cast<const uint32_t*>(shape_match_cluster_count_buf_.Data());
+}
+const float* XpbdWorld::DeviceShapeMatchStiffness() const {
+    return static_cast<const float*>(shape_match_stiffness_.Data());
+}
+const math::Vec3* XpbdWorld::DeviceShapeMatchRestCentroid() const {
+    return static_cast<const math::Vec3*>(shape_match_rest_centroid_.Data());
+}
+const uint32_t* XpbdWorld::DeviceShapeMatchParticles() const {
+    return static_cast<const uint32_t*>(shape_match_particles_.Data());
+}
+const math::Vec3* XpbdWorld::DeviceShapeMatchRestQ() const {
+    return static_cast<const math::Vec3*>(shape_match_rest_q_.Data());
+}
+const float* XpbdWorld::DeviceShapeMatchMass() const {
+    return static_cast<const float*>(shape_match_mass_.Data());
+}
 
 // =============================================================================
 // Upload
@@ -491,6 +732,8 @@ XpbdWorld UploadXpbdWorld(const phi::DeviceContext& context,
         constraints.bend.size() >
             static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()) ||
         constraints.volume.size() >
+            static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()) ||
+        constraints.shape_match.size() >
             static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
         throw std::runtime_error("UploadXpbdWorld constraint count exceeds uint32_t range");
     }
@@ -501,6 +744,8 @@ XpbdWorld UploadXpbdWorld(const phi::DeviceContext& context,
     const uint32_t bend_count = static_cast<uint32_t>(constraints.bend.size());
     const uint32_t volume_count =
         static_cast<uint32_t>(constraints.volume.size());
+    const uint32_t shape_match_count =
+        static_cast<uint32_t>(constraints.shape_match.size());
 
     // De-interleave the host constraint AoS into per-field device SoA. Validate
     // particle indices so a malformed constraint surfaces at upload, not as a
@@ -556,10 +801,72 @@ XpbdWorld UploadXpbdWorld(const phi::DeviceContext& context,
         volume_alpha[c] = vc.compliance_alpha;
     }
 
+    // Shape-match clusters: flatten the variable-size clusters into a CSR-style
+    // (offset, count) layout over flat particle / rest-offset / weight arrays. The
+    // rest centroid c0 is cooked once per cluster and the per-particle rest
+    // OFFSET q_i = x_i^0 - c0 is precomputed so the solve kernel only forms the
+    // covariance A = sum_i m_i (p_i - c) q_i^T (no per-step rest-centroid recompute).
+    std::vector<uint32_t> sm_offset(shape_match_count);
+    std::vector<uint32_t> sm_size(shape_match_count);
+    std::vector<float> sm_stiffness(shape_match_count);
+    std::vector<math::Vec3> sm_rest_centroid(shape_match_count);
+    std::vector<uint32_t> sm_particles;
+    std::vector<math::Vec3> sm_rest_q;
+    std::vector<float> sm_mass;
+    {
+        std::size_t total = 0u;
+        for (const XpbdShapeMatchCluster& cl : constraints.shape_match) {
+            total += cl.particle.size();
+        }
+        sm_particles.reserve(total);
+        sm_rest_q.reserve(total);
+        sm_mass.reserve(total);
+    }
+    for (uint32_t cl = 0u; cl < shape_match_count; ++cl) {
+        const XpbdShapeMatchCluster& smc = constraints.shape_match[cl];
+        const std::size_t n = smc.particle.size();
+        if (n == 0u) {
+            throw std::runtime_error(
+                "UploadXpbdWorld shape-match cluster must have at least one particle");
+        }
+        if (smc.rest_positions.size() != n || smc.cluster_mass.size() != n) {
+            throw std::runtime_error(
+                "UploadXpbdWorld shape-match cluster particle/rest/mass lengths must match");
+        }
+        // Cook the rest centroid c0 = (sum_i m_i x_i^0) / sum_i m_i (fixed order).
+        float mass_sum = 0.0f;
+        math::Vec3 c0{0.0f, 0.0f, 0.0f};
+        for (std::size_t j = 0u; j < n; ++j) {
+            if (smc.particle[j] >= particle_count) {
+                throw std::runtime_error(
+                    "UploadXpbdWorld shape-match cluster references out-of-range particle index");
+            }
+            const float mi = smc.cluster_mass[j];
+            mass_sum += mi;
+            c0 = c0 + smc.rest_positions[j] * mi;
+        }
+        if (mass_sum <= 0.0f) {
+            throw std::runtime_error(
+                "UploadXpbdWorld shape-match cluster total weight must be positive");
+        }
+        c0 = c0 * (1.0f / mass_sum);
+
+        sm_offset[cl] = static_cast<uint32_t>(sm_particles.size());
+        sm_size[cl] = static_cast<uint32_t>(n);
+        sm_stiffness[cl] = smc.stiffness;
+        sm_rest_centroid[cl] = c0;
+        for (std::size_t j = 0u; j < n; ++j) {
+            sm_particles.push_back(smc.particle[j]);
+            sm_rest_q.push_back(smc.rest_positions[j] - c0);  // q_i = x_i^0 - c0
+            sm_mass.push_back(smc.cluster_mass[j]);
+        }
+    }
+
     return XpbdWorld(particle_count,
                      distance_count,
                      bend_count,
                      volume_count,
+                     shape_match_count,
                      phi::UploadVector(particles.positions),
                      phi::UploadVector(particles.positions),  // prev seeded = p
                      phi::UploadVector(particles.velocities),
@@ -576,7 +883,14 @@ XpbdWorld UploadXpbdWorld(const phi::DeviceContext& context,
                      phi::UploadVector(volume_particles),
                      phi::UploadVector(volume_rest),
                      phi::UploadVector(volume_alpha),
-                     phi::UploadVector(volume_lambda));
+                     phi::UploadVector(volume_lambda),
+                     phi::UploadVector(sm_offset),
+                     phi::UploadVector(sm_size),
+                     phi::UploadVector(sm_stiffness),
+                     phi::UploadVector(sm_rest_centroid),
+                     phi::UploadVector(sm_particles),
+                     phi::UploadVector(sm_rest_q),
+                     phi::UploadVector(sm_mass));
 }
 
 XpbdWorld UploadXpbdWorld(const XpbdParticleSet& particles,
@@ -600,6 +914,7 @@ XpbdStepReport StepXpbdWorld(const phi::DeviceContext& context,
     report.distance_constraint_count = world.DistanceConstraintCount();
     report.bend_constraint_count = world.BendConstraintCount();
     report.volume_constraint_count = world.VolumeConstraintCount();
+    report.shape_match_cluster_count = world.ShapeMatchClusterCount();
 
     if (options.dt <= 0.0f || options.step_count == 0u ||
         world.ParticleCount() == 0u) {
@@ -674,6 +989,28 @@ XpbdStepReport StepXpbdWorld(const phi::DeviceContext& context,
                 world.DeviceVolumeLambda(),
                 options.dt);
             CheckCuda(cudaGetLastError(), "SolveVolumeConstraintsKernel launch");
+            ++report.kernel_launch_count;
+        }
+
+        // Shape-match is solved LAST (after the local constraints) so it pulls the
+        // already-projected configuration toward the rigid goal. Single-thread
+        // serial sweep -- D1 fixed order, no atomics (the kernel does NOT reset a
+        // lambda: shape matching has no Lagrange multiplier, it is a direct goal
+        // projection re-evaluated from the current positions each iteration).
+        if (world.ShapeMatchClusterCount() > 0u) {
+            SolveShapeMatchConstraintsKernel<<<1u, 1u, 0, stream>>>(
+                world.ShapeMatchClusterCount(),
+                solver_iterations,
+                world.DevicePositions(),
+                world.DeviceInvMasses(),
+                world.DeviceShapeMatchClusterOffset(),
+                world.DeviceShapeMatchClusterCount(),
+                world.DeviceShapeMatchStiffness(),
+                world.DeviceShapeMatchRestCentroid(),
+                world.DeviceShapeMatchParticles(),
+                world.DeviceShapeMatchRestQ(),
+                world.DeviceShapeMatchMass());
+            CheckCuda(cudaGetLastError(), "SolveShapeMatchConstraintsKernel launch");
             ++report.kernel_launch_count;
         }
 

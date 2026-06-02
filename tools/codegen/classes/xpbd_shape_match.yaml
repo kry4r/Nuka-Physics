@@ -1,0 +1,127 @@
+row_class_id: 9
+row_class_name: XPBDShapeMatchRow
+
+body_count_mode: variable
+body_count: null
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.7 p09-C: XPBD (Macklin et al. 2016) soft-body SHAPE-MATCHING constraint
+# (id 9) -- the meshless cluster regularizer of Mueller et al. 2005, "Meshless
+# Deformations Based on Shape Matching". The 4th and hardest XPBD row class. A
+# cluster of n PARTICLES (n VARIABLE per cluster -- body_count_mode: variable, the
+# featherstone pattern) is pulled toward the best rigid transform of its REST
+# shape. With rest positions x_i^0, masses m_i, current positions p_i:
+#
+#     centroids:  c  = (sum_i m_i p_i)/sum_i m_i ;  c0 = (sum_i m_i x_i^0)/sum_i m_i
+#     covariance: A  = sum_i m_i (p_i - c)(x_i^0 - c0)^T        # 3x3
+#     rotation:   R  = polar(A)  (orthogonal factor; SVD A=U S V^T, R=U V^T,
+#                                 det-corrected R=U diag(1,1,det(UV^T)) V^T)
+#     goal:       g_i = c + R (x_i^0 - c0)
+#     update:     p_i += stiffness * (g_i - p_i)               # stiffness from alpha
+#
+# DESIGN (the core adjoint-granularity decision of this phase): shape matching has
+# NO single scalar constraint C, NO Lagrange multiplier lambda, and NO scalar
+# effective_mass -- it is a per-particle GOAL PROJECTION, not the scalar
+# multiplier law of the distance/bend/volume rows. Forcing it into the (C, lambda,
+# effective_mass, alpha_tilde) shape would fabricate structure the math does not
+# have. The codegen-expressible reduced form is therefore the PER-PARTICLE,
+# PER-AXIS goal projection (one representative scalar channel; the 3 axes of g_i,
+# p_i are independent applications of the SAME scalar law, exactly as the other
+# three rows emit ONE scalar lambda law per constraint):
+#     position_new = position + stiffness * (goal - position)
+#                  = (1 - stiffness) * position + stiffness * goal
+# This is MULTILINEAR (degree <= 1 in each of position, goal, stiffness), so the
+# V3 central-difference Jacobian is exact in real arithmetic (only float32
+# cancellation remains) -- the same property that lets the maximal / distance /
+# bend / volume rows clear the 1e-3 gate. The cluster size n NEVER enters this
+# local adjoint -- all size-dependence lives in computing goal (centroid /
+# covariance / polar), which is the FORWARD / downstream part. That is exactly why
+# body_count_mode: variable is clean here: the per-row adjoint is invariant to n.
+#
+# The polar-decomposition derivative dR/dA is the analog of the distance row's
+# normal / the volume row's determinant gradient: it is DOWNSTREAM geometry that
+# rides the goal -> position chain, NOT part of this local per-row adjoint (and
+# unlike grad C it is not even used by the forward, which needs R, not dR/dA -- so
+# it is genuinely backward-only). It is implemented analytically and host-FD
+# validated at a non-degenerate well-conditioned cluster in the cluster sim test
+# (tests/runtime/test_xpbd_shape_match, the analog of the volume row's
+# DeterminantGradientMatchesFdAndSumsToZero gate). Named downstream consumer of
+# BOTH this local goal-projection adjoint and the dR/dA derivative: the
+# soft/coupling backward in a later phase (same consumer the distance/bend/volume
+# rows name for their geometric chains).
+#
+# GPU-only serial fixed-order Gauss-Seidel solve + cooked rest data
+# (rest positions, rest centroid, per-particle mass) live in
+# src/runtime/soft/xpbd_world.{hpp,cu}. The covariance / centroid sums are
+# single-thread ascending accumulations (NO float atomicAdd -- D1 fixed order).
+# Parallel / colored GS is deferred (task #25). This IR governs the row-class
+# registry entry (id 9) and the per-row reverse-mode adjoint emitted by regen.py.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+
+# Reverse-mode (dense_adjoint) -- the LOCAL per-particle, per-axis goal-projection
+# adjoint of ONE shape-match application. Unlike distance/bend/volume this is NOT
+# the scalar XPBD multiplier law; it is the goal projection:
+#     u = position + stiffness * (goal - position)
+# (position_new = clamp(u, lower, upper) = u for the unbounded equality box --
+# shape matching has no active set; the box_lower_upper sentinels keep the clamp
+# inactive, identical to the other XPBD equality rows).
+#
+# Holding the reduced scalars (position, goal, stiffness) independent makes u
+# MULTILINEAR, so the V3 central-difference Jacobian is exact in real arithmetic
+# (only float32 cancellation remains) -- the property that lets it clear the 1e-3
+# gate. The TOTAL-derivative chain to the geometric inputs (the goal g_i = c +
+# R(x_i^0 - c0), i.e. the polar-decomposition rotation, and the per-particle
+# masses) rides DOWNSTREAM on the position chain, exactly as the other XPBD rows
+# defer their geometric (normal / stencil / determinant) chains. Named downstream
+# consumer: the soft/coupling backward in a later phase.
+#
+# Differentiable inputs:
+#   position   -- the current particle coordinate (one axis) BEFORE the projection
+#   goal       -- the shape-matched goal coordinate g_i = c + R(x_i^0 - c0) (one axis)
+#   stiffness  -- the XPBD shape-match stiffness in [0,1] (from compliance_alpha)
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - position
+    - goal
+    - stiffness
+  grad_output_fields:
+    - position_new
+  # u = position + stiffness*(goal - position); the emitted primal is
+  # clamp(u, lower, upper) (unbounded for this equality row).
+  unclamped_expression: >-
+    position + stiffness * (goal - position)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is identically 1 for an unbounded equality box):
+  derivative_rules:
+    position: "1.0f - stiffness"
+    goal: "stiffness"
+    stiffness: "(goal - position)"

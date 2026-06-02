@@ -398,6 +398,8 @@ if(CMAKE_CUDA_COMPILER)
         # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validators.
         codegen/v3_validation/xpbd_bend_fd.cu
         codegen/v3_validation/xpbd_volume_fd.cu
+        # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validator.
+        codegen/v3_validation/xpbd_shape_match_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

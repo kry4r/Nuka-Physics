@@ -110,6 +110,12 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cu"
+    # v0.7 p09-C: XPBD soft-body SHAPE-MATCH (id 9). Ships a GENUINE dispatchable
+    # per-row adjoint (the per-particle goal-projection law), so BOTH the forward
+    # and adjoint __global__ symbols must compile into nuka_codegen_generated
+    # (regen alone leaves the adjoint .cu orphaned -- the p09-A lesson).
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS
@@ -122,6 +128,8 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint headers.
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cuh"
+    # v0.7 p09-C: XPBD shape-match (id 9) adjoint header.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cuh"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}

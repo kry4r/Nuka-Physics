@@ -87,10 +87,29 @@ struct XpbdVolumeConstraint {
     float compliance_alpha = 0.0f;    // XPBD compliance (1/volume-stiffness).
 };
 
+// Host-side description of one SHAPE-MATCH cluster over a VARIABLE number of
+// particles (id 9; Mueller et al. 2005 meshless shape matching). The cluster is
+// pulled toward the best rigid transform of its REST shape. rest_positions holds
+// the cluster's rest coordinates x_i^0 (one per cluster particle, same order as
+// `particle`); rest data (rest centroid c0, the per-particle q_i = x_i^0 - c0,
+// the mass-weighted total) is cooked once at upload from rest_positions +
+// cluster_mass. cluster_mass[i] is the shape-match WEIGHT m_i used in the
+// centroid / covariance sums (defaults to the particle's mass = 1/inv_mass when
+// finite; a pinned particle -- inv_mass 0 -- still contributes to the cluster
+// shape with a chosen weight). stiffness in [0,1] is the per-step fraction of the
+// goal correction applied (XPBD shape-match stiffness; from compliance_alpha).
+struct XpbdShapeMatchCluster {
+    std::vector<uint32_t> particle;       // cluster particle indices (size n>=1)
+    std::vector<math::Vec3> rest_positions;  // x_i^0, size n (same order)
+    std::vector<float> cluster_mass;      // m_i shape-match weight, size n (>0)
+    float stiffness = 1.0f;               // goal-pull fraction in [0,1].
+};
+
 struct XpbdConstraintSet {
     std::vector<XpbdDistanceConstraint> distance;
     std::vector<XpbdBendConstraint> bend;
     std::vector<XpbdVolumeConstraint> volume;
+    std::vector<XpbdShapeMatchCluster> shape_match;
 };
 
 // Host snapshot downloaded from the device (state read-back for tests / oracles).
@@ -114,6 +133,7 @@ struct XpbdStepReport {
     uint32_t distance_constraint_count = 0u;
     uint32_t bend_constraint_count = 0u;
     uint32_t volume_constraint_count = 0u;
+    uint32_t shape_match_cluster_count = 0u;
     uint32_t simulated_step_count = 0u;
     uint32_t kernel_launch_count = 0u;
 };
@@ -127,6 +147,7 @@ public:
               uint32_t distance_constraint_count,
               uint32_t bend_constraint_count,
               uint32_t volume_constraint_count,
+              uint32_t shape_match_cluster_count,
               phi::Buffer positions,
               phi::Buffer prev_positions,
               phi::Buffer velocities,
@@ -143,7 +164,14 @@ public:
               phi::Buffer volume_particles,
               phi::Buffer volume_rest_times6,
               phi::Buffer volume_compliance_alpha,
-              phi::Buffer volume_lambda);
+              phi::Buffer volume_lambda,
+              phi::Buffer shape_match_cluster_offset,
+              phi::Buffer shape_match_cluster_count_buf,
+              phi::Buffer shape_match_stiffness,
+              phi::Buffer shape_match_rest_centroid,
+              phi::Buffer shape_match_particles,
+              phi::Buffer shape_match_rest_q,
+              phi::Buffer shape_match_mass);
 
     XpbdWorld(const XpbdWorld&) = delete;
     XpbdWorld& operator=(const XpbdWorld&) = delete;
@@ -154,6 +182,7 @@ public:
     uint32_t DistanceConstraintCount() const { return distance_constraint_count_; }
     uint32_t BendConstraintCount() const { return bend_constraint_count_; }
     uint32_t VolumeConstraintCount() const { return volume_constraint_count_; }
+    uint32_t ShapeMatchClusterCount() const { return shape_match_cluster_count_; }
     std::size_t DeviceBytes() const;
     bool HasUploadedState() const;
     XpbdWorldState DownloadState() const;
@@ -185,11 +214,23 @@ public:
     const float* DeviceVolumeComplianceAlpha() const;
     float* DeviceVolumeLambda();
 
+    // Shape-match: per-cluster offset/count into the flat particle/q/mass arrays,
+    // per-cluster stiffness + rest centroid c0, and the flattened cluster
+    // particle indices, rest offsets q_i = x_i^0 - c0, and weights m_i.
+    const uint32_t* DeviceShapeMatchClusterOffset() const;
+    const uint32_t* DeviceShapeMatchClusterCount() const;
+    const float* DeviceShapeMatchStiffness() const;
+    const math::Vec3* DeviceShapeMatchRestCentroid() const;
+    const uint32_t* DeviceShapeMatchParticles() const;
+    const math::Vec3* DeviceShapeMatchRestQ() const;
+    const float* DeviceShapeMatchMass() const;
+
 private:
     uint32_t particle_count_ = 0u;
     uint32_t distance_constraint_count_ = 0u;
     uint32_t bend_constraint_count_ = 0u;
     uint32_t volume_constraint_count_ = 0u;
+    uint32_t shape_match_cluster_count_ = 0u;
     phi::Buffer positions_;
     phi::Buffer prev_positions_;
     phi::Buffer velocities_;
@@ -207,6 +248,13 @@ private:
     phi::Buffer volume_rest_times6_;
     phi::Buffer volume_compliance_alpha_;
     phi::Buffer volume_lambda_;
+    phi::Buffer shape_match_cluster_offset_;   // cluster_count uint32_t
+    phi::Buffer shape_match_cluster_count_buf_; // cluster_count uint32_t (n_c)
+    phi::Buffer shape_match_stiffness_;        // cluster_count float
+    phi::Buffer shape_match_rest_centroid_;    // cluster_count math::Vec3 (c0)
+    phi::Buffer shape_match_particles_;        // sum(n_c) uint32_t
+    phi::Buffer shape_match_rest_q_;           // sum(n_c) math::Vec3 (x_i^0 - c0)
+    phi::Buffer shape_match_mass_;             // sum(n_c) float (m_i)
 };
 
 XpbdWorld UploadXpbdWorld(const phi::DeviceContext& context,
