@@ -233,11 +233,20 @@ TEST(DiffsimTapeCAbi, SparseSolverBackendSetGetRoundTrip) {
               NUKA_RESULT_OK);
     EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_CG);
 
-    // Reserved (later-phase) backends honestly return NOT_SUPPORTED and DO NOT
-    // change the stored selection.
+    // v0.7 p02: SELF_MINRES is now a SHIPPING backend (self-written symmetric
+    // indefinite MINRES + ILU(0)); it is accepted and round-trips.
     EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
                                                    NUKA_SOLVER_BACKEND_SELF_MINRES),
-              NUKA_RESULT_NOT_SUPPORTED);
+              NUKA_RESULT_OK);
+    EXPECT_EQ(nuka_world_get_sparse_solver_backend(world.handle, &got),
+              NUKA_RESULT_OK);
+    EXPECT_EQ(got, NUKA_SOLVER_BACKEND_SELF_MINRES);
+    // Restore the default so the rest of the contract checks read SELF_CG.
+    EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
+                                                   NUKA_SOLVER_BACKEND_SELF_CG),
+              NUKA_RESULT_OK);
+
+    // SELF_GMRES remains reserved for v0.7 phase 3 -> NOT_SUPPORTED, no mutation.
     EXPECT_EQ(nuka_world_set_sparse_solver_backend(world.handle,
                                                    NUKA_SOLVER_BACKEND_SELF_GMRES),
               NUKA_RESULT_NOT_SUPPORTED);

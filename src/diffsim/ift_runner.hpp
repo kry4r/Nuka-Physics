@@ -115,12 +115,18 @@ public:
 private:
     const phi::DeviceContext& context_;
     DeterminismLevel determinism_;
-    std::unique_ptr<SparseLinearSolver> solver_;
+    std::unique_ptr<SparseLinearSolver> solver_;       // CG (SPD), the default path
+    // v0.7 p02: lazily-constructed MINRES backend, used ONLY when the assembled KKT
+    // is detected SYMMETRIC INDEFINITE (a negative LDLT pivot). For the validated
+    // (all-SPD) contact scenes the detector never fires, so this stays null and the
+    // CG path runs byte-identically -- the no-regression guarantee.
+    std::unique_ptr<SparseLinearSolver> minres_solver_;
 
     // Reused intermediates (lazily (re)allocated to the current shape).
     ContactDelassusBuffers delassus_;     // A (values + block_dim)
     phi::Buffer rhs_;                     // J M^-1 g, block-major stride kMaxBlockDim
     phi::Buffer z_;                       // A^-1 rhs,  block-major stride kMaxBlockDim
+    phi::Buffer indef_flag_;              // uint32[1] indefinite-detector flag
     uint32_t capacity_blocks_ = 0u;
 };
 
