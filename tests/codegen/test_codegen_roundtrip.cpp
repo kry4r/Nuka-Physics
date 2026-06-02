@@ -48,13 +48,18 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
 
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
-    const std::array<const char*, 8> files = {
+    const std::array<const char*, 12> files = {
         "maximal_contact_forward.cu",
         "maximal_joint_forward.cu",
         "maximal_drive_forward.cu",
         "featherstone_contact_forward.cu",
         "xpbd_distance_forward.cu",
         "xpbd_distance_adjoint.cuh",
+        // v0.7 p09-B: bend (id 7) + volume (id 8) forward + adjoint pairs.
+        "xpbd_bend_forward.cu",
+        "xpbd_bend_adjoint.cuh",
+        "xpbd_volume_forward.cu",
+        "xpbd_volume_adjoint.cuh",
         "row_dispatch.cu",
         "row_class_registry.hpp",
     };
@@ -80,11 +85,14 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::kMaximalJointRowId;
     using nuka::solver::generated::kRigidSDFContactRowId;
     using nuka::solver::generated::kRowClassCount;
+    using nuka::solver::generated::kXPBDBendRowId;
     using nuka::solver::generated::kXPBDDistanceRowId;
+    using nuka::solver::generated::kXPBDVolumeRowId;
 
-    // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A adds the
-    // XPBD soft-body distance row (id 6) -> 7 total.
-    EXPECT_EQ(kRowClassCount, 7u);
+    // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A added the
+    // XPBD soft-body distance row (id 6); p09-B adds the XPBD bend (id 7) + volume
+    // (id 8) rows -> 9 total.
+    EXPECT_EQ(kRowClassCount, 9u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
@@ -126,6 +134,25 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     EXPECT_EQ(RowClassMaxRowsPerBlock(kXPBDDistanceRowId), 6u);
     EXPECT_TRUE(RowClassHasAdjoint(kXPBDDistanceRowId));
     EXPECT_EQ(RowClassGradientMode(kXPBDDistanceRowId),
+              static_cast<uint8_t>(GradientMode::dense_adjoint));
+
+    // v0.7 p09-B: the XPBD BEND (id 7) + VOLUME (id 8) soft rows. Both ship a
+    // GENUINE dispatchable per-row adjoint -- exit-crit 6, same as the distance
+    // row. This block is the contract tripwire: RowClassHasAdjoint(7)/(8) MUST
+    // stay true and the gradient mode MUST stay dense_adjoint. If either XPBD
+    // adjoint is ever removed/changed, this fails consciously rather than
+    // silently degrading to a stop-gradient.
+    EXPECT_TRUE(IsKnownRowClass(kXPBDBendRowId));
+    EXPECT_TRUE(IsKnownRowClass(kXPBDVolumeRowId));
+    EXPECT_EQ(kXPBDBendRowId, 7u);
+    EXPECT_EQ(kXPBDVolumeRowId, 8u);
+    EXPECT_STREQ(RowClassName(kXPBDBendRowId), "XPBDBendRow");
+    EXPECT_STREQ(RowClassName(kXPBDVolumeRowId), "XPBDVolumeRow");
+    EXPECT_TRUE(RowClassHasAdjoint(kXPBDBendRowId));
+    EXPECT_TRUE(RowClassHasAdjoint(kXPBDVolumeRowId));
+    EXPECT_EQ(RowClassGradientMode(kXPBDBendRowId),
+              static_cast<uint8_t>(GradientMode::dense_adjoint));
+    EXPECT_EQ(RowClassGradientMode(kXPBDVolumeRowId),
               static_cast<uint8_t>(GradientMode::dense_adjoint));
 
     EXPECT_FALSE(IsKnownRowClass(99u));

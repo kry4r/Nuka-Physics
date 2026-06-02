@@ -1,0 +1,109 @@
+row_class_id: 7
+row_class_name: XPBDBendRow
+
+body_count_mode: fixed
+body_count: 4
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.7 p09-B: XPBD (Macklin et al. 2016) soft-body BEND constraint -- one
+# constraint over FOUR particles forming two triangles (p1,p3,p4) and (p2,p4,p3)
+# that share the edge (p3,p4). The bending energy uses the Bergou et al. 2006
+# QUADRATIC / ISOMETRIC bending model (NOT the dihedral-angle form, which is
+# singular at the flat coplanar rest state a cloth patch starts from). The
+# isometric model is LINEAR in the vertex positions: a scalar stencil k =
+# [k1 k2 k3 k4] (the cotangent-Laplacian flap weights) with the LINEAR-PRECISION
+# property sum_i k_i = 0 and sum_i k_i * x_i_rest = 0 on the flat rest flap. For a
+# non-degenerate flat (coplanar) flap that pair of conditions (3 eqns on 4
+# unknowns) PINS k up to scale, so the cook builder computes k DIRECTLY as the
+# unique affine null-vector of the rest flap (== the cotangent stencil up to a
+# scalar, which folds into compliance_alpha; sign is irrelevant since the
+# projection drives C->0 either way). To keep grad C a CONSTANT vector with no
+# 1/sin(theta) singularity, the row's scalar constraint is the rest-normal
+# projection of the Bergou vector:
+#     C = sum_i K_i . x_i   with   K_i = k_i * n_hat_rest   (4 stored Vec3)
+# so grad_{x_i} C = K_i is constant (no per-step recompute) and C = 0 at flat rest
+# (sum_i k_i x_i_rest = 0). The XPBD generalized projection:
+#     a~  = compliance_alpha / dt^2
+#     dl  = (-C - a~*lambda) / (sum_i w_i*|K_i|^2 + a~)
+#     p_i += w_i * K_i * dl   (i = 1..4) ;  lambda += dl
+# (the |grad|^2 denominator generalizes the distance row's w_a+w_b, which is the
+# |grad|=1 special case; sum_i K_i = n_hat * sum_i k_i = 0 conserves momentum).
+# The cook-time stencil K_i live in src/runtime/soft/cloth_topology.*; the GPU
+# predict/solve/correct loop + the per-row bend solve live in
+# src/runtime/soft/xpbd_world.{hpp,cu}. CURVED-rest cotangent weights (general
+# developable rest shapes) are deferred to p09-C/p15. This IR governs the
+# row-class registry entry (id 7) and the per-row reverse-mode adjoint emitted by
+# regen.py.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+
+# Reverse-mode (dense_adjoint) -- the LOCAL projection adjoint of ONE bend
+# constraint application. IDENTICAL in form to the distance row (id 6): the XPBD
+# delta-lambda law is constraint-TYPE-agnostic once the reduced scalars are
+# treated as independent inputs. With effective_mass = 1/(sum_i w_i|k_i|^2 +
+# alpha_tilde):
+#     u = lambda + effective_mass * (-C - alpha_tilde * lambda)
+# (lambda_new = clamp(u, lower, upper) = u for the unbounded equality box).
+#
+# The per-row local adjoint differentiates this projection update treating its
+# reduced scalars (C, lambda, effective_mass, alpha_tilde) as INDEPENDENT inputs,
+# which makes u MULTILINEAR (degree <= 1 in each), so the V3 central-difference
+# Jacobian is exact in real arithmetic (only float32 cancellation remains) -- the
+# property that lets it pass the 1e-3 gate. The TOTAL-derivative chain to the
+# geometric inputs (the Bergou stencil k_i, the per-particle inverse masses) rides
+# DOWNSTREAM on the position chain (p_i += w_i*k_i*dl), exactly as the distance
+# row defers its geometric chain. Named downstream consumer: the soft/coupling
+# backward in a later phase.
+#
+# Differentiable inputs:
+#   C              -- the bend constraint value K . p (Bergou quadratic stencil)
+#   lambda         -- the warm-started / iterate Lagrange multiplier
+#   effective_mass -- 1/(sum_i w_i|k_i|^2 + alpha_tilde) (row's effective inv mass)
+#   alpha_tilde    -- XPBD compliance alpha~ = compliance_alpha / dt^2
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - C
+    - lambda
+    - effective_mass
+    - alpha_tilde
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(-C - alpha_tilde*lambda); the emitted primal is
+  # clamp(u, lower, upper) (unbounded for this equality row).
+  unclamped_expression: >-
+    lambda + effective_mass * (-C - alpha_tilde * lambda)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is identically 1 for an unbounded equality box):
+  derivative_rules:
+    C: "-effective_mass"
+    lambda: "1.0f - effective_mass * alpha_tilde"
+    effective_mass: "(-C - alpha_tilde * lambda)"
+    alpha_tilde: "-effective_mass * lambda"

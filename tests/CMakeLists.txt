@@ -653,6 +653,9 @@ if(CMAKE_CUDA_COMPILER)
         codegen/test_adjoint_fd_maximal_contact.cpp
         codegen/test_adjoint_fd_featherstone_contact.cpp
         codegen/test_adjoint_fd_xpbd_distance.cpp
+        # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validation.
+        codegen/test_adjoint_fd_xpbd_bend.cpp
+        codegen/test_adjoint_fd_xpbd_volume.cpp
     )
 
     add_dependencies(nuka_adjoint_fd_test nuka_codegen)
@@ -694,6 +697,9 @@ if(CMAKE_CUDA_COMPILER)
         runtime/test_cuda_solver.cpp
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
         runtime/test_xpbd_distance_oracle.cpp
+        # v0.7 p09-B: XPBD bend (cloth) + volume (tet) sim invariants + grad-C FD.
+        runtime/test_xpbd_bend_cloth.cpp
+        runtime/test_xpbd_volume_tet.cpp
     )
 
     target_link_libraries(nuka_cuda_runtime_test

@@ -101,6 +101,15 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     # advertising an uncompiled symbol (a non-dispatchable orphan).
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cu"
+    # v0.7 p09-B: XPBD soft-body BEND (id 7) + VOLUME (id 8) rows. Like the
+    # distance row each ships a GENUINE dispatchable per-row adjoint, so BOTH the
+    # forward and adjoint __global__ symbols must be compiled into
+    # nuka_codegen_generated (regen alone leaves the adjoint .cu orphaned -- the
+    # p09-A lesson). Mirror the _forward.cu + _adjoint.cu pairing.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS
@@ -110,6 +119,9 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cuh"
+    # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint headers.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cuh"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cuh"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}
