@@ -35,6 +35,9 @@ struct CookedJointTable {
     std::vector<float>      initial_positions;
 };
 
+// Sentinel: a shape row that carries no convex-hull geometry.
+constexpr uint32_t kNoConvexGeometry = ~uint32_t(0);
+
 struct CookedShapeTable {
     std::vector<ShapeType>       types;
     std::vector<BodyId>          body_ids;
@@ -43,6 +46,25 @@ struct CookedShapeTable {
     std::vector<math::Vec3>      half_extents;
     std::vector<float>           radii;
     std::vector<float>           half_heights;
+    // Per-shape index into CookedConvexGeometry (kNoConvexGeometry for shapes
+    // without hull geometry, e.g. Sphere/Box/Plane/Capsule). Parallel to the
+    // arrays above. v0.7 p06.
+    std::vector<uint32_t>        convex_geometry_indices;
+};
+
+// Flat geometry storage for ConvexHull shapes (one entry per ConvexHull row).
+// Vertices are x,y,z triples; indices are triangles. Each hull's slice is
+// [vertex_offsets[i]*3, +vertex_counts[i]*3) into `vertices` and
+// [index_offsets[i], +index_counts[i]) into `indices`. v0.7 p06.
+struct CookedConvexGeometry {
+    std::vector<float>    vertices;        // flat x,y,z triples for all hulls
+    std::vector<uint32_t> indices;         // flat triangle indices for all hulls
+    std::vector<uint32_t> vertex_offsets;  // per-hull start vertex (in vertices/3)
+    std::vector<uint32_t> vertex_counts;   // per-hull vertex count
+    std::vector<uint32_t> index_offsets;   // per-hull start index (in indices)
+    std::vector<uint32_t> index_counts;    // per-hull index count
+    std::vector<float>    volumes;         // per-hull volume
+    uint32_t Count() const { return static_cast<uint32_t>(vertex_counts.size()); }
 };
 
 struct CookedSensorTable {
@@ -95,6 +117,7 @@ struct CookedBlob {
     CookedBodyTable  bodies;
     CookedJointTable joints;
     CookedShapeTable shapes;
+    CookedConvexGeometry convex_geometry;  // v0.7 p06: hull geometry for ConvexHull rows
     CookedSensorTable sensors;
     CookedMaterialTable materials;
     CookedCameraTable cameras;

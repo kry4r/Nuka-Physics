@@ -320,6 +320,7 @@ add_executable(nuka_import_test
     import/test_mjcf_importer.cpp
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
+    import/test_decompose_attribute.cpp
 )
 
 target_link_libraries(nuka_import_test
@@ -329,6 +330,31 @@ target_link_libraries(nuka_import_test
 )
 
 gtest_discover_tests(nuka_import_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# --- V-HACD convex decomposition tests (v0.7 p06) --------------------------
+# Cook-time decomposition: DecomposeMesh / cache (nuka_cooker) + the cooker
+# integration (CookScene emits ConvexHull pieces, nuka_scene). Includes
+# tests/import/vhacd_test_meshes.hpp via the source-root include dir.
+add_executable(nuka_vhacd_test
+    import/test_vhacd_simple_cube.cpp
+    import/test_vhacd_robot_finger.cpp
+    import/test_vhacd_determinism.cpp
+    import/test_vhacd_cooker_integration.cpp
+)
+
+target_include_directories(nuka_vhacd_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}
+)
+
+target_link_libraries(nuka_vhacd_test
+    PRIVATE
+        nuka_cooker
+        nuka_scene
+        GTest::gtest_main
+)
+
+gtest_discover_tests(nuka_vhacd_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # --- Collision tests -------------------------------------------------------
 add_executable(nuka_collision_test

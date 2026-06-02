@@ -47,6 +47,23 @@ DLPack
   Licensed under the Apache License, Version 2.0.
   Used for zero-copy tensor interop (PyTorch / JAX) via the DLPack protocol.
 
+V-HACD (Volumetric Hierarchical Approximate Convex Decomposition)
+  Copyright (c) 2011 Khaled Mamou and the V-HACD contributors.
+  Licensed under the BSD 3-Clause License (see external/vhacd/LICENSE).
+  Vendored as the single-header v4.1 release (external/vhacd/VHACD.h). Used at
+  COOK TIME ONLY (offline / host CPU) by the asset cooker to decompose concave
+  collision meshes into convex pieces; it is a one-time pre-simulation step and
+  is NOT part of the GPU runtime / per-step physics path (master plan §5.6
+  sanctioned exception). The implementation is compiled into a single
+  translation unit (src/import/cooker/convex_decomposition.cpp).
+
+SHA-256 (content-hash cache key)
+  Derived from the public-domain SHA-256 reference implementation by Brad Conte
+  ("crypto-algorithms"), released into the public domain (see
+  external/sha256/LICENSE). Reformatted into a single namespaced C++ header
+  (external/sha256/sha256.h). Used at COOK TIME ONLY to content-hash the convex
+  decomposition inputs (mesh bytes + serialized params) for the dedup cache.
+
 Philox4x32-10 counter-based RNG (algorithm)
   The Philox4x32-10 counter-based pseudo-random number generator used in this
   project is SELF-IMPLEMENTED; no third-party Philox/Random123 source code is

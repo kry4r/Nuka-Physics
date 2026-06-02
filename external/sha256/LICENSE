@@ -1,0 +1,13 @@
+SHA-256 implementation
+=======================
+
+The SHA-256 implementation vendored in this directory (sha256.h) is derived
+from the public-domain SHA-256 reference implementation by Brad Conte
+("crypto-algorithms", https://github.com/B-Con/crypto-algorithms), which the
+author released into the public domain.
+
+It has been reformatted into a single C++ header, namespaced under
+nuka::sha256, and adapted for incremental hashing. It carries no third-party
+copyright restrictions.
+
+Public domain. No rights reserved.

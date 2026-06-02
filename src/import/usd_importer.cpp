@@ -51,6 +51,8 @@ struct UsdPrim {
     std::string body_path;
     std::string axis_token = "Z";
     std::string nuka_type;
+    std::string decompose_mode;          // nuka:decompose token
+    int decompose_max_pieces = 32;       // nuka:decompose:max_pieces
     bool has_initial_position = false;
     float initial_position = 0.0f;
     float lower_limit = -3.14159f;
@@ -143,6 +145,19 @@ bool ParseFloatValue(const std::string& line, std::string_view key, float& value
     return !stream.fail();
 }
 
+bool ParseIntValue(const std::string& line, std::string_view key, int& value) {
+    if (line.find(key) == std::string::npos) {
+        return false;
+    }
+    const size_t equals = line.find('=');
+    if (equals == std::string::npos) {
+        return false;
+    }
+    std::istringstream stream(Trim(std::string_view(line).substr(equals + 1)));
+    stream >> value;
+    return !stream.fail();
+}
+
 bool ParseVec3Value(const std::string& line, std::string_view key, math::Vec3& value) {
     if (line.find(key) == std::string::npos) {
         return false;
@@ -213,6 +228,14 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseRelationship(line, "nuka:body", prim.body_path);
     (void)ParseTokenValue(line, "physics:axis", prim.axis_token);
     (void)ParseTokenValue(line, "nuka:type", prim.nuka_type);
+    // nuka:decompose:max_pieces (int) must be tried before nuka:decompose
+    // (token) since the former line contains the latter as a substring; the
+    // token parser requires quotes (absent on the int line) so it is harmless,
+    // but parse the int form explicitly first for clarity.
+    (void)ParseIntValue(line, "nuka:decompose:max_pieces", prim.decompose_max_pieces);
+    if (line.find("nuka:decompose:max_pieces") == std::string::npos) {
+        (void)ParseTokenValue(line, "nuka:decompose", prim.decompose_mode);
+    }
     (void)ParseFloatValue(line, "physics:lowerLimit", prim.lower_limit);
     (void)ParseFloatValue(line, "physics:upperLimit", prim.upper_limit);
     if (ParseFloatValue(line, "nuka:initialPosition", prim.initial_position)) {
@@ -388,6 +411,17 @@ scene::SensorType SensorTypeFromToken(const std::string& token) {
     return scene::SensorType::Imu;
 }
 
+scene::DecomposeMode DecomposeModeFromToken(const std::string& token) {
+    const std::string lower = Lowercase(token);
+    if (lower == "force") {
+        return scene::DecomposeMode::Force;
+    }
+    if (lower == "skip") {
+        return scene::DecomposeMode::Skip;
+    }
+    return scene::DecomposeMode::Auto;
+}
+
 scene::LightType LightTypeFromUsdType(const std::string& type) {
     if (type == "DistantLight") {
         return scene::LightType::Directional;
@@ -452,6 +486,13 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         } else if (shape_type == scene::ShapeType::Capsule) {
             shape.radius = prim.radius;
             shape.half_height = prim.height * 0.5f;
+        }
+        if (shape_type == scene::ShapeType::TriMesh) {
+            shape.decompose_mode = DecomposeModeFromToken(prim.decompose_mode);
+            if (prim.decompose_max_pieces > 0) {
+                shape.decompose_max_pieces =
+                    static_cast<uint32_t>(prim.decompose_max_pieces);
+            }
         }
         scene.AddCollisionShape(std::move(shape));
     }

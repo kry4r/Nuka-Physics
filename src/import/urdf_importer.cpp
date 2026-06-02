@@ -50,7 +50,17 @@ scene::ShapeType UrdfGeomType(const char* tag_name) {
     if (t == "box")      return scene::ShapeType::Box;
     if (t == "sphere")   return scene::ShapeType::Sphere;
     if (t == "cylinder")  return scene::ShapeType::Capsule; // approximate
+    if (t == "mesh")     return scene::ShapeType::TriMesh;
     return scene::ShapeType::Box;
+}
+
+/// Map a nuka:decompose token to DecomposeMode.
+scene::DecomposeMode DecomposeModeFromToken(const char* token) {
+    if (!token) return scene::DecomposeMode::Auto;
+    const std::string t(token);
+    if (t == "force") return scene::DecomposeMode::Force;
+    if (t == "skip")  return scene::DecomposeMode::Skip;
+    return scene::DecomposeMode::Auto;
 }
 
 } // anonymous namespace
@@ -158,6 +168,17 @@ scene::SceneIR LoadUrdf(const std::string& path) {
                     shape.local_transform = math::Transform{
                         ParseVec3(xyz), math::Quat::Identity()
                     };
+                }
+            }
+
+            // Parse <nuka:decompose [decompose="auto|force|skip"] [max_pieces="N"]/>
+            // on a mesh collision element (v0.7 p06).
+            if (auto* decomp = collision->FirstChildElement("nuka:decompose")) {
+                shape.decompose_mode = DecomposeModeFromToken(decomp->Attribute("decompose"));
+                int max_pieces = 0;
+                if (decomp->QueryIntAttribute("max_pieces", &max_pieces) ==
+                        tinyxml2::XML_SUCCESS && max_pieces > 0) {
+                    shape.decompose_max_pieces = static_cast<uint32_t>(max_pieces);
                 }
             }
 

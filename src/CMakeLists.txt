@@ -25,6 +25,37 @@ target_include_directories(nuka_math
 )
 
 # ---------------------------------------------------------------------------
+# nuka_cooker – cook-time asset processing (V-HACD convex decomposition)
+# ---------------------------------------------------------------------------
+# COOK-TIME / HOST-CPU code (master plan §5.6 sanctioned exception). This is a
+# LEAF library: DecomposeMesh() takes only raw pointers + its own POD structs,
+# so it carries no scene/runtime types and can be linked PUBLIC by nuka_scene
+# (whose CookScene invokes it) without creating a dependency cycle. The
+# importers (nuka_import, which depends on nuka_scene) only parse the
+# nuka:decompose attribute; they do NOT link nuka_cooker directly.
+#
+# nuka_set_warnings is intentionally NOT applied: the vendored single-header
+# V-HACD implementation is compiled into convex_decomposition.cpp and does not
+# build clean under -Werror -Wconversion -Wshadow. It is third-party cook-time
+# code (not a D1 / hot-path concern); warnings on it are suppressed via the
+# SYSTEM include path and by omitting the strict flag set on this TU.
+add_library(nuka_cooker STATIC
+    import/cooker/convex_decomposition.cpp
+)
+set_target_properties(nuka_cooker PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_include_directories(nuka_cooker
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(nuka_cooker
+    PUBLIC
+        nuka_vhacd
+        nuka_sha256
+)
+
+# ---------------------------------------------------------------------------
 # nuka_scene – Scene IR and runtime cooking
 # ---------------------------------------------------------------------------
 add_library(nuka_scene STATIC
@@ -42,6 +73,7 @@ target_include_directories(nuka_scene
 target_link_libraries(nuka_scene
     PUBLIC
         nuka_math
+        nuka_cooker
 )
 
 nuka_set_warnings(nuka_scene)
