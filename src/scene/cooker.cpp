@@ -5,10 +5,26 @@
 #include "scene/cooker.hpp"
 
 #include "import/cooker/convex_decomposition.hpp"
+#include "import/cooker/sdf_bake_backend.hpp"
+#include "import/cooker/sparse_sdf_cooker.hpp"
+#include "runtime/sdf/sparse_sdf_query.cuh"  // PackSdfCellKey codec (shared)
+
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace nuka::scene {
 
 namespace {
+
+// V-HACD content-hash cache dir for the p06 fold-in. Deliberately EMPTY here:
+// the in-process memo (keyed by mesh content hash) already dedups identical
+// meshes within a single cook, which is the win for multi-instance scenes. An
+// on-disk dir would re-open a stale-output risk (the key is over INPUTS, so a
+// decomposition-logic change without an input change would serve a stale file
+// across builds). Empty => memo-only; still routed through DecomposeMeshCached.
+constexpr const char* kDecomposeCacheDir = "";
 
 math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
     const auto& body = scene.GetBody(body_id);
@@ -42,6 +58,86 @@ uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
     geom.vertices.insert(geom.vertices.end(), vertices.begin(), vertices.end());
     geom.indices.insert(geom.indices.end(), indices.begin(), indices.end());
     return index;
+}
+
+// Append one cooked SparseSdfData into the blob's CookedSdfTable and return its
+// SDF index. Cells are stored flat/concatenated; the per-SDF slice is
+// [key_offsets[idx], +key_counts[idx]).
+uint32_t AppendSdf(CookedSdfTable& table,
+                   const import::cooker::SparseSdfData& sdf) {
+    const uint32_t index = table.Count();
+    table.origins.push_back({sdf.origin[0], sdf.origin[1], sdf.origin[2]});
+    table.voxel_sizes.push_back(sdf.voxel_size);
+    table.dims_x.push_back(sdf.dims[0]);
+    table.dims_y.push_back(sdf.dims[1]);
+    table.dims_z.push_back(sdf.dims[2]);
+    table.key_offsets.push_back(static_cast<uint32_t>(table.cell_keys.size()));
+    table.key_counts.push_back(sdf.CellCount());
+    table.cell_keys.insert(table.cell_keys.end(), sdf.cell_keys.begin(), sdf.cell_keys.end());
+    table.cell_values.insert(table.cell_values.end(), sdf.cell_values.begin(),
+                             sdf.cell_values.end());
+    for (uint32_t n = 0; n < sdf.CellCount(); ++n) {
+        table.cell_gradients.push_back({sdf.cell_gradients[3 * n + 0],
+                                        sdf.cell_gradients[3 * n + 1],
+                                        sdf.cell_gradients[3 * n + 2]});
+    }
+    return index;
+}
+
+// Cook a narrow-band SDF per UNIQUE convex-geometry piece, deduplicated by
+// content hash. Two identical pieces share ONE stored SDF (exit-crit 7).
+// piece_sdf_indices is parallel to the convex-geometry pieces.
+//
+// `unique_out` / `total_out` report the dedup stats; `bytes_out` the total
+// narrow-band bytes (R-C ~80MB cap surfaced by the caller).
+void CookSdfsForGeometry(const CookedConvexGeometry& geom,
+                         CookedSdfTable& table,
+                         uint32_t* unique_out,
+                         uint32_t* total_out,
+                         uint64_t* bytes_out) {
+    const import::cooker::SparseSdfParams params;  // defaults (auto voxel size)
+    // v0.7 p07 seam: route bake through the swappable backend (CPU now; the
+    // v1.0 GPU backend drops in via DefaultSdfBakeBackend with no caller change).
+    const import::cooker::SdfBakeBackend& backend =
+        import::cooker::DefaultSdfBakeBackend();
+    std::unordered_map<std::string, uint32_t> by_hash;  // hash -> sdf index
+    table.piece_sdf_indices.assign(geom.Count(), kNoSdf);
+
+    uint32_t total = 0;
+    uint64_t bytes = 0;
+    for (uint32_t piece = 0; piece < geom.Count(); ++piece) {
+        const uint32_t vbase = geom.vertex_offsets[piece];
+        const uint32_t vcount = geom.vertex_counts[piece];
+        const uint32_t ibase = geom.index_offsets[piece];
+        const uint32_t icount = geom.index_counts[piece];
+        if (vcount == 0u || icount == 0u) {
+            continue;  // leave kNoSdf
+        }
+        const float* vptr = geom.vertices.data() + static_cast<size_t>(vbase) * 3u;
+        const uint32_t* iptr = geom.indices.data() + ibase;
+        const uint32_t tri_count = icount / 3u;
+
+        ++total;
+        const std::string key =
+            backend.CacheKey(vptr, vcount, iptr, tri_count, params);
+        const auto it = by_hash.find(key);
+        if (it != by_hash.end()) {
+            table.piece_sdf_indices[piece] = it->second;  // dedup: reuse
+            continue;
+        }
+        const auto sdf = backend.Bake(vptr, vcount, iptr, tri_count, params);
+        if (sdf.CellCount() == 0u) {
+            continue;  // degenerate; leave kNoSdf
+        }
+        const uint32_t sdf_index = AppendSdf(table, sdf);
+        by_hash.emplace(key, sdf_index);
+        table.piece_sdf_indices[piece] = sdf_index;
+        bytes += sdf.NarrowBandBytes();
+    }
+
+    if (unique_out) *unique_out = table.Count();
+    if (total_out)  *total_out = total;
+    if (bytes_out)  *bytes_out = bytes;
 }
 
 // Push one cooked shape row (all parallel arrays stay the same length).
@@ -159,15 +255,21 @@ CookedBlob CookScene(const SceneIR& scene) {
         }
 
         // Auto / Force => run V-HACD. (A convex input naturally yields 1 piece,
-        // so Auto ~= Force at this phase.)
+        // so Auto ~= Force at this phase.) Served through the content-hash cache
+        // (p06): identical (mesh, params) reuse a prior decomposition instead of
+        // re-running the 0.5-5s V-HACD.
         import::cooker::ConvexDecompositionParams params;
         params.max_pieces = s.decompose_max_pieces;
-        const auto result = import::cooker::DecomposeMesh(
+        bool decompose_hit = false;
+        const auto result = import::cooker::DecomposeMeshCached(
             s.mesh_vertices.data(),
             static_cast<uint32_t>(s.mesh_vertices.size() / 3),
             s.mesh_indices.data(),
             static_cast<uint32_t>(s.mesh_indices.size() / 3),
-            params);
+            params,
+            kDecomposeCacheDir,
+            &decompose_hit);
+        (void)decompose_hit;
 
         if (!result.succeeded || result.pieces.empty()) {
             // Decomposition failed: fall back to passing the mesh through as a
@@ -186,6 +288,26 @@ CookedBlob CookScene(const SceneIR& scene) {
     }
 
     blob.shape_count = static_cast<uint32_t>(blob.shapes.types.size());
+
+    // v0.7 p07: cook a narrow-band SDF per unique convex-geometry piece,
+    // deduplicated by content hash. The leaf cooker stays dependency-free, so
+    // the dedup/byte stats are returned here; we SURFACE an over-budget scene on
+    // stderr (R-C ~80MB cap). The detailed stats remain reachable via
+    // CookedSdfTable (Count() vs piece count; sum of per-cell bytes) for callers
+    // / tests that want them.
+    {
+        uint32_t unique = 0, total = 0;
+        uint64_t bytes = 0;
+        CookSdfsForGeometry(blob.convex_geometry, blob.sdfs, &unique, &total, &bytes);
+        constexpr uint64_t kSdfMemoryCapBytes = 80ull * 1024ull * 1024ull;  // R-C
+        if (bytes > kSdfMemoryCapBytes) {
+            std::fprintf(stderr,
+                         "[nuka cooker] WARNING: cooked SDF memory %llu bytes "
+                         "(%u unique of %u pieces) exceeds the ~80MB cap (R-C); "
+                         "consider coarser voxel_size or more aggressive sharing.\n",
+                         static_cast<unsigned long long>(bytes), unique, total);
+        }
+    }
 
     const auto& sensors = scene.Sensors();
     blob.sensor_count = static_cast<uint32_t>(sensors.size());

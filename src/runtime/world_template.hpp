@@ -22,6 +22,12 @@ struct WorldTemplate {
     scene::CookedJointTable joint_table;
     scene::CookedShapeTable shape_table;
     scene::CookedActuatorTable actuator_table;
+    // v0.7 p06/p07: ConvexHull hull geometry + per-unique-piece narrow-band SDFs.
+    // Threaded through so p08 (Newton-summed-SDF contact) can upload + sample
+    // them. The cooked tables hold the byte-reproducible golden SDF cells; an
+    // upload step (later) builds the device-side SparseSdfDevice views.
+    scene::CookedConvexGeometry convex_geometry;
+    scene::CookedSdfTable   sdf_table;
     std::vector<articulation::ArticulationCookedTopology> articulations;
 };
 

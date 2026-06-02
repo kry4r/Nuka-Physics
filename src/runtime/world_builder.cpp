@@ -21,6 +21,8 @@ BuiltWorld BuildWorld(const scene::CookedBlob& blob) {
     tmpl.joint_table   = blob.joints;
     tmpl.shape_table   = blob.shapes;
     tmpl.actuator_table = blob.actuators;
+    tmpl.convex_geometry = blob.convex_geometry;  // v0.7 p06
+    tmpl.sdf_table     = blob.sdfs;                // v0.7 p07
     tmpl.articulations = articulation::CookArticulations(blob);
 
     // --- Instance: initialise mutable state ---
