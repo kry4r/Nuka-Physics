@@ -145,6 +145,23 @@ FetchContent_Declare(
 set(tinyxml2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tinyxml2)
 
+# --- V-HACD (v0.7 p06): cook-time convex decomposition -----------------------
+# Vendored as the single-header v4.1 release under external/vhacd/ (BSD
+# 3-Clause; see external/vhacd/LICENSE). The implementation is compiled into a
+# single TU (src/import/cooker/convex_decomposition.cpp, which defines
+# ENABLE_VHACD_IMPLEMENTATION). Exposed here only as an INTERFACE include path.
+# COOK-TIME / HOST-CPU code (master plan §5.6 sanctioned exception).
+add_library(nuka_vhacd INTERFACE)
+target_include_directories(nuka_vhacd SYSTEM INTERFACE
+    ${CMAKE_SOURCE_DIR}/external/vhacd)
+
+# --- SHA-256 (v0.7 p06): content-hash cache key ------------------------------
+# Public-domain single-header implementation under external/sha256/ (see
+# external/sha256/LICENSE). Header-only INTERFACE target.
+add_library(nuka_sha256 INTERFACE)
+target_include_directories(nuka_sha256 SYSTEM INTERFACE
+    ${CMAKE_SOURCE_DIR}/external/sha256)
+
 if(NK_BUILD_TESTS)
     FetchContent_Declare(
         googletest

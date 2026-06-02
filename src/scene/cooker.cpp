@@ -4,6 +4,8 @@
 
 #include "scene/cooker.hpp"
 
+#include "import/cooker/convex_decomposition.hpp"
+
 namespace nuka::scene {
 
 namespace {
@@ -14,6 +16,47 @@ math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
         return body.local_transform;
     }
     return ResolveWorldTransform(scene, body.parent_id) * body.local_transform;
+}
+
+import::cooker::DecomposeMode ToCookerMode(DecomposeMode mode) {
+    switch (mode) {
+        case DecomposeMode::Force: return import::cooker::DecomposeMode::Force;
+        case DecomposeMode::Skip:  return import::cooker::DecomposeMode::Skip;
+        case DecomposeMode::Auto:  break;
+    }
+    return import::cooker::DecomposeMode::Auto;
+}
+
+// Append one convex hull (vertices/indices/volume) into the cooked geometry
+// table and return its index.
+uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
+                              const std::vector<float>& vertices,
+                              const std::vector<uint32_t>& indices,
+                              float volume) {
+    const uint32_t index = geom.Count();
+    geom.vertex_offsets.push_back(static_cast<uint32_t>(geom.vertices.size() / 3));
+    geom.vertex_counts.push_back(static_cast<uint32_t>(vertices.size() / 3));
+    geom.index_offsets.push_back(static_cast<uint32_t>(geom.indices.size()));
+    geom.index_counts.push_back(static_cast<uint32_t>(indices.size()));
+    geom.volumes.push_back(volume);
+    geom.vertices.insert(geom.vertices.end(), vertices.begin(), vertices.end());
+    geom.indices.insert(geom.indices.end(), indices.begin(), indices.end());
+    return index;
+}
+
+// Push one cooked shape row (all parallel arrays stay the same length).
+void PushShapeRow(CookedShapeTable& shapes,
+                  const CollisionShapeRecord& src,
+                  ShapeType type,
+                  uint32_t convex_geometry_index) {
+    shapes.types.push_back(type);
+    shapes.body_ids.push_back(src.body_id);
+    shapes.material_ids.push_back(src.material_id);
+    shapes.local_transforms.push_back(src.local_transform);
+    shapes.half_extents.push_back(src.half_extents);
+    shapes.radii.push_back(src.radius);
+    shapes.half_heights.push_back(src.half_height);
+    shapes.convex_geometry_indices.push_back(convex_geometry_index);
 }
 
 } // namespace
@@ -83,7 +126,6 @@ CookedBlob CookScene(const SceneIR& scene) {
     }
 
     const auto& shapes = scene.Shapes();
-    blob.shape_count = static_cast<uint32_t>(shapes.size());
     blob.shapes.types.reserve(shapes.size());
     blob.shapes.body_ids.reserve(shapes.size());
     blob.shapes.material_ids.reserve(shapes.size());
@@ -91,16 +133,59 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.shapes.half_extents.reserve(shapes.size());
     blob.shapes.radii.reserve(shapes.size());
     blob.shapes.half_heights.reserve(shapes.size());
+    blob.shapes.convex_geometry_indices.reserve(shapes.size());
 
     for (const auto& s : shapes) {
-        blob.shapes.types.push_back(s.type);
-        blob.shapes.body_ids.push_back(s.body_id);
-        blob.shapes.material_ids.push_back(s.material_id);
-        blob.shapes.local_transforms.push_back(s.local_transform);
-        blob.shapes.half_extents.push_back(s.half_extents);
-        blob.shapes.radii.push_back(s.radius);
-        blob.shapes.half_heights.push_back(s.half_height);
+        const bool is_mesh =
+            (s.type == ShapeType::TriMesh || s.type == ShapeType::ConvexHull);
+        const bool has_geometry = !s.mesh_vertices.empty() && !s.mesh_indices.empty();
+
+        // Non-mesh shapes (and mesh shapes lacking geometry — e.g. importers
+        // that do not yet load mesh files) pass through unchanged, one row.
+        if (!is_mesh || !has_geometry) {
+            PushShapeRow(blob.shapes, s, s.type, kNoConvexGeometry);
+            continue;
+        }
+
+        const import::cooker::DecomposeMode mode = ToCookerMode(s.decompose_mode);
+
+        if (mode == import::cooker::DecomposeMode::Skip) {
+            // Treat the source mesh as a single convex piece (store its own
+            // geometry as one ConvexHull; no V-HACD run).
+            const uint32_t geom_index = AppendConvexGeometry(
+                blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
+            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+            continue;
+        }
+
+        // Auto / Force => run V-HACD. (A convex input naturally yields 1 piece,
+        // so Auto ~= Force at this phase.)
+        import::cooker::ConvexDecompositionParams params;
+        params.max_pieces = s.decompose_max_pieces;
+        const auto result = import::cooker::DecomposeMesh(
+            s.mesh_vertices.data(),
+            static_cast<uint32_t>(s.mesh_vertices.size() / 3),
+            s.mesh_indices.data(),
+            static_cast<uint32_t>(s.mesh_indices.size() / 3),
+            params);
+
+        if (!result.succeeded || result.pieces.empty()) {
+            // Decomposition failed: fall back to passing the mesh through as a
+            // single ConvexHull carrying its own geometry (never drop the shape).
+            const uint32_t geom_index = AppendConvexGeometry(
+                blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
+            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+            continue;
+        }
+
+        for (const auto& piece : result.pieces) {
+            const uint32_t geom_index = AppendConvexGeometry(
+                blob.convex_geometry, piece.vertices, piece.indices, piece.volume);
+            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+        }
     }
+
+    blob.shape_count = static_cast<uint32_t>(blob.shapes.types.size());
 
     const auto& sensors = scene.Sensors();
     blob.sensor_count = static_cast<uint32_t>(sensors.size());

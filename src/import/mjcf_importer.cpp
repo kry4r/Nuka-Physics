@@ -103,6 +103,20 @@ scene::ShapeType MjcfGeomType(const char* type_str) {
     return scene::ShapeType::Box;
 }
 
+scene::DecomposeMode DecomposeModeFromToken(const char* token) {
+    if (!token) {
+        return scene::DecomposeMode::Auto;
+    }
+    const std::string t(token);
+    if (t == "force") {
+        return scene::DecomposeMode::Force;
+    }
+    if (t == "skip") {
+        return scene::DecomposeMode::Skip;
+    }
+    return scene::DecomposeMode::Auto;
+}
+
 scene::JointType MjcfJointType(const char* type_str) {
     if (!type_str) {
         return scene::JointType::Revolute;
@@ -329,6 +343,17 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                 if (sz.y > 0.0f) {
                     shape.half_height = sz.y;
                 }
+            }
+        }
+
+        // nuka:decompose="auto|force|skip" + optional nuka:decompose:max_pieces
+        // on a mesh geom (v0.7 p06).
+        if (shape.type == scene::ShapeType::TriMesh) {
+            shape.decompose_mode = DecomposeModeFromToken(geom->Attribute("nuka:decompose"));
+            int max_pieces = 0;
+            if (geom->QueryIntAttribute("nuka:decompose:max_pieces", &max_pieces) ==
+                    tinyxml2::XML_SUCCESS && max_pieces > 0) {
+                shape.decompose_max_pieces = static_cast<uint32_t>(max_pieces);
             }
         }
 
