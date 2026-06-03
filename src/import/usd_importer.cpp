@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -34,6 +36,7 @@ struct UsdPrim {
     float mass = 1.0f;
     math::Vec3 diagonal_inertia = {1.0f, 1.0f, 1.0f};
     math::Vec3 translate = math::Vec3::Zero();
+    math::Vec3 scale = {1.0f, 1.0f, 1.0f};   // xformOp:scale (baked into grafted mesh)
     float cube_size = 1.0f;
     float radius = 0.5f;
     float height = 1.0f;
@@ -60,6 +63,22 @@ struct UsdPrim {
     float gain = 1.0f;
     float force_limit = 0.0f;
     float sample_rate_hz = 0.0f;
+
+    // -- Mesh geometry (def Mesh; #32) --------------------------------------
+    // Parsed straight from the USD attributes; triangulation to mesh_indices is
+    // done at SceneIR-build time. mesh_points is flat x,y,z triples in file
+    // order (no dedup).
+    std::vector<float> mesh_points;            // point3f[] points
+    std::vector<int> face_vertex_indices;      // int[] faceVertexIndices
+    std::vector<int> face_vertex_counts;       // int[] faceVertexCounts (per-face vert count)
+
+    // -- references (#32) ---------------------------------------------------
+    // (prepend|append)? references = @relpath@</PrimPath>. The relpath is
+    // resolved against the file the reference is authored in; the referenced
+    // subtree is grafted under this prim with this prim's xformOp:scale baked
+    // into the grafted mesh points.
+    std::string reference_asset;               // relpath inside the @...@
+    std::string reference_prim_path;           // the </...> target prim path
 };
 
 std::string Trim(std::string_view text) {
@@ -200,6 +219,150 @@ bool ParseTokenValue(const std::string& line, std::string_view key, std::string&
     return !value.empty();
 }
 
+// Extract the substring between the value-opening '[' and the matching final
+// ']' on a (possibly multi-line-joined) logical line. Returns false if no
+// balanced value-bracket pair is present.
+//
+// The search for the opening '[' starts AFTER the '=' so it never matches the
+// '[]' of the SDF array-type token (e.g. `int[] faceVertexIndices = [ ... ]`):
+// matching the first '[' in the whole line would otherwise capture the type
+// token's bracket and leak `] faceVertexIndices = [ ...` into the body, which
+// poisons the strict int reader. When there is no '=' (no value authored) we
+// fall back to the first '[' so a value-less declaration still reports "no body"
+// cleanly rather than mis-parsing.
+bool ExtractBracketBody(const std::string& line, std::string& body) {
+    const size_t equals = line.find('=');
+    const size_t search_from = (equals == std::string::npos) ? 0 : equals + 1;
+    const size_t open = line.find('[', search_from);
+    if (open == std::string::npos) {
+        return false;
+    }
+    const size_t close = line.rfind(']');
+    if (close == std::string::npos || close < open) {
+        return false;
+    }
+    body = line.substr(open + 1, close - open - 1);
+    return true;
+}
+
+// Parse the body of a `point3f[] points = [ (x,y,z), (x,y,z), ... ]` array into
+// flat x,y,z triples appended to out (file order, no dedup). Tuples are
+// delimited by parentheses; commas inside and between tuples are treated as
+// whitespace. Returns false (and leaves out untouched) on a malformed tuple.
+bool ParseVec3Array(const std::string& body, std::vector<float>& out) {
+    std::vector<float> parsed;
+    size_t pos = 0;
+    while (true) {
+        const size_t open = body.find('(', pos);
+        if (open == std::string::npos) {
+            break;
+        }
+        const size_t close = body.find(')', open + 1);
+        if (close == std::string::npos) {
+            return false;
+        }
+        std::string tuple = body.substr(open + 1, close - open - 1);
+        std::replace(tuple.begin(), tuple.end(), ',', ' ');
+        std::istringstream stream(tuple);
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        stream >> x >> y >> z;
+        if (stream.fail()) {
+            return false;
+        }
+        parsed.push_back(x);
+        parsed.push_back(y);
+        parsed.push_back(z);
+        pos = close + 1;
+    }
+    out.insert(out.end(), parsed.begin(), parsed.end());
+    return true;
+}
+
+// Parse the body of an `int[] ... = [ i, j, k, ... ]` array into ints appended
+// to out (file order). Commas are treated as whitespace.
+bool ParseIntArray(const std::string& body, std::vector<int>& out) {
+    std::string normalized = body;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::istringstream stream(normalized);
+    std::vector<int> parsed;
+    int value = 0;
+    while (stream >> value) {
+        parsed.push_back(value);
+    }
+    if (stream.bad()) {
+        return false;
+    }
+    out.insert(out.end(), parsed.begin(), parsed.end());
+    return true;
+}
+
+// Parse `(prepend|append)? references = @relpath@</PrimPath>` from a (logical)
+// line. The asset path lives between the two '@' delimiters; the target prim
+// path is the </...> relationship that follows.
+bool ParseReference(const std::string& line, std::string& asset, std::string& prim_path) {
+    if (line.find("references") == std::string::npos) {
+        return false;
+    }
+    const size_t first_at = line.find('@');
+    if (first_at == std::string::npos) {
+        return false;
+    }
+    const size_t second_at = line.find('@', first_at + 1);
+    if (second_at == std::string::npos) {
+        return false;
+    }
+    asset = Trim(line.substr(first_at + 1, second_at - first_at - 1));
+    if (asset.empty()) {
+        return false;
+    }
+    const size_t open = line.find('<', second_at + 1);
+    const size_t close = (open == std::string::npos) ? std::string::npos
+                                                     : line.find('>', open + 1);
+    if (open != std::string::npos && close != std::string::npos) {
+        prim_path = line.substr(open + 1, close - open - 1);
+    } else {
+        prim_path.clear();
+    }
+    return true;
+}
+
+// Route a (logical) line's mesh-array / reference content into the prim. This is
+// additive to ApplyPropertyLine (the scalar/relationship handler) -- a points /
+// faceVertex* / references line carries none of the scalar keys, so calling both
+// is safe.
+void ApplyMeshAndReferenceLine(const std::string& line, UsdPrim& prim) {
+    std::string body;
+    if (line.find("point3f[] points") != std::string::npos ||
+        line.find("float3[] points") != std::string::npos) {
+        if (ExtractBracketBody(line, body)) {
+            (void)ParseVec3Array(body, prim.mesh_points);
+        }
+        return;
+    }
+    if (line.find("faceVertexIndices") != std::string::npos) {
+        if (ExtractBracketBody(line, body)) {
+            (void)ParseIntArray(body, prim.face_vertex_indices);
+        }
+        return;
+    }
+    if (line.find("faceVertexCounts") != std::string::npos) {
+        if (ExtractBracketBody(line, body)) {
+            (void)ParseIntArray(body, prim.face_vertex_counts);
+        }
+        return;
+    }
+    if (line.find("references") != std::string::npos) {
+        std::string asset;
+        std::string ref_prim;
+        if (ParseReference(line, asset, ref_prim)) {
+            prim.reference_asset = asset;
+            prim.reference_prim_path = ref_prim;
+        }
+    }
+}
+
 void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     ApplyApiSchemas(line, prim);
     (void)ParseBoolValue(line, "physics:rigidBodyEnabled", prim.rigid_body_enabled);
@@ -207,6 +370,7 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseFloatValue(line, "physics:mass", prim.mass);
     (void)ParseVec3Value(line, "physics:diagonalInertia", prim.diagonal_inertia);
     (void)ParseVec3Value(line, "xformOp:translate", prim.translate);
+    (void)ParseVec3Value(line, "xformOp:scale", prim.scale);
     (void)ParseFloatValue(line, "double size", prim.cube_size);
     (void)ParseFloatValue(line, "float size", prim.cube_size);
     (void)ParseFloatValue(line, "double radius", prim.radius);
@@ -244,6 +408,8 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseFloatValue(line, "nuka:gain", prim.gain);
     (void)ParseFloatValue(line, "nuka:forceLimit", prim.force_limit);
     (void)ParseFloatValue(line, "nuka:sampleRate", prim.sample_rate_hz);
+    // Mesh geometry arrays + references (#32) -- additive, see helper note.
+    ApplyMeshAndReferenceLine(line, prim);
 }
 
 std::string JoinPath(const std::string& parent, const std::string& name) {
@@ -253,6 +419,38 @@ std::string JoinPath(const std::string& parent, const std::string& name) {
     return parent + "/" + name;
 }
 
+// Net bracket balance of a string: (count of '[') - (count of ']').
+int BracketBalance(const std::string& text) {
+    int balance = 0;
+    for (const char c : text) {
+        if (c == '[') {
+            ++balance;
+        } else if (c == ']') {
+            --balance;
+        }
+    }
+    return balance;
+}
+
+// Resolve a reference asset path (relative or absolute) against the directory of
+// the file that authored the reference.
+std::string ResolveReferencePath(const std::string& base_dir, const std::string& asset) {
+    std::filesystem::path p(asset);
+    if (p.is_absolute() || base_dir.empty()) {
+        return p.lexically_normal().string();
+    }
+    return (std::filesystem::path(base_dir) / p).lexically_normal().string();
+}
+
+// Forward declaration: parsing a file may recurse into referenced files, whose
+// references are resolved against THEIR own directory.
+std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
+                                                  const std::string& text);
+
+// Parse USDA text into a flat prim list. Multi-line bracketed array values
+// (point3f[] points, int[] faceVertex*) are joined into a single logical line
+// before being handed to the (additive) property handlers, so the single-line
+// path is just the degenerate "opens and closes on one physical line" case.
 std::vector<UsdPrim> ParseUsdaText(const std::string& text) {
     constexpr size_t kNoPendingPrim = static_cast<size_t>(-1);
     std::vector<UsdPrim> prims;
@@ -262,9 +460,22 @@ std::vector<UsdPrim> ParseUsdaText(const std::string& text) {
     std::istringstream input(text);
     std::string raw_line;
     while (std::getline(input, raw_line)) {
-        const std::string line = Trim(raw_line);
+        std::string line = Trim(raw_line);
         if (line.empty() || StartsWith(line, "#")) {
             continue;
+        }
+
+        // Multi-line array join: if this line opens more '[' than it closes, an
+        // array value spans subsequent physical lines -- accumulate them (as one
+        // space-joined logical line) until the brackets balance. Brackets only
+        // appear inside property values, never in the structural '{'/'}' prim
+        // nesting, so this never swallows a scope close.
+        int balance = BracketBalance(line);
+        while (balance > 0 && std::getline(input, raw_line)) {
+            const std::string continuation = Trim(raw_line);
+            balance += BracketBalance(continuation);
+            line += ' ';
+            line += continuation;
         }
 
         std::string prim_type;
@@ -302,6 +513,99 @@ std::vector<UsdPrim> ParseUsdaText(const std::string& text) {
     return prims;
 }
 
+// Bake a per-axis scale into a flat x,y,z vertex array in place. A (1,1,1) scale
+// is an exact no-op.
+void BakeScaleIntoPoints(std::vector<float>& points, const math::Vec3& scale) {
+    if (scale.x == 1.0f && scale.y == 1.0f && scale.z == 1.0f) {
+        return;
+    }
+    const size_t triples = points.size() / 3u;
+    for (size_t t = 0; t < triples; ++t) {
+        points[t * 3u + 0u] *= scale.x;
+        points[t * 3u + 1u] *= scale.y;
+        points[t * 3u + 2u] *= scale.z;
+    }
+}
+
+// Graft a referenced prim subtree under a referencing prim. `ref_prims` is the
+// fully-parsed (and reference-resolved) prim list of the referenced file;
+// `target_path` is the </PrimPath> selected from it. The selected prim and all
+// of its descendants are appended to `out` with their paths re-rooted under
+// `host.path`, and the host prim's xformOp:scale is baked into every grafted
+// Mesh prim's points.
+void GraftReference(const UsdPrim& host,
+                    const std::vector<UsdPrim>& ref_prims,
+                    const std::string& target_path,
+                    std::vector<UsdPrim>& out) {
+    // Find the selected root prim by exact path match.
+    const UsdPrim* root = nullptr;
+    for (const auto& prim : ref_prims) {
+        if (prim.path == target_path) {
+            root = &prim;
+            break;
+        }
+    }
+    if (root == nullptr) {
+        return;
+    }
+
+    // Remap a referenced-file path onto the host: the selected root maps to the
+    // host's own path; descendants keep their suffix below the root.
+    const std::string& root_path = root->path;
+    const auto remap = [&](const std::string& path) -> std::string {
+        if (path == root_path) {
+            return host.path;
+        }
+        // path begins with root_path + "/" for descendants.
+        return host.path + path.substr(root_path.size());
+    };
+
+    for (const auto& prim : ref_prims) {
+        const bool is_root = prim.path == root_path;
+        const bool is_descendant =
+            prim.path.size() > root_path.size() &&
+            prim.path.compare(0, root_path.size(), root_path) == 0 &&
+            prim.path[root_path.size()] == '/';
+        if (!is_root && !is_descendant) {
+            continue;
+        }
+        UsdPrim grafted = prim;
+        grafted.path = remap(prim.path);
+        grafted.parent_path = is_root ? host.parent_path : remap(prim.parent_path);
+        // Bake the host's scale into the grafted mesh vertices.
+        BakeScaleIntoPoints(grafted.mesh_points, host.scale);
+        out.push_back(std::move(grafted));
+    }
+}
+
+std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
+                                                 const std::string& text) {
+    std::vector<UsdPrim> prims = ParseUsdaText(text);
+
+    // Resolve references: for each prim carrying a reference, load + parse the
+    // referenced file (resolved against THIS file's directory; its own
+    // references resolve against ITS directory), select the target subtree, and
+    // graft it under the referencing prim with the host's scale baked in.
+    std::vector<UsdPrim> grafted;
+    for (const auto& prim : prims) {
+        if (prim.reference_asset.empty()) {
+            continue;
+        }
+        const std::string resolved = ResolveReferencePath(base_dir, prim.reference_asset);
+        const UsdStageData stage = LoadUsdStageData(resolved);  // binary target -> throws
+        const std::string ref_dir = std::filesystem::path(resolved).parent_path().string();
+        const std::vector<UsdPrim> ref_prims =
+            ParseUsdaFileWithReferences(ref_dir, stage.text);
+        GraftReference(prim, ref_prims, prim.reference_prim_path, grafted);
+    }
+    if (!grafted.empty()) {
+        prims.insert(prims.end(),
+                     std::make_move_iterator(grafted.begin()),
+                     std::make_move_iterator(grafted.end()));
+    }
+    return prims;
+}
+
 scene::BodyId FindNearestBodyAncestor(
     std::string path,
     const std::unordered_map<std::string, scene::BodyId>& body_map) {
@@ -324,7 +628,18 @@ bool IsRigidBodyPrim(const UsdPrim& prim) {
     return prim.has_rigid_body_api && prim.rigid_body_enabled;
 }
 
+bool MeshHasGeometry(const UsdPrim& prim) {
+    return prim.type == "Mesh" && !prim.mesh_points.empty();
+}
+
 bool ShapeTypeFromUsdPrim(const UsdPrim& prim, scene::ShapeType& shape_type) {
+    // A def Mesh that carries geometry is always a TriMesh shape, even without a
+    // PhysicsCollisionAPI (cup-like USD assets have no physics APIs; #32). All
+    // other primitive shapes still require the collision API as before.
+    if (MeshHasGeometry(prim)) {
+        shape_type = scene::ShapeType::TriMesh;
+        return true;
+    }
     if (!prim.has_collision_api) {
         return false;
     }
@@ -345,6 +660,42 @@ bool ShapeTypeFromUsdPrim(const UsdPrim& prim, scene::ShapeType& shape_type) {
         return true;
     }
     return false;
+}
+
+// Fan-triangulate a USD face list into a flat triangle-index array. counts is
+// the per-face vertex count (3 -> 1 tri pass-through; 4 -> 2 tris; N -> N-2).
+// When counts is empty the indices are treated as already-triangulated triples.
+// Deterministic: file order, no reordering.
+std::vector<uint32_t> FanTriangulate(const std::vector<int>& indices,
+                                     const std::vector<int>& counts) {
+    std::vector<uint32_t> out;
+    if (counts.empty()) {
+        out.reserve(indices.size());
+        for (const int idx : indices) {
+            if (idx >= 0) {
+                out.push_back(static_cast<uint32_t>(idx));
+            }
+        }
+        return out;
+    }
+    size_t cursor = 0;
+    for (const int raw_count : counts) {
+        if (raw_count < 3) {
+            cursor += static_cast<size_t>(raw_count < 0 ? 0 : raw_count);
+            continue;
+        }
+        const size_t count = static_cast<size_t>(raw_count);
+        if (cursor + count > indices.size()) {
+            break;  // malformed: not enough indices for this face.
+        }
+        for (size_t v = 1; v + 1 < count; ++v) {
+            out.push_back(static_cast<uint32_t>(indices[cursor]));
+            out.push_back(static_cast<uint32_t>(indices[cursor + v]));
+            out.push_back(static_cast<uint32_t>(indices[cursor + v + 1]));
+        }
+        cursor += count;
+    }
+    return out;
 }
 
 bool IsJointPrim(const UsdPrim& prim) {
@@ -469,9 +820,24 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         if (!ShapeTypeFromUsdPrim(prim, shape_type)) {
             continue;
         }
-        const scene::BodyId body_id = FindNearestBodyAncestor(prim.parent_path, body_map);
+        scene::BodyId body_id = FindNearestBodyAncestor(prim.parent_path, body_map);
         if (body_id == scene::kInvalidBody) {
-            continue;
+            // A geometry-bearing Mesh with no rigid-body ancestor (cup-like USD
+            // with no physics APIs; #32) gets an implicit static body so the
+            // shape has a target. Other shapes without a body are skipped as
+            // before. Static is fine -- a later demo step adds a freejoint to
+            // make the cup dynamic.
+            if (!MeshHasGeometry(prim)) {
+                continue;
+            }
+            scene::RigidBodyRecord implicit_body;
+            implicit_body.name = prim.name + "_body";
+            implicit_body.parent_id = scene::kInvalidBody;
+            implicit_body.local_transform =
+                math::Transform{prim.translate, math::Quat::Identity()};
+            implicit_body.is_static = true;
+            body_id = scene.AddRigidBody(std::move(implicit_body));
+            body_map[prim.path] = body_id;
         }
         scene::CollisionShapeRecord shape;
         shape.name = prim.name;
@@ -493,6 +859,11 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
                 shape.decompose_max_pieces =
                     static_cast<uint32_t>(prim.decompose_max_pieces);
             }
+            // Mesh geometry (#32): points -> flat vertices (file order, no
+            // dedup); faceVertexIndices + faceVertexCounts -> fan triangulation.
+            shape.mesh_vertices = prim.mesh_points;
+            shape.mesh_indices =
+                FanTriangulate(prim.face_vertex_indices, prim.face_vertex_counts);
         }
         scene.AddCollisionShape(std::move(shape));
     }
@@ -571,9 +942,22 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
 
 scene::SceneIR LoadUsd(const std::string& path) {
     const UsdStageData stage = LoadUsdStageData(path);
-    auto scene = BuildSceneFromUsdPrims(ParseUsdaText(stage.text));
-    if (scene.RigidBodyCount() == 0u) {
-        throw std::runtime_error("USD: no enabled UsdPhysics rigid bodies found in " + path);
+    const std::string base_dir = std::filesystem::path(path).parent_path().string();
+    auto scene = BuildSceneFromUsdPrims(ParseUsdaFileWithReferences(base_dir, stage.text));
+
+    // A valid USD scene must yield either rigid bodies (physics scenes) OR at
+    // least one mesh shape (cup-like geometry-only assets; #32). It is an error
+    // only when it yields NEITHER.
+    bool has_mesh_geometry = false;
+    for (const auto& shape : scene.Shapes()) {
+        if (!shape.mesh_vertices.empty()) {
+            has_mesh_geometry = true;
+            break;
+        }
+    }
+    if (scene.RigidBodyCount() == 0u && !has_mesh_geometry) {
+        throw std::runtime_error(
+            "USD: no enabled UsdPhysics rigid bodies and no mesh geometry found in " + path);
     }
     return scene;
 }
