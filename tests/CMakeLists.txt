@@ -742,6 +742,31 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_xpbd_cooker_test)
 
+    # --- v0.7 p10-B: PBF fluid COOKER (programmatic FluidBoxSpec -> particles) --
+    # PURE host/CPU: cooks a box volume + asserts the hand-computed lattice count,
+    # the uniform mass = rest_density*spacing^3, cell-centered placement, two-cook
+    # byte-identical determinism, degenerate-spec empties, and the optional
+    # inscribed-sphere carve. Links nuka_runtime_gpu because the fluid cooker +
+    # PbfParticleSet live there (the lib is CUDA-language, hence inside the
+    # CMAKE_CUDA_COMPILER guard) -- but the test itself runs no device code.
+    add_executable(nuka_fluid_cooker_test
+        import/test_fluid_cooker.cpp
+    )
+
+    target_include_directories(nuka_fluid_cooker_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_fluid_cooker_test
+        PRIVATE
+            nuka_runtime_gpu
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_fluid_cooker_test)
+
     # --- v0.7 p10-A: PBF fluid core (density iteration + volume + D1) -------
     # Analytic/physical invariants for the forward density-projection fluid
     # (Macklin & Mueller 2013): rest-density block, over-compressed relaxation,
@@ -749,9 +774,17 @@ if(CMAKE_CUDA_COMPILER)
     # two-run byte-exact. NOT a Flex golden (Flex oracle deferred to p15). rho0 is
     # calibrated numerically from the engine's own Poly6 kernel. Links
     # nuka_runtime_gpu (PbfWorld lives there; reuses the p05 particle grid).
+    # p10-B adds the polish-layer gates: XSPH viscosity (variance reduction +
+    # off-gate skip + D1), surface-tension cohesion (blob contraction + off-gate +
+    # D1 + stability), and the PBF V2 particle-count invariant (count conserved
+    # with viscosity + cohesion ON; the central V2 sampler is rigid-only, so this
+    # is the focused fluid count-conservation test -- see the file header).
     add_executable(nuka_pbf_test
         runtime/test_pbf_density_iteration.cpp
         runtime/test_pbf_volume_conservation.cpp
+        runtime/test_pbf_viscosity.cpp
+        runtime/test_pbf_surface_tension.cpp
+        runtime/test_pbf_v2_invariant.cpp
     )
 
     target_link_libraries(nuka_pbf_test

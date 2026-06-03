@@ -473,6 +473,13 @@ if(CMAKE_CUDA_COMPILER)
         # library (not nuka_cooker) because it calls the builders here; nuka_cooker
         # is deliberately CUDA-free, so routing the other way would pull CUDA in.
         import/cooker/xpbd_cooker.cpp
+        # v0.7 p10-B: the PBF fluid COOKER (programmatic FluidBoxSpec ->
+        # runtime::fluid::PbfParticleSet). THIN cook-time CPU: samples a
+        # cell-centered uniform lattice filling an AABB (optional inscribed-sphere
+        # carve) + the uniform mass = rest_density*spacing^3. Lives in this library
+        # (not nuka_cooker) because it includes pbf_world.hpp (a CUDA-language
+        # header in this lib); nuka_cooker is deliberately CUDA-free.
+        import/cooker/fluid_cooker.cpp
         # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
