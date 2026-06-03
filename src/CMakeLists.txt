@@ -594,6 +594,32 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # v0.7 p14b: the RGB+depth+normal+uv CAMERA SENSOR over the LIVE batched sim
+    # state (sensor/camera_render.cu). Instances each body's cooked SDF at its live
+    # pose and reuses nuka_rt_gpu's __host__ __device__ SDF sphere-trace + stackless
+    # traversal. Built --fmad=false to pair bit-for-bit with the reused fp64 leaf.
+    # Raw-pointer entry (world-agnostic, mirrors nuka::sensor::ComputeContactWrench)
+    # so it renders any BatchedDeviceWorld+SdfDeviceWorld's DevicePoses()/DeviceViews().
+    add_library(nuka_camera_sensor_gpu STATIC
+        sensor/camera_render.cu
+    )
+    set_target_properties(nuka_camera_sensor_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(nuka_camera_sensor_gpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+    )
+    target_include_directories(nuka_camera_sensor_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_camera_sensor_gpu
+        PUBLIC
+            nuka_rt_gpu
+            nuka_collision
+            nuka_collision_gpu
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka_row_solver_gpu STATIC
         solver/gpu/row_scheduler.cu
         solver/gpu/row_solver.cu
