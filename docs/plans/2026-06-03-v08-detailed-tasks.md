@@ -180,12 +180,12 @@ Bakes MuJoCo-parity collision filtering + contact compliance params into the IR 
 
 ### C1b — MJCF importer parse (contype/conaffinity/solref/solimp/condim/priority + `<exclude>`/`<pair>`)
 - **Objective.** Parse the MuJoCo collision/contact attributes the importer currently drops (`mjcf_importer.cpp:362` parses geom type/pos/quat/size/material/mesh ONLY — verified no contype).
-- **Technical approach.** In the geom loop (`mjcf_importer.cpp:362-415`) read `contype`, `conaffinity`, `condim`, `group`, `priority`, `solref` (2 floats), `solimp` (5 floats), `friction` (take [0] as isotropic μ), `solmix`, `margin`, `gap`, `solreffriction`. Parse `<contact><exclude body1= body2=>` → `SceneIR::AddExcludePair`; parse `<contact><pair geom1= geom2= …>` → an explicit-pair override list. Apply MuJoCo defaults from `<default>` class inheritance (already handled for geom? verify; if not, fold into this task). Wire to C1a fields.
+- **Technical approach.** In the geom loop (`mjcf_importer.cpp:362-415`) read `contype`, `conaffinity`, `condim`, `group`, `priority`, `solref` (2 floats), `solimp` (5 floats), `friction` (take [0] as isotropic μ), `solmix`, `margin`, `gap`, `solreffriction`. Parse `<contact><exclude body1= body2=>` → `SceneIR::AddExcludePair`; parse `<contact><pair geom1= geom2= …>` → an explicit-pair override list. Apply MuJoCo defaults from `<default><geom contype=… conaffinity=… solref=… solimp=… friction=…>` class inheritance. **This is NEW work folded into C1b (not a verify-and-maybe):** VERIFIED the importer has only `ApplyJointDefault` + `ApplyGeneralDefault` (`mjcf_importer.cpp:161,178`) — there is NO `ApplyGeomDefault`, so geom `<default>`-class inheritance does not exist and must be added here. Wire to C1a fields.
 - **Inputs/Outputs/Interface.** In: MJCF XML. Out: SceneIR with metadata. Interface: feeds C1a cook.
 - **Dependencies.** C1a (fields must exist).
 - **D1 strategy.** Deterministic XML walk (tinyxml2, fixed sibling order); host-only.
 - **Validation/test gates.** `tests/import/test_mjcf_contact_filtering.cpp` — parse an MJCF with contype masks + `<exclude>` + a `<pair>` override; assert parsed values. Use an h1_with_hand snippet (memory: fingers are contype=0 visual-only) to confirm contype=0 is read.
-- **Effort.** M.
+- **Effort.** M (realistic-to-tight: the new geom `<default>`-class inheritance — no existing `ApplyGeomDefault` — is the part that pushes M toward its upper bound).
 - **Risks.** `<default>`-class inheritance of contype/solref is easy to miss → wrong masks. MuJoCo friction is a vector (condim−1 entries); v0.8 takes only the tangential μ — document the drop.
 
 ### C1c — Filtered system-pair matrix at cook time (the MuJoCo precedence)
@@ -201,6 +201,8 @@ Bakes MuJoCo-parity collision filtering + contact compliance params into the IR 
 ## C2 — Unified broadphase dispatcher (cross-system candidate-pair MATRIX)
 
 Generalize the per-system structures (LBVH rigid `broadphase_lbvh.hpp` + uniform grid particles `particle_uniform_grid.hpp` + `cross_system_query.hpp`) into a cross-system query MATRIX producing ONE filtered, D1-sorted candidate-pair stream. Topology Q9-B (`v08-unified-collision-contact.md:22`): per-system optimal structures, unify the OUTPUT stream not the geometry. Mirrors MJ's pluggable broadphase + staged filter (`collision_driver.py:286`).
+
+> **D1-gate note (applies to every per-task `N≥32 cross-replica` + two-run byte-exact gate below).** These gates REUSE existing test idioms — `tests/runtime/test_batched_articulation_replication.cpp` (`NReplicasStepBitIdenticalToSingleEnv`) for the N≥32 cross-replica check and the `D1TwoRunByteExact` pattern already used across `tests/collision/` + `tests/runtime/` (e.g. `test_cross_system_query.cpp`, `test_lbvh_vs_sap_pair_set.cpp`). No separate harness-building task is needed; each task instantiates these idioms on its own buffers.
 
 ### C2a — Unified candidate-pair stream type + collidable-type registry
 - **Objective.** Define the registry (0.4) and the unified candidate-pair output type that every cross-query path writes into.
@@ -391,6 +393,7 @@ Migrate XPBD soft/cloth (p09) and PBF fluid (p10) to CONSUME unified manifolds v
 - **Validation/test gates.** Regression (architecture §0 / roadmap §3): **no-interpenetration** (assert min separation ≥ −slop), **hold** (cup does not slip out over N steps), **D1** (2-run bit-identity of the trajectory), **V2 energy** (no spurious energy injection). RT video rendered on the G1 tracer for the homepage.
 - **Effort.** L.
 - **Risks.** Fingertip collision enablement (the honesty finding) + grasp stability (multi-point manifold + friction pyramid + two-way reaction all must work together). This is the integration capstone; failures here diagnose C3–C5.
+- **OPEN-J (owner): C7 cup format.** C7 (v0.8) is v0.8-standalone ONLY if the grasp cup ships as a `.usda` ASCII asset (works today via p16 #32, `src/import/usd_importer.cpp`) OR a primitive cylinder. If the real **usdc-binary** newton-assets cup is mandatory, C7 instead depends on **U4a (the v0.9 usdc reader)** — a version inversion (v0.8 reaching into v0.9). RECOMMENDATION: author the C7 cup as usda/primitive to keep the v0.8 grasp gate standalone; pull U4a into v0.8 only if the real usdc asset is required. Flagged for owner. See Appendix D OPEN-J.
 
 ## R1 — Inverse Kinematics (Featherstone-Jacobian DLS / Levenberg-Marquardt)
 
@@ -510,7 +513,7 @@ C1a ─▶ C1b ─▶ C1c ────────────┐  (metadata + i
         C5a ─▶ C5b ─▶ C5c     (unified solve + two-way + foot-ground re-baseline)
                        │
                        ▼
-        C6a ─▶ C6b            (PBD co-step + coupling-row framework / id13)
+        C6b ─▶ C6a            (coupling-row framework / id13 + PBD co-step)
                        │
                        ▼
         C7a                   (H1 grasp-place validation)  ◀── R1a (optional reach)
@@ -525,7 +528,7 @@ INDEPENDENT TRACKS (parallel branches, no C-spine dependency):
 ```
 
 **Recommended serial commit order (single-branch):**
-`C1a, C1b, C1c, C2a, C2b, C2c, C3a, C3b, C3c, C3d, C4a, C4b, C4c, C5a, C5b, C5c, C6a, C6b, C7a` — then the independent tracks `R1a, G2a, G2b, G3a, G4a, U1a, U1b, U1c` (these may be reordered or parallelized; G2/U1 can begin immediately since they only need the shipped G1/Vulkan seams). 27 commit-tasks total.
+`C1a, C1b, C1c, C2a, C2b, C2c, C3a, C3b, C3c, C3d, C4a, C4b, C4c, C5a, C5b, C5c, C6b, C6a, C7a` — then the independent tracks `R1a, G2a, G2b, G3a, G4a, U1a, U1b, U1c` (these may be reordered or parallelized; G2/U1 can begin immediately since they only need the shipped G1/Vulkan seams). 27 commit-tasks total.
 
 **Critical path:** C1c → C2 → C3 → C4 → C5 → C6 → C7 is the spine; everything in C7's grasp depends on the full chain. R1/G2/G3/G4/U1 do not block the grasp gate (R1 only assists reach; the video uses G1, G2 is an upgrade).
 
@@ -554,7 +557,7 @@ Current goldens (`tests/oracle/golden/`):
 These are DECOMPOSITION/IMPLEMENTATION forks, NOT re-litigation of Q1–Q11.
 
 - **OPEN-A (0.1):** `ContactManifold` — mechanical rename `body_a/body_b` → `a.handle/b.handle` (recommend) vs a `body_a()` accessor shim. 4 call sites.
-- **OPEN-B (0.2):** contact regularizer `R=1/D` — reuse `Row.compliance_alpha` (recommend, no Row growth) vs add an explicit `float regularizer_R` field (Row 16→17, codegen regen).
+- **OPEN-B (0.2) — RESOLVED: reuse is safe.** Contact regularizer `R=1/D` reuses `Row.compliance_alpha` (no Row growth). VERIFIED no aliasing: `src/solver/gpu/row_solver.cu` NEVER reads `compliance_alpha` (it is a separate kernel from `xpbd_world.cu`, which is the only consumer), so the rigid-contact branch can repurpose the field with zero collision against the XPBD path. The `float regularizer_R` field alternative (Row 16→17, codegen regen) stays a fallback only if a future test surfaces a concrete aliasing bug.
 - **OPEN-C (0.3):** row-class ids — reserve id11/12 for v0.9 Cosserat now (so coupling = id13, `kRowClassCount=14`, recommend) vs leave registry at 11, coupling=id11, force v0.9 renumber.
 - **OPEN-D (0.4):** collidable registry — codegen-time enum + runtime fn-pointer table (recommend, matches the YAML→registry path) vs a pure-runtime registry object.
 - **OPEN-E (C6b):** does v0.8 ship a CONCRETE coupling row class (id13 + the K2 proving pair, recommend) or ONLY the interface (framework + co-step bridge, no shipped pair)? Architecture §5/roadmap §3 say "framework as foundation, specific pairs → v0.9" — K2 as the one proving pair is the minimal concrete validation.
@@ -562,3 +565,4 @@ These are DECOMPOSITION/IMPLEMENTATION forks, NOT re-litigation of Q1–Q11.
 - **OPEN-G (G3a):** semantic class-id SOURCE — where do semantic class ids come from in MJCF/USD import? (a new `<geom nuka:semantic="...">` attr? reuse material id? a cooker heuristic?) Needs an authoring decision.
 - **OPEN-H (U1a):** windowing library (GLFW) — acceptable under the "no closed SDK" pillar (it is a windowing lib, not a solver/render SDK)? And does the build/CI env have a display (headless gate needed)?
 - **OPEN-I (C3d):** SDF tier gives a SINGLE witness point (resting stability weaker than analytical 4-point). For the grasp, is single-point fingertip SDF contact + analytical multi-point elsewhere sufficient, or does C3d need perturbed-restart multi-point now (vs v0.9)?
+- **OPEN-J (owner, C7a):** C7 cup format. v0.8-standalone ONLY if the grasp cup is `.usda` ASCII (works today via p16 #32, `usd_importer.cpp`) OR a primitive cylinder; if the real **usdc-binary** newton-assets cup is mandatory, C7 depends on **U4a (v0.9 usdc reader)** — a version inversion. RECOMMEND: author the C7 cup as usda/primitive to keep the v0.8 grasp gate standalone; pull U4a into v0.8 only if the real usdc asset is required.
