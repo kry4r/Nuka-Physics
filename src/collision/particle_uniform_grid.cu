@@ -6,7 +6,8 @@
 //   2. stable_sort_by_key    -- (D1) radix sort particles by cell key
 //   3. build_cell_ranges     -- per-cell [start,end) from the sorted keys
 //   4. count_neighbors       -- pass 1: per-particle in-radius neighbor count
-//                               (capped at kParticleGridMaxNeighbors)
+//                               (capped at kParticleGridMaxNeighbors == 32; bumped
+//                               from 16 for p10 PBF density estimation)
 //   5. exclusive scan        -- (D1) prefix-sum counts -> CSR offsets
 //   6. fill_neighbors        -- pass 2: write each particle's neighbors into its
 //                               PRIVATE CSR slice, already sorted ascending

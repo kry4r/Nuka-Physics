@@ -14,10 +14,13 @@
 // so the final neighbor lists are byte-identical across runs regardless of warp
 // scheduling.
 //
-// 16-candidate cap (memory R-C, spec 7.5.5): each particle keeps at most
-// kMaxNeighbors candidates (the 16 LOWEST neighbor indices -- a deterministic
-// subset). If a particle has more in-radius neighbors, the surplus is counted in
-// TruncatedParticleCount() (surfaced, never silently dropped).
+// 32-candidate cap (memory R-C, spec 7.5.5; bumped from 16 for p10 PBF): each
+// particle keeps at most kMaxNeighbors candidates (the 32 LOWEST neighbor indices
+// -- a deterministic subset). If a particle has more in-radius neighbors, the
+// surplus is counted in TruncatedParticleCount() (surfaced, never silently
+// dropped). PBF density estimation needs >=~25 neighbors for a stable SPH sum, so
+// the cap was raised 16 -> 32; the deterministic "keep the lowest-index
+// neighbors" truncation algorithm is UNCHANGED (D1-preserving), only the cap grew.
 //
 // HOST header: included from g++ TUs (tests). Config uses math::Vec3 + a
 // uint32_t[3]; the kernels convert to float3/uint3 internally. No CUDA types.
@@ -32,10 +35,10 @@
 
 namespace nuka::collision::gpu {
 
-// Per-particle neighbor cap (16, spec 7.5.5 memory R-C). A particle with more
-// in-radius neighbors keeps its 16 lowest-index neighbors and increments the
-// truncation counter.
-inline constexpr uint32_t kParticleGridMaxNeighbors = 16u;
+// Per-particle neighbor cap (32, spec 7.5.5 memory R-C; bumped from 16 for p10
+// PBF density estimation). A particle with more in-radius neighbors keeps its 32
+// lowest-index neighbors and increments the truncation counter.
+inline constexpr uint32_t kParticleGridMaxNeighbors = 32u;
 
 // Uniform-grid configuration. `cell_size` is typically 2 x particle radius (so
 // the query radius fits within one cell ring -> a 27-cell search suffices).

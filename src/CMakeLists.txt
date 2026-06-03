@@ -477,6 +477,14 @@ if(CMAKE_CUDA_COMPILER)
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
         runtime/sdf/sdf_device_world.cu
+        # v0.7 p10-A: Position-Based Fluids (Macklin & Mueller 2013) -- the CORE
+        # forward density-projection fluid. GPU predict/density-iterate/finalize;
+        # FORWARD-ONLY + INTERNAL (no row class, no codegen, no adjoint). Reuses
+        # the p05 particle uniform grid (nuka_collision_gpu) for the per-step
+        # neighbor list; cuda_world_stepper.cu's additive rigid+fluid co-step
+        # overload links against it, so it lives in the same library. p10-B layers
+        # XSPH viscosity + surface tension + the fluid cooker on top.
+        runtime/fluid/pbf_world.cu
     )
     set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -490,6 +498,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_solver
             nuka_phi
+            # v0.7 p10-A: the PBF substep reuses the p05 particle uniform grid.
+            nuka_collision_gpu
     )
 
     # --- v0.7 p04: self-written LBVH rigid broadphase (Karras 2012) ----------

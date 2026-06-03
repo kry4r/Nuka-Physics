@@ -123,7 +123,7 @@ __device__ inline uint32_t QueryParticleNeighbors(
                     }
                     // Insert `other` keeping the buffer sorted ascending and
                     // capped at max_count (keep the lowest indices). This is an
-                    // insertion sort into a small (<=16) array -- O(max_count)
+                    // insertion sort into a small (<=32) array -- O(max_count)
                     // per insert, but max_count is tiny so it is cheap and gives
                     // a deterministic, already-sorted output.
                     if (count < max_count) {
