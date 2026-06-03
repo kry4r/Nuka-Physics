@@ -1,0 +1,120 @@
+row_class_id: 10
+row_class_name: ParticleParticleContactRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: dense_adjoint
+default_recompute_mode: checkpoint
+constraint_kind: unilateral
+
+# v0.7 p11 (K3): CROSS-SYSTEM particle-particle CONTACT constraint -- the v0.7
+# infrastructure deliverable for cross-system coupling (master plan SS7
+# lines 319-323/336/350: "a row with a Jacobian spanning two systems; the
+# scheduler does not distinguish"). It couples the two PARTICLE subsystems already
+# built -- XPBD soft bodies (ids 6-9) and PBF fluid -- with a SINGLE class-blind
+# row: two particle pseudo-bodies i,j with an inverse-mass each. The row does NOT
+# care which subsystem each particle belongs to, so it covers:
+#   * soft <-> soft   (incl. self-collision)   -- two XPBD particles,
+#   * soft <-> fluid  (e.g. "towel absorbs water") -- one XPBD + one PBF particle.
+# (K2 particle<->rigid-SDF coupling is a SEPARATE, DEFERRED v1.0 row; this is K3.)
+#
+# Constraint: UNILATERAL non-penetration between two particles i,j separated by a
+# minimum contact distance d_min (= sum of the two contact radii). With
+# n = (p_i - p_j)/|p_i - p_j| (the contact normal, grad_{p_i} C, |grad C| = 1):
+#     C   = |p_i - p_j| - d_min            # signed gap; ACTIVE (corrected) iff C < 0
+# This is ALGEBRAICALLY the XPBDDistanceRow (id 6) constraint with
+# rest_length -> d_min, plus a UNILATERAL clamp (a contact PUSHES apart, never
+# sticks): lower = 0, upper = +huge (vs distance's unbounded equality box). The
+# mass-weighted symmetric XPBD projection (one Gauss-Seidel step, a~ = 0, lambda
+# warm-start 0 in the position-based co-step) reduces to the task's two-way law:
+#     dl       = (-C)/(w_i + w_j)                          # (= effective_mass*(-C))
+#     p_i += w_i*n*dl ;  p_j -= w_j*n*dl
+# i.e. dp_i = +(w_i/(w_i+w_j))*(-C)*n, dp_j = -(w_j/(w_i+w_j))*(-C)*n. This
+# conserves the MASS-WEIGHTED centroid (m_i*dp_i + m_j*dp_j = 0 since m*w = 1) and
+# is consistent with BOTH subsystems (both are position-based). It runs as an
+# ADDITIVE coupling CO-STEP after each subsystem's own internal solve, operating
+# on both worlds' position buffers (the GPU narrow-phase + Jacobi double-buffer
+# projection live in src/runtime/coupling/particle_particle_contact.{hpp,cu};
+# the broadphase reuses the p05 cross-system uniform particle grid). This IR
+# governs the row-class registry entry (id 10) and the per-row reverse-mode
+# adjoint emitted by regen.py.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+
+# Reverse-mode (dense_adjoint) -- the LOCAL projection adjoint of ONE contact
+# constraint application. It is the IDENTICAL multilinear XPBD multiplier-update
+# Jacobian as the distance/bend/volume rows (the XPBD delta-lambda law is
+# constraint-TYPE-agnostic once the reduced scalars are held independent); only
+# the geometric grad C (the normal n, which is DOWNSTREAM of this local adjoint)
+# and the UNILATERAL box differ. With effective_mass = 1/(w_i + w_j + alpha_tilde):
+#     u = lambda + effective_mass * (-C - alpha_tilde * lambda)
+# lambda_new = clamp(u, lower, upper). For the active contact (C<0, penetrating)
+# the row is strictly INSIDE the unilateral box [0, +huge) -- u = effective_mass*
+# (-C) > 0 -- so the clamp sub-gradient indicator (clamp_strategy=box_lower_upper +
+# event_strategy=subgradient) is 1 and the adjoint matches the central-difference
+# Jacobian, exactly as the equality XPBD rows. A SEPARATING pair (C>0) is never
+# emitted as a row (the narrow phase only emits penetrating pairs), so the clamp's
+# lower edge is the active-set boundary the V3 harness samples AWAY from.
+#
+# Holding the reduced scalars (C, lambda, effective_mass, alpha_tilde) independent
+# makes u MULTILINEAR (degree <= 1 in each), so the V3 central-difference Jacobian
+# is exact in real arithmetic (only float32 cancellation remains) -- the property
+# that lets the maximal / distance / volume rows clear the 1e-3 gate. The
+# TOTAL-derivative chain to the geometric inputs (the contact normal n as a
+# function of the two positions, and the per-particle inverse masses w_i/w_j) rides
+# DOWNSTREAM on the position chain (p += w*n*dl), exactly as the distance row defers
+# its geometric chain. Named downstream consumer of this row-level adjoint: the
+# K2/K3 cross-system coupling backward (a v1.0 deliverable; v0.7 ships this row as
+# INFRASTRUCTURE only -- no working-coupling backward is wired in p11).
+#
+# Differentiable inputs:
+#   C              -- signed gap |p_i-p_j| - d_min (the constraint; ACTIVE C<0)
+#   lambda         -- the warm-started / iterate Lagrange multiplier
+#   effective_mass -- 1/(w_i + w_j + alpha_tilde) (the row's effective inverse mass)
+#   alpha_tilde    -- XPBD compliance alpha~ = compliance_alpha / dt^2
+adjoint_evaluator:
+  clamp_strategy: box_lower_upper
+  event_strategy: subgradient
+  grad_input_fields:
+    - C
+    - lambda
+    - effective_mass
+    - alpha_tilde
+  grad_output_fields:
+    - lambda_new
+  # u = lambda + effective_mass*(-C - alpha_tilde*lambda); the emitted primal is
+  # clamp(u, lower, upper) (lower=0, upper=+huge for this UNILATERAL contact row;
+  # an active penetrating contact is strictly in-band).
+  unclamped_expression: >-
+    lambda + effective_mass * (-C - alpha_tilde * lambda)
+  # du/dx_i (clamp-agnostic; the emitter multiplies each by the in-band indicator,
+  # which is 1 strictly inside the unilateral box and 0 at the active-set edge):
+  derivative_rules:
+    C: "-effective_mass"
+    lambda: "1.0f - effective_mass * alpha_tilde"
+    effective_mass: "(-C - alpha_tilde * lambda)"
+    alpha_tilde: "-effective_mass * lambda"

@@ -116,6 +116,13 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     # (regen alone leaves the adjoint .cu orphaned -- the p09-A lesson).
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cu"
+    # v0.7 p11 (K3): cross-system particle-particle CONTACT row (id 10). Ships a
+    # GENUINE dispatchable per-row adjoint (the multilinear XPBD multiplier law, as
+    # the distance row), so BOTH the forward and adjoint __global__ symbols must
+    # compile into nuka_codegen_generated (regen alone leaves the adjoint .cu
+    # orphaned -- the p09-A lesson). Mirror the _forward.cu + _adjoint.cu pairing.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS
@@ -130,6 +137,8 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cuh"
     # v0.7 p09-C: XPBD shape-match (id 9) adjoint header.
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cuh"
+    # v0.7 p11 (K3): particle-particle contact (id 10) adjoint header.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cuh"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}

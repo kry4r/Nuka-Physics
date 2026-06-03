@@ -54,6 +54,15 @@ ALLOWED_ROW_CLASSES = {
     # local adjoint). The polar-decomposition dR/dA is downstream geometry,
     # host-FD validated in the cluster sim test (analog of grad C for volume).
     "XPBDShapeMatchRow",
+    # v0.7 p11 (K3): CROSS-SYSTEM particle-particle CONTACT (id 10) -- the v0.7
+    # infrastructure deliverable for cross-system coupling. A SINGLE class-blind
+    # unilateral non-penetration row (two particle pseudo-bodies + an inverse-mass
+    # each) couples the XPBD soft (ids 6-9) and PBF fluid subsystems (soft<->soft,
+    # incl. self-collision, and soft<->fluid). Ships a GENUINE dispatchable per-row
+    # adjoint (dense_adjoint) -- the SAME multilinear XPBD multiplier-update Jacobian
+    # as the distance/volume rows (only the geometric grad C, the contact normal,
+    # which is downstream of this local adjoint, differs; plus the unilateral box).
+    "ParticleParticleContactRow",
 }
 
 # Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).

@@ -400,6 +400,10 @@ if(CMAKE_CUDA_COMPILER)
         codegen/v3_validation/xpbd_volume_fd.cu
         # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validator.
         codegen/v3_validation/xpbd_shape_match_fd.cu
+        # v0.7 p11 (K3): particle-particle contact (id 10) adjoint FD validator --
+        # the SAME multilinear XPBD multiplier law as the distance row (only the
+        # unilateral box / active-contact sampling differs).
+        codegen/v3_validation/particle_particle_contact_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -492,6 +496,13 @@ if(CMAKE_CUDA_COMPILER)
         # overload links against it, so it lives in the same library. p10-B layers
         # XSPH viscosity + surface tension + the fluid cooker on top.
         runtime/fluid/pbf_world.cu
+        # v0.7 p11 (K3): the cross-system particle-particle CONTACT co-step -- the
+        # v0.7 infrastructure deliverable for cross-system coupling. Concatenates
+        # the XPBD soft + PBF fluid particles into a union, builds the p05 cross-
+        # system uniform grid (nuka_collision_gpu) over it, and applies the
+        # mass-weighted symmetric non-penetration projection as a D1 Jacobi double-
+        # buffer (NO float atomicAdd). Links both worlds, so it lives in this lib.
+        runtime/coupling/particle_particle_contact.cu
     )
     set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

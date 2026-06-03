@@ -658,6 +658,9 @@ if(CMAKE_CUDA_COMPILER)
         codegen/test_adjoint_fd_xpbd_volume.cpp
         # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validation.
         codegen/test_adjoint_fd_xpbd_shape_match.cpp
+        # v0.7 p11 (K3): particle-particle contact (id 10) contact-multiplier
+        # adjoint FD validation (active penetrating contacts, unilateral box).
+        codegen/test_adjoint_fd_particle_particle_contact.cpp
     )
 
     add_dependencies(nuka_adjoint_fd_test nuka_codegen)
@@ -704,6 +707,10 @@ if(CMAKE_CUDA_COMPILER)
         runtime/test_xpbd_volume_tet.cpp
         # v0.7 p09-C: XPBD shape-match (cluster) sim + polar dR/dA host-FD.
         runtime/test_xpbd_shape_match.cpp
+        # v0.7 p11 (K3): cross-system particle-particle contact co-step oracles
+        # (separation, mass-weighted momentum, soft<->fluid, segment-reduction, D1,
+        # inert byte-identity).
+        runtime/test_particle_particle_contact.cpp
     )
 
     target_link_libraries(nuka_cuda_runtime_test

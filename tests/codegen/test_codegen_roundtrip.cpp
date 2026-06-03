@@ -48,7 +48,7 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
 
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
-    const std::array<const char*, 14> files = {
+    const std::array<const char*, 16> files = {
         "maximal_contact_forward.cu",
         "maximal_joint_forward.cu",
         "maximal_drive_forward.cu",
@@ -63,6 +63,9 @@ TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
         // v0.7 p09-C: shape-match (id 9) forward + adjoint pair.
         "xpbd_shape_match_forward.cu",
         "xpbd_shape_match_adjoint.cuh",
+        // v0.7 p11 (K3): particle-particle contact (id 10) forward + adjoint pair.
+        "particle_particle_contact_forward.cu",
+        "particle_particle_contact_adjoint.cuh",
         "row_dispatch.cu",
         "row_class_registry.hpp",
     };
@@ -89,14 +92,16 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::kRigidSDFContactRowId;
     using nuka::solver::generated::kRowClassCount;
     using nuka::solver::generated::kXPBDBendRowId;
+    using nuka::solver::generated::kParticleParticleContactRowId;
     using nuka::solver::generated::kXPBDDistanceRowId;
     using nuka::solver::generated::kXPBDShapeMatchRowId;
     using nuka::solver::generated::kXPBDVolumeRowId;
 
     // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A added the
     // XPBD soft-body distance row (id 6); p09-B added the XPBD bend (id 7) +
-    // volume (id 8) rows; p09-C adds the XPBD shape-match (id 9) row -> 10 total.
-    EXPECT_EQ(kRowClassCount, 10u);
+    // volume (id 8) rows; p09-C added the XPBD shape-match (id 9) row; p11 adds the
+    // cross-system particle-particle contact row (id 10) -> 11 total.
+    EXPECT_EQ(kRowClassCount, 11u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
@@ -178,6 +183,23 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     EXPECT_STREQ(RowClassName(kXPBDShapeMatchRowId), "XPBDShapeMatchRow");
     EXPECT_TRUE(RowClassHasAdjoint(kXPBDShapeMatchRowId));
     EXPECT_EQ(RowClassGradientMode(kXPBDShapeMatchRowId),
+              static_cast<uint8_t>(GradientMode::dense_adjoint));
+
+    // v0.7 p11 (K3): the cross-system particle-particle CONTACT row (id 10) -- the
+    // v0.7 infrastructure deliverable for cross-system coupling. It ships a GENUINE
+    // dispatchable per-row adjoint -- the SAME multilinear XPBD multiplier law as
+    // the distance/volume rows (dense_adjoint), NOT the forward-only posture of the
+    // id4/id5 SDF rows. This block is the contract tripwire: RowClassHasAdjoint(10)
+    // MUST stay true and the gradient mode MUST stay dense_adjoint. If the adjoint
+    // is ever removed/changed, this fails consciously rather than silently
+    // degrading to a stop-gradient.
+    EXPECT_TRUE(IsKnownRowClass(kParticleParticleContactRowId));
+    EXPECT_EQ(kParticleParticleContactRowId, 10u);
+    EXPECT_STREQ(RowClassName(kParticleParticleContactRowId),
+                 "ParticleParticleContactRow");
+    EXPECT_EQ(RowClassMaxRowsPerBlock(kParticleParticleContactRowId), 6u);
+    EXPECT_TRUE(RowClassHasAdjoint(kParticleParticleContactRowId));
+    EXPECT_EQ(RowClassGradientMode(kParticleParticleContactRowId),
               static_cast<uint8_t>(GradientMode::dense_adjoint));
 
     EXPECT_FALSE(IsKnownRowClass(99u));
