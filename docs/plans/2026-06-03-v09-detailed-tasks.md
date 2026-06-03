@@ -518,12 +518,12 @@ Import real complex USD scenes for demos (the p16 requirement; `post-v07-roadmap
 - **Dependencies.** importer/cooker + scene_compose (exist); #19 mesh loader (landed).
 - **D1 strategy.** Deterministic parse (fixed traversal order); host-only cook. Cook-twice memcmp.
 - **Validation/test gates.** `tests/import/test_usdc_reader.cpp` — a usdc file with references parses to the expected SceneIR; mesh points/indices correct; cook-twice byte-equal.
-- **Effort.** **M–L** (usdc binary format + composition is involved).
+- **Effort.** **M–L** (usdc binary format + composition is involved) — realistically the **HIGH end of M–L**, and **R-adjacent** if USD composition arcs (references / payloads / sublayers) must actually be followed rather than the shallowest single-file case.
 - **Risks.** usdc is a complex binary format (crate, versioned); scope to the subset the target demo assets use (newton-assets kitchen/cup, memory `newton-assets-resource`); document unsupported features. Composition arcs (variants/inherits) may be deep — scope to references/payloads first.
 
 ### U4b — Real-asset demo scene assembly (kitchen + cup coexistence)
 - **Objective.** Assemble a real complex demo scene (USD cup on MJCF kitchen counter — the owner must-do, memory `v07-usd-mjcf-coexistence`) cooked + sim-ready.
-- **Technical approach.** Load the newton-assets kitchen (MJCF+OBJ) + cup (USD mesh) via U4a + the existing MJCF importer; `scene_compose` (exists) merges them at a placement; cook; verify physics-ready (collision geometry retained per memory `v07-integration-debt-discipline` mesh-retention orphan). The H1 grasp (v0.8 C7) uses this scene.
+- **Technical approach.** Load the newton-assets kitchen (MJCF+OBJ) + cup (USD mesh) via U4a + the existing MJCF importer; `scene_compose` (exists) merges them at a placement; cook; verify physics-ready (collision geometry retained per memory `v07-integration-debt-discipline` mesh-retention orphan). The H1 grasp (v0.8 C7) uses this scene. **Cross-ref v0.8 OPEN-J (C7 cup format):** the C7↔U4a version-inversion (a v0.8 gate reaching into the v0.9 usdc reader) is resolved by pinning the C7 cup to usda/primitive for the standalone v0.8 grasp — this U4b real-usdc kitchen+cup scene is the v0.9 upgrade that supersedes that placeholder, not a v0.8 dependency.
 - **Registers into:** scene_compose + cooker (consumes U4a output).
 - **Inputs/Outputs/Interface.** In: kitchen + cup assets. Out: a cooked composed scene. Interface: the grasp + photoreal demos.
 - **Dependencies.** U4a, scene_compose (exists), v0.8 C1 (cook), v0.8 C7 (grasp consumer).
