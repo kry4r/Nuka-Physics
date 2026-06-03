@@ -29,6 +29,7 @@ enum class RowClassId : uint32_t {
     XPBDBendRow = 7u,
     XPBDVolumeRow = 8u,
     XPBDShapeMatchRow = 9u,
+    ParticleParticleContactRow = 10u,
 };
 
 // Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
@@ -58,7 +59,7 @@ struct Row {
     uint8_t contact_softness = 0u;
 };
 
-inline constexpr uint32_t kRowClassCount = 10u;
+inline constexpr uint32_t kRowClassCount = 11u;
 inline constexpr uint32_t kMaximalContactRowId = 0u;
 inline constexpr uint32_t kMaximalContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kMaximalContactRowGradientMode = 1u;
@@ -99,6 +100,10 @@ inline constexpr uint32_t kXPBDShapeMatchRowId = 9u;
 inline constexpr uint32_t kXPBDShapeMatchRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kXPBDShapeMatchRowGradientMode = 0u;
 inline constexpr uint16_t kXPBDShapeMatchRowAdjointKernelId = 8u;
+inline constexpr uint32_t kParticleParticleContactRowId = 10u;
+inline constexpr uint32_t kParticleParticleContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kParticleParticleContactRowGradientMode = 0u;
+inline constexpr uint16_t kParticleParticleContactRowAdjointKernelId = 9u;
 
 const char* RowClassName(uint32_t row_class_id) noexcept;
 const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept;

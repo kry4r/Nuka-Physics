@@ -32,6 +32,8 @@ const char* RowClassName(uint32_t row_class_id) noexcept {
         return "XPBDVolumeRow";
     case 9u:
         return "XPBDShapeMatchRow";
+    case 10u:
+        return "ParticleParticleContactRow";
     default:
         return "Unknown";
     }
@@ -59,6 +61,8 @@ const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
         return "xpbd_volume_forward_kernel";
     case 9u:
         return "xpbd_shape_match_forward_kernel";
+    case 10u:
+        return "particle_particle_contact_forward_kernel";
     default:
         return nullptr;
     }
@@ -85,6 +89,8 @@ uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
     case 8u:
         return 6u;
     case 9u:
+        return 6u;
+    case 10u:
         return 6u;
     default:
         return 0u;
@@ -117,6 +123,8 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
         return 0u;
     case 9u:
         return 0u;
+    case 10u:
+        return 0u;
     default:
         return 0u;
     }
@@ -144,6 +152,8 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
         return 7u;
     case 9u:
         return 8u;
+    case 10u:
+        return 9u;
     default:
         return 0u;
     }
@@ -167,6 +177,8 @@ const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
         return "xpbd_volume_adjoint_kernel";
     case 9u:
         return "xpbd_shape_match_adjoint_kernel";
+    case 10u:
+        return "particle_particle_contact_adjoint_kernel";
     default:
         return nullptr;
     }
