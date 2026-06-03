@@ -110,8 +110,8 @@ TEST(ParticleGridCorrectness, LatticeMatchesBruteForce) {
 }
 
 // 100 random particles in a 5^3 box; radius 0.8. Sparse enough that no particle
-// exceeds 16 neighbors. Margins are statistically clear (uniform in a continuum;
-// exact-radius hits have measure zero).
+// exceeds kParticleGridMaxNeighbors (32). Margins are statistically clear (uniform
+// in a continuum; exact-radius hits have measure zero).
 TEST(ParticleGridCorrectness, RandomSparseMatchesBruteForce) {
     std::mt19937 rng(0xBEEFu);
     std::uniform_real_distribution<float> d(0.0f, 5.0f);
@@ -126,7 +126,7 @@ TEST(ParticleGridCorrectness, RandomSparseMatchesBruteForce) {
     const auto got = GridNeighborSets(grid);
 
     ASSERT_EQ(grid.TruncatedParticleCount(), 0u)
-        << "scene exceeded the 16-cap; lower density for an exact-match oracle";
+        << "scene exceeded the neighbor cap (32); lower density for an exact-match oracle";
     ASSERT_EQ(oracle.size(), got.size());
     for (size_t i = 0; i < oracle.size(); ++i) {
         EXPECT_EQ(oracle[i], got[i]) << "particle " << i << " neighbor set mismatch";

@@ -75,8 +75,8 @@ TEST(ParticleGridDeterminism, TwoRunByteExactNeighborLists) {
     EXPECT_EQ(i1, i2) << "flat neighbor indices not two-run byte-exact (D1)";
 }
 
-// Dense scene: a tight cluster so many particles exceed 16 neighbors. Verifies
-// the cap is enforced + surfaced and the truncated subset stays deterministic.
+// Dense scene: a tight cluster so many particles exceed the neighbor cap (32).
+// Verifies the cap is enforced + surfaced and the truncated subset stays deterministic.
 TEST(ParticleGridDeterminism, CapTruncationSurfacedAndDeterministic) {
     // 2000 particles in a small box -> high local density.
     const auto pts = RandomCloud(2000u, 0xABCDu, 2.0f);
