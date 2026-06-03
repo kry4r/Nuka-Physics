@@ -76,6 +76,17 @@ scope_definitions:
       # pre-p04 scope did NOT include src/collision/**; add it here.
       - "src/collision/**/*.cu"
       - "src/collision/**/*.cuh"
+      # v0.7 p12: the self-written CUDA ray tracer (src/rt/**) is D1-critical --
+      # its closest-hit depth + prim-id framebuffers must be two-run byte-exact.
+      # The traversal is one-thread-per-pixel with a sequential local
+      # best_t/best_prim register and ZERO atomics (no float atomicMin/atomicAdd
+      # on depth -- the RT analog of the PBF/coupling races this ban catches), so
+      # the no-float-atomic guard MUST cover this path. Added to physics_path
+      # ONLY (NOT hot_path): RenderDepth allocates its output framebuffers like
+      # cross_system_query does -- a per-frame sensor render, not a per-step
+      # physics kernel -- so it must not trip hot_path_cuda_malloc.
+      - "src/rt/**/*.cu"
+      - "src/rt/**/*.cuh"
     exclude:
       - "src/**/reference/**"
       - "tests/**"

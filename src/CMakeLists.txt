@@ -560,6 +560,33 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # --- v0.7 p12: self-written CUDA ray tracer (camera -> LBVH -> closest-hit
+    # depth, box leaves). NO OptiX / NO closed SDK. NAMED CONSUMER that wires the
+    # retained LBVH (BuildLbvhForQuery) into the runtime renderer. Stackless
+    # parent-pointer ray traversal, one thread per pixel, ZERO atomics -> D1
+    # byte-exact. --fmad=false: the leaf slab test (rt/ray_box.cuh) is a shared
+    # __host__ __device__ function whose t must match the CPU oracle bit-for-bit;
+    # forbidding FMA contraction on the device side guarantees host==device
+    # arithmetic (the oracle TU pairs this with -ffp-contract=off).
+    add_library(nuka_rt_gpu STATIC
+        rt/bvh_ray_traversal.cu
+    )
+    set_target_properties(nuka_rt_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(nuka_rt_gpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+    )
+    target_include_directories(nuka_rt_gpu
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_gpu
+        PUBLIC
+            nuka_collision
+            nuka_collision_gpu
+            nuka_phi
+            CUDA::cudart
+    )
+
     add_library(nuka_row_solver_gpu STATIC
         solver/gpu/row_scheduler.cu
         solver/gpu/row_solver.cu

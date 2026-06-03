@@ -866,6 +866,31 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_particle_grid_test)
 
+    # --- v0.7 p12: self-written CUDA ray tracer (camera -> LBVH -> closest-hit
+    # depth, box leaves). Matches a CPU brute-force ray-vs-all-boxes oracle that
+    # REUSES the same __host__ __device__ slab test + closest-hit update + camera
+    # ray-gen as the GPU kernel; D1 two-run byte-exact (memcmp); degenerate-deep
+    # tree (deeper than stack[64]) renders with no overflow. The oracle TU is
+    # built with -ffp-contract=off to pair with the kernel's --fmad=false so the
+    # shared slab arithmetic is host==device bit-for-bit (depth max-err == 0).
+    add_executable(nuka_rt_traversal_test
+        rt/test_bvh_ray_traversal.cpp
+    )
+    set_source_files_properties(rt/test_bvh_ray_traversal.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_traversal_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_traversal_test
+        PRIVATE
+            nuka_rt_gpu
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_traversal_test)
+
     # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
     # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
     # find_sdf_contact_newton (the SAME function the device kernel wraps) on the
