@@ -34,12 +34,20 @@
 // no intra-pass write conflict, NO float atomicAdd. Two runs of Step() with
 // identical inputs produce byte-identical position + velocity buffers.
 //
-// DEFERRED to p10-B (named consumers): XSPH viscosity, surface tension, the fluid
-// COOKER, the V2 particle-count invariant harness, and the s_corr tensile term
-// (a documented hook only -- see pbf_world.cu). The Flex ball-into-water oracle
-// is deferred to p15 (NVIDIA Flex not reproducible here); p10-A ships the analytic
-// invariants instead (rest density, relaxation, stable pool, density-drift volume
-// conservation, D1).
+// p10-B ADDS (this layer): XSPH viscosity (M&M eq.17 velocity smoothing) and a
+// BASIC surface-tension COHESION pass (Akinci et al. 2013 cohesion term; the
+// curvature half is deferred to p13 demo polish), both OPTIONAL post-finalize
+// passes gated on a coefficient > 0 (inert / zero-cost when off -- the launch is
+// SKIPPED, not scaled by 0). The fluid COOKER lives in import/cooker/fluid_cooker.
+// The PBF particle-count invariant is covered by a focused count-conservation test
+// (the central V2 InvariantSampler is rigid/articulation-only; PBF is forward-only
+// and not plumbed into PhysicsWorld -- see tests/runtime/test_pbf_v2_invariant).
+//
+// STILL DEFERRED (named consumers): the s_corr tensile term (a documented hook
+// only -- see pbf_world.cu); the full Akinci curvature surface-tension term (->
+// p13 visual polish); the Flex ball-into-water oracle (-> p15; NVIDIA Flex not
+// reproducible here -- p10-A/B ship analytic invariants instead: rest density,
+// relaxation, stable pool, density-drift volume conservation, D1).
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
@@ -74,6 +82,25 @@ struct PbfParams {
     bool clamp_to_overdensity = true; // only correct C_i > 0 (rho_i > rho0): kills
                                       // spurious free-surface cohesion + improves
                                       // stability (a standard PBF choice).
+
+    // --- p10-B polish passes (appended; DEFAULT 0 => inert) -----------------
+    // Both default to 0 so an existing (p10-A) caller -- which uses member-wise
+    // assignment, not aggregate init -- is byte-identical: a zero coefficient
+    // SKIPS the pass launch entirely (not "scale by 0", which would flip -0.0f
+    // bits and break D1 / the off-gate). See StepPbfWorld.
+    //
+    // XSPH viscosity (M&M 2013 eq.17): a post-finalize velocity smoothing
+    //   v_i += c * sum_j (m_j/rho_j) * (v_j - v_i) * Poly6(|r_ij|, h)
+    // c is a small dimensionless blend (~0.01-0.1). > 0 enables the pass.
+    float xsph_viscosity_c = 0.0f;
+
+    // Surface tension -- BASIC Akinci et al. 2013 COHESION term only (the
+    // curvature/surface-area-minimizing half is DEFERRED to p13 demo polish).
+    // A post-finalize velocity nudge pulling neighbors together via the C(r)
+    // cohesion spline:
+    //   a_i = -gamma * sum_j m_j * C(|r_ij|) * (r_ij/|r_ij|) ; v_i += dt*a_i
+    // gamma >= 0 is the cohesion strength; > 0 enables the pass.
+    float surface_tension_gamma = 0.0f;
 };
 
 // Floor / boundary plane (p10-A keeps a single horizontal floor; full SDF / box

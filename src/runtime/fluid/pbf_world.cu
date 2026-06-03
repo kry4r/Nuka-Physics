@@ -26,6 +26,7 @@
 #include "math/cuda_vec_ops.cuh"
 #include "phi/buffer_transfer.hpp"
 #include "runtime/fluid/pbf_kernels.cuh"
+#include "runtime/fluid/pbf_polish.cuh"
 
 #include <cuda_runtime.h>
 
@@ -240,7 +241,8 @@ __global__ void ApplyCorrectionKernel(uint32_t particle_count,
 // One thread per particle. Rebuild velocity from the corrected predicted position
 // and commit it as the new position.
 //     v_i = (p_pred_i - p_i) / dt ;  p_i = p_pred_i
-// (XSPH viscosity / vorticity confinement are p10-B; finalize is the hook point.)
+// (p10-B XSPH viscosity + surface-tension cohesion run AFTER finalize, gated on
+// their coefficients; vorticity confinement remains a future hook.)
 __global__ void FinalizeKernel(uint32_t particle_count,
                                math::Vec3* __restrict__ positions,
                                const math::Vec3* __restrict__ predicted,
@@ -255,6 +257,128 @@ __global__ void FinalizeKernel(uint32_t particle_count,
     velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
                                (pp.z - p0.z) * inv_dt};
     positions[i] = pp;
+}
+
+// --- XSPH viscosity, pass A: compute dv (p10-B) -----------------------------
+// One thread per particle. M&M 2013 eq.17 velocity smoothing. The blended
+// velocity correction is computed READ-ONLY into a scratch buffer (out_dv); it is
+// NOT applied here. This double-buffer is REQUIRED (same reasoning as the Jacobi
+// correction): a fused `velocities[i] += dv` would have thread k read velocities[i]
+// (i a neighbor of k) while thread i writes it in the SAME launch -- a global
+// read-write race whose result depends on warp scheduling (a D1 violation). By
+// reading the consistent post-finalize velocities and writing only own-index dv,
+// the smoothing is race-free + D1.
+//   dv_i = c * sum_{j in N(i)} (m / rho_j) * (v_j - v_i) * Poly6(|p_i - p_j|^2)
+// Uses the SAME neighbor list as the density passes; m_j == m (uniform mass).
+// rho_j is the LAST density iteration's value (a standard XSPH approximation;
+// the relative-velocity smoothing is insensitive to the exact rho normalization).
+__global__ void ComputeXsphDeltaKernel(uint32_t particle_count,
+                                       const math::Vec3* __restrict__ positions,
+                                       const math::Vec3* __restrict__ velocities,
+                                       const float* __restrict__ density,
+                                       float particle_mass,
+                                       float c,
+                                       PbfKernelCoeffs coeffs,
+                                       const uint32_t* __restrict__ neighbor_offsets,
+                                       const uint32_t* __restrict__ neighbor_counts,
+                                       const uint32_t* __restrict__ neighbor_indices,
+                                       math::Vec3* __restrict__ out_dv) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particle_count) {
+        return;
+    }
+    const math::Vec3 pi = positions[i];
+    const math::Vec3 vi = velocities[i];
+    const uint32_t base = neighbor_offsets[i];
+    const uint32_t n = neighbor_counts[i];
+
+    math::Vec3 acc{0.0f, 0.0f, 0.0f};
+    for (uint32_t k = 0u; k < n; ++k) {
+        const uint32_t j = neighbor_indices[base + k];
+        const math::Vec3 r = Sub(pi, positions[j]);
+        const float r2 = Dot(r, r);
+        const float w = Poly6FromR2(r2, coeffs);
+        const float rho_j = density[j];
+        if (rho_j <= 0.0f) {
+            continue;  // guard a degenerate density (e.g. an isolated particle).
+        }
+        const float scale = (particle_mass / rho_j) * w;
+        const math::Vec3 dvj = Sub(velocities[j], vi);  // v_j - v_i
+        acc.x += dvj.x * scale;
+        acc.y += dvj.y * scale;
+        acc.z += dvj.z * scale;
+    }
+    out_dv[i] = math::Vec3{acc.x * c, acc.y * c, acc.z * c};
+}
+
+// --- XSPH viscosity, pass B: apply dv ---------------------------------------
+// One thread per particle. v_i += dv_i. Pure own-index write -> race-free, no
+// atomics, D1. Separated from pass A so the smoothing reads the consistent
+// pre-smoothing velocities (the Jacobi barrier).
+__global__ void ApplyVelocityDeltaKernel(uint32_t particle_count,
+                                         math::Vec3* __restrict__ velocities,
+                                         const math::Vec3* __restrict__ dv) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particle_count) {
+        return;
+    }
+    const math::Vec3 v = velocities[i];
+    const math::Vec3 d = dv[i];
+    velocities[i] = math::Vec3{v.x + d.x, v.y + d.y, v.z + d.z};
+}
+
+// --- surface tension: cohesion velocity nudge (p10-B) -----------------------
+// One thread per particle. Akinci et al. 2013 COHESION term only (the curvature
+// half is DEFERRED to p13). Reads neighbor POSITIONS, writes only own velocity ->
+// single-pass, race-free (no thread writes a value another reads), D1.
+//   a_i = -gamma * sum_{j in N(i)} m * C(|r_ij|) * (r_ij / |r_ij|)
+//   v_i += dt * a_i
+// r_ij = p_i - p_j; C(r) > 0 over most of the support so -C * r_hat pulls p_i
+// toward its neighbors (cohesion). Uses the SAME neighbor list as the density
+// passes. SAFE-by-construction: a velocity nudge cannot push particles past each
+// other within a step, and the density projection (run BEFORE this, every step)
+// resists the cohesion compressing the blob past rest spacing -- so the pass is
+// stable-when-on and (gated) inert-when-off.
+__global__ void ComputeCohesionKernel(uint32_t particle_count,
+                                      const math::Vec3* __restrict__ positions,
+                                      math::Vec3* __restrict__ velocities,
+                                      float particle_mass,
+                                      float gamma,
+                                      float dt,
+                                      PbfCohesionCoeffs coeffs,
+                                      const uint32_t* __restrict__ neighbor_offsets,
+                                      const uint32_t* __restrict__ neighbor_counts,
+                                      const uint32_t* __restrict__ neighbor_indices) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particle_count) {
+        return;
+    }
+    const math::Vec3 pi = positions[i];
+    const uint32_t base = neighbor_offsets[i];
+    const uint32_t n = neighbor_counts[i];
+
+    math::Vec3 force{0.0f, 0.0f, 0.0f};
+    for (uint32_t k = 0u; k < n; ++k) {
+        const uint32_t j = neighbor_indices[base + k];
+        const math::Vec3 r = Sub(pi, positions[j]);  // r_ij = p_i - p_j
+        const float dist = sqrtf(Dot(r, r));
+        if (dist <= 0.0f) {
+            continue;  // coincident: no cohesion direction.
+        }
+        const float cval = CohesionSpline(dist, coeffs);
+        // -gamma * m * C(r) * (r_ij / |r_ij|): magnitude folded with 1/dist.
+        const float scale = -gamma * particle_mass * cval / dist;
+        force.x += r.x * scale;
+        force.y += r.y * scale;
+        force.z += r.z * scale;
+    }
+    // a_i = force (per unit mass: force already excludes m_i, treating the nudge
+    // as an acceleration); v_i += dt * a_i.
+    math::Vec3 v = velocities[i];
+    v.x += dt * force.x;
+    v.y += dt * force.y;
+    v.z += dt * force.z;
+    velocities[i] = v;
 }
 
 constexpr uint32_t kBlockSize = 128u;
@@ -439,6 +563,8 @@ PbfStepReport StepPbfWorld(const phi::DeviceContext& context,
     report.solver_iterations = solver_iterations;
 
     const PbfKernelCoeffs coeffs = MakePbfKernelCoeffs(params.support_radius_h);
+    const PbfCohesionCoeffs cohesion_coeffs =
+        MakePbfCohesionCoeffs(params.support_radius_h);
     const float inv_rho0 = 1.0f / params.rest_density_rho0;
     const float inv_dt = 1.0f / options.dt;
     const uint32_t particle_count = world.ParticleCount();
@@ -533,6 +659,50 @@ PbfStepReport StepPbfWorld(const phi::DeviceContext& context,
             inv_dt);
         CheckCuda(cudaGetLastError(), "FinalizeKernel launch");
         ++report.kernel_launch_count;
+
+        // --- p10-B post-finalize polish passes (gated; reuse THIS step's grid) ---
+        // GATING is by SKIPPING the launch (not scale-by-0): a zero coefficient
+        // takes the EXACT p10-A path, so velocities are byte-identical to no-polish
+        // (the off-gate proof) and D1 is preserved (no -0.0f bit flip). Both
+        // consume the live neighbor grid (built above on the predicted positions;
+        // freed at step scope end). Order: viscosity smooths, THEN cohesion nudges.
+        if (params.xsph_viscosity_c > 0.0f) {
+            // Pass A: dv into the position-delta scratch (free after finalize) --
+            // no new buffer, so PbfWorld's buffer set / DeviceBytes are unchanged.
+            ComputeXsphDeltaKernel<<<particle_blocks, kBlockSize, 0, stream>>>(
+                particle_count,
+                world.DevicePositions(),     // finalized positions.
+                world.DeviceVelocities(),    // finalized velocities (pre-smoothing).
+                world.DeviceDensities(),     // last-iteration rho_j.
+                world.ParticleMass(),
+                params.xsph_viscosity_c,
+                coeffs,
+                d_offsets, d_counts, d_indices,
+                world.DevicePositionDeltas());  // scratch dv.
+            CheckCuda(cudaGetLastError(), "ComputeXsphDeltaKernel launch");
+            ++report.kernel_launch_count;
+
+            ApplyVelocityDeltaKernel<<<particle_blocks, kBlockSize, 0, stream>>>(
+                particle_count,
+                world.DeviceVelocities(),
+                world.DevicePositionDeltas());
+            CheckCuda(cudaGetLastError(), "ApplyVelocityDeltaKernel launch");
+            ++report.kernel_launch_count;
+        }
+
+        if (params.surface_tension_gamma > 0.0f) {
+            ComputeCohesionKernel<<<particle_blocks, kBlockSize, 0, stream>>>(
+                particle_count,
+                world.DevicePositions(),
+                world.DeviceVelocities(),
+                world.ParticleMass(),
+                params.surface_tension_gamma,
+                options.dt,
+                cohesion_coeffs,
+                d_offsets, d_counts, d_indices);
+            CheckCuda(cudaGetLastError(), "ComputeCohesionKernel launch");
+            ++report.kernel_launch_count;
+        }
 
         context.stream.Synchronize();  // grid frees at scope end; sync first.
     }
