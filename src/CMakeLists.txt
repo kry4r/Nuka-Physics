@@ -568,8 +568,15 @@ if(CMAKE_CUDA_COMPILER)
     # __host__ __device__ function whose t must match the CPU oracle bit-for-bit;
     # forbidding FMA contraction on the device side guarantees host==device
     # arithmetic (the oracle TU pairs this with -ffp-contract=off).
+    # v0.7 p13: the sensor renderer (scene_render.cu) -- real per-primitive leaf
+    # intersections (triangle/sphere/sparse-SDF) + Lambert+GGX shade + hard
+    # shadows + full AOV framebuffer. Shares nuka_rt_gpu's --fmad=false so the
+    # fp64-internal intersections stay bit-exact vs the CPU oracle. Links
+    # nuka_cooker (no link dep here; the SDF cell arrays are passed in by the
+    # caller via SparseSdfDevice) -- only the runtime sampler header is used.
     add_library(nuka_rt_gpu STATIC
         rt/bvh_ray_traversal.cu
+        rt/scene_render.cu
     )
     set_target_properties(nuka_rt_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_options(nuka_rt_gpu PRIVATE

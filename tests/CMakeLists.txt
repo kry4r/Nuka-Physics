@@ -891,6 +891,36 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_rt_traversal_test)
 
+    # --- v0.7 p13: the SENSOR renderer (real per-primitive leaf intersections
+    # triangle/sphere/sparse-SDF + Lambert+GGX shade + hard shadows + full AOV
+    # framebuffer). Matches a CPU brute-force ray-vs-all-prims oracle that REUSES
+    # the same __host__ __device__ intersection + shade + closest-hit functions
+    # the kernel uses (triangle hit + bary EXACT, sphere depth + normal EXACT,
+    # SDF hit within tolerance, Lambert/GGX == analytic, hard-shadow occlusion);
+    # NaN-guard for a surface-origin axis-parallel ray; D1 two-run byte-exact
+    # across ALL AOVs. Built -ffp-contract=off to pair with the kernel's
+    # --fmad=false so the shared fp64-internal intersection math is host==device
+    # bit-for-bit. Links nuka_cooker for the in-test cooked sparse SDF (p07).
+    add_executable(nuka_rt_scene_render_test
+        rt/test_scene_render.cpp
+    )
+    set_source_files_properties(rt/test_scene_render.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_scene_render_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_scene_render_test
+        PRIVATE
+            nuka_rt_gpu
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_scene_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
     # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
     # find_sdf_contact_newton (the SAME function the device kernel wraps) on the

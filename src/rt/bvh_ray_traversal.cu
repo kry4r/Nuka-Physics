@@ -31,6 +31,7 @@
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "phi/device_context.hpp"
+#include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
 #include "rt/ray_box.cuh"
 
@@ -57,169 +58,30 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 using ::nuka::collision::gpu::LbvhNode;
 
-// Ray-AABB entry t for the NODE-pruning test (not a surface hit -- a node bound
-// is an internal volume the ray may enter). Returns the entry distance (tmin
-// clamped to 0 when the ray starts inside the node) and whether the ray
-// intersects the node's AABB at all with tmax >= 0. We prune a subtree iff it is
-// missed OR its entry t >= best_t (a closer hit already exists). Same fp64 slab
-// math as RayBoxIntersect; node test only needs the entry distance + a hit flag.
-__device__ __forceinline__ bool NodeEntryT(const math::Vec3& origin,
-                                           const math::Vec3& dir,
-                                           const collision::AABB& box,
-                                           float* entry_t) {
-    const double inv_x = 1.0 / static_cast<double>(dir.x);
-    const double inv_y = 1.0 / static_cast<double>(dir.y);
-    const double inv_z = 1.0 / static_cast<double>(dir.z);
-
-    const double tx0 = (static_cast<double>(box.min.x) - static_cast<double>(origin.x)) * inv_x;
-    const double tx1 = (static_cast<double>(box.max.x) - static_cast<double>(origin.x)) * inv_x;
-    const double ty0 = (static_cast<double>(box.min.y) - static_cast<double>(origin.y)) * inv_y;
-    const double ty1 = (static_cast<double>(box.max.y) - static_cast<double>(origin.y)) * inv_y;
-    const double tz0 = (static_cast<double>(box.min.z) - static_cast<double>(origin.z)) * inv_z;
-    const double tz1 = (static_cast<double>(box.max.z) - static_cast<double>(origin.z)) * inv_z;
-
-    const double txmin = tx0 < tx1 ? tx0 : tx1;
-    const double txmax = tx0 < tx1 ? tx1 : tx0;
-    const double tymin = ty0 < ty1 ? ty0 : ty1;
-    const double tymax = ty0 < ty1 ? ty1 : ty0;
-    const double tzmin = tz0 < tz1 ? tz0 : tz1;
-    const double tzmax = tz0 < tz1 ? tz1 : tz0;
-
-    double tmin = txmin > tymin ? txmin : tymin;
-    tmin = tmin > tzmin ? tmin : tzmin;
-    double tmax = txmax < tymax ? txmax : tymax;
-    tmax = tmax < tzmax ? tmax : tzmax;
-
-    if (tmax < tmin || tmax < 0.0) {
-        return false;
-    }
-    *entry_t = static_cast<float>(tmin >= 0.0 ? tmin : 0.0);
-    return true;
-}
-
-// Test+possibly-update the closest hit against the leaf box at flat node index
-// `leaf_node`. nodes[leaf_node].left holds the ORIGINAL box index (the prim id
-// the oracle uses). Uses the shared RayBoxIntersect + RtClosestHitUpdate.
-__device__ __forceinline__ void IntersectLeaf(const LbvhNode* __restrict__ nodes,
-                                              int32_t leaf_node,
-                                              const math::Vec3& origin,
-                                              const math::Vec3& dir,
-                                              float* best_t,
-                                              uint32_t* best_prim) {
-    const collision::AABB box = nodes[leaf_node].aabb;
-    float t;
-    if (RayBoxIntersect(origin, dir, box, &t)) {
-        // Surface hit must be in front of the ray and not farther than best.
-        if (t >= 0.0f) {
-            const uint32_t prim = static_cast<uint32_t>(nodes[leaf_node].left);
-            RtClosestHitUpdate(t, prim, best_t, best_prim);
-        }
-    }
-}
-
-// Stackless Hapala traversal of one ray. `internal_count` = N-1 (a flat index
-// >= internal_count is a leaf). For N==1 the single node IS the leaf (handled by
-// the caller). Returns closest (best_t, best_prim) via out-params.
-//
-// NOTE (premise correction, see tests): this is stackless NOT because the LBVH
-// emits deep trees -- it does NOT. LbvhDelta's index tie-break (32+clz(i^j))
-// keeps the Karras tree O(log N) even for fully-coincident Morton codes, so the
-// existing stack[64] is safe to ~2^64 leaves. We are stackless because it is
-// robust REGARDLESS of any depth assumption (no global stack memory, no
-// runtime-sized register array, no compile-time stack+guard) -- the right shape
-// for one-thread-per-pixel over a full framebuffer.
-//
-// State machine: we move between a node and its parent. `from_child` encodes
-// which child we just RETURNED from (0=came from above/start, 1=returned from
-// left, 2=returned from right). At an internal node we decide the next node:
-// descend left, then right, then go up -- pruning any child whose bound is
-// missed or whose entry t >= best_t.
-__device__ void TraverseRay(const LbvhNode* __restrict__ nodes,
-                            uint32_t internal_count,
-                            const math::Vec3& origin,
-                            const math::Vec3& dir,
-                            float* best_t,
-                            uint32_t* best_prim) {
-    // Should we descend into `child` (prune if missed or entry t >= best_t)?
-    auto want = [&](int32_t child) -> bool {
-        float et;
-        if (!NodeEntryT(origin, dir, nodes[child].aabb, &et)) {
-            return false;
-        }
-        return et < *best_t;
-    };
-
-    constexpr int kFromParent = 0;
-    constexpr int kFromLeft = 1;
-    constexpr int kFromRight = 2;
-
-    int32_t current = 0;      // start at root (internal node 0)
-    int from = kFromParent;   // how we arrived at `current`
-
-    // Root pruning: if the root bound is entirely missed, nothing to do.
-    {
-        float et;
-        if (!NodeEntryT(origin, dir, nodes[0].aabb, &et)) {
-            return;
-        }
-    }
-
-    while (true) {
-        const LbvhNode node = nodes[current];
-        const int32_t left = node.left;
-        const int32_t right = node.right;
-        const int32_t parent = node.parent;
-
-        int32_t next = -1;
-        int next_from = kFromParent;
-
-        if (from == kFromParent) {
-            // Just arrived from above: try left child first.
-            const bool left_leaf = (static_cast<uint32_t>(left) >= internal_count);
-            if (left_leaf) {
-                IntersectLeaf(nodes, left, origin, dir, best_t, best_prim);
-                // Then try right (as if we returned from left).
-                from = kFromLeft;
-                continue;
-            } else if (want(left)) {
-                next = left;
-                next_from = kFromParent;
-            } else {
-                // Left pruned/leaf-done: fall through to right.
-                from = kFromLeft;
-                continue;
+// Box-leaf functor for the p12 depth renderer. Test+possibly-update the closest
+// hit against the leaf BOX at flat node index `leaf_node`; nodes[leaf_node].left
+// holds the ORIGINAL box index (the prim id the oracle uses). Uses the shared
+// RayBoxIntersect + RtClosestHitUpdate. This is the ONLY p12-specific piece; the
+// stackless descent itself is the SHARED rt::TraverseRay (bvh_traverse_impl.cuh),
+// reused UNCHANGED by p13's primitive renderer with a different leaf functor.
+struct BoxLeaf {
+    const LbvhNode* __restrict__ nodes;
+    __device__ void operator()(int32_t leaf_node,
+                               const math::Vec3& origin,
+                               const math::Vec3& dir,
+                               float* best_t,
+                               uint32_t* best_prim) const {
+        const collision::AABB box = nodes[leaf_node].aabb;
+        float t;
+        if (RayBoxIntersect(origin, dir, box, &t)) {
+            // Surface hit must be in front of the ray and not farther than best.
+            if (t >= 0.0f) {
+                const uint32_t prim = static_cast<uint32_t>(nodes[leaf_node].left);
+                RtClosestHitUpdate(t, prim, best_t, best_prim);
             }
-        } else if (from == kFromLeft) {
-            // Returned from (or skipped) left: try right child.
-            const bool right_leaf = (static_cast<uint32_t>(right) >= internal_count);
-            if (right_leaf) {
-                IntersectLeaf(nodes, right, origin, dir, best_t, best_prim);
-                from = kFromRight;
-                continue;
-            } else if (want(right)) {
-                next = right;
-                next_from = kFromParent;
-            } else {
-                from = kFromRight;
-                continue;
-            }
-        } else { // kFromRight: both children done -> go up.
-            if (parent < 0) {
-                return; // returned to root from its right subtree: done.
-            }
-            // Determine whether `current` was the parent's left or right child,
-            // so the parent resumes from the correct state.
-            const int32_t pleft = nodes[parent].left;
-            next = parent;
-            next_from = (pleft == current) ? kFromLeft : kFromRight;
-        }
-
-        if (next >= 0) {
-            current = next;
-            from = next_from;
         }
     }
-}
+};
 
 // One thread per pixel. Generates the ray (deterministic), traverses, writes the
 // closest-hit depth + prim into the framebuffer. Exactly one writer per pixel ->
@@ -241,12 +103,13 @@ __global__ void RenderDepthKernel(PinholeCamera camera,
 
     const Ray ray = camera.GenerateRay(px, py);
 
+    BoxLeaf leaf{nodes};
     if (leaf_count == 1u) {
         // Single node IS the leaf (node 0); intersect directly.
-        IntersectLeaf(nodes, 0, ray.origin, ray.dir, &best_t, &best_prim);
+        leaf(0, ray.origin, ray.dir, &best_t, &best_prim);
     } else if (leaf_count >= 2u) {
         TraverseRay(nodes, leaf_count - 1u, ray.origin, ray.dir, &best_t,
-                    &best_prim);
+                    &best_prim, leaf);
     }
 
     out_depth[pixel] = best_t;

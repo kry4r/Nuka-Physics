@@ -45,22 +45,52 @@ NUKA_RT_HD inline float RtMissDepth() {
 
 inline constexpr uint32_t kNoPrim = 0xFFFFFFFFu;
 
-// Ray vs AABB slab test. origin/dir are world-space (dir unit length). On a hit
-// returns true and sets *t_near to the entry distance along the ray (>= 0 for a
-// camera outside the box). fp64 internally, fp32 stored. The branchless slab
-// formulation uses fmin/fmax of the two per-axis plane distances; division by a
-// (possibly zero) dir component yields +/-inf which fmin/fmax handle correctly
-// (a ray parallel to a slab is inside that slab iff origin is between the
-// planes, which the inf arithmetic encodes). The ONLY operations are subtract,
-// multiply (by inv_dir), and min/max -- no fused multiply-add anywhere.
-NUKA_RT_HD inline bool RayBoxIntersect(const math::Vec3& origin,
-                                       const math::Vec3& dir,
-                                       const collision::AABB& box,
-                                       float* t_near) {
-    // inv_dir in fp64; a zero component -> +/-inf, intentional.
-    const double inv_x = 1.0 / static_cast<double>(dir.x);
-    const double inv_y = 1.0 / static_cast<double>(dir.y);
-    const double inv_z = 1.0 / static_cast<double>(dir.z);
+// ---------------------------------------------------------------------------
+// NaN-GUARD (p13, p12 reviewer carry-over now LIVE): a ray exactly axis-parallel
+// to a slab (dir component == 0) while ORIGINATING on that slab's plane gives
+// (plane - origin) == 0 and inv_dir == +/-inf, so 0 * inf == NaN -- and a NaN
+// poisons the fmin/fmax slab reduction (a comparison against NaN is false, so
+// the wrong branch is taken). p12 was immune (camera outside all boxes, never on
+// a plane); p13's SHADOW / secondary rays originate ON surfaces, so this is live.
+//
+// Guard: replace 1/d for a (near-)zero d with a LARGE FINITE value of the right
+// sign (copysign(kHuge, d)). Then 0 * large == 0 (finite, not NaN), and a true
+// axis-parallel-but-off-plane ray still gets a huge +/- t that fmin/fmax select
+// away identically to the +/-inf it replaced -- so this is bit-exact-preserving
+// for every p12 ray (where the in-plane case never occurred) AND NaN-free for
+// the p13 surface-origin case. kHuge is 1e300: comfortably larger than any scene
+// extent yet finite, so 0*kHuge == 0 exactly. ONE helper, used by BOTH the leaf
+// box test here AND NodeEntryT in the traversal .cu, so the guard covers the
+// node-pruning math too (a NaN there would mis-prune a subtree => wrong result).
+// ---------------------------------------------------------------------------
+NUKA_RT_HD inline double RtSafeInvDir(float d) {
+    const double dd = static_cast<double>(d);
+    // |d| below this -> treat as axis-parallel; clamp inv to a large finite of
+    // the same sign. 1e-300 is far below any meaningful unit-direction component.
+    constexpr double kTinyDir = 1.0e-300;
+    constexpr double kHugeInv = 1.0e300;
+    if (dd > kTinyDir) {
+        return 1.0 / dd;
+    }
+    if (dd < -kTinyDir) {
+        return 1.0 / dd;
+    }
+    // dd == 0 (or denormally tiny): return a large finite with the sign of dd.
+    // copysign(x, +0)=+x, copysign(x, -0)=-x; for a literal 0.0f the sign is +.
+    return dd < 0.0 ? -kHugeInv : kHugeInv;
+}
+
+// Shared slab reduction: computes the [tmin, tmax] interval of the ray vs the
+// box. Uses RtSafeInvDir (NaN-guarded). Subtract-then-multiply only (no FMA).
+// Returns false on a miss (interval empty or box entirely behind the ray).
+NUKA_RT_HD inline bool RtSlabInterval(const math::Vec3& origin,
+                                      const math::Vec3& dir,
+                                      const collision::AABB& box,
+                                      double* out_tmin,
+                                      double* out_tmax) {
+    const double inv_x = RtSafeInvDir(dir.x);
+    const double inv_y = RtSafeInvDir(dir.y);
+    const double inv_z = RtSafeInvDir(dir.z);
 
     // Per-axis plane distances: (plane - origin) * inv_dir. Subtract then
     // multiply -> no a*b+c -> no FMA contraction.
@@ -83,15 +113,47 @@ NUKA_RT_HD inline bool RayBoxIntersect(const math::Vec3& origin,
     double tmax = txmax < tymax ? txmax : tymax;
     tmax = tmax < tzmax ? tmax : tzmax;
 
-    // Miss if the slabs don't overlap, or the box is entirely behind the ray.
     if (tmax < tmin || tmax < 0.0) {
         return false;
     }
+    *out_tmin = tmin;
+    *out_tmax = tmax;
+    return true;
+}
+
+// Ray vs AABB slab test. origin/dir are world-space (dir unit length). On a hit
+// returns true and sets *t_near to the entry distance along the ray (>= 0 for a
+// camera outside the box). fp64 internally, fp32 stored. NaN-guarded via the
+// shared RtSlabInterval. The ONLY operations are subtract, multiply (by inv_dir),
+// and min/max -- no fused multiply-add anywhere.
+NUKA_RT_HD inline bool RayBoxIntersect(const math::Vec3& origin,
+                                       const math::Vec3& dir,
+                                       const collision::AABB& box,
+                                       float* t_near) {
+    double tmin, tmax;
+    if (!RtSlabInterval(origin, dir, box, &tmin, &tmax)) {
+        return false;
+    }
     // Entry distance: if the origin is inside the box tmin < 0; clamp to the
-    // first surface crossing in front of the ray (tmin if >= 0 else tmax). In
-    // p12 the camera is outside all boxes so tmin >= 0; this clamp is a guard.
+    // first surface crossing in front of the ray (tmin if >= 0 else tmax).
     const double t = tmin >= 0.0 ? tmin : tmax;
     *t_near = static_cast<float>(t);
+    return true;
+}
+
+// Ray vs AABB ENTRY t for node pruning: the entry distance clamped to 0 when the
+// ray starts inside the box, plus a hit flag. Same NaN-guarded slab math as
+// RayBoxIntersect (shares RtSlabInterval). Used by the traversal's NodeEntryT so
+// the NaN guard covers the node-pruning test too.
+NUKA_RT_HD inline bool RtNodeEntryT(const math::Vec3& origin,
+                                    const math::Vec3& dir,
+                                    const collision::AABB& box,
+                                    float* entry_t) {
+    double tmin, tmax;
+    if (!RtSlabInterval(origin, dir, box, &tmin, &tmax)) {
+        return false;
+    }
+    *entry_t = static_cast<float>(tmin >= 0.0 ? tmin : 0.0);
     return true;
 }
 
