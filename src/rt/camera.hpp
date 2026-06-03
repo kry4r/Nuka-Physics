@@ -1,0 +1,121 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// nuka::rt::PinholeCamera -- deterministic pinhole ray generation (v0.7 p12).
+//
+// A bare-bones pinhole camera for the self-written CUDA ray tracer. ONE ray per
+// pixel through the pixel CENTER -- NO anti-aliasing / jitter / stochastic
+// sampling (those need a seeded deterministic RNG and would break D1 if added
+// naively; they are deferred to p13/later). Ray generation is a pure function of
+// the pixel index + camera params, so it is byte-identical run-to-run (D1).
+//
+// HOST-buildable, DEVICE-callable: the whole struct + GenerateRay are
+// __host__ __device__ (NUKA_RT_HD) so the SAME ray-gen runs in the render kernel
+// AND in the CPU brute-force oracle (no mirrored arithmetic -> the only thing
+// that can diverge between GPU and oracle is the leaf slab test, which is itself
+// a single shared function in ray_box.cuh).
+//
+// Convention: right-handed, camera looks down `forward`; `right` and `up` span
+// the image plane. Image-plane half-extents derive from a vertical FOV and the
+// aspect ratio. Pixel (px,py): px increases to the +right, py increases DOWN the
+// image (row 0 at the TOP), which is the conventional framebuffer layout.
+// ---------------------------------------------------------------------------
+
+#include "math/vec3.hpp"
+
+#include <cstdint>
+
+#if defined(__CUDACC__)
+#define NUKA_RT_HD __host__ __device__
+#else
+#define NUKA_RT_HD
+#endif
+
+namespace nuka::rt {
+
+// A single generated ray: origin + (normalized) direction. We keep the
+// direction normalized so the returned slab `t` is a true world-space distance
+// (depth), which is what the oracle and the depth buffer compare.
+struct Ray {
+    math::Vec3 origin;
+    math::Vec3 dir; // unit length
+};
+
+// Pinhole camera. Build it on the host (BuildPinhole), pass it by value into the
+// kernel (it is trivially copyable), and call GenerateRay on device or host.
+struct PinholeCamera {
+    math::Vec3 origin = {0.0f, 0.0f, 0.0f};
+    math::Vec3 forward = {0.0f, 0.0f, 1.0f}; // unit
+    math::Vec3 right = {1.0f, 0.0f, 0.0f};   // unit, image +x
+    math::Vec3 up = {0.0f, 1.0f, 0.0f};      // unit, image +y (world up)
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    // Half-extents of the image plane at unit distance (tan(fov/2)).
+    float half_w = 1.0f;
+    float half_h = 1.0f;
+
+    // Deterministic ray through the CENTER of pixel (px, py). Row 0 is the TOP
+    // of the image (py grows downward), matching the framebuffer layout.
+    NUKA_RT_HD Ray GenerateRay(uint32_t px, uint32_t py) const {
+        // Pixel-center NDC in [-1, 1]; +1 maps to image edge. fp64 internally,
+        // store fp32 -- consistent with the slab test, no FMA contraction.
+        const double sx = (2.0 * (static_cast<double>(px) + 0.5) /
+                           static_cast<double>(width)) - 1.0;
+        // py grows DOWN, image +up is -py, so negate.
+        const double sy = 1.0 - (2.0 * (static_cast<double>(py) + 0.5) /
+                                 static_cast<double>(height));
+        const double dx = sx * static_cast<double>(half_w);
+        const double dy = sy * static_cast<double>(half_h);
+
+        // dir = forward + dx*right + dy*up, then normalize. Done in fp64 to keep
+        // host/device identical, stored fp32.
+        const double rx = static_cast<double>(forward.x) +
+                          dx * static_cast<double>(right.x) +
+                          dy * static_cast<double>(up.x);
+        const double ry = static_cast<double>(forward.y) +
+                          dx * static_cast<double>(right.y) +
+                          dy * static_cast<double>(up.y);
+        const double rz = static_cast<double>(forward.z) +
+                          dx * static_cast<double>(right.z) +
+                          dy * static_cast<double>(up.z);
+        const double inv_len = 1.0 / sqrt(rx * rx + ry * ry + rz * rz);
+
+        Ray ray;
+        ray.origin = origin;
+        ray.dir = math::Vec3{static_cast<float>(rx * inv_len),
+                             static_cast<float>(ry * inv_len),
+                             static_cast<float>(rz * inv_len)};
+        return ray;
+    }
+};
+
+// Build a pinhole camera looking from `eye` toward `target`, with `world_up`
+// defining roll. `vfov_radians` is the FULL vertical field of view. The image is
+// `width` x `height`; aspect = width/height. HOST-only (uses sqrt via Vec3); the
+// resulting struct is then device-callable. Deterministic (no RNG).
+inline PinholeCamera BuildPinhole(math::Vec3 eye,
+                                  math::Vec3 target,
+                                  math::Vec3 world_up,
+                                  float vfov_radians,
+                                  uint32_t width,
+                                  uint32_t height) {
+    PinholeCamera cam;
+    cam.origin = eye;
+    cam.width = width;
+    cam.height = height;
+
+    const math::Vec3 fwd = (target - eye).Normalized();
+    const math::Vec3 rgt = fwd.Cross(world_up).Normalized();
+    const math::Vec3 up = rgt.Cross(fwd).Normalized();
+    cam.forward = fwd;
+    cam.right = rgt;
+    cam.up = up;
+
+    cam.half_h = std::tan(0.5f * vfov_radians);
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    cam.half_w = cam.half_h * aspect;
+    return cam;
+}
+
+} // namespace nuka::rt
+
+#undef NUKA_RT_HD
