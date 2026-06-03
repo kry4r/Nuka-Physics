@@ -68,11 +68,12 @@ Effort key: S=small, M=medium, L=large, R=research. Each phase reuses the noted 
 | **U4 Real complex-USD asset pipeline** | import real complex USD scenes for demos (p16 requirement) | harden the hand-rolled importer or adopt a real USD path; mesh-geometry retention (#19) | M–L | importer, cooker |
 | **U5 Teleop / XR** (later) | device input → robot retargeting | keyboard/spacemouse/VR abstraction | M | U1 |
 
-## 3. Sequencing recommendation
-1. **Finish v0.7 exit** (current): p12 → p13 → p14b → p15 → p16 (H1 grasp-cup demo from real USD scene → RT video on homepage). This is the gate; do NOT divert.
-2. **Then the fast-render + beauty spine** (W2 G1→G2→G4): TLAS/BLAS fast tracer + photoreal path — directly serves the homepage-showcase directive and the beauty bar.
-3. **Then physics completeness, value-ordered** (W1): IK (R1, cheap, demo-useful) → cable/DER (R2, leapfrogs Newton) → garment cloth (R3) → MPM (R4) → FEM (R5) → closed-loops (R6) → tendon/muscle (R7), with coupling (R8) trailing each.
-4. **Usability in parallel** (W3 U1→U2→U3) once the fast render exists; U4 (real USD) is pulled EARLY because p16 needs it.
+## 3. Sequencing (owner-set, 2026-06-03 — REVISED: G1 pulled EARLY)
+★ **Owner reseq (2026-06-03): pull G1 (self-written TLAS/BLAS fast tracer) to RIGHT AFTER p14b, BEFORE p15/p16** — "我要快，速度很重要" — so the p16 homepage demo renders on the fast multi-instance (robot+cup+table+USD) tracer. (Task #28.)
+1. **v0.7 exit with G1 inserted:** p12 ✅ → p13 ✅ → p14b (in flight) → **G1 TLAS/BLAS fast tracer (pulled here)** → p15 (oracle) → p16 (H1 grasp-cup from real USD scene → RT video on homepage = the gate). Do NOT divert.
+2. **Then the rest of the render-beauty spine** (W2 G2→G4 + G3): photoreal A1 path (G2) + benchmark/OptiX-trigger (G4) + semantic/normal AOVs (G3). (G2 photoreal is the v1.0 "all demos 真实画面" bar; G1-fast is enough to render the v0.7 p16 demo.)
+3. **Then physics completeness, value-ordered** (W1): IK (R1, cheap, demo-useful) → cable/DER (R2, leapfrogs Newton) → garment cloth (R3) → MPM (R4) → FEM (R5) → closed-loops/Kamino-gap (R6) → tendon/muscle (R7), with coupling (R8) trailing each.
+4. **Usability in parallel** (W3 U1→U2→U3) once the fast render exists; U4 (real complex-USD) is pulled EARLY because p16 needs it.
 
 ## 4. Stays deferred (per sim2sim focus)
 Sim-to-real noise N1/N2/N3 (geometric/physical noise, beam divergence, rolling shutter, lens distortion, dark-current, ISP) and v3.0 real-hardware deployment + transfer metrics. Kept on the long-term map; not current priorities.
