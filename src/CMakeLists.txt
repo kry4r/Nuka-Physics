@@ -574,9 +574,17 @@ if(CMAKE_CUDA_COMPILER)
     # fp64-internal intersections stay bit-exact vs the CPU oracle. Links
     # nuka_cooker (no link dep here; the SDF cell arrays are passed in by the
     # caller via SparseSdfDevice) -- only the runtime sampler header is used.
+    # v0.7 G1-A: the self-written TWO-LEVEL (TLAS/BLAS) tracer
+    # (rt/two_level_render.cu). Nests the p12 stackless rt::TraverseRay two deep:
+    # a per-frame TLAS over instance world-AABBs whose leaf transforms the ray to
+    # each instance's local frame and runs an INNER traversal over that instance's
+    # once-built BLAS. RIGID two-level core (p16 demo: H1 + cup + table + USD =
+    # many rigid mesh instances). Shares --fmad=false so the fp64 leaf math +
+    # fp32 QuatInvRotate stay bit-exact vs the host oracle (-ffp-contract=off).
     add_library(nuka_rt_gpu STATIC
         rt/bvh_ray_traversal.cu
         rt/scene_render.cu
+        rt/two_level_render.cu
     )
     set_target_properties(nuka_rt_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_options(nuka_rt_gpu PRIVATE

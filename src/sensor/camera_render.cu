@@ -27,6 +27,7 @@
 #include "phi/device_context.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
+#include "rt/instance_transform.cuh"  // QuatRotate / QuatInvRotate (HOISTED here)
 #include "rt/intersect_primitives.cuh"
 #include "rt/ray_box.cuh"
 #include "runtime/sdf/sparse_sdf_query.cuh"
@@ -48,6 +49,8 @@ using ::nuka::collision::gpu::LbvhNode;
 using ::nuka::math::Transform;
 using ::nuka::math::Vec3;
 using ::nuka::rt::kNoPrim;
+using ::nuka::rt::QuatInvRotate;  // HOISTED to rt/instance_transform.cuh
+using ::nuka::rt::QuatRotate;     // HOISTED to rt/instance_transform.cuh
 using ::nuka::rt::RtMissDepth;
 using ::nuka::rt::RtNormalize;
 
@@ -88,21 +91,10 @@ struct DevEnvScene {
     uint32_t body_count = 0u;
 };
 
-// Inverse-rotate a vector by a unit quaternion (q^-1 * v * q), INLINED so it is
-// device-callable without touching the host-only math::Quat::Rotate. Conjugate of
-// a unit quaternion is its inverse. Uses the same t = 2*cross(qv,v) form Quat
-// uses on the host; arithmetic on the HD-marked Vec3 is host==device.
-__device__ __forceinline__ Vec3 QuatRotate(const math::Quat& q, const Vec3& v) {
-    const Vec3 qv{q.x, q.y, q.z};
-    const Vec3 t = 2.0f * qv.Cross(v);
-    return v + q.w * t + qv.Cross(t);
-}
-__device__ __forceinline__ Vec3 QuatInvRotate(const math::Quat& q, const Vec3& v) {
-    // Conjugate (unit quat inverse): negate the vector part.
-    const Vec3 qv{-q.x, -q.y, -q.z};
-    const Vec3 t = 2.0f * qv.Cross(v);
-    return v + q.w * t + qv.Cross(t);
-}
+// QuatRotate / QuatInvRotate are HOISTED to rt/instance_transform.cuh (shared by
+// the p14b camera sensor, the G1-A two-level tracer, and its host oracle). They
+// are imported via the `using` declarations above; behavior-identical (same fp32
+// t=2*cross(qv,v) form) -> nuka_camera_render_test is the no-regression guard.
 
 // Local SDF bound of a view: [origin, origin + dims*voxel_size]. Used both to clip
 // the local-frame march and (host-side) to build the world LBVH AABB.
