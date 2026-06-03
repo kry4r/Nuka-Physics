@@ -1455,6 +1455,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_link_contact_wrench_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- p14b (v0.7) RGB+depth+normal+uv CAMERA SENSOR over the LIVE batched sim
+    # state. Analytic depth/camera-space-normal/palette-RGB/miss; LIVE-tracking
+    # (move a body's DevicePoses() -> image changes); batched per-env; D1 two-run
+    # byte-exact across all channels. The poses come from a real BatchedDeviceWorld
+    # (nuka_runtime_gpu), the SDFs are real p07 cooked SDFs (nuka_cooker); the
+    # renderer is nuka_camera_sensor_gpu. -ffp-contract=off pairs with the kernel's
+    # --fmad=false so the shared fp64 SDF sphere-trace is host==device bit-for-bit.
+    add_executable(nuka_camera_render_test
+        sensor/test_camera_render.cpp
+    )
+    set_source_files_properties(sensor/test_camera_render.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_camera_render_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_camera_render_test
+        PRIVATE
+            nuka_camera_sensor_gpu
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_cooker
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_camera_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- p03 per-env RESET primitive (RL autoreset) ------------------------
     add_executable(nuka_batched_reset_test
         runtime/test_batched_reset.cpp
