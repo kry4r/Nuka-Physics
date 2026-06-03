@@ -957,6 +957,35 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_rt_two_level_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
+    # MEASURES flat p13 RenderScene (rebuild-all every frame over N*~300 baked
+    # world triangles) vs the G1-A two-level RenderFrame (per-mesh BLAS built
+    # ONCE + cheap per-frame N-instance TLAS rebuild). Sweeps N=1,16,64,256,1024
+    # at 512x512, animates instances each frame, times the WHOLE host per-frame
+    # call (wall-clock), reports ms/frame + full-per-frame-wall-time MRays/s +
+    # speedup, and prints the explicit G1-B go/no-go verdict. Asserts ONLY the
+    # relative structural invariant (two-level < flat at N>=64); absolute numbers
+    # are hardware-dependent (nvidia-smi NVML-broken) and never asserted.
+    add_executable(nuka_rt_two_level_bench
+        rt/test_two_level_bench.cpp
+    )
+    set_source_files_properties(rt/test_two_level_bench.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_two_level_bench
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_two_level_bench
+        PRIVATE
+            nuka_rt_gpu
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_two_level_bench WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
     # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
     # find_sdf_contact_newton (the SAME function the device kernel wraps) on the
