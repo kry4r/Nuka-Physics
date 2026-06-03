@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "runtime/gpu/cuda_world_stepper.hpp"
+#include "runtime/fluid/pbf_world.hpp"
 #include "runtime/gpu/device_world.hpp"
 #include "runtime/soft/xpbd_world.hpp"
 #include "runtime/world_builder.hpp"
@@ -248,6 +249,73 @@ TEST(CudaWorldStepper, RigidPathByteIdenticalWithEmptyXpbdWorld) {
                           a.angular_velocities.size() * sizeof(math::Vec3)),
               0)
         << "rigid angular velocities diverged when an empty XpbdWorld was attached";
+}
+
+// v0.7 p10-A: the additive rigid+PBF co-step overload must be byte-identical to
+// the rigid-only path when the attached PbfWorld is EMPTY (inert-when-empty).
+// Mirrors RigidPathByteIdenticalWithEmptyXpbdWorld: same scene + schedule through
+// both entry points; rigid pose/velocity buffers memcmp identical, zero PBF work.
+TEST(CudaWorldStepper, RigidPathByteIdenticalWithEmptyPbfWorld) {
+    const auto blob = scene::CookScene(BuildTwoBodyScene());
+
+    runtime::gpu::CudaWorldStepOptions options;
+    options.gravity = {0.0f, -9.81f, 0.0f};
+    options.dt = 1.0f / 120.0f;
+    options.step_count = 12;
+    options.clear_forces_after_step = true;
+
+    auto run_rigid_only = [&]() {
+        auto host = runtime::BuildWorld(blob);
+        host.instance.forces[0] = {4.0f, 0.0f, 0.0f};
+        host.instance.torques[1] = {1.0f, 0.0f, 3.0f};
+        auto device_world = runtime::gpu::UploadDeviceWorld(host.template_view);
+        runtime::gpu::UploadDeviceState(device_world, host.instance);
+        runtime::gpu::StepCudaWorld(device_world, options);
+        return device_world.DownloadState();
+    };
+
+    auto run_with_empty_pbf = [&]() {
+        auto host = runtime::BuildWorld(blob);
+        host.instance.forces[0] = {4.0f, 0.0f, 0.0f};
+        host.instance.torques[1] = {1.0f, 0.0f, 3.0f};
+        auto device_world = runtime::gpu::UploadDeviceWorld(host.template_view);
+        runtime::gpu::UploadDeviceState(device_world, host.instance);
+
+        runtime::fluid::PbfParticleSet empty_particles;  // zero particles.
+        auto pbf_world = runtime::fluid::UploadPbfWorld(empty_particles);
+        runtime::fluid::PbfParams pbf_params;
+        pbf_params.support_radius_h = 0.1f;
+        pbf_params.rest_density_rho0 = 1.0f;
+        auto context = phi::MakeDefaultDeviceContext();
+        const auto report = runtime::gpu::StepCudaWorld(
+            context, device_world, pbf_world, pbf_params, options);
+
+        // No PBF work was done.
+        EXPECT_EQ(report.pbf_particle_count, 0u);
+        EXPECT_EQ(report.pbf_kernel_launch_count, 0u);
+        // The rigid kernel_launch_count is unchanged by the additive overload.
+        EXPECT_EQ(report.kernel_launch_count, options.step_count);
+        return device_world.DownloadState();
+    };
+
+    const auto a = run_rigid_only();
+    const auto b = run_with_empty_pbf();
+
+    ASSERT_EQ(a.poses.size(), b.poses.size());
+    ASSERT_EQ(a.linear_velocities.size(), b.linear_velocities.size());
+    ASSERT_EQ(a.angular_velocities.size(), b.angular_velocities.size());
+    EXPECT_EQ(std::memcmp(a.poses.data(), b.poses.data(),
+                          a.poses.size() * sizeof(math::Transform)),
+              0)
+        << "rigid poses diverged when an empty PbfWorld was attached";
+    EXPECT_EQ(std::memcmp(a.linear_velocities.data(), b.linear_velocities.data(),
+                          a.linear_velocities.size() * sizeof(math::Vec3)),
+              0)
+        << "rigid linear velocities diverged when an empty PbfWorld was attached";
+    EXPECT_EQ(std::memcmp(a.angular_velocities.data(), b.angular_velocities.data(),
+                          a.angular_velocities.size() * sizeof(math::Vec3)),
+              0)
+        << "rigid angular velocities diverged when an empty PbfWorld was attached";
 }
 
 TEST(CudaWorldStepper, RejectsStepBeforeDeviceStateUpload) {

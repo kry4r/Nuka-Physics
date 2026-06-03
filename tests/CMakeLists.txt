@@ -742,6 +742,27 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_xpbd_cooker_test)
 
+    # --- v0.7 p10-A: PBF fluid core (density iteration + volume + D1) -------
+    # Analytic/physical invariants for the forward density-projection fluid
+    # (Macklin & Mueller 2013): rest-density block, over-compressed relaxation,
+    # single column -> stable pool, density-drift volume conservation, and D1
+    # two-run byte-exact. NOT a Flex golden (Flex oracle deferred to p15). rho0 is
+    # calibrated numerically from the engine's own Poly6 kernel. Links
+    # nuka_runtime_gpu (PbfWorld lives there; reuses the p05 particle grid).
+    add_executable(nuka_pbf_test
+        runtime/test_pbf_density_iteration.cpp
+        runtime/test_pbf_volume_conservation.cpp
+    )
+
+    target_link_libraries(nuka_pbf_test
+        PRIVATE
+            nuka_runtime_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_pbf_test)
+
     # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
     # Cooks known meshes' narrow-band SDFs on the host (p07), uploads via
     # SdfDeviceWorld, launches the shipping p07 sampler kernel through the

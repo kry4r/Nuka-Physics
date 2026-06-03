@@ -154,4 +154,32 @@ CudaWorldStepReport StepCudaWorld(const phi::DeviceContext& context,
     return report;
 }
 
+CudaWorldStepReport StepCudaWorld(const phi::DeviceContext& context,
+                                  DeviceWorld& device_world,
+                                  fluid::PbfWorld& pbf_world,
+                                  const fluid::PbfParams& pbf_params,
+                                  const CudaWorldStepOptions& options,
+                                  const fluid::PbfBoundary& pbf_boundary) {
+    // The rigid step is run UNCHANGED -- bit-for-bit identical to the rigid-only
+    // overload above. The PBF co-step is purely additive and runs only when the
+    // attached world actually has particles (inert-when-empty).
+    CudaWorldStepReport report = StepCudaWorld(context, device_world, options);
+    report.pbf_particle_count = pbf_world.ParticleCount();
+
+    if (pbf_world.ParticleCount() == 0u || options.dt <= 0.0f ||
+        options.step_count == 0u) {
+        return report;  // no PBF work: rigid result is byte-identical.
+    }
+
+    fluid::PbfStepOptions pbf_options;
+    pbf_options.gravity = options.gravity;
+    pbf_options.dt = options.dt;
+    pbf_options.step_count = options.step_count;
+    pbf_options.boundary = pbf_boundary;
+    const fluid::PbfStepReport pbf_report =
+        fluid::StepPbfWorld(context, pbf_world, pbf_params, pbf_options);
+    report.pbf_kernel_launch_count = pbf_report.kernel_launch_count;
+    return report;
+}
+
 } // namespace nuka::runtime::gpu
