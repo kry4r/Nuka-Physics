@@ -921,6 +921,42 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_rt_scene_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.7 G1-A: the self-written TWO-LEVEL (TLAS/BLAS) ray tracer
+    # (rt::BuildTwoLevelScene + rt::RenderFrame). Gates:
+    #   * Oracle 1 (host two-level brute-force, shares QuatInvRotate/intersect/
+    #     PackPrimId): byte-exact host==device across ALL 6 AOVs for ANY transform
+    #     incl. rotation (D1 + host/device-parity + traversal-independence).
+    #   * Oracle 2 (the trusted INDEPENDENT flat p13 RenderScene with each
+    #     instance baked to world verts): memcmp==0 depth/normal/color/albedo at
+    #     IDENTITY instances; near-exact (stated tol) for rotated/translated.
+    #   * Analytic anchors: p13's single-triangle t through the nest + a NEW
+    #     rotated+translated instance with a hand-computed world t AND an exact
+    #     prim_id == PackPrimId(known_instance, known_local) (bit-split + instance-
+    #     high ordering gate).
+    #   * Instance-transform tracking (move one instance, reuse the BLAS).
+    #   * D1 two-run byte-exact across ALL 6 AOVs.
+    # Built -ffp-contract=off to pair with the kernel's --fmad=false so Oracle 1's
+    # shared fp64-internal math + fp32 QuatInvRotate is host==device bit-for-bit.
+    add_executable(nuka_rt_two_level_test
+        rt/test_two_level_render.cpp
+    )
+    set_source_files_properties(rt/test_two_level_render.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_two_level_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_two_level_test
+        PRIVATE
+            nuka_rt_gpu
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_two_level_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
     # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
     # find_sdf_contact_newton (the SAME function the device kernel wraps) on the
