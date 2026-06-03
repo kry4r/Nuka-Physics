@@ -68,6 +68,7 @@ target_link_libraries(nuka_cooker
 # ---------------------------------------------------------------------------
 add_library(nuka_scene STATIC
     scene/scene_ir.cpp
+    scene/scene_compose.cpp
     scene/cooker.cpp
     scene/scene_graph.cpp
 )
