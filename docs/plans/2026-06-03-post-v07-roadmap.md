@@ -47,7 +47,7 @@ Effort key: S=small, M=medium, L=large, R=research. Each phase reuses the noted 
 | **R3 Garment cloth** | robot-dressing-grade cloth | strain-limited XPBD + robust self-collision/CCD + accurate bending; or projective-dynamics / VBD | M–L | XPBD cloth + particle grid + RT-BVH for CCD |
 | **R4 MPM** | granular / sand / snow / elastoplastic | MLS-MPM + APIC transfer; implicit MPM for stiff; Drucker-Prager/von-Mises return map | L | particle grid, SDF, D1 reductions |
 | **R5 Volumetric FEM** | constitutive soft-tissue / soft-robot | corotational / Neo-Hookean tet FEM, implicit (backward-Euler + self-written CG) | M–L | tet topology (p09), CG solver |
-| **R6 Closed kinematic loops** | parallel/linkage robots (the Kamino gap) | maximal-coord + Proximal-ADMM (or Lagrangian loop-closure) — a NEW solver alongside Featherstone | R | maximal-coord contact, solver suite |
+| **R6 Closed kinematic loops** ⏸ **DEFERRED (owner 2026-06-03: "kamino先不做")** | parallel/linkage robots (the Kamino gap) | maximal-coord + Proximal-ADMM (or Lagrangian loop-closure) — a NEW solver alongside Featherstone; plugs into the v0.8 solver registry when revived | R | maximal-coord contact, solver suite |
 | **R7 Tendon / muscle / actuator** | MuJoCo-parity actuation | routed/fixed tendons (length=Σ joint coeffs), Hill-type muscle, transmission | M | articulation + constraint rows |
 | **R8 Coupling breadth** | rigid↔MPM↔cloth↔fluid two-way | extend K2/K3 rows per new solver pair (MPM-rigid grid forces, cloth-fluid) | M (grows) | p11 coupling rows |
 
@@ -69,16 +69,44 @@ Effort key: S=small, M=medium, L=large, R=research. Each phase reuses the noted 
 | **U4 Real complex-USD asset pipeline** | import real complex USD scenes for demos (p16 requirement) | harden the hand-rolled importer or adopt a real USD path; mesh-geometry retention (#19) | M–L | importer, cooker |
 | **U5 Teleop / XR** (later) | device input → robot retargeting | keyboard/spacemouse/VR abstraction | M | U1 |
 
-## 3. Sequencing (owner-set, 2026-06-03 — REVISED for the version restructure)
-**v0.7 — CLOSED.** p12 ✅ → p13 ✅ → p14b ✅ → G1 TLAS/BLAS fast tracer ✅(#28) → p15 ✅ → asset pipeline ✅ (#19 mesh loader, #31 SceneIR compose, #32 USD mesh). The H1 grasp gate moves to v0.8/C7.
+## 3. Version structure & sequencing (owner-ratified via /grill-me, 2026-06-03)
 
-**v0.8 — engine completeness (the collision spine FIRST, then physics + render-beauty + usability):**
-1. **Unified collision/contact/coupling subsystem** (C1–C7, see [[v08-unified-collision-contact]]) — the SPINE. Closes the grasp demo (C7) as its first validation consumer. Pulls in former-v1.0 engine items where adjacent: GPU SDF cook backend (#21, behind p07 seam), SDF reverse-mode (#23, p08 debt), coupling wire-in (#27), AMG (#24, at its large-sparse-stiff consumer).
-2. **Physics completeness, value-ordered** (W1, each consumes the new contact spine): IK (R1, cheap, demo-useful) → cable/DER (R2, leapfrogs Newton) → garment cloth (R3, needs the CCD seam) → MPM (R4) → FEM (R5) → closed-loops/Kamino SolverKamino-ADMM (R6, plugs into the solver registry) → tendon/muscle (R7); coupling (R8) trails each via the coupling matrix.
-3. **Render beauty + speed** (W2 G2→G4 + G3): photoreal A1 path (G2) + benchmark/OptiX-trigger (G4) + semantic/normal AOVs (G3).
-4. **Usability** (W3 U1→U2→U3 + U4 real-complex-USD), once the fast render exists.
+Dependency-driven split: **foundation (v0.8) → breadth solvers (v0.9) → demos (v1.0)**. Cross-cutting policy (§6): full D1 everywhere; new breadth solvers forward-only (diff deferred).
 
-**v1.0 — DEMOS ONLY.** A few showcase demos on the v0.8 engine: H1 grasp-place, fluid/soft/coupling scenes, all photoreal-RT-rendered (A1 tier) on the GitHub homepage ([[v10-exit-conditions-expansion]], [[demo-homepage-readme-directives]]). No new engine work — purely demos + polish.
+**v0.7 — CLOSED.** p12 ✅ → p13 ✅ → p14b ✅ → G1 TLAS/BLAS fast tracer ✅(#28) → p15 ✅ → asset pipeline ✅ (#19 mesh loader, #31 SceneIR compose, #32 USD mesh). The H1 grasp gate moves to v0.8/C7 (validation, not gate).
+
+**v0.8 — SPINE + cross-cutting foundations** (every breadth solver / demo depends on these):
+1. **Unified collision/contact/coupling subsystem** (C1–C8, see [[v08-unified-collision-contact]]) — THE spine. Includes the **coupling-row framework + co-step bridge** as foundation (specific coupling pairs → v0.9). C7 grasp = first validation consumer. Pulls in adjacent former-v1.0 engine items: GPU SDF cook backend (#21), SDF reverse-mode (#23), coupling wire-in (#27), AMG (#24) at its consumer.
+2. **R1 IK** — Featherstone-Jacobian DLS/pseudo-inverse; demo-enabling for manipulation.
+3. **W2 render beauty+speed** — G2 photoreal A1 path + G3 semantic/normal AOVs + G4 perf-benchmark/OptiX-trigger (the "MEASURE" half; publish → v1.0).
+4. **W3 U1** — real-time interactive Vulkan viewport.
+
+**v0.9 — BREADTH solvers (plug into the spine) + advanced frontend:**
+1. **W1 breadth**, value-ordered: R2 cable/DER → R3 garment-grade cloth (CCD seam) → R4 MPM (granular) → R5 volumetric FEM → R7 tendon/muscle. **R6 Kamino closed-loops ⏸ DEFERRED** (owner "先不做"; revived later into the solver registry). R8 coupling **per-pair** (rigid↔fluid, articulated↔MPM, cloth↔rigid …) trails each, via the v0.8 coupling framework.
+2. **W3 advanced frontend**: U2 authoring/inspection → U3 web/log viewer → U4 real-complex-USD pipeline → U5 teleop/XR.
+
+**v1.0 — DEMOS ONLY** + release-grade wrapper (§5). No new engine work. The **6 showcase demos** (all photoreal-RT A1 on the GitHub homepage, [[v10-exit-conditions-expansion]], [[demo-homepage-readme-directives]]):
+1. **H1 dexterous grasp-and-place** (collision spine + R1 IK)
+2. **Rigid-body collision showcase** (stack/dominoes/pile — general rigid contact + multi-point manifold)
+3. **Fluid + rigid coupling** (pour water, objects pushed — PBF + rigid↔fluid R8)
+4. **Soft / cloth showcase** (drape/squish + cloth↔rigid — existing XPBD p09, NOT garment-grade)
+5. **MPM go2-on-sand** (granular walking — R4 MPM + articulated↔MPM coupling R8)
+6. **Cable / rope** (R2 cable/DER)
+
+## 5. v1.0 release-grade (non-demo) requirements — owner-approved 2026-06-03
+1. **Packaging/dist (MUST)**: pip-installable Python wheel (extend `scripts/build_python_wheel.sh`) + prebuilt CUDA wheel; optional Docker image.
+2. **Documentation (MUST)**: modernized README + C-ABI/Python API reference + getting-started + the 6 demo scenes as runnable examples + architecture overview.
+3. **Performance baselines**: MEASURE in v0.9 (W2 G4 + sim steps/s batched + D1 two-run/cross-replica gates); **PUBLISH** the honest benchmark table (incl. Newton/Isaac comparables) in **v1.0**.
+4. **License (MUST)**: maintain Apache-2.0; add third-party asset licenses (newton-assets / mujoco_menagerie) + NOTICE.
+5. **API stability (v1.0)**: freeze the C-ABI + Python surface (semver guarantee) + deprecation policy — a 1.0-appropriate commitment.
+6. **Release hygiene (MUST)**: CHANGELOG + GitHub release/tag + full CI green + all goldens regenerated/passing (incl. the C5 re-baselined standing golden).
+7. **Homepage (MUST)**: GitHub homepage with RT-rendered demo videos + logo (kry4r/Nuka assets/logo.png).
+
+## 6. Cross-cutting engineering policies (all versions)
+- **Determinism**: FULL D1 on every new subsystem/solver (two-run bit-identity + N≥32 cross-replica identity). D2/weak = optional fast-path seam only. Non-negotiable pillar.
+- **Differentiability**: rides only where it exists — the SDF contact tier (p08 adjoint) + the existing rigid/articulated IFT adjoint. New breadth solvers (cable/MPM/FEM/IK) are **forward-only**; diff = post-v1.0 research seam.
+- **No closed SDK**: self-written throughout (no OptiX/cuBLAS/OpenUSD); OptiX revisited only on a measured G4 trigger.
+- **Extensibility/maintainability** (Q9 directive): registration-based seams — new collidable types, narrowphase pairs, solvers (Kamino slot), coupling pairs, and a reserved CCD hook — so v0.9 breadth plugs in without touching the v0.8 spine.
 
 ## 4. Stays deferred (per sim2sim focus)
 Sim-to-real noise N1/N2/N3 (geometric/physical noise, beam divergence, rolling shutter, lens distortion, dark-current, ISP) and v3.0 real-hardware deployment + transfer metrics. Kept on the long-term map; not current priorities.
