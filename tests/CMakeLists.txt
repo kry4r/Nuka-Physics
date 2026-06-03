@@ -287,6 +287,7 @@ endif()
 # --- Scene tests -----------------------------------------------------------
 add_executable(nuka_scene_test
     scene/test_scene_ir.cpp
+    scene/test_scene_compose.cpp
     scene/test_scene_cooker.cpp
     scene/test_scene_pipeline.cpp
 )
