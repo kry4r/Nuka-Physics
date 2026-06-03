@@ -26,6 +26,25 @@ std::filesystem::path WriteTemp(const char* name, const std::string& contents) {
     return path;
 }
 
+// A minimal single-triangle ASCII STL fixture. The MJCF mesh-file wiring now
+// loads the geometry referenced by a `type="mesh"` geom, so a mesh geom must
+// resolve to a real on-disk asset. These decompose tests only assert the
+// nuka:decompose attribute parsing (which happens before geometry load), so any
+// valid mesh suffices.
+std::filesystem::path WriteFingerStl(const char* name) {
+    const std::string stl =
+        "solid finger\n"
+        "  facet normal 0 0 1\n"
+        "    outer loop\n"
+        "      vertex 0 0 0\n"
+        "      vertex 1 0 0\n"
+        "      vertex 0 1 0\n"
+        "    endloop\n"
+        "  endfacet\n"
+        "endsolid finger\n";
+    return WriteTemp(name, stl);
+}
+
 // --- USD --------------------------------------------------------------------
 // A Mesh collision shape carrying the custom nuka:decompose token + max_pieces.
 TEST(DecomposeAttribute, UsdParsesForceAndMaxPieces) {
@@ -139,7 +158,12 @@ TEST(DecomposeAttribute, UrdfParsesExplicitModeAttribute) {
 
 // --- MJCF -------------------------------------------------------------------
 TEST(DecomposeAttribute, MjcfParsesAutoAndMaxPieces) {
+    WriteFingerStl("finger.stl");
     const std::string mjcf = R"MJCF(<mujoco>
+  <compiler meshdir="."/>
+  <asset>
+    <mesh name="finger" file="finger.stl"/>
+  </asset>
   <worldbody>
     <body name="finger">
       <geom name="fingergeom" type="mesh" mesh="finger"
@@ -161,7 +185,12 @@ TEST(DecomposeAttribute, MjcfParsesAutoAndMaxPieces) {
 }
 
 TEST(DecomposeAttribute, MjcfDefaultsToAutoWhenAbsent) {
+    WriteFingerStl("finger.stl");
     const std::string mjcf = R"MJCF(<mujoco>
+  <compiler meshdir="."/>
+  <asset>
+    <mesh name="finger" file="finger.stl"/>
+  </asset>
   <worldbody>
     <body name="finger">
       <geom name="fingergeom" type="mesh" mesh="finger"/>

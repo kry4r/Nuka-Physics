@@ -4,6 +4,7 @@
 
 #include "import/mjcf_importer.hpp"
 
+#include "import/mesh_file_loader.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -11,6 +12,7 @@
 
 #include <tinyxml2.h>
 
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,10 +75,18 @@ struct MjcfDefaults {
     std::unordered_map<std::string, MjcfDefaultClass> classes;
 };
 
+// A resolved <asset><mesh> entry: the on-disk path (meshdir-resolved) plus the
+// optional per-axis scale applied to the loaded geometry.
+struct MjcfMeshAsset {
+    std::string resolved_path;
+    math::Vec3  scale = {1.0f, 1.0f, 1.0f};
+};
+
 struct MjcfParseContext {
     std::unordered_map<std::string, scene::BodyId> body_ids;
     std::unordered_map<std::string, scene::JointId> joint_ids;
     std::unordered_map<std::string, scene::MaterialId> material_ids;
+    std::unordered_map<std::string, MjcfMeshAsset> mesh_assets;
     MjcfDefaults defaults;
 };
 
@@ -254,6 +264,46 @@ void ParseMaterials(tinyxml2::XMLElement* mujoco,
     }
 }
 
+// Resolve <asset><mesh name= file= scale=> entries into the context, honoring
+// <compiler meshdir="...">. Mesh paths are resolved relative to the MJCF file's
+// own directory (base_dir) + meshdir. The actual mesh bytes are loaded lazily
+// when a geom references the asset (see ParseBody) so unused assets cost nothing.
+void ParseMeshAssets(tinyxml2::XMLElement* mujoco,
+                     MjcfParseContext& context,
+                     const std::filesystem::path& base_dir) {
+    std::filesystem::path meshdir;
+    if (auto* compiler = mujoco->FirstChildElement("compiler")) {
+        if (const char* md = compiler->Attribute("meshdir")) {
+            meshdir = md;
+        }
+    }
+
+    auto* asset = mujoco->FirstChildElement("asset");
+    if (!asset) {
+        return;
+    }
+
+    for (auto* mesh = asset->FirstChildElement("mesh");
+         mesh != nullptr;
+         mesh = mesh->NextSiblingElement("mesh")) {
+
+        const char* name = mesh->Attribute("name");
+        const char* file = mesh->Attribute("file");
+        if (!name || !file) {
+            continue;
+        }
+
+        MjcfMeshAsset record;
+        // std::filesystem::operator/ resets to the right operand if it is
+        // absolute, so an absolute meshdir or file path is handled correctly.
+        record.resolved_path = (base_dir / meshdir / file).string();
+        if (const char* scale = mesh->Attribute("scale")) {
+            record.scale = ParseVec3(scale);
+        }
+        context.mesh_assets[name] = std::move(record);
+    }
+}
+
 scene::BodyId ResolveBody(const char* name, const MjcfParseContext& context) {
     if (!name) {
         return scene::kInvalidBody;
@@ -354,6 +404,26 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             if (geom->QueryIntAttribute("nuka:decompose:max_pieces", &max_pieces) ==
                     tinyxml2::XML_SUCCESS && max_pieces > 0) {
                 shape.decompose_max_pieces = static_cast<uint32_t>(max_pieces);
+            }
+
+            // Load the referenced mesh file (STL/OBJ) into the shape's source
+            // geometry so the cooker (V-HACD/SDF) and renderer have triangles.
+            if (const char* mesh_name = geom->Attribute("mesh")) {
+                const auto it = context.mesh_assets.find(mesh_name);
+                if (it == context.mesh_assets.end()) {
+                    throw std::runtime_error(
+                        "MJCF: geom references unknown mesh asset '" +
+                        std::string(mesh_name) + "'");
+                }
+                MeshGeometry geo = LoadMeshFile(it->second.resolved_path);
+                const math::Vec3 s = it->second.scale;
+                for (std::size_t i = 0; i + 2 < geo.vertices.size(); i += 3) {
+                    geo.vertices[i + 0] *= s.x;
+                    geo.vertices[i + 1] *= s.y;
+                    geo.vertices[i + 2] *= s.z;
+                }
+                shape.mesh_vertices = std::move(geo.vertices);
+                shape.mesh_indices = std::move(geo.indices);
             }
         }
 
@@ -527,6 +597,7 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     ParseDefaults(mujoco, context);
     ParseMaterials(mujoco, scene, context);
+    ParseMeshAssets(mujoco, context, std::filesystem::path(path).parent_path());
     ParseLights(worldbody, scene);
 
     for (auto* body = worldbody->FirstChildElement("body");

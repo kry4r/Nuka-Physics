@@ -321,6 +321,7 @@ add_executable(nuka_import_test
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
     import/test_decompose_attribute.cpp
+    import/test_mesh_file_loader.cpp
 )
 
 target_link_libraries(nuka_import_test
