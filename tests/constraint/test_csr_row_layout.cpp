@@ -22,8 +22,8 @@ TEST(CsrRowLayout, BuildContactRowsForPointCount) {
 
 TEST(CsrRowLayout, BuildContactRowsFromManifolds) {
     ContactManifold manifold;
-    manifold.body_a = 0u;
-    manifold.body_b = 1u;
+    manifold.a.handle = 0u;
+    manifold.b.handle = 1u;
 
     ContactPoint point;
     point.position = {0.0f, 0.0f, 0.0f};
@@ -47,8 +47,8 @@ TEST(CsrRowLayout, BuildContactRowsFromManifolds) {
 
 TEST(CsrRowLayout, ContactMaterialParametersPropagateFromManifold) {
     ContactManifold manifold;
-    manifold.body_a = 0u;
-    manifold.body_b = 1u;
+    manifold.a.handle = 0u;
+    manifold.b.handle = 1u;
     manifold.friction = 0.65f;
     manifold.restitution = 0.25f;
 

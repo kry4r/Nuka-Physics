@@ -159,8 +159,8 @@ void BuildContactRows(std::span<const ContactManifold> manifolds,
         if (manifold.point_count == 0u) {
             continue;
         }
-        AppendContactGroup(manifold.body_a,
-                           manifold.body_b,
+        AppendContactGroup(manifold.a.handle,
+                           manifold.b.handle,
                            manifold.point_count,
                            manifold.friction,
                            manifold.restitution,

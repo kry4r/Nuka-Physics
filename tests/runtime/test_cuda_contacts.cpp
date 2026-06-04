@@ -135,8 +135,8 @@ TEST(CudaContacts, GeneratesAabbsPairsAndPlaneBoxContactOnDevice) {
     EXPECT_EQ(report.contact_point_count, 1u);
 
     ASSERT_EQ(manifolds.size(), 1u);
-    EXPECT_EQ(manifolds[0].body_a, 1u);
-    EXPECT_EQ(manifolds[0].body_b, 0u);
+    EXPECT_EQ(manifolds[0].a.handle, 1u);
+    EXPECT_EQ(manifolds[0].b.handle, 0u);
     ASSERT_EQ(manifolds[0].point_count, 1u);
     EXPECT_NEAR(manifolds[0].points[0].position.y, 0.0f, 1.0e-6f);
     EXPECT_EQ(manifolds[0].points[0].normal, math::Vec3::UnitY());
@@ -161,8 +161,8 @@ TEST(CudaContacts, GeneratesSphereSphereContactOnDevice) {
     const auto manifolds = contacts.DownloadManifolds();
 
     ASSERT_EQ(manifolds.size(), 1u);
-    EXPECT_EQ(manifolds[0].body_a, 0u);
-    EXPECT_EQ(manifolds[0].body_b, 1u);
+    EXPECT_EQ(manifolds[0].a.handle, 0u);
+    EXPECT_EQ(manifolds[0].b.handle, 1u);
     ASSERT_EQ(manifolds[0].point_count, 1u);
     EXPECT_NEAR(manifolds[0].points[0].normal.x, -1.0f, 1.0e-6f);
     EXPECT_NEAR(manifolds[0].points[0].normal.y, 0.0f, 1.0e-6f);

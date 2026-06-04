@@ -919,6 +919,30 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_lbvh_filtered_pairs_test)
 
+    # --- v0.8 C3a: extended ContactManifold + narrowphase dispatch table -------
+    # Validates SelectTier routing (primitive->Analytical, mesh/convex->Convex,
+    # SDF-equipped->Sdf), the constexpr (typeA,typeB,tier)->handler dispatch table
+    # (looked-up fn-ptr == expected tier stub AND call-through stamps the tier
+    # marker), and the extended ContactManifold round-trip (AddPoint clamp@4, Clear
+    # reset, CollidableRef a/b type+react+handle, trivially-copyable memcpy
+    # byte-stability). Header-only (narrowphase_dispatch.hpp + contact_manifold.hpp
+    # + collidable.hpp) -- needs nuka_codegen (collidable.hpp -> generated
+    # collidable_registry.hpp) + the src include dir; nuka_phi for completeness.
+    add_executable(nuka_narrowphase_dispatch_test
+        collision/test_narrowphase_dispatch.cpp
+    )
+    add_dependencies(nuka_narrowphase_dispatch_test nuka_codegen)
+    target_include_directories(nuka_narrowphase_dispatch_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_narrowphase_dispatch_test
+        PRIVATE
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_narrowphase_dispatch_test)
+
     # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
     # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
     # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity
