@@ -38,7 +38,9 @@
 #include "collision/analytical_manifold.hpp" // C3b: PrimParams + amf:: handlers
 #include "collision/candidate_pair.hpp"     // CandidatePair, CollidableRef
 #include "collision/convex_narrowphase.hpp" // C3c: cvx:: GJK/EPA/face-clip + ConvexHullView
+#include "collision/sdf_contact.hpp"        // C3d: find_sdf_contact_newton + SdfBodyFrame
 #include "constraint/contact_manifold.hpp"  // ContactManifold (extended, C3a)
+#include "runtime/sdf/sparse_sdf_query.cuh" // C3d: SparseSdfDevice (the SDF view)
 #include "scene/canonical_types.hpp"        // scene::ShapeType
 
 #include <cstdint>
@@ -97,6 +99,24 @@ inline constexpr uint32_t kShapeTypeCount =
 // spans) + C3d (CookedSdfTable handle) -- those tiers DO have contiguous backing
 // stores, so the void* is the right representation THERE. (C3a defaults preserved
 // so the C3a routing test still constructs ShapeProxyView with no args.)
+//
+// C3d GROWTH (Sdf tier, REUSES the void* seam): the Sdf-tier handler needs, per
+// side, the cooked SDF's device view (SparseSdfDevice) + the body world<->local
+// frame (SdfBodyFrame). Both have a contiguous backing struct, so -- exactly as
+// the void* seam was reserved for "tiers that DO have a contiguous backing store"
+// -- we point geom_a/geom_b at an SdfProxyView{sdf, frame} rather than growing the
+// view with two more inline structs. The Sdf handler reads geom_X as a
+// `const SdfProxyView*` (valid ONLY in the Sdf tier, which is the ONLY tier whose
+// handler this struct feeds -- has_sdf overrides tier, so any SDF-equipped pair
+// routes to the Sdf plane and nowhere else reads geom_X as an SDF view). A null
+// geom (caller didn't populate the seam) -> empty manifold (mirrors C3c's hull
+// null-guard). This keeps ONE handler signature: the void* is reinterpreted
+// per-tier, never widening the shared struct.
+struct SdfProxyView {
+    runtime::sdf::SparseSdfDevice sdf{};   // the cooked SDF device/host view, this side
+    collision::SdfBodyFrame       frame{}; // this body's world<->local frame
+};
+
 struct ShapeProxyView {
     ShapeType       type_a = ShapeType::Sphere;
     ShapeType       type_b = ShapeType::Sphere;
@@ -178,12 +198,10 @@ inline void NarrowphaseStubConvex(const CandidatePair& pair,
     StubFillEmpty(pair, out, NarrowphaseTier::Convex);
 }
 
-// TODO(C3d): SDF high-precision single-witness manifold (wraps find_sdf_contact).
-inline void NarrowphaseStubSdf(const CandidatePair& pair,
-                               const ShapeProxyView& /*geom*/,
-                               ContactManifold* out) {
-    StubFillEmpty(pair, out, NarrowphaseTier::Sdf);
-}
+// C3d REAL Sdf handler: NarrowphaseSdf -- defined below, AFTER StampSides (the
+// shared a/b-stamp helper it reuses). It REPLACES the Sdf stub across the whole
+// Sdf plane of the table in MakeNarrowphaseTable() (has_sdf overrides tier, so
+// any SDF-equipped pair routes to the Sdf plane). See its header comment there.
 
 // ---------------------------------------------------------------------------
 // C3b REAL Analytical handlers (primitive x primitive multi-point/face-face).
@@ -391,6 +409,99 @@ inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g
 }
 
 // ---------------------------------------------------------------------------
+// C3d REAL Sdf handler (high-precision single-witness Newton-on-summed-SDF).
+// ---------------------------------------------------------------------------
+// Wraps find_sdf_contact_newton (sdf_contact.hpp) -- the EXISTING D1, HD,
+// differentiable-ready SDF narrowphase that, until C3d, had ZERO stepping
+// callsites (architecture §0(c) dead code). This handler is its FIRST caller:
+// for an SDF-equipped pair it reads each side's SparseSdfDevice view + body
+// frame (from the SdfProxyView the caller aimed geom_a/geom_b at), seeds the
+// Newton solve, and converts the single SdfContactResult witness into a 1-point
+// ContactManifold (OPEN-I: single witness -> 1 point for v0.8 grasp; multi-point
+// via perturbed restarts is v0.9).
+//
+// INITIAL GUESS. The spec says "midpoint of the pair AABBs". The ShapeProxyView
+// carries no AABBs (it is the lean cooked-geometry view), so we use the MIDPOINT
+// OF THE TWO BODY FRAME TRANSLATIONS -- the body/piece centers in world. For the
+// just-touching SDF-equipped pieces this tier targets (fingertip vs cup piece),
+// that midpoint lands in both narrow bands (the bands straddle the contact
+// surface, which sits between the two centers). DOCUMENTED CHOICE. (If a future
+// caller carries true AABB centers, swapping this one line to their midpoint is
+// the localized edit; the contact surface still lies between the AABB centers.)
+//   Band caveat (D1, not a regression): find_sdf_contact_newton requires the
+//   INITIAL iterate to be in BOTH narrow bands (sdf_contact.hpp:184-187 returns
+//   invalid otherwise; the halving line-search only engages after one in-band
+//   step). For widely-separated centers the midpoint may miss the bands -> valid
+//   == false -> EMPTY manifold (correct "no contact at this seed"); single-
+//   witness SDF is a high-precision near-contact tier, not a global search.
+//
+// NORMAL SIGN (the load-bearing mapping). SdfContactResult.normal is unit and in
+// the "a<-b sense" == the SEPARATION direction for body a (sdf_contact.hpp:106,
+// 230-238: normalize(grad_b - grad_a)). The ContactManifold convention is
+// "separation dir for side A" (contact_manifold.hpp:44). We bind the pair's
+// side A -> sdf_a (geom_a) and side B -> sdf_b (geom_b), so SDF body a == pair
+// side A: the SDF normal is ALREADY "separation dir for side A" -- NO FLIP. (A
+// flip would be needed only if the caller swapped the binding; verified against
+// the box-on-ground analytical case in test_sdf_tier_wired: top box A on ground
+// box B -> normal.y > 0, i.e. A separates +Y, matching grad_b(+Y)-grad_a(-Y).)
+//
+// p08-C ADJOINT / DIFFERENTIABILITY SEAM (NOT dropped). The Q5 differentiable
+// tier rides p08's IFT-at-convergence adjoint, which needs the converged
+// stationarity-residual state (phi_a/phi_b, grad_a/grad_b world, step_curvature)
+// -- fields the ContactManifold does NOT carry (it is the solver hand-off, not
+// the adjoint state). We do NOT widen ContactManifold for them (blast radius +
+// breaks its trivially-copyable D1 contract). The adjoint state is RECOVERED by
+// DETERMINISTIC RE-QUERY: find_sdf_contact_newton is D1 (fixed-iter/tol/clamp,
+// no atomics), so re-running it from the same (sdf_a, frame_a, sdf_b, frame_b,
+// guess) yields a BYTE-IDENTICAL SdfContactResult carrying the full adjoint
+// state. That is exactly what test_sdf_contact_adjoint_fd already does (re-runs
+// the descent under perturbation). So the differentiability seam is preserved at
+// the C4/p08-adjoint consumer via re-query, NOT silently discarded here.
+inline void NarrowphaseSdf(const CandidatePair& pair, const ShapeProxyView& g,
+                           ContactManifold* out) {
+    if (out == nullptr) {
+        return;
+    }
+    out->Clear();
+    StampSides(pair, out);
+    // Tag the reaction providers from each side's CollidableType static metadata
+    // (the Sdf tier is class-blind: rigid piece, articulation-link fingertip,
+    // etc. -- the solver reads .react off the ref to build each row side).
+    out->a.react = constraint::GetCollidableTypeInfo(pair.a.type).react;
+    out->b.react = constraint::GetCollidableTypeInfo(pair.b.type).react;
+
+    // Read the per-side SDF views from the void* seam. Null (unpopulated) ->
+    // empty manifold, no crash (mirrors C3c's hull null-guard; also the
+    // separated/no-SDF path).
+    const auto* sa = static_cast<const SdfProxyView*>(g.geom_a);
+    const auto* sb = static_cast<const SdfProxyView*>(g.geom_b);
+    if (sa == nullptr || sb == nullptr) {
+        return;
+    }
+
+    // Initial guess = midpoint of the two body/piece centers (frame translations).
+    const math::Vec3 ta = sa->frame.translation;
+    const math::Vec3 tb = sb->frame.translation;
+    const math::Vec3 guess{0.5f * (ta.x + tb.x), 0.5f * (ta.y + tb.y),
+                           0.5f * (ta.z + tb.z)};
+
+    const SdfContactResult r = find_sdf_contact_newton(
+        sa->sdf, sa->frame, sb->sdf, sb->frame, guess, SdfContactParams{});
+
+    // No contact (not converged in-band, or not penetrating) -> empty manifold.
+    if (!(r.valid && r.penetrating)) {
+        return;  // point_count stays 0 (Clear above)
+    }
+
+    // Single witness -> 1-point manifold. normal already "sep dir for side A".
+    constraint::ContactPoint pt{};
+    pt.position    = r.point;
+    pt.normal      = r.normal;
+    pt.penetration = r.penetration;
+    out->AddPoint(pt);  // point_count -> 1
+}
+
+// ---------------------------------------------------------------------------
 // The dispatch table: table[typeA][typeB][tier] -> handler.
 // ---------------------------------------------------------------------------
 // Representation: a dense 3-D constexpr array of function pointers. O(1) lookup
@@ -420,8 +531,19 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
                 &NarrowphaseStubAnalytical;
             t.fns[ia][ib][static_cast<uint32_t>(NarrowphaseTier::Convex)] =
                 &NarrowphaseStubConvex;
+            // C3d: the WHOLE Sdf plane defaults to the REAL NarrowphaseSdf handler
+            // (not a stub). RATIONALE: SelectTier routes ANY has_sdf==true pair to
+            // the Sdf tier REGARDLESS of (typeA,typeB) -- the SDF view is the only
+            // geometry the Newton solve reads, so the shapes' enum tags don't pick
+            // a different SDF math. One generic handler therefore covers every
+            // (typeA,typeB,Sdf) slot (the broad "Sdf plane" the spec asks for), so
+            // the right registration is to fill the plane in this default loop --
+            // exactly how the table's per-tier default-fill works. NarrowphaseSdf
+            // null-guards an unpopulated SdfProxyView seam -> empty manifold, so a
+            // slot reached without SDF data still behaves like the old stub (empty
+            // manifold) but is no longer the dead-marker stub.
             t.fns[ia][ib][static_cast<uint32_t>(NarrowphaseTier::Sdf)] =
-                &NarrowphaseStubSdf;
+                &NarrowphaseSdf;
         }
     }
     // --- C3b/C3c/C3d real-handler registration goes here (localized edits) ---
