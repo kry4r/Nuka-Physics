@@ -199,6 +199,11 @@ TEST(LbvhFilteredPairs, UnfilteredEqualsBruteForceOverlap) {
 //   (d) explicit <pair> on a bitmask-rejected pair -> FORCE-INCLUDED.
 //   (e) (optional) explicit <pair> on NON-overlapping shapes -> still INCLUDED
 //       (proves the merge is unconditional / independent of the LBVH).
+//   (f) explicit <pair> on an EXCLUDED overlapping pair -> FORCE-INCLUDED
+//       (MuJoCo: a predefined <pair> always generates; <exclude> only suppresses
+//       DYNAMIC detection, so an explicit pair overrides the exclude). This pins
+//       the precedence the .cu host merge implements (append without consulting
+//       the exclude list).
 // Plus a plain overlapping pair that should survive (control).
 // ---------------------------------------------------------------------------
 TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
@@ -249,6 +254,12 @@ TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
     const auto b10 = add_box({30.0f, 0.0f, 0.0f}, 1u, 1u); // shape 10
     const auto b11 = add_box({40.0f, 0.0f, 0.0f}, 1u, 1u); // shape 11
 
+    // (f) explicit force-include on an EXCLUDED overlapping pair: 12 & 13. Default
+    //     mask + overlap (would survive), BUT body-excluded (would drop) AND an
+    //     explicit <pair> (must override the exclude -> KEEP).
+    const auto b12 = add_box({50.0f, 0.0f, 0.0f}, 1u, 1u); // shape 12
+    const auto b13 = add_box({50.6f, 0.0f, 0.0f}, 1u, 1u); // shape 13 (overlaps 12)
+
     scene.AddExcludePair(b4, b5);                 // (b)
     scene.AddJoint("j", b6, b7);                  // (c) parent=b6, child=b7
     scene::ContactPairOverride ov_d;
@@ -257,6 +268,10 @@ TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
     scene::ContactPairOverride ov_e;
     ov_e.geom1 = 10u; ov_e.geom2 = 11u;
     scene.AddContactPair(ov_e);                   // (e)
+    scene.AddExcludePair(b12, b13);               // (f) exclude...
+    scene::ContactPairOverride ov_f;
+    ov_f.geom1 = 12u; ov_f.geom2 = 13u;
+    scene.AddContactPair(ov_f);                   // (f) ...but explicit overrides it
 
     const auto blob = scene::CookScene(scene);
     ASSERT_EQ(blob.shape_count, aabbs.size());
@@ -269,10 +284,15 @@ TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
     ASSERT_TRUE(aabbs[6].Overlaps(aabbs[7])) << "(c) joint case not overlapping";
     ASSERT_TRUE(aabbs[8].Overlaps(aabbs[9])) << "(d) explicit case not overlapping";
     ASSERT_FALSE(aabbs[10].Overlaps(aabbs[11])) << "(e) must be NON-overlapping";
+    ASSERT_TRUE(aabbs[12].Overlaps(aabbs[13])) << "(f) excluded-explicit case not overlapping";
     // Confirm the cooker actually unioned the joint into the exclude list (so (c)
     // is a real auto-exclude, not a silent no-op).
     ASSERT_TRUE(scene::IsBodyPairExcluded(blob.filter_policy, b6, b7))
         << "cooker did not auto-exclude the parent-child joint pair";
+    // Confirm (f) is genuinely excluded -- so the explicit pair really is overriding
+    // an exclude, not a no-op on an already-includable pair.
+    ASSERT_TRUE(scene::IsBodyPairExcluded(blob.filter_policy, b12, b13))
+        << "(f) pair is not actually excluded -- precedence test is vacuous";
 
     const auto got = ToBodyPairSet(RunBuilder(aabbs, blob));
     const auto oracle = Oracle(aabbs, blob);
@@ -281,8 +301,9 @@ TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
     EXPECT_EQ(got.size(), oracle.size());
     EXPECT_EQ(got, oracle);
     // Documented expectation: survivors {b0-b1 (control), b8-b9 (explicit),
-    // b10-b11 (explicit non-overlap)} = 3; (a)(b)(c) all dropped.
-    EXPECT_EQ(oracle.size(), 3u);
+    // b10-b11 (explicit non-overlap), b12-b13 (explicit overrides exclude)} = 4;
+    // (a)(b)(c) all dropped.
+    EXPECT_EQ(oracle.size(), 4u);
 
     // --- Per-case membership (independent of the set equality). --------------
     EXPECT_TRUE(got.count(Canon(b0, b1)))  << "control survivor missing";
@@ -292,6 +313,8 @@ TEST(LbvhFilteredPairs, FilteredMatchesOracle) {
     EXPECT_TRUE(got.count(Canon(b8, b9)))  << "(d) explicit force-include missing";
     EXPECT_TRUE(got.count(Canon(b10, b11)))
         << "(e) explicit force-include on non-overlapping pair missing";
+    EXPECT_TRUE(got.count(Canon(b12, b13)))
+        << "(f) explicit pair did NOT override the exclude (precedence broken)";
 }
 
 // ---------------------------------------------------------------------------
