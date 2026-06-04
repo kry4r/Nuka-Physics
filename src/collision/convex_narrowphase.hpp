@@ -331,11 +331,17 @@ NUKA_CVX_HD inline GjkResult GjkIntersect(const SupportProxy& A,
 // ---------------------------------------------------------------------------
 // EPA -- expanding polytope. Penetration depth + normal from the GJK tetra.
 // ---------------------------------------------------------------------------
-inline constexpr int   kEpaMaxIter   = 64;
-inline constexpr int   kEpaMaxFaces  = 128;
-inline constexpr int   kEpaMaxVerts  = 64;
-inline constexpr int   kEpaMaxEdges  = 64;
-inline constexpr float kEpaTol       = 1.0e-4f;
+inline constexpr int   kEpaMaxIter     = 64;
+inline constexpr int   kEpaMaxFaces    = 128;
+inline constexpr int   kEpaMaxVerts    = 64;
+inline constexpr int   kEpaMaxEdges    = 64;
+inline constexpr float kEpaTol         = 1.0e-4f;
+// Enclosure pre-loop: a seed face whose SIGNED origin-distance is <= this is
+// treated as "origin on/outside it" -> the polytope does not strictly contain the
+// origin and must be expanded before the metric loop. Fixed retry budget so the
+// pre-loop is bounded + D1 (origin-on-edge needs 2 dirs, on-vertex 3; 12 is ample).
+inline constexpr float kEpaEnclEps     = 1.0e-6f;
+inline constexpr int   kEpaMaxEnclIter = 12;
 
 struct EpaFace {
     int  a, b, c;       // vertex indices into the vert pool
@@ -353,8 +359,20 @@ struct EpaResult {
     Vec3  witness_b{0.0f, 0.0f, 0.0f};
 };
 
-// Build an outward-normal face from 3 CSO verts (origin must be on the inside).
-NUKA_CVX_HD inline EpaFace MakeFace(const MinkPoint* verts, int a, int b, int c) {
+// Build an outward-normal face from 3 CSO verts. Orientation is by the POLYTOPE
+// CENTROID (`interior`), NOT the origin-sign: GJK's output simplex has no
+// guaranteed consistent winding, and for an origin-on-boundary seed a `dist==0`
+// face's origin-sign flip never triggers, leaving the normal pointing INWARD --
+// the precise root cause of the origin-on-boundary false-negative (the support
+// query along an inward normal can never advance past the origin, so the polytope
+// churns coplanar). The centroid of a non-degenerate seed tetra is a guaranteed
+// strictly-interior point, so `nrm . (va - interior) > 0` reliably picks OUTWARD
+// regardless of where the origin sits. `dist` is then the SIGNED origin->plane
+// distance (>0 origin inside this face's halfspace, <=0 origin on/outside it).
+// For a strictly-interior origin centroid-sign == origin-sign, so every config
+// that already enclosed the origin gets a BIT-IDENTICAL face (D1 preserved).
+NUKA_CVX_HD inline EpaFace MakeFace(const MinkPoint* verts, int a, int b, int c,
+                                   Vec3 interior) {
     EpaFace f;
     f.a = a; f.b = b; f.c = c; f.alive = true;
     const Vec3 va = verts[a].v, vb = verts[b].v, vc = verts[c].v;
@@ -362,10 +380,82 @@ NUKA_CVX_HD inline EpaFace MakeFace(const MinkPoint* verts, int a, int b, int c)
     const float nlen = amf::Len(nrm);
     if (nlen < 1.0e-12f) { f.normal = Vec3::UnitY(); f.dist = 0.0f; return f; }
     nrm = nrm / nlen;
-    float d = nrm.Dot(va);          // signed distance origin->plane
-    if (d < 0.0f) { nrm = -nrm; d = -d; }   // force OUTWARD (origin inside polytope)
-    f.normal = nrm; f.dist = d;
+    // Force OUTWARD relative to the interior point (centroid), not the origin.
+    if (nrm.Dot(va - interior) < 0.0f) nrm = -nrm;
+    f.normal = nrm;
+    f.dist = nrm.Dot(va);           // SIGNED distance origin->plane (may be <=0)
     return f;
+}
+
+// Centroid of the first `nverts` CSO vertices (a strictly-interior point of their
+// convex hull -- the polytope). FIXED-ORDER sum (D1). Used to orient faces OUTWARD
+// independent of where the origin sits (origin-on-boundary robustness).
+NUKA_CVX_HD inline Vec3 PolytopeCentroid(const MinkPoint* verts, int nverts) {
+    Vec3 c{0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < nverts; ++i) c += verts[i].v;
+    return c / static_cast<float>(nverts > 0 ? nverts : 1);
+}
+
+// Outcome of inserting a support vertex + rebuilding the horizon.
+enum class EpaInsert : uint8_t { Inserted = 0, NoVisible = 1, Overflow = 2 };
+
+// Insert support point `p` into the polytope: remove every face VISIBLE from p
+// (p strictly on its OUTWARD side), build the silhouette horizon by edge-toggle,
+// and append a fan of new faces (each horizon edge + p), oriented OUTWARD by the
+// updated centroid. SHARED by the enclosure pre-loop AND the metric loop so the
+// topology update is byte-for-byte identical on both paths (D1).
+//   Edge buffer scanned in face index order, each face's 3 edges in fixed
+//   (a-b, b-c, c-a) order; add if absent, cancel if reverse present -> only the
+//   silhouette survives. Deterministic. The new vertex is appended at `verts`,
+//   then faces are reoriented against the NEW centroid (which includes p) so the
+//   fan normals point outward even when the origin is on the polytope boundary.
+NUKA_CVX_HD inline EpaInsert EpaInsertSupport(MinkPoint* verts, int& nverts,
+                                              EpaFace* faces, int& nfaces,
+                                              const MinkPoint& p) {
+    if (nverts >= kEpaMaxVerts) return EpaInsert::Overflow;
+    // --- find + kill visible faces, toggle horizon edges (fixed order). ---
+    int edge_a[kEpaMaxEdges];
+    int edge_b[kEpaMaxEdges];
+    int nedges = 0;
+    bool any_visible = false;
+    for (int i = 0; i < nfaces; ++i) {
+        if (!faces[i].alive) continue;
+        // visible if p is strictly on the OUTWARD side of the face plane.
+        if (faces[i].normal.Dot(p.v) - faces[i].dist <= 0.0f) continue;
+        any_visible = true;
+        faces[i].alive = false;  // consumed
+        const int e[3][2] = {{faces[i].a, faces[i].b},
+                             {faces[i].b, faces[i].c},
+                             {faces[i].c, faces[i].a}};
+        for (int k = 0; k < 3; ++k) {
+            const int u = e[k][0], v = e[k][1];
+            int found = -1;
+            for (int q = 0; q < nedges; ++q) {
+                if (edge_a[q] == v && edge_b[q] == u) { found = q; break; }
+            }
+            if (found >= 0) {
+                for (int q = found; q < nedges - 1; ++q) {
+                    edge_a[q] = edge_a[q + 1]; edge_b[q] = edge_b[q + 1];
+                }
+                --nedges;
+            } else {
+                if (nedges >= kEpaMaxEdges) return EpaInsert::Overflow;
+                edge_a[nedges] = u; edge_b[nedges] = v; ++nedges;
+            }
+        }
+    }
+    if (!any_visible) return EpaInsert::NoVisible;  // p inside polytope (no progress)
+
+    // Append p, then build the fan, orienting against the NEW centroid (incl. p)
+    // so the new faces' normals are OUTWARD even on an origin-on-boundary seed.
+    const int new_vi = nverts;
+    verts[nverts++] = p;
+    const Vec3 c = PolytopeCentroid(verts, nverts);
+    for (int q = 0; q < nedges; ++q) {
+        if (nfaces >= kEpaMaxFaces) return EpaInsert::Overflow;
+        faces[nfaces++] = MakeFace(verts, edge_a[q], edge_b[q], new_vi, c);
+    }
+    return EpaInsert::Inserted;
 }
 
 NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy& B,
@@ -390,26 +480,94 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
     }
     if (nverts < 4) { res.ok = false; return res; }
 
-    // --- 2) Seed the polytope: 4 faces of the tetra, each forced OUTWARD. ---
+    // --- 2) Seed the polytope: 4 faces of the tetra, each oriented OUTWARD by the
+    // tetra CENTROID (a guaranteed strictly-interior point of the non-degenerate
+    // seed). This is the load-bearing fix: orienting by the origin-sign (the old
+    // posture) leaves a `dist==0` face's normal pointing INWARD on an
+    // origin-on-boundary seed, so the subsequent support query churns coplanar and
+    // never finds the real penetrating face (the confirmed false-negative). With
+    // centroid-orientation `face.dist` is the SIGNED origin->plane distance: <=0
+    // means the origin is on/outside that face -> the seed does NOT strictly
+    // contain the origin and must be expanded (step 2b) before the metric loop. ---
     EpaFace faces[kEpaMaxFaces];
     int nfaces = 0;
-    faces[nfaces++] = MakeFace(verts, 0, 1, 2);
-    faces[nfaces++] = MakeFace(verts, 0, 2, 3);
-    faces[nfaces++] = MakeFace(verts, 0, 3, 1);
-    faces[nfaces++] = MakeFace(verts, 1, 3, 2);
+    {
+        const Vec3 c0 = PolytopeCentroid(verts, nverts);
+        faces[nfaces++] = MakeFace(verts, 0, 1, 2, c0);
+        faces[nfaces++] = MakeFace(verts, 0, 2, 3, c0);
+        faces[nfaces++] = MakeFace(verts, 0, 3, 1, c0);
+        faces[nfaces++] = MakeFace(verts, 1, 3, 2, c0);
+    }
+
+    // --- 2b) ENCLOSURE PRE-LOOP: make the origin STRICTLY interior. ---
+    // While any alive face has SIGNED dist <= kEpaEnclEps (origin on/outside it),
+    // query the support along that face's OUTWARD normal:
+    //   - if it advances strictly past the origin (pd - dist > eps), the CSO
+    //     extends beyond the origin in that direction -> insert it (horizon
+    //     rebuild) so the origin moves strictly inside; it cannot revert (the
+    //     polytope only grows). Lowest-index offending face first (D1).
+    //   - if it does NOT advance (pd <= eps), the CSO SURFACE passes through the
+    //     origin along that normal: a GENUINE touching contact (true depth 0).
+    //     Stop expanding -> the metric loop yields depth 0 -> BuildConvexManifold
+    //     drops it (correct "no penetration"), NOT a false positive.
+    // Fixed retry budget (kEpaMaxEnclIter) so the pre-loop is bounded + D1.
+    for (int encl = 0; encl < kEpaMaxEnclIter; ++encl) {
+        int   bad = -1;
+        for (int i = 0; i < nfaces; ++i) {
+            if (!faces[i].alive) continue;
+            if (faces[i].dist <= kEpaEnclEps) { bad = i; break; }  // lowest index
+        }
+        if (bad < 0) break;  // origin strictly inside every face -> enclosed
+        const MinkPoint p = SupportMink(A, B, faces[bad].normal);
+        const float pd = p.v.Dot(faces[bad].normal);
+        if (pd - faces[bad].dist <= kEpaEnclEps) {
+            // The CSO does NOT extend past the origin along this deficient normal:
+            // the origin sits ON the CSO SURFACE along `faces[bad].normal`, i.e. a
+            // GENUINE TOUCHING contact -- the true penetration depth is 0 in this
+            // direction, and that direction IS the contact normal. (The polytope may
+            // still be DEEP on the OTHER sides of a flat CSO -- e.g. two boxes flush
+            // face-to-face: the CSO is a box with the origin on its +Z face but ~2
+            // deep on -Z/sides. Letting the metric loop run would pick one of those
+            // FAR positive faces and report a bogus deep contact with the wrong
+            // normal.) So a genuine touch must terminate as depth-0 / NO contact:
+            // bail with ok=false -> empty manifold (correct; distinct from a real
+            // overlap, which DOES strictly enclose the origin and never reaches here).
+            res.ok = false;
+            return res;
+        }
+        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
+    }
 
     Vec3  best_n = Vec3::UnitY();
     float best_d = 0.0f;
     int   best_face = -1;
+    bool  progressed = false;  // did the metric loop converge on a positive-depth face?
 
     for (int it = 0; it < kEpaMaxIter; ++it) {
         // --- 3) FIXED-ORDER ARRAY SCAN for the closest ALIVE face. ---
         // Key = (dist ASC, face index ASC). Strict `<` improvement only, so on a
         // distance tie the LOWEST face index wins. NO float-keyed heap (D1 trap).
+        //
+        // CRITICAL: SKIP degenerate "on-origin" faces (signed dist <= kEpaEnclEps).
+        // The box-box (and any flat-faced) CSO carries a WALL of vertices coplanar
+        // with the origin (e.g. the x=0 / y=0 cross-section vertices); incremental
+        // expansion keeps fabricating SLIVER triangles whose 3 verts are coplanar-
+        // through-origin -> dist==0 with a spurious axis normal. Such a sliver is an
+        // INTERIOR artifact, never the true closest CSO face, yet its support
+        // advances (pd>>0) so selecting it churns the polytope NON-MONOTONICALLY
+        // (the confirmed 0->0.057->0 trace) until face overflow -> false negative.
+        // After the enclosure pre-loop the origin is STRICTLY interior (a genuine
+        // touch already bailed with ok=false above), so a strictly-POSITIVE-distance
+        // face (the real MTV face, z=0.1 here) always exists; selecting among only
+        // those gives classic monotone EPA convergence. If by FP edge effects no
+        // positive face is found, close stays -1 -> break -> ok=false -> empty (a
+        // safe no-contact). Fixed eps + fixed scan order keep the skip deterministic (D1).
         int   close = -1;
         float close_d = 3.4e38f;
         for (int i = 0; i < nfaces; ++i) {
             if (!faces[i].alive) continue;
+            if (faces[i].dist <= kEpaEnclEps) continue;  // skip on-origin sliver
             if (faces[i].dist < close_d) { close_d = faces[i].dist; close = i; }
         }
         if (close < 0) break;
@@ -419,59 +577,23 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
         const MinkPoint p = SupportMink(A, B, faces[close].normal);
         const float pd = p.v.Dot(faces[close].normal);
         if (pd - close_d < kEpaTol) {
-            break;  // converged: support no further than the face -> face is the hull
+            progressed = true;  // support no further than the face -> CONVERGED
+            break;
         }
-        if (nverts >= kEpaMaxVerts) break;  // overflow -> best-so-far (deterministic)
-        const int new_vi = nverts;
-        verts[nverts++] = p;
-
-        // --- 5) Remove all faces VISIBLE from p; build the horizon by edge-toggle.
-        // Edge buffer scanned in face index order, each face's 3 edges in fixed
-        // (a-b, b-c, c-a) order; add if absent, cancel if present (shared interior
-        // edges cancel -> only the silhouette survives). Deterministic.
-        int edge_a[kEpaMaxEdges];
-        int edge_b[kEpaMaxEdges];
-        int nedges = 0;
-        bool overflow = false;
-        for (int i = 0; i < nfaces && !overflow; ++i) {
-            if (!faces[i].alive) continue;
-            // visible if p is on the OUTWARD side of the face plane.
-            if (faces[i].normal.Dot(p.v) - faces[i].dist <= 0.0f) continue;
-            faces[i].alive = false;  // this face is consumed
-            const int e[3][2] = {{faces[i].a, faces[i].b},
-                                 {faces[i].b, faces[i].c},
-                                 {faces[i].c, faces[i].a}};
-            for (int k = 0; k < 3; ++k) {
-                const int u = e[k][0], v = e[k][1];
-                // look for the REVERSE edge (v,u) already in the buffer -> cancel.
-                int found = -1;
-                for (int q = 0; q < nedges; ++q) {
-                    if (edge_a[q] == v && edge_b[q] == u) { found = q; break; }
-                }
-                if (found >= 0) {
-                    // cancel: remove by shifting tail down (preserve order -> D1).
-                    for (int q = found; q < nedges - 1; ++q) {
-                        edge_a[q] = edge_a[q + 1]; edge_b[q] = edge_b[q + 1];
-                    }
-                    --nedges;
-                } else {
-                    if (nedges >= kEpaMaxEdges) { overflow = true; break; }
-                    edge_a[nedges] = u; edge_b[nedges] = v; ++nedges;
-                }
-            }
-        }
-        if (overflow) break;  // best-so-far
-
-        // --- 6) Append new faces from the horizon edges, FIXED scan order. ---
-        bool face_of = false;
-        for (int q = 0; q < nedges; ++q) {
-            if (nfaces >= kEpaMaxFaces) { face_of = true; break; }
-            faces[nfaces++] = MakeFace(verts, edge_a[q], edge_b[q], new_vi);
-        }
-        if (face_of) break;  // best-so-far
+        // --- 5) Insert + rebuild horizon (shared helper; centroid-oriented fan). ---
+        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
     }
 
     if (best_face < 0) { res.ok = false; return res; }
+
+    // --- ok semantics: only report success when the metric loop CONVERGED. An
+    // iteration/capacity cap hit WITHOUT convergence ("progressed" stays false)
+    // while the support proves a deeper face means the polytope is non-manifold /
+    // the seed failed -> res.ok=false so the caller does NOT emit a depth-0
+    // manifold for a real overlap (safety net; the enclosure step is what FINDS
+    // the true face). A genuine touch (depth 0) DOES converge (pd<=close_d) -> ok,
+    // and is dropped by the epa.depth<=0 guard, not by ok. ---
 
     // --- 7) Witness: barycentric projection of the origin onto the closest face,
     // then interpolate the per-body support points (the standard EPA witness). ---
@@ -489,10 +611,13 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
     const float bu = 1.0f - bv - bw;
     res.witness_a = verts[f.a].a * bu + verts[f.b].a * bv + verts[f.c].a * bw;
     res.witness_b = verts[f.a].b * bu + verts[f.b].b * bv + verts[f.c].b * bw;
-    res.ok = true;
+    res.ok = progressed;   // only a CONVERGED metric loop is a trustworthy result;
+                           // an un-converged cap-hit with a deeper support proven is
+                           // a seed/polytope failure -> ok=false -> empty (safety net).
     res.normal = best_n;   // CSO outward normal (origin -> closest face); the MTV
                            // that separates A is -res.normal (see BuildConvexManifold)
-    res.depth = best_d;
+    res.depth = best_d;    // SIGNED closest-face distance; <=0 == genuine touch ->
+                           // BuildConvexManifold's depth<=0 guard drops it (no contact)
     return res;
 }
 

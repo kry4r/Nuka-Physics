@@ -517,3 +517,247 @@ TEST(GjkEpaConvex, Determinism_TwoRunAndCrossReplica) {
             << "replica " << r << " diverged (EPA determinism gate)";
     }
 }
+
+// ===========================================================================
+// REGRESSION (C3c adversarial review): ORIGIN-ON-BOUNDARY EPA false-negative.
+// ===========================================================================
+// The MOST COMMON sim contact (flat-faced resting/stacking, origin exactly on the
+// CSO boundary of the GJK seed tetra) used to return an EMPTY manifold from a
+// DETERMINISTIC EPA churn (the seed tetra did not strictly enclose the origin ->
+// dist==0 seed faces with inward normals -> non-monotone polytope -> face overflow
+// -> stale depth 0 -> dropped). These tests pin the EXACT failing config + a SWEEP
+// that exposes the data-dependence a single hand-picked config hides.
+
+// (1) THE EXACT REPRODUCER: two unit boxes-as-hulls, A at origin, B at z=0.90
+// (overlap 0.10 along +Z). Pre-fix: point_count==0. Post-fix: pen≈0.10, normal≈±Z.
+TEST(GjkEpaConvex, OriginOnBoundary_ExactRepro_Z090) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto va = BoxVerts(he);
+    const auto vb = BoxVerts(he);
+    const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+    const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.0f, 0.90f});  // overlap Z=0.10
+    const ContactManifold m = RouteHullHull(A, B);
+    ASSERT_GT(m.point_count, 0u)
+        << "origin-on-boundary face-flush contact must NOT be an empty manifold";
+    for (uint32_t i = 0; i < m.point_count; ++i) {
+        EXPECT_NEAR(m.points[i].penetration, 0.10f, kTol);
+        // sep dir for A = -Z (A must move -Z to escape B above it on +Z).
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, -1.0f}, 1.0e-2f))
+            << "n=(" << m.points[i].normal.x << "," << m.points[i].normal.y << ","
+            << m.points[i].normal.z << ")";
+    }
+    EXPECT_EQ(m.point_count, 4u) << "axis-aligned face-face -> 4-pt patch";
+}
+
+// (2) THE SWEEP (the real anti-regression): boxes-as-hulls overlapping by
+// {0.05,0.10,0.15,0.20,0.30} along EACH of +X,+Y,+Z, PLUS a diagonal offset.
+// Each -> correct depth (the brute-force support-difference oracle along the
+// emitted normal) + a unit normal aligned with the contact axis. A single config
+// hides the GJK-seed data-dependence; the whole grid is what catches it.
+TEST(GjkEpaConvex, OriginOnBoundary_OverlapSweep_AllAxes) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto va = BoxVerts(he);
+    const auto vb = BoxVerts(he);
+    const float overlaps[5] = {0.05f, 0.10f, 0.15f, 0.20f, 0.30f};
+    // Axis-aligned: the +X,+Y,+Z separations (center offset = 1.0 - overlap).
+    const Vec3 axis_dir[3] = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+    const Vec3 expect_n[3] = {Vec3{-1, 0, 0}, Vec3{0, -1, 0}, Vec3{0, 0, -1}};
+    int ok = 0;
+    for (int ax = 0; ax < 3; ++ax) {
+        for (int oi = 0; oi < 5; ++oi) {
+            const float ov = overlaps[oi];
+            const float sep = 1.0f - ov;                  // center-to-center
+            const Vec3 pos = axis_dir[ax] * sep;
+            const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+            const ConvexHullView B = MakeHull(vb, pos);
+            const ContactManifold m = RouteHullHull(A, B);
+            ASSERT_GT(m.point_count, 0u)
+                << "axis " << ax << " overlap " << ov << " -> EMPTY (regression!)";
+            // Depth oracle along the emitted normal (the general support-difference).
+            const Vec3 n = m.points[0].normal;
+            const float d_oracle = OverlapAlong(va, Vec3{0, 0, 0}, vb, pos, n);
+            EXPECT_NEAR(m.points[0].penetration, d_oracle, kTol)
+                << "axis " << ax << " overlap " << ov << " depth != oracle";
+            EXPECT_NEAR(m.points[0].penetration, ov, kTol)
+                << "axis " << ax << " overlap " << ov << " wrong depth";
+            EXPECT_TRUE(Vec3Near(n, expect_n[ax], 2.0e-2f))
+                << "axis " << ax << " overlap " << ov << " wrong normal";
+            ++ok;
+        }
+    }
+    // (2b) A DIAGONAL offset (the on-EDGE/on-vertex degeneracy is orientation-
+    // dependent; an axis-only sweep can miss the diagonal variant). Two unit boxes
+    // overlapping along the body diagonal: each axis overlaps 0.20 (sep 0.80 on all
+    // three axes). The MTV is still an axis face (depth 0.20), but the GJK seed
+    // straddles the origin differently than the pure-axis cases.
+    {
+        const Vec3 pos{0.80f, 0.80f, 0.80f};
+        const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+        const ConvexHullView B = MakeHull(vb, pos);
+        const ContactManifold m = RouteHullHull(A, B);
+        ASSERT_GT(m.point_count, 0u) << "diagonal offset -> EMPTY (regression!)";
+        const Vec3 n = m.points[0].normal;
+        const float d_oracle = OverlapAlong(va, Vec3{0, 0, 0}, vb, pos, n);
+        EXPECT_NEAR(m.points[0].penetration, d_oracle, kTol)
+            << "diagonal depth != support-difference oracle along the normal";
+        // The MTV depth equals the min per-axis overlap (0.20 on each axis here).
+        EXPECT_NEAR(m.points[0].penetration, 0.20f, kTol);
+        // No sampled axis separates tighter than the emitted depth (n is the MTV).
+        const Vec3 probe[6] = {Vec3{1,0,0}, Vec3{0,1,0}, Vec3{0,0,1},
+                               Vec3{-1,0,0}, Vec3{0,-1,0}, Vec3{0,0,-1}};
+        for (const Vec3& u : probe) {
+            const float ovx = OverlapAlong(va, Vec3{0, 0, 0}, vb, pos, u);
+            EXPECT_GE(ovx, m.points[0].penetration - kTol)
+                << "diagonal: an axis separates tighter than the EPA normal";
+        }
+        ++ok;
+    }
+    EXPECT_EQ(ok, 16) << "expected 15 axis configs + 1 diagonal";
+}
+
+// (3) FLUSH-FACE convex x convex: two NON-box convex hulls (hexagonal prisms)
+// with a fully coplanar contact face overlapping slightly along +Z. This is the
+// general (not-a-box) origin-on-boundary class -> must be non-empty with a +Z/-Z
+// normal and the right depth. Proves the fix is geometry-general, not box-special.
+TEST(GjkEpaConvex, OriginOnBoundary_FlushFaceConvexConvex) {
+    // A hexagonal prism (6 side verts top + 6 bottom), half-height 0.5 along Z,
+    // circumradius 0.5 in XY. Two coplanar hex caps -> a flush +Z/-Z contact.
+    std::vector<float> hex;
+    for (int z = -1; z <= 1; z += 2) {
+        const float hz = 0.5f * static_cast<float>(z);
+        for (int k = 0; k < 6; ++k) {
+            const float ang = static_cast<float>(k) * (3.14159265f / 3.0f);
+            hex.push_back(0.5f * std::cos(ang));
+            hex.push_back(0.5f * std::sin(ang));
+            hex.push_back(hz);
+        }
+    }
+    // A at origin (top cap z=0.5), B at z=0.90 (bottom cap z=0.40) -> overlap 0.10
+    // along Z, the two hex caps flush/coplanar in the overlap band.
+    const ConvexHullView A = MakeHull(hex, Vec3{0.0f, 0.0f, 0.0f});
+    const ConvexHullView B = MakeHull(hex, Vec3{0.0f, 0.0f, 0.90f});
+    const ContactManifold m = RouteHullHull(A, B);
+    ASSERT_GT(m.point_count, 0u)
+        << "flush-face convex x convex must NOT be an empty manifold";
+    for (uint32_t i = 0; i < m.point_count; ++i) {
+        EXPECT_NEAR(m.points[i].penetration, 0.10f, kTol);
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, -1.0f}, 2.0e-2f))
+            << "n=(" << m.points[i].normal.x << "," << m.points[i].normal.y << ","
+            << m.points[i].normal.z << ")";
+    }
+}
+
+// (4) D1 on the FAILING class: 2-run byte-identity + N>=32 cross-replica on the
+// z=0.90 origin-on-boundary config (the exact bug class, which now exercises the
+// new enclosure pre-loop + sliver-skip path -- code the OLD determinism gate at
+// y=0.9 also exercises, but pin it on the SPECIFIC failing seed too).
+TEST(GjkEpaConvex, OriginOnBoundary_DeterminismOnFailingClass) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto va = BoxVerts(he);
+    const auto vb = BoxVerts(he);
+    const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+    const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.0f, 0.90f});  // the repro seed
+
+    ContactManifold m1, m2;
+    std::memset(&m1, 0, sizeof(m1));
+    std::memset(&m2, 0, sizeof(m2));
+    m1 = RouteHullHull(A, B);
+    m2 = RouteHullHull(A, B);
+    ASSERT_GT(m1.point_count, 0u);
+    EXPECT_EQ(std::memcmp(&m1, &m2, sizeof(ContactManifold)), 0)
+        << "2-run on the failing origin-on-boundary class must be byte-identical";
+
+    constexpr int kReplicas = 40;  // N >= 32 cross-replica
+    ContactManifold ref = RouteHullHull(A, B);
+    for (int r = 0; r < kReplicas; ++r) {
+        const ContactManifold mr = RouteHullHull(A, B);
+        EXPECT_EQ(std::memcmp(&ref, &mr, sizeof(ContactManifold)), 0)
+            << "replica " << r << " diverged (origin-on-boundary D1 gate)";
+    }
+}
+
+// (5) GENUINE TOUCH (depth 0) MUST NOT become a spurious deep contact. Two unit
+// boxes EXACTLY face-flush (B at z=1.0, overlap 0): the origin sits ON the CSO
+// surface. The robust-EPA fix must report NO contact here -- NOT a far +/-axis
+// face of the (flat, ~2-deep-on-the-other-side) box CSO. A tiny POSITIVE overlap
+// just inside the boundary must still produce a real contact (the fix discriminates
+// depth-0 touching from a real overlap, it does not blanket-drop near-zero depth).
+TEST(GjkEpaConvex, GenuineTouchAndNearBoundary_NoSpuriousContact) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto va = BoxVerts(he);
+    const auto vb = BoxVerts(he);
+    const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+
+    // Exact touch (overlap 0) -> NO contact (depth 0).
+    {
+        const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.0f, 1.0f});
+        const ContactManifold m = RouteHullHull(A, B);
+        EXPECT_EQ(m.point_count, 0u)
+            << "exact face-flush touch (overlap 0) must be NO contact, "
+               "not a spurious deep manifold from the flat CSO's far side";
+    }
+    // Just SEPARATED (gap 0.001 and 0.05) -> NO contact.
+    for (float gap : {0.001f, 0.05f}) {
+        const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.0f, 1.0f + gap});
+        const ContactManifold m = RouteHullHull(A, B);
+        EXPECT_EQ(m.point_count, 0u) << "separated (gap=" << gap << ") -> no contact";
+    }
+    // Just OVERLAPPING (overlap 0.001) -> a real small contact, normal -Z.
+    {
+        const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.0f, 0.999f});
+        const ContactManifold m = RouteHullHull(A, B);
+        ASSERT_GT(m.point_count, 0u) << "tiny real overlap must still be a contact";
+        EXPECT_NEAR(m.points[0].penetration, 0.001f, 1.0e-3f);
+        EXPECT_TRUE(Vec3Near(m.points[0].normal, Vec3{0.0f, 0.0f, -1.0f}, 2.0e-2f));
+    }
+}
+
+// (6) ROTATED / OBLIQUE origin-on-boundary: the bug is GJK-SEED-ORIENTATION-
+// dependent, and (1)-(5) are all axis-aligned. A box B ROTATED off-axis and
+// overlapping A produces a DIFFERENT seed straddle of the origin. The centroid-
+// oriented fix is geometry-general -> each must give the right depth (the
+// brute-force support-difference oracle along the emitted normal). Locks
+// orientation coverage so an axis-only sweep can't hide an oblique regression.
+TEST(GjkEpaConvex, OriginOnBoundary_RotatedOblique) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto va = BoxVerts(he);
+    const auto vb = BoxVerts(he);
+    const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
+    // (axis, degrees, center-z) chosen to give a clear positive overlap.
+    struct Cfg { Vec3 axis; float deg; float z; };
+    const Cfg cfgs[5] = {
+        {Vec3{1, 1, 0}, 30.0f, 1.00f}, {Vec3{0, 1, 1}, 30.0f, 0.95f},
+        {Vec3{1, 1, 1}, 20.0f, 1.05f}, {Vec3{1, 2, 0}, 35.0f, 0.90f},
+        {Vec3{2, 1, 1}, 15.0f, 1.00f},
+    };
+    for (const Cfg& c : cfgs) {
+        const float r = c.deg * 3.14159265f / 180.0f;
+        const float s = std::sin(r * 0.5f);
+        const float l = std::sqrt(c.axis.x * c.axis.x + c.axis.y * c.axis.y +
+                                  c.axis.z * c.axis.z);
+        const Quat rot{c.axis.x / l * s, c.axis.y / l * s, c.axis.z / l * s,
+                       std::cos(r * 0.5f)};
+        const Vec3 pos{0.0f, 0.0f, c.z};
+        const ConvexHullView B = MakeHull(vb, pos, rot);
+        const ContactManifold m = RouteHullHull(A, B);
+        ASSERT_GT(m.point_count, 0u)
+            << "rotated " << c.deg << "deg @z=" << c.z << " -> EMPTY (regression!)";
+        // Depth oracle along the emitted normal, using the WORLD-TRANSFORMED verts
+        // of both hulls (B is rotated, so support must use the view's frame).
+        const Vec3 n = m.points[0].normal;
+        float ma = -3.4e38f, mb = -3.4e38f;
+        for (uint32_t i = 0; i < A.vcount; ++i) {
+            const float d = A.Vertex(i).Dot(Vec3{-n.x, -n.y, -n.z});
+            if (d > ma) ma = d;
+        }
+        for (uint32_t i = 0; i < B.vcount; ++i) {
+            const float d = B.Vertex(i).Dot(n);
+            if (d > mb) mb = d;
+        }
+        const float oracle = ma + mb;
+        EXPECT_NEAR(m.points[0].penetration, oracle, kTol)
+            << "rotated " << c.deg << "deg @z=" << c.z
+            << " depth != support-difference oracle along the normal";
+        EXPECT_GT(m.points[0].penetration, 0.0f);
+    }
+}
