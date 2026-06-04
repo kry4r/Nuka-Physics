@@ -37,6 +37,12 @@
 //   pos_imp  = pos                        // SAME signed value
 //   vel      = Jqvel                      // constraint-space (normal) velocity
 //   invweight= body_invweight0[b1] + body_invweight0[b2]   // reaction inv-mass
+// C5-WIRING NOTE (C4-review NIT-2): MuJoCo's invweight is `body_invweight0` (the
+// DIRECTION-INDEPENDENT approximation evaluated at qpos0). C5 will instead feed
+// the SUM of both sides' C4c `ReactionProvider::effective_inv_mass` (the EXACT
+// direction-dependent J M^-1 J^T). Same units/sense (additive J M^-1 J^T), so the
+// contract holds, but the value differs from MuJoCo's approx (measured ratio ~0.6
+// on an off-axis 2-link contact) — a DELIBERATE accuracy improvement, not a bug.
 // So for a Nuka contact: pos (== pos_imp == pos_aref for the normal row) is the
 // SIGNED separation distance: NEGATIVE when overlapping (penetration depth is
 // -pos), positive when there is a gap. The impedance uses |pos_imp| so it is

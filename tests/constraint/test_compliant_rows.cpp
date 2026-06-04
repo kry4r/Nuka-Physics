@@ -9,8 +9,10 @@
 //   (2) each normal row's compliance_alpha==R and rhs==aref from an INDEPENDENT
 //       ComputeCompliantRow call on the same inputs (cross-check, not echo).
 //   (3) the 4 friction spokes per point sum ~= 0 and span the tangent plane
-//       symmetrically (balanced polygonal approximation of the isotropic disk),
-//       and friction rows carry NO compliance bias.
+//       symmetrically (a balanced SQUARE/box linearization of the friction cone;
+//       the test asserts SYMMETRY + orthonormality, NOT disk-tightness -- a box
+//       reaches sqrt(2)*mu on the diagonal), and friction rows carry NO
+//       compliance bias.
 //   (4) the ContactRowSides side-output: exactly one per appended row, in order,
 //       carrying the manifold's per-side CollidableRef (type/react/handle).
 //   (5) 2-run byte-identity of the emitted rows (D1, host-vs-host).
@@ -153,7 +155,7 @@ TEST(CompliantRows, NormalRowsCarryComplianceFromC4a) {
     }
 }
 
-// (3) friction pyramid edges sum to the isotropic disk: spokes per point sum ~= 0
+// (3) friction box edges are symmetric (NOT the isotropic disk): spokes per point sum ~= 0
 //     and span the tangent plane symmetrically (orthonormal +-t0,+-t1).
 TEST(CompliantRows, FrictionPyramidApproximatesIsotropicDisk) {
     const ContactManifold manifold = MakeBoxManifold();

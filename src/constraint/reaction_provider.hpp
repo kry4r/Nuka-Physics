@@ -172,6 +172,19 @@ NUKA_REACTION_HD inline float ArticulationEffectiveInvMass(
 // apply_impulse: dqdot = dlambda * M^-1 J^T. BYTE-FOR-BYTE the apply loop in
 // SolveArticulatedContactRowsKernel (articulation_contacts.cu ~858-867):
 //   for r: acc = sum_c Minv[r*stride+c] * J[c]; qdot[r] += acc * dlambda
+//
+// ★ C5-WIRING WARNING (C4-review IMPORTANT-1) — flat-qdot vs scatter-by-link.
+// This writes a CONTIGUOUS qdot[0..dof_stride). Production
+// SolveArticulatedContactRowsKernel SCATTERS each logical DOF to either
+// state.qdot[link] (scalar joints) OR link_velocity[root].v[component] (a
+// FloatingBase base's 6 DOFs). For a FIXED-ROOT chain (v0.8's covered case) the
+// logical-DOF order maps monotonically to consecutive qdot slots, so a private
+// dof_stride-wide qdot slice is byte-faithful (padding cols are zeroed by the
+// chain-J builder). BUT for a FLOATING-BASE articulation the base-DOF reactions
+// belong in link_velocity, NOT qdot — a naive flat-qdot apply SILENTLY DROPS the
+// contact's push on the floating base. C5 MUST route base DOFs to link_velocity
+// when wiring floating-base articulations into the unified solve. (Named consumer
+// = C5; do not assume flat-qdot for floating bases.)
 NUKA_REACTION_HD inline void ArticulationApplyImpulse(
     const ArticulationReactionState& s, float dlambda) {
     if (s.chain_jacobian == nullptr || s.inertia_M_inv == nullptr ||
