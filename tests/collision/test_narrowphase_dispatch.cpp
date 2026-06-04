@@ -24,9 +24,9 @@
 
 using nuka::collision::CandidatePair;
 using nuka::collision::kNarrowphaseTable;
+using nuka::collision::NarrowphaseSdf;  // C3d: real Sdf-tier handler (stub removed)
 using nuka::collision::NarrowphaseStubAnalytical;
 using nuka::collision::NarrowphaseStubConvex;
-using nuka::collision::NarrowphaseStubSdf;
 using nuka::collision::NarrowphaseTier;
 using nuka::collision::ResolveNarrowphase;
 using nuka::collision::SelectTier;
@@ -159,9 +159,14 @@ TEST(NarrowphaseDispatch, LookupReturnsExpectedTierHandler) {
                     << "expected the Convex STUB for unregistered ("
                     << ia << "," << ib << ")";
             }
-            // Sdf tier still all-stub (C3d unland).
+            // C3d LANDED: the WHOLE Sdf plane now routes to the REAL
+            // NarrowphaseSdf handler (has_sdf overrides tier for ANY (a,b), so the
+            // SDF math -- find_sdf_contact_newton on the SDF views -- covers every
+            // slot; the Sdf stub is removed). No slot still points at a stub.
             EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Sdf),
-                      &NarrowphaseStubSdf);
+                      &NarrowphaseSdf)
+                << "every Sdf-plane slot must be the real C3d handler (" << ia
+                << "," << ib << ")";
         }
     }
 }
@@ -178,9 +183,9 @@ TEST(NarrowphaseDispatch, ResolveNarrowphasePicksTierThenHandler) {
     // Mesh pair, no SDF -> Convex handler.
     EXPECT_EQ(ResolveNarrowphase(ShapeType::TriMesh, ShapeType::Box, false),
               &NarrowphaseStubConvex);
-    // SDF-equipped -> Sdf handler (tier override).
+    // SDF-equipped -> the REAL C3d Sdf handler (tier override). No longer a stub.
     EXPECT_EQ(ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, true),
-              &NarrowphaseStubSdf);
+              &NarrowphaseSdf);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +219,27 @@ TEST(NarrowphaseDispatch, CallThroughTableReachesExpectedTier) {
               StubMarkerForTier(NarrowphaseTier::Analytical));
     EXPECT_EQ(RouteAndReadMarker(ShapeType::TriMesh, ShapeType::Box, false),
               StubMarkerForTier(NarrowphaseTier::Convex));
-    EXPECT_EQ(RouteAndReadMarker(ShapeType::Sphere, ShapeType::Box, true),
-              StubMarkerForTier(NarrowphaseTier::Sdf));
+    // Sdf tier: C3d landed -- the real NarrowphaseSdf runs (no stub marker). With
+    // the default ShapeProxyView (null SDF seam) it null-guards to an EMPTY
+    // manifold (manifold_key untouched == 0), proving the real handler ran without
+    // crashing. The SDF-driven manifold is exercised in test_sdf_tier_wired.
+    CandidatePair sdf_pair;
+    sdf_pair.a = CollidableRef{CollidableType::RigidBody,
+                               ReactionProviderKind::RigidInvMass, 7u};
+    sdf_pair.b = CollidableRef{CollidableType::StaticWorld,
+                               ReactionProviderKind::StaticNull, 3u};
+    ShapeProxyView sdf_geom;  // geom_a/geom_b default null -> handler null-guards
+    sdf_geom.type_a = ShapeType::Sphere;
+    sdf_geom.type_b = ShapeType::Box;
+    ContactManifold sdf_out;
+    sdf_out.AddPoint(ContactPoint{});  // dirty it; the handler must Clear
+    ASSERT_EQ(ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, true),
+              &NarrowphaseSdf);
+    ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, true)(sdf_pair, sdf_geom,
+                                                                &sdf_out);
+    EXPECT_EQ(sdf_out.point_count, 0u) << "null SDF seam -> empty manifold";
+    EXPECT_EQ(sdf_out.a.handle, 7u);   // sides preserved
+    EXPECT_EQ(sdf_out.b.handle, 3u);
 }
 
 TEST(NarrowphaseDispatch, StubPreservesCollidableSidesAndEmptyManifold) {

@@ -991,6 +991,36 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_gjk_epa_convex_test)
 
+    # --- v0.8 C3d: SDF high-precision tier WIRED into the dispatch table --------
+    # Validates the REAL Sdf-tier handler (NarrowphaseSdf, narrowphase_dispatch.hpp)
+    # -- the FIRST stepping callsite of find_sdf_contact_newton (sdf_contact.hpp,
+    # previously zero-callsite dead code). Cooks two unit-cube SDFs (CookSparseSdf,
+    # nuka_cooker), stacks them in contact (centers symmetric about y=0 so the
+    # handler's center-midpoint guess lands in both narrow bands), drives the
+    # resolved Sdf handler, and asserts: ResolveNarrowphase(..,has_sdf=true) is the
+    # real handler (not the removed stub); the 1-point manifold's normal (+Y = sep
+    # dir for side A) + penetration match the analytical box-on-box contact within
+    # voxel tol; a separated/null pair -> empty manifold; 2-run byte-identity (D1,
+    # memcmp on zeroed buffers). Header-only SDF path (find_sdf_contact_newton is
+    # the inline HD function -- NO device kernel launch), so deps are nuka_cooker +
+    # nuka_codegen + nuka_phi + the src/root includes (NOT nuka_collision_gpu).
+    add_executable(nuka_sdf_tier_wired_test
+        collision/test_sdf_tier_wired.cpp
+    )
+    add_dependencies(nuka_sdf_tier_wired_test nuka_codegen)
+    target_include_directories(nuka_sdf_tier_wired_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_sdf_tier_wired_test
+        PRIVATE
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_sdf_tier_wired_test)
+
     # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
     # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
     # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity
