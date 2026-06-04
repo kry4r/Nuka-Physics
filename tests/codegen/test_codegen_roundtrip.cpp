@@ -4,6 +4,12 @@
 
 #include "codegen/generated/row_class_registry.hpp"
 
+// v0.8 C2a: the GENERATED collidable-type registry (emitted by regen.py's second,
+// parallel collidable pass). Assert the static metadata table is correct here --
+// this TU already add_dependencies(nuka_codegen) and has src/ on its include path.
+#include "codegen/generated/collidable_registry.hpp"
+#include "constraint/collidable_kinds.hpp"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -203,6 +209,52 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
               static_cast<uint8_t>(GradientMode::dense_adjoint));
 
     EXPECT_FALSE(IsKnownRowClass(99u));
+}
+
+// v0.8 C2a: the GENERATED collidable-type registry. Proves regen.py's second,
+// parallel pass emitted the static metadata table correctly: 4 contiguous types,
+// enum values 0..3, and each type's accel/proxy/react kind selectors match its IR.
+TEST(CodegenRoundtrip, CollidableTypeRegistryIsCorrect) {
+    using nuka::constraint::AccelStructureKind;
+    using nuka::constraint::ReactionProviderKind;
+    using nuka::constraint::ShapeProxyKind;
+    using nuka::constraint::generated::CollidableType;
+    using nuka::constraint::generated::GetCollidableTypeInfo;
+    using nuka::constraint::generated::kCollidableTypeCount;
+
+    // v0.8 has 4 collidable types (v0.9 adds 4 more); enum values are the
+    // contiguous range 0..3 (the table is indexed by these, so this is a contract
+    // tripwire -- if a type is added/reordered, update this consciously).
+    EXPECT_EQ(kCollidableTypeCount, 4u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::RigidBody), 0u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::ArticulationLink), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::Particle), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::StaticWorld), 3u);
+
+    // RigidBody (id 0): rigid LBVH, shape-backed, rigid inverse-mass reaction.
+    const auto& rigid = GetCollidableTypeInfo(CollidableType::RigidBody);
+    EXPECT_EQ(rigid.type, CollidableType::RigidBody);
+    EXPECT_EQ(rigid.accel, AccelStructureKind::LbvhRigid);
+    EXPECT_EQ(rigid.proxy, ShapeProxyKind::ShapeBacked);
+    EXPECT_EQ(rigid.react, ReactionProviderKind::RigidInvMass);
+
+    // ArticulationLink (id 1): rigid LBVH, shape-backed, chain-Jacobian reaction.
+    const auto& link = GetCollidableTypeInfo(CollidableType::ArticulationLink);
+    EXPECT_EQ(link.accel, AccelStructureKind::LbvhRigid);
+    EXPECT_EQ(link.proxy, ShapeProxyKind::ShapeBacked);
+    EXPECT_EQ(link.react, ReactionProviderKind::ArticulationChainJ);
+
+    // Particle (id 2): uniform-grid, point-sphere proxy, particle inverse-mass.
+    const auto& particle = GetCollidableTypeInfo(CollidableType::Particle);
+    EXPECT_EQ(particle.accel, AccelStructureKind::UniformGridParticle);
+    EXPECT_EQ(particle.proxy, ShapeProxyKind::PointSphere);
+    EXPECT_EQ(particle.react, ReactionProviderKind::ParticleInvMass);
+
+    // StaticWorld (id 3): not broadphased (None), shape-backed, null reaction.
+    const auto& world = GetCollidableTypeInfo(CollidableType::StaticWorld);
+    EXPECT_EQ(world.accel, AccelStructureKind::None);
+    EXPECT_EQ(world.proxy, ShapeProxyKind::ShapeBacked);
+    EXPECT_EQ(world.react, ReactionProviderKind::StaticNull);
 }
 
 TEST(CodegenRoundtrip, SchemaRejectionReportsMalformedIrWithPath) {

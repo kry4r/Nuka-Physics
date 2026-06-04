@@ -1,0 +1,45 @@
+# Meta-schema for the Collidable Type Registry v0.1 (v0.8 C2a). Validates the
+# per-type collidable entries under tools/codegen/classes/collidable/*.yaml.
+#
+# Mirrors the structure of schema/row_v0_1.yaml (required_fields + field_types +
+# enums) but for the collidable registry. Each entry declares ONE collidable
+# type and the STATIC provider-kind selectors regen.py bakes into the generated
+# constexpr metadata table (src/codegen/generated/collidable_registry.hpp). The
+# enum-valued fields (accel_structure / shape_proxy / reaction_provider) MUST be
+# spelled EXACTLY as the corresponding enumerator in
+# src/constraint/collidable_kinds.hpp, because the template emits
+# AccelStructureKind::{{accel_structure}} etc. with no name mangling. The `name`
+# field is likewise the CollidableType enumerator spelling (CamelCase).
+schema_version: "0.1"
+
+required_fields:
+  - name
+  - collidable_type_id
+  - accel_structure
+  - shape_proxy
+  - reaction_provider
+
+field_types:
+  name: string
+  collidable_type_id: uint32
+  accel_structure: enum
+  shape_proxy: enum
+  reaction_provider: enum
+
+enums:
+  # Must match enum class AccelStructureKind in src/constraint/collidable_kinds.hpp.
+  accel_structure:
+    - LbvhRigid
+    - UniformGridParticle
+    - None
+  # Must match enum class ShapeProxyKind in src/constraint/collidable_kinds.hpp.
+  shape_proxy:
+    - ShapeBacked
+    - PointSphere
+    - None
+  # Must match enum class ReactionProviderKind in src/constraint/collidable_kinds.hpp.
+  reaction_provider:
+    - RigidInvMass
+    - ArticulationChainJ
+    - ParticleInvMass
+    - StaticNull

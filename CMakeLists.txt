@@ -139,6 +139,9 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cuh"
     # v0.7 p11 (K3): particle-particle contact (id 10) adjoint header.
     "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cuh"
+    # v0.8 C2a: the collidable-type registry header (enum CollidableType + static
+    # metadata table). Emitted by regen.py's SECOND, parallel collidable pass.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/collidable_registry.hpp"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}
@@ -146,6 +149,12 @@ set(NUKA_CODEGEN_OUTPUTS
 )
 file(GLOB NUKA_ROW_IR_FILES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/tools/codegen/classes/*.yaml"
+)
+# v0.8 C2a: collidable class YAMLs live in a SUBDIRECTORY (the row glob above is
+# non-recursive on purpose, so the row loader never sees them). Glob them too so
+# the codegen command re-runs when a collidable type is added/edited.
+file(GLOB NUKA_COLLIDABLE_IR_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/tools/codegen/classes/collidable/*.yaml"
 )
 file(GLOB NUKA_ROW_TEMPLATES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/tools/codegen/templates/*.j2"
@@ -156,8 +165,10 @@ add_custom_command(
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/codegen/regen.py"
     DEPENDS
         ${NUKA_ROW_IR_FILES}
+        ${NUKA_COLLIDABLE_IR_FILES}
         ${NUKA_ROW_TEMPLATES}
         "${CMAKE_SOURCE_DIR}/tools/codegen/schema/row_v0_1.yaml"
+        "${CMAKE_SOURCE_DIR}/tools/codegen/schema/collidable_v0_1.yaml"
         "${CMAKE_SOURCE_DIR}/tools/codegen/regen.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Regenerating row class CUDA kernels from IR"

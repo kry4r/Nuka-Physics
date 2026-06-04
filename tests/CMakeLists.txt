@@ -872,6 +872,28 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_particle_grid_test)
 
+    # --- v0.8 C2a: unified candidate-pair stream (the broadphase OUTPUT type) ---
+    # Canonical stable_key (type-in-high-bits, collision-free), thrust::stable_sort
+    # builder over a fixed host-provided pair set, two-run byte-exact + N>=32
+    # cross-replica D1. Links nuka_collision_gpu (carries candidate_pair.cu) +
+    # nuka_phi. Needs nuka_codegen: candidate_pair.hpp includes the GENERATED
+    # collidable_registry.hpp (via constraint/collidable.hpp).
+    add_executable(nuka_candidate_stream_test
+        collision/test_candidate_stream.cpp
+    )
+    add_dependencies(nuka_candidate_stream_test nuka_codegen)
+    target_include_directories(nuka_candidate_stream_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_candidate_stream_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_candidate_stream_test)
+
     # --- v0.7 p12: self-written CUDA ray tracer (camera -> LBVH -> closest-hit
     # depth, box leaves). Matches a CPU brute-force ray-vs-all-boxes oracle that
     # REUSES the same __host__ __device__ slab test + closest-hit update + camera
