@@ -4,6 +4,8 @@
 
 #include "constraint/row_builder.hpp"
 
+#include "constraint/solref_solimp.hpp"
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -166,6 +168,174 @@ void BuildContactRows(std::span<const ContactManifold> manifolds,
                            manifold.restitution,
                            manifold.points,
                            out_rows);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.8 C4b: NEW compliant-normal + pyramid-friction emitter. VALIDATED-NOT-WIRED.
+// ---------------------------------------------------------------------------
+// SPEC DEVIATION (controller + advisor RULED): the C4b spec says "Replace
+// AppendContactGroup". It is DELIBERATELY NOT replaced -- the compliance + 4-edge
+// pyramid MOVE the contact goldens, and per Appendix C + C4b's own re-baseline
+// risk note that re-baseline is scheduled at C5, not C4b. This NEW emitter is
+// validated-not-wired (matching the whole spine's "validated-not-wired until C5"
+// discipline). AppendContactGroup, both BuildContactRows overloads, and
+// runtime/world_stepper.cpp:665 are LEFT BYTE-UNTOUCHED.
+//   NAMED DOWNSTREAM CONSUMER = C5: flips world_stepper:665 to this emitter +
+//   re-baselines the contact goldens.
+//
+// PYRAMID STRUCTURE RECONCILIATION: the spec prose ("edges = +-tangent0 +- mu*
+// normal-style") is loose/garbled (it names only tangent0, which can't span the
+// tangent plane, and "+-mu*normal" coupled into friction Jacobians would
+// DOUBLE-COUNT the normal against the mandated SEPARATE normal row and would not
+// satisfy the test's "edges sum ~= 0"). The test counts settle it decisively:
+// "4 normal + 16 pyramid rows" for a 4-point box can only be the HYBRID
+// (separate compliant normal row + pure-tangent friction spokes); a true MuJoCo
+// pyramidal CONE (n +- mu*t, no separate normal row) yields 16 rows total, not
+// 20, and sums to 4*normal != 0. So the friction Jacobians are unit pure-tangent
+// spokes (+t0,-t0,+t1,-t1; fixed order); mu is carried in RowMaterial.friction
+// (the cone bound is C5's job), exactly as AppendContactGroup does. The "MuJoCo
+// pyramid" reference is about the EDGE COUNT (nmaxpyramid = 2*(condim-1) = 4,
+// research-newton-mujocowarp.md:94) and the polygonal-disk friction
+// approximation, not about normal-coupling.
+void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
+                              const ContactRowComplianceInputs& inputs,
+                              RowBuffers* out_rows,
+                              std::vector<ContactRowSides>* out_sides) {
+    if (out_rows == nullptr || out_sides == nullptr) {
+        return;
+    }
+
+    // condim=1 -> frictionless; condim>=2 -> 2*(condim-1) pyramid spokes. condim
+    // 4/6 (torsional/rolling) is the Q8 v1.0 seam; we honor the formula but the
+    // tangent-only spokes here are the v0.8 condim<=3 case. Fixed at world build.
+    const uint32_t friction_rows_per_point =
+        inputs.condim >= 2u ? 2u * (inputs.condim - 1u) : 0u;
+
+    for (const auto& manifold : manifolds) {
+        if (manifold.point_count == 0u) {
+            continue;
+        }
+        const uint32_t point_count =
+            std::min(manifold.point_count, ContactManifold::kMaxPoints);
+
+        // Group layout for the 1-normal + N-friction-per-point block (recomputed
+        // for the C4b counts -- NOT AppendContactGroup's 2-tangent layout). All
+        // normal rows are emitted first, then ALL friction rows, so C5 can locate
+        // the friction block by [first_friction_row, +friction_row_count).
+        const uint32_t group_first_row = out_rows->RowCount();
+        const uint32_t normal_row_count = point_count;
+        const uint32_t first_friction_row = group_first_row + normal_row_count;
+        const uint32_t total_friction_rows =
+            friction_rows_per_point * point_count;
+
+        const uint32_t body_a = manifold.a.handle;
+        const uint32_t body_b = manifold.b.handle;
+
+        // --- normal rows (one compliant unilateral row per point) ------------
+        for (uint32_t i = 0; i < point_count; ++i) {
+            const ContactPoint& point = manifold.points[i];
+            const math::Vec3 row_normal = point.normal.Normalized();
+
+            // C4a compliance. pos is SIGNED: the manifold stores penetration as
+            // a POSITIVE overlap depth, so pos = -penetration (negative when
+            // penetrating). pos_aref == pos_imp == pos for the normal row.
+            const float solref[2] = {
+                point.solref_timeconst,
+                point.solref_dampratio
+            };
+            const float pos = -point.penetration;
+            const CompliantContactRow compliant = ComputeCompliantRow(
+                solref,
+                manifold.solimp,
+                pos,                 // pos_imp
+                pos,                 // pos_aref
+                inputs.vel,
+                inputs.invweight,
+                inputs.dt,
+                inputs.refsafe);
+
+            RowMaterial material;
+            material.kind = RowKind::Contact;
+            material.group_id = group_first_row;
+            material.normal_row_count = normal_row_count;
+            material.first_friction_row = first_friction_row;
+            material.friction_row_count = total_friction_rows;
+            material.friction = manifold.friction;
+            material.restitution = manifold.restitution;
+            material.position_error = point.penetration;
+
+            Row row = MakeBaseRow(kMaximalContactRowClassId,
+                                  compliant.aref_bias,   // rhs = aref
+                                  0.0f,
+                                  FLT_MAX,
+                                  point.normal_impulse,
+                                  row_flags::Unilateral | row_flags::GradActive);
+            row.compliance_alpha = compliant.R;          // R = dual regularizer
+
+            out_rows->AddRow(row,
+                             {body_a, body_b},
+                             MakeJacobian(row_normal),
+                             MakeJacobian(-row_normal),
+                             material);
+            out_sides->push_back({manifold.a, manifold.b});
+        }
+
+        // --- pyramid friction rows (pure-tangent spokes, fixed order) --------
+        // The 4 (condim=3) spoke directions are +t0,-t0,+t1,-t1 where t0,t1 is
+        // the deterministic orthonormal tangent basis of point[0]'s normal. They
+        // sum to exactly zero and span the tangent plane symmetrically -> a
+        // balanced polygonal (square) approximation of the isotropic Coulomb
+        // friction disk. mu is carried in RowMaterial.friction (cone bound = C5).
+        if (friction_rows_per_point > 0u) {
+            const math::Vec3 base_normal = manifold.points[0].normal.Normalized();
+            const math::Vec3 tangent0 = ChooseTangent(base_normal);
+            const math::Vec3 tangent1 = base_normal.Cross(tangent0).Normalized();
+
+            for (uint32_t i = 0; i < point_count; ++i) {
+                const ContactPoint& point = manifold.points[i];
+                // Per-point spoke set. For condim==3 (4 spokes) the FIXED angular
+                // order is +t0, -t0, +t1, -t1. For other condims we replicate the
+                // same +-t0,+-t1 pattern (v0.8 supports condim<=3; >3 deferred).
+                const math::Vec3 spokes[4] = {
+                    tangent0, -tangent0, tangent1, -tangent1
+                };
+                const float warm[4] = {
+                    point.friction_impulse_1,
+                    point.friction_impulse_1,
+                    point.friction_impulse_2,
+                    point.friction_impulse_2
+                };
+                for (uint32_t s = 0; s < friction_rows_per_point; ++s) {
+                    const math::Vec3 dir = spokes[s & 3u];
+                    RowMaterial material;
+                    material.kind = RowKind::Contact;
+                    material.group_id = group_first_row;
+                    material.normal_row_count = normal_row_count;
+                    material.first_friction_row = first_friction_row;
+                    material.friction_row_count = total_friction_rows;
+                    material.friction = manifold.friction;
+                    material.restitution = manifold.restitution;
+
+                    // Friction rows carry NO compliance bias: compliance_alpha=0,
+                    // rhs=0 (MakeBaseRow default), direction only (mirrors
+                    // AppendContactGroup). Cone bounds are applied by C5.
+                    Row row = MakeBaseRow(kMaximalContactRowClassId,
+                                          0.0f,
+                                          0.0f,
+                                          0.0f,
+                                          warm[s & 3u],
+                                          row_flags::Friction |
+                                              row_flags::GradActive);
+                    out_rows->AddRow(row,
+                                     {body_a, body_b},
+                                     MakeJacobian(dir),
+                                     MakeJacobian(-dir),
+                                     material);
+                    out_sides->push_back({manifold.a, manifold.b});
+                }
+            }
+        }
     }
 }
 
