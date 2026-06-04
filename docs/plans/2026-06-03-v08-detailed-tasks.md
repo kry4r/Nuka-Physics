@@ -59,7 +59,7 @@ struct ContactManifold {
     void Clear();
 };
 ```
-**OPEN-A:** `body_a`/`body_b` are referenced by name in `row_builder.cpp:162` and `world_stepper.cpp`. Extending replaces them with `a.handle`/`b.handle`; the 4 call sites get a mechanical rename. Acceptable. Alternative (a `uint32 body_a() const { return a.handle; }` shim) keeps the diff smaller but hides the type — **recommend the rename** for clarity. Owner/advisor to confirm.
+**OPEN-A — RESOLVED (owner 2026-06-04): rename.** `body_a`/`body_b` are referenced by name in `row_builder.cpp:162` and `world_stepper.cpp`. Extending replaces them with `a.handle`/`b.handle`; the 4 call sites get a mechanical rename (clarity over a `body_a()` shim that hides the type). See Appendix D OPEN-A.
 
 ### 0.2 solref/solimp storage + the contact row regularizer (owned by C1 storage / C4 consumption)
 
@@ -86,7 +86,7 @@ Current registry (`row_class_registry.hpp:21`) ends at **id10** (`kRowClassCount
 - **Compliant contact = NO new row class.** Extend id0 (`MaximalContactRow`) and id3 (`FeatherstoneContactRow`) with the solref/solimp regularizer semantics from 0.2; ids 4/5 (SDF contact) already exist and gain the same path. This keeps the contact tier within existing classes (a forward-kernel change, not a new class), so the v0.9 cable ids 11/12 stay free.
 - **Coupling-row framework (C6) = NEW row class id13** `CouplingContactRow` (a generic two-system non-penetration/friction row whose two `CollidableRef`s may differ in type; the K2/K3 generalization). id11/12 are RESERVED for v0.9 Cosserat → coupling takes **id13**, NOT 11. Update the YAML + regen so `kRowClassCount` becomes 14 with 11/12 as reserved placeholders (or document them as reserved and let v0.9 fill them; **OPEN-C** below).
 
-**OPEN-C:** do we (i) add id11/12 as empty reserved placeholders now so `kRowClassCount=14` and id13 is the coupling row, or (ii) leave the registry at 11 and have C6's coupling row take id11, forcing v0.9 to renumber Cosserat to 13/14? Recommend **(i)** — reserve 11/12 for Cosserat, take 13 for coupling — so v0.9 plugs in with zero renumber. Costs two no-op registry entries now.
+**OPEN-C — RESOLVED (owner 2026-06-04): (i) reserve.** Add id11/12 as reserved placeholders now (`kRowClassCount=14`) and make id13 the coupling row, so v0.9 plugs Cosserat into 11/12 with zero renumber. Costs two no-op registry entries now. See Appendix D OPEN-C.
 
 ### 0.4 Collidable-type registry (owned by C2; codegen-time enum + runtime vtable-free dispatch)
 
@@ -384,16 +384,27 @@ Migrate XPBD soft/cloth (p09) and PBF fluid (p10) to CONSUME unified manifolds v
 
 ## C7 — H1 grasp-place demo (validation, the former #16)
 
-### C7a — H1 hand grasps cup, places on table (on the unified system)
+> **OPEN-J RESOLVED (owner, 2026-06-04): the REAL usdc-binary newton-assets cup is MANDATORY** (not a usda/primitive placeholder). The minimal usdc parse needed to load that cup is pulled into v0.8 as **C7a** (scoped to THIS cup, NOT a general usdc reader — general composition-arc hardening stays v0.9 U4a). **Critical-path risk (advisor):** C7 — the flagship grasp gate — now blocks on an **L-tier self-written binary parser (C7a)**, which sits on the C7 critical path. Schedule slack on C7a; if the cup asset turns out to exercise composition arcs, C7a escalates toward U4a scope (flag early). This is a deliberate version-inversion the owner accepted to ship the real asset.
+
+### C7a — Scoped usdc cup reader (newton-assets cup only)
+- **Objective.** Parse exactly the usdc-binary (crate) sections the newton-assets `manipulation_objects/cup` exercises, emitting the cup mesh into SceneIR — the minimal real-usdc capability the C7 grasp needs (OPEN-J). NOT general usdc support.
+- **Technical approach.** Self-written usdc (crate) binary reader (no OpenUSD — the no-closed-SDK pillar) on the `usd_stage_adapter` seam (memory `v07-usd-mjcf-coexistence`: "self-written reader, no OpenUSD"). Scope to the crate structural sections + `points`/`faceVertexIndices`/xform the cup asset actually uses; reuse the #19 mesh path + the #32 USD-mesh physics-less relaxation. Anything the cup does NOT exercise (general references/payloads/sublayers/variants) is OUT — that is the v0.9 U4a hardening item. Output the same SceneIR both importers produce → `scene_compose` (#31) composes onto the table.
+- **Inputs/Outputs/Interface.** In: the newton-assets cup usdc. Out: SceneIR with the cup TriMesh. Interface: C7b grasp scene; v0.9 U4a extends this to general usdc.
+- **Dependencies.** #19 mesh loader + #32 USD-mesh (landed v0.7); scene_compose (#31, exists). **Independent of the C1–C6 contact spine** (importer work — can land in parallel with the spine).
+- **D1 strategy.** Deterministic parse (fixed traversal order); host-only cook; cook-twice memcmp.
+- **Validation/test gates.** `tests/import/test_usdc_cup.cpp` — the real newton-assets cup usdc parses to the expected mesh (vertex/index counts + bbox within tol); cook-twice byte-equal.
+- **Effort.** **L** (usdc binary/crate format is involved even scoped to one asset; the C7 critical-path risk lives here — see the OPEN-J note above).
+- **Risks.** usdc crate format is versioned + nontrivial; the "load-this-cup-only" scope discipline is the mitigation. If the cup uses composition arcs this escalates toward U4a scope.
+
+### C7b — H1 hand grasps cup, places on table (on the unified system)
 - **Objective.** The re-homed grasp gate as VALIDATION (not a gate): H1 hand grasps a cup → places on a table, on the unified pipeline (architecture §0, roadmap §3).
-- **Technical approach.** Load h1_with_hand (MJCF, memory: fingers contype=0 visual-only → C1b reads that; the demo must ENABLE + cook fingertip collision per the honesty finding in memory `newton-assets-resource`). Cup = USD mesh (p16 #32) on a table; coexistence via `scene_compose` (#31). Fingertips = `ArticulationLink` collidables; cup = `RigidBody`; grasp contact = SDF high-precision tier (C3d) for fingertip precision + analytical for the table. Two-way reaction (C5b) holds the cup. Optional R1 IK to pre-position the hand. Run on the batched articulated world.
-- **Inputs/Outputs/Interface.** In: h1_with_hand + cup + table scene. Out: a grasp-place trajectory + RT video.
-- **Dependencies.** ALL of C1–C6; R1 (optional, for reach); G2 (for the photoreal video) optional.
+- **Technical approach.** Load h1_with_hand (MJCF, memory: fingers contype=0 visual-only → C1b reads that; the demo must ENABLE + cook fingertip collision per the honesty finding in memory `newton-assets-resource`). Cup = the REAL usdc newton-assets cup loaded via **C7a** (OPEN-J resolved) on a table; coexistence via `scene_compose` (#31). Fingertips = `ArticulationLink` collidables; cup = `RigidBody`; grasp contact = SDF high-precision tier (C3d) for fingertip precision + analytical for the table. Two-way reaction (C5b) holds the cup. Optional R1 IK to pre-position the hand. Run on the batched articulated world.
+- **Inputs/Outputs/Interface.** In: h1_with_hand + cup (via C7a) + table scene. Out: a grasp-place trajectory + RT video.
+- **Dependencies.** ALL of C1–C6 + **C7a (the real cup asset)**; R1 (optional, for reach); G2 (for the photoreal video) optional.
 - **D1 strategy.** The whole pipeline is D1; the demo trajectory is bit-reproducible (2-run). RT video via the G1 two-level tracer (`two_level_render.hpp`).
 - **Validation/test gates.** Regression (architecture §0 / roadmap §3): **no-interpenetration** (assert min separation ≥ −slop), **hold** (cup does not slip out over N steps), **D1** (2-run bit-identity of the trajectory), **V2 energy** (no spurious energy injection). RT video rendered on the G1 tracer for the homepage.
 - **Effort.** L.
-- **Risks.** Fingertip collision enablement (the honesty finding) + grasp stability (multi-point manifold + friction pyramid + two-way reaction all must work together). This is the integration capstone; failures here diagnose C3–C5.
-- **OPEN-J (owner): C7 cup format.** C7 (v0.8) is v0.8-standalone ONLY if the grasp cup ships as a `.usda` ASCII asset (works today via p16 #32, `src/import/usd_importer.cpp`) OR a primitive cylinder. If the real **usdc-binary** newton-assets cup is mandatory, C7 instead depends on **U4a (the v0.9 usdc reader)** — a version inversion (v0.8 reaching into v0.9). RECOMMENDATION: author the C7 cup as usda/primitive to keep the v0.8 grasp gate standalone; pull U4a into v0.8 only if the real usdc asset is required. Flagged for owner. See Appendix D OPEN-J.
+- **Risks.** Fingertip collision enablement (the honesty finding) + grasp stability (multi-point manifold + friction pyramid + two-way reaction all must work together). This is the integration capstone; failures here diagnose C3–C5. Plus the C7a asset-load critical-path risk (OPEN-J note).
 
 ## R1 — Inverse Kinematics (Featherstone-Jacobian DLS / Levenberg-Marquardt)
 
@@ -515,10 +526,12 @@ C1a ─▶ C1b ─▶ C1c ────────────┐  (metadata + i
                        ▼
         C6b ─▶ C6a            (coupling-row framework / id13 + PBD co-step)
                        │
+        C7a ───────────┤      (scoped usdc cup reader; importer — parallel to spine)
                        ▼
-        C7a                   (H1 grasp-place validation)  ◀── R1a (optional reach)
+        C7b                   (H1 grasp-place validation)  ◀── R1a (optional reach)
 
 INDEPENDENT TRACKS (parallel branches, no C-spine dependency):
+   C7a   (scoped usdc cup reader; importer work — can land anytime, gates C7b)
    R1a   (IK; needs only Featherstone Jacobians — can land anytime)
    G2a ─▶ G2b   (path tracer + denoise; needs only G1 — parallel)
    G3a          (semantic AOVs; needs G1 + a small cooker class-id field)
@@ -528,9 +541,9 @@ INDEPENDENT TRACKS (parallel branches, no C-spine dependency):
 ```
 
 **Recommended serial commit order (single-branch):**
-`C1a, C1b, C1c, C2a, C2b, C2c, C3a, C3b, C3c, C3d, C4a, C4b, C4c, C5a, C5b, C5c, C6b, C6a, C7a` — then the independent tracks `R1a, G2a, G2b, G3a, G4a, U1a, U1b, U1c` (these may be reordered or parallelized; G2/U1 can begin immediately since they only need the shipped G1/Vulkan seams). 27 commit-tasks total.
+`C1a, C1b, C1c, C2a, C2b, C2c, C3a, C3b, C3c, C3d, C4a, C4b, C4c, C5a, C5b, C5c, C6b, C6a, C7a, C7b` — then the independent tracks `R1a, G2a, G2b, G3a, G4a, U1a, U1b, U1c` (these may be reordered or parallelized; G2/U1/C7a can begin immediately — C7a only needs the v0.7 importer seams, G2/U1 only the shipped G1/Vulkan seams). 28 commit-tasks total.
 
-**Critical path:** C1c → C2 → C3 → C4 → C5 → C6 → C7 is the spine; everything in C7's grasp depends on the full chain. R1/G2/G3/G4/U1 do not block the grasp gate (R1 only assists reach; the video uses G1, G2 is an upgrade).
+**Critical path:** C1c → C2 → C3 → C4 → C5 → C6 → C7b is the contact spine; everything in C7b's grasp depends on the full chain **plus C7a (the real usdc cup asset — OPEN-J)**. C7a runs in parallel with the spine but MUST land before C7b. R1/G2/G3/G4/U1 do not block the grasp gate (R1 only assists reach; the video uses G1, G2 is an upgrade).
 
 ## Appendix B — Extension-seam checklist (roadmap-readiness; Q9 / architecture §3)
 
@@ -552,17 +565,17 @@ Current goldens (`tests/oracle/golden/`):
 
 **Regeneration discipline:** regenerate ONLY `go2_stand_5s.bin`, ONLY at C5c, ONLY after the stand is confirmed physically correct (not merely self-consistent). Commit the regenerated golden in the C5c commit with a message documenting the formulation change (compliant contact + StaticWorld reaction). Any C6 PBD/fluid goldens (if present beyond these three — none found in `tests/oracle/golden/`) follow the same rule at C6a.
 
-## Appendix D — Consolidated OPEN questions (for owner / advisor)
+## Appendix D — OPEN questions — ALL RESOLVED (owner, 2026-06-04)
 
-These are DECOMPOSITION/IMPLEMENTATION forks, NOT re-litigation of Q1–Q11.
+These were DECOMPOSITION/IMPLEMENTATION forks, NOT re-litigation of Q1–Q11. Owner directive 2026-06-04: "其余小型 OPEN 都解决" → every OPEN below is resolved at its recommended answer (or the owner's explicit choice for J).
 
-- **OPEN-A (0.1):** `ContactManifold` — mechanical rename `body_a/body_b` → `a.handle/b.handle` (recommend) vs a `body_a()` accessor shim. 4 call sites.
-- **OPEN-B (0.2) — RESOLVED: reuse is safe.** Contact regularizer `R=1/D` reuses `Row.compliance_alpha` (no Row growth). VERIFIED no aliasing: `src/solver/gpu/row_solver.cu` NEVER reads `compliance_alpha` (it is a separate kernel from `xpbd_world.cu`, which is the only consumer), so the rigid-contact branch can repurpose the field with zero collision against the XPBD path. The `float regularizer_R` field alternative (Row 16→17, codegen regen) stays a fallback only if a future test surfaces a concrete aliasing bug.
-- **OPEN-C (0.3):** row-class ids — reserve id11/12 for v0.9 Cosserat now (so coupling = id13, `kRowClassCount=14`, recommend) vs leave registry at 11, coupling=id11, force v0.9 renumber.
-- **OPEN-D (0.4):** collidable registry — codegen-time enum + runtime fn-pointer table (recommend, matches the YAML→registry path) vs a pure-runtime registry object.
-- **OPEN-E (C6b):** does v0.8 ship a CONCRETE coupling row class (id13 + the K2 proving pair, recommend) or ONLY the interface (framework + co-step bridge, no shipped pair)? Architecture §5/roadmap §3 say "framework as foundation, specific pairs → v0.9" — K2 as the one proving pair is the minimal concrete validation.
-- **OPEN-F (C4a):** `pow(x,power)` host/device determinism (g++ libm vs nvcc) for the solimp sigmoid — restrict to integer powers + unroll, or accept a documented host-vs-device tolerance for the non-integer-power case?
-- **OPEN-G (G3a):** semantic class-id SOURCE — where do semantic class ids come from in MJCF/USD import? (a new `<geom nuka:semantic="...">` attr? reuse material id? a cooker heuristic?) Needs an authoring decision.
-- **OPEN-H (U1a):** windowing library (GLFW) — acceptable under the "no closed SDK" pillar (it is a windowing lib, not a solver/render SDK)? And does the build/CI env have a display (headless gate needed)?
-- **OPEN-I (C3d):** SDF tier gives a SINGLE witness point (resting stability weaker than analytical 4-point). For the grasp, is single-point fingertip SDF contact + analytical multi-point elsewhere sufficient, or does C3d need perturbed-restart multi-point now (vs v0.9)?
-- **OPEN-J (owner, C7a):** C7 cup format. v0.8-standalone ONLY if the grasp cup is `.usda` ASCII (works today via p16 #32, `usd_importer.cpp`) OR a primitive cylinder; if the real **usdc-binary** newton-assets cup is mandatory, C7 depends on **U4a (v0.9 usdc reader)** — a version inversion. RECOMMEND: author the C7 cup as usda/primitive to keep the v0.8 grasp gate standalone; pull U4a into v0.8 only if the real usdc asset is required.
+- **OPEN-A (0.1) — RESOLVED: rename.** `ContactManifold` uses `a.handle/b.handle`; the 4 call sites (`row_builder.cpp:162`, `world_stepper.cpp`, …) get the mechanical rename (clarity over a `body_a()` shim).
+- **OPEN-B (0.2) — RESOLVED: reuse is safe.** Contact regularizer `R=1/D` reuses `Row.compliance_alpha` (no Row growth). VERIFIED no aliasing: `src/solver/gpu/row_solver.cu` NEVER reads `compliance_alpha` (it is a separate kernel from `xpbd_world.cu`, the only consumer), so the rigid-contact branch can repurpose the field. The `float regularizer_R` field alternative stays a fallback only if a future test surfaces a concrete aliasing bug.
+- **OPEN-C (0.3) — RESOLVED: reserve.** Reserve id11/id12 for v0.9 Cosserat now; the C6b coupling row takes **id13**; `kRowClassCount=14` (11/12 as reserved placeholders). v0.9 plugs Cosserat into 11/12 with zero renumber.
+- **OPEN-D (0.4) — RESOLVED: codegen enum + fn-ptr table.** Collidable registry = codegen-time enum + static metadata + runtime device-fn pointers resolved at world build (matches the YAML→registry path), NOT a pure-runtime registry object.
+- **OPEN-E (C6b) — RESOLVED: ship concrete.** v0.8 ships the CONCRETE id13 `CouplingContactRow` + the **K2 (particle↔rigid-SDF) proving pair** as the minimal concrete validation, not interface-only. v0.9 R8 fills the remaining pairs.
+- **OPEN-F (C4a) — RESOLVED: integer powers + unroll.** The solimp two-branch sigmoid restricts the `pow(x,power)` exponent to INTEGER powers, evaluated by an unrolled integer-power helper → host/device bit-identity (no g++-libm-vs-nvcc divergence). Non-integer `power` is not used (documented constraint); if a future material needs it, it carries a documented host-vs-device tolerance — out of scope for v0.8.
+- **OPEN-G (G3a) — RESOLVED: `nuka:semantic` attr + material-id fallback.** Semantic class ids come from an optional `nuka:semantic="<class>"` geom attribute in MJCF/USD import; when absent, the cooker falls back to the material id as the class id. The cooker maps both to the G3 class-id field. No heuristic guessing.
+- **OPEN-H (U1a) — RESOLVED: GLFW OK + headless gate.** GLFW is acceptable under the no-closed-SDK pillar (it is a windowing lib, not a solver/render SDK). Offscreen rendering is the CI path; the windowed viewport is gated behind a runtime display probe so headless CI never opens a window.
+- **OPEN-I (C3d) — RESOLVED: single-witness for the v0.8 grasp.** Single-point fingertip SDF contact + analytical multi-point elsewhere is sufficient for the C7b grasp. Perturbed-restart multi-point SDF is DEFERRED to v0.9 (OPEN-V4), where go2-on-sand foot resting stability needs it and R4f implements it.
+- **OPEN-J (owner, C7) — RESOLVED: real usdc cup, scoped reader into v0.8.** The REAL usdc-binary newton-assets cup is MANDATORY (owner 2026-06-04). The minimal usdc parse is pulled into v0.8 as **C7a (scoped to this one cup)** — general usdc composition-arc hardening stays v0.9 U4a. Accepted consequence: C7 (the flagship grasp gate) now has an **L-tier self-written binary parser on its critical path** (C7a). Documented as a critical-path risk in the C7 header note + the DAG.

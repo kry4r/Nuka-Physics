@@ -85,17 +85,21 @@ Dependency-driven split: **foundation (v0.8) → breadth solvers (v0.9) → demo
 1. **W1 breadth**, value-ordered: R2 cable/DER → R3 garment-grade cloth (CCD seam) → R4 MPM (granular) → R5 volumetric FEM → R7 tendon/muscle. **R6 Kamino closed-loops ⏸ DEFERRED** (owner "先不做"; revived later into the solver registry). R8 coupling **per-pair** (rigid↔fluid, articulated↔MPM, cloth↔rigid …) trails each, via the v0.8 coupling framework.
 2. **W3 advanced frontend**: U2 authoring/inspection → U3 web/log viewer → U4 real-complex-USD pipeline → U5 teleop/XR.
 
-**v1.0 — DEMOS ONLY** + release-grade wrapper (§5). No new engine work. The **6 showcase demos** (all photoreal-RT A1 on the GitHub homepage, [[v10-exit-conditions-expansion]], [[demo-homepage-readme-directives]]):
-1. **H1 dexterous grasp-and-place** (collision spine + R1 IK)
+**v1.0 — DEMOS ONLY** + release-grade wrapper (§5). No new engine work. The **8 showcase demos** (all photoreal-RT A1 on the GitHub homepage, [[v10-exit-conditions-expansion]], [[demo-homepage-readme-directives]]):
+1. **H1 dexterous grasp-and-place** (collision spine + R1 IK; real usdc cup via v0.8 C7a + full kitchen scene via v0.9 U4)
 2. **Rigid-body collision showcase** (stack/dominoes/pile — general rigid contact + multi-point manifold)
 3. **Fluid + rigid coupling** (pour water, objects pushed — PBF + rigid↔fluid R8)
-4. **Soft / cloth showcase** (drape/squish + cloth↔rigid — existing XPBD p09, NOT garment-grade)
-5. **MPM go2-on-sand** (granular walking — R4 MPM + articulated↔MPM coupling R8)
+4. **Garment cloth showcase** (drape/dressing with self-collision — **R3 garment-grade**, ACCD + cloth↔rigid/articulation R3d/R8c)
+5. **MPM go2-on-sand** (granular walking — R4 MPM + articulated↔MPM coupling R8; multi-point SDF footing per OPEN-V4)
 6. **Cable / rope** (R2 cable/DER)
+7. **FEM volumetric soft-body** (squish/elastic recovery — **R5** corotational→stable-Neo-Hookean)
+8. **Tendon / musculotendon actuation** (muscle-driven limb — **R7** Hill-type + fixed/spatial tendons, via-points; wrapping deferred)
+
+> **Demo-set decision (owner 2026-06-04, advisor-flagged dedup):** R3 garment / R5 FEM / R7 tendon EACH get a demo. The former generic "soft/cloth showcase" (basic XPBD p09) is **upgraded + split**, not kept alongside: its cloth half becomes the garment-grade **Demo 4 (R3)** and its volumetric-soft half becomes **Demo 7 (R5)** — avoiding two visually-redundant soft demos. Tendon is the new **Demo 8 (R7)**. Net 6 → 8. The XPBD p09 path still exists in the engine (it backs the R3 mass-spring base + the v0.8 PBD co-step), it just no longer fronts a standalone demo.
 
 ## 5. v1.0 release-grade (non-demo) requirements — owner-approved 2026-06-03
 1. **Packaging/dist (MUST)**: pip-installable Python wheel (extend `scripts/build_python_wheel.sh`) + prebuilt CUDA wheel; optional Docker image.
-2. **Documentation (MUST)**: modernized README + C-ABI/Python API reference + getting-started + the 6 demo scenes as runnable examples + architecture overview.
+2. **Documentation (MUST)**: modernized README + C-ABI/Python API reference + getting-started + the 8 demo scenes as runnable examples + architecture overview.
 3. **Performance baselines**: MEASURE in v0.9 (W2 G4 + sim steps/s batched + D1 two-run/cross-replica gates); **PUBLISH** the honest benchmark table (incl. Newton/Isaac comparables) in **v1.0**.
 4. **License (MUST)**: maintain Apache-2.0; add third-party asset licenses (newton-assets / mujoco_menagerie) + NOTICE.
 5. **API stability (v1.0)**: freeze the C-ABI + Python surface (semver guarantee) + deprecation policy — a 1.0-appropriate commitment.
