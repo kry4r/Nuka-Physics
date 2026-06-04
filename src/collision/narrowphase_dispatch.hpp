@@ -134,9 +134,16 @@ using NarrowphaseFn = void (*)(const CandidatePair& pair,
 
 // ---------------------------------------------------------------------------
 // SelectTier -- pick the precision tier from the cooked shapes (Q2).
-//   primitive × primitive            -> Analytical
+//   primitive × primitive            -> Analytical  (closed-form)
+//   capsule×box / capsule×capsule    -> Convex      (no closed-form; GJK/EPA, C3c)
 //   any mesh/convex (no SDF)         -> Convex
-//   any SDF-equipped piece           -> Sdf  (overrides, highest precision)
+//   has_sdf == true                  -> Sdf  (overrides, highest precision)
+//
+// `has_sdf` CONTRACT (C5 stream driver derives + passes it): TRUE iff BOTH sides
+// have a cooked SDF (CookedSdfTable, kNoSdf sentinel). The Sdf tier's Newton solve
+// needs both fields (sdf_a AND sdf_b); a pair with only ONE SDF side must NOT set
+// has_sdf (it falls through to Convex/Analytical). The NarrowphaseSdf handler's
+// null-SDF-view guard (-> empty manifold) is a safety net, NOT the routing rule.
 // ---------------------------------------------------------------------------
 constexpr bool IsPrimitiveShape(ShapeType t) {
     // Closed-form analytical primitives in v0.8.
@@ -144,9 +151,25 @@ constexpr bool IsPrimitiveShape(ShapeType t) {
            t == ShapeType::Box || t == ShapeType::Plane;
 }
 
+// Capsule×Box and Capsule×Capsule have NO closed-form analytical contact (a
+// segment-vs-OBB / segment-vs-segment + radius is exactly what GJK/EPA does well),
+// so they route to the Convex tier (C3c handles capsules via SupportCapsule). All
+// OTHER capsule pairs DO have closed-form handlers: capsule×plane, capsule×sphere
+// (C3b) -> Analytical.
+constexpr bool IsConvexOnlyPrimitivePair(ShapeType a, ShapeType b) {
+    const bool a_cap = (a == ShapeType::Capsule);
+    const bool b_cap = (b == ShapeType::Capsule);
+    const bool capsule_box =
+        (a_cap && b == ShapeType::Box) || (a == ShapeType::Box && b_cap);
+    return (a_cap && b_cap) || capsule_box;
+}
+
 constexpr NarrowphaseTier SelectTier(ShapeType a, ShapeType b, bool has_sdf) {
     if (has_sdf) {
         return NarrowphaseTier::Sdf;  // high-precision tier wins when available
+    }
+    if (IsConvexOnlyPrimitivePair(a, b)) {
+        return NarrowphaseTier::Convex;  // no closed-form -> GJK/EPA (C3c)
     }
     if (IsPrimitiveShape(a) && IsPrimitiveShape(b)) {
         return NarrowphaseTier::Analytical;
@@ -217,10 +240,19 @@ inline void NarrowphaseStubConvex(const CandidatePair& pair,
 // Defined `inline` BEFORE MakeNarrowphaseTable so &Handler is a constant
 // expression with one ODR-merged address across TUs (mirrors the stub posture).
 
-// Set the manifold sides from the pair (a/b carry type-tagged CollidableRefs).
+// Set the manifold sides from the pair (a/b carry type-tagged CollidableRefs)
+// AND stamp the D1 stream sort key (§0.1 `manifold_key = (min,max handle)+type`).
+// Every REAL handler calls this after filling geometry, so the manifold the C3->C4
+// stream carries is self-D1-sortable: manifold_key == the originating
+// CandidatePair's stable_key (the same canonical (type,handle) pack). The C3a STUBS
+// instead stamp a tier marker into manifold_key (they do NOT call StampSides), so a
+// real manifold and a stub manifold are always distinguishable. (Were this left
+// 0/unset, the manifold stream's deterministic sort would be unmet — the key is the
+// detection->solver identity, not just decoration.)
 inline void StampSides(const CandidatePair& pair, ContactManifold* out) {
     out->a = pair.a;
     out->b = pair.b;
+    out->manifold_key = MakeStableKey(pair.a, pair.b);
 }
 // Flip every point's normal in place (used by swapped-order wrappers).
 inline void FlipNormals(ContactManifold* out) {
@@ -571,29 +603,16 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
     t.fns[kCap][kSph][kAna] = &NarrowphaseCapsuleSphere;
     t.fns[kSph][kCap][kAna] = &NarrowphaseSphereCapsule;
 
-    // DEFERRED to the C3a stub (NarrowphaseStubAnalytical) WITH a named consumer:
-    //   (Capsule,Box)/(Box,Capsule)  -> C3c convex tier (capsule treated as a
-    //                                    swept-segment vs OBB; the GJK/face-clip
-    //                                    util generalises this cleanly).
-    //   (Capsule,Capsule)            -> C3c convex tier (segment-segment closest
-    //                                    point + 2-pt clip; shares the C3c clip).
-    //   (Plane,Plane)                -> physically degenerate (two half-spaces);
-    //                                    no finite manifold -> stub by design.
-    // These slots intentionally KEEP the default Analytical stub so they route to
-    // a well-defined empty manifold until C3c lands the segment-based handlers.
-    //
-    // C3c NOTE / HONEST ORPHAN (capsule x box, capsule x capsule): the C3b comment
-    // above names "C3c convex tier" as the consumer for these. BUT SelectTier
-    // routes BOTH capsule x box and capsule x capsule to the ANALYTICAL tier
-    // (capsule + box + capsule are all IsPrimitiveShape == true). So a Convex-tier
-    // registration for them would be UNREACHABLE dead code -- ResolveNarrowphase
-    // never asks the Convex tier for two primitives. C3c therefore does NOT close
-    // this with a phantom Convex-tier slot. Closing it correctly is either
-    // (a) Analytical-tier wrappers calling cvx::ConvexNarrowphase (1-pt witness,
-    // since capsule HasFace()==false -> weaker than C3b's envisioned swept-segment
-    // vs OBB face contact), or (b) a true analytical capsule-OBB handler. Both are
-    // OUT OF C3c SCOPE (C3c is the general convex path); the gap is surfaced to the
-    // controller and remains the C3b deferral's open item -- NOT silently shipped.
+    // CLOSED (C3-batch review fix): (Capsule,Box)/(Box,Capsule)/(Capsule,Capsule)
+    //   have NO closed-form analytical contact, so SelectTier now routes them to the
+    //   CONVEX tier (IsConvexOnlyPrimitivePair) and they are registered to the
+    //   generic NarrowphaseConvex below -- C3c's GJK/EPA already supports a capsule
+    //   side via SupportCapsule (so capsule+box / capsule+capsule are two primitive
+    //   SupportProxies through the SAME Minkowski path; 1-pt witness for now, which
+    //   is sufficient for v0.8 and is what GJK yields without a swept-segment face).
+    //   This removes the silent-empty-manifold landmine before the table reaches
+    //   production (C5). (Plane,Plane) stays the Analytical stub by design (two
+    //   half-spaces -> no finite manifold).
 
     // --- C3c: Convex-tier handlers (general convex x convex / convex x primitive).
     // The SAME generic NarrowphaseConvex serves every ConvexHull-involving slot
@@ -613,6 +632,15 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
     t.fns[kCap][kHull][kCvx]  = &NarrowphaseConvex;
     t.fns[kHull][kPln][kCvx]  = &NarrowphaseConvex;   // convex x plane (special-cased)
     t.fns[kPln][kHull][kCvx]  = &NarrowphaseConvex;
+
+    // C3-batch review fix: capsule×box / capsule×capsule have no closed-form, so
+    // SelectTier routes them HERE (Convex). Two primitive SupportProxies (no hull)
+    // through the SAME generic NarrowphaseConvex (MakeConvexProxy maps Box->Box,
+    // Capsule->Capsule). Closes the C3b/C3c deferral so C5 wiring can't silently
+    // emit empty manifolds for these pairs.
+    t.fns[kCap][kBox][kCvx]   = &NarrowphaseConvex;   // capsule x box (both orders)
+    t.fns[kBox][kCap][kCvx]   = &NarrowphaseConvex;
+    t.fns[kCap][kCap][kCvx]   = &NarrowphaseConvex;   // capsule x capsule
 
     // DEFERRED in the Convex tier WITH a NAMED CONSUMER:
     //   TriMesh x * / HeightField x * -> KEEP the Convex stub. v0.8 grasp consumes

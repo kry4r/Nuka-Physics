@@ -24,6 +24,7 @@
 
 using nuka::collision::CandidatePair;
 using nuka::collision::kNarrowphaseTable;
+using nuka::collision::MakeStableKey;
 using nuka::collision::NarrowphaseSdf;  // C3d: real Sdf-tier handler (stub removed)
 using nuka::collision::NarrowphaseStubAnalytical;
 using nuka::collision::NarrowphaseStubConvex;
@@ -48,9 +49,10 @@ TEST(NarrowphaseDispatch, SelectTierPrimitivePairsAnalytical) {
               NarrowphaseTier::Analytical);
     EXPECT_EQ(SelectTier(ShapeType::Box, ShapeType::Plane, false),
               NarrowphaseTier::Analytical);
-    EXPECT_EQ(SelectTier(ShapeType::Capsule, ShapeType::Box, false),
-              NarrowphaseTier::Analytical);
+    // Capsule pairs WITH a closed-form handler stay Analytical (C3b):
     EXPECT_EQ(SelectTier(ShapeType::Sphere, ShapeType::Capsule, false),
+              NarrowphaseTier::Analytical);
+    EXPECT_EQ(SelectTier(ShapeType::Capsule, ShapeType::Plane, false),
               NarrowphaseTier::Analytical);
 }
 
@@ -62,6 +64,18 @@ TEST(NarrowphaseDispatch, SelectTierMeshConvexHeightfieldConvex) {
     EXPECT_EQ(SelectTier(ShapeType::HeightField, ShapeType::Box, false),
               NarrowphaseTier::Convex);
     EXPECT_EQ(SelectTier(ShapeType::ConvexHull, ShapeType::TriMesh, false),
+              NarrowphaseTier::Convex);
+}
+
+TEST(NarrowphaseDispatch, SelectTierCapsuleNoClosedFormGoesConvex) {
+    // C3-batch review fix: capsule×box and capsule×capsule have NO closed-form
+    // analytical contact -> Convex tier (C3c GJK/EPA via SupportCapsule). Both
+    // orderings.
+    EXPECT_EQ(SelectTier(ShapeType::Capsule, ShapeType::Box, false),
+              NarrowphaseTier::Convex);
+    EXPECT_EQ(SelectTier(ShapeType::Box, ShapeType::Capsule, false),
+              NarrowphaseTier::Convex);
+    EXPECT_EQ(SelectTier(ShapeType::Capsule, ShapeType::Capsule, false),
               NarrowphaseTier::Convex);
 }
 
@@ -112,7 +126,8 @@ bool HasRealAnalyticalHandler(ShapeType a, ShapeType b) {
 // Mirrors MakeNarrowphaseTable's C3c Convex registration block: every
 // ConvexHull-involving pair (convex x convex + convex x {box,sphere,capsule,
 // plane}, both orderings) gets the real NarrowphaseConvex; TriMesh/HeightField
-// slots stay the Convex stub (the v0.9 named deferral).
+// slots stay the Convex stub (the v0.9 named deferral). PLUS the C3-batch review
+// fix: capsule×box / capsule×capsule (no closed-form) also route here.
 bool HasRealConvexHandler(ShapeType a, ShapeType b) {
     using nuka::scene::ShapeType;
     auto is = [](ShapeType x, ShapeType y, ShapeType s, ShapeType t) {
@@ -125,7 +140,9 @@ bool HasRealConvexHandler(ShapeType a, ShapeType b) {
            is(a, b, H, B) || is(a, b, B, H) ||
            is(a, b, H, S) || is(a, b, S, H) ||
            is(a, b, H, C) || is(a, b, C, H) ||
-           is(a, b, H, P) || is(a, b, P, H);
+           is(a, b, H, P) || is(a, b, P, H) ||
+           is(a, b, C, B) || is(a, b, B, C) ||   // capsule×box (review fix)
+           is(a, b, C, C);                        // capsule×capsule (review fix)
 }
 }  // namespace
 
@@ -176,9 +193,10 @@ TEST(NarrowphaseDispatch, ResolveNarrowphasePicksTierThenHandler) {
     // handler (no longer the stub).
     EXPECT_NE(ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, false),
               &NarrowphaseStubAnalytical);
-    // An UNregistered Analytical pair still routes to the Analytical stub
-    // (Capsule x Box deferred to C3c).
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::Capsule, ShapeType::Box, false),
+    // An UNregistered Analytical pair still routes to the Analytical stub.
+    // (Plane x Plane is degenerate -> stub by design; capsule×box now routes to
+    // the Convex tier, see SelectTierCapsuleNoClosedFormGoesConvex.)
+    EXPECT_EQ(ResolveNarrowphase(ShapeType::Plane, ShapeType::Plane, false),
               &NarrowphaseStubAnalytical);
     // Mesh pair, no SDF -> Convex handler.
     EXPECT_EQ(ResolveNarrowphase(ShapeType::TriMesh, ShapeType::Box, false),
@@ -212,17 +230,19 @@ uint64_t RouteAndReadMarker(ShapeType a, ShapeType b, bool has_sdf) {
 }  // namespace
 
 TEST(NarrowphaseDispatch, CallThroughTableReachesExpectedTier) {
-    // Analytical tier: use an UNregistered pair (Capsule x Box, deferred to C3c)
-    // so the stub still runs and stamps its marker. (Registered Analytical pairs
-    // now run real geometry math -- covered by test_analytical_manifold.)
-    EXPECT_EQ(RouteAndReadMarker(ShapeType::Capsule, ShapeType::Box, false),
+    // Analytical tier: use an UNregistered pair (Plane x Plane, degenerate -> stub
+    // by design) so the stub still runs and stamps its marker. (Registered
+    // Analytical pairs now run real geometry math -- covered by
+    // test_analytical_manifold; capsule×box now routes to the Convex tier.)
+    EXPECT_EQ(RouteAndReadMarker(ShapeType::Plane, ShapeType::Plane, false),
               StubMarkerForTier(NarrowphaseTier::Analytical));
     EXPECT_EQ(RouteAndReadMarker(ShapeType::TriMesh, ShapeType::Box, false),
               StubMarkerForTier(NarrowphaseTier::Convex));
     // Sdf tier: C3d landed -- the real NarrowphaseSdf runs (no stub marker). With
     // the default ShapeProxyView (null SDF seam) it null-guards to an EMPTY
-    // manifold (manifold_key untouched == 0), proving the real handler ran without
-    // crashing. The SDF-driven manifold is exercised in test_sdf_tier_wired.
+    // manifold (point_count 0; StampSides still stamps the real manifold_key from
+    // the sides, NOT a stub marker), proving the real handler ran without crashing.
+    // The SDF-driven manifold is exercised in test_sdf_tier_wired.
     CandidatePair sdf_pair;
     sdf_pair.a = CollidableRef{CollidableType::RigidBody,
                                ReactionProviderKind::RigidInvMass, 7u};
@@ -242,6 +262,29 @@ TEST(NarrowphaseDispatch, CallThroughTableReachesExpectedTier) {
     EXPECT_EQ(sdf_out.b.handle, 3u);
 }
 
+TEST(NarrowphaseDispatch, RealHandlerStampsManifoldKeyForD1Sort) {
+    // §0.1: the ContactManifold stream (C3->C4 handoff) is D1-sorted by
+    // `manifold_key`. Every REAL handler (via StampSides) must stamp it =
+    // MakeStableKey(a,b) -- NOT leave it 0 and NOT a stub marker. (Box x Box is a
+    // real C3b Analytical handler; default prims overlap at the origin so it runs.)
+    CandidatePair pair;
+    pair.a = CollidableRef{CollidableType::RigidBody,
+                           ReactionProviderKind::RigidInvMass, 7u};
+    pair.b = CollidableRef{CollidableType::StaticWorld,
+                           ReactionProviderKind::StaticNull, 3u};
+    ShapeProxyView geom;
+    geom.type_a = ShapeType::Box;
+    geom.type_b = ShapeType::Box;
+    ContactManifold out;
+    ResolveNarrowphase(ShapeType::Box, ShapeType::Box, false)(pair, geom, &out);
+
+    const uint64_t expected = MakeStableKey(pair.a, pair.b);
+    EXPECT_EQ(out.manifold_key, expected) << "real handler must stamp the D1 sort key";
+    EXPECT_NE(out.manifold_key, 0u);
+    EXPECT_NE(out.manifold_key, StubMarkerForTier(NarrowphaseTier::Analytical))
+        << "a real manifold_key must be distinguishable from a stub marker";
+}
+
 TEST(NarrowphaseDispatch, StubPreservesCollidableSidesAndEmptyManifold) {
     CandidatePair pair;
     pair.a = CollidableRef{CollidableType::ArticulationLink,
@@ -253,8 +296,9 @@ TEST(NarrowphaseDispatch, StubPreservesCollidableSidesAndEmptyManifold) {
     out.AddPoint(ContactPoint{});  // dirty it first to prove Clear ran
 
     // Use an UNregistered Analytical pair so the STUB (not a C3b real handler)
-    // runs (Capsule x Box deferred to C3c). The stub yields an empty manifold.
-    ResolveNarrowphase(ShapeType::Capsule, ShapeType::Box, false)(pair, geom, &out);
+    // runs (Plane x Plane is degenerate -> stub by design). The stub yields an
+    // empty manifold but preserves the type-tagged sides.
+    ResolveNarrowphase(ShapeType::Plane, ShapeType::Plane, false)(pair, geom, &out);
 
     EXPECT_EQ(out.point_count, 0u);  // stub yields an EMPTY manifold
     EXPECT_EQ(out.a.type, CollidableType::ArticulationLink);
