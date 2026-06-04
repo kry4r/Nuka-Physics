@@ -7,6 +7,7 @@
 #include "math/transform.hpp"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nuka::scene {
@@ -49,6 +50,24 @@ struct CollisionShapeRecord {
     uint32_t      decompose_max_pieces     = 32;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
+
+    // -- Contact metadata (v0.8 C1a) ----------------------------------------
+    // Per-SHAPE contact parameters, matching MuJoCo's per-geom semantics
+    // (per-shape strictly generalizes per-material and gives a material-less
+    // collision geom somewhere to store its params). Defaults are MuJoCo's.
+    // The cooker copies these verbatim into CookedContactParamTable, EXCEPT
+    // friction_mu, which is RESOLVED at cook time (see cooker.cpp precedence).
+    uint32_t contype          = 1;
+    uint32_t conaffinity      = 1;
+    int32_t  collision_group  = 0;
+    float    solref[2]        = {0.02f, 1.0f};                     // timeconst, dampratio
+    float    solimp[5]        = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f}; // dmin,dmax,width,mid,power
+    float    friction_mu      = -1.0f;   // SENTINEL: <0 => inherit material μ; >=0 => explicit per-shape override
+    int32_t  priority         = 0;
+    float    solmix           = 1.0f;
+    float    margin           = 0.0f;
+    float    gap              = 0.0f;
+    uint8_t  condim           = 3;       // {1,3,4,6}; v0.8 uses 1 & 3
 };
 
 struct JointRecord {
@@ -84,6 +103,11 @@ struct MaterialRecord {
     float alpha                            = 1.0f;
     float roughness                        = 0.5f;
     float metallic                         = 0.0f;
+
+    // Per-material default friction coefficient μ (owner Q8 "per-material μ").
+    // Resolved into the per-shape cooked μ at cook time when a shape does not
+    // carry an explicit per-shape override (see cooker.cpp precedence). (v0.8 C1a)
+    float friction_mu                      = 1.0f;
 };
 
 struct CameraRecord {
@@ -138,6 +162,12 @@ public:
     LightId AddLight(LightRecord record);
     ActuatorId AddActuator(ActuatorRecord record);
 
+    // Record an explicit collision-exclusion between two bodies. Stored
+    // canonicalized as (min,max) so call order does not matter. The filter
+    // POLICY that consumes this list (and the <contact><pair> explicit-override
+    // list) is C1b/C1c; C1a only stores the authored excludes. (v0.8 C1a)
+    void AddExcludePair(BodyId a, BodyId b);
+
     // -- counts -------------------------------------------------------------
     size_t RigidBodyCount() const;
     size_t JointCount()     const;
@@ -176,6 +206,7 @@ public:
     const std::vector<CameraRecord>&         Cameras() const;
     const std::vector<LightRecord>&          Lights() const;
     const std::vector<ActuatorRecord>&       Actuators() const;
+    const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
 
 private:
     std::vector<RigidBodyRecord>      bodies_;
@@ -186,6 +217,7 @@ private:
     std::vector<CameraRecord>         cameras_;
     std::vector<LightRecord>          lights_;
     std::vector<ActuatorRecord>       actuators_;
+    std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
 };
 
 } // namespace nuka::scene

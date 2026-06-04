@@ -140,11 +140,32 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
     if (bytes_out)  *bytes_out = bytes;
 }
 
-// Push one cooked shape row (all parallel arrays stay the same length).
+// Resolve the cooked per-shape friction μ from the per-shape override and the
+// (optional) per-material default. Friction resolution precedence (v0.8 C1a):
+//   1. shape.friction_mu  if >= 0   (explicit per-shape override)
+//   2. else material.friction_mu    if the shape has a valid material_id
+//   3. else 1.0f                    (MuJoCo default)
+float ResolveShapeFriction(const SceneIR& scene, const CollisionShapeRecord& src) {
+    if (src.friction_mu >= 0.0f) {
+        return src.friction_mu;                              // (1) per-shape override
+    }
+    if (src.material_id < scene.Materials().size()) {        // (2) per-material default
+        return scene.Materials()[src.material_id].friction_mu;
+    }
+    return 1.0f;                                             // (3) MuJoCo default
+}
+
+// Push one cooked shape row AND its parallel contact-param row in lockstep, so
+// the two tables can never desync. A single source CollisionShapeRecord may
+// emit MULTIPLE cooked rows (one per V-HACD piece) — each call here appends one
+// row to BOTH tables, and all pieces of a mesh inherit the parent's contact
+// metadata (resolved_friction is computed once per source shape). (v0.8 C1a)
 void PushShapeRow(CookedShapeTable& shapes,
+                  CookedContactParamTable& contact_params,
                   const CollisionShapeRecord& src,
                   ShapeType type,
-                  uint32_t convex_geometry_index) {
+                  uint32_t convex_geometry_index,
+                  float resolved_friction) {
     shapes.types.push_back(type);
     shapes.body_ids.push_back(src.body_id);
     shapes.material_ids.push_back(src.material_id);
@@ -153,6 +174,22 @@ void PushShapeRow(CookedShapeTable& shapes,
     shapes.radii.push_back(src.radius);
     shapes.half_heights.push_back(src.half_height);
     shapes.convex_geometry_indices.push_back(convex_geometry_index);
+
+    // Parallel contact-param row (copied verbatim except the resolved friction).
+    contact_params.contypes.push_back(src.contype);
+    contact_params.conaffinities.push_back(src.conaffinity);
+    contact_params.groups.push_back(src.collision_group);
+    contact_params.solref0.push_back(src.solref[0]);
+    contact_params.solref1.push_back(src.solref[1]);
+    for (int k = 0; k < 5; ++k) {
+        contact_params.solimp.push_back(src.solimp[k]);  // flattened, row-major
+    }
+    contact_params.frictions.push_back(resolved_friction);
+    contact_params.condims.push_back(src.condim);
+    contact_params.priorities.push_back(src.priority);
+    contact_params.solmix.push_back(src.solmix);
+    contact_params.margins.push_back(src.margin);
+    contact_params.gaps.push_back(src.gap);
 }
 
 } // namespace
@@ -230,8 +267,26 @@ CookedBlob CookScene(const SceneIR& scene) {
     blob.shapes.radii.reserve(shapes.size());
     blob.shapes.half_heights.reserve(shapes.size());
     blob.shapes.convex_geometry_indices.reserve(shapes.size());
+    // Contact-param table is parallel to the shape rows (>= shapes.size() once
+    // meshes decompose); reserve the lower bound. v0.8 C1a.
+    blob.contact_params.contypes.reserve(shapes.size());
+    blob.contact_params.conaffinities.reserve(shapes.size());
+    blob.contact_params.groups.reserve(shapes.size());
+    blob.contact_params.solref0.reserve(shapes.size());
+    blob.contact_params.solref1.reserve(shapes.size());
+    blob.contact_params.solimp.reserve(shapes.size() * 5);
+    blob.contact_params.frictions.reserve(shapes.size());
+    blob.contact_params.condims.reserve(shapes.size());
+    blob.contact_params.priorities.reserve(shapes.size());
+    blob.contact_params.solmix.reserve(shapes.size());
+    blob.contact_params.margins.reserve(shapes.size());
+    blob.contact_params.gaps.reserve(shapes.size());
 
     for (const auto& s : shapes) {
+        // Resolve friction ONCE per source shape; all cooked rows this shape
+        // emits (incl. every V-HACD piece) inherit the same contact metadata.
+        const float resolved_friction = ResolveShapeFriction(scene, s);
+
         const bool is_mesh =
             (s.type == ShapeType::TriMesh || s.type == ShapeType::ConvexHull);
         const bool has_geometry = !s.mesh_vertices.empty() && !s.mesh_indices.empty();
@@ -239,7 +294,8 @@ CookedBlob CookScene(const SceneIR& scene) {
         // Non-mesh shapes (and mesh shapes lacking geometry — e.g. importers
         // that do not yet load mesh files) pass through unchanged, one row.
         if (!is_mesh || !has_geometry) {
-            PushShapeRow(blob.shapes, s, s.type, kNoConvexGeometry);
+            PushShapeRow(blob.shapes, blob.contact_params, s, s.type,
+                         kNoConvexGeometry, resolved_friction);
             continue;
         }
 
@@ -250,7 +306,8 @@ CookedBlob CookScene(const SceneIR& scene) {
             // geometry as one ConvexHull; no V-HACD run).
             const uint32_t geom_index = AppendConvexGeometry(
                 blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+            PushShapeRow(blob.shapes, blob.contact_params, s,
+                         ShapeType::ConvexHull, geom_index, resolved_friction);
             continue;
         }
 
@@ -276,14 +333,16 @@ CookedBlob CookScene(const SceneIR& scene) {
             // single ConvexHull carrying its own geometry (never drop the shape).
             const uint32_t geom_index = AppendConvexGeometry(
                 blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+            PushShapeRow(blob.shapes, blob.contact_params, s,
+                         ShapeType::ConvexHull, geom_index, resolved_friction);
             continue;
         }
 
         for (const auto& piece : result.pieces) {
             const uint32_t geom_index = AppendConvexGeometry(
                 blob.convex_geometry, piece.vertices, piece.indices, piece.volume);
-            PushShapeRow(blob.shapes, s, ShapeType::ConvexHull, geom_index);
+            PushShapeRow(blob.shapes, blob.contact_params, s,
+                         ShapeType::ConvexHull, geom_index, resolved_friction);
         }
     }
 

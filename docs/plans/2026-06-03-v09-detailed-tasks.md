@@ -135,7 +135,7 @@ class FemWorld {                   // owns its implicit backward-Euler solve
 | **R8 Coupling per-pair** | (uses R2–R5 types) | ✅ | (per pair) | ✅ | ✅ | ✅ (**the core**) | ✅ (go2-sand) | ✅ | C5b, C6b + the partner solver phase |
 | **U2 authoring** | — | — | — | — | — | — | — | — | C-ABI, SceneIR (exist) |
 | **U3 web/log viewer** | — | — | — | — | — | — | — | — | bindings, framebuffer (exist) |
-| **U4 real-USD pipeline** | — | — | — | — | — | — | — | — | importer/cooker, scene_compose (exist) |
+| **U4 real-USD pipeline** | — | — | — | — | — | — | — | — | **v0.8 C7a (scoped usdc reader — U4a hardens it)**; importer/cooker, scene_compose (exist) |
 | **U5 teleop/XR** | — | — | — | — | — | — | — | — | v0.8 U1 viewport |
 
 ---
