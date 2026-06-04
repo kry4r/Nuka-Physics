@@ -919,6 +919,30 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_lbvh_filtered_pairs_test)
 
+    # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
+    # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
+    # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity
+    # shape->body map + 2-shapes->1-body dedup case), (2) a brute-force i<j radius
+    # oracle for p<->p, (3) the matrix-toggle gate (non-vacuous, same scene),
+    # (4) >=32-particle 2-run byte-exact D1, (5) 0-particle sanity. Links
+    # nuka_collision_gpu (particle_candidate_pairs.cu). Needs nuka_codegen
+    # (candidate_pair.hpp -> generated collidable_registry.hpp).
+    add_executable(nuka_cross_system_matrix_test
+        collision/test_cross_system_matrix.cpp
+    )
+    add_dependencies(nuka_cross_system_matrix_test nuka_codegen)
+    target_include_directories(nuka_cross_system_matrix_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_cross_system_matrix_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_cross_system_matrix_test)
+
     # --- v0.7 p12: self-written CUDA ray tracer (camera -> LBVH -> closest-hit
     # depth, box leaves). Matches a CPU brute-force ray-vs-all-boxes oracle that
     # REUSES the same __host__ __device__ slab test + closest-hit update + camera
