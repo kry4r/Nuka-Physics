@@ -416,6 +416,23 @@ target_link_libraries(nuka_constraint_test
 
 gtest_discover_tests(nuka_constraint_test)
 
+# --- v0.8 C4b: compliant-normal + pyramid-friction row emitter -------------
+# Validates the NEW, VALIDATED-NOT-WIRED EmitCompliantContactRows (row_builder):
+# row counts (4 normal + 16 pyramid for a condim=3 box), per-normal R/aref
+# cross-check vs an independent ComputeCompliantRow (C4a), the pyramid spokes
+# summing to the isotropic disk, the ContactRowSides side-output, 2-run host
+# byte-identity, and INERTNESS of the legacy BuildContactRows/AppendContactGroup
+# path. Plain host C++ (no CUDA): nuka_constraint is host-only.
+add_executable(nuka_compliant_rows_test
+    constraint/test_compliant_rows.cpp
+)
+target_link_libraries(nuka_compliant_rows_test
+    PRIVATE
+        nuka_constraint
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_compliant_rows_test)
+
 # --- Solver tests ----------------------------------------------------------
 add_executable(nuka_solver_test
     solver/test_contact_resting.cpp
