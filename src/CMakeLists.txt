@@ -560,6 +560,15 @@ if(CMAKE_CUDA_COMPILER)
         # explicit-<pair> merge -> BuildCandidatePairStream (C2a). A NEW
         # validated-not-forced path (rigid-only); NOT wired into world_stepper.
         collision/rigid_candidate_pairs.cu
+        # v0.8 C2c: the particle<->rigid + particle<->particle candidate-pair
+        # builders. REUSE the cross_system_query (particle->rigid LBVH) + the
+        # particle_uniform_grid (particle->particle) CSR queries, reframe each CSR
+        # entry into its offset slot (NO scan, NO append atomic) -> body/particle
+        # CandidatePairs -> BuildCandidatePairStream (C2a) -> adjacent dedup. Gated
+        # by the C1c SystemPairMatrix. NEW validated path; NOT wired into production
+        # (the PBD co-step wiring is C6a). Excludes articulation-link (no per-link
+        # AABB yet -- the C5b-prereq long-pole).
+        collision/particle_candidate_pairs.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     # candidate_pair.cu includes src/codegen/generated/collidable_registry.hpp
