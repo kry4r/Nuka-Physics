@@ -554,6 +554,12 @@ if(CMAKE_CUDA_COMPILER)
         # registry header -> this TU is the FIRST in nuka_collision_gpu to depend
         # on codegen output, so the lib add_dependencies(nuka_codegen) below.
         collision/candidate_pair.cu
+        # v0.8 C2b: the RIGID<->RIGID filtered candidate-pair builder. LBVH over
+        # per-shape world AABBs -> per-pair bitmask+exclude filter (count->scan->
+        # compact, NO append atomics) -> body-pair CandidatePairs -> host
+        # explicit-<pair> merge -> BuildCandidatePairStream (C2a). A NEW
+        # validated-not-forced path (rigid-only); NOT wired into world_stepper.
+        collision/rigid_candidate_pairs.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     # candidate_pair.cu includes src/codegen/generated/collidable_registry.hpp
