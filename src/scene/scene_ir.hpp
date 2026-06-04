@@ -139,6 +139,25 @@ struct ActuatorRecord {
     float force_limit                      = 0.0f;
 };
 
+// An authored <contact><pair> explicit contact override (v0.8 C1b). MuJoCo's
+// <pair> always carries a concrete parameter set (an absent attribute uses the
+// MuJoCo default, NOT the per-shape -1 friction sentinel), so the fields below
+// are initialized to MuJoCo's pair defaults. friction_mu holds only the FIRST
+// (isotropic tangential) friction component; spin/roll friction is dropped (see
+// the importer comment). geom1/geom2 are the resolved ShapeIds of the two named
+// geoms. The filter/merge POLICY that consumes these overrides is C1c; C1b only
+// stores them.
+struct ContactPairOverride {
+    ShapeId geom1       = kInvalidShape;
+    ShapeId geom2       = kInvalidShape;
+    uint8_t condim      = 3;
+    float   friction_mu = 1.0f;                          // <pair friction>[0]
+    float   solref[2]   = {0.02f, 1.0f};
+    float   solimp[5]   = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+    float   margin      = 0.0f;
+    float   gap         = 0.0f;
+};
+
 // ---------------------------------------------------------------------------
 // SceneIR
 // ---------------------------------------------------------------------------
@@ -167,6 +186,11 @@ public:
     // POLICY that consumes this list (and the <contact><pair> explicit-override
     // list) is C1b/C1c; C1a only stores the authored excludes. (v0.8 C1a)
     void AddExcludePair(BodyId a, BodyId b);
+
+    // Record an authored <contact><pair> explicit contact override (v0.8 C1b).
+    // Stored verbatim in authoring order; the merge/policy that consumes these
+    // is C1c.
+    void AddContactPair(ContactPairOverride pair);
 
     // -- counts -------------------------------------------------------------
     size_t RigidBodyCount() const;
@@ -207,6 +231,7 @@ public:
     const std::vector<LightRecord>&          Lights() const;
     const std::vector<ActuatorRecord>&       Actuators() const;
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
+    const std::vector<ContactPairOverride>&       ContactPairs() const;
 
 private:
     std::vector<RigidBodyRecord>      bodies_;
@@ -218,6 +243,7 @@ private:
     std::vector<LightRecord>          lights_;
     std::vector<ActuatorRecord>       actuators_;
     std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
+    std::vector<ContactPairOverride>       contact_pairs_;
 };
 
 } // namespace nuka::scene

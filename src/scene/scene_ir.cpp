@@ -102,6 +102,11 @@ void SceneIR::AddExcludePair(BodyId a, BodyId b) {
     exclude_pairs_.emplace_back(a, b);
 }
 
+void SceneIR::AddContactPair(ContactPairOverride pair) {
+    // Stored verbatim in authoring order; no dedup / merge here (that is C1c).
+    contact_pairs_.push_back(pair);
+}
+
 size_t SceneIR::RigidBodyCount() const { return bodies_.size(); }
 size_t SceneIR::JointCount() const { return joints_.size(); }
 size_t SceneIR::ShapeCount() const { return shapes_.size(); }
@@ -233,6 +238,9 @@ const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }
 const std::vector<ActuatorRecord>& SceneIR::Actuators() const { return actuators_; }
 const std::vector<std::pair<BodyId, BodyId>>& SceneIR::ExcludePairs() const {
     return exclude_pairs_;
+}
+const std::vector<ContactPairOverride>& SceneIR::ContactPairs() const {
+    return contact_pairs_;
 }
 
 } // namespace nuka::scene
