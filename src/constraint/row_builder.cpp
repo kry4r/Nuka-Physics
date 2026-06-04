@@ -285,8 +285,20 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
         // The 4 (condim=3) spoke directions are +t0,-t0,+t1,-t1 where t0,t1 is
         // the deterministic orthonormal tangent basis of point[0]'s normal. They
         // sum to exactly zero and span the tangent plane symmetrically -> a
-        // balanced polygonal (square) approximation of the isotropic Coulomb
-        // friction disk. mu is carried in RowMaterial.friction (cone bound = C5).
+        // balanced SQUARE (box) linearization of the Coulomb friction cone (it
+        // reaches sqrt(2)*mu on the diagonal -- it is NOT the inscribed disk).
+        // mu is carried in RowMaterial.friction (cone bound = C5).
+        //
+        // ★ C5-WIRING WARNING (C4-review IMPORTANT-2) — the 4-spoke shape is
+        // INCOMPATIBLE with the production solver's existing bilateral friction
+        // bound. row_solver.cu IsFrictionRow overrides EVERY friction row's bounds
+        // to [-mu*lambda_n, +mu*lambda_n] regardless of stored bounds. That is
+        // correct for AppendContactGroup's 2-row (t0,t1) box, but for these 4
+        // spokes (+t0,-t0,+t1,-t1) each +/- pair would then be TWO independently
+        // clamped negated rows -> per-axis capacity DOUBLES to 2*mu*lambda_n and
+        // the pair partially cancels. C5 MUST write NEW bound logic (unilateral
+        // coupled-pyramid spokes, lambda>=0 per edge), it CANNOT inherit the
+        // existing IsFrictionRow override. (Named consumer = C5.)
         if (friction_rows_per_point > 0u) {
             const math::Vec3 base_normal = manifold.points[0].normal.Normalized();
             const math::Vec3 tangent0 = ChooseTangent(base_normal);
