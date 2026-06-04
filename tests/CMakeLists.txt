@@ -943,6 +943,30 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_narrowphase_dispatch_test)
 
+    # --- v0.8 C3b: analytical primitive narrowphase (multi-point/face-face) -----
+    # Validates the REAL Analytical-tier handlers (analytical_manifold.hpp +
+    # narrowphase_dispatch.hpp): box-on-plane 4 corners, box-box face-clip 4-pt
+    # patch (order-insensitive SET vs hand oracle), sphere x {sphere,box,plane}
+    # 1-pt analytic, capsule x plane (2 endpoints) / capsule x sphere (1-pt),
+    # both (a,b) orderings (normal sign = separation dir for side A), the
+    # determinism-trap gate (symmetric box-box -> stable 4 distinct corners) and
+    # the two-run byte-identical (memcmp on zeroed buffers) D1 gate. Header-only
+    # (same deps as the C3a dispatch test) -- needs nuka_codegen + the src include.
+    add_executable(nuka_analytical_manifold_test
+        collision/test_analytical_manifold.cpp
+    )
+    add_dependencies(nuka_analytical_manifold_test nuka_codegen)
+    target_include_directories(nuka_analytical_manifold_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_analytical_manifold_test
+        PRIVATE
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_analytical_manifold_test)
+
     # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
     # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
     # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity

@@ -35,6 +35,7 @@
 // re-baselines. So goldens do not move from C3a.
 // ---------------------------------------------------------------------------
 
+#include "collision/analytical_manifold.hpp" // C3b: PrimParams + amf:: handlers
 #include "collision/candidate_pair.hpp"     // CandidatePair, CollidableRef
 #include "constraint/contact_manifold.hpp"  // ContactManifold (extended, C3a)
 #include "scene/canonical_types.hpp"        // scene::ShapeType
@@ -80,11 +81,28 @@ inline constexpr uint32_t kShapeTypeCount =
 // handler signature so the table stays a plain function-pointer array. The
 // `geom_a`/`geom_b` void* are the seam those subtasks fill; `type_a`/`type_b`
 // duplicate the CandidatePair's cooked shape types for the handler's convenience.
+//
+// C3b GROWTH (additive, INLINE primitive params): the Analytical handlers need,
+// per side, the primitive params (box half-extents / sphere radius / capsule
+// radius+half-height) + the world transform (baked into amf::PrimFrame columns).
+// We add these INLINE (amf::PrimParams prim_a/prim_b) rather than as a void*+cast
+// because the cooked store is SoA (CookedShapeTable parallel arrays: types[],
+// half_extents[], radii[], half_heights[], + a Transform): there is NO per-shape
+// CONTIGUOUS geometry struct to aim a void* at, so the caller would have to
+// allocate a temporary just to point at it. Inline params let the caller fill
+// from the parallel arrays with zero indirection, keep the view trivially
+// copyable (device-upload friendly), and keep the handler math branch-free of a
+// cast. The void* geom_a/geom_b SEAM STAYS for C3c (convex-hull vertex/face
+// spans) + C3d (CookedSdfTable handle) -- those tiers DO have contiguous backing
+// stores, so the void* is the right representation THERE. (C3a defaults preserved
+// so the C3a routing test still constructs ShapeProxyView with no args.)
 struct ShapeProxyView {
-    ShapeType   type_a = ShapeType::Sphere;
-    ShapeType   type_b = ShapeType::Sphere;
-    const void* geom_a = nullptr;   // SEAM (C3b/c/d): cooked geometry payload, side A
-    const void* geom_b = nullptr;   // SEAM (C3b/c/d): cooked geometry payload, side B
+    ShapeType       type_a = ShapeType::Sphere;
+    ShapeType       type_b = ShapeType::Sphere;
+    const void*     geom_a = nullptr;   // SEAM (C3c/d): cooked geometry payload, side A
+    const void*     geom_b = nullptr;   // SEAM (C3c/d): cooked geometry payload, side B
+    amf::PrimParams prim_a;             // C3b: inline primitive params + world frame, side A
+    amf::PrimParams prim_b;             // C3b: inline primitive params + world frame, side B
 };
 
 // The one handler signature. Out-param manifold; the handler fills it (or leaves
@@ -167,6 +185,119 @@ inline void NarrowphaseStubSdf(const CandidatePair& pair,
 }
 
 // ---------------------------------------------------------------------------
+// C3b REAL Analytical handlers (primitive x primitive multi-point/face-face).
+// ---------------------------------------------------------------------------
+// Each handler adapts the ShapeProxyView's inline prim params to the amf:: math
+// (analytical_manifold.hpp), then stamps the manifold's a/b sides from the pair.
+// The amf:: helpers fill point.normal as "separation dir for the helper's first
+// argument". A handler whose helper-first-arg == the pair's side A leaves the
+// normal as-is; a handler that must call the helper with the pair's side B first
+// (because the helper is written (sphere,box) but the pair is (box,sphere))
+// FLIPS the normal so it always means "separation dir for the pair's actual A".
+//
+// Defined `inline` BEFORE MakeNarrowphaseTable so &Handler is a constant
+// expression with one ODR-merged address across TUs (mirrors the stub posture).
+
+// Set the manifold sides from the pair (a/b carry type-tagged CollidableRefs).
+inline void StampSides(const CandidatePair& pair, ContactManifold* out) {
+    out->a = pair.a;
+    out->b = pair.b;
+}
+// Flip every point's normal in place (used by swapped-order wrappers).
+inline void FlipNormals(ContactManifold* out) {
+    for (uint32_t i = 0; i < out->point_count; ++i) {
+        out->points[i].normal = -out->points[i].normal;
+    }
+}
+
+// --- sphere x sphere (symmetric: normal flips with order) ---
+inline void NarrowphaseSphereSphere(const CandidatePair& pair,
+                                    const ShapeProxyView& g, ContactManifold* out) {
+    amf::SphereSphere(g.prim_a, g.prim_b, out);  // normal = sep dir for prim_a == A
+    StampSides(pair, out);
+}
+
+// --- sphere(A) x box(B): helper is (sphere,box); normal = sep dir for sphere == A ---
+inline void NarrowphaseSphereBox(const CandidatePair& pair,
+                                 const ShapeProxyView& g, ContactManifold* out) {
+    amf::SphereBox(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+// --- box(A) x sphere(B): call helper (sphere=B, box=A); normal = sep dir for
+//     sphere(B); flip so it is sep dir for A(box). ---
+inline void NarrowphaseBoxSphere(const CandidatePair& pair,
+                                 const ShapeProxyView& g, ContactManifold* out) {
+    amf::SphereBox(g.prim_b, g.prim_a, out);
+    FlipNormals(out);
+    StampSides(pair, out);
+}
+
+// --- sphere(A) x plane(B): helper (sphere,plane); normal = sep dir for sphere == A ---
+inline void NarrowphaseSpherePlane(const CandidatePair& pair,
+                                   const ShapeProxyView& g, ContactManifold* out) {
+    amf::SpherePlane(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+// --- plane(A) x sphere(B): helper (sphere=B,plane=A); normal = sep dir for
+//     sphere(B); flip -> sep dir for A(plane). ---
+inline void NarrowphasePlaneSphere(const CandidatePair& pair,
+                                   const ShapeProxyView& g, ContactManifold* out) {
+    amf::SpherePlane(g.prim_b, g.prim_a, out);
+    FlipNormals(out);
+    StampSides(pair, out);
+}
+
+// --- box(A) x plane(B): helper (box,plane); normal = sep dir for box == A ---
+inline void NarrowphaseBoxPlane(const CandidatePair& pair,
+                                const ShapeProxyView& g, ContactManifold* out) {
+    amf::BoxPlane(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+// --- plane(A) x box(B): helper (box=B,plane=A); normal = sep dir for box(B);
+//     flip -> sep dir for A(plane). ---
+inline void NarrowphasePlaneBox(const CandidatePair& pair,
+                                const ShapeProxyView& g, ContactManifold* out) {
+    amf::BoxPlane(g.prim_b, g.prim_a, out);
+    FlipNormals(out);
+    StampSides(pair, out);
+}
+
+// --- box x box: helper computes normal = sep dir for prim_a == A. Symmetric. ---
+inline void NarrowphaseBoxBox(const CandidatePair& pair,
+                              const ShapeProxyView& g, ContactManifold* out) {
+    amf::BoxBox(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+
+// --- capsule(A) x plane(B): helper (capsule,plane); normal = sep dir for capsule == A ---
+inline void NarrowphaseCapsulePlane(const CandidatePair& pair,
+                                    const ShapeProxyView& g, ContactManifold* out) {
+    amf::CapsulePlane(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+// --- plane(A) x capsule(B): helper (capsule=B,plane=A); flip -> sep dir for A(plane). ---
+inline void NarrowphasePlaneCapsule(const CandidatePair& pair,
+                                    const ShapeProxyView& g, ContactManifold* out) {
+    amf::CapsulePlane(g.prim_b, g.prim_a, out);
+    FlipNormals(out);
+    StampSides(pair, out);
+}
+
+// --- capsule(A) x sphere(B): helper (capsule,sphere); normal = sep dir for capsule == A ---
+inline void NarrowphaseCapsuleSphere(const CandidatePair& pair,
+                                     const ShapeProxyView& g, ContactManifold* out) {
+    amf::CapsuleSphere(g.prim_a, g.prim_b, out);
+    StampSides(pair, out);
+}
+// --- sphere(A) x capsule(B): helper (capsule=B,sphere=A); flip -> sep dir for A(sphere). ---
+inline void NarrowphaseSphereCapsule(const CandidatePair& pair,
+                                     const ShapeProxyView& g, ContactManifold* out) {
+    amf::CapsuleSphere(g.prim_b, g.prim_a, out);
+    FlipNormals(out);
+    StampSides(pair, out);
+}
+
+// ---------------------------------------------------------------------------
 // The dispatch table: table[typeA][typeB][tier] -> handler.
 // ---------------------------------------------------------------------------
 // Representation: a dense 3-D constexpr array of function pointers. O(1) lookup
@@ -201,9 +332,40 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
         }
     }
     // --- C3b/C3c/C3d real-handler registration goes here (localized edits) ---
-    // t.fns[(int)ShapeType::Sphere][(int)ShapeType::Sphere]
-    //      [(int)NarrowphaseTier::Analytical] = &NarrowphaseSphereSphere;   // C3b
-    // ... (one assignment per specialized (typeA,typeB,tier))
+    // C3b: Analytical-tier primitive x primitive handlers. BOTH orderings of each
+    // asymmetric pair are registered to a distinct wrapper that keeps the normal =
+    // "separation dir for the pair's ACTUAL side A" (swapped wrappers flip it). We
+    // register both slots (rather than canonicalize inside one handler) so the
+    // table stays a pure index->fn lookup with no in-handler order branch.
+    const uint32_t kAna = static_cast<uint32_t>(NarrowphaseTier::Analytical);
+    const uint32_t kSph = static_cast<uint32_t>(ShapeType::Sphere);
+    const uint32_t kCap = static_cast<uint32_t>(ShapeType::Capsule);
+    const uint32_t kBox = static_cast<uint32_t>(ShapeType::Box);
+    const uint32_t kPln = static_cast<uint32_t>(ShapeType::Plane);
+
+    t.fns[kSph][kSph][kAna] = &NarrowphaseSphereSphere;
+    t.fns[kSph][kBox][kAna] = &NarrowphaseSphereBox;
+    t.fns[kBox][kSph][kAna] = &NarrowphaseBoxSphere;
+    t.fns[kSph][kPln][kAna] = &NarrowphaseSpherePlane;
+    t.fns[kPln][kSph][kAna] = &NarrowphasePlaneSphere;
+    t.fns[kBox][kPln][kAna] = &NarrowphaseBoxPlane;
+    t.fns[kPln][kBox][kAna] = &NarrowphasePlaneBox;
+    t.fns[kBox][kBox][kAna] = &NarrowphaseBoxBox;
+    t.fns[kCap][kPln][kAna] = &NarrowphaseCapsulePlane;
+    t.fns[kPln][kCap][kAna] = &NarrowphasePlaneCapsule;
+    t.fns[kCap][kSph][kAna] = &NarrowphaseCapsuleSphere;
+    t.fns[kSph][kCap][kAna] = &NarrowphaseSphereCapsule;
+
+    // DEFERRED to the C3a stub (NarrowphaseStubAnalytical) WITH a named consumer:
+    //   (Capsule,Box)/(Box,Capsule)  -> C3c convex tier (capsule treated as a
+    //                                    swept-segment vs OBB; the GJK/face-clip
+    //                                    util generalises this cleanly).
+    //   (Capsule,Capsule)            -> C3c convex tier (segment-segment closest
+    //                                    point + 2-pt clip; shares the C3c clip).
+    //   (Plane,Plane)                -> physically degenerate (two half-spaces);
+    //                                    no finite manifold -> stub by design.
+    // These slots intentionally KEEP the default Analytical stub so they route to
+    // a well-defined empty manifold until C3c lands the segment-based handlers.
     return t;
 }
 
