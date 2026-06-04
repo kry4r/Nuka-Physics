@@ -9,9 +9,11 @@
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"  // PackSdfCellKey codec (shared)
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nuka::scene {
@@ -192,6 +194,83 @@ void PushShapeRow(CookedShapeTable& shapes,
     contact_params.gaps.push_back(src.gap);
 }
 
+// Bake the cook-time filtered-pair policy (v0.8 C1c). Called AFTER bodies /
+// joints / shapes are cooked. Implements three of MuJoCo's four filtering
+// precedence levels (research doc §8); the fourth (contype/conaffinity bitmask)
+// stays a per-pair runtime check from CookedContactParamTable.
+//
+//   excluded_body_pairs = union of:
+//     (a) scene.ExcludePairs()  -- authored <contact><exclude>, already (min,max)
+//     (b) parent-child auto-exclude -- each joint connects parent->child; that
+//         body pair is excluded (MuJoCo auto-excludes parent-child unless
+//         re-enabled). Joints with a kInvalidBody parent or child (e.g. a
+//         floating-base Free joint) are SKIPPED (no real body pair to exclude).
+//     ...canonicalized (min,max), deduplicated, ascending-sorted (binary search).
+//   LIMITATION: bodies welded together WITHOUT a joint (a Fixed weld expressed
+//   purely structurally, not as a JointRecord) are NOT auto-excluded in v0.8.
+//   Only joint-connected parent-child pairs auto-exclude.
+//
+//   explicit_pairs = scene.ContactPairs() copied as-authored (NOT geom-merged):
+//     each ContactPairOverride's params are stored verbatim into the
+//     MergedContactParams (C1b pre-filled MuJoCo defaults for omitted attrs).
+//     v0.8 does NOT merge omitted <pair> attributes with the per-geom params.
+//     geom1/geom2 canonicalized (min,max) and ascending-sorted (binary search).
+//     These are in SOURCE-shape space; the source->cooked-row expansion for a
+//     decomposed mesh is a C2 concern (see CookedExplicitPair doc).
+//
+//   system_pairs = default all-enabled (forward-looking seam for C2).
+void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
+    CookedFilterPolicy& policy = blob.filter_policy;
+
+    // -- excluded_body_pairs ------------------------------------------------
+    std::vector<std::pair<BodyId, BodyId>> excludes;
+    excludes.reserve(scene.ExcludePairs().size() + scene.Joints().size());
+
+    for (const auto& p : scene.ExcludePairs()) {
+        BodyId a = p.first, b = p.second;
+        if (b < a) std::swap(a, b);  // re-canonicalize defensively
+        excludes.emplace_back(a, b);
+    }
+    for (const auto& j : scene.Joints()) {
+        if (j.parent_body == kInvalidBody || j.child_body == kInvalidBody) {
+            continue;  // floating-base / parentless joint: no body pair
+        }
+        BodyId a = j.parent_body, b = j.child_body;
+        if (a == b) continue;  // degenerate self-joint: nothing to exclude
+        if (b < a) std::swap(a, b);
+        excludes.emplace_back(a, b);
+    }
+    std::sort(excludes.begin(), excludes.end());
+    excludes.erase(std::unique(excludes.begin(), excludes.end()), excludes.end());
+    policy.excluded_body_pairs = std::move(excludes);
+
+    // -- explicit_pairs (as-authored, NOT merged) ---------------------------
+    std::vector<CookedExplicitPair> explicit_pairs;
+    explicit_pairs.reserve(scene.ContactPairs().size());
+    for (const auto& ov : scene.ContactPairs()) {
+        CookedExplicitPair ep;
+        ep.geom1 = ov.geom1;
+        ep.geom2 = ov.geom2;
+        if (ep.geom2 < ep.geom1) std::swap(ep.geom1, ep.geom2);  // canonical
+        ep.params.condim      = ov.condim;
+        ep.params.friction_mu = ov.friction_mu;
+        ep.params.solref[0]   = ov.solref[0];
+        ep.params.solref[1]   = ov.solref[1];
+        for (int k = 0; k < 5; ++k) ep.params.solimp[k] = ov.solimp[k];
+        ep.params.margin      = ov.margin;
+        ep.params.gap         = ov.gap;
+        explicit_pairs.push_back(ep);
+    }
+    std::sort(explicit_pairs.begin(), explicit_pairs.end(),
+              [](const CookedExplicitPair& x, const CookedExplicitPair& y) {
+                  if (x.geom1 != y.geom1) return x.geom1 < y.geom1;
+                  return x.geom2 < y.geom2;
+              });
+    policy.explicit_pairs = std::move(explicit_pairs);
+
+    // -- system_pairs: default all-enabled (SystemPairMatrix ctor). ----------
+}
+
 } // namespace
 
 CookedBlob CookScene(const SceneIR& scene) {
@@ -347,6 +426,10 @@ CookedBlob CookScene(const SceneIR& scene) {
     }
 
     blob.shape_count = static_cast<uint32_t>(blob.shapes.types.size());
+
+    // v0.8 C1c: bake the filtered-pair policy now that bodies / joints / shapes
+    // are cooked (excludes derive from joints; explicit pairs from shapes).
+    BuildFilteredPairPolicy(scene, blob);
 
     // v0.7 p07: cook a narrow-band SDF per unique convex-geometry piece,
     // deduplicated by content hash. The leaf cooker stays dependency-free, so
