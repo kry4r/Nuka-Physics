@@ -1347,6 +1347,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_articulation_inertia_m_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C4c: reaction providers (rigid invM / chain-J / particle invM) -
+    # Validates the NEW, VALIDATED-NOT-WIRED src/constraint/reaction_provider.hpp
+    # §0.5 interface: a 1-DOF pendulum chain-J vs a hand-computed J M^-1 J^T (with
+    # an OFF-origin contact point -- the C4c arbitrary-point generalization),
+    # rigid invM vs the analytic diagonal path, particle scalar invM, StaticNull
+    # zero/no-op, and 2-run byte-identity (D1). Round-trips the proven device CRBA
+    # M^-1 + chain-J builders the articulation provider consumes, so it links the
+    # articulation GPU libs + nuka_constraint (the header-only providers).
+    add_executable(nuka_reaction_providers_test
+        constraint/test_reaction_providers.cpp
+    )
+
+    target_compile_definitions(nuka_reaction_providers_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_reaction_providers_test
+        PRIVATE
+            nuka_constraint
+            nuka_runtime
+            nuka_articulation_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_reaction_providers_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Articulated contact rows + block-PGS solve (p01-F T5) --------------
     add_executable(nuka_articulation_contact_rows_test
         runtime/test_articulation_contact_rows.cpp
