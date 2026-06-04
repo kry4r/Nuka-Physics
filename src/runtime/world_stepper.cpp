@@ -187,8 +187,8 @@ void AddPointIfPenetrating(const ShapeProxy& dynamic_shape,
     point.penetration = penetration;
 
     constraint::ContactManifold manifold;
-    manifold.body_a = dynamic_shape.body_index;
-    manifold.body_b = static_shape.body_index;
+    manifold.a.handle = dynamic_shape.body_index;
+    manifold.b.handle = static_shape.body_index;
     manifold.AddPoint(point);
     manifolds.push_back(manifold);
 }
@@ -237,8 +237,8 @@ void GenerateSphereSphereContact(const ShapeProxy& a,
     const math::Vec3 point = b.world_transform.position + normal * b.radius;
 
     constraint::ContactManifold manifold;
-    manifold.body_a = a.body_index;
-    manifold.body_b = b.body_index;
+    manifold.a.handle = a.body_index;
+    manifold.b.handle = b.body_index;
     manifold.AddPoint({point, normal, penetration});
     manifolds.push_back(manifold);
 }
@@ -259,8 +259,8 @@ void GenerateSphereBoxContact(const ShapeProxy& sphere,
         : math::Vec3::UnitY();
 
     constraint::ContactManifold manifold;
-    manifold.body_a = sphere.body_index;
-    manifold.body_b = box.body_index;
+    manifold.a.handle = sphere.body_index;
+    manifold.b.handle = box.body_index;
     manifold.AddPoint({closest, normal, penetration});
     manifolds.push_back(manifold);
 }
@@ -298,8 +298,8 @@ void GenerateBoxBoxContact(const ShapeProxy& a,
     };
 
     constraint::ContactManifold manifold;
-    manifold.body_a = a.body_index;
-    manifold.body_b = b.body_index;
+    manifold.a.handle = a.body_index;
+    manifold.b.handle = b.body_index;
     manifold.AddPoint({point, normal, penetration});
     manifolds.push_back(manifold);
 }

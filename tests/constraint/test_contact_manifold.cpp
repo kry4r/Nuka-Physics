@@ -14,8 +14,8 @@ using namespace nuka::constraint;
 
 TEST(ContactManifold, AddPoints) {
     ContactManifold m;
-    m.body_a = 0;
-    m.body_b = 1;
+    m.a.handle = 0;
+    m.b.handle = 1;
 
     ContactPoint pt;
     pt.position    = {1.0f, 0.0f, 0.0f};

@@ -67,8 +67,8 @@ __device__ void AddSinglePointManifold(uint32_t body_a,
         return;
     }
 
-    manifold->body_a = body_a;
-    manifold->body_b = body_b;
+    manifold->a.handle = body_a;
+    manifold->b.handle = body_b;
     manifold->point_count = 1u;
     manifold->friction = 0.5f;
     manifold->restitution = 0.0f;
@@ -177,8 +177,8 @@ __device__ bool IsSphere(scene::ShapeType type) {
 
 __device__ constraint::ContactManifold EmptyManifold() {
     constraint::ContactManifold manifold;
-    manifold.body_a = ~0u;
-    manifold.body_b = ~0u;
+    manifold.a.handle = ~0u;
+    manifold.b.handle = ~0u;
     manifold.point_count = 0u;
     manifold.friction = 0.5f;
     manifold.restitution = 0.0f;
