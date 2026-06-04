@@ -21,6 +21,13 @@ DEFAULT_CLASSES_DIR = CODEGEN_DIR / "classes"
 DEFAULT_TEMPLATES_DIR = CODEGEN_DIR / "templates"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "src" / "codegen" / "generated"
 
+# v0.8 C2a: the collidable-type registry pass. PARALLEL to (and fully isolated
+# from) the row pass above -- it reads a SEPARATE schema + a SEPARATE classes
+# subdirectory so the row loader's classes/*.yaml glob (non-recursive) never sees
+# these files, and the row test's --classes-dir override never entangles it.
+DEFAULT_COLLIDABLE_SCHEMA = CODEGEN_DIR / "schema" / "collidable_v0_1.yaml"
+DEFAULT_COLLIDABLE_CLASSES_DIR = CODEGEN_DIR / "classes" / "collidable"
+
 GENERATED_HEADER = "// GENERATED — DO NOT EDIT"
 ALLOWED_ROW_CLASSES = {
     "MaximalContactRow",
@@ -479,20 +486,113 @@ def render(schema: dict[str, Any], rows: list[RowClass], templates_dir: Path, ou
     return outputs
 
 
+# ---------------------------------------------------------------------------
+# v0.8 C2a: collidable-type registry pass (ADDITIVE; parallel to the row pass).
+# Reuses the generic _load_yaml / _validate_type / _environment / _write
+# helpers; touches NOTHING in the row path. Emits one file:
+#   src/codegen/generated/collidable_registry.hpp
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Collidable:
+    data: dict[str, Any]
+    source_path: Path
+
+    @property
+    def collidable_type_id(self) -> int:
+        return int(self.data["collidable_type_id"])
+
+    @property
+    def name(self) -> str:
+        return str(self.data["name"])
+
+
+def _validate_collidable(entry: dict[str, Any], source_map: SourceMap, schema: dict[str, Any]) -> Collidable:
+    required = schema.get("required_fields", [])
+    field_types = schema.get("field_types", {})
+    enums = schema.get("enums", {})
+    if not isinstance(required, list) or not isinstance(field_types, dict) or not isinstance(enums, dict):
+        raise _diagnostic(source_map.path, 1, "collidable schema must define required_fields, field_types, and enums")
+
+    for field in required:
+        if field not in entry:
+            raise _diagnostic(source_map.path, 1, f"missing required field '{field}'")
+
+    for field in required:
+        expected = field_types.get(field)
+        if expected is None:
+            raise _diagnostic(source_map.path, source_map.line_for(field), f"schema missing type for '{field}'")
+        _validate_type(entry, source_map, field, expected, enums)
+
+    name = entry["name"]
+    if not re.fullmatch(r"[A-Z][A-Za-z0-9]*", name):
+        raise _diagnostic(source_map.path, source_map.line_for("name"), "name must be CamelCase (a CollidableType enumerator)")
+
+    return Collidable(data=entry, source_path=source_map.path)
+
+
+def load_collidables(schema_path: Path, classes_dir: Path) -> list[Collidable]:
+    schema, _ = _load_yaml(schema_path)
+    class_paths = sorted(classes_dir.glob("*.yaml"))
+    if not class_paths:
+        raise _diagnostic(classes_dir, 1, "no collidable class YAML files found")
+
+    collidables: list[Collidable] = []
+    ids: dict[int, Path] = {}
+    names: dict[str, Path] = {}
+    for path in class_paths:
+        entry, source_map = _load_yaml(path)
+        collidable = _validate_collidable(entry, source_map, schema)
+        if collidable.collidable_type_id in ids:
+            raise _diagnostic(path, source_map.line_for("collidable_type_id"), f"duplicate collidable_type_id {collidable.collidable_type_id}; first seen in {display_path(ids[collidable.collidable_type_id])}")
+        if collidable.name in names:
+            raise _diagnostic(path, source_map.line_for("name"), f"duplicate collidable name {collidable.name}; first seen in {display_path(names[collidable.name])}")
+        ids[collidable.collidable_type_id] = path
+        names[collidable.name] = path
+        collidables.append(collidable)
+
+    ordered = sorted(collidables, key=lambda item: item.collidable_type_id)
+    # The generated GetCollidableTypeInfo indexes the table by static_cast<uint8_t>(type),
+    # so the ids MUST be the contiguous range 0..N-1 with no gaps.
+    for expected_id, collidable in enumerate(ordered):
+        if collidable.collidable_type_id != expected_id:
+            raise _diagnostic(collidable.source_path, 1, f"collidable_type_id must be contiguous from 0; expected {expected_id}, got {collidable.collidable_type_id}")
+
+    return ordered
+
+
+def render_collidables(collidables: list[Collidable], templates_dir: Path, output_dir: Path) -> list[Path]:
+    env = _environment(templates_dir)
+    registry_template = env.get_template("collidable_registry.hpp.j2")
+    context = {"collidables": [dict(c.data) for c in collidables]}
+
+    registry = output_dir / "collidable_registry.hpp"
+    _write(registry, registry_template.render(**context))
+    return [registry]
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     parser.add_argument("--classes-dir", type=Path, default=DEFAULT_CLASSES_DIR)
     parser.add_argument("--templates-dir", type=Path, default=DEFAULT_TEMPLATES_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--collidable-schema", type=Path, default=DEFAULT_COLLIDABLE_SCHEMA)
+    parser.add_argument("--collidable-classes-dir", type=Path, default=DEFAULT_COLLIDABLE_CLASSES_DIR)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
+        # Row pass FIRST (unchanged). If --classes-dir points at a bad dir, this
+        # raises here -> exit 1 (the SchemaRejection test relies on that ordering).
         schema, rows = load_rows(args.schema, args.classes_dir)
         outputs = render(schema, rows, args.templates_dir, args.output_dir)
+        # v0.8 C2a: collidable-type registry pass (additive; isolated dir/schema).
+        collidables = load_collidables(args.collidable_schema, args.collidable_classes_dir)
+        outputs += render_collidables(collidables, args.templates_dir, args.output_dir)
     except (CodegenError, jinja2.TemplateError) as exc:
         print(exc, file=sys.stderr)
         return 1

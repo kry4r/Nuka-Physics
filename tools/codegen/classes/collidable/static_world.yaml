@@ -1,0 +1,10 @@
+# Collidable type 3: the immovable static world (ground / fixed colliders). Not
+# broadphased into a rebuilt-per-step tree (accel None: queried directly),
+# presents a cooked Shape to narrowphase, and contributes ZERO reaction
+# (infinite mass, no DOFs) via the StaticNull provider.
+name: StaticWorld
+collidable_type_id: 3
+
+accel_structure: None
+shape_proxy: ShapeBacked
+reaction_provider: StaticNull

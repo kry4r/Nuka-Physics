@@ -1,0 +1,9 @@
+# Collidable type 1: an articulation link. Indexed by the rigid LBVH (its world
+# AABB is refit each step), presents a cooked Shape to narrowphase, reacts via
+# the Featherstone chain Jacobian of the owning articulation.
+name: ArticulationLink
+collidable_type_id: 1
+
+accel_structure: LbvhRigid
+shape_proxy: ShapeBacked
+reaction_provider: ArticulationChainJ

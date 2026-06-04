@@ -1,0 +1,8 @@
+# Collidable type 0: a maximal rigid body. Indexed by the rigid LBVH, presents a
+# cooked Shape to narrowphase, reacts via its 6x6 inverse mass.
+name: RigidBody
+collidable_type_id: 0
+
+accel_structure: LbvhRigid
+shape_proxy: ShapeBacked
+reaction_provider: RigidInvMass

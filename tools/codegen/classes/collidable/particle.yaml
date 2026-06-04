@@ -1,0 +1,9 @@
+# Collidable type 2: a simulation particle (soft-body / fluid node). Indexed by
+# the particle uniform-grid spatial hash, presents a point+radius sphere proxy to
+# narrowphase, reacts via its scalar inverse mass.
+name: Particle
+collidable_type_id: 2
+
+accel_structure: UniformGridParticle
+shape_proxy: PointSphere
+reaction_provider: ParticleInvMass

@@ -546,8 +546,20 @@ if(CMAKE_CUDA_COMPILER)
         # p07 trilinear sampler + pose at the FROZEN witness (valley-proof, no
         # step_curvature). The contact POINT is degenerate -> NOT differentiated.
         collision/sdf_contact_adjoint.cpp
+        # v0.8 C2a: the unified broadphase OUTPUT type. CandidatePairStream is a
+        # D1 device container of type-tagged CandidatePairs sorted by stable_key
+        # (thrust::stable_sort_by_key, no append atomics). C2b/C2c populate it
+        # from the real broadphase sources via private-slice fill and call the
+        # same builder. candidate_pair.hpp includes the GENERATED collidable
+        # registry header -> this TU is the FIRST in nuka_collision_gpu to depend
+        # on codegen output, so the lib add_dependencies(nuka_codegen) below.
+        collision/candidate_pair.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # candidate_pair.cu includes src/codegen/generated/collidable_registry.hpp
+    # (via constraint/collidable.hpp); force the codegen pass to run first so a
+    # clean/parallel build never compiles the TU before the header exists.
+    add_dependencies(nuka_collision_gpu nuka_codegen)
 
     target_include_directories(nuka_collision_gpu
         PUBLIC
