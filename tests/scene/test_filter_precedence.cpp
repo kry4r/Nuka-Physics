@@ -145,6 +145,44 @@ TEST(FilterMerge, DirectSolrefElementwiseMin) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Merge -- degenerate solmix "defer" (MuJoCo four-way). solmix=0 on one geom
+// means "defer to the other geom" => that geom's params win wholesale, NOT a 0.5
+// average. (Regression for C1-batch review IMPORTANT-1.)
+// ---------------------------------------------------------------------------
+
+TEST(FilterMerge, SolmixZeroDefersToOtherGeom) {
+    ContactParamsIn a;          // valid solmix, standard solref
+    a.priority  = 0;
+    a.solref[0] = 0.1f; a.solref[1] = 1.0f;
+    a.solimp[0] = 0.9f;
+    a.solmix    = 1.0f;
+
+    ContactParamsIn b;          // solmix = 0 => B defers, A must win
+    b.priority  = 0;
+    b.solref[0] = 0.3f; b.solref[1] = 9.0f;
+    b.solimp[0] = 0.5f;
+    b.solmix    = 0.0f;
+
+    // B defers (solmix<MINVAL) => mix=1.0 => result == A (not the 0.5 average 0.2).
+    const MergedContactParams m = MergeContactParams(a, b);
+    EXPECT_FLOAT_EQ(m.solref[0], 0.1f);
+    EXPECT_FLOAT_EQ(m.solref[1], 1.0f);
+    EXPECT_FLOAT_EQ(m.solimp[0], 0.9f);
+
+    // Symmetric: A defers => B wins wholesale.
+    const MergedContactParams m2 = MergeContactParams(b, a);
+    EXPECT_FLOAT_EQ(m2.solref[0], 0.1f);   // A still the valid one
+    EXPECT_FLOAT_EQ(m2.solimp[0], 0.9f);
+
+    // Both defer (both solmix<MINVAL) => mix=0.5 average.
+    ContactParamsIn c = a; c.solmix = 0.0f;
+    ContactParamsIn d = b; d.solref[0] = 0.3f; d.solref[1] = 9.0f; d.solimp[0] = 0.5f;
+    const MergedContactParams m3 = MergeContactParams(c, d);
+    EXPECT_FLOAT_EQ(m3.solref[0], 0.5f * 0.1f + 0.5f * 0.3f);  // 0.2
+    EXPECT_FLOAT_EQ(m3.solimp[0], 0.5f * 0.9f + 0.5f * 0.5f);  // 0.7
+}
+
+// ---------------------------------------------------------------------------
 // 4. Bitmask: (contype_i & conaff_j) || (contype_j & conaff_i).
 // ---------------------------------------------------------------------------
 
@@ -404,6 +442,13 @@ TEST(FilterPolicy, CookTwicePolicyIdentical) {
                         pb.explicit_pairs[i].params.friction_mu);
         EXPECT_EQ(pa.explicit_pairs[i].params.condim,
                   pb.explicit_pairs[i].params.condim);
+        // NIT-1 (C1-batch review): field-complete D1 gate on the merged params.
+        EXPECT_EQ(pa.explicit_pairs[i].params.solref[0], pb.explicit_pairs[i].params.solref[0]);
+        EXPECT_EQ(pa.explicit_pairs[i].params.solref[1], pb.explicit_pairs[i].params.solref[1]);
+        for (int k = 0; k < 5; ++k)
+            EXPECT_EQ(pa.explicit_pairs[i].params.solimp[k], pb.explicit_pairs[i].params.solimp[k]);
+        EXPECT_EQ(pa.explicit_pairs[i].params.margin, pb.explicit_pairs[i].params.margin);
+        EXPECT_EQ(pa.explicit_pairs[i].params.gap, pb.explicit_pairs[i].params.gap);
     }
     for (int i = 0; i < 5; ++i)
         for (int j = 0; j < 5; ++j)

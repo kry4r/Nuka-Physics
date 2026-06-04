@@ -77,6 +77,53 @@ TEST(VhacdCookerIntegration, ForceDecomposeExpandsToMultipleConvexHullRows) {
     }
 }
 
+// C1-batch review IMPORTANT-2: a source mesh that V-HACDs into N>1 pieces must
+// yield N PARALLEL CookedContactParamTable rows, each carrying the SOURCE geom's
+// contact metadata (the folded PushShapeRow keeps the two tables in lockstep).
+TEST(VhacdCookerIntegration, ContactParamsParallelAndPropagatedAcrossPieces) {
+    SceneIR scene;
+    const auto body = AddDynamicBody(scene);
+
+    const auto mesh = LShapeMesh();
+    CollisionShapeRecord shape;
+    shape.body_id = body;
+    shape.type = ShapeType::TriMesh;
+    shape.decompose_mode = DecomposeMode::Force;
+    shape.decompose_max_pieces = 16;
+    shape.mesh_vertices = mesh.vertices;
+    shape.mesh_indices = mesh.indices;
+    // Non-default per-shape contact metadata that must reach EVERY piece row.
+    shape.contype     = 7u;
+    shape.conaffinity = 5u;
+    shape.condim      = 1u;
+    shape.friction_mu = 0.42f;   // explicit per-shape override
+    shape.solref[0]   = 0.015f;
+    scene.AddCollisionShape(std::move(shape));
+
+    const auto blob = CookScene(scene);
+    ASSERT_GE(blob.shape_count, 2u);  // genuinely decomposed
+
+    const auto& cp = blob.contact_params;
+    // Parallelism: every contact-param vector has exactly shape_count rows.
+    ASSERT_EQ(cp.contypes.size(),      blob.shape_count);
+    EXPECT_EQ(cp.conaffinities.size(), blob.shape_count);
+    EXPECT_EQ(cp.groups.size(),        blob.shape_count);
+    EXPECT_EQ(cp.solref0.size(),       blob.shape_count);
+    EXPECT_EQ(cp.solref1.size(),       blob.shape_count);
+    EXPECT_EQ(cp.solimp.size(),        blob.shape_count * 5u);
+    EXPECT_EQ(cp.frictions.size(),     blob.shape_count);
+    EXPECT_EQ(cp.condims.size(),       blob.shape_count);
+
+    // Propagation: each piece inherits the source geom's metadata + resolved mu.
+    for (uint32_t row = 0; row < blob.shape_count; ++row) {
+        EXPECT_EQ(cp.contypes[row],      7u);
+        EXPECT_EQ(cp.conaffinities[row], 5u);
+        EXPECT_EQ(cp.condims[row],       1u);
+        EXPECT_FLOAT_EQ(cp.frictions[row], 0.42f);
+        EXPECT_FLOAT_EQ(cp.solref0[row],   0.015f);
+    }
+}
+
 TEST(VhacdCookerIntegration, SkipStoresSingleConvexHullWithSourceGeometry) {
     SceneIR scene;
     const auto body = AddDynamicBody(scene);

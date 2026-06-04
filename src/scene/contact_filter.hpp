@@ -83,21 +83,23 @@ NUKA_CF_HD inline bool PassesContactBitmask(uint32_t contypeA, uint32_t conaffA,
 //   If priorities are equal:
 //     condim   = max(condimA, condimB)
 //     friction = max(frictionA, frictionB)           (scalar isotropic mu)
-//     mix      = (solmixA>=MINVAL && solmixB>=MINVAL) ? solmixA/(solmixA+solmixB)
-//                                                     : 0.5  (degenerate, see note)
+//     mix      = MuJoCo mj_contactParam four-way (mix weights A; out=mix*A+(1-mix)*B):
+//                both >=MINVAL -> A/(A+B);  both <MINVAL -> 0.5;
+//                A <MINVAL     -> 0.0 (geomA defers -> B wins);
+//                B <MINVAL     -> 1.0 (geomB defers -> A wins)
 //     solref   = both[0]>0 (standard) ? mix*A + (1-mix)*B  (elementwise)
 //                                     : min(A,B)           (either direct/<=0)
 //     solimp   = mix*A + (1-mix)*B                   (elementwise)
 //     margin   = max(marginA, marginB)
 //     gap      = max(gapA, gapB)
 //
-// NOTE on the degenerate solmix branch: the research doc (line 83) shows the
-// guard `(solmix1>=MINVAL && solmix2>=MINVAL)` but truncates the else. The task
-// summary instead used `(solmixA+solmixB > MINVAL) ? .. : 0.5`. Following the
-// task instruction to PREFER THE DOC, we implement the doc's two-sided guard
-// and choose an explicit else of 0.5 (equal-weight average) since neither source
-// pins the degenerate else value. For any normal solmix (both >= MINVAL) the two
-// formulations agree; they diverge only when a geom authored solmix < 1e-15.
+// NOTE on the degenerate solmix branch: this implements MuJoCo's FULL four-way
+// branch from `engine_collision_driver.c` (mj_contactParam). The research doc
+// truncated the `else`; the canonical idiom `solmix=0` means "defer to the other
+// geom", so a single sub-MINVAL solmix must give that geom's params wholesale
+// (mix=0 or 1), NOT a 0.5 average. Only when BOTH are sub-MINVAL is mix=0.5.
+// (Earlier cut used a two-sided guard + 0.5 else, which mis-merged the solmix=0
+// defer case; fixed per C1-batch review IMPORTANT-1.)
 NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& A,
                                                          const ContactParamsIn& B) {
     MergedContactParams out;
@@ -119,10 +121,14 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
     out.condim      = (A.condim > B.condim) ? A.condim : B.condim;
     out.friction_mu = CfMaxF(A.friction_mu, B.friction_mu);
 
-    float mix = 0.5f;
-    if (A.solmix >= kContactSolmixMinVal && B.solmix >= kContactSolmixMinVal) {
-        mix = A.solmix / (A.solmix + B.solmix);
-    }
+    // solmix weight (MuJoCo mj_contactParam four-way). mix weights A.
+    const bool a_ok = A.solmix >= kContactSolmixMinVal;
+    const bool b_ok = B.solmix >= kContactSolmixMinVal;
+    float mix;
+    if (a_ok && b_ok)       mix = A.solmix / (A.solmix + B.solmix);
+    else if (!a_ok && !b_ok) mix = 0.5f;
+    else if (!a_ok)         mix = 0.0f;   // geomA defers -> B wins
+    else                    mix = 1.0f;   // geomB defers -> A wins
     const float imix = 1.0f - mix;
 
     // solref: standard form (both [0] > 0) => mix-weighted; else (either direct
