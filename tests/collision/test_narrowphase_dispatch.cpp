@@ -90,14 +90,45 @@ static_assert(SelectTier(ShapeType::Sphere, ShapeType::Sphere, true) ==
 // Table routing -- looked-up fn pointer matches the expected tier handler.
 // ---------------------------------------------------------------------------
 
+namespace {
+// True iff (a,b) got a REAL Analytical handler in C3b (else it keeps the stub).
+// Mirrors MakeNarrowphaseTable's C3b registration block.
+bool HasRealAnalyticalHandler(ShapeType a, ShapeType b) {
+    using nuka::scene::ShapeType;
+    auto is = [](ShapeType x, ShapeType y, ShapeType s, ShapeType t) {
+        return x == s && y == t;
+    };
+    const ShapeType S = ShapeType::Sphere, C = ShapeType::Capsule,
+                    B = ShapeType::Box, P = ShapeType::Plane;
+    return is(a, b, S, S) ||
+           is(a, b, S, B) || is(a, b, B, S) ||
+           is(a, b, S, P) || is(a, b, P, S) ||
+           is(a, b, B, P) || is(a, b, P, B) ||
+           is(a, b, B, B) ||
+           is(a, b, C, P) || is(a, b, P, C) ||
+           is(a, b, C, S) || is(a, b, S, C);
+}
+}  // namespace
+
 TEST(NarrowphaseDispatch, LookupReturnsExpectedTierHandler) {
-    // Every populated slot defaults to its tier stub in C3a.
+    // C3b registered REAL Analytical handlers for the primitive pairs listed in
+    // HasRealAnalyticalHandler; every OTHER Analytical slot (and ALL Convex/Sdf
+    // slots) still defaults to its tier stub.
     for (uint32_t ia = 0; ia < nuka::collision::kShapeTypeCount; ++ia) {
         for (uint32_t ib = 0; ib < nuka::collision::kShapeTypeCount; ++ib) {
             const auto a = static_cast<ShapeType>(ia);
             const auto b = static_cast<ShapeType>(ib);
-            EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Analytical),
-                      &NarrowphaseStubAnalytical);
+            const auto ana = kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Analytical);
+            if (HasRealAnalyticalHandler(a, b)) {
+                EXPECT_NE(ana, &NarrowphaseStubAnalytical)
+                    << "expected a REAL C3b Analytical handler for ("
+                    << ia << "," << ib << ")";
+            } else {
+                EXPECT_EQ(ana, &NarrowphaseStubAnalytical)
+                    << "expected the Analytical STUB for unregistered ("
+                    << ia << "," << ib << ")";
+            }
+            // Convex/Sdf tiers are still all-stub (C3c/C3d unland).
             EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Convex),
                       &NarrowphaseStubConvex);
             EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Sdf),
@@ -107,8 +138,13 @@ TEST(NarrowphaseDispatch, LookupReturnsExpectedTierHandler) {
 }
 
 TEST(NarrowphaseDispatch, ResolveNarrowphasePicksTierThenHandler) {
-    // Primitive pair, no SDF -> Analytical handler.
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, false),
+    // Primitive pair, no SDF -> Analytical tier; C3b makes Sphere x Box a REAL
+    // handler (no longer the stub).
+    EXPECT_NE(ResolveNarrowphase(ShapeType::Sphere, ShapeType::Box, false),
+              &NarrowphaseStubAnalytical);
+    // An UNregistered Analytical pair still routes to the Analytical stub
+    // (Capsule x Box deferred to C3c).
+    EXPECT_EQ(ResolveNarrowphase(ShapeType::Capsule, ShapeType::Box, false),
               &NarrowphaseStubAnalytical);
     // Mesh pair, no SDF -> Convex handler.
     EXPECT_EQ(ResolveNarrowphase(ShapeType::TriMesh, ShapeType::Box, false),
@@ -142,7 +178,10 @@ uint64_t RouteAndReadMarker(ShapeType a, ShapeType b, bool has_sdf) {
 }  // namespace
 
 TEST(NarrowphaseDispatch, CallThroughTableReachesExpectedTier) {
-    EXPECT_EQ(RouteAndReadMarker(ShapeType::Sphere, ShapeType::Box, false),
+    // Analytical tier: use an UNregistered pair (Capsule x Box, deferred to C3c)
+    // so the stub still runs and stamps its marker. (Registered Analytical pairs
+    // now run real geometry math -- covered by test_analytical_manifold.)
+    EXPECT_EQ(RouteAndReadMarker(ShapeType::Capsule, ShapeType::Box, false),
               StubMarkerForTier(NarrowphaseTier::Analytical));
     EXPECT_EQ(RouteAndReadMarker(ShapeType::TriMesh, ShapeType::Box, false),
               StubMarkerForTier(NarrowphaseTier::Convex));
@@ -160,7 +199,9 @@ TEST(NarrowphaseDispatch, StubPreservesCollidableSidesAndEmptyManifold) {
     ContactManifold out;
     out.AddPoint(ContactPoint{});  // dirty it first to prove Clear ran
 
-    ResolveNarrowphase(ShapeType::Sphere, ShapeType::Sphere, false)(pair, geom, &out);
+    // Use an UNregistered Analytical pair so the STUB (not a C3b real handler)
+    // runs (Capsule x Box deferred to C3c). The stub yields an empty manifold.
+    ResolveNarrowphase(ShapeType::Capsule, ShapeType::Box, false)(pair, geom, &out);
 
     EXPECT_EQ(out.point_count, 0u);  // stub yields an EMPTY manifold
     EXPECT_EQ(out.a.type, CollidableType::ArticulationLink);
