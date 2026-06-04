@@ -894,6 +894,31 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_candidate_stream_test)
 
+    # --- v0.8 C2b: RIGID<->RIGID filtered candidate-pair stream validation -----
+    # BuildRigidCandidatePairs (LBVH over per-shape AABBs -> bitmask + exclude +
+    # parent-child auto-exclude filter -> explicit-<pair> force-include -> sorted
+    # D1 stream) vs an independent host oracle driven by real CookScene policy.
+    # Gates: unfiltered==brute-force overlap, filtered==oracle (per-case), >=32
+    # body D1 two-run byte-exact, empty/no-overlap sanity. Links nuka_collision_gpu
+    # (rigid_candidate_pairs.cu) + nuka_scene (CookScene) + nuka_phi. Needs
+    # nuka_codegen (candidate_pair.hpp -> generated collidable_registry.hpp).
+    add_executable(nuka_lbvh_filtered_pairs_test
+        collision/test_lbvh_filtered_pairs.cpp
+    )
+    add_dependencies(nuka_lbvh_filtered_pairs_test nuka_codegen)
+    target_include_directories(nuka_lbvh_filtered_pairs_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_lbvh_filtered_pairs_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_scene
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_lbvh_filtered_pairs_test)
+
     # --- v0.7 p12: self-written CUDA ray tracer (camera -> LBVH -> closest-hit
     # depth, box leaves). Matches a CPU brute-force ray-vs-all-boxes oracle that
     # REUSES the same __host__ __device__ slab test + closest-hit update + camera
