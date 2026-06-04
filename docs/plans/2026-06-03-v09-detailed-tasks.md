@@ -25,7 +25,7 @@ v0.8 defines `enum class CollidableType : uint8_t` and **already reserved the v0
 
 ### 0.2 `RowClassId` registry (the constraint seam — v0.8 §0.3 / `row_class_registry.hpp`)
 
-**This is CONTINGENT on v0.8 OPEN-C** (`v08-detailed-tasks.md:558`), whose RECOMMENDED resolution is: reserve id11/12 for v0.9 Cosserat NOW, coupling takes **id13**, `kRowClassCount=14`. v0.9 honors that resolution and FILLS the reserved slots. Current registry ends at id10 (`kRowClassCount=11`, `row_class_registry.hpp:62`); v0.8 adds id13 + reserves 11/12. v0.9's final state:
+**This is RESOLVED by v0.8 OPEN-C (CLOSED, owner 2026-06-04):** reserve id11/12 for v0.9 Cosserat NOW, coupling takes **id13**, `kRowClassCount=14`. v0.9 honors that resolution and FILLS the reserved slots. Current registry ends at id10 (`kRowClassCount=11`, `row_class_registry.hpp:62`); v0.8 adds id13 + reserves 11/12. v0.9's final state:
 
 | id | name | Added by | jacobian_kind | constraint_kind | gradient_mode |
 |---|---|---|---|---|---|
@@ -115,11 +115,11 @@ class FemWorld {                   // owns its implicit backward-Euler solve
 | **Two-way articulation↔rigid reaction** (C5b) | summed effective mass, equal-and-opposite | R8 articulated↔MPM (go2-sand), R8 cloth↔articulated |
 | **Co-step ordering `pre_coupling → couple → post_coupling`** (C6a/C6b, Genesis `simulator.py`) | the bridge each system advances inside | R4 (MPM substep), R5 (FEM implicit solve), R3 (cloth predict/correct) |
 
-### 0.4 v0.8 OPEN flags v0.9 INHERITS (do not re-decide; track to closure)
+### 0.4 v0.8 OPEN flags v0.9 INHERITS — ALL CLOSED (owner, 2026-06-04)
 
-- **OPEN-C** (id allocation) — v0.9's §0.2 ASSUMES the recommended resolution (11/12 reserved → Cosserat, coupling=id13). If owner picks the alternative (coupling=id11, force renumber), R2 Cosserat moves to 13/14 and everything downstream shifts +2. **R2a must not start until OPEN-C is closed.**
-- **OPEN-E** (does v0.8 ship a concrete id13 row?) — v0.9 R8 ASSUMES YES (v0.8 ships id13 + the K2 fluid↔rigid proving pair). If v0.8 ships interface-only, R8a additionally lands the first concrete id13 emission.
-- **OPEN-I** (SDF tier = single witness point) — R8 articulated↔MPM and the grasp use SDF-as-grid-BC; the single-witness cardinality gap (`v08-detailed-tasks.md:564`) caps resting stability. R4/R8 must decide if perturbed-restart multi-point SDF is needed for go2-on-sand foot stability (flagged OPEN-V4).
+- **OPEN-C** (id allocation) — **CLOSED at the recommended resolution:** id11/12 reserved → Cosserat, coupling=id13, `kRowClassCount=14`. v0.9 §0.2 holds as written; R2a is unblocked (no renumber).
+- **OPEN-E** (does v0.8 ship a concrete id13 row?) — **CLOSED: YES.** v0.8 ships the concrete id13 row + the K2 (particle↔rigid-SDF) proving pair. R8 instantiates the remaining pairs as registry entries (no first-emission work left to R8a).
+- **OPEN-I** (SDF tier = single witness point) — **CLOSED:** the v0.8 grasp uses single-witness fingertip SDF (sufficient there); **v0.9 R4f IMPLEMENTS perturbed-restart multi-point SDF** for go2-on-sand foot resting stability (OPEN-V4 resolved → implement), since go2-on-sand is now a shipping v1.0 demo (Demo 5).
 
 ---
 
@@ -222,7 +222,7 @@ The high-precision upgrade over the basic XPBD cloth (id6 distance + id7 bend, `
 - **Objective.** Register `ClothTriangle` (CollidableType=5) and emit cloth↔rigid coupling through the generic id13 framework.
 - **Technical approach.** Append `CollidableTypeInfo` for `ClothTriangle`: AABB = per-triangle (swept for CCD), accel = cloth BLAS (LBVH refit), proxy = triangle, reaction = `ParticleInvMass` bary-weighted across the 3 verts. Cloth↔rigid candidate pairs (C2c) → manifolds (C3, SDF tier for rigid-carries-SDF, `research-genesis.md:39`) → **id13 `CouplingContactRow`** via `EmitCouplingRows` (v0.8 §0.7) — NO new row class. Two-way: rigid reacts via its provider, cloth verts via the bary-weighted Particle provider.
 - **Registers into:** the **collidable-type registry** (ClothTriangle=5); the **id13 coupling framework**; the SDF narrowphase tier.
-- **Inputs/Outputs/Interface.** In: cloth triangles + rigid SDFs. Out: id13 coupling rows. Interface: R8 cloth↔rigid; cloth showcase (drape on box) — note this is demo-4 territory but demo-4 uses BASIC XPBD (see capability→demo map).
+- **Inputs/Outputs/Interface.** In: cloth triangles + rigid SDFs. Out: id13 coupling rows. Interface: R8 cloth↔rigid; **this cloth↔rigid two-way coupling BACKS Demo 4 (garment cloth showcase)** — Demo 4 is now garment-grade R3 (owner 2026-06-04), superseding the former basic-XPBD soft/cloth demo (see capability→demo map).
 - **Dependencies.** v0.8 C6b (id13 framework), C3d (SDF tier), C2c; R3a/R3b (cloth solve).
 - **D1 strategy.** Forward-only; id13 rows D1 via C5; gather reductions. Two-run + N≥32.
 - **Validation/test gates.** `tests/runtime/test_cloth_rigid_coupling.cpp` — garment cloth drapes on a box with two-way reaction (box feels weight, within momentum tol); 2-run.
@@ -424,7 +424,7 @@ The v0.8 spine ships the **generic id13 `CouplingContactRow` framework + `EmitCo
 - **Objective.** Two-way cloth↔rigid/articulation for the garment/dressing scenarios.
 - **Technical approach.** R3d already registers ClothTriangle + cloth↔rigid id13. R8c adds the ARTICULATION side (cloth draped/grasped by an articulated hand) via the C5b two-way artic reaction + the ClothTriangle bary-weighted provider. No new row class.
 - **Registers into:** the **id13 framework** + ClothTriangle (R3d) + the C5b two-way artic path.
-- **Inputs/Outputs/Interface.** In: cloth + articulation. Out: id13 rows. Interface: robot-dressing (completeness; demo-4 cloth showcase uses BASIC XPBD — see map).
+- **Inputs/Outputs/Interface.** In: cloth + articulation. Out: id13 rows. Interface: robot-dressing — **this articulation-side coupling is part of Demo 4 (garment cloth showcase, now garment-grade R3; owner 2026-06-04)** — see capability→demo map.
 - **Dependencies.** R3d (ClothTriangle), v0.8 C5b, C6b.
 - **D1 strategy.** Forward-only; id13 + artic-chain-J D1. Two-run + N≥32.
 - **Validation/test gates.** `tests/runtime/test_cloth_artic_coupling.cpp` — an articulated gripper lifts a cloth corner (cloth follows, gripper feels weight); 2-run.
@@ -506,24 +506,24 @@ A lightweight shareable viewer (lower-effort than a Kit clone) — Rerun-style l
 
 ---
 
-# U4 — Real complex-USD asset pipeline
+# U4 — Real complex-USD asset pipeline (GENERAL usdc hardening)
 
-Import real complex USD scenes for demos (the p16 requirement; `post-v07-roadmap.md:69`). Hardens the hand-rolled importer + mesh-geometry retention (#19) + the usdc binary seam. Builds on the v0.7 `scene_compose` (`scene/scene_compose.hpp`) coexistence layer.
+Import real complex USD scenes for demos (the p16 requirement; `post-v07-roadmap.md:69`). **Scope note (owner 2026-06-04, OPEN-J):** the MINIMAL usdc parse needed to load the single newton-assets grasp cup was pulled into **v0.8 C7a** (so the C7 grasp ships on the real usdc cup). U4a here is the GENERAL hardening that builds ON the v0.8 C7a reader: full composition arcs + the kitchen-scale asset. Hardens the hand-rolled importer + mesh-geometry retention (#19) + the usdc binary seam. Builds on the v0.7 `scene_compose` (`scene/scene_compose.hpp`) coexistence layer.
 
-### U4a — usdc binary reader (self-written) + references-follow
-- **Objective.** Read real complex USD (often usdc binary + composition `references`/`payloads`), not just ASCII usda — the gap blocking real-asset demos (memory `v07-usd-mjcf-coexistence`).
-- **Technical approach.** Self-written usdc (crate) binary reader (no OpenUSD — the no-closed-SDK pillar) on the `usd_stage_adapter` seam (memory: "self-written reader, no OpenUSD"); follow `references`/`payloads`/sublayers composition. Mesh-geometry read (#19 STL/OBJ already landed in v0.7; add USD `points`/`faceVertexIndices`). Output the same SceneIR both importers produce → `scene_compose` (exists) composes.
-- **Registers into:** the importer → SceneIR → `scene_compose` (no physics seam).
-- **Inputs/Outputs/Interface.** In: real USD (usdc + references). Out: SceneIR. Interface: scene_compose, cooker.
-- **Dependencies.** importer/cooker + scene_compose (exist); #19 mesh loader (landed).
+### U4a — usdc reader HARDENING: general composition arcs + kitchen-scale assets
+- **Objective.** Generalize the v0.8 C7a scoped (single-cup) usdc reader to real complex USD: composition `references`/`payloads`/sublayers across MANY prims (the kitchen), not just the one cup C7a already loads (memory `v07-usd-mjcf-coexistence`).
+- **Technical approach.** EXTEND the v0.8 C7a self-written usdc (crate) reader (`usd_stage_adapter` seam; no OpenUSD — the no-closed-SDK pillar): add `references`/`payloads`/sublayers composition-arc following + the larger crate sections kitchen-scale assets exercise (C7a only parsed what one cup needed). Mesh-geometry read already landed (#19 + #32 + C7a `points`/`faceVertexIndices`). Output the same SceneIR both importers produce → `scene_compose` composes.
+- **Registers into:** the importer → SceneIR → `scene_compose` (no physics seam). Supersedes/extends v0.8 C7a.
+- **Inputs/Outputs/Interface.** In: real complex USD (usdc + references/payloads). Out: SceneIR. Interface: scene_compose, cooker, U4b.
+- **Dependencies.** **v0.8 C7a (the scoped usdc cup reader — the base this extends)**; importer/cooker + scene_compose (exist); #19 mesh loader (landed).
 - **D1 strategy.** Deterministic parse (fixed traversal order); host-only cook. Cook-twice memcmp.
-- **Validation/test gates.** `tests/import/test_usdc_reader.cpp` — a usdc file with references parses to the expected SceneIR; mesh points/indices correct; cook-twice byte-equal.
-- **Effort.** **M–L** (usdc binary format + composition is involved) — realistically the **HIGH end of M–L**, and **R-adjacent** if USD composition arcs (references / payloads / sublayers) must actually be followed rather than the shallowest single-file case.
-- **Risks.** usdc is a complex binary format (crate, versioned); scope to the subset the target demo assets use (newton-assets kitchen/cup, memory `newton-assets-resource`); document unsupported features. Composition arcs (variants/inherits) may be deep — scope to references/payloads first.
+- **Validation/test gates.** `tests/import/test_usdc_reader.cpp` — a usdc file with references/payloads parses to the expected SceneIR; mesh points/indices correct; cook-twice byte-equal.
+- **Effort.** **M–L** (composition arcs on top of the C7a base) — realistically the **HIGH end of M–L**, and **R-adjacent** if the kitchen's composition arcs (references / payloads / sublayers / variants) are deep rather than the shallow single-file case.
+- **Risks.** usdc is a complex binary format (crate, versioned); the single-cup base (C7a) de-risks the format basics — U4a's risk is composition-arc DEPTH. Scope to the kitchen asset's actual arcs (memory `newton-assets-resource`); document unsupported features; references/payloads first, variants/inherits later.
 
 ### U4b — Real-asset demo scene assembly (kitchen + cup coexistence)
 - **Objective.** Assemble a real complex demo scene (USD cup on MJCF kitchen counter — the owner must-do, memory `v07-usd-mjcf-coexistence`) cooked + sim-ready.
-- **Technical approach.** Load the newton-assets kitchen (MJCF+OBJ) + cup (USD mesh) via U4a + the existing MJCF importer; `scene_compose` (exists) merges them at a placement; cook; verify physics-ready (collision geometry retained per memory `v07-integration-debt-discipline` mesh-retention orphan). The H1 grasp (v0.8 C7) uses this scene. **Cross-ref v0.8 OPEN-J (C7 cup format):** the C7↔U4a version-inversion (a v0.8 gate reaching into the v0.9 usdc reader) is resolved by pinning the C7 cup to usda/primitive for the standalone v0.8 grasp — this U4b real-usdc kitchen+cup scene is the v0.9 upgrade that supersedes that placeholder, not a v0.8 dependency.
+- **Technical approach.** Load the newton-assets kitchen (MJCF+OBJ) + cup (USD mesh) via U4a + the existing MJCF importer; `scene_compose` (exists) merges them at a placement; cook; verify physics-ready (collision geometry retained per memory `v07-integration-debt-discipline` mesh-retention orphan). **Cross-ref v0.8 OPEN-J (RESOLVED, owner 2026-06-04):** the v0.8 C7 grasp already ships on the REAL usdc cup via the v0.8-relocated scoped reader (C7a) — there is NO version-inversion placeholder anymore. U4b is the v0.9 upgrade that adds the full KITCHEN scene (kitchen + cup coexistence) around that grasp, using the U4a general reader; the standalone v0.8 grasp uses the cup-on-table subset.
 - **Registers into:** scene_compose + cooker (consumes U4a output).
 - **Inputs/Outputs/Interface.** In: kitchen + cup assets. Out: a cooked composed scene. Interface: the grasp + photoreal demos.
 - **Dependencies.** U4a, scene_compose (exists), v0.8 C1 (cook), v0.8 C7 (grasp consumer).
@@ -600,22 +600,22 @@ U-track `U2a, U2b, U3a, U3b, U4a, U4b, U5a, U5b` (parallel-izable; U4 unblocks r
 
 ## Appendix B — Capability → v1.0 demo mapping (HONEST)
 
-The v1.0 demos (`post-v07-roadmap.md:88-94`). **Honesty (advisor):** not every breadth solver maps to a named demo — several are parity/completeness with NO named demo, and the doc must not overclaim.
+The **8** v1.0 demos (`post-v07-roadmap.md:88-96`). **Owner 2026-06-04: R3 garment / R5 FEM / R7 tendon now EACH ship a named v1.0 demo** (the former generic "soft/cloth" demo is upgraded/split into the garment R3 demo + the FEM R5 demo, avoiding two visually-redundant soft demos — see roadmap §4 demo note). **Remaining honesty (advisor):** R3c/R8c/U-track stay infrastructure/capability with no demo of their own.
 
 | v0.9 capability | v1.0 demo it unblocks | Notes |
 |---|---|---|
 | **R2 cable/DER** (R2a–c) | **Demo 6 — Cable/rope** | direct; +R3c CCD for tight knots |
 | **R4 MPM + R8b articulated↔MPM** | **Demo 5 — MPM go2-on-sand** | the R4+R8 headline; longest critical path |
 | **R8a rigid↔fluid** | **Demo 3 — Fluid+rigid coupling** | largely v0.8 C6b reuse; R8a hardens it |
-| **R3 garment cloth** (R3a–d) | **NO named v1.0 demo** | Demo 4 (soft/cloth showcase) uses **BASIC XPBD p09, NOT garment-grade** (`post-v07-roadmap.md:92`). R3 = completeness/parity vs Newton Style3D/VBD + robot-dressing capability; the SOTA cloth gap-closer, but not a gated demo. |
-| **R5 volumetric FEM** (R5a–e) | **NO named v1.0 demo** | constitutive soft-tissue / soft-robot completeness; gap-closer vs PhysX/Genesis FEM. No gated demo. |
-| **R7 tendon/muscle** (R7a–c) | **NO named v1.0 demo** | MuJoCo-parity actuation completeness; enables muscle-driven characters but not a gated demo. |
+| **R3 garment cloth** (R3a–d) | **Demo 4 — Garment cloth showcase** | self-collision drape/dressing (ACCD); **UPGRADES the former basic-XPBD soft/cloth demo to garment-grade** (owner 2026-06-04). Backed by R3d cloth↔rigid + R8c cloth↔articulation. |
+| **R5 volumetric FEM** (R5a–e) | **Demo 7 — FEM volumetric soft-body** | squish/elastic recovery (corotational→stable-Neo-Hookean); the VOLUMETRIC-soft showcase, distinct from cloth — the second half of the former generic soft/cloth demo (owner 2026-06-04). |
+| **R7 tendon/muscle** (R7a–c) | **Demo 8 — Tendon/musculotendon actuation** | muscle-driven limb (Hill-type + fixed/spatial tendons, **via-points**; wrapping deferred per OPEN-V3 — not a demo blocker). New demo (owner 2026-06-04). |
 | **R3c ACCD CCD seam** | (infrastructure) | enables R2 knots + R3 self-collision; no demo of its own |
-| **R8c cloth↔articulation** | (robot-dressing capability) | completeness; could feed a future dressing demo, not in the v1.0 six |
-| **U4 real-USD pipeline** | **Demo 1 — H1 grasp** (asset side) + homepage | real kitchen+cup scene for the grasp + photoreal showcase |
+| **R8c cloth↔articulation** | (Demo 4 dressing) | now part of Demo 4 (garment two-way coupling onto the articulated body) |
+| **U4 real-USD pipeline** | **Demo 1 — H1 grasp** (kitchen scene) + homepage | U4a/U4b add the full kitchen scene around the grasp (the scoped cup reader is v0.8 C7a); photoreal showcase |
 | **U2/U3/U5** | (usability, homepage shareable) | authoring + web viewer + teleop; support the homepage, no gated physics demo |
 
-(Demo 1 H1-grasp + Demo 2 rigid-collision are v0.8-spine demos, not v0.9 — listed only where U4 feeds the grasp's assets.)
+(Demo 1 H1-grasp + Demo 2 rigid-collision are v0.8-spine demos, not v0.9 — listed only where U4 feeds the grasp's assets. **Demos 4/5/7/8 are v0.9-solver-backed**; Demo 6 cable + Demo 5 MPM likewise.)
 
 ## Appendix C — D1 / forward-only discipline (the cross-cutting gate)
 
@@ -631,15 +631,15 @@ The v1.0 demos (`post-v07-roadmap.md:88-94`). **Honesty (advisor):** not every b
 
 The binding D1 rules (verified posture, `research-breadth-solvers.md:11`): `thrust::stable_sort_by_key` (radix); **integer atomics ONLY, NO float atomicAdd**; **gather-not-scatter** with fixed-order `__fadd_rn`; two-pass count→scan→private-slice (no append atomics); own-index quaternion/position projection. The two HARDEST D1 items: **R4b gather-form P2G** (the headline hazard) and **R3c ACCD TOI min-reduction** (fixed-order min with stable-key tie-break).
 
-## Appendix D — OPEN questions (for owner / advisor)
+## Appendix D — OPEN questions — ALL RESOLVED (owner, 2026-06-04)
 
-These are v0.9 DECOMPOSITION forks + the v0.8 OPENs v0.9 inherits.
+These were v0.9 DECOMPOSITION forks + the v0.8 OPENs v0.9 inherits. Owner directive 2026-06-04: "其余小型 OPEN 都解决" → all resolved at the recommended answer (with V3/V4 shaped by the new R7/R4 demos).
 
-- **OPEN-V1 (R4f / §0.2):** does the MPM↔rigid two-way reaction express as an id13 `CouplingContactRow` (the framework's intent — recommend), or does the grid-BC handshake genuinely require the SDF-field-in/impulse-field-out external-wrench path (a non-row coupling routed through the registered reaction provider)? The grid is not a point-contact manifold — this is the one place a pair might escape id13. Recommend: id13 where possible, impulse-field fallback documented per-pair.
-- **OPEN-V2 (R5b):** the existing self-written CG is per-articulation-block (≤12×12, one warp/block, `sparse_solver_cg.hpp`); the FEM global system is larger/different-topology. Does R5b reuse the CG with a FEM-shaped matrix-free `Ax` front-end (recommend), or does FEM need its own CG variant? Confirm the existing CG's D1 reduction posture ports to the bigger system.
-- **OPEN-V3 (R7b):** spatial-tendon **wrapping geometry** (cylinder/sphere wrap) is unresearched + geometrically involved. Defer to via-points-only in v0.9 + flag wrapping as a v1.0+ seam (recommend), or attempt wrapping now (R-effort)?
-- **OPEN-V4 (R4f/R8b, inherits v0.8 OPEN-I):** single-witness SDF contact (the v0.8 cardinality gap) for go2 foot-on-sand resting stability — sufficient, or does R4f need perturbed-restart multi-point SDF for stable footing?
-- **OPEN-V5 (U5a):** OpenXR for VR teleop — acceptable under the no-closed-SDK pillar (it is an open device API, not a solver/render SDK)? And the headless-CI gate for VR.
-- **Inherited v0.8 OPEN-C (id allocation):** v0.9 §0.2 ASSUMES the recommended resolution (id11/12 reserved → Cosserat, coupling=id13, count=14). **Must be closed before R2a.** If owner picks coupling=id11, R2 Cosserat renumbers to 13/14 and §0.2 shifts.
-- **Inherited v0.8 OPEN-E (id13 shipped):** R8 assumes v0.8 ships the concrete id13 row + the K2 fluid↔rigid proving pair. If interface-only, R8a additionally lands the first concrete id13 emission.
-- **Effort honesty:** **R3c (ACCD) and R4b (gather-P2G) are rated R (research-grade)** — the two hardest D1 items in all of v0.9. R4d (Drucker-Prager + analytic SVD), R5c (stable Neo-Hookean eigen-projection), R4f/R8b (go2-sand coupling), R5b, U4a (usdc reader) are the L-tier items where the estimate carries real but bounded uncertainty. R7b wrapping-geometry is deferred (OPEN-V3) precisely because it is unbounded-R. The U-track and R7a/c are the safe, low-risk warm-ups.
+- **OPEN-V1 (R4f / §0.2) — RESOLVED:** id13 `CouplingContactRow` where the manifold expresses it (the framework's intent); the MPM grid-BC case, if it genuinely can't express two-way reaction as a point-contact row, uses the SDF-field-in/impulse-field-out external-wrench path routed through the registered `MpmGridNodal` reaction provider — documented per-pair. id13-first, impulse-field fallback.
+- **OPEN-V2 (R5b) — RESOLVED:** R5b reuses the existing self-written CG with a **FEM-shaped matrix-free `Ax` front-end** (no separate CG variant); the existing per-block D1 reduction posture ports to the larger FEM system (verify the reduction order at R5b, re-baseline if it moves).
+- **OPEN-V3 (R7b) — RESOLVED: defer wrapping.** Spatial tendons are **via-points-only** in v0.9; wrapping geometry (cylinder/sphere wrap) is a v1.0+ seam. **The v1.0 tendon demo (Demo 8) runs on via-points (R7a/R7c) — a muscle-driven-limb showcase does NOT need wrapping**, so deferring wrapping does not block the demo.
+- **OPEN-V4 (R4f/R8b, was v0.8 OPEN-I) — RESOLVED: implement multi-point.** Since go2-on-sand is now a shipping v1.0 demo (Demo 5) needing stable footing, **R4f IMPLEMENTS perturbed-restart multi-point SDF** for foot-on-sand resting stability (upgrading the single-witness v0.8 tier for this consumer). Single-witness stays the default elsewhere (the v0.8 grasp).
+- **OPEN-V5 (U5a) — RESOLVED:** OpenXR is acceptable (an open device API, not a closed solver/render SDK — consistent with the GLFW resolution, v0.8 OPEN-H). VR/device path probed at runtime; offscreen/no-device path is the headless-CI gate.
+- **Inherited v0.8 OPEN-C (id allocation) — CLOSED:** id11/12 reserved → Cosserat, coupling=id13, count=14 (recommended resolution). R2a unblocked; no renumber.
+- **Inherited v0.8 OPEN-E (id13 shipped) — CLOSED:** v0.8 ships the concrete id13 row + the K2 particle↔rigid-SDF proving pair. R8 instantiates remaining pairs as registry entries.
+- **Effort honesty:** **R3c (ACCD) and R4b (gather-P2G) are rated R (research-grade)** — the two hardest D1 items in all of v0.9. R4d (Drucker-Prager + analytic SVD), R5c (stable Neo-Hookean eigen-projection), R4f/R8b (go2-sand coupling, now incl. multi-point SDF per V4), R5b, U4a (general usdc hardening — the single-cup base de-risked by v0.8 C7a) are the L-tier items where the estimate carries real but bounded uncertainty. R7b wrapping-geometry is deferred (OPEN-V3) precisely because it is unbounded-R — and the Demo-8 tendon showcase doesn't need it. The U-track and R7a/c are the safe, low-risk warm-ups.
