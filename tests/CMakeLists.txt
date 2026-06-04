@@ -837,6 +837,33 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_sdf_device_test)
 
+    # --- v0.8 C4a: MuJoCo _efc_row solref/solimp compliance port -----------
+    # Tests src/constraint/solref_solimp.hpp (header-only HD). Two regimes:
+    #   (1) function-vs-hand-evaluated-table (tolerance, independent oracle), and
+    #   (2) HOST-vs-DEVICE BYTE-EXACT parity -- the gate that justifies OPEN-F's
+    #       integer-power decision. The .cpp holds a __global__ so it compiles as
+    #       CUDA. Built --fmad=false (device) + -ffp-contract=off (host) so the
+    #       shared HD arithmetic is host==device bit-for-bit (no FMA contraction
+    #       on either side, integer-power => no libm powf divergence). Header-only
+    #       => no library link beyond cudart + gtest.
+    add_executable(nuka_solref_solimp_test
+        constraint/test_solref_solimp.cpp
+    )
+    set_source_files_properties(constraint/test_solref_solimp.cpp
+        PROPERTIES LANGUAGE CUDA
+                   COMPILE_OPTIONS "--fmad=false;-Xcompiler=-ffp-contract=off")
+    target_include_directories(nuka_solref_solimp_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_solref_solimp_test
+        PRIVATE
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_solref_solimp_test)
+
     # --- v0.7 p04: LBVH vs SAP differential gate + D1 byte-exact -----------
     add_executable(nuka_lbvh_vs_sap_test
         collision/test_lbvh_vs_sap_pair_set.cpp
