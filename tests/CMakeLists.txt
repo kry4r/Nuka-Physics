@@ -967,6 +967,30 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_analytical_manifold_test)
 
+    # --- v0.8 C3c: convex narrowphase (GJK/EPA/face-clip) -----------------------
+    # Validates the REAL Convex-tier handler (convex_narrowphase.hpp +
+    # narrowphase_dispatch.hpp): two penetrating tetrahedra / two boxes-as-hulls vs
+    # analytic depth+normal (and a TIGHT depth/normal cross-check vs the C3b box-box
+    # SAT), a separated pair -> no contact, convex x box / convex x sphere / convex
+    # x plane (both orderings, the plane special path + sign), and the EPA D1 gate:
+    # 2-run byte-identity (memset+memcmp) + N>=32 cross-replica on a SYMMETRIC
+    # tie-prone box-box config (a heap-based EPA would diverge there). Header-only
+    # (same deps as the C3a/C3b dispatch tests) -- needs nuka_codegen + src include.
+    add_executable(nuka_gjk_epa_convex_test
+        collision/test_gjk_epa_convex.cpp
+    )
+    add_dependencies(nuka_gjk_epa_convex_test nuka_codegen)
+    target_include_directories(nuka_gjk_epa_convex_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_gjk_epa_convex_test
+        PRIVATE
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_gjk_epa_convex_test)
+
     # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
     # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
     # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity

@@ -37,6 +37,7 @@
 
 #include "collision/analytical_manifold.hpp" // C3b: PrimParams + amf:: handlers
 #include "collision/candidate_pair.hpp"     // CandidatePair, CollidableRef
+#include "collision/convex_narrowphase.hpp" // C3c: cvx:: GJK/EPA/face-clip + ConvexHullView
 #include "constraint/contact_manifold.hpp"  // ContactManifold (extended, C3a)
 #include "scene/canonical_types.hpp"        // scene::ShapeType
 
@@ -298,6 +299,98 @@ inline void NarrowphaseSphereCapsule(const CandidatePair& pair,
 }
 
 // ---------------------------------------------------------------------------
+// C3c REAL Convex handlers (general convex x convex / convex x primitive).
+// ---------------------------------------------------------------------------
+// ONE generic handler serves every Convex-tier slot that involves a ConvexHull.
+// It maps the pair's ACTUAL side A -> SupportProxy A and side B -> SupportProxy B
+// (no order canonicalization), so cvx::ConvexNarrowphase already emits
+// point.normal = "separation dir for side A" -- NO flip wrapper is needed for the
+// GJK/EPA path (unlike C3b's analytical asymmetric wrappers). The handler reads
+// type_a/type_b to pick each side's SupportKind:
+//   ShapeType::ConvexHull -> kind=Hull, hull = (const cvx::ConvexHullView*)geom_X
+//                            (the C3a void* seam, populated by the caller/C5).
+//   ShapeType::Box/Sphere/Capsule -> kind=Box/Sphere/Capsule, prim = &g.prim_X
+//                            (the inline C3b prim params -- convex x primitive is
+//                            in C3c scope; the primitive's analytical support
+//                            feeds the SAME Minkowski GJK/EPA path).
+//
+// PLANE is the one special case: a MuJoCo plane is an INFINITE half-space, so the
+// Minkowski difference is unbounded and GJK never deterministically encloses the
+// origin (convex_narrowphase.hpp HullPlane header note). We special-case it:
+// call cvx::HullPlane(hull, plane, normal_for_hull). The plane normal is the
+// separation dir for the HULL side; we re-sign it to "separation dir for the
+// pair's ACTUAL side A":
+//   hull is side A (plane is B): normal_for_hull = +plane_normal  (A==hull pushes off plane)
+//   plane is side A (hull is B): A==plane; sep dir for A = -plane_normal (plane pushes
+//                                opposite the hull); HullPlane fills "sep dir for hull"
+//                                so we pass -plane_normal and DON'T flip (HullPlane
+//                                applies it verbatim to every point).
+// Both orderings are registered + tested (the sign bug hides in the swapped slot).
+
+inline cvx::SupportProxy MakeConvexProxy(ShapeType t, const void* geom,
+                                         const amf::PrimParams& prim) {
+    cvx::SupportProxy p;
+    switch (t) {
+        case ShapeType::ConvexHull:
+        case ShapeType::TriMesh:        // (Convex tier; TriMesh deferred -- see table)
+        case ShapeType::HeightField:
+            p.kind = cvx::SupportKind::Hull;
+            p.hull = static_cast<const cvx::ConvexHullView*>(geom);
+            break;
+        case ShapeType::Box:
+            p.kind = cvx::SupportKind::Box;    p.prim = &prim; break;
+        case ShapeType::Sphere:
+            p.kind = cvx::SupportKind::Sphere; p.prim = &prim; break;
+        case ShapeType::Capsule:
+            p.kind = cvx::SupportKind::Capsule; p.prim = &prim; break;
+        case ShapeType::Plane:
+            // Plane never goes through GJK; this branch is unreached (the handler
+            // detects Plane first). Map to Box as a benign default.
+            p.kind = cvx::SupportKind::Box;    p.prim = &prim; break;
+    }
+    return p;
+}
+
+// The single generic Convex-tier handler (registered in every ConvexHull slot).
+inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g,
+                              ContactManifold* out) {
+    // --- Plane special case (either side) -- NOT through GJK (unbounded CSO). ---
+    if (g.type_a == ShapeType::Plane || g.type_b == ShapeType::Plane) {
+        const bool plane_is_a = (g.type_a == ShapeType::Plane);
+        // The non-plane side must be a hull (Convex tier => one side is ConvexHull;
+        // plane x primitive routes Analytical, plane x plane is the stub).
+        const ShapeType hull_t = plane_is_a ? g.type_b : g.type_a;
+        const void* hull_geom  = plane_is_a ? g.geom_b : g.geom_a;
+        if (hull_t != ShapeType::ConvexHull && hull_t != ShapeType::TriMesh &&
+            hull_t != ShapeType::HeightField) {
+            // Not a hull-vs-plane (e.g. (Plane,Plane)) -> empty manifold.
+            out->Clear(); StampSides(pair, out); return;
+        }
+        const cvx::ConvexHullView* hull =
+            static_cast<const cvx::ConvexHullView*>(hull_geom);
+        const amf::PrimParams& plane = plane_is_a ? g.prim_a : g.prim_b;
+        if (hull == nullptr) { out->Clear(); StampSides(pair, out); return; }
+        // plane_normal = separation dir for the HULL side. Re-sign to side A:
+        //   hull == A (plane is B): +plane_normal ; plane == A: -plane_normal.
+        const math::Vec3 plane_n = amf::Norm(plane.frame.cy, math::Vec3::UnitY());
+        const math::Vec3 normal_for_hull = plane_is_a ? -plane_n : plane_n;
+        cvx::HullPlane(*hull, plane, normal_for_hull, out);
+        StampSides(pair, out);
+        return;
+    }
+    // --- General GJK/EPA/face-clip path. Side A == pair side A (no flip). ---
+    cvx::SupportProxy A = MakeConvexProxy(g.type_a, g.geom_a, g.prim_a);
+    cvx::SupportProxy B = MakeConvexProxy(g.type_b, g.geom_b, g.prim_b);
+    // A null hull view (caller didn't populate the seam) -> empty manifold.
+    if ((A.kind == cvx::SupportKind::Hull && A.hull == nullptr) ||
+        (B.kind == cvx::SupportKind::Hull && B.hull == nullptr)) {
+        out->Clear(); StampSides(pair, out); return;
+    }
+    cvx::ConvexNarrowphase(A, B, out);
+    StampSides(pair, out);
+}
+
+// ---------------------------------------------------------------------------
 // The dispatch table: table[typeA][typeB][tier] -> handler.
 // ---------------------------------------------------------------------------
 // Representation: a dense 3-D constexpr array of function pointers. O(1) lookup
@@ -366,6 +459,47 @@ constexpr NarrowphaseTable MakeNarrowphaseTable() {
     //                                    no finite manifold -> stub by design.
     // These slots intentionally KEEP the default Analytical stub so they route to
     // a well-defined empty manifold until C3c lands the segment-based handlers.
+    //
+    // C3c NOTE / HONEST ORPHAN (capsule x box, capsule x capsule): the C3b comment
+    // above names "C3c convex tier" as the consumer for these. BUT SelectTier
+    // routes BOTH capsule x box and capsule x capsule to the ANALYTICAL tier
+    // (capsule + box + capsule are all IsPrimitiveShape == true). So a Convex-tier
+    // registration for them would be UNREACHABLE dead code -- ResolveNarrowphase
+    // never asks the Convex tier for two primitives. C3c therefore does NOT close
+    // this with a phantom Convex-tier slot. Closing it correctly is either
+    // (a) Analytical-tier wrappers calling cvx::ConvexNarrowphase (1-pt witness,
+    // since capsule HasFace()==false -> weaker than C3b's envisioned swept-segment
+    // vs OBB face contact), or (b) a true analytical capsule-OBB handler. Both are
+    // OUT OF C3c SCOPE (C3c is the general convex path); the gap is surfaced to the
+    // controller and remains the C3b deferral's open item -- NOT silently shipped.
+
+    // --- C3c: Convex-tier handlers (general convex x convex / convex x primitive).
+    // The SAME generic NarrowphaseConvex serves every ConvexHull-involving slot
+    // (it reads type_a/type_b to pick each side's support kind; the plane case is
+    // special-cased inside). Registered for BOTH orderings of each asymmetric pair
+    // -- but no flip wrapper: side A == pair side A, so the normal is already the
+    // separation dir for side A (the cleaner C3c posture vs C3b's flip wrappers).
+    const uint32_t kCvx = static_cast<uint32_t>(NarrowphaseTier::Convex);
+    const uint32_t kHull = static_cast<uint32_t>(ShapeType::ConvexHull);
+
+    t.fns[kHull][kHull][kCvx] = &NarrowphaseConvex;   // convex x convex
+    t.fns[kHull][kBox][kCvx]  = &NarrowphaseConvex;   // convex x box (both orders)
+    t.fns[kBox][kHull][kCvx]  = &NarrowphaseConvex;
+    t.fns[kHull][kSph][kCvx]  = &NarrowphaseConvex;   // convex x sphere
+    t.fns[kSph][kHull][kCvx]  = &NarrowphaseConvex;
+    t.fns[kHull][kCap][kCvx]  = &NarrowphaseConvex;   // convex x capsule
+    t.fns[kCap][kHull][kCvx]  = &NarrowphaseConvex;
+    t.fns[kHull][kPln][kCvx]  = &NarrowphaseConvex;   // convex x plane (special-cased)
+    t.fns[kPln][kHull][kCvx]  = &NarrowphaseConvex;
+
+    // DEFERRED in the Convex tier WITH a NAMED CONSUMER:
+    //   TriMesh x * / HeightField x * -> KEEP the Convex stub. v0.8 grasp consumes
+    //     convex HULL pieces from V-HACD (CookedConvexGeometry), NOT raw trimesh
+    //     narrowphase; a raw-trimesh general narrowphase is a v0.9 concern (BVH-of-
+    //     triangles + per-triangle convex). MakeConvexProxy maps TriMesh/HeightField
+    //     to a Hull view so wiring them later is a one-line table edit once a cooked
+    //     triangle-soup view exists. Until then these slots route to the well-defined
+    //     Convex stub (empty manifold), NOT a phantom handler.
     return t;
 }
 

@@ -108,12 +108,32 @@ bool HasRealAnalyticalHandler(ShapeType a, ShapeType b) {
            is(a, b, C, P) || is(a, b, P, C) ||
            is(a, b, C, S) || is(a, b, S, C);
 }
+
+// Mirrors MakeNarrowphaseTable's C3c Convex registration block: every
+// ConvexHull-involving pair (convex x convex + convex x {box,sphere,capsule,
+// plane}, both orderings) gets the real NarrowphaseConvex; TriMesh/HeightField
+// slots stay the Convex stub (the v0.9 named deferral).
+bool HasRealConvexHandler(ShapeType a, ShapeType b) {
+    using nuka::scene::ShapeType;
+    auto is = [](ShapeType x, ShapeType y, ShapeType s, ShapeType t) {
+        return x == s && y == t;
+    };
+    const ShapeType S = ShapeType::Sphere, C = ShapeType::Capsule,
+                    B = ShapeType::Box, P = ShapeType::Plane,
+                    H = ShapeType::ConvexHull;
+    return is(a, b, H, H) ||
+           is(a, b, H, B) || is(a, b, B, H) ||
+           is(a, b, H, S) || is(a, b, S, H) ||
+           is(a, b, H, C) || is(a, b, C, H) ||
+           is(a, b, H, P) || is(a, b, P, H);
+}
 }  // namespace
 
 TEST(NarrowphaseDispatch, LookupReturnsExpectedTierHandler) {
     // C3b registered REAL Analytical handlers for the primitive pairs listed in
-    // HasRealAnalyticalHandler; every OTHER Analytical slot (and ALL Convex/Sdf
-    // slots) still defaults to its tier stub.
+    // HasRealAnalyticalHandler; C3c registered REAL Convex handlers for the
+    // ConvexHull-involving pairs in HasRealConvexHandler. Every OTHER slot in each
+    // tier (and ALL Sdf slots) still defaults to its tier stub.
     for (uint32_t ia = 0; ia < nuka::collision::kShapeTypeCount; ++ia) {
         for (uint32_t ib = 0; ib < nuka::collision::kShapeTypeCount; ++ib) {
             const auto a = static_cast<ShapeType>(ia);
@@ -128,9 +148,18 @@ TEST(NarrowphaseDispatch, LookupReturnsExpectedTierHandler) {
                     << "expected the Analytical STUB for unregistered ("
                     << ia << "," << ib << ")";
             }
-            // Convex/Sdf tiers are still all-stub (C3c/C3d unland).
-            EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Convex),
-                      &NarrowphaseStubConvex);
+            // Convex tier: real handler for ConvexHull pairs (C3c), stub otherwise.
+            const auto cvx = kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Convex);
+            if (HasRealConvexHandler(a, b)) {
+                EXPECT_NE(cvx, &NarrowphaseStubConvex)
+                    << "expected a REAL C3c Convex handler for ("
+                    << ia << "," << ib << ")";
+            } else {
+                EXPECT_EQ(cvx, &NarrowphaseStubConvex)
+                    << "expected the Convex STUB for unregistered ("
+                    << ia << "," << ib << ")";
+            }
+            // Sdf tier still all-stub (C3d unland).
             EXPECT_EQ(kNarrowphaseTable.Lookup(a, b, NarrowphaseTier::Sdf),
                       &NarrowphaseStubSdf);
         }
