@@ -102,6 +102,27 @@ struct CookedSdfTable {
     uint32_t Count() const { return static_cast<uint32_t>(voxel_sizes.size()); }
 };
 
+// Per-shape contact parameters (v0.8 C1a). EXACTLY one row per cooked shape
+// row, parallel to CookedShapeTable (so a mesh that decomposed into N convex
+// pieces has N identical contact-param rows, one per piece). `frictions` holds
+// the RESOLVED per-shape μ (see cooker.cpp friction-resolution precedence).
+// `solimp` is FLATTENED: 5 floats per shape, row-major, so shape `i`'s slice is
+// [i*5, i*5+5). `solref` is split into solref0 (timeconst) + solref1 (dampratio).
+struct CookedContactParamTable {
+    std::vector<uint32_t> contypes;
+    std::vector<uint32_t> conaffinities;
+    std::vector<int32_t>  groups;
+    std::vector<float>    solref0;       // timeconst
+    std::vector<float>    solref1;       // dampratio
+    std::vector<float>    solimp;        // FLATTENED: 5 floats per shape (row-major)
+    std::vector<float>    frictions;     // RESOLVED per-shape μ
+    std::vector<uint8_t>  condims;
+    std::vector<int32_t>  priorities;
+    std::vector<float>    solmix;
+    std::vector<float>    margins;
+    std::vector<float>    gaps;
+};
+
 struct CookedSensorTable {
     std::vector<SensorType>      types;
     std::vector<BodyId>          attached_bodies;
@@ -152,6 +173,7 @@ struct CookedBlob {
     CookedBodyTable  bodies;
     CookedJointTable joints;
     CookedShapeTable shapes;
+    CookedContactParamTable contact_params;  // v0.8 C1a: per-shape contact params (parallel to shapes)
     CookedConvexGeometry convex_geometry;  // v0.7 p06: hull geometry for ConvexHull rows
     CookedSdfTable    sdfs;                 // v0.7 p07: narrow-band SDFs per unique piece
     CookedSensorTable sensors;

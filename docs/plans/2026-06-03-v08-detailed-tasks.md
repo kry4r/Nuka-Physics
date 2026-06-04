@@ -63,19 +63,23 @@ struct ContactManifold {
 
 ### 0.2 solref/solimp storage + the contact row regularizer (owned by C1 storage / C4 consumption)
 
-**Storage decision (C1):** the 7 MuJoCo contact params live as NEW fields on `MaterialRecord` (`scene_ir.hpp:80`) + a new `CookedContactParamTable` in the cooked blob, NOT on the Row. Row-emission (C4) computes the derived `(k,b,D,R=1/D)` per `_efc_row` and writes DERIVED values into the Row.
+**Storage decision (C1) — REFINED in C1a (advisor-confirmed 2026-06-04): contact params are PER-SHAPE, not per-material.** The MuJoCo contact params (solref/solimp/condim/priority/solmix/margin/gap) live as NEW fields on `CollisionShapeRecord` (`scene_ir.hpp:29`) — matching MuJoCo's per-geom semantics — alongside the contype/conaffinity/group filtering bitmasks. The earlier "fields on `MaterialRecord`" wording was lossy: (1) MuJoCo's `mj_contactParam` merge is per-GEOM (C1b reads per-geom, C1c merges per-geom); (2) robot-MJCF collision geoms usually carry NO material, so per-material storage has nowhere to put their params. **Per-shape strictly generalizes per-material**, so this honors owner Q8 ("per-material μ") by keeping `MaterialRecord.friction_mu` as the per-material *default source*: the cooker resolves the per-shape μ with precedence `shape-override (friction_mu≥0) → material.friction_mu → MuJoCo default 1.0` and stores the RESOLVED value. A new `CookedContactParamTable` (one row per shape, parallel to the shape table) holds the cooked params, NOT on the Row. Row-emission (C4) computes the derived `(k,b,D,R=1/D)` per `_efc_row` and writes DERIVED values into the Row.
 
 ```cpp
-// scene_ir.hpp  MaterialRecord  (NEW fields, C1)
-float solref_timeconst = 0.02f;   // solref[0]  (s)
-float solref_dampratio = 1.0f;    // solref[1]
-float solimp[5]        = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f}; // dmin,dmax,width,mid,power
-float friction_mu      = 1.0f;    // isotropic tangential μ (condim=3)
-int   priority         = 0;       // mj per-contact merge priority
-float solmix           = 1.0f;    // mj solmix weight
-float margin           = 0.0f;
-float gap              = 0.0f;
-uint8_t condim         = 3;       // {1,3,4,6}; v0.8 supports 1 & 3
+// scene_ir.hpp  CollisionShapeRecord  (NEW per-shape fields, C1a — LANDED)
+uint32_t contype       = 1;       // collision bitmask (filtering, C2)
+uint32_t conaffinity   = 1;
+int32_t  collision_group = 0;
+float    solref[2]     = {0.02f, 1.0f};                     // timeconst, dampratio
+float    solimp[5]     = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f}; // dmin,dmax,width,mid,power
+float    friction_mu   = -1.0f;   // SENTINEL: <0 ⇒ inherit material μ; ≥0 ⇒ per-shape override
+int32_t  priority      = 0;       // mj per-contact merge priority
+float    solmix        = 1.0f;    // mj solmix weight
+float    margin        = 0.0f;
+float    gap           = 0.0f;
+uint8_t  condim        = 3;       // {1,3,4,6}; v0.8 supports 1 & 3
+// scene_ir.hpp  MaterialRecord  (NEW field, C1a — LANDED): per-material μ DEFAULT source
+float    friction_mu   = 1.0f;    // resolved into the per-shape cooked μ at cook time
 ```
 
 **Solver-regularizer decision (C4) — requires a solver consume-path change, NOT a new Row field (VERIFIED):** I read `src/solver/gpu/row_solver.cu`. The production maximal-contact PGS path consumes ONLY `baumgarte` (position bias at `row_solver.cu:310`, `SolveConstraints` config at `world_stepper.cpp:678`). `compliance_alpha`/`damping_beta`/`contact_softness` (`row.hpp:28-35`) are consumed ONLY by the XPBD path (`xpbd_world.cu:126` as `α/dt²`), NOT by rigid contact. So compliant solref/solimp contact CANNOT ride the existing fields without a solver change. **Decision:** reuse `compliance_alpha` to carry the dual regularizer `R = 1/D` (semantics: rigid-contact PGS adds `α̃ = R` to the row's effective-mass denominator exactly as XPBD adds `α/dt²`), and reuse `damping_beta`/`rhs` to carry the spring-damper reference accel `aref = −k·imp·pos_aref − b·vel`. This UNIFIES rigid contact and XPBD compliance through one denominator term (Q10's literal glue) and needs NO new Row field — only a new consume-path in `row_solver.cu`'s contact branch. **OPEN-B:** if reusing `compliance_alpha` for two different physical quantities (XPBD α vs contact R) proves confusing, add an explicit `float regularizer_R = 0.0f` field to `Row` (16→17 fields; codegen YAML `Row` struct + `row_class_registry.hpp` regen). Recommend reuse first; promote to a field only if a test shows aliasing bugs.
@@ -170,7 +174,7 @@ Bakes MuJoCo-parity collision filtering + contact compliance params into the IR 
 
 ### C1a — SceneIR + cooked-blob contact-metadata fields
 - **Objective.** Add contype/conaffinity/group + solref/solimp + per-material μ + condim/priority/solmix/margin/gap to the IR and cook them.
-- **Technical approach.** Add to `CollisionShapeRecord` (`scene_ir.hpp:29`): `uint32 contype = 1`, `uint32 conaffinity = 1`, `int32 collision_group = 0`. Add the 0.2 contact-param fields to `MaterialRecord` (`scene_ir.hpp:80`). Add an `<exclude>` body-pair list to `SceneIR` (new `std::vector<std::pair<BodyId,BodyId>> exclude_pairs_` + `AddExcludePair`). New `CookedContactParamTable` in `cooked_blob.hpp` (parallel-to-shape SoA: `contypes, conaffinities, groups, solref0, solref1, solimp[5], frictions, condims, priorities, solmix, margins, gaps`). Extend `cooker.cpp:326` (material cook) + `:227` (shape cook) to fill them.
+- **Technical approach.** Add to `CollisionShapeRecord` (`scene_ir.hpp:29`): `uint32 contype = 1`, `uint32 conaffinity = 1`, `int32 collision_group = 0`. Add the 0.2 contact-param fields **to `CollisionShapeRecord` (per-shape, the refined storage decision — see 0.2)**; add a `float friction_mu = 1.0f` per-material default to `MaterialRecord`. Add an `<exclude>` body-pair list to `SceneIR` (new `std::vector<std::pair<BodyId,BodyId>> exclude_pairs_` + `AddExcludePair`, canonicalized (min,max)). New `CookedContactParamTable` in `cooked_blob.hpp` (parallel-to-shape SoA: `contypes, conaffinities, groups, solref0, solref1, solimp[5], frictions, condims, priorities, solmix, margins, gaps`). Extend the `cooker.cpp` shape-cook loop to fill the table **in lockstep with the shape rows** (folded into `PushShapeRow` so a V-HACD-decomposed mesh's N pieces each inherit the parent geom's contact metadata — a separate loop would silently misalign on decomposed meshes); friction is RESOLVED per the 0.2 precedence at cook time. **LANDED (C1a): `CollisionShapeRecord`/`MaterialRecord`/`CookedContactParamTable`/`SceneIR::AddExcludePair` + `tests/scene/test_contact_metadata_cook.cpp` (9 tests, 47/47 scene suite green, cook-twice D1, lint 0).** **NAMED carry-over → C1c:** `scene_compose.cpp` does NOT yet propagate `exclude_pairs_` across a compose (relates to USD↔MJCF coexistence) — C1c owns it.
 - **Inputs/Outputs/Interface.** In: SceneIR. Out: CookedBlob with the new table. Interface: read by C1c (matrix), C2 (filtering), C4 (compliance).
 - **Dependencies.** None (pure data plumbing).
 - **D1 strategy.** Pure host data copy in fixed shape/material order; no FP, no atomics. Bit-exact by construction.

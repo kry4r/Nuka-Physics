@@ -93,6 +93,15 @@ ActuatorId SceneIR::AddActuator(ActuatorRecord record) {
     return id;
 }
 
+void SceneIR::AddExcludePair(BodyId a, BodyId b) {
+    // Canonicalize as (min,max) so (a,b) and (b,a) store identically. No dedup
+    // here — that (and the filter policy) is C1c.
+    if (b < a) {
+        std::swap(a, b);
+    }
+    exclude_pairs_.emplace_back(a, b);
+}
+
 size_t SceneIR::RigidBodyCount() const { return bodies_.size(); }
 size_t SceneIR::JointCount() const { return joints_.size(); }
 size_t SceneIR::ShapeCount() const { return shapes_.size(); }
@@ -222,5 +231,8 @@ const std::vector<MaterialRecord>& SceneIR::Materials() const { return materials
 const std::vector<CameraRecord>& SceneIR::Cameras() const { return cameras_; }
 const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }
 const std::vector<ActuatorRecord>& SceneIR::Actuators() const { return actuators_; }
+const std::vector<std::pair<BodyId, BodyId>>& SceneIR::ExcludePairs() const {
+    return exclude_pairs_;
+}
 
 } // namespace nuka::scene
