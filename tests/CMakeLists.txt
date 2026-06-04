@@ -320,6 +320,7 @@ gtest_discover_tests(nuka_runtime_test)
 # --- Import tests ----------------------------------------------------------
 add_executable(nuka_import_test
     import/test_mjcf_importer.cpp
+    import/test_mjcf_contact_filtering.cpp
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
     import/test_usd_mesh_geometry.cpp

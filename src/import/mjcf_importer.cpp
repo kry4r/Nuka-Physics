@@ -13,6 +13,7 @@
 #include <tinyxml2.h>
 
 #include <filesystem>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -51,6 +52,29 @@ void ParseRange(const char* text, float& lower, float& upper) {
     ss >> lower >> upper;
 }
 
+// Fill up to `count` floats from a whitespace-separated MuJoCo list into `out`,
+// assigning out[i] ONLY for entries that successfully extract. Entries beyond
+// what the text provides are LEFT UNCHANGED (so a partial solref="0.01" keeps
+// the default solref[1]). NOTE: a failed std::istream extraction zeroes its
+// target since C++11, so we extract into a temporary and copy only on success —
+// reusing `ss >> out[i]` directly would clobber the trailing defaults with 0.
+// Returns the number of values actually parsed.
+int ParseFloatList(const char* text, float* out, int count) {
+    if (!text || count <= 0) {
+        return 0;
+    }
+    std::istringstream ss(text);
+    int n = 0;
+    for (; n < count; ++n) {
+        float v;
+        if (!(ss >> v)) {
+            break;
+        }
+        out[n] = v;
+    }
+    return n;
+}
+
 struct MjcfJointDefaults {
     scene::JointType type = scene::JointType::Revolute;
     math::Vec3 axis = {0.0f, 1.0f, 0.0f};
@@ -65,9 +89,32 @@ struct MjcfGeneralDefaults {
     float force_limit = 0.0f;
 };
 
+// Per-class <geom> contact-attribute defaults (v0.8 C1b). Each field carries a
+// `has_*` presence flag so the geom loop applies a default ONLY when it was
+// explicitly authored in the <default><geom>; an unmentioned default attr must
+// NOT clobber the CollisionShapeRecord's own (MuJoCo-matching) C1a default.
+// (The joint-default path can apply unconditionally because its struct inits
+// match JointRecord's; that invariant does NOT hold here — notably the record's
+// friction_mu default is the -1 "inherit material μ" sentinel, not MuJoCo's
+// 1.0 — so per-field presence tracking is required.)
+struct MjcfGeomDefaults {
+    bool has_contype = false;       uint32_t contype = 1;
+    bool has_conaffinity = false;   uint32_t conaffinity = 1;
+    bool has_group = false;         int32_t group = 0;
+    bool has_condim = false;        uint8_t condim = 3;
+    bool has_priority = false;      int32_t priority = 0;
+    bool has_solmix = false;        float solmix = 1.0f;
+    bool has_margin = false;        float margin = 0.0f;
+    bool has_gap = false;           float gap = 0.0f;
+    bool has_solref = false;        float solref[2] = {0.02f, 1.0f};
+    bool has_solimp = false;        float solimp[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+    bool has_friction = false;      float friction_mu = 1.0f;  // first component only
+};
+
 struct MjcfDefaultClass {
     MjcfJointDefaults joint;
     MjcfGeneralDefaults general;
+    MjcfGeomDefaults geom;
 };
 
 struct MjcfDefaults {
@@ -87,6 +134,9 @@ struct MjcfParseContext {
     std::unordered_map<std::string, scene::JointId> joint_ids;
     std::unordered_map<std::string, scene::MaterialId> material_ids;
     std::unordered_map<std::string, MjcfMeshAsset> mesh_assets;
+    // Named geoms only: resolves a <contact><pair geom1=/geom2=> name to the
+    // ShapeId returned by AddCollisionShape (v0.8 C1b).
+    std::unordered_map<std::string, scene::ShapeId> geom_ids;
     MjcfDefaults defaults;
 };
 
@@ -185,6 +235,72 @@ void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* d
                defaults->general.force_limit);
 }
 
+// Read the first component of a MuJoCo `friction` list (slide,spin,roll[,...]).
+// MuJoCo geom/pair friction is a vector; v0.8 models tangential friction as a
+// single isotropic μ, so we take ONLY friction[0] and DROP the spin/roll (and
+// any further) components. Returns true if at least one value was present.
+bool ParseFrictionFirst(const char* text, float& out_mu) {
+    if (!text) {
+        return false;
+    }
+    float v;
+    if (ParseFloatList(text, &v, 1) == 1) {
+        out_mu = v;
+        return true;
+    }
+    return false;
+}
+
+// Read the C1b contact attributes from a <default>'s <geom> child into the
+// class's geom-default struct, setting the matching has_* flag for each attr
+// that is actually present (absent attrs leave both the value and flag alone, so
+// they inherit from the parent class via the `current = inherited` copy).
+void ApplyGeomDefault(const tinyxml2::XMLElement* geom_elem, MjcfDefaultClass* defaults) {
+    if (geom_elem == nullptr || defaults == nullptr) {
+        return;
+    }
+    MjcfGeomDefaults& g = defaults->geom;
+
+    if (geom_elem->QueryUnsignedAttribute("contype", &g.contype) == tinyxml2::XML_SUCCESS) {
+        g.has_contype = true;
+    }
+    if (geom_elem->QueryUnsignedAttribute("conaffinity", &g.conaffinity) ==
+            tinyxml2::XML_SUCCESS) {
+        g.has_conaffinity = true;
+    }
+    if (geom_elem->QueryIntAttribute("group", &g.group) == tinyxml2::XML_SUCCESS) {
+        g.has_group = true;
+    }
+    int condim = 0;
+    if (geom_elem->QueryIntAttribute("condim", &condim) == tinyxml2::XML_SUCCESS) {
+        g.condim = static_cast<uint8_t>(condim);
+        g.has_condim = true;
+    }
+    if (geom_elem->QueryIntAttribute("priority", &g.priority) == tinyxml2::XML_SUCCESS) {
+        g.has_priority = true;
+    }
+    if (geom_elem->QueryFloatAttribute("solmix", &g.solmix) == tinyxml2::XML_SUCCESS) {
+        g.has_solmix = true;
+    }
+    if (geom_elem->QueryFloatAttribute("margin", &g.margin) == tinyxml2::XML_SUCCESS) {
+        g.has_margin = true;
+    }
+    if (geom_elem->QueryFloatAttribute("gap", &g.gap) == tinyxml2::XML_SUCCESS) {
+        g.has_gap = true;
+    }
+    if (geom_elem->Attribute("solref") &&
+        ParseFloatList(geom_elem->Attribute("solref"), g.solref, 2) > 0) {
+        g.has_solref = true;
+    }
+    if (geom_elem->Attribute("solimp") &&
+        ParseFloatList(geom_elem->Attribute("solimp"), g.solimp, 5) > 0) {
+        g.has_solimp = true;
+    }
+    if (ParseFrictionFirst(geom_elem->Attribute("friction"), g.friction_mu)) {
+        g.has_friction = true;
+    }
+}
+
 void ParseDefaultElement(tinyxml2::XMLElement* default_elem,
                          const MjcfDefaultClass& inherited,
                          MjcfDefaults* defaults) {
@@ -195,6 +311,7 @@ void ParseDefaultElement(tinyxml2::XMLElement* default_elem,
     MjcfDefaultClass current = inherited;
     ApplyJointDefault(default_elem->FirstChildElement("joint"), &current);
     ApplyGeneralDefault(default_elem->FirstChildElement("general"), &current);
+    ApplyGeomDefault(default_elem->FirstChildElement("geom"), &current);
 
     if (const char* class_name = default_elem->Attribute("class")) {
         defaults->classes[class_name] = current;
@@ -427,7 +544,65 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             }
         }
 
-        scene.AddCollisionShape(std::move(shape));
+        // -- C1b collision/contact attributes --------------------------------
+        // Precedence (low -> high): the CollisionShapeRecord's C1a defaults
+        // (already MuJoCo's) < the resolved <default> class's <geom> attrs
+        // (presence-gated) < the geom's own explicit attrs. Geom class resolves
+        // exactly like joints: the geom's own `class` attr, else the body's
+        // (inherited) `childclass`.
+        const char* geom_class = geom->Attribute("class");
+        const MjcfGeomDefaults& gd =
+            DefaultClassOrRoot(context.defaults, geom_class ? geom_class : child_class).geom;
+        if (gd.has_contype)     { shape.contype = gd.contype; }
+        if (gd.has_conaffinity) { shape.conaffinity = gd.conaffinity; }
+        if (gd.has_group)       { shape.collision_group = gd.group; }
+        if (gd.has_condim)      { shape.condim = gd.condim; }
+        if (gd.has_priority)    { shape.priority = gd.priority; }
+        if (gd.has_solmix)      { shape.solmix = gd.solmix; }
+        if (gd.has_margin)      { shape.margin = gd.margin; }
+        if (gd.has_gap)         { shape.gap = gd.gap; }
+        if (gd.has_solref)      { shape.solref[0] = gd.solref[0]; shape.solref[1] = gd.solref[1]; }
+        if (gd.has_solimp) {
+            for (int k = 0; k < 5; ++k) { shape.solimp[k] = gd.solimp[k]; }
+        }
+        // friction_mu stays the -1 "inherit material μ" sentinel unless the
+        // default class explicitly set a friction; only friction[0] is kept.
+        if (gd.has_friction)    { shape.friction_mu = gd.friction_mu; }
+
+        // The geom's own explicit attrs override the resolved class default.
+        // QueryUnsignedAttribute/QueryIntAttribute/QueryFloatAttribute write the
+        // target ONLY on XML_SUCCESS, so an ABSENT attr leaves the value from
+        // the default/record untouched (this also makes contype="0" read as a
+        // literal 0, not the default 1 -- the h1 visual-only finger pattern).
+        geom->QueryUnsignedAttribute("contype", &shape.contype);
+        geom->QueryUnsignedAttribute("conaffinity", &shape.conaffinity);
+        geom->QueryIntAttribute("group", &shape.collision_group);
+        {
+            int condim = 0;
+            if (geom->QueryIntAttribute("condim", &condim) == tinyxml2::XML_SUCCESS) {
+                shape.condim = static_cast<uint8_t>(condim);
+            }
+        }
+        geom->QueryIntAttribute("priority", &shape.priority);
+        geom->QueryFloatAttribute("solmix", &shape.solmix);
+        geom->QueryFloatAttribute("margin", &shape.margin);
+        geom->QueryFloatAttribute("gap", &shape.gap);
+        // solref (<=2) / solimp (<=5): fill what's present, leave the rest at the
+        // already-resolved value (ParseFloatList only writes successfully-parsed
+        // entries, so a partial list does not zero the trailing defaults).
+        ParseFloatList(geom->Attribute("solref"), shape.solref, 2);
+        ParseFloatList(geom->Attribute("solimp"), shape.solimp, 5);
+        // friction: take ONLY the first (isotropic tangential) component;
+        // spin/roll (and any further) friction are DROPPED. Set the per-shape μ
+        // override only when friction is explicitly present here (so an
+        // unspecified friction keeps the -1 sentinel for the cooker to resolve).
+        ParseFrictionFirst(geom->Attribute("friction"), shape.friction_mu);
+
+        const std::string geom_name = shape.name;
+        const scene::ShapeId shape_id = scene.AddCollisionShape(std::move(shape));
+        if (!geom_name.empty()) {
+            context.geom_ids[geom_name] = shape_id;
+        }
     }
 
     for (auto* joint = body_elem->FirstChildElement("joint");
@@ -572,6 +747,74 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
     }
 }
 
+// Parse the top-level <contact> section (a sibling of <worldbody>), which holds
+// <exclude> (per-body-pair collision exclusion) and <pair> (explicit per-geom-
+// pair contact overrides). Run AFTER the body tree so body/geom names resolve.
+// Name resolution is non-fatal: an unresolved name is SKIPPED with a warning
+// (matching the importer's "skip-not-crash" intent for authoring slips). The
+// filter/merge POLICY that consumes excludes + pair overrides is C1c.
+void ParseContact(tinyxml2::XMLElement* mujoco,
+                  scene::SceneIR& scene,
+                  const MjcfParseContext& context) {
+    auto* contact_root = mujoco->FirstChildElement("contact");
+    if (!contact_root) {
+        return;
+    }
+
+    for (auto* exclude = contact_root->FirstChildElement("exclude");
+         exclude != nullptr;
+         exclude = exclude->NextSiblingElement("exclude")) {
+
+        const char* b1 = exclude->Attribute("body1");
+        const char* b2 = exclude->Attribute("body2");
+        const scene::BodyId id1 = ResolveBody(b1, context);
+        const scene::BodyId id2 = ResolveBody(b2, context);
+        if (id1 == scene::kInvalidBody || id2 == scene::kInvalidBody) {
+            std::cerr << "MJCF: <contact><exclude> references unknown body '"
+                      << (b1 ? b1 : "(null)") << "' / '" << (b2 ? b2 : "(null)")
+                      << "' -- skipped\n";
+            continue;
+        }
+        scene.AddExcludePair(id1, id2);
+    }
+
+    for (auto* pair = contact_root->FirstChildElement("pair");
+         pair != nullptr;
+         pair = pair->NextSiblingElement("pair")) {
+
+        const char* g1 = pair->Attribute("geom1");
+        const char* g2 = pair->Attribute("geom2");
+        const auto it1 = g1 ? context.geom_ids.find(g1) : context.geom_ids.end();
+        const auto it2 = g2 ? context.geom_ids.find(g2) : context.geom_ids.end();
+        if (it1 == context.geom_ids.end() || it2 == context.geom_ids.end()) {
+            std::cerr << "MJCF: <contact><pair> references unknown geom '"
+                      << (g1 ? g1 : "(null)") << "' / '" << (g2 ? g2 : "(null)")
+                      << "' -- skipped\n";
+            continue;
+        }
+
+        // A <pair> is an explicit authored override: ContactPairOverride is
+        // pre-initialized to MuJoCo's concrete pair defaults (NOT the -1 friction
+        // sentinel), so absent attrs keep those defaults.
+        scene::ContactPairOverride ov;
+        ov.geom1 = it1->second;
+        ov.geom2 = it2->second;
+        {
+            int condim = 0;
+            if (pair->QueryIntAttribute("condim", &condim) == tinyxml2::XML_SUCCESS) {
+                ov.condim = static_cast<uint8_t>(condim);
+            }
+        }
+        pair->QueryFloatAttribute("margin", &ov.margin);
+        pair->QueryFloatAttribute("gap", &ov.gap);
+        ParseFloatList(pair->Attribute("solref"), ov.solref, 2);
+        ParseFloatList(pair->Attribute("solimp"), ov.solimp, 5);
+        // friction: first (isotropic tangential) component only; spin/roll dropped.
+        ParseFrictionFirst(pair->Attribute("friction"), ov.friction_mu);
+        scene.AddContactPair(ov);
+    }
+}
+
 } // namespace
 
 scene::SceneIR LoadMjcf(const std::string& path) {
@@ -608,6 +851,8 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     ParseActuators(mujoco, scene, context);
     ParseSensors(mujoco, scene, context);
+    // <contact> is parsed LAST so all body + geom names already resolve.
+    ParseContact(mujoco, scene, context);
 
     return scene;
 }

@@ -1,0 +1,47 @@
+<mujoco model="contact_filtering">
+  <!-- v0.8 C1b fixture: geom collision/contact attributes, <default> class
+       inheritance for <geom>, and the top-level <contact> exclude/pair section.
+       Geoms are resolved BY NAME in the test (not parse order). -->
+  <default>
+    <default class="c">
+      <geom contype="8" solref="0.005 0.5"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <!-- b1: a fully-explicit geom (case 1) + a default-record geom (case 6). -->
+    <body name="b1" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.1 0.1 0.1"/>
+      <!-- case 1: every C1b attr set explicitly; friction[0]=0.7, spin/roll dropped. -->
+      <geom name="g_explicit" type="box" size="0.1 0.1 0.1"
+            contype="2" conaffinity="4" condim="1" group="3" priority="5"
+            solref="0.01 0.8" solimp="0.8 0.9 0.002 0.4 3"
+            friction="0.7 0.1 0.01" margin="0.01" gap="0.005" solmix="0.5"/>
+      <!-- case 6: no contact attrs -> all C1a record defaults. -->
+      <geom name="g_default" type="sphere" size="0.05"/>
+      <!-- case 2: contype=0 visual-only (h1 finger pattern). -->
+      <geom name="g_visual" type="box" size="0.02 0.02 0.02"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- b2: <default>-class inheritance (case 3). -->
+    <body name="b2" pos="1 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.1 0.1 0.1"/>
+      <!-- inherits contype=8 + solref from class "c"; condim NOT in class -> default 3. -->
+      <geom name="g_class" class="c" type="box" size="0.1 0.1 0.1"/>
+      <!-- in class "c" but sets its OWN contype -> own value (10) wins; solref still inherited. -->
+      <geom name="g_class_override" class="c" type="box" size="0.1 0.1 0.1" contype="10"/>
+    </body>
+  </worldbody>
+
+  <contact>
+    <!-- case 4: body-pair exclusion. -->
+    <exclude body1="b1" body2="b2"/>
+    <!-- unresolved name -> skipped with a warning, no crash. -->
+    <exclude body1="b1" body2="does_not_exist"/>
+    <!-- case 5: explicit geom-pair override; friction[0]=0.5, condim=1. -->
+    <pair geom1="g_explicit" geom2="g_default" friction="0.5" condim="1"/>
+    <!-- unresolved geom -> skipped with a warning, no crash. -->
+    <pair geom1="g_explicit" geom2="no_such_geom"/>
+  </contact>
+</mujoco>
