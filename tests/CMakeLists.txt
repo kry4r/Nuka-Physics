@@ -291,6 +291,7 @@ add_executable(nuka_scene_test
     scene/test_scene_cooker.cpp
     scene/test_scene_pipeline.cpp
     scene/test_contact_metadata_cook.cpp
+    scene/test_filter_precedence.cpp
 )
 
 target_link_libraries(nuka_scene_test

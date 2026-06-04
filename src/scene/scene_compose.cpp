@@ -44,6 +44,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     const auto body_off = static_cast<uint32_t>(base.RigidBodyCount());
     const auto mat_off  = static_cast<uint32_t>(base.MaterialCount());
     const auto joint_off = static_cast<uint32_t>(base.JointCount());
+    const auto shape_off = static_cast<uint32_t>(base.ShapeCount());
 
     // -- Materials ----------------------------------------------------------
     // (No cross-refs; id reassigned by AddMaterial. Append in order.)
@@ -118,6 +119,25 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.attached_body = RemapId(rec.attached_body, body_off);
         out.AddLight(std::move(rec));
+    }
+
+    // -- Collision-filter carry-over (v0.8 C1c) -----------------------------
+    // `out = base` already copied base's exclude_pairs_ / contact_pairs_; here we
+    // APPEND only the addon's, with the same append-with-offset remap the rest of
+    // the compose uses. Body-pair ids offset by body_off; <pair> geom ShapeIds
+    // offset by shape_off (shapes are reassigned dense ids by AddCollisionShape,
+    // so an addon shape at index s lands at shape_off + s -- identical to body
+    // remapping). AddExcludePair re-canonicalizes (min,max); offset preserves
+    // ordering so canonical form is stable. kInvalid* sentinels stay sentinel
+    // via RemapId.
+    for (const std::pair<BodyId, BodyId>& e : addon.ExcludePairs()) {
+        out.AddExcludePair(RemapId(e.first, body_off), RemapId(e.second, body_off));
+    }
+    for (const ContactPairOverride& src : addon.ContactPairs()) {
+        ContactPairOverride pair = src;
+        pair.geom1 = RemapId(pair.geom1, shape_off);
+        pair.geom2 = RemapId(pair.geom2, shape_off);
+        out.AddContactPair(pair);
     }
 
     return out;

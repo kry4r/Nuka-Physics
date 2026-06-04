@@ -4,8 +4,11 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/canonical_types.hpp"
+#include "scene/contact_filter.hpp"   // MergedContactParams (v0.8 C1c)
 #include "math/transform.hpp"
 
+#include <algorithm>
+#include <utility>
 #include <vector>
 
 namespace nuka::scene {
@@ -123,6 +126,103 @@ struct CookedContactParamTable {
     std::vector<float>    gaps;
 };
 
+// --- v0.8 C1c: cook-time filtered-pair policy + system-pair matrix --------
+//
+// The filter POLICY is the baked output of MuJoCo's collision filtering
+// precedence (research doc §8): explicit <pair> overrides > <exclude> >
+// parent-child auto-exclude > contype/conaffinity bitmask. C1c bakes the
+// first three at cook time; the bitmask test stays a per-pair runtime check
+// (PassesContactBitmask, contact_filter.hpp) since it depends only on the
+// per-shape contype/conaffinity already in CookedContactParamTable.
+
+// Broad classification of a body's owning simulation subsystem, for the
+// forward-looking cross-system enable matrix (consumed by C2). v0.8 has no
+// MJCF source that authors this; the matrix defaults all-enabled.
+enum class SystemKind : uint8_t {
+    Rigid      = 0,
+    Articulated = 1,
+    Soft       = 2,
+    Cloth      = 3,
+    Fluid      = 4
+};
+
+// Symmetric 5x5 enable matrix over SystemKind pairs. Default: ALL true (every
+// system collides with every system). A forward-looking enable seam for C2.
+struct SystemPairMatrix {
+    bool enabled[5][5];
+    SystemPairMatrix() {
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j) enabled[i][j] = true;
+    }
+};
+
+// Set/clear a SystemKind pair symmetrically (both (a,b) and (b,a)).
+inline void SetSystemPairEnabled(SystemPairMatrix& m, SystemKind a, SystemKind b,
+                                 bool enabled) {
+    const auto ia = static_cast<int>(a);
+    const auto ib = static_cast<int>(b);
+    m.enabled[ia][ib] = enabled;
+    m.enabled[ib][ia] = enabled;
+}
+
+inline bool IsSystemPairEnabled(const SystemPairMatrix& m, SystemKind a,
+                                SystemKind b) {
+    return m.enabled[static_cast<int>(a)][static_cast<int>(b)];
+}
+
+// An authored <contact><pair> explicit override, baked into the policy. geom1/
+// geom2 are in SOURCE-shape space (the ShapeIds the <pair> named), canonicalized
+// as (min,max) and sorted. params holds the as-authored override values copied
+// straight across (C1b pre-filled MuJoCo defaults for omitted attrs); v0.8 does
+// NOT geom-merge omitted <pair> attributes (see BuildFilteredPairPolicy doc).
+//
+// SOURCE-shape vs COOKED-row space: a <pair> on a mesh that V-HACD decomposed
+// into N convex pieces maps to N cooked rows (CookedShapeTable). That source ->
+// cooked-row expansion is a C2 consumption concern; this struct stays in source
+// space (the space the SceneIR authored), and C2 must bridge it via the cook's
+// per-row provenance.
+struct CookedExplicitPair {
+    ShapeId geom1 = kInvalidShape;
+    ShapeId geom2 = kInvalidShape;
+    MergedContactParams params;
+};
+
+struct CookedFilterPolicy {
+    // Union of authored <exclude> body pairs and parent-child auto-excludes,
+    // each canonicalized (min,max), deduplicated, and ascending-sorted so the
+    // lookup can binary search.
+    std::vector<std::pair<BodyId, BodyId>> excluded_body_pairs;
+    // Authored <contact><pair> overrides, canonical (min,max) on (geom1,geom2)
+    // and ascending-sorted for binary search.
+    std::vector<CookedExplicitPair>        explicit_pairs;
+    // Cross-system enable matrix; default all-enabled.
+    SystemPairMatrix                       system_pairs;
+};
+
+// Binary-search the sorted canonical excluded_body_pairs for (a,b) in any order.
+inline bool IsBodyPairExcluded(const CookedFilterPolicy& policy, BodyId a,
+                               BodyId b) {
+    if (b < a) std::swap(a, b);
+    const std::pair<BodyId, BodyId> key{a, b};
+    return std::binary_search(policy.excluded_body_pairs.begin(),
+                              policy.excluded_body_pairs.end(), key);
+}
+
+// Binary-search the sorted canonical explicit_pairs for (g1,g2) in any order.
+// Returns nullptr if no explicit pair was authored for that geom pair.
+inline const CookedExplicitPair* FindExplicitPair(const CookedFilterPolicy& policy,
+                                                  ShapeId g1, ShapeId g2) {
+    if (g2 < g1) std::swap(g1, g2);
+    const auto it = std::lower_bound(
+        policy.explicit_pairs.begin(), policy.explicit_pairs.end(), g1,
+        [](const CookedExplicitPair& p, ShapeId v) { return p.geom1 < v; });
+    for (auto cur = it; cur != policy.explicit_pairs.end() && cur->geom1 == g1;
+         ++cur) {
+        if (cur->geom2 == g2) return &(*cur);
+    }
+    return nullptr;
+}
+
 struct CookedSensorTable {
     std::vector<SensorType>      types;
     std::vector<BodyId>          attached_bodies;
@@ -174,6 +274,7 @@ struct CookedBlob {
     CookedJointTable joints;
     CookedShapeTable shapes;
     CookedContactParamTable contact_params;  // v0.8 C1a: per-shape contact params (parallel to shapes)
+    CookedFilterPolicy filter_policy;        // v0.8 C1c: baked filter/exclude/explicit-pair policy
     CookedConvexGeometry convex_geometry;  // v0.7 p06: hull geometry for ConvexHull rows
     CookedSdfTable    sdfs;                 // v0.7 p07: narrow-band SDFs per unique piece
     CookedSensorTable sensors;
