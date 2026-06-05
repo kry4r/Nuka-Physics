@@ -978,7 +978,19 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     report.row_count = rows.RowCount();
     report.velocity_iterations = config.velocity_iterations;
     report.position_iterations = config.position_iterations;
-    if (rows.RowCount() == 0u || body_count == 0u || bodies == nullptr) {
+    // v0.8 C5c-1: lift the body_count==0 early-return for the articulation-only
+    // case (go2 foot-ground is link<->static: no rigid bodies, but the chain-J
+    // reaction arm must still run). Proceed when there are rows AND at least one
+    // reacting side class is present: rigid bodies OR articulation data. The rigid
+    // apply path stays inert with body_count==0 because ValidBody(body, 0) is
+    // always false, so the kernel never dereferences a null `bodies`. Legacy /
+    // C5a / C5b rigid callers always pass body_count>0 + non-null bodies, so their
+    // guard behaviour is unchanged (they never hit the new have_articulation leg).
+    const bool have_rigid = body_count > 0u && bodies != nullptr;
+    const bool have_articulation_early =
+        articulation.art_refs != nullptr && articulation.art_refs_count > 0u &&
+        articulation.dof_stride > 0u;
+    if (rows.RowCount() == 0u || (!have_rigid && !have_articulation_early)) {
         return report;
     }
 
@@ -1006,10 +1018,15 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     UploadToScratch(scratch.color_ranges,
                     scratch.color_ranges_bytes,
                     partitions.color_ranges);
+    // v0.8 C5c-1: only upload the rigid body SoA when there ARE rigid bodies
+    // (body_count==0 + bodies==nullptr is the legitimate articulation-only case --
+    // do not push a null pointer through a 0-byte memcpy).
     const size_t bodies_bytes =
         body_count * sizeof(runtime::rigid::BodyState);
-    EnsureScratchBuffer(scratch.bodies, scratch.bodies_bytes, bodies_bytes);
-    scratch.bodies.CopyFromHost(bodies, bodies_bytes);
+    if (have_rigid) {
+        EnsureScratchBuffer(scratch.bodies, scratch.bodies_bytes, bodies_bytes);
+        scratch.bodies.CopyFromHost(bodies, bodies_bytes);
+    }
     EnsureScratchBuffer(scratch.max_error,
                         scratch.max_error_bytes,
                         sizeof(float));
@@ -1129,7 +1146,11 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     ++report.row_scheduler_report.solver_launch_count;
 
     CheckCuda(cudaStreamSynchronize(stream), "RowSolver stream synchronize");
-    scratch.bodies.CopyToHost(bodies, bodies_bytes);
+    // v0.8 C5c-1: download the mutated rigid bodies only when they exist (the
+    // articulation-only path has no rigid SoA to copy back).
+    if (have_rigid) {
+        scratch.bodies.CopyToHost(bodies, bodies_bytes);
+    }
     scratch.rows.CopyToHost(rows.rows.data(),
                             rows.rows.size() * sizeof(constraint::Row));
     // v0.8 C5b-core: download the MUTATED articulation qdot (the apply wrote it).

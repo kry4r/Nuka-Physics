@@ -1762,6 +1762,47 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_floating_base_contact_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C5c-1: floating-base go2 foot<->ground contact through the UNIFIED
+    # collision/contact spine (contact_stream_driver -> sphere x plane narrowphase
+    # -> EmitCompliantContactRows -> UnifiedSolve C5b-core ArticulationChainJ arm).
+    # PROVES the foot contact force recoils into the floating base via the 18-wide
+    # foot chain Jacobian (6 base + 12 leg): a structural base-column J check
+    # (roll=+lever_y, pitch=-lever_x, lin_z=1), the base-z recoil through the
+    # unified solve, a summed-normal-impulse ~ m_total*g*dt weight balance, and D1
+    # two-run byte-identity. Compiles the host contact_stream_driver.cpp directly
+    # (validated-not-wired: it is in no production lib); needs nuka_codegen for the
+    # generated collidable_registry.hpp.
+    add_executable(nuka_foot_ground_subsume_test
+        solver/test_foot_ground_subsume.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_foot_ground_subsume_test nuka_codegen)
+
+    target_compile_definitions(nuka_foot_ground_subsume_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_foot_ground_subsume_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_foot_ground_subsume_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_foot_ground_subsume_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
     add_executable(nuka_go2_pd_standing_test
         runtime/test_go2_pd_standing.cpp
