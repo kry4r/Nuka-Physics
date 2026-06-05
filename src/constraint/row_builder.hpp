@@ -5,6 +5,7 @@
 
 #include "constraint/collidable.hpp"
 #include "constraint/contact_manifold.hpp"
+#include "constraint/contact_row_sides.hpp"  // v0.8 C5a: ContactRowSides (POD)
 #include "constraint/row_buffers.hpp"
 #include "math/transform.hpp"
 
@@ -55,17 +56,9 @@ struct ContactRowComplianceInputs {
     bool refsafe = true;       // REFSAFE timeconst clamp (MuJoCo default on)
 };
 
-// Per-emitted-row side tags so C5's reaction providers can dispatch each side of
-// a contact row class-blind WITHOUT mutating any production-read struct (Row /
-// RowAnchor / RowBodyPair stay byte-identical -> goldens do not move). The
-// emitter fills ONE entry per row it appends, in the SAME order as the rows; a
-// row at appended-index i has its sides at out_sides[base + i] where base is the
-// RowBuffers row count captured at emitter entry. Production never reads this;
-// C5 does.
-struct ContactRowSides {
-    CollidableRef a;  // side-A collidable (type/react/handle from the manifold)
-    CollidableRef b;  // side-B collidable
-};
+// ContactRowSides (the per-emitted-row CollidableRef side tags) is defined in
+// constraint/contact_row_sides.hpp (split out in C5a so the C++17 CUDA row solver
+// can include it without row_builder.hpp's C++20 <span> dependency).
 
 // THE C4b DELIVERABLE. For each manifold, per contact point:
 //   * ONE compliant NORMAL row (kMaximalContactRowClassId, Unilateral|GradActive,

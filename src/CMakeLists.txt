@@ -245,6 +245,8 @@ nuka_set_warnings(nuka_constraint)
 add_library(nuka_solver STATIC
     solver/diff_test_bridge.cpp
     solver/rigid_solver.cpp
+    # v0.8 C5a: UnifiedSolve standalone entry (validated-not-wired).
+    solver/unified_solve.cpp
 )
 set_target_properties(nuka_solver PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

@@ -41,6 +41,15 @@ constexpr uint16_t Unilateral = 1u << 1;
 constexpr uint16_t Friction = 1u << 2;
 constexpr uint16_t Coupled = 1u << 3;
 constexpr uint16_t GradActive = 1u << 4;
+// v0.8 C5a: discriminates COMPLIANT contact rows (emitted by
+// EmitCompliantContactRows) from the legacy class-id-0 contact rows (both use
+// kMaximalContactRowClassId, so class id cannot discriminate). The unified
+// solver's compliant branch gates on this flag: compliant rows add
+// Row.compliance_alpha (the dual regularizer R) to the effective-mass
+// denominator, route reaction through the ReactionProvider per side, use
+// unilateral coupled-pyramid friction bounds, and skip Baumgarte. Legacy rows
+// never carry this flag, so the legacy solve path is byte-identical.
+constexpr uint16_t Compliant = 1u << 5;
 } // namespace row_flags
 
 inline constexpr uint32_t kMaximalContactRowClassId = 0u;

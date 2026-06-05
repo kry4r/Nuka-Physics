@@ -265,12 +265,17 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
             material.restitution = manifold.restitution;
             material.position_error = point.penetration;
 
+            // v0.8 C5a: tag the row Compliant so the unified solver routes it
+            // through the compliant branch (regularizer R in the denominator,
+            // ReactionProvider per side, unilateral pyramid bounds, no Baumgarte).
+            // Legacy rows never carry this flag -> legacy solve byte-identical.
             Row row = MakeBaseRow(kMaximalContactRowClassId,
                                   compliant.aref_bias,   // rhs = aref
                                   0.0f,
                                   FLT_MAX,
                                   point.normal_impulse,
-                                  row_flags::Unilateral | row_flags::GradActive);
+                                  row_flags::Unilateral | row_flags::GradActive |
+                                      row_flags::Compliant);
             row.compliance_alpha = compliant.R;          // R = dual regularizer
 
             out_rows->AddRow(row,
@@ -332,13 +337,17 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
                     // Friction rows carry NO compliance bias: compliance_alpha=0,
                     // rhs=0 (MakeBaseRow default), direction only (mirrors
                     // AppendContactGroup). Cone bounds are applied by C5.
+                    // v0.8 C5a: tag Compliant so the unified solver applies the
+                    // NEW unilateral coupled-pyramid bounds [0, mu*TotalNormalLambda]
+                    // (NOT the legacy bilateral IsFrictionRow override).
                     Row row = MakeBaseRow(kMaximalContactRowClassId,
                                           0.0f,
                                           0.0f,
                                           0.0f,
                                           warm[s & 3u],
                                           row_flags::Friction |
-                                              row_flags::GradActive);
+                                              row_flags::GradActive |
+                                              row_flags::Compliant);
                     out_rows->AddRow(row,
                                      {body_a, body_b},
                                      MakeJacobian(dir),

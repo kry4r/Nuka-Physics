@@ -1,0 +1,63 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// nuka::solver -- UnifiedSolve (v0.8 C5a). The class-blind contact-solve entry.
+// ---------------------------------------------------------------------------
+// VALIDATED, NOT WIRED. C5a is the first standalone-callable entry that drives
+// the COMPLIANT contact path end-to-end on the GPU: it consumes the C4b
+// EmitCompliantContactRows output (compliant normal rows carrying R/aref + the
+// linearized pyramid friction spokes + the per-row ContactRowSides) and runs the
+// (now compliant-aware) production graph-colored PGS kernel in row_solver.cu.
+//
+// It is a NEW entry alongside the legacy solver::SolveConstraints; it does NOT
+// flip the production world stepper. The legacy GPU solve stays byte-identical
+// (UnifiedSolve adds a separate code path; the legacy path passes sides=nullptr
+// and the kernel never reads sides for a non-Compliant row).
+//
+// WHAT IS / ISN'T WIRED in C5a:
+//   - The compliant EFFECTIVE MASS adds Row.compliance_alpha (= R, the dual
+//     regularizer) to the summed two-sided J M^-1 J^T -- the headline C5a wiring.
+//   - Per-side reaction dispatch is by ContactRowSides::{a,b}.react. The
+//     RigidInvMass arm is CORRECT (built inline from the rigid BodyState, reusing
+//     the C4c RigidEffectiveInvMass / RigidApplyImpulse math). The other arms
+//     (ArticulationChainJ -> C5b, ParticleInvMass -> C6, StaticNull -> zero) are
+//     dispatched but UNEXERCISED in C5a's all-rigid scope (see row_solver.cu).
+//   - Friction uses the NEW unilateral coupled-pyramid bounds [0, mu*sum lambda_n]
+//     (NOT the legacy bilateral override).
+//   - Compliant rows SKIP Baumgarte position projection (they self-correct via
+//     the aref velocity bias). UnifiedSolve is therefore VELOCITY-only for the
+//     compliant rows it drives; the CALLER owns gravity + integration.
+//
+// DETERMINISM (D1): preserved verbatim from the single-block graph-colored kernel
+// (no new atomics, fixed SolverConfig iteration counts, fixed-order scans).
+// ---------------------------------------------------------------------------
+
+#include "constraint/reaction_provider.hpp"  // ReactionProvider
+#include "constraint/row_buffers.hpp"        // RowBuffers
+#include "constraint/row_builder.hpp"        // ContactRowSides
+#include "runtime/rigid/body_state.hpp"      // BodyState
+#include "solver/rigid_solver.hpp"           // SolverConfig
+
+#include <vector>
+
+namespace nuka::solver {
+
+// Everything the unified solve needs for ONE velocity-solve pass over a set of
+// (mostly compliant) contact rows. `rows`/`state` are mutated in place (the rows'
+// lambda warm-start + the bodies' velocities). `sides` is the per-row side tag
+// stream from EmitCompliantContactRows (same order as rows.rows); `reactions` is
+// the §0.5 provider dispatcher (carried for the C5b/C6 device-resident wiring --
+// C5a dispatches the RigidInvMass arm inline from `state`, so a default-empty
+// provider is accepted). `dt` is the substep dt (informational for C5a).
+struct SolveContext {
+    constraint::RowBuffers* rows = nullptr;
+    std::vector<runtime::rigid::BodyState>* state = nullptr;
+    const std::vector<constraint::ContactRowSides>* sides = nullptr;
+    const constraint::ReactionProvider* reactions = nullptr;
+    float dt = 0.0f;
+};
+
+// Upload rows + bodies + sides -> launch the compliant-aware row_solver kernel ->
+// download. A no-op if rows/state are empty or null.
+void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config);
+
+} // namespace nuka::solver
