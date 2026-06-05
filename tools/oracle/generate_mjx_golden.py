@@ -49,6 +49,7 @@ class _UsdPrim:
     upper_limit: float = 3.14159
     gain: float = 1.0
     force_limit: float = 0.0
+    radius: float = 0.0
     children: list["_UsdPrim"] = field(default_factory=list)
 
 
@@ -190,6 +191,7 @@ def _apply_usd_property(line: str, prim: _UsdPrim) -> None:
     for key, attr in (
         ("nuka:gain", "gain"),
         ("nuka:forceLimit", "force_limit"),
+        ("radius", "radius"),
     ):
         value = _parse_float(line, key)
         if value is not None:
@@ -637,6 +639,340 @@ def generate_floating_base_random_samples(model_path: Path,
         os.replace(tmp_path, out_path)
 
 
+# ---------------------------------------------------------------------------
+# v0.8 C5c-2: floating-base FOOT-CONTACT single-step MJX parity golden.
+#
+# The acceptance layer for the foot-ground contact subsume. Unlike the
+# floating-RANDOM golden (which DISABLES contact and injects leg tau to probe
+# the bare ABA force->accel response), this mode KEEPS contact ON: it places a
+# floating go2 with its feet PENETRATING a +Z ground plane by a known delta and
+# records ONE mjx.forward -> qacc. The PRIMARY value under test is the base-6
+# qacc: proof that the foot CONTACT force recoils into the floating base
+# MJX-exactly (the part featherstone could only reach via leg tau, not contact).
+#
+# CRITICAL MODEL-ALIGNMENT DECISION (the task's #1 risk). The MJX side is built
+# by SOURCE-TO-SOURCE TRANSLATION of the SAME go2_float.usda that Nuka cooks,
+# NOT from go2_mjx.xml. go2_mjx.xml carries rotated/offset inertials
+# (quat=..., COM pos=0.0211...) and a different foot offset (-0.002 0 -0.213)
+# that would yield a DIFFERENT mass matrix M than Nuka's diagonal-at-origin USD
+# cook -- making a base-6 mismatch uninterpretable (M diff vs solver diff). The
+# thing under test is the contact-force->base coupling (the solver), so both
+# sides must share M BY CONSTRUCTION. The fixed-base oracle already proved this
+# translator's kinematics match Nuka's USD cook (~1e-4), so the floating variant
+# (freejoint + foot spheres at the SAME USD offsets + a floor) has Nuka-identical
+# FK + M. Foot spheres use the USD radius/offset and condim=1 frictionless with
+# MuJoCo-DEFAULT solref/solimp (== the Nuka ContactManifold defaults
+# solref=[0.02,1], solimp=[0.9,0.95,0.001,0.5,2]); go2's foot override
+# (solimp="0.015 1 0.031", condim=6) is DELIBERATELY NOT used.
+#
+# The record per config carries BOTH a contact-ON qacc and a contact-OFF qacc:
+# the OFF qacc is the GATE-0 free-dynamics tolerance floor (and lets the test
+# isolate the contact contribution as ON-OFF on both sides). It also records the
+# contact set (ncon, per-contact world pos/normal/dist) and efc_force so the C++
+# test can verify the contact STATE matches Nuka's manifold before comparing
+# qacc, and corroborate the per-contact normal force (Nuka lambda/dt).
+# ---------------------------------------------------------------------------
+
+# Custom golden layout for the contact-step golden (NOT the shared NUKAGOLD
+# GoldenTrajectory format, which is a fixed [qpos,qvel,tau,qacc] record). The
+# C5c-2 test ships a small bespoke reader. Magic "NUKACSTP" (Nuka Contact STeP).
+KIND_CONTACT_STEP_MAGIC = b"NUKACSTP"
+CONTACT_STEP_VERSION = 1
+MAX_CONTACTS_RECORDED = 8  # generous upper bound (go2 has 4 feet -> 4 contacts)
+
+
+def _usda_to_floating_contact_mjcf(source: Path, work: Path,
+                                   foot_solref, foot_solimp,
+                                   floor_height: float) -> tuple[Path, list[str]]:
+    """Translate go2_float.usda -> a FLOATING-BASE contact MJCF.
+
+    Identical body/joint/inertial emission to _usda_to_fixed_base_mjcf (the
+    translation the fixed-base oracle proved matches Nuka's cook) PLUS:
+      * a <freejoint/> on the root body (floating 6-DOF base),
+      * foot <geom type="sphere"> on each calf body at the USD Sphere's local
+        translate + radius, condim=1, with the supplied (MuJoCo-default) foot
+        solref/solimp; contype/conaffinity enabled so feet<->floor collide,
+      * a floor plane geom at floor_height.
+    Returns (mjcf_path, foot_geom_names_in_order) where the order is the USD
+    Sphere prim order (== Nuka's foot/manifold append order).
+    """
+    prims = _parse_usda_prims(source)
+    bodies = {prim.path: prim for prim in prims if _is_rigid_body(prim)}
+    joints = [prim for prim in prims if _is_joint(prim)]
+    spheres_by_parent: dict[str, list[_UsdPrim]] = {}
+    for prim in prims:
+        if prim.type == "Sphere":
+            spheres_by_parent.setdefault(prim.parent_path, []).append(prim)
+    for siblings in spheres_by_parent.values():
+        siblings.sort(key=lambda item: item.order)
+
+    children_by_parent: dict[str, list[_UsdPrim]] = {}
+    child_paths: set[str] = set()
+    joint_for_child: dict[str, _UsdPrim] = {}
+    for joint in joints:
+        if joint.type != "PhysicsRevoluteJoint":
+            raise SystemExit(
+                f"{source}: contact-step oracle supports only revolute USD "
+                f"joints; got {joint.type} for {joint.name}")
+        if joint.body0_path not in bodies or joint.body1_path not in bodies:
+            raise SystemExit(f"{source}: joint {joint.name} references an unknown body")
+        children_by_parent.setdefault(joint.body0_path, []).append(joint)
+        child_paths.add(joint.body1_path)
+        joint_for_child[joint.body1_path] = joint
+    for siblings in children_by_parent.values():
+        siblings.sort(key=lambda item: item.order)
+
+    roots = [prim for prim in prims if _is_rigid_body(prim) and prim.path not in child_paths]
+    if len(roots) != 1:
+        raise SystemExit(f"{source}: contact-step oracle expects exactly one root")
+
+    foot_geom_names: list[str] = []
+    solref_str = _fmt(tuple(foot_solref))
+    solimp_str = _fmt(tuple(foot_solimp))
+
+    lines = [
+        '<mujoco model="nuka_go2_float_contact">',
+        '  <compiler angle="radian" coordinate="local"/>',
+        '  <option integrator="Euler" gravity="0 0 -9.81" '
+        'iterations="200" tolerance="1e-12" cone="pyramidal"/>',
+        '  <worldbody>',
+        f'    <geom name="floor" type="plane" pos="0 0 {floor_height:.9g}" '
+        'size="10 10 0.1" contype="1" conaffinity="1" condim="1" '
+        f'solref="{solref_str}" solimp="{solimp_str}"/>',
+    ]
+
+    def emit_body(body: _UsdPrim, indent: int, is_root: bool) -> None:
+        prefix = " " * indent
+        lines.append(
+            f'{prefix}<body name="{_xml_name(body.name)}" pos="{_fmt(body.translate)}">'
+        )
+        if is_root:
+            lines.append(f"{prefix}  <freejoint/>")
+        joint = joint_for_child.get(body.path)
+        if joint is not None:
+            axis = _axis_tuple(joint.axis_token)
+            lines.append(
+                f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
+                f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
+            )
+        if body.mass > 0.0 and not body.kinematic_enabled:
+            lines.append(
+                f'{prefix}  <inertial pos="0 0 0" mass="{body.mass:.9g}" '
+                f'diaginertia="{_fmt(body.diagonal_inertia)}"/>'
+            )
+        for sphere in spheres_by_parent.get(body.path, []):
+            geom_name = f"{body.name}_foot"
+            foot_geom_names.append(geom_name)
+            lines.append(
+                f'{prefix}  <geom name="{_xml_name(geom_name)}" type="sphere" '
+                f'size="{sphere.radius:.9g}" pos="{_fmt(sphere.translate)}" '
+                f'contype="1" conaffinity="1" condim="1" '
+                f'solref="{solref_str}" solimp="{solimp_str}"/>'
+            )
+        for child_joint in children_by_parent.get(body.path, []):
+            emit_body(bodies[child_joint.body1_path], indent + 2, False)
+        lines.append(f"{prefix}</body>")
+
+    emit_body(roots[0], 4, True)
+    lines.append("  </worldbody>")
+    lines.append("</mujoco>")
+    out = work / f"{source.stem}_float_contact_mjx.xml"
+    out.write_text("\n".join(lines) + "\n")
+    return out, foot_geom_names
+
+
+def generate_floating_contact_step(model_path: Path,
+                                   out_path: Path) -> None:
+    """Generate the C5c-2 floating-base foot-CONTACT single-step parity golden.
+
+    See _usda_to_floating_contact_mjcf for the model-alignment rationale (MJX is
+    a source translation of go2_float.usda, NOT go2_mjx.xml). One or a few FIXED
+    configs: feet penetrating the floor by a known delta, qvel=0, gravity ON, a
+    leg holding-tau, base tau=0. Records per config (contact ON and OFF):
+      qpos(nq), qvel(nv), tau(nv), qacc_on(nv), qacc_off(nv),
+      ncon, then per-contact [pos(3), normal(3), dist] for MAX_CONTACTS_RECORDED,
+      then efc_force per-contact normal force (MAX_CONTACTS_RECORDED), then the
+      per-contact invweight (body_invweight0 == efc_diagApprox, MAX_CONTACTS).
+    """
+    jax, jnp, mujoco, mjx = _load_mjx_deps()
+    suffix = model_path.suffix.lower()
+    if suffix not in (".usd", ".usda"):
+        raise SystemExit(
+            "floating-contact-step oracle requires the go2_float USD source "
+            "(source translation), got " + model_path.name)
+
+    # MuJoCo-DEFAULT solref/solimp == the Nuka ContactManifold defaults. Pin both
+    # sides to these (NOT go2's foot override).
+    foot_solref = (0.02, 1.0)
+    foot_solimp = (0.9, 0.95, 0.001, 0.5, 2.0)
+    # Seat the floor so the feet penetrate by ~kPenetration (matches the C5c-1
+    # SeatGround rest-penetration so the contact STATE aligns with Nuka).
+    k_penetration = 0.002
+
+    with tempfile.TemporaryDirectory(prefix="nuka_mjx_float_contact_") as tmp:
+        work = Path(tmp)
+        # First pass: build at a provisional floor height to read the foot world
+        # positions at the home config, then re-seat the floor to the desired
+        # penetration. (Two-pass: cheap, and keeps the geometry exact.)
+        provisional, foot_geoms = _usda_to_floating_contact_mjcf(
+            model_path, work, foot_solref, foot_solimp, floor_height=-100.0)
+        m0 = mujoco.MjModel.from_xml_path(str(provisional))
+        base_dof = _free_joint_qvel_dof(m0)
+        if base_dof is None:
+            raise SystemExit("contact-step oracle: translated model has no freejoint")
+        base_qpos = int(m0.jnt_qposadr[
+            [int(m0.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+             for j in range(m0.njnt)].index(True)])
+
+        # Build the HOME qpos = the SAME configuration Nuka cooks. Nuka's cooker
+        # loads nuka:initialPosition into the cooked q (articulation_state.cpp:321
+        # q.push_back(initial_positions[...])), and the C5c-1 test zeroes only
+        # qdot -- NOT q -- so the cooked crouch (thigh=0.8, calf=-1.5, hip=0) is
+        # the configuration under test. The earlier model.qpos0 (legs straight)
+        # was the wrong config: M depends on q, so the whole parity (not just the
+        # contact STATE) requires q to match. We map each USD joint's initial
+        # position to its MJX qpos slot BY NAME (the MJX body-recursion order and
+        # Nuka's leg order are not guaranteed identical), exactly as the proven
+        # stand-trajectory oracle does (_usd_initial_positions).
+        usd_prims = _parse_usda_prims(model_path)
+        usd_initial_by_name = {
+            p.name: p.initial_position
+            for p in usd_prims
+            if _is_joint(p) and p.has_initial_position
+        }
+        q_home = np.array(m0.qpos0, dtype=np.float64)
+        for jname, q0 in usd_initial_by_name.items():
+            jid = mujoco.mj_name2id(m0, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid < 0:
+                raise SystemExit(
+                    f"contact-step oracle: USD joint {jname} not found in MJX model")
+            q_home[int(m0.jnt_qposadr[jid])] = float(q0)
+        # Base: keep the USD trunk pose (translate z, identity quat) from qpos0.
+
+        d0 = mujoco.MjData(m0)
+        d0.qpos[:] = q_home
+        d0.qvel[:] = 0.0
+        mujoco.mj_forward(m0, d0)
+        # Foot sphere world bottoms at the home config.
+        min_bottom = float("inf")
+        for gname in foot_geoms:
+            gid = mujoco.mj_name2id(m0, mujoco.mjtObj.mjOBJ_GEOM, gname)
+            r = float(m0.geom_size[gid, 0])
+            world_pos = d0.geom_xpos[gid]
+            min_bottom = min(min_bottom, float(world_pos[2]) - r)
+        floor_height = min_bottom + k_penetration
+
+        # Second pass: rebuild with the seated floor.
+        final_path, foot_geoms = _usda_to_floating_contact_mjcf(
+            model_path, work, foot_solref, foot_solimp, floor_height=floor_height)
+        model = mujoco.MjModel.from_xml_path(str(final_path))
+        model.opt.timestep = 1.0 / 240.0  # match the Nuka C5c-1 dt (lambda/dt).
+        nq = int(model.nq)
+        nv = int(model.nv)
+
+        # The fixed config(s). qvel=0, gravity ON, base tau=0, a leg holding-tau.
+        # We use ctrl-free qfrc_applied (qfrc_applied[6:] = leg tau). For the
+        # base-6 normal-recoil proof a ZERO leg tau is the cleanest (the contact
+        # alone drives the base); add a couple of nonzero-leg-tau configs so the
+        # leg-12 corroboration also exercises tau coupling. q_home (built above
+        # from the USD initial positions) is the Nuka cooked crouch.
+        configs = []
+        # Config 0: home stance, zero leg tau (pure contact recoil).
+        configs.append((q_home.copy(), np.zeros(nv)))
+        # Config 1: home stance, a small constant leg holding-tau.
+        tau1 = np.zeros(nv)
+        tau1[6:] = 1.5
+        configs.append((q_home.copy(), tau1.copy()))
+        # Config 2: a slightly deeper base (more penetration), zero leg tau.
+        q_deep = q_home.copy()
+        q_deep[base_qpos + 2] -= 0.001  # lower the base 1 mm -> deeper feet.
+        configs.append((q_deep.copy(), np.zeros(nv)))
+
+        mjx_model_on = mjx.put_model(model)
+        # Contact-OFF model (GATE 0): same model, contact disabled.
+        model_off = mujoco.MjModel.from_xml_path(str(final_path))
+        model_off.opt.timestep = model.opt.timestep
+        model_off.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        mjx_model_off = mjx.put_model(model_off)
+
+        def forward_qacc(mjx_model, qpos, qvel, tau):
+            data = mjx.make_data(mjx_model).replace(
+                qpos=qpos, qvel=qvel, qfrc_applied=tau)
+            return mjx.forward(mjx_model, data).qacc
+
+        forward_on = jax.jit(forward_qacc, static_argnums=())
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        with tmp_path.open("wb") as out:
+            out.write(KIND_CONTACT_STEP_MAGIC)
+            out.write(struct.pack("<IIIII",
+                                  CONTACT_STEP_VERSION,
+                                  len(configs),
+                                  nq, nv,
+                                  MAX_CONTACTS_RECORDED))
+            name = model_path.name.encode("utf-8")
+            out.write(struct.pack("<I", len(name)))
+            out.write(name)
+            for (qpos, tau) in configs:
+                qpos_f = qpos.astype(np.float32)
+                qvel_f = np.zeros(nv, dtype=np.float32)
+                tau_f = tau.astype(np.float32)
+                qacc_on = np.asarray(jax.device_get(forward_on(
+                    mjx_model_on, jnp.asarray(qpos_f), jnp.asarray(qvel_f),
+                    jnp.asarray(tau_f))), dtype=np.float32)
+                qacc_off = np.asarray(jax.device_get(forward_on(
+                    mjx_model_off, jnp.asarray(qpos_f), jnp.asarray(qvel_f),
+                    jnp.asarray(tau_f))), dtype=np.float32)
+                # Contact state + efc_force from a classic mj_forward (mjx data
+                # contact arrays are padded; the CPU pipeline gives the clean
+                # contact set + per-contact normal force via mj_contactForce).
+                dcpu = mujoco.MjData(model)
+                dcpu.qpos[:] = qpos.astype(np.float64)
+                dcpu.qvel[:] = 0.0
+                dcpu.qfrc_applied[:] = tau.astype(np.float64)
+                mujoco.mj_forward(model, dcpu)
+                ncon = int(dcpu.ncon)
+                contact_rows = np.zeros((MAX_CONTACTS_RECORDED, 7), dtype=np.float32)
+                normal_force = np.zeros(MAX_CONTACTS_RECORDED, dtype=np.float32)
+                # invweight per contact = the MuJoCo body_invweight0 sum the efc
+                # row uses (== efc_diagApprox for the contact's normal row). The
+                # parity test feeds this as inputs.invweight so the dual
+                # regularizer R = invweight*(1-imp)/imp matches MuJoCo's exactly
+                # (completing "same compliance inputs both sides"; NOT a tolerance
+                # loosen). With condim=1, efc rows map 1:1 to contacts in order.
+                invweight = np.zeros(MAX_CONTACTS_RECORDED, dtype=np.float32)
+                for c in range(min(ncon, MAX_CONTACTS_RECORDED)):
+                    con = dcpu.contact[c]
+                    pos = np.asarray(con.pos, dtype=np.float32)
+                    # contact frame row 0 is the normal (geom1->geom2 / MuJoCo).
+                    normal = np.asarray(con.frame[0:3], dtype=np.float32)
+                    contact_rows[c, 0:3] = pos
+                    contact_rows[c, 3:6] = normal
+                    contact_rows[c, 6] = float(con.dist)
+                    f6 = np.zeros(6, dtype=np.float64)
+                    mujoco.mj_contactForce(model, dcpu, c, f6)
+                    normal_force[c] = float(f6[0])  # normal component (contact frame)
+                    # The efc row index for contact c (condim=1: efc_address[c]).
+                    efc_row = int(dcpu.contact[c].efc_address)
+                    if 0 <= efc_row < int(dcpu.nefc):
+                        invweight[c] = float(dcpu.efc_diagApprox[efc_row])
+                record = np.concatenate((
+                    qpos.astype(np.float32),
+                    qvel_f,
+                    tau.astype(np.float32),
+                    qacc_on,
+                    qacc_off,
+                    np.array([float(ncon)], dtype=np.float32),
+                    contact_rows.reshape(-1),
+                    normal_force,
+                    invweight,
+                ))
+                out.write(record.astype("<f4", copy=False).tobytes())
+        os.replace(tmp_path, out_path)
+
+
 def generate_stand_trajectory(model_path: Path,
                               out_path: Path,
                               step_count: int,
@@ -764,6 +1100,7 @@ def main() -> int:
     parser.add_argument("--mode",
                         choices=("random-qacc",
                                  "floating-random-qacc",
+                                 "floating-contact-step",
                                  "stand-trajectory"),
                         default="random-qacc")
     parser.add_argument("--samples", default=1000, type=int)
@@ -781,6 +1118,8 @@ def main() -> int:
     elif args.mode == "floating-random-qacc":
         generate_floating_base_random_samples(
             args.model, args.out, args.samples, args.batch_size)
+    elif args.mode == "floating-contact-step":
+        generate_floating_contact_step(args.model, args.out)
     else:
         generate_stand_trajectory(args.model, args.out, args.steps, args.dt)
     print(f"wrote {args.out}")
