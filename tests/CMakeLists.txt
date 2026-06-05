@@ -440,6 +440,8 @@ add_executable(nuka_solver_test
     solver/test_joint_limit.cpp
     solver/test_joint_projection.cpp
     solver/test_row_scheduler_bridge.cpp
+    # v0.8 C5a: UnifiedSolve end-to-end (compliant contact + pyramid + D1).
+    solver/test_unified_solve.cpp
 )
 
 target_link_libraries(nuka_solver_test
