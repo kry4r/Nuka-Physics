@@ -522,6 +522,121 @@ def generate_random_samples(model_path: Path,
         os.replace(tmp_path, out_path)
 
 
+def _free_joint_qvel_dof(model) -> int | None:
+    """Return the qvel start index of the first free joint, or None.
+
+    A MuJoCo free joint owns 6 contiguous DOFs in qvel: [v_lin(3) in WORLD frame,
+    omega(3) in BODY-LOCAL frame] and 7 contiguous slots in qpos: [pos(3),
+    quat(4) w-first]. For the unitree go2/h1 the free joint is jnt 0 (base), so
+    the base occupies qvel[0:6]/qpos[0:7] and the legs follow.
+    """
+    free = int(__import__("mujoco").mjtJoint.mjJNT_FREE)
+    for jnt in range(model.njnt):
+        if int(model.jnt_type[jnt]) == free:
+            return int(model.jnt_dofadr[jnt])
+    return None
+
+
+def generate_floating_base_random_samples(model_path: Path,
+                                          out_path: Path,
+                                          sample_count: int,
+                                          batch_size: int) -> None:
+    """Generate a FLOATING-BASE random-sample golden (additive to the fixed one).
+
+    Unlike generate_random_samples this KEEPS the <freejoint/> so MJX builds the
+    real floating-base model (go2 nv=18/nq=19, h1 nv=25/nq=26: a 6-DOF base + the
+    leg DOFs). It DOES strip <actuator>+<keyframe> (mirroring _fixed_base_model_xml
+    but WITHOUT removing the freejoint): go2's 12 position servos would otherwise
+    inject qfrc_actuator (biasprm position/velocity feedback) into the MJX qacc
+    even at ctrl=0, a force Nuka's bare-tau ABA does not and should not model;
+    <keyframe> must go too because its ctrl field becomes invalid once <actuator>
+    is removed (MuJoCo would fail to compile). It writes RAW MJX arrays -- NO Nuka
+    root-slot padding -- so the golden record is [qpos(nq), qvel(nv), tau(nv),
+    qacc(nv)]; the loader reads the asymmetric (nq != nv) shape from the header.
+    The base qpos quaternion is normalized. The base 6 generalized forces
+    (qfrc_applied over the free-joint DOFs) are ZEROED: Nuka's floating-base ABA
+    has no external-base-force input (joint_force[root]=0), so a nonzero base force
+    in MJX would be unmatchable and would corrupt even the leg accelerations. The
+    harness converts MJX's mixed world/body free-joint convention to Nuka's
+    body-frame spatial convention (incl. the omega x v_lin spatial->classical
+    linear-accel term).
+    """
+    jax, jnp, mujoco, mjx = _load_mjx_deps()
+    suffix = model_path.suffix.lower()
+    if suffix not in (".xml", ".mjcf"):
+        raise SystemExit(
+            "floating-base random oracle supports only MJCF models with a "
+            "<freejoint/>; got " + model_path.name)
+    with tempfile.TemporaryDirectory(prefix="nuka_mjx_floating_base_") as tmp:
+        # Copy assets next to the model so relative mesh/include paths resolve.
+        # Strip <actuator>+<keyframe> (mirror _fixed_base_model_xml) so the MJX
+        # qacc carries NO servo-bias force, but KEEP the <freejoint/> so the base
+        # stays floating (nv=18/nq=19 for go2).
+        work = Path(tmp)
+        if (model_path.parent / "assets").exists():
+            shutil.copytree(model_path.parent / "assets", work / "assets")
+        text = model_path.read_text()
+        text = re.sub(r"\n\s*<keyframe>.*?</keyframe>\s*", "\n", text, flags=re.S)
+        text = re.sub(r"\n\s*<actuator>.*?</actuator>\s*", "\n", text, flags=re.S)
+        floating_model_path = work / model_path.name
+        floating_model_path.write_text(text)
+        model = mujoco.MjModel.from_xml_path(str(floating_model_path))
+        _disable_unconstrained_dynamics_terms(mujoco, model)
+        base_dof = _free_joint_qvel_dof(model)
+        if base_dof is None:
+            raise SystemExit(
+                f"{model_path.name}: no <freejoint/> found; floating-base oracle "
+                "requires a free base joint")
+        base_qpos = int(model.jnt_qposadr[
+            [int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+             for j in range(model.njnt)].index(True)])
+        mjx_model = mjx.put_model(model)
+        rng = np.random.default_rng(seed=4242)
+        batch_size = sample_count if batch_size <= 0 else batch_size
+
+        def forward_one(qpos, qvel, tau):
+            data = mjx.make_data(mjx_model).replace(
+                qpos=qpos,
+                qvel=qvel,
+                qfrc_applied=tau,
+            )
+            return mjx.forward(mjx_model, data).qacc
+
+        forward_batch = jax.jit(jax.vmap(forward_one))
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        with tmp_path.open("wb") as out:
+            _write_header(out,
+                          model_path.name,
+                          KIND_RANDOM_QACC,
+                          sample_count,
+                          model.nq,
+                          model.nv,
+                          model.nv)
+            for start in range(0, sample_count, batch_size):
+                count = min(batch_size, sample_count - start)
+                qpos = rng.uniform(-0.2, 0.2, (count, model.nq)).astype(np.float32)
+                qvel = rng.uniform(-0.5, 0.5, (count, model.nv)).astype(np.float32)
+                tau = rng.uniform(-2.0, 2.0, (count, model.nv)).astype(np.float32)
+                # Normalize the free-joint quaternion (qpos[base_qpos+3 : +7]).
+                quat = qpos[:, base_qpos + 3:base_qpos + 7]
+                norm = np.linalg.norm(quat, axis=1, keepdims=True)
+                norm[norm == 0.0] = 1.0
+                qpos[:, base_qpos + 3:base_qpos + 7] = quat / norm
+                # Zero the base generalized force: Nuka has no base-force input.
+                tau[:, base_dof:base_dof + 6] = 0.0
+                qacc = np.asarray(
+                    jax.device_get(
+                        forward_batch(jnp.asarray(qpos),
+                                      jnp.asarray(qvel),
+                                      jnp.asarray(tau))),
+                    dtype=np.float32)
+                records = np.concatenate((qpos, qvel, tau, qacc), axis=1)
+                out.write(records.astype("<f4", copy=False).tobytes())
+        os.replace(tmp_path, out_path)
+
+
 def generate_stand_trajectory(model_path: Path,
                               out_path: Path,
                               step_count: int,
@@ -647,7 +762,9 @@ def main() -> int:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--mode",
-                        choices=("random-qacc", "stand-trajectory"),
+                        choices=("random-qacc",
+                                 "floating-random-qacc",
+                                 "stand-trajectory"),
                         default="random-qacc")
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--steps", default=1200, type=int)
@@ -661,6 +778,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.mode == "random-qacc":
         generate_random_samples(args.model, args.out, args.samples, args.batch_size)
+    elif args.mode == "floating-random-qacc":
+        generate_floating_base_random_samples(
+            args.model, args.out, args.samples, args.batch_size)
     else:
         generate_stand_trajectory(args.model, args.out, args.steps, args.dt)
     print(f"wrote {args.out}")
