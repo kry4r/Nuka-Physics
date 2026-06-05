@@ -21,7 +21,20 @@ void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config) {
     if (ctx.rows == nullptr || ctx.state == nullptr) {
         return;
     }
-    if (ctx.rows->RowCount() == 0u || ctx.state->empty()) {
+    if (ctx.rows->RowCount() == 0u) {
+        return;
+    }
+    // v0.8 C5c-1: the articulation-only case. The go2 foot-ground path is
+    // link<->static -- there are NO rigid bodies (state is empty), but the
+    // articulation reaction buffers ARE present, so the solve must still run (the
+    // chain-J arm fires; the rigid arm is inert via ValidBody(body, 0) == false).
+    // C5a/C5b/legacy rigid callers always supply a non-empty `state`, so they keep
+    // the original `state->empty()` early-return behaviour byte-for-byte (the new
+    // branch is reachable ONLY when state is empty AND articulation data exists).
+    const auto& art = ctx.articulation;
+    const bool have_articulation =
+        art.art_refs != nullptr && !art.art_refs->empty() && art.dof_stride > 0u;
+    if (ctx.state->empty() && !have_articulation) {
         return;
     }
 
@@ -46,8 +59,7 @@ void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config) {
     // vectors/spans. Empty (the default SolveContext) -> the articulation arms
     // never fire and the solve is byte-identical to the C5a rigid-only path.
     gpu::RowArticulationData art_data;
-    const auto& art = ctx.articulation;
-    if (art.art_refs != nullptr && !art.art_refs->empty() && art.dof_stride > 0u) {
+    if (have_articulation) {
         art_data.art_refs = art.art_refs->data();
         art_data.art_refs_count = static_cast<uint32_t>(art.art_refs->size());
         if (art.chain_jacobians != nullptr) {
