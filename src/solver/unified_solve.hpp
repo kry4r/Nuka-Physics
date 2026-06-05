@@ -31,11 +31,12 @@
 // (no new atomics, fixed SolverConfig iteration counts, fixed-order scans).
 // ---------------------------------------------------------------------------
 
-#include "constraint/reaction_provider.hpp"  // ReactionProvider
-#include "constraint/row_buffers.hpp"        // RowBuffers
-#include "constraint/row_builder.hpp"        // ContactRowSides
-#include "runtime/rigid/body_state.hpp"      // BodyState
-#include "solver/rigid_solver.hpp"           // SolverConfig
+#include "constraint/reaction_provider.hpp"      // ReactionProvider
+#include "constraint/row_articulation_refs.hpp"  // RowArticulationRefs (C5b)
+#include "constraint/row_buffers.hpp"            // RowBuffers
+#include "constraint/row_builder.hpp"            // ContactRowSides
+#include "runtime/rigid/body_state.hpp"          // BodyState
+#include "solver/rigid_solver.hpp"               // SolverConfig
 
 #include <vector>
 
@@ -48,12 +49,37 @@ namespace nuka::solver {
 // the §0.5 provider dispatcher (carried for the C5b/C6 device-resident wiring --
 // C5a dispatches the RigidInvMass arm inline from `state`, so a default-empty
 // provider is accepted). `dt` is the substep dt (informational for C5a).
+// v0.8 C5b-core: the articulation reaction inputs (HOST-provided; UnifiedSolve
+// uploads them and downloads `qdot` back -- it is mutated by the apply). All
+// optional: a SolveContext with `art_refs == nullptr` (the default) drives the
+// pure-rigid C5a path byte-identically (the articulation arms never fire). For
+// C5b-core the data is built by HAND in the test; the foot-ground emitter fills
+// it in production (C5c), which may also add a device-ptr fast path (the
+// BatchedArticulatedWorld chain-J / M^-1 / qdot are already on the GPU, so an
+// upload from host vectors is redundant there -- named C5c gap).
+//   art_refs       : one RowArticulationRefs per row (same order as rows->rows).
+//   chain_jacobians: flat per-(row,side) chain-J rows, dof_stride floats / slot.
+//   inertia_m_inv  : flat per-articulation M^-1 tiles, dof_stride^2 floats / art.
+//   qdot           : flat per-articulation joint velocities, dof_stride / art
+//                    (MUTABLE -- the solved impulse writes qdot += M^-1 J^T dl;
+//                    UnifiedSolve copies the result back into this vector).
+//   dof_stride     : uniform max DOF (env-major, matching BatchedArticulatedWorld).
+struct SolveArticulationContext {
+    const std::vector<constraint::RowArticulationRefs>* art_refs = nullptr;
+    const std::vector<float>* chain_jacobians = nullptr;
+    const std::vector<float>* inertia_m_inv = nullptr;
+    std::vector<float>* qdot = nullptr;  // MUTABLE: downloaded after the solve
+    uint32_t dof_stride = 0u;
+};
+
 struct SolveContext {
     constraint::RowBuffers* rows = nullptr;
     std::vector<runtime::rigid::BodyState>* state = nullptr;
     const std::vector<constraint::ContactRowSides>* sides = nullptr;
     const constraint::ReactionProvider* reactions = nullptr;
     float dt = 0.0f;
+    // v0.8 C5b-core: optional reduced-coordinate articulation reaction data.
+    SolveArticulationContext articulation{};
 };
 
 // Upload rows + bodies + sides -> launch the compliant-aware row_solver kernel ->
