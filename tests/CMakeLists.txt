@@ -1803,6 +1803,47 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_ground_subsume_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C5c-2: MJX-parity ACCEPTANCE for the foot-ground subsume.
+    # At a FIXED penetrating contact state (go2 feet pressed delta into a +Z
+    # ground plane, qpos fixed, qvel=0) one mjx.forward -> qacc is compared to
+    # the qacc Nuka produces through the UNIFIED contact pipeline (reuses the
+    # C5c-1 wiring). PRIMARY assertion: the BASE-6 qacc match (the foot contact
+    # force recoils into the floating base MJX-exactly). The MJX golden
+    # (go2_foot_contact_step.bin, generated via generate_mjx_golden.py --mode
+    # floating-contact-step) is a SOURCE TRANSLATION of the SAME go2_float.usda
+    # Nuka cooks, so both sides share M by construction. Single-step, NOT a
+    # rollout. Same host contact_stream_driver.cpp compile as the subsume test.
+    add_executable(nuka_foot_ground_mjx_parity_test
+        solver/test_foot_ground_mjx_parity.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_foot_ground_mjx_parity_test nuka_codegen)
+
+    target_compile_definitions(nuka_foot_ground_mjx_parity_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_foot_ground_mjx_parity_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_foot_ground_mjx_parity_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_foot_ground_mjx_parity_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
     add_executable(nuka_go2_pd_standing_test
         runtime/test_go2_pd_standing.cpp
