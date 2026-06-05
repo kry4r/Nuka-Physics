@@ -1067,6 +1067,39 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_sdf_tier_wired_test)
 
+    # --- v0.8 C5a: contact stream DRIVER (CandidatePair -> ContactManifold) ------
+    # Validates the resolver-decoupled host driver (contact_stream_driver.hpp/.cpp,
+    # BuildContactManifolds): resolve each side via a caller-supplied ShapeResolver
+    # (the rigid-BodyState / articulation-link-pose decoupling seam), derive
+    # has_sdf = a.has_sdf && b.has_sdf (both-sides contract), route through the
+    # constexpr dispatch table, invoke the handler, merge the two sides' MuJoCo
+    # contact params via scene::MergeContactParams, and append non-empty manifolds.
+    # Cases: box-on-plane (rigid x static) geometry == direct ResolveNarrowphase
+    # call + merged friction/solimp/solref + manifold_key/a/b; foot sphere-on-plane
+    # (articulation-link x static, the C5c foot-ground shape); box-box (rigid x
+    # rigid) multi-point == direct call; param merge cross-checked vs an
+    # INDEPENDENT MergeContactParams call; has_sdf both-sides (one-sided -> real
+    # analytical, both-sided + null seam -> Sdf null-guards -> skipped); skip when a
+    # side fails to resolve; D1 two-run byte-exact (memcmp). Compiles the driver
+    # .cpp directly (host-only -- the dispatch table is host fn-ptrs; the device
+    # driver is C5/later). Header deps == the C3a dispatch test (narrowphase_
+    # dispatch.hpp + contact_filter.hpp) -- nuka_codegen + the src include + nuka_phi.
+    add_executable(nuka_contact_stream_driver_test
+        collision/test_contact_stream_driver.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_contact_stream_driver_test nuka_codegen)
+    target_include_directories(nuka_contact_stream_driver_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_contact_stream_driver_test
+        PRIVATE
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_contact_stream_driver_test)
+
     # --- v0.8 C2c: particle<->rigid + particle<->particle candidate-pair builders
     # gated by the C1c SystemPairMatrix. Validates the builders' reframed candidate
     # SET against (1) a hand-reframe of the raw cross-system CSR (non-identity
