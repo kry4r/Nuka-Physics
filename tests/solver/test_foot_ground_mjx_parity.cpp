@@ -12,12 +12,18 @@
 // OUTCOME (read before trusting GREEN): the recoil PATH is MJX-exact -- the exact
 // solve of Nuka's own assembled contact system matches MJX to ~7e-4 (J/M^-1/aref/
 // R + the a_free*dt seed + the featherstone frame bridge are all correct). The
-// END-TO-END base-6-vs-MJX is ~0.6%, NOT ~1e-5, because the C5b-core UnifiedSolve
-// PGS kernel has a known floating-base base-DOF apply gap (row_solver.cu:341-345)
-// that converges ~0.57% above the exact solve. That gap is the task's
-// characterize-and-report STOP finding (surfaced for the controller, NOT
-// self-fixed in C5c-2 scope). GREEN here == "inputs MJX-exact + kernel bias
-// bounded", NOT "base-6 == MJX exactly".
+// END-TO-END base-6-vs-MJX is now ~1.4e-4 (at the input-fidelity floor) after the
+// C5b-core regularizer-feedback FIX: the UnifiedSolve compliant PGS update carried
+// the dual regularizer R in the denominator but DROPPED the matching -R*lambda
+// feedback from the numerator, so it converged (flat across iters) to the WRONG
+// fixed point A*lambda=b instead of the assembled (A+R)*lambda=b -- a uniform ~R/A
+// (=0.57% on this sample) surplus. FIXED in src/solver/gpu/row_solver.cu
+// SolveCompliantVelocityRow (added -row.compliance_alpha*old_impulse to the
+// numerator). The earlier hypothesis blaming a floating-base base-DOF apply gap
+// (row_solver.cu:341-345 / link_velocity routing) was WRONG: this path is flat-18
+// end-to-end and its three reaction legs are mutually consistent; the bias was
+// purely the missing regularizer term (algebraic, scenario-INDEPENDENT). GREEN now
+// == "inputs MJX-exact AND kernel converges to its own assembled (A+R) system".
 //
 // THIS IS A SINGLE-STEP COMPARISON, NOT A TRAJECTORY ROLLOUT. Two different
 // contact solvers diverge within steps, so a loose multi-step tolerance would
@@ -58,14 +64,14 @@
 //           into (a) the INPUT-FIDELITY proof (the C5c-2 deliverable): the EXACT
 //           solve of Nuka's own assembled (A+R)lambda=rhs matches MJX efc to
 //           ~7e-4, so J/M^-1/aref/R + the a_free*dt seed + the frame bridge are
-//           MJX-correct; and (b) a CHARACTERIZED FINDING: the C5b-core PGS kernel
-//           converges (flat 10->200 iters) ~0.57% ABOVE that exact solve -> caps
-//           the end-to-end base-6-vs-MJX at ~0.6%. (b) is the task's
-//           characterize-and-report STOP signal, NOT met-acceptance: the kernel's
-//           floating-base base-DOF apply is a known C5b-coresidence gap
-//           (row_solver.cu:341-345). A GREEN test means "inputs MJX-exact +
-//           kernel bias bounded", NOT "base-6 == MJX". Corroborated by ON-OFF
-//           isolation and per-contact normal force (Nuka lambda/dt vs MJX efc).
+//           MJX-correct; and (b) the CONVERGENCE proof: the C5b-core PGS kernel
+//           converges to that exact (A+R) solve to ~2e-7 (flat 10->200 iters), so
+//           the end-to-end base-6-vs-MJX lands at the ~1.4e-4 input floor. (b) was
+//           previously a WRONG fixed point ~0.57% above the exact solve (R dropped
+//           from the compliant numerator); now FIXED (row_solver.cu Solve-
+//           CompliantVelocityRow regularizer feedback). A GREEN test now means
+//           "inputs MJX-exact AND kernel converges to its own assembled (A+R)".
+//           Corroborated by ON-OFF isolation and per-contact normal force.
 //
 // SCOPE (C5c-2). No production path is flipped; reuses the C5c-1 wiring. New
 // golden go2_foot_contact_step.bin (generated, not hand-edited). DEFERRED to
@@ -811,9 +817,9 @@ TEST(FootGroundMjxParity, BaseSixContactRecoilMatchesMjx) {
         // Per-contact normal force corroboration (Nuka lambda/dt vs MJX efc) PLUS
         // the EXACT linear solve of Nuka's OWN assembled (A+R)lambda=rhs system.
         // The exact-solve isolates INPUT correctness (J/M^-1/aref/R) from the
-        // C5b-core PGS kernel's convergence: exact-solve ~ MJX to ~0.1% PROVES the
-        // inputs are MJX-correct; the kernel's small uniform surplus over its own
-        // exact solve is a C5b-core PGS bias (reported, characterized below).
+        // C5b-core PGS kernel's convergence: exact-solve ~ MJX to ~7e-4 PROVES the
+        // inputs are MJX-correct; the kernel now matches its own exact solve to
+        // ~2e-7 (post regularizer-feedback fix -- was a uniform ~R/A=0.57% surplus).
         float exact_vs_mjx_rel = 0.0f, kernel_vs_exact_rel = 0.0f;
         for (uint32_t r = 0u; r < def.row_count && r < cfg.ncon; ++r) {
             std::printf("[diag] config %zu foot %u: Nuka kernel f=%.4f  exact-solve f=%.4f  "
@@ -837,44 +843,41 @@ TEST(FootGroundMjxParity, BaseSixContactRecoilMatchesMjx) {
         EXPECT_LT(exact_vs_mjx_rel, 5.0e-3f)
             << "config " << ci << " Nuka's exact contact-system solve diverges from MJX "
                "(an INPUT J/M^-1/aref/R error, not a solver-convergence residual)";
-        // NAMED FINDING (durable regression guard -- NOT 'parity achieved'): the
-        // C5b-core UnifiedSolve PGS kernel converges (flat 10->200 iters) to a
-        // fixed point ~5.7e-3 ABOVE the exact solve of its OWN (A+R)lambda=rhs
-        // system. THIS non-shrinking residual IS the gap to MJX-exact base-6 (it
-        // is the task's characterize-and-report finding, not a convergence
-        // artifact). MECHANISM (self-documented in src/solver/gpu/row_solver.cu
-        // :341-345 ArticulationChainJ apply): "For a FIXED-ROOT chain the
-        // flat-qdot apply is exact; floating-base base-DOF routing to
-        // link_velocity is a C5b-coresidence/later gap." -- i.e. the floating-base
-        // base-DOF apply/read in the flat-18 vector is not yet consistent with the
-        // production SolveArticulatedContactRowsKernel's link_velocity routing.
-        // Bounded here so it cannot silently DRIFT; TIGHTEN toward ~1e-4 when that
-        // floating-base apply gap is closed (out of C5c-2 scope -- surfaced to the
-        // controller; decide before the C5 production-flip).
-        EXPECT_LT(kernel_vs_exact_rel, 1.0e-2f)
-            << "config " << ci << " C5b-core PGS kernel drifted FURTHER from its own "
-               "exact solve than the recorded ~0.57% floating-base-apply bias";
+        // CONVERGENCE GATE (durable regression guard): the C5b-core UnifiedSolve PGS
+        // kernel now converges to the EXACT solve of its OWN assembled (A+R)lambda=rhs
+        // system to PGS precision (~2e-7, flat 10->200 iters). Previously it sat at a
+        // WRONG FIXED POINT ~5.7e-3 (== R/A) ABOVE that exact solve, because the
+        // compliant row update carried R only in the denominator (ComputeCompliant-
+        // EffectiveMass) and DROPPED the matching -R*lambda regularizer feedback from
+        // the numerator -- so its fixed point was A*lambda=b (R cancels) instead of
+        // (A+R)*lambda=b. FIXED in src/solver/gpu/row_solver.cu SolveCompliantVelocity-
+        // Row by adding the -row.compliance_alpha*old_impulse term to the numerator
+        // (regularized Gauss-Seidel). The earlier hypothesis that this was a
+        // floating-base base-DOF apply/link_velocity-routing gap (row_solver.cu
+        // :341-345) was WRONG: this entire test path is flat-18 end-to-end (no
+        // link_velocity scatter), and the three reaction legs (eff-mass / apply / Jv)
+        // are mutually consistent by construction. The bias was purely the missing
+        // regularizer term, an algebraic (scenario-independent) fix. This bound locks
+        // the fix: a regression that reintroduces the wrong fixed point trips it.
+        EXPECT_LT(kernel_vs_exact_rel, 1.0e-4f)
+            << "config " << ci << " C5b-core PGS kernel diverged from the exact solve "
+               "of its OWN assembled (A+R)lambda=rhs system (regularizer-feedback "
+               "regression: -R*lambda dropped from the compliant numerator?)";
 
         worst_base6_default = std::max<double>(worst_base6_default, base6_def);
         worst_base6_high = std::max<double>(worst_base6_high, base6_high);
 
         // RELATIVE base-6 error: max_i |nuka_i - mjx_i| / max(scale, |mjx_i|),
-        // with a small scale floor so near-zero components are absolute. The
-        // residual is a UNIFORM ~0.6% contact-force surplus (Nuka kernel per-foot
-        // f ~ 0.57% above its OWN exact-solve, config-INDEPENDENT -- see the
-        // exact-solve diag), so the base-6 tracks force RELATIVELY: config 0/2
-        // (forces ~1 N) land at ~5e-4 abs, config 1 (forces ~10 N, base accel ~64)
-        // at ~4.9e-3 abs == the SAME ~0.6% relative. A relative bound is therefore
-        // the principled measure (the task endorses relative tol for
-        // high-magnitude quantities). ROOT-CAUSE (characterized, NOT loosened to
-        // pass): the INPUTS are MJX-correct -- the exact solve of Nuka's own
-        // assembled (A+R)lambda=rhs matches MJX efc to ~7e-4 (asserted above:
-        // J/M^-1/aref/R are MJX-exact, A to 0.08%, aref+R bit-exact). The ~0.57%
-        // is a small UNIFORM bias in the C5b-core UnifiedSolve PGS kernel: it
-        // converges (flat 10->200 iters) to a fixed point ~0.57% above the exact
-        // solve of the SAME system. NOT a structural bug (directions correct, all
-        // feet uniform); a C5b-core solver-convergence detail surfaced for the
-        // controller (do NOT self-fix the production kernel in C5c-2 scope).
+        // with a small scale floor so near-zero components are absolute. A relative
+        // bound is the principled measure (the task endorses relative tol for
+        // high-magnitude quantities; config 1's base accel ~64). With the C5b-core
+        // regularizer-feedback FIX (see kernel_vs_exact gate above), the end-to-end
+        // base-6 now lands at the INPUT-FIDELITY floor: the kernel solves Nuka's own
+        // assembled (A+R)lambda=rhs to ~2e-7, and that assembled system matches MJX
+        // efc to ~7e-4 (J/M^-1/aref/R are MJX-exact, A to 0.08%, aref+R bit-exact),
+        // so base-6-vs-MJX is ~1.4e-4 (was ~0.6% under the old wrong fixed point).
+        // The residual is now solver-clean: it is the input-translation residual, NOT
+        // a kernel-convergence bias.
         const float kScale = 1.0f;  // floor: |accel| below 1 is checked absolutely.
         float base6_rel = 0.0f;
         for (uint32_t i = 0u; i < 6u; ++i) {
@@ -890,20 +893,18 @@ TEST(FootGroundMjxParity, BaseSixContactRecoilMatchesMjx) {
         std::printf("[diag] config %zu base-6 REL err=%.3e  per-foot force REL err=%.3e\n",
                     ci, base6_rel, force_rel);
 
-        // END-TO-END SANITY BOUND (KERNEL-BIAS-LIMITED -- this is NOT the parity
-        // acceptance criterion). The task's acceptance is base-6 ~1e-5; that is
-        // NOT met end-to-end because of the C5b-core floating-base-apply bias
-        // asserted above (~0.57% -> base-6 ~0.6% rel). What IS met (and IS the
-        // C5c-2 deliverable) is recoil-PATH input fidelity: exact-solve vs MJX
-        // ~7e-4. So a GREEN here means "inputs MJX-exact + kernel bias bounded",
-        // NOT "base-6 matches MJX exactly". The 1% bound just stops the
-        // end-to-end qacc from drifting beyond the recorded kernel bias.
-        EXPECT_LT(base6_rel, 1.0e-2f)
-            << "config " << ci << " base-6 contact-ON qacc drifted beyond the recorded "
-               "~0.6% C5b-core floating-base-apply bias (end-to-end sanity bound)";
-        EXPECT_LT(force_rel, 1.0e-2f)
-            << "config " << ci << " per-foot normal force drifted beyond the recorded "
-               "~0.6% C5b-core kernel bias vs MJX efc_force";
+        // END-TO-END BOUND (INPUT-FIDELITY-LIMITED post-fix). With the C5b-core
+        // regularizer-feedback fix the kernel is solver-clean, so the end-to-end
+        // base-6 is bounded by the recoil-PATH input fidelity (exact-solve vs MJX
+        // ~7e-4): base-6-vs-MJX ~1.4e-4, per-foot force ~7.2e-4. These bounds lock
+        // BOTH the input fidelity AND the kernel convergence -- a regressed kernel
+        // (wrong fixed point) would re-inflate base-6 to ~0.6% and trip the 1e-3 bound.
+        EXPECT_LT(base6_rel, 1.0e-3f)
+            << "config " << ci << " base-6 contact-ON qacc drifted beyond the "
+               "input-fidelity floor (kernel regularizer-feedback regression or input drift)";
+        EXPECT_LT(force_rel, 2.0e-3f)
+            << "config " << ci << " per-foot normal force drifted beyond the "
+               "input-fidelity floor vs MJX efc_force";
         // ON-OFF isolation corroboration (cancels the GATE-0 free residual): the
         // pure contact contribution base-6 also matches MJX within the same bound.
         const float iso_rel = [&] {
@@ -914,7 +915,10 @@ TEST(FootGroundMjxParity, BaseSixContactRecoilMatchesMjx) {
             }
             return m;
         }();
-        EXPECT_LT(iso_rel, 1.0e-2f)
+        // The ON-OFF isolation folds the GATE-0 free-ABA residual into a relative
+        // metric with a smaller (mjx_iso) denominator, so it runs slightly looser
+        // than base6_rel (config 1 ~1.3e-3). Still ~8x tighter than the pre-fix 1e-2.
+        EXPECT_LT(iso_rel, 2.0e-3f)
             << "config " << ci << " ON-OFF contact-isolation base-6 diverges from MJX";
         // Convergence behaviour: high-iter must not be WORSE than default (a real
         // bug would not tighten with iterations). Here it is converged (flat).

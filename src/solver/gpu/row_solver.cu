@@ -575,14 +575,31 @@ __device__ void SolveCompliantVelocityRow(DeviceRowBuffers rows,
     // ComputeJv's per-body Jlin.v + Jang.w term), so C5a tests do not move. The
     // shared ComputeJv stays BYTE-UNTOUCHED for the legacy path.
     const float jv = ComputeCompliantJv(rows, row_index, bodies, body_count);
+    const float old_impulse = row.lambda;
     // C5a: row.rhs holds the MuJoCo reference ACCELERATION (aref). The velocity-
     // impulse PGS needs a velocity-target bias, so scale by dt: the impulse
     // lambda = f*dt satisfies (A+R)lambda = aref*dt - Jv (R is already in 1/mass
     // units, so it is NOT scaled -- it stays in the denominator as-is). Computed
     // locally (no buffer mutation) so the caller's rows are reusable.
     const float rhs_v = row.rhs * dt;
-    const float lambda = effective_mass * (rhs_v - jv);
-    const float old_impulse = row.lambda;
+    // v0.8 C5c-2 FIX (wrong-fixed-point consistency): the compliant denominator is
+    // (A_ii + R) (ComputeCompliantEffectiveMass folds R = compliance_alpha into the
+    // diagonal), so the regularized Gauss-Seidel update MUST also carry the matching
+    // -R*lambda_i feedback in the NUMERATOR. ComputeCompliantJv returns Jv =
+    // sum_j A_ij*lambda_j (the FULL row, diagonal included, since qdot already
+    // reflects every applied impulse), so rhs_v - jv = b_i - sum_j A_ij*lambda_j.
+    // WITHOUT the -R*old_impulse term the increment's fixed point is jv == rhs_v
+    // i.e. A*lambda = b (R cancels): the kernel converges (flat across iters) to a
+    // fixed point ~R/A above the exact solve of its OWN assembled (A+R)lambda=b
+    // system (measured 0.57% == R/A on the 4-foot go2 sample). Adding -R*old_impulse
+    // makes the increment lambda_new = (b_i - sum_{j!=i}A_ij*lambda_j) / (A_ii + R) --
+    // EXACTLY the assembled-system Gauss-Seidel update (matches the C5c-2 exact-solve
+    // oracle to PGS precision). LEGACY/RIGID PATH IS UNTOUCHED: R == 0 for every
+    // non-compliant row AND for compliant friction rows (compliance_alpha = 0; the
+    // emitter only writes R on compliant normal rows), so this term is identically
+    // zero there -> byte-identical fixed-root / rigid solve.
+    const float lambda =
+        effective_mass * (rhs_v - jv - row.compliance_alpha * old_impulse);
     float lower = row.lower;
     float upper = row.upper;
     if (IsCompliantFrictionRow(rows, row_index)) {
