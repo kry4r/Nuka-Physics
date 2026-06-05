@@ -442,6 +442,10 @@ add_executable(nuka_solver_test
     solver/test_row_scheduler_bridge.cpp
     # v0.8 C5a: UnifiedSolve end-to-end (compliant contact + pyramid + D1).
     solver/test_unified_solve.cpp
+    # v0.8 C5b-core: ArticulationChainJ reaction arm wired into UnifiedSolve
+    # (closed-form chain oracle + same-articulation coloring + link<->rigid two-
+    # way + D1). Hand-built ArticulationReactionState data (no device CRBA).
+    solver/test_link_rigid_twoway.cpp
 )
 
 target_link_libraries(nuka_solver_test

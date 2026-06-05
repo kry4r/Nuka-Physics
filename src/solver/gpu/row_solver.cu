@@ -6,6 +6,7 @@
 
 #include "constraint/contact_row_sides.hpp"  // v0.8 C5a: ContactRowSides (POD)
 #include "constraint/reaction_provider.hpp"  // v0.8 C5a: ReactionProvider math cores
+#include "constraint/row_articulation_refs.hpp"  // v0.8 C5b: RowArticulationRefs (POD)
 #include "math/cuda_vec_ops.cuh"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer.hpp"
@@ -37,6 +38,17 @@ struct DeviceRowBuffers {
     // legacy branch NEVER touches this -> legacy solve byte-identical.
     const constraint::ContactRowSides* sides = nullptr;
     uint32_t sides_count = 0u;
+    // v0.8 C5b-core: per-row articulation indirection + global articulation
+    // reaction buffers (chain-J rows, M^-1 tiles, live qdot). Read ONLY on the
+    // compliant branch for a side whose art_index != kInvalidArtIndex. Legacy /
+    // C5a callers leave these null/0 -> the articulation arms never fire ->
+    // byte-identical. See constraint/row_articulation_refs.hpp.
+    const constraint::RowArticulationRefs* art_refs = nullptr;
+    uint32_t art_refs_count = 0u;
+    const float* chain_jacobians = nullptr;   // [slot * dof_stride] per (row,side)
+    const float* inertia_m_inv = nullptr;     // [art_index * dof_stride^2]
+    float* qdot = nullptr;                     // [art_index * dof_stride] (MUTABLE)
+    uint32_t dof_stride = 0u;
     uint32_t row_count = 0u;
     uint32_t body_index_count = 0u;
     uint32_t jacobian_data_count = 0u;
@@ -214,14 +226,60 @@ __device__ constraint::CollidableRef SideForRowBody(const DeviceRowBuffers& rows
                                   : rows.sides[row_index].b;
 }
 
+// v0.8 C5b-core: the per-row articulation indirection for local body 0 (== side.a)
+// / local body 1 (== side.b). Returns the not-an-articulation sentinel if no
+// art_refs stream is present or the row is out of range -> the articulation arm
+// stays inert (the side resolves via its C5a per-kind dispatch instead).
+__device__ constraint::RowArticulationSide ArtSideForRowBody(
+    const DeviceRowBuffers& rows,
+    uint32_t row_index,
+    uint32_t local_body_index) {
+    if (rows.art_refs == nullptr || row_index >= rows.art_refs_count) {
+        return constraint::RowArticulationSide{};  // art_index == kInvalidArtIndex
+    }
+    return local_body_index == 0u ? rows.art_refs[row_index].a
+                                  : rows.art_refs[row_index].b;
+}
+
+// v0.8 C5b-core: build a C4c ArticulationReactionState from a side's
+// RowArticulationSide indirection into the global buffers. The chain-J row is
+// keyed by chain_jac_slot (per-contact), the M^-1 tile + the live qdot slice by
+// art_index (per-articulation) -- DISTINCT indices (see row_articulation_refs.hpp).
+// qdot is the MUTABLE live joint-velocity slice ArticulationApplyImpulse writes.
+__device__ constraint::ArticulationReactionState BuildArticulationState(
+    const DeviceRowBuffers& rows,
+    const constraint::RowArticulationSide& art_side) {
+    constraint::ArticulationReactionState state;
+    if (art_side.art_index == constraint::kInvalidArtIndex ||
+        rows.chain_jacobians == nullptr || rows.inertia_m_inv == nullptr ||
+        rows.qdot == nullptr || rows.dof_stride == 0u) {
+        return state;  // null pointers -> the C4c helpers no-op (return 0 / skip).
+    }
+    const size_t stride = static_cast<size_t>(rows.dof_stride);
+    state.chain_jacobian =
+        rows.chain_jacobians + static_cast<size_t>(art_side.chain_jac_slot) * stride;
+    state.inertia_M_inv =
+        rows.inertia_m_inv + static_cast<size_t>(art_side.art_index) * stride * stride;
+    state.qdot = rows.qdot + static_cast<size_t>(art_side.art_index) * stride;
+    state.dof_stride = rows.dof_stride;
+    return state;
+}
+
 // One side's J M^-1 J^T contribution via the C4c provider math, dispatched by
 // side.react. Returns the RAW additive diagonal term (NOT the reciprocal);
 // the caller sums both sides + compliance_alpha and reciprocates once.
-__device__ float CompliantSideEffectiveInvMass(const constraint::CollidableRef& side,
-                                               const constraint::RowJacobian6& j,
-                                               uint32_t body_index,
-                                               const runtime::rigid::BodyState* bodies,
-                                               uint32_t body_count) {
+//
+// v0.8 C5b-core: `art_state` is the resolved ArticulationReactionState for this
+// side (null pointers if the side is not an articulation); the ArticulationChainJ
+// arm uses it directly (the side's RowJacobian6 is IGNORED -- the chain-J row is
+// the reduced-coordinate Jacobian).
+__device__ float CompliantSideEffectiveInvMass(
+    const constraint::CollidableRef& side,
+    const constraint::RowJacobian6& j,
+    uint32_t body_index,
+    const runtime::rigid::BodyState* bodies,
+    uint32_t body_count,
+    const constraint::ArticulationReactionState& art_state) {
     switch (side.react) {
         case constraint::ReactionProviderKind::RigidInvMass: {
             if (!ValidBody(body_index, body_count)) {
@@ -234,10 +292,10 @@ __device__ float CompliantSideEffectiveInvMass(const constraint::CollidableRef& 
             return constraint::RigidEffectiveInvMass(state, j);
         }
         case constraint::ReactionProviderKind::ArticulationChainJ:
-            // C5b GAP: the reduced-coordinate chain-J reaction needs the per-contact
-            // chain Jacobian + M^-1 tile resolved at world build (not bodies[idx]).
-            // Present for dispatch; unexercised in C5a (all-rigid box stack).
-            return 0.0f;
+            // v0.8 C5b-core: reduced-coordinate chain-J reaction = J M^-1 J^T over
+            // the per-contact chain Jacobian + the articulation's M^-1 tile. The
+            // C4c helper returns 0 if art_state's pointers are null (not wired).
+            return constraint::ArticulationEffectiveInvMass(art_state);
         case constraint::ReactionProviderKind::ParticleInvMass:
             // C6 GAP: particle reaction needs the particle SoA inv_mass/velocity
             // views, not the rigid BodyState array. Present for dispatch; unexercised.
@@ -250,12 +308,18 @@ __device__ float CompliantSideEffectiveInvMass(const constraint::CollidableRef& 
 
 // Apply a solved impulse delta to one side's DOFs via the C4c provider math,
 // dispatched by side.react. Mutates bodies[idx] for the RigidInvMass arm.
-__device__ void CompliantSideApplyImpulse(const constraint::CollidableRef& side,
-                                          const constraint::RowJacobian6& j,
-                                          float delta,
-                                          uint32_t body_index,
-                                          runtime::rigid::BodyState* bodies,
-                                          uint32_t body_count) {
+//
+// v0.8 C5b-core: `art_state` is the resolved ArticulationReactionState (with the
+// MUTABLE qdot slice) for an articulation side; the ArticulationChainJ arm writes
+// qdot += M^-1 J^T delta through it. Null pointers -> the C4c helper no-ops.
+__device__ void CompliantSideApplyImpulse(
+    const constraint::CollidableRef& side,
+    const constraint::RowJacobian6& j,
+    float delta,
+    uint32_t body_index,
+    runtime::rigid::BodyState* bodies,
+    uint32_t body_count,
+    const constraint::ArticulationReactionState& art_state) {
     switch (side.react) {
         case constraint::ReactionProviderKind::RigidInvMass: {
             if (!ValidBody(body_index, body_count)) {
@@ -274,7 +338,11 @@ __device__ void CompliantSideApplyImpulse(const constraint::CollidableRef& side,
             return;
         }
         case constraint::ReactionProviderKind::ArticulationChainJ:
-            // C5b GAP (see CompliantSideEffectiveInvMass). Present for dispatch.
+            // v0.8 C5b-core: qdot += M^-1 J^T delta via the C4c apply (BYTE-FOR-BYTE
+            // SolveArticulatedContactRowsKernel's flat-qdot loop). For a FIXED-ROOT
+            // chain (v0.8 go2/h1) the flat-qdot apply is exact; floating-base base-
+            // DOF routing to link_velocity is a C5b-coresidence/later gap.
+            constraint::ArticulationApplyImpulse(art_state, delta);
             return;
         case constraint::ReactionProviderKind::ParticleInvMass:
             // C6 GAP (see CompliantSideEffectiveInvMass). Present for dispatch.
@@ -282,6 +350,61 @@ __device__ void CompliantSideApplyImpulse(const constraint::CollidableRef& side,
         case constraint::ReactionProviderKind::StaticNull:
         default:
             return;  // immovable: no-op.
+    }
+}
+
+// v0.8 C5b-core ★ THE THIRD ARM: one side's constraint velocity contribution
+// Jv = (this side's row of J) . (this side's DOF velocities), dispatched by
+// side.react. This REPLACES the shared ComputeJv on the compliant path because
+// ComputeJv loops row BODIES and `continue`s on !ValidBody -> an articulation
+// side (body index >= body_count) is silently DROPPED, so the foot's real
+// approach velocity (chain_J . qdot) would vanish. (That hides at equilibrium --
+// a standing chain has foot Jv ~= 0 -- but breaks transients + two-way.) The
+// per-arm math mirrors each provider:
+//   RigidInvMass    : dot(Jlin, v) + dot(Jang, w)  (== ComputeJv's per-body term).
+//   ArticulationChainJ: sum_r chain_jacobian[r] * qdot[r] (the reduced-coord Jv).
+//   ParticleInvMass : dot(Jlin, v) (angular ignored) -- C6 wires the particle SoA;
+//                     the rigid bodies[] array has no particle velocities, so this
+//                     stays 0 here (unexercised, named C6 gap).
+//   StaticNull      : 0 (immovable world: no constraint velocity).
+__device__ float CompliantSideConstraintVelocity(
+    const constraint::CollidableRef& side,
+    const constraint::RowJacobian6& j,
+    uint32_t body_index,
+    const runtime::rigid::BodyState* bodies,
+    uint32_t body_count,
+    const constraint::ArticulationReactionState& art_state) {
+    switch (side.react) {
+        case constraint::ReactionProviderKind::RigidInvMass: {
+            if (!ValidBody(body_index, body_count)) {
+                return 0.0f;  // static/invalid rigid side: no constraint velocity.
+            }
+            const auto& body = bodies[body_index];
+            // BYTE-FOR-BYTE ComputeJv's per-body accumulation (Jlin.v + Jang.w),
+            // so an all-rigid compliant row's jv is numerically identical to the
+            // shared ComputeJv -> C5a tests do not move.
+            return Dot(j.linear, body.linear_velocity) +
+                   Dot(j.angular, body.angular_velocity);
+        }
+        case constraint::ReactionProviderKind::ArticulationChainJ: {
+            // Reduced-coordinate Jv = sum_r chain_jacobian[r] * qdot[r]. Null
+            // pointers (not wired) -> 0. Padding cols of J are zeroed by the
+            // chain-J builder, so iterating the full stride is safe.
+            if (art_state.chain_jacobian == nullptr || art_state.qdot == nullptr) {
+                return 0.0f;
+            }
+            float jv = 0.0f;
+            for (uint32_t r = 0u; r < art_state.dof_stride; ++r) {
+                jv += art_state.chain_jacobian[r] * art_state.qdot[r];
+            }
+            return jv;
+        }
+        case constraint::ReactionProviderKind::ParticleInvMass:
+            // C6 GAP: needs the particle SoA velocity view (not bodies[idx]).
+            return 0.0f;
+        case constraint::ReactionProviderKind::StaticNull:
+        default:
+            return 0.0f;
     }
 }
 
@@ -299,11 +422,38 @@ __device__ float ComputeCompliantEffectiveMass(const DeviceRowBuffers& rows,
             SideForRowBody(rows, row_index, local);
         const auto jacobian = JacobianForRowBody(rows, row, local);
         const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowArticulationSide art_side =
+            ArtSideForRowBody(rows, row_index, local);
+        const constraint::ArticulationReactionState art_state =
+            BuildArticulationState(rows, art_side);
         diagonal += CompliantSideEffectiveInvMass(side, jacobian, body_index,
-                                                  bodies, body_count);
+                                                  bodies, body_count, art_state);
     }
     diagonal += row.compliance_alpha;  // + R (dual regularizer)
     return diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
+}
+
+// v0.8 C5b-core: the compliant row's Jv, summed over its sides via the per-side
+// dispatch (NOT the shared ComputeJv -- see CompliantSideConstraintVelocity).
+__device__ float ComputeCompliantJv(const DeviceRowBuffers& rows,
+                                    uint32_t row_index,
+                                    const runtime::rigid::BodyState* bodies,
+                                    uint32_t body_count) {
+    const constraint::Row& row = rows.rows[row_index];
+    float jv = 0.0f;
+    for (uint32_t local = 0; local < row.body_count; ++local) {
+        const constraint::CollidableRef side =
+            SideForRowBody(rows, row_index, local);
+        const auto jacobian = JacobianForRowBody(rows, row, local);
+        const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowArticulationSide art_side =
+            ArtSideForRowBody(rows, row_index, local);
+        const constraint::ArticulationReactionState art_state =
+            BuildArticulationState(rows, art_side);
+        jv += CompliantSideConstraintVelocity(side, jacobian, body_index,
+                                              bodies, body_count, art_state);
+    }
+    return jv;
 }
 
 // Apply a compliant row's solved impulse delta across both sides via the provider
@@ -320,8 +470,12 @@ __device__ void ApplyCompliantVelocityImpulse(const DeviceRowBuffers& rows,
             SideForRowBody(rows, row_index, local);
         const auto jacobian = JacobianForRowBody(rows, row, local);
         const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowArticulationSide art_side =
+            ArtSideForRowBody(rows, row_index, local);
+        const constraint::ArticulationReactionState art_state =
+            BuildArticulationState(rows, art_side);
         CompliantSideApplyImpulse(side, jacobian, delta, body_index,
-                                  bodies, body_count);
+                                  bodies, body_count, art_state);
     }
 }
 
@@ -414,7 +568,13 @@ __device__ void SolveCompliantVelocityRow(DeviceRowBuffers rows,
     constraint::Row& row = rows.rows[row_index];
     const float effective_mass =
         ComputeCompliantEffectiveMass(rows, row_index, bodies, body_count);
-    const float jv = ComputeJv(rows, row_index, bodies, body_count);
+    // v0.8 C5b-core: jv via the per-side dispatch (ComputeCompliantJv), NOT the
+    // shared ComputeJv -- the shared one drops articulation sides (body index >=
+    // body_count -> !ValidBody -> continue). For an all-rigid compliant row the
+    // per-side sum is numerically identical to ComputeJv (the rigid arm reuses
+    // ComputeJv's per-body Jlin.v + Jang.w term), so C5a tests do not move. The
+    // shared ComputeJv stays BYTE-UNTOUCHED for the legacy path.
+    const float jv = ComputeCompliantJv(rows, row_index, bodies, body_count);
     // C5a: row.rhs holds the MuJoCo reference ACCELERATION (aref). The velocity-
     // impulse PGS needs a velocity-target bias, so scale by dt: the impulse
     // lambda = f*dt satisfies (A+R)lambda = aref*dt - Jv (R is already in 1/mass
@@ -709,6 +869,11 @@ struct RowSolverScratch {
     phi::Buffer bodies;
     phi::Buffer max_error;
     phi::Buffer sides;  // v0.8 C5a: per-row ContactRowSides (UnifiedSolve only)
+    // v0.8 C5b-core: articulation reaction buffers (UnifiedSolve only).
+    phi::Buffer art_refs;
+    phi::Buffer chain_jacobians;
+    phi::Buffer inertia_m_inv;
+    phi::Buffer qdot;
     size_t rows_bytes = 0u;
     size_t body_indices_bytes = 0u;
     size_t jacobians_bytes = 0u;
@@ -719,6 +884,11 @@ struct RowSolverScratch {
     size_t bodies_bytes = 0u;
     size_t max_error_bytes = 0u;
     size_t sides_bytes = 0u;  // v0.8 C5a
+    // v0.8 C5b-core
+    size_t art_refs_bytes = 0u;
+    size_t chain_jacobians_bytes = 0u;
+    size_t inertia_m_inv_bytes = 0u;
+    size_t qdot_bytes = 0u;
 };
 
 RowSolverScratch& ThreadScratchForDevice(int device_id) {
@@ -802,7 +972,8 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
                                   uint32_t body_count,
                                   const constraint::ContactRowSides* sides,
                                   uint32_t sides_count,
-                                  const RowSolveConfig& config) {
+                                  const RowSolveConfig& config,
+                                  const RowArticulationData& articulation) {
     RowSolveReport report;
     report.row_count = rows.RowCount();
     report.velocity_iterations = config.velocity_iterations;
@@ -856,6 +1027,43 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
         scratch.sides.CopyFromHost(sides, sides_bytes);
     }
 
+    // v0.8 C5b-core: upload the articulation reaction buffers (UnifiedSolve only).
+    // qdot is MUTABLE -- it is downloaded after the solve (the apply writes it).
+    // Legacy / C5a callers pass an empty RowArticulationData -> nothing uploaded,
+    // the device_view articulation pointers stay null, and the kernel never enters
+    // the articulation arm (every side's art_index is the sentinel).
+    const bool have_articulation =
+        articulation.art_refs != nullptr && articulation.art_refs_count > 0u &&
+        articulation.dof_stride > 0u;
+    if (have_articulation) {
+        const size_t art_refs_bytes = static_cast<size_t>(articulation.art_refs_count) *
+                                      sizeof(constraint::RowArticulationRefs);
+        EnsureScratchBuffer(scratch.art_refs, scratch.art_refs_bytes, art_refs_bytes);
+        scratch.art_refs.CopyFromHost(articulation.art_refs, art_refs_bytes);
+        if (articulation.chain_jacobians != nullptr &&
+            articulation.chain_jacobians_count > 0u) {
+            const size_t bytes =
+                static_cast<size_t>(articulation.chain_jacobians_count) * sizeof(float);
+            EnsureScratchBuffer(scratch.chain_jacobians,
+                                scratch.chain_jacobians_bytes, bytes);
+            scratch.chain_jacobians.CopyFromHost(articulation.chain_jacobians, bytes);
+        }
+        if (articulation.inertia_m_inv != nullptr &&
+            articulation.inertia_m_inv_count > 0u) {
+            const size_t bytes =
+                static_cast<size_t>(articulation.inertia_m_inv_count) * sizeof(float);
+            EnsureScratchBuffer(scratch.inertia_m_inv,
+                                scratch.inertia_m_inv_bytes, bytes);
+            scratch.inertia_m_inv.CopyFromHost(articulation.inertia_m_inv, bytes);
+        }
+        if (articulation.qdot != nullptr && articulation.qdot_count > 0u) {
+            const size_t bytes =
+                static_cast<size_t>(articulation.qdot_count) * sizeof(float);
+            EnsureScratchBuffer(scratch.qdot, scratch.qdot_bytes, bytes);
+            scratch.qdot.CopyFromHost(articulation.qdot, bytes);
+        }
+    }
+
     DeviceRowBuffers device_view;
     device_view.rows = static_cast<constraint::Row*>(scratch.rows.Data());
     device_view.body_indices =
@@ -871,6 +1079,28 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
             ? static_cast<const constraint::ContactRowSides*>(scratch.sides.Data())
             : nullptr;  // v0.8 C5a
     device_view.sides_count = have_sides ? sides_count : 0u;
+    // v0.8 C5b-core: articulation device pointers (null unless have_articulation).
+    device_view.art_refs =
+        have_articulation
+            ? static_cast<const constraint::RowArticulationRefs*>(scratch.art_refs.Data())
+            : nullptr;
+    device_view.art_refs_count = have_articulation ? articulation.art_refs_count : 0u;
+    device_view.chain_jacobians =
+        (have_articulation && articulation.chain_jacobians != nullptr &&
+         articulation.chain_jacobians_count > 0u)
+            ? static_cast<const float*>(scratch.chain_jacobians.Data())
+            : nullptr;
+    device_view.inertia_m_inv =
+        (have_articulation && articulation.inertia_m_inv != nullptr &&
+         articulation.inertia_m_inv_count > 0u)
+            ? static_cast<const float*>(scratch.inertia_m_inv.Data())
+            : nullptr;
+    device_view.qdot =
+        (have_articulation && articulation.qdot != nullptr &&
+         articulation.qdot_count > 0u)
+            ? static_cast<float*>(scratch.qdot.Data())
+            : nullptr;
+    device_view.dof_stride = have_articulation ? articulation.dof_stride : 0u;
     device_view.row_count = rows.RowCount();
     device_view.body_index_count = rows.BodyIndexCount();
     device_view.jacobian_data_count = rows.JacobianDataCount();
@@ -902,6 +1132,13 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     scratch.bodies.CopyToHost(bodies, bodies_bytes);
     scratch.rows.CopyToHost(rows.rows.data(),
                             rows.rows.size() * sizeof(constraint::Row));
+    // v0.8 C5b-core: download the MUTATED articulation qdot (the apply wrote it).
+    if (have_articulation && articulation.qdot != nullptr &&
+        articulation.qdot_count > 0u) {
+        scratch.qdot.CopyToHost(
+            articulation.qdot,
+            static_cast<size_t>(articulation.qdot_count) * sizeof(float));
+    }
     scratch.max_error.CopyToHost(&report.max_position_error, sizeof(float));
     report.row_scheduler_report.executed_iterations = config.velocity_iterations;
     report.row_scheduler_report.active_row_count = rows.RowCount();
