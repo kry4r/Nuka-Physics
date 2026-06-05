@@ -446,6 +446,12 @@ add_executable(nuka_solver_test
     # (closed-form chain oracle + same-articulation coloring + link<->rigid two-
     # way + D1). Hand-built ArticulationReactionState data (no device CRBA).
     solver/test_link_rigid_twoway.cpp
+    # v0.8 C5b-core: compliant-PGS regularizer R-SWEEP guard (210c11f). Drives a
+    # coupled full-rank SPD A = J M^-1 J^T (dof_stride==N) compliant system through
+    # UnifiedSolve and matches the converged lambda to a double-precision dense
+    # (A+diag(R))lambda=b solve across R/A from ~1e-3 to ~1e+1, + a large-R
+    # discriminator vs the pre-fix A*lambda=b fixed point + D1. MJX-FREE.
+    solver/test_compliant_pgs_regularizer.cpp
 )
 
 target_link_libraries(nuka_solver_test
