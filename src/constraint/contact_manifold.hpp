@@ -73,9 +73,33 @@ struct ContactManifold {
         }
     }
 
-    /// Reset all points.
+    /// Reset the manifold to its DEFAULT-CONSTRUCTED state (C3c-named debt, folded
+    /// at W1a). A bare `point_count = 0` left the unused points[] tail + a/b/
+    /// friction/restitution/solimp/manifold_key at STALE values from a prior fill --
+    /// so a manifold buffer REUSED across steps could carry nondeterministic padding
+    /// into a multi-step rollout and break the D1 byte-identity gate. Reset EVERY
+    /// member to its default initializer (the whole points[] array, the
+    /// CollidableRefs, the merged params, the key) so a cleared-then-refilled
+    /// manifold is byte-identical to a value-initialized `ContactManifold{}`.
+    /// AddPoint/StampSides re-populate the live fields; this only guarantees the
+    /// UNUSED tail is deterministic. Behavior-preserving for the single-shot callers
+    /// (the driver already value-inits `ContactManifold m{}` before each fill, so
+    /// their tail already matched these defaults -- nothing they read changes).
     NUKA_MANIFOLD_HD void Clear() {
+        a = CollidableRef{};
+        b = CollidableRef{};
         point_count = 0;
+        friction = 0.5f;
+        restitution = 0.0f;
+        solimp[0] = 0.9f;
+        solimp[1] = 0.95f;
+        solimp[2] = 0.001f;
+        solimp[3] = 0.5f;
+        solimp[4] = 2.0f;
+        manifold_key = 0u;
+        for (uint32_t i = 0u; i < kMaxPoints; ++i) {
+            points[i] = ContactPoint{};
+        }
     }
 };
 
