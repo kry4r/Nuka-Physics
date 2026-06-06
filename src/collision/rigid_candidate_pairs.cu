@@ -87,15 +87,20 @@ __device__ __forceinline__ bool DeviceIsExcluded(uint32_t a, uint32_t b,
     return false;
 }
 
-// --- Pass 1: per-shape-pair keep flag (bitmask AND exclude) -----------------
-// One thread per LBVH shape-pair. Writes 1 (keep) or 0 (drop). NO atomics; the
+// --- Pass 1: per-AABB-pair keep flag (bitmask AND exclude) ------------------
+// One thread per LBVH AABB-pair. Writes 1 (keep) or 0 (drop). NO atomics; the
 // explicit-<pair> force-include is applied later on the host (it can only ADD
-// pairs the bitmask dropped, never remove a kept one).
+// pairs the bitmask dropped, never remove a kept one). The contype/conaffinity
+// and body-id arrays are indexed by the AABB's ORIGINAL input index (LBVH leaf
+// order == input order). These tags are per-AABB and type-agnostic (commit 2):
+// the body-id is for the same-body drop + the exclude search ONLY, distinct from
+// the emit handle (see CompactKernel).
 __global__ void KeepFlagKernel(uint32_t pair_count,
-                               const collision::CollisionPair* __restrict__ shape_pairs,
-                               const uint32_t* __restrict__ shape_body_ids,
-                               const uint32_t* __restrict__ shape_contypes,
-                               const uint32_t* __restrict__ shape_conaffinities,
+                               const collision::CollisionPair* __restrict__ aabb_pairs,
+                               const uint32_t* __restrict__ aabb_types,
+                               const uint32_t* __restrict__ aabb_body_ids,
+                               const uint32_t* __restrict__ aabb_contypes,
+                               const uint32_t* __restrict__ aabb_conaffinities,
                                const uint32_t* __restrict__ excl_lo,
                                const uint32_t* __restrict__ excl_hi,
                                uint32_t excl_count,
@@ -104,39 +109,53 @@ __global__ void KeepFlagKernel(uint32_t pair_count,
     if (i >= pair_count) {
         return;
     }
-    const collision::CollisionPair sp = shape_pairs[i];
-    const uint32_t sa = sp.body_a;  // SHAPE indices (LBVH leaf order)
+    const collision::CollisionPair sp = aabb_pairs[i];
+    const uint32_t sa = sp.body_a;  // AABB indices (LBVH leaf == input order)
     const uint32_t sb = sp.body_b;
 
     // 1. contype/conaffinity bitmask (MuJoCo two-way AND/OR).
     const bool bitmask_ok = scene::PassesContactBitmask(
-        shape_contypes[sa], shape_conaffinities[sa],
-        shape_contypes[sb], shape_conaffinities[sb]);
+        aabb_contypes[sa], aabb_conaffinities[sa],
+        aabb_contypes[sb], aabb_conaffinities[sb]);
 
     // 2. body-level exclude (authored <exclude> UNION parent-child auto-exclude).
-    const uint32_t ba = shape_body_ids[sa];
-    const uint32_t bb = shape_body_ids[sb];
+    const uint32_t ba = aabb_body_ids[sa];
+    const uint32_t bb = aabb_body_ids[sb];
     const bool excluded = DeviceIsExcluded(ba, bb, excl_lo, excl_hi, excl_count);
 
     // 3. drop a same-body pair (two shapes of ONE multi-shape body) -- a body
     //    never collides with itself. (For v0.8's 1-shape/body this never fires,
     //    since distinct shapes have distinct bodies; it makes the multi-shape
     //    path correct so CompactKernel never emits a (X,X) self-body-pair.)
-    out_flags[i] = (bitmask_ok && !excluded && ba != bb) ? 1u : 0u;
+    //
+    //    CROSS-TYPE NOTE: a body id only identifies "the same physical body" WITHIN
+    //    one collidable type. A RigidBody and an ArticulationLink could carry the
+    //    same numeric body id yet are never the same body, so the same-body drop
+    //    must fire ONLY when the two sides share a type. We gate on type-equality:
+    //    a same-body-id pair is dropped iff both sides are the SAME type. For the
+    //    all-rigid path every AABB is RigidBody, so the type-equality is always
+    //    true and this reduces EXACTLY to C2b's `ba != bb` -> byte-identical rigid
+    //    output (the regression guard).
+    const bool same_actual_body = (ba == bb) && (aabb_types[sa] == aabb_types[sb]);
+    out_flags[i] = (bitmask_ok && !excluded && !same_actual_body) ? 1u : 0u;
 }
 
-// --- Pass 2: compact kept shape-pairs into emitted body-pair CandidatePairs --
+// --- Pass 2: compact kept AABB-pairs into emitted CandidatePairs ------------
 // Scatter into the PRIVATE slot flag_scan[i] (exclusive scan of the flags). No
 // atomics: each kept pair owns a distinct output index. Self-pairs (sa==sb) can
-// never appear (LBVH emits canonical a<b); same-body multi-shape pairs (ba==bb)
-// were already dropped by KeepFlagKernel (flag==0), so every pair reaching here
-// has two distinct bodies.
+// never appear (LBVH emits canonical a<b); same-(body,type) pairs were already
+// dropped by KeepFlagKernel (flag==0). Each emitted side's (type, react, handle)
+// is stamped from the per-AABB tag arrays -- NOT hardcoded RigidBody -- so one
+// pass emits rigid<->rigid, link<->link, AND link<->rigid pairs. The emit HANDLE
+// comes from aabb_handles (body-id for rigid, link-index for articulation),
+// DISTINCT from the body_id the filter used.
 __global__ void CompactKernel(uint32_t pair_count,
-                              const collision::CollisionPair* __restrict__ shape_pairs,
-                              const uint32_t* __restrict__ shape_body_ids,
+                              const collision::CollisionPair* __restrict__ aabb_pairs,
+                              const uint32_t* __restrict__ aabb_types,
+                              const uint32_t* __restrict__ aabb_reacts,
+                              const uint32_t* __restrict__ aabb_handles,
                               const uint32_t* __restrict__ flags,
                               const uint32_t* __restrict__ flag_scan,
-                              ReactionProviderKind react,
                               CandidatePair* __restrict__ out_pairs) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= pair_count) {
@@ -145,17 +164,17 @@ __global__ void CompactKernel(uint32_t pair_count,
     if (flags[i] == 0u) {
         return;
     }
-    const collision::CollisionPair sp = shape_pairs[i];
-    const uint32_t ba = shape_body_ids[sp.body_a];
-    const uint32_t bb = shape_body_ids[sp.body_b];
+    const collision::CollisionPair sp = aabb_pairs[i];
+    const uint32_t ia = sp.body_a;  // AABB indices (LBVH leaf == input order)
+    const uint32_t ib = sp.body_b;
 
     CandidatePair out;
-    out.a.type = CollidableType::RigidBody;
-    out.a.react = react;
-    out.a.handle = ba;
-    out.b.type = CollidableType::RigidBody;
-    out.b.react = react;
-    out.b.handle = bb;
+    out.a.type   = static_cast<CollidableType>(aabb_types[ia]);
+    out.a.react  = static_cast<ReactionProviderKind>(aabb_reacts[ia]);
+    out.a.handle = aabb_handles[ia];
+    out.b.type   = static_cast<CollidableType>(aabb_types[ib]);
+    out.b.react  = static_cast<ReactionProviderKind>(aabb_reacts[ib]);
+    out.b.handle = aabb_handles[ib];
     out.stable_key = 0ull;  // BuildCandidatePairStream recomputes the canonical key.
 
     out_pairs[flag_scan[i]] = out;
@@ -163,170 +182,172 @@ __global__ void CompactKernel(uint32_t pair_count,
 
 } // namespace
 
-CandidatePairStream BuildRigidCandidatePairs(
+// ---------------------------------------------------------------------------
+// The TYPE-AGNOSTIC tagged core (commit 2). LBVH over the tagged AABBs ->
+// bitmask+exclude+same-(body,type) filter -> compact (stamp tags) -> union the
+// caller-supplied extra survivors -> sorted D1 stream -> adjacent dedup.
+// ---------------------------------------------------------------------------
+CandidatePairStream BuildCandidatePairsTagged(
     const phi::DeviceContext& context,
-    const collision::AABB* device_shape_aabbs, uint32_t shape_count,
-    const uint32_t* shape_body_ids,
-    const uint32_t* shape_contypes,
-    const uint32_t* shape_conaffinities,
-    const scene::CookedFilterPolicy& policy) {
+    const collision::AABB* device_aabbs, uint32_t count,
+    const CandidateAabbTags& tags,
+    const std::vector<std::pair<uint32_t, uint32_t>>& excluded_body_pairs,
+    const std::vector<CandidatePair>& extra_survivors) {
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
 
-    if (shape_count == 0u) {
-        return BuildCandidatePairStream(context, {});
+    // --- Host-side handle-guard (C2-named-debt consumer) --------------------
+    // A handle >= 2^28 would alias the type bits in PackSideKey (candidate_pair.hpp
+    // packs (type<<28)|(handle & 0x0FFFFFFF)), silently corrupting the stable_key.
+    // This is the mint site for every handle that enters the stream (rigid body id
+    // or articulation link index), so the guard lives here once.
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (tags.handles[i] > kCandidateHandleMask) {
+            throw std::runtime_error(
+                "BuildCandidatePairsTagged: collidable handle " +
+                std::to_string(tags.handles[i]) + " exceeds the 2^28 limit (" +
+                std::to_string(kCandidateHandleMask) +
+                ") and would alias the CollidableType bits in the stable_key");
+        }
     }
 
-    // The RigidBody reaction provider kind, read off the generated registry so
-    // the emit stays in sync with the collidable metadata (no hard-coded enum).
-    const ReactionProviderKind rigid_react =
-        constraint::GetCollidableTypeInfo(CollidableType::RigidBody).react;
-
-    // --- LBVH over the per-shape world AABBs (already D1) --------------------
-    // RETAIN nothing extra; we only need the sorted compact shape-pair list.
-    auto lbvh = collision::gpu::BuildLbvhBroadphase(context, device_shape_aabbs,
-                                                    shape_count);
-    const uint32_t pair_count = lbvh.PairCount();
-
-    // Upload the per-shape metadata the kernels index by SHAPE id.
-    std::vector<uint32_t> body_ids(shape_body_ids, shape_body_ids + shape_count);
-    std::vector<uint32_t> contypes(shape_contypes, shape_contypes + shape_count);
-    std::vector<uint32_t> conaff(shape_conaffinities,
-                                 shape_conaffinities + shape_count);
-    phi::Buffer d_body_ids = phi::UploadVector(body_ids);
-    phi::Buffer d_contypes = phi::UploadVector(contypes);
-    phi::Buffer d_conaff = phi::UploadVector(conaff);
-
-    // Upload the sorted canonical exclude list as two parallel uint32 arrays so
-    // the device binary search needs no std::pair. (min,max) per entry, ascending.
-    const uint32_t excl_count =
-        static_cast<uint32_t>(policy.excluded_body_pairs.size());
-    std::vector<uint32_t> excl_lo(excl_count);
-    std::vector<uint32_t> excl_hi(excl_count);
-    for (uint32_t i = 0u; i < excl_count; ++i) {
-        excl_lo[i] = policy.excluded_body_pairs[i].first;
-        excl_hi[i] = policy.excluded_body_pairs[i].second;
-    }
-    // Allocate >=1 element so Data() is a valid (unused-when-count-0) pointer.
-    phi::Buffer d_excl_lo(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
-                          phi::MemoryKind::Device);
-    phi::Buffer d_excl_hi(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
-                          phi::MemoryKind::Device);
-    if (excl_count > 0u) {
-        d_excl_lo.CopyFromHost(excl_lo.data(), excl_count * sizeof(uint32_t));
-        d_excl_hi.CopyFromHost(excl_hi.data(), excl_count * sizeof(uint32_t));
-    }
-
-    // Survivors of the on-device bitmask+exclude filter (body-pairs).
+    // Survivors of the on-device bitmask+exclude filter. The caller's extras are
+    // appended AFTER the device survivors (below), NOT before: BuildCandidatePairStream
+    // uses thrust::STABLE_sort and does NOT swap a/b to canonical, so when an extra
+    // (e.g. an explicit <pair> authored in descending geom order -> stored (max,min))
+    // duplicates a device-detected pair (always stored (min,max)) the adjacent dedup
+    // keeps the FIRST of the equal-key run. Device-first preserves the device's
+    // canonical (min,max) byte layout in the deduped output -- the byte-identity the
+    // rigid wrapper requires vs the pre-refactor C2b builder.
     std::vector<CandidatePair> survivors;
 
-    if (pair_count > 0u) {
-        const uint32_t blocks = (pair_count + kBlockSize - 1u) / kBlockSize;
+    if (count > 0u) {
+        // --- LBVH over the tagged world AABBs (already D1) -------------------
+        // RETAIN nothing extra; we only need the sorted compact AABB-pair list.
+        // The LBVH emits ORIGINAL-input-order indices (proven C2), so each tag
+        // array indexes straight by the pair's body_a / body_b.
+        auto lbvh = collision::gpu::BuildLbvhBroadphase(context, device_aabbs, count);
+        const uint32_t pair_count = lbvh.PairCount();
 
-        // --- Pass 1: keep flags ---------------------------------------------
-        phi::Buffer d_flags(pair_count * sizeof(uint32_t), phi::MemoryKind::Device);
-        KeepFlagKernel<<<blocks, kBlockSize, 0, stream>>>(
-            pair_count, lbvh.DevicePairs(),
-            static_cast<const uint32_t*>(d_body_ids.Data()),
-            static_cast<const uint32_t*>(d_contypes.Data()),
-            static_cast<const uint32_t*>(d_conaff.Data()),
-            static_cast<const uint32_t*>(d_excl_lo.Data()),
-            static_cast<const uint32_t*>(d_excl_hi.Data()),
-            excl_count,
-            static_cast<uint32_t*>(d_flags.Data()));
-        CheckCuda(cudaGetLastError(), "KeepFlagKernel launch");
-
-        // --- Exclusive scan -> per-pair output slot -------------------------
-        phi::Buffer d_scan(pair_count * sizeof(uint32_t), phi::MemoryKind::Device);
-        thrust::exclusive_scan(
-            thrust::cuda::par.on(stream),
-            static_cast<const uint32_t*>(d_flags.Data()),
-            static_cast<const uint32_t*>(d_flags.Data()) + pair_count,
-            static_cast<uint32_t*>(d_scan.Data()));
-        CheckCuda(cudaGetLastError(), "exclusive_scan keep flags");
-
-        context.stream.Synchronize();
-        uint32_t last_scan = 0u;
-        uint32_t last_flag = 0u;
-        {
-            const auto* scan_dev = static_cast<const uint32_t*>(d_scan.Data());
-            const auto* flag_dev = static_cast<const uint32_t*>(d_flags.Data());
-            CheckCuda(cudaMemcpy(&last_scan, scan_dev + (pair_count - 1u),
-                                 sizeof(uint32_t), cudaMemcpyDeviceToHost),
-                      "copy last scan");
-            CheckCuda(cudaMemcpy(&last_flag, flag_dev + (pair_count - 1u),
-                                 sizeof(uint32_t), cudaMemcpyDeviceToHost),
-                      "copy last flag");
+        // Upload the per-AABB tag arrays the kernels index by input id.
+        std::vector<uint32_t> types(count);
+        std::vector<uint32_t> reacts(count);
+        for (uint32_t i = 0u; i < count; ++i) {
+            types[i]  = static_cast<uint32_t>(tags.types[i]);
+            reacts[i] = static_cast<uint32_t>(tags.reacts[i]);
         }
-        const uint32_t survivor_count = last_scan + last_flag;
+        std::vector<uint32_t> handles(tags.handles, tags.handles + count);
+        std::vector<uint32_t> body_ids(tags.body_ids, tags.body_ids + count);
+        std::vector<uint32_t> contypes(tags.contypes, tags.contypes + count);
+        std::vector<uint32_t> conaff(tags.conaffinities, tags.conaffinities + count);
+        phi::Buffer d_types    = phi::UploadVector(types);
+        phi::Buffer d_reacts   = phi::UploadVector(reacts);
+        phi::Buffer d_handles  = phi::UploadVector(handles);
+        phi::Buffer d_body_ids = phi::UploadVector(body_ids);
+        phi::Buffer d_contypes = phi::UploadVector(contypes);
+        phi::Buffer d_conaff   = phi::UploadVector(conaff);
 
-        if (survivor_count > 0u) {
-            // --- Pass 2: compact into body-pair CandidatePairs --------------
-            phi::Buffer d_out(survivor_count * sizeof(CandidatePair),
+        // Upload the sorted canonical exclude list as two parallel uint32 arrays
+        // so the device binary search needs no std::pair ((min,max), ascending).
+        const uint32_t excl_count = static_cast<uint32_t>(excluded_body_pairs.size());
+        std::vector<uint32_t> excl_lo(excl_count);
+        std::vector<uint32_t> excl_hi(excl_count);
+        for (uint32_t i = 0u; i < excl_count; ++i) {
+            excl_lo[i] = excluded_body_pairs[i].first;
+            excl_hi[i] = excluded_body_pairs[i].second;
+        }
+        // Allocate >=1 element so Data() is a valid (unused-when-count-0) pointer.
+        phi::Buffer d_excl_lo(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
                               phi::MemoryKind::Device);
-            CompactKernel<<<blocks, kBlockSize, 0, stream>>>(
+        phi::Buffer d_excl_hi(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
+                              phi::MemoryKind::Device);
+        if (excl_count > 0u) {
+            d_excl_lo.CopyFromHost(excl_lo.data(), excl_count * sizeof(uint32_t));
+            d_excl_hi.CopyFromHost(excl_hi.data(), excl_count * sizeof(uint32_t));
+        }
+
+        if (pair_count > 0u) {
+            const uint32_t blocks = (pair_count + kBlockSize - 1u) / kBlockSize;
+
+            // --- Pass 1: keep flags -----------------------------------------
+            phi::Buffer d_flags(pair_count * sizeof(uint32_t),
+                                phi::MemoryKind::Device);
+            KeepFlagKernel<<<blocks, kBlockSize, 0, stream>>>(
                 pair_count, lbvh.DevicePairs(),
+                static_cast<const uint32_t*>(d_types.Data()),
                 static_cast<const uint32_t*>(d_body_ids.Data()),
+                static_cast<const uint32_t*>(d_contypes.Data()),
+                static_cast<const uint32_t*>(d_conaff.Data()),
+                static_cast<const uint32_t*>(d_excl_lo.Data()),
+                static_cast<const uint32_t*>(d_excl_hi.Data()),
+                excl_count,
+                static_cast<uint32_t*>(d_flags.Data()));
+            CheckCuda(cudaGetLastError(), "KeepFlagKernel launch");
+
+            // --- Exclusive scan -> per-pair output slot ---------------------
+            phi::Buffer d_scan(pair_count * sizeof(uint32_t),
+                               phi::MemoryKind::Device);
+            thrust::exclusive_scan(
+                thrust::cuda::par.on(stream),
                 static_cast<const uint32_t*>(d_flags.Data()),
-                static_cast<const uint32_t*>(d_scan.Data()),
-                rigid_react,
-                static_cast<CandidatePair*>(d_out.Data()));
-            CheckCuda(cudaGetLastError(), "CompactKernel launch");
-            context.stream.Synchronize();
+                static_cast<const uint32_t*>(d_flags.Data()) + pair_count,
+                static_cast<uint32_t*>(d_scan.Data()));
+            CheckCuda(cudaGetLastError(), "exclusive_scan keep flags");
 
-            survivors.resize(survivor_count);
-            d_out.CopyToHost(survivors.data(),
-                             survivor_count * sizeof(CandidatePair));
-        } else {
             context.stream.Synchronize();
+            uint32_t last_scan = 0u;
+            uint32_t last_flag = 0u;
+            {
+                const auto* scan_dev = static_cast<const uint32_t*>(d_scan.Data());
+                const auto* flag_dev = static_cast<const uint32_t*>(d_flags.Data());
+                CheckCuda(cudaMemcpy(&last_scan, scan_dev + (pair_count - 1u),
+                                     sizeof(uint32_t), cudaMemcpyDeviceToHost),
+                          "copy last scan");
+                CheckCuda(cudaMemcpy(&last_flag, flag_dev + (pair_count - 1u),
+                                     sizeof(uint32_t), cudaMemcpyDeviceToHost),
+                          "copy last flag");
+            }
+            const uint32_t survivor_count = last_scan + last_flag;
+
+            if (survivor_count > 0u) {
+                // --- Pass 2: compact into tagged CandidatePairs -------------
+                phi::Buffer d_out(survivor_count * sizeof(CandidatePair),
+                                  phi::MemoryKind::Device);
+                CompactKernel<<<blocks, kBlockSize, 0, stream>>>(
+                    pair_count, lbvh.DevicePairs(),
+                    static_cast<const uint32_t*>(d_types.Data()),
+                    static_cast<const uint32_t*>(d_reacts.Data()),
+                    static_cast<const uint32_t*>(d_handles.Data()),
+                    static_cast<const uint32_t*>(d_flags.Data()),
+                    static_cast<const uint32_t*>(d_scan.Data()),
+                    static_cast<CandidatePair*>(d_out.Data()));
+                CheckCuda(cudaGetLastError(), "CompactKernel launch");
+                context.stream.Synchronize();
+
+                const size_t base = survivors.size();
+                survivors.resize(base + survivor_count);
+                d_out.CopyToHost(survivors.data() + base,
+                                 survivor_count * sizeof(CandidatePair));
+            } else {
+                context.stream.Synchronize();
+            }
         }
     }
 
-    // --- Host explicit-<pair> force-include merge ---------------------------
-    // MuJoCo: an authored <contact><pair> ALWAYS generates, even if the bitmask
-    // would reject it. The policy stores explicit pairs in SOURCE-shape space and
-    // v0.8 has NO mesh decomposition (cooked-row id == source-shape id, 1:1), so
-    // an explicit pair's (geom1, geom2) are directly the cooked SHAPE ids we map
-    // to body ids via shape_body_ids. (The SOURCE-shape -> COOKED-row bridge for a
-    // V-HACD-decomposed mesh -- one source shape -> N cooked rows -- is a C3/later
-    // concern; this builder treats them 1:1 as v0.8 reality dictates.)
-    //
-    // We force-include by appending each explicit pair's body-pair to the survivor
-    // set. A pair the bitmask already kept becomes a duplicate body-pair; the
-    // post-sort dedup below collapses it, so the union is idempotent. We only add
-    // pairs whose source shapes are in range (defensive) and whose bodies differ.
-    for (const auto& ep : policy.explicit_pairs) {
-        const scene::ShapeId g1 = ep.geom1;
-        const scene::ShapeId g2 = ep.geom2;
-        if (g1 >= shape_count || g2 >= shape_count) {
-            continue;  // out-of-range source shape (no 1:1 cooked row) -> skip.
-        }
-        const uint32_t ba = shape_body_ids[g1];
-        const uint32_t bb = shape_body_ids[g2];
-        if (ba == bb) {
-            continue;  // a body never collides with itself.
-        }
-        CandidatePair out;
-        out.a.type = CollidableType::RigidBody;
-        out.a.react = rigid_react;
-        out.a.handle = ba;
-        out.b.type = CollidableType::RigidBody;
-        out.b.react = rigid_react;
-        out.b.handle = bb;
-        out.stable_key = 0ull;
-        survivors.push_back(out);
-    }
+    // Append the caller's extras AFTER the device survivors (see the survivors
+    // declaration: device-first preserves the device's canonical (min,max) byte
+    // layout as the dedup winner -> byte-identity vs the pre-refactor C2b builder).
+    survivors.insert(survivors.end(), extra_survivors.begin(), extra_survivors.end());
 
     // --- Build the sorted D1 stream (C2a stamps stable_key + stable_sort) ----
-    CandidatePairStream stream_out =
-        BuildCandidatePairStream(context, survivors);
+    CandidatePairStream stream_out = BuildCandidatePairStream(context, survivors);
 
-    // --- Dedup adjacent identical body-pairs --------------------------------
-    // After the C2a sort, identical body-pairs (a multi-shape body's per-shape-pair
-    // candidates mapping to the same body-pair, OR an explicit pair duplicating a
+    // --- Dedup adjacent identical pairs -------------------------------------
+    // After the C2a sort, identical pairs (a multi-shape collidable's per-shape-pair
+    // candidates mapping to the same (a,b), OR an extra-survivor duplicating a
     // bitmask survivor) are ADJACENT (same stable_key). Collapse them so the stream
-    // carries each body-pair once (C3 narrowphase re-expands the body's shapes).
-    // For v0.8's 1-shape/body with no duplicate explicit pair this is a no-op.
+    // carries each pair once (C3 narrowphase re-expands shapes). For 1-shape/body
+    // with no duplicate extra this is a no-op.
     const auto sorted = stream_out.DownloadPairs();
     bool has_dup = false;
     for (size_t i = 1; i < sorted.size(); ++i) {
@@ -348,6 +369,75 @@ CandidatePairStream BuildRigidCandidatePairs(
     return BuildCandidatePairStream(context, unique_pairs);
 }
 
+// ---------------------------------------------------------------------------
+// The RIGID<->RIGID wrapper -- a thin all-RigidBody tag build over the tagged
+// core, BYTE-IDENTICAL to the C2b builder (the rigid regression guard). The
+// explicit-<pair> force-include (rigid-source-shape-specific) is computed HERE
+// and passed as extra survivors; cross-type explicit pairs are out of scope.
+// ---------------------------------------------------------------------------
+CandidatePairStream BuildRigidCandidatePairs(
+    const phi::DeviceContext& context,
+    const collision::AABB* device_shape_aabbs, uint32_t shape_count,
+    const uint32_t* shape_body_ids,
+    const uint32_t* shape_contypes,
+    const uint32_t* shape_conaffinities,
+    const scene::CookedFilterPolicy& policy) {
+    if (shape_count == 0u && policy.explicit_pairs.empty()) {
+        return BuildCandidatePairStream(context, {});
+    }
+
+    // The RigidBody reaction provider kind, read off the generated registry so
+    // the emit stays in sync with the collidable metadata (no hard-coded enum).
+    const ReactionProviderKind rigid_react =
+        constraint::GetCollidableTypeInfo(CollidableType::RigidBody).react;
+
+    // All-RigidBody tags: type=RigidBody, react=rigid_react, handle=body_id,
+    // body_id=body_id -> the handle/body_id split is a no-op so this reduces to
+    // C2b's emit exactly.
+    std::vector<CollidableType>     types(shape_count, CollidableType::RigidBody);
+    std::vector<ReactionProviderKind> reacts(shape_count, rigid_react);
+    CandidateAabbTags tags;
+    tags.types         = types.data();
+    tags.reacts        = reacts.data();
+    tags.handles       = shape_body_ids;   // handle == body id for rigid.
+    tags.body_ids      = shape_body_ids;
+    tags.contypes      = shape_contypes;
+    tags.conaffinities = shape_conaffinities;
+
+    // --- Host explicit-<pair> force-include (rigid only) --------------------
+    // MuJoCo: an authored <contact><pair> ALWAYS generates, even if the bitmask
+    // would reject it. The policy stores explicit pairs in SOURCE-shape space and
+    // v0.8 has NO mesh decomposition (cooked-row id == source-shape id, 1:1), so
+    // an explicit pair's (geom1, geom2) are directly the cooked SHAPE ids we map
+    // to body ids via shape_body_ids. We append each as an extra survivor (a
+    // duplicate of a bitmask survivor collapses in the core's adjacent dedup).
+    std::vector<CandidatePair> extra;
+    for (const auto& ep : policy.explicit_pairs) {
+        const scene::ShapeId g1 = ep.geom1;
+        const scene::ShapeId g2 = ep.geom2;
+        if (g1 >= shape_count || g2 >= shape_count) {
+            continue;  // out-of-range source shape (no 1:1 cooked row) -> skip.
+        }
+        const uint32_t ba = shape_body_ids[g1];
+        const uint32_t bb = shape_body_ids[g2];
+        if (ba == bb) {
+            continue;  // a body never collides with itself.
+        }
+        CandidatePair out;
+        out.a.type = CollidableType::RigidBody;
+        out.a.react = rigid_react;
+        out.a.handle = ba;
+        out.b.type = CollidableType::RigidBody;
+        out.b.react = rigid_react;
+        out.b.handle = bb;
+        out.stable_key = 0ull;
+        extra.push_back(out);
+    }
+
+    return BuildCandidatePairsTagged(context, device_shape_aabbs, shape_count,
+                                     tags, policy.excluded_body_pairs, extra);
+}
+
 CandidatePairStream BuildRigidCandidatePairs(
     const collision::AABB* device_shape_aabbs, uint32_t shape_count,
     const uint32_t* shape_body_ids,
@@ -358,6 +448,94 @@ CandidatePairStream BuildRigidCandidatePairs(
     return BuildRigidCandidatePairs(context, device_shape_aabbs, shape_count,
                                     shape_body_ids, shape_contypes,
                                     shape_conaffinities, policy);
+}
+
+// ---------------------------------------------------------------------------
+// The ARTICULATION-LINK <-> RIGID mixed entry (commit 3's gate consumer).
+// Concatenate [rigid AABBs | link AABBs] with parallel tag arrays (rigid side
+// tagged RigidBody/handle=body-id; link side tagged ArticulationLink/handle=link
+// index) and run the tagged core. No extra survivors (cross-type explicit pairs
+// are out of scope).
+// ---------------------------------------------------------------------------
+CandidatePairStream BuildArticulationRigidCandidatePairs(
+    const phi::DeviceContext& context,
+    const collision::AABB* rigid_aabbs, uint32_t rigid_count,
+    const uint32_t* rigid_body_ids,
+    const uint32_t* rigid_contypes,
+    const uint32_t* rigid_conaffinities,
+    const LinkShapeAabbs& links,
+    const uint32_t* link_contypes,
+    const uint32_t* link_conaffinities,
+    const std::vector<std::pair<uint32_t, uint32_t>>& excluded_body_pairs) {
+    const uint32_t link_count = static_cast<uint32_t>(links.aabbs.size());
+    const uint32_t total = rigid_count + link_count;
+    if (total == 0u) {
+        return BuildCandidatePairStream(context, {});
+    }
+
+    const ReactionProviderKind rigid_react =
+        constraint::GetCollidableTypeInfo(CollidableType::RigidBody).react;
+    const ReactionProviderKind link_react =
+        constraint::GetCollidableTypeInfo(CollidableType::ArticulationLink).react;
+
+    // Concatenate the AABBs: [rigid... | link...]. The tag arrays below are in the
+    // SAME concatenated order (the LBVH emits input-order indices, proven C2).
+    std::vector<collision::AABB> aabbs;
+    aabbs.reserve(total);
+    {
+        // The rigid AABBs live in DEVICE memory; copy them to host to concatenate
+        // with the link AABBs (host), then re-upload the unified array. (This entry
+        // is the validated-not-wired gate path; the unified upload keeps the tag
+        // arrays trivially parallel to one contiguous device buffer.)
+        std::vector<collision::AABB> rigid_host(rigid_count);
+        if (rigid_count > 0u) {
+            // rigid_aabbs is already device-resident; copy device->host directly.
+            CheckCuda(cudaMemcpy(rigid_host.data(), rigid_aabbs,
+                                 rigid_count * sizeof(collision::AABB),
+                                 cudaMemcpyDeviceToHost),
+                      "copy rigid AABBs to host");
+        }
+        for (uint32_t i = 0u; i < rigid_count; ++i) aabbs.push_back(rigid_host[i]);
+        for (uint32_t i = 0u; i < link_count; ++i) aabbs.push_back(links.aabbs[i]);
+    }
+    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+
+    // Parallel tag arrays over the concatenated order.
+    std::vector<CollidableType>       types(total);
+    std::vector<ReactionProviderKind> reacts(total);
+    std::vector<uint32_t>             handles(total);
+    std::vector<uint32_t>             body_ids(total);
+    std::vector<uint32_t>             contypes(total);
+    std::vector<uint32_t>             conaff(total);
+    for (uint32_t i = 0u; i < rigid_count; ++i) {
+        types[i]    = CollidableType::RigidBody;
+        reacts[i]   = rigid_react;
+        handles[i]  = rigid_body_ids[i];   // rigid handle == body id.
+        body_ids[i] = rigid_body_ids[i];
+        contypes[i] = rigid_contypes[i];
+        conaff[i]   = rigid_conaffinities[i];
+    }
+    for (uint32_t i = 0u; i < link_count; ++i) {
+        const uint32_t k = rigid_count + i;
+        types[k]    = CollidableType::ArticulationLink;
+        reacts[k]   = link_react;
+        handles[k]  = links.link_indices[i];   // articulation handle == link index.
+        body_ids[k] = links.shape_body_ids[i];
+        contypes[k] = link_contypes[i];
+        conaff[k]   = link_conaffinities[i];
+    }
+
+    CandidateAabbTags tags;
+    tags.types         = types.data();
+    tags.reacts        = reacts.data();
+    tags.handles       = handles.data();
+    tags.body_ids      = body_ids.data();
+    tags.contypes      = contypes.data();
+    tags.conaffinities = conaff.data();
+
+    return BuildCandidatePairsTagged(
+        context, static_cast<const collision::AABB*>(d_aabbs.Data()), total,
+        tags, excluded_body_pairs, {});
 }
 
 } // namespace nuka::collision
