@@ -283,7 +283,9 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
                              MakeJacobian(row_normal),
                              MakeJacobian(-row_normal),
                              material);
-            out_sides->push_back({manifold.a, manifold.b});
+            // v0.8 C5c: carry the world contact point so the unified solver fills
+            // the rigid side's angular Jacobian r x n in-kernel (linear-only row).
+            out_sides->push_back({manifold.a, manifold.b, point.position});
         }
 
         // --- pyramid friction rows (pure-tangent spokes, fixed order) --------
@@ -353,7 +355,9 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
                                      MakeJacobian(dir),
                                      MakeJacobian(-dir),
                                      material);
-                    out_sides->push_back({manifold.a, manifold.b});
+                    // v0.8 C5c: same per-row contact point as the normal row, so a
+                    // rigid side's friction spoke also gets its r x tangent torque.
+                    out_sides->push_back({manifold.a, manifold.b, point.position});
                 }
             }
         }

@@ -16,12 +16,22 @@
 // ---------------------------------------------------------------------------
 
 #include "constraint/collidable.hpp"  // CollidableRef
+#include "math/vec3.hpp"              // math::Vec3 (contact_point)
 
 namespace nuka::constraint {
 
 struct ContactRowSides {
     CollidableRef a;  // side-A collidable (type/react/handle from the manifold)
     CollidableRef b;  // side-B collidable
+    // v0.8 C5c co-residence: the WORLD contact point of this row (the manifold
+    // point.position). The unified solver fills the rigid side's angular contact
+    // Jacobian r x n IN-KERNEL from it (r = contact_point - body.position[COM]),
+    // since the compliant emitter builds a linear-only row (mirrors the legacy
+    // maximal solver computing r x n from body state). Defaults to origin; a
+    // hand-built ContactRowSides with a RIGID side whose COM is NOT the origin MUST
+    // set this (else the in-kernel r x n is spurious). Articulation / static /
+    // particle sides ignore j.angular, so the value is irrelevant for them.
+    math::Vec3 contact_point = math::Vec3{0.0f, 0.0f, 0.0f};
 };
 
 } // namespace nuka::constraint
