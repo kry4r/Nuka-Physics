@@ -25,21 +25,19 @@
 //         -> EmitCompliantContactRows (compliant normal row + ContactRowSides)
 //           -> UnifiedSolve: ctx.state=[box BodyState], ctx.articulation=go2
 //
-// THE LINEAR-ONLY EMITTER GAP (the real grasp blocker -- surfaced here, FIXED in
-// the follow-on commit). EmitCompliantContactRows (and the production
-// AppendContactGroup) build a contact normal row whose Jacobian is LINEAR ONLY --
-// the box-side RowJacobian6.angular is ZERO. RigidApplyImpulse / RigidEffectiveInvMass
-// touch angular only through j.angular, so the box gets NO torque even though this
-// contact is deliberately OFF the box COM (a real lever, r x n != 0) -> a rigid box
-// cannot rotate under contact -> a grasp cannot reorient a held object. The legacy
-// MAXIMAL solver dodges this by computing r x n IN-KERNEL from body state
-// (batched_device_world.cu: jacobian_angular = Cross(r, dir)); the unified row path
-// has no such step, so the rigid side's angular reaction must be supplied. The
-// REQUIRED angular reaction is asserted by DISABLED_BoxRotatesUnderOffCenterContact
-// (a VISIBLY-PENDING test, not a silent print, not a bug-locking angular~0 assert);
-// the follow-on commit computes the rigid-side r x n and ENABLES it. This gate
-// commit asserts only the genuinely-proven parts (the broadphase finds the pair,
-// linear two-way reaction, exact-solve of the assembled linear system, qdot recoil).
+// THE RIGID ANGULAR CONTACT JACOBIAN (the grasp blocker, now CLOSED). The compliant
+// emitter (EmitCompliantContactRows, like the legacy AppendContactGroup) builds a
+// LINEAR-ONLY contact row -- the box-side RowJacobian6.angular is ZERO. The unified
+// solver fills the rigid side's angular contact Jacobian r x n IN-KERNEL
+// (row_solver.cu AugmentRigidContactAngular: r = contact_point - body.position[COM],
+// j.angular = r x j.linear), mirroring the legacy MAXIMAL solver which computes the
+// same from body state (batched_device_world.cu: jacobian_angular = Cross(r, dir)).
+// So an off-COM contact (a real lever, r x n != 0) now gives the box angular
+// velocity -> a grasp can reorient a held object. The contact point rides the
+// ContactRowSides buffer (set by the emitter to the manifold point). This gate
+// asserts: the broadphase finds the pair, linear two-way reaction, exact-solve of
+// the assembled (A+R) system (A_box NOW includes the (r x n).I^-1.(r x n) term),
+// qdot recoil, AND the box angular reaction (BoxRotatesUnderOffCenterContact).
 //
 // THE GATE (MJX-free; force magnitude proven elsewhere):
 //   PRIMARY (the sharp instrument): assemble the co-resident (A+R) lambda = b for
@@ -51,9 +49,9 @@
 //     solve in double, compare to the kernel's converged lambda. rel err < 1e-4.
 //   STRUCTURAL (the genuinely-new surface): the DOWNLOADED box BodyState changed:
 //     (a) box linear velocity changed, nonzero, pushed AWAY from the foot along the
-//         contact normal (sign-checked); (b) box angular velocity from the off-COM
-//         contact -- asserted by the PENDING DISABLED_BoxRotatesUnderOffCenterContact
-//         (the grasp blocker; enabled by the follow-on r x n commit); (c) the
+//         contact normal (sign-checked); (b) box ANGULAR velocity from the off-COM
+//         contact (the grasp blocker, now closed -- in-kernel r x n; the dedicated
+//         BoxRotatesUnderOffCenterContact pins the rotation axis); (c) the
 //         articulation qdot ALSO changed (BOTH sides react). One-sided reaction = bug.
 //   D1: two full runs -> byte-identical lambda + box BodyState + qdot (memcmp).
 // ---------------------------------------------------------------------------
@@ -432,6 +430,12 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
     // The box-side row normal n_box = the box jacobian's linear part (the direction
     // the box is pushed for lambda>0).
     result.box_normal = result.j_box.linear;
+    // v0.8 C5c: the emitter builds a LINEAR-ONLY row; the unified solver fills the
+    // rigid box side's angular Jacobian r x n IN-KERNEL (r = contact_point - box
+    // COM). Mirror that here so result.j_box matches what the kernel uses AND the
+    // exact-solve oracle (A_box) assembles the SAME angular effective-mass term.
+    result.j_box.angular =
+        (result.contact_point - box_center).Cross(result.j_box.linear);
 
     // --- the 18-wide foot chain-J on the manifold's normal-into-the-foot --------
     // The foot side's RowJacobian6.linear IS the foot's contact normal (separation
@@ -628,22 +632,22 @@ TEST(FootBoxCoResidence, BothArmsFireAndBoxVelocityChanges) {
     EXPECT_LT(out.box_lin_after.z, out.box_lin_before.z)
         << "box was not pushed downward (away from the foot above it)";
 
-    // --- STRUCTURAL (b): the box ANGULAR reaction from the off-COM contact is the
-    // grasp blocker. Its assertion lives in DISABLED_BoxRotatesUnderOffCenterContact
-    // (the rigid side's r x n angular Jacobian is still dropped; the follow-on commit
-    // computes it and enables that test). Here we only (1) report the measured
-    // angular delta and (2) assert the geometry is genuinely off-COM, so the pending
-    // test is not vacuous. We do NOT assert angular ~ 0 -- that would lock in the
-    // buggy zero-torque physics (a weakened acceptance criterion). ----------------
+    // --- STRUCTURAL (b): the box ANGULAR reaction from the off-COM contact -- the
+    // grasp blocker, NOW CLOSED. The unified solver fills the rigid side's angular
+    // contact Jacobian r x n in-kernel, so the off-COM contact (a real lever) gives
+    // the box angular velocity. (The axis-specific check is in the dedicated
+    // BoxRotatesUnderOffCenterContact test.) -------------------------------------
     const Vec3 dang = out.box_ang_after - out.box_ang_before;
-    std::printf("[diag] STRUCTURAL(b) box ANG vel delta=%.3e  j_box.angular=(%.3e,%.3e,%.3e) "
-                "[angular reaction PENDING -- see DISABLED_BoxRotatesUnderOffCenterContact]\n",
-                dang.Length(), out.j_box.angular.x, out.j_box.angular.y, out.j_box.angular.z);
     const float lever_x = out.contact_point.x - out.box_state.position.x;
-    std::printf("[diag] STRUCTURAL(b) off-COM lever (contact_x - box_com_x) = %+.5f m\n",
-                lever_x);
+    std::printf("[diag] STRUCTURAL(b) box ANG vel delta=%.3e  j_box.angular=(%.3e,%.3e,%.3e)"
+                "  off-COM lever=%.5f m\n",
+                dang.Length(), out.j_box.angular.x, out.j_box.angular.y,
+                out.j_box.angular.z, lever_x);
     EXPECT_GT(std::fabs(lever_x), 1.0e-3f)
-        << "the contact is NOT off-COM -- the pending angular test would be vacuous";
+        << "the contact is NOT off-COM -- the angular reaction would be vacuous";
+    EXPECT_GT(dang.Length(), 1.0e-4f)
+        << "off-COM contact gave the box NO angular velocity -- the rigid-side r x n "
+           "angular Jacobian is dropped (the grasp blocker has regressed)";
 
     // --- STRUCTURAL (c): the articulation qdot ALSO changed (BOTH sides react) --
     std::printf("[diag] STRUCTURAL(c) qdot delta L1 norm=%.6f  base vz: %+.5f -> %+.5f\n",
@@ -658,16 +662,14 @@ TEST(FootBoxCoResidence, BothArmsFireAndBoxVelocityChanges) {
 }
 
 // ===========================================================================
-// PENDING (the grasp blocker): an off-COM contact MUST give the rigid box angular
-// velocity. The current EmitCompliantContactRows emits a LINEAR-ONLY normal row
-// (box-side RowJacobian6.angular == 0) -> no torque -> the box cannot rotate, so a
-// grasp cannot reorient a held object. The follow-on commit computes the rigid
-// side's r x n angular Jacobian (mirroring the legacy in-kernel
-// batched_device_world.cu jacobian_angular = Cross(r, dir)) and ENABLES this test
-// by dropping the DISABLED_ prefix. DISABLED (not deleted, not a silent print, not
-// a bug-locking angular~0 assert) so the gap is VISIBLE in the test runner.
+// THE GRASP BLOCKER, NOW CLOSED: an off-COM contact gives the rigid box angular
+// velocity. The unified solver fills the rigid side's angular contact Jacobian
+// r x n IN-KERNEL (row_solver.cu AugmentRigidContactAngular, r = contact_point -
+// body.position[COM]), mirroring the legacy maximal solver
+// (batched_device_world.cu jacobian_angular = Cross(r, dir)). This test was
+// DISABLED in the gate commit (the emitter was linear-only) and is ENABLED here.
 // ===========================================================================
-TEST(FootBoxCoResidence, DISABLED_BoxRotatesUnderOffCenterContact) {
+TEST(FootBoxCoResidence, BoxRotatesUnderOffCenterContact) {
     const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
@@ -689,7 +691,28 @@ TEST(FootBoxCoResidence, DISABLED_BoxRotatesUnderOffCenterContact) {
     const Vec3 dang = out.box_ang_after - out.box_ang_before;
     EXPECT_GT(dang.Length(), 1.0e-4f)
         << "off-COM contact gave the box NO angular velocity -- the rigid-side "
-           "angular Jacobian (r x n) is still dropped (the grasp blocker)";
+           "angular Jacobian (r x n) is dropped (the grasp blocker has regressed)";
+    // The torque is about the lever axis: a +x lever under a -z normal gives a
+    // torque about y (r x n has a y-component). Assert the dominant axis is y so the
+    // rotation is the physically-correct one, not numerical noise on another axis.
+    EXPECT_GT(std::fabs(dang.y), std::fabs(dang.x))
+        << "box angular velocity is not dominated by the expected (lever x normal) axis";
+    EXPECT_GT(std::fabs(dang.y), std::fabs(dang.z))
+        << "box angular velocity is not dominated by the expected (lever x normal) axis";
+
+    // INDEPENDENT magnitude check (does NOT go through the exact-solve oracle, which
+    // shares r x n with the kernel and so cannot validate the formula -- only "kernel
+    // solves its own assembly"). From rigid-body dynamics, a single contact converged
+    // to impulse lambda applies omega = (r x n) . invI . lambda componentwise. Derive
+    // the expected omega_y from the geometry (j_box.angular = r x n), the box inertia,
+    // and the final lambda, and confirm the kernel's box angular velocity matches.
+    // (For the gate's go2 foot @ +0.02 m lever, -z normal, invI=600: ~0.02*600*lambda.)
+    const float expected_wy = out.j_box.angular.y * kBoxInvInertia * out.lambda;
+    std::printf("[diag] independent omega_y = (rxn)_y*invI*lambda = %.6f  vs kernel %.6f\n",
+                expected_wy, out.box_ang_after.y);
+    EXPECT_NEAR(out.box_ang_after.y, expected_wy, 1.0e-4f)
+        << "box angular velocity != (r x n).invI.lambda -- the in-kernel apply or the "
+           "lever is wrong (this check is independent of the exact-solve oracle)";
 }
 
 // ===========================================================================

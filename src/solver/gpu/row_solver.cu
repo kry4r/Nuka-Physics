@@ -408,6 +408,41 @@ __device__ float CompliantSideConstraintVelocity(
     }
 }
 
+// v0.8 C5c co-residence: the per-row world contact point (rides ContactRowSides).
+// Returns the origin if no sides stream is present (legacy / non-contact paths).
+__device__ math::Vec3 ContactPointForRow(const DeviceRowBuffers& rows,
+                                         uint32_t row_index) {
+    if (rows.sides == nullptr || row_index >= rows.sides_count) {
+        return MakeVec3(0.0f, 0.0f, 0.0f);
+    }
+    return rows.sides[row_index].contact_point;
+}
+
+// v0.8 C5c co-residence ★ THE ANGULAR FIX. The compliant emitter builds a
+// LINEAR-ONLY contact row (RowJacobian6.angular == 0). For a RIGID side, fill the
+// angular contact Jacobian r x n IN-KERNEL from the per-row contact point and the
+// body COM (body.position) -- mirroring the legacy MAXIMAL solver
+// (batched_device_world.cu: jacobian_angular = Cross(r, dir)). Using r x j.linear
+// gives the CORRECT sign for BOTH sides because j.linear already carries +n (side a)
+// / -n (side b); for a friction spoke j.linear is +/-tangent, so r x tangent is the
+// matching friction torque. Articulation / static / particle sides ignore j.angular
+// (their reaction does not read it), so this is a no-op for them. WITHOUT it an
+// off-COM contact gives a rigid body NO torque -> it cannot rotate (the grasp blocker).
+__device__ constraint::RowJacobian6 AugmentRigidContactAngular(
+    const constraint::CollidableRef& side,
+    constraint::RowJacobian6 j,
+    uint32_t body_index,
+    const runtime::rigid::BodyState* bodies,
+    uint32_t body_count,
+    math::Vec3 contact_point) {
+    if (side.react == constraint::ReactionProviderKind::RigidInvMass &&
+        ValidBody(body_index, body_count)) {
+        const math::Vec3 r = Sub(contact_point, bodies[body_index].position);
+        j.angular = Cross(r, j.linear);
+    }
+    return j;
+}
+
 // Effective mass for a compliant row: 1 / (eff_inv_a + eff_inv_b + R), where R is
 // Row.compliance_alpha (the dual regularizer -- the headline C5a wiring). Floored
 // like the legacy ComputeEffectiveMass (>1e-12 -> reciprocal, else 0).
@@ -416,12 +451,15 @@ __device__ float ComputeCompliantEffectiveMass(const DeviceRowBuffers& rows,
                                                const runtime::rigid::BodyState* bodies,
                                                uint32_t body_count) {
     const constraint::Row& row = rows.rows[row_index];
+    const math::Vec3 contact_point = ContactPointForRow(rows, row_index);
     float diagonal = 0.0f;
     for (uint32_t local = 0; local < row.body_count; ++local) {
         const constraint::CollidableRef side =
             SideForRowBody(rows, row_index, local);
-        const auto jacobian = JacobianForRowBody(rows, row, local);
         const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowJacobian6 jacobian = AugmentRigidContactAngular(
+            side, JacobianForRowBody(rows, row, local), body_index, bodies,
+            body_count, contact_point);
         const constraint::RowArticulationSide art_side =
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
@@ -440,12 +478,15 @@ __device__ float ComputeCompliantJv(const DeviceRowBuffers& rows,
                                     const runtime::rigid::BodyState* bodies,
                                     uint32_t body_count) {
     const constraint::Row& row = rows.rows[row_index];
+    const math::Vec3 contact_point = ContactPointForRow(rows, row_index);
     float jv = 0.0f;
     for (uint32_t local = 0; local < row.body_count; ++local) {
         const constraint::CollidableRef side =
             SideForRowBody(rows, row_index, local);
-        const auto jacobian = JacobianForRowBody(rows, row, local);
         const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowJacobian6 jacobian = AugmentRigidContactAngular(
+            side, JacobianForRowBody(rows, row, local), body_index, bodies,
+            body_count, contact_point);
         const constraint::RowArticulationSide art_side =
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
@@ -465,11 +506,14 @@ __device__ void ApplyCompliantVelocityImpulse(const DeviceRowBuffers& rows,
                                               runtime::rigid::BodyState* bodies,
                                               uint32_t body_count) {
     const constraint::Row& row = rows.rows[row_index];
+    const math::Vec3 contact_point = ContactPointForRow(rows, row_index);
     for (uint32_t local = 0; local < row.body_count; ++local) {
         const constraint::CollidableRef side =
             SideForRowBody(rows, row_index, local);
-        const auto jacobian = JacobianForRowBody(rows, row, local);
         const uint32_t body_index = BodyForRowBody(rows, row, local);
+        const constraint::RowJacobian6 jacobian = AugmentRigidContactAngular(
+            side, JacobianForRowBody(rows, row, local), body_index, bodies,
+            body_count, contact_point);
         const constraint::RowArticulationSide art_side =
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
