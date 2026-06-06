@@ -428,6 +428,34 @@ inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g
         StampSides(pair, out);
         return;
     }
+    // --- Sphere special case (either side) -- NOT through GJK/EPA. ---
+    // A sphere fed to the general boolean-GJK->EPA path has a shallow-penetration
+    // non-monotonicity (the curved support breaks EPA's incremental expansion in a
+    // ~1mm dead band -> a periodic single-step contact dropout). The robust
+    // formulation is the EXACT point-to-convex distance: closest point on the hull
+    // to the sphere CENTER, contact iff |center-closest| < radius. This BYPASSES
+    // EPA entirely and is monotone at all depths. Only sphere x ConvexHull (and the
+    // deferred TriMesh/HeightField hull slots) reaches here: sphere x box and
+    // sphere x sphere route to the Analytical tier (SelectTier), and sphere x plane
+    // is caught by the plane case above. We special-case the sphere-vs-hull slots.
+    if (g.type_a == ShapeType::Sphere || g.type_b == ShapeType::Sphere) {
+        const bool sphere_is_a = (g.type_a == ShapeType::Sphere);
+        const ShapeType hull_t = sphere_is_a ? g.type_b : g.type_a;
+        const void* hull_geom  = sphere_is_a ? g.geom_b : g.geom_a;
+        // The non-sphere side must be a hull view (ConvexHull / deferred mesh slots
+        // map to a hull view). A non-hull other side (e.g. sphere x sphere/box --
+        // routed Analytical, never here) falls through to the general path.
+        if (hull_t == ShapeType::ConvexHull || hull_t == ShapeType::TriMesh ||
+            hull_t == ShapeType::HeightField) {
+            const cvx::ConvexHullView* hull =
+                static_cast<const cvx::ConvexHullView*>(hull_geom);
+            if (hull == nullptr) { out->Clear(); StampSides(pair, out); return; }
+            const amf::PrimParams& sphere = sphere_is_a ? g.prim_a : g.prim_b;
+            cvx::SphereHull(sphere, *hull, sphere_is_a, out);
+            StampSides(pair, out);
+            return;
+        }
+    }
     // --- General GJK/EPA/face-clip path. Side A == pair side A (no flip). ---
     cvx::SupportProxy A = MakeConvexProxy(g.type_a, g.geom_a, g.prim_a);
     cvx::SupportProxy B = MakeConvexProxy(g.type_b, g.geom_b, g.prim_b);

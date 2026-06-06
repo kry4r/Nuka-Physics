@@ -1071,14 +1071,24 @@ if(CMAKE_CUDA_COMPILER)
     add_dependencies(nuka_gjk_epa_convex_test nuka_codegen)
     target_include_directories(nuka_gjk_epa_convex_test
         PRIVATE
+            ${CMAKE_SOURCE_DIR}
             ${CMAKE_SOURCE_DIR}/src
     )
+    # nuka_import/nuka_scene/nuka_cooker: the C3-hardening regression
+    # (SphereHullShallowPenetrationIsMonotone) loads the REAL cup hull -- the only
+    # geometry that reproduces the EPA shallow-penetration dead band -- via
+    # LoadUsd + CookScene (asset-gated; SKIPs when the fetch-per-env cup is absent).
     target_link_libraries(nuka_gjk_epa_convex_test
         PRIVATE
             nuka_phi
+            nuka_import
+            nuka_scene
+            nuka_cooker
             GTest::gtest_main
     )
-    gtest_discover_tests(nuka_gjk_epa_convex_test)
+    # WORKING_DIRECTORY = repo root so the relative cup asset path resolves.
+    gtest_discover_tests(nuka_gjk_epa_convex_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- v0.8 C3d: SDF high-precision tier WIRED into the dispatch table --------
     # Validates the REAL Sdf-tier handler (NarrowphaseSdf, narrowphase_dispatch.hpp)
@@ -2051,6 +2061,50 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_unified_coresident_stepper_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- v0.8 C7b-1: the HOLD-AGAINST-GRAVITY grasp SPIKE. A synthetic fixed-base
+    # 2-finger gripper holds the C7a cup (convex hull) against gravity by FINGER
+    # FRICTION ALONE -- NO table. Drives the generalized unified_coresident_stepper
+    # in grasp mode (N fingertip<->cup contacts, condim=3 friction, constant grip
+    # torque through the control->tau->ABA drive path). Gates: STEP-0 drive-path-is-
+    # live probe, the discriminating hold gate (Sigma(finger vert impulse) ~= m*g*dt,
+    # no static row, bounded drift), V2 energy, the grip=0 BITE proof (cup falls),
+    # D1. Reuses the C7a usdc cup (fetch-per-env; SKIP if absent). VALIDATED-NOT-
+    # WIRED. Same dep set as the W1a stepper test (+ compiles the stepper + driver).
+    add_executable(nuka_grasp_hold_spike_test
+        coresident/test_grasp_hold_spike.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_grasp_hold_spike_test nuka_codegen)
+
+    target_compile_definitions(nuka_grasp_hold_spike_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NUKA_GRASP_DIAG
+    )
+
+    target_include_directories(nuka_grasp_hold_spike_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_grasp_hold_spike_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_grasp_hold_spike_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---

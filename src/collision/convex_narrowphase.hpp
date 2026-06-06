@@ -841,6 +841,275 @@ NUKA_CVX_HD inline void HullPlane(const ConvexHullView& hull,
 }
 
 // ---------------------------------------------------------------------------
+// SPHERE x CONVEX-HULL (special-cased -- NOT through GJK/EPA).
+// ---------------------------------------------------------------------------
+// A sphere is the one analytic-support shape whose CSO curvature breaks EPA's
+// shallow-penetration robustness: when the sphere CENTER is OUTSIDE the hull and
+// only the RADIUS penetrates, the Minkowski difference's surface near the origin
+// is a curved cap, and the incremental polytope expansion is NON-MONOTONE in
+// depth (a confirmed detect->drop->detect dead band at pen ~1.0-1.4mm for a
+// fingertip-on-cup-wall config). The robust formulation is the EXACT point-to-
+// convex distance query: the closest point on the hull to the sphere CENTER. When
+// the center is outside the hull this is a pure (monotone) distance problem; the
+// penetration is radius - distance and the contact normal is the separation
+// direction along (center - closest). This BYPASSES EPA entirely, mirroring the
+// HullPlane special case.
+//
+// CLOSEST POINT ON A CONVEX HULL TO A POINT via GJK-DISTANCE. The ConvexHullView
+// carries verts + a frame but NO face/edge connectivity, so a Voronoi-feature
+// face walk is not available; the GJK distance sub-algorithm needs only the
+// SUPPORT function (the SAME SupportHull the boolean GJK uses), so it is the
+// connectivity-free robust choice. We run GJK on the Minkowski difference of the
+// HULL and the single point `q`: each CSO vertex is (hull_vertex - q). The closest
+// point on that CSO to the ORIGIN, mapped back, is the closest point on the hull
+// to `q`. If the origin ends up INSIDE the CSO the point is inside the hull
+// (overlap case). FIXED support scan + FIXED sub-simplex evaluation order + fixed
+// iteration cap == D1 (no atomics, no float-keyed reordering).
+// ---------------------------------------------------------------------------
+inline constexpr int   kGjkDistMaxIter = 48;
+inline constexpr float kGjkDistEps     = 1.0e-12f;
+// Convergence is on a LENGTH gap along the UNIT search direction (scale-invariant):
+// an absolute floor (sub-micron) + a relative term so both grasp-scale (mm) hulls
+// and metre-scale hulls converge tightly without over-iterating.
+inline constexpr float kGjkDistTol     = 1.0e-7f;   // absolute length gap (metres)
+inline constexpr float kGjkDistRelTol  = 1.0e-5f;   // relative to |closest|
+
+// A sub-simplex reduction result: the closest point to the origin AND the set of
+// simplex vertices (by their index 0..n-1) that SUPPORT it (its Voronoi feature).
+// Returning the support set is what lets the GJK distance loop shrink the simplex
+// to the supporting feature each step (the textbook Johnson reduction) -- FIXED
+// region-test order == D1.
+struct SubSimplex {
+    Vec3 closest{0.0f, 0.0f, 0.0f};
+    int  keep[4] = {0, 0, 0, 0};   // indices (into the passed array) to retain
+    int  nkeep = 0;
+};
+
+// Closest point to the origin on a SEGMENT (verts[i0], verts[i1]); keep set is the
+// supporting vertex (endpoint) or both (interior). FIXED order.
+NUKA_CVX_HD inline SubSimplex ReduceSegment(const Vec3* v, int i0, int i1) {
+    SubSimplex r;
+    const Vec3 a = v[i0], b = v[i1];
+    const Vec3 ab = b - a;
+    const float t = ab.Dot(ab);
+    if (t < kGjkDistEps) { r.closest = a; r.keep[0] = i0; r.nkeep = 1; return r; }
+    float u = (-a).Dot(ab) / t;
+    if (u <= 0.0f)      { r.closest = a; r.keep[0] = i0; r.nkeep = 1; return r; }
+    if (u >= 1.0f)      { r.closest = b; r.keep[0] = i1; r.nkeep = 1; return r; }
+    r.closest = a + ab * u; r.keep[0] = i0; r.keep[1] = i1; r.nkeep = 2; return r;
+}
+
+// Closest point to the origin on a TRIANGLE (Ericson RTCD region test); the keep
+// set is the supporting vertex / edge pair / all three. FIXED region-test order.
+NUKA_CVX_HD inline SubSimplex ReduceTriangle(const Vec3* v, int i0, int i1, int i2) {
+    SubSimplex r;
+    const Vec3 a = v[i0], b = v[i1], c = v[i2];
+    const Vec3 ab = b - a, ac = c - a, ap = -a;
+    const float d1 = ab.Dot(ap), d2 = ac.Dot(ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) { r.closest = a; r.keep[0] = i0; r.nkeep = 1; return r; }
+    const Vec3 bp = -b;
+    const float d3 = ab.Dot(bp), d4 = ac.Dot(bp);
+    if (d3 >= 0.0f && d4 <= d3) { r.closest = b; r.keep[0] = i1; r.nkeep = 1; return r; }
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {       // edge AB
+        const float t = d1 / (d1 - d3);
+        r.closest = a + ab * t; r.keep[0] = i0; r.keep[1] = i1; r.nkeep = 2; return r;
+    }
+    const Vec3 cp = -c;
+    const float d5 = ab.Dot(cp), d6 = ac.Dot(cp);
+    if (d6 >= 0.0f && d5 <= d6) { r.closest = c; r.keep[0] = i2; r.nkeep = 1; return r; }
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {       // edge AC
+        const float t = d2 / (d2 - d6);
+        r.closest = a + ac * t; r.keep[0] = i0; r.keep[1] = i2; r.nkeep = 2; return r;
+    }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {  // edge BC
+        const float t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        r.closest = b + (c - b) * t; r.keep[0] = i1; r.keep[1] = i2; r.nkeep = 2; return r;
+    }
+    // face interior: keep all three (barycentric projection onto the plane).
+    const float denom = 1.0f / (va + vb + vc);
+    const float tv = vb * denom, tw = vc * denom;
+    r.closest = a + ab * tv + ac * tw;
+    r.keep[0] = i0; r.keep[1] = i1; r.keep[2] = i2; r.nkeep = 3; return r;
+}
+
+// Result of the point-to-hull GJK distance query.
+struct HullPointDist {
+    Vec3  closest{0.0f, 0.0f, 0.0f};  // closest point ON THE HULL (world) to q
+    float dist = 0.0f;                // |q - closest| (>=0); ~0 when q is on/inside
+    // `inside` is a BEST-EFFORT corroboration only: the distance loop terminates on
+    // a near-zero LENGTH gap, so for a deeply-interior q it converges to a surface
+    // point with tiny `dist` and reports inside=false. The AUTHORITATIVE inside test
+    // is the boolean GJK in SphereHull (GjkIntersect on a zero-radius point), which
+    // is scale-invariant. A direct caller that needs a reliable inside flag must use
+    // GjkIntersect, NOT this field.
+    bool  inside = false;
+};
+
+// Closest point on `h` to the world point `q` (GJK distance; SUPPORT-only, D1).
+// We map the closest CSO point back to a hull point exactly: closest_cso ==
+// closest_hull - q, so closest_hull == closest_cso + q. (The witness barycentric
+// is the SAME on the hull-world simplex, but the identity makes it unnecessary.)
+NUKA_CVX_HD inline HullPointDist ClosestHullToPoint(const ConvexHullView& h, Vec3 q) {
+    HullPointDist res;
+    // CSO of (hull - {q}): a simplex of <=4 CSO verts. cso[i] = hull_world_i - q.
+    Vec3 cso[4];
+    int  n = 0;
+    // Seed: support along (q - hull_center) so the first vertex faces q (D1 dir).
+    Vec3 dir = q - h.frame.t;
+    if (dir.Dot(dir) < kGjkDistEps) dir = Vec3::UnitX();
+    {
+        uint32_t idx = 0u;
+        cso[0] = SupportHull(h, dir, &idx) - q; n = 1;
+    }
+    Vec3 closest = cso[0];
+    for (int it = 0; it < kGjkDistMaxIter; ++it) {
+        // 1) closest point on the current simplex + its supporting feature.
+        SubSimplex sub;
+        if (n == 1) {
+            sub.closest = cso[0]; sub.keep[0] = 0; sub.nkeep = 1;
+        } else if (n == 2) {
+            sub = ReduceSegment(cso, 0, 1);
+        } else if (n == 3) {
+            sub = ReduceTriangle(cso, 0, 1, 2);
+        } else {  // n == 4: closest over the 4 triangular faces (fixed order).
+            float best = 3.4e38f; SubSimplex bs;
+            const int tri[4][3] = {{0,1,2},{0,1,3},{0,2,3},{1,2,3}};
+            for (int f = 0; f < 4; ++f) {
+                const SubSimplex t = ReduceTriangle(cso, tri[f][0], tri[f][1], tri[f][2]);
+                const float d2 = t.closest.Dot(t.closest);
+                if (d2 < best) { best = d2; bs = t; }  // strict -> lowest face index
+            }
+            sub = bs;
+        }
+        closest = sub.closest;
+        // 2) shrink the simplex to the supporting feature (FIXED order copy).
+        Vec3 nc[4];
+        for (int i = 0; i < sub.nkeep; ++i) nc[i] = cso[sub.keep[i]];
+        for (int i = 0; i < sub.nkeep; ++i) cso[i] = nc[i];
+        n = sub.nkeep;
+
+        const float cd2 = closest.Dot(closest);
+        if (cd2 < kGjkDistEps) {           // origin in the simplex -> q inside hull
+            res.inside = true;
+            res.dist = 0.0f;
+            res.closest = q;               // zero distance: closest == q
+            return res;
+        }
+        // 3) search toward the origin (toward q): support along the NORMALIZED
+        //    -closest. Normalizing is load-bearing: the progress gap must have units
+        //    of LENGTH so the convergence tolerance is SCALE-INVARIANT. An
+        //    unnormalized -closest makes `improve` a length^2, which at grasp scale
+        //    (|closest| ~ 3.6mm -> ~1.3e-5 m^2) trips an absolute length tol after
+        //    1-2 iterations, returning a CRUDE closest point that jitters the contact
+        //    point/penetration/normal as the cup pose shifts (the ~5% impulse beat).
+        const float cd = sqrtf(cd2);
+        const Vec3 sdir = -closest / cd;              // unit, points toward the origin
+        uint32_t idx = 0u;
+        const Vec3 newc = SupportHull(h, sdir, &idx) - q;
+        // progress (in LENGTH): the support along the unit search dir must extend the
+        // CSO past the current closest face by more than a small absolute gap (with a
+        // relative floor so huge hulls still converge). Otherwise the surface is
+        // reached -> converged. kGjkDistTol is an absolute LENGTH (metres).
+        const float improve = newc.Dot(sdir) - closest.Dot(sdir);
+        if (improve <= kGjkDistTol + kGjkDistRelTol * cd) break;  // converged
+        // duplicate guard (D1: never re-append an existing simplex vertex).
+        bool dup = false;
+        for (int i = 0; i < n; ++i) {
+            if (amf::Len(newc - cso[i]) < 1.0e-9f) { dup = true; break; }
+        }
+        if (dup) break;
+        if (n >= 4) break;                  // full tetra w/ progress: numerically converged
+        cso[n] = newc; ++n;
+    }
+    res.closest = closest + q;            // closest point on the hull (world)
+    res.dist = amf::Len(closest);
+    res.inside = false;
+    return res;
+}
+
+// Sphere x convex-hull -> 1-pt manifold. `sphere_is_a` selects the manifold side
+// convention: point.normal is the SEPARATION DIR FOR SIDE A. When the sphere is
+// side A the separation dir is (center - closest) (push the sphere off the hull);
+// when the hull is side A it is the negation. `out` is cleared first; an empty
+// manifold means no contact (separated, or a center-inside fallback that produced
+// no positive depth -- never reached by the fingertip-on-wall grasp).
+NUKA_CVX_HD inline void SphereHull(const amf::PrimParams& sphere,
+                                   const ConvexHullView& hull, bool sphere_is_a,
+                                   ContactManifold* out) {
+    out->Clear();
+    const Vec3 c = sphere.frame.t;        // sphere center (world)
+    const float r = sphere.radius;
+
+    // Containment test: is the sphere CENTER inside the hull? We test it with the
+    // boolean GJK on a zero-radius sphere (== the point `c`) vs the hull -- robust
+    // and SCALE-INVARIANT (the boolean GJK encloses the origin or it does not; no
+    // distance tolerance involved, unlike the closest-point loop's near-zero
+    // termination). This is the load-bearing inside/outside decision; the
+    // closest-point query's own `inside` flag is only a fast-path corroboration.
+    amf::PrimParams point = sphere;
+    point.radius = 0.0f;                  // a point at the sphere center
+    SupportProxy pp; pp.kind = SupportKind::Sphere; pp.prim = &point;
+    SupportProxy hp_proxy; hp_proxy.kind = SupportKind::Hull; hp_proxy.hull = &hull;
+    const bool center_inside = GjkIntersect(pp, hp_proxy).intersect;
+
+    if (!center_inside) {
+        // Center OUTSIDE the hull: contact iff distance < radius. The closest point
+        // on the hull to the center is a MONOTONE function of the center position
+        // along the approach, so the penetration r - dist never drops out.
+        const HullPointDist hp = ClosestHullToPoint(hull, c);
+        const float pen = r - hp.dist;
+        if (pen <= 0.0f) return;          // separated -> no contact
+        // Separation dir for the SPHERE = (center - closest) (push sphere away).
+        const Vec3 sep_sphere = amf::Norm(c - hp.closest, Vec3::UnitY());
+        const Vec3 sep_dir_A = sphere_is_a ? sep_sphere : -sep_sphere;
+        ContactPoint pt;
+        pt.position = hp.closest;         // on the hull surface (the contact point)
+        pt.normal = sep_dir_A;
+        pt.penetration = pen;
+        pt.stable_key = 0ull;
+        out->AddPoint(pt);
+        return;
+    }
+    // Center INSIDE the hull (deep penetration -- the grasp never hits this). We
+    // have no face connectivity to read the min face-plane depth, so recover the
+    // shallowest exit by a FIXED-ORDER scan over (a) the 6 axis directions and (b)
+    // each hull VERTEX direction from the center (each vertex normal is a candidate
+    // outward face direction): the smallest support gap (center->surface distance)
+    // is the shallowest face-plane depth, and penetration = radius + that depth.
+    // Deterministic (fixed scan, integer tie-break -> lowest index), never garbage;
+    // correctness-bounded for the (unused) deep-overlap case, not the shallow case.
+    Vec3 best_n = Vec3::UnitY();
+    float best_inside = 3.4e38f;          // shallowest distance from center to a face
+    const Vec3 axis_probe[6] = {Vec3::UnitX(), {-1,0,0}, Vec3::UnitY(),
+                                {0,-1,0}, Vec3::UnitZ(), {0,0,-1}};
+    for (int p = 0; p < 6; ++p) {
+        uint32_t idx = 0u;
+        const Vec3 sv = SupportHull(hull, axis_probe[p], &idx);
+        const float gap = (sv - c).Dot(axis_probe[p]);
+        if (gap < best_inside) { best_inside = gap; best_n = axis_probe[p]; }
+    }
+    for (uint32_t i = 0u; i < hull.vcount; ++i) {
+        const Vec3 dir = amf::Norm(hull.Vertex(i) - c, Vec3::UnitY());
+        uint32_t idx = 0u;
+        const Vec3 sv = SupportHull(hull, dir, &idx);
+        const float gap = (sv - c).Dot(dir);
+        if (gap < best_inside) { best_inside = gap; best_n = dir; }
+    }
+    if (best_inside < 0.0f) best_inside = 0.0f;
+    const Vec3 sep_sphere = best_n;       // shallowest outward direction for the sphere
+    const Vec3 sep_dir_A = sphere_is_a ? sep_sphere : -sep_sphere;
+    ContactPoint pt;
+    pt.position = c - best_n * best_inside;          // on the hull surface
+    pt.normal = sep_dir_A;
+    pt.penetration = r + best_inside;     // radius + inside depth
+    pt.stable_key = 0ull;
+    out->AddPoint(pt);
+}
+
+// ---------------------------------------------------------------------------
 // TOP-LEVEL: convex narrowphase for two proxies. normal = sep dir for A.
 // ---------------------------------------------------------------------------
 NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,

@@ -27,7 +27,9 @@
 #include "constraint/row_buffers.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer.hpp"
-#include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses, ArticulationDofCount
+#include "collision/convex_narrowphase.hpp"      // cvx::ConvexHullView (cup hull seam)
+#include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses, ArticulationDofCount, ArticulationJointDofCount
+#include "runtime/articulation/articulation_drives.hpp"    // LaunchApplyTorqueDriveKernels (the grip drive path)
 #include "runtime/articulation/articulation_jacobian.hpp"  // ComputeContactChainJacobians + M/M^-1
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "solver/unified_solve.hpp"
@@ -215,9 +217,53 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
     device_ = articulation::UploadArticulationState(context_, host_proto_);
     dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
     root_link_ = host_proto_.articulation_link_offset[0];
+    base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
+}
+
+// ---------------------------------------------------------------------------
+// C7b-1 GRASP constructor: N fingertips + a convex-hull cup + a constant grip
+// torque + friction, NO table. The foot/box/ground members stay default (inert);
+// grasp_mode_ routes Step() to StepGrasp().
+// ---------------------------------------------------------------------------
+UnifiedCoResidentStepper::UnifiedCoResidentStepper(
+    const phi::DeviceContext& context,
+    const articulation::ArticulationHostState& host, const GraspConfig& grasp,
+    float gravity_z, float dt)
+    : context_(context),
+      host_proto_(host),
+      box_state_(grasp.cup_state),   // the cup IS the movable rigid body (box_state_).
+      gravity_z_(gravity_z),
+      dt_(dt),
+      grasp_mode_(true),
+      grasp_(grasp) {
+    device_ = articulation::UploadArticulationState(context_, host_proto_);
+    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    root_link_ = host_proto_.articulation_link_offset[0];
+    base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
+
+    // Upload the constant grip torque + force limits ONCE; re-applied to tau each
+    // step (idempotent). Sized to the device link count.
+    const uint32_t link_count = host_proto_.TotalLinkCount();
+    std::vector<float> torque = grasp_.grip_torque;
+    torque.resize(link_count, 0.0f);
+    std::vector<float> limits = grasp_.drive_force_limits;
+    limits.resize(link_count, 0.0f);
+    grip_torque_dev_ = nuka::phi::UploadVector(torque);
+    grip_limits_dev_ = nuka::phi::UploadVector(limits);
+}
+
+// The flat-qdot prefix-sum DOF index of a device link: Σ JointDofCount over the
+// articulation's links in [offset, link). Generic over fixed/floating roots.
+uint32_t UnifiedCoResidentStepper::DofIndexOf(uint32_t link) const {
+    uint32_t idx = 0u;
+    for (uint32_t k = root_link_; k < link; ++k) {
+        idx += articulation::ArticulationJointDofCount(host_proto_.joint_type[k]);
+    }
+    return idx;
 }
 
 CoResidentStepReport UnifiedCoResidentStepper::Step() {
+    if (grasp_mode_) return StepGrasp();
     CoResidentStepReport report;
     auto view = device_.View();
     const uint32_t link_count = host_proto_.TotalLinkCount();
@@ -364,14 +410,16 @@ CoResidentStepReport UnifiedCoResidentStepper::Step() {
     std::vector<float> chain_jacobians;  // one dof_stride-wide slot per foot row.
 
     // ----- assemble the flat dof_stride-wide qdot from the LIVE device state ------
-    // [0..5] = base spatial velocity (omega-first) from link_velocity[root].v;
-    // [6..]  = leg qdot, in link order (column 6+(link-root-1) == leg link's qdot).
+    // Generic prefix-sum packing (DofIndexOf): a FloatingBase root fills its 6 base
+    // DOFs from link_velocity[root].v (omega-first); each scalar joint fills its own
+    // column from live.qdot[link]. For go2 (floating root @ dof_index 0) this is
+    // base@[0..5] + leg k@[6+k] -- BYTE-FOR-BYTE the previous hard-coded packing.
     std::vector<float> qdot(dof_stride_, 0.0f);
-    for (uint32_t i = 0u; i < 6u && i < dof_stride_; ++i) {
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
         qdot[i] = live.link_velocity[root_link_].v[i];
     }
     for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
-        const uint32_t col = 6u + (leg - root_link_ - 1u);
+        const uint32_t col = DofIndexOf(leg);
         if (col < dof_stride_) qdot[col] = live.qdot[leg];
     }
     std::vector<float> qdot_before = qdot;
@@ -498,12 +546,13 @@ CoResidentStepReport UnifiedCoResidentStepper::Step() {
     report.qdot_delta_l1 = dn;
 
     // ----- SCATTER the post-contact flat-qdot back into the device state ---------
-    // base spatial velocity slots [0..5] -> link_velocity[root]; legs [6..] -> qdot.
-    for (uint32_t i = 0u; i < 6u && i < dof_stride_; ++i) {
+    // The inverse of the prefix-sum pack: base DOFs -> link_velocity[root]; each
+    // scalar joint column -> live.qdot[link]. Byte-identical to the old fixed layout.
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
         live.link_velocity[root_link_].v[i] = qdot[i];
     }
     for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
-        const uint32_t col = 6u + (leg - root_link_ - 1u);
+        const uint32_t col = DofIndexOf(leg);
         if (col < dof_stride_) live.qdot[leg] = qdot[col];
     }
     // Push ONLY the mutated velocity buffers back to the device (q / base_pose /
@@ -526,6 +575,323 @@ CoResidentStepReport UnifiedCoResidentStepper::Step() {
     // ----- stage 11 (box): position integrate (position += vel*dt; orientation
     //       from angular velocity, first-order normalized, matching the base). -----
     IntegrateBoxPosition();
+    return report;
+}
+
+// ===========================================================================
+// C7b-1 GRASP STEP: hold the cup against gravity by finger friction alone.
+// ===========================================================================
+// Mirrors Step()'s stage order but: (a) re-applies the constant grip torque to tau
+// BEFORE ComputeAccelerations (the DRIVE path -> the fingers squeeze inward), (b)
+// emits N fingertip<->cup contacts (NO table), (c) uses condim=3 (a normal row + a
+// 4-edge friction pyramid per contact) so FRICTION holds the cup, (d) reports the
+// vertical contact impulse the fingers deliver to the cup (the force-balance gate).
+CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
+    CoResidentStepReport report;
+    auto view = device_.View();
+    const uint32_t link_count = host_proto_.TotalLinkCount();
+
+    // ----- stage 0: the DRIVE path. Re-apply the constant grip torque to tau. -----
+    // LaunchApplyTorqueDriveKernels writes state.tau[link] = clamp(torque_input);
+    // ComputeAccelerations then READS tau in its bias-force pass (never zeroes it).
+    // Re-applying the same constant each step is idempotent. This is what makes the
+    // fingers actively squeeze -- the W1a path ran passive (tau held at 0).
+    articulation::LaunchApplyTorqueDriveKernels(
+        context_, view, static_cast<const float*>(grip_torque_dev_.Data()),
+        static_cast<const float*>(grip_limits_dev_.Data()));
+
+    // ----- stage 1/2: ABA accelerations -> qddot (now WITH the grip tau). ---------
+    articulation::FeatherstoneAba::ComputeAccelerations(context_, view, gravity_z_);
+
+    // ----- stage 3: velocity integrate (articulation halves + the cup). ----------
+    articulation::FeatherstoneAba::IntegrateVelocity(context_, view, dt_);
+    articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, view, dt_,
+                                                                 gravity_z_);
+    if (box_state_.inv_mass > 0.0f) {
+        box_state_.linear_velocity.z += gravity_z_ * dt_;  // cup gravity kick.
+    }
+    // The cup vertical velocity AFTER gravity but BEFORE the contact solve -- the
+    // baseline the contact impulse must lift back to balance the weight.
+    const float cup_vz_pre_contact = box_state_.linear_velocity.z;
+
+    // ===== CONTACT PHASE (fingertips <-> cup, NO table) ======================
+    articulation::ArticulationHostState live = host_proto_;
+    articulation::DownloadArticulationState(device_, &live);
+    const std::vector<Transform> poses = DownloadWorldPoses(context_, device_, link_count);
+
+    // The cup convex hull view in WORLD space (mesh-local verts + live cup pose).
+    const Transform cup_pose{box_state_.position, box_state_.orientation};
+    nuka::collision::cvx::ConvexHullView cup_hull;
+    cup_hull.verts = grasp_.cup.hull_verts.data();
+    cup_hull.vcount = grasp_.cup.VertexCount();
+    cup_hull.frame = amf::BuildPrimFrame(cup_pose);
+
+    // Each fingertip world center (from FK) + the direct fingertip<->cup pairs. We
+    // DIRECT-EMIT the known (fingertip, cup) pairs (the broadphase is proven by W1a/
+    // the foot-box gate; the spike's risk is the SOLVE, not the broadphase). A cup
+    // with NO hull geometry (the drive-path probe) emits NO contact -> the fingers
+    // are free to accelerate under the grip torque alone.
+    std::vector<Vec3> finger_centers(grasp_.fingertips.size());
+    std::vector<CandidatePair> drive_pairs;
+    if (cup_hull.vcount == 0u) {
+        articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+        IntegrateBoxPosition();
+        report.cup_vz = box_state_.linear_velocity.z;
+        report.cup_z = box_state_.position.z;
+        return report;
+    }
+    drive_pairs.reserve(grasp_.fingertips.size());
+    for (size_t f = 0u; f < grasp_.fingertips.size(); ++f) {
+        const CoResidentFingertip& ft = grasp_.fingertips[f];
+        const Transform& lp = poses[ft.link];
+        finger_centers[f] = lp.position + lp.rotation.Rotate(ft.local_offset);
+        CandidatePair p;
+        p.a.type = CollidableType::ArticulationLink;
+        p.a.react = ReactionProviderKind::ArticulationChainJ;
+        p.a.handle = ft.broadphase_handle;
+        p.b.type = CollidableType::RigidBody;
+        p.b.react = ReactionProviderKind::RigidInvMass;
+        p.b.handle = grasp_.cup.broadphase_body_id;
+        drive_pairs.push_back(p);
+    }
+
+    // stage 6: narrowphase via the driver. fingertip(Sphere) x cup(ConvexHull) ->
+    // the C3c Convex tier (GJK/EPA + face-clip), already in the dispatch table.
+    ShapeResolver resolve = [&](const CollidableRef& ref, ResolvedShape* out) -> bool {
+        if (ref.type == CollidableType::ArticulationLink) {
+            for (size_t f = 0u; f < grasp_.fingertips.size(); ++f) {
+                if (grasp_.fingertips[f].broadphase_handle == ref.handle) {
+                    out->type = scene::ShapeType::Sphere;
+                    out->prim = FootSpherePrim(finger_centers[f],
+                                               grasp_.fingertips[f].radius);
+                    out->geom = nullptr;
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (ref.type == CollidableType::RigidBody &&
+            ref.handle == grasp_.cup.broadphase_body_id) {
+            out->type = scene::ShapeType::ConvexHull;
+            out->geom = &cup_hull;  // the convex-hull seam (geom_a/geom_b passthrough).
+            return true;
+        }
+        return false;
+    };
+    std::vector<ContactManifold> manifolds;
+    nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
+    report.manifold_count = static_cast<uint32_t>(manifolds.size());
+
+    // Count finger contact points (the cup is pinched at >=1 point per finger).
+    uint32_t finger_points = 0u;
+    for (const auto& m : manifolds) finger_points += m.point_count;
+    report.finger_contacts = finger_points;
+    report.pair_found = finger_points > 0u;
+
+#ifdef NUKA_GRASP_DIAG
+    if (finger_points < grasp_.fingertips.size()) {
+        std::fprintf(stderr, "[DIAG] DROP: cup pos=(%.5f,%.5f,%.5f) finger_pts=%u/%zu  ",
+                     box_state_.position.x, box_state_.position.y, box_state_.position.z,
+                     finger_points, grasp_.fingertips.size());
+        for (size_t f = 0u; f < grasp_.fingertips.size(); ++f) {
+            const Vec3 c = finger_centers[f];
+            const float gap = (c - box_state_.position).Length();  // crude separation.
+            const uint32_t pc = f < manifolds.size() ? manifolds[f].point_count : 0u;
+            const float pen = (pc > 0u) ? manifolds[f].points[0].penetration : -999.0f;
+            std::fprintf(stderr, "f%zu[cx=%.5f pc=%u pen=%.5f gap=%.5f] ", f, c.x, pc,
+                         pen, gap);
+        }
+        std::fprintf(stderr, "\n");
+    }
+#endif
+
+    if (manifolds.empty() || finger_points == 0u) {
+        // No contact -> the cup free-falls. Still integrate (the BITE path).
+        articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+        IntegrateBoxPosition();
+        report.cup_vz = box_state_.linear_velocity.z;
+        report.cup_z = box_state_.position.z;
+        return report;
+    }
+
+    // stage 7: compliant rows + sides (condim=3 -> normal row + 4 friction spokes
+    // per contact point). mu in RowMaterial.friction (the friction cone bound is
+    // applied by the solver as [0, mu*TotalNormalLambda(group)] per spoke). FRICTION
+    // is what holds the cup -- a frictionless (condim=1) grasp could not.
+    nuka::constraint::ContactRowComplianceInputs inputs;
+    inputs.vel = 0.0f;
+    inputs.invweight = 1.0f;
+    inputs.dt = dt_;
+    inputs.condim = grasp_.condim;
+    RowBuffers rows;
+    std::vector<ContactRowSides> sides;
+    nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
+    report.row_count = rows.RowCount();
+    // Stamp the per-contact friction coefficient (the merged manifold default is
+    // 0.5; we set the spike's mu explicitly so the cone bound is the spike's).
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+        rows.materials[r].friction = grasp_.friction_mu;
+    }
+    if (rows.RowCount() == 0u || sides.empty()) {
+        articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+        IntegrateBoxPosition();
+        report.cup_vz = box_state_.linear_velocity.z;
+        report.cup_z = box_state_.position.z;
+        return report;
+    }
+
+    const std::vector<float> minv =
+        InverseInertia(context_, live, gravity_z_, dof_stride_);
+    std::vector<float> chain_jacobians;  // one dof_stride-wide slot per finger row.
+
+    // ----- the flat dof_stride-wide qdot (prefix-sum packing). For a Fixed-root
+    // gripper base_dof_==0 -> every column is a finger joint qdot. ------------------
+    std::vector<float> qdot(dof_stride_, 0.0f);
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
+        qdot[i] = live.link_velocity[root_link_].v[i];
+    }
+    for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
+        const uint32_t col = DofIndexOf(leg);
+        if (col < dof_stride_) qdot[col] = live.qdot[leg];
+    }
+    std::vector<float> qdot_before = qdot;
+
+    // ----- wire each row: the articulation (finger) side gets a chain-J slot +
+    // coloring key body_count+art_index; the cup side gets BodyState index 0. -------
+    const uint32_t kArtIndex = 0u;
+    const uint32_t body_count = 1u;  // ctx.state = [cup].
+    std::vector<RowArticulationRefs> art_refs(rows.RowCount());
+    RowArticulationSide none_side{};
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+        const ContactRowSides& s = sides[r];
+        if (s.a.react == ReactionProviderKind::StaticNull ||
+            s.b.react == ReactionProviderKind::StaticNull) {
+            report.any_static_row = true;  // there must be NO table -> assert in gate.
+        }
+        const bool a_art = s.a.react == ReactionProviderKind::ArticulationChainJ;
+        const bool b_art = s.b.react == ReactionProviderKind::ArticulationChainJ;
+        const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
+        const bool b_cup = s.b.react == ReactionProviderKind::RigidInvMass;
+        art_refs[r].a = none_side;
+        art_refs[r].b = none_side;
+        if ((a_art && b_cup) || (b_art && a_cup)) {
+            const int finger_local = a_art ? 0 : 1;
+            const int cup_local = a_art ? 1 : 0;
+            const RowJacobian6 j_finger =
+                rows.JacobianForRowBody(r, static_cast<uint32_t>(finger_local));
+            // The finger side's RowJacobian6.linear is the contact direction (the
+            // normal for the normal row, +/-tangent for a friction spoke). Project
+            // the chain-J on it -- the reduced-coordinate reaction the kernel uses.
+            const Vec3 finger_dir = j_finger.linear;
+            const Vec3 contact_point = sides[r].contact_point;
+            // Which device link owns this finger contact (from the row's broadphase
+            // handle == ArticulationLink handle == device link index).
+            const uint32_t finger_link = sides[r].a.react ==
+                    ReactionProviderKind::ArticulationChainJ
+                ? sides[r].a.handle : sides[r].b.handle;
+            const std::vector<float> chain_j =
+                FootChainJ(context_, live, poses, finger_link, contact_point,
+                           finger_dir, dof_stride_);
+            const uint32_t slot =
+                static_cast<uint32_t>(chain_jacobians.size() / dof_stride_);
+            chain_jacobians.insert(chain_jacobians.end(), chain_j.begin(),
+                                   chain_j.end());
+            rows.body_indices[2u * r + static_cast<uint32_t>(cup_local)] = 0u;
+            rows.body_indices[2u * r + static_cast<uint32_t>(finger_local)] =
+                body_count + kArtIndex;
+            const RowArticulationSide finger_side{kArtIndex, slot};
+            art_refs[r].a = (finger_local == 0) ? finger_side : none_side;
+            art_refs[r].b = (finger_local == 1) ? finger_side : none_side;
+        }
+    }
+
+    // ----- the cup BodyState (the rigid body that reacts two-way) -----------------
+    std::vector<BodyState> bodies = {box_state_};
+    const Vec3 cup_lin_before = box_state_.linear_velocity;
+
+    // ----- stage 10: the unified two-way solve (ALL finger rows together) --------
+    nuka::solver::SolverConfig cfg;
+    cfg.velocity_iterations = 64u;
+    cfg.position_iterations = 0u;
+    cfg.slop = 0.0f;
+    cfg.baumgarte = 0.0f;
+    nuka::solver::SolveContext ctx;
+    ctx.rows = &rows;
+    ctx.state = &bodies;
+    ctx.sides = &sides;
+    ctx.dt = dt_;
+    ctx.articulation.art_refs = &art_refs;
+    ctx.articulation.chain_jacobians =
+        chain_jacobians.empty() ? nullptr : &chain_jacobians;
+    ctx.articulation.inertia_m_inv = &minv;
+    ctx.articulation.qdot = &qdot;
+    ctx.articulation.dof_stride = dof_stride_;
+    nuka::solver::UnifiedSolve(ctx, cfg);
+
+    // ----- the FORCE-BALANCE gate numbers (the discriminating hold metric) -------
+    // (1) Σ over EVERY finger row of (cup-side λ * cup-side jacobian.linear.z): the
+    //     vertical impulse the fingers deliver to the cup (normal + friction spokes).
+    //     For a held cup at steady state this balances the cup weight kick m*g*dt.
+    double cup_vert_impulse = 0.0;
+    float max_depth = 0.0f, max_lambda = 0.0f;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+        const ContactRowSides& s = sides[r];
+        const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
+        const int cup_local = a_cup ? 0 : 1;
+        const RowJacobian6 j_cup =
+            rows.JacobianForRowBody(r, static_cast<uint32_t>(cup_local));
+        cup_vert_impulse +=
+            static_cast<double>(rows.rows[r].lambda) * j_cup.linear.z;
+        max_lambda = std::max(max_lambda, rows.rows[r].lambda);
+        max_depth = std::max(max_depth, rows.materials[r].position_error);
+    }
+    report.cup_vertical_impulse = cup_vert_impulse;
+    report.lambda = max_lambda;
+    report.contact_depth = max_depth;
+
+    // ----- read back the cup BodyState + recoil metrics --------------------------
+    box_state_ = bodies[0];
+    const Vec3 cup_dv = box_state_.linear_velocity - cup_lin_before;
+    report.box_dv_norm = static_cast<double>(cup_dv.Length());
+    // (2) the cross-check: cup mass * (vz_after_solve - vz_before_solve) = the net
+    //     vertical contact impulse. Must AGREE with cup_vertical_impulse (same thing,
+    //     measured from the cup velocity change vs from the row impulses).
+    const double cup_mass =
+        box_state_.inv_mass > 0.0f ? 1.0 / static_cast<double>(box_state_.inv_mass) : 0.0;
+    report.cup_dvz_impulse =
+        cup_mass * (static_cast<double>(box_state_.linear_velocity.z) - cup_vz_pre_contact);
+    double dn = 0.0;
+    for (uint32_t i = 0u; i < dof_stride_; ++i)
+        dn += std::fabs(static_cast<double>(qdot[i]) - qdot_before[i]);
+    report.qdot_delta_l1 = dn;
+
+    // ----- SCATTER the post-contact flat-qdot back to the device state -----------
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
+        live.link_velocity[root_link_].v[i] = qdot[i];
+    }
+    for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
+        const uint32_t col = DofIndexOf(leg);
+        if (col < dof_stride_) live.qdot[leg] = qdot[col];
+    }
+    device_.link_velocity.CopyFromHost(
+        live.link_velocity.data(),
+        live.link_velocity.size() * sizeof(articulation::LinkSpatialVel));
+    device_.qdot.CopyFromHost(live.qdot.data(), live.qdot.size() * sizeof(float));
+    context_.stream.Synchronize();
+    // ===== END CONTACT PHASE ================================================
+
+    // ----- stage 11: position integrate (articulation + cup) with the POST-contact
+    //       velocity. -------------------------------------------------------------
+    view = device_.View();
+    articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+    articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+    IntegrateBoxPosition();
+
+    report.cup_vz = box_state_.linear_velocity.z;
+    report.cup_z = box_state_.position.z;
     return report;
 }
 

@@ -22,13 +22,19 @@
 #include "collision/analytical_manifold.hpp"
 #include "constraint/collidable.hpp"
 #include "constraint/contact_manifold.hpp"
+#include "import/usd_importer.hpp"        // cup hull reproducer (C3 hardening regression)
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "scene/canonical_types.hpp"
+#include "scene/cooker.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 using nuka::collision::CandidatePair;
@@ -175,6 +181,51 @@ ContactManifold RouteHullHull(const ConvexHullView& a, const ConvexHullView& b) 
 bool Vec3Near(Vec3 a, Vec3 b, float tol = kTol) {
     return std::fabs(a.x - b.x) < tol && std::fabs(a.y - b.y) < tol &&
            std::fabs(a.z - b.z) < tol;
+}
+
+// --- Cup hull loader (C3 hardening regression reproducer; mirrors the grasp
+// spike's LoadCupHull). The cup is a fetch-per-env asset (.nuka-assets gitignored);
+// the regression SKIPs when absent. ----------------------------------------------
+const std::string kCupUsda =
+    ".nuka-assets/newton_assets/manipulation_objects/cup/model.usda";
+
+bool CupHullAvailable() { return std::filesystem::exists(kCupUsda); }
+
+// Load the C7a cup -> a SINGLE cooked ConvexHull, recenter its verts about the
+// bbox center (the grasp poses the cup with its center at BodyState.position), and
+// report the +X support-x (the wall the fingertip pinches). Out verts are flat
+// x,y,z triples, mesh-local, centered.
+void LoadCupHullCenteredAndFaceX(std::vector<float>* verts, float* face_x) {
+    auto scene = nuka::import::LoadUsd(kCupUsda);
+    for (size_t i = 0; i < scene.ShapeCount(); ++i) {
+        auto& s = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
+        if (!s.mesh_vertices.empty())
+            s.decompose_mode = nuka::scene::DecomposeMode::Skip;  // single hull.
+    }
+    const auto blob = nuka::scene::CookScene(scene);
+    const auto& cg = blob.convex_geometry;
+    verts->clear();
+    *face_x = 0.0f;
+    if (cg.vertex_counts.empty()) return;
+    const uint32_t voff = cg.vertex_offsets[0];
+    const uint32_t vcnt = cg.vertex_counts[0];
+    verts->assign(cg.vertices.begin() + voff * 3u,
+                  cg.vertices.begin() + (voff + vcnt) * 3u);
+    Vec3 lo{(*verts)[0], (*verts)[1], (*verts)[2]}, hi = lo;
+    for (uint32_t i = 0u; i < vcnt; ++i) {
+        const Vec3 v{(*verts)[i * 3u], (*verts)[i * 3u + 1u], (*verts)[i * 3u + 2u]};
+        lo = Vec3{std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+        hi = Vec3{std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+    }
+    const Vec3 ctr = (lo + hi) * 0.5f;
+    float fx = -3.4e38f;
+    for (uint32_t i = 0u; i < vcnt; ++i) {
+        (*verts)[i * 3u + 0u] -= ctr.x;
+        (*verts)[i * 3u + 1u] -= ctr.y;
+        (*verts)[i * 3u + 2u] -= ctr.z;
+        if ((*verts)[i * 3u + 0u] > fx) fx = (*verts)[i * 3u + 0u];
+    }
+    *face_x = fx;
 }
 
 }  // namespace
@@ -339,6 +390,156 @@ TEST(GjkEpaConvex, HullVsSpherePrimitive) {
     EXPECT_NEAR(m.points[0].penetration, 0.2f, kTol);
     // sep dir for A (hull) = -X (hull pushes away from sphere on +X side).
     EXPECT_TRUE(Vec3Near(m.points[0].normal, Vec3{-1.0f, 0.0f, 0.0f}, 1.0e-2f));
+}
+
+// ===========================================================================
+// Sphere CENTER INSIDE the hull (deep overlap) -> the SphereHull inside-fallback
+// must return a SANE bounded manifold (NOT garbage / NOT a crash). The grasp never
+// reaches this (the fingertip center stays outside the cup wall), so this is a
+// smoke/robustness bound on the spec-required center-inside branch, not the
+// validated shallow path. A unit-cube hull (he=0.5) with a small sphere (r=0.05)
+// at the hull CENTER: the center is deep inside, the shallowest face is 0.5 away,
+// so penetration = r + inside_depth ~ 0.55 (> radius), normal ~unit and axis-aligned.
+// ===========================================================================
+TEST(GjkEpaConvex, SphereCenterInsideHull_SaneBoundedManifold) {
+    const Vec3 he{0.5f, 0.5f, 0.5f};
+    const auto vh = BoxVerts(he);
+    const ConvexHullView H = MakeHull(vh, Vec3{0.0f, 0.0f, 0.0f});
+    const PrimParams S = MakeSpherePrim(0.05f, Vec3{0.0f, 0.0f, 0.0f});  // center inside
+    ShapeProxyView g;
+    g.type_a = ShapeType::Sphere; g.type_b = ShapeType::ConvexHull;
+    g.prim_a = S; g.geom_b = &H;
+    ContactManifold m;
+    std::memset(&m, 0, sizeof(m));
+    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    ASSERT_EQ(m.point_count, 1u) << "center-inside must still emit a contact";
+    const float pen = m.points[0].penetration;
+    EXPECT_TRUE(std::isfinite(pen)) << "center-inside penetration is non-finite (garbage)";
+    EXPECT_GT(pen, 0.05f) << "penetration must exceed the radius (radius + inside depth)";
+    EXPECT_NEAR(pen, 0.55f, 1.0e-2f) << "pen = r(0.05) + shallowest face depth(0.5)";
+    const Vec3 n = m.points[0].normal;
+    EXPECT_NEAR(std::sqrt(n.LengthSq()), 1.0f, 1.0e-2f) << "normal must be ~unit";
+    // The shallowest exit from the cube center is some +/- axis face (all 0.5 away;
+    // the deterministic scan picks one) -> the normal is an axis direction.
+    const float ax = std::fabs(n.x), ay = std::fabs(n.y), az = std::fabs(n.z);
+    EXPECT_GT(std::max(ax, std::max(ay, az)), 0.98f)
+        << "center-inside exit normal must be ~axis-aligned for a cube hull";
+}
+
+// ===========================================================================
+// C3 HARDENING REGRESSION: sphere x convex-hull detection is MONOTONE in depth.
+// ===========================================================================
+// THE BUG (C7b-1 grasp dropout): a fingertip SPHERE (r=0.008) pinching the cup
+// CONVEX HULL fed the sphere through the general boolean-GJK->EPA path. EPA has a
+// SHALLOW-PENETRATION non-monotonicity on the sphere's CURVED support: a sphere
+// whose CENTER is OUTSIDE the hull (only the radius penetrating) was detected at
+// pen~0.07mm, DROPPED OUT across pen~1.6-2.8mm, then re-detected from ~2.87mm --
+// detect->drop->detect (probe-measured on the ACTUAL cup hull). The cup's tiny
+// equator tilt walked a contact into that dead band periodically -> a per-21-step
+// single-finger contact dropout. The fix special-cases sphere x hull via the EXACT
+// point-to-convex distance (closest point on the hull to the sphere center),
+// bypassing EPA -> MONOTONE at all depths.
+//
+// THIS TEST locks the fix on the EXACT reproducer (the real cup hull -- a synthetic
+// box/cylinder hull does NOT reproduce the dead band: probed, the old EPA path is
+// monotone on a clean axis-aligned/symmetric hull; only the irregular V-HACD cup
+// hull triggers it on a STRAIGHT march). MARCH the fingertip sphere (r=0.008)
+// STRAIGHT along -X into the cup's +X wall from SEPARATED, through the OLD dead band
+// (0->~6mm penetration, center-OUTSIDE only so the analytic depth is monotone), in
+// sub-mm steps. ASSERT detection is MONOTONE: once detected it STAYS detected, and
+// the reported penetration is monotonically NON-DECREASING (no detect->drop->detect).
+//
+// BITE: against the OLD path (sphere routed back through general GJK->EPA) the march
+// goes detect -> point_count==0 for 7 consecutive samples (pen 1.60->2.80mm) ->
+// detect again -> this test FAILS (a detected contact dropped out). Through the
+// special-case path it is GREEN. Asset-gated (mirrors the grasp spike): SKIPs if the
+// cup is absent (the always-on HullVsSpherePrimitive test covers the path otherwise).
+// Runs BOTH sphere-as-A and sphere-as-B (the kSph][kHull + kHull][kSph slots + sign).
+TEST(GjkEpaConvex, SphereHullShallowPenetrationIsMonotone) {
+    if (!CupHullAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    // Load the actual cooked cup hull (centered about its bbox center) -- the only
+    // geometry that reproduces the EPA shallow-penetration dead band.
+    std::vector<float> verts;
+    float face_x = 0.0f;
+    LoadCupHullCenteredAndFaceX(&verts, &face_x);
+    ASSERT_GT(verts.size(), 0u);
+    ConvexHullView H;
+    H.verts = verts.data();
+    H.vcount = static_cast<uint32_t>(verts.size() / 3u);
+    H.frame = BuildPrimFrame(Transform{Vec3{0.0f, 0.0f, 0.0f}, Quat::Identity()});
+
+    constexpr float kR = 0.008f;            // fingertip sphere radius.
+    // March the sphere CENTER toward the +X cup wall along -X. Contact begins when
+    // (cx - r) < face_x i.e. cx < face_x + r. We sweep cx from face_x+r+5mm
+    // (separated) down to face_x+r-6mm (penetration 6mm), in 0.0002 m (0.2mm) steps
+    // -- sub-mm resolution straight through the OLD 1.6-2.8mm dead band. The center
+    // stays OUTSIDE (max pen 6mm < radius 8mm) so the analytic depth is monotone.
+    const float cx_start = face_x + kR + 0.005f;     // 5mm separated
+    auto run = [&](bool sphere_is_a, float cx) -> ContactManifold {
+        const PrimParams S = MakeSpherePrim(kR, Vec3{cx, 0.0f, 0.0f});
+        ShapeProxyView g;
+        ContactManifold m;
+        std::memset(&m, 0, sizeof(m));
+        if (sphere_is_a) {
+            g.type_a = ShapeType::Sphere; g.type_b = ShapeType::ConvexHull;
+            g.prim_a = S; g.geom_b = &H;
+        } else {
+            g.type_a = ShapeType::ConvexHull; g.type_b = ShapeType::Sphere;
+            g.geom_a = &H; g.prim_b = S;
+        }
+        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+        return m;
+    };
+
+    for (int side = 0; side < 2; ++side) {
+        const bool sphere_is_a = (side == 0);
+        bool   detected = false;
+        float  last_pen = -1.0f;
+        int    steps = 0, contact_steps = 0;
+        // cx from cx_start down to (face_x + kR - 0.006), 0.2mm steps (55 samples).
+        for (int i = 0; i <= 55; ++i) {
+            const float cx = cx_start - 0.0002f * static_cast<float>(i);
+            const ContactManifold m = run(sphere_is_a, cx);
+            ++steps;
+            const float true_pen = face_x + kR - cx;   // analytic penetration (m).
+            if (m.point_count > 0u) {
+                ++contact_steps;
+                const float pen = m.points[0].penetration;
+                detected = true;
+                // (b) penetration POSITIVE and ~matches the analytic depth (the
+                //     closest-point query is exact: pen = r - |center - wall|).
+                EXPECT_GT(pen, 0.0f) << "side " << side << " cx=" << cx;
+                EXPECT_NEAR(pen, true_pen, 1.5e-3f)
+                    << "side " << side << " cx=" << cx << " pen!=analytic depth";
+                // (c) MONOTONE NON-DECREASING in depth as the sphere advances.
+                if (last_pen >= 0.0f) {
+                    EXPECT_GE(pen, last_pen - 1.0e-4f)
+                        << "side " << side << " cx=" << cx
+                        << " penetration DECREASED as the sphere went deeper "
+                           "(non-monotone EPA dead band: " << last_pen << "->" << pen << ")";
+                }
+                last_pen = pen;
+                // (d) NORMAL is +/-X (sep dir for side A); ~unit.
+                const Vec3 n = m.points[0].normal;
+                EXPECT_NEAR(std::sqrt(n.LengthSq()), 1.0f, 1.0e-2f);
+                const Vec3 expect = sphere_is_a ? Vec3{1.0f, 0.0f, 0.0f}
+                                                : Vec3{-1.0f, 0.0f, 0.0f};
+                EXPECT_TRUE(Vec3Near(n, expect, 5.0e-2f))
+                    << "side " << side << " cx=" << cx << " wrong normal";
+            } else {
+                // (a) THE BITE: a gap AFTER a detection == the dead-band dropout.
+                EXPECT_FALSE(detected)
+                    << "side " << side << " cx=" << cx << " (true_pen=" << true_pen
+                    << " m): contact DROPPED OUT after being detected -- the "
+                       "sphere x hull shallow-penetration dead band regressed";
+            }
+        }
+        // Once contact begins it must persist for the rest of the (deepening) march.
+        EXPECT_GT(contact_steps, steps / 2)
+            << "side " << side << " too few contact samples -- detection never "
+               "established or dropped out across the march";
+    }
 }
 
 // ===========================================================================
