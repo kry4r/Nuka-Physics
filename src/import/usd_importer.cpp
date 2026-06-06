@@ -4,6 +4,7 @@
 
 #include "import/usd_importer.hpp"
 
+#include "import/usd_crate_reader.hpp"
 #include "import/usd_stage_adapter.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
@@ -531,9 +532,11 @@ void BakeScaleIntoPoints(std::vector<float>& points, const math::Vec3& scale) {
 // fully-parsed (and reference-resolved) prim list of the referenced file;
 // `target_path` is the </PrimPath> selected from it. The selected prim and all
 // of its descendants are appended to `out` with their paths re-rooted under
-// `host.path`, and the host prim's xformOp:scale is baked into every grafted
-// Mesh prim's points.
+// `host.path`, and `effective_scale` (the host's own xformOp:scale times every
+// ancestor Xform's scale -- see ComputeEffectiveScale) is baked into every
+// grafted Mesh prim's points.
 void GraftReference(const UsdPrim& host,
+                    const math::Vec3& effective_scale,
                     const std::vector<UsdPrim>& ref_prims,
                     const std::string& target_path,
                     std::vector<UsdPrim>& out) {
@@ -572,10 +575,39 @@ void GraftReference(const UsdPrim& host,
         UsdPrim grafted = prim;
         grafted.path = remap(prim.path);
         grafted.parent_path = is_root ? host.parent_path : remap(prim.parent_path);
-        // Bake the host's scale into the grafted mesh vertices.
-        BakeScaleIntoPoints(grafted.mesh_points, host.scale);
+        // Bake the host's effective (accumulated ancestor) scale into the
+        // grafted mesh vertices.
+        BakeScaleIntoPoints(grafted.mesh_points, effective_scale);
         out.push_back(std::move(grafted));
     }
+}
+
+// The effective xformOp:scale for `prim`: the prim's own scale times every
+// ancestor Xform's scale up the hierarchy. USD applies a mesh's whole ancestor
+// transform chain; the cup authors its scale on the parent Xform while the
+// reference sits on the child Mesh, so a self-only scale would be identity. Only
+// scale is accumulated (this asset's rotate/translate are 0); per-component
+// product, no rotate/translate baking (out of scope -- would be gold-plating).
+math::Vec3 ComputeEffectiveScale(const UsdPrim& prim,
+                                 const std::vector<UsdPrim>& prims) {
+    std::unordered_map<std::string, const UsdPrim*> by_path;
+    by_path.reserve(prims.size());
+    for (const auto& p : prims) {
+        by_path[p.path] = &p;
+    }
+    math::Vec3 scale = prim.scale;
+    std::string parent = prim.parent_path;
+    while (!parent.empty() && parent != "/") {
+        const auto it = by_path.find(parent);
+        if (it == by_path.end()) {
+            break;
+        }
+        scale.x *= it->second->scale.x;
+        scale.y *= it->second->scale.y;
+        scale.z *= it->second->scale.z;
+        parent = it->second->parent_path;
+    }
+    return scale;
 }
 
 std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
@@ -585,18 +617,51 @@ std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
     // Resolve references: for each prim carrying a reference, load + parse the
     // referenced file (resolved against THIS file's directory; its own
     // references resolve against ITS directory), select the target subtree, and
-    // graft it under the referencing prim with the host's scale baked in.
+    // graft it under the referencing prim with the host's (accumulated) scale
+    // baked in.
     std::vector<UsdPrim> grafted;
     for (const auto& prim : prims) {
         if (prim.reference_asset.empty()) {
             continue;
         }
         const std::string resolved = ResolveReferencePath(base_dir, prim.reference_asset);
-        const UsdStageData stage = LoadUsdStageData(resolved);  // binary target -> throws
+        const math::Vec3 effective_scale = ComputeEffectiveScale(prim, prims);
+
+        // A USDC (crate) binary reference target (the newton-assets cup's
+        // ./mesh.usd; v0.8 C7a): parse the crate's Mesh geometry with the
+        // self-written reader and synthesize a single ref Mesh prim at the
+        // referenced prim path, so the SAME GraftReference + scale-bake +
+        // SceneIR-build path the ASCII reference graft uses applies unchanged.
+        // Detect by the crate MAGIC (not the extension): the cup's binary file
+        // is named "mesh.usd", and a ".usd" file may be either ASCII or crate.
+        if (DetectUsdStageFormat(resolved) == UsdStageFormat::UsdcCrate ||
+            IsUsdcCrateFile(resolved)) {
+            const CrateMesh mesh = ReadUsdcMesh(resolved, prim.reference_prim_path);
+            UsdPrim ref_mesh;
+            ref_mesh.type = "Mesh";
+            // The path inside the referenced file (e.g. "/Model"); GraftReference
+            // selects the prim whose path == reference_prim_path, so name them so.
+            ref_mesh.path = mesh.prim_path;
+            const size_t slash = mesh.prim_path.find_last_of('/');
+            ref_mesh.name = (slash == std::string::npos)
+                                ? mesh.prim_path
+                                : mesh.prim_path.substr(slash + 1);
+            ref_mesh.parent_path =
+                (slash == std::string::npos || slash == 0) ? "/"
+                                                           : mesh.prim_path.substr(0, slash);
+            ref_mesh.mesh_points = mesh.points;
+            ref_mesh.face_vertex_indices = mesh.face_vertex_indices;
+            ref_mesh.face_vertex_counts = mesh.face_vertex_counts;
+            const std::vector<UsdPrim> ref_prims = {ref_mesh};
+            GraftReference(prim, effective_scale, ref_prims, prim.reference_prim_path, grafted);
+            continue;
+        }
+
+        const UsdStageData stage = LoadUsdStageData(resolved);  // other binary -> throws
         const std::string ref_dir = std::filesystem::path(resolved).parent_path().string();
         const std::vector<UsdPrim> ref_prims =
             ParseUsdaFileWithReferences(ref_dir, stage.text);
-        GraftReference(prim, ref_prims, prim.reference_prim_path, grafted);
+        GraftReference(prim, effective_scale, ref_prims, prim.reference_prim_path, grafted);
     }
     if (!grafted.empty()) {
         prims.insert(prims.end(),

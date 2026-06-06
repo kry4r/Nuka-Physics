@@ -179,6 +179,7 @@ add_library(nuka_import STATIC
     import/urdf_importer.cpp
     import/usd_stage_adapter.cpp
     import/usd_importer.cpp
+    import/usd_crate_reader.cpp
     import/mesh_file_loader.cpp
 )
 set_target_properties(nuka_import PROPERTIES POSITION_INDEPENDENT_CODE ON)
