@@ -219,7 +219,11 @@ NUKA_LINK_AABB_HD inline AABB ShapeWorldAabb(scene::ShapeType type,
 //     * `aabbs[i]`         -> the shape's tight WORLD AABB (upload as
 //                             device_shape_aabbs),
 //     * `shape_body_ids[i]`-> the owning BODY id (mirrors rigid shape_body_ids;
-//                             this is the CandidatePair handle space),
+//                             used for the same-body drop + the exclude filter),
+//     * `link_indices[i]`  -> the owning LINK index (the ArticulationLink
+//                             CandidatePair `handle` space -- distinct from the
+//                             body id; commit 2 emits THIS as the side handle so
+//                             a contact reaction resolves the chain Jacobian),
 //     * `source_shape_ids[i]` -> the GLOBAL shape-table index it came from (so
 //                             commit 2 can recover any other shape_table field).
 //   Shapes whose body maps to no link, or whose type is unbounded/unsupported
@@ -235,6 +239,8 @@ NUKA_LINK_AABB_HD inline AABB ShapeWorldAabb(scene::ShapeType type,
 struct LinkShapeAabbs {
     std::vector<AABB>     aabbs;             // per emitted shape, world AABB.
     std::vector<uint32_t> shape_body_ids;    // per emitted shape, owning body id.
+    std::vector<uint32_t> link_indices;      // per emitted shape, owning link idx
+                                             // (the ArticulationLink handle space).
     std::vector<uint32_t> source_shape_ids;  // per emitted shape, shape-table idx.
 };
 
@@ -284,6 +290,7 @@ inline LinkShapeAabbs ExtractLinkShapeAabbs(
         out.aabbs.push_back(
             ShapeWorldAabb(type, link_pose, local, half_extents, radius, half_height));
         out.shape_body_ids.push_back(body);
+        out.link_indices.push_back(owner_link);  // the ArticulationLink handle.
         out.source_shape_ids.push_back(shape);
     }
     return out;

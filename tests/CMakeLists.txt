@@ -975,6 +975,34 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_lbvh_filtered_pairs_test)
 
+    # --- v0.8 co-residence (commit 2/3): ARTICULATION-LINK <-> RIGID candidate
+    # pairs through the generalized tagged broadphase core. Synthetic mixed AABB
+    # sets + per-AABB tags (no cooked robot) exercise: cross-type emission (link
+    # AABB overlapping a rigid AABB -> one CandidatePair with correct per-side
+    # type + handle, canonical stable_key), same-type alongside, cross-type
+    # bitmask + exclude drops (non-vacuous), the rigid wrapper byte-identical to
+    # the tagged core (regression), two-run D1 byte-exactness, and the handle<2^28
+    # guard. Consumes commit 1's LinkShapeAabbs (link_aabb.hpp). VALIDATED-NOT-
+    # WIRED. Links nuka_collision_gpu (rigid_candidate_pairs.cu) + nuka_phi. Needs
+    # nuka_codegen (candidate_pair.hpp -> generated collidable_registry.hpp); the
+    # scene::CookedFilterPolicy struct comes from nuka_scene (header-only use).
+    add_executable(nuka_link_rigid_candidate_pairs_test
+        collision/test_link_rigid_candidate_pairs.cpp
+    )
+    add_dependencies(nuka_link_rigid_candidate_pairs_test nuka_codegen)
+    target_include_directories(nuka_link_rigid_candidate_pairs_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_link_rigid_candidate_pairs_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_scene
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_link_rigid_candidate_pairs_test)
+
     # --- v0.8 C3a: extended ContactManifold + narrowphase dispatch table -------
     # Validates SelectTier routing (primitive->Analytical, mesh/convex->Convex,
     # SDF-equipped->Sdf), the constexpr (typeA,typeB,tier)->handler dispatch table
