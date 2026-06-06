@@ -759,6 +759,14 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
         if (col < dof_stride_) qdot[col] = live.qdot[leg];
     }
     std::vector<float> qdot_before = qdot;
+#ifdef NUKA_H1_GRASP_DIAG
+    {
+        std::fprintf(stderr, "[QDOT] packed finger qdot (grip-driven inward vel): ");
+        for (uint32_t c = 0u; c < dof_stride_; ++c)
+            std::fprintf(stderr, "%.5e ", qdot[c]);
+        std::fprintf(stderr, " | cup vz pre-contact=%.5e\n", cup_vz_pre_contact);
+    }
+#endif
 
     // ----- wire each row: the articulation (finger) side gets a chain-J slot +
     // coloring key body_count+art_index; the cup side gets BodyState index 0. -------
@@ -796,6 +804,22 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
             const std::vector<float> chain_j =
                 FootChainJ(context_, live, poses, finger_link, contact_point,
                            finger_dir, dof_stride_);
+#ifdef NUKA_H1_GRASP_DIAG
+            {
+                double jnorm = 0.0;
+                int argmax = -1;
+                float amax = 0.0f;
+                for (uint32_t c = 0u; c < dof_stride_; ++c) {
+                    jnorm += static_cast<double>(chain_j[c]) * chain_j[c];
+                    if (std::fabs(chain_j[c]) > amax) { amax = std::fabs(chain_j[c]); argmax = static_cast<int>(c); }
+                }
+                std::fprintf(stderr, "[CHAINJ] row=%u finger_link=%u dir=(%.3f,%.3f,%.3f) "
+                             "|J|=%.5f argmaxcol=%d val=%.5f dof_stride=%u\n",
+                             r, finger_link, finger_dir.x, finger_dir.y, finger_dir.z,
+                             std::sqrt(jnorm), argmax, argmax >= 0 ? chain_j[argmax] : 0.0f,
+                             dof_stride_);
+            }
+#endif
             const uint32_t slot =
                 static_cast<uint32_t>(chain_jacobians.size() / dof_stride_);
             chain_jacobians.insert(chain_jacobians.end(), chain_j.begin(),
@@ -853,6 +877,25 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
     report.lambda = max_lambda;
     report.contact_depth = max_depth;
 
+#ifdef NUKA_H1_GRASP_DIAG
+    // Per-row diagnostic: finger link, contact direction (cup-side jacobian.linear),
+    // its z-component (rim contacts carry a large |z|; pure-radial wall contacts ~0),
+    // and lambda. Lets the spike characterize WHY a rim-heavy 3-point grasp fails.
+    {
+        for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+            const ContactRowSides& s = sides[r];
+            const uint32_t fl = s.a.react == ReactionProviderKind::ArticulationChainJ
+                                    ? s.a.handle : s.b.handle;
+            const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
+            const int cup_local = a_cup ? 0 : 1;
+            const RowJacobian6 jc = rows.JacobianForRowBody(r, (uint32_t)cup_local);
+            std::fprintf(stderr, "[CONTACT] row=%u link=%u dir=(%.3f,%.3f,%.3f) "
+                         "lambda=%.5e depth=%.5f\n", r, fl, jc.linear.x, jc.linear.y,
+                         jc.linear.z, rows.rows[r].lambda, rows.materials[r].position_error);
+        }
+    }
+#endif
+
     // ----- read back the cup BodyState + recoil metrics --------------------------
     box_state_ = bodies[0];
     const Vec3 cup_dv = box_state_.linear_velocity - cup_lin_before;
@@ -909,6 +952,18 @@ void UnifiedCoResidentStepper::IntegrateBoxPosition() {
     // NO floor clamp here. The box<->ground support is resolved THROUGH the unified
     // spine in the contact phase (box x plane narrowphase -> compliant row ->
     // UnifiedSolve), exactly like foot<->box. The integrate path is pure kinematics.
+}
+
+void UnifiedCoResidentStepper::SetGripTorque(const std::vector<float>& torque) {
+    // Overwrite the DEVICE grip-torque buffer the next StepGrasp() drive path reads.
+    // grip_torque_dev_ was sized to link_count at construction; size the host copy to
+    // match (pad/truncate) so the copy is exactly the buffer's byte length -- a host-
+    // only update would be a silent no-op (the kernel reads the device pointer).
+    const uint32_t link_count = host_proto_.TotalLinkCount();
+    std::vector<float> padded = torque;
+    padded.resize(link_count, 0.0f);
+    grip_torque_dev_.CopyFromHost(padded.data(),
+                                  static_cast<size_t>(link_count) * sizeof(float));
 }
 
 void UnifiedCoResidentStepper::Download(articulation::ArticulationHostState* out) const {
