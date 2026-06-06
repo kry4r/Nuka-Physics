@@ -1917,6 +1917,52 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_ground_mjx_parity_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 co-residence commit 3/3: THE GATE (the grasp crux). A go2
+    # articulation FOOT and a MOVABLE RIGID BODY box co-resident in ONE unified
+    # contact solve, BOTH reaction arms firing (foot=ArticulationChainJ, box=
+    # RigidInvMass) and the box GPU BodyState velocity actually changing. De-orphans
+    # commit 1 (link_aabb.hpp ExtractLinkShapeAabbs) + commit 2 (rigid_candidate_
+    # pairs.cu BuildArticulationRigidCandidatePairs) by driving the FULL stack:
+    # per-link AABB -> cross-type broadphase -> sphere x box narrowphase ->
+    # compliant rows -> UnifiedSolve. PRIMARY: kernel lambda vs the DOUBLE exact
+    # (A+R) solve of the co-resident system (J_foot M^-1 J_foot^T + box inv-mass).
+    # STRUCTURAL: box linear velocity changes (sign-checked away from the foot), the
+    # articulation qdot recoils (two-way), box angular ~0 (the linear-only-emitter
+    # grasp-blocker finding, reported). VALIDATED-NOT-WIRED. Links nuka_collision_gpu
+    # (rigid_candidate_pairs.cu) + compiles contact_stream_driver.cpp like the
+    # subsume/parity tests; needs nuka_codegen for the generated registry.
+    add_executable(nuka_foot_box_coresidence_test
+        solver/test_foot_box_coresidence.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_foot_box_coresidence_test nuka_codegen)
+
+    target_compile_definitions(nuka_foot_box_coresidence_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_foot_box_coresidence_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_foot_box_coresidence_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_foot_box_coresidence_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
     add_executable(nuka_go2_pd_standing_test
         runtime/test_go2_pd_standing.cpp

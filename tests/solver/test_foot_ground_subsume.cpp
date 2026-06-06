@@ -63,6 +63,8 @@
 #include "solver/gpu/row_scheduler.hpp"
 #include "solver/unified_solve.hpp"
 
+#include "foot_chain_jacobian.hpp"  // shared ComputeFootChainJ18 (FK-refresh-correct)
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -214,34 +216,20 @@ std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& conte
     return out;
 }
 
-// 18-wide foot chain Jacobian projected on a contact normal, for ONE foot. REUSES
-// the production ComputeContactChainJacobians (the T8b 6-base-column walk).
+// 18-wide foot chain Jacobian via the shared FK-refresh-correct helper (see
+// tests/solver/foot_chain_jacobian.hpp). The shared helper refreshes link_pose
+// from the passed FK world poses (the subsume copy formerly omitted this; for the
+// +Z-normal coplanar-feet scenario here the refresh is invisible to the base-column
+// assertions, but it is the correct version -- the named-debt fold).
 std::vector<float> ComputeFootChainJ18(const nuka::phi::DeviceContext& context,
                                        const articulation::ArticulationHostState& host,
+                                       const std::vector<Transform>& fk_world_poses,
                                        uint32_t contact_link,
                                        const Vec3& contact_point,
                                        const Vec3& contact_normal) {
-    auto device = articulation::UploadArticulationState(context, host);
-    nuka::phi::Buffer link_buf(sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jbuf(static_cast<size_t>(kDof) * sizeof(float),
-                           nuka::phi::MemoryKind::Device);
-    link_buf.CopyFromHost(&contact_link, sizeof(uint32_t));
-    point_buf.CopyFromHost(&contact_point, sizeof(Vec3));
-    normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
-    std::vector<float> zero(kDof, 0.0f);
-    jbuf.CopyFromHost(zero.data(), zero.size() * sizeof(float));
-    articulation::ComputeContactChainJacobians(
-        context, device.View(),
-        static_cast<const uint32_t*>(link_buf.Data()),
-        static_cast<const Vec3*>(point_buf.Data()),
-        static_cast<const Vec3*>(normal_buf.Data()),
-        1u, kDof, static_cast<float*>(jbuf.Data()));
-    context.stream.Synchronize();
-    std::vector<float> j(kDof);
-    jbuf.CopyToHost(j.data(), j.size() * sizeof(float));
-    return j;
+    return nuka::test::ComputeFootChainJ18(context, host, fk_world_poses,
+                                           contact_link, contact_point, contact_normal,
+                                           kDof);
 }
 
 // A ground PrimParams whose plane normal is world +Z (SpherePlane reads the
@@ -397,7 +385,7 @@ UnifiedFootGroundResult RunUnifiedFootGround(const nuka::phi::DeviceContext& con
     result.contact_depth.resize(manifolds.size());
     for (size_t m = 0u; m < manifolds.size(); ++m) {
         const std::vector<float> j =
-            ComputeFootChainJ18(context, host, foot_calf_link[m], foot_point[m], kUp);
+            ComputeFootChainJ18(context, host, poses, foot_calf_link[m], foot_point[m], kUp);
         chain_jacobians.insert(chain_jacobians.end(), j.begin(), j.end());
         result.foot_J[m] = j;
         result.contact_depth[m] =
@@ -532,7 +520,7 @@ TEST(FootGroundSubsume, FootChainJacobianHas18WideBaseColumns) {
     for (const auto& foot : cooked.feet) {
         const Vec3 center = FootWorldCenter(poses, foot);
         const std::vector<float> j =
-            ComputeFootChainJ18(context, host, foot.calf_local_link, center, kUp);
+            ComputeFootChainJ18(context, host, poses, foot.calf_local_link, center, kUp);
         ASSERT_EQ(j.size(), static_cast<size_t>(kDof));
 
         const float lever_x = center.x - base_origin.x;
