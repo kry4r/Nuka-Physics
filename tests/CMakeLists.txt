@@ -325,6 +325,9 @@ add_executable(nuka_import_test
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
     import/test_usd_mesh_geometry.cpp
+    # v0.8 C7a: the self-written USDC (crate) reader on the REAL newton cup.
+    # Links nuka_scene/nuka_cooker for the convex-hull cook gate (CookScene).
+    import/test_usdc_cup.cpp
     import/test_decompose_attribute.cpp
     import/test_mesh_file_loader.cpp
 )
@@ -332,6 +335,8 @@ add_executable(nuka_import_test
 target_link_libraries(nuka_import_test
     PRIVATE
         nuka_import
+        nuka_scene
+        nuka_cooker
         GTest::gtest_main
 )
 

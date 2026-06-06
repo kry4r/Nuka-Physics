@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -91,6 +92,20 @@ UsdStageFormat DetectUsdStageFormat(const std::string& path) {
         return UsdStageFormat::UsdzPackage;
     }
     return UsdStageFormat::Unknown;
+}
+
+bool IsUsdcCrateFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    char magic[8] = {0};
+    in.read(magic, sizeof(magic));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(magic))) {
+        return false;
+    }
+    static const char kCrateMagic[8] = {'P', 'X', 'R', '-', 'U', 'S', 'D', 'C'};
+    return std::memcmp(magic, kCrateMagic, sizeof(magic)) == 0;
 }
 
 UsdStageData LoadUsdStageData(const std::string& path) {

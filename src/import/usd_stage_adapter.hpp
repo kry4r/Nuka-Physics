@@ -23,6 +23,11 @@ struct UsdStageData {
 
 UsdStageFormat DetectUsdStageFormat(const std::string& path);
 
+// True iff the file begins with the USDC crate magic ("PXR-USDC"). A ".usd"
+// file may be either ASCII or a crate, so callers that must distinguish the
+// binary crate use this content sniff rather than the extension alone.
+bool IsUsdcCrateFile(const std::string& path);
+
 UsdStageData LoadUsdStageData(const std::string& path);
 
 } // namespace nuka::import
