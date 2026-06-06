@@ -30,6 +30,9 @@ enum class RowClassId : uint32_t {
     XPBDVolumeRow = 8u,
     XPBDShapeMatchRow = 9u,
     ParticleParticleContactRow = 10u,
+    XpbdCosseratStretchShearRow = 11u,
+    XpbdCosseratBendTwistRow = 12u,
+    CouplingContactRow = 13u,
 };
 
 // Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
@@ -59,7 +62,7 @@ struct Row {
     uint8_t contact_softness = 0u;
 };
 
-inline constexpr uint32_t kRowClassCount = 11u;
+inline constexpr uint32_t kRowClassCount = 14u;
 inline constexpr uint32_t kMaximalContactRowId = 0u;
 inline constexpr uint32_t kMaximalContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kMaximalContactRowGradientMode = 1u;
@@ -104,6 +107,18 @@ inline constexpr uint32_t kParticleParticleContactRowId = 10u;
 inline constexpr uint32_t kParticleParticleContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kParticleParticleContactRowGradientMode = 0u;
 inline constexpr uint16_t kParticleParticleContactRowAdjointKernelId = 9u;
+inline constexpr uint32_t kXpbdCosseratStretchShearRowId = 11u;
+inline constexpr uint32_t kXpbdCosseratStretchShearRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kXpbdCosseratStretchShearRowGradientMode = 3u;
+inline constexpr uint16_t kXpbdCosseratStretchShearRowAdjointKernelId = 0u;
+inline constexpr uint32_t kXpbdCosseratBendTwistRowId = 12u;
+inline constexpr uint32_t kXpbdCosseratBendTwistRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kXpbdCosseratBendTwistRowGradientMode = 3u;
+inline constexpr uint16_t kXpbdCosseratBendTwistRowAdjointKernelId = 0u;
+inline constexpr uint32_t kCouplingContactRowId = 13u;
+inline constexpr uint32_t kCouplingContactRowMaxRowsPerBlock = 6u;
+inline constexpr uint8_t kCouplingContactRowGradientMode = 3u;
+inline constexpr uint16_t kCouplingContactRowAdjointKernelId = 0u;
 
 const char* RowClassName(uint32_t row_class_id) noexcept;
 const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept;
