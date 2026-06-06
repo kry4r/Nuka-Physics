@@ -1963,6 +1963,48 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_box_coresidence_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 W1b: the CO-RESIDENT FREE-BOX foot-contact STEP-0 MJX-parity
+    # capstone -- the box-side REALITY ANCHOR to MuJoCo for the unified co-resident
+    # contact path. A go2 FL foot penetrates a FREE rigid box; one mjx.forward gives
+    # the ground-truth qacc for the articulation base 6 + legs 12 AND the box 6 free
+    # DOFs. Nuka's unified pipeline (per-link AABB -> cross-type broadphase ->
+    # sphere x box narrowphase -> compliant rows -> UnifiedSolve) must reproduce the
+    # BOX 6-DOF qacc (PRIMARY) + the base-6 (SECONDARY, the C5c-2 anchor with the box
+    # present). The box mass+inertia are pinned to match MJX exactly (GATE 1). New
+    # golden go2_foot_box_contact_step.bin (generated, NOT hand-edited).
+    # VALIDATED-NOT-WIRED. Same dep set as nuka_foot_box_coresidence_test.
+    add_executable(nuka_foot_box_mjx_parity_test
+        solver/test_foot_box_mjx_parity.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_foot_box_mjx_parity_test nuka_codegen)
+
+    target_compile_definitions(nuka_foot_box_mjx_parity_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_foot_box_mjx_parity_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_foot_box_mjx_parity_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_foot_box_mjx_parity_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 W1a: the MULTI-STEP unified co-resident contact stepper. A go2 foot
     # + a movable rigid box co-resident, stepped TOGETHER (predict -> detect ->
     # solve -> integrate -> repeat) so the contact HOLDS over many steps. REUSES
