@@ -1,0 +1,50 @@
+row_class_id: 11
+row_class_name: XpbdCosseratStretchShearRow
+
+body_count_mode: fixed
+body_count: 3
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: none
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.8 C6b RESERVED PLACEHOLDER (OPEN-C, owner-ruled 2026-06-04) -- this id is
+# RESERVED for v0.9 R2a and emits a FORWARD-ONLY compile/linkable STUB only; v0.8
+# never EMITS a row of this class (no XpbdCosserat* manifold path exists yet), so
+# the stub kernel never fires. The reservation exists because the row registry
+# numbers ids by len(rows) (kRowClassCount), so the C6b coupling row can only be
+# id13 with kRowClassCount=14 if ids 11/12 are present -- reserving them NOW lets
+# v0.9 fill the real Cosserat semantics with ZERO renumber AND zero rename (the
+# name/file/id are already what v0.9 R2a expects, v09-detailed-tasks.md:33,151).
+#
+# v0.9 R2a fills this in: stretch+shear constraint (Kugelstadt 2016)
+# C = (1/l)(p_{i+1} - p_i) - d_3(q) over {p_i, p_{i+1}, q} (2 rod nodes + 1
+# segment orientation pseudo-body = body_count 3), compliant equality, forward
+# only (default_gradient_mode: none -- all v0.9 rows are forward-only,
+# v09-detailed-tasks.md:43). Until then this stub carries the generic maximal_6vec
+# field list so the generated forward kernel compiles and links.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true

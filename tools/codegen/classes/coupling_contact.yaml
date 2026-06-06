@@ -1,0 +1,61 @@
+row_class_id: 13
+row_class_name: CouplingContactRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: true
+supports_compliance: true
+default_gradient_mode: none
+default_recompute_mode: checkpoint
+constraint_kind: unilateral_with_friction
+
+# v0.8 C6b: the GENERIC CROSS-SYSTEM coupling-row class (architecture 0.7,
+# OPEN-C owner-ruled id13). A solver-resolved non-penetration + friction contact
+# row whose two CollidableRef sides may be ANY two CollidableTypes (rigid /
+# articulation-link / particle / static) -- the cross-system generalization that
+# replaces Genesis's O(N^2) static per-pair coupling whitelist
+# (research-genesis.md:96) and its conditionally-stable EXPLICIT -dmv/dt force
+# (legacy_coupler.py:284-347) with ONE implicit compliant row carried by the
+# unified regularized-PGS (the same (A+R) solve the R-sweep guard 0e39ace locked
+# R-independent). The solref/solimp compliant schedule (0.2) replaces Genesis's
+# influence = exp(-d/eps) soft gate.
+#
+# FORWARD ONLY for v0.8 (no adjoint_evaluator) -- mirrors the id4/id5 SDF contact
+# rows shipped forward-only in p08-B, with the adjoint added later (p08-C for SDF;
+# the coupling-row adjoint is the NAMED downstream consumer of the SDF IFT
+# reference, see rigid_sdf_contact.yaml). default_gradient_mode: none records that
+# no dispatchable per-row gradient exists this milestone; RowClassHasAdjoint(13)
+# == false is the AUTHORITATIVE "no adjoint" signal a backward consumer must gate
+# on (false => stop-gradient / hard error, never a silent zero).
+#
+# The actual coupling-row SOLVE is NOT this generated stub kernel: like every
+# contact class, the row is resolved by the unified PGS (RowKind::Contact /
+# UnifiedSolve compliant branch) dispatching on the per-side ReactionProvider, not
+# on row_class_id. The stub below only reserves the registry symbol so the row
+# class is dispatchable + linkable. The framework that EMITS these rows is
+# src/runtime/coupling/coupling_row_framework.hpp (C6b).
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true
+  friction_pyramid_sides: 4

@@ -70,6 +70,19 @@ ALLOWED_ROW_CLASSES = {
     # as the distance/volume rows (only the geometric grad C, the contact normal,
     # which is downstream of this local adjoint, differs; plus the unilateral box).
     "ParticleParticleContactRow",
+    # v0.8 C6b RESERVED PLACEHOLDERS (OPEN-C, owner-ruled): ids 11/12 are reserved
+    # for v0.9 Cosserat rods (R2a/R2b) so the C6b coupling row can take id13 with
+    # kRowClassCount=14 and v0.9 fills them with ZERO renumber/rename. Both emit a
+    # FORWARD-ONLY stub (no adjoint_evaluator) and are never EMITTED as rows in
+    # v0.8 -- the stub kernels reserve the registry symbols only.
+    "XpbdCosseratStretchShearRow",
+    "XpbdCosseratBendTwistRow",
+    # v0.8 C6b: the generic CROSS-SYSTEM coupling-row class (id13, architecture
+    # 0.7) -- a solver-resolved compliant non-penetration + friction row whose two
+    # CollidableRef sides may be any two CollidableTypes. FORWARD-ONLY this
+    # milestone (the SDF id4/id5 precedent); the adjoint is the named downstream
+    # consumer of the SDF IFT reference.
+    "CouplingContactRow",
 }
 
 # Adjoint strategy selectors (see schema/row_v0_1.yaml adjoint_evaluator notes).

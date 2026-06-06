@@ -123,6 +123,14 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     # orphaned -- the p09-A lesson). Mirror the _forward.cu + _adjoint.cu pairing.
     "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cu"
+    # v0.8 C6b: ids 11/12 RESERVED placeholders (v0.9 Cosserat R2a/R2b) + id13 the
+    # cross-system coupling-row class. All THREE are FORWARD-ONLY (no adjoint_evaluator
+    # in their IR -> regen emits no _adjoint.* for them, like the id4/id5 SDF rows), so
+    # only the _forward.cu stubs compile into nuka_codegen_generated. They reserve the
+    # registry symbols (kRowClassCount=14); v0.8 never EMITS rows of 11/12.
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_cosserat_stretch_shear_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_cosserat_bend_twist_forward.cu"
+    "${NUKA_CODEGEN_OUTPUT_DIR}/coupling_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
 set(NUKA_CODEGEN_GENERATED_HEADERS

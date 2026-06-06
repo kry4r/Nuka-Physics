@@ -1,0 +1,46 @@
+row_class_id: 12
+row_class_name: XpbdCosseratBendTwistRow
+
+body_count_mode: fixed
+body_count: 2
+
+jacobian_kind: maximal_6vec
+max_rows_per_block: 6
+
+supports_friction: false
+supports_compliance: true
+default_gradient_mode: none
+default_recompute_mode: checkpoint
+constraint_kind: equality
+
+# v0.8 C6b RESERVED PLACEHOLDER (OPEN-C, owner-ruled 2026-06-04) -- see the
+# companion xpbd_cosserat_stretch_shear.yaml (id11) header for the full rationale.
+# RESERVED for v0.9 R2b; emits a FORWARD-ONLY compile/linkable STUB only and is
+# never EMITTED as a row in v0.8. Reserving id11/id12 now is what lets the C6b
+# coupling row be id13 with kRowClassCount=14 (the registry numbers by len(rows)).
+#
+# v0.9 R2b fills this in: bend+twist constraint between two consecutive segment
+# orientations via the Darboux vector (Kugelstadt 2016), over 2 segment
+# orientation pseudo-bodies (body_count 2), compliant equality, forward only
+# (default_gradient_mode: none). Until then this stub carries the generic
+# maximal_6vec field list so the generated forward kernel compiles and links.
+forward_evaluator:
+  input_fields:
+    - body_a
+    - body_b
+    - jacobian_linear_a
+    - jacobian_angular_a
+    - jacobian_linear_b
+    - jacobian_angular_b
+    - rhs
+    - lower
+    - upper
+    - lambda
+    - effective_mass
+  output_fields:
+    - lambda
+    - position_error
+  body_index_field: body_list_offset
+  jacobian_field: jacobian_offset
+  inner_loop_strategy: row_serial_jacobi
+  warm_start: true

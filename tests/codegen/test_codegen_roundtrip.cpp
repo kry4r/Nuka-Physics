@@ -54,7 +54,7 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
 
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
-    const std::array<const char*, 16> files = {
+    const std::array<const char*, 19> files = {
         "maximal_contact_forward.cu",
         "maximal_joint_forward.cu",
         "maximal_drive_forward.cu",
@@ -72,6 +72,11 @@ TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
         // v0.7 p11 (K3): particle-particle contact (id 10) forward + adjoint pair.
         "particle_particle_contact_forward.cu",
         "particle_particle_contact_adjoint.cuh",
+        // v0.8 C6b: ids 11/12 reserved Cosserat placeholders + id13 coupling row,
+        // all FORWARD-ONLY (no _adjoint.* emitted -- the id4/id5 SDF posture).
+        "xpbd_cosserat_stretch_shear_forward.cu",
+        "xpbd_cosserat_bend_twist_forward.cu",
+        "coupling_contact_forward.cu",
         "row_dispatch.cu",
         "row_class_registry.hpp",
     };
@@ -96,7 +101,10 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     using nuka::solver::generated::kMaximalDriveRowId;
     using nuka::solver::generated::kMaximalJointRowId;
     using nuka::solver::generated::kRigidSDFContactRowId;
+    using nuka::solver::generated::kCouplingContactRowId;
     using nuka::solver::generated::kRowClassCount;
+    using nuka::solver::generated::kXpbdCosseratBendTwistRowId;
+    using nuka::solver::generated::kXpbdCosseratStretchShearRowId;
     using nuka::solver::generated::kXPBDBendRowId;
     using nuka::solver::generated::kParticleParticleContactRowId;
     using nuka::solver::generated::kXPBDDistanceRowId;
@@ -105,9 +113,11 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
 
     // v0.7 p08-B added the two SDF contact row classes (ids 4/5); p09-A added the
     // XPBD soft-body distance row (id 6); p09-B added the XPBD bend (id 7) +
-    // volume (id 8) rows; p09-C added the XPBD shape-match (id 9) row; p11 adds the
-    // cross-system particle-particle contact row (id 10) -> 11 total.
-    EXPECT_EQ(kRowClassCount, 11u);
+    // volume (id 8) rows; p09-C added the XPBD shape-match (id 9) row; p11 added the
+    // cross-system particle-particle contact row (id 10). v0.8 C6b RESERVES ids
+    // 11/12 (v0.9 Cosserat R2a/R2b, forward-only placeholders) and adds the
+    // cross-system coupling row (id 13) -> 14 total (OPEN-C owner ruling: reserve).
+    EXPECT_EQ(kRowClassCount, 14u);
     EXPECT_TRUE(IsKnownRowClass(kMaximalContactRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalJointRowId));
     EXPECT_TRUE(IsKnownRowClass(kMaximalDriveRowId));
@@ -207,6 +217,44 @@ TEST(CodegenRoundtrip, GeneratedRegistryLinksAndReportsBaseRows) {
     EXPECT_TRUE(RowClassHasAdjoint(kParticleParticleContactRowId));
     EXPECT_EQ(RowClassGradientMode(kParticleParticleContactRowId),
               static_cast<uint8_t>(GradientMode::dense_adjoint));
+
+    // v0.8 C6b: ids 11/12 are RESERVED placeholders for v0.9 Cosserat rods (R2a
+    // XpbdCosseratStretchShear / R2b XpbdCosseratBendTwist) so the coupling row can
+    // take id13 with kRowClassCount=14 and v0.9 fills them with zero renumber/rename
+    // (OPEN-C owner ruling). They are FORWARD-ONLY stubs -- never EMITTED as rows in
+    // v0.8 -- so RowClassHasAdjoint(11)/(12)==false and the gradient mode is `none`.
+    // This block is the contract tripwire: when v0.9 fills the real Cosserat
+    // semantics it updates the ids/names here consciously (the names/ids must stay
+    // exactly as reserved, v09-detailed-tasks.md:33-34).
+    EXPECT_EQ(kXpbdCosseratStretchShearRowId, 11u);
+    EXPECT_EQ(kXpbdCosseratBendTwistRowId, 12u);
+    EXPECT_TRUE(IsKnownRowClass(kXpbdCosseratStretchShearRowId));
+    EXPECT_TRUE(IsKnownRowClass(kXpbdCosseratBendTwistRowId));
+    EXPECT_STREQ(RowClassName(kXpbdCosseratStretchShearRowId),
+                 "XpbdCosseratStretchShearRow");
+    EXPECT_STREQ(RowClassName(kXpbdCosseratBendTwistRowId),
+                 "XpbdCosseratBendTwistRow");
+    EXPECT_FALSE(RowClassHasAdjoint(kXpbdCosseratStretchShearRowId));
+    EXPECT_FALSE(RowClassHasAdjoint(kXpbdCosseratBendTwistRowId));
+    EXPECT_EQ(RowClassGradientMode(kXpbdCosseratStretchShearRowId),
+              static_cast<uint8_t>(GradientMode::none));
+    EXPECT_EQ(RowClassGradientMode(kXpbdCosseratBendTwistRowId),
+              static_cast<uint8_t>(GradientMode::none));
+
+    // v0.8 C6b: the generic CROSS-SYSTEM coupling-row class (id13, architecture
+    // 0.7) -- a solver-resolved compliant non-penetration + friction row whose two
+    // CollidableRef sides may be any two CollidableTypes. FORWARD-ONLY this
+    // milestone (the id4/id5 SDF precedent): RowClassHasAdjoint(13)==false (the
+    // authoritative "no adjoint" signal) and gradient mode `none`. The framework
+    // that EMITS these rows is src/runtime/coupling/coupling_row_framework.hpp; the
+    // solve is the unified PGS contact path, not this generated stub.
+    EXPECT_EQ(kCouplingContactRowId, 13u);
+    EXPECT_TRUE(IsKnownRowClass(kCouplingContactRowId));
+    EXPECT_STREQ(RowClassName(kCouplingContactRowId), "CouplingContactRow");
+    EXPECT_EQ(RowClassMaxRowsPerBlock(kCouplingContactRowId), 6u);
+    EXPECT_FALSE(RowClassHasAdjoint(kCouplingContactRowId));
+    EXPECT_EQ(RowClassGradientMode(kCouplingContactRowId),
+              static_cast<uint8_t>(GradientMode::none));
 
     EXPECT_FALSE(IsKnownRowClass(99u));
 }
