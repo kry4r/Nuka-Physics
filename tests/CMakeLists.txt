@@ -1963,6 +1963,49 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_box_coresidence_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 W1a: the MULTI-STEP unified co-resident contact stepper. A go2 foot
+    # + a movable rigid box co-resident, stepped TOGETHER (predict -> detect ->
+    # solve -> integrate -> repeat) so the contact HOLDS over many steps. REUSES
+    # FeatherstoneAba:: integration verbatim (the production integrator). Compiles
+    # the NEW src/runtime/coresident/unified_coresident_stepper.cpp + the host
+    # contact_stream_driver.cpp directly (same pattern as the subsume / parity /
+    # coresidence tests). 4 gates: (1) integrator-isolation closed-form ballistic
+    # spin (the sharp gate, with a test-side bite proof), (2) multi-step stability +
+    # two-way reaction, (3) V2 energy non-increasing, (4) D1 byte-exact two-run.
+    # VALIDATED-NOT-WIRED. Same dep set as nuka_foot_box_coresidence_test.
+    add_executable(nuka_unified_coresident_stepper_test
+        coresident/test_unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_unified_coresident_stepper_test nuka_codegen)
+
+    target_compile_definitions(nuka_unified_coresident_stepper_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_unified_coresident_stepper_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_unified_coresident_stepper_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_unified_coresident_stepper_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
