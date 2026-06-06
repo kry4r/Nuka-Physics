@@ -1809,6 +1809,45 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_ground_subsume_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 co-residence PEAK (commit 1/3): per-link/per-shape WORLD AABB
+    # extraction from articulation FK (src/collision/link_aabb.hpp). The
+    # artic-link<->rigid broadphase PREREQUISITE C2b excluded (no per-link AABB).
+    # Cooks go2_float, sweeps >=3 distinct FK poses, asserts each foot sphere's
+    # world AABB contains its surface samples + is exactly tight, a synthetic
+    # rotated-box AABB == an independent 8-corner reference (and grows under
+    # rotation), a capsule's caps are contained, D1 two-run byte-identity, AND a
+    # __global__ kernel proves the HD core compiles + runs on-device == host
+    # (so commit 2 can call it in a .cu). VALIDATED-NOT-WIRED. The .cu drives the
+    # device-core proof; needs nuka_codegen for the generated registry CookScene/
+    # BuildWorld pull in (same dep set as the foot-ground subsume exe).
+    add_executable(nuka_link_aabb_test
+        collision/test_link_aabb.cu
+    )
+    add_dependencies(nuka_link_aabb_test nuka_codegen)
+
+    target_compile_definitions(nuka_link_aabb_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_link_aabb_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_link_aabb_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_link_aabb_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C5c-2: MJX-parity ACCEPTANCE for the foot-ground subsume.
     # At a FIXED penetrating contact state (go2 feet pressed delta into a +Z
     # ground plane, qpos fixed, qvel=0) one mjx.forward -> qacc is compared to
