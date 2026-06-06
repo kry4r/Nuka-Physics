@@ -102,6 +102,8 @@
 #include "solver/gpu/row_scheduler.hpp"
 #include "solver/unified_solve.hpp"
 
+#include "foot_chain_jacobian.hpp"  // shared ComputeFootChainJ18 (FK-refresh-correct)
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -366,44 +368,16 @@ std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& conte
     return out;
 }
 
-// 18-wide foot chain Jacobian projected on a contact normal. CRITICAL: the
-// production ComputeContactChainJacobians kernel reads state.link_pose (the WORLD
-// link poses), but UploadArticulationState leaves link_pose at the STATIC COOKED
-// rest pose (q=0, base at cook origin). The production pipeline refreshes it from
-// the current q each step (batched_articulated_world.cu stage 4:
-// UpdateWorldLinkPoses -> copy into state.link_pose) BEFORE the chain-J. We mirror
-// that here: the caller passes the FK world poses (already computed via
-// ForwardKinematics) which we write into a COPY of the host state's link_pose
-// before upload. WITHOUT this refresh the leg joint anchors collapse to the base
-// origin and the leg columns degenerate to -lever_x (a stale-FK artifact, not a
-// kernel bug -- the production no-tipping/Sigma=Mg test passes because its step
-// runs FK first).
+// 18-wide foot chain Jacobian via the shared FK-refresh-correct helper (see
+// tests/solver/foot_chain_jacobian.hpp). Thin forwarder pinning dof_stride=kDof.
 std::vector<float> ComputeFootChainJ18(const nuka::phi::DeviceContext& context,
                                        articulation::ArticulationHostState host,  // by value.
                                        const std::vector<Transform>& fk_world_poses,
                                        uint32_t contact_link, const Vec3& contact_point,
                                        const Vec3& contact_normal) {
-    if (fk_world_poses.size() == host.link_pose.size()) {
-        host.link_pose = fk_world_poses;  // refresh world poses from current q.
-    }
-    auto device = articulation::UploadArticulationState(context, host);
-    nuka::phi::Buffer link_buf(sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jbuf(static_cast<size_t>(kDof) * sizeof(float), nuka::phi::MemoryKind::Device);
-    link_buf.CopyFromHost(&contact_link, sizeof(uint32_t));
-    point_buf.CopyFromHost(&contact_point, sizeof(Vec3));
-    normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
-    std::vector<float> zero(kDof, 0.0f);
-    jbuf.CopyFromHost(zero.data(), zero.size() * sizeof(float));
-    articulation::ComputeContactChainJacobians(
-        context, device.View(), static_cast<const uint32_t*>(link_buf.Data()),
-        static_cast<const Vec3*>(point_buf.Data()), static_cast<const Vec3*>(normal_buf.Data()),
-        1u, kDof, static_cast<float*>(jbuf.Data()));
-    context.stream.Synchronize();
-    std::vector<float> j(kDof);
-    jbuf.CopyToHost(j.data(), j.size() * sizeof(float));
-    return j;
+    return nuka::test::ComputeFootChainJ18(context, std::move(host), fk_world_poses,
+                                           contact_link, contact_point, contact_normal,
+                                           kDof);
 }
 
 amf::PrimParams MakeGroundPrim(float ground_height) {
