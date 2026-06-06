@@ -281,6 +281,12 @@ constexpr uint32_t kFieldSetSentinel = 0xFFFFFFFFu;  // default FieldIndex
 // MinCompressedArraySize from crateFile.cpp: arrays below this are stored raw.
 constexpr std::size_t kMinCompressedArraySize = 16;
 
+// Sanity cap on a count read from the (untrusted) crate payload, used only where
+// a byte bound is impossible (integer-compressed arrays expand from far fewer
+// on-disk bytes than n*4). Generously above any real mesh's element count; a
+// count past it is treated as corruption and rejected before any allocation.
+constexpr std::size_t kMaxArrayElements = 1ull << 30;  // 1 Gi elements
+
 // ---------------------------------------------------------------------------
 // Crate document: parsed structural sections.
 // ---------------------------------------------------------------------------
@@ -480,7 +486,14 @@ std::vector<float> ReadVec3fArray(const Crate& c, const ValueRep& rep) {
     }
     std::size_t o = static_cast<std::size_t>(rep.Payload());
     const uint64_t count = c.r.U64(o);
-    o += 8;
+    o += 8;  // o <= size() here (U64 already RequireRange'd o+8).
+    // Validate the count BEFORE allocating: a garbage-large count must fail with
+    // the file's runtime_error, not bad_alloc/length_error. Bound in division form
+    // so an untrusted count*12 (or count*3) cannot wrap past the check. Vec3f is
+    // always raw little-endian f32 here, so the exact byte cost is count*12.
+    if (count > (c.r.size() - o) / 12u) {
+        throw std::runtime_error("USDC: vec3f array count exceeds remaining payload");
+    }
     std::vector<float> out;
     out.resize(static_cast<std::size_t>(count) * 3);
     for (std::size_t i = 0; i < out.size(); ++i) {
@@ -498,11 +511,25 @@ std::vector<int> ReadIntArray(const Crate& c, const ValueRep& rep) {
     }
     std::size_t o = static_cast<std::size_t>(rep.Payload());
     const uint64_t count = c.r.U64(o);
-    o += 8;
+    o += 8;  // o <= size() here (U64 already RequireRange'd o+8).
+    const bool raw = (!rep.IsCompressed() || count < kMinCompressedArraySize);
+    // Validate the count BEFORE reserving: a garbage count must fail with the
+    // file's runtime_error, not bad_alloc/length_error. The raw path consumes n*4
+    // bytes, so bound it exactly in division form (overflow-safe). The compressed
+    // path expands from far fewer on-disk bytes than n*4, so no byte bound is
+    // possible there -- fall back to a sane max-element cap (this also shields the
+    // downstream EncodedBufferSize32(n) reserve in ReadCompressedInts).
+    if (raw) {
+        if (count > (c.r.size() - o) / 4u) {
+            throw std::runtime_error("USDC: int array count exceeds remaining payload");
+        }
+    } else if (count > kMaxArrayElements) {
+        throw std::runtime_error("USDC: compressed int array count exceeds sanity cap");
+    }
     const std::size_t n = static_cast<std::size_t>(count);
     std::vector<int> out;
     out.reserve(n);
-    if (!rep.IsCompressed() || n < kMinCompressedArraySize) {
+    if (raw) {
         for (std::size_t i = 0; i < n; ++i) {
             out.push_back(static_cast<int>(c.r.U32(o + i * 4)));
         }
