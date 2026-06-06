@@ -2107,6 +2107,50 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_grasp_hold_spike_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C7b-2a: the REAL h1_with_hand grasp SPIKE ---------------------
+    # Replaces the synthetic gripper with an imported unitree h1_with_hand hand
+    # (MJCF -> SceneIR -> cook -> ArticulationHostState, base forced Fixed). A real
+    # revolute thumb + opposing finger pinch the C7a cup; constant grip torque
+    # squeezes; the cup is held against gravity AND a disturbance by finger friction
+    # ALONE (NO table). Gates: STEP-ZERO posability (opposing fingertip spheres
+    # straddle the cup), the hold gate (Sigma(finger vert impulse) ~= m*g*dt, no
+    # static row, bounded drift), the grip=0 BITE, the DISTURBANCE cage gate, V2
+    # energy, D1. Asset-gated (SKIP if h1/cup absent). VALIDATED-NOT-WIRED. Same dep
+    # set as the C7b-1 grasp spike (+ the MJCF importer is already in nuka_import).
+    add_executable(nuka_h1_grasp_spike_test
+        coresident/test_h1_grasp_spike.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_grasp_spike_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_grasp_spike_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_grasp_spike_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_grasp_spike_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_grasp_spike_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the

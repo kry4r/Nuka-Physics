@@ -217,6 +217,27 @@ public:
     const runtime::rigid::BodyState& Box() const { return box_state_; }
     const runtime::rigid::BodyState& Cup() const { return box_state_; }
 
+    // C7b-2a DISTURBANCE hook (additive). Inject a velocity impulse on the movable
+    // body's linear (dv) + angular (dw) velocity, applied BEFORE the next Step()'s
+    // contact phase. Used by the H1 grasp spike's disturbance gate to perturb the
+    // held cup (lateral nudge, angular tilt, brief upward kick) and prove it stays
+    // caged. Purely additive: the W1a/foot-box + C7b-1 grasp gates never call it.
+    void ApplyCupImpulse(const math::Vec3& dv, const math::Vec3& dw) {
+        box_state_.linear_velocity += dv;
+        box_state_.angular_velocity += dw;
+    }
+
+    // C7b-2b PD-CONTROL hook (additive). Overwrite the per-device-link grip torque
+    // that the NEXT StepGrasp() re-applies to tau (the DRIVE path). The W1a foot+box
+    // path + the C7b-1/C7b-2a constant-torque grasp gates NEVER call this, so they
+    // are byte-for-byte unchanged (the constructor still uploads grasp.grip_torque
+    // once; a caller that never invokes the setter sees the exact prior behavior).
+    // This lets a test compute a PD law tau_i = Kp*(q_target_i - q_i) - Kd*qdot_i
+    // host-side each step from the Download'd q/qdot and feed it through the SAME
+    // device drive seam. `torque` is per device link (length == total link count);
+    // it is copied straight into grip_torque_dev_ (device memory the kernel reads).
+    void SetGripTorque(const std::vector<float>& torque);
+
     // Snapshot the articulation host state (downloads q/qdot/base_pose/link_velocity).
     void Download(articulation::ArticulationHostState* out) const;
 
