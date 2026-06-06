@@ -973,6 +973,395 @@ def generate_floating_contact_step(model_path: Path,
         os.replace(tmp_path, out_path)
 
 
+# ---------------------------------------------------------------------------
+# v0.8 W1b: the CO-RESIDENT FREE-BOX foot-CONTACT single-step MJX parity golden.
+#
+# This is the box-side REALITY ANCHOR to MuJoCo. The C5c-2 floating-contact-step
+# golden anchored the foot CONTACT recoil into the floating BASE (the
+# articulation side) vs MJX, but the BOX side of the co-resident two-way contact
+# (movable rigid box <-> articulation foot) has only ever been validated vs
+# exact-solve oracles + the production kernel + legacy-Nuka -- NEVER vs MuJoCo.
+# W1b closes that: a single go2 foot PENETRATES a FREE RIGID BOX (a <body> with a
+# <freejoint/> + a <geom type="box">) by a known depth; one mjx.forward gives the
+# ground-truth qacc for ALL DOFs -- the articulation base 6 + legs 12 AND the box
+# 6 free DOFs. Nuka's unified pipeline (foot<->box -> EmitCompliantContactRows ->
+# UnifiedSolve) must reproduce the BOX 6-DOF qacc (PRIMARY) + the base-6 (the
+# C5c-2 secondary, confirmed still anchored with the box present).
+#
+# THE MODEL-ALIGNMENT CRUX (the task's #1 risk -- box mass+inertia). Nuka's box
+# (mass + diagonal inertia on the BodyState) MUST EXACTLY match what MJX builds
+# from the <geom box>. We pin both sides by setting an EXPLICIT <inertial> on the
+# box body with a chosen mass + the exact box diagonal inertia
+#   I = (m/3)*(h_y^2+h_z^2, h_x^2+h_z^2, h_x^2+h_y^2)
+# for half-extents h. The box geom is ALSO emitted (it provides the contact
+# geometry) but with mass="0" density="0" so it contributes NO inertia -- the
+# explicit <inertial> is the sole inertia source. ASYMMETRIC half-extents make
+# the three principal inertias DISTINCT, so a wrong-axis box inertia (or a
+# dropped box angular Jacobian) is detectable in the box qacc. The exact box
+# params (BOX_MASS, BOX_HALF_EXTENTS, the derived inertia) are duplicated in the
+# Nuka test (tests/solver/test_foot_box_mjx_parity.cpp) so both sides match BY
+# CONSTRUCTION. No <floor> is emitted: the ONLY contact is foot<->box, isolating
+# the two-way reaction. The articulation side reuses the SAME source translation
+# of go2_float.usda the C5c-2 golden uses (shared M by construction).
+# ---------------------------------------------------------------------------
+
+KIND_FOOT_BOX_STEP_MAGIC = b"NUKAFBOX"
+FOOT_BOX_STEP_VERSION = 1
+
+# The free rigid box (PINNED -- the Nuka test duplicates these EXACTLY). Asymmetric
+# half-extents -> three distinct principal inertias (a wrong-axis inertia or a
+# dropped box angular Jacobian shows up in the box qacc).
+BOX_MASS = 2.0
+BOX_HALF_EXTENTS = (0.06, 0.05, 0.04)  # h_x, h_y, h_z (metres)
+
+
+def _box_diag_inertia(mass: float, half: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Solid box diagonal inertia about its COM: I = (m/3)*(h_b^2 + h_c^2)."""
+    hx, hy, hz = half
+    return (
+        (mass / 3.0) * (hy * hy + hz * hz),
+        (mass / 3.0) * (hx * hx + hz * hz),
+        (mass / 3.0) * (hx * hx + hy * hy),
+    )
+
+
+def _usda_to_foot_box_contact_mjcf(source: Path, work: Path,
+                                   foot_solref, foot_solimp,
+                                   contact_foot_index: int,
+                                   box_center, box_half, box_mass,
+                                   box_inertia) -> tuple[Path, list[str], str]:
+    """Translate go2_float.usda -> a FLOATING-BASE go2 + a FREE RIGID BOX MJCF.
+
+    Identical body/joint/inertial emission to _usda_to_floating_contact_mjcf (the
+    floating-base translation the C5c-2 golden uses) EXCEPT:
+      * NO floor plane (the only contact is foot<->box),
+      * a SECOND worldbody <body> with a <freejoint/>, an explicit <inertial>
+        (the sole inertia source, pinned to box_mass + box_inertia), and a
+        <geom type="box"> at box_half with mass="0" density="0" (geometry only).
+    The box is the LAST body so its 6 free DOFs come AFTER the go2 base-6 + legs-12
+    in qvel/qacc. Returns (mjcf_path, foot_geom_names_in_order, box_body_name).
+    The foot geoms get contype/conaffinity that collide with the box; ALL the
+    foot spheres are emitted (so the FK is identical to Nuka's) but only the
+    contact_foot_index foot is positioned to penetrate the box.
+    """
+    prims = _parse_usda_prims(source)
+    bodies = {prim.path: prim for prim in prims if _is_rigid_body(prim)}
+    joints = [prim for prim in prims if _is_joint(prim)]
+    spheres_by_parent: dict[str, list[_UsdPrim]] = {}
+    for prim in prims:
+        if prim.type == "Sphere":
+            spheres_by_parent.setdefault(prim.parent_path, []).append(prim)
+    for siblings in spheres_by_parent.values():
+        siblings.sort(key=lambda item: item.order)
+
+    children_by_parent: dict[str, list[_UsdPrim]] = {}
+    child_paths: set[str] = set()
+    joint_for_child: dict[str, _UsdPrim] = {}
+    for joint in joints:
+        if joint.type != "PhysicsRevoluteJoint":
+            raise SystemExit(
+                f"{source}: foot-box oracle supports only revolute USD "
+                f"joints; got {joint.type} for {joint.name}")
+        if joint.body0_path not in bodies or joint.body1_path not in bodies:
+            raise SystemExit(f"{source}: joint {joint.name} references an unknown body")
+        children_by_parent.setdefault(joint.body0_path, []).append(joint)
+        child_paths.add(joint.body1_path)
+        joint_for_child[joint.body1_path] = joint
+    for siblings in children_by_parent.values():
+        siblings.sort(key=lambda item: item.order)
+
+    roots = [prim for prim in prims if _is_rigid_body(prim) and prim.path not in child_paths]
+    if len(roots) != 1:
+        raise SystemExit(f"{source}: foot-box oracle expects exactly one root")
+
+    foot_geom_names: list[str] = []
+    solref_str = _fmt(tuple(foot_solref))
+    solimp_str = _fmt(tuple(foot_solimp))
+
+    lines = [
+        '<mujoco model="nuka_go2_foot_box">',
+        '  <compiler angle="radian" coordinate="local"/>',
+        '  <option integrator="Euler" gravity="0 0 -9.81" '
+        'iterations="200" tolerance="1e-12" cone="pyramidal"/>',
+        '  <worldbody>',
+    ]
+
+    def emit_body(body: _UsdPrim, indent: int, is_root: bool) -> None:
+        prefix = " " * indent
+        lines.append(
+            f'{prefix}<body name="{_xml_name(body.name)}" pos="{_fmt(body.translate)}">'
+        )
+        if is_root:
+            lines.append(f"{prefix}  <freejoint/>")
+        joint = joint_for_child.get(body.path)
+        if joint is not None:
+            axis = _axis_tuple(joint.axis_token)
+            lines.append(
+                f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
+                f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
+            )
+        if body.mass > 0.0 and not body.kinematic_enabled:
+            lines.append(
+                f'{prefix}  <inertial pos="0 0 0" mass="{body.mass:.9g}" '
+                f'diaginertia="{_fmt(body.diagonal_inertia)}"/>'
+            )
+        for sphere in spheres_by_parent.get(body.path, []):
+            geom_name = f"{body.name}_foot"
+            foot_geom_names.append(geom_name)
+            lines.append(
+                f'{prefix}  <geom name="{_xml_name(geom_name)}" type="sphere" '
+                f'size="{sphere.radius:.9g}" pos="{_fmt(sphere.translate)}" '
+                f'contype="1" conaffinity="1" condim="1" '
+                f'solref="{solref_str}" solimp="{solimp_str}"/>'
+            )
+        for child_joint in children_by_parent.get(body.path, []):
+            emit_body(bodies[child_joint.body1_path], indent + 2, False)
+        lines.append(f"{prefix}</body>")
+
+    emit_body(roots[0], 4, True)
+
+    # The FREE RIGID BOX (last worldbody body -> its 6 DOFs follow the go2's 18).
+    box_body_name = "free_box"
+    box_inert_str = _fmt(tuple(box_inertia))
+    box_size_str = _fmt(tuple(box_half))
+    box_pos_str = _fmt(tuple(box_center))
+    lines.append(f'    <body name="{box_body_name}" pos="{box_pos_str}">')
+    lines.append('      <freejoint/>')
+    # Explicit inertial = the SOLE inertia source (pinned for Nuka alignment).
+    lines.append(
+        f'      <inertial pos="0 0 0" mass="{box_mass:.9g}" '
+        f'diaginertia="{box_inert_str}"/>'
+    )
+    # The box geom = contact geometry ONLY (mass/density 0 -> no inertia).
+    lines.append(
+        f'      <geom name="{box_body_name}_geom" type="box" size="{box_size_str}" '
+        f'pos="0 0 0" mass="0" density="0" contype="1" conaffinity="1" condim="1" '
+        f'solref="{solref_str}" solimp="{solimp_str}"/>'
+    )
+    lines.append('    </body>')
+
+    lines.append("  </worldbody>")
+    lines.append("</mujoco>")
+    out = work / f"{source.stem}_foot_box_mjx.xml"
+    out.write_text("\n".join(lines) + "\n")
+    return out, foot_geom_names, box_body_name
+
+
+def generate_foot_box_contact_step(model_path: Path, out_path: Path) -> None:
+    """Generate the W1b co-resident FREE-BOX foot-contact single-step parity golden.
+
+    See _usda_to_foot_box_contact_mjcf for the model-alignment rationale (MJX is a
+    source translation of go2_float.usda + a free box whose mass/inertia the Nuka
+    test duplicates exactly). A single FIXED config: the FL foot penetrating the
+    box top face by a known delta, qvel=0, gravity ON, base+leg tau=0, box tau=0.
+    Records (contact ON and OFF):
+      nq, nv, then per config:
+      qpos(nq), qvel(nv), tau(nv), qacc_on(nv), qacc_off(nv),
+      base_qvel_dof, box_qvel_dof, box pos(3)+quat(4)+mass+inertia(3),
+      ncon, then per-contact [pos(3), normal(3), dist] for MAX_CONTACTS_RECORDED,
+      then efc_force per-contact normal force, then per-contact invweight.
+    """
+    jax, jnp, mujoco, mjx = _load_mjx_deps()
+    suffix = model_path.suffix.lower()
+    if suffix not in (".usd", ".usda"):
+        raise SystemExit(
+            "foot-box-contact-step oracle requires the go2_float USD source "
+            "(source translation), got " + model_path.name)
+
+    # MuJoCo-DEFAULT solref/solimp == the Nuka ContactManifold defaults.
+    foot_solref = (0.02, 1.0)
+    foot_solimp = (0.9, 0.95, 0.001, 0.5, 2.0)
+    # The FL foot penetrates the box top by this depth (matches the co-residence
+    # gate's 4 mm). The box is placed so its top face is `k_penetration` above the
+    # FL foot sphere bottom.
+    k_penetration = 0.004
+    contact_foot_index = 0  # FL (the USD Sphere prim order; Nuka's foot[0]).
+    box_inertia = _box_diag_inertia(BOX_MASS, BOX_HALF_EXTENTS)
+
+    with tempfile.TemporaryDirectory(prefix="nuka_mjx_foot_box_") as tmp:
+        work = Path(tmp)
+        # ---- Pass 1: build go2 ONLY (provisional box far away) to read the FL
+        # foot world center at the cooked home crouch. We reuse the floating-
+        # contact MJCF builder for a clean go2-with-floor-far-below model just to
+        # do FK -- simpler: build the foot-box model with a provisional box, read
+        # the foot, then re-place the box. ----------------------------------------
+        provisional, foot_geoms, box_name = _usda_to_foot_box_contact_mjcf(
+            model_path, work, foot_solref, foot_solimp, contact_foot_index,
+            box_center=(0.0, 0.0, -100.0), box_half=BOX_HALF_EXTENTS,
+            box_mass=BOX_MASS, box_inertia=box_inertia)
+        m0 = mujoco.MjModel.from_xml_path(str(provisional))
+        base_dof = _free_joint_qvel_dof(m0)
+        if base_dof is None:
+            raise SystemExit("foot-box oracle: translated model has no freejoint")
+        base_qpos = int(m0.jnt_qposadr[
+            [int(m0.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+             for j in range(m0.njnt)].index(True)])
+
+        # Home qpos = the SAME configuration Nuka cooks (USD initial positions,
+        # mapped by NAME), exactly as the C5c-2 generator does.
+        usd_prims = _parse_usda_prims(model_path)
+        usd_initial_by_name = {
+            p.name: p.initial_position
+            for p in usd_prims
+            if _is_joint(p) and p.has_initial_position
+        }
+        q_home = np.array(m0.qpos0, dtype=np.float64)
+        for jname, q0 in usd_initial_by_name.items():
+            jid = mujoco.mj_name2id(m0, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid < 0:
+                raise SystemExit(
+                    f"foot-box oracle: USD joint {jname} not found in MJX model")
+            q_home[int(m0.jnt_qposadr[jid])] = float(q0)
+
+        d0 = mujoco.MjData(m0)
+        d0.qpos[:] = q_home
+        d0.qvel[:] = 0.0
+        mujoco.mj_forward(m0, d0)
+        # The FL foot world center + radius.
+        fl_geom = foot_geoms[contact_foot_index]
+        fl_gid = mujoco.mj_name2id(m0, mujoco.mjtObj.mjOBJ_GEOM, fl_geom)
+        fl_radius = float(m0.geom_size[fl_gid, 0])
+        fl_center = np.asarray(d0.geom_xpos[fl_gid], dtype=np.float64)
+        # Place the box so its TOP face is k_penetration above the FL foot bottom,
+        # OFFSET in x by an off-COM lever so the box angular reaction is excited.
+        foot_bottom = float(fl_center[2]) - fl_radius
+        x_lever = 0.02  # 2 cm off-COM lever (matches the co-residence gate).
+        box_top = foot_bottom + k_penetration
+        box_center = (
+            float(fl_center[0]) + x_lever,
+            float(fl_center[1]),
+            box_top - BOX_HALF_EXTENTS[2],
+        )
+
+        # ---- Pass 2: rebuild with the seated box. -------------------------------
+        final_path, foot_geoms, box_name = _usda_to_foot_box_contact_mjcf(
+            model_path, work, foot_solref, foot_solimp, contact_foot_index,
+            box_center=box_center, box_half=BOX_HALF_EXTENTS,
+            box_mass=BOX_MASS, box_inertia=box_inertia)
+        model = mujoco.MjModel.from_xml_path(str(final_path))
+        model.opt.timestep = 1.0 / 240.0
+        nq = int(model.nq)
+        nv = int(model.nv)
+
+        # Free-joint DOF addresses: base = go2 root freejoint (first), box = the
+        # box freejoint (second). Find both free joints in qvel-DOF order.
+        free_dofs = [int(model.jnt_dofadr[j]) for j in range(model.njnt)
+                     if int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)]
+        free_dofs.sort()
+        if len(free_dofs) != 2:
+            raise SystemExit(
+                f"foot-box oracle: expected 2 free joints (base + box), got "
+                f"{len(free_dofs)}")
+        base_qvel_dof = free_dofs[0]
+        box_qvel_dof = free_dofs[1]
+        # The box body id + its qpos start.
+        box_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, box_name)
+        free_qpos = [int(model.jnt_qposadr[j]) for j in range(model.njnt)
+                     if int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)]
+        free_qpos.sort()
+        box_qpos_adr = free_qpos[1]
+
+        # Rebuild q_home for the final model (box freejoint adds 7 qpos slots).
+        q_home = np.array(model.qpos0, dtype=np.float64)
+        for jname, q0 in usd_initial_by_name.items():
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            q_home[int(model.jnt_qposadr[jid])] = float(q0)
+        # The box qpos0 already carries box_center (body pos) + identity quat.
+
+        # The single fixed config: home stance, zero tau everywhere (pure contact).
+        configs = [(q_home.copy(), np.zeros(nv))]
+
+        mjx_model_on = mjx.put_model(model)
+        model_off = mujoco.MjModel.from_xml_path(str(final_path))
+        model_off.opt.timestep = model.opt.timestep
+        model_off.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        mjx_model_off = mjx.put_model(model_off)
+
+        def forward_qacc(mjx_model, qpos, qvel, tau):
+            data = mjx.make_data(mjx_model).replace(
+                qpos=qpos, qvel=qvel, qfrc_applied=tau)
+            return mjx.forward(mjx_model, data).qacc
+
+        forward_on = jax.jit(forward_qacc, static_argnums=())
+
+        # The box mass/inertia MJX actually built (for the Nuka alignment audit:
+        # the test asserts these equal its own pinned values).
+        box_mass_actual = float(model.body_mass[box_bid])
+        box_inertia_actual = np.asarray(model.body_inertia[box_bid], dtype=np.float32)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        with tmp_path.open("wb") as out:
+            out.write(KIND_FOOT_BOX_STEP_MAGIC)
+            out.write(struct.pack("<IIIII",
+                                  FOOT_BOX_STEP_VERSION,
+                                  len(configs),
+                                  nq, nv,
+                                  MAX_CONTACTS_RECORDED))
+            name = model_path.name.encode("utf-8")
+            out.write(struct.pack("<I", len(name)))
+            out.write(name)
+            for (qpos, tau) in configs:
+                qpos_f = qpos.astype(np.float32)
+                qvel_f = np.zeros(nv, dtype=np.float32)
+                tau_f = tau.astype(np.float32)
+                qacc_on = np.asarray(jax.device_get(forward_on(
+                    mjx_model_on, jnp.asarray(qpos_f), jnp.asarray(qvel_f),
+                    jnp.asarray(tau_f))), dtype=np.float32)
+                qacc_off = np.asarray(jax.device_get(forward_on(
+                    mjx_model_off, jnp.asarray(qpos_f), jnp.asarray(qvel_f),
+                    jnp.asarray(tau_f))), dtype=np.float32)
+                # Clean contact set + efc_force from a classic mj_forward.
+                dcpu = mujoco.MjData(model)
+                dcpu.qpos[:] = qpos.astype(np.float64)
+                dcpu.qvel[:] = 0.0
+                dcpu.qfrc_applied[:] = tau.astype(np.float64)
+                mujoco.mj_forward(model, dcpu)
+                ncon = int(dcpu.ncon)
+                contact_rows = np.zeros((MAX_CONTACTS_RECORDED, 7), dtype=np.float32)
+                normal_force = np.zeros(MAX_CONTACTS_RECORDED, dtype=np.float32)
+                invweight = np.zeros(MAX_CONTACTS_RECORDED, dtype=np.float32)
+                for c in range(min(ncon, MAX_CONTACTS_RECORDED)):
+                    con = dcpu.contact[c]
+                    pos = np.asarray(con.pos, dtype=np.float32)
+                    normal = np.asarray(con.frame[0:3], dtype=np.float32)
+                    contact_rows[c, 0:3] = pos
+                    contact_rows[c, 3:6] = normal
+                    contact_rows[c, 6] = float(con.dist)
+                    f6 = np.zeros(6, dtype=np.float64)
+                    mujoco.mj_contactForce(model, dcpu, c, f6)
+                    normal_force[c] = float(f6[0])
+                    efc_row = int(dcpu.contact[c].efc_address)
+                    if 0 <= efc_row < int(dcpu.nefc):
+                        invweight[c] = float(dcpu.efc_diagApprox[efc_row])
+                # Box pose (pos+quat) read back from the home qpos slot.
+                box_pos = qpos[box_qpos_adr:box_qpos_adr + 3].astype(np.float32)
+                box_quat = qpos[box_qpos_adr + 3:box_qpos_adr + 7].astype(np.float32)
+                record = np.concatenate((
+                    qpos.astype(np.float32),
+                    qvel_f,
+                    tau.astype(np.float32),
+                    qacc_on,
+                    qacc_off,
+                    np.array([float(base_qvel_dof), float(box_qvel_dof)],
+                             dtype=np.float32),
+                    box_pos,
+                    box_quat,
+                    np.array([box_mass_actual], dtype=np.float32),
+                    box_inertia_actual,
+                    np.array([float(ncon)], dtype=np.float32),
+                    contact_rows.reshape(-1),
+                    normal_force,
+                    invweight,
+                ))
+                out.write(record.astype("<f4", copy=False).tobytes())
+        os.replace(tmp_path, out_path)
+        print(f"foot-box golden: nq={nq} nv={nv} base_dof={base_qvel_dof} "
+              f"box_dof={box_qvel_dof} box_mass={box_mass_actual:.6f} "
+              f"box_inertia={box_inertia_actual} ncon={ncon}")
+
+
 def generate_stand_trajectory(model_path: Path,
                               out_path: Path,
                               step_count: int,
@@ -1101,6 +1490,7 @@ def main() -> int:
                         choices=("random-qacc",
                                  "floating-random-qacc",
                                  "floating-contact-step",
+                                 "floating-foot-box-contact-step",
                                  "stand-trajectory"),
                         default="random-qacc")
     parser.add_argument("--samples", default=1000, type=int)
@@ -1120,6 +1510,8 @@ def main() -> int:
             args.model, args.out, args.samples, args.batch_size)
     elif args.mode == "floating-contact-step":
         generate_floating_contact_step(args.model, args.out)
+    elif args.mode == "floating-foot-box-contact-step":
+        generate_foot_box_contact_step(args.model, args.out)
     else:
         generate_stand_trajectory(args.model, args.out, args.steps, args.dt)
     print(f"wrote {args.out}")
