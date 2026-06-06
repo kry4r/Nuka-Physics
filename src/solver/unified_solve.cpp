@@ -34,7 +34,13 @@ void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config) {
     const auto& art = ctx.articulation;
     const bool have_articulation =
         art.art_refs != nullptr && !art.art_refs->empty() && art.dof_stride > 0u;
-    if (ctx.state->empty() && !have_articulation) {
+    // v0.8 C6b: a particle-only coupling solve (no rigid bodies, no articulation)
+    // must still run -- e.g. particle<->particle / particle<->static coupling.
+    const auto& part = ctx.particles;
+    const bool have_particles =
+        part.inv_mass != nullptr && part.velocities != nullptr &&
+        !part.inv_mass->empty() && !part.velocities->empty();
+    if (ctx.state->empty() && !have_articulation && !have_particles) {
         return;
     }
 
@@ -79,6 +85,15 @@ void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config) {
         art_data.dof_stride = art.dof_stride;
     }
 
+    // v0.8 C6b: build the device-side particle descriptor from the host vectors.
+    // Empty (the default SolveContext) -> the particle arm never fires.
+    gpu::RowParticleData part_data;
+    if (have_particles) {
+        part_data.inv_mass = part.inv_mass->data();
+        part_data.velocities = part.velocities->data();
+        part_data.count = static_cast<uint32_t>(part.velocities->size());
+    }
+
     gpu::SolveRowsWithSides(context,
                             *ctx.rows,
                             ctx.state->data(),
@@ -86,7 +101,8 @@ void UnifiedSolve(const SolveContext& ctx, const solver::SolverConfig& config) {
                             sides_ptr,
                             sides_count,
                             gpu_config,
-                            art_data);
+                            art_data,
+                            part_data);
 #else
     (void)config;
     throw std::runtime_error(

@@ -49,6 +49,16 @@ struct DeviceRowBuffers {
     const float* inertia_m_inv = nullptr;     // [art_index * dof_stride^2]
     float* qdot = nullptr;                     // [art_index * dof_stride] (MUTABLE)
     uint32_t dof_stride = 0u;
+    // v0.8 C6b: per-particle reaction SoA (UnifiedSolve coupling rows only). A
+    // ParticleInvMass contact side resolves its scalar inverse mass + linear
+    // velocity by ref.handle DIRECTLY into these arrays (no per-row indirection
+    // stream, unlike articulation -- a particle is a single point DOF). velocities
+    // is MUTABLE (the apply writes it; downloaded after the solve). Legacy / C5a /
+    // C5b callers leave these null/0 -> the particle arm never fires -> the rigid
+    // and articulation paths stay byte-identical.
+    const float* particle_inv_mass = nullptr;   // [particle_count]
+    math::Vec3* particle_velocities = nullptr;  // [particle_count] (MUTABLE)
+    uint32_t particle_count = 0u;
     uint32_t row_count = 0u;
     uint32_t body_index_count = 0u;
     uint32_t jacobian_data_count = 0u;
@@ -265,6 +275,27 @@ __device__ constraint::ArticulationReactionState BuildArticulationState(
     return state;
 }
 
+// v0.8 C6b: build a C4c ParticleReactionState for a ParticleInvMass contact side.
+// The particle is indexed DIRECTLY by side.handle (== particle id) into the
+// per-particle SoA -- no per-row indirection stream (a particle is one point DOF,
+// unlike an articulation chain). A non-particle side / null SoA / out-of-range
+// handle -> an empty state (inv_mass 0 + null velocity) the C4c helpers no-op on.
+// The velocity pointer aliases the MUTABLE device array so ParticleApplyImpulse
+// writes through it directly (downloaded after the solve).
+__device__ constraint::ParticleReactionState BuildParticleState(
+    const DeviceRowBuffers& rows,
+    const constraint::CollidableRef& side) {
+    constraint::ParticleReactionState state;
+    if (side.react != constraint::ReactionProviderKind::ParticleInvMass ||
+        rows.particle_inv_mass == nullptr || rows.particle_velocities == nullptr ||
+        side.handle >= rows.particle_count) {
+        return state;  // null pointers -> the C4c helpers no-op (0 / skip).
+    }
+    state.inv_mass = rows.particle_inv_mass[side.handle];
+    state.velocity = &rows.particle_velocities[side.handle];
+    return state;
+}
+
 // One side's J M^-1 J^T contribution via the C4c provider math, dispatched by
 // side.react. Returns the RAW additive diagonal term (NOT the reciprocal);
 // the caller sums both sides + compliance_alpha and reciprocates once.
@@ -279,7 +310,8 @@ __device__ float CompliantSideEffectiveInvMass(
     uint32_t body_index,
     const runtime::rigid::BodyState* bodies,
     uint32_t body_count,
-    const constraint::ArticulationReactionState& art_state) {
+    const constraint::ArticulationReactionState& art_state,
+    const constraint::ParticleReactionState& part_state) {
     switch (side.react) {
         case constraint::ReactionProviderKind::RigidInvMass: {
             if (!ValidBody(body_index, body_count)) {
@@ -297,9 +329,10 @@ __device__ float CompliantSideEffectiveInvMass(
             // C4c helper returns 0 if art_state's pointers are null (not wired).
             return constraint::ArticulationEffectiveInvMass(art_state);
         case constraint::ReactionProviderKind::ParticleInvMass:
-            // C6 GAP: particle reaction needs the particle SoA inv_mass/velocity
-            // views, not the rigid BodyState array. Present for dispatch; unexercised.
-            return 0.0f;
+            // v0.8 C6b: particle reaction J M^-1 J^T = inv_mass * |J_linear|^2
+            // (M^-1 = inv_mass*I3, no angular DOF). The C4c helper returns 0 if
+            // part_state is empty (a non-particle side / null SoA / out-of-range).
+            return constraint::ParticleEffectiveInvMass(part_state, j);
         case constraint::ReactionProviderKind::StaticNull:
         default:
             return 0.0f;  // immovable world collider: zero reaction.
@@ -319,7 +352,8 @@ __device__ void CompliantSideApplyImpulse(
     uint32_t body_index,
     runtime::rigid::BodyState* bodies,
     uint32_t body_count,
-    const constraint::ArticulationReactionState& art_state) {
+    const constraint::ArticulationReactionState& art_state,
+    const constraint::ParticleReactionState& part_state) {
     switch (side.react) {
         case constraint::ReactionProviderKind::RigidInvMass: {
             if (!ValidBody(body_index, body_count)) {
@@ -345,7 +379,10 @@ __device__ void CompliantSideApplyImpulse(
             constraint::ArticulationApplyImpulse(art_state, delta);
             return;
         case constraint::ReactionProviderKind::ParticleInvMass:
-            // C6 GAP (see CompliantSideEffectiveInvMass). Present for dispatch.
+            // v0.8 C6b: dv = delta * inv_mass * J_linear (no angular). Writes the
+            // MUTABLE particle velocity through part_state.velocity (the C4c helper
+            // no-ops on inv_mass<=0 or a null velocity pointer).
+            constraint::ParticleApplyImpulse(part_state, j, delta);
             return;
         case constraint::ReactionProviderKind::StaticNull:
         default:
@@ -373,7 +410,8 @@ __device__ float CompliantSideConstraintVelocity(
     uint32_t body_index,
     const runtime::rigid::BodyState* bodies,
     uint32_t body_count,
-    const constraint::ArticulationReactionState& art_state) {
+    const constraint::ArticulationReactionState& art_state,
+    const constraint::ParticleReactionState& part_state) {
     switch (side.react) {
         case constraint::ReactionProviderKind::RigidInvMass: {
             if (!ValidBody(body_index, body_count)) {
@@ -400,8 +438,17 @@ __device__ float CompliantSideConstraintVelocity(
             return jv;
         }
         case constraint::ReactionProviderKind::ParticleInvMass:
-            // C6 GAP: needs the particle SoA velocity view (not bodies[idx]).
-            return 0.0f;
+            // v0.8 C6b ★ THE PARTICLE Jv LEG. Jv = dot(J_linear, v_particle)
+            // (angular ignored -- a particle has no rotational DOF). Reading the
+            // particle's REAL velocity here is load-bearing: the compliant solve is
+            // lambda = m_eff*(aref*dt - Jv - R*lambda), and dropping this term
+            // (returning 0) would silently use Jv = 0 for the particle side -> a
+            // WRONG fixed point that still passes a rest/momentum-only gate but
+            // breaks transients + two-way (the exact C5b-core failure mode). Null
+            // velocity (empty part_state) -> 0.
+            return (part_state.velocity != nullptr)
+                       ? Dot(j.linear, *part_state.velocity)
+                       : 0.0f;
         case constraint::ReactionProviderKind::StaticNull:
         default:
             return 0.0f;
@@ -464,8 +511,11 @@ __device__ float ComputeCompliantEffectiveMass(const DeviceRowBuffers& rows,
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
             BuildArticulationState(rows, art_side);
+        const constraint::ParticleReactionState part_state =
+            BuildParticleState(rows, side);
         diagonal += CompliantSideEffectiveInvMass(side, jacobian, body_index,
-                                                  bodies, body_count, art_state);
+                                                  bodies, body_count, art_state,
+                                                  part_state);
     }
     diagonal += row.compliance_alpha;  // + R (dual regularizer)
     return diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
@@ -491,8 +541,11 @@ __device__ float ComputeCompliantJv(const DeviceRowBuffers& rows,
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
             BuildArticulationState(rows, art_side);
+        const constraint::ParticleReactionState part_state =
+            BuildParticleState(rows, side);
         jv += CompliantSideConstraintVelocity(side, jacobian, body_index,
-                                              bodies, body_count, art_state);
+                                              bodies, body_count, art_state,
+                                              part_state);
     }
     return jv;
 }
@@ -518,8 +571,10 @@ __device__ void ApplyCompliantVelocityImpulse(const DeviceRowBuffers& rows,
             ArtSideForRowBody(rows, row_index, local);
         const constraint::ArticulationReactionState art_state =
             BuildArticulationState(rows, art_side);
+        const constraint::ParticleReactionState part_state =
+            BuildParticleState(rows, side);
         CompliantSideApplyImpulse(side, jacobian, delta, body_index,
-                                  bodies, body_count, art_state);
+                                  bodies, body_count, art_state, part_state);
     }
 }
 
@@ -935,6 +990,9 @@ struct RowSolverScratch {
     phi::Buffer chain_jacobians;
     phi::Buffer inertia_m_inv;
     phi::Buffer qdot;
+    // v0.8 C6b: per-particle reaction SoA (UnifiedSolve coupling rows only).
+    phi::Buffer particle_inv_mass;
+    phi::Buffer particle_velocities;  // MUTABLE: downloaded after the solve
     size_t rows_bytes = 0u;
     size_t body_indices_bytes = 0u;
     size_t jacobians_bytes = 0u;
@@ -950,6 +1008,9 @@ struct RowSolverScratch {
     size_t chain_jacobians_bytes = 0u;
     size_t inertia_m_inv_bytes = 0u;
     size_t qdot_bytes = 0u;
+    // v0.8 C6b
+    size_t particle_inv_mass_bytes = 0u;
+    size_t particle_velocities_bytes = 0u;
 };
 
 RowSolverScratch& ThreadScratchForDevice(int device_id) {
@@ -1034,7 +1095,8 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
                                   const constraint::ContactRowSides* sides,
                                   uint32_t sides_count,
                                   const RowSolveConfig& config,
-                                  const RowArticulationData& articulation) {
+                                  const RowArticulationData& articulation,
+                                  const RowParticleData& particles) {
     RowSolveReport report;
     report.row_count = rows.RowCount();
     report.velocity_iterations = config.velocity_iterations;
@@ -1051,7 +1113,14 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     const bool have_articulation_early =
         articulation.art_refs != nullptr && articulation.art_refs_count > 0u &&
         articulation.dof_stride > 0u;
-    if (rows.RowCount() == 0u || (!have_rigid && !have_articulation_early)) {
+    // v0.8 C6b: a particle-only coupling solve (e.g. particle<->particle, or
+    // particle<->static) has no rigid bodies and no articulation, but the particle
+    // arm must still run. Legacy/C5a/C5b callers pass empty particles -> unchanged.
+    const bool have_particles_early =
+        particles.inv_mass != nullptr && particles.velocities != nullptr &&
+        particles.count > 0u;
+    if (rows.RowCount() == 0u ||
+        (!have_rigid && !have_articulation_early && !have_particles_early)) {
         return report;
     }
 
@@ -1142,6 +1211,24 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
         }
     }
 
+    // v0.8 C6b: upload the per-particle reaction SoA (UnifiedSolve coupling rows
+    // only). velocities is MUTABLE -- downloaded after the solve (the apply writes
+    // it). Legacy / C5a / C5b callers pass empty particles -> nothing uploaded, the
+    // device_view particle pointers stay null, and the particle arm never fires.
+    const bool have_particles = have_particles_early;
+    if (have_particles) {
+        const size_t inv_mass_bytes =
+            static_cast<size_t>(particles.count) * sizeof(float);
+        EnsureScratchBuffer(scratch.particle_inv_mass,
+                            scratch.particle_inv_mass_bytes, inv_mass_bytes);
+        scratch.particle_inv_mass.CopyFromHost(particles.inv_mass, inv_mass_bytes);
+        const size_t vel_bytes =
+            static_cast<size_t>(particles.count) * sizeof(math::Vec3);
+        EnsureScratchBuffer(scratch.particle_velocities,
+                            scratch.particle_velocities_bytes, vel_bytes);
+        scratch.particle_velocities.CopyFromHost(particles.velocities, vel_bytes);
+    }
+
     DeviceRowBuffers device_view;
     device_view.rows = static_cast<constraint::Row*>(scratch.rows.Data());
     device_view.body_indices =
@@ -1179,6 +1266,15 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
             ? static_cast<float*>(scratch.qdot.Data())
             : nullptr;
     device_view.dof_stride = have_articulation ? articulation.dof_stride : 0u;
+    // v0.8 C6b: particle device pointers (null unless have_particles).
+    device_view.particle_inv_mass =
+        have_particles ? static_cast<const float*>(scratch.particle_inv_mass.Data())
+                       : nullptr;
+    device_view.particle_velocities =
+        have_particles
+            ? static_cast<math::Vec3*>(scratch.particle_velocities.Data())
+            : nullptr;
+    device_view.particle_count = have_particles ? particles.count : 0u;
     device_view.row_count = rows.RowCount();
     device_view.body_index_count = rows.BodyIndexCount();
     device_view.jacobian_data_count = rows.JacobianDataCount();
@@ -1220,6 +1316,12 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
         scratch.qdot.CopyToHost(
             articulation.qdot,
             static_cast<size_t>(articulation.qdot_count) * sizeof(float));
+    }
+    // v0.8 C6b: download the MUTATED particle velocities (the apply wrote them).
+    if (have_particles) {
+        scratch.particle_velocities.CopyToHost(
+            particles.velocities,
+            static_cast<size_t>(particles.count) * sizeof(math::Vec3));
     }
     scratch.max_error.CopyToHost(&report.max_position_error, sizeof(float));
     report.row_scheduler_report.executed_iterations = config.velocity_iterations;

@@ -1963,6 +1963,36 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_box_coresidence_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
+    # The K2 proving pair (a particle pushes a free rigid body two-way through one
+    # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
+    # first exercise of the ParticleInvMass arm; the broken-Jv variant differs >>
+    # tol). CASE 2/3 prove EmitCouplingRows (re-class to id13 + end-to-end two-way).
+    # Header-only framework (coupling_row_framework.hpp) + hand-built manifolds, so
+    # no broadphase/narrowphase libs -- just the solver + constraint emitter; needs
+    # nuka_codegen for the generated row-class registry (kCouplingContactRowId).
+    add_executable(nuka_coupling_test
+        coupling/test_coupling_framework.cpp
+    )
+    add_dependencies(nuka_coupling_test nuka_codegen)
+
+    target_include_directories(nuka_coupling_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_coupling_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_coupling_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
     add_executable(nuka_go2_pd_standing_test
         runtime/test_go2_pd_standing.cpp
