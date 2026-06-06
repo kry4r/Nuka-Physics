@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include "constraint/row_buffers.hpp"
+#include "math/vec3.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/gpu/cuda_constraint_row_buffer.hpp"
 #include "runtime/rigid/body_state.hpp"
@@ -70,6 +71,22 @@ struct RowArticulationData {
     uint32_t dof_stride = 0u;
 };
 
+// v0.8 C6b: the per-particle reaction SoA a ParticleInvMass coupling-row side
+// resolves by ref.handle (== particle id). All host pointers; SolveRowsWithSides
+// uploads them (same pattern as `sides`/articulation) and DOWNLOADS velocities
+// afterwards (the apply mutates them). Legacy / C5a / C5b callers leave everything
+// null/zero -> the particle arm never fires -> byte-identical. The C6b coupling
+// framework (src/runtime/coupling/coupling_row_framework.hpp) fills it; in
+// production the PBD co-step (C6a) binds it to the live particle world velocities.
+//   inv_mass   : per particle, 1 float each (CudaParticleSet::inv_masses mirror).
+//   velocities : per particle, 1 Vec3 each (MUTABLE, downloaded after the solve).
+//   count      : the particle count (ref.handle must be < count).
+struct RowParticleData {
+    const float* inv_mass = nullptr;
+    math::Vec3* velocities = nullptr;  // host buffer, mutated in place
+    uint32_t count = 0u;
+};
+
 // v0.8 C5a: the SAME graph-colored kernel, but with the per-row ContactRowSides
 // stream uploaded so the COMPLIANT branch can dispatch each side's reaction by
 // side.react. `sides` must be one-per-row, in the SAME order as rows.rows (the
@@ -80,6 +97,10 @@ struct RowArticulationData {
 // v0.8 C5b-core: `articulation` additionally carries the reduced-coordinate
 // chain-J reaction buffers so a compliant ArticulationChainJ side resolves its
 // J M^-1 J^T + qdot apply via the C4c provider math. Empty/null -> inert.
+//
+// v0.8 C6b: `particles` carries the per-particle reaction SoA so a compliant
+// ParticleInvMass coupling side resolves its inv_mass * |J_linear|^2 + the
+// velocity apply. Empty/null -> inert (the particle arm never fires).
 RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
                                   constraint::RowBuffers& rows,
                                   runtime::rigid::BodyState* bodies,
@@ -87,6 +108,7 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
                                   const constraint::ContactRowSides* sides,
                                   uint32_t sides_count,
                                   const RowSolveConfig& config = {},
-                                  const RowArticulationData& articulation = {});
+                                  const RowArticulationData& articulation = {},
+                                  const RowParticleData& particles = {});
 
 } // namespace nuka::solver::gpu

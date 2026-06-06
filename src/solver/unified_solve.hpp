@@ -35,6 +35,7 @@
 #include "constraint/row_articulation_refs.hpp"  // RowArticulationRefs (C5b)
 #include "constraint/row_buffers.hpp"            // RowBuffers
 #include "constraint/row_builder.hpp"            // ContactRowSides
+#include "math/vec3.hpp"                         // math::Vec3 (C6b particles)
 #include "runtime/rigid/body_state.hpp"          // BodyState
 #include "solver/rigid_solver.hpp"               // SolverConfig
 
@@ -72,6 +73,21 @@ struct SolveArticulationContext {
     uint32_t dof_stride = 0u;
 };
 
+// v0.8 C6b: optional per-particle reaction state for a ParticleInvMass coupling
+// side. A particle is resolved DIRECTLY by ContactRowSides::{a,b}.handle (==
+// particle id) into these flat arrays -- no per-row indirection stream (unlike
+// articulation). All optional: a SolveContext with `inv_mass == nullptr` (the
+// default) drives the rigid/articulation path byte-identically (the particle arm
+// never fires). The coupling framework (C6b) builds it by hand in the test; the
+// PBD co-step (C6a) binds it to the live particle world velocity buffer.
+//   inv_mass   : per particle, 1 float each (1/particle_mass).
+//   velocities : per particle, 1 Vec3 each (MUTABLE -- the apply writes
+//                v += inv_mass * J_linear * dlambda; downloaded after the solve).
+struct SolveParticleContext {
+    const std::vector<float>* inv_mass = nullptr;
+    std::vector<math::Vec3>* velocities = nullptr;  // MUTABLE: downloaded
+};
+
 struct SolveContext {
     constraint::RowBuffers* rows = nullptr;
     std::vector<runtime::rigid::BodyState>* state = nullptr;
@@ -80,6 +96,8 @@ struct SolveContext {
     float dt = 0.0f;
     // v0.8 C5b-core: optional reduced-coordinate articulation reaction data.
     SolveArticulationContext articulation{};
+    // v0.8 C6b: optional per-particle reaction data (cross-system coupling rows).
+    SolveParticleContext particles{};
 };
 
 // Upload rows + bodies + sides -> launch the compliant-aware row_solver kernel ->
