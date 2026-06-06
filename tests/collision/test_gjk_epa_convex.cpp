@@ -452,8 +452,25 @@ TEST(GjkEpaConvex, SphereCenterInsideHull_SaneBoundedManifold) {
 // BITE: against the OLD path (sphere routed back through general GJK->EPA) the march
 // goes detect -> point_count==0 for 7 consecutive samples (pen 1.60->2.80mm) ->
 // detect again -> this test FAILS (a detected contact dropped out). Through the
-// special-case path it is GREEN. Asset-gated (mirrors the grasp spike): SKIPs if the
-// cup is absent (the always-on HullVsSpherePrimitive test covers the path otherwise).
+// special-case path it is GREEN.
+//
+// CI-TEETH DEBT (named): this regression is ASSET-GATED (mirrors the grasp spike) --
+// it SKIPs when the cup is absent. So in a CLEAN CI CLONE (no .nuka-assets fetch) a
+// revert of the SphereHull fix would show GREEN here: NO always-on test catches a
+// SphereHull monotonicity revert. (HullVsSpherePrimitive does NOT cover this: it
+// checks ONE depth on a clean box, not monotonicity across the dead band, and uses
+// the special-case path -- it cannot bite a revert.) A time-boxed hardening attempt
+// (advisor #2, v0.8 review batch) tried to reproduce the dead band on a SMALL
+// SYNTHETIC IRREGULAR hull (an asymmetrically-perturbed slanted-wall prism) marched
+// 0->6mm in 0.2mm steps, comparing the direct EPA path (sphere SupportProxy ->
+// cvx::ConvexNarrowphase) vs cvx::SphereHull: the OLD/EPA path detected at contact
+// onset (~0.2mm) and NEVER dropped across the 0->6mm march (no detect->drop->detect),
+// so a synthetic hull did not reproduce the V-HACD cup's dead band -- consistent with
+// "only the irregular cup hull triggers it" (the head-on march likely hit a locally
+// near-symmetric edge at y=0). Per the one-attempt
+// time-box this was NOT iterated; the regression stays asset-gated = the CI-teeth debt
+// remains open (closes when the cup is in CI, or a future irregular reproducer lands).
+//
 // Runs BOTH sphere-as-A and sphere-as-B (the kSph][kHull + kHull][kSph slots + sign).
 TEST(GjkEpaConvex, SphereHullShallowPenetrationIsMonotone) {
     if (!CupHullAvailable())

@@ -14,8 +14,10 @@
 //   * the cup cooks to a COLLIDABLE convex hull (the C7b grasp-gate need).
 //
 // The asset path resolves relative to ${CMAKE_SOURCE_DIR} (the import test's
-// WORKING_DIRECTORY). If the asset is ABSENT the test FAILS LOUD -- a skipped
-// oracle is a dead oracle (anti-green-wash).
+// WORKING_DIRECTORY). The cup is a fetch-per-env asset (.nuka-assets is
+// gitignored, per the newton-assets policy), so this suite SKIPS when the asset
+// is absent -- matching the repo convention (e.g. foot_ground_mjx_parity). When
+// the asset IS present every assertion above runs.
 // ---------------------------------------------------------------------------
 
 #include "import/usd_crate_reader.hpp"

@@ -300,7 +300,7 @@ GraspScene BuildGraspScene(const CupHull& hull, float grip_force, float mu) {
     gs.config.grip_torque[gs.gripper.finger_link[1]] = grip_force;
     gs.config.drive_force_limits.assign(link_count, 0.0f);  // no clamp.
     gs.config.friction_mu = mu;
-    gs.config.condim = 3u;  // normal + 4-edge friction pyramid (friction holds it).
+    gs.config.condim = 3u;  // 1 normal + 2 tangential dirs (4-spoke pyramid); friction holds it.
     return gs;
 }
 

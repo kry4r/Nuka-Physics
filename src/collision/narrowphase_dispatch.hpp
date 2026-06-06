@@ -438,6 +438,10 @@ inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g
     // deferred TriMesh/HeightField hull slots) reaches here: sphere x box and
     // sphere x sphere route to the Analytical tier (SelectTier), and sphere x plane
     // is caught by the plane case above. We special-case the sphere-vs-hull slots.
+    // NOTE: only Sphere is routed out of EPA here. capsule x hull (and box x hull /
+    // convex x convex) still ride the general EPA path below and retain the SAME
+    // shallow-penetration dead band; named consumer for hardening that = C7b-2
+    // (real-hand grasp + place-on-counter).
     if (g.type_a == ShapeType::Sphere || g.type_b == ShapeType::Sphere) {
         const bool sphere_is_a = (g.type_a == ShapeType::Sphere);
         const ShapeType hull_t = sphere_is_a ? g.type_b : g.type_a;

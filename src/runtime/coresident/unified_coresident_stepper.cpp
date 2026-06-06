@@ -583,8 +583,9 @@ CoResidentStepReport UnifiedCoResidentStepper::Step() {
 // ===========================================================================
 // Mirrors Step()'s stage order but: (a) re-applies the constant grip torque to tau
 // BEFORE ComputeAccelerations (the DRIVE path -> the fingers squeeze inward), (b)
-// emits N fingertip<->cup contacts (NO table), (c) uses condim=3 (a normal row + a
-// 4-edge friction pyramid per contact) so FRICTION holds the cup, (d) reports the
+// emits N fingertip<->cup contacts (NO table), (c) uses condim=3 (1 normal + 2
+// tangential friction directions, discretized as a 4-spoke pyramid per contact) so
+// FRICTION holds the cup, (d) reports the
 // vertical contact impulse the fingers deliver to the cup (the force-balance gate).
 CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
     CoResidentStepReport report;
