@@ -1993,6 +1993,43 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_coupling_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C6a: the PBD<->rigid unified-contact CO-STEP bridge -------------
+    # Drives the REAL front-end together (C2c broadphase -> C5 contact driver ->
+    # C6b coupling framework -> C6b unified solver) for the Genesis-style "couple"
+    # phase: a PBD particle system consumes unified manifolds + reacts TWO-WAY
+    # against rigid bodies through ONE compliant solve. CASE A: multi-particle drop
+    # onto a heavy free box, TOTAL-energy (KE+gravPE) non-increasing + settle +
+    # two-way. CASE B: the mis-order bite-check (double-applied couple injects
+    # energy -> the gate must FAIL). CASE C: fluid rest on a static floor. CASE D:
+    # D1. Compiles the bridge (unified_costep.cpp) + the contact driver
+    # (contact_stream_driver.cpp) directly, like nuka_foot_box_coresidence_test;
+    # needs nuka_codegen for the generated row-class registry.
+    add_executable(nuka_pbd_costep_test
+        coupling/test_pbd_costep_unified.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coupling/unified_costep.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_pbd_costep_test nuka_codegen)
+
+    target_include_directories(nuka_pbd_costep_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_pbd_costep_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_collision_gpu
+            nuka_runtime
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_pbd_costep_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
     add_executable(nuka_go2_pd_standing_test
         runtime/test_go2_pd_standing.cpp
