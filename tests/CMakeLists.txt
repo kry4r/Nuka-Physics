@@ -2151,6 +2151,46 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_grasp_spike_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C7b-2a-v2: the H1 POWER/WRAP grasp + LIFT spike ------------------
+    # Mirrors the fingertip h1 spike block. STEP ZERO (FK surround) + a table-
+    # supported wrap-close -> table-removal LIFT gate (the discriminator) + dynamic
+    # lift load + BITE + D1. Drives the SAME unified_coresident_stepper (grasp mode +
+    # the additive, inert-by-default cup<->table support). Asset-gated (SKIP if
+    # h1/cup absent). VALIDATED-NOT-WIRED. Same dep set as the fingertip spike.
+    add_executable(nuka_h1_power_grasp_lift_test
+        coresident/test_h1_power_grasp_lift.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_power_grasp_lift_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_power_grasp_lift_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_power_grasp_lift_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_power_grasp_lift_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_power_grasp_lift_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the

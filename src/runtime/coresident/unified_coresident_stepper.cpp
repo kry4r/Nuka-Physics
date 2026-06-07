@@ -250,6 +250,11 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
     limits.resize(link_count, 0.0f);
     grip_torque_dev_ = nuka::phi::UploadVector(torque);
     grip_limits_dev_ = nuka::phi::UploadVector(limits);
+
+    // The cup<->table support starts at the config flag (inert by default). A caller
+    // that constructs with has_table=false + never calls SetTableEnabled keeps the
+    // exact prior StepGrasp behavior (no table pair, no StaticNull side, D1-exact).
+    table_enabled_ = grasp_.has_table;
 }
 
 // The flat-qdot prefix-sum DOF index of a device link: Σ JointDofCount over the
@@ -657,6 +662,20 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
         drive_pairs.push_back(p);
     }
 
+    // ----- C7b-2a-v2 OPTIONAL cup<->table support pair (the LIFT choreography) -----
+    // Direct-emit the cup<->table pair (cup AABB vs a static +Z plane is trivial
+    // broadphase). Side A = cup (RigidInvMass), side B = table (StaticWorld ->
+    // StaticNull). Routed through the SAME unified spine as the fingertip rows. Only
+    // when has_table AND the runtime toggle is on -- removing the table == toggling
+    // this off, after which no StaticNull side is emitted (any_static_row -> false).
+    const bool emit_table = grasp_.has_table && table_enabled_;
+    if (emit_table) {
+        CandidatePair tp;
+        tp.a = MakeBoxRef(grasp_.cup.broadphase_body_id);   // cup = RigidInvMass.
+        tp.b = MakeGroundRef(grasp_.table_broadphase_id);   // table = StaticNull (+Z plane).
+        drive_pairs.push_back(tp);
+    }
+
     // stage 6: narrowphase via the driver. fingertip(Sphere) x cup(ConvexHull) ->
     // the C3c Convex tier (GJK/EPA + face-clip), already in the dispatch table.
     ShapeResolver resolve = [&](const CollidableRef& ref, ResolvedShape* out) -> bool {
@@ -676,6 +695,13 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
             ref.handle == grasp_.cup.broadphase_body_id) {
             out->type = scene::ShapeType::ConvexHull;
             out->geom = &cup_hull;  // the convex-hull seam (geom_a/geom_b passthrough).
+            return true;
+        }
+        if (ref.type == CollidableType::StaticWorld &&
+            ref.handle == grasp_.table_broadphase_id) {
+            out->type = scene::ShapeType::Plane;
+            out->prim = GroundPrim(grasp_.table_height);  // +Z plane at table_height.
+            out->geom = nullptr;
             return true;
         }
         return false;
@@ -731,9 +757,13 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
     nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
     report.row_count = rows.RowCount();
     // Stamp the per-contact friction coefficient (the merged manifold default is
-    // 0.5; we set the spike's mu explicitly so the cone bound is the spike's).
+    // 0.5; we set the spike's mu explicitly so the cone bound is the spike's). A
+    // cup<->table row gets table_mu; every finger row gets friction_mu.
     for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
-        rows.materials[r].friction = grasp_.friction_mu;
+        const ContactRowSides& s = sides[r];
+        const bool is_table = s.a.react == ReactionProviderKind::StaticNull ||
+                              s.b.react == ReactionProviderKind::StaticNull;
+        rows.materials[r].friction = is_table ? grasp_.table_mu : grasp_.friction_mu;
     }
     if (rows.RowCount() == 0u || sides.empty()) {
         articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
@@ -786,6 +816,20 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
         const bool b_cup = s.b.react == ReactionProviderKind::RigidInvMass;
         art_refs[r].a = none_side;
         art_refs[r].b = none_side;
+        const bool a_static = s.a.react == ReactionProviderKind::StaticNull;
+        const bool b_static = s.b.react == ReactionProviderKind::StaticNull;
+        if ((a_cup && b_static) || (b_cup && a_static)) {
+            // ----- cup<->table row (the LIFT support) -----
+            // Mirrors Step()'s box<->ground wiring: cup side -> BodyState index 0,
+            // static side -> kInvalidBodyIndex (no reaction, no coloring conflict).
+            // art_refs[r] stays {none,none} -> the articulation arm never fires.
+            const int cup_l = a_cup ? 0 : 1;
+            const int static_l = a_cup ? 1 : 0;
+            rows.body_indices[2u * r + static_cast<uint32_t>(cup_l)] = 0u;
+            rows.body_indices[2u * r + static_cast<uint32_t>(static_l)] =
+                nuka::constraint::kInvalidBodyIndex;
+            continue;  // no chain-J for the static side.
+        }
         if ((a_art && b_cup) || (b_art && a_cup)) {
             const int finger_local = a_art ? 0 : 1;
             const int cup_local = a_art ? 1 : 0;
@@ -860,22 +904,51 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
     // (1) Σ over EVERY finger row of (cup-side λ * cup-side jacobian.linear.z): the
     //     vertical impulse the fingers deliver to the cup (normal + friction spokes).
     //     For a held cup at steady state this balances the cup weight kick m*g*dt.
+    // The FINGER vertical impulse (the hold/LIFT discriminator) sums ONLY the rows
+    // whose OTHER side is the articulation (finger<->cup). A cup<->table row is
+    // excluded so the LIFT gate reads the impulse the HAND delivers, separate from the
+    // table support (report.table_lambda). max_lambda/max_depth likewise skip table
+    // rows so the contact-depth metric stays the finger penetration.
     double cup_vert_impulse = 0.0;
+    double finger_vimp_normal = 0.0, finger_vimp_friction = 0.0;
+    double table_vert_impulse = 0.0;
     float max_depth = 0.0f, max_lambda = 0.0f;
+    uint32_t table_rows = 0u;
+    float max_table_lambda = 0.0f;
     for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
         const ContactRowSides& s = sides[r];
         const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
         const int cup_local = a_cup ? 0 : 1;
         const RowJacobian6 j_cup =
             rows.JacobianForRowBody(r, static_cast<uint32_t>(cup_local));
-        cup_vert_impulse +=
-            static_cast<double>(rows.rows[r].lambda) * j_cup.linear.z;
+        const double vimp = static_cast<double>(rows.rows[r].lambda) * j_cup.linear.z;
+        const bool is_table = s.a.react == ReactionProviderKind::StaticNull ||
+                              s.b.react == ReactionProviderKind::StaticNull;
+        if (is_table) {
+            // The table support: SUM the cup-side vertical impulse over EVERY table
+            // row (comparable to cup_vertical_impulse; both are Σ λ*j_z). max_lambda /
+            // max_depth stay the FINGER metrics so the contact-depth gate is unchanged.
+            ++table_rows;
+            max_table_lambda = std::max(max_table_lambda, rows.rows[r].lambda);
+            table_vert_impulse += vimp;
+            continue;
+        }
+        cup_vert_impulse += vimp;
+        if (rows.rows[r].flags & nuka::constraint::row_flags::Friction)
+            finger_vimp_friction += vimp;
+        else
+            finger_vimp_normal += vimp;
         max_lambda = std::max(max_lambda, rows.rows[r].lambda);
         max_depth = std::max(max_depth, rows.materials[r].position_error);
     }
     report.cup_vertical_impulse = cup_vert_impulse;
+    report.finger_vimpulse_normal = finger_vimp_normal;
+    report.finger_vimpulse_friction = finger_vimp_friction;
     report.lambda = max_lambda;
     report.contact_depth = max_depth;
+    report.table_row_count = table_rows;
+    report.table_lambda = max_table_lambda;
+    report.table_vertical_impulse = table_vert_impulse;
 
 #ifdef NUKA_H1_GRASP_DIAG
     // Per-row diagnostic: finger link, contact direction (cup-side jacobian.linear),
