@@ -117,6 +117,22 @@ struct CoResidentStepReport {
     double   cup_vz          = 0.0;  // cup vertical velocity AFTER this step.
     double   cup_z           = 0.0;  // cup height AFTER this step.
     bool     any_static_row  = false;  // a row carried a StaticNull side (a table!).
+    // C7b-2a-v2 cup<->table support (only non-zero when GraspConfig.has_table +
+    // SetTableEnabled(true)). Lets the LIFT gate prove the table carries load while
+    // present, then goes to 0 after the table is removed (any_static_row -> false).
+    uint32_t table_row_count = 0u;     // # cup<->table rows emitted this step.
+    float    table_lambda    = 0.0f;   // cup<->table converged normal impulse (max row).
+    // The cup-side VERTICAL impulse summed over EVERY cup<->table row (the table's
+    // total upward support). Comparable to cup_vertical_impulse (both are Σ λ*j_z over
+    // their rows): table-supported, table_vertical_impulse + cup_vertical_impulse
+    // ~= +m*g*dt (cup static); after table removal table_vertical_impulse -> 0 and the
+    // finger impulse must carry +m*g*dt alone (the LIFT gate's closing triangle).
+    double   table_vertical_impulse = 0.0;
+    // Split of the FINGER cup-side vertical impulse into the normal-row and the
+    // friction-spoke contributions (diagnoses a LIFT failure: cone-exhausted vs
+    // dropped contacts vs pivot). cup_vertical_impulse == normal + friction parts.
+    double   finger_vimpulse_normal = 0.0;    // Σ over finger NORMAL rows of λ*j_z.
+    double   finger_vimpulse_friction = 0.0;  // Σ over finger FRICTION rows of λ*j_z.
 };
 
 // The full co-resident state, mechanical-energy probe inputs included. KE/PE use a
@@ -182,6 +198,19 @@ struct GraspConfig {
     std::vector<float> drive_force_limits;   // per device link (0 -> no clamp).
     float              friction_mu = 0.6f;   // per-contact isotropic friction coeff.
     uint32_t           condim      = 3u;     // 3 -> normal + 4 friction spokes.
+
+    // ----- C7b-2a-v2 OPTIONAL cup<->table support (the LIFT choreography) ---------
+    // The power-grasp LIFT spike rests the cup on a STATIC table while the wrap
+    // closes (no acquisition race), then REMOVES the table -- the LIFT gate. The
+    // table support is routed THROUGH the unified spine exactly like Step()'s
+    // box<->ground (cup side = RigidInvMass, table side = StaticNull / +Z plane), NOT
+    // a hand clamp. INERT BY DEFAULT (has_table=false): the C7b-1 / fingertip grasp
+    // gates construct with has_table=false and never call SetTableEnabled, so their
+    // StepGrasp path -- and every prior gate + D1 -- is byte-for-byte unchanged.
+    bool               has_table     = false;  // false -> no table pair ever emitted.
+    float              table_height  = 0.0f;    // static plane z (the cup bottom rests here).
+    float              table_mu      = 0.6f;    // cup<->table friction (cup sits, no slide).
+    uint32_t           table_broadphase_id = 8500u;  // distinct from cup + every link id.
 };
 
 // The stepper. Owns the GPU articulation buffers + the host box; advances both in
@@ -238,6 +267,15 @@ public:
     // it is copied straight into grip_torque_dev_ (device memory the kernel reads).
     void SetGripTorque(const std::vector<float>& torque);
 
+    // C7b-2a-v2 TABLE toggle (additive). Enable/disable the cup<->table support pair
+    // at runtime. "Remove the table" == SetTableEnabled(false): the next StepGrasp()
+    // stops emitting the cup<->table pair, the table row's lambda goes to 0, and
+    // report.any_static_row returns to false on its own (no StaticNull side remains).
+    // Starts at grasp.has_table; the W1a/foot-box + C7b-1/fingertip gates never call
+    // this and construct with has_table=false, so they are byte-for-byte unchanged.
+    void SetTableEnabled(bool enabled) { table_enabled_ = enabled; }
+    bool TableEnabled() const { return table_enabled_; }
+
     // Snapshot the articulation host state (downloads q/qdot/base_pose/link_velocity).
     void Download(articulation::ArticulationHostState* out) const;
 
@@ -264,6 +302,7 @@ private:
     GraspConfig  grasp_;               // the grasp config (fingertips/cup/grip/...).
     phi::Buffer  grip_torque_dev_;     // per-link constant grip torque (device).
     phi::Buffer  grip_limits_dev_;     // per-link force limits (device).
+    bool         table_enabled_ = false;  // live cup<->table support toggle (C7b-2a-v2).
 
     // Run ONE grasp step: re-apply the constant grip torque -> ABA -> velocity
     // integrate (artic + cup) -> N fingertip<->cup contacts through the spine (NO
