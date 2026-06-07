@@ -2191,6 +2191,47 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_power_grasp_lift_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C7b-2b: the SCALED-CUP H1 power/wrap grasp VALIDATION spike ---
+    # Tests ONE variable (the OWNER-chosen option-1 fix): scale the C7a cup UP to
+    # ~10cm so it fills the H1 hand aperture + a PALM sphere can co-contact the
+    # fingers, closing the ~110deg palm-side void the 6cm cup left open. Re-runs the
+    # power-grasp machinery (Step Zero void-closure, table-removal LIFT, BITE, dynamic
+    # load, D1) over a scale sweep. Additive parallel TU: the 6cm honest-negative
+    # gates in test_h1_power_grasp_lift.cpp are LEFT INTACT. Same dep set.
+    add_executable(nuka_h1_scaled_cup_grasp_test
+        coresident/test_h1_scaled_cup_grasp.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_scaled_cup_grasp_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_scaled_cup_grasp_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_scaled_cup_grasp_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_scaled_cup_grasp_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_scaled_cup_grasp_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
