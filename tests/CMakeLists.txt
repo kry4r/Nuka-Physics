@@ -2232,6 +2232,51 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_scaled_cup_grasp_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 C7b-2c: the DENSE-CONTACT H1 power/wrap grasp DISCRIMINATOR ---
+    # Isolates CONTACT DENSITY: the four prior grasp spikes placed ONE sphere per
+    # phalanx (~11 contacts), undersampling the finger/cylinder patch ~10x, so the only
+    # way to hold was a deep (~7.2mm) passive wedge. This TU re-uses the validated ~10cm
+    # scaled-cup machinery (Fixed base, real armature/damping, the same PD gains + table-
+    # removal LIFT through the unified spine) but with a DENSE sphere-chain (~37 contacts)
+    # + a SHALLOW (<=2mm) placement filter, and a UNIQUE broadphase_handle per sphere
+    # (the stepper resolver picks the right geometry; the inert-by-default finger_link<-
+    # handle decoupling keeps the chain-J on the real link). Additive parallel TU: the
+    # prior honest-negative gates in test_h1_scaled_cup_grasp.cpp are LEFT INTACT. Same
+    # dep set + the contact_stream_driver.cpp the grasp path needs.
+    add_executable(nuka_h1_dense_grasp_test
+        coresident/test_h1_dense_grasp.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_dense_grasp_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_dense_grasp_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_dense_grasp_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_dense_grasp_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_dense_grasp_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the

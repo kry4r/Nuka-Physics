@@ -840,11 +840,26 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
             // the chain-J on it -- the reduced-coordinate reaction the kernel uses.
             const Vec3 finger_dir = j_finger.linear;
             const Vec3 contact_point = sides[r].contact_point;
-            // Which device link owns this finger contact (from the row's broadphase
-            // handle == ArticulationLink handle == device link index).
-            const uint32_t finger_link = sides[r].a.react ==
+            // Which device link owns this finger contact. The row carries the
+            // fingertip's broadphase_handle on its ArticulationChainJ side; map it
+            // back to the fingertip's REAL device link via the fingertips vector.
+            // INERT BY DEFAULT: every existing fingertip sets broadphase_handle ==
+            // link, so this returns the handle unchanged (byte-for-byte the prior
+            // behavior). It only differs when a dense multi-sphere-per-link layout
+            // gives each sphere a UNIQUE handle (so the resolver can pick the right
+            // sphere geometry) while keeping `link` = the true articulation link the
+            // chain-J needs. (A handle with no matching fingertip falls back to the
+            // handle itself -- the prior assumption.)
+            const uint32_t finger_handle = sides[r].a.react ==
                     ReactionProviderKind::ArticulationChainJ
                 ? sides[r].a.handle : sides[r].b.handle;
+            uint32_t finger_link = finger_handle;
+            for (size_t f = 0u; f < grasp_.fingertips.size(); ++f) {
+                if (grasp_.fingertips[f].broadphase_handle == finger_handle) {
+                    finger_link = grasp_.fingertips[f].link;
+                    break;
+                }
+            }
             const std::vector<float> chain_j =
                 FootChainJ(context_, live, poses, finger_link, contact_point,
                            finger_dir, dof_stride_);
