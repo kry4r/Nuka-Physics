@@ -2321,6 +2321,51 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_costand_transfer_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 POLICY->CO-RESIDENT INFERENCE BRIDGE SPIKE -----------------------
+    # The GATE before a multi-week PPO standing campaign: prove the deploy SEAM
+    # (PPO trains a torch NN in the BATCHED reduced-16-DOF world; the demo runs it
+    # in the CO-RESIDENT full-51-DOF C++ world via flat f32 weights + a ~50-line C++
+    # forward, NOT python-bind/ONNX/torch-at-deploy). Piece A = structural leg-index
+    # correspondence (reduced 1..10 == full by-name); Gate 1 = EXACT obs+forward
+    # parity (1e-5) vs the python MLP from bridge_export.py + its anti-green-wash
+    # BITE (permutation + transpose); Gate 2 (SOFT) = closed-loop MLP stand in the
+    # full world. Mirrors nuka_h1_costand_transfer_test's dep set + compiles the
+    # production stepper + the host contact_stream_driver.cpp (EDITS nothing).
+    add_executable(nuka_h1_bridge_spike_test
+        coresident/test_h1_bridge_spike.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_bridge_spike_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_bridge_spike_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_bridge_spike_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/coresident
+    )
+
+    target_link_libraries(nuka_h1_bridge_spike_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_bridge_spike_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
