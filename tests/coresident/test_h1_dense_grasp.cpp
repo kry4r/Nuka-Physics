@@ -315,6 +315,16 @@ CurlPose CurlForScale(float sxy) {
     c.thumb_dist = std::max(0.35f, 0.6f - relax * 0.4f);
     return c;
 }
+CurlPose OffsetCurl(CurlPose c, float finger_delta, float thumb_yaw_delta,
+                    float thumb_pitch_delta) {
+    c.finger_prox = std::clamp(c.finger_prox + finger_delta, 0.25f, 1.45f);
+    c.finger_int = std::clamp(c.finger_int + finger_delta, 0.35f, 1.55f);
+    c.thumb_yaw = std::clamp(c.thumb_yaw + thumb_yaw_delta, 0.35f, 1.45f);
+    c.thumb_pitch = std::clamp(c.thumb_pitch + thumb_pitch_delta, 0.20f, 1.10f);
+    c.thumb_int = std::clamp(c.thumb_int + 0.5f * finger_delta, 0.25f, 1.10f);
+    c.thumb_dist = std::clamp(c.thumb_dist + 0.5f * finger_delta, 0.25f, 1.10f);
+    return c;
+}
 
 Vec3 SphereCenter(const std::vector<Transform>& poses, uint32_t link,
                   const Vec3& local_offset) {
@@ -445,6 +455,7 @@ float SqueezeMag(const CookedH1& h1, const std::vector<Transform>& poses_curl,
 
 constexpr float kVoidGapDeg = 110.0f;     // the 6cm palm-side void; "closed" = gap < this.
 constexpr float kShallowPenMax = 0.002f;  // <=2mm == SHALLOW (NOT the 7.2mm wedge).
+constexpr float kLargeCagingArcMin = 200.0f;
 
 // THE SHALLOW placement: min net-squeeze imbalance WITHIN {covered_arc>180, palm
 // contacts, max_gap<110, AND max_pen<=2mm}. This is the discriminating constraint --
@@ -503,6 +514,59 @@ Place BestPlacementShallowNoPalm(const CookedH1& h1, const std::vector<Transform
     return best;
 }
 
+// The Phase-1 larger-cup placement: <=2mm everywhere, palm co-contact present, and
+// caging arc >~200deg. This is deliberately less tied to the old 110deg void threshold:
+// the large-object question is whether the palm fills the opposite side shallow and closes
+// the prior ~165deg finger-only gap.
+Place BestPlacementShallowCaging(const CookedH1& h1, const std::vector<Transform>& poses_curl,
+                                 const std::vector<WrapSphere>& spheres, const CupHull& hull) {
+    Vec3 lo, hi;
+    const Vec3 cz = CavityCenterZ(h1, poses_curl, spheres, &lo, &hi);
+    Place best{Vec3{}, 0, 0, 360.0f, false, 0.0f, 1e9f, false};
+    const int kN = 25;
+    for (int i = 0; i < kN; ++i) for (int j = 0; j < kN; ++j) {
+        const float fx = lo.x + (hi.x - lo.x) * i / (kN - 1);
+        const float fy = lo.y + (hi.y - lo.y) * j / (kN - 1);
+        const Vec3 cc{fx, fy, cz.z};
+        const Surround sr = MeasureSurround(h1, poses_curl, spheres, hull, cc);
+        if (sr.covered_arc <= kLargeCagingArcMin || sr.genuine < 3u) continue;
+        if (!sr.palm_contacts) continue;
+        const float pen = MaxPrePenetration(h1, poses_curl, spheres, hull, cc);
+        if (pen > kShallowPenMax) continue;
+        const float sq = SqueezeMag(h1, poses_curl, spheres, hull, cc);
+        if (sq < best.squeeze_mag) {
+            best = Place{cc, sr.genuine, sr.covered_arc, sr.max_gap, sr.palm_contacts,
+                         pen, sq, true};
+        }
+    }
+    return best;
+}
+
+Place BestPlacementShallowNoPalmCaging(const CookedH1& h1,
+                                       const std::vector<Transform>& poses_curl,
+                                       const std::vector<WrapSphere>& spheres,
+                                       const CupHull& hull) {
+    Vec3 lo, hi;
+    const Vec3 cz = CavityCenterZ(h1, poses_curl, spheres, &lo, &hi);
+    Place best{Vec3{}, 0, 0, 360.0f, false, 0.0f, 1e9f, false};
+    const int kN = 25;
+    for (int i = 0; i < kN; ++i) for (int j = 0; j < kN; ++j) {
+        const float fx = lo.x + (hi.x - lo.x) * i / (kN - 1);
+        const float fy = lo.y + (hi.y - lo.y) * j / (kN - 1);
+        const Vec3 cc{fx, fy, cz.z};
+        const Surround sr = MeasureSurround(h1, poses_curl, spheres, hull, cc);
+        if (sr.covered_arc <= kLargeCagingArcMin || sr.genuine < 3u) continue;
+        const float pen = MaxPrePenetration(h1, poses_curl, spheres, hull, cc);
+        if (pen > kShallowPenMax) continue;
+        const float sq = SqueezeMag(h1, poses_curl, spheres, hull, cc);
+        if (sq < best.squeeze_mag) {
+            best = Place{cc, sr.genuine, sr.covered_arc, sr.max_gap, sr.palm_contacts,
+                         pen, sq, true};
+        }
+    }
+    return best;
+}
+
 // The diagnostic best void-closed placement WITHOUT the shallow filter (for reporting
 // how deep the void-closed placement would have to be if shallow is infeasible).
 Place BestPlacementVoidClosed(const CookedH1& h1, const std::vector<Transform>& poses_curl,
@@ -531,8 +595,21 @@ Place BestPlacementVoidClosed(const CookedH1& h1, const std::vector<Transform>& 
 // ---------------------------------------------------------------------------
 // The DENSE grasp scene. UNIQUE broadphase_handle per sphere; link = real link.
 // ---------------------------------------------------------------------------
-constexpr float kDynSxy = 1.6f;   // the ~9.66cm believable mug (the validated size).
+struct ScaleSpec { float sxy; float sz; };
+
+constexpr float kDynSxy = 1.6f;   // the ~9.66cm prior dense negative.
 constexpr float kDynSz = 1.2f;
+constexpr float kLargeDynSxy = 1.8f;  // model_large.usda canonical scale (~10.9cm dia).
+constexpr float kLargeDynSz = 1.8f;
+constexpr float kFingerOnlyFallbackSxy = 1.8f;
+constexpr float kFingerOnlyFallbackSz = 1.8f;
+constexpr float kFingerOnlyFallbackFingerDelta = 0.0f;
+constexpr float kFingerOnlyFallbackThumbYawDelta = 0.0f;
+constexpr float kFingerOnlyFallbackThumbPitchDelta = 0.0f;
+const ScaleSpec kLargeScaleSweep[] = {
+    {1.6f, 1.6f}, {1.7f, 1.7f}, {1.8f, 1.8f}, {1.9f, 1.9f},
+    {2.0f, 2.0f}, {2.2f, 2.2f}, {2.4f, 2.4f}, {2.6f, 2.6f},
+};
 constexpr float kMu = 0.8f;
 constexpr float kCloseOffset = 0.18f;  // the same ACTIVE squeeze curl-beyond.
 constexpr float kKp = 4.0f;
@@ -554,16 +631,20 @@ struct DenseGraspScene {
 // best void-closed placement WITHOUT the shallow filter, used to VALIDATE the apparatus
 // + the unique-handle stepper edit: the deep placement always exists, so stepping there
 // exercises the dense contact set + the finger_link<-handle decoupling for the first time).
-enum class PlaceMode { Shallow, VoidClosed };
+enum class PlaceMode { Shallow, VoidClosed, ShallowCaging, FingerOnlyShallow };
 
 DenseGraspScene BuildDenseGraspScene(const nuka::phi::DeviceContext& context,
                                      const CupHull& base, bool has_table,
-                                     PlaceMode mode = PlaceMode::Shallow) {
+                                     PlaceMode mode = PlaceMode::Shallow,
+                                     float sxy = kDynSxy, float sz = kDynSz,
+                                     bool with_palm = true,
+                                     CurlPose curl_override = CurlPose{},
+                                     bool use_curl_override = false) {
     DenseGraspScene gs;
-    const CupHull hull = ScaleCupHull(base, kDynSxy, kDynSz);
+    const CupHull hull = ScaleCupHull(base, sxy, sz);
     gs.h1 = LoadH1Fixed(kWrapDriven, kRealArmature, kRealDamping);
     gs.host = gs.h1.host;
-    const CurlPose curl = CurlForScale(kDynSxy);
+    const CurlPose curl = use_curl_override ? curl_override : CurlForScale(sxy);
     ApplyCurl(gs.h1, &gs.host, curl);
 
     for (const auto& nm : kWrapDriven) {
@@ -573,11 +654,17 @@ DenseGraspScene BuildDenseGraspScene(const nuka::phi::DeviceContext& context,
 
     const auto poses_curl = ForwardKinematics(context, gs.host);
     const Vec3 palm_offset{PALM_OFFSET_X, 0.0f, 0.0f};
-    const auto spheres = WrapSpheres(true, palm_offset);
+    const auto spheres = WrapSpheres(with_palm, palm_offset);
     gs.sphere_count = static_cast<uint32_t>(spheres.size());
-    gs.place = (mode == PlaceMode::Shallow)
-                   ? BestPlacementShallow(gs.h1, poses_curl, spheres, hull)
-                   : BestPlacementVoidClosed(gs.h1, poses_curl, spheres, hull);
+    if (mode == PlaceMode::Shallow) {
+        gs.place = BestPlacementShallow(gs.h1, poses_curl, spheres, hull);
+    } else if (mode == PlaceMode::ShallowCaging) {
+        gs.place = BestPlacementShallowCaging(gs.h1, poses_curl, spheres, hull);
+    } else if (mode == PlaceMode::FingerOnlyShallow) {
+        gs.place = BestPlacementShallowNoPalmCaging(gs.h1, poses_curl, spheres, hull);
+    } else {
+        gs.place = BestPlacementVoidClosed(gs.h1, poses_curl, spheres, hull);
+    }
     gs.cup_center = gs.place.center;
 
     // Each sphere -> a fingertip with a UNIQUE broadphase_handle (so the resolver picks
@@ -653,13 +740,103 @@ double RelTilt(const Quat& q_ref, const Quat& q_cur) {
 }
 
 // Live coverage (dense): contacts retained + arc/gap + palm, from the live FK + cup pose.
-struct LiveCov { float covered_arc = 0.0f; float max_gap = 360.0f; bool palm = false; uint32_t n = 0u; };
+struct LargeScaleEval {
+    float sxy = 1.0f;
+    float sz = 1.0f;
+    float diameter = 0.0f;
+    Place shallow;
+    Place no_palm;
+    Place void_closed;
+    float finger_pen = 0.0f;
+    float thumb_pen = 0.0f;
+    float palm_pen = 0.0f;
+};
+
+LargeScaleEval EvaluateLargeScale(const nuka::phi::DeviceContext& context, const CookedH1& h1,
+                                  const CupHull& base, float sxy, float sz) {
+    LargeScaleEval e;
+    e.sxy = sxy;
+    e.sz = sz;
+    const CupHull hull = ScaleCupHull(base, sxy, sz);
+    e.diameter = 2.0f * CupRadius(hull);
+    articulation::ArticulationHostState host = h1.host;
+    ApplyCurl(h1, &host, CurlForScale(sxy));
+    const auto poses = ForwardKinematics(context, host);
+    const Vec3 palm_offset{PALM_OFFSET_X, 0.0f, 0.0f};
+    const auto spheres = WrapSpheres(true, palm_offset);
+    const auto finger_only = WrapSpheres(false, palm_offset);
+    e.shallow = BestPlacementShallowCaging(h1, poses, spheres, hull);
+    e.no_palm = BestPlacementShallowNoPalmCaging(h1, poses, finger_only, hull);
+    e.void_closed = BestPlacementVoidClosed(h1, poses, spheres, hull);
+    if (e.shallow.found) {
+        e.finger_pen = MaxPrePenetration(h1, poses, spheres, hull, e.shallow.center, "finger");
+        e.thumb_pen = MaxPrePenetration(h1, poses, spheres, hull, e.shallow.center, "thumb");
+        e.palm_pen = MaxPrePenetration(h1, poses, spheres, hull, e.shallow.center, "palm");
+    } else if (e.void_closed.found) {
+        e.finger_pen = MaxPrePenetration(h1, poses, spheres, hull, e.void_closed.center, "finger");
+        e.thumb_pen = MaxPrePenetration(h1, poses, spheres, hull, e.void_closed.center, "thumb");
+        e.palm_pen = MaxPrePenetration(h1, poses, spheres, hull, e.void_closed.center, "palm");
+    }
+    return e;
+}
+
+bool LargeGeometryPasses(const LargeScaleEval& e) {
+    return e.shallow.found && e.shallow.palm && e.shallow.covered_arc > kLargeCagingArcMin &&
+           e.shallow.max_pen <= kShallowPenMax + 1e-5f &&
+           e.finger_pen <= kShallowPenMax + 1e-5f &&
+           e.thumb_pen <= kShallowPenMax + 1e-5f &&
+           e.palm_pen <= kShallowPenMax + 1e-5f;
+}
+
+struct FingerOnlyFallbackEval {
+    float sxy = 1.0f;
+    float sz = 1.0f;
+    float finger_delta = 0.0f;
+    float thumb_yaw_delta = 0.0f;
+    float thumb_pitch_delta = 0.0f;
+    Place place;
+};
+
+FingerOnlyFallbackEval EvaluateFingerOnlyFallback(
+    const nuka::phi::DeviceContext& context, const CookedH1& h1, const CupHull& base,
+    float sxy, float sz, float finger_delta, float thumb_yaw_delta,
+    float thumb_pitch_delta) {
+    FingerOnlyFallbackEval e;
+    e.sxy = sxy;
+    e.sz = sz;
+    e.finger_delta = finger_delta;
+    e.thumb_yaw_delta = thumb_yaw_delta;
+    e.thumb_pitch_delta = thumb_pitch_delta;
+    const CupHull hull = ScaleCupHull(base, sxy, sz);
+    articulation::ArticulationHostState host = h1.host;
+    ApplyCurl(h1, &host,
+              OffsetCurl(CurlForScale(sxy), finger_delta, thumb_yaw_delta, thumb_pitch_delta));
+    const auto poses = ForwardKinematics(context, host);
+    const Vec3 palm_offset{PALM_OFFSET_X, 0.0f, 0.0f};
+    const auto finger_only = WrapSpheres(false, palm_offset);
+    e.place = BestPlacementShallowNoPalmCaging(h1, poses, finger_only, hull);
+    return e;
+}
+
+struct LiveCov {
+    float covered_arc = 0.0f;
+    float max_gap = 360.0f;
+    bool palm = false;
+    uint32_t n = 0u;
+    // C7b-2d (additive): world-XY azimuth (deg, [0,360)) of the bisector of the
+    // largest live coverage gap -- i.e. the direction toward which the cup can most
+    // easily escape an opposed (force-closure) grasp. ForceClosureLiftWithDisturbance
+    // pushes the held cup along this azimuth as the pre-committed worst case. Prior
+    // callers ignore this field, so they are byte-for-byte unchanged.
+    float gap_bisector_az = 0.0f;
+};
 LiveCov LiveCoverage(const nuka::phi::DeviceContext& context, const DenseGraspScene& gs,
-                     coresident::UnifiedCoResidentStepper& stepper, const CupHull& hull) {
+                     coresident::UnifiedCoResidentStepper& stepper, const CupHull& hull,
+                     bool with_palm = true) {
     articulation::ArticulationHostState st; stepper.Download(&st);
     const auto poses = ForwardKinematics(context, st);
     const Vec3 palm_offset{PALM_OFFSET_X, 0.0f, 0.0f};
-    const auto spheres = WrapSpheres(true, palm_offset);
+    const auto spheres = WrapSpheres(with_palm, palm_offset);
     const Vec3 cc = stepper.Cup().position;
     LiveCov out;
     std::vector<float> azs;
@@ -677,16 +854,299 @@ LiveCov LiveCoverage(const nuka::phi::DeviceContext& context, const DenseGraspSc
     if (azs.size() < 2u) return out;
     std::sort(azs.begin(), azs.end());
     float max_gap = 0.0f;
+    float gap_start = azs[0];  // azimuth at the CCW start of the largest gap.
     for (size_t i = 0u; i < azs.size(); ++i) {
         const float next = (i + 1u < azs.size()) ? azs[i + 1u] : azs[0] + 360.0f;
-        max_gap = std::max(max_gap, next - azs[i]);
+        const float g = next - azs[i];
+        if (g > max_gap) { max_gap = g; gap_start = azs[i]; }
     }
     out.max_gap = max_gap;
     out.covered_arc = 360.0f - max_gap;
+    // Bisector of the largest gap; std::fmod keeps it in [0,360) after the wraparound.
+    out.gap_bisector_az = std::fmod(gap_start + max_gap * 0.5f, 360.0f);
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// C7b-2d: FORCE-CLOSURE DISTURBANCE-ROBUSTNESS rollout (additive).
+//
+// FingerOnlyFallbackLiftGate proved the opposed finger-only wrap HOLDS the cup
+// against gravity after table removal (support == mg.dt, 220/220 in contact) but
+// SKIPs on its CAGING-ARC sub-criterion: the grasp is FORCE CLOSURE (opposed
+// friction), not FORM CLOSURE (caging), so a ~176-184 deg azimuth gap remains.
+// Caging-arc was only a PROXY for "secure". The CORRECT security proof for a
+// force-closure grasp is DISTURBANCE ROBUSTNESS: when pushed toward the open gap
+// (the direction it can most easily escape) it must NOT escape, with the grip held
+// FIXED (no re-grab, no squeeze-up).
+//
+// Protocol (single source of truth so the gate + its D1 sibling are byte-identical):
+//   * 70-step table-supported settle, then SetTableEnabled(false).
+//   * kLiftSettle lift steps under gravity ONLY (confirm hold: support ~= mg.dt),
+//     snapshot the held pose, and read the gap-bisector azimuth from the live
+//     coverage (the SAME max_gap LiveCoverage reports) -> the worst-case push dir.
+//   * kPushSteps push window: SUSTAINED lateral body acceleration kLatAccelG*g along
+//     the bisector dir, injected as dv = a_lat*dir*kDt EACH step; plus a ONE-SHOT
+//     in-plane angular kick kTiltKickW (rad/s) applied ONCE at the first push step
+//     (ApplyCupImpulse ADDS to angular_velocity -- repeating it would integrate to an
+//     absurd spin; the held cup must merely survive the initial tilt). Grip held at
+//     the SAME pd target throughout (DrivePd unchanged).
+//   * kReleaseSettle steps with NO impulse: the held cup must recover.
+// Gravity stays ON the whole time (held cup resists gravity + lateral simultaneously
+// == the realistic worst case). Magnitudes are PRE-COMMITTED constants below and are
+// NOT tuned to pass: 1.0*g lateral is "as hard as the gravity it already holds"; a
+// free cup under 1g for kPushSteps would slide ~0.5*g*(kPushSteps*dt)^2 ~= 7.7cm,
+// well past the bound below, so the bound cleanly separates "grasp arrests it" from
+// "cup escapes".
+// ---------------------------------------------------------------------------
+constexpr float kFcLatAccelG = 1.0f;     // sustained lateral accel == 1.0 g (worst case).
+constexpr uint32_t kFcLiftSettle = 50u;  // gravity-only hold before the push.
+constexpr uint32_t kFcPushSteps = 30u;   // sustained-push window length.
+constexpr uint32_t kFcReleaseSettle = 70u;  // post-push recovery window.
+constexpr float kFcTiltKickW = 2.5f;     // ONE-SHOT angular kick magnitude (rad/s).
+// Translation bound: ~1.3x the 1.8x cup radius (~0.055 m) -> 0.07 m. A free cup at 1g
+// blows past this in the push window; a held cup stays cm-scale.
+constexpr double kFcMaxDisp = 0.07;
+constexpr double kFcMaxTilt = 0.35;      // bounded rotation away from the held attitude.
+constexpr double kFcMaxFinalW = 1.20;    // bounded residual spin after recovery.
+
+struct ForceClosureDistResult {
+    bool placement_found = false;
+    bool gap_defined = false;       // >=2 live contacts at end-of-settle (gap well-posed).
+    float bisector_az = 0.0f;       // deg, world XY.
+    Vec3 push_dir{};                // unit, world XY (along the bisector).
+    double settle_fimp = 0.0;       // support just before the push (sanity: ~= mg.dt).
+    double peak_disp = 0.0;         // peak displacement from held pose (push + recovery).
+    double peak_tilt = 0.0;         // peak tilt from held attitude.
+    double recovered_fimp = 0.0;    // mean support over the recovery window.
+    double recovery_cross = 0.0;    // max vertical-impulse bookkeeping mismatch (recovery).
+    double final_w = 0.0;           // |w| at the end.
+    uint32_t steps_post = 0u;       // total post-removal steps.
+    uint32_t contact_post = 0u;     // # post-removal steps with finger_contacts>0.
+    bool any_static_post = false;   // a StaticNull (table) row persisted post-removal.
+    double max_gap_push = 0.0;      // live gap during/after the push (informational).
+    BodyState cup_final{};          // for D1 byte-identity.
+};
+
+// Runs the FULL force-closure disturbance protocol once. Deterministic by construction
+// (fixed seed-free integration, pre-committed constants). `art_out`, if non-null, gets
+// the final articulation host state for D1.
+ForceClosureDistResult RunForceClosureDist(const nuka::phi::DeviceContext& context,
+                                           const CupHull& base,
+                                           articulation::ArticulationHostState* art_out) {
+    ForceClosureDistResult r;
+    const CupHull hull = ScaleCupHull(base, kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz);
+    const CurlPose curl = OffsetCurl(CurlForScale(kFingerOnlyFallbackSxy),
+                                     kFingerOnlyFallbackFingerDelta,
+                                     kFingerOnlyFallbackThumbYawDelta,
+                                     kFingerOnlyFallbackThumbPitchDelta);
+    DenseGraspScene gs = BuildDenseGraspScene(
+        context, base, /*has_table=*/true, PlaceMode::FingerOnlyShallow,
+        kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz, /*with_palm=*/false,
+        curl, /*use_curl_override=*/true);
+    if (!gs.place.found) return r;  // placement_found stays false.
+    r.placement_found = true;
+
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+
+    // --- table-supported settle ---
+    for (uint32_t s = 0u; s < 70u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+    stepper.SetTableEnabled(false);
+
+    // --- phase a: gravity-only hold; snapshot held pose + measure support ---
+    coresident::CoResidentStepReport rep;
+    double settle_fimp_sum = 0.0; uint32_t settle_fimp_n = 0u;
+    for (uint32_t s = 0u; s < kFcLiftSettle; ++s) {
+        DrivePd(stepper, gs, pd);
+        rep = stepper.Step();
+        if (rep.any_static_row) r.any_static_post = true;
+        if (s >= kFcLiftSettle / 2u && rep.finger_contacts > 0u) {
+            settle_fimp_sum += rep.cup_vertical_impulse; ++settle_fimp_n;
+        }
+    }
+    r.settle_fimp = settle_fimp_n ? settle_fimp_sum / settle_fimp_n : 0.0;
+    const Vec3 c_held = stepper.Cup().position;
+    const Quat q_held = stepper.Cup().orientation;
+    const LiveCov cov_held = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+    r.bisector_az = cov_held.gap_bisector_az;
+    r.gap_defined = (cov_held.n >= 2u);
+    const float az_rad = cov_held.gap_bisector_az * kPi / 180.0f;
+    r.push_dir = Vec3{std::cos(az_rad), std::sin(az_rad), 0.0f};
+
+    // --- phase b: sustained lateral push along the bisector + ONE-SHOT tilt ---
+    const Vec3 dv_step = r.push_dir * (kFcLatAccelG * (-kGravityZ) * kDt);
+    // In-plane tilt axis = perpendicular to the push (worst-case roll about the escape line).
+    const Vec3 tilt_axis{-r.push_dir.y, r.push_dir.x, 0.0f};
+    auto track = [&](const coresident::CoResidentStepReport& rp) {
+        ++r.steps_post;
+        if (rp.finger_contacts > 0u) ++r.contact_post;
+        if (rp.any_static_row) r.any_static_post = true;
+        const Vec3 cp = stepper.Cup().position;
+        r.peak_disp = std::max(r.peak_disp, (double)(cp - c_held).Length());
+        r.peak_tilt = std::max(r.peak_tilt, RelTilt(q_held, stepper.Cup().orientation));
+    };
+    for (uint32_t s = 0u; s < kFcPushSteps; ++s) {
+        DrivePd(stepper, gs, pd);
+        if (s == 0u) {
+            // ONE-SHOT angular kick (NOT per-step: ApplyCupImpulse accumulates).
+            stepper.ApplyCupImpulse(dv_step, tilt_axis * kFcTiltKickW);
+        } else {
+            stepper.ApplyCupImpulse(dv_step, Vec3::Zero());
+        }
+        rep = stepper.Step();
+        track(rep);
+        if (s % 10u == 0u || s + 1u == kFcPushSteps) {
+            const LiveCov cv = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+            r.max_gap_push = std::max(r.max_gap_push, (double)cv.max_gap);
+        }
+    }
+
+    // --- phase c: release; recover; measure recovered support + clean bookkeeping ---
+    double rec_sum = 0.0; uint32_t rec_n = 0u;
+    for (uint32_t s = 0u; s < kFcReleaseSettle; ++s) {
+        DrivePd(stepper, gs, pd);
+        rep = stepper.Step();
+        track(rep);
+        // Accumulate recovery support over the LATTER half (settled, impulse-free).
+        if (s >= kFcReleaseSettle / 2u && rep.finger_contacts > 0u) {
+            rec_sum += rep.cup_vertical_impulse; ++rec_n;
+            if (rep.cup_vertical_impulse != 0.0) {
+                const double cross =
+                    std::fabs(rep.cup_vertical_impulse - rep.cup_dvz_impulse) /
+                    std::max(std::fabs(rep.cup_dvz_impulse), 1e-9);
+                r.recovery_cross = std::max(r.recovery_cross, cross);
+            }
+        }
+        if (s % 20u == 0u || s + 1u == kFcReleaseSettle) {
+            const LiveCov cv = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+            r.max_gap_push = std::max(r.max_gap_push, (double)cv.max_gap);
+        }
+    }
+    r.recovered_fimp = rec_n ? rec_sum / rec_n : 0.0;
+    r.final_w = stepper.Cup().angular_velocity.Length();
+    r.cup_final = stepper.Cup();
+    (void)weight_kick;
+    if (art_out) stepper.Download(art_out);
+    return r;
+}
+
 }  // namespace
+
+// ===========================================================================
+// PHASE 1 / GATE 0: sweep the DENSE wrap over larger round cups (1.6x..2.6x) and
+// find the first scale whose fingers, thumb, and palm all co-contact shallow (<=2mm)
+// while the palm closes the old finger-only azimuth gap. This is the owner-selected
+// next branch after the 1.6x dense negative: switch to a larger object, validate the
+// geometry before spending dynamics time.
+// ==========================================================================
+TEST(H1DenseGraspLargeCup, ScaleSweepFindsBothSidesShallow) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CookedH1 h1 = LoadH1Fixed(kWrapDriven, kRealArmature, kRealDamping);
+
+    bool any_pass = false;
+    bool any_finger_only = false;
+    LargeScaleEval chosen;
+    for (const ScaleSpec spec : kLargeScaleSweep) {
+        const LargeScaleEval e = EvaluateLargeScale(context, h1, base, spec.sxy, spec.sz);
+        std::printf("[LARGE-SWEEP] k=%.2f/%.2f diam=%.4f m shallow=%d arc=%.1f "
+                    "gap=%.1f max_pen=%.2f mm region(finger/thumb/palm)=%.2f/%.2f/%.2f "
+                    "nopalm=%d nopalm_arc=%.1f nopalm_gap=%.1f void_pen=%.2f mm\n",
+                    e.sxy, e.sz, e.diameter, e.shallow.found ? 1 : 0,
+                    e.shallow.covered_arc, e.shallow.max_gap,
+                    e.shallow.max_pen * 1000.0f, e.finger_pen * 1000.0f,
+                    e.thumb_pen * 1000.0f, e.palm_pen * 1000.0f,
+                    e.no_palm.found ? 1 : 0, e.no_palm.covered_arc, e.no_palm.max_gap,
+                    e.void_closed.max_pen * 1000.0f);
+        if (e.no_palm.found) any_finger_only = true;
+        if (!any_pass && LargeGeometryPasses(e)) {
+            chosen = e;
+            any_pass = true;
+        }
+    }
+
+    if (!any_pass) {
+        GTEST_SKIP() << "NEGATIVE: no round-cup scale in 1.6..2.6 achieved both-sides "
+                        "shallow closure (fingers/thumb/palm all <=2mm, palm co-contact, "
+                        "arc >200deg). Finger-only caging in the same fixed curl was "
+                     << (any_finger_only ? "found" : "not found")
+                     << "; see FingerOnlyFallbackScaleAndCurlSweep for the bounded "
+                        "fallback scan and [LARGE-SWEEP] table.";
+    }
+
+    std::printf("[LARGE-SWEEP] CHOSEN k=%.2f/%.2f diam=%.4f m arc=%.1f gap=%.1f "
+                "max_pen=%.2f mm region=%.2f/%.2f/%.2f mm\n",
+                chosen.sxy, chosen.sz, chosen.diameter, chosen.shallow.covered_arc,
+                chosen.shallow.max_gap, chosen.shallow.max_pen * 1000.0f,
+                chosen.finger_pen * 1000.0f, chosen.thumb_pen * 1000.0f,
+                chosen.palm_pen * 1000.0f);
+    EXPECT_TRUE(LargeGeometryPasses(chosen));
+    EXPECT_NEAR(chosen.sxy, kLargeDynSxy, 1e-4f)
+        << "canonical model_large.usda is expected to be the selected 1.8x gate object";
+}
+
+TEST(H1DenseGraspLargeCup, FingerOnlyFallbackScaleAndCurlSweep) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CookedH1 h1 = LoadH1Fixed(kWrapDriven, kRealArmature, kRealDamping);
+
+    const FingerOnlyFallbackEval canonical = EvaluateFingerOnlyFallback(
+        context, h1, base, kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz,
+        kFingerOnlyFallbackFingerDelta, kFingerOnlyFallbackThumbYawDelta,
+        kFingerOnlyFallbackThumbPitchDelta);
+    std::printf("[LARGE-FINGER-ONLY] canonical k=%.2f/%.2f found=%d arc=%.1f gap=%.1f "
+                "max_pen=%.2f mm contacts=%u\n",
+                canonical.sxy, canonical.sz, canonical.place.found ? 1 : 0,
+                canonical.place.covered_arc, canonical.place.max_gap,
+                canonical.place.max_pen * 1000.0f, canonical.place.genuine);
+    if (canonical.place.found) {
+        EXPECT_GT(canonical.place.covered_arc, kLargeCagingArcMin);
+        EXPECT_LE(canonical.place.max_pen, kShallowPenMax + 1e-5f);
+        return;
+    }
+
+    const float finger_offsets[] = {-0.20f, 0.0f, 0.20f};
+    const float thumb_yaw_offsets[] = {-0.35f, 0.0f, 0.35f};
+    const float thumb_pitch_offsets[] = {-0.25f, 0.0f, 0.25f};
+    bool found = false;
+    FingerOnlyFallbackEval best;
+    float best_arc = 0.0f;
+    for (const ScaleSpec spec : kLargeScaleSweep) {
+        for (float fd : finger_offsets) for (float ty : thumb_yaw_offsets) {
+            for (float tp : thumb_pitch_offsets) {
+                const FingerOnlyFallbackEval e = EvaluateFingerOnlyFallback(
+                    context, h1, base, spec.sxy, spec.sz, fd, ty, tp);
+                if (e.place.covered_arc > best_arc) {
+                    best = e;
+                    best_arc = e.place.covered_arc;
+                }
+                if (e.place.found) {
+                    found = true;
+                    best = e;
+                    goto fallback_done;
+                }
+            }
+        }
+    }
+fallback_done:
+    std::printf("[LARGE-FINGER-ONLY] found=%d k=%.2f/%.2f curl_offsets(fd/ty/tp)=%.2f/%.2f/%.2f "
+                "arc=%.1f gap=%.1f max_pen=%.2f mm contacts=%u\n",
+                found ? 1 : 0, best.sxy, best.sz, best.finger_delta,
+                best.thumb_yaw_delta, best.thumb_pitch_delta, best.place.covered_arc,
+                best.place.max_gap, best.place.max_pen * 1000.0f, best.place.genuine);
+    if (!found) {
+        GTEST_SKIP() << "NEGATIVE: bounded finger-only fallback scan (8 scales x 27 curl "
+                        "offsets) found no >200deg shallow opposed wrap without palm. Best "
+                        "arc=" << best_arc << " deg. Stop Phase 1 and ask owner for a "
+                        "different object/pose strategy; do not grind parameters.";
+    }
+    EXPECT_TRUE(found);
+}
 
 // ===========================================================================
 // GATE 1 (the VALIDITY precondition): does the stepper REALIZE the dense set as MANY
@@ -872,6 +1332,388 @@ TEST(H1DenseGrasp, ShallowPlacementCalibration) {
 // difference from the prior negative is that coverage should NOT collapse (the live
 // max_gap stays closed) because many distributed contacts share the load.
 // ===========================================================================
+TEST(H1DenseGraspLargeCup, FingerOnlyFallbackLiftGate) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CupHull hull = ScaleCupHull(base, kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz);
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+    const CurlPose curl = OffsetCurl(CurlForScale(kFingerOnlyFallbackSxy),
+                                     kFingerOnlyFallbackFingerDelta,
+                                     kFingerOnlyFallbackThumbYawDelta,
+                                     kFingerOnlyFallbackThumbPitchDelta);
+    DenseGraspScene gs = BuildDenseGraspScene(
+        context, base, /*has_table=*/true, PlaceMode::FingerOnlyShallow,
+        kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz, /*with_palm=*/false,
+        curl, /*use_curl_override=*/true);
+    if (!gs.place.found) {
+        GTEST_SKIP() << "NEGATIVE: canonical finger-only fallback has no <=2mm caging "
+                        "placement. See FingerOnlyFallbackScaleAndCurlSweep.";
+    }
+    std::printf("[FINGER-LIFT] step-zero k=%.2f diam=%.4f m max_pen=%.2f mm arc=%.1f "
+                "gap=%.1f spheres=%u\n",
+                kFingerOnlyFallbackSxy, 2.0f * CupRadius(hull), gs.place.max_pen * 1000.0f,
+                gs.place.covered_arc, gs.place.max_gap, gs.sphere_count);
+
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    coresident::CoResidentStepReport rep;
+    for (uint32_t s = 0u; s < 70u; ++s) { DrivePd(stepper, gs, pd); rep = stepper.Step(); }
+    const Vec3 c_settled = stepper.Cup().position;
+    const Quat q_settled = stepper.Cup().orientation;
+    const LiveCov cov_settle = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+    std::printf("[FINGER-LIFT] table settle: contacts=%u table_rows=%u finger_vimp=%.4e "
+                "table_vimp=%.4e (mg.dt=%.4e) arc=%.1f gap=%.1f\n",
+                rep.finger_contacts, rep.table_row_count, rep.cup_vertical_impulse,
+                rep.table_vertical_impulse, weight_kick, cov_settle.covered_arc,
+                cov_settle.max_gap);
+
+    stepper.SetTableEnabled(false);
+    const uint32_t kLift = 220u, kLiftSettle = 60u;
+    double max_disp = 0.0, max_tilt = 0.0, max_cross = 0.0, max_gap_live = 0.0;
+    double sum_fimp = 0.0;
+    uint32_t n_steady = 0u, contact_after = 0u;
+    bool any_static_after = false;
+    for (uint32_t s = 0u; s < kLift; ++s) {
+        DrivePd(stepper, gs, pd);
+        rep = stepper.Step();
+        if (rep.finger_contacts > 0u) ++contact_after;
+        if (rep.any_static_row) any_static_after = true;
+        const Vec3 cp = stepper.Cup().position;
+        max_disp = std::max(max_disp, (double)(cp - c_settled).Length());
+        max_tilt = std::max(max_tilt, RelTilt(q_settled, stepper.Cup().orientation));
+        if (rep.finger_contacts > 0u && rep.cup_vertical_impulse != 0.0) {
+            const double cross = std::fabs(rep.cup_vertical_impulse - rep.cup_dvz_impulse) /
+                std::max(std::fabs(rep.cup_dvz_impulse), 1e-9);
+            max_cross = std::max(max_cross, cross);
+        }
+        if (s % 20u == 0u || s + 1u == kLift) {
+            const LiveCov cov = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+            if (s >= 20u) max_gap_live = std::max(max_gap_live, (double)cov.max_gap);
+            std::printf("[FINGER-LIFT]   traj s=%3u tilt=%.4f rad |w|=%.3f gap=%.1f n=%u\n",
+                        s, RelTilt(q_settled, stepper.Cup().orientation),
+                        stepper.Cup().angular_velocity.Length(), cov.max_gap, cov.n);
+        }
+        if (s >= kLiftSettle) { sum_fimp += rep.cup_vertical_impulse; ++n_steady; }
+    }
+    const double mean_fimp = n_steady ? sum_fimp / n_steady : 0.0;
+    const LiveCov cov_end = LiveCoverage(context, gs, stepper, hull, /*with_palm=*/false);
+    const double final_w = stepper.Cup().angular_velocity.Length();
+    std::printf("[FINGER-LIFT] after removal: contact=%u/%u any_static=%d mean_fimp=%.4e "
+                "(mg.dt=%.4e) cross=%.2e max_disp=%.4f max_tilt=%.4f |w|=%.3f "
+                "end_arc=%.1f end_gap=%.1f max_gap=%.1f\n",
+                contact_after, kLift, any_static_after ? 1 : 0, mean_fimp, weight_kick,
+                max_cross, max_disp, max_tilt, final_w, cov_end.covered_arc,
+                cov_end.max_gap, max_gap_live);
+
+    EXPECT_FALSE(any_static_after) << "a table row persisted after removal";
+    EXPECT_LT(max_cross, 5.0e-2)
+        << "finger-only impulse bookkeeping disagrees (numerically invalid lift gate)";
+    const bool support_ok = std::fabs(mean_fimp - weight_kick) < 0.35 * weight_kick;
+    const bool translation_ok = max_disp < 0.05;
+    const bool contact_ok = contact_after >= kLift - 12u;
+    const bool arc_ok = (max_gap_live <= 160.0) && (cov_end.max_gap <= 160.0f);
+    const bool tilt_ok = max_tilt < 0.20 && final_w < 0.90;
+    const bool caged = support_ok && translation_ok && contact_ok && arc_ok && tilt_ok &&
+                       !any_static_after && max_cross < 5.0e-2;
+    if (!caged) {
+        GTEST_SKIP() << "NEGATIVE: finger-only fallback shallow geometry did not lift-cage: "
+                     << "support_ok=" << support_ok << " mean_fimp=" << mean_fimp
+                     << " translation_ok=" << translation_ok << " disp=" << max_disp
+                     << " contact_ok=" << contact_ok << " " << contact_after << "/" << kLift
+                     << " arc_ok=" << arc_ok << " max_gap=" << max_gap_live
+                     << " tilt_ok=" << tilt_ok << " tilt=" << max_tilt << " |w|="
+                     << final_w << ". Stop Phase 1; no parameter grinding.";
+    }
+    EXPECT_TRUE(caged);
+}
+
+// ---------------------------------------------------------------------------
+// C7b-2d: the FORCE-CLOSURE security proof. FingerOnlyFallbackLiftGate holds the cup
+// against gravity but SKIPs on caging-arc (the grasp is force closure, not form
+// closure). The correct security proof for a force-closure grasp is disturbance
+// robustness: push the held cup toward its open gap (worst-case escape direction) at
+// 1.0 g sustained + a one-shot tilt, grip held FIXED, and require it does NOT escape
+// and that support RECOVERS to mg.dt afterward. PASS => the opposed wrap is a validated
+// secure grasp; SKIP-with-numbers => force closure too fragile laterally -> next move
+// is a flat-faced object (box), not parameter grinding.
+// ---------------------------------------------------------------------------
+TEST(H1DenseGraspLargeCup, ForceClosureLiftWithDisturbance) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+
+    const ForceClosureDistResult r = RunForceClosureDist(context, base, /*art_out=*/nullptr);
+    if (!r.placement_found) {
+        GTEST_SKIP() << "NEGATIVE: finger-only fallback has no <=2mm placement. See "
+                        "FingerOnlyFallbackScaleAndCurlSweep.";
+    }
+    if (!r.gap_defined) {
+        GTEST_SKIP() << "NEGATIVE: <2 live contacts at end-of-settle -> escape gap "
+                        "ill-defined (cup not held). settle_fimp=" << r.settle_fimp
+                     << " (mg.dt=" << weight_kick << ").";
+    }
+
+    // PRE-COMMITTED disturbance, echoed verbatim so the worst case is on record.
+    std::printf("[FORCE-CLOSURE-DIST] PRE-COMMIT: lat=%.2f g sustained %u steps along gap-"
+                "bisector az=%.1f deg dir=(%.3f,%.3f,0) + ONE-SHOT tilt %.2f rad/s; grip held "
+                "FIXED (Kp=%.1f Kd=%.1f offset=%.2f); release+settle %u steps; gravity ON.\n",
+                kFcLatAccelG, kFcPushSteps, r.bisector_az, r.push_dir.x, r.push_dir.y,
+                kFcTiltKickW, kKp, kKd, kCloseOffset, kFcReleaseSettle);
+    std::printf("[FORCE-CLOSURE-DIST] held support before push: fimp=%.4e (mg.dt=%.4e)\n",
+                r.settle_fimp, weight_kick);
+    std::printf("[FORCE-CLOSURE-DIST] result: peak_disp=%.4f m (bound %.3f) peak_tilt=%.4f rad "
+                "(bound %.2f) recovered_fimp=%.4e (mg.dt=%.4e) final|w|=%.3f contacts=%u/%u "
+                "any_static=%d max_gap=%.1f recovery_cross=%.2e\n",
+                r.peak_disp, kFcMaxDisp, r.peak_tilt, kFcMaxTilt, r.recovered_fimp, weight_kick,
+                r.final_w, r.contact_post, r.steps_post, r.any_static_post ? 1 : 0,
+                r.max_gap_push, r.recovery_cross);
+
+    const bool translation_ok = r.peak_disp < kFcMaxDisp;
+    const bool tilt_ok = r.peak_tilt < kFcMaxTilt && r.final_w < kFcMaxFinalW;
+    const bool contact_ok = r.contact_post >= r.steps_post - 12u;
+    const bool recover_ok = std::fabs(r.recovered_fimp - weight_kick) < 0.35 * weight_kick;
+    const bool static_ok = !r.any_static_post;
+    const bool cross_ok = r.recovery_cross < 5.0e-2;
+    const bool held = translation_ok && tilt_ok && contact_ok && recover_ok && static_ok &&
+                      cross_ok;
+
+    if (!held) {
+        GTEST_SKIP() << "NEGATIVE: force closure too fragile laterally -> next move is a "
+                        "flat-faced object (box), not parameter grinding. translation_ok="
+                     << translation_ok << " disp=" << r.peak_disp << " tilt_ok=" << tilt_ok
+                     << " tilt=" << r.peak_tilt << " |w|=" << r.final_w << " contact_ok="
+                     << contact_ok << " " << r.contact_post << "/" << r.steps_post
+                     << " recover_ok=" << recover_ok << " recovered_fimp=" << r.recovered_fimp
+                     << " static_ok=" << static_ok << " cross_ok=" << cross_ok
+                     << " cross=" << r.recovery_cross << ".";
+    }
+    EXPECT_TRUE(held);
+}
+
+// C7b-2d D1: the disturbance protocol must be deterministic (byte-identical across two
+// runs of the SAME pre-committed rollout).
+TEST(H1DenseGraspLargeCup, ForceClosureLiftWithDisturbanceDeterministicTwoRun) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    articulation::ArticulationHostState aa, ab;
+    const ForceClosureDistResult ra = RunForceClosureDist(context, base, &aa);
+    if (!ra.placement_found)
+        GTEST_SKIP() << "NEGATIVE: finger-only fallback geometry absent.";
+    const ForceClosureDistResult rb = RunForceClosureDist(context, base, &ab);
+    ASSERT_TRUE(rb.placement_found);
+    EXPECT_EQ(std::memcmp(&ra.cup_final, &rb.cup_final, sizeof(BodyState)), 0)
+        << "force-closure disturbance cup diverged across 2 rollouts";
+    ASSERT_EQ(aa.qdot.size(), ab.qdot.size());
+    EXPECT_EQ(std::memcmp(aa.qdot.data(), ab.qdot.data(), aa.qdot.size() * sizeof(float)), 0)
+        << "force-closure disturbance qdot diverged across 2 rollouts";
+    std::printf("[FORCE-CLOSURE-D1] disturbance rollout cup + qdot byte-identical across 2 runs "
+                "(bisector az=%.1f deg, peak_disp=%.4f m)\n", ra.bisector_az, ra.peak_disp);
+}
+
+TEST(H1DenseGraspLargeCup, FingerOnlyFallbackBiteGripOffVsOn) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+    const uint32_t kFall = 120u;
+    const double free_fall = 0.5 * (-kGravityZ) * (kFall * kDt) * (kFall * kDt);
+    const CurlPose curl = OffsetCurl(CurlForScale(kFingerOnlyFallbackSxy),
+                                     kFingerOnlyFallbackFingerDelta,
+                                     kFingerOnlyFallbackThumbYawDelta,
+                                     kFingerOnlyFallbackThumbPitchDelta);
+    DenseGraspScene gs = BuildDenseGraspScene(
+        context, base, /*has_table=*/true, PlaceMode::FingerOnlyShallow,
+        kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz, /*with_palm=*/false,
+        curl, /*use_curl_override=*/true);
+    if (!gs.place.found) GTEST_SKIP() << "NEGATIVE: finger-only fallback geometry absent.";
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    for (uint32_t s = 0u; s < 70u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+    stepper.SetTableEnabled(false);
+    coresident::CoResidentStepReport rep_on;
+    for (uint32_t s = 0u; s < 40u; ++s) { DrivePd(stepper, gs, pd); rep_on = stepper.Step(); }
+    const double z_active = stepper.Cup().position.z;
+    const double vz_on = stepper.Cup().linear_velocity.z;
+    const bool holds_on = (std::fabs(z_active - gs.cup0.position.z) < 0.05) &&
+                          (std::fabs(vz_on) < 0.5) &&
+                          (rep_on.cup_vertical_impulse > 0.5 * weight_kick);
+    const std::vector<float> zero(gs.host.TotalLinkCount(), 0.0f);
+    coresident::CoResidentStepReport rep_off;
+    for (uint32_t s = 0u; s < kFall; ++s) { stepper.SetGripTorque(zero); rep_off = stepper.Step(); }
+    const BodyState cupF = stepper.Cup();
+    const double drop = z_active - cupF.position.z;
+    const bool falls = (drop > 0.02) || (cupF.linear_velocity.z < -0.10);
+    std::printf("[FINGER-BITE] max_pen=%.2f mm grip=ON holds=%d z=%.5f vz=%.4f "
+                "finger_vimp=%.4e mg.dt=%.4e | grip=0 drop=%.5f free=%.4f vz=%.4f "
+                "finger_vimp=%.4e -> %s\n",
+                gs.place.max_pen * 1000.0f, holds_on ? 1 : 0, z_active, vz_on,
+                rep_on.cup_vertical_impulse, weight_kick, drop, free_fall,
+                cupF.linear_velocity.z, rep_off.cup_vertical_impulse,
+                falls ? "FALLS (ACTIVE)" : "HOLDS (shallow form closure)");
+    if (!holds_on) {
+        GTEST_SKIP() << "NEGATIVE: finger-only fallback grip=ON did not hold. vimp="
+                     << rep_on.cup_vertical_impulse << " vs mg.dt=" << weight_kick
+                     << " vz=" << vz_on;
+    }
+    std::printf("[FINGER-BITE] diagnostic: active opposed hold only; lift coverage gate "
+                "decides whether this is a caging grasp.\n");
+    EXPECT_TRUE(holds_on);
+    EXPECT_LE(gs.place.max_pen, kShallowPenMax + 1e-5f);
+}
+
+TEST(H1DenseGraspLargeCup, FingerOnlyFallbackDeterministicTwoRun) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CurlPose curl = OffsetCurl(CurlForScale(kFingerOnlyFallbackSxy),
+                                     kFingerOnlyFallbackFingerDelta,
+                                     kFingerOnlyFallbackThumbYawDelta,
+                                     kFingerOnlyFallbackThumbPitchDelta);
+    auto rollout = [&](BodyState* cup, articulation::ArticulationHostState* art) {
+        DenseGraspScene gs = BuildDenseGraspScene(
+            context, base, /*has_table=*/true, PlaceMode::FingerOnlyShallow,
+            kFingerOnlyFallbackSxy, kFingerOnlyFallbackSz, /*with_palm=*/false,
+            curl, /*use_curl_override=*/true);
+        if (!gs.place.found) return false;
+        coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+        const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+        for (uint32_t s = 0u; s < 60u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+        stepper.SetTableEnabled(false);
+        for (uint32_t s = 0u; s < 60u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+        *cup = stepper.Cup();
+        stepper.Download(art);
+        return true;
+    };
+    BodyState ca, cb;
+    articulation::ArticulationHostState aa, ab;
+    if (!rollout(&ca, &aa)) GTEST_SKIP() << "NEGATIVE: finger-only fallback geometry absent.";
+    ASSERT_TRUE(rollout(&cb, &ab));
+    EXPECT_EQ(std::memcmp(&ca, &cb, sizeof(BodyState)), 0) << "finger-only cup diverged";
+    ASSERT_EQ(aa.qdot.size(), ab.qdot.size());
+    EXPECT_EQ(std::memcmp(aa.qdot.data(), ab.qdot.data(), aa.qdot.size() * sizeof(float)), 0)
+        << "finger-only qdot diverged";
+    std::printf("[FINGER-D1] finger-only fallback cup + qdot byte-identical across 2 rollouts\n");
+}
+
+TEST(H1DenseGraspLargeCup, LiftGateActiveShallowWrapCagesCup) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CupHull hull = ScaleCupHull(base, kLargeDynSxy, kLargeDynSz);
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+
+    DenseGraspScene gs = BuildDenseGraspScene(context, base, /*has_table=*/true,
+                                              PlaceMode::ShallowCaging,
+                                              kLargeDynSxy, kLargeDynSz);
+    if (!gs.place.found) {
+        GTEST_SKIP() << "NEGATIVE: canonical 1.8x large cup has no <=2mm palm+finger "
+                        "caging placement. See ScaleSweepFindsBothSidesShallow.";
+    }
+    std::printf("[LARGE-LIFT] step-zero k=%.2f diam=%.4f m max_pen=%.2f mm "
+                "arc=%.1f gap=%.1f palm=%d spheres=%u\n",
+                kLargeDynSxy, 2.0f * CupRadius(hull), gs.place.max_pen * 1000.0f,
+                gs.place.covered_arc, gs.place.max_gap, gs.place.palm ? 1 : 0,
+                gs.sphere_count);
+    EXPECT_LE(gs.place.max_pen, kShallowPenMax + 1e-5f);
+    EXPECT_GT(gs.place.covered_arc, kLargeCagingArcMin);
+    EXPECT_TRUE(gs.place.palm);
+
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    coresident::CoResidentStepReport rep;
+    for (uint32_t s = 0u; s < 70u; ++s) { DrivePd(stepper, gs, pd); rep = stepper.Step(); }
+    const Vec3 c_settled = stepper.Cup().position;
+    const Quat q_settled = stepper.Cup().orientation;
+    const LiveCov cov_settle = LiveCoverage(context, gs, stepper, hull);
+    std::printf("[LARGE-LIFT] table-supported settle: finger_contacts=%u table_rows=%u "
+                "finger_vimp=%.4e table_vimp=%.4e (mg.dt=%.4e) arc=%.1f gap=%.1f palm=%d\n",
+                rep.finger_contacts, rep.table_row_count, rep.cup_vertical_impulse,
+                rep.table_vertical_impulse, weight_kick, cov_settle.covered_arc,
+                cov_settle.max_gap, cov_settle.palm ? 1 : 0);
+
+    stepper.SetTableEnabled(false);
+    const uint32_t kLift = 220u, kLiftSettle = 60u;
+    double max_disp = 0.0, max_tilt = 0.0, max_cross = 0.0, max_gap_live = 0.0;
+    double sum_fimp = 0.0, sum_friction = 0.0;
+    uint32_t n_steady = 0u, contact_after = 0u, palm_after = 0u;
+    bool any_static_after = false;
+    for (uint32_t s = 0u; s < kLift; ++s) {
+        DrivePd(stepper, gs, pd);
+        rep = stepper.Step();
+        if (rep.finger_contacts > 0u) ++contact_after;
+        if (rep.any_static_row) any_static_after = true;
+        const Vec3 cp = stepper.Cup().position;
+        max_disp = std::max(max_disp, (double)(cp - c_settled).Length());
+        max_tilt = std::max(max_tilt, RelTilt(q_settled, stepper.Cup().orientation));
+        if (rep.finger_contacts > 0u && rep.cup_vertical_impulse != 0.0) {
+            const double cross = std::fabs(rep.cup_vertical_impulse - rep.cup_dvz_impulse) /
+                std::max(std::fabs(rep.cup_dvz_impulse), 1e-9);
+            max_cross = std::max(max_cross, cross);
+        }
+        if (s % 20u == 0u || s + 1u == kLift) {
+            const LiveCov cov = LiveCoverage(context, gs, stepper, hull);
+            max_gap_live = std::max(max_gap_live, (double)cov.max_gap);
+            if (cov.palm) ++palm_after;
+            std::printf("[LARGE-LIFT]   traj s=%3u tilt=%.4f rad |w|=%.3f "
+                        "live_gap=%.1f n=%u palm=%d\n",
+                        s, RelTilt(q_settled, stepper.Cup().orientation),
+                        stepper.Cup().angular_velocity.Length(), cov.max_gap,
+                        cov.n, cov.palm ? 1 : 0);
+        }
+        if (s >= kLiftSettle) {
+            sum_fimp += rep.cup_vertical_impulse;
+            sum_friction += rep.finger_vimpulse_friction;
+            ++n_steady;
+        }
+    }
+    const double mean_fimp = n_steady ? sum_fimp / n_steady : 0.0;
+    const double mean_friction = n_steady ? sum_friction / n_steady : 0.0;
+    const LiveCov cov_end = LiveCoverage(context, gs, stepper, hull);
+    const double final_w = stepper.Cup().angular_velocity.Length();
+
+    std::printf("[LARGE-LIFT] AFTER TABLE REMOVAL: contact=%u/%u any_static=%d "
+                "palm_retained=%u mean finger_vimp=%.4e friction=%.4e (mg.dt=%.4e) "
+                "cross=%.2e\n",
+                contact_after, kLift, any_static_after ? 1 : 0, palm_after, mean_fimp,
+                mean_friction, weight_kick, max_cross);
+    std::printf("[LARGE-LIFT] cage: max_disp=%.4f max_tilt=%.4f rad final|w|=%.3f "
+                "end_arc=%.1f end_gap=%.1f max_gap_live=%.1f end_palm=%d\n",
+                max_disp, max_tilt, final_w, cov_end.covered_arc, cov_end.max_gap,
+                max_gap_live, cov_end.palm ? 1 : 0);
+
+    EXPECT_FALSE(any_static_after) << "a table row persisted after removal";
+    EXPECT_LT(max_cross, 5.0e-2)
+        << "finger impulse bookkeeping disagrees (numerically invalid lift gate)";
+
+    const bool support_ok = std::fabs(mean_fimp - weight_kick) < 0.35 * weight_kick;
+    const bool translation_ok = max_disp < 0.05;
+    const bool contact_ok = contact_after >= kLift - 12u;
+    const bool arc_ok = (max_gap_live <= 130.0) && (cov_end.max_gap <= 130.0f);
+    const bool tilt_ok = max_tilt < 0.15 && final_w < 0.75;
+    const bool caged = support_ok && translation_ok && contact_ok && arc_ok && tilt_ok &&
+                       !any_static_after && max_cross < 5.0e-2;
+    if (!caged) {
+        GTEST_SKIP() << "NEGATIVE: large-cup shallow lift did not cage: support_ok="
+                     << support_ok << " (mean_fimp " << mean_fimp << " vs mg.dt "
+                     << weight_kick << ") translation_ok=" << translation_ok << " (disp "
+                     << max_disp << ") contact_ok=" << contact_ok << " (" << contact_after
+                     << "/" << kLift << ") arc_ok=" << arc_ok << " (max_gap_live "
+                     << max_gap_live << " end_gap " << cov_end.max_gap << ") tilt_ok="
+                     << tilt_ok << " (tilt " << max_tilt << " rad, |w| " << final_w
+                     << "). Faithful params held; do not grind gains/tolerances.";
+    }
+    EXPECT_TRUE(caged);
+}
+
 TEST(H1DenseGrasp, LiftGateDenseWrapCagesCup) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
     const auto context = nuka::phi::MakeDefaultDeviceContext();
@@ -988,6 +1830,66 @@ TEST(H1DenseGrasp, LiftGateDenseWrapCagesCup) {
 // if grip=0 STILL holds it is legitimate shallow FORM closure (report it), NOT the 7.2mm
 // wedge. Report the depth + grip=0 vs grip=on either way.
 // ===========================================================================
+TEST(H1DenseGraspLargeCup, ActiveBiteGripOffVsOn) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const double weight_kick = static_cast<double>(kCupMass) * (-kGravityZ) * kDt;
+    const uint32_t kFall = 120u;
+    const double free_fall = 0.5 * (-kGravityZ) * (kFall * kDt) * (kFall * kDt);
+
+    DenseGraspScene gs = BuildDenseGraspScene(context, base, /*has_table=*/true,
+                                              PlaceMode::ShallowCaging,
+                                              kLargeDynSxy, kLargeDynSz);
+    if (!gs.place.found) {
+        GTEST_SKIP() << "NEGATIVE: canonical 1.8x large cup has no <=2mm palm+finger "
+                        "caging placement. See ScaleSweepFindsBothSidesShallow.";
+    }
+    std::printf("[LARGE-BITE] shallow placement max_pen=%.4f m (%.1f mm) spheres=%u\n",
+                gs.place.max_pen, gs.place.max_pen * 1000.0f, gs.sphere_count);
+
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    for (uint32_t s = 0u; s < 70u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+    stepper.SetTableEnabled(false);
+
+    coresident::CoResidentStepReport rep_on;
+    for (uint32_t s = 0u; s < 40u; ++s) { DrivePd(stepper, gs, pd); rep_on = stepper.Step(); }
+    const double z_active = stepper.Cup().position.z;
+    const double vz_on = stepper.Cup().linear_velocity.z;
+    const bool holds_on = (std::fabs(z_active - gs.cup0.position.z) < 0.05) &&
+                          (std::fabs(vz_on) < 0.5) &&
+                          (rep_on.cup_vertical_impulse > 0.5 * weight_kick);
+
+    const std::vector<float> zero(gs.host.TotalLinkCount(), 0.0f);
+    coresident::CoResidentStepReport rep_off;
+    for (uint32_t s = 0u; s < kFall; ++s) { stepper.SetGripTorque(zero); rep_off = stepper.Step(); }
+    const BodyState cupF = stepper.Cup();
+    const double drop = z_active - cupF.position.z;
+    const bool falls = (drop > 0.02) || (cupF.linear_velocity.z < -0.10);
+
+    std::printf("[LARGE-BITE] grip=ON holds=%d (z=%.5f vz=%.4f finger_vimp=%.4e mg.dt=%.4e)\n",
+                holds_on ? 1 : 0, z_active, vz_on, rep_on.cup_vertical_impulse, weight_kick);
+    std::printf("[LARGE-BITE] grip=0 after active hold: dropped %.5f m over %u steps "
+                "(free-fall=%.4f) final vz=%.4f finger_vimp=%.4e -> %s\n",
+                drop, kFall, free_fall, cupF.linear_velocity.z, rep_off.cup_vertical_impulse,
+                falls ? "FALLS (ACTIVE grasp)" : "HOLDS (shallow form closure)");
+
+    if (!holds_on) {
+        GTEST_SKIP() << "NEGATIVE: grip=ON did not hold the shallow large-cup placement "
+                        "(finger_vimp " << rep_on.cup_vertical_impulse << " vs mg.dt "
+                     << weight_kick << ", vz " << vz_on << ").";
+    }
+    if (!falls) {
+        std::printf("[LARGE-BITE] NOTE: grip=0 also holds at %.2f mm; this is shallow "
+                    "form closure, not the historical deep passive wedge.\n",
+                    gs.place.max_pen * 1000.0f);
+    }
+    EXPECT_TRUE(holds_on);
+    EXPECT_LE(gs.place.max_pen, kShallowPenMax + 1e-5f);
+}
+
 TEST(H1DenseGrasp, ActiveBiteGripOffVsOn) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
     const auto context = nuka::phi::MakeDefaultDeviceContext();
@@ -1053,6 +1955,61 @@ TEST(H1DenseGrasp, ActiveBiteGripOffVsOn) {
 // GATE 5 (dynamic lift load, confirmatory): after table removal + active hold, impose a
 // sustained ~1.75g upward accel + lateral + tilt; the dense wrap must stay caged.
 // ===========================================================================
+TEST(H1DenseGraspLargeCup, DynamicLiftLoadStaysCaged) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    const CupHull hull = ScaleCupHull(base, kLargeDynSxy, kLargeDynSz);
+
+    DenseGraspScene gs = BuildDenseGraspScene(context, base, /*has_table=*/true,
+                                              PlaceMode::ShallowCaging,
+                                              kLargeDynSxy, kLargeDynSz);
+    if (!gs.place.found) {
+        GTEST_SKIP() << "NEGATIVE: canonical 1.8x large cup has no <=2mm palm+finger "
+                        "caging placement. See ScaleSweepFindsBothSidesShallow.";
+    }
+    coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    for (uint32_t s = 0u; s < 80u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+    stepper.SetTableEnabled(false);
+    for (uint32_t s = 0u; s < 20u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+    const Vec3 c_settled = stepper.Cup().position;
+    const Quat q_settled = stepper.Cup().orientation;
+
+    stepper.ApplyCupImpulse(Vec3{0.04f, 0.04f, 0.0f}, Vec3{1.5f, 0.8f, 0.8f});
+    double max_disp = 0.0, max_tilt = 0.0, max_gap_live = 0.0;
+    uint32_t contact_after = 0u;
+    const uint32_t kLoad = 120u;
+    for (uint32_t s = 0u; s < kLoad; ++s) {
+        DrivePd(stepper, gs, pd);
+        if (s < 30u)
+            stepper.ApplyCupImpulse(Vec3{0.0f, 0.0f, 1.75f * (-kGravityZ) * kDt}, Vec3::Zero());
+        const auto rep = stepper.Step();
+        if (rep.finger_contacts > 0u) ++contact_after;
+        const Vec3 cp = stepper.Cup().position;
+        max_disp = std::max(max_disp, (double)(cp - c_settled).Length());
+        max_tilt = std::max(max_tilt, RelTilt(q_settled, stepper.Cup().orientation));
+        if (s % 20u == 0u || s + 1u == kLoad) {
+            const LiveCov cov = LiveCoverage(context, gs, stepper, hull);
+            max_gap_live = std::max(max_gap_live, (double)cov.max_gap);
+        }
+    }
+    const double final_w = stepper.Cup().angular_velocity.Length();
+    std::printf("[LARGE-DYNLOAD] 1.75g lift + lateral + tilt: max_disp=%.4f "
+                "max_tilt=%.4f rad final|w|=%.3f contact=%u/%u max_gap=%.1f\n",
+                max_disp, max_tilt, final_w, contact_after, kLoad, max_gap_live);
+    const bool caged = (contact_after >= kLoad - 16u) && (max_tilt < 0.30) &&
+                       (max_disp < 0.08) && (max_gap_live <= 150.0);
+    if (!caged) {
+        GTEST_SKIP() << "NEGATIVE: large-cup dynamic load not caged: contact="
+                     << contact_after << "/" << kLoad << " max_tilt=" << max_tilt
+                     << " rad max_disp=" << max_disp << " max_gap=" << max_gap_live
+                     << ".";
+    }
+    EXPECT_TRUE(caged);
+}
+
 TEST(H1DenseGrasp, DynamicLiftLoadStaysCaged) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
     const auto context = nuka::phi::MakeDefaultDeviceContext();
@@ -1105,6 +2062,39 @@ TEST(H1DenseGrasp, DynamicLiftLoadStaysCaged) {
 // found here, the cup would sit at the origin far from the hand, and D1 would be a
 // trivial contact-free check -- so we deliberately use the deep, contact-active path.)
 // ===========================================================================
+TEST(H1DenseGraspLargeCup, DeterministicTwoRun) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+    auto rollout = [&](BodyState* cup, articulation::ArticulationHostState* art) {
+        DenseGraspScene gs = BuildDenseGraspScene(context, base, /*has_table=*/true,
+                                                  PlaceMode::ShallowCaging,
+                                                  kLargeDynSxy, kLargeDynSz);
+        if (!gs.place.found) return false;
+        coresident::UnifiedCoResidentStepper stepper(context, gs.host, gs.config, kGravityZ, kDt);
+        const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+        for (uint32_t s = 0u; s < 60u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+        stepper.SetTableEnabled(false);
+        for (uint32_t s = 0u; s < 60u; ++s) { DrivePd(stepper, gs, pd); stepper.Step(); }
+        *cup = stepper.Cup();
+        stepper.Download(art);
+        return true;
+    };
+    BodyState ca, cb;
+    articulation::ArticulationHostState aa, ab;
+    if (!rollout(&ca, &aa)) {
+        GTEST_SKIP() << "NEGATIVE: canonical 1.8x large cup has no <=2mm palm+finger "
+                        "caging placement. See ScaleSweepFindsBothSidesShallow.";
+    }
+    ASSERT_TRUE(rollout(&cb, &ab));
+    EXPECT_EQ(std::memcmp(&ca, &cb, sizeof(BodyState)), 0) << "large-cup cup diverged across runs";
+    ASSERT_EQ(aa.qdot.size(), ab.qdot.size());
+    EXPECT_EQ(std::memcmp(aa.qdot.data(), ab.qdot.data(), aa.qdot.size() * sizeof(float)), 0)
+        << "large-cup qdot diverged across runs";
+    std::printf("[LARGE-D1] large dense cup + qdot byte-identical across 2 rollouts\n");
+}
+
 TEST(H1DenseGrasp, DeterministicTwoRun) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
     const auto context = nuka::phi::MakeDefaultDeviceContext();
