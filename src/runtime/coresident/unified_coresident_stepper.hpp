@@ -133,6 +133,13 @@ struct CoResidentStepReport {
     // dropped contacts vs pivot). cup_vertical_impulse == normal + friction parts.
     double   finger_vimpulse_normal = 0.0;    // Σ over finger NORMAL rows of λ*j_z.
     double   finger_vimpulse_friction = 0.0;  // Σ over finger FRICTION rows of λ*j_z.
+
+    // ----- S3 stand-mode fields (only populated in stand mode) --------------------
+    // Σ over EVERY foot NORMAL row of λ (the total upward normal impulse the ground
+    // delivers to the feet). At a steady stand this balances the robot weight kick
+    // m_total*g*dt -- the contact-model support discriminator (compliant vs Baumgarte).
+    double   foot_normal_impulse_sum = 0.0;
+    uint32_t foot_normal_rows = 0u;   // # foot NORMAL rows this step (== contact count).
 };
 
 // The full co-resident state, mechanical-energy probe inputs included. KE/PE use a
@@ -213,6 +220,45 @@ struct GraspConfig {
     uint32_t           table_broadphase_id = 8500u;  // distinct from cup + every link id.
 };
 
+// ===========================================================================
+// S3 STANDING / DEPLOY mode: feet<->static-ground through the unified spine.
+// ===========================================================================
+// The TRANSFER-SMOKE deploy path. Where StepGrasp() pinches a MOVABLE cup with N
+// fingertips, StepStand() presses N FOOT SPHERES onto a STATIC GROUND PLANE -- the
+// articulation<->STATIC contact (ArticulationChainJ <-> StaticNull, the EXACT row
+// class the C5c-1 foot-ground subsume test validated single-shot). It reuses the
+// SAME machinery as StepGrasp (DRIVE-torque stage 0 via LaunchApplyTorqueDriveKernels,
+// FK foot centers, the resolver-decoupled narrowphase, EmitCompliantContactRows, the
+// chain-J reaction arm, UnifiedSolve) but: (a) the ground side is a +Z plane (reuse
+// GroundPrim / MakeGroundRef), (b) there is NO movable rigid body (bodies empty,
+// body_count=0, coloring key 0+0 -- the subsume recipe), (c) condim=3 so the feet
+// have FRICTION (don't slip). The W1a Step() + StepGrasp() are byte-for-byte unchanged.
+
+// One foot collision sphere on an articulation ankle link (mirrors CoResidentFingertip
+// but contacts the STATIC ground, not a movable cup). A foot polygon is N of these
+// (e.g. 2 spheres per ankle -- toe + heel -- on a 2-foot biped == the 4-corner polygon).
+struct CoResidentFootSphere {
+    uint32_t   link = ~0u;          // the ArticulationLink handle (ankle link).
+    math::Vec3 local_offset{};      // sphere center in the ankle-link frame.
+    float      radius = 0.0f;
+    uint32_t   broadphase_handle = ~0u;  // UNIQUE per sphere (resolver picks geometry);
+                                         // the chain-J uses `link` (the real ankle link).
+};
+
+// The STANDING config: N foot spheres on a static +Z ground, condim=3 friction, a
+// DRIVE-torque path (the balance controller drives the legs through SetGripTorque).
+struct StandConfig {
+    std::vector<CoResidentFootSphere> feet;   // the foot polygon (toe/heel per ankle).
+    CoResidentGround                  ground; // static +Z plane (foot bottoms rest here).
+    // The per-DEVICE-LINK drive torque (length == total link count); re-applied to tau
+    // each StepStand() BEFORE ABA (the SAME idempotent drive path as the grasp grip).
+    // Overwrite it each step from the host balance law via SetGripTorque.
+    std::vector<float> drive_torque;          // per device link.
+    std::vector<float> drive_force_limits;    // per device link (0 -> no clamp).
+    float              friction_mu = 0.8f;    // per-foot isotropic friction (no slip).
+    uint32_t           condim      = 3u;      // 3 -> normal + 4 friction spokes.
+};
+
 // The stepper. Owns the GPU articulation buffers + the host box; advances both in
 // lockstep. The articulation is uploaded once at construction and stepped in
 // place; Download() snapshots q/qdot/base_pose/link_velocity back.
@@ -235,6 +281,16 @@ public:
     UnifiedCoResidentStepper(const phi::DeviceContext& context,
                              const articulation::ArticulationHostState& host,
                              const GraspConfig& grasp,
+                             float gravity_z, float dt);
+
+    // S3 STANDING constructor: N foot spheres on a STATIC +Z ground + condim=3 friction
+    // + a DRIVE-torque path (the balance controller). Advances a FLOATING-BASE
+    // articulation in lockstep with the foot<->ground contact through the unified spine.
+    // Reuses the SAME Step() machinery as the grasp path; the foot/box/cup members stay
+    // inert (the W1a + grasp paths never run in stand mode). NO movable rigid body.
+    UnifiedCoResidentStepper(const phi::DeviceContext& context,
+                             const articulation::ArticulationHostState& host,
+                             const StandConfig& stand,
                              float gravity_z, float dt);
 
     // Advance ONE step: ComputeAccelerations -> velocity integrate (artic + box) ->
@@ -308,6 +364,16 @@ private:
     // integrate (artic + cup) -> N fingertip<->cup contacts through the spine (NO
     // table) -> position integrate. The cup is held by finger friction alone.
     CoResidentStepReport StepGrasp();
+
+    // ----- S3 stand mode --------------------------------------------------------
+    bool         stand_mode_ = false;  // false -> W1a/grasp paths.
+    StandConfig  stand_;               // the standing config (feet/ground/drive/...).
+
+    // Run ONE stand step: re-apply the drive torque (the balance law) -> ABA ->
+    // velocity integrate (floating base) -> N foot<->STATIC-ground contacts through
+    // the spine (condim=3 friction, NO movable body) -> position integrate. The
+    // contact recoils into the floating base through the 18-wide foot chain-J.
+    CoResidentStepReport StepStand();
 
     // Advance the box pose by one symplectic position step (position += vel*dt +
     // orientation from angular vel). NO contact physics here -- the box<->ground

@@ -257,6 +257,40 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
     table_enabled_ = grasp_.has_table;
 }
 
+// ---------------------------------------------------------------------------
+// S3 STANDING constructor: N foot spheres on a STATIC +Z ground + condim=3 friction
+// + a DRIVE-torque balance path. The foot/box/cup members stay default (inert);
+// stand_mode_ routes Step() to StepStand(). NO movable rigid body (box_state_ stays
+// inv_mass=0 -> every box/cup integrate self-inerts).
+// ---------------------------------------------------------------------------
+UnifiedCoResidentStepper::UnifiedCoResidentStepper(
+    const phi::DeviceContext& context,
+    const articulation::ArticulationHostState& host, const StandConfig& stand,
+    float gravity_z, float dt)
+    : context_(context),
+      host_proto_(host),
+      gravity_z_(gravity_z),
+      dt_(dt),
+      stand_mode_(true),
+      stand_(stand) {
+    device_ = articulation::UploadArticulationState(context_, host_proto_);
+    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    root_link_ = host_proto_.articulation_link_offset[0];
+    base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
+
+    // Upload the drive torque + force limits ONCE (re-applied each step via the SAME
+    // device drive seam SetGripTorque overwrites). The balance controller overwrites
+    // the torque every step from the Download'd state, so the initial values are just
+    // a zero seed sized to the device link count.
+    const uint32_t link_count = host_proto_.TotalLinkCount();
+    std::vector<float> torque = stand_.drive_torque;
+    torque.resize(link_count, 0.0f);
+    std::vector<float> limits = stand_.drive_force_limits;
+    limits.resize(link_count, 0.0f);
+    grip_torque_dev_ = nuka::phi::UploadVector(torque);
+    grip_limits_dev_ = nuka::phi::UploadVector(limits);
+}
+
 // The flat-qdot prefix-sum DOF index of a device link: Σ JointDofCount over the
 // articulation's links in [offset, link). Generic over fixed/floating roots.
 uint32_t UnifiedCoResidentStepper::DofIndexOf(uint32_t link) const {
@@ -268,6 +302,7 @@ uint32_t UnifiedCoResidentStepper::DofIndexOf(uint32_t link) const {
 }
 
 CoResidentStepReport UnifiedCoResidentStepper::Step() {
+    if (stand_mode_) return StepStand();
     if (grasp_mode_) return StepGrasp();
     CoResidentStepReport report;
     auto view = device_.View();
@@ -1024,6 +1059,239 @@ CoResidentStepReport UnifiedCoResidentStepper::StepGrasp() {
 
     report.cup_vz = box_state_.linear_velocity.z;
     report.cup_z = box_state_.position.z;
+    return report;
+}
+
+// ===========================================================================
+// S3 STANDING STEP: N foot spheres on a STATIC +Z ground (the deploy path).
+// ===========================================================================
+// Mirrors StepGrasp()'s stage order but: (a) the contact is foot(Sphere) x ground
+// (Plane) -- an ArticulationChainJ <-> StaticNull row, the C5c-1 subsume row class,
+// (b) there is NO movable rigid body (bodies empty, body_count=0, coloring key 0+0),
+// (c) condim=3 so the feet have friction (don't slip). The drive torque (the balance
+// law, set each step via SetGripTorque) is re-applied to tau BEFORE ABA, so the legs
+// are driven. The foot reaction recoils into the FLOATING BASE through the dof_stride-
+// wide foot chain-J (the same 18-wide-for-go2 base-inclusive Jacobian).
+CoResidentStepReport UnifiedCoResidentStepper::StepStand() {
+    CoResidentStepReport report;
+    auto view = device_.View();
+    const uint32_t link_count = host_proto_.TotalLinkCount();
+
+    // ----- stage 0: the DRIVE path. Re-apply the (balance-law) drive torque to tau. --
+    articulation::LaunchApplyTorqueDriveKernels(
+        context_, view, static_cast<const float*>(grip_torque_dev_.Data()),
+        static_cast<const float*>(grip_limits_dev_.Data()));
+
+    // ----- stage 1/2: ABA accelerations -> qddot (now WITH the drive tau). ---------
+    articulation::FeatherstoneAba::ComputeAccelerations(context_, view, gravity_z_);
+
+    // ----- stage 3: velocity integrate (articulation halves; NO movable body). -----
+    articulation::FeatherstoneAba::IntegrateVelocity(context_, view, dt_);
+    articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, view, dt_,
+                                                                 gravity_z_);
+
+    // ===== CONTACT PHASE (N feet <-> STATIC ground) ==========================
+    articulation::ArticulationHostState live = host_proto_;
+    articulation::DownloadArticulationState(device_, &live);
+    const std::vector<Transform> poses = DownloadWorldPoses(context_, device_, link_count);
+
+    // Each foot world center (from FK) + the direct (foot, ground) pairs. DIRECT-EMIT
+    // (the broadphase is proven by W1a/subsume; the gate's risk is the controller, not
+    // the broadphase). Side A = foot (ArticulationChainJ), side B = ground (StaticNull).
+    std::vector<Vec3> foot_centers(stand_.feet.size());
+    std::vector<CandidatePair> drive_pairs;
+    drive_pairs.reserve(stand_.feet.size());
+    for (size_t f = 0u; f < stand_.feet.size(); ++f) {
+        const CoResidentFootSphere& fs = stand_.feet[f];
+        const Transform& lp = poses[fs.link];
+        foot_centers[f] = lp.position + lp.rotation.Rotate(fs.local_offset);
+        CandidatePair p;
+        p.a.type = CollidableType::ArticulationLink;
+        p.a.react = ReactionProviderKind::ArticulationChainJ;
+        p.a.handle = fs.broadphase_handle;
+        p.b = MakeGroundRef(stand_.ground.broadphase_id);  // StaticWorld -> StaticNull.
+        drive_pairs.push_back(p);
+    }
+
+    // stage 6: narrowphase via the driver. foot(Sphere) x ground(Plane) -> the C3b
+    // analytical SpherePlane handler (the +Z plane reads its normal from frame.cy).
+    ShapeResolver resolve = [&](const CollidableRef& ref, ResolvedShape* out) -> bool {
+        if (ref.type == CollidableType::ArticulationLink) {
+            for (size_t f = 0u; f < stand_.feet.size(); ++f) {
+                if (stand_.feet[f].broadphase_handle == ref.handle) {
+                    out->type = scene::ShapeType::Sphere;
+                    out->prim = FootSpherePrim(foot_centers[f], stand_.feet[f].radius);
+                    out->geom = nullptr;
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (ref.type == CollidableType::StaticWorld &&
+            ref.handle == stand_.ground.broadphase_id) {
+            out->type = scene::ShapeType::Plane;
+            out->prim = GroundPrim(stand_.ground.height);  // +Z plane at ground height.
+            out->geom = nullptr;
+            return true;
+        }
+        return false;
+    };
+    std::vector<ContactManifold> manifolds;
+    nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
+    report.manifold_count = static_cast<uint32_t>(manifolds.size());
+
+    uint32_t foot_points = 0u;
+    for (const auto& m : manifolds) foot_points += m.point_count;
+    report.finger_contacts = foot_points;     // reuse: # foot contact points this step.
+    report.pair_found = foot_points > 0u;
+
+    if (manifolds.empty() || foot_points == 0u) {
+        // No contact -> the robot free-falls (a clean RED if the feet leave the ground).
+        articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+        return report;
+    }
+
+    // stage 7: compliant rows + sides (condim=3 -> normal + 4 friction spokes / point).
+    nuka::constraint::ContactRowComplianceInputs inputs;
+    inputs.vel = 0.0f;
+    inputs.invweight = 1.0f;
+    inputs.dt = dt_;
+    inputs.condim = stand_.condim;
+    RowBuffers rows;
+    std::vector<ContactRowSides> sides;
+    nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
+    report.row_count = rows.RowCount();
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r)
+        rows.materials[r].friction = stand_.friction_mu;
+    if (rows.RowCount() == 0u || sides.empty()) {
+        articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
+        return report;
+    }
+
+    const std::vector<float> minv =
+        InverseInertia(context_, live, gravity_z_, dof_stride_);
+    std::vector<float> chain_jacobians;  // one dof_stride-wide slot per foot row.
+
+    // ----- the flat dof_stride-wide qdot (prefix-sum packing). FloatingBase root ->
+    // base spatial v (omega-first) in [0..5]; each scalar joint in its own column. ---
+    std::vector<float> qdot(dof_stride_, 0.0f);
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
+        qdot[i] = live.link_velocity[root_link_].v[i];
+    }
+    for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
+        const uint32_t col = DofIndexOf(leg);
+        if (col < dof_stride_) qdot[col] = live.qdot[leg];
+    }
+    std::vector<float> qdot_before = qdot;
+
+    // ----- wire each row: the FOOT side (ArticulationChainJ) gets a chain-J slot +
+    // the SHARED coloring key body_count+art_index (== 0+0 == 0, so all feet serialize
+    // on the shared base DOFs -- the C5c-1 subsume recipe); the GROUND side (StaticNull)
+    // gets kInvalidBodyIndex (no reaction, no coloring conflict, no chain-J). There is
+    // NO movable body (body_count=0). -------------------------------------------------
+    const uint32_t kArtIndex = 0u;
+    const uint32_t body_count = 0u;  // ctx.state is empty (articulation-only contact).
+    std::vector<RowArticulationRefs> art_refs(rows.RowCount());
+    RowArticulationSide none_side{};
+    float max_depth = 0.0f, max_lambda = 0.0f;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+        const ContactRowSides& s = sides[r];
+        const bool a_art = s.a.react == ReactionProviderKind::ArticulationChainJ;
+        const bool b_art = s.b.react == ReactionProviderKind::ArticulationChainJ;
+        art_refs[r].a = none_side;
+        art_refs[r].b = none_side;
+        if (!(a_art || b_art)) continue;  // (cannot occur: every row has a foot side.)
+        const int foot_local = a_art ? 0 : 1;
+        const int static_local = a_art ? 1 : 0;
+        const RowJacobian6 j_foot =
+            rows.JacobianForRowBody(r, static_cast<uint32_t>(foot_local));
+        const Vec3 foot_dir = j_foot.linear;  // normal for the normal row, +/-tangent.
+        const Vec3 contact_point = s.contact_point;
+        // Map the foot's broadphase_handle back to its REAL device (ankle) link.
+        const uint32_t foot_handle = a_art ? s.a.handle : s.b.handle;
+        uint32_t foot_link = foot_handle;
+        for (size_t f = 0u; f < stand_.feet.size(); ++f) {
+            if (stand_.feet[f].broadphase_handle == foot_handle) {
+                foot_link = stand_.feet[f].link;
+                break;
+            }
+        }
+        const std::vector<float> chain_j =
+            FootChainJ(context_, live, poses, foot_link, contact_point, foot_dir,
+                       dof_stride_);
+        const uint32_t slot =
+            static_cast<uint32_t>(chain_jacobians.size() / dof_stride_);
+        chain_jacobians.insert(chain_jacobians.end(), chain_j.begin(), chain_j.end());
+        rows.body_indices[2u * r + static_cast<uint32_t>(foot_local)] =
+            body_count + kArtIndex;
+        rows.body_indices[2u * r + static_cast<uint32_t>(static_local)] =
+            nuka::constraint::kInvalidBodyIndex;
+        const RowArticulationSide foot_side{kArtIndex, slot};
+        art_refs[r].a = (foot_local == 0) ? foot_side : none_side;
+        art_refs[r].b = (foot_local == 1) ? foot_side : none_side;
+        max_depth = std::max(max_depth, rows.materials[r].position_error);
+    }
+
+    // ----- stage 10: the unified solve (ALL foot rows together; NO rigid body). ----
+    std::vector<BodyState> empty_bodies;  // articulation-only contact (the subsume case).
+    nuka::solver::SolverConfig cfg;
+    cfg.velocity_iterations = 64u;
+    cfg.position_iterations = 0u;
+    cfg.slop = 0.0f;
+    cfg.baumgarte = 0.0f;
+    nuka::solver::SolveContext ctx;
+    ctx.rows = &rows;
+    ctx.state = &empty_bodies;
+    ctx.sides = &sides;
+    ctx.dt = dt_;
+    ctx.articulation.art_refs = &art_refs;
+    ctx.articulation.chain_jacobians =
+        chain_jacobians.empty() ? nullptr : &chain_jacobians;
+    ctx.articulation.inertia_m_inv = &minv;
+    ctx.articulation.qdot = &qdot;
+    ctx.articulation.dof_stride = dof_stride_;
+    nuka::solver::UnifiedSolve(ctx, cfg);
+
+    // ----- read back the report metrics (max + Σ foot normal impulse + penetration). -
+    double normal_impulse_sum = 0.0;
+    uint32_t normal_rows = 0u;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+        if (!(rows.rows[r].flags & nuka::constraint::row_flags::Friction)) {
+            max_lambda = std::max(max_lambda, rows.rows[r].lambda);
+            normal_impulse_sum += static_cast<double>(rows.rows[r].lambda);
+            ++normal_rows;
+        }
+    }
+    report.lambda = max_lambda;
+    report.contact_depth = max_depth;
+    report.foot_normal_impulse_sum = normal_impulse_sum;
+    report.foot_normal_rows = normal_rows;
+    double dn = 0.0;
+    for (uint32_t i = 0u; i < dof_stride_; ++i)
+        dn += std::fabs(static_cast<double>(qdot[i]) - qdot_before[i]);
+    report.qdot_delta_l1 = dn;
+
+    // ----- SCATTER the post-contact flat-qdot back to the device state -----------
+    for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
+        live.link_velocity[root_link_].v[i] = qdot[i];
+    }
+    for (uint32_t leg = root_link_ + 1u; leg < link_count; ++leg) {
+        const uint32_t col = DofIndexOf(leg);
+        if (col < dof_stride_) live.qdot[leg] = qdot[col];
+    }
+    device_.link_velocity.CopyFromHost(
+        live.link_velocity.data(),
+        live.link_velocity.size() * sizeof(articulation::LinkSpatialVel));
+    device_.qdot.CopyFromHost(live.qdot.data(), live.qdot.size() * sizeof(float));
+    context_.stream.Synchronize();
+    // ===== END CONTACT PHASE ================================================
+
+    // ----- stage 11: position integrate (articulation) with the POST-contact vel. --
+    view = device_.View();
+    articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
+    articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
     return report;
 }
 

@@ -2277,6 +2277,50 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_dense_grasp_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 S3: the TRANSFER-SMOKE GATE (full-DOF floating-base H1 STANDING) ---
+    # Cooks the FULL-DOF FLOATING-BASE h1_with_hand (skip mesh decompose, do NOT
+    # force-fix the base), seats it at the bent stance on 4 foot spheres, and runs the
+    # PORTED h1_balance_gate.py controller (CoP ankle strategy + posture PD on legs +
+    # held torso/arms/fingers, clamped to the MJCF limits) through the NEW StepStand()
+    # path (N foot spheres <-> static ground, condim=3 friction, art<->static rows). The
+    # S3 gate: does the SAME controller that stood the batched reduced-DOF H1 ALSO stand
+    # the full-DOF articulated H1 in the compliant deploy world? Additive parallel TU;
+    # the grasp gates in test_h1_dense_grasp.cpp are LEFT INTACT. Same dep set + the
+    # contact_stream_driver.cpp the contact path needs.
+    add_executable(nuka_h1_costand_transfer_test
+        coresident/test_h1_costand_transfer.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_costand_transfer_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_costand_transfer_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_costand_transfer_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_costand_transfer_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_costand_transfer_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
     # The K2 proving pair (a particle pushes a free rigid body two-way through one
     # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
