@@ -49,3 +49,7 @@ Thumbs.db
 
 # rl_games training output (checkpoints / tb logs)
 runs/
+
+# spike-exported, regenerable artifacts (the SCRIPT is the source of truth):
+# bridge_export.py emits the flat MLP weights + golden triples here.
+python/spikes/out/
