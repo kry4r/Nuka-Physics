@@ -182,10 +182,14 @@ public:
     const std::vector<BatchedGraspEnvReport>& GraspReports() const {
         return grasp_reports_;
     }
-    // Snapshot the single-env gripper articulation host state (q / qdot / base_pose /
-    // link_velocity). For A1/A2 byte/tolerance comparison of the gripper joints. P2.3b
-    // makes this per-env. A no-op (leaves *out unchanged) when !has_grasp_.
-    void DownloadGripper(articulation::ArticulationHostState* out) const;
+    // Snapshot env e's gripper articulation host state (q / qdot / base_pose /
+    // link_velocity). For per-env byte/tolerance comparison of the gripper joints. A
+    // no-op (leaves *out unchanged) when !has_grasp_ or env >= env_count_.
+    void DownloadGripper(uint32_t env, articulation::ArticulationHostState* out) const;
+    // Convenience: env 0 (the N=1 case). Keeps the existing A1/A2 call sites unchanged.
+    void DownloadGripper(articulation::ArticulationHostState* out) const {
+        DownloadGripper(0u, out);
+    }
 
 private:
     const phi::DeviceContext& context_;
@@ -199,11 +203,16 @@ private:
     math::Vec3 box_half_extent_;
     float      ground_height_;
 
-    // ----- P2.3a articulation<->rigid GRASP (inert unless has_grasp_) ------------
-    // ONE persistent device-resident gripper articulation for the single env (P2.3b
-    // makes this a per-env vector + an env loop in ResolveBatchedGraspContact). The
-    // proto stays host-resident for the per-step InverseInertia / FootChainJ uploads
-    // (which need a fresh host snapshot, exactly as the oracle's `live` does).
+    // ----- P2.3a/P2.3b articulation<->rigid GRASP (inert unless has_grasp_) -------
+    // P2.3b: ONE persistent device-resident gripper articulation PER ENV (env_devices_,
+    // sized env_count_, each constructed from the SAME replicated proto). Per env e the
+    // grasp resolver applies the grip drive / ABA / IntegrateVelocity / downloads live
+    // state / FK poses / scatters the post-contact qdot on env_devices_[e]. The proto
+    // (env-invariant) stays host-resident for the per-step InverseInertia / FootChainJ
+    // uploads (which need a fresh host snapshot, exactly as the oracle's `live` does);
+    // the dof_stride is asserted uniform across envs (replicated proto -> it is), which
+    // is WHAT makes the env-major M^-1 (@ e*dof_stride^2) / qdot (@ e*dof_stride) tiling
+    // valid (the row solver indexes those buffers by art_index = e).
     bool       has_grasp_ = false;
     uint32_t   cup_local_index_ = 0u;
     uint32_t   dof_stride_  = 0u;
@@ -213,11 +222,11 @@ private:
     float      friction_mu_ = 0.6f;
     uint32_t   condim_      = 3u;
     articulation::ArticulationHostState gripper_proto_;      // refresh-able CPU mirror.
-    articulation::ArticulationDeviceBuffers gripper_device_; // the single-env GPU gripper.
+    std::vector<articulation::ArticulationDeviceBuffers> env_devices_;  // one GPU gripper per env.
     std::vector<CoResidentFingertip> fingertips_;
     CoResidentCup grasp_cup_;
-    phi::Buffer   grip_torque_dev_;   // per-link constant grip torque (device).
-    phi::Buffer   grip_limits_dev_;   // per-link drive force limits (device).
+    phi::Buffer   grip_torque_dev_;   // per-link constant grip torque (device, SHARED -- proto-invariant).
+    phi::Buffer   grip_limits_dev_;   // per-link drive force limits (device, SHARED -- proto-invariant).
     std::vector<BatchedGraspEnvReport> grasp_reports_;  // last-Step() per-env metrics.
 
     // The env-major rigid BodyState SoA: env e's bodies at [e*k, (e+1)*k). This is

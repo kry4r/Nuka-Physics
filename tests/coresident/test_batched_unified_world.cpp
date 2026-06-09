@@ -1461,4 +1461,227 @@ TEST(BatchedUnifiedWorldGrasp, Gate_BITE_GripOffCupFalls) {
         << "grip=0 cup is not accelerating downward -- not in free fall";
 }
 
+// ===========================================================================
+// P2.3b -- the N>1 grasp gates. The N=1 physics is PROVEN (A1/A2/HOLD/BITE above);
+// the ONLY new correctness surface is the BATCHING itself -- the bijection invariant
+// in action (cross-env finger rows carry DISJOINT keys total_body_count+e -> the row
+// coloring parallelizes them into N independent solves) + the env-major M^-1/qdot tile
+// placement (env e's tile @ e*dof_stride^2 / e*dof_stride). These gates prove batched
+// grasp == N independent N=1 grasps, BYTE-EXACT (same TU, disjoint per-env graphs color
+// identically per the greedy-in-index row scheduler).
+// ===========================================================================
+
+// Snapshot one env's full grasp state (cup BodyState + gripper q + qdot) for memcmp.
+struct GraspEnvSnapshot {
+    BodyState cup;
+    std::vector<float> q;
+    std::vector<float> qdot;
+};
+GraspEnvSnapshot SnapshotGraspEnv(const coresident::BatchedUnifiedWorld& world,
+                                  uint32_t env, uint32_t cup_local) {
+    GraspEnvSnapshot snap;
+    snap.cup = world.Body(env, cup_local);
+    articulation::ArticulationHostState art;
+    world.DownloadGripper(env, &art);
+    snap.q = art.q;
+    snap.qdot = art.qdot;
+    return snap;
+}
+// Byte-exact equality of two env snapshots (cup struct + q + qdot buffers).
+bool GraspEnvByteEqual(const GraspEnvSnapshot& a, const GraspEnvSnapshot& b) {
+    if (std::memcmp(&a.cup, &b.cup, sizeof(BodyState)) != 0) return false;
+    if (a.q.size() != b.q.size() ||
+        std::memcmp(a.q.data(), b.q.data(), a.q.size() * sizeof(float)) != 0)
+        return false;
+    if (a.qdot.size() != b.qdot.size() ||
+        std::memcmp(a.qdot.data(), b.qdot.data(), a.qdot.size() * sizeof(float)) != 0)
+        return false;
+    return true;
+}
+
+// A distinct per-env cup IC: a small x/y/z perturbation about the nominal grip pose so
+// every env's finger<->cup contact geometry differs (the cup stays in the pinch -> still
+// held, but the contact points / impulses are per-env distinct). Used by the per-env
+// independence gate.
+BodyState PerturbedGraspCup(const BodyState& seed, uint32_t e) {
+    BodyState cup = seed;
+    const float fe = static_cast<float>(e);
+    cup.position.x += 0.0008f * fe;   // sub-mm lateral nudge (changes which hull face).
+    cup.position.y += -0.0006f * fe;
+    cup.position.z += 0.0010f * fe;   // mm vertical nudge (changes the contact height).
+    return cup;
+}
+
+// ---------------------------------------------------------------------------
+// GATE PER-ENV INDEPENDENCE (the key new batching gate): N>=8 envs, each with a
+// DISTINCT cup IC. Each env e's full state (cup + gripper q/qdot) must be BYTE-EXACT
+// == a single-env (N=1) BatchedUnifiedWorld grasp run with env e's IC. Adjacent envs
+// must DIFFER. Proves batched grasp == N independent solves.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldGrasp, Gate_PerEnvIndependence_N8) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f,
+                                                      /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 8u;
+    const uint32_t kRun = 60u;
+
+    // The batched N=8 run: each env gets its own perturbed cup IC.
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    std::vector<BodyState> ic(kEnvs);
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        ic[e] = PerturbedGraspCup(gs.config.cup_state, e);
+        world.BodyMut(e, 0u) = ic[e];
+    }
+    for (uint32_t s = 0u; s < kRun; ++s) world.Step();
+
+    // Each env e must equal an INDEPENDENT N=1 grasp world seeded with env e's IC.
+    uint32_t held_envs = 0u;
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        coresident::BatchedUnifiedWorld solo(context, tmpl, 1u, kGraspGravityZ, kGraspDt);
+        solo.BodyMut(0u, 0u) = ic[e];
+        for (uint32_t s = 0u; s < kRun; ++s) solo.Step();
+
+        const GraspEnvSnapshot batched = SnapshotGraspEnv(world, e, 0u);
+        const GraspEnvSnapshot single = SnapshotGraspEnv(solo, 0u, 0u);
+        EXPECT_TRUE(GraspEnvByteEqual(batched, single))
+            << "env " << e << " (N=8 batched) was NOT byte-exact vs its own N=1 grasp run "
+               "-- batching cross-contamination (suspect env-major M^-1/qdot tile offsets)";
+        // Sanity: every env is still held (non-vacuous -- the perturbation kept the grip).
+        if (world.GraspReports()[e].finger_contacts > 0u) ++held_envs;
+    }
+    EXPECT_EQ(held_envs, kEnvs) << "a perturbed env lost the grip (gate vacuous)";
+
+    // Adjacent envs must DIFFER (distinct ICs -> distinct trajectories, no collapse).
+    for (uint32_t e = 1u; e < kEnvs; ++e) {
+        const GraspEnvSnapshot a = SnapshotGraspEnv(world, e, 0u);
+        const GraspEnvSnapshot b = SnapshotGraspEnv(world, e - 1u, 0u);
+        EXPECT_FALSE(GraspEnvByteEqual(a, b))
+            << "env " << e << " collapsed onto its neighbor (no per-env independence)";
+    }
+    std::printf("[GRASP PER-ENV] N=%u: every env byte-exact vs its own N=1 grasp run; "
+                "all held; adjacent envs differ\n", kEnvs);
+}
+
+// ---------------------------------------------------------------------------
+// GATE MIXED CONTACT/NO-CONTACT (catches the sparse env-major tile bug + the scatter
+// clobber bug): N envs where SOME hold the cup (in finger reach) and SOME have the cup
+// OUT of reach (placed far above the fingers -> no finger contact -> free-falls). Each
+// env must be BYTE-EXACT == its own N=1 run. This SPECIFICALLY exercises the env-major
+// minv/qdot placement WITH GAPS: if minv/qdot were sequentially appended, a held env
+// AFTER a no-contact env would read the wrong tile; if the scatter were unguarded, a
+// no-contact env's gripper would be clobbered with zero qdot.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldGrasp, Gate_MixedContactNoContact) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f,
+                                                      /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 8u;
+    const uint32_t kRun = 60u;
+
+    // Interleave held (even env) and no-contact (odd env) so a HELD env sits AFTER a
+    // NO-CONTACT env in the env-major order -- the layout that breaks a sequential
+    // (append-based) minv/qdot or an unguarded scatter.
+    auto is_held = [](uint32_t e) { return (e % 2u) == 0u; };
+    const float kCupZ0 = gs.config.cup_state.position.z;
+    auto make_ic = [&](uint32_t e) {
+        BodyState cup = gs.config.cup_state;
+        if (!is_held(e)) cup.position.z += 0.30f;  // 30 cm ABOVE the fingers -> no contact.
+        return cup;
+    };
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    std::vector<BodyState> ic(kEnvs);
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        ic[e] = make_ic(e);
+        world.BodyMut(e, 0u) = ic[e];
+    }
+    for (uint32_t s = 0u; s < kRun; ++s) world.Step();
+
+    // (1) Each env byte-exact vs its own N=1 run (held -> HOLD-style; no-contact -> BITE-
+    //     style free-fall). This is the env-major-tile + scatter-guard correctness proof.
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        coresident::BatchedUnifiedWorld solo(context, tmpl, 1u, kGraspGravityZ, kGraspDt);
+        solo.BodyMut(0u, 0u) = ic[e];
+        for (uint32_t s = 0u; s < kRun; ++s) solo.Step();
+        const GraspEnvSnapshot batched = SnapshotGraspEnv(world, e, 0u);
+        const GraspEnvSnapshot single = SnapshotGraspEnv(solo, 0u, 0u);
+        EXPECT_TRUE(GraspEnvByteEqual(batched, single))
+            << "MIXED env " << e << " (" << (is_held(e) ? "held" : "no-contact")
+            << ") was NOT byte-exact vs its own N=1 run -- the env-major M^-1/qdot tile "
+               "placement or the scatter guard is wrong (a held env after a no-contact "
+               "env read the wrong tile, OR a no-contact gripper was clobbered)";
+    }
+
+    // (2) Physical discrimination: held envs hold (small drift), no-contact envs free-fall.
+    const double free_fall = 0.5 * static_cast<double>(-kGraspGravityZ) *
+                             (kRun * static_cast<double>(kGraspDt)) *
+                             (kRun * static_cast<double>(kGraspDt));
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        const BodyState cup = world.Body(e, 0u);
+        const auto& rep = world.GraspReports()[e];
+        if (is_held(e)) {
+            EXPECT_GT(rep.finger_contacts, 0u) << "held env " << e << " lost the grip";
+            EXPECT_LT(std::fabs(cup.position.z - kCupZ0), 0.1 * free_fall)
+                << "held env " << e << " drifted like a free-fall";
+        } else {
+            EXPECT_EQ(rep.finger_contacts, 0u)
+                << "no-contact env " << e << " unexpectedly contacted";
+            const double drop = (kCupZ0 + 0.30) - cup.position.z;
+            EXPECT_GT(drop, 0.5 * free_fall)
+                << "no-contact env " << e << " did not free-fall (drop=" << drop << ")";
+        }
+    }
+    std::printf("[GRASP MIXED] N=%u (held=even, no-contact=odd): every env byte-exact vs "
+                "its own N=1 run; held envs hold, no-contact envs free-fall\n", kEnvs);
+}
+
+// ---------------------------------------------------------------------------
+// GATE GRASP D1 (two-run): two full N-env grasp rollouts, byte-exact (memcmp of the
+// whole env-major Bodies() + every env's gripper q/qdot).
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldGrasp, Gate_D1_DeterministicTwoRun_N8) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f,
+                                                      /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 8u;
+    const uint32_t kRun = 60u;
+
+    auto run = [&]() {
+        coresident::BatchedUnifiedWorld w(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+        for (uint32_t e = 0u; e < kEnvs; ++e)
+            w.BodyMut(e, 0u) = PerturbedGraspCup(gs.config.cup_state, e);
+        for (uint32_t s = 0u; s < kRun; ++s) w.Step();
+        std::vector<GraspEnvSnapshot> out(kEnvs);
+        for (uint32_t e = 0u; e < kEnvs; ++e) out[e] = SnapshotGraspEnv(w, e, 0u);
+        return out;
+    };
+
+    const std::vector<GraspEnvSnapshot> a = run();
+    const std::vector<GraspEnvSnapshot> b = run();
+    ASSERT_EQ(a.size(), b.size());
+    for (uint32_t e = 0u; e < kEnvs; ++e)
+        EXPECT_TRUE(GraspEnvByteEqual(a[e], b[e]))
+            << "GRASP D1: env " << e << " differed between two identical runs";
+    std::printf("[GRASP D1] N=%u: two identical grasp rollouts byte-exact (cup + q/qdot)\n",
+                kEnvs);
+}
+
 }  // namespace
