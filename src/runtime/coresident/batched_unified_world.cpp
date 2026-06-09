@@ -27,8 +27,9 @@
 #include "core/perf/perf_recorder.hpp"         // PerfRecorder (host wall-clock attribution)
 #include "collision/analytical_manifold.hpp"   // amf::PrimParams / BuildPrimFrame
 #include "collision/candidate_pair.hpp"        // CandidatePair / CollidableRef
-#include "collision/contact_stream_driver.hpp" // BuildContactManifolds / ResolvedShape
+#include "collision/contact_stream_driver.hpp" // BuildContactManifolds / ResolvedShape (ground path)
 #include "collision/convex_narrowphase.hpp"    // cvx::ConvexHullView (cup hull seam)
+#include "collision/gpu/narrowphase_grasp.hpp" // P2.4c: batched GPU grasp narrowphase launcher
 #include "constraint/contact_manifold.hpp"     // ContactManifold
 #include "constraint/contact_row_sides.hpp"    // ContactRowSides
 #include "constraint/reaction_provider.hpp"    // ReactionProviderKind
@@ -164,14 +165,9 @@ constexpr uint32_t kGroundHandle = 8000u;  // distinct from the box handle.
 // batched == real StepGrasp) catches any divergence. Copy verbatim; do not edit.
 // ===========================================================================
 
-// A sphere PrimParams at the fingertip world center (identity rotation; a sphere is
-// rotation-invariant). (UnifiedCoResidentStepper::FootSpherePrim, ~:154.)
-amf::PrimParams FootSpherePrim(const Vec3& center, float radius) {
-    amf::PrimParams p;
-    p.radius = radius;
-    p.frame.t = center;
-    return p;
-}
+// NOTE (P2.4c): the host FootSpherePrim helper was removed -- the grasp narrowphase now
+// builds the fingertip sphere prim INSIDE the GPU kernel (narrowphase_grasp.cu), from the
+// per-slot fingertip world center + radius. The ground path (box x plane) never used it.
 
 }  // namespace
 
@@ -658,67 +654,91 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     // impulse attribution). For N=1 there is one range; P2.3b keeps one per env.
     std::vector<std::pair<std::size_t, std::size_t>> env_row_range(env_count_, {0u, 0u});
 
+    // ----- P2.4c: BATCHED GPU narrowphase (fingertip Sphere x cup ConvexHull). -----------
+    // REPLACES the P2.4b per-env host BuildContactManifolds loop (the measured 90.9% at
+    // N=32). ONE kernel over ALL (env x fingertip) slots wraps the SAME HD-clean cvx::
+    // SphereHull the host dispatch calls (sphere_is_a=true). We gather every slot's sphere
+    // input (fingertip world center from the FK download + radius), the per-env cup world
+    // frame (host-baked -- BuildPrimFrame/Quat::Rotate are host-only), and the per-slot
+    // candidate side refs (a=fingertip ArticulationLink, b=cup RigidBody) the launcher uses
+    // for StampSides, then ONE launch + ONE download yields the per-env manifolds EXACTLY as
+    // host BuildContactManifolds would (StampSides + param merge applied in the launcher),
+    // modulo the ULP-scale SphereHull host-vs-device float delta the A2 gate (1e-5) absorbs.
+    // env_manifolds[e] holds env e's NON-EMPTY fingertip manifolds in fingertip order -- the
+    // SAME input the per-env row assembly fed before.
+    std::vector<std::vector<ContactManifold>> env_manifolds(env_count_);
+    {
+        // perf tag `narrowphase`: the batched-kernel prep (sphere inputs + cup frames) +
+        // the ONE launch + the ONE download + the host StampSides/merge. The whole grasp
+        // narrowphase cost lives under this tag so the re-measure honestly shows the
+        // host->GPU collapse (vs the P2.4b per-env host BuildContactManifolds).
+        ScopedWallTimer np_timer(perf_, "narrowphase");
+        const uint32_t nfinger = static_cast<uint32_t>(fingertips_.size());
+        const uint32_t cup_vcount = grasp_cup_.VertexCount();
+        if (nfinger > 0u && cup_vcount > 0u) {
+            // Per-env cup world frame (one entry / env, host-baked from the live cup pose).
+            std::vector<amf::PrimFrame> cup_frames(env_count_);
+            // Per-(env x fingertip) sphere slot inputs + side refs (fingertip order).
+            std::vector<nuka::collision::gpu::GraspSphereInput> inputs;
+            std::vector<CollidableRef> side_a, side_b;
+            inputs.reserve(static_cast<size_t>(env_count_) * nfinger);
+            side_a.reserve(inputs.capacity());
+            side_b.reserve(inputs.capacity());
+            CollidableRef cup_ref;
+            cup_ref.type = CollidableType::RigidBody;
+            cup_ref.react = ReactionProviderKind::RigidInvMass;
+            cup_ref.handle = grasp_cup_.broadphase_body_id;
+            for (uint32_t e = 0u; e < env_count_; ++e) {
+                const BodyState& cup = bodies_[BodyIndex(e, cup_local_index_)];
+                const Transform cup_pose{cup.position, cup.orientation};
+                cup_frames[e] = amf::BuildPrimFrame(cup_pose);
+                for (uint32_t f = 0u; f < nfinger; ++f) {
+                    const CoResidentFingertip& ft = fingertips_[f];
+                    const Transform& lp = env_poses[e][ft.link];
+                    nuka::collision::gpu::GraspSphereInput in;
+                    in.center = lp.position + lp.rotation.Rotate(ft.local_offset);
+                    in.radius = ft.radius;
+                    in.env_index = e;
+                    inputs.push_back(in);
+                    CollidableRef finger_ref;  // pair side A == fingertip (mirrors drive_pairs).
+                    finger_ref.type = CollidableType::ArticulationLink;
+                    finger_ref.react = ReactionProviderKind::ArticulationChainJ;
+                    finger_ref.handle = ft.broadphase_handle;
+                    side_a.push_back(finger_ref);
+                    side_b.push_back(cup_ref);
+                }
+            }
+            // ONE batched launch -> slot-indexed manifolds (one per (env x fingertip),
+            // env-major then fingertip; a no-contact slot has point_count==0).
+            std::vector<ContactManifold> flat;
+            nuka::collision::gpu::LaunchGraspSphereHullNarrowphase(
+                context_, inputs, cup_frames, grasp_cup_.hull_verts.data(), cup_vcount,
+                side_a, side_b, &flat);
+            // BUCKET the slot-indexed output back into per-env manifold lists. Slot
+            // e*nfinger+f is env e's fingertip f; skip a no-contact slot (point_count==0),
+            // mirroring host BuildContactManifolds' non-empty append + the fingertip order
+            // the per-env row assembly consumed before.
+            for (uint32_t e = 0u; e < env_count_; ++e) {
+                env_manifolds[e].reserve(nfinger);
+                for (uint32_t f = 0u; f < nfinger; ++f) {
+                    const ContactManifold& m = flat[static_cast<size_t>(e) * nfinger + f];
+                    if (m.point_count > 0u) env_manifolds[e].push_back(m);
+                }
+            }
+        }
+    }
+
     bool any_contact = false;
     for (uint32_t e = 0u; e < env_count_; ++e) {
         const uint32_t art_index = e;  // env e's articulation index (the M^-1/qdot key).
         BodyState& cup = bodies_[BodyIndex(e, cup_local_index_)];
 
-        // The cup convex-hull view in WORLD space (mesh-local verts + live cup pose).
-        const Transform cup_pose{cup.position, cup.orientation};
-        nuka::collision::cvx::ConvexHullView cup_hull;
-        cup_hull.verts = grasp_cup_.hull_verts.data();
-        cup_hull.vcount = grasp_cup_.VertexCount();
-        cup_hull.frame = amf::BuildPrimFrame(cup_pose);
-        if (cup_hull.vcount == 0u) continue;  // no cup geometry -> no contact this env.
+        if (grasp_cup_.VertexCount() == 0u) continue;  // no cup geometry -> no contact this env.
 
-        // Each fingertip world center (from FK) + the direct fingertip<->cup pairs.
-        std::vector<Vec3> finger_centers(fingertips_.size());
-        std::vector<CandidatePair> drive_pairs;
-        drive_pairs.reserve(fingertips_.size());
-        for (size_t f = 0u; f < fingertips_.size(); ++f) {
-            const CoResidentFingertip& ft = fingertips_[f];
-            const Transform& lp = env_poses[e][ft.link];
-            finger_centers[f] = lp.position + lp.rotation.Rotate(ft.local_offset);
-            CandidatePair p;
-            p.a.type = CollidableType::ArticulationLink;
-            p.a.react = ReactionProviderKind::ArticulationChainJ;
-            p.a.handle = ft.broadphase_handle;
-            p.b.type = CollidableType::RigidBody;
-            p.b.react = ReactionProviderKind::RigidInvMass;
-            p.b.handle = grasp_cup_.broadphase_body_id;
-            drive_pairs.push_back(p);
-        }
-
-        // stage 6: narrowphase. fingertip(Sphere) x cup(ConvexHull) -> the C3c Convex
-        // tier (the cvx::SphereHull closest-point special-case bypasses EPA).
-        ShapeResolver resolve = [&](const CollidableRef& ref,
-                                    ResolvedShape* out) -> bool {
-            if (ref.type == CollidableType::ArticulationLink) {
-                for (size_t f = 0u; f < fingertips_.size(); ++f) {
-                    if (fingertips_[f].broadphase_handle == ref.handle) {
-                        out->type = scene::ShapeType::Sphere;
-                        out->prim = FootSpherePrim(finger_centers[f],
-                                                   fingertips_[f].radius);
-                        out->geom = nullptr;
-                        return true;
-                    }
-                }
-                return false;
-            }
-            if (ref.type == CollidableType::RigidBody &&
-                ref.handle == grasp_cup_.broadphase_body_id) {
-                out->type = scene::ShapeType::ConvexHull;
-                out->geom = &cup_hull;  // the convex-hull seam (geom passthrough).
-                return true;
-            }
-            return false;
-        };
-        std::vector<ContactManifold> manifolds;
-        {
-            // perf tag `narrowphase`: per-env sphere(fingertip) x ConvexHull(cup) manifolds.
-            ScopedWallTimer np_timer(perf_, "narrowphase");
-            nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
-        }
+        // The per-env fingertip<->cup manifolds, produced by the ONE batched GPU narrowphase
+        // launch above (env e's NON-EMPTY slots in fingertip order). Replaces the P2.4b
+        // per-env host BuildContactManifolds.
+        std::vector<ContactManifold>& manifolds = env_manifolds[e];
 
         uint32_t finger_points = 0u;
         for (const auto& m : manifolds) finger_points += m.point_count;

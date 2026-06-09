@@ -19,6 +19,7 @@
 #include "collision/candidate_pair.hpp"        // CandidatePair / CollidableRef
 #include "collision/contact_stream_driver.hpp" // BuildContactManifolds / ResolvedShape
 #include "collision/convex_narrowphase.hpp"    // cvx::ConvexHullView (cup hull seam)
+#include "collision/gpu/narrowphase_grasp.hpp" // P2.4c: batched GPU grasp narrowphase launcher
 #include "constraint/contact_manifold.hpp"     // ContactManifold
 #include "constraint/contact_row_sides.hpp"    // ContactRowSides
 #include "constraint/reaction_provider.hpp"    // ReactionProviderKind
@@ -133,6 +134,7 @@ using nuka::collision::ShapeResolver;
 using nuka::constraint::CollidableRef;
 using nuka::constraint::CollidableType;
 using nuka::constraint::ContactManifold;
+using nuka::constraint::ContactPoint;
 using nuka::constraint::ContactRowSides;
 using nuka::constraint::ReactionProviderKind;
 using nuka::constraint::RowBuffers;
@@ -1014,7 +1016,9 @@ std::vector<float> RefInverseInertia(const nuka::phi::DeviceContext& context,
     m_inv.CopyToHost(out.data(), out.size() * sizeof(float));
     return out;
 }
-amf::PrimParams RefFootSpherePrim(const Vec3& center, float radius) {
+// P2.4c: no longer called (the ref now builds the fingertip sphere inside the GPU
+// kernel, like the batched world); kept as documented scaffolding -> maybe_unused.
+[[maybe_unused]] amf::PrimParams RefFootSpherePrim(const Vec3& center, float radius) {
     amf::PrimParams p;
     p.radius = radius;
     p.frame.t = center;
@@ -1087,56 +1091,51 @@ struct StandaloneGraspRef {
             RefDownloadWorldPoses(context, device, link_count);
 
         const Transform cup_pose{cup.position, cup.orientation};
-        cvx::ConvexHullView cup_hull;
-        cup_hull.verts = config.cup.hull_verts.data();
-        cup_hull.vcount = config.cup.VertexCount();
-        cup_hull.frame = amf::BuildPrimFrame(cup_pose);
+        const uint32_t cup_vcount = config.cup.VertexCount();
+        const bool has_geom = cup_vcount != 0u;
 
-        const bool has_geom = cup_hull.vcount != 0u;
+        // ----- P2.4c: the SAME batched GPU grasp narrowphase the BatchedUnifiedWorld runs
+        // (at N=1 here). Wiring the ref to the identical kernel launcher makes the A1 gate
+        // device-vs-device SAME-BINARY -> byte-exact (no gate edit). We build the per-slot
+        // sphere inputs (fingertip world centers from FK + radius), ONE cup world frame, and
+        // the per-slot side refs (a=fingertip, b=cup), then LaunchGraspSphereHullNarrowphase
+        // produces the slot-indexed manifolds; we bucket the non-empty slots in fingertip
+        // order, exactly as the host BuildContactManifolds output was consumed before. -----
         std::vector<Vec3> finger_centers(config.fingertips.size());
-        std::vector<CandidatePair> drive_pairs;
+        std::vector<ContactManifold> manifolds;
         if (has_geom) {
-            drive_pairs.reserve(config.fingertips.size());
+            std::vector<nuka::collision::gpu::GraspSphereInput> inputs;
+            std::vector<CollidableRef> side_a, side_b;
+            inputs.reserve(config.fingertips.size());
+            side_a.reserve(config.fingertips.size());
+            side_b.reserve(config.fingertips.size());
+            CollidableRef cup_ref;
+            cup_ref.type = CollidableType::RigidBody;
+            cup_ref.react = ReactionProviderKind::RigidInvMass;
+            cup_ref.handle = config.cup.broadphase_body_id;
             for (size_t f = 0u; f < config.fingertips.size(); ++f) {
                 const CoResidentFingertip& ft = config.fingertips[f];
                 const Transform& lp = poses[ft.link];
                 finger_centers[f] = lp.position + lp.rotation.Rotate(ft.local_offset);
-                CandidatePair p;
-                p.a.type = CollidableType::ArticulationLink;
-                p.a.react = ReactionProviderKind::ArticulationChainJ;
-                p.a.handle = ft.broadphase_handle;
-                p.b.type = CollidableType::RigidBody;
-                p.b.react = ReactionProviderKind::RigidInvMass;
-                p.b.handle = config.cup.broadphase_body_id;
-                drive_pairs.push_back(p);
+                nuka::collision::gpu::GraspSphereInput in;
+                in.center = finger_centers[f];
+                in.radius = ft.radius;
+                in.env_index = 0u;  // N=1: the single cup frame.
+                inputs.push_back(in);
+                CollidableRef finger_ref;
+                finger_ref.type = CollidableType::ArticulationLink;
+                finger_ref.react = ReactionProviderKind::ArticulationChainJ;
+                finger_ref.handle = ft.broadphase_handle;
+                side_a.push_back(finger_ref);
+                side_b.push_back(cup_ref);
             }
-        }
-
-        std::vector<ContactManifold> manifolds;
-        if (has_geom) {
-            ShapeResolver resolve = [&](const CollidableRef& ref,
-                                        ResolvedShape* out) -> bool {
-                if (ref.type == CollidableType::ArticulationLink) {
-                    for (size_t f = 0u; f < config.fingertips.size(); ++f) {
-                        if (config.fingertips[f].broadphase_handle == ref.handle) {
-                            out->type = nuka::scene::ShapeType::Sphere;
-                            out->prim = RefFootSpherePrim(finger_centers[f],
-                                                          config.fingertips[f].radius);
-                            out->geom = nullptr;
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                if (ref.type == CollidableType::RigidBody &&
-                    ref.handle == config.cup.broadphase_body_id) {
-                    out->type = nuka::scene::ShapeType::ConvexHull;
-                    out->geom = &cup_hull;
-                    return true;
-                }
-                return false;
-            };
-            nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
+            const std::vector<amf::PrimFrame> cup_frames = {amf::BuildPrimFrame(cup_pose)};
+            std::vector<ContactManifold> flat;
+            nuka::collision::gpu::LaunchGraspSphereHullNarrowphase(
+                context, inputs, cup_frames, config.cup.hull_verts.data(), cup_vcount,
+                side_a, side_b, &flat);
+            for (const ContactManifold& m : flat)
+                if (m.point_count > 0u) manifolds.push_back(m);
         }
         uint32_t finger_points = 0u;
         for (const auto& m : manifolds) finger_points += m.point_count;
@@ -1682,6 +1681,125 @@ TEST(BatchedUnifiedWorldGrasp, Gate_D1_DeterministicTwoRun_N8) {
             << "GRASP D1: env " << e << " differed between two identical runs";
     std::printf("[GRASP D1] N=%u: two identical grasp rollouts byte-exact (cup + q/qdot)\n",
                 kEnvs);
+}
+
+// ---------------------------------------------------------------------------
+// P2.4c DIAGNOSTIC: the HOST(BuildContactManifolds)-vs-DEVICE(grasp kernel) contact
+// delta over the grasp fingertip-on-cup-wall poses. Confirms the GPU narrowphase math
+// matches the host SphereHull at ULP-scale (~1e-6) -- so A2's 1e-5 tolerance is amply
+// adequate and the (untouched) A1 byte-exactness is the genuinely-correct path, not a
+// masked mismatch. Sweeps the fingertip center across a penetration range against the
+// REAL cup hull, runs BOTH paths on the SAME inputs, and reports the max |Δ| on contact
+// point / normal / penetration. NOT a green-wash: a >=1e-3 delta would be a kernel /
+// input-layout bug (the task's HARD RULE 1), so we assert ULP-scale.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldGrasp, Diag_HostVsDeviceNarrowphaseDelta) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f, /*mu=*/0.8f);
+
+    // The cup hull (COM-centered mesh-local verts) at the live grasp cup pose (the cup
+    // sits at z=0.20, identity orientation -- the scene's nominal pre-grasp pose).
+    const Transform cup_pose{gs.config.cup_state.position, gs.config.cup_state.orientation};
+    const amf::PrimFrame cup_frame = amf::BuildPrimFrame(cup_pose);
+    cvx::ConvexHullView cup_hull;  // host view (BuildContactManifolds side).
+    cup_hull.verts = gs.config.cup.hull_verts.data();
+    cup_hull.vcount = gs.config.cup.VertexCount();
+    cup_hull.frame = cup_frame;
+
+    const float radius = gs.config.fingertips[0].radius;
+    const float cup_half_x = (hull.hi.x - hull.lo.x) * 0.5f;
+    // Sweep the +X-wall fingertip center from JUST touching to ~2.5mm deep (the shallow
+    // band where the SphereHull closest-point path is the load-bearing EPA bypass), plus
+    // a clear-of-cup pose (no contact -> both produce point_count=0).
+    const float kPens[] = {-0.001f, 0.0f, 0.0005f, 0.001f, 0.0015f, 0.002f, 0.0025f};
+
+    CollidableRef finger_ref;
+    finger_ref.type = CollidableType::ArticulationLink;
+    finger_ref.react = ReactionProviderKind::ArticulationChainJ;
+    finger_ref.handle = gs.config.fingertips[0].broadphase_handle;
+    CollidableRef cup_ref;
+    cup_ref.type = CollidableType::RigidBody;
+    cup_ref.react = ReactionProviderKind::RigidInvMass;
+    cup_ref.handle = gs.config.cup.broadphase_body_id;
+
+    double max_dpos = 0.0, max_dnrm = 0.0, max_dpen = 0.0;
+    uint32_t compared = 0u, contact_poses = 0u;
+    for (float pen : kPens) {
+        // Fingertip center on the +X wall: cup center.x + (cup_half_x + radius - pen).
+        const Vec3 center{cup_pose.position.x + cup_half_x + radius - pen,
+                          cup_pose.position.y, cup_pose.position.z};
+
+        // --- HOST path: BuildContactManifolds (sphere x ConvexHull). ---
+        std::vector<ContactManifold> host_m;
+        {
+            CandidatePair p;
+            p.a = finger_ref; p.b = cup_ref;
+            const CandidatePair pairs[1] = {p};
+            amf::PrimParams sphere;  // FootSpherePrim: center + radius, identity rotation.
+            sphere.radius = radius; sphere.frame.t = center;
+            ShapeResolver resolve = [&](const CollidableRef& ref, ResolvedShape* out) -> bool {
+                if (ref.type == CollidableType::ArticulationLink) {
+                    out->type = nuka::scene::ShapeType::Sphere; out->prim = sphere;
+                    out->geom = nullptr; return true;
+                }
+                if (ref.type == CollidableType::RigidBody && ref.handle == cup_ref.handle) {
+                    out->type = nuka::scene::ShapeType::ConvexHull; out->geom = &cup_hull;
+                    return true;
+                }
+                return false;
+            };
+            nuka::collision::BuildContactManifolds(pairs, resolve, &host_m);
+        }
+
+        // --- DEVICE path: the grasp kernel launcher (SAME center / radius / cup frame). ---
+        std::vector<ContactManifold> dev_slots;
+        {
+            std::vector<nuka::collision::gpu::GraspSphereInput> inputs(1);
+            inputs[0].center = center; inputs[0].radius = radius; inputs[0].env_index = 0u;
+            const std::vector<amf::PrimFrame> frames = {cup_frame};
+            const std::vector<CollidableRef> sa = {finger_ref}, sb = {cup_ref};
+            nuka::collision::gpu::LaunchGraspSphereHullNarrowphase(
+                context, inputs, frames, gs.config.cup.hull_verts.data(), cup_hull.vcount,
+                sa, sb, &dev_slots);
+        }
+        const ContactManifold& dev = dev_slots[0];  // slot-indexed: size==1.
+
+        const bool host_hit = !host_m.empty() && host_m[0].point_count > 0u;
+        const bool dev_hit = dev.point_count > 0u;
+        EXPECT_EQ(host_hit, dev_hit)
+            << "host/device DISAGREE on contact existence at pen=" << pen
+            << " (host=" << host_hit << " dev=" << dev_hit << ")";
+        if (!host_hit || !dev_hit) continue;
+        ++contact_poses;
+        ASSERT_EQ(host_m[0].point_count, dev.point_count);
+        for (uint32_t k = 0u; k < dev.point_count; ++k) {
+            const ContactPoint& h = host_m[0].points[k];
+            const ContactPoint& d = dev.points[k];
+            max_dpos = std::max<double>(max_dpos, (h.position - d.position).Length());
+            max_dnrm = std::max<double>(max_dnrm, (h.normal - d.normal).Length());
+            max_dpen = std::max<double>(max_dpen,
+                                        std::fabs(static_cast<double>(h.penetration) -
+                                                  static_cast<double>(d.penetration)));
+            ++compared;
+        }
+    }
+
+    std::printf("[GRASP NP DIAG] host(BuildContactManifolds) vs device(kernel) over %u "
+                "fingertip-on-wall poses (%u contact pts): max|Δpos|=%.3e m max|Δnormal|=%.3e "
+                "max|Δpen|=%.3e m\n",
+                static_cast<uint32_t>(sizeof(kPens) / sizeof(kPens[0])), compared,
+                max_dpos, max_dnrm, max_dpen);
+    ASSERT_GT(contact_poses, 0u) << "no contact pose produced a manifold -- diagnostic vacuous";
+    // HARD RULE 1: a >=1e-3 delta is a kernel / input-layout BUG, not a tolerance. The host
+    // and device run the SAME float ops (cvx::SphereHull HD), so the delta is ULP-scale.
+    EXPECT_LT(max_dpos, 1.0e-4) << "host-vs-device contact POINT delta is NOT ULP-scale -- "
+                                   "a real kernel/layout bug (the cup frame / verts disagree)";
+    EXPECT_LT(max_dnrm, 1.0e-4) << "host-vs-device contact NORMAL delta is NOT ULP-scale";
+    EXPECT_LT(max_dpen, 1.0e-4) << "host-vs-device PENETRATION delta is NOT ULP-scale";
 }
 
 }  // namespace
