@@ -33,17 +33,17 @@
 //          forward on obs_py, assert max|action_cpp - action_py| < 1e-5.
 //   BITE -- prove Gate 1 BITES: (i) a leg-index PERMUTATION in the obs-builder and
 //          (ii) a TRANSPOSED W1 each produce diffs >> 1e-5.
-//   C   -- GATE 2 (integration smoke, SOFT): deploy the MLP in the FULL co-resident
-//          world (Download -> obs_cpp -> MLP -> per-link leg torque -> SetGripTorque
-//          -> Step), hold the upper body with the SAME hold-PD as costand, ~1000
-//          steps, assert it STANDS on the S3 metrics. If it does NOT stand but
-//          Gate 1 passes, that is a DISTILLATION-QUALITY issue (report MLP-vs-
-//          handcoded torque RMS), NOT a bridge failure.
+//   C   -- GATE 2: deploy the exported PPO MLP in the FULL co-resident world
+//          (Download -> obs_cpp -> MLP -> normalized action -> per-link leg torque
+//          -> SetGripTorque -> Step), hold the upper body with the SAME hold-PD as
+//          costand, ~1000 steps, and assert S4 standing metrics: tilt<15deg,
+//          4/4 foot contacts, physical torque limits, stable height, no NaN.
 //
 // ADDITIVE: a NEW translation unit. It COMPILES the production stepper + the host
 // contact driver (same as test_h1_costand_transfer.cpp) but EDITS nothing. The
-// goldens/weights are produced by bridge_export.py (regenerable, gitignored); the
-// SCRIPT is the source of truth.
+// current PPO goldens/weights are produced by
+// examples/training/export_h1_tiny_actor_bridge.py (regenerable, gitignored); the
+// exporter is the source of truth for the normalized-action bridge artifact.
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
@@ -69,6 +69,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -86,7 +87,7 @@ constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kGravityZ = -9.81f;
 constexpr float kDt = 0.005f;
 
-// The shared obs/action contract dimensions (== bridge_export.py).
+// The shared obs/action contract dimensions (== export_h1_tiny_actor_bridge.py).
 constexpr uint32_t kObsDim = 32u;
 constexpr uint32_t kActDim = 10u;
 
@@ -337,7 +338,7 @@ TEST(H1BridgeSpike, PieceAStructuralLegCorrespondence) {
 // ===========================================================================
 TEST(H1BridgeSpike, Gate1BridgeParity) {
     if (!FileExists(kWeightsBin) || !FileExists(kGoldensTxt))
-        GTEST_SKIP() << "bridge artifacts missing (run python/spikes/bridge_export.py)";
+        GTEST_SKIP() << "bridge artifacts missing (run examples/training/export_h1_tiny_actor_bridge.py)";
 
     const auto mlp = nuka::test::TinyMlp<32, 64, 10>::Load(kWeightsBin);
     const auto goldens = LoadGoldens(kGoldensTxt);
@@ -378,7 +379,7 @@ TEST(H1BridgeSpike, Gate1BridgeParity) {
 // ===========================================================================
 TEST(H1BridgeSpike, Gate1BiteDetectsBrokenBridge) {
     if (!FileExists(kWeightsBin) || !FileExists(kGoldensTxt))
-        GTEST_SKIP() << "bridge artifacts missing (run python/spikes/bridge_export.py)";
+        GTEST_SKIP() << "bridge artifacts missing (run examples/training/export_h1_tiny_actor_bridge.py)";
 
     const auto mlp = nuka::test::TinyMlp<32, 64, 10>::Load(kWeightsBin);
     const auto goldens = LoadGoldens(kGoldensTxt);
@@ -618,19 +619,19 @@ std::vector<float> Gate2Obs(const StandScene& sc,
 }
 
 // ===========================================================================
-// GATE 2 (SOFT integration smoke): deploy the MLP in the FULL co-resident world.
+// GATE 2: deploy the MLP in the FULL co-resident world and enforce S4 standing.
 // ===========================================================================
 TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
     if (!FileExists(kFullMjcf)) GTEST_SKIP() << "h1_with_hand asset not available";
     if (!FileExists(kWeightsBin))
-        GTEST_SKIP() << "bridge weights missing (run python/spikes/bridge_export.py)";
+        GTEST_SKIP() << "bridge weights missing (run examples/training/export_h1_tiny_actor_bridge.py)";
 
     const auto context = nuka::phi::MakeDefaultDeviceContext();
     const auto mlp = nuka::test::TinyMlp<32, 64, 10>::Load(kWeightsBin);
     StandScene sc = BuildStandScene(context);
     const auto id = IdentityLegIndex();
 
-    std::printf("\n#### GATE 2 (SOFT): closed-loop MLP stand in the FULL co-resident world ####\n");
+    std::printf("\n#### GATE 2: closed-loop MLP stand in the FULL co-resident world ####\n");
     std::printf("  total mass=%.2f kg  seat z=%.4f  poly_cx(pinned)=%.4f  legs(by-name):",
                 sc.com.total, sc.seat_base_z, kPolyCx);
     for (uint32_t s = 0u; s < 10u; ++s) std::printf(" %u", sc.leg_links[s]);
@@ -638,7 +639,13 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
 
     coresident::UnifiedCoResidentStepper stepper(context, sc.host, sc.config,
                                                  kGravityZ, kDt);
-    const uint32_t kSteps = 1000u;
+    uint32_t policy_decimation = 1u;
+    if (const char* env_decim = std::getenv("NUKA_H1_POLICY_DECIMATION")) {
+        const int parsed = std::atoi(env_decim);
+        if (parsed > 0) policy_decimation = static_cast<uint32_t>(parsed);
+    }
+    const uint32_t kControlSteps = 1000u;
+    const uint32_t kSteps = kControlSteps * policy_decimation;
     const float half_len = 0.5f * (kFootToeX - kFootHeelX);
 
     articulation::ArticulationHostState st;
@@ -648,41 +655,51 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
     double tilt_max = 0.0, tilt_final = 0.0, com_ex_max = 0.0, min_edge = 1e9;
     uint32_t min_contacts = 4u, low_contact_steps = 0u;
     float peak_ankle = 0.0f, peak_knee = 0.0f, peak_hip = 0.0f;
+    std::array<double, 4> min_foot_gap = {1e9, 1e9, 1e9, 1e9};
+    std::array<double, 4> final_foot_gap = {0.0, 0.0, 0.0, 0.0};
     bool went_nan = false;
 
-    // For the SOFT distillation-quality report: accumulate MLP-vs-handcoded leg
-    // torque RMS. The handcoded reference = the SAME law the costand controller
-    // applies (posture PD legs + CoP ankle), computed here from the live full state.
-    // We accumulate TWO windows: (a) IN-DISTRIBUTION (tilt < 15deg == pre-fall, the
-    // standing regime the MLP was trained on) and (b) FULL (all steps). The
-    // in-distribution RMS is the real distillation-quality metric AND empirically
-    // confirms Gate2Obs (the full-state->obs projection, the one piece Gate 1 does
-    // NOT cover) is correct: you cannot track for ~200 steps on a corrupted obs. The
-    // FULL RMS is dominated by post-fall garbage (the ref over the same falling
-    // states is just as large) and is reported only for contrast.
+    // Diagnostic-only cross-world report: compare learned PPO leg torques against
+    // the old handcoded stand controller on the same live full-world states. This is
+    // NOT an acceptance metric; Gate 2 accepts on S4 behavior (upright, 4/4 contacts,
+    // torque limits, no NaN). The diagnostic is retained only as a contrast against
+    // the previous controller family.
     double sq_err = 0.0, sq_ref = 0.0;
     uint64_t n_pairs = 0u;
     double sq_err_id = 0.0, sq_ref_id = 0.0;
     uint64_t n_pairs_id = 0u;
 
+    const bool trace = std::getenv("NUKA_H1_BRIDGE_TRACE") != nullptr;
     Vec3 com_prev{0, 0, 0};
     bool have_com_prev = false;
+    std::vector<float> act(kActDim, 0.0f);
+    std::vector<float> obs(kObsDim, 0.0f);
     for (uint32_t k = 0u; k < kSteps; ++k) {
         stepper.Download(&st);
         const double tilt_pre = TiltDeg(st.base_pose[0].rotation);  // in-distribution gate.
-        const auto obs = Gate2Obs(sc, st, id);
-        const auto act = mlp.Forward(obs);   // 10 leg torques (contract order).
+        if ((k % policy_decimation) == 0u) {
+            obs = Gate2Obs(sc, st, id);
+            act = mlp.Forward(obs);   // 10 normalized leg actions (contract order).
+            for (float v : obs) went_nan = went_nan || !std::isfinite(v);
+            for (float v : act) went_nan = went_nan || !std::isfinite(v);
+            if (went_nan) {
+                std::printf("    t=%u !! nonfinite obs/action\n", k + 1);
+                break;
+            }
+        }
 
-        // Build the per-link torque vector: legs from the MLP (clamped to limits),
-        // hold-set from the SAME hold-PD as costand.
+        // Build the per-link torque vector: legs from normalized MLP actions scaled
+        // by the MJCF torque limits, then clamped to physical limits. The policy action
+        // is held for policy_decimation physics ticks. The deploy gate defaults to
+        // 200 Hz bridge inference; set NUKA_H1_POLICY_DECIMATION=4 to mirror training.
         std::vector<float> tau(st.TotalLinkCount(), 0.0f);
         for (uint32_t s = 0u; s < 10u; ++s) {
             const float lim = LegLimit(s);
-            float u = act[s];
+            float u = std::max(-1.0f, std::min(1.0f, act[s])) * lim;
             u = std::max(-lim, std::min(lim, u));
             tau[sc.leg_links[s]] = u;
             const uint32_t j = s % 5u;
-            const float au = std::fabs(act[s]);
+            const float au = std::fabs(u);
             if (j == 4u) peak_ankle = std::max(peak_ankle, au);
             else if (j == 3u) peak_knee = std::max(peak_knee, au);
             else peak_hip = std::max(peak_hip, au);
@@ -694,7 +711,7 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
             tau[l] = std::max(-lim, std::min(lim, u));
         }
 
-        // SOFT distillation-quality probe: the handcoded leg torque on THIS state
+        // Diagnostic probe: the handcoded leg torque on THIS state
         // (the SAME law the batched gate + costand controller apply: posture PD legs
         // + CoP ankle from world CoM, incl. the CoM-velocity damping term via a
         // finite-diff of the whole-body CoM across steps).
@@ -719,7 +736,8 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
                 else ref = kp[j] * (tgt[j] - st.q[l]) - kd[j] * st.qdot[l];
                 const float lim = LegLimit(s);
                 ref = std::max(-lim, std::min(lim, ref));
-                const float d = act[s] - ref;
+                const float mlp_tau = std::max(-1.0f, std::min(1.0f, act[s])) * lim;
+                const float d = mlp_tau - ref;
                 sq_err += static_cast<double>(d) * d;
                 sq_ref += static_cast<double>(ref) * ref;
                 ++n_pairs;
@@ -738,12 +756,32 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
         const double tilt = TiltDeg(st.base_pose[0].rotation);
         const double bz = st.base_pose[0].position.z;
         auto poses2 = ForwardKinematics(context, st);
+        for (size_t fi = 0u; fi < sc.config.feet.size() && fi < min_foot_gap.size(); ++fi) {
+            const auto& fs = sc.config.feet[fi];
+            const Vec3 fc = poses2[fs.link].position + poses2[fs.link].rotation.Rotate(fs.local_offset);
+            const double gap = static_cast<double>(fc.z - fs.radius - sc.config.ground.height);
+            min_foot_gap[fi] = std::min(min_foot_gap[fi], gap);
+            final_foot_gap[fi] = gap;
+        }
         const Vec3 com2 = WholeBodyCoM(sc.com, poses2);
         const double exv = com2.x - kPolyCx;
         const double edge = half_len - std::fabs(exv);
-        if (!std::isfinite(tilt) || !std::isfinite(bz)) {
+        if (!std::isfinite(tilt) || !std::isfinite(bz) || !std::isfinite(exv) ||
+            !std::isfinite(edge)) {
             went_nan = true;
-            std::printf("    t=%u !! NaN\n", k + 1);
+            std::printf("    t=%u !! nonfinite pose/com\n", k + 1);
+            break;
+        }
+        for (uint32_t s = 0u; s < 10u; ++s) {
+            const uint32_t l = sc.leg_links[s];
+            if (!std::isfinite(st.q[l]) || !std::isfinite(st.qdot[l])) went_nan = true;
+        }
+        const uint32_t root = sc.host.articulation_link_offset[0];
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            if (!std::isfinite(st.link_velocity[root].v[i])) went_nan = true;
+        }
+        if (went_nan) {
+            std::printf("    t=%u !! nonfinite joint/root velocity state\n", k + 1);
             break;
         }
         tilt_max = std::max(tilt_max, tilt);
@@ -756,10 +794,24 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
         min_contacts = std::min(min_contacts, rep.foot_normal_rows);
         if (rep.foot_normal_rows < 4u) ++low_contact_steps;
 
-        if ((k + 1u) % 100u == 0u || k < 4u) {
-            std::printf("    t=%4u tilt=%5.2f z=%+.4f com_ex=%+.4f edge=%+.4f "
+        if ((k + 1u) % (100u * policy_decimation) == 0u || k < 4u) {
+            std::printf("    t=%4u ctrl=%4u tilt=%5.2f z=%+.4f com_ex=%+.4f edge=%+.4f "
                         "contacts=%u/4 peak_an=%5.1f\n",
-                        k + 1, tilt, bz, exv, edge, rep.foot_normal_rows, peak_ankle);
+                        k + 1, (k + 1u) / policy_decimation, tilt, bz, exv, edge,
+                        rep.foot_normal_rows, peak_ankle);
+        }
+        if (trace && (k < 8u || (k + 1u) == 100u * policy_decimation ||
+                      (k + 1u) == kSteps)) {
+            std::printf("    [TRACE t=%u ctrl=%u] obs0_12=", k + 1u, (k + 1u) / policy_decimation);
+            for (uint32_t i = 0u; i < 12u; ++i) std::printf(" %.6f", obs[i]);
+            std::printf(" action=");
+            for (uint32_t i = 0u; i < kActDim; ++i) std::printf(" %.6f", act[i]);
+            std::printf(" q=");
+            for (uint32_t s = 0u; s < 10u; ++s) std::printf(" %.6f", st.q[sc.leg_links[s]]);
+            std::printf(" qd=");
+            for (uint32_t s = 0u; s < 10u; ++s) std::printf(" %.6f", st.qdot[sc.leg_links[s]]);
+            std::printf(" foot_gap=%.6f %.6f %.6f %.6f\n",
+                        final_foot_gap[0], final_foot_gap[1], final_foot_gap[2], final_foot_gap[3]);
         }
     }
 
@@ -773,6 +825,7 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
     const bool height_stable = std::fabs(base_z_final - base_z0) < 0.12 && base_z_sink < 0.12;
     const bool com_in_poly = min_edge > 0.0;
     const bool contacts_held = min_contacts >= 2u;
+    const bool contacts_4of4 = min_contacts >= 4u;
     const bool within_torque = peak_ankle <= 40.0f + 1e-2f && peak_knee <= 300.0f + 1e-2f
                                && peak_hip <= 200.0f + 1e-2f;
     const bool stood = upright && height_stable && com_in_poly && contacts_held;
@@ -783,57 +836,33 @@ TEST(H1BridgeSpike, Gate2ClosedLoopStandSoft) {
                 tilt_max, tilt_final, base_z0, base_z_final, base_z_min, base_z_sink,
                 com_ex_max, min_edge, min_contacts, low_contact_steps,
                 peak_ankle, peak_knee, peak_hip, went_nan ? 1 : 0);
-    std::printf("  => [GATE2] verdict: stood=%d within_torque=%d (upright=%d height=%d "
-                "com_in_poly=%d contacts=%d)\n",
-                stood ? 1 : 0, within_torque ? 1 : 0, upright ? 1 : 0,
-                height_stable ? 1 : 0, com_in_poly ? 1 : 0, contacts_held ? 1 : 0);
-    // The REAL distillation quality is the PYTHON in-distribution fit RMS (printed by
-    // bridge_export.py, ~0.056 N*m over the standing transient+steady). The Gate2
-    // MLP-vs-handcoded RMS below is a COARSE CROSS-WORLD DIAGNOSTIC, inflated by
-    // REFERENCE-RECONSTRUCTION mismatch (this ref applies CoP from step 0 -- no
-    // settle window -- and uses the PINNED poly center, where training used the live
-    // ankle-x; the x320 ankle gain magnifies small deltas) PLUS the OOD onset (by
-    // t~200 tilt~11deg + base sunk ~0.08m == the edge of the training distribution).
-    // No window makes it clean; it is NOT the distillation-quality metric and NOT the
-    // bridge verdict. Reported for contrast only.
-    std::printf("  => [GATE2 SOFT] MLP-vs-handcoded leg-torque RMS (cross-world "
-                "DIAGNOSTIC, NOT distillation quality): pre-fall window (tilt<15deg, "
-                "%llu steps) = %.2f N*m (ref %.2f) | FULL (%llu steps, post-fall "
-                "garbage) = %.1f N*m (ref %.1f). Inflated by reference-reconstruction "
-                "mismatch (no settle / pinned-vs-live poly center) + OOD onset. The "
-                "REAL distillation quality is the python in-distribution fit RMS "
-                "(~0.056 N*m, see bridge_export.py). Gate 1 is the bridge verdict.\n",
+    std::printf("  => [GATE2] verdict: stood=%d within_torque=%d contacts_4of4=%d "
+                "(upright=%d height=%d com_in_poly=%d contacts_ge2=%d)\n",
+                stood ? 1 : 0, within_torque ? 1 : 0, contacts_4of4 ? 1 : 0,
+                upright ? 1 : 0, height_stable ? 1 : 0, com_in_poly ? 1 : 0,
+                contacts_held ? 1 : 0);
+    std::printf("  => [GATE2] foot gap min/final (Ltoe,Lheel,Rtoe,Rheel) = "
+                "[%.4f/%.4f %.4f/%.4f %.4f/%.4f %.4f/%.4f] m\n",
+                min_foot_gap[0], final_foot_gap[0], min_foot_gap[1], final_foot_gap[1],
+                min_foot_gap[2], final_foot_gap[2], min_foot_gap[3], final_foot_gap[3]);
+    // This RMS is a coarse learned-policy-vs-legacy-controller diagnostic. It is
+    // intentionally separate from the hard S4 deploy-standing assertions below.
+    std::printf("  => [GATE2 diagnostic] learned-vs-handcoded leg-torque RMS "
+                "(cross-world diagnostic, NOT an acceptance metric): tilt<15deg "
+                "window (%llu steps) = %.2f N*m (ref %.2f) | full window "
+                "(%llu steps) = %.1f N*m (ref %.1f). Gate 1 + Gate 2 assertions "
+                "are the bridge/deploy verdict.\n",
                 static_cast<unsigned long long>(n_pairs_id / 10u), mlp_rms_id, ref_rms_id,
                 static_cast<unsigned long long>(n_pairs / 10u), mlp_rms, ref_rms);
 
     if (stood) {
         std::printf("  => [GATE2] STANDS: the bridged MLP closes the loop in the full world.\n");
     } else {
-        std::printf("  => [GATE2] does NOT stand. SOFTNESS RULE: Gate 1 (bridge) is the "
-                    "verdict; this is a DISTILLATION/OOD finding, NOT a bridge failure.\n"
-                    "     FAILURE MODE = behavior-cloning COVARIATE SHIFT (NOT an obs flaw). "
-                    "The obs is INFORMATION-SUFFICIENT for the law: world CoM_x and CoM_vx "
-                    "are reconstructable from (base pose, base spatial vel, leg qpos, leg "
-                    "qvel) via FK -- nothing is lost. The distilled MLP fits the law to "
-                    "~0.056 N*m RMS ON the law's OWN narrow rollout distribution, tracks the "
-                    "standing transient correctly (drove com_ex %+.4f->dead-centered, held "
-                    "4/4 contacts, tilt<11deg to ~t=200), then compounds tiny errors into "
-                    "OOD states the rollout never visited, extrapolates poorly there, and "
-                    "falls (~t=300). This is the canonical supervised-cloning failure that "
-                    "on-policy RL (PPO) fixes by TRAINING ON ITS OWN state distribution -- "
-                    "and crucially, because the obs is sufficient (not lossy), PPO with the "
-                    "SAME obs is SAFE; only BC's distribution coverage was the problem. That "
-                    "is exactly the campaign this gate green-lights.\n"
-                    "     Gate2Obs (the full-state->obs projection, the ONE piece Gate 1 "
-                    "does not cover by golden) is CONFIRMED CORRECT: (a) field-by-field it "
-                    "matches bridge_export.py assemble_obs (same fields/order/frame); (b) "
-                    "the base-velocity frame is the SAME engine link_velocity[root] both "
-                    "worlds read (C5c-1 byte-faithful); (c) behaviorally a corrupted obs "
-                    "could not actively drive CoM to the polygon center for ~200 steps.\n",
-                    -0.0447);  // the t=1 com_ex (printed in the per-step trace above).
+        std::printf("  => [GATE2] does NOT satisfy S4 deploy-standing metrics.\n");
     }
-    // SOFT gate: never fail the bridge on integration. Just report.
-    SUCCEED();
+    ASSERT_TRUE(stood);
+    ASSERT_TRUE(within_torque);
+    ASSERT_TRUE(contacts_4of4);
 }
 
 }  // namespace
