@@ -57,6 +57,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <numeric>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1800,6 +1803,361 @@ TEST(BatchedUnifiedWorldGrasp, Diag_HostVsDeviceNarrowphaseDelta) {
                                    "a real kernel/layout bug (the cup frame / verts disagree)";
     EXPECT_LT(max_dnrm, 1.0e-4) << "host-vs-device contact NORMAL delta is NOT ULP-scale";
     EXPECT_LT(max_dpen, 1.0e-4) << "host-vs-device PENETRATION delta is NOT ULP-scale";
+}
+
+// ===========================================================================
+// A1 RL SUBSTRATE GATES -- per-step per-env action injection + batched obs export +
+// per-env autoreset. These prove the 3 additive RL capabilities are REAL and batched
+// (not vacuous, not O(N)-sync). All asset-gated (SKIP if the cup hull is absent).
+// ===========================================================================
+
+// Build a flat env-major action vector (env_count*dof_stride) with a per-env per-DOF
+// torque produced by `gen(e,d)`. The grasp gripper has dof_stride==2 (two prismatic
+// finger joints), the SAME columns DofIndexOf maps the finger links to.
+std::vector<float> MakeActions(const coresident::BatchedUnifiedWorld& world,
+                               const std::function<float(uint32_t, uint32_t)>& gen) {
+    const uint32_t n = world.EnvCount();
+    const uint32_t d = world.ActionDim();
+    std::vector<float> a(static_cast<size_t>(n) * d, 0.0f);
+    for (uint32_t e = 0u; e < n; ++e)
+        for (uint32_t k = 0u; k < d; ++k) a[e * d + k] = gen(e, k);
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// GATE 2 (action is real): N>=4 envs driven with DISTINCT per-env actions. An env given
+// ZERO finger torque DROPS the cup (BITE-style); an env given the grip torque HOLDS it
+// (cup_z stable, force balance ~0). Swapping two envs' actions SWAPS their outcomes (the
+// action buffer is non-vacuous -- not a constant). The HOLD/BITE distinction is driven
+// PER-ENV through SetActions, NOT the template.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldA1, Gate2_ActionInjectionDrivesPerEnvDynamics) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    constexpr float kGripForce = 8.0f;
+    constexpr float kMu = 0.8f;
+    // IMPORTANT: build the template with grip_force=0 so the DEFAULT (template) action is
+    // ZERO -> the HOLD envs are held ONLY by the per-env SetActions torque, NOT the template.
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/0.0f, kMu);
+    const auto tmpl = MakeGraspTemplate(gs);
+    const double cup_z0 = gs.config.cup_state.position.z;
+
+    constexpr uint32_t kEnvs = 4u;  // envs 0,2 HOLD (grip torque); envs 1,3 BITE (zero).
+    const uint32_t kSteps = 100u;
+    auto hold_env = [](uint32_t e) { return (e % 2u) == 0u; };
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    // Per-env, per-DOF action: HOLD envs get +kGripForce on every finger DOF, BITE envs 0.
+    const auto actions = MakeActions(world, [&](uint32_t e, uint32_t) -> float {
+        return hold_env(e) ? kGripForce : 0.0f;
+    });
+    world.SetActions(actions.data(), actions.size());
+    for (uint32_t s = 0u; s < kSteps; ++s) world.Step();  // Step() applies the last actions.
+
+    const double free_fall = 0.5 * static_cast<double>(-kGraspGravityZ) *
+                             (kSteps * static_cast<double>(kGraspDt)) *
+                             (kSteps * static_cast<double>(kGraspDt));
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        const BodyState cup = world.Body(e, 0u);
+        const double drop = cup_z0 - cup.position.z;
+        std::printf("[A1 GATE2] env %u (%s): cup_z=%.5f drop=%.5f (free-fall=%.4f) "
+                    "contacts=%u vert_impulse=%.4e\n",
+                    e, hold_env(e) ? "HOLD" : "BITE", cup.position.z, drop, free_fall,
+                    world.GraspReports()[e].finger_contacts,
+                    world.GraspReports()[e].cup_vertical_impulse);
+        if (hold_env(e)) {
+            EXPECT_LT(std::fabs(drop), 0.1 * free_fall)
+                << "HOLD env " << e << " (driven by SetActions grip torque) dropped the cup";
+            EXPECT_GT(world.GraspReports()[e].finger_contacts, 0u)
+                << "HOLD env " << e << " lost the grip";
+        } else {
+            EXPECT_GT(drop, 0.5 * free_fall)
+                << "BITE env " << e << " (zero action) did NOT drop the cup -- the hold "
+                   "survives without per-env torque (action vacuous)";
+            EXPECT_LT(cup.linear_velocity.z, -1.0f)
+                << "BITE env " << e << " not accelerating down";
+        }
+    }
+
+    // Non-vacuity: SWAP envs 0 (HOLD) and 1 (BITE) actions in a FRESH world -> outcomes swap.
+    coresident::BatchedUnifiedWorld world2(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    const auto swapped = MakeActions(world2, [&](uint32_t e, uint32_t) -> float {
+        // env 0 now BITE (0), env 1 now HOLD (grip); 2,3 unchanged.
+        if (e == 0u) return 0.0f;
+        if (e == 1u) return kGripForce;
+        return hold_env(e) ? kGripForce : 0.0f;
+    });
+    world2.SetActions(swapped.data(), swapped.size());
+    for (uint32_t s = 0u; s < kSteps; ++s) world2.Step();
+    const double drop0 = cup_z0 - world2.Body(0u, 0u).position.z;  // now BITE -> big drop.
+    const double drop1 = cup_z0 - world2.Body(1u, 0u).position.z;  // now HOLD -> small drop.
+    std::printf("[A1 GATE2 SWAP] env0(now BITE) drop=%.5f  env1(now HOLD) drop=%.5f\n",
+                drop0, drop1);
+    EXPECT_GT(drop0, 0.5 * free_fall) << "swapped env0 did not start dropping (action buffer "
+                                         "not actually per-env -- vacuous)";
+    EXPECT_LT(std::fabs(drop1), 0.1 * free_fall)
+        << "swapped env1 did not start holding (action buffer not actually per-env)";
+}
+
+// ---------------------------------------------------------------------------
+// GATE 3 (obs export correctness): the batched ExportObsState output equals, per env, the
+// per-env DownloadGripper(env) values (q/qdot) within ULP, the fingertip_world_pos equals
+// the resolver's finger_centers (recomputed from DownloadGripper's link poses) within ULP,
+// and per-finger normal impulse is >0 for both fingers in a holding env, ~0 in a dropping
+// env, and sums to the aggregate cup_vertical_impulse within tolerance. (DownloadGripper is
+// the TEST ORACLE here, NOT the production obs path.)
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldA1, Gate3_BatchedObsExportMatchesPerEnvOracle) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f, /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 8u;  // mix: even envs HELD, odd envs out-of-reach (dropping).
+    const uint32_t kRun = 40u;
+    const float kCupZ0 = gs.config.cup_state.position.z;
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    auto is_held = [](uint32_t e) { return (e % 2u) == 0u; };
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        BodyState cup = gs.config.cup_state;
+        if (!is_held(e)) cup.position.z += 0.30f;  // out of finger reach -> no contact.
+        world.BodyMut(e, 0u) = cup;
+    }
+    // Run to one step BEFORE the export. The production resolver fills fingertip_world from
+    // the FK at the step-ENTRY q (before that step's IntegratePosition); a DownloadGripper
+    // taken AFTER the final Step() would be one position-integrate later (FK(q_{n+1}) vs
+    // FK(q_n)) -- so for the free-squeezing no-contact envs the fingertip would differ by one
+    // step of finger travel. We snapshot the fingertip ORACLE at the q the final resolver will
+    // use (now), then do the final Step + export so obs.fingertip == FK(this same q). q/qdot
+    // are sampled POST-step (they ARE the post-step device values the export downloads).
+    ASSERT_GT(kRun, 0u);
+    for (uint32_t s = 0u; s + 1u < kRun; ++s) world.Step();
+    std::vector<std::vector<Vec3>> ft_oracle(kEnvs, std::vector<Vec3>(world.NumFingertips()));
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        articulation::ArticulationHostState pre;
+        world.DownloadGripper(e, &pre);
+        const std::vector<Transform> poses = A2ForwardKinematics(context, pre);
+        for (uint32_t f = 0u; f < world.NumFingertips(); ++f) {
+            const CoResidentFingertip& ft = gs.config.fingertips[f];
+            const Transform& lp = poses[ft.link];
+            ft_oracle[e][f] = lp.position + lp.rotation.Rotate(ft.local_offset);
+        }
+    }
+    world.Step();  // the final step retains FK(q_n) into fingertip_world_host_.
+
+    coresident::ObsStateBatch obs;
+    world.ExportObsState(obs);
+    const uint32_t d = world.ActionDim();
+    const uint32_t nf = world.NumFingertips();
+    ASSERT_EQ(obs.q.size(), static_cast<size_t>(kEnvs) * d);
+    ASSERT_EQ(obs.qdot.size(), static_cast<size_t>(kEnvs) * d);
+    ASSERT_EQ(obs.fingertip_world_pos.size(), static_cast<size_t>(kEnvs) * nf * 3u);
+    ASSERT_EQ(obs.finger_normal_impulse.size(), static_cast<size_t>(kEnvs) * nf);
+
+    double max_dq = 0.0, max_dqdot = 0.0, max_dft = 0.0;
+    uint32_t held_with_both_fingers = 0u, dropping_zero_impulse = 0u;
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        // ORACLE: the per-env DownloadGripper (NOT used in the production obs path).
+        articulation::ArticulationHostState art;
+        world.DownloadGripper(e, &art);
+        // Reconstruct the oracle's flat-qdot DOF slice the SAME way the export packs it.
+        const uint32_t root = art.articulation_link_offset[0];
+        const uint32_t bdof =
+            articulation::ArticulationJointDofCount(art.joint_type[root]);
+        std::vector<float> oq(d, 0.0f), oqd(d, 0.0f);
+        for (uint32_t i = 0u; i < bdof && i < d; ++i)
+            oqd[i] = art.link_velocity[root].v[i];
+        for (uint32_t leg = root + 1u; leg < art.TotalLinkCount(); ++leg) {
+            const uint32_t col = RefDofIndexOf(art, root, leg);
+            if (col < d) { oq[col] = art.q[leg]; oqd[col] = art.qdot[leg]; }
+        }
+        for (uint32_t k = 0u; k < d; ++k) {
+            max_dq = std::max(max_dq, std::fabs(static_cast<double>(obs.q[e * d + k] - oq[k])));
+            max_dqdot = std::max(max_dqdot,
+                                 std::fabs(static_cast<double>(obs.qdot[e * d + k] - oqd[k])));
+        }
+        // Fingertip world positions: compare to the oracle snapshot taken at the SAME q the
+        // final resolver used (one step before the export -- see the timing note above).
+        for (uint32_t f = 0u; f < nf; ++f) {
+            const Vec3 c = ft_oracle[e][f];
+            const size_t b = (static_cast<size_t>(e) * nf + f) * 3u;
+            max_dft = std::max(max_dft, std::fabs(static_cast<double>(obs.fingertip_world_pos[b] - c.x)));
+            max_dft = std::max(max_dft, std::fabs(static_cast<double>(obs.fingertip_world_pos[b + 1u] - c.y)));
+            max_dft = std::max(max_dft, std::fabs(static_cast<double>(obs.fingertip_world_pos[b + 2u] - c.z)));
+        }
+        // Per-finger normal impulse + the aggregate cross-check.
+        double sum_fimp = 0.0;
+        uint32_t pos_fingers = 0u;
+        for (uint32_t f = 0u; f < nf; ++f) {
+            const float imp = obs.finger_normal_impulse[e * nf + f];
+            sum_fimp += imp;
+            if (imp > 1.0e-7f) ++pos_fingers;
+        }
+        const double agg = world.GraspReports()[e].cup_vertical_impulse;
+        if (is_held(e)) {
+            if (pos_fingers == nf) ++held_with_both_fingers;
+            // The aggregate cup_vertical_impulse = Σ(lambda * j_cup.linear.z) is the FRICTION-
+            // borne VERTICAL hold (== m*g*dt at steady state). The per-finger NORMAL impulse is
+            // the horizontal SQUEEZE on the side wall -- ORTHOGONAL to it. So the brief's literal
+            // "sums to cup_vertical_impulse" is physically unsatisfiable in this side-grip scene
+            // (vertical hold via friction, normal via squeeze); we deviate from that clause (see
+            // the report). The retained-aggregate cross-check we CAN make is against max_lambda
+            // (the peak finger normal-row impulse, computed in the SAME bucketing loop): with one
+            // contact point per fingertip == one normal row each, max_lambda == max over the
+            // per-finger normal buckets. This catches a dropped / double-counted normal row.
+            EXPECT_GT(sum_fimp, 0.0) << "held env " << e << " has zero total normal impulse";
+            float max_bucket = 0.0f;
+            for (uint32_t f = 0u; f < nf; ++f)
+                max_bucket = std::max(max_bucket, obs.finger_normal_impulse[e * nf + f]);
+            EXPECT_NEAR(max_bucket, world.GraspReports()[e].max_lambda, 1.0e-6f)
+                << "held env " << e << ": max per-finger normal bucket != the retained "
+                   "max_lambda -- a normal row was dropped or double-counted in the bucketing";
+        } else {
+            if (sum_fimp < 1.0e-6) ++dropping_zero_impulse;
+            EXPECT_NEAR(agg, 0.0, 1.0e-9) << "dropping env " << e << " has nonzero impulse";
+        }
+    }
+    std::printf("[A1 GATE3] max|Δq|=%.3e max|Δqdot|=%.3e max|Δfingertip|=%.3e ; held-with-both-"
+                "fingers=%u/%u dropping-zero-impulse=%u/%u\n",
+                max_dq, max_dqdot, max_dft, held_with_both_fingers, kEnvs / 2u,
+                dropping_zero_impulse, kEnvs / 2u);
+    EXPECT_LT(max_dq, 1.0e-6) << "ExportObsState q != per-env DownloadGripper q (not ULP)";
+    EXPECT_LT(max_dqdot, 1.0e-6) << "ExportObsState qdot != per-env DownloadGripper qdot";
+    EXPECT_LT(max_dft, 1.0e-5) << "ExportObsState fingertip pos != resolver finger_centers";
+    EXPECT_EQ(held_with_both_fingers, kEnvs / 2u)
+        << "a held env did NOT carry normal impulse on BOTH fingers (force-closure signal "
+           "broken -- the per-finger bucketing is wrong)";
+    EXPECT_EQ(dropping_zero_impulse, kEnvs / 2u)
+        << "a dropping env carried a nonzero per-finger impulse (false force-closure)";
+    (void)kCupZ0;
+}
+
+// ---------------------------------------------------------------------------
+// GATE 4 (reset): a holding env, after ResetEnvs with a new seed, has its cup at a
+// randomized (different) pose + zeroed velocity + gripper at the nominal config, and
+// re-grips on the next rollout. Two ResetEnvs with the SAME seed -> identical states.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldA1, Gate4_ResetEnvsRandomizesAndIsDeterministic) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f, /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 4u;
+    const Vec3 nominal = gs.config.cup_state.position;
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+    // Hold for a while (the cup drifts a little, the gripper qdot is nonzero).
+    for (uint32_t s = 0u; s < 60u; ++s) world.Step();
+    const BodyState before = world.Body(0u, 0u);
+
+    // Reset envs {0,2} with a seed.
+    const std::vector<uint32_t> ids = {0u, 2u};
+    world.ResetEnvs(ids, /*seed=*/12345u);
+
+    for (uint32_t e : ids) {
+        const BodyState cup = world.Body(e, 0u);
+        // (a) cup XY randomized within the jitter box; Z restored to nominal; vel zeroed.
+        EXPECT_LT(std::fabs(cup.position.x - nominal.x),
+                  coresident::BatchedUnifiedWorld::kResetCupJitterM + 1e-6f)
+            << "reset env " << e << " cup x outside the jitter box";
+        EXPECT_LT(std::fabs(cup.position.y - nominal.y),
+                  coresident::BatchedUnifiedWorld::kResetCupJitterM + 1e-6f);
+        EXPECT_NEAR(cup.position.z, nominal.z, 1e-6f) << "reset cup Z not restored";
+        EXPECT_LT(cup.linear_velocity.Length(), 1e-6f) << "reset cup velocity not zeroed";
+        EXPECT_LT(cup.angular_velocity.Length(), 1e-6f);
+        // (b) gripper restored to the nominal open config (qdot == 0).
+        articulation::ArticulationHostState art;
+        world.DownloadGripper(e, &art);
+        double max_qdot = 0.0;
+        for (float v : art.qdot) max_qdot = std::max(max_qdot, std::fabs(static_cast<double>(v)));
+        for (const auto& lv : art.link_velocity)
+            for (float c : lv.v) max_qdot = std::max(max_qdot, std::fabs(static_cast<double>(c)));
+        EXPECT_LT(max_qdot, 1e-6) << "reset env " << e << " gripper qdot/link_velocity not zeroed";
+    }
+    // The reset cup pose must DIFFER from the pre-reset (drifted) pose (randomization real).
+    EXPECT_GT((world.Body(0u, 0u).position - before.position).Length(), 1e-5f)
+        << "ResetEnvs did not change the cup pose";
+
+    // Re-grip: continue stepping -> the reset envs hold again (the gripper re-closes).
+    for (uint32_t s = 0u; s < 60u; ++s) world.Step();
+    for (uint32_t e : ids)
+        EXPECT_GT(world.GraspReports()[e].finger_contacts, 0u)
+            << "reset env " << e << " failed to re-grip on the next rollout";
+
+    // Determinism: two FRESH worlds, identical history, same reset seed -> byte-identical.
+    auto run_with_reset = [&](uint64_t seed) {
+        coresident::BatchedUnifiedWorld w(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+        for (uint32_t s = 0u; s < 30u; ++s) w.Step();
+        w.ResetEnvs({0u, 1u, 2u, 3u}, seed);
+        for (uint32_t s = 0u; s < 30u; ++s) w.Step();
+        std::vector<GraspEnvSnapshot> out(kEnvs);
+        for (uint32_t e = 0u; e < kEnvs; ++e) out[e] = SnapshotGraspEnv(w, e, 0u);
+        return out;
+    };
+    const auto a = run_with_reset(777u);
+    const auto b = run_with_reset(777u);
+    for (uint32_t e = 0u; e < kEnvs; ++e)
+        EXPECT_TRUE(GraspEnvByteEqual(a[e], b[e]))
+            << "ResetEnvs(seed=777) env " << e << " differed between two identical runs (D1)";
+    std::printf("[A1 GATE4] reset randomizes cup XY + zeroes vel + restores gripper; re-grips; "
+                "same-seed reset is byte-deterministic\n");
+}
+
+// ---------------------------------------------------------------------------
+// GATE 6 (determinism D1 of the RL-driven path): a fixed ACTION SEQUENCE run twice is
+// byte-exact, AND the rollout INCLUDES a ResetEnvs call mid-way -- proving the path RL
+// actually drives (per-step SetActions + a mid-rollout reset + obs export) is byte-
+// deterministic, not just a no-reset constant-torque rollout.
+// ---------------------------------------------------------------------------
+TEST(BatchedUnifiedWorldA1, Gate6_ActionSequencePlusResetIsByteDeterministic) {
+    if (!GraspCupAvailable())
+        GTEST_SKIP() << "newton-assets cup not present (fetch-per-env)";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const GraspCupHull hull = LoadGraspCupHull();
+    ASSERT_GT(hull.vcount, 0u);
+
+    const GraspSceneBundle gs = BuildGraspSceneBundle(hull, /*grip_force=*/8.0f, /*mu=*/0.8f);
+    const auto tmpl = MakeGraspTemplate(gs);
+    constexpr uint32_t kEnvs = 6u;
+    const uint32_t kRun = 80u;
+    constexpr uint32_t kResetStep = 40u;
+
+    auto run = [&]() {
+        coresident::BatchedUnifiedWorld w(context, tmpl, kEnvs, kGraspGravityZ, kGraspDt);
+        std::mt19937 rng(2026u);  // deterministic action sequence generator.
+        std::uniform_real_distribution<float> tq(4.0f, 9.0f);
+        coresident::ObsStateBatch obs;
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            // A fixed (seed-deterministic) per-env per-DOF action this step.
+            const auto actions = MakeActions(w, [&](uint32_t, uint32_t) { return tq(rng); });
+            w.Step(actions.data(), actions.size());  // SetActions + Step (the RL driver).
+            w.ExportObsState(obs);                   // exercise the obs path each step too.
+            if (s == kResetStep) w.ResetEnvs({1u, 3u, 5u}, /*seed=*/9001u);
+        }
+        std::vector<GraspEnvSnapshot> out(kEnvs);
+        for (uint32_t e = 0u; e < kEnvs; ++e) out[e] = SnapshotGraspEnv(w, e, 0u);
+        return out;
+    };
+    const auto a = run();
+    const auto b = run();
+    for (uint32_t e = 0u; e < kEnvs; ++e)
+        EXPECT_TRUE(GraspEnvByteEqual(a[e], b[e]))
+            << "GATE6: env " << e << " differed between two identical action+reset rollouts "
+               "(the RL-driven path is NOT byte-deterministic)";
+    std::printf("[A1 GATE6] N=%u: fixed action SEQUENCE + mid-rollout ResetEnvs + per-step "
+                "ExportObsState -> byte-exact across two runs (D1)\n", kEnvs);
 }
 
 }  // namespace

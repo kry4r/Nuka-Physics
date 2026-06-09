@@ -270,15 +270,33 @@ uint32_t StepsForN(uint32_t n) {
     return std::clamp(k, kKMin, kK);
 }
 
+// A1: the per-step RL cost is SetActions + Step + ExportObsState. The timed region BRACKETS
+// all three so env_steps_per_sec is the FULL RL per-step throughput (GATE-5). We build one
+// env-major action vector once (the template grip torque on every finger DOF -> the SAME drive
+// as the default, so the dynamics are unchanged from the pre-A1 harness; SetActions exercises
+// the upload path each step) and reuse an ObsStateBatch (sized once by the first export).
 double RunHarness(const nuka::phi::DeviceContext& context,
                   const coresident::BatchedSceneTemplate& tmpl, uint32_t n,
                   uint32_t k, double* ms_per_step_out) {
     coresident::BatchedUnifiedWorld world(context, tmpl, n, kGraspGravityZ, kGraspDt);
-    for (uint32_t s = 0u; s < kWarm; ++s) world.Step();
+    // A fixed per-env per-DOF action == the scene grip torque (8 N on each finger DOF), so the
+    // timed rollout's physics matches the constant-grip gates while still paying SetActions.
+    const uint32_t d = world.ActionDim();
+    std::vector<float> actions(static_cast<size_t>(n) * d, 8.0f);
+    coresident::ObsStateBatch obs;
+    for (uint32_t s = 0u; s < kWarm; ++s) {
+        world.SetActions(actions.data(), actions.size());
+        world.Step();
+        world.ExportObsState(obs);
+    }
     world.Perf().Reset();  // discard warm-up samples.
 
     const auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t s = 0u; s < k; ++s) world.Step();
+    for (uint32_t s = 0u; s < k; ++s) {
+        world.SetActions(actions.data(), actions.size());  // per-step action injection.
+        world.Step();                                       // advance (applies the actions).
+        world.ExportObsState(obs);                          // the per-step RL obs readout.
+    }
     const auto t1 = std::chrono::steady_clock::now();
 
     const double elapsed_sec =
@@ -289,10 +307,11 @@ double RunHarness(const nuka::phi::DeviceContext& context,
     return env_steps_per_sec;
 }
 
-// The 9 canonical stage tags (the order they are printed in the breakdown).
+// The canonical stage tags (the order they are printed in the breakdown). A1 adds
+// `obs_export` (the batched RL readout) so the breakdown shows its per-step cost + scaling.
 const char* const kStageTags[] = {
     "pose_download", "artic_download", "crba_minv",   "chain_jacobian", "aba_integrate",
-    "narrowphase",   "row_assembly",   "row_solver",  "scatter_integrate",
+    "narrowphase",   "row_assembly",   "row_solver",  "scatter_integrate", "obs_export",
 };
 
 // Per-tag total wall time (us) = count * mean_us (PerfRecorder exposes no sum; mean is
@@ -316,12 +335,25 @@ double TagTotalUs(const nuka::core::perf::PerfRecorder& perf, const char* tag) {
 // ---------------------------------------------------------------------------
 double RunStageBreakdown(const nuka::phi::DeviceContext& context,
                          const coresident::BatchedSceneTemplate& tmpl, uint32_t n,
-                         uint32_t k) {
+                         uint32_t k, double* obs_ms_per_step_out = nullptr) {
     coresident::BatchedUnifiedWorld world(context, tmpl, n, kGraspGravityZ, kGraspDt);
-    for (uint32_t s = 0u; s < kWarm; ++s) world.Step();
+    // A1: drive the FULL RL per-step cost (SetActions + Step + ExportObsState), so the
+    // breakdown attributes the obs_export tag alongside the dynamics stages.
+    const uint32_t d = world.ActionDim();
+    std::vector<float> actions(static_cast<size_t>(n) * d, 8.0f);
+    coresident::ObsStateBatch obs;
+    for (uint32_t s = 0u; s < kWarm; ++s) {
+        world.SetActions(actions.data(), actions.size());
+        world.Step();
+        world.ExportObsState(obs);
+    }
     world.Perf().Reset();
     const auto wall0 = std::chrono::steady_clock::now();
-    for (uint32_t s = 0u; s < k; ++s) world.Step();
+    for (uint32_t s = 0u; s < k; ++s) {
+        world.SetActions(actions.data(), actions.size());
+        world.Step();
+        world.ExportObsState(obs);
+    }
     const auto wall1 = std::chrono::steady_clock::now();
     const double wall_total_ms =
         std::chrono::duration<double, std::milli>(wall1 - wall0).count();
@@ -352,6 +384,9 @@ double RunStageBreakdown(const nuka::phi::DeviceContext& context,
     EXPECT_LE(sum_tags_ms, wall_total_ms * 1.05)
         << "Σ(stage tags) exceeds the measured wall time at N=" << n
         << " -> a timer is nested / double-counted; the breakdown cannot be trusted";
+    if (obs_ms_per_step_out != nullptr)
+        *obs_ms_per_step_out =
+            TagTotalUs(perf, "obs_export") * 1.0e-3 / static_cast<double>(k > 0u ? k : 1u);
     return solver_ms / static_cast<double>(k > 0u ? k : 1u);  // PER-STEP (see header).
 }
 
@@ -415,14 +450,17 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
     // ----- (1) the env-steps/sec sweep -----------------------------------------------
     const uint32_t kNs[] = {1u, 8u, 32u, 64u, 256u, 1024u};
     double measured_n32_eps = 0.0;
+    double measured_n1024_eps = 0.0;  // A1 GATE-5: the FULL RL per-step throughput at N=1024.
     for (uint32_t n : kNs) {
         const uint32_t k = StepsForN(n);
         double ms_per_step = 0.0;
+        // RunHarness now brackets SetActions + Step + ExportObsState (the full RL per-step cost).
         const double eps = RunHarness(context, tmpl, n, k, &ms_per_step);
-        std::printf("[PERF] N=%u K=%u env_steps_per_sec=%.1f ms_per_step=%.3f\n", n, k,
-                    eps, ms_per_step);
+        std::printf("[PERF] N=%u K=%u env_steps_per_sec=%.1f ms_per_step=%.3f "
+                    "(INCLUDES SetActions+ExportObsState)\n", n, k, eps, ms_per_step);
         std::fflush(stdout);
         if (n == 32u) measured_n32_eps = eps;
+        if (n == 1024u) measured_n1024_eps = eps;
     }
 
     // ----- (2) the PER-STAGE breakdown at N=32, 256, 1024 (fresh, isolated runs) --------
@@ -433,9 +471,21 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
     // super-linearly in N? Returns each N's PER-STEP row_solver ms for the (D) verdict (the
     // printed BREAKDOWN lines are tag TOTALS over k steps; these returns are total/k -- one
     // UnifiedSolve/BuildRowColorPartitions per Step, so per-step is the coloring denominator).
-    const double solver_ms_n32 = RunStageBreakdown(context, tmpl, 32u, kK);   // K=200.
-    const double solver_ms_n256 = RunStageBreakdown(context, tmpl, 256u, 20u);
-    const double solver_ms_n1024 = RunStageBreakdown(context, tmpl, 1024u, 10u);
+    double obs_ms_n32 = 0.0, obs_ms_n256 = 0.0, obs_ms_n1024 = 0.0;
+    const double solver_ms_n32 = RunStageBreakdown(context, tmpl, 32u, kK, &obs_ms_n32);  // K=200.
+    const double solver_ms_n256 = RunStageBreakdown(context, tmpl, 256u, 20u, &obs_ms_n256);
+    const double solver_ms_n1024 = RunStageBreakdown(context, tmpl, 1024u, 10u, &obs_ms_n1024);
+
+    // ----- (2a) A1 GATE-5: the ExportObsState per-step ms scaling (N=32/256/1024) ----------
+    // It must be ~linear in N and small (like the other downloads) -- NOT re-introducing an
+    // O(N) host-sync per-env storm. The whole obs export is a bulk device download (q + qdot
+    // via direct CopyToHost over the env-major buffers -- NOT a full DownloadArticulationState)
+    // + host packing + the host-resident fingertip copy.
+    std::printf("[A1 OBS-EXPORT per-step] N=32=%.4f_ms N=256=%.4f_ms N=1024=%.4f_ms "
+                "(ratio 1024/32=%.1fx for 32x envs -- ~linear if ~32x)\n",
+                obs_ms_n32, obs_ms_n256, obs_ms_n1024,
+                obs_ms_n32 > 0.0 ? obs_ms_n1024 / obs_ms_n32 : 0.0);
+    std::fflush(stdout);
 
     // ----- (2b) THE DECISIVE MEASUREMENT: isolate the coloring cost ---------------------
     // Directly host-wall-clock-time nuka::solver::gpu::BuildRowColorPartitions (the named
@@ -567,4 +617,23 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
         << "N=32 throughput (" << measured_n32_eps
         << " env-steps/sec) fell below 0.3x the baseline (" << kN32BaselineEps
         << ") -- a gross perf regression, not noise";
+
+    // ----- (4) A1 GATE-5: the obs export must NOT re-introduce O(N) host-sync cost ----------
+    // The per-step measurement above BRACKETS SetActions + Step + ExportObsState, so
+    // measured_n1024_eps is the FULL RL per-step throughput at N=1024. The bar: stay within
+    // ~0.85x of the coloring-fix baseline (~10,183 env-steps/sec measured at HEAD 0ae4388 on
+    // this box, BEFORE A1 -- Step only). If the obs export were a per-env DownloadGripper loop
+    // it would crater this; the ONE consolidated download keeps it ~flat. The floor is 0.85x of
+    // a conservative baseline so a noisy box does not flake while still catching a real O(N)
+    // regression in the export. Update the baseline if the box's clean throughput moves.
+    constexpr double kN1024BaselineEps = 10000.0;  // ~coloring-fix baseline (Step-only, HEAD).
+    std::printf("[A1 GATE-5 N=1024] env_steps_per_sec(WITH obs export)=%.1f  bar=0.85x_baseline="
+                "%.1f (baseline=%.1f)\n",
+                measured_n1024_eps, 0.85 * kN1024BaselineEps, kN1024BaselineEps);
+    std::fflush(stdout);
+    EXPECT_GT(measured_n1024_eps, 0.85 * kN1024BaselineEps)
+        << "N=1024 throughput WITH the obs export (" << measured_n1024_eps
+        << " env-steps/sec) fell below 0.85x the coloring-fix baseline (" << kN1024BaselineEps
+        << ") -- the obs export re-introduced O(N) host-sync cost; it must be batched, not a "
+           "per-env DownloadGripper loop";
 }
