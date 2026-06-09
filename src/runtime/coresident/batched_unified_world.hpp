@@ -49,6 +49,7 @@
 // any FeatherstoneAba method, the row solver/scheduler, or any golden.
 // ---------------------------------------------------------------------------
 
+#include "core/perf/perf_recorder.hpp"  // PerfRecorder (host wall-clock stage attribution)
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
@@ -191,6 +192,20 @@ public:
         DownloadGripper(0u, out);
     }
 
+    // ----- P2.4a perf-gate instrumentation (ADDITIVE; physics-neutral) -----------
+    // Per-tag HOST WALL-CLOCK aggregator (mirrors BatchedArticulatedWorld::Perf). The
+    // Step / ResolveBatchedGraspContact stages already Synchronize internally, so a
+    // chrono RAII timer bracketing each stage captures the REAL host round-trip cost
+    // (the per-env download/upload + CopyToHost storms a CUDA-event timer would miss).
+    // Canonical disjoint tags: pose_download / artic_download / crba_minv /
+    // chain_jacobian / aba_integrate / narrowphase / row_assembly / row_solver /
+    // scatter_integrate. The recorder is a pure-host sample bucket (no CUDA, no float
+    // ops, no extra syncs) -> the 16 correctness gates stay byte-exact. A perf TU reads
+    // this to test the "articulation sync storm dominates, row_solver is negligible"
+    // hypothesis (roadmap §7). Use Perf().Reset() to clear warm-up samples.
+    core::perf::PerfRecorder& Perf() { return perf_; }
+    const core::perf::PerfRecorder& Perf() const { return perf_; }
+
 private:
     const phi::DeviceContext& context_;
     uint32_t env_count_;
@@ -228,6 +243,12 @@ private:
     phi::Buffer   grip_torque_dev_;   // per-link constant grip torque (device, SHARED -- proto-invariant).
     phi::Buffer   grip_limits_dev_;   // per-link drive force limits (device, SHARED -- proto-invariant).
     std::vector<BatchedGraspEnvReport> grasp_reports_;  // last-Step() per-env metrics.
+
+    // ----- P2.4a perf instrumentation (ADDITIVE; mutable -> const Step path can time) ---
+    // Host wall-clock per-tag aggregator. mutable so the timer scopes can feed it without
+    // making Step() non-const (Step() is already non-const, but the file-static stage
+    // call-sites are bracketed via a member-visible recorder). Pure-host: no physics.
+    mutable core::perf::PerfRecorder perf_;
 
     // The env-major rigid BodyState SoA: env e's bodies at [e*k, (e+1)*k). This is
     // the leading block of the concatenated buffer the batched UnifiedSolve will
