@@ -445,6 +445,11 @@ add_executable(nuka_solver_test
     solver/test_joint_limit.cpp
     solver/test_joint_projection.cpp
     solver/test_row_scheduler_bridge.cpp
+    # Row-coloring O(rows*K) rewrite EQUIVALENCE gate: production
+    # BuildRowColorPartitions / ValidateNoSharedBodiesPerColor vs a test-local
+    # O(rows^2) reference, byte-identical over synthetic cliques + randomized
+    # rows (incl. invalid-body / body_a==body_b traps) + dense/all-invalid edges.
+    solver/test_row_scheduler_coloring_equivalence.cpp
     # v0.8 C5a: UnifiedSolve end-to-end (compliant contact + pyramid + D1).
     solver/test_unified_solve.cpp
     # v0.8 C5b-core: ArticulationChainJ reaction arm wired into UnifiedSolve
