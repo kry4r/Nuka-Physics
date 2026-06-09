@@ -25,6 +25,7 @@
 
 #include "nuka/nuka.h"
 #include "nuka/nuka_diffsim.h"
+#include "nuka/nuka_grasp.h"  // v0.8 A2: the batched grasp world C ABI (BatchedUnifiedWorld)
 #include "nuka/nuka_noise.h"
 
 namespace nb = nanobind;
@@ -574,6 +575,185 @@ FloatArray Tape::state_view(nuka_state_field_t field) {
 }
 
 // ---------------------------------------------------------------------------
+// GraspWorld wrapper (RAII) -- the BATCHED GRASP WORLD (v0.8 A2, nuka_grasp.h).
+// ---------------------------------------------------------------------------
+//
+// Wraps the nuka_grasp_world_* C ABI over BatchedUnifiedWorld so a Python PPO env
+// (H1GraspEnv) can drive N parallel grasp envs. Mirrors the World wrapper shape: a
+// static create() factory (take_ownership), step / set_actions, and readout methods
+// that return HOST numpy arrays. UNLIKE World.buffer_view (zero-copy DEVICE DLPack),
+// the obs here are HOST float* fills (new[] + capsule deleter -> nb::ndarray<nb::numpy>),
+// the SAME host-array pattern Tape.backward uses -- the engine's ExportObsState already
+// did the ONE bulk device->host download per buffer, so the Python side gets numpy.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Allocate a host float[] of `n` and wrap it as a 1-D numpy ndarray owning the
+// memory (capsule deleter). Mirrors the Tape.backward() host-array pattern.
+nb::ndarray<nb::numpy, float> make_host_float_array(size_t n, size_t d0) {
+    auto* p = new float[n == 0u ? 1u : n];
+    for (size_t i = 0u; i < n; ++i) p[i] = 0.0f;
+    nb::capsule owner(p, [](void* q) noexcept { delete[] reinterpret_cast<float*>(q); });
+    size_t shape[1] = {d0};
+    return nb::ndarray<nb::numpy, float>(p, 1, shape, owner);
+}
+
+}  // namespace
+
+class GraspWorld {
+public:
+    static GraspWorld* create(Device* device, const std::string& cup_asset_path,
+                              uint32_t env_count, float grip_force, float friction_mu,
+                              float gravity_z, float dt) {
+        if (device == nullptr) {
+            throw std::runtime_error("GraspWorld.create: device is None");
+        }
+        nuka_grasp_world_desc_t desc{};
+        desc.cup_asset_path = cup_asset_path.c_str();
+        desc.env_count = env_count;
+        desc.grip_force = grip_force;
+        desc.friction_mu = friction_mu;
+        desc.gravity_z = gravity_z;
+        desc.fixed_dt = dt;
+        nuka_grasp_world_handle h = nullptr;
+        check(nuka_grasp_world_create(device->raw(), &desc, &h),
+              "nuka_grasp_world_create");
+        uint32_t ec = 0u, ad = 0u, nf = 0u, bpe = 0u;
+        check(nuka_grasp_world_env_count(h, &ec), "nuka_grasp_world_env_count");
+        check(nuka_grasp_world_action_dim(h, &ad), "nuka_grasp_world_action_dim");
+        check(nuka_grasp_world_num_fingertips(h, &nf), "nuka_grasp_world_num_fingertips");
+        check(nuka_grasp_world_bodies_per_env(h, &bpe), "nuka_grasp_world_bodies_per_env");
+        return new GraspWorld(h, ec, ad, nf, bpe);
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_grasp_world_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~GraspWorld() { destroy(); }
+
+    void step() { check(nuka_grasp_world_step(h_), "nuka_grasp_world_step"); }
+
+    // set_actions: a HOST contiguous float32 array of length env_count*action_dim
+    // (env-major). Accepts numpy / a CPU torch tensor (c_contig).
+    void set_actions(nb::ndarray<float, nb::c_contig> actions) {
+        const size_t want = static_cast<size_t>(env_count_) * action_dim_;
+        if (actions.size() != want) {
+            throw std::runtime_error(
+                "GraspWorld.set_actions: length " + std::to_string(actions.size()) +
+                " != env_count*action_dim (" + std::to_string(want) + ")");
+        }
+        if (actions.device_type() != nb::device::cpu::value) {
+            throw std::runtime_error(
+                "GraspWorld.set_actions: actions must be a HOST (CPU) contiguous array");
+        }
+        check(nuka_grasp_world_set_actions(h_, actions.data(), actions.size()),
+              "nuka_grasp_world_set_actions");
+    }
+
+    // step_with_actions: set_actions then step in one call (the RL per-step driver).
+    void step_with_actions(nb::ndarray<float, nb::c_contig> actions) {
+        set_actions(actions);
+        step();
+    }
+
+    // export_obs -> dict of HOST numpy arrays (env-major), shaped per the C ABI:
+    //   q                    : (env_count, action_dim)
+    //   qdot                 : (env_count, action_dim)
+    //   fingertip_world_pos  : (env_count, 3*num_fingertips)
+    //   finger_normal_impulse: (env_count, num_fingertips)
+    nb::object export_obs() {
+        const size_t n = env_count_;
+        const size_t nq = n * action_dim_;
+        const size_t nft = n * 3u * num_fingertips_;
+        const size_t nimp = n * num_fingertips_;
+        nb::ndarray<nb::numpy, float> q = make_host_float_array(nq, nq);
+        nb::ndarray<nb::numpy, float> qdot = make_host_float_array(nq, nq);
+        nb::ndarray<nb::numpy, float> ft = make_host_float_array(nft, nft);
+        nb::ndarray<nb::numpy, float> imp = make_host_float_array(nimp, nimp);
+        check(nuka_grasp_world_export_obs(
+                  h_, q.data(), nq, qdot.data(), nq, ft.data(), nft, imp.data(), nimp),
+              "nuka_grasp_world_export_obs");
+        // Reshape the 1-D buffers to their env-major 2-D shapes via numpy.reshape.
+        nb::dict out;
+        out["q"] = q.cast().attr("reshape")(n, action_dim_);
+        out["qdot"] = qdot.cast().attr("reshape")(n, action_dim_);
+        out["fingertip_world_pos"] = ft.cast().attr("reshape")(n, 3u * num_fingertips_);
+        out["finger_normal_impulse"] = imp.cast().attr("reshape")(n, num_fingertips_);
+        return out;
+    }
+
+    // read_cup -> dict of HOST numpy arrays (env-major): cup pose/vel + per-env
+    // contact signals (the reward inputs).
+    //   cup_pose       : (env_count, 7)  [px,py,pz, qw,qx,qy,qz]
+    //   cup_vel        : (env_count, 6)  [vx,vy,vz, wx,wy,wz]
+    //   cup_z          : (env_count,)
+    //   cup_vz         : (env_count,)
+    //   finger_contacts: (env_count,) uint32
+    nb::object read_cup() {
+        const size_t n = env_count_;
+        nb::ndarray<nb::numpy, float> pose = make_host_float_array(n * 7u, n * 7u);
+        nb::ndarray<nb::numpy, float> vel = make_host_float_array(n * 6u, n * 6u);
+        nb::ndarray<nb::numpy, float> cz = make_host_float_array(n, n);
+        nb::ndarray<nb::numpy, float> cvz = make_host_float_array(n, n);
+        auto* fc = new uint32_t[n == 0u ? 1u : n];
+        for (size_t i = 0u; i < n; ++i) fc[i] = 0u;
+        nb::capsule fc_owner(fc, [](void* q) noexcept {
+            delete[] reinterpret_cast<uint32_t*>(q);
+        });
+        size_t fc_shape[1] = {n};
+        nb::ndarray<nb::numpy, uint32_t> fc_arr(fc, 1, fc_shape, fc_owner);
+        check(nuka_grasp_world_read_cup(h_, pose.data(), n * 7u, vel.data(), n * 6u,
+                                        cz.data(), n, cvz.data(), n, fc, n),
+              "nuka_grasp_world_read_cup");
+        nb::dict out;
+        out["cup_pose"] = pose.cast().attr("reshape")(n, 7u);
+        out["cup_vel"] = vel.cast().attr("reshape")(n, 6u);
+        out["cup_z"] = cz;
+        out["cup_vz"] = cvz;
+        out["finger_contacts"] = fc_arr;
+        return out;
+    }
+
+    // reset_envs: restore the listed envs to a seed-randomized cup pose + nominal
+    // gripper. env_ids: a 1-D int array (numpy / torch / list). Deterministic given seed.
+    void reset_envs(nb::object env_ids, uint64_t seed) {
+        nb::object seq = env_ids;
+        if (nb::hasattr(env_ids, "tolist")) {
+            seq = env_ids.attr("tolist")();
+        }
+        std::vector<uint32_t> ids;
+        for (nb::handle item : seq) {
+            const long long v = nb::cast<long long>(item);
+            if (v < 0) {
+                throw std::runtime_error("GraspWorld.reset_envs: env_id must be non-negative");
+            }
+            ids.push_back(static_cast<uint32_t>(v));
+        }
+        check(nuka_grasp_world_reset_envs(h_, ids.empty() ? nullptr : ids.data(),
+                                          static_cast<uint32_t>(ids.size()), seed),
+              "nuka_grasp_world_reset_envs");
+    }
+
+    uint32_t env_count() const { return env_count_; }
+    uint32_t action_dim() const { return action_dim_; }
+    uint32_t num_fingertips() const { return num_fingertips_; }
+    uint32_t bodies_per_env() const { return bodies_per_env_; }
+
+private:
+    GraspWorld(nuka_grasp_world_handle h, uint32_t ec, uint32_t ad, uint32_t nf,
+               uint32_t bpe)
+        : h_(h), env_count_(ec), action_dim_(ad), num_fingertips_(nf), bodies_per_env_(bpe) {}
+    nuka_grasp_world_handle h_ = nullptr;
+    uint32_t env_count_ = 0u;
+    uint32_t action_dim_ = 0u;
+    uint32_t num_fingertips_ = 0u;
+    uint32_t bodies_per_env_ = 0u;
+};
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 NB_MODULE(_nuka_ext, m) {
@@ -930,6 +1110,59 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](Tape& t) -> Tape& { return t; })
         .def("__exit__",
              [](Tape& t, nb::object, nb::object, nb::object) { t.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    // v0.8 A2: the BATCHED GRASP WORLD (BatchedUnifiedWorld) -- the RL-grasp substrate.
+    nb::class_<GraspWorld>(m, "GraspWorld")
+        .def_static("create", &GraspWorld::create, nb::arg("device"),
+                    nb::arg("cup_asset_path"), nb::arg("env_count"),
+                    nb::arg("grip_force") = 8.0f, nb::arg("friction_mu") = 0.8f,
+                    nb::arg("gravity_z") = -9.81f, nb::arg("dt") = 1.0f / 240.0f,
+                    nb::rv_policy::take_ownership,
+                    "Create a batched grasp world: env_count parallel fixed-base "
+                    "2-finger grippers each pinching the C7a cup (loaded+cooked from "
+                    "cup_asset_path) by friction alone (NO table). grip_force is the "
+                    "constant per-finger grip torque the template seeds (overridden "
+                    "per-step by set_actions); friction_mu is the contact friction; "
+                    "gravity_z/dt are the integrator params. Built via the SAME "
+                    "validated scene factory the 21 BatchedUnifiedWorld gates exercise.")
+        .def("step", &GraspWorld::step,
+             "Advance EVERY env one fixed step (applies the last set_actions, or the "
+             "template grip until set_actions is first called).")
+        .def("set_actions", &GraspWorld::set_actions, nb::arg("actions"),
+             "Set the per-env per-finger drive torque from a HOST contiguous float32 "
+             "array of length env_count*action_dim (env-major). The next step() "
+             "applies it (replacing the constant template grip).")
+        .def("step_with_actions", &GraspWorld::step_with_actions, nb::arg("actions"),
+             "set_actions(actions) then step() -- the RL per-step driver.")
+        .def("export_obs", &GraspWorld::export_obs,
+             "Export the batched per-step obs as a dict of HOST numpy arrays "
+             "(env-major): q (env,action_dim), qdot (env,action_dim), "
+             "fingertip_world_pos (env,3*num_fingertips), finger_normal_impulse "
+             "(env,num_fingertips). The engine does ONE bulk device->host download "
+             "per buffer (no per-env sync loop).")
+        .def("read_cup", &GraspWorld::read_cup,
+             "Read cup pose/vel + per-env contact signals as a dict of HOST numpy "
+             "arrays (env-major): cup_pose (env,7) [px,py,pz,qw,qx,qy,qz], cup_vel "
+             "(env,6) [vx,vy,vz,wx,wy,wz], cup_z (env,), cup_vz (env,), "
+             "finger_contacts (env,) uint32 (# fingertip<->cup contacts per env).")
+        .def("reset_envs", &GraspWorld::reset_envs, nb::arg("env_ids"),
+             nb::arg("seed"),
+             "Reset the listed envs to a seed-randomized cup pose + nominal open "
+             "gripper. env_ids: a 1-D int array (numpy / torch / list) in "
+             "[0,env_count). Deterministic given seed (a re-run with the same seed "
+             "produces identical states).")
+        .def("destroy", &GraspWorld::destroy, "Destroy the grasp world.")
+        .def_prop_ro("env_count", &GraspWorld::env_count)
+        .def_prop_ro("action_dim", &GraspWorld::action_dim,
+                     "Per-env per-finger DOF count (== gripper joint DOFs). Actions "
+                     "are (env_count, action_dim) env-major.")
+        .def_prop_ro("num_fingertips", &GraspWorld::num_fingertips)
+        .def_prop_ro("bodies_per_env", &GraspWorld::bodies_per_env)
+        .def("__enter__", [](GraspWorld& w) -> GraspWorld& { return w; })
+        .def("__exit__",
+             [](GraspWorld& w, nb::object, nb::object, nb::object) { w.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 

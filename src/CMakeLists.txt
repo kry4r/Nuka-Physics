@@ -111,6 +111,7 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_grasp.h
 )
 
 add_library(nuka_render STATIC
@@ -828,6 +829,18 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/error.cpp
         c_abi/diffsim.cpp
         c_abi/noise.cpp
+        # v0.8 A2: the BATCHED GRASP WORLD C-ABI shim over BatchedUnifiedWorld (the
+        # RL-grasp substrate exposed to Python). Compiles the coresident sources +
+        # the SHARED grasp scene factory (the SAME validated scene the 21
+        # nuka_batched_unified_world_test gates exercise) + the host contact driver
+        # the grasp narrowphase needs, directly into libnuka (g++-14). The binding
+        # (python/src/nuka_ext.cpp, g++-10) binds the C surface only -- no C++ class
+        # ABI crosses the toolchain boundary.
+        c_abi/grasp_world.cpp
+        runtime/coresident/batched_unified_world.cpp
+        runtime/coresident/unified_coresident_stepper.cpp
+        runtime/coresident/grasp_scene_factory.cpp
+        collision/contact_stream_driver.cpp
     )
 
     target_include_directories(nuka
@@ -847,6 +860,12 @@ if(CMAKE_CUDA_COMPILER)
             nuka_diffsim
             nuka_sensor_noise
             nuka_phi
+            # v0.8 A2: the unified collision/contact spine the BatchedUnifiedWorld
+            # grasp path needs (the same delta the nuka_batched_unified_world_test
+            # target adds over the previous libnuka link set).
+            nuka_solver
+            nuka_constraint
+            nuka_collision_gpu
         PUBLIC
             CUDA::cudart
     )
@@ -854,6 +873,10 @@ if(CMAKE_CUDA_COMPILER)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(nuka PUBLIC stdc++)
     endif()
+
+    # v0.8 A2: the grasp path compiles batched_unified_world.cpp, which includes the
+    # GENERATED collidable registry (candidate_pair.hpp) -- ensure codegen runs first.
+    add_dependencies(nuka nuka_codegen)
 
     set_target_properties(nuka PROPERTIES
         OUTPUT_NAME nuka
@@ -863,6 +886,23 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     nuka_set_warnings(nuka)
+
+    # v0.8 A2: the PROMOTED coresident physics sources (+ the host contact driver)
+    # keep the warning posture of their authoring home (the test target, which does
+    # NOT apply nuka_set_warnings) rather than getting the library's strict
+    # -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror imposed by promotion.
+    # These 170 KB of byte-exact, gate-validated sources were never written under
+    # those flags; re-auditing them would risk the byte-identity the 21 gates pin.
+    # `-w` is appended AFTER -Werror per source file, so GCC suppresses the warnings
+    # before -Werror can elevate them. The NEW c_abi/grasp_world.cpp shim is
+    # deliberately NOT exempt -- it stays strict to catch real bugs.
+    set_source_files_properties(
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+        PROPERTIES COMPILE_OPTIONS "-w"
+    )
 
     install(TARGETS nuka
         EXPORT nukaTargets
