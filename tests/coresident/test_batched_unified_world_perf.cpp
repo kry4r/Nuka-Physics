@@ -395,15 +395,17 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
     // catches a GROSS regression (a 3x+ slowdown, e.g. an accidental extra per-env device
     // round-trip in the host orchestration loop), not noise.
     //
-    // BASELINE: ~525 env-steps/sec measured at P2.4b bake time on the build-cuda128 box (N=32,
-    // K=200), up ~2.9x from the P2.4a-era ~180 (which was O(N) host orchestration, N-independent).
-    // P2.4b consolidated the per-env articulation into ONE env-major device + batched FK/CRBA/
-    // chain-J/ABA launches, killing the 62.8% per-env SYNC STORM (chain_jacobian 53.4%->~0.1%);
-    // the step is now narrowphase-bound (90.8% at N=32 -> P2.4c is host->GPU narrowphase). The
-    // floor stays GENEROUS at 0.3x (catches a 3x+ regression, not noise); set conservatively
-    // below the measured 525 so a noisy box does not flake. Update if the baseline moves again
-    // (e.g. after P2.4c GPU narrowphase or P2.4d/P2.4e device-resident rows lift throughput).
-    constexpr double kN32BaselineEps = 500.0;  // see comment above; floor is 0.3x this.
+    // BASELINE: ~4836 env-steps/sec measured at P2.4c bake time on the build-cuda128 box (N=32,
+    // K=200), up ~9.2x from the P2.4b-era ~525 (which was narrowphase-bound at 90.9%). P2.4c
+    // moved the grasp narrowphase (sphere fingertip x cup ConvexHull) host->GPU: ONE batched
+    // grasp_sphere_hull_kernel wrapping the HD-clean cvx::SphereHull over all (env x fingertip)
+    // slots, replacing the per-env host BuildContactManifolds loop. narrowphase collapsed
+    // 90.9%->~10.6% at N=32; the step is now ROW_SOLVER-bound (~79.7% -- the single-block
+    // batched UnifiedSolve + its host round-trip), which is the P2.4d/P2.4e target (device-
+    // resident rows + a multi-block solve kernel). The floor stays GENEROUS at 0.3x (catches a
+    // 3x+ regression, not noise); set conservatively below the measured 4836 so a noisy box
+    // does not flake. Update if the baseline moves again (e.g. after P2.4d/P2.4e lift throughput).
+    constexpr double kN32BaselineEps = 4500.0;  // see comment above; floor is 0.3x this.
     EXPECT_GT(measured_n32_eps, 0.3 * kN32BaselineEps)
         << "N=32 throughput (" << measured_n32_eps
         << " env-steps/sec) fell below 0.3x the baseline (" << kN32BaselineEps

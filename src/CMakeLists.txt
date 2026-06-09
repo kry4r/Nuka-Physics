@@ -572,6 +572,13 @@ if(CMAKE_CUDA_COMPILER)
         # (the PBD co-step wiring is C6a). Excludes articulation-link (no per-link
         # AABB yet -- the C5b-prereq long-pole).
         collision/particle_candidate_pairs.cu
+        # v0.8 P2.4c: the BATCHED GRASP NARROWPHASE kernel. One thread per (env x
+        # fingertip) wraps the HD-clean cvx::SphereHull (sphere=fingertip x cup hull)
+        # -- the SAME math the host narrowphase dispatch calls -- moving the
+        # P2.4b-dominant grasp narrowphase (90.9% at N=32) host->GPU. The host launcher
+        # (LaunchGraspSphereHullNarrowphase) is the BuildContactManifolds drop-in
+        # (StampSides + param merge applied post-download). ADDITIVE; no existing TU edited.
+        collision/gpu/narrowphase_grasp.cu
     )
     set_target_properties(nuka_collision_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     # candidate_pair.cu includes src/codegen/generated/collidable_registry.hpp
