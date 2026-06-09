@@ -140,6 +140,27 @@ struct BatchedGraspEnvReport {
     double   cup_vz = 0.0;                // cup vertical velocity AFTER this step.
     double   cup_z  = 0.0;                // cup height AFTER this step.
     float    max_lambda = 0.0f;           // peak finger normal-row impulse this step.
+    // ----- A1 RL substrate: the FORCE-CLOSURE signal (per-fingertip normal impulse) -----
+    // Σ over THIS fingertip's NORMAL rows (NOT the friction spokes) of the row lambda --
+    // the squeeze impulse each finger delivers. Both fingers' impulse > 0 with the cup
+    // held == grasped (not batted by one finger). Bucketed host-side here (the SAME place
+    // cup_vertical_impulse / max_lambda are extracted), keyed by the fingertip the row's
+    // chain-J slot belongs to; the solver is NOT touched. Indexed by fingertip order
+    // (size == num_fingertips); Σ over fingers == max-style aggregate cross-check.
+    std::vector<float> finger_normal_impulse;  // per-fingertip normal-row impulse (>=0).
+};
+
+// ----- A1 RL substrate: the batched per-step OBS readout (the throughput-critical piece) ---
+// Every DEVICE-resident quantity the downstream H1GraspEnv force-closure-HOLD reward needs,
+// exported in ONE bulk device->host copy per buffer for ALL envs (no per-env loop -> the
+// P2.4b sync-storm elimination is preserved). Cup pose/vel stay on the host accessors
+// Body(env,cup_local) / GraspReports(); this struct carries ONLY the device-resident signals.
+// All vectors are env-major; sized once by ExportObsState and reused.
+struct ObsStateBatch {
+    std::vector<float> q;                   // finger joint q       [dof_stride per env].
+    std::vector<float> qdot;                // finger joint qdot    [dof_stride per env].
+    std::vector<float> fingertip_world_pos; // fingertip world xyz  [3*num_fingertips per env].
+    std::vector<float> finger_normal_impulse;  // per-finger normal impulse [num_fingertips per env].
 };
 
 // The batched general world. Owns N envs of co-resident state and advances them in
@@ -155,7 +176,31 @@ public:
     // Advance EVERY env one step. P2.1: per-env rigid gravity velocity-kick +
     // symplectic-Euler position/orientation integrate (NO contact). Deterministic
     // (D1): the bodies are advanced in fixed env-major index order, no atomics.
+    // A1 (grasp): applies the LAST actions set by SetActions (the template grip torque
+    // until the first SetActions call), so a world that never calls SetActions is
+    // BYTE-IDENTICAL to today (GATE-1).
     void Step();
+
+    // ----- A1 RL substrate: PER-STEP PER-ENV ACTION INJECTION --------------------
+    // Set the per-env per-finger DRIVE TORQUE for ALL envs from a host array in ONE
+    // device upload. `actions` is env_count*DofStride() floats ENV-MAJOR: action
+    // [e*DofStride()+d] is env e's drive torque on the gripper joint at flat-qdot DOF
+    // index d (the SAME prefix-sum index DofIndexOf produces -- so d maps to a finger
+    // prismatic joint). The torque is scattered into the env-major per-link drive buffer
+    // the grip kernel reads (global link e*BaseLinkCount()+link), REPLACING the constant
+    // template grip torque. No-op when !has_grasp_ or count != env_count*DofStride().
+    // NEVER a per-env host loop -- one cudaMemcpy-class upload. After SetActions, Step()
+    // uses these actions every step until the next SetActions / ResetEnvs.
+    void SetActions(const float* actions, size_t count);
+    // Convenience: set actions then advance one step (the RL per-step driver).
+    void Step(const float* actions, size_t count) {
+        SetActions(actions, count);
+        Step();
+    }
+    // The per-env action width (== the gripper's joint DOF count). Actions are
+    // env_count*ActionDim() floats env-major.
+    uint32_t ActionDim() const { return dof_stride_; }
+    uint32_t NumFingertips() const { return static_cast<uint32_t>(fingertips_.size()); }
 
     uint32_t EnvCount() const { return env_count_; }
     uint32_t BodiesPerEnv() const { return bodies_per_env_; }
@@ -191,6 +236,31 @@ public:
     void DownloadGripper(articulation::ArticulationHostState* out) const {
         DownloadGripper(0u, out);
     }
+
+    // ----- A1 RL substrate: BATCHED OBS EXPORT (the per-step RL readout) ----------
+    // Fill `out` with every DEVICE-resident obs signal for ALL envs in ONE bulk
+    // device->host copy per buffer (q, qdot, fingertip_world_pos download from the
+    // env-major device buffers; finger_normal_impulse is read from the LAST Step()'s
+    // host-side report aggregation). NEVER a per-env DownloadGripper loop -- that would
+    // re-create the O(N) sync storm P2.4b eliminated. Sizes `out`'s vectors once
+    // (env_count*DofStride / env_count*3*NumFingertips / env_count*NumFingertips) and
+    // reuses them across calls. Cup pose/vel come from Body(env,cup_local) /
+    // GraspReports() (already host-resident). No-op (clears `out`) when !has_grasp_.
+    void ExportObsState(ObsStateBatch& out) const;
+
+    // ----- A1 RL substrate: PER-ENV AUTORESET with deterministic randomization ----
+    // For each env in `env_ids`: (a) restore the cup BodyState to a seed-randomized
+    // initial pose (cup XY jittered within +/-kResetCupJitterM of the template grasp
+    // position, cup Z + orientation reset to the template, velocity zeroed); (b) restore
+    // that env's gripper device slice to the template (q to the nominal open config,
+    // qdot=0, link_velocity=0). The device write is BATCHED over the listed envs (one
+    // consolidated download-modify-upload, NOT a per-env synchronous round-trip), kept
+    // OFF the per-step critical path. Randomization is DETERMINISTIC given `seed`
+    // (per-env std::mt19937 seeded from seed XOR env-id) so two ResetEnvs calls with the
+    // same seed produce identical states (D1). No-op when !has_grasp_.
+    void ResetEnvs(const std::vector<uint32_t>& env_ids, uint64_t seed);
+    // The cup XY randomization half-box (m) ResetEnvs jitters within (small, ~+/-2.5 cm).
+    static constexpr float kResetCupJitterM = 0.025f;
 
     // ----- P2.4a perf-gate instrumentation (ADDITIVE; physics-neutral) -----------
     // Per-tag HOST WALL-CLOCK aggregator (mirrors BatchedArticulatedWorld::Perf). The
@@ -257,6 +327,39 @@ private:
     CoResidentCup grasp_cup_;
     phi::Buffer   grip_torque_dev_;   // env-major per-link constant grip torque (device).
     phi::Buffer   grip_limits_dev_;   // env-major per-link drive force limits (device).
+    // ----- A1 RL substrate: per-step per-env ACTION drive (replaces grip_torque_dev_ at
+    // the drive call). Env-major per-link layout (length env_count_*base_link_count_, the
+    // SAME the kernel reads), DEFAULT-INITIALIZED to a byte-identical copy of the replicated
+    // template grip torque -> a world that never calls SetActions drives EXACTLY the constant
+    // grip (GATE-1 byte-identity). SetActions scatters env_count_*dof_stride_ host actions
+    // (env-major, DOF-indexed) into this buffer in ONE upload. action_torque_host_ is the
+    // CPU mirror used by SetActions to map DOF index -> global link before the upload.
+    phi::Buffer        action_torque_dev_;   // env-major per-link drive torque (the LIVE drive).
+    std::vector<float> action_torque_host_;  // CPU mirror (env_count_*base_link_count_).
+    // The gripper joint-DOF -> articulation-LOCAL link map (length dof_stride_): flat-qdot
+    // DOF index d is driven on link dof_to_link_[d]. Built once from the proto's joint types
+    // (the inverse of DofIndexOf restricted to single-DOF prismatic/revolute finger joints).
+    std::vector<uint32_t> dof_to_link_;
+    // ----- A1 RL substrate: the reset template (the nominal cup IC + the proto open config) ---
+    // The per-env cup BodyState the scene was seeded with (template body cup_local_index_),
+    // captured at construction so ResetEnvs can restore + jitter it without a scene rebuild.
+    runtime::rigid::BodyState reset_cup_template_;
+    // ----- A1 RL substrate: retained fingertip WORLD positions (host-resident) -------------
+    // The resolver computes finger_centers = lp.position + lp.rotation.Rotate(ft.local_offset)
+    // ON THE HOST during the narrowphase prep (from the ONE batched FK download). We retain
+    // them here env-major [num_fingertips*3 per env] in that same loop, so ExportObsState
+    // surfaces them with NO extra device round-trip (they are already host-computed). Reused
+    // each Step(). mutable so the const ExportObsState reads them; the resolver fills them.
+    mutable std::vector<float> fingertip_world_host_;  // env_count_*num_fingertips*3 (env-major).
+    // ----- A1 RL substrate: ExportObsState scratch (reused; the bulk q/qdot/link_vel download) ---
+    // ExportObsState copies ONLY the q / qdot / link_velocity device buffers it actually reads
+    // (NOT a full DownloadArticulationState of all ~20 SoA arrays) into these env-major host
+    // mirrors via direct CopyToHost -- the "ONE bulk download from the env-major device buffers"
+    // contract. Sized once at construction (env_count_*base_link_count_); mutable so the const
+    // ExportObsState can fill them.
+    mutable std::vector<float> obs_q_scratch_;       // env_count_*base_link_count_ (device q).
+    mutable std::vector<float> obs_qdot_scratch_;    // env_count_*base_link_count_ (device qdot).
+    mutable std::vector<articulation::LinkSpatialVel> obs_linkvel_scratch_;  // env-major link vel.
     // ----- P2.4b persistent batched articulation scratch (allocated once, reused) ------
     // Mirrors BatchedArticulatedWorld's world_pose_/m_/m_inv_/composite_ layout. world_pose_
     // is Transform[env_count_*base_link_count_] (ONE batched UpdateWorldLinkPoses output);
