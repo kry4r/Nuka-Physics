@@ -259,6 +259,60 @@ struct StandConfig {
     uint32_t           condim      = 3u;      // 3 -> normal + 4 friction spokes.
 };
 
+// ===========================================================================
+// C7b-2 SHOWCASE: the CONJUNCTION mode -- stand AND grasp in ONE step.
+// ===========================================================================
+// StepStand() balances a floating-base H1 on its feet (NO movable body); StepGrasp()
+// holds a movable cup with N fingertips (NO foot-ground). The demo's central claim --
+// the standing policy maintaining balance WHILE the arm reaches/closes/lifts/places a
+// cup -- is the conjunction NEITHER runs. StepStandGrasp() emits the UNION of all three
+// contact pairs every step, sharing the SAME spine (EmitCompliantContactRows ->
+// UnifiedSolve) as the other modes -- additive composition of proven row classes, NOT
+// new physics:
+//   * foot<->ground : ArticulationChainJ <-> StaticNull   (== StepStand's row class),
+//   * finger<->cup  : ArticulationChainJ <-> RigidInvMass  (== StepGrasp's finger row),
+//   * cup<->table   : RigidInvMass <-> StaticNull          (== StepGrasp's table row).
+// ONE movable cup (body_count=1) co-resident with the floating base + static ground +
+// optional static table. Row classification by the (reaction-kind, reaction-kind) pair
+// is UNAMBIGUOUS: the cup is the only RigidInvMass side; the ground/table are the only
+// StaticNull sides; feet+fingers are the only ChainJ sides (disjoint broadphase handles
+// distinguish a foot sphere from a fingertip sphere). The drive torque is ONE per-link
+// vector: leg slots = the RL balance policy, arm slots = the deterministic reach
+// trajectory PD, finger slots = the grip -- all overwritten each step via SetGripTorque.
+struct StandGraspConfig {
+    // --- standing (feet <-> static ground) ---
+    std::vector<CoResidentFootSphere> feet;     // the foot polygon (toe/heel per ankle).
+    CoResidentGround                  ground;   // static +Z plane (foot bottoms rest here).
+    float                             foot_mu = 0.8f;   // per-foot friction (no slip).
+    // --- grasp (fingertips <-> movable cup) ---
+    std::vector<CoResidentFingertip>  fingertips;  // the N pinch contacts (hand links).
+    CoResidentCup                     cup;         // the convex-hull movable cup.
+    runtime::rigid::BodyState         cup_state;   // cup mass/inertia/initial pose.
+    float                             finger_mu = 0.6f; // per-finger friction (the hold).
+    // --- optional cup<->static-table support (the place/lift choreography) ---
+    bool      has_table     = false;   // false -> no table pair ever emitted.
+    float     table_height  = 0.0f;    // static plane z (the cup bottom rests here).
+    float     table_mu      = 0.6f;    // cup<->table friction (cup sits, no slide).
+    uint32_t  table_broadphase_id = 8500u;  // distinct from cup + ground + every link id.
+    // Cup's flat-bottom collision PROXY for the cup<->table support ONLY. A real mug has
+    // a flat base, so a box is the FAITHFUL resting-contact representation -- this
+    // sidesteps the hull-vs-plane coplanar-bottom-face narrowphase instability (the
+    // detailed hull, id `cup.broadphase_body_id`=7000, rocks on the plane: tips, then
+    // the position-error aref launches it). The hull stays for finger<->cup + render; the
+    // proxy (id `cup_table_proxy_id`=7001) is used ONLY in the cup<->table pair. BOTH are
+    // RigidInvMass sharing the cup BodyState (body 0), so the row wiring maps both to the
+    // same mass. Set half-extents to the cup footprint + a thin z, and offset so the box
+    // BOTTOM aligns with the hull bottom (the cup renders flush on the table). Zero
+    // half-extents -> the proxy is unused (the table pair falls back to the hull id).
+    math::Vec3 cup_table_proxy_half{};       // box half-extents (x,y ~ cup footprint, z thin).
+    math::Vec3 cup_table_proxy_offset{};     // box-center offset in the cup body frame.
+    uint32_t   cup_table_proxy_id = 7001u;   // distinct from the cup hull id (7000).
+    // --- the unified DRIVE torque (legs RL + arm deterministic + finger grip) ---
+    std::vector<float> drive_torque;          // per device link; overwrite via SetGripTorque.
+    std::vector<float> drive_force_limits;    // per device link (0 -> no clamp).
+    uint32_t           condim       = 3u;     // 3 -> normal + 4 friction spokes / point.
+};
+
 // The stepper. Owns the GPU articulation buffers + the host box; advances both in
 // lockstep. The articulation is uploaded once at construction and stepped in
 // place; Download() snapshots q/qdot/base_pose/link_velocity back.
@@ -291,6 +345,17 @@ public:
     UnifiedCoResidentStepper(const phi::DeviceContext& context,
                              const articulation::ArticulationHostState& host,
                              const StandConfig& stand,
+                             float gravity_z, float dt);
+
+    // C7b-2 SHOWCASE constructor: the CONJUNCTION (stand AND grasp). N foot spheres on a
+    // static +Z ground + N fingertips on a movable convex-hull cup + an optional static
+    // table, all through the unified spine. ONE movable cup co-resident with the floating
+    // base. Reuses the SAME Step() machinery as the grasp + stand paths; the W1a foot/box
+    // path stays inert. The drive torque (legs RL + arm reach + finger grip) is overwritten
+    // each step via SetGripTorque; the table support toggles via SetTableEnabled.
+    UnifiedCoResidentStepper(const phi::DeviceContext& context,
+                             const articulation::ArticulationHostState& host,
+                             const StandGraspConfig& stand_grasp,
                              float gravity_z, float dt);
 
     // Advance ONE step: ComputeAccelerations -> velocity integrate (artic + box) ->
@@ -374,6 +439,16 @@ private:
     // the spine (condim=3 friction, NO movable body) -> position integrate. The
     // contact recoils into the floating base through the 18-wide foot chain-J.
     CoResidentStepReport StepStand();
+
+    // ----- C7b-2 stand+grasp (the conjunction) ----------------------------------
+    bool             stand_grasp_mode_ = false;  // false -> W1a/grasp/stand paths.
+    StandGraspConfig stand_grasp_;               // feet + fingertips + cup + table + drive.
+
+    // Run ONE stand+grasp step: re-apply the drive torque (legs RL + arm reach + finger
+    // grip) -> ABA -> velocity integrate (floating base + cup gravity) -> the UNION of
+    // foot<->ground + finger<->cup + (optional) cup<->table contacts through the spine
+    // (body_count=1, the cup) -> two-way UnifiedSolve -> position integrate (artic + cup).
+    CoResidentStepReport StepStandGrasp();
 
     // Advance the box pose by one symplectic position step (position += vel*dt +
     // orientation from angular vel). NO contact physics here -- the box<->ground
