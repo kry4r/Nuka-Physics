@@ -6,7 +6,7 @@
 
 **Architecture:** Keep RL scoped to standing: the exported H1 standing actor drives the legs through the existing C++ bridge. A deterministic full-world controller drives upper body/hand phases for reach, close, lift, place, and release. The validated rollout is captured once, then rendered by a real geometry/PBR-style renderer; the Go2 stick renderer is not acceptable as final output.
 
-**Tech Stack:** C++ co-resident stepper/tests, `TinyMlp<32,64,10>` bridge artifacts, CUDA RT/two-level renderer (`src/rt`), Python orchestration/encoding, `ffmpeg`, existing H1/cup assets.
+**Tech Stack:** C++ co-resident stepper/tests, `TinyMlp<32,64,10>` bridge artifacts, CUDA RT/two-level renderer (`src/rt`), Python orchestration/encoding, `ffmpeg`, existing H1/cup assets, and the `newton-assets` kitchen scene at `.nuka-assets/kitchen/mjcf/kitchen.xml` for the final video environment.
 
 ---
 
@@ -33,10 +33,11 @@
 - Create `examples/demo/h1_cup_pbr_render.py`
   - Converts captured poses/phase metadata into PBR-style frames.
   - Uses a geometry renderer, not stick figures. Preferred path: C++/CUDA RT helper executable; fallback inside the plan is a polished analytic proxy over link poses with PBR shading and shadows.
+  - Requires the final render path to use kitchen-scene support/context assets when `.nuka-assets/kitchen/mjcf/kitchen.xml` is present; synthetic support is only a smoke/fallback artifact.
 
 - Create `src/apps/h1_cup_rt_render.cpp` and optionally `src/apps/h1_cup_rt_render.hpp`
   - CLI renderer that loads capture manifest/pose data and writes PPM frames using `rt::TwoLevelScene` / `rt::RenderFrame` public APIs.
-  - Builds reusable robot/cup/table/floor meshes or analytic primitives from captured poses.
+  - Builds reusable robot/cup/kitchen-support/floor context meshes from captured poses plus kitchen SceneIR/OBJ/material data where available; analytic primitives are allowed for H1 link proxies and explicit fallback diagnostics.
   - Do not modify existing `src/rt/**` internals without owner approval.
 
 - Modify `src/CMakeLists.txt` to add `nuka_h1_cup_rt_render` if the C++ RT renderer path is used.
@@ -69,7 +70,7 @@
 
 - [ ] **Step 1: Write a failing renderer smoke test**
 
-Create `tests/rt/test_h1_cup_pbr_render.cpp` with a minimal scene: floor plane/box, table, cup proxy sphere/cylinder mesh, and a humanoid proxy made of capsules/spheres/boxes. Test that `rt::RenderFrame` produces non-background pixels, shadows/contact shadows, distinct material colors, and stable camera framing. This test is a render-quality smoke, not a stick/debug renderer test.
+Create `tests/rt/test_h1_cup_pbr_render.cpp` with a minimal synthetic scene: floor/support box, cup proxy sphere/cylinder mesh, and a humanoid proxy made of capsules/spheres/boxes. Test that `rt::RenderFrame` produces non-background pixels, shadows/contact shadows, distinct material colors, and stable camera framing. This test is a render-quality smoke for the RT path, not the final kitchen scene and not a stick/debug renderer test.
 
 - [ ] **Step 2: Run test to verify it fails to compile**
 
@@ -106,7 +107,7 @@ cmake --build build-cuda128 --target nuka_h1_cup_pbr_render_test -j$(nproc)
 build-cuda128/tests/nuka_h1_cup_pbr_render_test --gtest_filter=H1CupPbrRender.SmokeHeroScene
 ```
 
-Expected: PASS, nonzero hit pixels, non-black color variance, shadowed pixels present, robot/cup/table visible in expected image regions.
+Expected: PASS, nonzero hit pixels, non-black color variance, shadowed pixels present, robot/cup/support visible in expected image regions. The test output must remain labeled as a synthetic feasibility smoke, not final kitchen-render evidence.
 
 - [ ] **Step 5: Commit renderer feasibility**
 
@@ -201,7 +202,7 @@ Initial expectations:
 
 - skips if H1/cup/bridge artifacts missing.
 - loads standing MLP.
-- constructs full H1 stand scene plus cup/table/grasp config.
+- constructs full H1 stand scene plus cup/kitchen-support/grasp config, using the kitchen counter/table target when available and a named fallback support only for non-final gates.
 - runs phases and accumulates metrics.
 - asserts metrics from spec.
 
@@ -221,7 +222,7 @@ Add `nuka_h1_cup_sequence_demo_test` linking the same libraries as `nuka_h1_brid
 
 - [ ] **Step 4: Implement establish-only sequence**
 
-First green target only runs standing policy for 300-500 control steps with cup/table present but no arm motion.
+First green target only runs standing policy for 300-500 control steps with cup and kitchen-support/fallback-support present but no arm motion.
 
 Expected metrics:
 
@@ -261,7 +262,7 @@ Before reach/lift/place, prove the mechanics can coexist in one world without cl
 - RL leg policy active
 - non-leg PD/hold active
 - dense fingertip geometry registered
-- cup/table contact enabled
+- cup kitchen-support/table contact enabled
 - no arm motion yet except a small deterministic hand-close probe away from the cup if needed
 
 - [ ] **Step 2: Assert coexistence metrics**
@@ -379,7 +380,7 @@ Each frame record includes:
 - frame index, time, phase
 - H1 link poses
 - cup pose
-- table transform
+- kitchen support transform and dimensions
 - camera target hints
 
 - [ ] **Step 2: Add Python wrapper**
@@ -430,13 +431,14 @@ build-cuda128/src/apps/nuka_h1_cup_rt_render \
 
 - [ ] **Step 2: Build TwoLevelScene assets**
 
-Use RT meshes:
+Use RT meshes and imported scene data:
 
-- H1 analytic proxy links: capsules/spheres/boxes from link poses; material groups for torso/legs/arms/hand.
-- Cup: cylinder/sphere/convex proxy with ceramic material, or imported mesh if feasible.
-- Table/floor: boxes/planes with matte PBR material.
+- H1 analytic proxy links: capsules/spheres/boxes from link poses; material groups for torso/legs/arms/hand until imported H1 mesh rendering is feasible.
+- Cup: imported cup mesh/convex proxy when feasible; otherwise a clearly declared ceramic proxy aligned to the captured cup pose.
+- Kitchen scene: load `.nuka-assets/kitchen/mjcf/kitchen.xml` and referenced OBJ/material data as the final support/context source of truth; preserve authored `base_color`, roughness, metallic/reflectance-style material hints where the importer exposes them.
+- Fallback support/floor boxes are allowed only for smoke tests or `renderer_mode=rt_pbr_proxy_fallback`, never silently as the final presentable kitchen video.
 
-This is not stick rendering: use shaded 3D geometry, shadows, material roughness/metallic, and camera perspective. Add tone mapping and supersampling/anti-aliasing if single-sample frames look jagged. Use multiple/faked studio lights if the bounded RT API only supports one direct light; document the chosen lighting trick in the manifest.
+This is not stick rendering: use shaded 3D geometry, shadows, material roughness/metallic, and camera perspective. Add tone mapping and supersampling/anti-aliasing if single-sample frames look jagged. Use multiple/faked studio lights if the bounded RT API only supports one direct light; document the chosen lighting trick, kitchen asset path, and any proxy/fallback usage in the manifest.
 
 - [ ] **Step 3: Implement camera path**
 
@@ -462,7 +464,7 @@ Update `tests/rt/test_h1_cup_pbr_render.cpp` to run one captured mini-scene thro
 build-cuda128/src/apps/nuka_h1_cup_rt_render --rollout out/h1_cup_demo/rollout.jsonl --frames out/h1_cup_demo/frames --width 1920 --height 1080 --fps 30
 ```
 
-Expected: frame count matches manifest, nonzero images, robot/cup/table visible in target frame regions, no blank frames. Generate a contact sheet for visual review.
+Expected: frame count matches manifest, nonzero images, robot/cup/kitchen support visible in target frame regions, no blank frames, and manifest records whether the final output used `rt_pbr_mesh`, `rt_pbr_proxy`, or `rt_pbr_proxy_fallback`. Generate a contact sheet for visual review.
 
 - [ ] **Step 7: Commit renderer CLI**
 
@@ -513,7 +515,7 @@ Include manifest fields:
 - render command
 - encode command
 - metrics summary
-- renderer mode: `rt_pbr_proxy` or `rt_pbr_mesh`
+- renderer mode: `rt_pbr_mesh`, `rt_pbr_proxy`, or non-final `rt_pbr_proxy_fallback`
 - camera path name and frame ranges
 - frame count, width, height, fps, duration
 
@@ -523,7 +525,7 @@ Machine checks must parse `ffprobe` and fail unless:
 - FPS is 30
 - duration is 8-12 seconds
 - encoded frame count matches rendered frame count
-- selected frames are nonblank and show expected robot/cup/table visibility regions
+- selected frames are nonblank and show expected robot/cup/kitchen-support visibility regions
 - no debug overlay flag is enabled
 
 - [ ] **Step 4: Run full one-command demo**
@@ -566,7 +568,7 @@ State clearly:
 
 - RL drives standing.
 - Manipulation is deterministic state machine.
-- Renderer is PBR-style RT/proxy or mesh mode according to manifest.
+- Renderer is PBR-style RT/proxy or mesh mode according to manifest, with kitchen assets as the final scene source when present and any fallback clearly marked non-final.
 - Full dexterous manipulation RL is future work unless implemented later.
 
 - [ ] **Step 3: Document artifact regeneration**

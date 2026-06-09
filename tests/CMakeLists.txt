@@ -1268,6 +1268,27 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_rt_two_level_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- H1 cup demo: PBR-style hero scene smoke over the two-level RT path ----
+    add_executable(nuka_h1_cup_pbr_render_test
+        rt/test_h1_cup_pbr_render.cpp
+    )
+    set_source_files_properties(rt/test_h1_cup_pbr_render.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_h1_cup_pbr_render_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_h1_cup_pbr_render_test
+        PRIVATE
+            nuka_rt_gpu
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_h1_cup_pbr_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
     # MEASURES flat p13 RenderScene (rebuild-all every frame over N*~300 baked
     # world triangles) vs the G1-A two-level RenderFrame (per-mesh BLAS built
@@ -2275,6 +2296,51 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     gtest_discover_tests(nuka_h1_dense_grasp_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
+    # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
+    # the right hand co-resides a movable cup + static table + N fingertip collidables
+    # -- all in ONE step through the NEW StepStandGrasp() path (foot<->ground +
+    # finger<->cup + cup<->table). R0 = pure stand through the conjunction path (cup
+    # plumbing inert) proves no stand regression; R1 = cup on a table + resting fingers
+    # proves co-residence does not break the stand solve. Reuses the proven bridge-spike
+    # / dense-grasp helpers via h1_demo_shared.hpp + tiny_mlp.hpp (the coresident/ dir).
+    # Additive parallel TU; the bridge spike + dense grasp gates are LEFT INTACT. Same
+    # dep set + the contact_stream_driver.cpp the contact path needs.
+    add_executable(nuka_h1_cup_sequence_demo_test
+        coresident/test_h1_cup_sequence_demo.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_cup_sequence_demo_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_cup_sequence_demo_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_cup_sequence_demo_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/coresident
+    )
+
+    target_link_libraries(nuka_h1_cup_sequence_demo_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_cup_sequence_demo_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- v0.8 S3: the TRANSFER-SMOKE GATE (full-DOF floating-base H1 STANDING) ---

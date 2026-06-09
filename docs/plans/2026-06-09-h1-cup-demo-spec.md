@@ -10,7 +10,7 @@
 
 A reproducible command produces:
 
-1. A full-world co-resident rollout artifact containing H1 link poses, cup pose, table pose, phase labels, and validation metrics.
+1. A full-world co-resident rollout artifact containing H1 link poses, cup pose, kitchen counter/table support pose, phase labels, and validation metrics.
 2. A hard validation gate proving:
    - RL standing bridge remains active throughout the sequence.
    - H1 remains upright: `tilt_max < 15 deg`.
@@ -33,6 +33,7 @@ This split is intentional: current verified assets already prove standing RL and
 - Standing policy gate: `tests/coresident/test_h1_bridge_spike.cpp` loads `python/spikes/out/h1_bridge_mlp.bin`, projects full-world H1 state to the 32-dim bridge observation, runs `TinyMlp<32,64,10>`, applies normalized action times per-joint H1 limits, and asserts S4 standing metrics.
 - H1 reduced training env: `python/nuka/tasks/h1_stand.py` implements 32-dim observation and 10-dim normalized torque action.
 - Dense hand/cup grasp gate: `tests/coresident/test_h1_dense_grasp.cpp` builds the H1 hand + large cup dense-contact scene and validates force-closure hold under disturbance, grip-off bite, and deterministic replay.
+- Kitchen asset design: `docs/plans/2026-06-03-v07-p16-asset-pipeline-reshape.md` makes the newton-assets kitchen scene the intended demo environment, with kitchen counter support, OBJ visual meshes, and authored roughness/metallic material data.
 - Demo gate wrapper: `examples/demo/h1_cup_demo_gate.py` proves standing and dense grasp gates, but does not run one continuous sequence and does not render.
 - Rendering precedent: Go2 demo uses capture-to-frames-to-MP4, but H1 needs a new PBR-oriented renderer/capture path.
 
@@ -40,14 +41,14 @@ This split is intentional: current verified assets already prove standing RL and
 
 The sequence is phase-based:
 
-1. **Establish:** H1 stands in the full co-resident world under the exported RL leg policy. Upper body is held in a neutral presentation posture. Cup rests on a table in front/right of the robot.
+1. **Establish:** H1 stands in the full co-resident world under the exported RL leg policy. Upper body is held in a neutral presentation posture. Cup rests on the kitchen counter/table support in front/right of the robot.
 2. **Reach:** Upper-body and arm joints follow a deterministic pose schedule toward the prevalidated grasp pose. Leg policy continues at the bridge rate. The cup remains table-supported.
 3. **Pregrasp:** Fingers open around the cup using the dense-grasp placement geometry. The hand approaches without destabilizing the base.
 4. **Close:** Hand grip torque/PD target closes to the validated dense-contact grasp. Validation starts tracking finger/cup contacts and grip support.
 5. **Lift:** Table support for the cup is removed or the cup is lifted upward with the hand, depending on what the existing co-resident grasp path exposes. The gate must prove cup support comes from hand contacts, not table support.
 6. **Place:** Arm schedule lowers cup back to the table. The gate watches cup height, table support, tilt, and velocity.
 7. **Release:** Grip torque/PD target opens. Cup remains on table for a post-release settle window.
-8. **Hero Hold:** Robot stays standing with released cup visible on table for a final camera beat.
+8. **Hero Hold:** Robot stays standing with released cup visible on the kitchen counter/table support for a final camera beat.
 
 ## Controller Architecture
 
@@ -71,14 +72,16 @@ Use a deterministic phase controller:
 - Hand close/open uses the dense-grasp `CurlPose`/drive-link style from `test_h1_dense_grasp.cpp`.
 - The state machine is deterministic and phase durations are fixed.
 
-### Cup and Table
+### Cup and Kitchen Counter/Table Support
 
-Use the dense-contact large cup setup already validated by `test_h1_dense_grasp.cpp`:
+Use the dense-contact large cup setup already validated by `test_h1_dense_grasp.cpp`, but place it in the kitchen-scene support context for the final video:
 
-- Cup asset: `.nuka-assets/newton_assets/manipulation_objects/cup/model.usda`.
 - H1 asset: `.nuka-assets/newton_assets/unitree_h1/mjcf/h1_with_hand.xml`.
-- Table support is explicit and logged.
-- Release gate proves the cup remains stable on the table without active grip.
+- Cup asset: `.nuka-assets/newton_assets/manipulation_objects/cup/model.usda` unless the kitchen-prop variant is explicitly chosen later.
+- Kitchen environment target: `newton-assets` kitchen MJCF/OBJ scene from the v07 p16 asset plan. If absent locally, the pipeline must report the missing kitchen asset and may only use a clearly-labeled synthetic support for tests, not for the final presentable video.
+- Support surface: prefer a real kitchen counter/countertop collision surface from the kitchen scene; a simple table is allowed only as an explicit fallback/gate scaffold when the kitchen asset is unavailable.
+- Support/contact is explicit and logged.
+- Release gate proves the cup remains stable on the support surface without active grip.
 
 ## Validation Metrics
 
@@ -122,7 +125,7 @@ The runner writes `out/h1_cup_demo/rollout.npz` or equivalent containing:
 
 - H1 link poses per frame.
 - Cup pose per frame.
-- Table pose and dimensions.
+- Kitchen counter/table support pose and dimensions.
 - Camera phase metadata.
 - Phase labels per frame.
 - Metric JSON.
@@ -136,8 +139,8 @@ The final video must use a real PBR-style renderer, not the Go2 stick-figure/deb
 Required output:
 
 - MP4: `1920x1080`, 30 FPS, 8-12 seconds.
-- Geometry-based rendering of H1, table, floor, and cup; no stick skeleton as the final artifact.
-- PBR-style materials: dark studio floor, matte table, realistic cup albedo/roughness, H1 metal/plastic material separation where available.
+- Geometry-based rendering of H1, kitchen counter/table support, kitchen/floor context, and cup; no stick skeleton as the final artifact.
+- PBR-style materials: prefer imported kitchen/H1/cup authored material data (`base_color`, `roughness`, `metallic`) from SceneIR/importers; only use hand-authored fallback materials when an asset lacks material metadata, and record that in the manifest.
 - Lighting: large soft key light, cool rim light, subtle fill, visible ground/contact shadows.
 - Camera: NVIDIA keynote style reference — low 3/4 hero angle, slight telephoto compression, slow dolly/orbit, robot and cup centered, no top-down debug view.
 - Composition: establish feet/stance, cut or dolly to hand/cup close-up during grasp/lift/place, final hero shot after release.
@@ -147,6 +150,7 @@ Renderer implementation requirement:
 
 - Do **not** reuse `examples/demo/go2_demo_render.py` as final rendering. It is a stick/raster preview path.
 - Prefer building a new app on top of the existing CUDA RT/two-level renderer APIs because they already provide triangle/sphere primitives, GGX-like material fields, shadows, camera, AOVs, and per-frame instance transforms. Do not modify existing `src/rt/**` without owner approval; first use the public API from a new app/test.
+- Synthetic proxy geometry is allowed for renderer feasibility smoke tests and for explicitly labeled fallback diagnostics only. It is not the intended final scene. The final video should use kitchen-scene geometry/materials where the assets are present; if they are missing, the top-level demo command must fail or mark the output as non-final rather than silently substituting a synthetic studio/table scene.
 - If imported H1 mesh geometry is not directly available to RT on day one, use a high-quality analytic proxy renderer over captured link poses (capsules/spheres/boxes with PBR shading, shadows, depth, camera motion) as an intermediate, but it must be visually polished and still PBR-style. Mark any analytic proxy usage explicitly in the manifest.
 - The production/debug Vulkan storage-image renderer is not sufficient by itself because it currently maps `RenderScene` to debug draw boxes/capsules and lacks the desired photoreal camera/material/shadow presentation.
 - Because the current RT stack is bounded direct-light GGX/Lambert rather than a full path tracer, the MVP visual target is `PBR-style presentation-quality`: geometry, materials, shadows, tone mapping, supersampling/anti-aliasing if needed, studio lighting, and good camera motion. The manifest must disclose whether the renderer used analytic proxy geometry (`rt_pbr_proxy`) or imported mesh geometry (`rt_pbr_mesh`).
@@ -184,10 +188,11 @@ It should build required targets if needed, run the sequence gate, render frames
 ## Risks and Fallbacks
 
 1. **Full standing + grasp controller integration may expose co-resident API gaps.** Fallback: first build a sequence gate that reuses test-side helpers, then refactor into a demo runner.
-2. **Production PBR renderer may not ingest captured articulation/cup poses.** Fallback: implement a polished headless renderer over captured poses, then upgrade to Vulkan/PBR ingestion later.
-3. **Reach trajectory may destabilize standing.** Fallback: shorten arm motion, keep center of mass close, use a camera-framed tabletop pose near the validated grasp configuration.
-4. **Release/place may fail with current cup/table contact.** Fallback: add a hard negative gate and tune deterministic place height/orientation, not physics constants.
-5. **Artifacts are ignored.** Fallback: scripts regenerate artifacts and manifest records provenance.
+2. **Kitchen assets may be absent in a local checkout.** Fallback: run synthetic RT smoke and sequence scaffolds, but the final video command must report the missing kitchen asset and must not label a synthetic scene as final.
+3. **Production PBR renderer may not ingest captured articulation/cup poses.** Fallback: implement a polished headless renderer over captured poses, then upgrade to Vulkan/PBR ingestion later.
+4. **Reach trajectory may destabilize standing.** Fallback: shorten arm motion, keep center of mass close, use a camera-framed counter/table pose near the validated grasp configuration.
+5. **Release/place may fail with current cup/support contact.** Fallback: add a hard negative gate and tune deterministic place height/orientation, not physics constants.
+6. **Artifacts are ignored.** Fallback: scripts regenerate artifacts and manifest records provenance.
 
 ## Non-Negotiables
 
@@ -196,5 +201,6 @@ It should build required targets if needed, run the sequence gate, render frames
 - Do not silently hard-code runtime action biases outside exported/golden-validated weights.
 - Do not claim manipulation is RL-trained unless a manipulation RL training loop and acceptance gate are actually added.
 - Do not ship a video that is not generated from a passing captured rollout.
+- Do not silently replace the kitchen-scene final demo with synthetic proxy floor/table geometry; proxy scenes must be named as smoke/fallback artifacts.
 - Allowed edit surface for MVP: new tests, new demo scripts, new renderer app, docs, and CMake registrations. Existing production runtime/collision/solver/constraint/RT internals require owner approval before modification.
 - The top-level video command must machine-check MP4 resolution, FPS, duration, frame count, missing/blank frames, and basic robot/cup visibility; manual inspection is additional evidence, not the only video gate.
