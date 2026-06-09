@@ -395,12 +395,15 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
     // catches a GROSS regression (a 3x+ slowdown, e.g. an accidental extra per-env device
     // round-trip in the host orchestration loop), not noise.
     //
-    // BASELINE: ~183 env-steps/sec measured at bake time on the build-cuda128 box (N=32,
-    // K=200), consistent with the roadmap's "~180 env-steps/sec independent of N" finding
-    // -- the whole point of this gate is that the current path is O(N) host orchestration.
-    // Floor = 0.3 x baseline = 54 env-steps/sec. Update the constant if the baseline moves
-    // (e.g. after the device-resident N-env articulation increment lifts throughput).
-    constexpr double kN32BaselineEps = 180.0;  // see comment above; floor is 0.3x this.
+    // BASELINE: ~525 env-steps/sec measured at P2.4b bake time on the build-cuda128 box (N=32,
+    // K=200), up ~2.9x from the P2.4a-era ~180 (which was O(N) host orchestration, N-independent).
+    // P2.4b consolidated the per-env articulation into ONE env-major device + batched FK/CRBA/
+    // chain-J/ABA launches, killing the 62.8% per-env SYNC STORM (chain_jacobian 53.4%->~0.1%);
+    // the step is now narrowphase-bound (90.8% at N=32 -> P2.4c is host->GPU narrowphase). The
+    // floor stays GENEROUS at 0.3x (catches a 3x+ regression, not noise); set conservatively
+    // below the measured 525 so a noisy box does not flake. Update if the baseline moves again
+    // (e.g. after P2.4c GPU narrowphase or P2.4d/P2.4e device-resident rows lift throughput).
+    constexpr double kN32BaselineEps = 500.0;  // see comment above; floor is 0.3x this.
     EXPECT_GT(measured_n32_eps, 0.3 * kN32BaselineEps)
         << "N=32 throughput (" << measured_n32_eps
         << " env-steps/sec) fell below 0.3x the baseline (" << kN32BaselineEps
