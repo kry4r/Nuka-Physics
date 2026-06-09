@@ -31,6 +31,8 @@ from ._nuka_ext import (  # noqa: F401
     Field,
     World,
     Tape,
+    # v0.8 A2: the batched grasp world (BatchedUnifiedWorld) -- the RL-grasp substrate.
+    GraspWorld,
     sync,
     __engine_version__,
     DETERMINISM_STRONG,
