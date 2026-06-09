@@ -24,6 +24,7 @@
 
 #include "runtime/coresident/batched_unified_world.hpp"
 
+#include "core/perf/perf_recorder.hpp"         // PerfRecorder (host wall-clock attribution)
 #include "collision/analytical_manifold.hpp"   // amf::PrimParams / BuildPrimFrame
 #include "collision/candidate_pair.hpp"        // CandidatePair / CollidableRef
 #include "collision/contact_stream_driver.hpp" // BuildContactManifolds / ResolvedShape
@@ -47,6 +48,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -54,6 +56,38 @@
 namespace nuka::runtime::coresident {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// P2.4a perf-gate instrumentation: a HOST WALL-CLOCK RAII timer that feeds a
+// PerfRecorder under `tag` on scope exit. CHRONO (not ScopedCudaTimer) on purpose:
+// the bracketed stages already Synchronize/CopyToHost internally, so the cost being
+// attributed is the HOST round-trip wall time -- a CUDA-event timer measures only GPU
+// stream time and would miss the per-env download/upload storm entirely. Pure host C++:
+// no CUDA calls, no float math, no extra synchronizes -> ADDITIVE + physics-neutral, so
+// the 16 byte-exact correctness gates are unaffected (a chrono read between existing
+// calls changes nothing the solver sees). RAII accumulation lets a single tag span
+// disjoint code regions across functions (e.g. scatter_integrate = the scatter loop +
+// the Step() position integrate). Always-on (the overhead is a steady_clock read pair).
+class ScopedWallTimer {
+public:
+    ScopedWallTimer(core::perf::PerfRecorder& recorder, const char* tag)
+        : recorder_(recorder),
+          tag_(tag),
+          start_(std::chrono::steady_clock::now()) {}
+    ~ScopedWallTimer() {
+        const auto end = std::chrono::steady_clock::now();
+        const double us =
+            std::chrono::duration<double, std::micro>(end - start_).count();
+        recorder_.AddSample(tag_, us);
+    }
+    ScopedWallTimer(const ScopedWallTimer&) = delete;
+    ScopedWallTimer& operator=(const ScopedWallTimer&) = delete;
+
+private:
+    core::perf::PerfRecorder& recorder_;
+    const char* tag_;
+    std::chrono::steady_clock::time_point start_;
+};
 
 namespace amf = nuka::collision::amf;
 namespace articulation = nuka::runtime::articulation;
@@ -341,6 +375,10 @@ void BatchedUnifiedWorld::Step() {
     // velocities, matching the oracle's stage 11.
     if (has_grasp_) {
         ResolveBatchedGraspContact();
+        // ----- scatter_integrate (part 2/2): the POSITION integrate stage. ----------
+        // The scatter-qdot-back half lives in ResolveBatchedGraspContact (same tag, RAII
+        // accumulates); this is the gripper IntegratePosition + cup symplectic-Euler step.
+        ScopedWallTimer integrate_timer(perf_, "scatter_integrate");
         // Advance EVERY env's gripper joints (q += qdot*dt) + the floating base (no-op for
         // the Fixed-root gripper, but called unconditionally to mirror the oracle stage 11)
         // with the post-contact velocity scattered by ResolveBatchedGraspContact. Each env's
@@ -507,6 +545,10 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     // ----- stages 0-3 PER ENV: drive + ABA + velocity integrate on env_devices_[e]. ----
     // Each env's gripper device is independent (P2.3b), so this is a clean per-env loop --
     // byte-for-byte the same op sequence the N=1 path ran, applied to env e's own device.
+    // perf tag `aba_integrate`: the grip-torque drive + ABA accelerations + velocity
+    // integrate (gripper halves) over every env's device.
+    {
+    ScopedWallTimer aba_timer(perf_, "aba_integrate");
     for (auto& device : env_devices_) {
         auto view = device.View();
         // ----- stage 0: the DRIVE path. Re-apply the constant grip torque to tau. -----
@@ -524,6 +566,7 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, view, dt_,
                                                                      gravity_z_);
     }
+    }  // end aba_integrate timer scope.
 
     // The cup (env e's local body cup_local_index_) gravity velocity-kick, BEFORE the
     // contact solve. NOTE: this kick lives ONLY in the grasp branch -- the top-of-Step
@@ -549,8 +592,16 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     std::vector<std::vector<Transform>> env_poses(env_count_);
     for (uint32_t e = 0u; e < env_count_; ++e) {
         env_live[e] = gripper_proto_;
-        articulation::DownloadArticulationState(env_devices_[e], &env_live[e]);
-        env_poses[e] = DownloadWorldPoses(context_, env_devices_[e], link_count_);
+        {
+            // perf tag `artic_download`: per-env device->host state read-back (q/qdot/...).
+            ScopedWallTimer artic_dl(perf_, "artic_download");
+            articulation::DownloadArticulationState(env_devices_[e], &env_live[e]);
+        }
+        {
+            // perf tag `pose_download`: per-env FK world-link-pose download (Sync+CopyToHost).
+            ScopedWallTimer pose_dl(perf_, "pose_download");
+            env_poses[e] = DownloadWorldPoses(context_, env_devices_[e], link_count_);
+        }
     }
 
     // ONE shared rows/sides buffer across ALL envs (EmitCompliantContactRows APPENDS).
@@ -642,7 +693,11 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
             return false;
         };
         std::vector<ContactManifold> manifolds;
-        nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
+        {
+            // perf tag `narrowphase`: per-env sphere(fingertip) x ConvexHull(cup) manifolds.
+            ScopedWallTimer np_timer(perf_, "narrowphase");
+            nuka::collision::BuildContactManifolds(drive_pairs, resolve, &manifolds);
+        }
 
         uint32_t finger_points = 0u;
         for (const auto& m : manifolds) finger_points += m.point_count;
@@ -657,7 +712,13 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         inputs.dt = dt_;
         inputs.condim = condim_;
         const std::size_t row_start = rows.RowCount();
-        nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
+        {
+            // perf tag `row_assembly`: compliant contact-row emission (normal + friction
+            // spokes). The host index/key wiring loop below is left UNTIMED (microseconds)
+            // so this stays DISJOINT from chain_jacobian (FootChainJ lives in that loop).
+            ScopedWallTimer ra_timer(perf_, "row_assembly");
+            nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
+        }
         // Stamp the per-contact friction coefficient (the cone bound is mu * Σλ_n).
         for (std::size_t r = row_start; r < rows.RowCount(); ++r) {
             rows.materials[r].friction = friction_mu_;
@@ -677,8 +738,13 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         // only the CONTACTING earlier envs, so the solver's art_index*dof_stride^2 read would
         // land on the wrong env's data the moment any earlier env lacked contact.
         const articulation::ArticulationHostState& live = env_live[e];
-        const std::vector<float> env_minv =
-            InverseInertia(context_, live, gravity_z_, dof_stride_);
+        std::vector<float> env_minv;
+        {
+            // perf tag `crba_minv`: per-env CRBA M^-1 (Upload + ComputeM + Factor +
+            // Synchronize + CopyToHost). Timed ALONE (disjoint from chain_jacobian below).
+            ScopedWallTimer minv_timer(perf_, "crba_minv");
+            env_minv = InverseInertia(context_, live, gravity_z_, dof_stride_);
+        }
         std::copy(env_minv.begin(), env_minv.end(),
                   minv.begin() + static_cast<std::ptrdiff_t>(
                                      static_cast<size_t>(art_index) * dof_stride_ * dof_stride_));
@@ -736,9 +802,15 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
                     break;
                 }
             }
-            const std::vector<float> chain_j =
-                FootChainJ(context_, live, env_poses[e], finger_link, contact_point,
-                           finger_dir, dof_stride_);
+            std::vector<float> chain_j;
+            {
+                // perf tag `chain_jacobian`: per-finger-row chain-J (Upload + kernel +
+                // Synchronize + CopyToHost). Timed ALONE -- the enclosing index-wiring loop
+                // is NOT bracketed, so this is DISJOINT from row_assembly (no double-count).
+                ScopedWallTimer cj_timer(perf_, "chain_jacobian");
+                chain_j = FootChainJ(context_, live, env_poses[e], finger_link,
+                                     contact_point, finger_dir, dof_stride_);
+            }
             const uint32_t slot =
                 static_cast<uint32_t>(chain_jacobians.size() / dof_stride_);
             chain_jacobians.insert(chain_jacobians.end(), chain_j.begin(),
@@ -784,7 +856,13 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     ctx.articulation.inertia_m_inv = &minv;
     ctx.articulation.qdot = &qdot;
     ctx.articulation.dof_stride = dof_stride_;
-    nuka::solver::UnifiedSolve(ctx, cfg);
+    {
+        // perf tag `row_solver`: the SINGLE-BLOCK batched UnifiedSolve kernel + its host
+        // round-trip. The hypothesis under test (roadmap §7) is that this is NEGLIGIBLE vs
+        // the per-env articulation sync storm; the N=32 breakdown decides it.
+        ScopedWallTimer solve_timer(perf_, "row_solver");
+        nuka::solver::UnifiedSolve(ctx, cfg);
+    }
 
     // ----- per-env grasp metrics (the FORCE-BALANCE gate numbers) ----------------
     // Computed HERE, while the rows / lambdas are live -- the SAME quantities StepGrasp
@@ -827,6 +905,10 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     // device byte-identical to the N=1 BITE early-return (which never scatters) -- exactly
     // what the MIXED-CONTACT gate's free-fall envs require. UnifiedSolve mutated `bodies_`
     // (the cup velocities) in place for every env.
+    // perf tag `scatter_integrate` (part 1/2): the qdot-scatter-to-device + sync. Part 2/2
+    // (the position integrate) is in Step()'s grasp branch (same tag, RAII accumulates).
+    {
+    ScopedWallTimer scatter_timer(perf_, "scatter_integrate");
     for (uint32_t e = 0u; e < env_count_; ++e) {
         const auto [rbegin, rend] = env_row_range[e];
         if (rend <= rbegin) continue;  // no finger rows this env -> device already current.
@@ -846,6 +928,7 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
                                           live.qdot.size() * sizeof(float));
     }
     context_.stream.Synchronize();
+    }  // end scatter_integrate (part 1/2) timer scope.
     // ===== END CONTACT PHASE -- the position integrate happens in Step(). =========
 }
 

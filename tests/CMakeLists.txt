@@ -2130,6 +2130,47 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_unified_world_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 P2.4a: the BatchedUnifiedWorld env-steps/sec PERF GATE. A COMMITTED
+    # throughput harness + per-stage wall-clock attribution (a hypothesis test, not a
+    # correctness gate). Links the SAME batched_unified_world.cpp the correctness test
+    # links (so any accidental physics change there surfaces in the 16 gates), drives the
+    # grasp scene, sweeps N in {1,8,32,64,256,1024}, and dumps the N=32 stage breakdown
+    # + the ARTIC_SYNC_STORM vs row_solver verdict. SAME dep set / extra sources as
+    # nuka_batched_unified_world_test. ADDITIVE: a NEW target, no production edits.
+    add_executable(nuka_batched_unified_world_perf_test
+        coresident/test_batched_unified_world_perf.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_batched_unified_world_perf_test nuka_codegen)
+
+    target_compile_definitions(nuka_batched_unified_world_perf_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_batched_unified_world_perf_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_batched_unified_world_perf_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_unified_world_perf_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C7b-1: the HOLD-AGAINST-GRAVITY grasp SPIKE. A synthetic fixed-base
     # 2-finger gripper holds the C7a cup (convex hull) against gravity by FINGER
     # FRICTION ALONE -- NO table. Drives the generalized unified_coresident_stepper
