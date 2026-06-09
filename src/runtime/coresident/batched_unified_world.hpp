@@ -218,30 +218,54 @@ private:
     math::Vec3 box_half_extent_;
     float      ground_height_;
 
-    // ----- P2.3a/P2.3b articulation<->rigid GRASP (inert unless has_grasp_) -------
-    // P2.3b: ONE persistent device-resident gripper articulation PER ENV (env_devices_,
-    // sized env_count_, each constructed from the SAME replicated proto). Per env e the
-    // grasp resolver applies the grip drive / ABA / IntegrateVelocity / downloads live
-    // state / FK poses / scatters the post-contact qdot on env_devices_[e]. The proto
-    // (env-invariant) stays host-resident for the per-step InverseInertia / FootChainJ
-    // uploads (which need a fresh host snapshot, exactly as the oracle's `live` does);
-    // the dof_stride is asserted uniform across envs (replicated proto -> it is), which
-    // is WHAT makes the env-major M^-1 (@ e*dof_stride^2) / qdot (@ e*dof_stride) tiling
-    // valid (the row solver indexes those buffers by art_index = e).
+    // ----- P2.3a/P2.3b/P2.4b articulation<->rigid GRASP (inert unless has_grasp_) -------
+    // P2.4b: ONE consolidated env-major device-resident multi-gripper state (env_device_,
+    // articulation_count == env_count_, built once from ReplicateArticulationHostState).
+    // REPLACES the P2.3b std::vector<ArticulationDeviceBuffers> (one device per env), whose
+    // per-finger-per-env upload+sync+copyback was the P2.4a sync storm. The grasp resolver now
+    // runs the grip drive / ABA / IntegrateVelocity / FK / CRBA / chain-J as BATCHED launches
+    // over all N grippers in ONE call each; the live host snapshot is downloaded ONCE per step
+    // (sliced per env for the host narrowphase / scatter). The replicated proto -> uniform
+    // dof_stride / base_link_count_ across envs, which is WHAT makes the env-major M^-1 (@
+    // e*dof_stride^2) / qdot (@ e*dof_stride) tiling valid (the row solver / batched CRBA index
+    // those buffers by art_index = e); asserted at construction.
     bool       has_grasp_ = false;
     uint32_t   cup_local_index_ = 0u;
     uint32_t   dof_stride_  = 0u;
     uint32_t   base_dof_    = 0u;   // root DOF count (FloatingBase=6, Fixed gripper=0).
     uint32_t   root_link_   = 0u;
-    uint32_t   link_count_  = 0u;
+    uint32_t   link_count_  = 0u;   // per-env (single-articulation) gripper link count.
     float      friction_mu_ = 0.6f;
     uint32_t   condim_      = 3u;
-    articulation::ArticulationHostState gripper_proto_;      // refresh-able CPU mirror.
-    std::vector<articulation::ArticulationDeviceBuffers> env_devices_;  // one GPU gripper per env.
+    articulation::ArticulationHostState gripper_proto_;      // refresh-able CPU mirror (ONE articulation).
+    // ----- P2.4b: ONE consolidated env-major device-resident multi-gripper state ------
+    // The P2.4b throughput increment. The per-env std::vector<ArticulationDeviceBuffers>
+    // (P2.3b) became a per-finger-per-env upload+sync+copyback STORM (P2.4a measured
+    // chain_jacobian=53.4% at N=32). It is REPLACED by ONE ArticulationDeviceBuffers
+    // holding env_count_ replicated grippers (built ONCE at construction from
+    // ReplicateArticulationHostState(gripper_proto_, env_count_), articulation_count ==
+    // env_count_, replica e's links at [e*base_link_count_, (e+1)*base_link_count_)),
+    // mirroring BatchedArticulatedWorld::device_ VERBATIM. The already-per-articulation-
+    // batched kernels (FeatherstoneAba::*, UpdateWorldLinkPoses, ComputeArticulationInertiaM,
+    // FactorArticulationInertiaM, ComputeContactChainJacobians) then advance ALL N envs in
+    // ONE launch each over this state -- NO per-step re-upload (the per-step work is the
+    // in-place tau/q/qdot update + batched launches). The host snapshot env_live_ is
+    // downloaded ONCE per step (consolidated) for the host narrowphase / scatter.
+    articulation::ArticulationDeviceBuffers env_device_;  // ONE env-major multi-gripper device.
+    uint32_t   base_link_count_ = 0u;  // per-env (proto) link count; replica stride.
     std::vector<CoResidentFingertip> fingertips_;
     CoResidentCup grasp_cup_;
-    phi::Buffer   grip_torque_dev_;   // per-link constant grip torque (device, SHARED -- proto-invariant).
-    phi::Buffer   grip_limits_dev_;   // per-link drive force limits (device, SHARED -- proto-invariant).
+    phi::Buffer   grip_torque_dev_;   // env-major per-link constant grip torque (device).
+    phi::Buffer   grip_limits_dev_;   // env-major per-link drive force limits (device).
+    // ----- P2.4b persistent batched articulation scratch (allocated once, reused) ------
+    // Mirrors BatchedArticulatedWorld's world_pose_/m_/m_inv_/composite_ layout. world_pose_
+    // is Transform[env_count_*base_link_count_] (ONE batched UpdateWorldLinkPoses output);
+    // m_/m_inv_ are env-major CRBA tiles float[env_count_*dof_stride_^2] (one batched
+    // ComputeArticulationInertiaM/Factor over all N); composite_ is the CRBA scratch.
+    phi::Buffer   world_pose_dev_;    // Transform[env_count_*base_link_count_] (batched FK).
+    phi::Buffer   crba_composite_;    // LinkSpatialInertia[env_count_*base_link_count_] (CRBA scratch).
+    phi::Buffer   crba_m_;            // float[env_count_*dof_stride_^2] (CRBA M tiles).
+    phi::Buffer   crba_m_inv_;        // float[env_count_*dof_stride_^2] (CRBA M^-1 tiles).
     std::vector<BatchedGraspEnvReport> grasp_reports_;  // last-Step() per-env metrics.
 
     // ----- P2.4a perf instrumentation (ADDITIVE; mutable -> const Step path can time) ---

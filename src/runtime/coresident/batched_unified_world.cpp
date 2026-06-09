@@ -164,84 +164,6 @@ constexpr uint32_t kGroundHandle = 8000u;  // distinct from the box handle.
 // batched == real StepGrasp) catches any divergence. Copy verbatim; do not edit.
 // ===========================================================================
 
-// Download the live FK world poses of every link from the current device state.
-// (UnifiedCoResidentStepper::DownloadWorldPoses, ~:69.)
-std::vector<Transform> DownloadWorldPoses(const nuka::phi::DeviceContext& context,
-                                          articulation::ArticulationDeviceBuffers& device,
-                                          uint32_t link_count) {
-    auto view = device.View();
-    nuka::phi::Buffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform),
-                              nuka::phi::MemoryKind::Device);
-    articulation::UpdateWorldLinkPoses(context, view,
-                                       static_cast<Transform*>(pose_buf.Data()));
-    context.stream.Synchronize();
-    std::vector<Transform> poses(link_count);
-    pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
-    return poses;
-}
-
-// The dof_stride-wide chain-J on `contact_normal`, against the LIVE link poses.
-// (UnifiedCoResidentStepper::FootChainJ, ~:88.)
-std::vector<float> FootChainJ(const nuka::phi::DeviceContext& context,
-                              articulation::ArticulationHostState host,  // by value
-                              const std::vector<Transform>& fk_world_poses,
-                              uint32_t contact_link, const Vec3& contact_point,
-                              const Vec3& contact_normal, uint32_t dof_stride) {
-    if (fk_world_poses.size() == host.link_pose.size()) {
-        host.link_pose = fk_world_poses;
-    }
-    auto device = articulation::UploadArticulationState(context, host);
-    nuka::phi::Buffer link_buf(sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jbuf(static_cast<size_t>(dof_stride) * sizeof(float),
-                           nuka::phi::MemoryKind::Device);
-    link_buf.CopyFromHost(&contact_link, sizeof(uint32_t));
-    point_buf.CopyFromHost(&contact_point, sizeof(Vec3));
-    normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
-    std::vector<float> zero(dof_stride, 0.0f);
-    jbuf.CopyFromHost(zero.data(), zero.size() * sizeof(float));
-    articulation::ComputeContactChainJacobians(
-        context, device.View(), static_cast<const uint32_t*>(link_buf.Data()),
-        static_cast<const Vec3*>(point_buf.Data()),
-        static_cast<const Vec3*>(normal_buf.Data()), 1u, dof_stride,
-        static_cast<float*>(jbuf.Data()));
-    context.stream.Synchronize();
-    std::vector<float> j(dof_stride);
-    jbuf.CopyToHost(j.data(), j.size() * sizeof(float));
-    return j;
-}
-
-// The dof_stride x dof_stride M^-1 via the production CRBA (reuse, not hand-rolled).
-// Requires ABA pass-1 (link_xup current), so ComputeAccelerations runs first.
-// (UnifiedCoResidentStepper::InverseInertia, ~:120.)
-std::vector<float> InverseInertia(const nuka::phi::DeviceContext& context,
-                                  const articulation::ArticulationHostState& host,
-                                  float gravity_z, uint32_t dof_stride) {
-    auto device = articulation::UploadArticulationState(context, host);
-    auto view = device.View();
-    const uint32_t link_count = host.TotalLinkCount();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, gravity_z);
-    nuka::phi::Buffer composite(
-        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m(static_cast<size_t>(dof_stride) * dof_stride * sizeof(float),
-                        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_inv(static_cast<size_t>(dof_stride) * dof_stride * sizeof(float),
-                            nuka::phi::MemoryKind::Device);
-    articulation::ComputeArticulationInertiaM(
-        context, view, dof_stride,
-        static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
-        static_cast<float*>(m.Data()));
-    articulation::FactorArticulationInertiaM(
-        context, view, dof_stride, static_cast<const float*>(m.Data()),
-        static_cast<float*>(m_inv.Data()));
-    context.stream.Synchronize();
-    std::vector<float> out(static_cast<size_t>(dof_stride) * dof_stride);
-    m_inv.CopyToHost(out.data(), out.size() * sizeof(float));
-    return out;
-}
-
 // A sphere PrimParams at the fingertip world center (identity rotation; a sphere is
 // rotation-invariant). (UnifiedCoResidentStepper::FootSpherePrim, ~:154.)
 amf::PrimParams FootSpherePrim(const Vec3& center, float radius) {
@@ -300,40 +222,94 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
         root_link_ = gripper_proto_.articulation_link_offset[0];
         base_dof_ =
             articulation::ArticulationJointDofCount(gripper_proto_.joint_type[root_link_]);
-        link_count_ = gripper_proto_.TotalLinkCount();
+        link_count_ = gripper_proto_.TotalLinkCount();   // per-env (single-articulation) links.
+        base_link_count_ = link_count_;                  // replica stride in the consolidated state.
 
-        // One persistent device-resident gripper per env (replicated proto -> identical
-        // dof_stride across envs, which is the env-major tiling assumption made explicit
-        // by ArticulationDofCount being a pure function of the proto). ASSERT it.
-        env_devices_.reserve(env_count_);
+        // ----- P2.4b: ONE consolidated env-major device-resident multi-gripper state -----
+        // REPLACES the P2.3b per-env std::vector<ArticulationDeviceBuffers> (the per-finger-
+        // per-env upload+sync+copyback STORM). ReplicateArticulationHostState tiles the proto
+        // into env_count_ independent replicas (replica e's links at [e*base_link_count_,
+        // (e+1)*base_link_count_), articulation_count == env_count_, link_to_articulation /
+        // articulation_link_offset per-replica offset), uploaded ONCE -> articulation_count==N.
+        // This is BatchedArticulatedWorld::device_'s layout VERBATIM, which is what makes the
+        // already-per-articulation-batched kernels advance all N grippers in ONE launch each.
+        const articulation::ArticulationHostState env_major_host =
+            articulation::ReplicateArticulationHostState(gripper_proto_, env_count_);
+        env_device_ = articulation::UploadArticulationState(context_, env_major_host);
+        // The replicated proto -> uniform dof_stride / base_link_count_ across envs, which is
+        // WHAT makes the env-major M^-1 (@ e*dof_stride^2) / qdot (@ e*dof_stride) tiling valid
+        // (the row solver / batched CRBA index those buffers by art_index = e). Assert the
+        // consolidated device actually carries env_count_ articulations of base_link_count_
+        // links each, so the tiling precondition BITES if a future change broke replication.
+        assert(env_device_.articulation_count == env_count_ &&
+               env_device_.total_link_count == env_count_ * base_link_count_ &&
+               "env-major grasp tiling requires env_count_ uniform replicas of the proto");
+
+        // Per-link grip torque / force limits, REPLICATED across all N envs (the drive kernel
+        // reads them by the SAME global link index the consolidated state uses, length
+        // total_link_count). One env's per-link torque == scene_template.grip_torque resized to
+        // base_link_count_; tile it env_count_ times so global link e*base_link_count_+l reads
+        // env e's (identical) value.
+        std::vector<float> torque_one = scene_template.grip_torque;
+        torque_one.resize(base_link_count_, 0.0f);
+        std::vector<float> limits_one = scene_template.drive_force_limits;
+        limits_one.resize(base_link_count_, 0.0f);
+        std::vector<float> torque(static_cast<size_t>(env_count_) * base_link_count_, 0.0f);
+        std::vector<float> limits(static_cast<size_t>(env_count_) * base_link_count_, 0.0f);
         for (uint32_t e = 0u; e < env_count_; ++e) {
-            env_devices_.push_back(
-                articulation::UploadArticulationState(context_, gripper_proto_));
-            // Each env's device is an independent upload of the SAME proto, so they share
-            // one dof_stride / link_count -- which is WHAT makes the env-major M^-1 (@
-            // e*dof_stride^2) / qdot (@ e*dof_stride) tiling valid (the row solver reads
-            // those buffers by art_index=e). Assert the freshly-uploaded device actually
-            // carries the proto's link count, so the tiling precondition BITES if a future
-            // change ever made the per-env devices non-uniform.
-            assert(env_devices_.back().total_link_count == link_count_ &&
-                   "env-major grasp tiling requires a uniform dof_stride/link_count across "
-                   "envs (per-env device diverged from the proto)");
+            std::copy(torque_one.begin(), torque_one.end(),
+                      torque.begin() + static_cast<std::ptrdiff_t>(
+                                           static_cast<size_t>(e) * base_link_count_));
+            std::copy(limits_one.begin(), limits_one.end(),
+                      limits.begin() + static_cast<std::ptrdiff_t>(
+                                           static_cast<size_t>(e) * base_link_count_));
         }
-
-        std::vector<float> torque = scene_template.grip_torque;
-        torque.resize(link_count_, 0.0f);
-        std::vector<float> limits = scene_template.drive_force_limits;
-        limits.resize(link_count_, 0.0f);
         grip_torque_dev_ = nuka::phi::UploadVector(torque);
         grip_limits_dev_ = nuka::phi::UploadVector(limits);
+
+        // ----- P2.4b persistent batched articulation scratch (allocated once, reused) -----
+        // world_pose_dev_ = the ONE batched UpdateWorldLinkPoses output (every env's link
+        // poses); crba_* = the batched CRBA composite scratch + env-major M / M^-1 tiles
+        // (one ComputeArticulationInertiaM/Factor over all N). Sized from the world; never
+        // re-allocated per step (the per-step work is in-place kernel writes).
+        const size_t tlc = static_cast<size_t>(env_count_) * base_link_count_;
+        const size_t tile = static_cast<size_t>(dof_stride_) * dof_stride_;
+        world_pose_dev_ = nuka::phi::Buffer(tlc * sizeof(Transform),
+                                            nuka::phi::MemoryKind::Device);
+        crba_composite_ = nuka::phi::Buffer(
+            tlc * sizeof(articulation::LinkSpatialInertia), nuka::phi::MemoryKind::Device);
+        crba_m_ = nuka::phi::Buffer(static_cast<size_t>(env_count_) * tile * sizeof(float),
+                                    nuka::phi::MemoryKind::Device);
+        crba_m_inv_ = nuka::phi::Buffer(static_cast<size_t>(env_count_) * tile * sizeof(float),
+                                        nuka::phi::MemoryKind::Device);
     }
 }
 
 void BatchedUnifiedWorld::DownloadGripper(
     uint32_t env, articulation::ArticulationHostState* out) const {
-    if (out == nullptr || !has_grasp_ || env >= env_devices_.size()) return;
+    if (out == nullptr || !has_grasp_ || env >= env_count_) return;
+    // P2.4b: env_device_ now holds ALL N grippers env-major. Download the consolidated
+    // state, then COPY OUT env e's single-articulation slice (links [e*base_link_count_,
+    // (e+1)*base_link_count_), the per-link / per-DOF arrays are tiled in replica order) so
+    // the returned host state is the SAME shape the old per-env DownloadGripper produced.
     *out = gripper_proto_;
-    articulation::DownloadArticulationState(env_devices_[env], out);
+    articulation::ArticulationHostState all =
+        articulation::ReplicateArticulationHostState(gripper_proto_, env_count_);
+    articulation::DownloadArticulationState(env_device_, &all);
+    const size_t off = static_cast<size_t>(env) * base_link_count_;
+    auto slice = [&](auto& dst, const auto& src) {
+        dst.assign(src.begin() + static_cast<std::ptrdiff_t>(off),
+                   src.begin() + static_cast<std::ptrdiff_t>(off + base_link_count_));
+    };
+    slice(out->link_velocity, all.link_velocity);
+    slice(out->link_acceleration, all.link_acceleration);
+    slice(out->q, all.q);
+    slice(out->qdot, all.qdot);
+    slice(out->qddot, all.qddot);
+    slice(out->tau, all.tau);
+    // base_pose is per-articulation (one entry / env); copy env e's single base pose.
+    if (env < all.base_pose.size() && !out->base_pose.empty())
+        out->base_pose[0] = all.base_pose[env];
 }
 
 uint32_t BatchedUnifiedWorld::DofIndexOf(uint32_t link) const {
@@ -381,10 +357,11 @@ void BatchedUnifiedWorld::Step() {
         ScopedWallTimer integrate_timer(perf_, "scatter_integrate");
         // Advance EVERY env's gripper joints (q += qdot*dt) + the floating base (no-op for
         // the Fixed-root gripper, but called unconditionally to mirror the oracle stage 11)
-        // with the post-contact velocity scattered by ResolveBatchedGraspContact. Each env's
-        // device is independent (P2.3b), so the per-env position integrates are order-free.
-        for (auto& device : env_devices_) {
-            auto view = device.View();
+        // with the post-contact velocity scattered by ResolveBatchedGraspContact. P2.4b: ONE
+        // batched IntegratePosition / IntegrateFloatingBasePose over the consolidated env-major
+        // device advances all N grippers in a single launch each (one block per articulation).
+        {
+            auto view = env_device_.View();
             articulation::FeatherstoneAba::IntegratePosition(context_, view, dt_);
             articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, view, dt_);
         }
@@ -542,31 +519,61 @@ void BatchedUnifiedWorld::ResolveBatchedGroundContact() {
 void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     if (!has_grasp_ || env_count_ == 0u || bodies_per_env_ == 0u) return;
 
-    // ----- stages 0-3 PER ENV: drive + ABA + velocity integrate on env_devices_[e]. ----
-    // Each env's gripper device is independent (P2.3b), so this is a clean per-env loop --
-    // byte-for-byte the same op sequence the N=1 path ran, applied to env e's own device.
-    // perf tag `aba_integrate`: the grip-torque drive + ABA accelerations + velocity
-    // integrate (gripper halves) over every env's device.
+    // ----- stages 0-3 BATCHED over ALL N envs in ONE launch each (P2.4b). --------------
+    // The consolidated env-major device (articulation_count == env_count_) lets the already-
+    // per-articulation-batched FeatherstoneAba:: methods advance every gripper at once. This
+    // REPLACES the P2.3b per-env loop (the per-env upload/sync round-trips). Each kernel is
+    // one block per articulation, so byte-for-byte the same op sequence env e ran in N=1, with
+    // env e reading/writing its own [e*base_link_count_, ...) slice -- no cross-env coupling.
+    // perf tag `aba_integrate`: the grip-torque drive + ABA accelerations + velocity integrate.
     {
     ScopedWallTimer aba_timer(perf_, "aba_integrate");
-    for (auto& device : env_devices_) {
-        auto view = device.View();
-        // ----- stage 0: the DRIVE path. Re-apply the constant grip torque to tau. -----
-        // LaunchApplyTorqueDriveKernels writes state.tau; ComputeAccelerations then READS
-        // tau in its bias-force pass (never zeroes it). Re-applying the same constant each
-        // step is idempotent -- this is what makes the fingers actively squeeze. The grip
-        // torque/limit device buffers are SHARED (the proto is env-invariant).
-        articulation::LaunchApplyTorqueDriveKernels(
-            context_, view, static_cast<const float*>(grip_torque_dev_.Data()),
-            static_cast<const float*>(grip_limits_dev_.Data()));
-        // ----- stage 1/2: ABA accelerations -> qddot (now WITH the grip tau). ---------
-        articulation::FeatherstoneAba::ComputeAccelerations(context_, view, gravity_z_);
-        // ----- stage 3: velocity integrate (gripper halves). -------------------------
-        articulation::FeatherstoneAba::IntegrateVelocity(context_, view, dt_);
-        articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, view, dt_,
-                                                                     gravity_z_);
-    }
+    auto view = env_device_.View();
+    // ----- stage 0: the DRIVE path. Re-apply the constant (env-major-replicated) grip
+    // torque to tau. LaunchApplyTorqueDriveKernels writes state.tau (per global link);
+    // ComputeAccelerations then READS tau in its bias-force pass (never zeroes it). Re-
+    // applying the same constant each step is idempotent -- the fingers actively squeeze.
+    articulation::LaunchApplyTorqueDriveKernels(
+        context_, view, static_cast<const float*>(grip_torque_dev_.Data()),
+        static_cast<const float*>(grip_limits_dev_.Data()));
+    // ----- stage 1/2: ABA accelerations -> qddot (now WITH the grip tau). ---------
+    articulation::FeatherstoneAba::ComputeAccelerations(context_, view, gravity_z_);
+    // ----- stage 3: velocity integrate (gripper halves). -------------------------
+    articulation::FeatherstoneAba::IntegrateVelocity(context_, view, dt_);
+    articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(context_, view, dt_,
+                                                                 gravity_z_);
     }  // end aba_integrate timer scope.
+
+    // ----- stage 4: ONE batched FK over all N envs -> world_pose_dev_ -> refresh device
+    // link_pose (the chain-J reads state.link_pose) + ONE host download for the per-env
+    // narrowphase. UpdateWorldLinkPoses walks every articulation's links (one block per
+    // articulation) writing the live world pose; this REPLACES the P2.3b per-env
+    // DownloadWorldPoses (a fresh UpdateWorldLinkPoses + Sync + CopyToHost PER ENV). The
+    // device link_pose is refreshed from these FK poses (mirrors BatchedArticulatedWorld's
+    // stage-4 world_pose->link_pose copy + the oracle FootChainJ's host.link_pose=fk seam)
+    // via a host round-trip CopyFromHost -- byte-identical to the oracle (ABA/CRBA never read
+    // link_pose; only ComputeContactChainJacobians does, and it now reads the FK pose).
+    std::vector<Transform> all_poses(static_cast<size_t>(env_count_) * base_link_count_);
+    {
+        ScopedWallTimer pose_dl(perf_, "pose_download");
+        auto view = env_device_.View();
+        articulation::UpdateWorldLinkPoses(
+            context_, view, static_cast<Transform*>(world_pose_dev_.Data()));
+        context_.stream.Synchronize();
+        world_pose_dev_.CopyToHost(all_poses.data(), all_poses.size() * sizeof(Transform));
+        // Refresh the device link_pose from the FK poses so the batched chain-J reads the
+        // current geometry (the cooked link_pose is the static rest pose).
+        env_device_.link_pose.CopyFromHost(all_poses.data(),
+                                           all_poses.size() * sizeof(Transform));
+    }
+    // ONE consolidated host download of the live gripper state (q/qdot/link_velocity/...) for
+    // the per-env scatter + the env-major qdot pack. REPLACES the P2.3b per-env artic_download.
+    articulation::ArticulationHostState all_live =
+        articulation::ReplicateArticulationHostState(gripper_proto_, env_count_);
+    {
+        ScopedWallTimer artic_dl(perf_, "artic_download");
+        articulation::DownloadArticulationState(env_device_, &all_live);
+    }
 
     // The cup (env e's local body cup_local_index_) gravity velocity-kick, BEFORE the
     // contact solve. NOTE: this kick lives ONLY in the grasp branch -- the top-of-Step
@@ -582,26 +589,27 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     }
 
     // ===== CONTACT PHASE (fingertips <-> cup, NO table) ======================
-    // Snapshot EACH env's post-velocity-integrate gripper state for the host pipeline +
-    // the FK world poses (the contact geometry needs env e's current q / base). Retained
-    // per env so the GUARDED scatter below reuses env e's `live` (NO re-download -- an
-    // extra device round-trip risks breaking N=1 byte-exactness). A no-contact env's
-    // `live` is downloaded but never written back (its device already holds the correct
-    // stage-3 velocity), exactly mirroring the N=1 BITE early-return.
+    // Slice the ONE consolidated host download (all_live / all_poses, taken ONCE above) into a
+    // per-env single-articulation host snapshot (env e's links [e*base_link_count_, ...)). The
+    // rest of the per-env loop (narrowphase, row assembly, qdot pack) reads env_live[e] /
+    // env_poses[e] exactly as the P2.3b path did -- only the SOURCE changed (one batched
+    // download + a host slice, NOT a fresh per-env device round-trip). The GUARDED scatter
+    // below still reuses env e's `live`; a no-contact env's slice is built but never written
+    // back, exactly mirroring the N=1 BITE early-return.
     std::vector<articulation::ArticulationHostState> env_live(env_count_);
     std::vector<std::vector<Transform>> env_poses(env_count_);
     for (uint32_t e = 0u; e < env_count_; ++e) {
         env_live[e] = gripper_proto_;
-        {
-            // perf tag `artic_download`: per-env device->host state read-back (q/qdot/...).
-            ScopedWallTimer artic_dl(perf_, "artic_download");
-            articulation::DownloadArticulationState(env_devices_[e], &env_live[e]);
-        }
-        {
-            // perf tag `pose_download`: per-env FK world-link-pose download (Sync+CopyToHost).
-            ScopedWallTimer pose_dl(perf_, "pose_download");
-            env_poses[e] = DownloadWorldPoses(context_, env_devices_[e], link_count_);
-        }
+        const size_t loff = static_cast<size_t>(e) * base_link_count_;
+        auto slice_link = [&](auto& dst, const auto& src) {
+            dst.assign(src.begin() + static_cast<std::ptrdiff_t>(loff),
+                       src.begin() + static_cast<std::ptrdiff_t>(loff + base_link_count_));
+        };
+        slice_link(env_live[e].link_velocity, all_live.link_velocity);
+        slice_link(env_live[e].qdot, all_live.qdot);
+        // env e's FK world poses (single-articulation slice of the batched FK output).
+        env_poses[e].assign(all_poses.begin() + static_cast<std::ptrdiff_t>(loff),
+                            all_poses.begin() + static_cast<std::ptrdiff_t>(loff + base_link_count_));
     }
 
     // ONE shared rows/sides buffer across ALL envs (EmitCompliantContactRows APPENDS).
@@ -622,10 +630,23 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     // (a running append counter, keyed by the per-row slot, NOT art_index) -- append is
     // correct there.
     std::vector<RowArticulationRefs> art_refs;
-    std::vector<float> chain_jacobians;  // one dof_stride-wide slot per finger row (slot-indexed).
+    std::vector<float> chain_jacobians;  // one dof_stride-wide slot per finger row (slot-indexed; filled post-loop).
     std::vector<float> minv(static_cast<size_t>(env_count_) * dof_stride_ * dof_stride_,
-                            0.0f);  // env e's CRBA tile @ e*dof_stride^2.
+                            0.0f);  // env e's CRBA tile @ e*dof_stride^2 (filled by the ONE batched CRBA).
     std::vector<float> qdot(static_cast<size_t>(env_count_) * dof_stride_, 0.0f);  // env e @ e*dof_stride.
+
+    // ----- P2.4b: per-slot chain-J inputs, GATHERED in the per-env row-wiring loop in slot
+    // order, then consumed by ONE batched ComputeContactChainJacobians AFTER the loop (this
+    // REPLACES the P2.3b per-finger-row FootChainJ round-trip -- the measured 53.4%). The
+    // slot index is the running count of finger rows; art_refs[r].slot is assigned the SAME
+    // slot during the loop, so the batched output's [slot*dof_stride] slice lines up with the
+    // row by construction. ★ contact_link MUST be the GLOBAL link e*base_link_count_+local
+    // (the kernel selects env e's columns via link_to_articulation[global_link]); deriving it
+    // from a running slot counter instead of from e is THE bug Gate_MixedContactNoContact
+    // catches (interleaved no-contact envs make slot-index != env-index).
+    std::vector<uint32_t> cj_link;       // GLOBAL contact link per slot.
+    std::vector<Vec3>     cj_point;      // world contact point per slot.
+    std::vector<Vec3>     cj_dir;        // world contact direction (finger jacobian linear) per slot.
 
     // The bijection invariant body keys (see the comment at the wiring site below).
     // total_body_count is the env-major BodyState count (NOT bodies_per_env_): every
@@ -728,30 +749,18 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         grasp_reports_[e].finger_row_count =
             static_cast<uint32_t>(rows.RowCount() - row_start);
 
-        // Build env e's M^-1 tile (CRBA) + its flat prefix-sum qdot slice from env e's LIVE
-        // device state, written AT env e's env-major offset (M^-1 tile @ art_index*dof_stride^2,
-        // qdot slice @ art_index*dof_stride). ★ ENV-MAJOR PLACEMENT (the named-debt fix):
-        // the tile is COPIED INTO the pre-sized buffer at its e-th offset, NOT appended -- so
-        // the row solver (which reads art_index=e's tile) gets the right data regardless of
-        // which OTHER envs have contact (a no-contact env leaves its zero-filled tile, never
-        // read because it emits no rows). A sequential append would place env e's tile after
-        // only the CONTACTING earlier envs, so the solver's art_index*dof_stride^2 read would
-        // land on the wrong env's data the moment any earlier env lacked contact.
+        // Pack env e's flat prefix-sum qdot slice from env e's LIVE host slice, written AT env
+        // e's env-major offset (qdot slice @ art_index*dof_stride). env e's M^-1 tile is NOT
+        // built here in P2.4b -- it comes from the ONE batched CRBA after the loop, which
+        // writes the SAME env-major layout (tile @ art_index*dof_stride^2). The env-major
+        // PLACEMENT (write AT the e-th offset, never append) is the P2.3b named-debt fix and
+        // is preserved: the batched CRBA writes EVERY env's tile (a no-contact env's tile is
+        // computed but never read because it emits no rows), so there is no gap to misplace.
         const articulation::ArticulationHostState& live = env_live[e];
-        std::vector<float> env_minv;
-        {
-            // perf tag `crba_minv`: per-env CRBA M^-1 (Upload + ComputeM + Factor +
-            // Synchronize + CopyToHost). Timed ALONE (disjoint from chain_jacobian below).
-            ScopedWallTimer minv_timer(perf_, "crba_minv");
-            env_minv = InverseInertia(context_, live, gravity_z_, dof_stride_);
-        }
-        std::copy(env_minv.begin(), env_minv.end(),
-                  minv.begin() + static_cast<std::ptrdiff_t>(
-                                     static_cast<size_t>(art_index) * dof_stride_ * dof_stride_));
         for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
             qdot[art_index * dof_stride_ + i] = live.link_velocity[root_link_].v[i];
         }
-        for (uint32_t leg = root_link_ + 1u; leg < link_count_; ++leg) {
+        for (uint32_t leg = root_link_ + 1u; leg < base_link_count_; ++leg) {
             const uint32_t col = DofIndexOf(leg);
             if (col < dof_stride_) qdot[art_index * dof_stride_ + col] = live.qdot[leg];
         }
@@ -802,19 +811,18 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
                     break;
                 }
             }
-            std::vector<float> chain_j;
-            {
-                // perf tag `chain_jacobian`: per-finger-row chain-J (Upload + kernel +
-                // Synchronize + CopyToHost). Timed ALONE -- the enclosing index-wiring loop
-                // is NOT bracketed, so this is DISJOINT from row_assembly (no double-count).
-                ScopedWallTimer cj_timer(perf_, "chain_jacobian");
-                chain_j = FootChainJ(context_, live, env_poses[e], finger_link,
-                                     contact_point, finger_dir, dof_stride_);
-            }
-            const uint32_t slot =
-                static_cast<uint32_t>(chain_jacobians.size() / dof_stride_);
-            chain_jacobians.insert(chain_jacobians.end(), chain_j.begin(),
-                                   chain_j.end());
+            // ★ GATHER the chain-J input for this finger row into the next slot (the chain-J
+            // VALUE is filled post-loop by ONE batched ComputeContactChainJacobians). The GLOBAL
+            // contact link is e*base_link_count_+finger_link (the consolidated state's link
+            // index for env e's finger) -- the kernel selects env e's columns via
+            // link_to_articulation[global_link]. The slot is the running finger-row count;
+            // art_refs[r].slot below is set to the SAME slot, so the batched output's
+            // [slot*dof_stride] slice lines up with row r by construction.
+            const uint32_t slot = static_cast<uint32_t>(cj_link.size());
+            cj_link.push_back(art_index * base_link_count_ + finger_link);
+            cj_point.push_back(contact_point);
+            cj_dir.push_back(finger_dir);
+            chain_jacobians.resize(static_cast<size_t>(slot + 1u) * dof_stride_, 0.0f);
             rows.body_indices[2u * r + static_cast<uint32_t>(cup_local)] =
                 cup_body_index;
             rows.body_indices[2u * r + static_cast<uint32_t>(finger_local)] =
@@ -836,6 +844,66 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
                 bodies_[BodyIndex(e, cup_local_index_)].linear_velocity.z;
         }
         return;
+    }
+
+    // ----- P2.4b: ONE batched CRBA M^-1 over ALL N envs -> env-major minv. --------------
+    // REPLACES the P2.3b per-env InverseInertia (a fresh Upload + ComputeM + Factor + Sync +
+    // CopyToHost PER ENV). ComputeArticulationInertiaM reads link_xup, which the stage-1/2
+    // ComputeAccelerations wrote on the consolidated device and which nothing since touched
+    // (IntegrateVelocity / FK / link_pose-refresh do not change link_xup, and q is unchanged
+    // until IntegratePosition in Step()) -- so the M tile is byte-identical to the oracle's
+    // InverseInertia (which re-runs ComputeAccelerations only because it uploads a fresh temp
+    // with stale link_xup; here link_xup is already current, mirroring BatchedArticulatedWorld).
+    // The batched kernel writes EVERY env's tile env-major at art_index*dof_stride^2 -- the
+    // SAME layout the P2.3b std::copy produced, so the row solver's per-env tile read is
+    // unchanged. A no-contact env's tile is computed but never read (it emits no rows).
+    {
+        ScopedWallTimer minv_timer(perf_, "crba_minv");
+        auto view = env_device_.View();
+        articulation::ComputeArticulationInertiaM(
+            context_, view, dof_stride_,
+            static_cast<articulation::LinkSpatialInertia*>(crba_composite_.Data()),
+            static_cast<float*>(crba_m_.Data()));
+        articulation::FactorArticulationInertiaM(
+            context_, view, dof_stride_, static_cast<const float*>(crba_m_.Data()),
+            static_cast<float*>(crba_m_inv_.Data()));
+        context_.stream.Synchronize();
+        crba_m_inv_.CopyToHost(minv.data(), minv.size() * sizeof(float));
+    }
+
+    // ----- P2.4b: ONE batched chain-J over ALL envs' gathered finger contacts. ----------
+    // REPLACES the P2.3b per-finger-row FootChainJ (the measured 53.4% storm). The gathered
+    // (cj_link=GLOBAL link, cj_point, cj_dir) arrays are in slot order; ComputeContactChainJacobians
+    // selects each contact's env columns via link_to_articulation[cj_link[slot]] and writes a
+    // dof_stride-wide row per slot to chain_jacobians[slot*dof_stride] -- exactly the slot the
+    // row's art_refs[r].slot points at. The device link_pose was refreshed to the FK poses
+    // above (the kernel reads state.link_pose), so the chain-J is byte-identical to the
+    // oracle's FootChainJ (which set host.link_pose=fk_world_poses before its upload).
+    if (!cj_link.empty()) {
+        ScopedWallTimer cj_timer(perf_, "chain_jacobian");
+        const uint32_t contact_count = static_cast<uint32_t>(cj_link.size());
+        nuka::phi::Buffer link_buf(static_cast<size_t>(contact_count) * sizeof(uint32_t),
+                                   nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer point_buf(static_cast<size_t>(contact_count) * sizeof(Vec3),
+                                    nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer dir_buf(static_cast<size_t>(contact_count) * sizeof(Vec3),
+                                  nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer jbuf(
+            static_cast<size_t>(contact_count) * dof_stride_ * sizeof(float),
+            nuka::phi::MemoryKind::Device);
+        link_buf.CopyFromHost(cj_link.data(), cj_link.size() * sizeof(uint32_t));
+        point_buf.CopyFromHost(cj_point.data(), cj_point.size() * sizeof(Vec3));
+        dir_buf.CopyFromHost(cj_dir.data(), cj_dir.size() * sizeof(Vec3));
+        // The kernel only writes the ancestor-chain columns -> zero the output first.
+        jbuf.CopyFromHost(chain_jacobians.data(), chain_jacobians.size() * sizeof(float));
+        auto view = env_device_.View();
+        articulation::ComputeContactChainJacobians(
+            context_, view, static_cast<const uint32_t*>(link_buf.Data()),
+            static_cast<const Vec3*>(point_buf.Data()),
+            static_cast<const Vec3*>(dir_buf.Data()), contact_count, dof_stride_,
+            static_cast<float*>(jbuf.Data()));
+        context_.stream.Synchronize();
+        jbuf.CopyToHost(chain_jacobians.data(), chain_jacobians.size() * sizeof(float));
     }
 
     // ----- stage 10: the unified two-way solve (ALL finger rows together) --------
@@ -896,38 +964,47 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         grasp_reports_[e].cup_vz = cup.linear_velocity.z;  // velocity unchanged by integrate.
     }
 
-    // ----- SCATTER the post-contact flat-qdot back to EACH CONTACTING env's device ---
-    // The inverse of the prefix-sum pack (per env). ★ GUARDED to envs that EMITTED finger
-    // rows (env_row_range[e] non-empty): UnifiedSolve only mutated those envs' qdot tiles;
-    // a no-contact env's qdot slice stayed ZERO (never packed -- its env continued before
-    // the pack), so scattering it would CLOBBER that gripper's correct post-IntegrateVelocity
-    // (stage-3) velocity with zero and diverge its q trajectory. Skipping it leaves its
-    // device byte-identical to the N=1 BITE early-return (which never scatters) -- exactly
-    // what the MIXED-CONTACT gate's free-fall envs require. UnifiedSolve mutated `bodies_`
-    // (the cup velocities) in place for every env.
+    // ----- SCATTER the post-contact flat-qdot back into the consolidated env-major device ---
+    // The inverse of the prefix-sum pack (per env), written into the ONE consolidated host
+    // download `all_live` at env e's [e*base_link_count_, ...) slice, then ONE CopyFromHost of
+    // the whole env-major link_velocity + qdot back to the device (P2.4b: one upload, not a
+    // per-env round-trip). ★ GUARDED to envs that EMITTED finger rows (env_row_range[e] non-
+    // empty): UnifiedSolve only mutated those envs' qdot tiles. A no-contact env's `all_live`
+    // slice is LEFT UNTOUCHED -- it already holds the correct post-IntegrateVelocity (stage-3)
+    // velocity from the consolidated download, so writing the whole buffer back is a no-op for
+    // it (byte-identical to the N=1 BITE early-return, which never scatters). UnifiedSolve
+    // mutated `bodies_` (the cup velocities) in place for every env.
     // perf tag `scatter_integrate` (part 1/2): the qdot-scatter-to-device + sync. Part 2/2
     // (the position integrate) is in Step()'s grasp branch (same tag, RAII accumulates).
     {
     ScopedWallTimer scatter_timer(perf_, "scatter_integrate");
+    bool any_scattered = false;
     for (uint32_t e = 0u; e < env_count_; ++e) {
         const auto [rbegin, rend] = env_row_range[e];
-        if (rend <= rbegin) continue;  // no finger rows this env -> device already current.
+        if (rend <= rbegin) continue;  // no finger rows this env -> slice already current.
+        any_scattered = true;
         const uint32_t art_index = e;
-        articulation::ArticulationHostState& live = env_live[e];
+        const size_t loff = static_cast<size_t>(e) * base_link_count_;
+        // Write env e's post-solve flat qdot into the consolidated host slice at its offset.
         for (uint32_t i = 0u; i < base_dof_ && i < dof_stride_; ++i) {
-            live.link_velocity[root_link_].v[i] = qdot[art_index * dof_stride_ + i];
+            all_live.link_velocity[loff + root_link_].v[i] = qdot[art_index * dof_stride_ + i];
         }
-        for (uint32_t leg = root_link_ + 1u; leg < link_count_; ++leg) {
+        for (uint32_t leg = root_link_ + 1u; leg < base_link_count_; ++leg) {
             const uint32_t col = DofIndexOf(leg);
-            if (col < dof_stride_) live.qdot[leg] = qdot[art_index * dof_stride_ + col];
+            if (col < dof_stride_)
+                all_live.qdot[loff + leg] = qdot[art_index * dof_stride_ + col];
         }
-        env_devices_[e].link_velocity.CopyFromHost(
-            live.link_velocity.data(),
-            live.link_velocity.size() * sizeof(articulation::LinkSpatialVel));
-        env_devices_[e].qdot.CopyFromHost(live.qdot.data(),
-                                          live.qdot.size() * sizeof(float));
     }
-    context_.stream.Synchronize();
+    if (any_scattered) {
+        // ONE upload of the whole env-major link_velocity + qdot (untouched no-contact env
+        // slices upload their own unchanged stage-3 values -> a no-op for them).
+        env_device_.link_velocity.CopyFromHost(
+            all_live.link_velocity.data(),
+            all_live.link_velocity.size() * sizeof(articulation::LinkSpatialVel));
+        env_device_.qdot.CopyFromHost(all_live.qdot.data(),
+                                      all_live.qdot.size() * sizeof(float));
+        context_.stream.Synchronize();
+    }
     }  // end scatter_integrate (part 1/2) timer scope.
     // ===== END CONTACT PHASE -- the position integrate happens in Step(). =========
 }
