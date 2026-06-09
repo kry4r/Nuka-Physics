@@ -2105,6 +2105,9 @@ if(CMAKE_CUDA_COMPILER)
         coresident/test_batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        # A2: the grasp-scene builders were promoted out of this test into the shared
+        # library factory; the test DELEGATES to them, so it compiles the same TU.
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_batched_unified_world_test nuka_codegen)
