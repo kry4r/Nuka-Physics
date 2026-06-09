@@ -2084,17 +2084,23 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_unified_coresident_stepper_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.8 P2.1: BatchedUnifiedWorld -- the GENERAL, scene-driven, BATCHED world.
-    # N parallel envs of co-resident rigid bodies (P2.1 scope: free-fall, NO contact,
-    # NO articulation) on the env-major buffer layout the batched UnifiedSolve will
-    # consume in P2.2+. The rigid recurrence is byte-identical to the co-resident
-    # IntegrateBoxPosition so an N=1 world matches that oracle. ADDITIVE: compiles the
+    # --- v0.8 P2.1/P2.2: BatchedUnifiedWorld -- the GENERAL, scene-driven, BATCHED
+    # world. N parallel envs of co-resident rigid bodies on the env-major buffer
+    # layout the batched UnifiedSolve consumes. P2.1: free-fall (NO contact). P2.2:
+    # the batched box<->static-ground contact phase (per-env narrowphase -> shared
+    # compliant rows with per-env body-id offsets -> ONE UnifiedSolve), byte-identical
+    # to UnifiedCoResidentStepper's box<->ground branch at N=1. ADDITIVE: compiles the
     # NEW src/runtime/coresident/batched_unified_world.cpp; modifies no production
-    # stepper/solver/golden. Gates: discrete+continuous free-fall, per-env
-    # independence, D1 byte-exact two-run, immovable-body freeze.
+    # stepper/solver/golden. P2.2 pulls in the collision/constraint/solver spine, the
+    # host contact_stream_driver.cpp (BuildContactManifolds), and -- for Gate A2's
+    # production anchor -- the unified_coresident_stepper.cpp (read-only co-resident
+    # box-mode oracle; the stepper TU is NOT edited). Same dep set as the co-resident
+    # stepper test target. Gates: P2.1 free-fall x4 + P2.2 A1/A2/B/C/D.
     add_executable(nuka_batched_unified_world_test
         coresident/test_batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_batched_unified_world_test nuka_codegen)
 
@@ -2110,7 +2116,12 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_batched_unified_world_test
         PRIVATE
+            nuka_solver
+            nuka_constraint
             nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_collision_gpu
             nuka_core
             nuka_phi
             GTest::gtest_main

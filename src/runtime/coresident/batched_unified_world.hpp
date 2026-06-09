@@ -49,6 +49,7 @@
 // any FeatherstoneAba method, the row solver/scheduler, or any golden.
 // ---------------------------------------------------------------------------
 
+#include "math/vec3.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/rigid/body_state.hpp"
 
@@ -66,6 +67,20 @@ struct BatchedSceneTemplate {
     // env-major SoA at construction; per-env initial-condition perturbation is then
     // applied via BodyMut() before the first Step().
     std::vector<runtime::rigid::BodyState> bodies_per_env;
+
+    // ----- P2.2: the static +Z ground plane the FIRST per-env body rests on -------
+    // ADDITIVE; inert by default. P2.2 inserts a batched box x static-plane contact
+    // phase: each env's local body 0 is treated as a BOX (the stable C3b BoxPlane
+    // narrowphase -- a flat-bottom cup proxy that sidesteps the hull-vs-plane
+    // coplanar-bottom-face instability) resting on ONE static world +Z plane at
+    // `ground_height`. The box uses `box_half_extent` (per-axis half-extents; a
+    // cup-sized cube ~0.045 m is a good default). When `has_ground` is false (the
+    // default), NO box<->ground pair is ever emitted -> the contact phase stays empty
+    // -> the P2.1 free-fall path is byte-for-byte unchanged. Only local body 0 of each
+    // env participates (the one movable rigid body per env in the P2.2 scope).
+    bool       has_ground     = false;   // false -> NO contact (pure P2.1 free-fall).
+    math::Vec3 box_half_extent{0.045f, 0.045f, 0.045f};  // body-0 box half-extents (m).
+    float      ground_height  = 0.0f;    // static +Z plane z (the box bottom rests here).
 };
 
 // The batched general world. Owns N envs of co-resident state and advances them in
@@ -110,10 +125,27 @@ private:
     float gravity_z_;
     float dt_;
 
+    // ----- P2.2 static ground (inert unless has_ground_) -------------------------
+    bool       has_ground_;
+    math::Vec3 box_half_extent_;
+    float      ground_height_;
+
     // The env-major rigid BodyState SoA: env e's bodies at [e*k, (e+1)*k). This is
     // the leading block of the concatenated buffer the batched UnifiedSolve will
     // consume in P2.2+; the per-env body-id offset is exactly BodyIndex().
     std::vector<runtime::rigid::BodyState> bodies_;
+
+    // ----- P2.2: the batched box<->static-ground contact phase -------------------
+    // For EVERY env e (in fixed env-major order, D1): narrowphase env e's local body 0
+    // (a BOX) against the ONE static +Z plane -> EmitCompliantContactRows (condim=1,
+    // APPENDING to the shared rows/sides) -> OVERWRITE the appended rows' body indices
+    // (rigid side -> BodyIndex(e,0); static side -> kInvalidBodyIndex). After ALL envs,
+    // ONE UnifiedSolve over the concatenated rows + the full env-major `bodies_`
+    // mutates the velocities in place. Mirrors UnifiedCoResidentStepper::Step()'s
+    // box<->ground branch EXACTLY (same PrimParams, same cfg/inputs, same body-index
+    // wiring) so an N=1 world is byte-identical to the single-instance reference. A
+    // no-op when !has_ground_ (P2.1 free-fall path preserved).
+    void ResolveBatchedGroundContact();
 
     // Advance ONE rigid body by the symplectic-Euler position step (gravity has
     // already kicked the velocity). BYTE-IDENTICAL to
