@@ -45,7 +45,14 @@ from rl_games.common.ivecenv import IVecEnv
 from rl_games.common import vecenv as _vecenv
 from rl_games.common import env_configurations as _env_configurations
 
-from ..tasks.go2_locomotion import make_env
+from ..tasks.go2_locomotion import make_env as make_go2_env
+from ..tasks.h1_stand import make_env as make_h1_stand_env
+
+
+_ENV_FACTORIES = {
+    "nuka_go2": make_go2_env,
+    "nuka_h1_stand": make_h1_stand_env,
+}
 
 
 class NukaVecEnv(IVecEnv):
@@ -66,6 +73,13 @@ class NukaVecEnv(IVecEnv):
         # ``device`` here would be a nuka.Device -- not provided via yaml, so the
         # env creates+owns its own (ordinal 0). All other kwargs forwarded.
         kwargs.pop("num_actors", None)  # defensive: never double-pass.
+        try:
+            make_env = _ENV_FACTORIES[config_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"unknown Nuka rl_games env config {config_name!r}; "
+                f"available={sorted(_ENV_FACTORIES)}"
+            ) from exc
         self.env = make_env(self.num_actors, **kwargs)
 
         # Single-env spaces (rl_games prepends num_actors).
@@ -115,21 +129,24 @@ def _nuka_vecenv_factory(config_name, num_actors, **kwargs):
 
 
 def register() -> None:
-    """Register the 'NUKA' vecenv type + the 'nuka_go2' env name with rl_games.
+    """Register Nuka vecenv type + env names with rl_games.
 
     Idempotent: safe to call multiple times (e.g. once per process import).
     """
     _vecenv.register("NUKA", _nuka_vecenv_factory)
-    _env_configurations.register(
-        "nuka_go2",
-        {
-            "vecenv_type": "NUKA",
-            # Vestigial for non-RAY vecenv types (only RayVecEnv calls
-            # env_creator); provided so env_configurations is internally
-            # consistent + a direct ``env_creator(**cfg)`` smoke would work.
-            "env_creator": lambda **kw: make_env(kw.pop("num_actors", 256), **kw),
-        },
-    )
+    for env_name, make_env in _ENV_FACTORIES.items():
+        _env_configurations.register(
+            env_name,
+            {
+                "vecenv_type": "NUKA",
+                # Vestigial for non-RAY vecenv types (only RayVecEnv calls
+                # env_creator); provided so env_configurations is internally
+                # consistent + a direct ``env_creator(**cfg)`` smoke works.
+                "env_creator": lambda _make_env=make_env, **kw: _make_env(
+                    kw.pop("num_actors", 256), **kw
+                ),
+            },
+        )
 
 
 # Register at import so ``import nuka.rl_games`` is enough to make
