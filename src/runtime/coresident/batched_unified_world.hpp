@@ -49,8 +49,12 @@
 // any FeatherstoneAba method, the row solver/scheduler, or any golden.
 // ---------------------------------------------------------------------------
 
+#include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
+#include "runtime/articulation/articulation_state.hpp"  // ArticulationHostState / DeviceBuffers
+#include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResidentFingertip / CoResidentCup
 #include "runtime/rigid/body_state.hpp"
 
 #include <cstdint>
@@ -81,6 +85,60 @@ struct BatchedSceneTemplate {
     bool       has_ground     = false;   // false -> NO contact (pure P2.1 free-fall).
     math::Vec3 box_half_extent{0.045f, 0.045f, 0.045f};  // body-0 box half-extents (m).
     float      ground_height  = 0.0f;    // static +Z plane z (the box bottom rests here).
+
+    // ----- P2.3a: the per-env articulation<->rigid GRASP contact phase ------------
+    // ADDITIVE; inert by default (has_grasp=false -> NO grasp pair ever emitted, the
+    // P2.1/P2.2 paths are byte-for-byte unchanged). The grasp scope is a FIXED-base
+    // 2-finger gripper (a CoResident articulation proto, replicated per env) that
+    // pinches ONE movable rigid CUP (a convex hull == one of the bodies_per_env
+    // bodies, selected by `cup_local_index`) by FINGER FRICTION ALONE -- NO table.
+    // Each step: re-apply the constant grip torque to tau (the drive path) -> ABA ->
+    // velocity integrate (gripper + cup gravity kick) -> per-finger sphere x cup-hull
+    // narrowphase -> EmitCompliantContactRows(condim=3) -> per-row finger chain-J +
+    // cup body index -> ONE UnifiedSolve -> scatter qdot -> position integrate. This
+    // is the N=1 batched analog of UnifiedCoResidentStepper::StepGrasp (the validated
+    // oracle); P2.3b adds an env loop + env-major tile concatenation, no restructure.
+    bool has_grasp = false;  // false -> NO grasp (P2.1/P2.2 path preserved byte-exact).
+
+    // The gripper articulation proto (a CoResident fixed-base 2-finger gripper, built
+    // the SAME way the grasp-hold spike's BuildGripper does). Replicated per env.
+    articulation::ArticulationHostState gripper_proto;
+
+    // The N fingertip sphere descriptors (link / local offset / radius / broadphase
+    // handle) -- the pinch contacts. Kept SPHERES (cvx::SphereHull EPA-bypass).
+    std::vector<CoResidentFingertip> fingertips;
+
+    // The movable convex-hull CUP geometry (mesh-local hull verts, COM-centered) +
+    // which bodies_per_env body IS the cup (its env-major BodyState carries the live
+    // pose / mass / inertia). The cup BodyState lives in bodies_per_env[cup_local_index].
+    CoResidentCup cup;
+    uint32_t      cup_local_index = 0u;  // which bodies_per_env body is the cup.
+
+    // The constant grip torque + optional drive force limits, PER DEVICE LINK (length
+    // == gripper link count; 0 on non-finger links). Re-applied to tau each step.
+    std::vector<float> grip_torque;
+    std::vector<float> drive_force_limits;
+
+    // Per-contact isotropic friction coefficient (stamped into RowMaterial.friction)
+    // + the contact dimension (3 -> 1 normal row + a 4-spoke friction pyramid / point;
+    // FRICTION is what holds the cup -- a frictionless condim=1 grasp could not).
+    float    friction_mu = 0.6f;
+    uint32_t condim      = 3u;
+};
+
+// Per-env grasp metrics (the P2.3a HOLD / NO-TABLE / BITE gates read this). Populated
+// by ResolveBatchedGraspContact -- the SAME quantities StepGrasp reports, computed
+// while the rows / lambdas are live (a test CANNOT reconstruct the contact impulse
+// after Step() integrates). For N=1 there is one entry; P2.3b makes this per-env.
+struct BatchedGraspEnvReport {
+    uint32_t finger_contacts = 0u;        // # cup<->fingertip manifold points this step.
+    uint32_t finger_row_count = 0u;       // # finger contact rows (normal + spokes).
+    bool     any_static_row = false;      // a row carried a StaticNull side (a table!).
+    double   cup_vertical_impulse = 0.0;  // Σ over finger rows of λ * j_cup.linear.z.
+    double   cup_dvz_impulse = 0.0;       // m_cup * (vz_after_solve - vz_pre_contact).
+    double   cup_vz = 0.0;                // cup vertical velocity AFTER this step.
+    double   cup_z  = 0.0;                // cup height AFTER this step.
+    float    max_lambda = 0.0f;           // peak finger normal-row impulse this step.
 };
 
 // The batched general world. Owns N envs of co-resident state and advances them in
@@ -118,6 +176,17 @@ public:
     // The whole env-major rigid SoA (read-only). Size == env_count * bodies_per_env.
     const std::vector<runtime::rigid::BodyState>& Bodies() const { return bodies_; }
 
+    // ----- P2.3a grasp observability (the gates read these) ----------------------
+    // The per-env grasp report from the LAST Step() (populated only when has_grasp_).
+    // For N=1 size()==1. The cup is bodies_per_env[cup_local_index].
+    const std::vector<BatchedGraspEnvReport>& GraspReports() const {
+        return grasp_reports_;
+    }
+    // Snapshot the single-env gripper articulation host state (q / qdot / base_pose /
+    // link_velocity). For A1/A2 byte/tolerance comparison of the gripper joints. P2.3b
+    // makes this per-env. A no-op (leaves *out unchanged) when !has_grasp_.
+    void DownloadGripper(articulation::ArticulationHostState* out) const;
+
 private:
     const phi::DeviceContext& context_;
     uint32_t env_count_;
@@ -129,6 +198,27 @@ private:
     bool       has_ground_;
     math::Vec3 box_half_extent_;
     float      ground_height_;
+
+    // ----- P2.3a articulation<->rigid GRASP (inert unless has_grasp_) ------------
+    // ONE persistent device-resident gripper articulation for the single env (P2.3b
+    // makes this a per-env vector + an env loop in ResolveBatchedGraspContact). The
+    // proto stays host-resident for the per-step InverseInertia / FootChainJ uploads
+    // (which need a fresh host snapshot, exactly as the oracle's `live` does).
+    bool       has_grasp_ = false;
+    uint32_t   cup_local_index_ = 0u;
+    uint32_t   dof_stride_  = 0u;
+    uint32_t   base_dof_    = 0u;   // root DOF count (FloatingBase=6, Fixed gripper=0).
+    uint32_t   root_link_   = 0u;
+    uint32_t   link_count_  = 0u;
+    float      friction_mu_ = 0.6f;
+    uint32_t   condim_      = 3u;
+    articulation::ArticulationHostState gripper_proto_;      // refresh-able CPU mirror.
+    articulation::ArticulationDeviceBuffers gripper_device_; // the single-env GPU gripper.
+    std::vector<CoResidentFingertip> fingertips_;
+    CoResidentCup grasp_cup_;
+    phi::Buffer   grip_torque_dev_;   // per-link constant grip torque (device).
+    phi::Buffer   grip_limits_dev_;   // per-link drive force limits (device).
+    std::vector<BatchedGraspEnvReport> grasp_reports_;  // last-Step() per-env metrics.
 
     // The env-major rigid BodyState SoA: env e's bodies at [e*k, (e+1)*k). This is
     // the leading block of the concatenated buffer the batched UnifiedSolve will
@@ -146,6 +236,28 @@ private:
     // wiring) so an N=1 world is byte-identical to the single-instance reference. A
     // no-op when !has_ground_ (P2.1 free-fall path preserved).
     void ResolveBatchedGroundContact();
+
+    // ----- P2.3a: the batched articulation<->rigid GRASP contact phase -----------
+    // The N=1 batched analog of UnifiedCoResidentStepper::StepGrasp. Mirrors the
+    // oracle's exact stage order: (stage 0) re-apply the constant grip torque to tau
+    // via LaunchApplyTorqueDriveKernels (the DRIVE path); (stage 1/2) ABA accelerations
+    // WITH the grip tau; (stage 3) velocity integrate (gripper halves + cup gravity
+    // kick); (stage 4-6) download live state + FK poses -> per-finger sphere x cup-hull
+    // narrowphase; (stage 7) EmitCompliantContactRows(condim=3) + stamp friction_mu;
+    // wire each finger row (cup side -> BodyIndex(e,cup_local), finger side -> coloring
+    // key total_body_count+art_index + a chain-J slot, art_index=e); build minv (CRBA
+    // M^-1) + the flat prefix-sum qdot; (stage 10) ONE UnifiedSolve; scatter qdot ->
+    // device link_velocity/qdot. The POSITION integrate (gripper device IntegratePosition
+    // + IntegrateFloatingBasePose + cup IntegrateBodyPosition) happens in Step() after.
+    // A no-op when !has_grasp_ (the P2.1/P2.2 paths stay byte-for-byte unchanged). The
+    // cup's vertical velocity BEFORE the contact solve is returned so a HOLD gate can
+    // read the force balance (the finger vertical impulse must lift it back).
+    void ResolveBatchedGraspContact();
+
+    // The flat-qdot prefix-sum DOF index of a gripper device link: Σ JointDofCount over
+    // the gripper links in [root_link_, link). REPLICATED byte-for-byte from
+    // UnifiedCoResidentStepper::DofIndexOf (a member reading the proto's joint_type).
+    uint32_t DofIndexOf(uint32_t link) const;
 
     // Advance ONE rigid body by the symplectic-Euler position step (gravity has
     // already kicked the velocity). BYTE-IDENTICAL to
