@@ -2084,6 +2084,41 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_unified_coresident_stepper_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 P2.1: BatchedUnifiedWorld -- the GENERAL, scene-driven, BATCHED world.
+    # N parallel envs of co-resident rigid bodies (P2.1 scope: free-fall, NO contact,
+    # NO articulation) on the env-major buffer layout the batched UnifiedSolve will
+    # consume in P2.2+. The rigid recurrence is byte-identical to the co-resident
+    # IntegrateBoxPosition so an N=1 world matches that oracle. ADDITIVE: compiles the
+    # NEW src/runtime/coresident/batched_unified_world.cpp; modifies no production
+    # stepper/solver/golden. Gates: discrete+continuous free-fall, per-env
+    # independence, D1 byte-exact two-run, immovable-body freeze.
+    add_executable(nuka_batched_unified_world_test
+        coresident/test_batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+    )
+    add_dependencies(nuka_batched_unified_world_test nuka_codegen)
+
+    target_compile_definitions(nuka_batched_unified_world_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_batched_unified_world_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_batched_unified_world_test
+        PRIVATE
+            nuka_runtime
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_unified_world_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C7b-1: the HOLD-AGAINST-GRAVITY grasp SPIKE. A synthetic fixed-base
     # 2-finger gripper holds the C7a cup (convex hull) against gravity by FINGER
     # FRICTION ALONE -- NO table. Drives the generalized unified_coresident_stepper
