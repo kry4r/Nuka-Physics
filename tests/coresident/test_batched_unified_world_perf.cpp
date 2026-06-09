@@ -30,8 +30,11 @@
 // scaffolding, byte-for-byte) so this TU does not depend on that test's internals.
 // ---------------------------------------------------------------------------
 
+#include "constraint/row.hpp"                                // Row / RowJacobian6 / kInvalidBodyIndex
+#include "constraint/row_buffers.hpp"                        // RowBuffers (synthetic coloring input)
 #include "core/perf/perf_recorder.hpp"
 #include "import/usd_importer.hpp"                          // LoadUsd (cup hull)
+#include "solver/gpu/row_scheduler.hpp"                      // BuildRowColorPartitions / ValidateNoSharedBodiesPerColor
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -299,6 +302,95 @@ double TagTotalUs(const nuka::core::perf::PerfRecorder& perf, const char* tag) {
     return static_cast<double>(st.count) * st.mean_us;
 }
 
+// ---------------------------------------------------------------------------
+// (A) Per-stage breakdown at an arbitrary N. Builds a CLEAN world, warms up, resets the
+// recorder, runs `k` timed Step()s, then prints the SAME PERF-BREAKDOWN block the N=32
+// path prints (each tag's total ms + its % of Σtags, the two roll-ups, and the Σ-check).
+// Returns the PER-STEP row_solver tag ms (the tag total / k). ★ PER-STEP is essential for
+// the (D) verdict: the printed tag TOTALS are summed over k Step()s, and k differs per N
+// (200/20/10), so a TOTAL-vs-TOTAL comparison against the per-CALL coloring time would be
+// off by exactly the factor k. There is exactly one UnifiedSolve (hence one
+// BuildRowColorPartitions) per Step, so per-step row_solver is the right denominator for
+// the per-call coloring time. The in-function breakdown %s are within-run ratios (k
+// cancels) -> unaffected by this division.
+// ---------------------------------------------------------------------------
+double RunStageBreakdown(const nuka::phi::DeviceContext& context,
+                         const coresident::BatchedSceneTemplate& tmpl, uint32_t n,
+                         uint32_t k) {
+    coresident::BatchedUnifiedWorld world(context, tmpl, n, kGraspGravityZ, kGraspDt);
+    for (uint32_t s = 0u; s < kWarm; ++s) world.Step();
+    world.Perf().Reset();
+    const auto wall0 = std::chrono::steady_clock::now();
+    for (uint32_t s = 0u; s < k; ++s) world.Step();
+    const auto wall1 = std::chrono::steady_clock::now();
+    const double wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+
+    const auto& perf = world.Perf();
+    double sum_tags_ms = 0.0;
+    for (const char* tag : kStageTags) sum_tags_ms += TagTotalUs(perf, tag) * 1.0e-3;
+    const double denom_ms = sum_tags_ms > 0.0 ? sum_tags_ms : 1.0;
+    for (const char* tag : kStageTags) {
+        const double tag_ms = TagTotalUs(perf, tag) * 1.0e-3;
+        std::printf("[PERF-BREAKDOWN N=%u K=%u] %s=%.3f (%.1f%%)\n", n, k, tag, tag_ms,
+                    100.0 * tag_ms / denom_ms);
+    }
+    const double storm_ms = (TagTotalUs(perf, "pose_download") +
+                             TagTotalUs(perf, "artic_download") +
+                             TagTotalUs(perf, "crba_minv") +
+                             TagTotalUs(perf, "chain_jacobian")) *
+                            1.0e-3;
+    const double solver_ms = TagTotalUs(perf, "row_solver") * 1.0e-3;
+    std::printf("[PERF-BREAKDOWN N=%u K=%u] ARTIC_SYNC_STORM=%.3f (%.1f%%)\n", n, k,
+                storm_ms, 100.0 * storm_ms / denom_ms);
+    std::printf("[PERF-BREAKDOWN N=%u K=%u] SOLVER=%.3f (%.1f%%)\n", n, k, solver_ms,
+                100.0 * solver_ms / denom_ms);
+    std::printf("[PERF-BREAKDOWN N=%u K=%u] SUM_TAGS=%.3f WALL_TOTAL=%.3f (sum/wall=%.1f%%)\n",
+                n, k, sum_tags_ms, wall_total_ms,
+                wall_total_ms > 0.0 ? 100.0 * sum_tags_ms / wall_total_ms : 0.0);
+    std::fflush(stdout);
+    EXPECT_LE(sum_tags_ms, wall_total_ms * 1.05)
+        << "Σ(stage tags) exceeds the measured wall time at N=" << n
+        << " -> a timer is nested / double-counted; the breakdown cannot be trusted";
+    return solver_ms / static_cast<double>(k > 0u ? k : 1u);  // PER-STEP (see header).
+}
+
+// ---------------------------------------------------------------------------
+// (B) FAITHFUL synthetic row set for the coloring micro-benchmark: N disjoint K-cliques.
+// Empirically K=10 (condim=3 -> 5 rows/contact-point x 2 fingertip contacts; confirmed by
+// a temporary [KPROBE] in batched_unified_world.cpp, since reverted: total_rows = N*10 for
+// every N in the sweep). The real grasp row assembly (batched_unified_world.cpp:846-849)
+// rewrites BOTH body_indices of every finger row of env e to {body_a = total_body_count+e,
+// body_b = cup BodyIndex(e,...)}, so all K rows in env e share BOTH bodies (a K-clique that
+// all pairwise-conflict via RowsConflict), while cross-env rows share NO index (never
+// conflict). RowsConflict (row_scheduler.cu:14) reads ONLY BodiesForRow -> body_indices
+// [body_list_offset] and [+1]; the jacobian/material/anchor payload is irrelevant to
+// coloring. We build via RowBuffers::AddRow, which sets body_count=2 and body_list_offset
+// =2*idx for us (row_buffers.cpp:20-40) -- exactly what BodiesForRow reads -- so the CSR is
+// correct by construction. The exact index VALUES are immaterial (only the disjoint-clique
+// STRUCTURE drives cost + ColorCount); we use body_a = n_envs + e, body_b = e (disjoint
+// across envs, equal within an env). The decisive invariant: ColorCount() == K for EVERY N
+// (one color per clique member, reused across all envs). If it is 1 or N*K, the structure
+// is wrong.
+constexpr uint32_t kSyntheticK = 10u;  // confirmed empirically (see comment above).
+nuka::constraint::RowBuffers BuildSyntheticGraspRows(uint32_t n_envs, uint32_t k) {
+    nuka::constraint::RowBuffers rows;
+    rows.rows.reserve(static_cast<size_t>(n_envs) * k);
+    rows.body_indices.reserve(2u * static_cast<size_t>(n_envs) * k);
+    rows.jacobian_data.reserve(2u * static_cast<size_t>(n_envs) * k);
+    rows.materials.reserve(static_cast<size_t>(n_envs) * k);
+    rows.anchors.reserve(static_cast<size_t>(n_envs) * k);
+    const nuka::constraint::RowJacobian6 zero_j{};
+    for (uint32_t e = 0u; e < n_envs; ++e) {
+        const uint32_t finger_key = n_envs + e;  // synthetic finger-side key (disjoint/env).
+        const uint32_t cup_key = e;              // synthetic cup body index (disjoint/env).
+        for (uint32_t f = 0u; f < k; ++f) {
+            rows.AddRow(nuka::constraint::Row{}, {finger_key, cup_key}, zero_j, zero_j);
+        }
+    }
+    return rows;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -333,59 +425,124 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
         if (n == 32u) measured_n32_eps = eps;
     }
 
-    // ----- (2) the N=32 PER-STAGE breakdown (a fresh, isolated N=32 run) --------------
-    // Re-run N=32 standalone so the recorder holds ONLY this run's samples (the sweep's
-    // N=32 world was destroyed; build a clean one and time it the same way).
-    coresident::BatchedUnifiedWorld w32(context, tmpl, 32u, kGraspGravityZ, kGraspDt);
-    for (uint32_t s = 0u; s < kWarm; ++s) w32.Step();
-    w32.Perf().Reset();
-    const auto wall0 = std::chrono::steady_clock::now();
-    for (uint32_t s = 0u; s < kK; ++s) w32.Step();
-    const auto wall1 = std::chrono::steady_clock::now();
-    const double wall_total_ms =
-        std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    // ----- (2) the PER-STAGE breakdown at N=32, 256, 1024 (fresh, isolated runs) --------
+    // Each call builds a CLEAN world so the recorder holds ONLY that N's samples (the
+    // sweep's worlds were destroyed). The big-N runs use a small K (the step orchestration
+    // is O(N), so a fixed K=200 would make N=1024 take ~10 min) -- K is printed in every
+    // line. This is the (A) deliverable: does row_solver (and which other tags) grow
+    // super-linearly in N? Returns each N's PER-STEP row_solver ms for the (D) verdict (the
+    // printed BREAKDOWN lines are tag TOTALS over k steps; these returns are total/k -- one
+    // UnifiedSolve/BuildRowColorPartitions per Step, so per-step is the coloring denominator).
+    const double solver_ms_n32 = RunStageBreakdown(context, tmpl, 32u, kK);   // K=200.
+    const double solver_ms_n256 = RunStageBreakdown(context, tmpl, 256u, 20u);
+    const double solver_ms_n1024 = RunStageBreakdown(context, tmpl, 1024u, 10u);
 
-    const auto& perf = w32.Perf();
-    double sum_tags_ms = 0.0;
-    for (const char* tag : kStageTags) sum_tags_ms += TagTotalUs(perf, tag) * 1.0e-3;
+    // ----- (2b) THE DECISIVE MEASUREMENT: isolate the coloring cost ---------------------
+    // Directly host-wall-clock-time nuka::solver::gpu::BuildRowColorPartitions (the named
+    // O(rows^2) super-linearity suspect) on a FAITHFUL synthetic N-disjoint-K-clique row
+    // set at N in {32,256,1024}. BuildRowColorPartitions + ValidateNoSharedBodiesPerColor
+    // are BOTH host O(rows^2) and BOTH run inside the `row_solver` tag (row_solver.cu:1128
+    // -1129, behind UnifiedSolve); everything after them in SolveRowsWithSides (the scratch
+    // uploads at 1138-1230, the device_view assembly, the single-block SolveRowsSweepKernel
+    // at 1291) is O(rows) host work + device work. So `row_solver` tag ~= (Build + Validate)
+    // + O(rows) residual. We time each separately, several reps (more at small N where each
+    // call is microseconds), and report mean ms + ColorCount() + row count.
+    struct ColoringPoint {
+        uint32_t n, rows, colors, reps;
+        double build_ms, validate_ms;
+    };
+    std::vector<ColoringPoint> coloring;
+    const uint32_t kColorNs[] = {32u, 256u, 1024u};
+    const uint32_t kColorReps[] = {500u, 50u, 10u};  // inverse-scaled with N (see comment).
+    for (size_t i = 0u; i < 3u; ++i) {
+        const uint32_t n = kColorNs[i];
+        const uint32_t reps = kColorReps[i];
+        const nuka::constraint::RowBuffers rows = BuildSyntheticGraspRows(n, kSyntheticK);
+        // One untimed call to capture ColorCount() + validity (and warm any allocation).
+        const auto warm_part = nuka::solver::gpu::BuildRowColorPartitions(rows);
+        const bool valid =
+            nuka::solver::gpu::ValidateNoSharedBodiesPerColor(rows, warm_part);
+        EXPECT_TRUE(valid) << "synthetic partition self-conflicts at N=" << n;
+        EXPECT_EQ(warm_part.ColorCount(), kSyntheticK)
+            << "synthetic coloring at N=" << n << " gave ColorCount="
+            << warm_part.ColorCount() << " (expected K=" << kSyntheticK
+            << "); the N-disjoint-K-clique structure is WRONG";
 
-    // Denominator for both per-tag % and the roll-ups = Σ(the 9 tag totals), so the
-    // shares sum to 100% by construction (the verdict is then robust to any untimed gap).
-    const double denom_ms = sum_tags_ms > 0.0 ? sum_tags_ms : 1.0;
-    for (const char* tag : kStageTags) {
-        const double tag_ms = TagTotalUs(perf, tag) * 1.0e-3;
-        std::printf("[PERF-BREAKDOWN N=32] %s=%.3f (%.1f%%)\n", tag, tag_ms,
-                    100.0 * tag_ms / denom_ms);
+        const auto b0 = std::chrono::steady_clock::now();
+        for (uint32_t r = 0u; r < reps; ++r) {
+            const auto p = nuka::solver::gpu::BuildRowColorPartitions(rows);
+            (void)p.ColorCount();  // keep the result live (defeat dead-code elision).
+        }
+        const auto b1 = std::chrono::steady_clock::now();
+        const double build_ms =
+            std::chrono::duration<double, std::milli>(b1 - b0).count() / reps;
+
+        const auto v0 = std::chrono::steady_clock::now();
+        for (uint32_t r = 0u; r < reps; ++r) {
+            const bool ok =
+                nuka::solver::gpu::ValidateNoSharedBodiesPerColor(rows, warm_part);
+            (void)ok;
+        }
+        const auto v1 = std::chrono::steady_clock::now();
+        const double validate_ms =
+            std::chrono::duration<double, std::milli>(v1 - v0).count() / reps;
+
+        coloring.push_back({n, rows.RowCount(), warm_part.ColorCount(), reps, build_ms,
+                            validate_ms});
+        std::printf("[COLORING N=%u] rows=%u ColorCount=%u reps=%u BuildRowColorPartitions="
+                    "%.4f_ms ValidateNoSharedBodiesPerColor=%.4f_ms (Build+Validate=%.4f_ms)\n",
+                    n, rows.RowCount(), warm_part.ColorCount(), reps, build_ms,
+                    validate_ms, build_ms + validate_ms);
+        std::fflush(stdout);
     }
 
-    // The two verdict roll-ups.
-    const double storm_ms = (TagTotalUs(perf, "pose_download") +
-                             TagTotalUs(perf, "artic_download") +
-                             TagTotalUs(perf, "crba_minv") +
-                             TagTotalUs(perf, "chain_jacobian")) *
-                            1.0e-3;
-    const double solver_ms = TagTotalUs(perf, "row_solver") * 1.0e-3;
-    const double storm_pct = 100.0 * storm_ms / denom_ms;
-    const double solver_pct = 100.0 * solver_ms / denom_ms;
-    std::printf("[PERF-BREAKDOWN N=32] ARTIC_SYNC_STORM=%.3f (%.1f%%)\n", storm_ms,
-                storm_pct);
-    std::printf("[PERF-BREAKDOWN N=32] SOLVER=%.3f (%.1f%%)\n", solver_ms, solver_pct);
+    // ----- (2c) THE VERDICT (D): coloring as a fraction of the row_solver tag -----------
+    auto coloring_at = [&](uint32_t n) -> const ColoringPoint& {
+        for (const auto& c : coloring)
+            if (c.n == n) return c;
+        return coloring.front();
+    };
+    const ColoringPoint& c32 = coloring_at(32u);
+    const ColoringPoint& c1024 = coloring_at(1024u);
+    const double col32_ms = c32.build_ms + c32.validate_ms;
+    const double col1024_ms = c1024.build_ms + c1024.validate_ms;
 
-    // Σ-check (the advisor's nested-timer guard): Σtags must be <= wall and close. If
-    // Σtags > wall, a timer was double-counted (nested) and the breakdown is corrupt.
-    std::printf("[PERF-BREAKDOWN N=32] SUM_TAGS=%.3f WALL_TOTAL=%.3f (sum/wall=%.1f%%)\n",
-                sum_tags_ms, wall_total_ms,
-                wall_total_ms > 0.0 ? 100.0 * sum_tags_ms / wall_total_ms : 0.0);
-    std::fflush(stdout);
-    EXPECT_LE(sum_tags_ms, wall_total_ms * 1.05)
-        << "Σ(stage tags) exceeds the measured wall time -> a timer is nested / "
-           "double-counted; the breakdown percentages cannot be trusted";
+    // Sanity (B last bullet): the synthetic coloring @ N=32 must be CONSISTENT with the real
+    // N=32 per-step row_solver -- it is the dominant share of it (already ~75% at N=32),
+    // never EXCEEDING it (coloring is INSIDE the tag). If coloring > tag, K or the clique
+    // structure is wrong (the synthetic is over-counting conflicts).
+    std::printf("[COLORING-SANITY N=32] Build+Validate=%.4f_ms row_solver_per_step=%.4f_ms "
+                "(coloring/per_step=%.1f%%)\n",
+                col32_ms, solver_ms_n32,
+                solver_ms_n32 > 0.0 ? 100.0 * col32_ms / solver_ms_n32 : 0.0);
+    EXPECT_LE(col32_ms, solver_ms_n32 * 1.10)
+        << "synthetic coloring (" << col32_ms << " ms) exceeds the real per-step row_solver ("
+        << solver_ms_n32 << " ms) -- coloring is INSIDE that tag, so the synthetic must be "
+           "over-counting conflicts (K or the clique structure is wrong)";
 
-    // The verdict (printed plainly for the report).
-    std::printf("[PERF-VERDICT N=32] ARTIC_SYNC_STORM=%.1f%% vs SOLVER(row_solver)=%.1f%% "
-                "-> %s dominates\n",
-                storm_pct, solver_pct,
-                storm_pct >= solver_pct ? "ARTIC_SYNC_STORM" : "SOLVER");
+    // The O(rows) residual = per-step row_solver - coloring (the scratch uploads + the
+    // single-block kernel + the host round-trip). It must be SMALL and ~linear in N; the
+    // quadratic coloring swamping it is the COLORING-BOUND signature.
+    const double resid32 = solver_ms_n32 - col32_ms;
+    const double resid256 = solver_ms_n256 - (coloring_at(256u).build_ms +
+                                              coloring_at(256u).validate_ms);
+    const double resid1024 = solver_ms_n1024 - col1024_ms;
+
+    const double col1024_frac =
+        solver_ms_n1024 > 0.0 ? 100.0 * col1024_ms / solver_ms_n1024 : 0.0;
+    const bool coloring_bound = col1024_frac >= 50.0;
+    std::printf("[PERF-VERDICT N=1024] coloring(Build+Validate)=%.4f_ms "
+                "row_solver_per_step=%.4f_ms -> coloring/per_step=%.1f%% -> %s\n",
+                col1024_ms, solver_ms_n1024, col1024_frac,
+                coloring_bound ? "COLORING-BOUND" : "KERNEL/TRANSFER-BOUND");
+    std::printf("[PERF-VERDICT] row_solver PER-STEP growth: N=32=%.3f_ms N=256=%.3f_ms "
+                "N=1024=%.3f_ms (%.0fx for 32x envs) ; coloring growth: N=32=%.4f_ms "
+                "N=256=%.4f_ms N=1024=%.4f_ms ; O(rows) residual: N=32=%.3f_ms "
+                "N=256=%.3f_ms N=1024=%.3f_ms\n",
+                solver_ms_n32, solver_ms_n256, solver_ms_n1024,
+                solver_ms_n32 > 0.0 ? solver_ms_n1024 / solver_ms_n32 : 0.0,
+                col32_ms, coloring_at(256u).build_ms + coloring_at(256u).validate_ms,
+                col1024_ms, resid32, resid256, resid1024);
     std::fflush(stdout);
 
     // ----- (3) ONE loose regression guard -------------------------------------------
