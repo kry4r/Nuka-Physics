@@ -102,7 +102,8 @@ nuka_result_t nuka_grasp_world_create(nuka_device_handle device,
             return NUKA_RESULT_FILE_NOT_FOUND;
         }
         const coresident::GraspSceneBundle bundle =
-            coresident::BuildGraspSceneBundle(hull, desc->grip_force, desc->friction_mu);
+            coresident::BuildGraspSceneBundle(hull, desc->grip_force, desc->friction_mu,
+                                              desc->cup_start_z_offset);
         const coresident::BatchedSceneTemplate tmpl = coresident::MakeGraspTemplate(bundle);
 
         auto record = std::make_unique<GraspWorldRecord>();

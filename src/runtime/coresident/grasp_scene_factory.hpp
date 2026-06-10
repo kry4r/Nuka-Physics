@@ -81,10 +81,20 @@ struct GraspSceneBundle {
 };
 
 // Assemble the validated grasp scene from a cup hull + the grip force (constant
-// per-finger drive torque, N) + the friction coefficient `mu`. BYTE-IDENTICAL to
-// the test helper it replaces -> the A1 byte-exact / A2 1e-5 gates are preserved.
+// per-finger drive torque, N) + the friction coefficient `mu`. With
+// `cup_start_z_offset == 0` this is BYTE-IDENTICAL to the test helper it replaces
+// -> the A1 byte-exact / A2 1e-5 gates are preserved.
+//
+// `cup_start_z_offset` (A3, default 0) is the DISCRIMINATIVE-IC knob: it raises the
+// cup's INITIAL body Z (and therefore the ResetEnvs template Z, captured from this
+// same BodyState) by that many metres ABOVE the fingertip catch plane (z=0.20),
+// WITHOUT moving the fingertips (their pre-pose math keeps using the fixed 0.20
+// catch-plane Z). So at offset>0 the cup starts above OPEN fingertips with NO
+// contact at t=0 and DESCENDS under gravity -> a timed close catches it but a
+// constant-max slam shuts on empty space before the cup arrives (proven non-trivial
+// in A3). At offset==0 every field is bit-identical to the validated scene.
 GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_force,
-                                       float mu);
+                                       float mu, float cup_start_z_offset = 0.0f);
 
 // Populate a BatchedSceneTemplate from the bundle (cup == the single per-env body,
 // cup_local_index 0; the gripper proto + fingertips + grip torque + friction). The
