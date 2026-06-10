@@ -39,6 +39,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import train_go2_ppo as _base  # noqa: E402
+from grasp_catch_eval import CatchRateAlgoObserver  # noqa: E402
 
 _DEFAULT_CFG = os.path.join(_HERE, "h1_grasp_ppo_cfg.yaml")
 
@@ -49,6 +50,26 @@ def _build_argparser():
     parser.set_defaults(cfg=_DEFAULT_CFG)
     parser.add_argument("--checkpoint", default=None,
                         help="Resume training from an rl_games checkpoint.")
+    # A5b: periodic DETERMINISTIC catch-rate eval on a SEPARATE env (the metric
+    # that answers 'does PPO learn to grasp', which return cannot -- cup transit
+    # farms return). --catch-eval-every K (0 disables -> plain StdoutAlgoObserver).
+    parser.add_argument("--catch-eval-every", dest="catch_eval_every",
+                        type=int, default=5,
+                        help="Run the deterministic catch-rate eval every K "
+                             "epochs (0 disables).")
+    parser.add_argument("--catch-eval-envs", dest="catch_eval_envs",
+                        type=int, default=256,
+                        help="Env count for the catch-rate eval env.")
+    parser.add_argument("--catch-log", dest="catch_log", default=None,
+                        help="CSV path for the catch-rate log "
+                             "(default runs/grasp_catch_eval.csv).")
+    # A5b: let the SHORT bootstrapping window checkpoint frequently so the trained
+    # high-catch policy is captured as an artifact (the cfg default save_frequency=
+    # 100 never fires in a <100-epoch run).
+    parser.add_argument("--save-frequency", dest="save_frequency", type=int,
+                        default=None, help="Override cfg save_frequency (epochs).")
+    parser.add_argument("--save-best-after", dest="save_best_after", type=int,
+                        default=None, help="Override cfg save_best_after (epochs).")
     return parser
 
 
@@ -72,6 +93,10 @@ def main(argv=None) -> int:
     # ENV_CONFIG HYGIENE: drop the go2/h1_stand-only smoke key the shared override
     # injects -- H1GraspEnv does not accept episode_length_s (see module docstring).
     cfg.get("env_config", {}).pop("episode_length_s", None)
+    if args.save_frequency is not None:
+        cfg["save_frequency"] = args.save_frequency
+    if args.save_best_after is not None:
+        cfg["save_best_after"] = args.save_best_after
     if args.smoke:
         cfg["name"] = cfg["full_experiment_name"] = "h1_grasp_smoke"
     print(f"[train_h1_grasp_ppo] env_name={cfg['env_name']} num_actors={cfg['num_actors']} "
@@ -79,7 +104,18 @@ def main(argv=None) -> int:
           f"mini_epochs={cfg['mini_epochs']} max_epochs={cfg['max_epochs']} "
           f"env_config={cfg.get('env_config', {})} smoke={args.smoke}", flush=True)
 
-    runner = Runner(algo_observer=_base.StdoutAlgoObserver())
+    if args.catch_eval_every and args.catch_eval_every > 0:
+        observer = CatchRateAlgoObserver(
+            eval_envs=args.catch_eval_envs,
+            eval_every=args.catch_eval_every,
+            log_path=args.catch_log,
+        )
+        print(f"[train_h1_grasp_ppo] catch-rate eval ON: every "
+              f"{args.catch_eval_every} epochs, {args.catch_eval_envs} envs "
+              f"(SEPARATE eval env; does not perturb training).", flush=True)
+    else:
+        observer = _base.StdoutAlgoObserver()
+    runner = Runner(algo_observer=observer)
     runner.load_config(params)
     run_args = {"train": True, "play": False}
     if args.checkpoint:
