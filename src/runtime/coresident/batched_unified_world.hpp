@@ -149,6 +149,28 @@ struct BatchedSceneTemplate {
     CoResidentGround                  ground;             // static +Z plane (height + bp id).
     float                             foot_mu = 0.8f;     // per-foot isotropic friction.
 
+    // ----- G1d UNION: cup(-proxy-box) x static-TABLE rows (inert unless has_table) --
+    // ADDITIVE; inert by default (has_table=false -> NO table pair is ever emitted, so
+    // every existing template path is byte-for-byte unchanged). When enabled, the grasp
+    // branch ALSO emits ONE cup x table-plane row class per env (the oracle
+    // StepStandGrasp's third class: RigidInvMass <-> StaticNull) into the SAME per-env
+    // append -> one-solve loop, AFTER the feet + finger rows (the oracle's drive_pairs
+    // order, :1455-1459 -- row-layout parity). The cup side uses the FLAT-BOTTOM PROXY
+    // box (C3b BoxPlane at the LIVE cup pose; a real mug rests on its flat base --
+    // sidesteps the hull-vs-plane coplanar-bottom-rim instability, named engine debt)
+    // when any cup_table_proxy_half component > 0; zero half-extents fall back to the
+    // detailed hull id (hull x plane). HOST emission like the P2.2 ground branch (one
+    // trivial box x plane per env). The mid-run toggle is SetTableEnabled (the lift
+    // choreography: cup rests -> hand closes -> table removed -> friction-only hold).
+    // has_table without has_grasp is a LOUD construction error (the cup lives there).
+    bool       has_table     = false;   // false -> no cup x table pair ever emitted.
+    float      table_height  = 0.0f;    // static +Z plane z (the cup bottom rests here).
+    float      table_mu      = 0.6f;    // cup<->table friction (cup sits, no slide).
+    uint32_t   table_broadphase_id = 8500u;  // distinct from cup/proxy/ground/links.
+    math::Vec3 cup_table_proxy_half{};       // box half-extents; all-zero -> hull id.
+    math::Vec3 cup_table_proxy_offset{};     // box-center offset in the cup body frame.
+    uint32_t   cup_table_proxy_id = 7001u;   // distinct from the cup hull id (7000).
+
     // ----- A5a: per-axis cup RESET JITTER half-box (m), read by ResetEnvs ----------
     // ResetEnvs perturbs each reset cup's X by +/-reset_jitter_x and its Y by
     // +/-reset_jitter_y (independent uniform draws, X then Y, per-env mt19937_64).
@@ -193,6 +215,17 @@ struct BatchedGraspEnvReport {
     // G1b force-balance gate number.
     double   foot_normal_impulse_sum = 0.0;  // Σ over foot NORMAL rows of λ this step.
     uint32_t foot_normal_rows = 0u;          // # foot NORMAL rows (== foot contact count).
+    // ----- G1d UNION: the cup<->TABLE support fields (the oracle's table metrics,
+    // CoResidentStepReport hpp:123-130, classified by (react,react) -- a cup x table
+    // row is (RigidInvMass, StaticNull), distinct from BOTH the foot class (ChainJ,
+    // StaticNull) and the finger class (ChainJ, RigidInvMass) -- exactly as the
+    // StepStandGrasp report walk :1717-1728). Zero unless the template has has_table.
+    // While the cup RESTS, table_vertical_impulse balances m_cup*g*dt; after
+    // SetTableEnabled(false) it is EXACTLY 0 (no rows) and the finger vertical
+    // impulse must close the triangle -- the G1d lift-choreography gate numbers.
+    uint32_t table_row_count = 0u;       // # cup<->table NORMAL rows this step.
+    float    table_lambda = 0.0f;        // max cup<->table NORMAL-row impulse.
+    double   table_vertical_impulse = 0.0;  // Σ over ALL table rows of λ * j_cup.z.
 };
 
 // ----- A1 RL substrate: the batched per-step OBS readout (the throughput-critical piece) ---
@@ -292,6 +325,21 @@ public:
         DownloadGripper(0u, out);
     }
 
+    // ----- G1d: the mid-run TABLE toggle (mirrors the oracle's SetTableEnabled, the
+    // lift choreography's "remove the table" step: the next Step() stops emitting the
+    // cup x table pair, table_vertical_impulse goes EXACTLY to 0, and the finger
+    // friction must carry the cup alone). Per-env state (a host byte vector -- OFF
+    // the per-step hot path; the emission gate reads it per env). The all-envs form
+    // is the N=1 / lockstep-choreography call; the per-env form serves MIXED gates +
+    // future RL stage resets. Emission ALSO requires has_table (the oracle's
+    // emit_table = has_table && table_enabled_ && have_cup), so toggling a
+    // has_table=false world stays inert -> byte-compat.
+    void SetTableEnabled(bool enabled);                 // all envs.
+    void SetTableEnabled(uint32_t env, bool enabled);   // one env.
+    bool TableEnabled(uint32_t env = 0u) const {
+        return env < table_enabled_.size() && table_enabled_[env] != 0u;
+    }
+
     // ----- A1 RL substrate: BATCHED OBS EXPORT (the per-step RL readout) ----------
     // Fill `out` with every DEVICE-resident obs signal for ALL envs in ONE bulk
     // device->host copy per buffer (q, qdot, fingertip_world_pos download from the
@@ -373,6 +421,19 @@ private:
     std::vector<CoResidentFootSphere> feet_;       // authored ankle spheres.
     CoResidentGround foot_ground_;                 // static +Z plane (height + bp id).
     float      foot_mu_ = 0.8f;                    // per-foot isotropic friction.
+    // ----- G1d UNION: cup(-proxy) x static-table (inert unless has_table_) ----------
+    // Captured verbatim from the template. The per-env table emission lives in the
+    // grasp branch (the cup lives there); has_table_ without has_grasp_ is rejected
+    // LOUDLY at construction. table_enabled_ is the per-env LIVE toggle (init ==
+    // has_table_, the oracle's table_enabled_ = stand_grasp.has_table).
+    bool       has_table_ = false;
+    float      table_height_ = 0.0f;
+    float      table_mu_ = 0.6f;
+    uint32_t   table_broadphase_id_ = 8500u;
+    math::Vec3 cup_table_proxy_half_{};
+    math::Vec3 cup_table_proxy_offset_{};
+    uint32_t   cup_table_proxy_id_ = 7001u;
+    std::vector<uint8_t> table_enabled_;           // per-env live toggle (host-only).
     // A5a: the LIVE per-axis cup reset-jitter half-box (m), captured from the scene
     // template. ResetEnvs draws X within +/-reset_jitter_x_ then Y within
     // +/-reset_jitter_y_. Both default to kDefaultResetCupJitterM -> the legacy
