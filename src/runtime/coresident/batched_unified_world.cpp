@@ -52,6 +52,8 @@
 #include <chrono>
 #include <cstddef>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -218,6 +220,17 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
     if (has_grasp_) {
         gripper_proto_ = scene_template.gripper_proto;
         dof_stride_ = articulation::ArticulationDofCount(gripper_proto_, 0u);
+        // G0 honesty: the contact-solve spine's factorization / working storage
+        // is sized kMaxArticulationDof. Reject a bigger articulation HERE, at
+        // construction, with a clear error (the pre-G0 path silently truncated
+        // everything past DOF 18 -- welded joints, zero M^-1 coupling).
+        if (dof_stride_ > articulation::kMaxArticulationDof) {
+            throw std::runtime_error(
+                "BatchedUnifiedWorld: articulation DOF count (" +
+                std::to_string(dof_stride_) + ") exceeds kMaxArticulationDof (" +
+                std::to_string(articulation::kMaxArticulationDof) +
+                "); the contact-solve spine cannot factor/solve it");
+        }
         root_link_ = gripper_proto_.articulation_link_offset[0];
         base_dof_ =
             articulation::ArticulationJointDofCount(gripper_proto_.joint_type[root_link_]);
