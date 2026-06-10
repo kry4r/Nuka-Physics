@@ -207,6 +207,13 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
       feet_(scene_template.feet),
       foot_ground_(scene_template.ground),
       foot_mu_(scene_template.foot_mu),
+      has_table_(scene_template.has_table),
+      table_height_(scene_template.table_height),
+      table_mu_(scene_template.table_mu),
+      table_broadphase_id_(scene_template.table_broadphase_id),
+      cup_table_proxy_half_(scene_template.cup_table_proxy_half),
+      cup_table_proxy_offset_(scene_template.cup_table_proxy_offset),
+      cup_table_proxy_id_(scene_template.cup_table_proxy_id),
       reset_jitter_x_(scene_template.reset_jitter_x),
       reset_jitter_y_(scene_template.reset_jitter_y),
       fingertips_(scene_template.fingertips),
@@ -232,6 +239,17 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
             "ground through the env's articulation; a feet-only template would be "
             "silently inert)");
     }
+
+    // ----- G1d UNION honesty: the table rides the grasp branch (the cup lives
+    // there). A has_table template without has_grasp would be SILENTLY inert --
+    // reject it LOUDLY at construction, never a no-op scene. The per-env live
+    // toggle starts at has_table (the oracle's table_enabled_ = has_table).
+    if (has_table_ && !has_grasp_) {
+        throw std::runtime_error(
+            "BatchedUnifiedWorld: has_table requires has_grasp (the cup x table pair "
+            "supports the grasp cup; a table-only template would be silently inert)");
+    }
+    table_enabled_.assign(env_count_, has_table_ ? uint8_t{1} : uint8_t{0});
 
     // ----- P2.3a/P2.3b: stand up ONE gripper articulation device PER ENV (inert unless
     // grasp). Each env gets its OWN device copy of the env-invariant proto so per-env grasp
@@ -409,6 +427,23 @@ void BatchedUnifiedWorld::SetGripperBasePose(uint32_t env,
     base[env] = pose;
     env_device_.base_pose.CopyFromHost(base.data(), base.size() * sizeof(Transform));
     context_.stream.Synchronize();
+}
+
+// ===========================================================================
+// G1d: the mid-run TABLE toggle (the oracle's SetTableEnabled, per env).
+// ===========================================================================
+// OFF the per-step hot path: a host byte-vector write; the per-env table-emission
+// gate in ResolveBatchedGraspContact reads it. Emission also requires has_table_
+// (the oracle's emit_table = has_table && table_enabled_ && have_cup), so calls
+// on a has_table=false world stay inert -> byte-compat.
+void BatchedUnifiedWorld::SetTableEnabled(bool enabled) {
+    std::fill(table_enabled_.begin(), table_enabled_.end(),
+              enabled ? uint8_t{1} : uint8_t{0});
+}
+
+void BatchedUnifiedWorld::SetTableEnabled(uint32_t env, bool enabled) {
+    if (env < table_enabled_.size())
+        table_enabled_[env] = enabled ? uint8_t{1} : uint8_t{0};
 }
 
 // ===========================================================================
@@ -866,8 +901,9 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         cup_vz_pre_contact[e] = cup.linear_velocity.z;
     }
 
-    // ===== CONTACT PHASE (the UNION: feet x ground [G1b, host SpherePlane] +
-    // fingertips x cup [GPU sphere x hull]; cup x table joins in G1d) ==========
+    // ===== CONTACT PHASE (the COMPLETE UNION: feet x ground [G1b, host SpherePlane]
+    // + fingertips x cup [GPU sphere x hull] + cup-proxy x table [G1d, host
+    // BoxPlane]) ================================================================
     // Slice the ONE consolidated host download (all_live / all_poses, taken ONCE above) into a
     // per-env single-articulation host snapshot (env e's links [e*base_link_count_, ...)). The
     // rest of the per-env loop (narrowphase, row assembly, qdot pack) reads env_live[e] /
@@ -1093,7 +1129,77 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
             for (const auto& m : env_manifolds[e]) finger_points += m.point_count;
         }
         grasp_reports_[e].finger_contacts = finger_points;
-        if (foot_points + finger_points == 0u) continue;  // env contact-free this step.
+
+        // ----- G1d: per-env CUP(-proxy-box) x static-TABLE HOST narrowphase. ----------
+        // The oracle StepStandGrasp's THIRD row class (drive_pairs :1455-1459 -- the
+        // table pair is appended AFTER feet + fingers; the manifold/row order below
+        // preserves that for row-layout parity). DIRECT-EMIT one (cup-proxy =
+        // RigidInvMass, table = StaticNull) pair at the cup's LIVE pose, resolved
+        // through the SAME host BuildContactManifolds (C3b BoxPlane via the flat-bottom
+        // proxy when any cup_table_proxy_half_ component > 0 -- a real mug rests on its
+        // flat base, sidestepping the hull-vs-plane coplanar-rim instability, named
+        // engine debt; all-zero half-extents fall back to the detailed hull id, hull x
+        // plane). This is ResolveBatchedGroundContact's exact emission shape with the
+        // cup body index instead of body 0, appended into the SAME union rows -> the
+        // ONE UnifiedSolve. Gated per env on the LIVE toggle (the oracle's emit_table =
+        // has_table && table_enabled_ && have_cup, :1445): SetTableEnabled(false) is
+        // the lift choreography's "remove the table". has_table_=false -> this whole
+        // block is dead -> every pre-G1d path is byte-for-byte unchanged.
+        std::vector<ContactManifold> table_manifolds;
+        uint32_t table_points = 0u;
+        if (has_table_ && table_enabled_[e] != 0u && grasp_cup_.VertexCount() > 0u) {
+            ScopedWallTimer np_timer(perf_, "narrowphase");  // RAII accumulates.
+            const Transform cup_pose{cup.position, cup.orientation};
+            const bool use_proxy = cup_table_proxy_half_.x > 0.0f ||
+                                   cup_table_proxy_half_.y > 0.0f ||
+                                   cup_table_proxy_half_.z > 0.0f;
+            const uint32_t cup_table_id =
+                use_proxy ? cup_table_proxy_id_ : grasp_cup_.broadphase_body_id;
+            CandidatePair tp;
+            tp.a = MakeBoxRef(cup_table_id);             // cup proxy = RigidInvMass.
+            tp.b = MakeGroundRef(table_broadphase_id_);  // table = StaticNull (+Z).
+            // The hull view for the no-proxy fallback (mesh-local verts + live pose;
+            // mirrors the oracle resolver's ConvexHull seam, :1499-1504).
+            nuka::collision::cvx::ConvexHullView cup_hull;
+            cup_hull.verts = grasp_cup_.hull_verts.data();
+            cup_hull.vcount = grasp_cup_.VertexCount();
+            cup_hull.frame = amf::BuildPrimFrame(cup_pose);
+            ShapeResolver table_resolve = [&](const CollidableRef& ref,
+                                              ResolvedShape* out) -> bool {
+                if (ref.type == CollidableType::RigidBody &&
+                    ref.handle == cup_table_id) {
+                    if (use_proxy) {
+                        // The flat-bottom proxy box at the cup's LIVE pose (the
+                        // offset is in the cup body frame; oracle :1486-1497).
+                        Transform proxy_pose = cup_pose;
+                        proxy_pose.position =
+                            cup_pose.position +
+                            cup_pose.rotation.Rotate(cup_table_proxy_offset_);
+                        out->type = scene::ShapeType::Box;
+                        out->prim = BoxPrim(proxy_pose, cup_table_proxy_half_);
+                        out->geom = nullptr;
+                    } else {
+                        out->type = scene::ShapeType::ConvexHull;
+                        out->geom = &cup_hull;  // hull x plane fallback.
+                    }
+                    return true;
+                }
+                if (ref.type == CollidableType::StaticWorld &&
+                    ref.handle == table_broadphase_id_) {
+                    out->type = scene::ShapeType::Plane;
+                    out->prim = GroundPrim(table_height_);  // +Z plane at table z.
+                    out->geom = nullptr;
+                    return true;
+                }
+                return false;
+            };
+            const CandidatePair table_pairs[1] = {tp};
+            nuka::collision::BuildContactManifolds(table_pairs, table_resolve,
+                                                   &table_manifolds);
+            for (const auto& m : table_manifolds) table_points += m.point_count;
+        }
+        if (foot_points + finger_points + table_points == 0u)
+            continue;  // env contact-free this step.
 
         // stage 7: compliant rows + sides (condim=3 -> normal row + 4 friction spokes
         // per contact point). APPEND this env's rows to the shared buffer, FEET rows
@@ -1107,10 +1213,14 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         inputs.condim = condim_;
         const std::size_t row_start = rows.RowCount();
         std::size_t foot_rows_end = row_start;
+        std::size_t finger_rows_end = row_start;
         {
             // perf tag `row_assembly`: compliant contact-row emission (normal + friction
             // spokes). The host index/key wiring loop below is left UNTIMED (microseconds)
             // so this stays DISJOINT from chain_jacobian (FootChainJ lives in that loop).
+            // Emission ORDER = the oracle's single emission over its feet-then-fingers-
+            // then-table manifold list (EmitCompliantContactRows is a pure per-manifold
+            // append, so the split calls are byte-identical to its one call).
             ScopedWallTimer ra_timer(perf_, "row_assembly");
             if (foot_points > 0u) {
                 nuka::constraint::EmitCompliantContactRows(foot_manifolds, inputs, &rows,
@@ -1121,21 +1231,35 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
                 nuka::constraint::EmitCompliantContactRows(env_manifolds[e], inputs,
                                                            &rows, &sides);
             }
+            finger_rows_end = rows.RowCount();
+            if (table_points > 0u) {  // G1d: cup x table rows LAST (oracle pair order).
+                nuka::constraint::EmitCompliantContactRows(table_manifolds, inputs,
+                                                           &rows, &sides);
+            }
         }
-        // Stamp the per-contact friction by CATEGORY (oracle :1551-1560): a StaticNull
-        // side -> foot x ground (foot_mu_); else finger x cup (friction_mu_). With
-        // has_feet=false no static row exists -> every row gets friction_mu_, byte-
-        // identical to the pre-G1b stamp. (Cup x table joins in G1d with table_mu.)
+        // Stamp the per-contact friction by CATEGORY (oracle :1551-1560): cup AND
+        // static -> cup x table (table_mu_); cup -> finger x cup (friction_mu_); else
+        // -> foot x ground (foot_mu_). With has_table=false no (cup,static) row exists
+        // -> this reduces EXACTLY to the pre-G1d two-way stamp (static -> foot_mu_,
+        // else friction_mu_), byte-identical; with has_feet=false too, every row gets
+        // friction_mu_ -- the pre-G1b stamp.
         for (std::size_t r = row_start; r < rows.RowCount(); ++r) {
             const ContactRowSides& s = sides[r];
+            const bool is_cup = s.a.react == ReactionProviderKind::RigidInvMass ||
+                                s.b.react == ReactionProviderKind::RigidInvMass;
             const bool is_static = s.a.react == ReactionProviderKind::StaticNull ||
                                    s.b.react == ReactionProviderKind::StaticNull;
-            rows.materials[r].friction = is_static ? foot_mu_ : friction_mu_;
+            if (is_cup && is_static)
+                rows.materials[r].friction = table_mu_;        // cup x table.
+            else if (is_cup)
+                rows.materials[r].friction = friction_mu_;     // finger x cup.
+            else
+                rows.materials[r].friction = foot_mu_;         // foot x ground.
         }
         if (rows.RowCount() == row_start) continue;  // no rows emitted this env.
         env_row_range[e] = {row_start, rows.RowCount()};
         grasp_reports_[e].finger_row_count =
-            static_cast<uint32_t>(rows.RowCount() - foot_rows_end);
+            static_cast<uint32_t>(finger_rows_end - foot_rows_end);
 
         // Pack env e's flat prefix-sum qdot slice from env e's LIVE host slice, written AT env
         // e's env-major offset (qdot slice @ art_index*dof_stride). env e's M^-1 tile is NOT
@@ -1182,6 +1306,24 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
             const bool b_static = s.b.react == ReactionProviderKind::StaticNull;
             art_refs[r].a = none_side;
             art_refs[r].b = none_side;
+            if ((a_cup && b_static) || (b_cup && a_static)) {
+                // ----- G1d cup<->table row (oracle StepStandGrasp :1610-1618): the
+                // cup side -> env e's flat env-major cup body index, the static table
+                // side -> kInvalidBodyIndex. NO chain-J, NO art_refs (both sides are
+                // rigid/static -- the pure-rigid arm of the union; art_refs stay
+                // none_side, set above). The cup body index is SHARED with env e's
+                // finger rows, so same-env table+finger rows SERIALIZE on the cup
+                // (correct -- both mutate it) while cross-env table rows carry
+                // DISJOINT BodyIndex(e, cup_local) keys -> parallelize. The bijection
+                // invariant is untouched (no articulation side on this class).
+                const int cup_l2 = a_cup ? 0 : 1;
+                const int static_l2 = a_cup ? 1 : 0;
+                rows.body_indices[2u * r + static_cast<uint32_t>(cup_l2)] =
+                    cup_body_index;
+                rows.body_indices[2u * r + static_cast<uint32_t>(static_l2)] =
+                    nuka::constraint::kInvalidBodyIndex;
+                continue;
+            }
             if ((a_art && b_static) || (b_art && a_static)) {
                 // ----- G1b foot<->ground row (oracle StepStandGrasp :1620-1644): the
                 // foot side gets a chain-J slot + the env's SAME synthetic coloring key
@@ -1379,6 +1521,9 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         float max_lambda = 0.0f;
         double foot_normal_impulse = 0.0;  // G1b: Σ foot NORMAL λ (the stand support).
         uint32_t foot_normal_rows = 0u;    // G1b: # foot NORMAL rows.
+        double table_vert_impulse = 0.0;   // G1d: Σ over ALL table rows of λ*j_cup.z.
+        uint32_t table_rows_n = 0u;        // G1d: # table NORMAL rows.
+        float max_table_lambda = 0.0f;     // G1d: max table NORMAL-row λ.
         // ----- A1 RL substrate: per-fingertip NORMAL-impulse bucket (the force-closure
         // signal). Σ over each fingertip's NORMAL rows (NOT friction spokes) of the row
         // lambda. The fingertip a row belongs to is read from sides[r]'s ArticulationChainJ
@@ -1398,6 +1543,27 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
             const bool b_art2 = s.b.react == ReactionProviderKind::ArticulationChainJ;
             const bool a_static2 = s.a.react == ReactionProviderKind::StaticNull;
             const bool b_static2 = s.b.react == ReactionProviderKind::StaticNull;
+            const bool a_cup2 = s.a.react == ReactionProviderKind::RigidInvMass;
+            const bool b_cup2 = s.b.react == ReactionProviderKind::RigidInvMass;
+            if ((a_cup2 && b_static2) || (b_cup2 && a_static2)) {
+                // ----- G1d: a (RigidInvMass, StaticNull) row is CUP x TABLE -- the
+                // oracle report walk's first class (StepStandGrasp :1717-1728): Σ its
+                // λ*j_cup.z (normal + friction spokes) into the table support, count/
+                // max only the NORMAL rows, and SKIP the finger terms (crediting the
+                // table's vertical support to cup_vertical_impulse would fake the
+                // finger hold -- the lift gate's triangle would never close honestly).
+                const int cup_l2 = a_cup2 ? 0 : 1;
+                const RowJacobian6 j_cup2 =
+                    rows.JacobianForRowBody(static_cast<uint32_t>(r),
+                                            static_cast<uint32_t>(cup_l2));
+                table_vert_impulse +=
+                    static_cast<double>(rows.rows[r].lambda) * j_cup2.linear.z;
+                if (!(rows.rows[r].flags & nuka::constraint::row_flags::Friction)) {
+                    ++table_rows_n;
+                    max_table_lambda = std::max(max_table_lambda, rows.rows[r].lambda);
+                }
+                continue;
+            }
             if ((a_art2 && b_static2) || (b_art2 && a_static2)) {
                 if (!(rows.rows[r].flags & nuka::constraint::row_flags::Friction)) {
                     foot_normal_impulse += static_cast<double>(rows.rows[r].lambda);
@@ -1429,6 +1595,9 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         grasp_reports_[e].max_lambda = max_lambda;
         grasp_reports_[e].foot_normal_impulse_sum = foot_normal_impulse;  // G1b.
         grasp_reports_[e].foot_normal_rows = foot_normal_rows;            // G1b.
+        grasp_reports_[e].table_vertical_impulse = table_vert_impulse;    // G1d.
+        grasp_reports_[e].table_row_count = table_rows_n;                 // G1d.
+        grasp_reports_[e].table_lambda = max_table_lambda;                // G1d.
         const BodyState& cup = bodies_[BodyIndex(e, cup_local_index_)];
         const double cup_mass =
             cup.inv_mass > 0.0f ? 1.0 / static_cast<double>(cup.inv_mass) : 0.0;

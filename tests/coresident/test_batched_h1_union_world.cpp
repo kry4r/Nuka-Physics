@@ -322,6 +322,18 @@ coresident::BatchedSceneTemplate MakeUnionTemplate(const UnionScene& sc) {
         tmpl.ground = sc.sg.ground;
         tmpl.foot_mu = sc.sg.foot_mu;
     }
+    // ----- G1d: the cup(-proxy) x table union fields (inert when the scene has
+    // none -- every G1a/G1b/G1c scene authors sg.has_table=false). Copied verbatim
+    // from the StandGraspConfig so BOTH sides resolve the identical table. -----
+    tmpl.has_table = sc.sg.has_table;
+    if (sc.sg.has_table) {
+        tmpl.table_height = sc.sg.table_height;
+        tmpl.table_mu = sc.sg.table_mu;
+        tmpl.table_broadphase_id = sc.sg.table_broadphase_id;
+        tmpl.cup_table_proxy_half = sc.sg.cup_table_proxy_half;
+        tmpl.cup_table_proxy_offset = sc.sg.cup_table_proxy_offset;
+        tmpl.cup_table_proxy_id = sc.sg.cup_table_proxy_id;
+    }
     return tmpl;
 }
 
@@ -773,6 +785,58 @@ UnionScene BuildGraspStandScene(const nuka::phi::DeviceContext& context) {
     // Move the cup INTO the hand on BOTH sides (oracle config + template seed).
     sc.sg.cup_state = sc.config.cup_state;
     sc.cup0 = sc.config.cup_state;
+    return sc;
+}
+
+// ===========================================================================
+// G1d scene: the G1c grasp-while-standing scene + the STATIC TABLE under the
+// settled carried cup (the lift choreography's support). The cup<->table pair
+// uses the FLAT-BOTTOM PROXY box (id 7001 -- the cup-sequence demo's advisor-
+// confirmed authoring, test_h1_cup_sequence_demo.cpp:368-370: the raw hull's
+// coplanar bottom rim ROCKS on a plane, named engine debt; a real mug has a
+// flat base, so the bounding box centered on the cup origin -- proxy bottom ==
+// hull bottom -- is the FAITHFUL resting representation, not a cheat). TABLE
+// HEIGHT (the G1c scene finding "derive from the SETTLED cup bottom"): cup0 IS
+// the settled carried placement (the searched seat-pose placement carried
+// through the 200-step stance settle by the hand-frame delta), so its proxy
+// bottom -half.z is the settled in-wrap cup bottom at t=0; the plane is seated
+// kTableRestPen INTO it (the foot/cup-demo 2mm active-rest authoring) so the
+// cup RESTS from step 0, no fall-then-catch transient. The FURTHER ~6cm sink
+// G1c measured happens only once the support is REMOVED -- exactly gate (a)'s
+// post-SetTableEnabled(false) phase (reported there).
+// ===========================================================================
+constexpr float kTableRestPen = 0.002f;
+
+// G1d: the REST-phase grip target offset (rad, NEGATIVE = backed off the curl).
+// MEASURED scene finding (gate a header): holding the bare curl (offset 0) WEDGES
+// the resting cup -- the shallow wrap contacts squeeze it down-and-out and it
+// CLIMBS off the table (~0.6 mm/step, table rows gone by ~step 27, BOTH sides
+// identically). A -0.10 back-off was MEASURED INSUFFICIENT: the cup stays jammed
+// hovering ~6 mm up (wrap contacts persist 100/100 rest steps, table over-
+// carrying ~4.5 m*g*dt against fingers pressing -3.7). Backing the 12 driven
+// joints 0.25 rad off the curl genuinely opens the wrap so the cup drops back
+// and the table ALONE carries it; the close phase then sweeps back in
+// (-0.25 -> +0.18 target) and captures -- the honest lift choreography.
+constexpr float kRestBackOffset = -0.25f;
+
+UnionScene BuildGraspStandTableScene(const nuka::phi::DeviceContext& context) {
+    UnionScene sc = BuildGraspStandScene(context);
+    if (!sc.place.found) return sc;  // upstream ASSERT(place.found) fails loudly.
+    const nuka::demo::CupHull base = nuka::demo::LoadCupHull(kCupUsda);
+    const nuka::demo::CupHull hull = nuka::demo::ScaleCupHull(base, kSxy, kSz);
+    const Vec3 half = (hull.hi - hull.lo) * 0.5f;
+    sc.sg.has_table = true;
+    sc.sg.cup_table_proxy_half = half;  // bbox proxy, centered (offset 0): bottom
+    sc.sg.cup_table_proxy_offset = Vec3{0.0f, 0.0f, 0.0f};  // == hull bottom.
+    sc.sg.cup_table_proxy_id = 7001u;   // canonical disjoint handle map (risk #7):
+    sc.sg.table_broadphase_id = 8500u;  // cup 7000 / proxy 7001 / ground 8000 /
+                                        // table 8500 / fingers 9000+ / feet 12000+.
+    sc.sg.table_mu = 0.6f;
+    // The settled carried-cup bottom: the COM-centered hull's bottom is -half.z in
+    // the cup body frame (the settle tilt dq is near-identity); seat the plane 2mm
+    // ABOVE it (cup bottom 2mm below the plane -> active rest contact at step 0,
+    // the same arithmetic the cup-sequence demo + the G1b foot seat use).
+    sc.sg.table_height = sc.cup0.position.z - half.z + kTableRestPen;
     return sc;
 }
 
@@ -1790,6 +1854,603 @@ TEST(BatchedH1UnionWorld, G1c_GraspStandUnion_MidRunGripKill_CupFallsRobotStands
            "friction-only (parenting/scripting/contact fakery: a FINDING)";
     EXPECT_LT(dead.cup.position.z, min_tip_z - 0.4f)
         << "the cup did not fall AWAY from the hand";
+    EXPECT_GT(dead.base_pose.position.z, sc.seat_pose.position.z - 0.2f)
+        << "the robot fell with the cup -- the stand did not survive the grip kill";
+    EXPECT_EQ(late_finger_contacts, 0u)
+        << "finger contacts persist long after the grip kill -- the cup is stuck "
+           "to the hand";
+}
+
+// ===========================================================================
+// ★ G1d GATE (a) -- N=1 COMPLETE union parity (feet x ground + finger x cup +
+// cup-proxy x TABLE in ONE solve) vs the FULL StandGraspConfig oracle
+// (has_table=true), 300 steps, the LIFT CHOREOGRAPHY:
+//   WINDOW (steps 0..9):    fingers HOLD the curl (offset 0) -- the quasi-
+//                           static seeded regime the FP-floor parity window is
+//                           measured in (all THREE classes live: 30 finger
+//                           contacts + 4 feet + 4..2 table rows, both sides);
+//   REST  (steps 10..99):   fingers BACK OFF the curl (offset -0.10); the
+//                           wedge releases, the cup re-lands and RESTS -- the
+//                           TABLE alone carries it (late-rest window asserted);
+//   CLOSE (steps 100..179): the H1.1 grip PD (close_offset=0.18) sweeps the
+//                           fingers back in + squeezes the wrap into the hold;
+//   LIFT  (steps 180..299): SetTableEnabled(false) on BOTH sides at step 180
+//                           -- the table pair vanishes; the cup is held by
+//                           finger friction force-closure ALONE.
+// TWO MEASURED G1d scene findings shaped this schedule (BOTH sides identically
+// affected -- scene physics, not batching defects):
+//   (1) the CURL WEDGE: holding the bare curl pre-pose, the <=2mm-shallow wrap
+//       contacts squeeze the resting cup UP-and-OUT (finger vertical impulse
+//       NEGATIVE ~-1..-9 m*g*dt, table over-reacting, cup climbing ~0.6 mm/
+//       step; table rows 4->3->2->1->0 by ~step 27 -- a watermelon-seed
+//       squeeze, not a rest). The fingers must BACK OFF for an honest rest --
+//       and the wedge still launches the cup BEFORE the slow grip PD (Kp=4)
+//       clears, so the cup pops a few mm off the table, falls back once the
+//       wrap opens, and settles -- the mid-REST table contact is therefore
+//       TRANSIENT (reported), and the table-liveness HARD asserts live in the
+//       seeded WINDOW + the settled late-REST window.
+//   (2) the moving-finger back-off SLIDES the wrap contacts through the parity
+//       window and amplifies the GPU-vs-host NP seam ~10x faster (|dvel| 7e-6
+//       by step 5) -- so the WINDOW phase holds the curl (offset 0), the exact
+//       quasi-static regime G1c's FP-floor bar was measured in (|dvel|<=6e-7,
+//       |dqdot|<=2.9e-6 there), and the back-off starts AFTER the window.
+// ---------------------------------------------------------------------------
+// THE PARITY BAR == G1c's (the H1.2 reformulated bar; spec §G1(a) written
+// justification, carried verbatim): the finger GPU-vs-host SphereHull NP seam
+// is LIVE from step 0 (the resting cup sits IN the wrap) and the 30-contact
+// condim=3 grasp on 12 shared links is CHAOTIC at the FP floor (H1.2/G1c
+// measured + chaos-controlled: a 1e-7 m IC seed in IDENTICAL code amplifies
+// past 1e-4) -- full-run tol-0 is impossible for ANY two code paths. The TABLE
+// rows themselves add NO new seam (host C3b BoxPlane on BOTH sides), so the
+// strongest honest bar is UNCHANGED: HARD FP-floor window (cup pos/vel/base
+// <=1e-6, gripper qdot <=5e-6) + contact-COUNT parity through the window (now
+// including the TABLE row count) + the chaos control re-run through the SAME
+// choreography + full-run deltas REPORTED. If tol-0 held it would be asserted
+// instead -- it does not (the finger NP seam, measured in G1c).
+// THE IMPULSE CHOREOGRAPHY (HARD -- the gate's physics, oracle §1.2 fields):
+//   * resting (late-rest window): table_vertical_impulse ~= m_cup*g*dt (the
+//     table carries the cup);
+//   * after the toggle: table rows + table impulse EXACTLY 0 (no ghost rows);
+//   * the triangle closes: Σλ_finger*j_z rises to ~= m_cup*g*dt (late window);
+//   * the feet carry robot+cup throughout (the G1c balance, late window).
+// All THREE union row classes -- (ChainJ,StaticNull) feet, (ChainJ,RigidInvMass)
+// fingers, (RigidInvMass,StaticNull) cup x table -- live in ONE run.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1d_TableLiftUnion_N1_FpFloorWindowAndImpulseTriangleVsOracle) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandTableScene(context);
+    ASSERT_EQ(sc.base_dof, 6u) << "the cook is NOT floating-base";
+    ASSERT_EQ(sc.dof_stride, 51u);
+    ASSERT_EQ(sc.sg.feet.size(), 4u);
+    ASSERT_GE(sc.config.fingertips.size(), 30u);
+    ASSERT_TRUE(sc.place.found);
+    ASSERT_TRUE(sc.sg.has_table);
+    const double mg_dt_feet = (sc.total_mass + kCupMass) * 9.81 * kDt;
+    const double mg_dt_cup = kCupMass * 9.81 * kDt;
+    std::printf("[G1d GATE-A] table-lift union: table_z=%.4f (cup0_z=%.4f proxy_half_z="
+                "%.4f) m_cup*g*dt=%.5f (m_r+m_c)*g*dt=%.4f feet=%zu fingertips=%zu\n",
+                sc.sg.table_height, sc.cup0.position.z, sc.sg.cup_table_proxy_half.z,
+                mg_dt_cup, mg_dt_feet, sc.sg.feet.size(), sc.config.fingertips.size());
+
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto hold_drive = BuildGraspStanceDriveSet(sc, /*close_offset=*/0.0f);
+    const auto rest_drive = BuildGraspStanceDriveSet(sc, kRestBackOffset);
+    const auto close_drive = BuildGraspStanceDriveSet(sc);
+    for (const DriveLink& d : hold_drive) ASSERT_NE(d.link, kInvalidLink);
+    for (const DriveLink& d : rest_drive) ASSERT_NE(d.link, kInvalidLink);
+    for (const DriveLink& d : close_drive) ASSERT_NE(d.link, kInvalidLink);
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, 1u, kGravityZ, kDt);
+    coresident::UnifiedCoResidentStepper oracle(context, sc.host, sc.sg, kGravityZ, kDt);
+    ASSERT_TRUE(world.TableEnabled(0u));  // starts at has_table, the oracle's init.
+    ASSERT_TRUE(oracle.TableEnabled());
+    CopCtl cop_o(context, sc, 1u);
+    CopCtl cop_b(context, sc, 1u);
+
+    constexpr uint32_t kFloorSteps = 10u;  // the H1.2/G1c FP-floor window bar; the
+                                           // hold-curl WINDOW phase spans exactly it.
+    constexpr uint32_t kRest = 100u;   // back-off from kFloorSteps; cup re-lands+rests.
+    constexpr uint32_t kClose = 80u;   // grip PD sweeps in + squeezes into the hold.
+    constexpr uint32_t kLiftAt = kRest + kClose;  // table removed HERE (both sides).
+    constexpr uint32_t kRun = 300u;
+    constexpr uint32_t kRestWin = 50u;        // late-REST settled window length.
+    constexpr double kFloorTol = 1.0e-6;
+    constexpr double kFloorTolQdot = 5.0e-6;
+    const std::vector<float> one_scale = {1.0f};
+
+    double floor_max_dpos = 0.0, floor_max_dvel = 0.0, floor_max_dqdot = 0.0,
+           floor_max_dbase = 0.0;
+    double full_max_dpos = 0.0, full_max_dvel = 0.0, full_max_dqdot = 0.0;
+    uint32_t count_match_onset = kRun;
+    bool count_open = true;
+    uint32_t rest_finger_steps = 0u, all3_steps = 0u, close_table_steps = 0u;
+    uint32_t first_engage = kRun;  // first CLOSE-phase step with finger contact.
+    uint32_t lift_table_rows_total = 0u;
+    double lift_table_vimp_abs = 0.0;
+    double rest_table_ratio_sum = 0.0, rest_tri_ratio_sum = 0.0,
+           rest_feet_ratio_sum = 0.0;
+    uint32_t rest_ratio_n = 0u;
+    double late_cup_ratio_sum = 0.0, late_feet_ratio_sum = 0.0;
+    uint32_t late_ratio_n = 0u;
+    float cup_z_at_toggle = 0.0f;
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        if (s == kLiftAt) {
+            oracle.SetTableEnabled(false);  // the SAME step on BOTH sides.
+            world.SetTableEnabled(false);
+            cup_z_at_toggle = SnapBatched(world, 0u).cup.position.z;
+        }
+        const auto& drv = (s < kFloorSteps) ? hold_drive
+                          : (s < kRest)     ? rest_drive
+                                            : close_drive;
+        DrivePdOracle(oracle, sc, drv, 1.0f, &cop_o);
+        DrivePdBatched(world, sc, drv, one_scale, 0.0f, &cop_b);
+        const auto rep = oracle.Step();
+        world.Step();
+        const auto& brep = world.GraspReports()[0];
+
+        // ----- (i) ROW-CLASS liveness: the COMPLETE union, phase-aware. -----------
+        ASSERT_GT(rep.foot_normal_rows, 0u) << "oracle lost foot contact at step " << s;
+        ASSERT_GT(brep.foot_normal_rows, 0u)
+            << "batched world lost foot contact at step " << s;
+        if (brep.finger_contacts > 0u && brep.table_row_count > 0u)
+            ++all3_steps;  // feet asserted above -> all three classes in ONE solve.
+        if (s < kRest) {
+            // The table must carry rows on BOTH sides through the seeded WINDOW
+            // (measured 4..2 rows, all three classes live) and through the SETTLED
+            // late-REST window (the cup re-landed and rests). The mid-REST contact
+            // is TRANSIENT (the curl wedge pops the cup a few mm up before the
+            // back-off clears -- scene finding (1) in the header): REPORTED only.
+            if (s < kFloorSteps || s >= kRest - kRestWin) {
+                ASSERT_GT(rep.table_row_count, 0u)
+                    << "oracle table rows vanished while RESTING at step " << s;
+                ASSERT_GT(brep.table_row_count, 0u)
+                    << "batched table rows vanished while RESTING at step " << s
+                    << " (table emission missing? has_table support absent)";
+            }
+            if (brep.finger_contacts > 0u) ++rest_finger_steps;
+        } else if (s < kLiftAt) {
+            // CLOSING: the fingers sweep in from the back-off -- record the first
+            // engagement (asserted < kLiftAt below); table support is REPORTED (the
+            // squeeze may progressively unload it).
+            if (first_engage == kRun && brep.finger_contacts > 0u &&
+                rep.finger_contacts > 0u)
+                first_engage = s;
+            if (brep.table_row_count > 0u) ++close_table_steps;
+        } else {
+            // LIFTED: the table pair is GONE (exactly zero rows, both sides) and the
+            // hold is friction-only.
+            ASSERT_EQ(rep.table_row_count, 0u)
+                << "oracle still emits table rows after SetTableEnabled(false), step "
+                << s;
+            lift_table_rows_total += brep.table_row_count;
+            lift_table_vimp_abs += std::fabs(brep.table_vertical_impulse);
+            ASSERT_GT(brep.finger_contacts, 0u)
+                << "batched world lost the cup after the table was removed, step " << s;
+            ASSERT_GT(rep.finger_contacts, 0u)
+                << "oracle lost the cup after the table was removed, step " << s;
+        }
+
+        // ----- (ii) contact-set COUNT parity (fingers + feet + TABLE rows). -------
+        if (count_open && (rep.finger_contacts != brep.finger_contacts ||
+                           rep.foot_normal_rows != brep.foot_normal_rows ||
+                           rep.table_row_count != brep.table_row_count)) {
+            count_open = false;
+            count_match_onset = s;
+        }
+
+        // ----- (iii) state deltas: HARD in-window, REPORTED full-run. -------------
+        const EnvSnap so = SnapOracle(oracle);
+        const EnvSnap sb = SnapBatched(world, 0u);
+        const SnapDiff d = SnapMaxDiff(so, sb);
+        const double dvel = (so.cup.linear_velocity - sb.cup.linear_velocity).Length();
+        full_max_dpos = std::max(full_max_dpos, d.dcup);
+        full_max_dvel = std::max(full_max_dvel, dvel);
+        full_max_dqdot = std::max(full_max_dqdot, d.dqdot);
+        if (s < kFloorSteps) {
+            floor_max_dpos = std::max(floor_max_dpos, d.dcup);
+            floor_max_dvel = std::max(floor_max_dvel, dvel);
+            floor_max_dqdot = std::max(floor_max_dqdot, d.dqdot);
+            floor_max_dbase = std::max(floor_max_dbase, d.dbase);
+        }
+
+        // ----- (iv) the impulse-choreography windows (batched side). --------------
+        if (s >= kRest - kRestWin && s < kRest) {  // late-REST: settled on the table.
+            rest_table_ratio_sum += brep.table_vertical_impulse / mg_dt_cup;
+            rest_tri_ratio_sum +=
+                (brep.table_vertical_impulse + brep.cup_vertical_impulse) / mg_dt_cup;
+            rest_feet_ratio_sum += brep.foot_normal_impulse_sum / mg_dt_feet;
+            ++rest_ratio_n;
+        }
+        if (s >= kRun - 50u) {  // late-LIFT: friction-only hold.
+            late_cup_ratio_sum += brep.cup_vertical_impulse / mg_dt_cup;
+            late_feet_ratio_sum += brep.foot_normal_impulse_sum / mg_dt_feet;
+            ++late_ratio_n;
+        }
+        if (s <= 11u || (s % 50u) == 49u || s == kLiftAt || s == kRun - 1u) {
+            std::printf("[G1d GATE-A] step %3u%s: |dcup|=%.3e |dvel|=%.3e |dqdot|=%.3e "
+                        "contacts(o=%u b=%u) feet(o=%u b=%u) table(o=%u b=%u) "
+                        "Tλ/mgdt=%.3f Fλ/mgdt=%.3f feetλ/mgdt=%.3f cup_z=%.4f\n",
+                        s, (s < kRest ? " REST" : s < kLiftAt ? " CLOS" : " LIFT"),
+                        d.dcup, dvel, d.dqdot, rep.finger_contacts, brep.finger_contacts,
+                        rep.foot_normal_rows, brep.foot_normal_rows, rep.table_row_count,
+                        brep.table_row_count, brep.table_vertical_impulse / mg_dt_cup,
+                        brep.cup_vertical_impulse / mg_dt_cup,
+                        brep.foot_normal_impulse_sum / mg_dt_feet, sb.cup.position.z);
+        }
+    }
+
+    const double rest_table_ratio = rest_table_ratio_sum / std::max(1u, rest_ratio_n);
+    const double rest_tri_ratio = rest_tri_ratio_sum / std::max(1u, rest_ratio_n);
+    const double rest_feet_ratio = rest_feet_ratio_sum / std::max(1u, rest_ratio_n);
+    const double late_cup_ratio = late_cup_ratio_sum / std::max(1u, late_ratio_n);
+    const double late_feet_ratio = late_feet_ratio_sum / std::max(1u, late_ratio_n);
+    const EnvSnap send = SnapBatched(world, 0u);
+    std::printf("[G1d GATE-A RESULT] FP-FLOOR WINDOW (steps 0-%u): max|dcup|=%.3e "
+                "max|dvel|=%.3e max|dqdot|=%.3e max|dbase|=%.3e. FULL RUN: "
+                "max|dcup|=%.3e max|dvel|=%.3e max|dqdot|=%.3e (REPORTED, chaotic). "
+                "count fork @ %u. IMPULSE TRIANGLE: rest Tλ=%.4f tri=%.4f feet=%.4f | "
+                "lift table rows=%u |Tλ|=%.3e | late Fλ=%.4f feet=%.4f. rest finger-"
+                "steps=%u/%u first-engage @ %u all3-steps=%u close table-steps=%u/%u. "
+                "cup_z %.4f ->(toggle) %.4f -> %.4f (sink %.3f) base_z=%.4f\n",
+                kFloorSteps - 1u, floor_max_dpos, floor_max_dvel, floor_max_dqdot,
+                floor_max_dbase, full_max_dpos, full_max_dvel, full_max_dqdot,
+                count_match_onset, rest_table_ratio, rest_tri_ratio, rest_feet_ratio,
+                lift_table_rows_total, lift_table_vimp_abs, late_cup_ratio,
+                late_feet_ratio, rest_finger_steps, kRest, first_engage, all3_steps,
+                close_table_steps, kClose, sc.cup0.position.z, cup_z_at_toggle,
+                send.cup.position.z, cup_z_at_toggle - send.cup.position.z,
+                send.base_pose.position.z);
+
+    // ★ THE HEADLINE (HARD): the FP-floor window + in-window count parity.
+    EXPECT_LE(floor_max_dpos, kFloorTol)
+        << "batched cup POSITION diverged in the FP-floor window -- a table-row "
+           "composition defect (emission order / body key / friction stamp), not the "
+           "finger NP seam";
+    EXPECT_LE(floor_max_dvel, kFloorTol)
+        << "batched cup VELOCITY diverged in the FP-floor window";
+    EXPECT_LE(floor_max_dqdot, kFloorTolQdot)
+        << "batched gripper qdot diverged in the FP-floor window";
+    EXPECT_LE(floor_max_dbase, kFloorTol)
+        << "batched BASE position diverged in the FP-floor window";
+    EXPECT_GE(count_match_onset, kFloorSteps)
+        << "the contact-set COUNT (incl. table rows) forked INSIDE the FP-floor "
+           "window -- a structural composition defect";
+
+    // ★ THE IMPULSE CHOREOGRAPHY (HARD): rest -> toggle -> triangle closes.
+    EXPECT_GT(rest_table_ratio, 0.7)
+        << "the TABLE is not carrying the resting cup (~m*g*dt) -- no honest rest";
+    EXPECT_LT(rest_table_ratio, 1.3) << "table impulse far above the cup weight";
+    EXPECT_EQ(lift_table_rows_total, 0u)
+        << "table rows persist after SetTableEnabled(false) -- GHOST table support";
+    EXPECT_EQ(lift_table_vimp_abs, 0.0)
+        << "nonzero table impulse after the toggle -- ghost support";
+    EXPECT_GT(late_cup_ratio, 0.7)
+        << "fingers NOT carrying the cup weight after the table removal -- the "
+           "triangle never closed (no honest friction hold)";
+    EXPECT_LT(late_cup_ratio, 1.3) << "finger vertical impulse far above the cup weight";
+    EXPECT_GT(late_feet_ratio, 0.7) << "feet NOT carrying robot+cup";
+    EXPECT_LT(late_feet_ratio, 1.3) << "foot impulse far above the robot+cup weight";
+
+    // The CLOSE phase genuinely captured the cup BEFORE the table was removed.
+    EXPECT_LT(first_engage, kLiftAt)
+        << "the fingers never re-engaged the resting cup during the CLOSE phase -- "
+           "the lift choreography has no hold to hand the cup to";
+
+    // All three classes were SIMULTANEOUSLY live in one solve (the complete union:
+    // feet + fingers + table -- the capture window, fingers closed on the still-
+    // table-supported cup).
+    EXPECT_GT(all3_steps, 0u)
+        << "feet+fingers+table never coexisted in one solve -- the union is not "
+           "genuinely composed";
+
+    // Non-vacuous: still standing, still holding (a dropped cup falls ~7.7m/300).
+    EXPECT_GT(send.base_pose.position.z, sc.seat_pose.position.z - 0.2f)
+        << "the base sank -- the feet did not support the robot";
+    EXPECT_GT(send.cup.position.z, sc.cup0.position.z - 0.25f)
+        << "the cup fell after the table removal -- the close never built a hold";
+
+    // ------------------------------------------------------------------------------
+    // THE CHAOS CONTROL through the SAME choreography (proves the full-run divergence
+    // is the SCENE, not the batched path): two SAME-CODE oracles, cup IC nudged
+    // 1e-7 m, identical phase schedule incl. the table toggle at kLiftAt.
+    // ------------------------------------------------------------------------------
+    coresident::StandGraspConfig sg_a = sc.sg;
+    coresident::StandGraspConfig sg_b = sc.sg;
+    sg_b.cup_state.position.x += 1.0e-7f;
+    coresident::UnifiedCoResidentStepper o_a(context, sc.host, sg_a, kGravityZ, kDt);
+    coresident::UnifiedCoResidentStepper o_b(context, sc.host, sg_b, kGravityZ, kDt);
+    CopCtl cop_a2(context, sc, 1u);
+    CopCtl cop_b2(context, sc, 1u);
+    double self_max_dpos = 0.0, self_max_dvel = 0.0;
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        if (s == kLiftAt) {
+            o_a.SetTableEnabled(false);
+            o_b.SetTableEnabled(false);
+        }
+        const auto& drv = (s < kFloorSteps) ? hold_drive
+                          : (s < kRest)     ? rest_drive
+                                            : close_drive;
+        DrivePdOracle(o_a, sc, drv, 1.0f, &cop_a2);
+        DrivePdOracle(o_b, sc, drv, 1.0f, &cop_b2);
+        o_a.Step();
+        o_b.Step();
+        const double dpos = (o_a.Cup().position - o_b.Cup().position).Length();
+        const double dvel =
+            (o_a.Cup().linear_velocity - o_b.Cup().linear_velocity).Length();
+        self_max_dpos = std::max(self_max_dpos, dpos);
+        self_max_dvel = std::max(self_max_dvel, dvel);
+    }
+    std::printf("[G1d GATE-A CHAOS CONTROL] two SAME-code oracles through the SAME "
+                "lift choreography, cup IC nudged 1e-7 m: self max|dpos|=%.3e "
+                "max|dvel|=%.3e (vs batched-vs-oracle full-run max|dpos|=%.3e)\n",
+                self_max_dpos, self_max_dvel, full_max_dpos);
+    EXPECT_GT(self_max_dpos, 1.0e-4)
+        << "a 1e-7 m IC seed did NOT amplify -- the scene is NOT chaotic, so the "
+           "batched-vs-oracle full-run divergence is unexplained (investigate)";
+    EXPECT_LT(full_max_dpos, 10.0 * self_max_dpos)
+        << "the batched-vs-oracle delta is >10x a 1e-7 m IC nudge's amplification -- "
+           "larger than scene chaos explains (investigate the batched table path)";
+}
+
+// ===========================================================================
+// G1d GATE (b)+(c) -- N=8 MIXED independence + D1, the table LIVE, with ALL the
+// per-class gap kinds: (i) env 2 NEVER-GRASPED (grip 0 + the cup parked 0.35 m
+// to +X via BodyMut: it rests on the table plane OUT of the hand's reach the
+// whole run -- TABLE rows persist, FINGER rows absent; the only robot<->cup
+// collidables are the fingertips, so 0.35 m guarantees separation); (ii) env 6
+// FOOT-AIRBORNE (base + cup seated 0.8 m high -- NO foot rows AND no table rows
+// [the cup free-falls 0.55 m < 0.8 m in 80 steps, never reaching the plane]
+// while the FINGER class is live: the dual-class tile gap). The remaining envs
+// carry ALL THREE classes (feet + fingers closing + cup resting on the table)
+// at per-env distinct stance scales. Each env must be BYTE-EXACT vs its OWN N=1
+// run (same IC + grip seams); adjacent envs differ; D1 two-run byte-identity.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1d_TableLiftUnion_N8_MixedNeverGraspedAirborneIndependenceAndD1) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandTableScene(context);
+    ASSERT_EQ(sc.base_dof, 6u);
+    ASSERT_TRUE(sc.place.found);
+    ASSERT_TRUE(sc.sg.has_table);
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto drive = BuildGraspStanceDriveSet(sc);  // close PD from step 0.
+    for (const DriveLink& d : drive) ASSERT_NE(d.link, kInvalidLink);
+
+    constexpr uint32_t kEnvs = 8u;
+    constexpr uint32_t kRun = 80u;
+    constexpr uint32_t kParkedEnv = 2u;    // never grasped: cup on the table, far.
+    constexpr uint32_t kAirborneEnv = 6u;  // base+cup 0.8m high: fingers only.
+    constexpr float kParkX = 0.35f;
+    const std::vector<float> scales = {0.0f, 0.6f, 0.8f, 1.0f, 1.15f, 1.3f, 1.0f, 1.45f};
+    std::vector<uint8_t> grip_on(kEnvs, 1u);
+    grip_on[kParkedEnv] = 0u;
+    Transform high_pose = sc.seat_pose;
+    high_pose.position.z += 0.8f;
+
+    // ---- (b) PER-ENV INDEPENDENCE ----
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGravityZ, kDt);
+    world.SetGripperBasePose(kAirborneEnv, high_pose);
+    world.BodyMut(kAirborneEnv, 0u).position.z += 0.8f;  // cup rides up with the hand.
+    world.BodyMut(kParkedEnv, 0u).position.x += kParkX;  // cup parked on the table.
+    CopCtl cop(context, sc, kEnvs);
+    std::vector<uint32_t> foot_steps(kEnvs, 0u), finger_steps(kEnvs, 0u),
+        table_steps(kEnvs, 0u);
+    uint32_t parked_finger_total = 0u, airborne_foot_total = 0u,
+             airborne_table_total = 0u;
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        DrivePdBatched(world, sc, drive, scales, 0.0f, &cop, &grip_on);
+        world.Step();
+        for (uint32_t e = 0u; e < kEnvs; ++e) {
+            const auto& r = world.GraspReports()[e];
+            if (r.foot_normal_rows > 0u) ++foot_steps[e];
+            if (r.finger_contacts > 0u) ++finger_steps[e];
+            if (r.table_row_count > 0u) ++table_steps[e];
+        }
+        parked_finger_total += world.GraspReports()[kParkedEnv].finger_contacts;
+        airborne_foot_total += world.GraspReports()[kAirborneEnv].foot_normal_rows;
+        airborne_table_total += world.GraspReports()[kAirborneEnv].table_row_count;
+    }
+    // The MIXED shape is REAL -- every per-class gap present:
+    EXPECT_EQ(parked_finger_total, 0u)
+        << "the parked cup was touched by a finger -- the never-grasped env is vacuous";
+    EXPECT_EQ(table_steps[kParkedEnv], kRun)
+        << "the parked cup left the table -- it must REST the whole run";
+    EXPECT_GE(foot_steps[kParkedEnv], (kRun * 7u) / 10u)
+        << "the never-grasped env's feet unloaded";
+    EXPECT_EQ(airborne_foot_total, 0u)
+        << "the 'airborne' env touched the ground -- the foot-class gap is vacuous";
+    EXPECT_EQ(airborne_table_total, 0u)
+        << "the airborne env's cup reached the table plane -- raise it or shorten "
+           "the run";
+    EXPECT_GE(finger_steps[kAirborneEnv], (kRun * 7u) / 10u)
+        << "the airborne env's hand lost the cup -- the finger-only shape is vacuous";
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        if (e == kParkedEnv || e == kAirborneEnv) continue;
+        EXPECT_GE(foot_steps[e], (kRun * 7u) / 10u)
+            << "env " << e << " (scale " << scales[e] << ") feet unloaded";
+        EXPECT_GE(finger_steps[e], kRun / 2u)
+            << "env " << e << " (scale " << scales[e] << ") never engaged the cup";
+        // The close-squeeze on a table-seated cup can progressively unload the
+        // table (the gate-(a) wedge finding: the wrap squeezes the cup up); the
+        // table-class PERSISTENCE env is the designed parked env (==kRun above).
+        // Here require the seeded table contact was genuinely live (the all-three-
+        // classes union ran in this env) and REPORT the persistence count.
+        EXPECT_GE(table_steps[e], 1u)
+            << "env " << e << " (scale " << scales[e]
+            << ") never had a table row -- the seeded rest contact is missing";
+    }
+
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        coresident::BatchedUnifiedWorld solo(context, tmpl, 1u, kGravityZ, kDt);
+        if (e == kAirborneEnv) {
+            solo.SetGripperBasePose(0u, high_pose);
+            solo.BodyMut(0u, 0u).position.z += 0.8f;
+        }
+        if (e == kParkedEnv) solo.BodyMut(0u, 0u).position.x += kParkX;
+        CopCtl solo_cop(context, sc, 1u);
+        const std::vector<float> solo_scale = {scales[e]};
+        const std::vector<uint8_t> solo_grip = {grip_on[e]};
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            DrivePdBatched(solo, sc, drive, solo_scale, 0.0f, &solo_cop, &solo_grip);
+            solo.Step();
+        }
+        EXPECT_TRUE(SnapByteEqual(SnapBatched(world, e), SnapBatched(solo, 0u)))
+            << "env " << e << " (N=8, scale " << scales[e]
+            << (e == kAirborneEnv ? ", AIRBORNE" : "")
+            << (e == kParkedEnv ? ", NEVER-GRASPED" : "")
+            << ") NOT byte-exact vs its own N=1 run -- env-major cross-contamination "
+               "through the table rows / per-class tile gaps";
+    }
+    for (uint32_t e = 1u; e < kEnvs; ++e) {
+        EXPECT_FALSE(SnapByteEqual(SnapBatched(world, e), SnapBatched(world, e - 1u)))
+            << "env " << e << " collapsed onto its neighbor";
+    }
+    std::printf("[G1d GATE-B] N=%u MIXED (env %u NEVER-GRASPED/table-only, env %u "
+                "AIRBORNE/finger-only, 6 all-three-classes): every env byte-exact vs "
+                "its own N=1 run; foot/finger/table steps per env:",
+                kEnvs, kParkedEnv, kAirborneEnv);
+    for (uint32_t e = 0u; e < kEnvs; ++e)
+        std::printf(" %u/%u/%u", foot_steps[e], finger_steps[e], table_steps[e]);
+    std::printf(" (of %u)\n", kRun);
+
+    // ---- (c) D1 two-run byte-identity of the FULL N=8 trajectory ----
+    auto run = [&]() {
+        coresident::BatchedUnifiedWorld w(context, tmpl, kEnvs, kGravityZ, kDt);
+        w.SetGripperBasePose(kAirborneEnv, high_pose);
+        w.BodyMut(kAirborneEnv, 0u).position.z += 0.8f;
+        w.BodyMut(kParkedEnv, 0u).position.x += kParkX;
+        CopCtl run_cop(context, sc, kEnvs);
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            DrivePdBatched(w, sc, drive, scales, 0.0f, &run_cop, &grip_on);
+            w.Step();
+        }
+        std::vector<EnvSnap> out(kEnvs);
+        for (uint32_t e = 0u; e < kEnvs; ++e) out[e] = SnapBatched(w, e);
+        return out;
+    };
+    const auto a = run();
+    const auto b = run();
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        EXPECT_TRUE(SnapByteEqual(a[e], b[e]))
+            << "D1: env " << e << " differed between two identical table-union runs";
+    }
+    std::printf("[G1d GATE-C D1] N=%u: two identical table-union rollouts (incl. "
+                "never-grasped + airborne envs) byte-exact\n", kEnvs);
+}
+
+// ===========================================================================
+// G1d GATE (d) -- HONESTY/BITE (spec §3, the STANDING eval): after the table is
+// REMOVED and the cup is friction-held, kill the GRIP -> the cup must fall PAST
+// the table height it used to rest at, while the robot keeps standing. This is
+// the toggle's anti-ghost proof: phantom table rows would catch the falling cup
+// AT the plane; falling far below it proves SetTableEnabled(false) genuinely
+// removed the row class (and the report's table_row_count==0 is not cosmetic).
+// Choreography: rest(60, hold-curl, table carries) -> close(60, grip PD) ->
+// SetTableEnabled(false) -> held-free(60, friction-only hold proven) -> grip
+// killed (240, stance drive continues) -> the cup falls away.
+// NOTE: the cup pairs ONLY with the TABLE plane (the oracle's pair set -- there
+// is no cup x ground pair), so once the table is off NOTHING stops the fall.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1d_TableLiftUnion_TableRemovedGripKill_CupFallsPastTable_BITE) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandTableScene(context);
+    ASSERT_TRUE(sc.place.found);
+    ASSERT_TRUE(sc.sg.has_table);
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto rest_drive = BuildGraspStanceDriveSet(sc, kRestBackOffset);
+    const auto close_drive = BuildGraspStanceDriveSet(sc);
+    for (const DriveLink& d : close_drive) ASSERT_NE(d.link, kInvalidLink);
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, 1u, kGravityZ, kDt);
+    CopCtl cop(context, sc, 1u);
+    const std::vector<float> one_scale = {1.0f};
+
+    // ----- phase 1: REST (fingers backed off -- the table carries the cup; the
+    // baseline table support is real). The gate-(a) wedge finding applies: the
+    // curl wedge pops the cup a few mm up before the back-off clears, then it
+    // re-lands -- so the support baseline is asserted on the SETTLED tail. --------
+    constexpr uint32_t kRest = 80u;
+    constexpr uint32_t kRestTail = 20u;
+    uint32_t rest_table_steps = 0u, rest_tail_table_steps = 0u;
+    for (uint32_t s = 0u; s < kRest; ++s) {
+        DrivePdBatched(world, sc, rest_drive, one_scale, 0.0f, &cop);
+        world.Step();
+        if (world.GraspReports()[0].table_row_count > 0u) {
+            ++rest_table_steps;
+            if (s >= kRest - kRestTail) ++rest_tail_table_steps;
+        }
+    }
+    EXPECT_EQ(rest_tail_table_steps, kRestTail)
+        << "the cup is not RESTING on the table at the end of the rest phase ("
+        << rest_table_steps << "/" << kRest
+        << " supported overall) -- the BITE has no support baseline";
+
+    // ----- phase 2: CLOSE (the grip PD sweeps in + builds the hold while the table
+    // still supports). The fingers START backed off, so engagement is asserted by
+    // the END of the phase, not per step. -------------------------------------------
+    constexpr uint32_t kClose = 80u;
+    uint32_t close_engaged_steps = 0u;
+    for (uint32_t s = 0u; s < kClose; ++s) {
+        DrivePdBatched(world, sc, close_drive, one_scale, 0.0f, &cop);
+        world.Step();
+        if (world.GraspReports()[0].finger_contacts > 0u) ++close_engaged_steps;
+    }
+    ASSERT_GT(close_engaged_steps, 0u)
+        << "fingers never engaged during the close phase -- no hold to hand off";
+    ASSERT_GT(world.GraspReports()[0].finger_contacts, 0u)
+        << "fingers not engaged at the END of the close phase";
+
+    // ----- phase 3: TABLE REMOVED -- friction-only hold (the lift). ---------------
+    world.SetTableEnabled(false);
+    ASSERT_FALSE(world.TableEnabled(0u));
+    constexpr uint32_t kHeldFree = 60u;
+    uint32_t free_table_rows = 0u;
+    for (uint32_t s = 0u; s < kHeldFree; ++s) {
+        DrivePdBatched(world, sc, close_drive, one_scale, 0.0f, &cop);
+        world.Step();
+        free_table_rows += world.GraspReports()[0].table_row_count;
+        ASSERT_GT(world.GraspReports()[0].finger_contacts, 0u)
+            << "the cup left the hand right after the table removal at step " << s
+            << " -- no friction hold to BITE";
+    }
+    EXPECT_EQ(free_table_rows, 0u)
+        << "table rows persist after SetTableEnabled(false) -- ghost support";
+    const EnvSnap held = SnapBatched(world, 0u);
+    EXPECT_GT(held.cup.position.z, sc.cup0.position.z - 0.25f)
+        << "the cup fell during the friction-held phase -- no hold to BITE";
+
+    // ----- phase 4: GRIP KILLED (stance drive continues) -> the cup falls PAST the
+    // table plane it used to rest on. -----------------------------------------------
+    constexpr uint32_t kDead = 240u;
+    const std::vector<uint8_t> grip_off = {0u};
+    uint32_t late_finger_contacts = 0u, dead_table_rows = 0u;
+    for (uint32_t s = 0u; s < kDead; ++s) {
+        DrivePdBatched(world, sc, close_drive, one_scale, 0.0f, &cop, &grip_off);
+        world.Step();
+        dead_table_rows += world.GraspReports()[0].table_row_count;
+        if (s >= kDead - 50u)
+            late_finger_contacts += world.GraspReports()[0].finger_contacts;
+    }
+    const EnvSnap dead = SnapBatched(world, 0u);
+    std::printf("[G1d GATE-D BITE] table_z=%.4f: rest(%u, table rows %u/%u) -> close"
+                "(%u) -> table OFF + held(%u, cup_z=%.4f, 0 table rows) -> grip killed"
+                "(%u): cup_z=%.4f (%.3f m BELOW the table plane) base_z=%.4f late "
+                "finger contacts=%u dead-phase table rows=%u\n",
+                sc.sg.table_height, kRest, rest_table_steps, kRest, kClose, kHeldFree,
+                held.cup.position.z, kDead, dead.cup.position.z,
+                sc.sg.table_height - dead.cup.position.z, dead.base_pose.position.z,
+                late_finger_contacts, dead_table_rows);
+    EXPECT_LT(dead.cup.position.z, sc.sg.table_height - 0.5f)
+        << "the cup did NOT fall past the table height it rested at -- GHOST table "
+           "support survives the toggle (or the hold is not friction-only): a FINDING";
+    EXPECT_EQ(dead_table_rows, 0u)
+        << "table rows re-appeared while the cup fell through the plane -- the "
+           "toggle did not remove the pair";
     EXPECT_GT(dead.base_pose.position.z, sc.seat_pose.position.z - 0.2f)
         << "the robot fell with the cup -- the stand did not survive the grip kill";
     EXPECT_EQ(late_finger_contacts, 0u)
