@@ -2437,6 +2437,54 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_grasp_feasibility_probe_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 H1.2: the COOKED H1 HAND cup grasp WRAPPED INTO the batched general world.
+    # Takes the H1.1-PROVEN ~10.9cm finger-only-wrap grasp (the feasibility probe's scene)
+    # and runs it through the BATCHED general world (BatchedUnifiedWorld) at N envs, then
+    # proves the batched H1-hand grasp is BYTE-EXACT (1e-5) vs the N=1 co-resident oracle
+    # (UnifiedCoResidentStepper) on the IDENTICAL scene -- the bigger H1-hand articulation
+    # (~18 links, dof_stride ~12, ~30 fingertips, ~11 contacts) is the surface where the
+    # env-major batching machinery (M^-1 tile @ art_index*dof_stride^2, chain-J over GLOBAL
+    # contact links) must generalize. Gates: G1 N=1 byte-exact parity (cup pose/vel +
+    # gripper qdot), G2 multi-env independence (per-env / mixed / D1), a throughput lower-
+    # bound sweep. Compiles the SAME batched_unified_world.cpp + unified_coresident_stepper.cpp
+    # + contact_stream_driver.cpp as nuka_batched_unified_world_test (accidental physics
+    # changes there surface in the synthetic 17 gates). Asset-gated SKIP. ADDITIVE: a NEW
+    # parallel TU; the feasibility probe + synthetic batched gates are LEFT INTACT.
+    add_executable(nuka_batched_h1_hand_grasp_test
+        coresident/test_batched_h1_hand_grasp.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_batched_h1_hand_grasp_test nuka_codegen)
+
+    target_compile_definitions(nuka_batched_h1_hand_grasp_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_batched_h1_hand_grasp_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_batched_h1_hand_grasp_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_h1_hand_grasp_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
     # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
     # the right hand co-resides a movable cup + static table + N fingertip collidables
