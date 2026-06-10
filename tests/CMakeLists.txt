@@ -2510,6 +2510,52 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_h1_hand_grasp_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- SG G1: the BATCHED UNION WORLD parity TU (G1a floating-base, NO contact) ---
+    # G1a proves BatchedUnifiedWorld's env-major machinery batches the FLOATING-BASE
+    # whole-body H1 (nuka::demo::LoadFloating, 51 DOF = 6 base + 45 revolute) BYTE-
+    # EXACT (tol 0) vs the N=1 UnifiedCoResidentStepper oracle on the IDENTICAL proto,
+    # with ZERO contact rows (the cup is parked 5 m away and free-falls alongside) --
+    # isolating floating-root replication, per-env IntegrateFloatingBase* activation,
+    # and the SetActions seam over a dof_stride with 6 (dead) base columns. Gates:
+    # (a) N=1 byte-exact over 120 driven free-fall steps, (b) N=8 mixed-action
+    # independence, (c) D1 two-run identity, (d) base action columns 0..5 dead.
+    # G1b..G1d (feet/finger/table union rows) will EXTEND this TU. Asset-gated SKIP.
+    # ADDITIVE parallel TU mirroring the nuka_batched_h1_hand_grasp_test dep set.
+    add_executable(nuka_batched_h1_union_world_test
+        coresident/test_batched_h1_union_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_batched_h1_union_world_test nuka_codegen)
+
+    target_compile_definitions(nuka_batched_h1_union_world_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_batched_h1_union_world_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_batched_h1_union_world_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_batched_h1_union_world_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
     # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
     # the right hand co-resides a movable cup + static table + N fingertip collidables
