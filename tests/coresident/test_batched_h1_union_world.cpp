@@ -51,6 +51,30 @@
 // batched_unified_world.{hpp,cpp} (has_feet template fields + foot row emission),
 // byte-inert when has_feet=false.
 // ---------------------------------------------------------------------------
+// G1c (THIS increment) -- + FINGER x CUP at the floating base: the FULL grasp
+// while standing (no table). The SAME world now steps feet x ground AND
+// fingertip x cup rows in ONE solve: the G1b feet/ground/stance scene + the
+// H1.1/H1.2 grasp pose (cup ~10.9cm nestled in the curled right hand via the
+// proven BestPlacementShallowNoPalmCaging search, PD-close Kp=4/Kd=0.4/+0.18),
+// cup held against gravity by friction force-closure ALONE while the CoP-
+// stabilized legs carry robot+cup. ZERO production change expected -- G1b
+// already restructured the grasp-branch emission to COMPOSE (feet rows first,
+// then finger rows, shared chain-J gather list, per-category friction stamp);
+// G1c's job is to PROVE the composed union parity vs the SAME StandGraspConfig
+// oracle mode G1b used (now with the cup in the hand instead of parked 5m) and
+// flush out composition bugs (row ordering / friction stamping / report
+// splitting / qdot pack-scatter with BOTH row classes live in one env).
+//   THE PARITY BAR (G1b tol-0 does NOT carry over -- documented, not relaxed):
+// bringing the cup into the hand REOPENS the GPU-vs-host SphereHull NP seam
+// (the batched finger narrowphase is the GPU launcher; the oracle narrowphases
+// on host) and the 30-contact grasp on SHARED links is CHAOTIC at the FP floor
+// (H1.2's evidenced finding). So gate (a) HARD-asserts the H1.2 reformulated
+// bar: a leading FP-floor window (cup pos/vel <=1e-6, gripper qdot <=5e-6,
+// contact-count match through the window) + a CHAOS CONTROL (two same-code
+// oracles, 1e-7 m cup IC nudge, must amplify to the same order as the batched-
+// vs-oracle delta) + the full-run deltas REPORTED. See the gate-(a) body for
+// the full written justification (spec §G1(a) requires it in-test).
+// ---------------------------------------------------------------------------
 
 #include "math/quat.hpp"
 #include "math/transform.hpp"
@@ -102,6 +126,29 @@ constexpr float kSz = 1.8f;
 // -- the fingertip<->cup narrowphase runs every step and must emit ZERO contacts.
 constexpr float kCupFarOffsetX = 5.0f;
 
+// ----- G1c: the H1.1/H1.2 PROVEN grip-close PD (Kp=4/Kd=0.4/offset 0.18, the
+// validated 10.9cm close drive) applied to the 12 wrap-driven right-hand links.
+constexpr float kGripKp = 4.0f;
+constexpr float kGripKd = 0.4f;
+constexpr float kCloseOffset = 0.18f;
+// The H1.1/H1.2 driven-finger joint properties (LoadH1Fixed's overrides -- the
+// cook the 10.9cm grasp GO was PROVEN on). The G1c grasp scenes pin the 12
+// driven joints to these explicitly (see LoadFloatingGraspCook for the measured
+// no-op finding: the importer's default-class-only damping parse means the plain
+// cook already carries them). G1a/G1b scenes keep the plain cook.
+constexpr float kRealArmature = 0.1f;
+constexpr float kRealDamping = 1.0f;
+
+// The 12 grip-DRIVEN right-hand links (== H1.2 kWrapDriven): every link carrying a
+// wrap sphere is in this set, so every contacted phalanx actively squeezes.
+const char* const kWrapDriven[] = {
+    "R_thumb_proximal_base", "R_thumb_proximal", "R_thumb_intermediate", "R_thumb_distal",
+    "R_index_proximal",  "R_index_intermediate",
+    "R_middle_proximal", "R_middle_intermediate",
+    "R_ring_proximal",   "R_ring_intermediate",
+    "R_pinky_proximal",  "R_pinky_intermediate",
+};
+
 const std::string kH1Mjcf =
     ".nuka-assets/newton_assets/unitree_h1/mjcf/h1_with_hand.xml";
 const std::string kCupUsda =
@@ -109,6 +156,58 @@ const std::string kCupUsda =
 
 bool AssetsAvailable() {
     return std::filesystem::exists(kH1Mjcf) && std::filesystem::exists(kCupUsda);
+}
+
+// ===========================================================================
+// G1c: the FLOATING GRASP cook -- nuka::demo::LoadFloating + the H1.1/H1.2
+// driven-finger joint overrides (LoadH1Fixed's damping/armature seam, here on
+// the FLOATING whole-body cook: every joint keeps its natural type, only the 12
+// wrap-driven finger joints get kRealDamping/kRealArmature). This reproduces,
+// on the floating cook, exactly the finger dynamics the 10.9cm grasp GO (H1.1)
+// and the H1.2 parity were proven on. Used by the G1c grasp scenes ONLY.
+//   MEASURED no-op FINDING (kept for explicitness + as a guard against a future
+// importer fix changing the cook under this scene): the MJCF importer reads
+// joint damping/armature from the DEFAULT CLASS only (mjcf_importer.cpp:624,
+// per-joint damping="0.5" attributes are silently ignored), and h1_with_hand's
+// default class is damping=1/armature=0.1 -- so the plain floating cook ALREADY
+// carries the H1.1 values on every joint (a run with this override is bit-
+// identical to one without). Pre-existing importer behavior, NOT a G1c bug;
+// surfaced as named debt.
+// ===========================================================================
+nuka::demo::Cooked LoadFloatingGraspCook(const std::string& mjcf) {
+    nuka::demo::Cooked out;
+    out.scene = nuka::import::LoadMjcf(mjcf);
+    // Drop mesh geometry (== LoadFloating: dodge V-HACD; inertia + topology only).
+    for (size_t i = 0u; i < out.scene.ShapeCount(); ++i) {
+        auto& s = out.scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
+        s.mesh_vertices.clear();
+        s.mesh_indices.clear();
+    }
+    const auto blob = nuka::scene::CookScene(out.scene);
+    auto topos = nuka::runtime::articulation::CookArticulations(blob);
+    // Resolve the 12 wrap-driven finger BODIES by name (== LoadH1Fixed's seam).
+    std::vector<uint32_t> driven_bodies;
+    for (const char* nm : kWrapDriven) {
+        for (uint32_t b = 0u; b < out.scene.RigidBodyCount(); ++b) {
+            if (out.scene.GetBody(b).name == nm) {
+                driven_bodies.push_back(b);
+                break;
+            }
+        }
+    }
+    auto is_driven = [&](uint32_t body) {
+        return std::find(driven_bodies.begin(), driven_bodies.end(), body) !=
+               driven_bodies.end();
+    };
+    for (auto& topo : topos) {
+        for (size_t i = 0u; i < topo.link_bodies.size(); ++i) {
+            if (!is_driven(topo.link_bodies[i])) continue;
+            topo.joint_dampings[i] = kRealDamping;
+            topo.joint_armatures[i] = kRealArmature;
+        }
+    }
+    out.host = nuka::runtime::articulation::BuildArticulationHostState(topos, blob.bodies);
+    return out;
 }
 
 // ===========================================================================
@@ -130,11 +229,18 @@ struct UnionScene {
     double total_mass = 0.0;          // Σ link masses (the m*g*dt force-balance reference).
     Transform seat_pose{};            // the seated base pose (foot bottoms 2mm into ground).
     float poly_cx = 0.0f;             // pinned world foot-polygon center x (the CoP ref).
+    // ----- G1c: the grasp-while-standing scene (filled by BuildGraspStandScene) ----
+    nuka::demo::Place place{};        // the cup placement in the curled hand (world).
+    std::vector<uint32_t> grip_links; // the 12 wrap-driven right-hand device links.
 };
 
-UnionScene BuildFloatingNoContactScene() {
+// `grasp_cook` (G1c): cook the 12 wrap-driven finger joints at the H1.1-proven
+// kRealDamping/kRealArmature (LoadFloatingGraspCook). Default false -> the plain
+// LoadFloating cook, byte-identical for every G1a/G1b scene.
+UnionScene BuildFloatingNoContactScene(bool grasp_cook = false) {
     UnionScene sc;
-    sc.h1 = nuka::demo::LoadFloating(kH1Mjcf);
+    sc.h1 = grasp_cook ? LoadFloatingGraspCook(kH1Mjcf)
+                       : nuka::demo::LoadFloating(kH1Mjcf);
     sc.host = sc.h1.host;
     // Quiescent IC (== the cup-sequence demo's floating seed): zero velocities,
     // identity base rotation; q stays at the cook rest pose.
@@ -227,8 +333,9 @@ coresident::BatchedSceneTemplate MakeUnionTemplate(const UnionScene& sc) {
 // so the oracle emits the SAME pair set the batched world resolves: every finger
 // pair finds NOTHING (cup 5m away) -> EXACTLY feet x ground rows exist.
 // ===========================================================================
-UnionScene BuildFeetGroundScene(const nuka::phi::DeviceContext& context) {
-    UnionScene sc = BuildFloatingNoContactScene();
+UnionScene BuildFeetGroundScene(const nuka::phi::DeviceContext& context,
+                                bool grasp_cook = false) {
+    UnionScene sc = BuildFloatingNoContactScene(grasp_cook);
 
     // Bent stance on both legs (hip_pitch/knee/ankle; yaw/roll = 0).
     const auto legs = nuka::demo::ResolveLegLinks(sc.h1);
@@ -313,6 +420,12 @@ struct DriveLink {
     // four members -> tlim stays 0 -> the G1a drive math is bit-unchanged. Applied
     // IDENTICALLY in DrivePdOracle and DrivePdBatched (parity-preserving).
     float tlim = 0.0f;
+    // G1c: a GRIP-close link. Its target is NOT scaled by the per-env stance scale
+    // (the close target q_curl+0.18 is absolute) and it honors the per-env grip
+    // kill switch (gate b's cup-dropped env / gate d's BITE). false everywhere in
+    // the G1a/G1b sets -> their drive math stays bit-identical (the non-grip path
+    // computes the SAME scale*target expression as before).
+    bool grip = false;
 };
 
 std::vector<DriveLink> BuildDriveSet(const nuka::demo::Cooked& h1) {
@@ -375,6 +488,51 @@ std::vector<DriveLink> BuildStanceHoldDriveSet(const UnionScene& sc) {
         d.kd = nuka::demo::kKdHold;
         d.tlim = nuka::demo::HoldLimitFor(nuka::demo::LinkName(sc.h1, l));
         out.push_back(d);
+    }
+    return out;
+}
+
+// G1c: the GRASP-while-standing drive = the G1b stance-hold set with the 12 wrap-
+// driven right-hand links' gentle rest-hold REPLACED by the H1.1 grip-close PD
+// (Kp=4/Kd=0.4/target = q + close_offset, UNCLAMPED -- exactly the proven close
+// the H1.1 probe / H1.2 parity scene drive at close_offset=kCloseOffset; the
+// scene builder's SETTLE pre-roll uses close_offset=0 so the fingers HOLD the
+// curled pre-pose while the stance settles). Built from the CURRENT sc.host q
+// (curled; settled after the pre-roll), so the non-grip links' hold targets are
+// their equilibrium q. grip=true marks the close links for the per-env grip kill
+// switch + the unscaled-target rule in the drive seams.
+std::vector<DriveLink> BuildGraspStanceDriveSet(const UnionScene& sc,
+                                                float close_offset = kCloseOffset) {
+    std::vector<DriveLink> out = BuildStanceHoldDriveSet(sc);
+    auto is_grip = [&](uint32_t l) {
+        for (uint32_t g : sc.grip_links)
+            if (g == l) return true;
+        return false;
+    };
+    const uint32_t wrist = nuka::demo::LinkByName(sc.h1, "right_hand_link");
+    for (DriveLink& d : out) {
+        if (d.link == wrist) {
+            // The WRIST is the one right-hand joint NOT in the wrap-driven set. The
+            // H1.1/H1.2 cooks WELDED it (LoadH1Fixed); on the floating whole-body
+            // cook it is live and carries the cup load + the close-reaction torque,
+            // so it gets its REAL MJCF motor limit (right_hand_joint ctrlrange
+            // +/-6 N*m, h1_with_hand.xml:408) instead of HoldLimitFor's 1 N*m finger
+            // default -- a DRIVE choice within the real actuator, applied identically
+            // to both seams (parity-preserving), standing in for the weld the proven
+            // H1.1 scene had. NOT contact fakery: the cup is held by finger friction
+            // alone. (Honesty note: the pre-settle cup escape that motivated probing
+            // this was MEASURED insensitive to 1-vs-6 N*m -- its root cause was the
+            // unsettled scene authoring, fixed by the settle pre-roll above; the real
+            // limit is kept because it is the honest actuator capability.)
+            d.tlim = 6.0f;
+            continue;
+        }
+        if (!is_grip(d.link)) continue;
+        d.target = sc.host.q[d.link] + close_offset;  // close past the curled pre-pose.
+        d.kp = kGripKp;
+        d.kd = kGripKd;
+        d.tlim = 0.0f;  // unclamped (the H1.1/H1.2 close drive has no clamp).
+        d.grip = true;
     }
     return out;
 }
@@ -445,8 +603,11 @@ void DrivePdOracle(coresident::UnifiedCoResidentStepper& stepper, const UnionSce
     stepper.Download(&st);
     std::vector<float> tau(sc.link_count, 0.0f);
     for (const DriveLink& d : drive) {
-        float u =
-            d.kp * (target_scale * d.target - st.q[d.link]) - d.kd * st.qdot[d.link];
+        // G1c: a grip link's close target is ABSOLUTE (never stance-scaled). For the
+        // G1a/G1b sets (grip=false everywhere) tgt == target_scale*d.target -- the
+        // identical float expression as before, bit-unchanged.
+        const float tgt = d.grip ? d.target : target_scale * d.target;
+        float u = d.kp * (tgt - st.q[d.link]) - d.kd * st.qdot[d.link];
         if (d.tlim > 0.0f) u = std::max(-d.tlim, std::min(d.tlim, u));  // G1b clamp.
         tau[d.link] = u;
     }
@@ -464,10 +625,14 @@ void DrivePdOracle(coresident::UnifiedCoResidentStepper& stepper, const UnionSce
 // Batched seam: env-major DOF-indexed actions from EACH env's own downloaded state
 // -> SetActions. `base_col_value` != 0 stuffs ALL SIX base columns (0..5) with that
 // value -- gate (d)'s dead-column probe; 0 leaves them at the parity default.
+// `grip_on` (G1c): an optional per-env grip kill switch -- 0 leaves the grip links'
+// action columns at 0 (zero close torque from that step on: the cup-dropped env /
+// the BITE), 1 (or nullptr) drives the H1.1 close PD. Non-grip links are unaffected.
 void DrivePdBatched(coresident::BatchedUnifiedWorld& world, const UnionScene& sc,
                     const std::vector<DriveLink>& drive,
                     const std::vector<float>& target_scales,
-                    float base_col_value = 0.0f, CopCtl* cop = nullptr) {
+                    float base_col_value = 0.0f, CopCtl* cop = nullptr,
+                    const std::vector<uint8_t>* grip_on = nullptr) {
     const uint32_t n = world.EnvCount();
     const uint32_t dof_stride = sc.dof_stride;
     std::vector<float> actions(static_cast<size_t>(n) * dof_stride, 0.0f);
@@ -483,7 +648,12 @@ void DrivePdBatched(coresident::BatchedUnifiedWorld& world, const UnionScene& sc
         for (const DriveLink& dl : drive) {
             const uint32_t d = DofIndexOf(sc.host, sc.root_link, dl.link);
             if (d < dof_stride) {
-                float u = dl.kp * (scale * dl.target - st.q[dl.link]) -
+                if (dl.grip && grip_on != nullptr && (*grip_on)[e] == 0u)
+                    continue;  // G1c: grip killed for this env -> zero close torque.
+                // G1c: a grip link's close target is ABSOLUTE (never stance-scaled);
+                // non-grip links compute the identical scale*target as before.
+                const float tgt = dl.grip ? dl.target : scale * dl.target;
+                float u = dl.kp * (tgt - st.q[dl.link]) -
                           dl.kd * st.qdot[dl.link];
                 if (dl.tlim > 0.0f)
                     u = std::max(-dl.tlim, std::min(dl.tlim, u));  // G1b clamp.
@@ -503,6 +673,107 @@ void DrivePdBatched(coresident::BatchedUnifiedWorld& world, const UnionScene& sc
         }
     }
     world.SetActions(actions.data(), actions.size());
+}
+
+// ===========================================================================
+// G1c scene: the G1b feet/ground/stance scene + the H1.1/H1.2 GRASP POSE -- the
+// cup moved from 5m away INTO the curled right hand's wrap, AT THE SETTLED
+// STANDING STATE. Authoring sequence (all deterministic, both sides share the
+// result):
+//   1. curl the right hand to the proven 10.9cm open pre-pose (CurlForScale),
+//   2. SETTLE pre-roll: run the ORACLE on the cup-far config (feet-only rows,
+//      exactly the G1b regime) for kGraspSettleSteps with the full stance drive
+//      + CoP law + fingers HOLDING the curl (close_offset=0) -> the base sinks
+//      to its compliant-contact equilibrium and the hold-PD arm sags to ITS
+//      equilibrium; download that settled state as the scene proto,
+//   3. search the cup placement on the SETTLED FK (the same validated force-
+//      closure caging search the H1.1 GO used) and seed the cup there.
+// WHY the settle is REQUIRED (measured): authored at the raw seat pose, the
+// stance/arm settle transient moves the hand away from the searched placement
+// within the first steps (base -7mm by step 14) and the marginally-caged cup
+// walks out of the wrap by step ~58 -- on the ORACLE and the batched world
+// IDENTICALLY (so it was never a parity defect; it was a scene-authoring
+// defect). The H1.1 GO held its cup on a FIXED cook (zero robot transient);
+// "the cup starts held in the closed hand" therefore means: at the standing
+// EQUILIBRIUM. NO table either way: the cup free-hangs in the wrap, held by
+// finger friction force-closure alone.
+// ===========================================================================
+constexpr uint32_t kGraspSettleSteps = 200u;  // ~0.83s: stance+arm quasi-static.
+
+UnionScene BuildGraspStandScene(const nuka::phi::DeviceContext& context) {
+    // grasp_cook=true: the 12 driven finger joints pinned to the H1.1-proven
+    // damping/armature (a measured no-op today; see LoadFloatingGraspCook).
+    UnionScene sc = BuildFeetGroundScene(context, /*grasp_cook=*/true);
+
+    // Curl the right hand to the H1.1 curled-open pre-pose. ApplyCurl touches
+    // EXACTLY the 12 wrap-driven links, so the G1b stance/seat (ankle FK) is
+    // unchanged; the proto BOTH sides step from now carries the curled q.
+    nuka::demo::ApplyCurl(sc.h1, &sc.host, nuka::demo::CurlForScale(kSxy));
+
+    // The 12 grip-driven links, resolved by name on the floating cook.
+    for (const char* nm : kWrapDriven) {
+        const uint32_t l = nuka::demo::LinkByName(sc.h1, nm);
+        if (l != kInvalidLink) sc.grip_links.push_back(l);
+    }
+    const uint32_t hand = nuka::demo::LinkByName(sc.h1, "right_hand_link");
+    if (hand == kInvalidLink) return sc;  // place.found stays false -> loud test fail.
+
+    // ----- The cup placement, searched on the SEAT + curled FK -- the H1.1-GO
+    // search geometry (arc 218deg / 11 genuine / 1.9mm shallow, measured). The
+    // settled hand TILTS slightly, which pushes every grid candidate off the
+    // marginal <=2mm-shallow / >200deg-arc criteria (measured: found=false on the
+    // settled FK), so the search runs HERE and the result is carried through the
+    // settle by the HAND-FRAME delta below -- the cup IC rides the hand exactly,
+    // preserving the searched wrap geometry. -----
+    const auto seat_poses = nuka::demo::ForwardKinematics(context, sc.host);
+    const Transform hand_seat = seat_poses[hand];
+    {
+        const auto spheres = nuka::demo::WrapSpheres(false, Vec3{});
+        const nuka::demo::CupHull base = nuka::demo::LoadCupHull(kCupUsda);
+        const nuka::demo::CupHull hull = nuka::demo::ScaleCupHull(base, kSxy, kSz);
+        sc.place =
+            nuka::demo::BestPlacementShallowNoPalmCaging(sc.h1, seat_poses, spheres, hull);
+    }
+
+    // ----- SETTLE pre-roll (step 2 above; the cup is STILL parked 5m away, so
+    // this is exactly the G1b feet-only regime). Deterministic -> the scene is
+    // identical across every world/oracle a test builds from it. -----
+    {
+        coresident::UnifiedCoResidentStepper settle(context, sc.host, sc.sg,
+                                                    kGravityZ, kDt);
+        CopCtl cop(context, sc, 1u);
+        const auto hold = BuildGraspStanceDriveSet(sc, /*close_offset=*/0.0f);
+        for (uint32_t s = 0u; s < kGraspSettleSteps; ++s) {
+            DrivePdOracle(settle, sc, hold, 1.0f, &cop);
+            settle.Step();
+        }
+        articulation::ArticulationHostState settled;
+        settle.Download(&settled);
+        sc.host.q = settled.q;
+        sc.host.qdot = settled.qdot;
+        sc.host.link_velocity = settled.link_velocity;
+        sc.host.base_pose[0] = settled.base_pose[0];
+    }
+
+    // ----- Carry the searched placement through the settle by the HAND-FRAME
+    // delta: the cup is rigidly attached to the hand frame across the settle
+    // (cup-in-hand offset preserved; orientation gets the same small rotation),
+    // exactly how a held cup would ride. -----
+    if (sc.place.found) {
+        const auto settled_poses = nuka::demo::ForwardKinematics(context, sc.host);
+        const Transform hand_settled = settled_poses[hand];
+        const Quat dq = hand_settled.rotation * hand_seat.rotation.Conjugate();
+        const Vec3 local = hand_seat.rotation.Conjugate().Rotate(
+            sc.place.center - hand_seat.position);
+        sc.place.center = hand_settled.position + hand_settled.rotation.Rotate(local);
+        sc.config.cup_state.position = sc.place.center;
+        sc.config.cup_state.orientation = dq;  // near-identity settle tilt.
+    }
+
+    // Move the cup INTO the hand on BOTH sides (oracle config + template seed).
+    sc.sg.cup_state = sc.config.cup_state;
+    sc.cup0 = sc.config.cup_state;
+    return sc;
 }
 
 // ===========================================================================
@@ -1074,4 +1345,454 @@ TEST(BatchedH1UnionWorld, G1b_FeetGroundUnion_DriveKillCollapse_BITE) {
     EXPECT_LT(z_dead, z_driven - 0.25f)
         << "the robot did NOT collapse when the drive was killed -- the bent stance "
            "held itself up: silently-welded legs or faked foot support (a FINDING)";
+}
+
+// ===========================================================================
+// ★ G1c GATE (a) -- N=1 COMPOSED union parity (feet x ground AND finger x cup in
+// ONE solve), 300 steps, feet loaded AND fingers gripping the whole run.
+// ---------------------------------------------------------------------------
+// THE HONEST BAR (the H1.2 reformulated bar, an EVIDENCED reformulation -- NOT a
+// relaxation to hide a bug; spec §G1(a) allows <=1e-5 with a written justification,
+// this is it). G1b held tol-0 because the feet path has ZERO divergence surface
+// (host narrowphase on BOTH sides, zero finger manifolds). G1c brings the cup into
+// the hand, which REOPENS the two H1.2 surfaces simultaneously:
+//   (1) the batched finger narrowphase is the GPU SphereHull launcher while the
+//       oracle narrowphases on HOST -- a documented ULP-scale float seam, and
+//   (2) the 30-contact condim=3 grasp on 12 SHARED links is CHAOTIC at the FP
+//       floor (H1.2's perturbation control PROVED a 1e-7 m IC seed in IDENTICAL
+//       code amplifies past 1e-4 within ~70 steps).
+// Both classes feed the SAME UnifiedSolve here, so the ULP seam perturbs the whole
+// union state (base, legs, foot lambdas included) -- full-run byte-parity is
+// impossible for ANY two code paths, correct or not. The IRREDUCIBLE FP-floor
+// window is the LEADING steps before the seed amplifies. So the HARD assert =
+// the first kFloorSteps at the FP floor (cup pos/vel <=1e-6, gripper qdot <=5e-6,
+// base pos <=1e-6) AND the contact-set COUNTS (finger points + foot rows) matching
+// through the window -- a real STRUCTURAL-bug discriminator: a composition bug
+// (wrong row order, wrong friction stamp, wrong body key, qdot pack/scatter
+// corruption with both classes live) corrupts step 0 by orders of magnitude
+// and/or forks the contact set immediately. Steps beyond the window are REPORTED
+// (chaotic), and the CHAOS CONTROL below proves the full-run delta is the scene,
+// not the batched path. If tol-0 happens to hold it would be asserted instead --
+// it does NOT (measured: the GPU-vs-host NP seam is real), hence this bar.
+// COMPOSITION asserts (the point of G1c): every step has foot rows AND finger
+// contacts SIMULTANEOUSLY on both sides; the two force balances close --
+//   feet:    Σλ_foot_normal ~= (m_robot + m_cup)*g*dt (the robot carries the cup),
+//   fingers: Σλ_finger*j_z  ~= m_cup*g*dt             (the hand carries the cup)
+// -- the H1.1/C7b-1 balance pattern, late-window means.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1c_GraspStandUnion_N1_FpFloorWindowVsStandGraspOracle) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandScene(context);
+    ASSERT_EQ(sc.base_dof, 6u) << "the cook is NOT floating-base";
+    ASSERT_EQ(sc.dof_stride, 51u);
+    ASSERT_EQ(sc.sg.feet.size(), 4u);
+    ASSERT_GE(sc.config.fingertips.size(), 30u);
+    ASSERT_EQ(sc.grip_links.size(), 12u) << "a wrap-driven link failed to resolve";
+    ASSERT_TRUE(sc.place.found)
+        << "the 10.9cm finger-only shallow caging placement vanished on the floating "
+           "stance cook -- the G1c grasp pose does not exist";
+    const double mg_dt_feet = (sc.total_mass + kCupMass) * 9.81 * kDt;
+    const double mg_dt_cup = kCupMass * 9.81 * kDt;
+    std::printf("[G1c GATE-A] grasp-while-standing union: m_robot=%.2f kg m_cup=%.2f kg "
+                "cup@(%.3f,%.3f,%.3f) arc=%.0fdeg genuine=%u pen=%.4f feet=%zu "
+                "fingertips=%zu (m_r+m_c)*g*dt=%.4f m_c*g*dt=%.5f\n",
+                sc.total_mass, kCupMass, sc.place.center.x, sc.place.center.y,
+                sc.place.center.z, sc.place.covered_arc, sc.place.genuine,
+                sc.place.max_pen, sc.sg.feet.size(), sc.config.fingertips.size(),
+                mg_dt_feet, mg_dt_cup);
+
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto drive = BuildGraspStanceDriveSet(sc);
+    for (const DriveLink& d : drive) ASSERT_NE(d.link, kInvalidLink);
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, 1u, kGravityZ, kDt);
+    coresident::UnifiedCoResidentStepper oracle(context, sc.host, sc.sg, kGravityZ, kDt);
+    CopCtl cop_o(context, sc, 1u);
+    CopCtl cop_b(context, sc, 1u);
+
+    constexpr uint32_t kRun = 300u;
+    // The H1.2 FP-floor window bar (the evidenced reformulation; see the test header).
+    constexpr uint32_t kFloorSteps = 10u;
+    constexpr double kFloorTol = 1.0e-6;      // cup pos/vel + base pos in-window.
+    constexpr double kFloorTolQdot = 5.0e-6;  // gripper qdot (51 DOF) in-window.
+    const std::vector<float> one_scale = {1.0f};
+    double floor_max_dpos = 0.0, floor_max_dvel = 0.0, floor_max_dqdot = 0.0,
+           floor_max_dbase = 0.0;
+    double full_max_dpos = 0.0, full_max_dvel = 0.0, full_max_dqdot = 0.0;
+    uint32_t count_match_onset = kRun;  // first step a contact COUNT forks (chaos marker).
+    bool count_open = true;
+    uint32_t both_steps = 0u;           // steps with feet AND fingers loaded (batched).
+    double feet_ratio_sum = 0.0, cup_ratio_sum = 0.0;
+    uint32_t ratio_n = 0u;
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        DrivePdOracle(oracle, sc, drive, 1.0f, &cop_o);
+        DrivePdBatched(world, sc, drive, one_scale, 0.0f, &cop_b);
+        const auto rep = oracle.Step();
+        world.Step();
+        const auto& brep = world.GraspReports()[0];
+
+        // ----- (i) the COMPOSITION invariant: feet rows AND finger contacts exist
+        // SIMULTANEOUSLY, every step, on BOTH sides (the union is genuinely composed,
+        // not two disjoint regimes). -----
+        ASSERT_GT(rep.foot_normal_rows, 0u) << "oracle lost foot contact at step " << s;
+        ASSERT_GT(brep.foot_normal_rows, 0u)
+            << "batched world lost foot contact at step " << s;
+        ASSERT_GT(rep.finger_contacts, 0u)
+            << "oracle lost the cup at step " << s << " -- the grasp did not hold";
+        ASSERT_GT(brep.finger_contacts, 0u)
+            << "batched world lost the cup at step " << s;
+        if (brep.foot_normal_rows > 0u && brep.finger_contacts > 0u) ++both_steps;
+
+        // ----- (ii) contact-set COUNT parity through the FP-floor window (asserted
+        // after the loop via count_match_onset; the fork step is REPORTED). -----
+        if (count_open && (rep.finger_contacts != brep.finger_contacts ||
+                           rep.foot_normal_rows != brep.foot_normal_rows)) {
+            count_open = false;
+            count_match_onset = s;
+        }
+
+        // ----- (iii) state deltas: HARD in-window, REPORTED full-run. -----
+        const EnvSnap so = SnapOracle(oracle);
+        const EnvSnap sb = SnapBatched(world, 0u);
+        const SnapDiff d = SnapMaxDiff(so, sb);
+        const double dvel =
+            (so.cup.linear_velocity - sb.cup.linear_velocity).Length();
+        full_max_dpos = std::max(full_max_dpos, d.dcup);
+        full_max_dvel = std::max(full_max_dvel, dvel);
+        full_max_dqdot = std::max(full_max_dqdot, d.dqdot);
+        if (s < kFloorSteps) {
+            floor_max_dpos = std::max(floor_max_dpos, d.dcup);
+            floor_max_dvel = std::max(floor_max_dvel, dvel);
+            floor_max_dqdot = std::max(floor_max_dqdot, d.dqdot);
+            floor_max_dbase = std::max(floor_max_dbase, d.dbase);
+        }
+
+        // ----- (iv) the two force balances (late settled window, batched side). -----
+        if (s >= kRun - 100u) {
+            feet_ratio_sum += brep.foot_normal_impulse_sum / mg_dt_feet;
+            cup_ratio_sum += brep.cup_vertical_impulse / mg_dt_cup;
+            ++ratio_n;
+        }
+        if (s <= 14u || (s % 50u) == 49u || s == kRun - 1u) {
+            std::printf("[G1c GATE-A] step %3u: |dcup|=%.3e |dvel|=%.3e |dqdot|=%.3e "
+                        "|dbase|=%.3e contacts(o=%u b=%u) feet(o=%u b=%u) "
+                        "Σλf/mgdt=%.3f Σλc/mgdt=%.3f cup_z=%.4f base_z=%.4f\n",
+                        s, d.dcup, dvel, d.dqdot, d.dbase, rep.finger_contacts,
+                        brep.finger_contacts, rep.foot_normal_rows,
+                        brep.foot_normal_rows,
+                        brep.foot_normal_impulse_sum / mg_dt_feet,
+                        brep.cup_vertical_impulse / mg_dt_cup, sb.cup.position.z,
+                        sb.base_pose.position.z);
+        }
+    }
+
+    const double feet_ratio = feet_ratio_sum / std::max(1u, ratio_n);
+    const double cup_ratio = cup_ratio_sum / std::max(1u, ratio_n);
+    const EnvSnap send = SnapBatched(world, 0u);
+    std::printf("[G1c GATE-A RESULT] FP-FLOOR WINDOW (steps 0-%u): max|dcup|=%.3e "
+                "max|dvel|=%.3e max|dqdot|=%.3e max|dbase|=%.3e (HARD tol pos/vel/base "
+                "%.0e qdot %.0e). FULL RUN (%u steps): max|dcup|=%.3e max|dvel|=%.3e "
+                "max|dqdot|=%.3e (REPORTED, chaotic). contact-count fork @ step %u. "
+                "both-classes %u/%u steps. late-window Σλ_feet/((m_r+m_c)g dt)=%.4f "
+                "Σλ_cup/(m_c g dt)=%.4f. cup_z %.4f->%.4f base_z %.4f->%.4f\n",
+                kFloorSteps - 1u, floor_max_dpos, floor_max_dvel, floor_max_dqdot,
+                floor_max_dbase, kFloorTol, kFloorTolQdot, kRun, full_max_dpos,
+                full_max_dvel, full_max_dqdot, count_match_onset, both_steps, kRun,
+                feet_ratio, cup_ratio, sc.cup0.position.z, send.cup.position.z,
+                sc.seat_pose.position.z, send.base_pose.position.z);
+
+    // ★ THE HEADLINE (HARD): the FP-floor window. A structural composition bug
+    // (row order, friction stamp, body key, pack/scatter with both classes live)
+    // corrupts step 0 by ~1e-3+ and/or forks the contact set immediately -- this
+    // window catches it; Gate (b)'s tol-0 batching proof is BLIND to N-independent
+    // resolver bugs, this window is not.
+    EXPECT_LE(floor_max_dpos, kFloorTol)
+        << "batched cup POSITION diverged in the FP-floor window -- a composition "
+           "defect in the union row assembly (not the NP seam)";
+    EXPECT_LE(floor_max_dvel, kFloorTol)
+        << "batched cup VELOCITY diverged in the FP-floor window";
+    EXPECT_LE(floor_max_dqdot, kFloorTolQdot)
+        << "batched gripper qdot diverged in the FP-floor window";
+    EXPECT_LE(floor_max_dbase, kFloorTol)
+        << "batched BASE position diverged in the FP-floor window -- the base "
+           "prefix-sum lanes corrupt under the composed row classes";
+    EXPECT_GE(count_match_onset, kFloorSteps)
+        << "the contact-set COUNT forked INSIDE the FP-floor window -- a structural "
+           "composition defect, not the NP seam";
+
+    // The COMPOSITION was total: every step carried both row classes.
+    EXPECT_EQ(both_steps, kRun);
+
+    // The two force balances (the robot carries the cup; the hand carries the cup).
+    EXPECT_GT(feet_ratio, 0.7) << "feet NOT carrying robot+cup";
+    EXPECT_LT(feet_ratio, 1.3) << "foot impulse far above the robot+cup weight";
+    EXPECT_GT(cup_ratio, 0.7) << "fingers NOT carrying the cup weight (no honest hold)";
+    EXPECT_LT(cup_ratio, 1.3) << "finger vertical impulse far above the cup weight";
+
+    // Non-vacuous: genuinely standing AND genuinely holding (a dropped cup falls
+    // ~7.7 m in 300 steps; an unsupported robot likewise).
+    EXPECT_GT(send.base_pose.position.z, sc.seat_pose.position.z - 0.2f)
+        << "the base sank -- the feet did not support the robot";
+    EXPECT_GT(send.cup.position.z, sc.cup0.position.z - 0.25f)
+        << "the cup fell -- the hand did not hold it";
+
+    // ------------------------------------------------------------------------------
+    // THE CHAOS CONTROL (proves the full-run divergence is the SCENE, not the batched
+    // path). Two SAME-CODE oracles on the IDENTICAL scene, one with the cup IC nudged
+    // 1e-7 m in x, each with its OWN CopCtl. If the 1e-7 seed amplifies to the SAME
+    // order as the batched-vs-oracle full-run delta, full-run byte-parity is
+    // impossible for ANY two code paths, correct or not -- the cross-path delta is
+    // explained by scene chaos, not a batched defect.
+    // ------------------------------------------------------------------------------
+    coresident::StandGraspConfig sg_a = sc.sg;
+    coresident::StandGraspConfig sg_b = sc.sg;
+    sg_b.cup_state.position.x += 1.0e-7f;
+    coresident::UnifiedCoResidentStepper o_a(context, sc.host, sg_a, kGravityZ, kDt);
+    coresident::UnifiedCoResidentStepper o_b(context, sc.host, sg_b, kGravityZ, kDt);
+    CopCtl cop_a2(context, sc, 1u);
+    CopCtl cop_b2(context, sc, 1u);
+    double self_max_dpos = 0.0, self_max_dvel = 0.0;
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        DrivePdOracle(o_a, sc, drive, 1.0f, &cop_a2);
+        DrivePdOracle(o_b, sc, drive, 1.0f, &cop_b2);
+        o_a.Step();
+        o_b.Step();
+        const double dpos = (o_a.Cup().position - o_b.Cup().position).Length();
+        const double dvel =
+            (o_a.Cup().linear_velocity - o_b.Cup().linear_velocity).Length();
+        self_max_dpos = std::max(self_max_dpos, dpos);
+        self_max_dvel = std::max(self_max_dvel, dvel);
+    }
+    std::printf("[G1c GATE-A CHAOS CONTROL] two SAME-code oracles, cup IC nudged "
+                "1e-7 m: self max|dpos|=%.3e max|dvel|=%.3e over %u steps (vs batched-"
+                "vs-oracle full-run max|dpos|=%.3e)\n",
+                self_max_dpos, self_max_dvel, kRun, full_max_dpos);
+    EXPECT_GT(self_max_dpos, 1.0e-4)
+        << "a 1e-7 m IC seed did NOT amplify -- the scene is NOT chaotic, so the "
+           "batched-vs-oracle full-run divergence is unexplained (investigate)";
+    EXPECT_LT(full_max_dpos, 10.0 * self_max_dpos)
+        << "the batched-vs-oracle delta is >10x a 1e-7 m IC nudge's amplification -- "
+           "larger than scene chaos explains (investigate the batched path)";
+}
+
+// ===========================================================================
+// G1c GATE (b)+(c) -- N=8 MIXED independence + D1, with BOTH gap kinds (brief
+// risk #4): (i) env 6 FOOT-AIRBORNE (seated +0.8m via SetGripperBasePose, cup
+// raised with it via BodyMut -> FINGER rows only, NO foot rows -- the foot-class
+// tile gap while the finger class is live); (ii) env 2 CUP-DROPPED (grip torque
+// ZERO from step 0 -> the cup falls free of the open hand -> foot rows only, no
+// finger rows after separation -- the finger-class gap while the foot class is
+// live). The remaining envs carry BOTH classes at per-env distinct stance scales.
+// Each env must be BYTE-EXACT vs its OWN N=1 run (same IC + grip seams); adjacent
+// envs differ; D1 two-run byte-identity over the full N=8 trajectory.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1c_GraspStandUnion_N8_MixedDroppedAirborneIndependenceAndD1) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandScene(context);
+    ASSERT_EQ(sc.base_dof, 6u);
+    ASSERT_TRUE(sc.place.found);
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto drive = BuildGraspStanceDriveSet(sc);
+    for (const DriveLink& d : drive) ASSERT_NE(d.link, kInvalidLink);
+
+    constexpr uint32_t kEnvs = 8u;
+    constexpr uint32_t kRun = 80u;
+    constexpr uint32_t kDroppedEnv = 2u;   // grip killed from step 0 -> cup falls.
+    constexpr uint32_t kAirborneEnv = 6u;  // base+cup seated 0.8m high -> no foot rows.
+    // Per-env stance-target scales (grip targets are NOT scaled; envs 3 and 6 share
+    // scale 1.0 -- env 6 is distinct by its IC, the G1b pattern).
+    const std::vector<float> scales = {0.0f, 0.6f, 0.8f, 1.0f, 1.15f, 1.3f, 1.0f, 1.45f};
+    std::vector<uint8_t> grip_on(kEnvs, 1u);
+    grip_on[kDroppedEnv] = 0u;
+    Transform high_pose = sc.seat_pose;
+    high_pose.position.z += 0.8f;
+
+    // ---- (b) PER-ENV INDEPENDENCE ----
+    coresident::BatchedUnifiedWorld world(context, tmpl, kEnvs, kGravityZ, kDt);
+    world.SetGripperBasePose(kAirborneEnv, high_pose);
+    world.BodyMut(kAirborneEnv, 0u).position.z += 0.8f;  // the cup rides up with the hand.
+    CopCtl cop(context, sc, kEnvs);
+    uint32_t airborne_foot_rows = 0u;
+    std::vector<uint32_t> foot_steps(kEnvs, 0u), finger_steps(kEnvs, 0u);
+    uint32_t dropped_late_contacts = 0u;  // finger contacts in the dropped env's last 15.
+    for (uint32_t s = 0u; s < kRun; ++s) {
+        DrivePdBatched(world, sc, drive, scales, 0.0f, &cop, &grip_on);
+        world.Step();
+        for (uint32_t e = 0u; e < kEnvs; ++e) {
+            const auto& r = world.GraspReports()[e];
+            if (r.foot_normal_rows > 0u) ++foot_steps[e];
+            if (r.finger_contacts > 0u) ++finger_steps[e];
+        }
+        airborne_foot_rows += world.GraspReports()[kAirborneEnv].foot_normal_rows;
+        if (s >= kRun - 15u)
+            dropped_late_contacts += world.GraspReports()[kDroppedEnv].finger_contacts;
+    }
+    // The MIXED shape is REAL -- both gap kinds present:
+    //   * airborne env: ZERO foot rows the whole run (foot-class tile gap), finger
+    //     rows LIVE for the sustained majority (the hand holds the cup in free-fall);
+    //   * dropped env: feet loaded the sustained majority, finger contacts GONE by
+    //     the end (the cup separated and free-falls);
+    //   * every other env: BOTH classes for the sustained majority.
+    EXPECT_EQ(airborne_foot_rows, 0u)
+        << "the 'airborne' env touched the ground -- the foot-class gap is vacuous";
+    EXPECT_GE(finger_steps[kAirborneEnv], (kRun * 7u) / 10u)
+        << "the airborne env's hand lost the cup -- the finger-only shape is vacuous";
+    EXPECT_GE(foot_steps[kDroppedEnv], (kRun * 7u) / 10u)
+        << "the dropped-cup env's feet unloaded";
+    EXPECT_EQ(dropped_late_contacts, 0u)
+        << "the dropped env still has finger contacts at the end -- the cup never "
+           "separated (the grip kill is not reaching the drive)";
+    {
+        const EnvSnap sd = SnapBatched(world, kDroppedEnv);
+        EXPECT_LT(sd.cup.position.z, sc.cup0.position.z - 0.10f)
+            << "the dropped env's cup never fell";
+    }
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        if (e == kDroppedEnv || e == kAirborneEnv) continue;
+        EXPECT_GE(foot_steps[e], (kRun * 7u) / 10u)
+            << "env " << e << " (scale " << scales[e] << ") feet unloaded";
+        // The VIGOROUS per-env stance scales (the independence point: 0.0 straightens
+        // the legs, 1.45 over-bends) shake the marginal force-closure transiently at
+        // some scales -- MEASURED finger persistence across the both-classes envs:
+        // 80/68/80/80/53/80 of 80 (scales 0.0/0.6/1.0/1.15/1.3/1.45). The honest
+        // non-vacuity guard is a SUSTAINED MAJORITY (>50%) of the run, mirroring
+        // G1b's hop-and-reland allowance for the hard-driven feet; the byte-exact
+        // vs-own-N=1 check below is the REAL gate and is unconditional.
+        EXPECT_GE(finger_steps[e], kRun / 2u)
+            << "env " << e << " (scale " << scales[e] << ") lost the cup";
+    }
+
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        coresident::BatchedUnifiedWorld solo(context, tmpl, 1u, kGravityZ, kDt);
+        if (e == kAirborneEnv) {
+            solo.SetGripperBasePose(0u, high_pose);
+            solo.BodyMut(0u, 0u).position.z += 0.8f;
+        }
+        CopCtl solo_cop(context, sc, 1u);
+        const std::vector<float> solo_scale = {scales[e]};
+        const std::vector<uint8_t> solo_grip = {grip_on[e]};
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            DrivePdBatched(solo, sc, drive, solo_scale, 0.0f, &solo_cop, &solo_grip);
+            solo.Step();
+        }
+        EXPECT_TRUE(SnapByteEqual(SnapBatched(world, e), SnapBatched(solo, 0u)))
+            << "env " << e << " (N=8, scale " << scales[e]
+            << (e == kAirborneEnv ? ", AIRBORNE" : "")
+            << (e == kDroppedEnv ? ", CUP-DROPPED" : "")
+            << ") NOT byte-exact vs its own N=1 run -- env-major cross-contamination "
+               "through the COMPOSED union rows / per-class tile gaps";
+    }
+    for (uint32_t e = 1u; e < kEnvs; ++e) {
+        EXPECT_FALSE(SnapByteEqual(SnapBatched(world, e), SnapBatched(world, e - 1u)))
+            << "env " << e << " collapsed onto its neighbor";
+    }
+    std::printf("[G1c GATE-B] N=%u MIXED (env %u CUP-DROPPED, env %u AIRBORNE/finger-"
+                "only, 6 both-classes): every env byte-exact vs its own N=1 run; "
+                "foot_steps/finger_steps per env:", kEnvs, kDroppedEnv, kAirborneEnv);
+    for (uint32_t e = 0u; e < kEnvs; ++e)
+        std::printf(" %u/%u", foot_steps[e], finger_steps[e]);
+    std::printf(" (of %u)\n", kRun);
+
+    // ---- (c) D1 two-run byte-identity of the FULL N=8 trajectory ----
+    auto run = [&]() {
+        coresident::BatchedUnifiedWorld w(context, tmpl, kEnvs, kGravityZ, kDt);
+        w.SetGripperBasePose(kAirborneEnv, high_pose);
+        w.BodyMut(kAirborneEnv, 0u).position.z += 0.8f;
+        CopCtl run_cop(context, sc, kEnvs);
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            DrivePdBatched(w, sc, drive, scales, 0.0f, &run_cop, &grip_on);
+            w.Step();
+        }
+        std::vector<EnvSnap> out(kEnvs);
+        for (uint32_t e = 0u; e < kEnvs; ++e) out[e] = SnapBatched(w, e);
+        return out;
+    };
+    const auto a = run();
+    const auto b = run();
+    for (uint32_t e = 0u; e < kEnvs; ++e) {
+        EXPECT_TRUE(SnapByteEqual(a[e], b[e]))
+            << "D1: env " << e << " differed between two identical composed-union runs";
+    }
+    std::printf("[G1c GATE-C D1] N=%u: two identical composed-union rollouts (incl. "
+                "dropped-cup + airborne envs) byte-exact\n", kEnvs);
+}
+
+// ===========================================================================
+// G1c GATE (d) -- HONESTY/BITE (spec §3, the STANDING eval): kill the GRIP mid-
+// run while the stand drive continues -> the cup FALLS AWAY from the still-
+// standing robot. Phase 1 (120 steps): full drive, feet loaded + cup held.
+// Phase 2 (240 steps): grip torque -> 0 (the stance-hold + CoP law keep running)
+// -> the cup must drop far below the (still-up) hand, finger contacts -> 0,
+// while the base stays at stance height. Friction-only hold, no parenting/
+// scripting: a parented/scripted cup CANNOT fall while the hand stays up.
+// ===========================================================================
+TEST(BatchedH1UnionWorld, G1c_GraspStandUnion_MidRunGripKill_CupFallsRobotStands_BITE) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    UnionScene sc = BuildGraspStandScene(context);
+    ASSERT_TRUE(sc.place.found);
+    const auto tmpl = MakeUnionTemplate(sc);
+    const auto drive = BuildGraspStanceDriveSet(sc);
+    for (const DriveLink& d : drive) ASSERT_NE(d.link, kInvalidLink);
+
+    coresident::BatchedUnifiedWorld world(context, tmpl, 1u, kGravityZ, kDt);
+    CopCtl cop(context, sc, 1u);
+    const std::vector<float> one_scale = {1.0f};
+
+    // ----- phase 1: FULL DRIVE -- standing AND holding. ---------------------------
+    constexpr uint32_t kHeld = 120u;
+    for (uint32_t s = 0u; s < kHeld; ++s) {
+        DrivePdBatched(world, sc, drive, one_scale, 0.0f, &cop);
+        world.Step();
+        ASSERT_GT(world.GraspReports()[0].foot_normal_rows, 0u)
+            << "feet unloaded during the held phase at step " << s;
+        ASSERT_GT(world.GraspReports()[0].finger_contacts, 0u)
+            << "the cup left the hand during the held phase at step " << s;
+    }
+    const EnvSnap held = SnapBatched(world, 0u);
+    const float cup_z_held = held.cup.position.z;
+    const float base_z_held = held.base_pose.position.z;
+
+    // ----- phase 2: GRIP KILLED, stand drive continues. ---------------------------
+    constexpr uint32_t kDead = 240u;
+    const std::vector<uint8_t> grip_off = {0u};
+    uint32_t late_finger_contacts = 0u;
+    for (uint32_t s = 0u; s < kDead; ++s) {
+        DrivePdBatched(world, sc, drive, one_scale, 0.0f, &cop, &grip_off);
+        world.Step();
+        if (s >= kDead - 50u)
+            late_finger_contacts += world.GraspReports()[0].finger_contacts;
+    }
+    const EnvSnap dead = SnapBatched(world, 0u);
+
+    // The hand is still UP: read the live fingertip world z's (ExportObsState) and
+    // require the cup far below the LOWEST fingertip -- "falls away from the hand",
+    // not "hand and cup fell together".
+    coresident::ObsStateBatch obs;
+    world.ExportObsState(obs);
+    float min_tip_z = std::numeric_limits<float>::infinity();
+    for (size_t f = 0u; f * 3u + 2u < obs.fingertip_world_pos.size(); ++f)
+        min_tip_z = std::min(min_tip_z, obs.fingertip_world_pos[f * 3u + 2u]);
+
+    std::printf("[G1c GATE-D BITE] held(%u): cup_z=%.4f base_z=%.4f -> grip killed"
+                "(%u): cup_z=%.4f (drop %.3f m) base_z=%.4f min_fingertip_z=%.4f "
+                "late finger contacts=%u\n",
+                kHeld, cup_z_held, base_z_held, kDead, dead.cup.position.z,
+                cup_z_held - dead.cup.position.z, dead.base_pose.position.z, min_tip_z,
+                late_finger_contacts);
+    EXPECT_LT(dead.cup.position.z, cup_z_held - 0.5f)
+        << "the cup did NOT fall when the grip was killed -- the hold is not "
+           "friction-only (parenting/scripting/contact fakery: a FINDING)";
+    EXPECT_LT(dead.cup.position.z, min_tip_z - 0.4f)
+        << "the cup did not fall AWAY from the hand";
+    EXPECT_GT(dead.base_pose.position.z, sc.seat_pose.position.z - 0.2f)
+        << "the robot fell with the cup -- the stand did not survive the grip kill";
+    EXPECT_EQ(late_finger_contacts, 0u)
+        << "finger contacts persist long after the grip kill -- the cup is stuck "
+           "to the hand";
 }
