@@ -2393,6 +2393,50 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_dense_grasp_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- H1.1: the CHEAP SCRIPTED force-closure FEASIBILITY PROBE (GO/NO-GO) ---
+    # Answers ONE question for the RL-grasp track: does an HONEST force-closure grasp of
+    # the cup EXIST for the cooked H1 hand + sphere fingertips? Runs the CONJOINT honest
+    # gate -- in ONE scripted close, settle ACTIVE grip -> rotational disturbance ->
+    # bounded tilt (HOLD-rotation) AND grip->0 -> cup drops (BITE honesty) -- swept over
+    # cup{8.5,9.7,10.9}cm x wrap-depth{shallow,medium,deep} (the gap the prior 4 spikes
+    # left: they ran the gate fragments separately, at one config). Reuses the validated
+    # wrap/palm/curl scaffold (Fixed base, real armature 0.1/damping 1.0, PD close, table-
+    # removal LIFT) from the scaled-cup spike; mass faithful at 0.2kg. Additive parallel
+    # TU; the prior grasp gates are LEFT INTACT. Same dep set + contact_stream_driver.cpp.
+    add_executable(nuka_h1_grasp_feasibility_probe_test
+        coresident/test_h1_grasp_feasibility_probe.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_grasp_feasibility_probe_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_grasp_feasibility_probe_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_grasp_feasibility_probe_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_grasp_feasibility_probe_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_grasp_feasibility_probe_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
     # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
     # the right hand co-resides a movable cup + static table + N fingertip collidables
