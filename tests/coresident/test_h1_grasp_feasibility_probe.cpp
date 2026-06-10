@@ -722,12 +722,20 @@ void PrintRow(const CellResult& r) {
 
 struct Cell { float sxy; float sz; const char* tag; };
 // Size sweep at near-uniform scale (matching the dense GO's 1.8x/1.8 canonical). 1.4x ->
-// ~8.5cm, 1.6x -> ~9.7cm, 1.8x -> ~10.9cm. The minimum-size question: does the GO hold
-// down at the owner's 8-9cm allowance, or only at 10.9cm?
+// ~8.5cm, 1.6x -> ~9.7cm, 1.8x -> ~10.9cm. DOWNWARD answered the minimum-size question (GO
+// floor = 10.9cm; 8.5/9.7cm have NO shallow caging placement). H1.1b adds the UPWARD cells
+// {2.0,2.2x} = {~12.1, ~13.3cm}: the owner accepted ~10.9cm and blessed "up to ~12cm" for a
+// thicker RL target, so this characterizes whether the honest-grasp envelope WIDENS or
+// NARROWS going up -- a fixed finger arc-length covers a SMALLER angular fraction of a
+// larger cup, so coverage MAY drop back below 200deg and lose the cage at the TOP too. The
+// upward cells are MEASURED (GO/no-go reported), NOT hard-asserted; the hard EXPECT_TRUE
+// stays on the proven 10.9cm cell so the gate is green regardless of the upward trend.
 const std::vector<Cell> kCells = {
     {1.4f, 1.4f, "8.5cm"},
     {1.6f, 1.6f, "9.7cm"},
     {1.8f, 1.8f, "10.9cm"},
+    {2.0f, 2.0f, "12.1cm"},
+    {2.2f, 2.2f, "13.3cm"},
 };
 
 }  // namespace
@@ -801,21 +809,27 @@ TEST(H1GraspFeasibilityProbe, ConjointHonestGateVerdict) {
                             r.tag.c_str(), r.cup_diam * 100.0f, r.seat_pen * 1000.0f,
                             r.peak_disp, r.peak_tilt, r.final_w, r.bite_drop, r.free_fall,
                             r.bite_vz);
+        double proven_gap = 0.0;
+        for (const auto& r : results) if (r.tag == "10.9cm") proven_gap = (double)r.max_gap;
         std::printf("[VERDICT]   NOTE: the GO is an opposed 2-sided ACTIVE wrap (gap ~"
                     "%.0f deg, NOT a >180deg geometric cage); the dense spike's "
                     "FingerOnlyFallbackLiftGate SKIP is a stricter distributed-cage arc "
                     "metric, NOT a force-closure-feasibility test. This probe's "
                     "ForceClosureLift-style disturbance gate is the feasibility measure.\n",
-                    results.empty() ? 0.0 : (double)results.back().max_gap);
-        // Assert the largest size (the validated dense GO config) genuinely threads both,
-        // so the controller's re-run is a GREEN gate (not a SKIP) on the proven config.
-        const CellResult& large = results.back();
-        EXPECT_TRUE(large.placement_found) << "10.9cm finger-only placement vanished";
-        EXPECT_TRUE(large.hold_gravity) << "10.9cm did not hold the weight after table removal";
-        EXPECT_TRUE(large.hold_rotation) << "10.9cm pivoted/flew out under the worst-case "
-                                            "disturbance (disp/tilt/|w| over bound)";
-        EXPECT_TRUE(large.grip_on_holds) << "10.9cm grip-on did not hold";
-        EXPECT_TRUE(large.bite_drops) << "10.9cm grip=0 did NOT drop -> PASSIVE WEDGE (fake)";
+                    proven_gap);
+        // Assert the PROVEN 10.9cm cell (the validated dense GO config) genuinely threads
+        // both gates, so the controller's re-run is a GREEN gate (not a SKIP) on the proven
+        // config -- found BY TAG, not results.back(), so the H1.1b upward cells may report
+        // no-go (envelope narrowing) without flipping this hard assertion.
+        const CellResult* proven = nullptr;
+        for (const auto& r : results) if (r.tag == "10.9cm") proven = &r;
+        ASSERT_NE(proven, nullptr) << "10.9cm cell missing from the sweep";
+        EXPECT_TRUE(proven->placement_found) << "10.9cm finger-only placement vanished";
+        EXPECT_TRUE(proven->hold_gravity) << "10.9cm did not hold the weight after table removal";
+        EXPECT_TRUE(proven->hold_rotation) << "10.9cm pivoted/flew out under the worst-case "
+                                              "disturbance (disp/tilt/|w| over bound)";
+        EXPECT_TRUE(proven->grip_on_holds) << "10.9cm grip-on did not hold";
+        EXPECT_TRUE(proven->bite_drops) << "10.9cm grip=0 did NOT drop -> PASSIVE WEDGE (fake)";
         return;
     }
 
