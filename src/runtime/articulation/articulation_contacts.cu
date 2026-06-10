@@ -428,14 +428,20 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
 }
 
 // (2) Per-articulation unpivoted LDL^T of the leading dof_count block, then the
-// explicit symmetric inverse. One block, single lane. Local scratch is sized for
-// the Go2's 12 DOF (and any articulation up to kMaxFactorDof).
-constexpr uint32_t kMaxFactorDof = 18u;  // 6-DOF floating base + 12 revolute.
+// explicit symmetric inverse. One block, single lane. Scratch is sized for the
+// engine DOF ceiling (kMaxArticulationDof = 64, the ~51-DOF whole-body H1 with
+// headroom). The dense dof x dof scratch lives in STATIC SHARED memory (16KB
+// per block, well under the 48KB static budget) rather than per-thread local:
+// the block launches 32 lanes but only lane 0 works, and a 16KB per-thread
+// local frame would make the driver reserve lmem for every resident thread.
+constexpr uint32_t kMaxFactorDof = kMaxArticulationDof;
 
 __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
                                                  uint32_t max_dof,
                                                  const float* inertia_M,
                                                  float* out_inertia_M_inv) {
+    __shared__ float a[kMaxFactorDof * kMaxFactorDof];
+
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -448,8 +454,17 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
     for (uint32_t local = 0u; local < count; ++local) {
         dof += JointDofCountDevice(state.joint_type[offset + local]);
     }
-    if (dof > kMaxFactorDof) {
-        dof = kMaxFactorDof;
+    if (dof > max_dof) {
+        // Defensive MEMORY-SAFETY bound only, NOT a truncation policy: the M
+        // tile holds just the leading max_dof block (there is nothing beyond
+        // it to invert), every production caller passes max_dof == the
+        // articulation's exact DOF count (BatchedArticulatedWorld asserts
+        // equality at construction; the coresident worlds compute dof_stride
+        // from ArticulationDofCount), and the host launcher rejects
+        // max_dof > kMaxArticulationDof with a LOUD throw. Unreachable via
+        // host-validated inputs -- the old silent 18-clamp (which WELDED real
+        // DOFs of >18-DOF articulations) is gone.
+        dof = max_dof;
     }
 
     const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
@@ -462,8 +477,7 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
         return;
     }
 
-    // Copy the leading dof x dof block into dense local scratch.
-    float a[kMaxFactorDof * kMaxFactorDof];
+    // Copy the leading dof x dof block into the dense (shared) scratch.
     for (uint32_t r = 0u; r < dof; ++r) {
         for (uint32_t c = 0u; c < dof; ++c) {
             a[r * kMaxFactorDof + c] = M[static_cast<size_t>(r) * max_dof + c];
@@ -697,15 +711,15 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     // a value < 6 is base component k; kInvalidLink marks a scalar joint DOF held
     // in state.qdot[link]. The expansion is gated on FloatingBase, so a fixed root
     // yields the exact same one-entry-per-link map as before (byte-identical solve).
-    uint32_t dof_to_link[kMaxContactSolverDof];
-    uint32_t dof_to_component[kMaxContactSolverDof];
+    uint32_t dof_to_link[kMaxArticulationDof];
+    uint32_t dof_to_component[kMaxArticulationDof];
     uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count && dof < kMaxContactSolverDof; ++local) {
+    for (uint32_t local = 0u; local < count && dof < kMaxArticulationDof; ++local) {
         const uint32_t link = offset + local;
         const ArticulationJointType type = state.joint_type[link];
         if (local == 0u && state.parent_link[link] == kInvalidLink &&
             type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u && dof < kMaxContactSolverDof; ++b) {
+            for (uint32_t b = 0u; b < 6u && dof < kMaxArticulationDof; ++b) {
                 dof_to_link[dof] = link;
                 dof_to_component[dof] = b;
                 ++dof;
@@ -724,7 +738,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
 
     // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
     // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
-    float qdot_work[kMaxContactSolverDof];
+    float qdot_work[kMaxArticulationDof];
     for (uint32_t k = 0u; k < dof; ++k) {
         if (dof_to_component[k] != kInvalidLink) {
             qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
@@ -751,7 +765,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     // co-resolved consistently. Unconditionally stable: replaces the explicit
     // -Kd*qdot that buzzed at coarse dt. joint_damping==nullptr -> exact prior path.
     if (joint_damping != nullptr && dt > 0.0f) {
-        float c_qdot[kMaxContactSolverDof];
+        float c_qdot[kMaxArticulationDof];
         for (uint32_t k = 0u; k < dof; ++k) {
             const float c = (dof_to_component[k] == kInvalidLink)
                                 ? joint_damping[dof_to_link[k]]
@@ -1019,15 +1033,15 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
     // link_velocity[root].v, scalar joints tagged kInvalidLink living in
     // state.qdot). Gated on FloatingBase, so a fixed root yields the exact
     // one-entry-per-link map (byte-identical to the solve kernel).
-    uint32_t dof_to_link[kMaxContactSolverDof];
-    uint32_t dof_to_component[kMaxContactSolverDof];
+    uint32_t dof_to_link[kMaxArticulationDof];
+    uint32_t dof_to_component[kMaxArticulationDof];
     uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count && dof < kMaxContactSolverDof; ++local) {
+    for (uint32_t local = 0u; local < count && dof < kMaxArticulationDof; ++local) {
         const uint32_t link = offset + local;
         const ArticulationJointType type = state.joint_type[link];
         if (local == 0u && state.parent_link[link] == kInvalidLink &&
             type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u && dof < kMaxContactSolverDof; ++b) {
+            for (uint32_t b = 0u; b < 6u && dof < kMaxArticulationDof; ++b) {
                 dof_to_link[dof] = link;
                 dof_to_component[dof] = b;
                 ++dof;
@@ -1046,7 +1060,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
 
     // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
     // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
-    float qdot_work[kMaxContactSolverDof];
+    float qdot_work[kMaxArticulationDof];
     for (uint32_t k = 0u; k < dof; ++k) {
         if (dof_to_component[k] != kInvalidLink) {
             qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
@@ -1068,7 +1082,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
     // C is diagonal (c_j = joint_damping[link] on scalar joint DOFs, 0 on the free
     // floating-base DOFs). joint_damping==nullptr || dt<=0 -> exact prior path.
     if (joint_damping != nullptr && dt > 0.0f) {
-        float c_qdot[kMaxContactSolverDof];
+        float c_qdot[kMaxArticulationDof];
         for (uint32_t k = 0u; k < dof; ++k) {
             const float c = (dof_to_component[k] == kInvalidLink)
                                 ? joint_damping[dof_to_link[k]]
@@ -1230,6 +1244,16 @@ void FactorArticulationInertiaM(const phi::DeviceContext& context,
     if (state.articulation_count == 0u || max_dof == 0u) {
         return;
     }
+    // G0 honesty: the factorization scratch is sized kMaxArticulationDof; beyond
+    // it we FAIL LOUDLY here instead of letting the kernel truncate (the old
+    // silent 18-clamp welded every DOF past the cap).
+    if (max_dof > kMaxArticulationDof) {
+        throw std::runtime_error(
+            "FactorArticulationInertiaM: max_dof (" + std::to_string(max_dof) +
+            ") exceeds kMaxArticulationDof (" +
+            std::to_string(kMaxArticulationDof) +
+            "); raising the ceiling requires resizing the factor kernel scratch");
+    }
     if (inertia_M == nullptr || out_inertia_M_inv == nullptr) {
         throw std::runtime_error(
             "FactorArticulationInertiaM requires device input and output buffers");
@@ -1251,9 +1275,11 @@ void ApplyImplicitJointDamping(const phi::DeviceContext& context,
     if (state.articulation_count == 0u || dof_stride == 0u) {
         return;
     }
-    if (dof_stride > kMaxContactSolverDof) {
+    if (dof_stride > kMaxArticulationDof) {
         throw std::runtime_error(
-            "ApplyImplicitJointDamping: dof_stride exceeds kMaxContactSolverDof");
+            "ApplyImplicitJointDamping: dof_stride (" + std::to_string(dof_stride) +
+            ") exceeds kMaxArticulationDof (" +
+            std::to_string(kMaxArticulationDof) + ")");
     }
     if (inertia_M_inv == nullptr) {
         throw std::runtime_error(
@@ -1383,9 +1409,11 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
     if (state.articulation_count == 0u || env_count == 0u || dof_stride == 0u) {
         return;
     }
-    if (dof_stride > kMaxContactSolverDof) {
+    if (dof_stride > kMaxArticulationDof) {
         throw std::runtime_error(
-            "SolveArticulatedContactRows: dof_stride exceeds kMaxContactSolverDof");
+            "SolveArticulatedContactRows: dof_stride (" + std::to_string(dof_stride) +
+            ") exceeds kMaxArticulationDof (" +
+            std::to_string(kMaxArticulationDof) + ")");
     }
     if (rows == nullptr || normal_jacobian == nullptr ||
         tangent1_jacobian == nullptr || tangent2_jacobian == nullptr ||

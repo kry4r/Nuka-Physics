@@ -1461,6 +1461,31 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_articulation_inertia_m_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- v0.8 SG G0: DOF honesty above 18 (whole-body H1 precondition) -------
+    # Synthetic >18-DOF chains: M^-1 factorization covers the FULL dof block,
+    # m_eff uses the full chain-J, implicit damping reaches DOF>18, and beyond
+    # kMaxArticulationDof the launchers fail LOUDLY (never a silent clamp).
+    add_executable(nuka_dof_above18_honesty_test
+        runtime/test_dof_above18_honesty.cpp
+    )
+
+    target_compile_definitions(nuka_dof_above18_honesty_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_link_libraries(nuka_dof_above18_honesty_test
+        PRIVATE
+            nuka_runtime
+            nuka_import
+            nuka_articulation_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_dof_above18_honesty_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- v0.8 C4c: reaction providers (rigid invM / chain-J / particle invM) -
     # Validates the NEW, VALIDATED-NOT-WIRED src/constraint/reaction_provider.hpp
     # §0.5 interface: a 1-DOF pendulum chain-J vs a hand-computed J M^-1 J^T (with

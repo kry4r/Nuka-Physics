@@ -37,6 +37,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace nuka::runtime::coresident {
@@ -64,6 +66,21 @@ using nuka::math::Quat;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 using nuka::runtime::rigid::BodyState;
+
+// G0 honesty: the contact-solve spine's factorization / PGS working storage is
+// sized kMaxArticulationDof. Reject a bigger articulation at CONSTRUCTION with a
+// clear error (the pre-G0 path silently truncated everything past DOF 18).
+uint32_t ValidatedDofStride(const articulation::ArticulationHostState& host) {
+    const uint32_t dof = articulation::ArticulationDofCount(host, 0u);
+    if (dof > articulation::kMaxArticulationDof) {
+        throw std::runtime_error(
+            "UnifiedCoResidentStepper: articulation DOF count (" +
+            std::to_string(dof) + ") exceeds kMaxArticulationDof (" +
+            std::to_string(articulation::kMaxArticulationDof) +
+            "); the contact-solve spine cannot factor/solve it");
+    }
+    return dof;
+}
 
 // Download the live FK world poses of every link from the current device state.
 std::vector<Transform> DownloadWorldPoses(const nuka::phi::DeviceContext& context,
@@ -227,7 +244,7 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
       gravity_z_(gravity_z),
       dt_(dt) {
     device_ = articulation::UploadArticulationState(context_, host_proto_);
-    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    dof_stride_ = ValidatedDofStride(host_proto_);
     root_link_ = host_proto_.articulation_link_offset[0];
     base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
 }
@@ -249,7 +266,7 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
       grasp_mode_(true),
       grasp_(grasp) {
     device_ = articulation::UploadArticulationState(context_, host_proto_);
-    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    dof_stride_ = ValidatedDofStride(host_proto_);
     root_link_ = host_proto_.articulation_link_offset[0];
     base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
 
@@ -286,7 +303,7 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
       stand_mode_(true),
       stand_(stand) {
     device_ = articulation::UploadArticulationState(context_, host_proto_);
-    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    dof_stride_ = ValidatedDofStride(host_proto_);
     root_link_ = host_proto_.articulation_link_offset[0];
     base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
 
@@ -321,7 +338,7 @@ UnifiedCoResidentStepper::UnifiedCoResidentStepper(
       stand_grasp_mode_(true),
       stand_grasp_(stand_grasp) {
     device_ = articulation::UploadArticulationState(context_, host_proto_);
-    dof_stride_ = articulation::ArticulationDofCount(host_proto_, 0u);
+    dof_stride_ = ValidatedDofStride(host_proto_);
     root_link_ = host_proto_.articulation_link_offset[0];
     base_dof_ = articulation::ArticulationJointDofCount(host_proto_.joint_type[root_link_]);
 

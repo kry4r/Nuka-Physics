@@ -579,9 +579,19 @@ void LaunchApplyComputedTorqueDriveKernels(const phi::DeviceContext& context,
     // articulation (lane 0 owns the dense joint-block solve), matching the CRBA
     // kernel.
     if (state.articulation_count == 0u || max_dof == 0u ||
-        max_dof > kMaxContactSolverDof || inertia_M_inv == nullptr ||
-        qddot_free == nullptr || q_target == nullptr) {
+        inertia_M_inv == nullptr || qddot_free == nullptr ||
+        q_target == nullptr) {
         return;
+    }
+    // G0 honesty: the ComputedTorque scratch is pinned at kMaxContactSolverDof
+    // (18, in lockstep with its diffsim adjoint tiles); beyond it FAIL LOUDLY
+    // instead of the old silent drive no-op.
+    if (max_dof > kMaxContactSolverDof) {
+        throw std::runtime_error(
+            "LaunchApplyComputedTorqueDriveKernels: max_dof (" +
+            std::to_string(max_dof) + ") exceeds kMaxContactSolverDof (" +
+            std::to_string(kMaxContactSolverDof) +
+            "), the ComputedTorque drive scratch cap");
     }
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
@@ -621,9 +631,18 @@ void LaunchApplyOscDriveKernels(const phi::DeviceContext& context,
     // a no-op (tau left as-is). One block per articulation (lane 0 owns the dense
     // task-Jacobian build + 3x3 solve), matching the ComputedTorque / CRBA grid.
     if (state.articulation_count == 0u || max_dof == 0u ||
-        max_dof > kMaxContactSolverDof || inertia_M_inv == nullptr ||
-        task_target == nullptr) {
+        inertia_M_inv == nullptr || task_target == nullptr) {
         return;
+    }
+    // G0 honesty: the Osc task-Jacobian scratch is pinned at kMaxContactSolverDof
+    // (18, in lockstep with the diffsim osc_adjoint tiles); beyond it FAIL LOUDLY
+    // instead of the old silent drive no-op.
+    if (max_dof > kMaxContactSolverDof) {
+        throw std::runtime_error(
+            "LaunchApplyOscDriveKernels: max_dof (" + std::to_string(max_dof) +
+            ") exceeds kMaxContactSolverDof (" +
+            std::to_string(kMaxContactSolverDof) +
+            "), the Osc drive scratch cap");
     }
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();

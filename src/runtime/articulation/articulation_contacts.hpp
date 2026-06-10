@@ -140,7 +140,10 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
 // inverse. `inertia_M` is the buffer ComputeArticulationInertiaM filled (read
 // only). `out_inertia_M_inv` is a device buffer of the same layout/length; each
 // tile holds the symmetric M^-1 in its leading dof_count x dof_count block,
-// zero-padded beyond. One block per articulation.
+// zero-padded beyond. One block per articulation. `max_dof` must be <=
+// kMaxArticulationDof (the factor scratch ceiling) AND equal every
+// articulation's exact DOF count; exceeding the ceiling throws LOUDLY here
+// (G0: never a silent clamp -- the old 18-cap silently welded DOFs past it).
 void FactorArticulationInertiaM(const phi::DeviceContext& context,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
@@ -289,8 +292,27 @@ struct ArticulatedContactRow {
     math::Vec3 tangent2{};         // world friction tangent 2 (= n x t1).
 };
 
-// Maximum DOFs per articulation supported by the on-thread PGS working vectors.
-// 6-DOF floating base + 12 revolute = 18 (matches the factorization's cap).
+// Engine-wide articulation DOF ceiling for the contact-solve spine's working
+// storage: the M^-1 factorization scratch, the on-thread PGS working vectors
+// (dof_to_link / qdot_work), and the implicit-joint-damping working vectors.
+// 64 = clean headroom over the ~51-DOF whole-body H1 (6-DOF floating base +
+// ~45 scalar joints) whose FINGER-contact chain DOF indices exceed the old 18
+// cap. G0 honesty contract: exceeding this ceiling is a LOUD host-side failure
+// (the launchers throw; the coresident worlds reject at construction) -- NEVER
+// a silent clamp. Raising the array sizes does not change any float op for
+// articulations within the old cap, so all <=18-DOF results stay byte-identical.
+constexpr uint32_t kMaxArticulationDof = 64u;
+
+// LEGACY 18-DOF cap (6-DOF floating base + 12 revolute = the Go2). The contact
+// solve itself now sizes by kMaxArticulationDof above; this constant remains
+// ONLY for its named consumers whose scratch is genuinely pinned at 18:
+//   * BatchedArticulatedWorld's construction gate (legacy world, Go2-shaped),
+//   * the ComputedTorque/Osc drive kernels' dense scratch (articulation_drives.cu)
+//     -- which must stay in lockstep with their diffsim adjoint,
+//   * the diffsim KKT/IFT/Osc-adjoint __shared__ tiles (kkt_builder.cu /
+//     ift_runner.cu / osc_adjoint.cu), where 64-wide double tiles would not fit
+//     the 48KB static shared-memory budget.
+// All of those consumers fail LOUDLY (throw / construction error) beyond it.
 constexpr uint32_t kMaxContactSolverDof = 18u;
 
 // Assemble the per-active-contact row set from the T2/T3/T4 outputs. Inputs are
