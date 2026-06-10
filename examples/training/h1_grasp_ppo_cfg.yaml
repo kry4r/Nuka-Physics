@@ -1,0 +1,91 @@
+# rl_games (1.6.5) PPO config for the Nuka H1 fixed-base 2-finger cup-grasp task
+# (A4 -- PPO plumbing). Continuous control, like go2/h1_stand.
+#
+# Locked contract (from H1GraspEnv / h1_grasp_obs):
+#   env_name: nuka_h1_grasp   (resolves via the nuka.rl_games adapter on import)
+#   obs:      27-wide privileged grasp obs (h1_grasp_obs.assemble_obs)
+#   action:   2 normalized per-finger drive forces in [-1,1]
+#             (ACTION_SPACE_LIMIT == 1.0; rl_games clip_actions rescales the
+#              policy [-1,1] output onto these bounds, x FINGER_FORCE_SCALE=12 N
+#              in the env -> the proven ~8 N hold is reachable mid-range).
+#
+# Keeps the Go2/H1-stand anti-collapse settings that matter to rl_games: unit
+# action bounds, entropy_coef, adaptive KL, value_bootstrap (consumes the env's
+# info['time_outs']), normalized input/value. Short smoke overrides come through
+# train_h1_grasp_ppo.py --smoke.
+#
+# env_config IS INTENTIONALLY EMPTY: every H1GraspEnv default is the validated A3
+# IC (dt=1/240, decimation=1, episode_length=220, cup_start_z_offset=0.06,
+# termination_z=0.12). H1GraspEnv.__init__ has NO **kwargs catch-all, so any stray
+# key (e.g. a locomotion termination_height / episode_length_s) would be a hard
+# TypeError at env construction -- so we set nothing here.
+params:
+  seed: 1
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [256, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: h1_grasp
+    full_experiment_name: h1_grasp
+    env_name: nuka_h1_grasp
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-3
+    lr_schedule: adaptive
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 1500
+    save_best_after: 100
+    save_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.01
+    truncate_grads: True
+    e_clip: 0.2
+    # 220-step episode -> horizon 22 tiles it cleanly (10 rollouts/episode). The
+    # full-run minibatch = num_actors*horizon/4 = 4096*22/4 = 22528. (Smoke
+    # overrides horizon/num_actors/minibatch via train_h1_grasp_ppo.py.)
+    horizon_length: 22
+    num_actors: 4096
+    minibatch_size: 22528
+    mini_epochs: 5
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0001
+
+    # See header: empty on purpose -- all H1GraspEnv defaults are the validated A3 IC.
+    env_config: {}
