@@ -132,6 +132,23 @@ struct BatchedSceneTemplate {
     float    friction_mu = 0.6f;
     uint32_t condim      = 3u;
 
+    // ----- G1b UNION: feet x static-ground rows (inert unless has_feet) -----------
+    // ADDITIVE; inert by default (has_feet=false -> NO foot pair is ever emitted, so
+    // every existing template path is byte-for-byte unchanged). When enabled, the grasp
+    // branch ALSO emits foot-sphere x ground-plane rows (the oracle StepStandGrasp's
+    // foot row class: ArticulationChainJ <-> StaticNull) into the SAME per-env append ->
+    // one-solve loop as the finger rows. Feet are authored ankle contact spheres (the
+    // fingertip pattern, spec §4); the foot narrowphase is HOST emission (~4 spheres/env
+    // on the trivial C3b SpherePlane -- a GPU foot kernel is the NAMED G1f deferral,
+    // gated on a measured throughput finding). Gated on has_feet (NOT a new has_union
+    // flag) so the G1 increments compose (G1b feet, G1c fingers+cup, G1d table).
+    // Requires has_grasp (the articulation lives there); has_feet without has_grasp is a
+    // LOUD construction error, never a silent no-op.
+    bool                              has_feet = false;   // false -> no foot pair emitted.
+    std::vector<CoResidentFootSphere> feet;               // authored ankle spheres (toe/heel).
+    CoResidentGround                  ground;             // static +Z plane (height + bp id).
+    float                             foot_mu = 0.8f;     // per-foot isotropic friction.
+
     // ----- A5a: per-axis cup RESET JITTER half-box (m), read by ResetEnvs ----------
     // ResetEnvs perturbs each reset cup's X by +/-reset_jitter_x and its Y by
     // +/-reset_jitter_y (independent uniform draws, X then Y, per-env mt19937_64).
@@ -152,7 +169,10 @@ struct BatchedSceneTemplate {
 struct BatchedGraspEnvReport {
     uint32_t finger_contacts = 0u;        // # cup<->fingertip manifold points this step.
     uint32_t finger_row_count = 0u;       // # finger contact rows (normal + spokes).
-    bool     any_static_row = false;      // a row carried a StaticNull side (a table!).
+    bool     any_static_row = false;      // a row carried a StaticNull side (the P2.3a
+                                          // NO-TABLE gate's tripwire; with G1b feet the
+                                          // foot<->ground rows set it too, mirroring the
+                                          // oracle StepStandGrasp :1622).
     double   cup_vertical_impulse = 0.0;  // Σ over finger rows of λ * j_cup.linear.z.
     double   cup_dvz_impulse = 0.0;       // m_cup * (vz_after_solve - vz_pre_contact).
     double   cup_vz = 0.0;                // cup vertical velocity AFTER this step.
@@ -166,6 +186,13 @@ struct BatchedGraspEnvReport {
     // chain-J slot belongs to; the solver is NOT touched. Indexed by fingertip order
     // (size == num_fingertips); Σ over fingers == max-style aggregate cross-check.
     std::vector<float> finger_normal_impulse;  // per-fingertip normal-row impulse (>=0).
+    // ----- G1b UNION: the foot<->ground standing-support fields (the oracle's S3
+    // stand fields, CoResidentStepReport hpp:141-142, classified by (react,react)
+    // exactly as StepStandGrasp :1730-1738). Zero unless the template has has_feet.
+    // At a quasi-static stance foot_normal_impulse_sum balances m_total*g*dt -- the
+    // G1b force-balance gate number.
+    double   foot_normal_impulse_sum = 0.0;  // Σ over foot NORMAL rows of λ this step.
+    uint32_t foot_normal_rows = 0u;          // # foot NORMAL rows (== foot contact count).
 };
 
 // ----- A1 RL substrate: the batched per-step OBS readout (the throughput-critical piece) ---
@@ -250,6 +277,16 @@ public:
     // link_velocity). For per-env byte/tolerance comparison of the gripper joints. A
     // no-op (leaves *out unchanged) when !has_grasp_ or env >= env_count_.
     void DownloadGripper(uint32_t env, articulation::ArticulationHostState* out) const;
+
+    // ----- G1b: per-env FLOATING-BASE initial-condition seam ----------------------
+    // Overwrite env e's articulation base pose on the consolidated env-major device
+    // (base_pose[e]; the FloatingBase root's live transform). The articulation analog
+    // of BodyMut(): per-env IC setup BEFORE stepping (e.g. the G1b MIXED gate seats one
+    // env's base high so its feet never touch -- the foot-airborne tile-gap env; the
+    // future RL reset randomizes base ICs through the same seam). One bulk
+    // download-modify-upload of the base_pose buffer, OFF the per-step path. No-op when
+    // !has_grasp_ or env >= env_count_. NOT called by any pre-G1b path -> byte-compat.
+    void SetGripperBasePose(uint32_t env, const math::Transform& pose);
     // Convenience: env 0 (the N=1 case). Keeps the existing A1/A2 call sites unchanged.
     void DownloadGripper(articulation::ArticulationHostState* out) const {
         DownloadGripper(0u, out);
@@ -328,6 +365,14 @@ private:
     uint32_t   link_count_  = 0u;   // per-env (single-articulation) gripper link count.
     float      friction_mu_ = 0.6f;
     uint32_t   condim_      = 3u;
+    // ----- G1b UNION: feet x static-ground (inert unless has_feet_) ----------------
+    // Captured verbatim from the template. The per-env foot emission lives in the grasp
+    // branch (the feet share the env's articulation); has_feet_ without has_grasp_ is
+    // rejected LOUDLY at construction (a silent no-op would be a dishonest scene).
+    bool       has_feet_ = false;
+    std::vector<CoResidentFootSphere> feet_;       // authored ankle spheres.
+    CoResidentGround foot_ground_;                 // static +Z plane (height + bp id).
+    float      foot_mu_ = 0.8f;                    // per-foot isotropic friction.
     // A5a: the LIVE per-axis cup reset-jitter half-box (m), captured from the scene
     // template. ResetEnvs draws X within +/-reset_jitter_x_ then Y within
     // +/-reset_jitter_y_. Both default to kDefaultResetCupJitterM -> the legacy

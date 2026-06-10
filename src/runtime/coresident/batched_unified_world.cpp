@@ -171,6 +171,16 @@ constexpr uint32_t kGroundHandle = 8000u;  // distinct from the box handle.
 // NOTE (P2.4c): the host FootSpherePrim helper was removed -- the grasp narrowphase now
 // builds the fingertip sphere prim INSIDE the GPU kernel (narrowphase_grasp.cu), from the
 // per-slot fingertip world center + radius. The ground path (box x plane) never used it.
+// G1b RE-ADDS it for the FOOT-sphere x ground-plane HOST narrowphase (the union's feet
+// rows; ~4 spheres/env on the trivial C3b SpherePlane -- brief §3.3 keeps this on the
+// host; a GPU foot kernel is the NAMED G1f deferral). Byte-for-byte the oracle's helper
+// (unified_coresident_stepper.cpp ~:171).
+amf::PrimParams FootSpherePrim(const Vec3& center, float radius) {
+    amf::PrimParams p;
+    p.radius = radius;
+    p.frame.t = center;  // identity rotation; sphere is rotation-invariant.
+    return p;
+}
 
 }  // namespace
 
@@ -193,6 +203,10 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
       cup_local_index_(scene_template.cup_local_index),
       friction_mu_(scene_template.friction_mu),
       condim_(scene_template.condim),
+      has_feet_(scene_template.has_feet),
+      feet_(scene_template.feet),
+      foot_ground_(scene_template.ground),
+      foot_mu_(scene_template.foot_mu),
       reset_jitter_x_(scene_template.reset_jitter_x),
       reset_jitter_y_(scene_template.reset_jitter_y),
       fingertips_(scene_template.fingertips),
@@ -207,6 +221,16 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
         for (uint32_t i = 0u; i < bodies_per_env_; ++i) {
             bodies_.push_back(scene_template.bodies_per_env[i]);
         }
+    }
+
+    // ----- G1b UNION honesty: feet ride the grasp branch (they share the env's
+    // articulation). A has_feet template without has_grasp would be SILENTLY inert --
+    // reject it LOUDLY at construction, never a no-op scene.
+    if (has_feet_ && !has_grasp_) {
+        throw std::runtime_error(
+            "BatchedUnifiedWorld: has_feet requires has_grasp (the feet contact the "
+            "ground through the env's articulation; a feet-only template would be "
+            "silently inert)");
     }
 
     // ----- P2.3a/P2.3b: stand up ONE gripper articulation device PER ENV (inert unless
@@ -236,6 +260,19 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
             articulation::ArticulationJointDofCount(gripper_proto_.joint_type[root_link_]);
         link_count_ = gripper_proto_.TotalLinkCount();   // per-env (single-articulation) links.
         base_link_count_ = link_count_;                  // replica stride in the consolidated state.
+
+        // G1b: validate the authored foot spheres against the proto (a foot on a
+        // non-existent link would read out-of-range FK poses -- fail LOUDLY here).
+        if (has_feet_) {
+            for (const CoResidentFootSphere& fs : feet_) {
+                if (fs.link >= link_count_) {
+                    throw std::runtime_error(
+                        "BatchedUnifiedWorld: foot sphere link " +
+                        std::to_string(fs.link) + " out of range (proto has " +
+                        std::to_string(link_count_) + " links)");
+                }
+            }
+        }
 
         // ----- P2.4b: ONE consolidated env-major device-resident multi-gripper state -----
         // REPLACES the P2.3b per-env std::vector<ArticulationDeviceBuffers> (the per-finger-
@@ -355,6 +392,23 @@ void BatchedUnifiedWorld::DownloadGripper(
     // base_pose is per-articulation (one entry / env); copy env e's single base pose.
     if (env < all.base_pose.size() && !out->base_pose.empty())
         out->base_pose[0] = all.base_pose[env];
+}
+
+// ===========================================================================
+// G1b: per-env FLOATING-BASE initial-condition seam (the articulation BodyMut).
+// ===========================================================================
+void BatchedUnifiedWorld::SetGripperBasePose(uint32_t env,
+                                             const math::Transform& pose) {
+    if (!has_grasp_ || env >= env_count_) return;
+    // ONE bulk download-modify-upload of the env-major base_pose buffer (one Transform
+    // per articulation == per env). OFF the per-step path: an IC-setup seam, called
+    // before stepping (the G1b MIXED gate / future RL base-IC randomization).
+    std::vector<Transform> base(env_count_);
+    env_device_.base_pose.CopyToHost(base.data(), base.size() * sizeof(Transform));
+    context_.stream.Synchronize();
+    base[env] = pose;
+    env_device_.base_pose.CopyFromHost(base.data(), base.size() * sizeof(Transform));
+    context_.stream.Synchronize();
 }
 
 // ===========================================================================
@@ -812,7 +866,8 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         cup_vz_pre_contact[e] = cup.linear_velocity.z;
     }
 
-    // ===== CONTACT PHASE (fingertips <-> cup, NO table) ======================
+    // ===== CONTACT PHASE (the UNION: feet x ground [G1b, host SpherePlane] +
+    // fingertips x cup [GPU sphere x hull]; cup x table joins in G1d) ==========
     // Slice the ONE consolidated host download (all_live / all_poses, taken ONCE above) into a
     // per-env single-articulation host snapshot (env e's links [e*base_link_count_, ...)). The
     // rest of the per-env loop (narrowphase, row assembly, qdot pack) reads env_live[e] /
@@ -975,41 +1030,112 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         const uint32_t art_index = e;  // env e's articulation index (the M^-1/qdot key).
         BodyState& cup = bodies_[BodyIndex(e, cup_local_index_)];
 
-        if (grasp_cup_.VertexCount() == 0u) continue;  // no cup geometry -> no contact this env.
+        // ----- G1b: per-env FOOT-sphere x static-ground HOST narrowphase. ------------
+        // The union's feet rows (oracle StepStandGrasp drive_pairs :1420-1430: feet
+        // FIRST, then fingers -- the manifold/row order below preserves that). DIRECT-
+        // EMIT one (foot=ArticulationChainJ, ground=StaticNull) pair per authored ankle
+        // sphere at its FK world center, resolved through the SAME host
+        // BuildContactManifolds (C3b SpherePlane) the oracle runs -- byte-identical
+        // inputs (the FK poses are the ONE batched download) -> byte-identical
+        // manifolds. HOST on purpose (brief §3.3): ~4 spheres/env is trivial next to
+        // the 30-fingertip GPU sphere x hull; a GPU foot kernel is the NAMED G1f
+        // deferral, gated on a measured throughput finding.
+        std::vector<ContactManifold> foot_manifolds;
+        uint32_t foot_points = 0u;
+        if (has_feet_ && !feet_.empty()) {
+            ScopedWallTimer np_timer(perf_, "narrowphase");  // RAII accumulates with the GPU tag.
+            std::vector<Vec3> foot_centers(feet_.size());
+            std::vector<CandidatePair> foot_pairs;
+            foot_pairs.reserve(feet_.size());
+            for (size_t f = 0u; f < feet_.size(); ++f) {
+                const CoResidentFootSphere& fs = feet_[f];
+                const Transform& lp = env_poses[e][fs.link];
+                foot_centers[f] = lp.position + lp.rotation.Rotate(fs.local_offset);
+                CandidatePair p;
+                p.a.type = CollidableType::ArticulationLink;
+                p.a.react = ReactionProviderKind::ArticulationChainJ;
+                p.a.handle = fs.broadphase_handle;
+                p.b = MakeGroundRef(foot_ground_.broadphase_id);  // StaticWorld -> StaticNull.
+                foot_pairs.push_back(p);
+            }
+            ShapeResolver foot_resolve = [&](const CollidableRef& ref,
+                                             ResolvedShape* out) -> bool {
+                if (ref.type == CollidableType::ArticulationLink) {
+                    for (size_t f = 0u; f < feet_.size(); ++f) {
+                        if (feet_[f].broadphase_handle == ref.handle) {
+                            out->type = scene::ShapeType::Sphere;
+                            out->prim = FootSpherePrim(foot_centers[f], feet_[f].radius);
+                            out->geom = nullptr;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                if (ref.type == CollidableType::StaticWorld &&
+                    ref.handle == foot_ground_.broadphase_id) {
+                    out->type = scene::ShapeType::Plane;
+                    out->prim = GroundPrim(foot_ground_.height);  // +Z plane.
+                    out->geom = nullptr;
+                    return true;
+                }
+                return false;
+            };
+            nuka::collision::BuildContactManifolds(foot_pairs, foot_resolve,
+                                                   &foot_manifolds);
+            for (const auto& m : foot_manifolds) foot_points += m.point_count;
+        }
 
         // The per-env fingertip<->cup manifolds, produced by the ONE batched GPU narrowphase
         // launch above (env e's NON-EMPTY slots in fingertip order). Replaces the P2.4b
         // per-env host BuildContactManifolds.
-        std::vector<ContactManifold>& manifolds = env_manifolds[e];
-
         uint32_t finger_points = 0u;
-        for (const auto& m : manifolds) finger_points += m.point_count;
+        if (grasp_cup_.VertexCount() > 0u) {
+            for (const auto& m : env_manifolds[e]) finger_points += m.point_count;
+        }
         grasp_reports_[e].finger_contacts = finger_points;
-        if (manifolds.empty() || finger_points == 0u) continue;  // cup free this env.
+        if (foot_points + finger_points == 0u) continue;  // env contact-free this step.
 
         // stage 7: compliant rows + sides (condim=3 -> normal row + 4 friction spokes
-        // per contact point). APPEND this env's rows to the shared buffer.
+        // per contact point). APPEND this env's rows to the shared buffer, FEET rows
+        // FIRST then FINGER rows (the oracle's single emission over the feet-then-
+        // fingers manifold list; EmitCompliantContactRows is a pure per-manifold append,
+        // so two calls over the split lists are byte-identical to its one call).
         nuka::constraint::ContactRowComplianceInputs inputs;
         inputs.vel = 0.0f;
         inputs.invweight = 1.0f;
         inputs.dt = dt_;
         inputs.condim = condim_;
         const std::size_t row_start = rows.RowCount();
+        std::size_t foot_rows_end = row_start;
         {
             // perf tag `row_assembly`: compliant contact-row emission (normal + friction
             // spokes). The host index/key wiring loop below is left UNTIMED (microseconds)
             // so this stays DISJOINT from chain_jacobian (FootChainJ lives in that loop).
             ScopedWallTimer ra_timer(perf_, "row_assembly");
-            nuka::constraint::EmitCompliantContactRows(manifolds, inputs, &rows, &sides);
+            if (foot_points > 0u) {
+                nuka::constraint::EmitCompliantContactRows(foot_manifolds, inputs, &rows,
+                                                           &sides);
+                foot_rows_end = rows.RowCount();
+            }
+            if (finger_points > 0u) {
+                nuka::constraint::EmitCompliantContactRows(env_manifolds[e], inputs,
+                                                           &rows, &sides);
+            }
         }
-        // Stamp the per-contact friction coefficient (the cone bound is mu * Σλ_n).
+        // Stamp the per-contact friction by CATEGORY (oracle :1551-1560): a StaticNull
+        // side -> foot x ground (foot_mu_); else finger x cup (friction_mu_). With
+        // has_feet=false no static row exists -> every row gets friction_mu_, byte-
+        // identical to the pre-G1b stamp. (Cup x table joins in G1d with table_mu.)
         for (std::size_t r = row_start; r < rows.RowCount(); ++r) {
-            rows.materials[r].friction = friction_mu_;
+            const ContactRowSides& s = sides[r];
+            const bool is_static = s.a.react == ReactionProviderKind::StaticNull ||
+                                   s.b.react == ReactionProviderKind::StaticNull;
+            rows.materials[r].friction = is_static ? foot_mu_ : friction_mu_;
         }
         if (rows.RowCount() == row_start) continue;  // no rows emitted this env.
         env_row_range[e] = {row_start, rows.RowCount()};
         grasp_reports_[e].finger_row_count =
-            static_cast<uint32_t>(rows.RowCount() - row_start);
+            static_cast<uint32_t>(rows.RowCount() - foot_rows_end);
 
         // Pack env e's flat prefix-sum qdot slice from env e's LIVE host slice, written AT env
         // e's env-major offset (qdot slice @ art_index*dof_stride). env e's M^-1 tile is NOT
@@ -1046,14 +1172,57 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
             const ContactRowSides& s = sides[r];
             if (s.a.react == ReactionProviderKind::StaticNull ||
                 s.b.react == ReactionProviderKind::StaticNull) {
-                grasp_reports_[e].any_static_row = true;  // a table -> NO-TABLE gate fails.
+                grasp_reports_[e].any_static_row = true;  // a static side (ground/table).
             }
             const bool a_art = s.a.react == ReactionProviderKind::ArticulationChainJ;
             const bool b_art = s.b.react == ReactionProviderKind::ArticulationChainJ;
             const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
             const bool b_cup = s.b.react == ReactionProviderKind::RigidInvMass;
+            const bool a_static = s.a.react == ReactionProviderKind::StaticNull;
+            const bool b_static = s.b.react == ReactionProviderKind::StaticNull;
             art_refs[r].a = none_side;
             art_refs[r].b = none_side;
+            if ((a_art && b_static) || (b_art && a_static)) {
+                // ----- G1b foot<->ground row (oracle StepStandGrasp :1620-1644): the
+                // foot side gets a chain-J slot + the env's SAME synthetic coloring key
+                // as the fingers (total_body_count + art_index -- feet and fingers are
+                // the SAME articulation e, so same-env foot+finger rows SERIALIZE on env
+                // e's qdot tile and cross-env rows parallelize; the bijection invariant
+                // extends UNCHANGED). The static ground side -> kInvalidBodyIndex (no
+                // reaction, no coloring conflict, no chain-J). The chain-J input joins
+                // the SAME cj_link/cj_point/cj_dir slot list the fingers gather into --
+                // ONE batched ComputeContactChainJacobians serves both classes.
+                const int foot_local = a_art ? 0 : 1;
+                const int static_local = a_art ? 1 : 0;
+                const RowJacobian6 j_foot =
+                    rows.JacobianForRowBody(static_cast<uint32_t>(r),
+                                            static_cast<uint32_t>(foot_local));
+                const Vec3 foot_dir = j_foot.linear;
+                const Vec3 contact_point = sides[r].contact_point;
+                // Map the foot's broadphase handle back to its REAL device (ankle) link.
+                const uint32_t foot_handle = a_art ? s.a.handle : s.b.handle;
+                uint32_t foot_link = foot_handle;
+                for (size_t f = 0u; f < feet_.size(); ++f) {
+                    if (feet_[f].broadphase_handle == foot_handle) {
+                        foot_link = feet_[f].link;
+                        break;
+                    }
+                }
+                const uint32_t slot = static_cast<uint32_t>(cj_link.size());
+                cj_link.push_back(art_index * base_link_count_ + foot_link);
+                cj_point.push_back(contact_point);
+                cj_dir.push_back(foot_dir);
+                chain_jacobians.resize(static_cast<size_t>(slot + 1u) * dof_stride_,
+                                       0.0f);
+                rows.body_indices[2u * r + static_cast<uint32_t>(foot_local)] =
+                    finger_key;  // ★ the SAME env key as fingers (bijection invariant).
+                rows.body_indices[2u * r + static_cast<uint32_t>(static_local)] =
+                    nuka::constraint::kInvalidBodyIndex;
+                const RowArticulationSide foot_side{art_index, slot};
+                art_refs[r].a = (foot_local == 0) ? foot_side : none_side;
+                art_refs[r].b = (foot_local == 1) ? foot_side : none_side;
+                continue;
+            }
             if (!((a_art && b_cup) || (b_art && a_cup))) continue;  // finger<->cup only.
             const int finger_local = a_art ? 0 : 1;
             const int cup_local = a_art ? 1 : 0;
@@ -1208,6 +1377,8 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         const auto [rbegin, rend] = env_row_range[e];
         double cup_vert_impulse = 0.0;
         float max_lambda = 0.0f;
+        double foot_normal_impulse = 0.0;  // G1b: Σ foot NORMAL λ (the stand support).
+        uint32_t foot_normal_rows = 0u;    // G1b: # foot NORMAL rows.
         // ----- A1 RL substrate: per-fingertip NORMAL-impulse bucket (the force-closure
         // signal). Σ over each fingertip's NORMAL rows (NOT friction spokes) of the row
         // lambda. The fingertip a row belongs to is read from sides[r]'s ArticulationChainJ
@@ -1217,6 +1388,23 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         fimp.assign(nfinger, 0.0f);
         for (std::size_t r = rbegin; r < rend; ++r) {
             const ContactRowSides& s = sides[r];
+            // ----- G1b: classify by (react,react) exactly as the oracle's report walk
+            // (StepStandGrasp :1706-1738). A (ChainJ, StaticNull) row is FOOT x GROUND:
+            // Σ its NORMAL λ into the stand-support fields and SKIP the cup terms (a
+            // foot row has NO cup side -- reading 'the other side' would project the
+            // static jacobian into cup_vertical_impulse). With has_feet=false no static
+            // row exists -> the finger accumulation below is bit-unchanged.
+            const bool a_art2 = s.a.react == ReactionProviderKind::ArticulationChainJ;
+            const bool b_art2 = s.b.react == ReactionProviderKind::ArticulationChainJ;
+            const bool a_static2 = s.a.react == ReactionProviderKind::StaticNull;
+            const bool b_static2 = s.b.react == ReactionProviderKind::StaticNull;
+            if ((a_art2 && b_static2) || (b_art2 && a_static2)) {
+                if (!(rows.rows[r].flags & nuka::constraint::row_flags::Friction)) {
+                    foot_normal_impulse += static_cast<double>(rows.rows[r].lambda);
+                    ++foot_normal_rows;
+                }
+                continue;
+            }
             const bool a_cup = s.a.react == ReactionProviderKind::RigidInvMass;
             const int cup_local = a_cup ? 0 : 1;
             const RowJacobian6 j_cup =
@@ -1239,6 +1427,8 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
         }
         grasp_reports_[e].cup_vertical_impulse = cup_vert_impulse;
         grasp_reports_[e].max_lambda = max_lambda;
+        grasp_reports_[e].foot_normal_impulse_sum = foot_normal_impulse;  // G1b.
+        grasp_reports_[e].foot_normal_rows = foot_normal_rows;            // G1b.
         const BodyState& cup = bodies_[BodyIndex(e, cup_local_index_)];
         const double cup_mass =
             cup.inv_mass > 0.0f ? 1.0 / static_cast<double>(cup.inv_mass) : 0.0;
