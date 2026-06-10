@@ -52,6 +52,13 @@ typedef struct nuka_grasp_world_desc_t {
                                      // gives the discriminative timing IC (cup descends
                                      // into open fingers). NOT validated against the gate
                                      // (which set it 0); a new field default-inits to 0.
+    float       reset_jitter_x;      // A5a: per-axis cup RESET-jitter half-box (m). The X
+    float       reset_jitter_y;      // (actuated) + Y (un-actuated) reset perturbation
+                                     // ResetEnvs draws. The factory DEFAULT is 0.025 (==
+                                     // the legacy isotropic +/-2.5 cm jitter, byte-
+                                     // identical); the create caller (nuka_ext) passes the
+                                     // env's anisotropic values. A zero-init desc would
+                                     // give 0 (no jitter), so the create path sets BOTH.
 } nuka_grasp_world_desc_t;
 
 // Create a batched grasp world from the cup asset. On success *out is a non-null

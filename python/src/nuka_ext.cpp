@@ -604,7 +604,8 @@ class GraspWorld {
 public:
     static GraspWorld* create(Device* device, const std::string& cup_asset_path,
                               uint32_t env_count, float grip_force, float friction_mu,
-                              float gravity_z, float dt, float cup_start_z_offset) {
+                              float gravity_z, float dt, float cup_start_z_offset,
+                              float reset_jitter_x, float reset_jitter_y) {
         if (device == nullptr) {
             throw std::runtime_error("GraspWorld.create: device is None");
         }
@@ -616,6 +617,8 @@ public:
         desc.gravity_z = gravity_z;
         desc.fixed_dt = dt;
         desc.cup_start_z_offset = cup_start_z_offset;
+        desc.reset_jitter_x = reset_jitter_x;
+        desc.reset_jitter_y = reset_jitter_y;
         nuka_grasp_world_handle h = nullptr;
         check(nuka_grasp_world_create(device->raw(), &desc, &h),
               "nuka_grasp_world_create");
@@ -1121,6 +1124,8 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("grip_force") = 8.0f, nb::arg("friction_mu") = 0.8f,
                     nb::arg("gravity_z") = -9.81f, nb::arg("dt") = 1.0f / 240.0f,
                     nb::arg("cup_start_z_offset") = 0.0f,
+                    nb::arg("reset_jitter_x") = 0.025f,
+                    nb::arg("reset_jitter_y") = 0.025f,
                     nb::rv_policy::take_ownership,
                     "Create a batched grasp world: env_count parallel fixed-base "
                     "2-finger grippers each pinching the C7a cup (loaded+cooked from "
@@ -1130,9 +1135,13 @@ NB_MODULE(_nuka_ext, m) {
                     "gravity_z/dt are the integrator params. cup_start_z_offset (A3, "
                     "default 0 == the byte-identical validated scene) raises the cup's "
                     "INITIAL Z above the fixed fingertip catch plane (z=0.20) so the cup "
-                    "descends into OPEN fingers -> the discriminative timing IC. Built "
-                    "via the SAME validated scene factory the 21 BatchedUnifiedWorld "
-                    "gates exercise (offset 0 keeps them byte-identical).")
+                    "descends into OPEN fingers -> the discriminative timing IC. "
+                    "reset_jitter_x / reset_jitter_y (A5a, default 0.025 == the legacy "
+                    "isotropic +/-2.5 cm jitter, byte-identical) are the per-axis cup "
+                    "RESET-jitter half-boxes ResetEnvs draws -- set Y small/0 so the "
+                    "X-only gripper can catch the jittered cups (the un-actuated Y jitter "
+                    "is unsaveable). Built via the SAME validated scene factory the 21 "
+                    "BatchedUnifiedWorld gates exercise (defaults keep them byte-identical).")
         .def("step", &GraspWorld::step,
              "Advance EVERY env one fixed step (applies the last set_actions, or the "
              "template grip until set_actions is first called).")

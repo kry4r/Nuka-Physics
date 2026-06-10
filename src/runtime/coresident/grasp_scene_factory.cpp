@@ -108,7 +108,8 @@ GraspGripper BuildGraspGripper(const Vec3& base_pos, float cup_half_x,
 }
 
 GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_force,
-                                       float mu, float cup_start_z_offset) {
+                                       float mu, float cup_start_z_offset,
+                                       float reset_jitter_x, float reset_jitter_y) {
     const Vec3 half = (hull.hi - hull.lo) * 0.5f;
     const Vec3 cup_local_center = (hull.hi + hull.lo) * 0.5f;
     // The FIXED fingertip catch plane (z=0.20) -- the fingertip pre-pose math below
@@ -164,6 +165,10 @@ GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_forc
     gs.config.drive_force_limits.assign(link_count, 0.0f);
     gs.config.friction_mu = mu;
     gs.config.condim = 3u;
+    // A5a: per-axis reset-jitter half-box -> carried into MakeGraspTemplate. Default ==
+    // kDefaultResetCupJitterM so the legacy isotropic +/-2.5 cm reset is byte-identical.
+    gs.reset_jitter_x = reset_jitter_x;
+    gs.reset_jitter_y = reset_jitter_y;
     return gs;
 }
 
@@ -179,6 +184,9 @@ BatchedSceneTemplate MakeGraspTemplate(const GraspSceneBundle& gs) {
     tmpl.drive_force_limits = gs.config.drive_force_limits;
     tmpl.friction_mu = gs.config.friction_mu;
     tmpl.condim = gs.config.condim;
+    // A5a: per-axis cup reset-jitter half-box (read by BatchedUnifiedWorld::ResetEnvs).
+    tmpl.reset_jitter_x = gs.reset_jitter_x;
+    tmpl.reset_jitter_y = gs.reset_jitter_y;
     return tmpl;
 }
 

@@ -63,6 +63,12 @@
 
 namespace nuka::runtime::coresident {
 
+// The cup XY reset-jitter half-box default (m, ~+/-2.5 cm). Hoisted to namespace
+// scope so BatchedSceneTemplate (defined before BatchedUnifiedWorld) can default its
+// per-axis jitter fields to it, AND so BatchedUnifiedWorld::kResetCupJitterM (the
+// named constant the gate test reads) can alias it -- the SAME literal both places.
+inline constexpr float kDefaultResetCupJitterM = 0.025f;
+
 // The per-env scene template, replicated across all envs at construction. P2.1
 // scope: rigid bodies only. (P2.2+ extends with articulation proto, fingertips,
 // cup hull, and static colliders -- additive fields, no layout churn for the
@@ -125,6 +131,18 @@ struct BatchedSceneTemplate {
     // FRICTION is what holds the cup -- a frictionless condim=1 grasp could not).
     float    friction_mu = 0.6f;
     uint32_t condim      = 3u;
+
+    // ----- A5a: per-axis cup RESET JITTER half-box (m), read by ResetEnvs ----------
+    // ResetEnvs perturbs each reset cup's X by +/-reset_jitter_x and its Y by
+    // +/-reset_jitter_y (independent uniform draws, X then Y, per-env mt19937_64).
+    // BOTH default to kDefaultResetCupJitterM (0.025) so the legacy isotropic +/-2.5 cm
+    // jitter is byte-identical (the range-parameterized distributions equal the old
+    // single one at the default). Anisotropic settings (e.g. X=0.025, Y=0) let the RL
+    // env request jitter along the gripper's ACTUATED (X) axis only -- the un-actuated
+    // Y jitter is unsaveable by the X-only gripper, so shrinking it raises the policy's
+    // reachable catch rate WITHOUT touching the discriminative timing IC.
+    float    reset_jitter_x = kDefaultResetCupJitterM;
+    float    reset_jitter_y = kDefaultResetCupJitterM;
 };
 
 // Per-env grasp metrics (the P2.3a HOLD / NO-TABLE / BITE gates read this). Populated
@@ -259,8 +277,11 @@ public:
     // (per-env std::mt19937 seeded from seed XOR env-id) so two ResetEnvs calls with the
     // same seed produce identical states (D1). No-op when !has_grasp_.
     void ResetEnvs(const std::vector<uint32_t>& env_ids, uint64_t seed);
-    // The cup XY randomization half-box (m) ResetEnvs jitters within (small, ~+/-2.5 cm).
-    static constexpr float kResetCupJitterM = 0.025f;
+    // The DEFAULT cup XY randomization half-box (m) ResetEnvs jitters within (small,
+    // ~+/-2.5 cm). The LIVE per-axis magnitudes are reset_jitter_x_/reset_jitter_y_
+    // (from the scene template, each defaulting to THIS); this named constant is kept
+    // for the gate test's box check and as the canonical default literal.
+    static constexpr float kResetCupJitterM = kDefaultResetCupJitterM;
 
     // ----- P2.4a perf-gate instrumentation (ADDITIVE; physics-neutral) -----------
     // Per-tag HOST WALL-CLOCK aggregator (mirrors BatchedArticulatedWorld::Perf). The
@@ -307,6 +328,12 @@ private:
     uint32_t   link_count_  = 0u;   // per-env (single-articulation) gripper link count.
     float      friction_mu_ = 0.6f;
     uint32_t   condim_      = 3u;
+    // A5a: the LIVE per-axis cup reset-jitter half-box (m), captured from the scene
+    // template. ResetEnvs draws X within +/-reset_jitter_x_ then Y within
+    // +/-reset_jitter_y_. Both default to kDefaultResetCupJitterM -> the legacy
+    // isotropic +/-2.5 cm jitter is byte-identical (range-parameterized distributions).
+    float      reset_jitter_x_ = kDefaultResetCupJitterM;
+    float      reset_jitter_y_ = kDefaultResetCupJitterM;
     articulation::ArticulationHostState gripper_proto_;      // refresh-able CPU mirror (ONE articulation).
     // ----- P2.4b: ONE consolidated env-major device-resident multi-gripper state ------
     // The P2.4b throughput increment. The per-env std::vector<ArticulationDeviceBuffers>

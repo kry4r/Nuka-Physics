@@ -78,6 +78,33 @@ DEFAULT_CUP_START_Z_OFFSET = 0.06
 # killed mid-flight; a true drop runs well past this to terminate.
 DEFAULT_TERMINATION_Z = 0.12
 
+# A5a per-axis cup RESET-JITTER half-box (m). The synthetic gripper actuates its two
+# fingertips along X ONLY, so a cup jittered along the un-actuated Y is UNSAVEABLE by
+# any policy -- the ~80% of the legacy isotropic +/-2.5 cm jitter that landed off-X
+# capped the hand-cradle catch rate at ~10% (all-zero-reward episodes that starve the
+# PPO gradient). So the env default jitter is PURE-X: all the spread on the actuated X
+# (+/-1.5 cm), ZERO on the un-actuated Y (un-actuated Y = permanently-unsaveable noise,
+# so zeroing it gives the crispest learnability signal -- advisor-chosen).
+#
+# EMPIRICAL (measured A5a scan, single-episode alive-masked, GOOD timed-cradle):
+#   x      y      GOOD caught   discriminative
+#   0.025  0.000  0.50          yes
+#   0.025  0.005  0.40          yes
+#   0.020  0.000  0.64          yes
+#   0.015  0.000  0.83          yes
+#   0.015  0.005  0.66          yes
+# A KEY FINDING: pure-X jitter is FULLY discriminative (const/random/zero all catch 0
+# -- the discriminativeness is from the TIMING IC, not the jitter axis), but +/-2.5 cm
+# along X is itself partly UNSAVEABLE -- the X-extreme cups land PAST the fixed
+# fingertip reach, so even a perfect timed close caps at ~0.50. Clearing the ">0.5 with
+# margin" target therefore required SHRINKING X (to 0.015), not just Y; shrinking Y
+# alone (the obvious lever) tops out at 0.50. The default is PURE-X (0.015, 0.0) ->
+# ~0.83 catch: the un-actuated Y is permanently-unsaveable noise, so zeroing it gives
+# the CRISPEST learnability signal (advisor-chosen; "realism on both axes" is not a
+# goal for this throwaway timed-catch scaffold). Still fully discriminative.
+DEFAULT_RESET_JITTER_X = 0.015
+DEFAULT_RESET_JITTER_Y = 0.0
+
 
 class H1GraspEnv:
     """Fixed-base 2-finger cup-grasp RL env (gymnasium 5-tuple step) on GraspWorld."""
@@ -96,6 +123,8 @@ class H1GraspEnv:
         friction_mu: float = 0.8,
         gravity_z: float = -9.81,
         cup_start_z_offset: float = DEFAULT_CUP_START_Z_OFFSET,
+        reset_jitter_x: float = DEFAULT_RESET_JITTER_X,
+        reset_jitter_y: float = DEFAULT_RESET_JITTER_Y,
         termination_z: float = DEFAULT_TERMINATION_Z,
         episode_length: int = 220,
         seed: int | None = None,
@@ -122,6 +151,8 @@ class H1GraspEnv:
             grip_force=float(grip_force), friction_mu=float(friction_mu),
             gravity_z=float(gravity_z), dt=self.dt,
             cup_start_z_offset=float(cup_start_z_offset),
+            reset_jitter_x=float(reset_jitter_x),
+            reset_jitter_y=float(reset_jitter_y),
         )
         assert self._world.action_dim == H.H1_GRASP_ACTION_DIM, (
             f"H1GraspEnv expects a 2-DOF gripper, got action_dim="
@@ -317,5 +348,6 @@ def make_env(num_envs: int, *, device=None, **kw) -> H1GraspEnv:
     Mirrors the go2/h1_stand make_env signature: ``num_envs`` positional, ``device``
     an open nuka.Device (created+owned by the env if None), the rest forwarded to
     :class:`H1GraspEnv` (dt, friction_mu, gravity_z, cup_start_z_offset,
-    termination_z, episode_length, seed, cup_asset_path)."""
+    reset_jitter_x, reset_jitter_y, termination_z, episode_length, seed,
+    cup_asset_path)."""
     return H1GraspEnv(num_envs, device=device, **kw)

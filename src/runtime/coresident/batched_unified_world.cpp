@@ -191,6 +191,8 @@ BatchedUnifiedWorld::BatchedUnifiedWorld(
       cup_local_index_(scene_template.cup_local_index),
       friction_mu_(scene_template.friction_mu),
       condim_(scene_template.condim),
+      reset_jitter_x_(scene_template.reset_jitter_x),
+      reset_jitter_y_(scene_template.reset_jitter_y),
       fingertips_(scene_template.fingertips),
       grasp_cup_(scene_template.cup) {
     // Replicate the per-env body template into the env-major SoA: env e's bodies
@@ -449,15 +451,20 @@ void BatchedUnifiedWorld::ResetEnvs(const std::vector<uint32_t>& env_ids,
 
     // ----- (a) per-env cup restore + deterministic XY jitter -------------------------
     // Each listed env's cup BodyState is restored to the reset template (Z + orientation +
-    // mass/inertia), its XY jittered within +/-kResetCupJitterM by a per-env mt19937 seeded
-    // from (seed XOR env-id) so two calls with the SAME seed produce IDENTICAL states (D1).
-    // The host bodies_ are updated directly (Body()/BodyMut() read them).
+    // mass/inertia), its X jittered within +/-reset_jitter_x_ and Y within +/-reset_jitter_y_
+    // by a per-env mt19937 seeded from (seed XOR env-id) so two calls with the SAME seed
+    // produce IDENTICAL states (D1). At the default (both == kResetCupJitterM == 0.025) the
+    // two range-parameterized distributions are byte-identical to the legacy single
+    // jit(-0.025,0.025) drawn X-then-Y (libstdc++ uniform_real_distribution is stateless
+    // across operator() and consumes one engine draw per call, so the draw order/count is
+    // unchanged). The host bodies_ are updated directly (Body()/BodyMut() read them).
     for (uint32_t e : env_ids) {
         if (e >= env_count_ || cup_local_index_ >= bodies_per_env_) continue;
         std::mt19937_64 rng(seed ^ (0x9E3779B97F4A7C15ull * (static_cast<uint64_t>(e) + 1ull)));
-        std::uniform_real_distribution<float> jit(-kResetCupJitterM, kResetCupJitterM);
-        const float dx = jit(rng);
-        const float dy = jit(rng);
+        std::uniform_real_distribution<float> jit_x(-reset_jitter_x_, reset_jitter_x_);
+        std::uniform_real_distribution<float> jit_y(-reset_jitter_y_, reset_jitter_y_);
+        const float dx = jit_x(rng);
+        const float dy = jit_y(rng);
         BodyState cup = reset_cup_template_;            // template Z / orientation / mass.
         cup.position.x += dx;
         cup.position.y += dy;
