@@ -314,14 +314,20 @@ def test_DISCRIMINATIVE_GATE():
     assert d_good < 0.5, ("good should catch most cups", d_good)
 
     # THE TRAINING-DISTRIBUTION GATE: the env PPO trains on always starts from
-    # reset() (cup XY jitter +-2.5 cm). The milestone-relevant question there is
-    # "does a GENUINE grasp policy beat a NO-OP?" -- because if a no-op out-returned a
-    # grasp, PPO would learn to do nothing. Single-episode, alive-masked (no farming).
-    # The hand-coded cradle catches only ~10% of the +-2.5 cm jittered cups (MEASURED;
-    # the rest land the cup off the X-squeeze line -- mostly on the un-actuated Y axis
-    # -> unsaveable; a finding flagged for the next increment), so the absolute return
-    # is modest, but GOOD must clearly beat ZERO, and const/random (which never close)
-    # stay ~0.
+    # reset() (cup XY jitter). The milestone-relevant question there is "does a GENUINE
+    # grasp policy beat a NO-OP?" -- because if a no-op out-returned a grasp, PPO would
+    # learn to do nothing. Single-episode, alive-masked (no farming).
+    #
+    # A5a made the reset jitter ANISOTROPIC; the env default is PURE-X (x=0.015, y=0.0):
+    # the synthetic gripper actuates X ONLY, so a cup jittered along the un-actuated Y is
+    # UNSAVEABLE by any policy. At the OLD isotropic +-2.5 cm jitter the hand-cradle
+    # caught only ~10% (~80% of the cups landed off the X-squeeze line), which starved the
+    # PPO reward. Zeroing Y (the un-actuated axis) AND shrinking X to 0.015 (whose extremes
+    # land PAST the fixed fingertip reach -- itself unsaveable, capping pure-X +-2.5 cm at
+    # ~0.50) raises the GOOD catch to ~0.83 (MEASURED) so MOST cups are now catchable and
+    # the PPO reward is dense. The discriminativeness is UNCHANGED -- it comes from the
+    # TIMING IC (cup descends from above OPEN fingers), not the jitter axis -- so
+    # const/random (which never time the close) still NEVER catch and stay ~0.
     def jittered(make_pol):
         with make_env(N, seed=0) as env:
             return rollout_jittered_episode(env, make_pol())
@@ -329,8 +335,8 @@ def test_DISCRIMINATIVE_GATE():
     jr_zero, jc_zero, _ = jittered(lambda: pol_zero)
     jr_const, jc_const, _ = jittered(lambda: pol_const_max)
     jr_rand, jc_rand, _ = jittered(lambda: make_pol_rand(0))
-    print("[A3 -- JITTERED IC (the PPO training distribution, +-2.5cm XY), "
-          "single-episode alive-masked]")
+    print("[A5a -- JITTERED IC (the PPO training distribution, PURE-X anisotropic "
+          "reset jitter x=0.015 y=0.0), single-episode alive-masked]")
     print("  GOOD : return=%8.2f caught=%.2f" % (jr_good, jc_good))
     print("  ZERO : return=%8.2f caught=%.2f" % (jr_zero, jc_zero))
     print("  CONST: return=%8.2f caught=%.2f" % (jr_const, jc_const))
@@ -342,6 +348,10 @@ def test_DISCRIMINATIVE_GATE():
     assert jr_const <= jr_zero + 5.0, ("const-max must not beat no-op", jr_const, jr_zero)
     assert jr_rand <= jr_zero + 5.0, ("random must not beat no-op", jr_rand, jr_zero)
     assert jc_good > jc_const and jc_good > jc_rand   # good catches; the others don't.
+    # A5a: the X-dominant anisotropic jitter raises the hand-cradle catch from the OLD
+    # ~10% ceiling to a MAJORITY of cups -- the densified reward the PPO train needs.
+    assert jc_good > 0.5, ("A5a: GOOD must catch MOST jittered cups (X-dominant jitter)",
+                           jc_good)
 
 
 if __name__ == "__main__":

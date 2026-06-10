@@ -78,6 +78,11 @@ GraspGripper BuildGraspGripper(const math::Vec3& base_pos, float cup_half_x,
 struct GraspSceneBundle {
     GraspGripper gripper;
     GraspConfig  config;
+    // A5a: per-axis cup RESET-JITTER half-box (m) carried into the BatchedSceneTemplate
+    // (read by ResetEnvs). Default == kDefaultResetCupJitterM so MakeGraspTemplate yields
+    // the legacy isotropic +/-2.5 cm jitter byte-identically.
+    float reset_jitter_x = kDefaultResetCupJitterM;
+    float reset_jitter_y = kDefaultResetCupJitterM;
 };
 
 // Assemble the validated grasp scene from a cup hull + the grip force (constant
@@ -93,8 +98,18 @@ struct GraspSceneBundle {
 // contact at t=0 and DESCENDS under gravity -> a timed close catches it but a
 // constant-max slam shuts on empty space before the cup arrives (proven non-trivial
 // in A3). At offset==0 every field is bit-identical to the validated scene.
+//
+// `reset_jitter_x` / `reset_jitter_y` (A5a, default kDefaultResetCupJitterM == 0.025)
+// set the per-axis cup RESET-JITTER half-box (m) ResetEnvs uses. Both at the default
+// reproduce the legacy isotropic +/-2.5 cm jitter byte-identically; an anisotropic
+// setting (e.g. x=0.025, y=0) jitters only along the gripper's actuated X axis so the
+// X-only gripper can actually catch the jittered cups. These are reset-only -- they do
+// NOT touch the create-time scene, so the byte gates (which never vary them) are
+// unaffected, and the cup_start_z_offset / fingertip math is untouched.
 GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_force,
-                                       float mu, float cup_start_z_offset = 0.0f);
+                                       float mu, float cup_start_z_offset = 0.0f,
+                                       float reset_jitter_x = kDefaultResetCupJitterM,
+                                       float reset_jitter_y = kDefaultResetCupJitterM);
 
 // Populate a BatchedSceneTemplate from the bundle (cup == the single per-env body,
 // cup_local_index 0; the gripper proto + fingertips + grip torque + friction). The
