@@ -47,6 +47,11 @@ typedef struct nuka_grasp_world_desc_t {
     float       friction_mu;     // per-contact isotropic friction coefficient.
     float       gravity_z;       // gravity Z (m/s^2), e.g. -9.81.
     float       fixed_dt;        // fixed integrator dt (s), e.g. 1/240. Must be > 0.
+    float       cup_start_z_offset;  // A3: cup start Z ABOVE the fingertip catch plane
+                                     // (m). 0 == the byte-identical validated scene; >0
+                                     // gives the discriminative timing IC (cup descends
+                                     // into open fingers). NOT validated against the gate
+                                     // (which set it 0); a new field default-inits to 0.
 } nuka_grasp_world_desc_t;
 
 // Create a batched grasp world from the cup asset. On success *out is a non-null

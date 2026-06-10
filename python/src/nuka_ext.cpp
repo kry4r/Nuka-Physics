@@ -604,7 +604,7 @@ class GraspWorld {
 public:
     static GraspWorld* create(Device* device, const std::string& cup_asset_path,
                               uint32_t env_count, float grip_force, float friction_mu,
-                              float gravity_z, float dt) {
+                              float gravity_z, float dt, float cup_start_z_offset) {
         if (device == nullptr) {
             throw std::runtime_error("GraspWorld.create: device is None");
         }
@@ -615,6 +615,7 @@ public:
         desc.friction_mu = friction_mu;
         desc.gravity_z = gravity_z;
         desc.fixed_dt = dt;
+        desc.cup_start_z_offset = cup_start_z_offset;
         nuka_grasp_world_handle h = nullptr;
         check(nuka_grasp_world_create(device->raw(), &desc, &h),
               "nuka_grasp_world_create");
@@ -1119,14 +1120,19 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("cup_asset_path"), nb::arg("env_count"),
                     nb::arg("grip_force") = 8.0f, nb::arg("friction_mu") = 0.8f,
                     nb::arg("gravity_z") = -9.81f, nb::arg("dt") = 1.0f / 240.0f,
+                    nb::arg("cup_start_z_offset") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched grasp world: env_count parallel fixed-base "
                     "2-finger grippers each pinching the C7a cup (loaded+cooked from "
                     "cup_asset_path) by friction alone (NO table). grip_force is the "
                     "constant per-finger grip torque the template seeds (overridden "
                     "per-step by set_actions); friction_mu is the contact friction; "
-                    "gravity_z/dt are the integrator params. Built via the SAME "
-                    "validated scene factory the 21 BatchedUnifiedWorld gates exercise.")
+                    "gravity_z/dt are the integrator params. cup_start_z_offset (A3, "
+                    "default 0 == the byte-identical validated scene) raises the cup's "
+                    "INITIAL Z above the fixed fingertip catch plane (z=0.20) so the cup "
+                    "descends into OPEN fingers -> the discriminative timing IC. Built "
+                    "via the SAME validated scene factory the 21 BatchedUnifiedWorld "
+                    "gates exercise (offset 0 keeps them byte-identical).")
         .def("step", &GraspWorld::step,
              "Advance EVERY env one fixed step (applies the last set_actions, or the "
              "template grip until set_actions is first called).")

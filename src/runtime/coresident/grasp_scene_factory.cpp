@@ -108,9 +108,11 @@ GraspGripper BuildGraspGripper(const Vec3& base_pos, float cup_half_x,
 }
 
 GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_force,
-                                       float mu) {
+                                       float mu, float cup_start_z_offset) {
     const Vec3 half = (hull.hi - hull.lo) * 0.5f;
     const Vec3 cup_local_center = (hull.hi + hull.lo) * 0.5f;
+    // The FIXED fingertip catch plane (z=0.20) -- the fingertip pre-pose math below
+    // keeps using THIS Z so the fingertips never move with the cup-start knob.
     const Vec3 cup_center{0.0f, 0.0f, 0.20f};
     const Vec3 base_pos{0.0f, 0.0f, 0.30f};
 
@@ -147,6 +149,9 @@ GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_forc
     const float iz = kGraspCupMass * (half.x * half.x + half.y * half.y) / 3.0f;
     cup.inv_inertia = Vec3{1.0f / ix, 1.0f / iy, 1.0f / iz};
     cup.position = cup_center;
+    // A3 discriminative-IC knob: raise ONLY the cup body's start Z above the (fixed)
+    // fingertip catch plane. At offset 0 cup.position == cup_center (bit-identical).
+    cup.position.z += cup_start_z_offset;
     cup.orientation = Quat::Identity();
     cup.linear_velocity = Vec3::Zero();
     cup.angular_velocity = Vec3::Zero();
