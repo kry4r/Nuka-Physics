@@ -480,6 +480,8 @@ void BatchedUnifiedWorld::ExportObsState(ObsStateBatch& out) const {
         out.qdot.clear();
         out.fingertip_world_pos.clear();
         out.finger_normal_impulse.clear();
+        out.base_pose.clear();
+        out.base_vel.clear();
         return;
     }
     // perf tag `obs_export`: the FULL batched RL readout cost (the ONE consolidated device
@@ -492,6 +494,8 @@ void BatchedUnifiedWorld::ExportObsState(ObsStateBatch& out) const {
     out.fingertip_world_pos.assign(
         static_cast<size_t>(env_count_) * nfinger * 3u, 0.0f);
     out.finger_normal_impulse.assign(static_cast<size_t>(env_count_) * nfinger, 0.0f);
+    out.base_pose.assign(static_cast<size_t>(env_count_) * 7u, 0.0f);
+    out.base_vel.assign(static_cast<size_t>(env_count_) * 6u, 0.0f);
 
     // ----- q / qdot: ONE bulk cudaMemcpy-class download PER device buffer (NOT a per-env
     // DownloadGripper loop, which is exactly the O(N) sync storm P2.4b removed; and NOT a full
@@ -509,6 +513,11 @@ void BatchedUnifiedWorld::ExportObsState(ObsStateBatch& out) const {
         env_device_.link_velocity.CopyToHost(
             obs_linkvel_scratch_.data(),
             obs_linkvel_scratch_.size() * sizeof(articulation::LinkSpatialVel));
+    // G2: the per-articulation base poses (env_count_ Transforms -- tiny; ONE bulk
+    // copy alongside the q/qdot downloads, NOT a per-env round-trip).
+    obs_basepose_scratch_.resize(env_count_);
+    env_device_.base_pose.CopyToHost(obs_basepose_scratch_.data(),
+                                     obs_basepose_scratch_.size() * sizeof(Transform));
     context_.stream.Synchronize();
     for (uint32_t e = 0u; e < env_count_; ++e) {
         const size_t loff = static_cast<size_t>(e) * base_link_count_;
@@ -525,6 +534,21 @@ void BatchedUnifiedWorld::ExportObsState(ObsStateBatch& out) const {
                 out.q[qoff + col] = obs_q_scratch_[loff + leg];
                 out.qdot[qoff + col] = obs_qdot_scratch_[loff + leg];
             }
+        }
+        // G2: base pose [px,py,pz,qw,qx,qy,qz] + base spatial velocity (the root
+        // link_velocity slot; zeros for a Fixed root, whose link_velocity was not
+        // downloaded -- base_dof_==0 -- and which never moves anyway).
+        if (e < obs_basepose_scratch_.size()) {
+            const Transform& bp = obs_basepose_scratch_[e];
+            float* p = out.base_pose.data() + static_cast<size_t>(e) * 7u;
+            p[0] = bp.position.x;    p[1] = bp.position.y;    p[2] = bp.position.z;
+            p[3] = bp.rotation.w;    p[4] = bp.rotation.x;
+            p[5] = bp.rotation.y;    p[6] = bp.rotation.z;
+        }
+        if (base_dof_ > 0u) {
+            float* v = out.base_vel.data() + static_cast<size_t>(e) * 6u;
+            for (uint32_t i = 0u; i < 6u; ++i)
+                v[i] = obs_linkvel_scratch_[loff + root_link_].v[i];
         }
     }
 
