@@ -19,9 +19,11 @@
 // [e*k, (e+1)*k) of one env-major BodyState SoA. The row solver's graph coloring
 // (RowsConflict, row_scheduler.cu) keys on the raw row body indices, so rows from
 // different envs share NO body id -> never conflict -> color into parallel groups
-// -> a single SolveRowsSweepKernel advances all envs, deterministically (D1: the
-// per-env disjoint constraint graphs make the colored PGS provably equal to N
-// independent solves). The articulation side uses the SAME convention the
+// -> one SolveRowsComponentSweepKernel launch advances all envs (G1d throughput
+// increment: one CUDA block per connected component = per env, byte-identical to
+// the former single-block sweep restricted to that env; D1: the per-env disjoint
+// constraint graphs make the colored PGS provably equal to N independent
+// solves). The articulation side uses the SAME convention the
 // co-resident emitter uses (synthetic body key = total_body_count + art_index,
 // with art_index = the env's articulation index, env-major M^-1 / qdot tiles per
 // row_articulation_refs.hpp) so same-articulation rows within an env serialize and
