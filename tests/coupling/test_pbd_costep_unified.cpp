@@ -41,7 +41,7 @@
 #include "runtime/coupling/unified_costep.hpp"
 #include "runtime/rigid/body_state.hpp"
 #include "scene/cooked_blob.hpp"
-#include "solver/rigid_solver.hpp"
+#include "solver/solver_config.hpp"
 
 #include <gtest/gtest.h>
 

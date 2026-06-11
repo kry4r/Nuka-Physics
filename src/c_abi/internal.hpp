@@ -11,7 +11,7 @@
 #include "runtime/articulation/control_mode.hpp"
 #include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
-#include "runtime/world_stepper.hpp"
+#include "runtime/step_options.hpp"
 
 #include <memory>
 #include <string>

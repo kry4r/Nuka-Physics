@@ -76,14 +76,14 @@ std::filesystem::path SourcePath(const char* relative_path) {
 
 // Holds the device buffers + view for one uploaded host state; rebuilt whenever
 // the host state changes so the view always matches the buffers.
-struct DeviceWorld {
+struct DeviceArticulation {
     articulation::ArticulationDeviceBuffers buffers;
     articulation::ArticulationDeviceState view;
 };
 
-DeviceWorld Upload(const nuka::phi::DeviceContext& context,
-                   const articulation::ArticulationHostState& host) {
-    DeviceWorld world;
+DeviceArticulation Upload(const nuka::phi::DeviceContext& context,
+                          const articulation::ArticulationHostState& host) {
+    DeviceArticulation world;
     world.buffers = articulation::UploadArticulationState(context, host);
     world.view = world.buffers.View();
     return world;

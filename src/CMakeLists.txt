@@ -95,7 +95,6 @@ add_library(nuka_runtime STATIC
     core/diagnostics/trace_sink.cpp
     runtime/world_builder.cpp
     runtime/physics_world.cpp
-    runtime/world_stepper.cpp
     runtime/rigid/integrator.cpp
     runtime/batch_scheduler.cpp
 )
@@ -247,7 +246,6 @@ nuka_set_warnings(nuka_constraint)
 # ---------------------------------------------------------------------------
 add_library(nuka_solver STATIC
     solver/diff_test_bridge.cpp
-    solver/rigid_solver.cpp
     # v0.8 C5a: UnifiedSolve standalone entry (validated-not-wired).
     solver/unified_solve.cpp
 )
@@ -320,51 +318,6 @@ target_link_libraries(nuka_sensor
 )
 
 nuka_set_warnings(nuka_sensor)
-
-# ---------------------------------------------------------------------------
-# nuka_debug_draw – Debug draw command list (no GPU dependency)
-# ---------------------------------------------------------------------------
-add_library(nuka_debug_draw STATIC
-    apps/debug_shell/debug_draw.cpp
-    apps/debug_shell/debug_visualization.cpp
-    apps/debug_shell/headless_debug_renderer.cpp
-    apps/debug_shell/scene_demo.cpp
-)
-
-target_include_directories(nuka_debug_draw
-    PUBLIC
-        ${CMAKE_SOURCE_DIR}/src
-)
-
-target_link_libraries(nuka_debug_draw
-    PUBLIC
-        nuka_collision
-        nuka_constraint
-        nuka_import
-        nuka_math
-        nuka_render
-        nuka_runtime
-        nuka_scene
-        nuka_scene_pipeline
-)
-
-nuka_set_warnings(nuka_debug_draw)
-
-add_executable(nuka_scene_demo
-    apps/debug_shell/main.cpp
-)
-
-target_include_directories(nuka_scene_demo
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-)
-
-target_link_libraries(nuka_scene_demo
-    PRIVATE
-        nuka_debug_draw
-)
-
-nuka_set_warnings(nuka_scene_demo)
 
 # ---------------------------------------------------------------------------
 # nuka_phi – Physics Hardware Interface (CUDA backend)
@@ -460,16 +413,14 @@ if(CMAKE_CUDA_COMPILER)
 
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
+        # SAP broadphase: O(n^2) pair-slot oracle over a device AABB buffer. The
+        # only remaining consumer is the LBVH-vs-SAP differential gate (the legacy
+        # whole-world AABB-generation path was removed in the M0 cleanup).
         collision/gpu/broadphase.cu
-        constraint/gpu/contact_generation.cu
-        runtime/gpu/batched_device_world.cu
-        runtime/gpu/cuda_particle_world.cu
-        runtime/gpu/device_world.cu
-        runtime/gpu/cuda_world_stepper.cu
         # v0.7 p09-A: XPBD soft-body distance world (GPU predict/solve/correct).
-        # The first soft path; cuda_world_stepper.cu's additive rigid+soft co-step
-        # overload links against it, so it lives in the same library. p09-B adds
-        # the bend (id 7) + volume (id 8) GPU solve sweeps in the same TU.
+        # The first soft path; the soft/fluid particle worlds live in this same
+        # library so their cross-system co-step overloads can link directly.
+        # p09-B adds the bend (id 7) + volume (id 8) GPU solve sweeps in the same TU.
         runtime/soft/xpbd_world.cu
         # v0.7 p09-B: cook-time HOST topology builders (cloth stretch+bend,
         # tet edge+volume) -> XpbdConstraintSet the GPU solve iterates. Cook-time
@@ -499,9 +450,9 @@ if(CMAKE_CUDA_COMPILER)
         # forward density-projection fluid. GPU predict/density-iterate/finalize;
         # FORWARD-ONLY + INTERNAL (no row class, no codegen, no adjoint). Reuses
         # the p05 particle uniform grid (nuka_collision_gpu) for the per-step
-        # neighbor list; cuda_world_stepper.cu's additive rigid+fluid co-step
-        # overload links against it, so it lives in the same library. p10-B layers
-        # XSPH viscosity + surface tension + the fluid cooker on top.
+        # neighbor list; the cross-system particle co-step links against it, so it
+        # lives in the same library. p10-B layers XSPH viscosity + surface tension
+        # + the fluid cooker on top.
         runtime/fluid/pbf_world.cu
         # v0.7 p11 (K3): the cross-system particle-particle CONTACT co-step -- the
         # v0.7 infrastructure deliverable for cross-system coupling. Concatenates
@@ -563,7 +514,7 @@ if(CMAKE_CUDA_COMPILER)
         # per-shape world AABBs -> per-pair bitmask+exclude filter (count->scan->
         # compact, NO append atomics) -> body-pair CandidatePairs -> host
         # explicit-<pair> merge -> BuildCandidatePairStream (C2a). A NEW
-        # validated-not-forced path (rigid-only); NOT wired into world_stepper.
+        # validated-not-forced path (rigid-only); NOT wired into the stepper.
         collision/rigid_candidate_pairs.cu
         # v0.8 C2c: the particle<->rigid + particle<->particle candidate-pair
         # builders. REUSE the cross_system_query (particle->rigid LBVH) + the
@@ -637,32 +588,6 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_link_libraries(nuka_rt_gpu
         PUBLIC
-            nuka_collision
-            nuka_collision_gpu
-            nuka_phi
-            CUDA::cudart
-    )
-
-    # v0.7 p14b: the RGB+depth+normal+uv CAMERA SENSOR over the LIVE batched sim
-    # state (sensor/camera_render.cu). Instances each body's cooked SDF at its live
-    # pose and reuses nuka_rt_gpu's __host__ __device__ SDF sphere-trace + stackless
-    # traversal. Built --fmad=false to pair bit-for-bit with the reused fp64 leaf.
-    # Raw-pointer entry (world-agnostic, mirrors nuka::sensor::ComputeContactWrench)
-    # so it renders any BatchedDeviceWorld+SdfDeviceWorld's DevicePoses()/DeviceViews().
-    add_library(nuka_camera_sensor_gpu STATIC
-        sensor/camera_render.cu
-    )
-    set_target_properties(nuka_camera_sensor_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_options(nuka_camera_sensor_gpu PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
-    )
-    target_include_directories(nuka_camera_sensor_gpu
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-    target_link_libraries(nuka_camera_sensor_gpu
-        PUBLIC
-            nuka_rt_gpu
             nuka_collision
             nuka_collision_gpu
             nuka_phi
@@ -930,48 +855,6 @@ if(CMAKE_CUDA_COMPILER)
         DESTINATION lib/cmake/nuka
     )
 
-    add_library(nuka_sensor_gpu STATIC
-        sensor/gpu/cuda_sensors.cu
-    )
-
-    target_include_directories(nuka_sensor_gpu
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_sensor_gpu
-        PUBLIC
-            nuka_runtime_gpu
-            nuka_sensor
-    )
-
-    target_link_libraries(nuka_debug_draw
-        PUBLIC
-            nuka_sensor_gpu
-            nuka_runtime_gpu
-    )
-
-    target_compile_definitions(nuka_debug_draw
-        PUBLIC
-            NUKA_HAS_CUDA_RUNTIME=1
-    )
-
-    add_executable(nuka_cuda_particle_demo
-        apps/cuda_particle_demo/main.cpp
-    )
-
-    target_include_directories(nuka_cuda_particle_demo
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_cuda_particle_demo
-        PRIVATE
-            nuka_runtime_gpu
-    )
-
-    nuka_set_warnings(nuka_cuda_particle_demo)
-
     add_executable(nuka_aba_cuda_probe
         ${CMAKE_SOURCE_DIR}/tools/reference/aba_cuda_probe.cpp
     )
@@ -989,22 +872,4 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     nuka_set_warnings(nuka_aba_cuda_probe)
-
-    add_executable(nuka_go2_stand_demo
-        apps/nuka_go2_stand_demo.cpp
-    )
-
-    target_include_directories(nuka_go2_stand_demo
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src/include
-            ${CMAKE_SOURCE_DIR}/tests
-    )
-
-    target_link_libraries(nuka_go2_stand_demo
-        PRIVATE
-            nuka
-            CUDA::cudart
-    )
-
-    nuka_set_warnings(nuka_go2_stand_demo)
 endif()

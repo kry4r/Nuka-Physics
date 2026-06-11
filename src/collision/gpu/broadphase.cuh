@@ -7,7 +7,6 @@
 #include "collision/dynamic_broadphase.hpp"
 #include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
-#include "runtime/gpu/device_world.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -50,8 +49,13 @@ private:
     phi::Buffer pair_count_;
 };
 
+// Run the SAP O(n^2) pair-slot broadphase directly over a device AABB buffer
+// (the oracle entry for the LBVH differential gate). The AABBs are the caller's;
+// the result borrows nothing from them (its own device pair buffers are built).
 CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
-                                         const runtime::gpu::DeviceWorld& device_world);
-CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device_world);
+                                         const collision::AABB* device_aabbs,
+                                         uint32_t shape_count);
+CudaBroadphaseResult BuildCudaBroadphase(const collision::AABB* device_aabbs,
+                                         uint32_t shape_count);
 
 } // namespace nuka::collision::gpu

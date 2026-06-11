@@ -46,7 +46,7 @@
 #include "phi/device_context.hpp"                // phi::DeviceContext
 #include "runtime/rigid/body_state.hpp"          // BodyState
 #include "scene/cooked_blob.hpp"                 // SystemKind
-#include "solver/rigid_solver.hpp"               // SolverConfig
+#include "solver/solver_config.hpp"              // SolverConfig
 
 #include <cstdint>
 #include <vector>

@@ -44,7 +44,7 @@
 #include "runtime/articulation/articulation_jacobian.hpp"  // ComputeContactChainJacobians + M/M^-1
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "scene/canonical_types.hpp"           // scene::ShapeType
-#include "solver/rigid_solver.hpp"             // SolverConfig
+#include "solver/solver_config.hpp"            // SolverConfig
 #include "solver/unified_solve.hpp"            // UnifiedSolve / SolveContext
 
 #include <algorithm>

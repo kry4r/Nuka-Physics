@@ -48,7 +48,7 @@
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/rigid/body_state.hpp"
 #include "scene/cooked_blob.hpp"                  // scene::CookedShapeTable
-#include "solver/rigid_solver.hpp"               // SolverConfig
+#include "solver/solver_config.hpp"              // SolverConfig
 
 #include <cstdint>
 #include <vector>
