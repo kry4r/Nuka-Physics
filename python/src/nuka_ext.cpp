@@ -27,6 +27,7 @@
 #include "nuka/nuka_diffsim.h"
 #include "nuka/nuka_grasp.h"  // v0.8 A2: the batched grasp world C ABI (BatchedUnifiedWorld)
 #include "nuka/nuka_noise.h"
+#include "nuka/nuka_union.h"  // v0.8 G2: the H1 whole-body UNION world C ABI
 
 namespace nb = nanobind;
 
@@ -758,6 +759,250 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// UnionWorld wrapper (RAII) -- the H1 WHOLE-BODY UNION WORLD (v0.8 G2,
+// nuka_union.h).
+// ---------------------------------------------------------------------------
+//
+// Wraps the nuka_union_world_* C ABI over BatchedUnifiedWorld carrying the
+// COMPLETE G1d union scene (floating-base 51-DOF whole-body H1 + cup settled in
+// the curled right hand + static ground + static table). A SEPARATE class from
+// GraspWorld (NOT an extension of it): the A4/A5 training scripts depend on
+// GraspWorld's exact scene/signature (the fixed-base 2-finger pinch), while the
+// union world has a different template, action width (full 51-DOF dof_stride)
+// and obs surface. Same host-numpy readout pattern as GraspWorld.
+// ---------------------------------------------------------------------------
+namespace {
+
+// uint32 sibling of make_host_float_array (per-env contact-count fields).
+nb::ndarray<nb::numpy, uint32_t> make_host_u32_array(size_t n) {
+    auto* p = new uint32_t[n == 0u ? 1u : n];
+    for (size_t i = 0u; i < n; ++i) p[i] = 0u;
+    nb::capsule owner(p, [](void* q) noexcept { delete[] reinterpret_cast<uint32_t*>(q); });
+    size_t shape[1] = {n};
+    return nb::ndarray<nb::numpy, uint32_t>(p, 1, shape, owner);
+}
+
+void check_union(nuka_result_t r, const char* what) { check(r, what); }
+
+}  // namespace
+
+class UnionWorld {
+public:
+    static UnionWorld* create(Device* device, uint32_t env_count,
+                              const std::string& h1_mjcf_path,
+                              const std::string& cup_usda_path,
+                              float gravity_z, float dt) {
+        if (device == nullptr) {
+            throw std::runtime_error("UnionWorld.create: device is None");
+        }
+        nuka_union_world_desc_t desc{};
+        desc.h1_mjcf_path = h1_mjcf_path.empty() ? nullptr : h1_mjcf_path.c_str();
+        desc.cup_usda_path = cup_usda_path.empty() ? nullptr : cup_usda_path.c_str();
+        desc.env_count = env_count;
+        desc.gravity_z = gravity_z;  // 0 -> the engine default (-9.81f).
+        desc.fixed_dt = dt;          // <= 0 -> the engine default (1/240f).
+        nuka_union_world_handle h = nullptr;
+        check_union(nuka_union_world_create(device->raw(), &desc, &h),
+                    "nuka_union_world_create");
+        nuka_union_world_dims_t dims{};
+        check_union(nuka_union_world_dims(h, &dims), "nuka_union_world_dims");
+        return new UnionWorld(h, dims);
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_union_world_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~UnionWorld() { destroy(); }
+
+    void step() { check_union(nuka_union_world_step(h_), "nuka_union_world_step"); }
+
+    void set_actions(nb::ndarray<float, nb::c_contig> actions) {
+        const size_t want = static_cast<size_t>(dims_.env_count) * dims_.action_dim;
+        if (actions.size() != want) {
+            throw std::runtime_error(
+                "UnionWorld.set_actions: length " + std::to_string(actions.size()) +
+                " != env_count*action_dim (" + std::to_string(want) + ")");
+        }
+        if (actions.device_type() != nb::device::cpu::value) {
+            throw std::runtime_error(
+                "UnionWorld.set_actions: actions must be a HOST (CPU) contiguous array");
+        }
+        check_union(nuka_union_world_set_actions(h_, actions.data(), actions.size()),
+                    "nuka_union_world_set_actions");
+    }
+
+    void step_with_actions(nb::ndarray<float, nb::c_contig> actions) {
+        set_actions(actions);
+        step();
+    }
+
+    // export_obs -> dict of HOST numpy arrays (env-major). ONE call covers both
+    // C-ABI fills (device-side export + cup/contact report readout).
+    nb::object export_obs() {
+        const size_t n = dims_.env_count;
+        const size_t ad = dims_.action_dim;
+        const size_t nf = dims_.num_fingertips;
+        auto q = make_host_float_array(n * ad, n * ad);
+        auto qdot = make_host_float_array(n * ad, n * ad);
+        auto bp = make_host_float_array(n * 7u, n * 7u);
+        auto bv = make_host_float_array(n * 6u, n * 6u);
+        auto ft = make_host_float_array(n * nf * 3u, n * nf * 3u);
+        auto fi = make_host_float_array(n * nf, n * nf);
+        auto la = make_host_float_array(n * ad, n * ad);
+        check_union(nuka_union_world_export_obs(
+                        h_, q.data(), n * ad, qdot.data(), n * ad, bp.data(), n * 7u,
+                        bv.data(), n * 6u, ft.data(), n * nf * 3u, fi.data(), n * nf,
+                        la.data(), n * ad),
+                    "nuka_union_world_export_obs");
+        auto cp = make_host_float_array(n * 7u, n * 7u);
+        auto cv = make_host_float_array(n * 6u, n * 6u);
+        auto fimp = make_host_float_array(n, n);
+        auto timp = make_host_float_array(n, n);
+        auto frows = make_host_u32_array(n);
+        auto trows = make_host_u32_array(n);
+        auto fc = make_host_u32_array(n);
+        check_union(nuka_union_world_read_cup_contacts(
+                        h_, cp.data(), n * 7u, cv.data(), n * 6u, frows.data(), n,
+                        fimp.data(), n, trows.data(), n, timp.data(), n, fc.data(), n),
+                    "nuka_union_world_read_cup_contacts");
+        nb::dict out;
+        out["q"] = q.cast().attr("reshape")(n, ad);
+        out["qdot"] = qdot.cast().attr("reshape")(n, ad);
+        out["base_pose"] = bp.cast().attr("reshape")(n, 7u);
+        out["base_vel"] = bv.cast().attr("reshape")(n, 6u);
+        out["cup_pose"] = cp.cast().attr("reshape")(n, 7u);
+        out["cup_vel"] = cv.cast().attr("reshape")(n, 6u);
+        out["fingertip_world_pos"] = ft.cast().attr("reshape")(n, nf, 3u);
+        out["finger_normal_impulse"] = fi.cast().attr("reshape")(n, nf);
+        out["last_action"] = la.cast().attr("reshape")(n, ad);
+        out["foot_rows"] = frows;
+        out["foot_impulse"] = fimp;
+        out["table_rows"] = trows;
+        out["table_impulse"] = timp;
+        out["finger_contacts"] = fc;
+        return out;
+    }
+
+    void set_table_enabled(int32_t env, bool enabled) {
+        check_union(nuka_union_world_set_table_enabled(h_, env, enabled ? 1u : 0u),
+                    "nuka_union_world_set_table_enabled");
+    }
+    bool table_enabled(uint32_t env) {
+        uint32_t v = 0u;
+        check_union(nuka_union_world_table_enabled(h_, env, &v),
+                    "nuka_union_world_table_enabled");
+        return v != 0u;
+    }
+
+    void set_base_pose(uint32_t env, nb::ndarray<float, nb::c_contig> pose7) {
+        if (pose7.size() != 7u) {
+            throw std::runtime_error("UnionWorld.set_base_pose: pose must be 7 floats");
+        }
+        check_union(nuka_union_world_set_base_pose(h_, env, pose7.data()),
+                    "nuka_union_world_set_base_pose");
+    }
+
+    void reset_envs(nb::object env_ids, uint64_t seed) {
+        nb::object seq = env_ids;
+        if (nb::hasattr(env_ids, "tolist")) {
+            seq = env_ids.attr("tolist")();
+        }
+        std::vector<uint32_t> ids;
+        for (nb::handle item : seq) {
+            const long long v = nb::cast<long long>(item);
+            if (v < 0) {
+                throw std::runtime_error("UnionWorld.reset_envs: env_id must be non-negative");
+            }
+            ids.push_back(static_cast<uint32_t>(v));
+        }
+        check_union(nuka_union_world_reset_envs(h_, ids.empty() ? nullptr : ids.data(),
+                                                static_cast<uint32_t>(ids.size()), seed),
+                    "nuka_union_world_reset_envs");
+    }
+
+    nb::object scene_info() {
+        nuka_union_scene_info_t info{};
+        check_union(nuka_union_world_scene_info(h_, &info),
+                    "nuka_union_world_scene_info");
+        nb::dict out;
+        out["table_height"] = info.table_height;
+        out["cup_mass"] = info.cup_mass;
+        out["total_mass"] = info.total_mass;
+        out["poly_cx"] = info.poly_cx;
+        out["dt"] = info.dt;
+        out["gravity_z"] = info.gravity_z;
+        out["ankle_settle_tau"] =
+            nb::make_tuple(info.ankle_settle_tau[0], info.ankle_settle_tau[1]);
+        out["place_found"] = info.place_found != 0u;
+        return out;
+    }
+
+    nb::object drive_table(const std::string& phase) {
+        uint32_t which = 0u;
+        if (phase == "hold") which = 0u;
+        else if (phase == "rest") which = 1u;
+        else if (phase == "close") which = 2u;
+        else throw std::runtime_error(
+            "UnionWorld.drive_table: phase must be 'hold' / 'rest' / 'close'");
+        const size_t k = dims_.drive_table_len;
+        auto dof = make_host_u32_array(k);
+        auto target = make_host_float_array(k, k);
+        auto kp = make_host_float_array(k, k);
+        auto kd = make_host_float_array(k, k);
+        auto tlim = make_host_float_array(k, k);
+        auto* gp = new uint8_t[k == 0u ? 1u : k]();
+        nb::capsule gown(gp, [](void* p) noexcept { delete[] reinterpret_cast<uint8_t*>(p); });
+        size_t gshape[1] = {k};
+        nb::ndarray<nb::numpy, uint8_t> grip(gp, 1, gshape, gown);
+        check_union(nuka_union_world_drive_table(h_, which, dof.data(), target.data(),
+                                                 kp.data(), kd.data(), tlim.data(),
+                                                 gp, k),
+                    "nuka_union_world_drive_table");
+        nb::dict out;
+        out["dof"] = dof;
+        out["target"] = target;
+        out["kp"] = kp;
+        out["kd"] = kd;
+        out["tlim"] = tlim;
+        out["grip"] = grip;
+        return out;
+    }
+
+    nb::object grip_dofs() {
+        const size_t k = dims_.num_grip_dofs;
+        auto dofs = make_host_u32_array(k);
+        check_union(nuka_union_world_grip_dofs(h_, dofs.data(), k),
+                    "nuka_union_world_grip_dofs");
+        return nb::cast(dofs);
+    }
+
+    nb::object dof_limits() {
+        const size_t k = dims_.action_dim;
+        auto lim = make_host_float_array(k, k);
+        check_union(nuka_union_world_dof_limits(h_, lim.data(), k),
+                    "nuka_union_world_dof_limits");
+        return nb::cast(lim);
+    }
+
+    uint32_t env_count() const { return dims_.env_count; }
+    uint32_t action_dim() const { return dims_.action_dim; }
+    uint32_t base_dof() const { return dims_.base_dof; }
+    uint32_t num_fingertips() const { return dims_.num_fingertips; }
+    uint32_t num_feet() const { return dims_.num_feet; }
+    uint32_t link_count() const { return dims_.link_count; }
+    uint32_t bodies_per_env() const { return dims_.bodies_per_env; }
+
+private:
+    UnionWorld(nuka_union_world_handle h, const nuka_union_world_dims_t& dims)
+        : h_(h), dims_(dims) {}
+    nuka_union_world_handle h_ = nullptr;
+    nuka_union_world_dims_t dims_{};
+};
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 NB_MODULE(_nuka_ext, m) {
@@ -1178,6 +1423,111 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](GraspWorld& w) -> GraspWorld& { return w; })
         .def("__exit__",
              [](GraspWorld& w, nb::object, nb::object, nb::object) { w.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    // v0.8 G2: the H1 WHOLE-BODY UNION WORLD (BatchedUnifiedWorld, G1d union scene).
+    nb::class_<UnionWorld>(m, "UnionWorld")
+        .def_static("create", &UnionWorld::create, nb::arg("device"),
+                    nb::arg("env_count"),
+                    nb::arg("h1_mjcf_path") = std::string(),
+                    nb::arg("cup_usda_path") = std::string(),
+                    nb::arg("gravity_z") = 0.0f, nb::arg("dt") = 0.0f,
+                    nb::rv_policy::take_ownership,
+                    "Create a batched H1 whole-body UNION world: env_count parallel "
+                    "floating-base 51-DOF H1s (h1_with_hand cook), each with the "
+                    "~10.9 cm cup SETTLED in its curled right hand, feet on a static "
+                    "ground and a static table seated 2 mm into the settled cup "
+                    "bottom -- feet x ground + finger x cup + cup-proxy x table in "
+                    "ONE solve (the G1d-proven union template). Construction runs "
+                    "the FULL deterministic authoring inside the engine (cook -> "
+                    "stance -> seat -> curl -> placement search -> 200-step oracle "
+                    "settle pre-roll with hand-frame cup carry -> table authoring); "
+                    "same inputs -> byte-same initial state. Empty paths -> the "
+                    "repo-relative default assets (run from the repo root); "
+                    "gravity_z=0 -> -9.81; dt=0 -> 1/240 (sentinel convention shared "
+                    "with the C++ reference so templates match byte-exactly).")
+        .def("step", &UnionWorld::step,
+             "Advance EVERY env one fixed step (applies the last set_actions; "
+             "all-zero drive until the first call).")
+        .def("set_actions", &UnionWorld::set_actions, nb::arg("actions"),
+             "Set the per-env per-DOF joint TORQUES from a HOST contiguous float32 "
+             "array of length env_count*action_dim (env-major). action_dim == the "
+             "FULL dof_stride (51 = 6 base + 45 joints). Columns 0..5 are the DEAD "
+             "floating-base columns (no actuator behind them; by spec convention "
+             "the caller's action mask zeroes them). Columns 6..50 are the 45 "
+             "single-DOF joints in prefix-sum (DofIndexOf) order -- the SAME "
+             "columns the exported q/qdot use, so a host PD reads q[:, d] / "
+             "qdot[:, d] and writes actions[:, d].")
+        .def("step_with_actions", &UnionWorld::step_with_actions, nb::arg("actions"),
+             "set_actions(actions) then step() -- the RL per-step driver.")
+        .def("export_obs", &UnionWorld::export_obs,
+             "Export the batched per-step obs as a dict of HOST numpy arrays "
+             "(env-major; single-copy through the C ABI):\n"
+             "  q                    (n, 51) f32  joint q at the action columns "
+             "(cols 0..5 = root filler)\n"
+             "  qdot                 (n, 51) f32  cols 0..5 = base spatial vel, "
+             "6..50 = joint qdot\n"
+             "  base_pose            (n, 7)  f32  [px,py,pz, qw,qx,qy,qz]\n"
+             "  base_vel             (n, 6)  f32  root spatial velocity "
+             "(== qdot[:, :6])\n"
+             "  cup_pose             (n, 7)  f32  [px,py,pz, qw,qx,qy,qz]\n"
+             "  cup_vel              (n, 6)  f32  [vx,vy,vz, wx,wy,wz]\n"
+             "  fingertip_world_pos  (n, 30, 3) f32  (LAST step's FK; zeros before "
+             "the first step, stale across reset until the next step)\n"
+             "  finger_normal_impulse(n, 30) f32  per-fingertip normal impulse\n"
+             "  last_action          (n, 51) f32  the exact last set_actions bytes\n"
+             "  foot_rows            (n,) u32   # foot<->ground normal rows\n"
+             "  foot_impulse         (n,) f32   Σλ over foot normal rows\n"
+             "  table_rows           (n,) u32   # cup<->table rows\n"
+             "  table_impulse        (n,) f32   Σλ*j_z over table rows\n"
+             "  finger_contacts      (n,) u32   # fingertip<->cup contacts")
+        .def("set_table_enabled", &UnionWorld::set_table_enabled, nb::arg("env"),
+             nb::arg("enabled"),
+             "Per-env (env >= 0) or all-env (env == -1) cup<->table support toggle "
+             "(the lift choreography's 'remove the table'). Takes effect on the "
+             "next step().")
+        .def("table_enabled", &UnionWorld::table_enabled, nb::arg("env") = 0u,
+             "Read one env's live table toggle.")
+        .def("set_base_pose", &UnionWorld::set_base_pose, nb::arg("env"),
+             nb::arg("pose7"),
+             "Overwrite env e's floating-base pose ([px,py,pz, qw,qx,qy,qz]) -- "
+             "the per-env IC seam (base randomization / airborne tests). OFF the "
+             "step path.")
+        .def("reset_envs", &UnionWorld::reset_envs, nb::arg("env_ids"),
+             nb::arg("seed"),
+             "Reset the listed envs: gripper to the SETTLED proto q (velocities "
+             "ZEROED -- the post-reset state is the settled pose at rest, not the "
+             "construction-time snapshot), cup to the settled in-hand placement "
+             "with a seed-deterministic XY jitter (+/-2.5 cm), table toggle back "
+             "ON. Same seed -> byte-same post-reset state.")
+        .def("scene_info", &UnionWorld::scene_info,
+             "Scene scalars: table_height, cup_mass, total_mass, poly_cx, dt, "
+             "gravity_z, ankle_settle_tau (L,R), place_found.")
+        .def("drive_table", &UnionWorld::drive_table, nb::arg("phase"),
+             "The factory's reference PD drive table for phase 'hold' / 'rest' / "
+             "'close' (the proven lift choreography + an ankle POSTURE stand-in "
+             "for the CoP balance law). dict of arrays {dof, target, kp, kd, tlim, "
+             "grip}: tau[dof] = kp*(target - q[dof]) - kd*qdot[dof], clamped to "
+             "+/-tlim when tlim > 0. A choreography aid for smokes -- the G3 RL "
+             "policy replaces it.")
+        .def("grip_dofs", &UnionWorld::grip_dofs,
+             "The 12 wrap-driven grip action columns (the BITE kill-switch).")
+        .def("dof_limits", &UnionWorld::dof_limits,
+             "Per-DOF |torque| limits (51; 0 on the 6 dead base columns) -- the "
+             "random-action envelope.")
+        .def("destroy", &UnionWorld::destroy, "Destroy the union world.")
+        .def_prop_ro("env_count", &UnionWorld::env_count)
+        .def_prop_ro("action_dim", &UnionWorld::action_dim,
+                     "The FULL dof_stride (51): 6 dead base columns + 45 joints.")
+        .def_prop_ro("base_dof", &UnionWorld::base_dof)
+        .def_prop_ro("num_fingertips", &UnionWorld::num_fingertips)
+        .def_prop_ro("num_feet", &UnionWorld::num_feet)
+        .def_prop_ro("link_count", &UnionWorld::link_count)
+        .def_prop_ro("bodies_per_env", &UnionWorld::bodies_per_env)
+        .def("__enter__", [](UnionWorld& w) -> UnionWorld& { return w; })
+        .def("__exit__",
+             [](UnionWorld& w, nb::object, nb::object, nb::object) { w.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 

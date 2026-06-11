@@ -2557,6 +2557,75 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_h1_union_world_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- SG G2: the PRODUCTION union-scene-factory EQUALITY gate -------------------
+    # src/runtime/coresident/h1_union_scene_factory.cpp reproduces the test-side
+    # G1c/G1d authoring (h1_union_scene_shared.hpp) VERBATIM so the C-ABI union
+    # world can construct it from libnuka. This gate pins the promotion: the
+    # factory's BatchedSceneTemplate (incl. the independently-run 200-step settle
+    # pre-roll) must be BYTE-IDENTICAL to the shared-header authoring. Compiles the
+    # factory + the same coresident sources as the union TU. Asset-gated SKIP.
+    add_executable(nuka_h1_union_scene_factory_test
+        coresident/test_h1_union_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_union_scene_factory_test nuka_codegen)
+
+    target_compile_definitions(nuka_h1_union_scene_factory_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+
+    target_include_directories(nuka_h1_union_scene_factory_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_h1_union_scene_factory_test
+        PRIVATE
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_h1_union_scene_factory_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- SG G2: the C++ REFERENCE RECORDER for the python byte-parity gate ---------
+    # Drives the union world THROUGH THE C ABI (links libnuka -- the exact code path
+    # the python binding calls, so the python replay has no cross-compile seam) with
+    # the closed-loop lift choreography and records per-step action bytes + the
+    # C-ABI obs export to .g2_logs/g2_pyref_n4.bin. The python gate harness
+    # (examples/training/g2_union_world_gates.py) runs this binary then replays.
+    if(TARGET nuka)
+        add_executable(nuka_h1_union_pyref_test
+            coresident/test_h1_union_pyref.cpp
+        )
+
+        target_include_directories(nuka_h1_union_pyref_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_h1_union_pyref_test
+            PRIVATE
+                nuka
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_h1_union_pyref_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endif()
+
     # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
     # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
     # the right hand co-resides a movable cup + static table + N fingertip collidables

@@ -241,6 +241,15 @@ struct ObsStateBatch {
     std::vector<float> qdot;                // finger joint qdot    [dof_stride per env].
     std::vector<float> fingertip_world_pos; // fingertip world xyz  [3*num_fingertips per env].
     std::vector<float> finger_normal_impulse;  // per-finger normal impulse [num_fingertips per env].
+    // ----- G2 UNION additions (ADDITIVE; zero-filled for a Fixed-root gripper) -----
+    // The articulation root state the whole-body RL obs needs, exported from the SAME
+    // bulk downloads (base_pose: one small env-major Transform copy; base_vel: the
+    // root slot of the link_velocity download ExportObsState already does when
+    // base_dof > 0). For a FIXED-root articulation base_pose still reports the live
+    // (constant) root transform; base_vel stays zero (the fixed root never moves).
+    std::vector<float> base_pose;  // [7 per env] px,py,pz, qw,qx,qy,qz.
+    std::vector<float> base_vel;   // [6 per env] root spatial velocity (== qdot cols 0..5
+                                   // for a FloatingBase root; zeros for a Fixed root).
 };
 
 // The batched general world. Owns N envs of co-resident state and advances them in
@@ -495,6 +504,9 @@ private:
     mutable std::vector<float> obs_q_scratch_;       // env_count_*base_link_count_ (device q).
     mutable std::vector<float> obs_qdot_scratch_;    // env_count_*base_link_count_ (device qdot).
     mutable std::vector<articulation::LinkSpatialVel> obs_linkvel_scratch_;  // env-major link vel.
+    // G2: base_pose download scratch (env_count_ Transforms -- one per articulation;
+    // tiny). Filled by ExportObsState for the base_pose/base_vel obs fields.
+    mutable std::vector<math::Transform> obs_basepose_scratch_;
     // ----- P2.4b persistent batched articulation scratch (allocated once, reused) ------
     // Mirrors BatchedArticulatedWorld's world_pose_/m_/m_inv_/composite_ layout. world_pose_
     // is Transform[env_count_*base_link_count_] (ONE batched UpdateWorldLinkPoses output);

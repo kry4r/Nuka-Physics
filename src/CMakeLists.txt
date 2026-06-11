@@ -112,6 +112,7 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_grasp.h
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_union.h
 )
 
 add_library(nuka_render STATIC
@@ -837,6 +838,13 @@ if(CMAKE_CUDA_COMPILER)
         # (python/src/nuka_ext.cpp, g++-10) binds the C surface only -- no C++ class
         # ABI crosses the toolchain boundary.
         c_abi/grasp_world.cpp
+        # v0.8 G2: the H1 WHOLE-BODY UNION WORLD C-ABI shim + the PRODUCTION union
+        # scene factory (the test-proven G1c/G1d authoring incl. the 200-step
+        # oracle settle pre-roll, reproduced verbatim from the shared test header
+        # and guarded by the byte-equality gate in
+        # tests/coresident/test_h1_union_scene_factory.cpp).
+        c_abi/union_world.cpp
+        runtime/coresident/h1_union_scene_factory.cpp
         runtime/coresident/batched_unified_world.cpp
         runtime/coresident/unified_coresident_stepper.cpp
         runtime/coresident/grasp_scene_factory.cpp
@@ -900,6 +908,11 @@ if(CMAKE_CUDA_COMPILER)
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
+        # G2: the union scene factory carries VERBATIM copies of the test-side
+        # authoring bodies (h1_demo_shared / h1_union_scene_shared, never written
+        # under the strict flags); re-auditing them would risk the byte-identity
+        # the equality gate pins. The NEW c_abi/union_world.cpp shim stays strict.
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
         PROPERTIES COMPILE_OPTIONS "-w"
     )
