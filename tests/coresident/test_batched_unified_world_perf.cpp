@@ -47,6 +47,13 @@
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"                                 // CookScene
 
+// G1e: the FULL UNION scene authoring (floating 51-DOF H1 + feet x ground +
+// finger x cup + cup-proxy x table, with the 200-step settle pre-roll / placement
+// search / table-height derivation) is shared with the union parity TU via this
+// header (EXTRACTED at G1e). The union throughput cases below build from it so the
+// gate-(d) numbers cover the SAME scene the parity gates proved.
+#include "h1_union_scene_shared.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -268,6 +275,29 @@ constexpr uint32_t kKMin = 20u;
 uint32_t StepsForN(uint32_t n) {
     const uint32_t k = (n == 0u) ? kK : (kTargetEnvSteps / n);
     return std::clamp(k, kKMin, kK);
+}
+
+// ----- G1e UNION-scene timing knobs --------------------------------------------------
+// The union scene is the HEAVIEST regime: ~51-DOF whole-body H1 (vs the grasp gate's
+// ~5-DOF gripper) + ~35 contacts/env (30 fingers + 4 feet + 1 table). MEASURED
+// ~19 ms per ENV-step (N=32: 593 ms / 32 envs) -- ~90x the grasp scene's ~0.2 ms. So a
+// single Step() at N=1024 is ~19 s of wall time (the host orchestration is O(N)). The
+// env_steps_per_sec is a THROUGHPUT RATE -- K only sets the sample count, not the rate.
+// We keep the FULL >=200-step timed window at N=32 (where each step is cheap, ~0.6 s),
+// and ADAPT K down at the big N (a fixed K=200 there would make ONE run ~63 min) to a
+// bounded ENV-STEP budget, exactly the existing grasp gate's adaptive-K pattern
+// (StepsForN above; that gate runs K=10 at N=1024). The big-N runs still sample several
+// thousand env-steps -- ample for a stable rate. The warm-up is SHORT: the scene proto
+// is ALREADY the 200-step-settled standing equilibrium (BuildGraspStandScene), so the
+// close drive grabs the cup within a few steps; the regime asserts validate it held.
+constexpr uint32_t kUnionWarm = 8u;              // short: proto is pre-settled.
+constexpr uint32_t kUnionK = 200u;               // the FULL timed window (N=32, spec §G1(d) >=200).
+constexpr uint32_t kUnionTargetEnvSteps = 6400u; // N=32 -> K=200 (>=200); big N adapts down.
+constexpr uint32_t kUnionKMin = 4u;              // big-N floor (>=4 clean steps at N=1024).
+
+uint32_t UnionStepsForN(uint32_t n) {
+    const uint32_t k = (n == 0u) ? kUnionK : (kUnionTargetEnvSteps / n);
+    return std::clamp(k, kUnionKMin, kUnionK);
 }
 
 // A1: the per-step RL cost is SetActions + Step + ExportObsState. The timed region BRACKETS
@@ -636,4 +666,321 @@ TEST(BatchedUnifiedWorldPerf, EnvStepsPerSecondAndStageBreakdown) {
         << " env-steps/sec) fell below 0.85x the coloring-fix baseline (" << kN1024BaselineEps
         << ") -- the obs export re-introduced O(N) host-sync cost; it must be batched, not a "
            "per-env DownloadGripper loop";
+}
+
+// ===========================================================================
+// G1e -- the FULL UNION-SCENE throughput gate (spec §G1(d) trainability) + the
+// trainability verdict. The grasp gate above measures the SMALL fixed-base 2-finger
+// gripper scene (~5 DOF, 2 fingertips, finger x cup ONLY). The UNION scene is the
+// HEAVIEST steady regime the RL training actually runs: a FLOATING 51-DOF whole-body
+// H1 standing on FEET x ground + holding the cup by FINGER x cup + the cup resting
+// on the cup-proxy-box x TABLE -- ALL THREE row classes live in ONE UnifiedSolve.
+// That is ~10x the dof_stride (51 vs ~5), ~30 fingertips + 4 feet + 1 table box per
+// env, and the 51-DOF CRBA factor / chain-J cost. The gate-(d) bar is the SAME for
+// both, but ONLY the union number is the honest training-time throughput.
+//
+// THE RL SEAM (NOT DrivePdBatched). The steady-state RL loop is ONE bulk SetActions
+// + Step (+ periodic ExportObsState). DrivePdBatched's per-env DownloadGripper is a
+// TEST ARTIFACT (it round-trips the device per env to recompute PD from live state),
+// so it is FORBIDDEN inside the timed window. We instead precompute ONE constant
+// env-major action vector ONCE from the warmed-up steady state (the per-env
+// DownloadGripper happens exactly once, OUTSIDE timing) and apply it every timed
+// step -- exactly the brief's "ONE host action vector ... applied every step".
+//
+// REGIME HONESTY -- the measured regime is the CLOSE-ON-TABLE capture. The frozen
+// action is the CLOSE drive (kCloseOffset, +0.18 rad: fingers actively SQUEEZE) with
+// the table KEPT enabled, computed at the warmed equilibrium. That holds all three
+// classes live in steady state: feet x ground, fingers x cup (squeezing), cup x table
+// (still resting). MEASURED FINDING: the kRestBackOffset rest drive UNLOADS the
+// fingers by design (lets the table alone carry the cup), so frozen it drifts the
+// fingers off the cup (finger contacts -> 0 by step ~200) and is NOT the heaviest
+// regime -- hence the close drive. We ASSERT the regime on a SAMPLED env at the START
+// and END of the timed window (foot rows > 0, finger contacts > 0, table rows > 0) --
+// the number is INVALID if the scene drifted out of the all-three regime. We report
+// BOTH variants: (V1) SetActions+Step only, and (V2) +ExportObsState every step (the
+// real RL loop shape). The verdict reads the BEST N's eps.
+// ===========================================================================
+namespace h1u = nuka::test::h1union;
+
+// Build ONE constant env-major action vector from the warmed-up STEADY state: per
+// env, download its gripper state ONCE (outside any timed loop) and evaluate the
+// passed-in `drive` (the CLOSE-on-table hold) + the CoP ankle law at the settled CoM
+// -- the SAME torque DrivePdBatched would compute, frozen. Applying this every step
+// holds the union at its close-on-table equilibrium so all three row classes stay
+// live without any per-step device round-trip. The CopCtl is advanced PAST its settle
+// window so the ankle feedforward is the live gravity-balancing hold.
+std::vector<float> BuildUnionConstantAction(const nuka::phi::DeviceContext& context,
+                                            coresident::BatchedUnifiedWorld& world,
+                                            const h1u::UnionScene& sc,
+                                            const std::vector<h1u::DriveLink>& drive) {
+    const uint32_t n = world.EnvCount();
+    const uint32_t dof_stride = sc.dof_stride;
+    std::vector<float> actions(static_cast<size_t>(n) * dof_stride, 0.0f);
+    // One CoP controller per env, pre-advanced past its 15-step settle so AnkleTorque
+    // returns the engaged gravity-balancing feedforward (not the 0 N*m warm window).
+    h1u::CopCtl cop(context, sc, n);
+    for (uint32_t e = 0u; e < n; ++e) {
+        articulation::ArticulationHostState st;
+        world.DownloadGripper(e, &st);  // ONCE per env, OUTSIDE the timed loop.
+        const size_t aoff = static_cast<size_t>(e) * dof_stride;
+        for (const h1u::DriveLink& dl : drive) {
+            const uint32_t d = h1u::DofIndexOf(sc.host, sc.root_link, dl.link);
+            if (d >= dof_stride) continue;
+            // target_scale == 1 here, so grip and non-grip both use dl.target directly
+            // (DrivePdBatched's scale*target collapses to target at scale 1; grip
+            // targets are already absolute q_curl+close_offset).
+            float u = dl.kp * (dl.target - st.q[dl.link]) - dl.kd * st.qdot[dl.link];
+            if (dl.tlim > 0.0f) u = std::max(-dl.tlim, std::min(dl.tlim, u));
+            actions[aoff + d] = u;
+        }
+        // Engage the CoP ankle law (advance the call counter past the settle window).
+        for (uint32_t w = 0u; w < cop.settle + 1u; ++w) (void)cop.AnkleTorque(st, e);
+        const float tau_cop = cop.AnkleTorque(st, e);
+        for (uint32_t l : cop.ankle_links) {
+            const uint32_t d = h1u::DofIndexOf(sc.host, sc.root_link, l);
+            if (d >= dof_stride) continue;
+            float u = tau_cop - cop.ankle_kd * st.qdot[l];
+            u = std::max(-cop.tlim, std::min(cop.tlim, u));
+            actions[aoff + d] = u;
+        }
+    }
+    return actions;
+}
+
+// The regime evidence on a sampled env: all three union row classes must be live.
+struct UnionRegime {
+    uint32_t foot_rows = 0u, finger_contacts = 0u, table_rows = 0u;
+    bool AllThree() const {
+        return foot_rows > 0u && finger_contacts > 0u && table_rows > 0u;
+    }
+};
+UnionRegime SampleRegime(const coresident::BatchedUnifiedWorld& world, uint32_t env) {
+    const auto& r = world.GraspReports()[env];
+    return {r.foot_normal_rows, r.finger_contacts, r.table_row_count};
+}
+
+// Run the union throughput for one N: build the world, warm up with the REAL
+// DrivePdBatched seam (untimed) to reach the steady stance, freeze ONE constant
+// action, then time K steps. `with_obs` selects the variant (V2 calls ExportObsState
+// every step). Asserts the all-three-classes regime on a sampled env at the window
+// edges. Returns env_steps_per_sec; fills the start/end regime out-params.
+double RunUnionHarness(const nuka::phi::DeviceContext& context,
+                       const h1u::UnionScene& sc,
+                       const coresident::BatchedSceneTemplate& tmpl,
+                       const std::vector<h1u::DriveLink>& hold_drive, uint32_t n,
+                       uint32_t k, bool with_obs, double* ms_per_step_out,
+                       UnionRegime* regime_start, UnionRegime* regime_end) {
+    coresident::BatchedUnifiedWorld world(context, tmpl, n, h1u::kGravityZ, h1u::kDt);
+    const std::vector<float> rest_scales(n, 1.0f);
+    // ----- WARM UP with the real PD seam (untimed): reach the steady CLOSE-on-table
+    // stance (fingers squeezing the still-table-supported cup) so the frozen constant
+    // action is the genuine all-three-classes equilibrium hold. -----
+    for (uint32_t s = 0u; s < kUnionWarm; ++s) {
+        h1u::CopCtl warm_cop(context, sc, n);
+        h1u::DrivePdBatched(world, sc, hold_drive, rest_scales, 0.0f, &warm_cop);
+        world.Step();
+    }
+    // ----- Freeze ONE constant env-major action from the warmed steady state (the
+    // ONLY per-env DownloadGripper, OUTSIDE the timed loop). -----
+    const std::vector<float> const_action =
+        BuildUnionConstantAction(context, world, sc, hold_drive);
+
+    coresident::ObsStateBatch obs;
+    world.SetActions(const_action.data(), const_action.size());
+    world.Step();  // one step on the frozen action (settle onto it) before sampling.
+    *regime_start = SampleRegime(world, n / 2u);  // a mid-index sampled env.
+    world.Perf().Reset();                          // discard warm-up samples.
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t s = 0u; s < k; ++s) {
+        world.SetActions(const_action.data(), const_action.size());  // ONE bulk upload.
+        world.Step();                                                 // advance all envs.
+        if (with_obs) world.ExportObsState(obs);                      // V2: RL obs readout.
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    *regime_end = SampleRegime(world, n / 2u);
+
+    const double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+    *ms_per_step_out = 1.0e3 * elapsed_sec / k;
+    return static_cast<double>(n) * k / elapsed_sec;
+}
+
+// Print the per-stage breakdown for the union scene at N (fresh world, frozen action).
+void RunUnionStageBreakdown(const nuka::phi::DeviceContext& context,
+                            const h1u::UnionScene& sc,
+                            const coresident::BatchedSceneTemplate& tmpl,
+                            const std::vector<h1u::DriveLink>& hold_drive, uint32_t n,
+                            uint32_t k) {
+    coresident::BatchedUnifiedWorld world(context, tmpl, n, h1u::kGravityZ, h1u::kDt);
+    const std::vector<float> rest_scales(n, 1.0f);
+    for (uint32_t s = 0u; s < kUnionWarm; ++s) {
+        h1u::CopCtl warm_cop(context, sc, n);
+        h1u::DrivePdBatched(world, sc, hold_drive, rest_scales, 0.0f, &warm_cop);
+        world.Step();
+    }
+    const std::vector<float> const_action =
+        BuildUnionConstantAction(context, world, sc, hold_drive);
+    coresident::ObsStateBatch obs;
+    world.SetActions(const_action.data(), const_action.size());
+    world.Step();
+    world.Perf().Reset();
+    const auto wall0 = std::chrono::steady_clock::now();
+    for (uint32_t s = 0u; s < k; ++s) {
+        world.SetActions(const_action.data(), const_action.size());
+        world.Step();
+        world.ExportObsState(obs);
+    }
+    const auto wall1 = std::chrono::steady_clock::now();
+    const double wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    const auto& perf = world.Perf();
+    double sum_tags_ms = 0.0;
+    for (const char* tag : kStageTags) sum_tags_ms += TagTotalUs(perf, tag) * 1.0e-3;
+    const double denom_ms = sum_tags_ms > 0.0 ? sum_tags_ms : 1.0;
+    for (const char* tag : kStageTags) {
+        const double tag_ms = TagTotalUs(perf, tag) * 1.0e-3;
+        std::printf("[UNION-PERF-BREAKDOWN N=%u K=%u] %s=%.3f (%.1f%%) per_step=%.4f_ms\n",
+                    n, k, tag, tag_ms, 100.0 * tag_ms / denom_ms,
+                    tag_ms / static_cast<double>(k > 0u ? k : 1u));
+    }
+    std::printf("[UNION-PERF-BREAKDOWN N=%u K=%u] SUM_TAGS=%.3f WALL_TOTAL=%.3f "
+                "(sum/wall=%.1f%%)\n", n, k, sum_tags_ms, wall_total_ms,
+                wall_total_ms > 0.0 ? 100.0 * sum_tags_ms / wall_total_ms : 0.0);
+    std::fflush(stdout);
+    EXPECT_LE(sum_tags_ms, wall_total_ms * 1.05)
+        << "Σ(stage tags) exceeds wall time at union N=" << n
+        << " -> a timer is nested / double-counted";
+}
+
+TEST(BatchedUnifiedWorldPerf, UnionSceneThroughputAndTrainabilityVerdict) {
+    if (!h1u::AssetsAvailable())
+        GTEST_SKIP() << "h1_with_hand / cup not present -- union perf gate skipped";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+
+    // Build the FULL union scene ONCE (the 200-step settle pre-roll + placement
+    // search + table-height derivation is expensive; the template is replicated per
+    // N). This is the SAME BuildGraspStandTableScene the G1d parity gate proved.
+    const h1u::UnionScene sc = h1u::BuildGraspStandTableScene(context);
+    ASSERT_TRUE(sc.place.found) << "union cup placement search failed -- no grasp scene";
+    ASSERT_EQ(sc.dof_stride, 51u) << "union proto is not the 51-DOF whole-body H1";
+    ASSERT_TRUE(sc.has_feet) << "union scene has no feet -- not the standing regime";
+    ASSERT_TRUE(sc.sg.has_table) << "union scene has no table -- not the heaviest regime";
+    const coresident::BatchedSceneTemplate tmpl = h1u::MakeUnionTemplate(sc);
+
+    // ----- The hold drive: the CLOSE-on-table capture (kCloseOffset, +0.18 rad), the
+    // G1d "all3-steps" regime where the fingers actively SQUEEZE the cup that is STILL
+    // resting on the (kept-enabled) table. We do NOT remove the table (no
+    // SetTableEnabled(false)), so the steady regime carries ALL THREE row classes:
+    // feet x ground (4) + fingers x cup (squeezing, persists) + cup x table (the cup
+    // rests). The earlier kRestBackOffset drive UNLOADS the fingers (by design, to let
+    // the table alone carry the cup), so frozen it drifts the fingers off the cup
+    // (MEASURED: finger contacts -> 0 by step ~200) -- not the heaviest regime. The
+    // close drive keeps all three live in steady state. The frozen action is the
+    // gravity-/squeeze-compensating equilibrium of THIS drive (see BuildUnionConstant-
+    // Action), so the constant-action rollout holds the close-on-table regime.
+    const auto hold_drive = h1u::BuildGraspStanceDriveSet(sc, h1u::kCloseOffset);
+
+    const uint32_t kNs[] = {32u, 256u, 1024u};
+    constexpr uint32_t kReps = 3u;  // median of >=3 repeats (report all).
+    double best_eps = 0.0;
+    uint32_t best_n = 0u;
+
+    for (uint32_t n : kNs) {
+        const uint32_t k = UnionStepsForN(n);  // >=200 at small N; adaptive at big N.
+        // ----- V1: SetActions + Step ONLY. -----
+        std::vector<double> v1_eps;
+        for (uint32_t r = 0u; r < kReps; ++r) {
+            double ms = 0.0;
+            UnionRegime rs{}, re{};
+            const double eps = RunUnionHarness(context, sc, tmpl, hold_drive, n, k,
+                                               /*with_obs=*/false, &ms, &rs, &re);
+            v1_eps.push_back(eps);
+            std::printf("[UNION-PERF V1 N=%u K=%u rep=%u] env_steps_per_sec=%.1f "
+                        "ms_per_step=%.3f regime_start{foot=%u,finger=%u,table=%u} "
+                        "regime_end{foot=%u,finger=%u,table=%u}\n",
+                        n, k, r, eps, ms, rs.foot_rows, rs.finger_contacts, rs.table_rows,
+                        re.foot_rows, re.finger_contacts, re.table_rows);
+            std::fflush(stdout);
+            // HONESTY: the number is only valid if all three classes stayed live.
+            EXPECT_TRUE(rs.AllThree())
+                << "union V1 N=" << n << " rep=" << r
+                << ": all-three-classes regime NOT live at the START of the timed window "
+                   "(foot=" << rs.foot_rows << " finger=" << rs.finger_contacts
+                << " table=" << rs.table_rows << ") -- the throughput number's regime is "
+                   "not the heaviest union regime";
+            EXPECT_TRUE(re.AllThree())
+                << "union V1 N=" << n << " rep=" << r
+                << ": the scene DRIFTED out of the all-three-classes regime by the END of "
+                   "the timed window (foot=" << re.foot_rows << " finger="
+                << re.finger_contacts << " table=" << re.table_rows
+                << ") -- shorten the window or refresh the action; do NOT report this number";
+        }
+        // ----- V2: + ExportObsState every step (the real RL loop shape). -----
+        std::vector<double> v2_eps;
+        for (uint32_t r = 0u; r < kReps; ++r) {
+            double ms = 0.0;
+            UnionRegime rs{}, re{};
+            const double eps = RunUnionHarness(context, sc, tmpl, hold_drive, n, k,
+                                               /*with_obs=*/true, &ms, &rs, &re);
+            v2_eps.push_back(eps);
+            std::printf("[UNION-PERF V2 N=%u K=%u rep=%u] env_steps_per_sec=%.1f "
+                        "ms_per_step=%.3f (WITH obs export) regime_end{foot=%u,finger=%u,"
+                        "table=%u}\n", n, k, r, eps, ms, re.foot_rows, re.finger_contacts,
+                        re.table_rows);
+            std::fflush(stdout);
+            EXPECT_TRUE(rs.AllThree() && re.AllThree())
+                << "union V2 N=" << n << " rep=" << r << ": all-three regime not live "
+                   "across the window";
+        }
+        auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2u];
+        };
+        const double v1_med = median(v1_eps);
+        const double v2_med = median(v2_eps);
+        std::printf("[UNION-PERF MEDIAN N=%u] V1(Step only)=%.1f eps  V2(+obs)=%.1f eps\n",
+                    n, v1_med, v2_med);
+        std::fflush(stdout);
+        if (v2_med > best_eps) { best_eps = v2_med; best_n = n; }
+    }
+
+    // ----- The per-stage breakdown at N=1024 (name the bottleneck from MEASUREMENT). --
+    // K=8: at ~19 s/step (N=1024) a bigger K would add minutes; 8 steps gives stable
+    // per-tag means (each tag is sampled 8x; the %-split is a within-run ratio).
+    RunUnionStageBreakdown(context, sc, tmpl, hold_drive, 1024u, 8u);
+
+    // ----- THE TRAINABILITY VERDICT (spec §G1(d)) ------------------------------------
+    // One PPO stage ~= 100M env-steps. Wall-clock at the BEST N = 100e6 / eps seconds.
+    // Bar: < 24 h  <=>  eps >= 100e6 / (24*3600) ~= 1157.4 env-steps/sec.
+    constexpr double kStageEnvSteps = 100.0e6;
+    constexpr double kBarSeconds = 24.0 * 3600.0;
+    const double kBarEps = kStageEnvSteps / kBarSeconds;  // ~1157.4.
+    const double hours_per_stage = best_eps > 0.0 ? kStageEnvSteps / best_eps / 3600.0 : 0.0;
+    const bool green = best_eps >= kBarEps;
+    std::printf("[UNION-TRAINABILITY VERDICT] best_N=%u best_eps=%.1f (V2, with obs) -> "
+                "%.2f h per 100M env-steps ; 24h bar = %.1f eps -> %s (margin %.1fx)\n",
+                best_n, best_eps, hours_per_stage, kBarEps,
+                green ? "GREEN" : "RED", best_eps / kBarEps);
+    std::fflush(stdout);
+
+    // ----- The regression tripwire (NOT the 24h bar -- that goes in the verdict). -----
+    // A CONSERVATIVE floor the box reliably clears, like the grasp gate's 0.3x floor.
+    // The union scene is the HEAVIEST regime (~51-DOF whole-body + ~35 contacts/env), and
+    // MEASURED at gate-bake time it is row-solver-bound at ~50-74 env-steps/sec, FLAT
+    // across N in {32,256,1024} (single-block UnifiedSolve = 97.6% of the step at N=1024:
+    // row_solver 19011.9 ms/step vs narrowphase 305.6 / row_assembly 119.5 / rest <0.1%).
+    // The floor is set WELL BELOW the measured worst-N (~50 eps) so a noisy shared box
+    // never flakes while a gross (3x+) regression still trips it. The DELIVERABLE is the
+    // PRINTED table + the trainability verdict; this assert only catches a structural break.
+    // BASELINE (this box, G1e bake, V2 +obs medians): N=32 50.2 eps, N=256 74.2 eps (BEST),
+    // N=1024 49.9 eps; the 100M-env-step PPO stage = 374.26 h at best-N -> RED vs the 24h
+    // bar (1157.4 eps, margin 0.1x). The NAMED optimization increment (a separate agent
+    // owns it; evidence = the breakdown's 97.6% row_solver share) = restructure the
+    // articulated row solve -- the iteration x color SEQUENTIAL LAUNCH STORM into a
+    // per-env in-block serial walk (or equivalent device-resident multi-block kernel).
+    // DO NOT raise this floor to the 24h bar -- the verdict is the report.
+    constexpr double kUnionFloorEps = 15.0;  // 0.3x of the ~50 eps worst-N measured.
+    EXPECT_GT(best_eps, kUnionFloorEps)
+        << "union throughput (" << best_eps << " eps best-N) fell below the conservative "
+        << kUnionFloorEps << " floor -- a gross perf regression in the union step path";
 }
