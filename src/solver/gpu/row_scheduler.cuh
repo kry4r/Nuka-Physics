@@ -7,10 +7,13 @@
 
 namespace nuka::solver::gpu {
 
-struct DeviceRowColorPartitions {
+// Device view of RowComponentPartitions (one solver CUDA block per component;
+// see row_scheduler.hpp for the byte-identity argument).
+struct DeviceRowComponentPartitions {
     const uint32_t* row_indices = nullptr;
-    const RowColorRange* color_ranges = nullptr;
-    uint32_t color_count = 0u;
+    const RowColorRange* segments = nullptr;
+    const RowComponentRange* components = nullptr;
+    uint32_t component_count = 0u;
 };
 
 } // namespace nuka::solver::gpu

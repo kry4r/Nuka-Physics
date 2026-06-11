@@ -15,7 +15,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -848,33 +851,63 @@ __device__ float SolvePositionRow(DeviceRowBuffers rows,
     return fabsf(error);
 }
 
-__global__ void SolveRowsSweepKernel(DeviceRowBuffers rows,
-                                     DeviceRowColorPartitions partitions,
-                                     runtime::rigid::BodyState* bodies,
-                                     uint32_t body_count,
-                                     uint32_t velocity_iterations,
-                                     uint32_t position_iterations,
-                                     float slop,
-                                     float baumgarte,
-                                     float dt,
-                                     float* max_error_out) {
+// =============================================================================
+// G1(d) throughput increment: ONE CUDA BLOCK PER CONNECTED COMPONENT.
+// =============================================================================
+// The former kernel ran the whole row set on a SINGLE block (<<<1, 128>>>): all
+// velocity_iterations x colors x rows serialized onto one SM, so the union-scene
+// wall time grew linearly with env count (the measured flat ~50-74 env-steps/s).
+// Rows in different CONNECTED COMPONENTS of the shared-mutable-state relation
+// (bodies / qdot tiles / particle velocities / lambda groups -- see
+// BuildRowComponentPartitions) touch disjoint memory, so their relative timing
+// cannot change any float. This kernel therefore runs one block per component;
+// each block walks ITS component's rows in ascending global-color order
+// (segments), with __syncthreads() between segments -- the EXACT operation
+// sequence the single-block sweep produced for that component's data (same ops,
+// same order, same operands), executed concurrently across components. Per-env
+// results are byte-identical BY CONSTRUCTION, for every caller (batched union
+// world AND the legacy/N=1 consumers).
+//
+// max_error_out: the old kernel reported max(lane-0's running position-solve
+// error, final-state recompute over all rows). Per-block we reduce ALL lanes'
+// running errors (a superset of lane 0's -- still a lower-bound-honest max) and
+// the final-state recompute over the block's rows, then combine across blocks
+// with atomicMax on the float's bit pattern (exact for the non-negative finite
+// errors produced here; max is order-independent, so D1 holds). No test or
+// production caller consumes this value beyond >= 0.0f sanity.
+__global__ void SolveRowsComponentSweepKernel(DeviceRowBuffers rows,
+                                              DeviceRowComponentPartitions comps,
+                                              runtime::rigid::BodyState* bodies,
+                                              uint32_t body_count,
+                                              uint32_t velocity_iterations,
+                                              uint32_t position_iterations,
+                                              float slop,
+                                              float baumgarte,
+                                              float dt,
+                                              float* max_error_out) {
+    const uint32_t comp_index = blockIdx.x;
+    if (comp_index >= comps.component_count) {
+        return;
+    }
+    const RowComponentRange comp = comps.components[comp_index];
     const uint32_t lane = threadIdx.x;
 
-    for (uint32_t row_index = lane;
-         row_index < rows.row_count;
-         row_index += blockDim.x) {
-        PrepareVelocityTargetRow(rows, row_index, bodies, body_count);
+    for (uint32_t local = lane; local < comp.row_count; local += blockDim.x) {
+        PrepareVelocityTargetRow(rows,
+                                 comps.row_indices[comp.row_offset + local],
+                                 bodies,
+                                 body_count);
     }
     __syncthreads();
 
     for (uint32_t iter = 0u; iter < velocity_iterations; ++iter) {
-        for (uint32_t color = 0u; color < partitions.color_count; ++color) {
-            const RowColorRange range = partitions.color_ranges[color];
+        for (uint32_t seg = 0u; seg < comp.segment_count; ++seg) {
+            const RowColorRange range = comps.segments[comp.segment_offset + seg];
             for (uint32_t local = lane;
                  local < range.row_count;
                  local += blockDim.x) {
                 SolveVelocityRow(rows,
-                                 partitions.row_indices[range.row_offset + local],
+                                 comps.row_indices[range.row_offset + local],
                                  bodies,
                                  body_count,
                                  dt);
@@ -885,15 +918,15 @@ __global__ void SolveRowsSweepKernel(DeviceRowBuffers rows,
 
     float local_error = 0.0f;
     for (uint32_t iter = 0u; iter < position_iterations; ++iter) {
-        for (uint32_t color = 0u; color < partitions.color_count; ++color) {
-            const RowColorRange range = partitions.color_ranges[color];
+        for (uint32_t seg = 0u; seg < comp.segment_count; ++seg) {
+            const RowColorRange range = comps.segments[comp.segment_offset + seg];
             for (uint32_t local = lane;
                  local < range.row_count;
                  local += blockDim.x) {
                 local_error = fmaxf(
                     local_error,
                     SolvePositionRow(rows,
-                                     partitions.row_indices[range.row_offset + local],
+                                     comps.row_indices[range.row_offset + local],
                                      bodies,
                                      body_count,
                                      slop,
@@ -903,60 +936,71 @@ __global__ void SolveRowsSweepKernel(DeviceRowBuffers rows,
         }
     }
 
+    __shared__ float error_lanes[kRowSolverBlockSize];
+    error_lanes[lane] = local_error;
+    __syncthreads();
+
     if (lane == 0u) {
-        float max_error = local_error;
-        for (uint32_t iter = 0u; iter < position_iterations; ++iter) {
-            for (uint32_t color = 0u; color < partitions.color_count; ++color) {
-                const RowColorRange range = partitions.color_ranges[color];
-                for (uint32_t local = 0u; local < range.row_count; ++local) {
-                    const uint32_t row_index =
-                        partitions.row_indices[range.row_offset + local];
-                    const auto& row = rows.rows[row_index];
-                    const auto& material = rows.materials[row_index];
-                    if (IsContactNormalRow(rows, row_index)) {
-                        max_error = fmaxf(max_error,
-                                          fmaxf(material.position_error, 0.0f));
-                    } else if (material.kind == constraint::RowKind::Joint) {
-                        const uint32_t body_a = BodyForRowBody(rows, row, 0u);
-                        const uint32_t body_b = BodyForRowBody(rows, row, 1u);
-                        const auto jacobian_a = JacobianForRowBody(rows, row, 0u);
-                        const auto jacobian_b = JacobianForRowBody(rows, row, 1u);
-                        math::Vec3 axis = jacobian_b.linear;
-                        if (Length(axis) <= 1.0e-8f) {
-                            axis = Scale(jacobian_a.linear, -1.0f);
-                        }
-                        if (Length(axis) <= 1.0e-8f) {
-                            continue;
-                        }
-                        math::Vec3 position_a = MakeVec3(0.0f, 0.0f, 0.0f);
-                        math::Vec3 position_b = MakeVec3(0.0f, 0.0f, 0.0f);
-                        math::Quat orientation_a =
-                            MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
-                        math::Quat orientation_b =
-                            MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
-                        if (ValidBody(body_a, body_count)) {
-                            position_a = bodies[body_a].position;
-                            orientation_a = bodies[body_a].orientation;
-                        }
-                        if (ValidBody(body_b, body_count)) {
-                            position_b = bodies[body_b].position;
-                            orientation_b = bodies[body_b].orientation;
-                        }
-                        const auto& anchor = rows.anchors[row_index];
-                        const math::Vec3 r_a =
-                            RotateShort(orientation_a, anchor.local_a);
-                        const math::Vec3 r_b =
-                            RotateShort(orientation_b, anchor.local_b);
-                        max_error = fmaxf(
-                            max_error,
-                            fabsf(Dot(Sub(Add(position_a, r_a),
-                                         Add(position_b, r_b)),
-                                      axis)));
+        float max_error = 0.0f;
+        for (uint32_t t = 0u; t < blockDim.x; ++t) {
+            max_error = fmaxf(max_error, error_lanes[t]);
+        }
+        // Final-state recompute over THIS component's rows (the old kernel's
+        // position_iterations-gated recompute loop body, verbatim; looping it
+        // position_iterations times recomputed the identical max, so one pass
+        // gated on position_iterations > 0 reproduces the same value).
+        if (position_iterations > 0u) {
+            for (uint32_t local = 0u; local < comp.row_count; ++local) {
+                const uint32_t row_index =
+                    comps.row_indices[comp.row_offset + local];
+                const auto& row = rows.rows[row_index];
+                const auto& material = rows.materials[row_index];
+                if (IsContactNormalRow(rows, row_index)) {
+                    max_error = fmaxf(max_error,
+                                      fmaxf(material.position_error, 0.0f));
+                } else if (material.kind == constraint::RowKind::Joint) {
+                    const uint32_t body_a = BodyForRowBody(rows, row, 0u);
+                    const uint32_t body_b = BodyForRowBody(rows, row, 1u);
+                    const auto jacobian_a = JacobianForRowBody(rows, row, 0u);
+                    const auto jacobian_b = JacobianForRowBody(rows, row, 1u);
+                    math::Vec3 axis = jacobian_b.linear;
+                    if (Length(axis) <= 1.0e-8f) {
+                        axis = Scale(jacobian_a.linear, -1.0f);
                     }
+                    if (Length(axis) <= 1.0e-8f) {
+                        continue;
+                    }
+                    math::Vec3 position_a = MakeVec3(0.0f, 0.0f, 0.0f);
+                    math::Vec3 position_b = MakeVec3(0.0f, 0.0f, 0.0f);
+                    math::Quat orientation_a =
+                        MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
+                    math::Quat orientation_b =
+                        MakeQuat(1.0f, 0.0f, 0.0f, 0.0f);
+                    if (ValidBody(body_a, body_count)) {
+                        position_a = bodies[body_a].position;
+                        orientation_a = bodies[body_a].orientation;
+                    }
+                    if (ValidBody(body_b, body_count)) {
+                        position_b = bodies[body_b].position;
+                        orientation_b = bodies[body_b].orientation;
+                    }
+                    const auto& anchor = rows.anchors[row_index];
+                    const math::Vec3 r_a =
+                        RotateShort(orientation_a, anchor.local_a);
+                    const math::Vec3 r_b =
+                        RotateShort(orientation_b, anchor.local_b);
+                    max_error = fmaxf(
+                        max_error,
+                        fabsf(Dot(Sub(Add(position_a, r_a),
+                                     Add(position_b, r_b)),
+                                  axis)));
                 }
             }
         }
-        *max_error_out = max_error;
+        // Non-negative finite floats order identically as their int bit
+        // patterns -> atomicMax on the bits is an exact float max.
+        atomicMax(reinterpret_cast<int*>(max_error_out),
+                  __float_as_int(max_error));
     }
 }
 
@@ -980,8 +1024,9 @@ struct RowSolverScratch {
     phi::Buffer jacobians;
     phi::Buffer materials;
     phi::Buffer anchors;
-    phi::Buffer color_rows;
-    phi::Buffer color_ranges;
+    phi::Buffer comp_rows;
+    phi::Buffer comp_segments;
+    phi::Buffer comp_ranges;
     phi::Buffer bodies;
     phi::Buffer max_error;
     phi::Buffer sides;  // v0.8 C5a: per-row ContactRowSides (UnifiedSolve only)
@@ -998,8 +1043,9 @@ struct RowSolverScratch {
     size_t jacobians_bytes = 0u;
     size_t materials_bytes = 0u;
     size_t anchors_bytes = 0u;
-    size_t color_rows_bytes = 0u;
-    size_t color_ranges_bytes = 0u;
+    size_t comp_rows_bytes = 0u;
+    size_t comp_segments_bytes = 0u;
+    size_t comp_ranges_bytes = 0u;
     size_t bodies_bytes = 0u;
     size_t max_error_bytes = 0u;
     size_t sides_bytes = 0u;  // v0.8 C5a
@@ -1124,11 +1170,30 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
         return report;
     }
 
+    // G1(d) mechanism probe (env-gated, default OFF, zero hot-path cost): with
+    // NUKA_ROW_SOLVER_TIMING set, prints the per-call host-schedule vs kernel
+    // wall split + the launch geometry. This is the instrumentation that
+    // confirmed the union-scene bottleneck was the SINGLE-BLOCK sweep kernel
+    // (grid_blocks=1 at ~600 ms/call, N=32) and that measures the
+    // one-block-per-component replacement.
+    static const bool kTimingEnabled =
+        std::getenv("NUKA_ROW_SOLVER_TIMING") != nullptr;
+    const auto t_color_start = std::chrono::steady_clock::now();
+
     phi::ScopedDeviceGuard guard(context.device_id);
     const RowColorPartitions partitions = BuildRowColorPartitions(rows);
     if (!ValidateNoSharedBodiesPerColor(rows, partitions)) {
         throw std::runtime_error("row scheduler produced a conflicting color partition");
     }
+
+    // G1(d) throughput increment: repartition the colored rows into connected
+    // components of the shared-mutable-state relation so the kernel can run one
+    // block per component (byte-identical schedule -- see row_scheduler.hpp).
+    const RowComponentPartitions components = BuildRowComponentPartitions(
+        rows, partitions, sides, sides_count, articulation.art_refs,
+        articulation.art_refs_count);
+
+    const auto t_color_end = std::chrono::steady_clock::now();
 
     report.color_count = partitions.ColorCount();
     report.row_scheduler_report =
@@ -1142,12 +1207,15 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     UploadToScratch(scratch.jacobians, scratch.jacobians_bytes, rows.jacobian_data);
     UploadToScratch(scratch.materials, scratch.materials_bytes, rows.materials);
     UploadToScratch(scratch.anchors, scratch.anchors_bytes, rows.anchors);
-    UploadToScratch(scratch.color_rows,
-                    scratch.color_rows_bytes,
-                    partitions.row_indices);
-    UploadToScratch(scratch.color_ranges,
-                    scratch.color_ranges_bytes,
-                    partitions.color_ranges);
+    UploadToScratch(scratch.comp_rows,
+                    scratch.comp_rows_bytes,
+                    components.row_indices);
+    UploadToScratch(scratch.comp_segments,
+                    scratch.comp_segments_bytes,
+                    components.segments);
+    UploadToScratch(scratch.comp_ranges,
+                    scratch.comp_ranges_bytes,
+                    components.components);
     // v0.8 C5c-1: only upload the rigid body SoA when there ARE rigid bodies
     // (body_count==0 + bodies==nullptr is the legitimate articulation-only case --
     // do not push a null pointer through a 0-byte memcpy).
@@ -1279,18 +1347,23 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
     device_view.body_index_count = rows.BodyIndexCount();
     device_view.jacobian_data_count = rows.JacobianDataCount();
 
-    DeviceRowColorPartitions device_partitions;
-    device_partitions.row_indices =
-        static_cast<const uint32_t*>(scratch.color_rows.Data());
-    device_partitions.color_ranges =
-        static_cast<const RowColorRange*>(scratch.color_ranges.Data());
-    device_partitions.color_count = partitions.ColorCount();
+    DeviceRowComponentPartitions device_components;
+    device_components.row_indices =
+        static_cast<const uint32_t*>(scratch.comp_rows.Data());
+    device_components.segments =
+        static_cast<const RowColorRange*>(scratch.comp_segments.Data());
+    device_components.components =
+        static_cast<const RowComponentRange*>(scratch.comp_ranges.Data());
+    device_components.component_count = components.ComponentCount();
+
+    const auto t_upload_end = std::chrono::steady_clock::now();
 
     constexpr uint32_t kBlockSize = kRowSolverBlockSize;
     const cudaStream_t stream = context.stream.Native();
-    SolveRowsSweepKernel<<<1u, kBlockSize, 0, stream>>>(
+    SolveRowsComponentSweepKernel<<<components.ComponentCount(), kBlockSize, 0,
+                                    stream>>>(
         device_view,
-        device_partitions,
+        device_components,
         static_cast<runtime::rigid::BodyState*>(scratch.bodies.Data()),
         body_count,
         config.velocity_iterations,
@@ -1299,10 +1372,25 @@ RowSolveReport SolveRowsWithSides(const phi::DeviceContext& context,
         config.baumgarte,
         config.dt,
         static_cast<float*>(scratch.max_error.Data()));
-    CheckCuda(cudaGetLastError(), "SolveRowsSweepKernel launch");
+    CheckCuda(cudaGetLastError(), "SolveRowsComponentSweepKernel launch");
     ++report.row_scheduler_report.solver_launch_count;
 
     CheckCuda(cudaStreamSynchronize(stream), "RowSolver stream synchronize");
+
+    if (kTimingEnabled) {
+        const auto t_kernel_end = std::chrono::steady_clock::now();
+        const auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr,
+                     "[ROW-SOLVER-TIMING] rows=%u colors=%u grid_blocks=%u "
+                     "block_threads=%u launches=1 coloring_ms=%.3f upload_ms=%.3f "
+                     "kernel_ms=%.3f\n",
+                     rows.RowCount(), partitions.ColorCount(),
+                     components.ComponentCount(), kBlockSize,
+                     ms(t_color_start, t_color_end), ms(t_color_end, t_upload_end),
+                     ms(t_upload_end, t_kernel_end));
+    }
     // v0.8 C5c-1: download the mutated rigid bodies only when they exist (the
     // articulation-only path has no rigid SoA to copy back).
     if (have_rigid) {

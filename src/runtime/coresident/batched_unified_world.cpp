@@ -1501,9 +1501,11 @@ void BatchedUnifiedWorld::ResolveBatchedGraspContact() {
     ctx.articulation.qdot = &qdot;
     ctx.articulation.dof_stride = dof_stride_;
     {
-        // perf tag `row_solver`: the SINGLE-BLOCK batched UnifiedSolve kernel + its host
-        // round-trip. The hypothesis under test (roadmap §7) is that this is NEGLIGIBLE vs
-        // the per-env articulation sync storm; the N=32 breakdown decides it.
+        // perf tag `row_solver`: the batched UnifiedSolve (host coloring + component
+        // partition + uploads + the one-block-per-component sweep kernel) + the host
+        // round-trip. G1d throughput increment: formerly a SINGLE-BLOCK kernel, which
+        // made this tag 97.6% of union-scene wall at N=1024 (19011 ms/step, eps flat
+        // across N); the per-component grid restores cross-env parallelism.
         ScopedWallTimer solve_timer(perf_, "row_solver");
         nuka::solver::UnifiedSolve(ctx, cfg);
     }

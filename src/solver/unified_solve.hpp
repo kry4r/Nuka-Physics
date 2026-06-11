@@ -27,8 +27,13 @@
 //     the aref velocity bias). UnifiedSolve is therefore VELOCITY-only for the
 //     compliant rows it drives; the CALLER owns gravity + integration.
 //
-// DETERMINISM (D1): preserved verbatim from the single-block graph-colored kernel
-// (no new atomics, fixed SolverConfig iteration counts, fixed-order scans).
+// DETERMINISM (D1): the graph-colored schedule now runs ONE CUDA BLOCK PER
+// CONNECTED COMPONENT of the shared-state relation (G1d throughput increment,
+// row_scheduler.hpp); per-component arithmetic is byte-identical to the former
+// single-block sweep (same ops, same order, same operands), components share no
+// memory, and the only cross-block combine is an order-independent atomicMax on
+// the (unconsumed beyond >=0) max_position_error. Fixed SolverConfig iteration
+// counts, fixed-order scans.
 // ---------------------------------------------------------------------------
 
 #include "constraint/reaction_provider.hpp"      // ReactionProvider
