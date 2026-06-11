@@ -2,6 +2,7 @@
 
 > 状态：owner 已批准方向；本 v3 为交叉评审（ggml / Genesis / Newton / Isaac Lab）后的终版。**写盘后暂停，等 owner 开工信号。** 开工后第一件事：本文件已入库为 `docs/plans/2026-06-11-nk-core-platform-refactor.md`，以它为多 session 执行基准。
 > 纪律：禁止 TDD、禁止新增单测；每个里程碑 = 交付物 + 验收门（oracle/场景/性能），门绿才前进；**本计划不含任何回退方案，每个设计点只有一条承诺路径**。
+> **修订 2026-06-11（owner，开工后）**：§3.6 场景树化——场景以**节点树（SceneGraph）**形式编辑与管理，原生承载机器人层级；`name` 只是单段名字、`path` 由树派生专管；基底参考 owner 的 Mangifera `core/manager/scene-graph.{hpp,cpp}` 并在其上扩充。波及 §2 / §3.7 / §3.9 / M2（已就地改写）。
 
 ---
 
@@ -52,7 +53,8 @@ src/nk/                         新统一核心（零 CUDA token，只 include p
   ├─ data/                      nk::Data（arena：persistent/scratch/tape 三块）
   ├─ pipeline/                  OpCall 列表构建 + World（Step/StepPlanned/Reset）
   └─ solve/                     SolveSchedule（构建期着色/island 划分缓存）
-src/scene/                      ECS Registry + 五组件 + 双材质 + SceneIR facade
+src/scene/                      场景树 + ECS Registry + 五组件 + 双材质 + SceneIR facade
+  ├─ graph/                     SceneGraph 场景树（first-child/next-sibling + path 寻址，Mangifera 基底）
   ├─ ecs/                       entity/components/registry
   ├─ asset/                     .nka 容器读写 + AssetCache（内容寻址）
   ├─ format/                    .nks 场景文件读写（serialize/deserialize/override-layer）
@@ -223,14 +225,45 @@ fields:
 - **任意 mesh 接触：`NarrowphaseSdf`**。cook 期每个碰撞 mesh 按其 **PhysicsMaterial 的烘焙指令**（`sdf_cell_size/sdf_min_res/sdf_max_res`，Genesis 同款字段）经现 `sparse_sdf_cooker` 生成稀疏窄带 SDF（AssetCache 内容寻址缓存，存入 .nka）；运行期对方形状的采样点集（hull 顶点 + 边中点，cook 期生成存 Model）查 SDF 值/梯度出接触点。凸分解（V-HACD）保留用于生成 hull 资产（broadphase AABB 细化 + 采样点源），**CPU GJK/EPA（`src/collision/convex_narrowphase.*`、`cvx::SphereHull` 特例）在 M9 删除**；`test_gjk_epa_convex.cpp` 的解析口径改造为 `NarrowphaseSdf` 的精度 oracle（球×球/球×盒解析真值，SDF 路径容差 ≤ 烘焙 cell 尺寸）。
 - broadphase：`BuildAabbs`→`LbvhBuild`→`LbvhQueryPairs`（现 `broadphase_lbvh.cu/candidate_pair.cu` 算法迁入 ops，thrust 调用保留在 op 实现内部）+ `ParticleGridBuild`（现 `particle_uniform_grid.cu`）。env 间过滤 = pair 生成期 env_id 门控（Model flag `filter_cross_env`）。
 
-### 3.6 ECS 组件模型（五组件 + 双材质，Isaac/Genesis 合成）
+### 3.6 场景树 + ECS 组件模型（SceneGraph 一等公民 + 五组件 + 双材质；Mangifera/Isaac/Genesis 合成）
 
-**`src/scene/ecs/components.hpp`** 完整字段契约：
+> **Owner 修订 2026-06-11**：场景以**场景树**形式编辑与管理（对象管理/机器人层级统一为节点树）；`name` 只是单段名字，`path` 专由节点树管理派生；基底 = owner 的 Mangifera `core/manager/scene-graph.{hpp,cpp}`（first-child/next-sibling 节点、`path_of`/`node_of` 寻址、entity↔node 映射、选中态），在其上扩充。
+
+**`src/scene/graph/scene_graph.hpp/.cpp`**（基底 Mangifera，扩充点标 ★）：
 
 ```cpp
-struct NameComponent      { std::string path; };                  // "h1/right_hand_link"
-struct TransformComponent { math::Transform local; math::Vec3 scale{1,1,1}; };
-struct HierarchyComponent { EntityId parent; };
+struct SceneNode {                          // first-child/next-sibling（Mangifera Scene_Node 同构）
+    uint64_t    id;                         // 图内唯一自增
+    std::string name;                       // 单段名（不含 '/'）；★同级唯一（插入校验，冲突自动后缀 _1/_2）
+    EntityId    entity;                     // ★ 节点↔实体 1:1（root 持哨兵实体）
+    std::weak_ptr<SceneNode>   parent;      // ★ parent 用 weak_ptr 防引用环（Mangifera 用 shared）
+    std::shared_ptr<SceneNode> first_child, next_sibling;
+};
+
+class SceneGraph {                          // ★ 非 Singleton：每 Scene 一实例（compose 需多场景共存）
+  public:
+    std::shared_ptr<SceneNode> Root();      // root->name = "Scene"，不入 path
+    std::shared_ptr<SceneNode> Selected();  void SetSelected(std::shared_ptr<SceneNode>);  // 编辑选中态（M11 viewer）
+    // —— Mangifera 原 API（语义不变，命名仓内化）——
+    std::string                PathOf(const std::shared_ptr<SceneNode>&) const;   // 向上拼 "h1/right_hand_link"（不含 root 段）
+    std::shared_ptr<SceneNode> NodeOf(const std::string& path) const;             // 按段下行；同级唯一名 ⇒ 确定解析
+    std::shared_ptr<SceneNode> ParentOf/FirstChildOf/NextSiblingOf(node) const;
+    std::shared_ptr<SceneNode> AddEntity(EntityId, parent, const std::string& name); // 尾插 ⇒ 兄弟序确定（序列化/D1 之锚）
+    // —— ★ 扩充 ——
+    void AttachSubtree(std::shared_ptr<SceneNode> subtree, parent);               // compose 嫁接（跨图迁移 + 实体 remap 由 compose 层做）
+    std::shared_ptr<SceneNode> Detach(node);                                       // 摘下子树（不毁实体）
+    void DestroyRecursive(node, Registry&);                                        // 子树连实体一并销毁
+    template<class F> void Traverse(node, F&&) const;                              // 先序遍历（确定序，序列化/diff 用）
+};
+```
+
+**机器人层级原生入树**：importer 把 articulation 按运动学树建子树（robot 根节点 → link 节点按 parent_link 逐层嫁接；h1 即 `h1/pelvis/left_hip_yaw_link/...`），`JointComponent` 挂在 child-link 实体上（parent_body/child_body 即父子节点实体）。树承载层级与命名（编辑视图），组件承载数据；`TransformComponent.local` 相对父**节点**，world = 沿树合成；cook 后运行期权威位姿在 `nk::Data`，TransformSync 经 SceneMap 回写（§3.8）。
+
+**`src/scene/ecs/components.hpp`** 完整字段契约（层级不再是组件——唯一权威 = SceneGraph）：
+
+```cpp
+struct NameComponent      { std::string name; };                  // ★单段名，与节点 name 同步（节点为权威）；path 一律 SceneGraph::PathOf 派生
+struct TransformComponent { math::Transform local; math::Vec3 scale{1,1,1}; };   // local 相对父节点
 struct PhysicsMaterial {   // 独立资产，实体经 id 引用（材质桶的 cook 源）
     float static_friction=0.5f, dynamic_friction=0.5f, restitution=0.f;
     enum class Combine : uint8_t {Average,Min,Multiply,Max} friction_combine=Combine::Average,
@@ -265,7 +298,7 @@ struct InitialStateComponent { std::vector<float> qpos; math::Transform root; };
 struct CameraComponent / LightComponent { ...现 Record 字段原样... };
 ```
 
-`Registry`（`registry.hpp/.cpp`）：每组件一个 `std::vector<T>` 池 + `EntityId{u32 index,u32 gen}`→slot 稠密映射 + 层级路径 `Find()`。**1:1 物理↔渲染**：物理世界与渲染世界是同一 Registry 上的两组系统视图，TransformSyncSystem 每帧把 Data 位姿写回 RenderWorld 实例（§3.8），实体身份经 SceneMap 双向。
+`Registry`（`registry.hpp/.cpp`）：每组件一个 `std::vector<T>` 池 + `EntityId{u32 index,u32 gen}`→slot 稠密映射 + ★entity→node 反查表（O(1) 找回节点）；**路径寻址一律走 `SceneGraph::NodeOf`，Registry 不再提供 `Find(path)`**。**1:1 物理↔渲染**：物理世界与渲染世界是同一 Registry 上的两组系统视图，TransformSyncSystem 每帧把 Data 位姿写回 RenderWorld 实例（§3.8），实体身份经 SceneMap 双向。
 
 ### 3.7 自有资产格式（.nks / .nka）
 
@@ -281,12 +314,13 @@ struct CameraComponent / LightComponent { ...现 Record 字段原样... };
       "sdf_cell_size":0.004, "sdf_min_res":32, "sdf_max_res":128}},
   "render_materials":  {"rm_cup": {"base_color":[0.9,0.9,0.95,1], "metallic":0.0,
       "roughness":0.3, "tex_albedo":"cup.nka#TEXB/0"}},
-  "entities": [
-    {"path":"cup/body", "parent":"", "transform":{"pos":[0.42,0,0.86],"quat":[1,0,0,0]},
-     "rigid_body":{"mass":0.2},
-     "collision_shape":{"kind":"sdf_mesh","cooked":"cup.nka#SDF0/0","physics_material":"mat_cup"},
-     "visual_mesh":{"mesh":"cup.nka#MESH/0","render_material":"rm_cup"}}],
-  "imports": [{"file":"h1_with_hand.xml","prefix":"h1/","transform":{...}}],
+  "tree": [
+    {"name":"cup", "children":[
+      {"name":"body", "transform":{"pos":[0.42,0,0.86],"quat":[1,0,0,0]},
+       "rigid_body":{"mass":0.2},
+       "collision_shape":{"kind":"sdf_mesh","cooked":"cup.nka#SDF0/0","physics_material":"mat_cup"},
+       "visual_mesh":{"mesh":"cup.nka#MESH/0","render_material":"rm_cup"}}]}],
+  "imports": [{"file":"h1_with_hand.xml","attach_at":"h1","transform":{...}}],
   "initial_state": {"h1":{"joint_pos":{"left_knee":0.70}}},
   "settle": {"steps":200, "dt":0.004167, "holds":[{"dofs":"h1/.*","mode":"pd"}]},
   "env": {"replicate":1, "spacing":2.0, "filter_cross_env_collisions":true},
@@ -294,7 +328,7 @@ struct CameraComponent / LightComponent { ...现 Record 字段原样... };
              "max_contacts_per_env":64, "max_rows_per_env":320}}
 ```
 
-API：`scene::format::Save(const Registry&, path)` / `Load(path) → Registry`（`imports` 节经 importer 展开后内联，Save 时实体已展平）；override layer：`Load(base, overlay)`，overlay 仅含被覆盖键（域随机化/实验配置不改基准文件）。**导入转换懒缓存**（Isaac T10）：`LoadMjcf/Usd/Urdf` 结果按 `(源文件内容哈希+导入配置哈希)` 缓存到 `.nuka_cache/<hash>.{nks,nka}`，命中直加载。importers 升级：MJCF 读 visual geoms（contype=0 几何 → VisualMeshComponent，h1_with_hand 视觉手指因此自然入渲染）与 rgba/material → RenderMaterial；URDF visual/collision 标签分流；USD 按 purpose 分流 + UsdPreviewSurface→RenderMaterial、UsdPhysics material→PhysicsMaterial。
+API：`scene::format::Save(const Scene&, path)` / `Load(path) → Scene`（Scene = SceneGraph + Registry 对）。**`tree` 节 = 场景树的嵌套序列化**：Save = `SceneGraph::Traverse` 先序遍历输出嵌套 `{name, <components...>, children:[]}`（兄弟序 = 树内尾插序 ⇒ 二次 Save byte 相同）；Load = 自顶向下重建节点+实体；`imports` 节经 importer 展开为 `attach_at` 节点下的子树后内联。override layer：`Load(base, overlay)`，overlay 以**派生 path** 为键、仅含被覆盖键（域随机化/实验配置不改基准文件）。**导入转换懒缓存**（Isaac T10）：`LoadMjcf/Usd/Urdf` 结果按 `(源文件内容哈希+导入配置哈希)` 缓存到 `.nuka_cache/<hash>.{nks,nka}`，命中直加载。importers 升级：MJCF 读 visual geoms（contype=0 几何 → VisualMeshComponent，h1_with_hand 视觉手指因此自然入渲染）与 rgba/material → RenderMaterial；URDF visual/collision 标签分流；USD 按 purpose 分流 + UsdPreviewSurface→RenderMaterial、UsdPhysics material→PhysicsMaterial。
 
 ### 3.8 渲染 1:1 模型
 
@@ -305,8 +339,10 @@ API：`scene::format::Save(const Registry&, path)` / `Load(path) → Registry`�
 ```python
 dev   = nuka.Device.create(0)
 scene = nuka.Scene.load("h1_with_hand.xml")            # mjcf/urdf/usd/nks 同一入口
-scene.compose(nuka.Scene.load("cup.usda"), pose, prefix="cup/")
-scene.find("cup/body").set_local(pos=..., quat=...)
+scene.compose(nuka.Scene.load("cup.usda"), pose, attach_at="cup")   # 子树嫁接到 "cup" 节点
+node  = scene.find("cup/body")                          # → SceneNode 句柄（树寻址）
+node.set_local(pos=..., quat=...)
+scene.root / node.name / node.path / node.parent / node.children()  # 场景树遍历/编辑一等 API
 scene.set_physics_material("cup/.*", static_friction=0.8)
 scene.settle(steps=200)
 scene.save("h1_cup.nks")                               # 自有格式导出（含 .nka 烘焙产物）
@@ -364,19 +400,20 @@ rec = nuka.Recorder(world, camera=...); rec.capture("out/frames"); rec.to_video(
 | 文件 | 内容 |
 |---|---|
 | `src/scene/ecs/entity.hpp` | `EntityId{u32 index, u32 gen}` + 哨兵 |
-| `src/scene/ecs/components.hpp` | §3.6 全部组件（字段照抄） |
-| `src/scene/ecs/registry.hpp/.cpp` | 组件池 + Create/Destroy/Get/Add + `Find(path)` + 遍历器 |
+| `src/scene/graph/scene_graph.hpp/.cpp` | §3.6 SceneGraph 场景树（Mangifera 基底 first-child/next-sibling + PathOf/NodeOf；扩充 AttachSubtree/Detach/DestroyRecursive/Traverse/同级唯一名/EntityId 关联；★per-Scene 实例非 Singleton） |
+| `src/scene/ecs/components.hpp` | §3.6 全部组件（字段照抄；NameComponent=单段 name，无 HierarchyComponent——层级唯一权威是 SceneGraph） |
+| `src/scene/ecs/registry.hpp/.cpp` | 组件池 + Create/Destroy/Get/Add + entity→node 反查 + 遍历器（路径寻址走 SceneGraph::NodeOf） |
 | `src/scene/scene_map.hpp/.cpp` | EntityId ↔ {body_row, joint_row, dof_index, shape_row, link_index, bp_group} 双向 + `<pair>` 展开 |
 | `src/scene/asset/nka.hpp/.cpp` | §3.7 容器读写（WriteChunks/ReadToc/LoadChunk） |
 | `src/scene/asset/asset_cache.hpp/.cpp` | 内容哈希寻址：mesh→MeshGeometry、(mesh,材质烘焙指令)→HULL/SDF0/SAMP、纹理→TEXB；`.nuka_cache/` 落盘 |
-| `src/scene/format/nks.hpp/.cpp` | §3.7 Save/Load/override-layer（JSON 用仓内既有 json 依赖或自写极简解析器——与现 importer 同栈） |
-| `tests/scenario/scene_roundtrip.cpp` | 门：LoadMjcf(h1)+LoadUsd(cup)→Compose→Save(.nks/.nka)→Load→Registry 全等（实体数/路径/组件字段逐项）+ SceneMap 名↔行回环 + 二次 Save byte 相同 |
+| `src/scene/format/nks.hpp/.cpp` | §3.7 Save/Load/override-layer（`tree` 嵌套序列化 = SceneGraph 先序；JSON 用仓内既有 json 依赖或自写极简解析器——与现 importer 同栈） |
+| `tests/scenario/scene_roundtrip.cpp` | 门：LoadMjcf(h1)+LoadUsd(cup)→Compose→Save(.nks/.nka)→Load→**场景树等价**（先序遍历：节点名/派生 path/兄弟序/组件字段逐项）+ SceneMap 名↔行回环 + 二次 Save byte 相同 |
 
 **修改：**
 | 文件 | 改动 |
 |---|---|
-| `src/scene/scene_ir.hpp/.cpp` | 改为 Registry facade（读 API 签名不变，oracle 不动） |
-| `src/scene/scene_compose.hpp/.cpp` | EntityId-gen 安全 remap + 路径前缀命名空间 |
+| `src/scene/scene_ir.hpp/.cpp` | 改为 Scene(SceneGraph+Registry) facade（读 API 签名不变，oracle 不动） |
+| `src/scene/scene_compose.hpp/.cpp` | 子树嫁接 compose：AttachSubtree + EntityId-gen 安全 remap + 前缀**节点**命名空间（原路径前缀改为挂载节点） |
 | `src/import/mjcf_importer.cpp` | 读 visual geoms（contype=0→VisualMeshComponent）、rgba/material→RenderMaterial、friction/solref→PhysicsMaterial；接 AssetCache |
 | `src/import/urdf_importer.cpp` | visual/collision 标签分流 + material 色→RenderMaterial |
 | `src/import/usd_importer.cpp`/`usd_stage_adapter` | purpose 分流、UsdPreviewSurface→RenderMaterial、UsdPhysics material→PhysicsMaterial |
