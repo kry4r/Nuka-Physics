@@ -14,7 +14,7 @@ struct DeviceContext;
 
 namespace nuka::runtime {
 struct PhysicsWorld;
-struct WorldInstance;
+struct BuiltWorldState;
 struct WorldStepReport;
 struct WorldTemplate;
 } // namespace nuka::runtime
@@ -64,7 +64,7 @@ struct InvariantConfig {
 
 struct InvariantWorldView {
     const runtime::WorldTemplate* world_template = nullptr;
-    const runtime::WorldInstance* instance = nullptr;
+    const runtime::BuiltWorldState* instance = nullptr;
     const runtime::WorldStepReport* step_report = nullptr;
     math::Vec3 gravity = {0.0f, -9.81f, 0.0f};
 };

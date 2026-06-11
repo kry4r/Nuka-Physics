@@ -42,7 +42,7 @@
 #include "constraint/row_builder.hpp"            // ContactRowSides
 #include "math/vec3.hpp"                         // math::Vec3 (C6b particles)
 #include "runtime/rigid/body_state.hpp"          // BodyState
-#include "solver/rigid_solver.hpp"               // SolverConfig
+#include "solver/solver_config.hpp"              // SolverConfig
 
 #include <vector>
 

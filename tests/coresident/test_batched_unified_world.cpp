@@ -46,7 +46,7 @@
 #include "runtime/world_builder.hpp"           // BuildWorld
 #include "scene/canonical_types.hpp"           // scene::ShapeType
 #include "scene/cooker.hpp"                    // CookScene
-#include "solver/rigid_solver.hpp"             // SolverConfig
+#include "solver/solver_config.hpp"            // SolverConfig
 #include "solver/unified_solve.hpp"            // UnifiedSolve / SolveContext
 
 #include <gtest/gtest.h>

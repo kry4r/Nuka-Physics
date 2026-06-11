@@ -4,8 +4,10 @@
 //
 // Oracle split (a conscious feasibility decision -- see the p04 report):
 //   * Small smoke scenes: oracle is the GPU SAP path (collision::gpu::
-//     BuildCudaBroadphase) -- the literal reference. We feed the SAME device
-//     AABB buffer SAP produced into the LBVH, so it is apples-to-apples.
+//     BuildCudaBroadphase). The per-shape AABBs are computed host-side (the same
+//     Sphere/Plane/Box formulas the removed device AABB kernel used) and
+//     uploaded once; BOTH the SAP oracle and the LBVH run over that one device
+//     AABB buffer, so it stays apples-to-apples.
 //   * 50k random AABBs: running GPU SAP is INFEASIBLE (its O(n^2) pair-slot
 //     layout is ~1.25e9 slots ~= 10 GB). The SAP set is DEFINITIONALLY the set
 //     of all overlapping {i<j} pairs, so we use a CPU brute-force O(n^2) overlap
@@ -19,10 +21,10 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "collision/gpu/broadphase.cuh"
+#include "math/transform.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "phi/device_context.hpp"
-#include "runtime/gpu/device_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
 
@@ -109,26 +111,55 @@ scene::SceneIR BuildPlaneBoxScene() {
     return scene;
 }
 
-runtime::gpu::DeviceWorld UploadScene(const scene::SceneIR& scene,
-                                      runtime::BuiltWorld& world) {
-    world = runtime::BuildWorld(scene::CookScene(scene));
-    auto device_world = runtime::gpu::UploadDeviceWorld(world.template_view);
-    runtime::gpu::UploadDeviceState(device_world, world.instance);
-    return device_world;
+// Compute the per-shape world-space AABBs host-side using the SAME Sphere /
+// Plane / Box formulas the (removed) device AABB kernel used: the world
+// transform is Compose(body_pose, shape_local_transform); Sphere -> center +/-
+// radius; Plane -> a wide thin slab at the plane height; Box -> 8-corner OBB
+// bound. This reproduces the exact AABB values the old GPU-SAP path produced.
+std::vector<collision::AABB> ComputeSceneAabbs(const scene::SceneIR& scene) {
+    const runtime::BuiltWorld world = runtime::BuildWorld(scene::CookScene(scene));
+    const auto& shapes = world.template_view.shape_table;
+    const auto& poses = world.instance.poses;
+
+    const uint32_t shape_count = static_cast<uint32_t>(shapes.types.size());
+    std::vector<collision::AABB> aabbs(shape_count);
+    for (uint32_t s = 0; s < shape_count; ++s) {
+        const auto body_id = shapes.body_ids[s];
+        const math::Transform world_transform =
+            poses[body_id] * shapes.local_transforms[s];
+
+        switch (shapes.types[s]) {
+        case scene::ShapeType::Sphere:
+            aabbs[s] = collision::AABB::FromSphere(world_transform.position,
+                                                   shapes.radii[s]);
+            break;
+        case scene::ShapeType::Plane: {
+            const float plane_y = world_transform.position.y;
+            aabbs[s].min = {-1.0e6f, plane_y - 0.01f, -1.0e6f};
+            aabbs[s].max = {1.0e6f, plane_y + 0.01f, 1.0e6f};
+            break;
+        }
+        default:
+            aabbs[s] = collision::AABB::FromBox(world_transform, shapes.half_extents[s]);
+            break;
+        }
+    }
+    return aabbs;
 }
 
-// Run the GPU-SAP broadphase, then run LBVH on the SAME device AABB buffer SAP
-// built, and assert the reduced SETs are equal.
+// Upload the host-computed scene AABBs once, then run BOTH the GPU-SAP oracle and
+// the LBVH over that same device AABB buffer, and assert the reduced SETs match.
 void ExpectLbvhEqualsSapOnScene(const scene::SceneIR& scene) {
-    runtime::BuiltWorld world;
-    auto device_world = UploadScene(scene, world);
+    const std::vector<collision::AABB> aabbs = ComputeSceneAabbs(scene);
+    const uint32_t n = static_cast<uint32_t>(aabbs.size());
 
-    auto sap = collision::gpu::BuildCudaBroadphase(device_world);
+    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    const auto* device_aabbs = static_cast<const collision::AABB*>(d_aabbs.Data());
+
+    auto sap = collision::gpu::BuildCudaBroadphase(device_aabbs, n);
     const auto sap_pairs = sap.DownloadPairs();
-    const uint32_t n = sap.ShapeCount();
 
-    // Feed SAP's own device AABBs into the LBVH (apples-to-apples input).
-    auto lbvh = collision::gpu::BuildLbvhBroadphase(sap.DeviceAabbs(), n);
+    auto lbvh = collision::gpu::BuildLbvhBroadphase(device_aabbs, n);
     const auto lbvh_pairs = lbvh.DownloadPairs();
 
     EXPECT_EQ(ToSet(sap_pairs), ToSet(lbvh_pairs));

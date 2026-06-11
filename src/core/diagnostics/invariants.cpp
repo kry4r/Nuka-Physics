@@ -5,7 +5,7 @@
 #include "core/diagnostics/invariants.hpp"
 
 #include "runtime/physics_world.hpp"
-#include "runtime/world_stepper.hpp"
+#include "runtime/step_options.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -55,7 +55,7 @@ struct Snapshot {
     float max_joint_excursion = 0.0f;
 };
 
-float JointAngleAroundAxis(const runtime::WorldInstance& instance,
+float JointAngleAroundAxis(const runtime::BuiltWorldState& instance,
                            const runtime::WorldTemplate& world_template,
                            uint32_t joint_index) {
     if (joint_index >= world_template.joint_table.parent_bodies.size() ||

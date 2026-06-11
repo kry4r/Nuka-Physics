@@ -7,51 +7,6 @@ allowlist:
     match: "atomicAdd(block_count, 1u)"
     reason: "Legacy uint32 block compaction counter; not a float accumulation path."
 
-  - path: src/runtime/gpu/batched_device_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(pair_count, 1u)"
-    reason: "Legacy uint32 pair compaction counter; not a float accumulation path."
-
-  - path: src/runtime/gpu/batched_device_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&report->contact_manifold_count, 1u)"
-    reason: "Legacy uint32 diagnostics counter; not a float accumulation path."
-
-  - path: src/runtime/gpu/batched_device_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&report->contact_point_count, manifolds[slot].point_count)"
-    reason: "Legacy uint32 diagnostics counter; not a float accumulation path."
-
-  - path: src/runtime/gpu/batched_device_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(block_count, 1u)"
-    reason: "Legacy uint32 block compaction counter; not a float accumulation path."
-
-  - path: src/runtime/gpu/cuda_particle_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&velocities[body_id].x, delta.x)"
-    reason: "Known legacy particle-rigid coupling float accumulation; scheduled for CSR deterministic row migration."
-
-  - path: src/runtime/gpu/cuda_particle_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&velocities[body_id].y, delta.y)"
-    reason: "Known legacy particle-rigid coupling float accumulation; scheduled for CSR deterministic row migration."
-
-  - path: src/runtime/gpu/cuda_particle_world.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&velocities[body_id].z, delta.z)"
-    reason: "Known legacy particle-rigid coupling float accumulation; scheduled for CSR deterministic row migration."
-
-  - path: src/constraint/gpu/contact_generation.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&report->contact_manifold_count, 1u)"
-    reason: "Legacy uint32 diagnostics counter; not a float accumulation path."
-
-  - path: src/constraint/gpu/contact_generation.cu
-    pattern: float_atomic_add
-    match: "atomicAdd(&report->contact_point_count, manifolds[slot].point_count)"
-    reason: "Legacy uint32 diagnostics counter; not a float accumulation path."
-
   # --- v0.7 p04 LBVH broadphase: all atomics here are uint32 (NOT float). The
   # no-float-atomic ban regex is type-agnostic, so these legitimate integer
   # counters need explicit allowlist entries. The float_atomic_add ban itself is

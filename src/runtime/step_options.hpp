@@ -1,18 +1,18 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::runtime::world_stepper -- fixed-step CPU stepping for WorldInstance
+// nuka::runtime::WorldStepOptions / WorldStepReport – stepping PODs
+// ---------------------------------------------------------------------------
+// Hoisted out of the (removed) per-instance CPU stepping header. That driver is
+// gone, but these two plain-data records are still consumed by kept
+// code: the C-ABI WorldRecord caches WorldStepOptions (dt/gravity/contacts read
+// by the diff-sim + noise paths) and the diagnostics InvariantWorldView points
+// at a WorldStepReport (max_constraint_error). No behaviour, no dependencies
+// beyond math::Vec3.
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "runtime/world_instance.hpp"
-#include "runtime/world_template.hpp"
 
 #include <cstdint>
-
-namespace nuka::core::diagnostics {
-class InvariantSampler;
-class TraceSink;
-} // namespace nuka::core::diagnostics
 
 namespace nuka::runtime {
 
@@ -40,14 +40,5 @@ struct WorldStepReport {
     uint32_t solver_iterations_used = 0;
     float max_constraint_error = 0.0f;
 };
-
-WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
-                                  WorldInstance& instance,
-                                  const WorldStepOptions& options = {});
-WorldStepReport StepWorldInstance(const WorldTemplate& world_template,
-                                  WorldInstance& instance,
-                                  const WorldStepOptions& options,
-                                  core::diagnostics::InvariantSampler* invariant_sampler,
-                                  core::diagnostics::TraceSink* trace_sink);
 
 } // namespace nuka::runtime

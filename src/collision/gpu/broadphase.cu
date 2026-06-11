@@ -4,12 +4,10 @@
 
 #include "collision/gpu/broadphase.cuh"
 
-#include "math/cuda_vec_ops.cuh"
 #include "phi/buffer_transfer.hpp"
 
 #include <cuda_runtime.h>
 
-#include <cfloat>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,69 +17,10 @@ namespace nuka::collision::gpu {
 
 namespace {
 
-// Small-vector / quaternion primitives now come from the shared device math
-// library (math/cuda_vec_ops.cuh). Bodies are bit-identical to the former local
-// copies; `Rotate` -> RotateShort and `Mul` -> QuatMul (used by the file-local
-// TransformPoint / Compose below). Buffer helpers come from
-// phi/buffer_transfer.hpp.
-namespace mg = ::nuka::math::gpu;
-using mg::Add;
-using mg::Cross;
-using mg::MakeQuat;
-using mg::MakeVec3;
-using mg::QuatMul;
-using mg::RotateShort;
-using mg::Scale;
-using mg::Sub;
-
-__device__ math::Vec3 TransformPoint(math::Transform transform, math::Vec3 point) {
-    return Add(RotateShort(transform.rotation, point), transform.position);
-}
-
-__device__ math::Transform Compose(math::Transform a, math::Transform b) {
-    math::Transform result;
-    result.position = TransformPoint(a, b.position);
-    result.rotation = QuatMul(a.rotation, b.rotation);
-    return result;
-}
-
-__device__ void Expand(collision::AABB& aabb, math::Vec3 point) {
-    aabb.min.x = fminf(aabb.min.x, point.x);
-    aabb.min.y = fminf(aabb.min.y, point.y);
-    aabb.min.z = fminf(aabb.min.z, point.z);
-    aabb.max.x = fmaxf(aabb.max.x, point.x);
-    aabb.max.y = fmaxf(aabb.max.y, point.y);
-    aabb.max.z = fmaxf(aabb.max.z, point.z);
-}
-
-__device__ collision::AABB SphereAabb(math::Vec3 center, float radius) {
-    collision::AABB aabb;
-    const math::Vec3 extents = MakeVec3(radius, radius, radius);
-    aabb.min = Sub(center, extents);
-    aabb.max = Add(center, extents);
-    return aabb;
-}
-
-__device__ collision::AABB PlaneAabb(float plane_y) {
-    collision::AABB aabb;
-    aabb.min = MakeVec3(-1.0e6f, plane_y - 0.01f, -1.0e6f);
-    aabb.max = MakeVec3(1.0e6f, plane_y + 0.01f, 1.0e6f);
-    return aabb;
-}
-
-__device__ collision::AABB BoxAabb(math::Transform transform, math::Vec3 half_extents) {
-    collision::AABB aabb;
-    aabb.min = MakeVec3(FLT_MAX, FLT_MAX, FLT_MAX);
-    aabb.max = MakeVec3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-    for (int corner_index = 0; corner_index < 8; ++corner_index) {
-        const math::Vec3 corner = MakeVec3(
-            (corner_index & 1) ? half_extents.x : -half_extents.x,
-            (corner_index & 2) ? half_extents.y : -half_extents.y,
-            (corner_index & 4) ? half_extents.z : -half_extents.z);
-        Expand(aabb, TransformPoint(transform, corner));
-    }
-    return aabb;
-}
+// Buffer helpers come from phi/buffer_transfer.hpp. This SAP path now consumes a
+// caller-provided device AABB buffer directly (the per-shape AABB derivation that
+// used to live here was tied to the removed whole-world device container), so the
+// only device math needed is the AABB overlap test below.
 
 __device__ bool Overlaps(collision::AABB a, collision::AABB b) {
     if (a.max.x < b.min.x || a.min.x > b.max.x) return false;
@@ -92,36 +31,6 @@ __device__ bool Overlaps(collision::AABB a, collision::AABB b) {
 
 __device__ uint32_t PairSlot(uint32_t shape_count, uint32_t i, uint32_t j) {
     return (i * (2u * shape_count - i - 1u)) / 2u + (j - i - 1u);
-}
-
-__global__ void GenerateAabbsKernel(uint32_t shape_count,
-                                    const math::Transform* poses,
-                                    const scene::BodyId* shape_body_ids,
-                                    const scene::ShapeType* shape_types,
-                                    const math::Transform* shape_local_transforms,
-                                    const math::Vec3* shape_half_extents,
-                                    const float* shape_radii,
-                                    collision::AABB* aabbs) {
-    const uint32_t shape_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (shape_index >= shape_count) {
-        return;
-    }
-
-    const scene::BodyId body_id = shape_body_ids[shape_index];
-    const math::Transform world_transform =
-        Compose(poses[body_id], shape_local_transforms[shape_index]);
-    const scene::ShapeType type = shape_types[shape_index];
-
-    if (type == scene::ShapeType::Sphere) {
-        aabbs[shape_index] = SphereAabb(world_transform.position, shape_radii[shape_index]);
-        return;
-    }
-    if (type == scene::ShapeType::Plane) {
-        aabbs[shape_index] = PlaneAabb(world_transform.position.y);
-        return;
-    }
-
-    aabbs[shape_index] = BoxAabb(world_transform, shape_half_extents[shape_index]);
 }
 
 __global__ void GeneratePairSlotsKernel(uint32_t shape_count,
@@ -216,19 +125,17 @@ std::vector<collision::CollisionPair> CudaBroadphaseResult::DownloadPairs() cons
 }
 
 CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
-                                         const runtime::gpu::DeviceWorld& device_world) {
+                                         const collision::AABB* device_aabbs,
+                                         uint32_t shape_count) {
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
-    if (!device_world.HasUploadedState()) {
-        throw std::runtime_error(
-            "BuildCudaBroadphase requires UploadDeviceState before generating CUDA AABBs");
-    }
 
-    const uint32_t shape_count = device_world.ShapeCount();
     const uint32_t pair_slot_count = shape_count > 1u
         ? (shape_count * (shape_count - 1u)) / 2u
         : 0u;
 
+    // The result owns its own AABB copy so DeviceAabbs()/DownloadAabbs() stay
+    // valid independent of the caller's buffer lifetime.
     phi::Buffer aabbs(shape_count * sizeof(collision::AABB), phi::MemoryKind::Device);
     phi::Buffer pairs(pair_slot_count * sizeof(collision::CollisionPair),
                       phi::MemoryKind::Device);
@@ -246,19 +153,13 @@ CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
                                     std::move(pair_count));
     }
 
+    CheckCuda(cudaMemcpyAsync(aabbs.Data(), device_aabbs,
+                              shape_count * sizeof(collision::AABB),
+                              cudaMemcpyDeviceToDevice, stream),
+              "cudaMemcpyAsync broadphase AABBs");
+
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t shape_blocks = (shape_count + kBlockSize - 1u) / kBlockSize;
-    GenerateAabbsKernel<<<shape_blocks, kBlockSize, 0, stream>>>(
-        shape_count,
-        device_world.DevicePoses(),
-        device_world.DeviceShapeBodyIds(),
-        device_world.DeviceShapeTypes(),
-        device_world.DeviceShapeLocalTransforms(),
-        device_world.DeviceShapeHalfExtents(),
-        device_world.DeviceShapeRadii(),
-        static_cast<collision::AABB*>(aabbs.Data()));
-    CheckCuda(cudaGetLastError(), "GenerateAabbsKernel launch");
-
     if (pair_slot_count > 0u) {
         GeneratePairSlotsKernel<<<shape_blocks, kBlockSize, 0, stream>>>(
             shape_count,
@@ -278,9 +179,10 @@ CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
                                 std::move(pair_count));
 }
 
-CudaBroadphaseResult BuildCudaBroadphase(const runtime::gpu::DeviceWorld& device_world) {
+CudaBroadphaseResult BuildCudaBroadphase(const collision::AABB* device_aabbs,
+                                         uint32_t shape_count) {
     auto context = phi::MakeDefaultDeviceContext();
-    return BuildCudaBroadphase(context, device_world);
+    return BuildCudaBroadphase(context, device_aabbs, shape_count);
 }
 
 } // namespace nuka::collision::gpu

@@ -44,7 +44,7 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
 }
 
 void SyncHostToInstance(const runtime::articulation::ArticulationHostState& host,
-                        runtime::WorldInstance* instance) {
+                        runtime::BuiltWorldState* instance) {
     if (instance == nullptr) {
         return;
     }

@@ -47,7 +47,7 @@ CompiledScene BuildCompiledScene(const SceneIR& scene) {
     return compiled;
 }
 
-void ApplyRuntimeStateToCompiledScene(const runtime::WorldInstance& instance,
+void ApplyRuntimeStateToCompiledScene(const runtime::BuiltWorldState& instance,
                                       CompiledScene& compiled) {
     const size_t body_count = std::min<size_t>({
         instance.body_count,

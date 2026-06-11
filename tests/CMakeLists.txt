@@ -29,39 +29,6 @@ target_link_libraries(nuka_math_test
 
 gtest_discover_tests(nuka_math_test)
 
-# --- v0.1 e2e foundation tests --------------------------------------------
-add_executable(nuka_v01_foundation_e2e_test
-    e2e/test_v01_foundation_pipeline.cpp
-)
-
-target_compile_definitions(nuka_v01_foundation_e2e_test
-    PRIVATE
-        NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-)
-
-if(TARGET nuka_aba_cuda_probe)
-    add_dependencies(nuka_v01_foundation_e2e_test nuka_aba_cuda_probe)
-    target_compile_definitions(nuka_v01_foundation_e2e_test
-        PRIVATE
-            NUKA_ABA_CUDA_PROBE="$<TARGET_FILE:nuka_aba_cuda_probe>"
-            NUKA_ORACLE_PYTHON="${CMAKE_SOURCE_DIR}/.nuka-oracle-venv/bin/python"
-    )
-endif()
-
-target_link_libraries(nuka_v01_foundation_e2e_test
-    PRIVATE
-        nuka_runtime
-        nuka_import
-        $<$<TARGET_EXISTS:nuka_articulation_gpu>:nuka_articulation_gpu>
-        $<$<TARGET_EXISTS:nuka_phi>:nuka_phi>
-        GTest::gtest_main
-)
-
-gtest_discover_tests(nuka_v01_foundation_e2e_test
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    PROPERTIES RUN_SERIAL TRUE
-)
-
 if(TARGET nuka)
     add_executable(nuka_c_abi_create_step_destroy_test
         c_abi/test_create_step_destroy.c
@@ -307,7 +274,6 @@ gtest_discover_tests(nuka_scene_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(nuka_runtime_test
     runtime/test_world_build.cpp
     runtime/test_rigid_integration.cpp
-    runtime/test_world_stepper.cpp
 )
 
 target_link_libraries(nuka_runtime_test
@@ -440,10 +406,6 @@ gtest_discover_tests(nuka_compliant_rows_test)
 
 # --- Solver tests ----------------------------------------------------------
 add_executable(nuka_solver_test
-    solver/test_contact_resting.cpp
-    solver/test_contact_material.cpp
-    solver/test_joint_limit.cpp
-    solver/test_joint_projection.cpp
     solver/test_row_scheduler_bridge.cpp
     # Row-coloring O(rows*K) rewrite EQUIVALENCE gate: production
     # BuildRowColorPartitions / ValidateNoSharedBodiesPerColor vs a test-local
@@ -501,44 +463,6 @@ target_link_libraries(nuka_sensor_test
 
 gtest_discover_tests(nuka_sensor_test)
 
-# --- Debug draw tests ------------------------------------------------------
-add_executable(nuka_debug_draw_test
-    apps/test_debug_draw_list.cpp
-)
-
-target_link_libraries(nuka_debug_draw_test
-    PRIVATE
-        nuka_debug_draw
-        nuka_scene_pipeline
-        nuka_import
-        nuka_constraint
-        GTest::gtest_main
-)
-
-gtest_discover_tests(nuka_debug_draw_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-add_executable(nuka_scene_demo_test
-    apps/test_scene_demo.cpp
-)
-
-target_link_libraries(nuka_scene_demo_test
-    PRIVATE
-        nuka_debug_draw
-        nuka_scene_pipeline
-        nuka_import
-        nuka_constraint
-        GTest::gtest_main
-)
-
-if(NK_BUILD_VULKAN_VALIDATION)
-    target_compile_definitions(nuka_scene_demo_test
-        PRIVATE
-            NUKA_ENABLE_VULKAN_VALIDATION_TESTS=1
-    )
-endif()
-
-gtest_discover_tests(nuka_scene_demo_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
 # --- Batch context tests ---------------------------------------------------
 add_executable(nuka_batch_test
     runtime/test_batch_context.cpp
@@ -581,8 +505,6 @@ gtest_discover_tests(nuka_oracle_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(nuka_regression_test
     regression/test_free_fall.cpp
     regression/test_go2_stand_5s.cpp
-    regression/test_rest_stack.cpp
-    regression/test_two_link_arm.cpp
 )
 
 target_compile_definitions(nuka_regression_test
@@ -609,63 +531,6 @@ target_include_directories(nuka_regression_test
 gtest_discover_tests(nuka_regression_test)
 
 # --- Performance tests -----------------------------------------------------
-add_executable(nuka_perf_test
-    perf/test_step_timing.cpp
-)
-
-target_link_libraries(nuka_perf_test
-    PRIVATE
-        nuka_runtime
-        nuka_debug_draw
-        nuka_render
-        nuka_scene_pipeline
-        nuka_import
-        nuka_solver
-        GTest::gtest_main
-)
-
-gtest_discover_tests(nuka_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-if(NK_BUILD_DEMO_TIMING_VALIDATION)
-    add_executable(nuka_demo_timing_test
-        perf/test_render_demo_timing.cpp
-    )
-
-    target_link_libraries(nuka_demo_timing_test
-        PRIVATE
-            nuka_runtime
-            nuka_debug_draw
-            nuka_render
-            nuka_scene_pipeline
-            nuka_import
-            nuka_solver
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_demo_timing_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-endif()
-
-if(NK_BUILD_VULKAN_VALIDATION)
-    add_executable(nuka_vulkan_perf_test
-        perf/test_vulkan_scene_demo_timing.cpp
-        perf/test_batched_vulkan_scene_demo_timing.cpp
-        perf/test_vulkan_renderscene_timing.cpp
-    )
-
-    target_link_libraries(nuka_vulkan_perf_test
-        PRIVATE
-            nuka_runtime
-            nuka_debug_draw
-            nuka_render
-            nuka_scene_pipeline
-            nuka_import
-            nuka_solver
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_vulkan_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-endif()
-
 # --- PHI tests (requires CUDA) --------------------------------------------
 if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_codegen_test
@@ -739,11 +604,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_phi_test)
 
     add_executable(nuka_cuda_runtime_test
-        runtime/test_cuda_batched_world.cpp
-        runtime/test_cuda_device_world.cpp
-        runtime/test_cuda_particle_world.cpp
-        runtime/test_cuda_world_stepper.cpp
-        runtime/test_cuda_contacts.cpp
         runtime/test_cuda_solver.cpp
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
         runtime/test_xpbd_distance_oracle.cpp
@@ -1323,32 +1183,6 @@ if(CMAKE_CUDA_COMPILER)
     )
     gtest_discover_tests(nuka_rt_two_level_bench WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.7 p08-B: Newton-on-summed-SDF contact (forward + D1) ------------
-    # Cooks (p07, nuka_cooker) a sphere + box SDF; calls the header-inline
-    # find_sdf_contact_newton (the SAME function the device kernel wraps) on the
-    # host; emits RigidSDFContactRow / FeatherstoneSDFContactRow rows and runs
-    # the existing PGS solve (nuka_solver, CUDA) to prove penetrating bodies are
-    # pushed apart. nuka_collision_gpu carries the device kernel + row builders.
-    add_executable(nuka_sdf_contact_test
-        collision/test_sdf_contact.cpp
-    )
-
-    target_include_directories(nuka_sdf_contact_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_sdf_contact_test
-        PRIVATE
-            nuka_collision_gpu
-            nuka_cooker
-            nuka_solver
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_sdf_contact_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- p08-C Channel 2/3: envelope-theorem contact-geometry adjoint -------
     # Cooks box+sphere SDFs, runs the SHIPPING find_sdf_contact_newton, and
@@ -2876,35 +2710,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_link_contact_wrench_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- p14b (v0.7) RGB+depth+normal+uv CAMERA SENSOR over the LIVE batched sim
-    # state. Analytic depth/camera-space-normal/palette-RGB/miss; LIVE-tracking
-    # (move a body's DevicePoses() -> image changes); batched per-env; D1 two-run
-    # byte-exact across all channels. The poses come from a real BatchedDeviceWorld
-    # (nuka_runtime_gpu), the SDFs are real p07 cooked SDFs (nuka_cooker); the
-    # renderer is nuka_camera_sensor_gpu. -ffp-contract=off pairs with the kernel's
-    # --fmad=false so the shared fp64 SDF sphere-trace is host==device bit-for-bit.
-    add_executable(nuka_camera_render_test
-        sensor/test_camera_render.cpp
-    )
-    set_source_files_properties(sensor/test_camera_render.cpp
-        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
-    target_include_directories(nuka_camera_render_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}
-            ${CMAKE_SOURCE_DIR}/src
-    )
-    target_link_libraries(nuka_camera_render_test
-        PRIVATE
-            nuka_camera_sensor_gpu
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_cooker
-            nuka_collision_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-    gtest_discover_tests(nuka_camera_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
     # --- p03 per-env RESET primitive (RL autoreset) ------------------------
     add_executable(nuka_batched_reset_test
         runtime/test_batched_reset.cpp
@@ -3087,40 +2892,14 @@ if(CMAKE_CUDA_COMPILER)
             nuka_phi
     )
 
-    add_executable(nuka_cuda_sensor_test
-        sensor/test_cuda_sensors.cpp
-    )
-
-    target_link_libraries(nuka_cuda_sensor_test
-        PRIVATE
-            nuka_sensor_gpu
-            nuka_sensor
-            nuka_runtime_gpu
-            nuka_runtime
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_cuda_sensor_test)
-
 add_executable(nuka_cuda_perf_test
-    perf/test_cuda_batch_timing.cpp
-    perf/test_cuda_batch_contact_timing.cpp
-    perf/test_cuda_batch_joint_drive_timing.cpp
-    perf/test_cuda_batch_sensor_timing.cpp
-    perf/test_cuda_contact_timing.cpp
-    perf/test_cuda_particle_coupling_timing.cpp
-    perf/test_cuda_sensor_timing.cpp
     perf/test_cuda_solver_timing.cpp
-    perf/test_cuda_step_timing.cpp
     perf/test_lbvh_50k_bodies.cpp
     perf/test_1m_particles_grid_perf.cpp
 )
 
     target_link_libraries(nuka_cuda_perf_test
         PRIVATE
-            nuka_debug_draw
-            nuka_sensor_gpu
-            nuka_sensor
             nuka_runtime_gpu
             nuka_runtime
             nuka_collision_gpu
@@ -3142,24 +2921,6 @@ add_executable(nuka_cuda_perf_test
     )
 
     gtest_discover_tests(nuka_perf_timing_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    if(NK_BUILD_DEMO_TIMING_VALIDATION)
-        add_executable(nuka_cuda_scene_demo_perf_test
-            perf/test_cuda_scene_demo_timing.cpp
-        )
-
-        target_link_libraries(nuka_cuda_scene_demo_perf_test
-            PRIVATE
-                nuka_debug_draw
-                nuka_sensor_gpu
-                nuka_sensor
-                nuka_runtime_gpu
-                nuka_runtime
-                GTest::gtest_main
-        )
-
-        gtest_discover_tests(nuka_cuda_scene_demo_perf_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    endif()
 endif()
 
 # --- Vulkan renderer tests -------------------------------------------------
