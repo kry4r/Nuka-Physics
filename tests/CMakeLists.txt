@@ -2194,6 +2194,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_constraint
             nuka_runtime
             nuka_import
+            nuka_cooker  # G1e: the union scene's CookScene/CookArticulations path.
             nuka_articulation_gpu
             nuka_collision_gpu
             nuka_core
