@@ -117,4 +117,18 @@ import::cooker::SparseSdfData AssetCache::GetOrCookSdf(
     return sdf;
 }
 
+std::vector<float> AssetCache::GetOrCookSamples(const std::string& key,
+                                                const SampleProducer& produce) {
+    const std::string path = PathFor(key, "nukasamp");
+    std::vector<uint8_t> bytes;
+    if (ReadFile(path, bytes)) {
+        return DecodeSamples(bytes);
+    }
+    std::vector<float> xyz = produce();
+    if (!xyz.empty()) {
+        WriteFile(path, EncodeSamples(xyz));
+    }
+    return xyz;
+}
+
 } // namespace nuka::scene

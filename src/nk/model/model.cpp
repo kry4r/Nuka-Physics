@@ -4,6 +4,7 @@
 
 #include "nk/model/model.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -60,6 +61,29 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::HullVerts) {
             // GLOBAL convex-hull vertex pool, xyz packed.
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
+        }
+        // M5 pair-driven / SDF GLOBAL tables (per-env template, base-relative).
+        if (id == FieldId::ShapeTable) {
+            return static_cast<uint64_t>(max_bodies_total) * 8ull;
+        }
+        if (id == FieldId::ExcludedPairs) {
+            return static_cast<uint64_t>(max_excluded_pairs);
+        }
+        if (id == FieldId::SampPoints) {
+            return static_cast<uint64_t>(max_samp_points) * 3ull;
+        }
+        if (id == FieldId::SampRanges) {
+            return static_cast<uint64_t>(max_bodies_total) * 2ull;
+        }
+        if (id == FieldId::SdfHeaders) {
+            return static_cast<uint64_t>(max_sdf_grids) * 8ull;
+        }
+        if (id == FieldId::SdfCellCount) {
+            return static_cast<uint64_t>(max_sdf_grids);
+        }
+        if (id == FieldId::SdfCellKeys || id == FieldId::SdfCellValues ||
+            id == FieldId::SdfCellGradients) {
+            return static_cast<uint64_t>(max_sdf_cells);
         }
         return static_cast<uint64_t>(env_count);
     }
@@ -233,6 +257,97 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::ShapeTable: {
+            // GLOBAL pair-driven shape table: 8 packed f32 per body row
+            // {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
+            //  sdf_grid(u32)}. Empty for the union slot-template family.
+            auto* p = reinterpret_cast<float*>(dst);
+            auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
+            const uint32_t rows = capacities.max_bodies_total;
+            for (uint32_t s = 0; s < shape_table_rows.size() && s < rows; ++s) {
+                const PairDrivenShape& sh = shape_table_rows[s];
+                const size_t b = static_cast<size_t>(s) * 8u;
+                put_u32(b + 0, sh.kind);
+                p[b + 1] = sh.params[0]; p[b + 2] = sh.params[1];
+                p[b + 3] = sh.params[2]; p[b + 4] = sh.params[3];
+                put_u32(b + 5, sh.contype);
+                put_u32(b + 6, sh.conaffinity);
+                put_u32(b + 7, sh.sdf_grid);
+            }
+            break;
+        }
+        case FieldId::ExcludedPairs: {
+            if (!excluded_pairs.empty()) {
+                const size_t n = std::min(excluded_pairs.size(),
+                                          static_cast<size_t>(capacities.max_excluded_pairs));
+                std::memcpy(dst, excluded_pairs.data(), n * sizeof(uint64_t));
+            }
+            break;
+        }
+        case FieldId::SampPoints: {
+            if (!samp_points.empty()) {
+                const size_t n = std::min(samp_points.size(),
+                                          static_cast<size_t>(capacities.max_samp_points) * 3u);
+                std::memcpy(dst, samp_points.data(), n * sizeof(float));
+            }
+            break;
+        }
+        case FieldId::SampRanges: {
+            if (!samp_ranges.empty()) {
+                const size_t n = std::min(samp_ranges.size(),
+                                          static_cast<size_t>(capacities.max_bodies_total) * 2u);
+                std::memcpy(dst, samp_ranges.data(), n * sizeof(uint32_t));
+            }
+            break;
+        }
+        case FieldId::SdfHeaders: {
+            // Per-grid record: origin.xyz, voxel_size, dims.xyz (u32 bits),
+            // cell_offset (u32 bits) — 8 f32 each.
+            auto* p = reinterpret_cast<float*>(dst);
+            auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
+            const uint32_t grids = capacities.max_sdf_grids;
+            for (uint32_t g = 0; g < sdf_grids.size() && g < grids; ++g) {
+                const SdfGrid& s = sdf_grids[g];
+                const size_t b = static_cast<size_t>(g) * 8u;
+                p[b + 0] = s.origin.x; p[b + 1] = s.origin.y; p[b + 2] = s.origin.z;
+                p[b + 3] = s.voxel_size;
+                put_u32(b + 4, s.dims[0]); put_u32(b + 5, s.dims[1]);
+                put_u32(b + 6, s.dims[2]); put_u32(b + 7, s.cell_offset);
+            }
+            break;
+        }
+        case FieldId::SdfCellCount: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t grids = capacities.max_sdf_grids;
+            for (uint32_t g = 0; g < sdf_grids.size() && g < grids; ++g) {
+                p[g] = sdf_grids[g].cell_count;
+            }
+            break;
+        }
+        case FieldId::SdfCellKeys: {
+            if (!sdf_cell_keys.empty()) {
+                const size_t n = std::min(sdf_cell_keys.size(),
+                                          static_cast<size_t>(capacities.max_sdf_cells));
+                std::memcpy(dst, sdf_cell_keys.data(), n * sizeof(uint64_t));
+            }
+            break;
+        }
+        case FieldId::SdfCellValues: {
+            if (!sdf_cell_values.empty()) {
+                const size_t n = std::min(sdf_cell_values.size(),
+                                          static_cast<size_t>(capacities.max_sdf_cells));
+                std::memcpy(dst, sdf_cell_values.data(), n * sizeof(float));
+            }
+            break;
+        }
+        case FieldId::SdfCellGradients: {
+            if (!sdf_cell_gradients.empty()) {
+                const size_t n = std::min(sdf_cell_gradients.size(),
+                                          static_cast<size_t>(capacities.max_sdf_cells));
+                std::memcpy(dst, sdf_cell_gradients.data(), n * sizeof(math::Vec3));
+            }
+            break;
+        }
         case FieldId::DofToLink:
             StampPerLink(dst, dof_to_link, capacities.dofs_per_env, E, sizeof(uint32_t));
             break;
@@ -296,6 +411,15 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
         case FieldId::UnionSlots:            v.union_slots = static_cast<float*>(p); break;
         case FieldId::HullVerts:             v.hull_verts = static_cast<float*>(p); break;
+        case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
+        case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
+        case FieldId::SampPoints:            v.samp_points = static_cast<float*>(p); break;
+        case FieldId::SampRanges:            v.samp_ranges = static_cast<uint32_t*>(p); break;
+        case FieldId::SdfHeaders:            v.sdf_headers = static_cast<float*>(p); break;
+        case FieldId::SdfCellCount:          v.sdf_cell_count = static_cast<uint32_t*>(p); break;
+        case FieldId::SdfCellKeys:           v.sdf_cell_keys = static_cast<uint64_t*>(p); break;
+        case FieldId::SdfCellValues:         v.sdf_cell_values = static_cast<float*>(p); break;
+        case FieldId::SdfCellGradients:      v.sdf_cell_gradients = static_cast<math::Vec3*>(p); break;
         case FieldId::DofToLink:             v.dof_to_link = static_cast<uint32_t*>(p); break;
         case FieldId::DofToComponent:        v.dof_to_component = static_cast<uint32_t*>(p); break;
         case FieldId::IslandRowOffsets:      v.island_row_offsets = static_cast<uint32_t*>(p); break;

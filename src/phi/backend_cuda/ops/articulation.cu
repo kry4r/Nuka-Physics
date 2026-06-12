@@ -1002,6 +1002,8 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkAbaOps();
     RegisterNkCrbaOps();
     RegisterNkContactsFootOps();
+    RegisterNkBroadphaseOps();
+    RegisterNkNarrowphaseSdfOps();
     RegisterNkAssembleRowsOps();
     RegisterNkSolveRowsOps();
     RegisterNkReadoutOps();

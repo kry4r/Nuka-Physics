@@ -19,6 +19,7 @@
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"   // M5: pair-driven dispatch
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"  // M4: union-family dispatch
 
@@ -175,6 +176,11 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
         // M4 union family: per-(env x union-slot) analytic detection
         // (contacts_union.cu).
         return LaunchUnionNarrowphase(model, data, *p, stream);
+    }
+    if (p->family == kContactFamilyPairDriven) {
+        // M5 generalized family: candidate_pairs -> analytic prim dispatch
+        // (narrowphase_prims.cu). ADDITIVE; never touches the union path.
+        return LaunchPairDrivenNarrowphase(model, data, *p, stream);
     }
     if (p->env_count == 0u) {
         return Status::Ok;

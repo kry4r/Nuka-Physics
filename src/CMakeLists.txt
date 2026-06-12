@@ -451,6 +451,14 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/crba.cu
         phi/backend_cuda/ops/contacts_foot.cu
         phi/backend_cuda/ops/contacts_union.cu
+        # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
+        # + generalized pair-driven narrowphase (analytic prim set + sphere x
+        # hull) + the SDF main path (SAMP x cooked sparse SDF grid). Ports of
+        # collision/broadphase_lbvh / particle_uniform_grid + the shared
+        # runtime/sdf sampler; the union slot-template path early-exits.
+        phi/backend_cuda/ops/broadphase.cu
+        phi/backend_cuda/ops/narrowphase_prims.cu
+        phi/backend_cuda/ops/narrowphase_sdf.cu
         phi/backend_cuda/ops/assemble_rows.cu
         phi/backend_cuda/ops/solve_rows.cu
         phi/backend_cuda/ops/readout.cu

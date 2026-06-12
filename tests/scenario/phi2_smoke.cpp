@@ -229,12 +229,16 @@ TEST_F(Phi2SmokeTest, UnregisteredOpReturnsUnsupported) {
     Backend* backend = DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    // LbvhBuild has no implementation until M5 -> Unsupported. (M3b registered
-    // the real AbaForward, so the former probe op is now supported.)
+    // XpbdProject has no implementation until M6 -> Unsupported. (M3b registered
+    // the real AbaForward; M5 registered LbvhBuild + the whole collision spine,
+    // so the former LbvhBuild probe is now supported — re-pointed to the next
+    // still-unimplemented milestone op, the M6 particle XPBD projection.)
     EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::AbaForward))
         << "M3b: the real AbaForward op should be registered";
-    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::LbvhBuild));
-    OpCall call{NkOp::LbvhBuild, nullptr};
+    EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::LbvhBuild))
+        << "M5: the real LbvhBuild broadphase op should be registered";
+    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::XpbdProject));
+    OpCall call{NkOp::XpbdProject, nullptr};
     ModelView model{};
     DataView data{};
     EXPECT_EQ(BackendDispatch(backend, model, data, call), Status::Unsupported);

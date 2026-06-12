@@ -1075,9 +1075,11 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_gjk_epa_convex_test
         PRIVATE
             nuka_phi
+            nuka_phi2       # M5: the NarrowphaseSdf op (SDF precision oracle).
             nuka_import
             nuka_scene
             nuka_cooker
+            CUDA::cudart    # cudaDeviceSynchronize in the SDF oracle harness.
             GTest::gtest_main
     )
     # WORKING_DIRECTORY = repo root so the relative cup asset path resolves.

@@ -160,6 +160,24 @@ fields:
   - {name: body_aabb_hi,    dtype: vec3, per: body,          arena: scratch, owner: data}
   - {name: pair_count,      dtype: u32,  per: env,           arena: scratch, owner: data}
   - {name: candidate_pairs, dtype: u32,  per: contact_slot,  arena: scratch, owner: data, elem: 2}
+
+  # =========================================================================
+  # M5 — LBVH broadphase scratch (BuildAabbs/LbvhBuild/LbvhQueryPairs ops). The
+  # per-env Karras LBVH builds over the env's body AABB set (env-major). Sized
+  # per:body so a 2N-1-node tree (N = bodies_per_env) plus the Morton key/index
+  # arrays fit one preallocated arena slice (NO per-call cudaMalloc on the
+  # pair-driven path — the ports' thrust temp allocs stay, but the node/morton/
+  # visit state is arena-resident, the plan §3.5 "preallocated arena scratch"
+  # posture). lbvh_nodes packs the LbvhNode record (8 floats: left/right/parent
+  # i32 + aabb 6 f32 = 36 B -> elem:9 f32 lanes covers it, 36 B/node). morton
+  # codes + the stable index companion + the bottom-up visit counters are u32.
+  # These are ONLY touched by the pair-driven family; the union slot-template
+  # path early-exits before LbvhBuild (gate-pinned, bit-identical to M4).
+  # =========================================================================
+  - {name: lbvh_nodes,      dtype: f32,  per: body,          arena: scratch, owner: data, elem: 9}
+  - {name: lbvh_morton,     dtype: u32,  per: body,          arena: scratch, owner: data}
+  - {name: lbvh_index,      dtype: u32,  per: body,          arena: scratch, owner: data}
+  - {name: lbvh_visit,      dtype: u32,  per: body,          arena: scratch, owner: data}
   - {name: contact_link,    dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_point,   dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_normal,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
@@ -242,6 +260,51 @@ fields:
   - {name: table_enabled,    dtype: u32, per: env,    arena: persistent, owner: data}
 
   # =========================================================================
+  # M5 — PAIR-DRIVEN broadphase FILTER policy + generalized narrowphase shape
+  # tables — MODEL (cook-constant). These back the pair-driven NarrowphasePrim/
+  # NarrowphaseSdf path (the generalized rigid/mesh collision the union slot-
+  # template family does NOT use). All GLOBAL (per-env template, base-relative).
+  #
+  # shape_table: the per-body collidable primitive record (8 packed f32 per
+  # body-row {kind(u32 bits), p0..p3 (sphere r / capsule r,hh / box he.xyz),
+  # contype(u32 bits), conaffinity(u32 bits), sdf_grid(u32 bits)}). The
+  # NarrowphasePrimitives pair-driven branch dispatches by (kind_a,kind_b) over
+  # the amf:: analytic set; sdf_grid != ~0 routes the pair through NarrowphaseSdf.
+  # excluded_pairs: the SORTED (lo<<32|hi) exclude list (cook filter policy);
+  # the pair query drops a candidate found by binary search. filter_excluded_count
+  # is its live length (a scalar staged into mat-bucket-style header — kept as a
+  # 1-row table so the op reads the count device-side without a host param).
+  # =========================================================================
+  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*8",       arena: persistent, owner: model}
+  - {name: excluded_pairs,   dtype: u64, per: scalar, count: "max_excluded_pairs",       arena: persistent, owner: model}
+
+  # =========================================================================
+  # M5 — SDF main path (NarrowphaseSdf op; plan §3.5 Genesis-style sampling).
+  # The OTHER shape's cooked SAMPLE-POINT set (hull verts + edge midpoints,
+  # cooked into the .nka SAMP chunk) queried against the cooked sparse narrow-
+  # band SDF grid (mirrors runtime/sdf CookedSdfTable / SparseSdfDevice layout).
+  #   samp_points       : flat mesh-local sample-point pool (xyz packed).
+  #   samp_ranges       : per body-row {offset, count} into samp_points (the
+  #                        sampling shape's sample slice).
+  #   sdf_headers        : per SDF grid record (8 f32: origin.xyz, voxel_size,
+  #                        dims.xyz (u32 bits), cell_offset (u32 bits into the
+  #                        flat cell arrays)).
+  #   sdf_cell_count     : per SDF grid live cell count (u32).
+  #   sdf_cell_keys      : flat ASCENDING-sorted PackSdfCellKey(i,j,k) (u64).
+  #   sdf_cell_values    : flat signed distance at each cell (f32).
+  #   sdf_cell_gradients : flat precomputed gradient at each cell (vec3).
+  # All GLOBAL (shared by every env; the sampling shape's body pose makes the
+  # query env-specific). The union family never references them (early-exit).
+  # =========================================================================
+  - {name: samp_points,       dtype: f32,  per: scalar, count: "max_samp_points*3",  arena: persistent, owner: model}
+  - {name: samp_ranges,       dtype: u32,  per: scalar, count: "max_bodies_total*2", arena: persistent, owner: model}
+  - {name: sdf_headers,       dtype: f32,  per: scalar, count: "max_sdf_grids*8",    arena: persistent, owner: model}
+  - {name: sdf_cell_count,    dtype: u32,  per: scalar, count: "max_sdf_grids",      arena: persistent, owner: model}
+  - {name: sdf_cell_keys,     dtype: u64,  per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
+  - {name: sdf_cell_values,   dtype: f32,  per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
+  - {name: sdf_cell_gradients,dtype: vec3, per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
+
+  # =========================================================================
   # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct
   # by nk::SolveSchedule (the row_scheduler algorithms migrated to
   # src/nk/solve/schedule.cpp) over MAX-CAPACITY row slots, uploaded once,
@@ -294,6 +357,29 @@ fields:
   - {name: pbf_position_delta, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: pbf_density,        dtype: f32,  per: particle, arena: scratch, owner: data}
   - {name: pbf_lambda,         dtype: f32,  per: particle, arena: scratch, owner: data}
+
+  # =========================================================================
+  # M5 — PARTICLE UNIFORM-GRID scratch (ParticleGridBuild op; ported from
+  # collision/particle_uniform_grid.cu). The hash-grid CSR neighbor structure
+  # the M6 PBF/XPBD co-step queries. grid_cell_key/grid_particle_idx are the
+  # per-particle (cell-key, original-index) pair the stable_sort orders (D1
+  # radix anchor); grid_neighbor_offset is the per-particle CSR offset (the
+  # exclusive-scan of the per-particle in-radius neighbor count, capped at
+  # kParticleGridMaxNeighbors=32); grid_neighbor_count is the per-particle
+  # active neighbor watermark; grid_neighbor_idx is the flat CSR neighbor pool
+  # (32 slots/particle, the fixed cap so the slice is preallocated — no per-call
+  # alloc). grid_cell_start/grid_cell_end are the per-cell [start,end) ranges
+  # into the sorted index (sized per:particle as a conservative cell upper
+  # bound; the op writes only the populated prefix). M6 wires the real PBF
+  # consumer; M5 ships the build op + the arena-resident neighbor CSR it exposes.
+  # =========================================================================
+  - {name: grid_cell_key,       dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_particle_idx,   dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_cell_start,     dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_cell_end,       dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_neighbor_offset,dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_neighbor_count, dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_neighbor_idx,   dtype: u32, per: particle, arena: scratch, owner: data, elem: 32}
 
   # =========================================================================
   # DOMAIN RANDOMIZATION / RNG — DATA. mat_buckets/mat_index above (§3.3).

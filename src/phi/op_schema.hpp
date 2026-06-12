@@ -144,29 +144,55 @@ struct CrbaFactorMParams {
 };
 
 // --- broadphase / spatial acceleration ----------------------------------
+// M5: the broadphase ops (BuildAabbs/LbvhBuild/LbvhQueryPairs) and the SDF
+// narrowphase EARLY-EXIT unless family == kContactFamilyPairDriven (the union
+// slot-template and fused-foot paths do their own detection and never read the
+// pair stream). The pair-driven ops carry their launch geometry in params (the
+// views are pure pointer aggregates).
 struct BuildAabbsParams {
-    float margin;          // AABB inflation margin
+    float    margin;            // AABB inflation margin
+    uint32_t family;            // kContactFamily* (PairDriven => build)
+    uint32_t env_count;
+    uint32_t bodies_per_env;    // collidable body rows / env (shape_table)
 };
 
 struct LbvhBuildParams {
-    uint32_t reserved;
+    uint32_t family;            // kContactFamily* (PairDriven => build)
+    uint32_t env_count;
+    uint32_t bodies_per_env;
 };
 
 struct LbvhQueryPairsParams {
-    uint32_t max_pairs;    // capacity of the output pair stream
+    uint32_t max_pairs;         // per-env capacity of the output pair stream
+    uint32_t family;            // kContactFamily* (PairDriven => query)
+    uint32_t env_count;
+    uint32_t bodies_per_env;
+    uint32_t max_contacts_per_env;  // candidate_pairs slot stride / env
+    uint32_t filter_cross_env;  // 1 => drop pairs spanning envs (env-major)
+    uint32_t excluded_count;    // sorted exclude-list length (excluded_pairs)
 };
 
 struct ParticleGridBuildParams {
-    float cell_size;       // uniform grid cell edge length
+    float    cell_size;         // uniform grid cell edge length
+    float    query_radius;      // neighbor search radius
+    uint32_t particle_count;    // total particles (env-major)
+    float    grid_min[3];       // grid lower corner
+    uint32_t grid_dims[3];      // grid resolution
 };
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
 // (mirrors nk::ContactFamily; a plain u32 so the POD stays header-light).
-//   0 = FusedFoot (M3 articulation foot pipeline, goldens byte-exact)
-//   1 = UnionCsr  (M4 union compliant-CSR pipeline)
-inline constexpr uint32_t kContactFamilyFusedFoot = 0u;
-inline constexpr uint32_t kContactFamilyUnionCsr  = 1u;
+//   0 = FusedFoot  (M3 articulation foot pipeline, goldens byte-exact)
+//   1 = UnionCsr   (M4 union compliant-CSR pipeline)
+//   2 = PairDriven (M5 generalized broadphase->narrowphase: BuildAabbs/Lbvh*/
+//       candidate_pairs -> NarrowphasePrimitives (amf:: analytic set + sphere x
+//       hull) + NarrowphaseSdf (SAMP x SDF grid). ADDITIVE; the union family's
+//       slot-template path is untouched. The broadphase + SDF ops EARLY-EXIT
+//       for FusedFoot/UnionCsr so those gate-pinned paths stay bit-identical.)
+inline constexpr uint32_t kContactFamilyFusedFoot  = 0u;
+inline constexpr uint32_t kContactFamilyUnionCsr   = 1u;
+inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 
 struct NarrowphasePrimitivesParams {
     float contact_margin;
@@ -184,10 +210,18 @@ struct NarrowphasePrimitivesParams {
     uint32_t hull_vert_count;   // live verts of the hull_verts pool
 };
 
-// Spec-fixed (M1).
+// Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
+// M5 appends the pair-driven launch geometry: the op samples each sampling
+// shape's SAMP point slice against the OTHER shape's cooked SDF grid (plan
+// §3.5). EARLY-EXITS unless family == kContactFamilyPairDriven.
 struct NarrowphaseSdfParams {
-    float contact_margin;
+    float   contact_margin;
     uint8_t max_contacts_per_pair;
+    // -- appended launch geometry (M5) -----------------------------------
+    uint32_t family;            // kContactFamily* (PairDriven => sample)
+    uint32_t env_count;
+    uint32_t bodies_per_env;
+    uint32_t max_contacts_per_env;  // ucontact slot stride / env
 };
 
 struct ContactTangentBasisParams {
