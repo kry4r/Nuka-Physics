@@ -333,6 +333,18 @@ void SolveSchedule::Build(Model* model) {
                 case UnionSlot::kBodyBoxPlane:
                     key_a = e * cap.bodies_per_env + u.body;
                     break;
+                case UnionSlot::kParticleSpherePlane:
+                    // side a == a particle (synthetic key past the artic keys so a
+                    // particle conflicts only with rows touching the SAME particle);
+                    // side b == static plane (no key).
+                    key_a = total_body_count + E +
+                            (e * cap.particles_per_env + u.link);
+                    break;
+                case UnionSlot::kParticleSphereBox:
+                    key_a = total_body_count + E +
+                            (e * cap.particles_per_env + u.link);
+                    key_b = e * cap.bodies_per_env + u.body;
+                    break;
                 default:
                     break;
             }

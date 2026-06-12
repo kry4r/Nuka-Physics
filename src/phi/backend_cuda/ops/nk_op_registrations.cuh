@@ -22,6 +22,7 @@ void RegisterNkBroadphaseOps();       // broadphase.cu (M5)
 void RegisterNkNarrowphaseSdfOps();   // narrowphase_sdf.cu (M5)
 void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
 void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
+void RegisterNkParticleOps();         // particles.cu (M6)
 void RegisterNkReadoutOps();          // readout.cu
 
 } // namespace nuka::phi

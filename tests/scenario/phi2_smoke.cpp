@@ -229,16 +229,19 @@ TEST_F(Phi2SmokeTest, UnregisteredOpReturnsUnsupported) {
     Backend* backend = DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    // XpbdProject has no implementation until M6 -> Unsupported. (M3b registered
-    // the real AbaForward; M5 registered LbvhBuild + the whole collision spine,
-    // so the former LbvhBuild probe is now supported — re-pointed to the next
-    // still-unimplemented milestone op, the M6 particle XPBD projection.)
+    // The probe op must be one with no implementation yet. M3b registered
+    // AbaForward; M5 registered LbvhBuild; M6 registered XpbdProject (the whole
+    // particle spine) — so the former XpbdProject probe is now supported. The
+    // next still-unimplemented milestone op is the M9 domain-randomization op
+    // RandomizeMaterialBuckets.
     EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::AbaForward))
         << "M3b: the real AbaForward op should be registered";
     EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::LbvhBuild))
         << "M5: the real LbvhBuild broadphase op should be registered";
-    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::XpbdProject));
-    OpCall call{NkOp::XpbdProject, nullptr};
+    EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::XpbdProject))
+        << "M6: the real XpbdProject particle op should be registered";
+    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::RandomizeMaterialBuckets));
+    OpCall call{NkOp::RandomizeMaterialBuckets, nullptr};
     ModelView model{};
     DataView data{};
     EXPECT_EQ(BackendDispatch(backend, model, data, call), Status::Unsupported);

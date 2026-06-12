@@ -559,7 +559,15 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     const uint32_t cells = p->grid_dims[0] * p->grid_dims[1] * p->grid_dims[2];
     if (cells == 0u) return Status::Ok;
     const uint32_t blocks = (Np + kBlockSize - 1u) / kBlockSize;
-    const auto* pos = static_cast<const math::Vec3*>(data.particle_pos);
+    // M6: PBF builds the neighbor grid on the PREDICTED positions (legacy
+    // StepPbfWorld), so pos_source routes the op to pbf_predicted_pos; the M5
+    // default (0) keeps the particle_pos source. All downstream PBF density /
+    // lambda / correction kernels read pbf_predicted_pos, so the neighbor list
+    // and the queries are over the SAME positions (D1 + the legacy semantics).
+    const auto* pos =
+        (p->pos_source == kGridPosSourcePbfPredicted)
+            ? static_cast<const math::Vec3*>(data.pbf_predicted_pos)
+            : static_cast<const math::Vec3*>(data.particle_pos);
 
     LaunchCuda(GridCellKeysKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, cfg, data.grid_cell_key, data.grid_particle_idx);

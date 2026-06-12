@@ -1006,6 +1006,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkNarrowphaseSdfOps();
     RegisterNkAssembleRowsOps();
     RegisterNkSolveRowsOps();
+    RegisterNkParticleOps();
     RegisterNkReadoutOps();
 }
 

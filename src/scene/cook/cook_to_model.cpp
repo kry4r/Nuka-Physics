@@ -466,4 +466,106 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// M6 particle cook.
+// ---------------------------------------------------------------------------
+
+void CookXpbdParticles(nk::Model& model, uint32_t env_count,
+                       const XpbdCookInput& in) {
+    const uint32_t envs = env_count > 0 ? env_count : 1u;
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Xpbd;
+    mp.initial_pos = in.positions;
+    mp.initial_vel = in.velocities;
+    mp.inv_mass = in.inv_mass;
+    if (mp.initial_vel.size() != mp.initial_pos.size()) {
+        mp.initial_vel.assign(mp.initial_pos.size(), math::Vec3::Zero());
+    }
+    if (mp.inv_mass.size() != mp.initial_pos.size()) {
+        mp.inv_mass.assign(mp.initial_pos.size(), 1.0f);
+    }
+    mp.xpbd_iters = in.solver_iterations == 0u ? 1u : in.solver_iterations;
+
+    // De-interleave the constraint AoS into the per-field SoA (the EXACT
+    // UploadXpbdWorld layout: distance a/b/rest/alpha; bend 4-particle +
+    // 4-gradient; volume 4-particle + rest6/alpha).
+    const uint32_t dn = static_cast<uint32_t>(in.distance.size());
+    mp.dist_a.resize(dn); mp.dist_b.resize(dn);
+    mp.dist_rest.resize(dn); mp.dist_alpha.resize(dn);
+    for (uint32_t c = 0; c < dn; ++c) {
+        mp.dist_a[c] = in.distance[c].a;
+        mp.dist_b[c] = in.distance[c].b;
+        mp.dist_rest[c] = in.distance[c].rest_length;
+        mp.dist_alpha[c] = in.distance[c].compliance_alpha;
+    }
+    const uint32_t bn = static_cast<uint32_t>(in.bend.size());
+    mp.bend_particles.resize(static_cast<size_t>(bn) * 4u);
+    mp.bend_gradients.resize(static_cast<size_t>(bn) * 4u);
+    mp.bend_alpha.resize(bn);
+    for (uint32_t c = 0; c < bn; ++c) {
+        for (uint32_t j = 0; j < 4u; ++j) {
+            mp.bend_particles[static_cast<size_t>(c) * 4u + j] = in.bend[c].p[j];
+            mp.bend_gradients[static_cast<size_t>(c) * 4u + j] = in.bend[c].k[j];
+        }
+        mp.bend_alpha[c] = in.bend[c].compliance_alpha;
+    }
+    const uint32_t vn = static_cast<uint32_t>(in.volume.size());
+    mp.vol_particles.resize(static_cast<size_t>(vn) * 4u);
+    mp.vol_rest6.resize(vn); mp.vol_alpha.resize(vn);
+    for (uint32_t c = 0; c < vn; ++c) {
+        for (uint32_t j = 0; j < 4u; ++j) {
+            mp.vol_particles[static_cast<size_t>(c) * 4u + j] = in.volume[c].p[j];
+        }
+        mp.vol_rest6[c] = in.volume[c].rest_volume_times6;
+        mp.vol_alpha[c] = in.volume[c].compliance_alpha;
+    }
+
+    cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    cap.dist_cons_per_env = dn;
+    cap.bend_cons_per_env = bn;
+    cap.vol_cons_per_env  = vn;
+}
+
+void CookPbfParticles(nk::Model& model, uint32_t env_count,
+                      const PbfCookInput& in) {
+    const uint32_t envs = env_count > 0 ? env_count : 1u;
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Pbf;
+    mp.initial_pos = in.positions;
+    mp.initial_vel = in.velocities;
+    mp.inv_mass = in.inv_mass;
+    if (mp.initial_vel.size() != mp.initial_pos.size()) {
+        mp.initial_vel.assign(mp.initial_pos.size(), math::Vec3::Zero());
+    }
+    if (mp.inv_mass.size() != mp.initial_pos.size()) {
+        // Uniform-mass fluid: inv_mass = 1/particle_mass (a free particle).
+        const float im = in.particle_mass > 0.0f ? 1.0f / in.particle_mass : 0.0f;
+        mp.inv_mass.assign(mp.initial_pos.size(), im);
+    }
+    mp.pbf_rest_density   = in.rest_density;
+    mp.pbf_support_radius = in.support_radius;
+    mp.pbf_particle_mass  = in.particle_mass;
+    mp.pbf_cfm_epsilon    = in.cfm_epsilon;
+    mp.pbf_iters          = in.iters == 0u ? 1u : in.iters;
+    mp.pbf_clamp_overdensity = in.clamp_overdensity;
+    mp.pbf_xsph_viscosity = in.xsph_viscosity;
+    mp.pbf_surface_tension= in.surface_tension;
+    mp.grid_min = in.grid_min;
+    mp.grid_dims[0] = in.grid_dims[0];
+    mp.grid_dims[1] = in.grid_dims[1];
+    mp.grid_dims[2] = in.grid_dims[2];
+    mp.cell_size = in.support_radius;
+    mp.query_radius = in.support_radius;
+    mp.boundary_enabled = in.boundary_enabled;
+    mp.floor_z = in.floor_z;
+
+    cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+}
+
 } // namespace nuka::scene::cook

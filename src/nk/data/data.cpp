@@ -99,6 +99,17 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::PbfPositionDelta:    v.pbf_position_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::PbfDensity:          v.pbf_density = static_cast<float*>(p); break;
         case FieldId::PbfLambda:           v.pbf_lambda = static_cast<float*>(p); break;
+        // M6 coupled v_pre scratch + the M5 particle uniform-grid CSR fields (the
+        // grid build op's neighbor structure — bound here so the ported thrust /
+        // CSR kernels see live arena pointers instead of null).
+        case FieldId::ParticleVPre:        v.particle_v_pre = static_cast<math::Vec3*>(p); break;
+        case FieldId::GridCellKey:         v.grid_cell_key = static_cast<uint32_t*>(p); break;
+        case FieldId::GridParticleIdx:     v.grid_particle_idx = static_cast<uint32_t*>(p); break;
+        case FieldId::GridCellStart:       v.grid_cell_start = static_cast<uint32_t*>(p); break;
+        case FieldId::GridCellEnd:         v.grid_cell_end = static_cast<uint32_t*>(p); break;
+        case FieldId::GridNeighborOffset:  v.grid_neighbor_offset = static_cast<uint32_t*>(p); break;
+        case FieldId::GridNeighborCount:   v.grid_neighbor_count = static_cast<uint32_t*>(p); break;
+        case FieldId::GridNeighborIdx:     v.grid_neighbor_idx = static_cast<uint32_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
         case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;
         case FieldId::ObsBuffer:           v.obs_buffer = static_cast<float*>(p); break;

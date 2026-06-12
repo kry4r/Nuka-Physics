@@ -356,6 +356,7 @@ __global__ void EmitUnionRowsKernel(const float* __restrict__ union_slots,
                                     uint32_t rows_per_env,
                                     uint32_t bodies_per_env,
                                     uint32_t base_link_count,
+                                    uint32_t particles_per_env,
                                     NkRow* __restrict__ urows,
                                     float* __restrict__ lambda,
                                     uint32_t* __restrict__ row_cj_link,
@@ -392,6 +393,16 @@ __global__ void EmitUnionRowsKernel(const float* __restrict__ union_slots,
         case kUSlotBodyBoxPlane:
             kind_a = kNkSideRigid;  idx_a = env * bodies_per_env + u.body;
             kind_b = kNkSideStatic; idx_b = ~0u;
+            break;
+        case kUSlotParticleSpherePlane:
+            // side a == the GLOBAL particle row (env*particles_per_env + link);
+            // side b == the static +Z plane.
+            kind_a = kNkSideParticle; idx_a = env * particles_per_env + u.link;
+            kind_b = kNkSideStatic;   idx_b = ~0u;
+            break;
+        case kUSlotParticleSphereBox:
+            kind_a = kNkSideParticle; idx_a = env * particles_per_env + u.link;
+            kind_b = kNkSideRigid;    idx_b = env * bodies_per_env + u.body;
             break;
         default:
             break;
@@ -706,7 +717,7 @@ Status OpAssembleRowsUnion(const ModelView& model, const DataView& data,
                    p->solimp[4],
                    p->dt,
                    p->env_count, p->union_slot_count, p->rows_per_env,
-                   p->bodies_per_env, p->base_link_count,
+                   p->bodies_per_env, p->base_link_count, p->particles_per_env,
                    reinterpret_cast<NkRow*>(data.urows),
                    data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,

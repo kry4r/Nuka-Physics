@@ -382,8 +382,96 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        // ---------------------------------------------------------------
+        // M6 XPBD constraint templates (owner:model). The single-env template
+        // is replicated env-major; env e's constraints get their particle
+        // indices offset by e*particles_per_env (the device particle arrays
+        // are env-major, so a constraint must point at its own env's particles).
+        // This mirrors the legacy per-world UploadXpbdWorld layout tiled E times.
+        // ---------------------------------------------------------------
+        case FieldId::DistParticleA:
+        case FieldId::DistParticleB: {
+            const auto& src = (id == FieldId::DistParticleA) ? particles.dist_a
+                                                             : particles.dist_b;
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t dn = capacities.dist_cons_per_env;
+            const uint32_t pn = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < dn && c < src.size(); ++c) {
+                    p[static_cast<size_t>(e) * dn + c] = src[c] + e * pn;
+                }
+            }
+            break;
+        }
+        case FieldId::DistRestLength:
+            StampPerLink(dst, particles.dist_rest, capacities.dist_cons_per_env, E,
+                         sizeof(float));
+            break;
+        case FieldId::DistCompliance:
+            StampPerLink(dst, particles.dist_alpha, capacities.dist_cons_per_env, E,
+                         sizeof(float));
+            break;
+        case FieldId::BendParticles: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t bn = capacities.bend_cons_per_env;
+            const uint32_t pn = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < bn; ++c) {
+                    for (uint32_t j = 0; j < 4u; ++j) {
+                        const size_t si = static_cast<size_t>(c) * 4u + j;
+                        if (si >= particles.bend_particles.size()) continue;
+                        p[(static_cast<size_t>(e) * bn + c) * 4u + j] =
+                            particles.bend_particles[si] + e * pn;
+                    }
+                }
+            }
+            break;
+        }
+        case FieldId::BendGradients: {
+            auto* p = reinterpret_cast<math::Vec3*>(dst);
+            const uint32_t bn = capacities.bend_cons_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < bn; ++c) {
+                    for (uint32_t j = 0; j < 4u; ++j) {
+                        const size_t si = static_cast<size_t>(c) * 4u + j;
+                        if (si >= particles.bend_gradients.size()) continue;
+                        p[(static_cast<size_t>(e) * bn + c) * 4u + j] =
+                            particles.bend_gradients[si];
+                    }
+                }
+            }
+            break;
+        }
+        case FieldId::BendCompliance:
+            StampPerLink(dst, particles.bend_alpha, capacities.bend_cons_per_env, E,
+                         sizeof(float));
+            break;
+        case FieldId::VolParticles: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t vn = capacities.vol_cons_per_env;
+            const uint32_t pn = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < vn; ++c) {
+                    for (uint32_t j = 0; j < 4u; ++j) {
+                        const size_t si = static_cast<size_t>(c) * 4u + j;
+                        if (si >= particles.vol_particles.size()) continue;
+                        p[(static_cast<size_t>(e) * vn + c) * 4u + j] =
+                            particles.vol_particles[si] + e * pn;
+                    }
+                }
+            }
+            break;
+        }
+        case FieldId::VolRestTimes6:
+            StampPerLink(dst, particles.vol_rest6, capacities.vol_cons_per_env, E,
+                         sizeof(float));
+            break;
+        case FieldId::VolCompliance:
+            StampPerLink(dst, particles.vol_alpha, capacities.vol_cons_per_env, E,
+                         sizeof(float));
+            break;
         default:
-            // XPBD-template (M6) sections: deterministic 0.
+            // Unpopulated model sections: deterministic 0.
             break;
     }
 }
@@ -503,6 +591,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.filter_cross_env = src.filter_cross_env;
     dst.contact_family = src.contact_family;
     dst.drive_mode = src.drive_mode;
+    dst.particles = std::move(src.particles);  // M6 particle cook product.
     dst.union_slots = std::move(src.union_slots);
     dst.hull_verts = std::move(src.hull_verts);
     for (int k = 0; k < 2; ++k) dst.union_solref[k] = src.union_solref[k];

@@ -117,6 +117,40 @@ bool World::SeedInitialState() {
         }
     }
 
+    // -- M6: particle (XPBD soft / PBF fluid) initial state seeding (env-major
+    // replication of the single-env template). particle_prev_pos is seeded == pos
+    // (the legacy UploadXpbdWorld "prev seeded = p" / UploadPbfWorld "predicted
+    // seeded = p"). The XPBD/PBF constraint lambdas + the PBF scratch stay at the
+    // arena's zero init (matching the legacy zero-seed).
+    if (cap.particles_per_env > 0 &&
+        model_.particles.mode != Model::ParticleMode::None) {
+        const Model::ModelParticles& mp = model_.particles;
+        const uint32_t P = cap.particles_per_env;
+        std::vector<math::Vec3> pos(static_cast<size_t>(P) * E);
+        std::vector<math::Vec3> vel(static_cast<size_t>(P) * E);
+        std::vector<float> inv_mass(static_cast<size_t>(P) * E, 0.0f);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t i = 0; i < P; ++i) {
+                const size_t at = static_cast<size_t>(e) * P + i;
+                pos[at] = i < mp.initial_pos.size() ? mp.initial_pos[i]
+                                                    : math::Vec3::Zero();
+                vel[at] = i < mp.initial_vel.size() ? mp.initial_vel[i]
+                                                    : math::Vec3::Zero();
+                inv_mass[at] = i < mp.inv_mass.size() ? mp.inv_mass[i] : 0.0f;
+            }
+        }
+        if (!data_.UploadField(FieldId::ParticlePos, pos.data(),
+                               pos.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticlePrevPos, pos.data(),
+                               pos.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticleVel, vel.data(),
+                               vel.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticleInvMass, inv_mass.data(),
+                               inv_mass.size() * sizeof(float))) {
+            return false;
+        }
+    }
+
     if (L == 0) {
         return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
                phi::Status::Ok;  // no articulation: bodies-only snapshot.

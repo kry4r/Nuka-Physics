@@ -732,6 +732,48 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_nk_union_n1_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- M6: coupled_grasp_soft — the multi-physics coupled co-step gate.
+    # XPBD soft tet + PBF fluid each co-step against rigid/plane through the ONE
+    # unified row solve (ParticleInvMass arm). Programmatic scene (no H1 asset).
+    # 5 assertion classes: force balance / volume / density / D1 / StepPlanned.
+    add_executable(nuka_coupled_grasp_soft_test
+        scenario/coupled_grasp_soft.cpp
+    )
+    add_dependencies(nuka_coupled_grasp_soft_test nuka_codegen)
+    target_include_directories(nuka_coupled_grasp_soft_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_coupled_grasp_soft_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            nuka_phi
+            nuka_core
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_coupled_grasp_soft_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- M6: nk standalone-particle equivalence to the legacy XPBD/PBF oracle bars
+    # (the nk mode==Xpbd / Pbf path reproduces the distance period / tet volume /
+    # rest-lattice density + D1; the legacy 4件套/5件套 stay green testing the
+    # legacy classes directly).
+    add_executable(nuka_nk_particle_equivalence_test
+        scenario/nk_particle_equivalence.cpp
+    )
+    add_dependencies(nuka_nk_particle_equivalence_test nuka_codegen)
+    target_include_directories(nuka_nk_particle_equivalence_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_nk_particle_equivalence_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            nuka_phi
+            nuka_core
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_nk_particle_equivalence_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_cuda_runtime_test
         runtime/test_cuda_solver.cpp
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
@@ -2737,14 +2779,12 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_bridge_spike_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.8 C6b: cross-system coupling-row framework + ParticleInvMass arm ---
-    # The K2 proving pair (a particle pushes a free rigid body two-way through one
-    # unified compliant solve). CASE 1 is the closed-form Jv discriminator (the
-    # first exercise of the ParticleInvMass arm; the broken-Jv variant differs >>
-    # tol). CASE 2/3 prove EmitCouplingRows (re-class to id13 + end-to-end two-way).
-    # Header-only framework (coupling_row_framework.hpp) + hand-built manifolds, so
-    # no broadphase/narrowphase libs -- just the solver + constraint emitter; needs
-    # nuka_codegen for the generated row-class registry (kCouplingContactRowId).
+    # M6 RE-POINT: the ParticleInvMass reaction arm on the nk path (the device-
+    # resident nk::SolveRowsBlockIsland, the union kUSlotParticleSphereBox class).
+    # A particle presses a free rigid box -> both react two-way (momentum balance);
+    # the box held on a static plane supports the particle through the
+    # particle->box->plane chain in ONE unified solve; D1. (The legacy host
+    # solver::UnifiedSolve + EmitCouplingRows are no longer consumed here.)
     add_executable(nuka_coupling_test
         coupling/test_coupling_framework.cpp
     )
@@ -2757,10 +2797,10 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_coupling_test
         PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_core
+            nuka_nk
+            nuka_phi2
             nuka_phi
+            nuka_core
             GTest::gtest_main
     )
 
@@ -2771,17 +2811,14 @@ if(CMAKE_CUDA_COMPILER)
     # Drives the REAL front-end together (C2c broadphase -> C5 contact driver ->
     # C6b coupling framework -> C6b unified solver) for the Genesis-style "couple"
     # phase: a PBD particle system consumes unified manifolds + reacts TWO-WAY
-    # against rigid bodies through ONE compliant solve. CASE A: multi-particle drop
-    # onto a heavy free box, TOTAL-energy (KE+gravPE) non-increasing + settle +
-    # two-way. CASE B: the mis-order bite-check (double-applied couple injects
-    # energy -> the gate must FAIL). CASE C: fluid rest on a static floor. CASE D:
-    # D1. Compiles the bridge (unified_costep.cpp) + the contact driver
-    # (contact_stream_driver.cpp) directly, like nuka_foot_box_coresidence_test;
-    # needs nuka_codegen for the generated row-class registry.
+    # M6 RE-POINT: a particle system co-steps against a rigid box through the ONE
+    # unified row solve (nk::World, the kUSlotParticleSphereBox union class ->
+    # AssembleRows -> SolveRowsBlockIsland ParticleInvMass arm). The legacy host
+    # bridge (unified_costep.cpp, the M6 deletion target) is no longer consumed.
+    # CASE A: multi-particle drop, TOTAL-energy non-increasing + settle + two-way.
+    # CASE C: rest-on-box. CASE D: D1.
     add_executable(nuka_pbd_costep_test
         coupling/test_pbd_costep_unified.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coupling/unified_costep.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_pbd_costep_test nuka_codegen)
 
@@ -2792,12 +2829,10 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_pbd_costep_test
         PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_collision_gpu
-            nuka_runtime
-            nuka_core
+            nuka_nk
+            nuka_phi2
             nuka_phi
+            nuka_core
             GTest::gtest_main
     )
 

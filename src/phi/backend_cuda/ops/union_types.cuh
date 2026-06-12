@@ -43,6 +43,11 @@ inline constexpr uint32_t kUSlotInactive       = 0u;
 inline constexpr uint32_t kUSlotFootSpherePlane = 1u;
 inline constexpr uint32_t kUSlotFingerSphereHull = 2u;
 inline constexpr uint32_t kUSlotBodyBoxPlane   = 3u;
+// M6 particle coupling: side a == a particle sphere (slot.link == LOCAL particle
+// index); side b == static +Z plane (kUSlotParticleSpherePlane) or rigid box
+// (slot.body; kUSlotParticleSphereBox).
+inline constexpr uint32_t kUSlotParticleSpherePlane = 4u;
+inline constexpr uint32_t kUSlotParticleSphereBox   = 5u;
 inline constexpr uint32_t kUSlotGatedOnTable   = 1u;  // flags bit0
 
 // The 16-f32 packed union_slots record (Model::StageModelField UnionSlots).

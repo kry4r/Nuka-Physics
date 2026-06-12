@@ -75,6 +75,8 @@ __global__ void UnionNarrowphaseKernel(const float* __restrict__ union_slots,
                                        uint32_t hull_vert_count,
                                        const math::Transform* __restrict__ link_pose,
                                        const math::Transform* __restrict__ body_pose,
+                                       const math::Vec3* __restrict__ particle_pos,
+                                       uint32_t particles_per_env,
                                        const uint32_t* __restrict__ table_enabled,
                                        uint32_t env_count,
                                        uint32_t slot_count,
@@ -209,6 +211,39 @@ __global__ void UnionNarrowphaseKernel(const float* __restrict__ union_slots,
             emitted = true;
             break;
         }
+        case kUSlotParticleSpherePlane: {
+            // particle sphere (slot.link == LOCAL particle index) x +Z plane.
+            const math::Vec3 pc =
+                particle_pos[static_cast<size_t>(env) * particles_per_env + u.link];
+            amf::PrimParams sphere;
+            sphere.radius = u.radius;
+            sphere.frame.t = pc;  // particle world position (identity rotation).
+            const amf::PrimParams plane = GroundPrimDev(u.plane_height);
+            amf::SpherePlane(sphere, plane, &m);
+            emitted = true;
+            break;
+        }
+        case kUSlotParticleSphereBox: {
+            // particle sphere (slot.link == LOCAL particle index) x rigid box
+            // (slot.body + offset + half_extents). The box pose is the body's.
+            const bool gated = (u.flags & kUSlotGatedOnTable) != 0u;
+            if (gated && table_enabled[env] == 0u) break;
+            const math::Vec3 pc =
+                particle_pos[static_cast<size_t>(env) * particles_per_env + u.link];
+            amf::PrimParams sphere;
+            sphere.radius = u.radius;
+            sphere.frame.t = pc;
+            const math::Transform bp =
+                body_pose[static_cast<size_t>(env) * bodies_per_env + u.body];
+            math::Transform proxy = bp;
+            proxy.position = bp.position + RotateQuatHostExpr(bp.rotation, u.offset);
+            amf::PrimParams box;
+            box.half_extents = u.box_half;
+            box.frame = BuildPrimFrameDev(proxy);
+            amf::SphereBox(sphere, box, &m);
+            emitted = true;
+            break;
+        }
         default:
             break;
     }
@@ -266,6 +301,8 @@ Status LaunchUnionNarrowphase(const ModelView& model, const DataView& data,
                p.hull_vert_count,
                static_cast<const math::Transform*>(data.link_pose),
                static_cast<const math::Transform*>(data.body_pose),
+               static_cast<const math::Vec3*>(data.particle_pos),
+               p.particles_per_env,
                static_cast<const uint32_t*>(data.table_enabled),
                p.env_count, p.union_slot_count, p.base_link_count,
                p.bodies_per_env,

@@ -68,6 +68,11 @@ Status DispatchOn(const ModelView& model, const DataView& data,
 Status BackendDispatchImpl(Backend* b, const ModelView& model,
                            const DataView& data, const OpCall& call) {
     CudaBackend* cb = AsBackend(b);
+    // Pin the active device to the backend's device (the ported thrust grid /
+    // LBVH sorts run on the default device via thrust::cuda::par.on(stream) —
+    // they REQUIRE the current device to match the stream's device, which a
+    // caller thread may not have set).
+    (void)cudaSetDevice(cb->device_id);
     return DispatchOn(model, data, call, cb->main);
 }
 
@@ -86,11 +91,22 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         return nullptr;
     }
     bool ok = true;
-    for (int i = 0; i < n_calls; ++i) {
-        if (DispatchOn(model, data, calls[i], cb->capture) != Status::Ok) {
-            ok = false;
-            break;
+    // An op that allocates during capture (the ported thrust grid/LBVH sorts use
+    // a caching allocator that cudaMalloc's mid-capture) throws std::bad_alloc
+    // (cudaErrorStreamCaptureUnsupported). Catch it so plan_create returns a clean
+    // nullptr (the caller falls back to Step) instead of unwinding through the C
+    // ABI vtable. The capture MUST still be ended (a left-open capture poisons the
+    // stream for the next StepPlanned). NAMED debt: a non-captureable op makes its
+    // scene Step-only — the PBF grid is the one such op today.
+    try {
+        for (int i = 0; i < n_calls; ++i) {
+            if (DispatchOn(model, data, calls[i], cb->capture) != Status::Ok) {
+                ok = false;
+                break;
+            }
         }
+    } catch (...) {
+        ok = false;
     }
 
     cudaGraph_t graph = nullptr;
