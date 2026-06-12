@@ -220,6 +220,7 @@ private:
         switch (c) {
             case '{': return ParseObject();
             case '[': return ParseArray();
+            // (nesting depth is bounded in ParseObject/ParseArray)
             case '"': return Value::Str(ParseString());
             case 't': case 'f': return ParseBool();
             case 'n': return ParseNull();
@@ -229,7 +230,21 @@ private:
         }
     }
 
+    // Recursion-depth guard: the parser is recursive-descent, so unbounded
+    // nesting ("[[[[...") would overflow the stack. 256 is far beyond any
+    // legitimate .nks depth and turns the crash into a ParseError.
+    static constexpr int kMaxDepth = 256;
+
+    struct DepthScope {
+        Parser& p;
+        explicit DepthScope(Parser& parser) : p(parser) {
+            if (++p.depth_ > kMaxDepth) p.Fail("nesting too deep");
+        }
+        ~DepthScope() { --p.depth_; }
+    };
+
     Value ParseObject() {
+        DepthScope depth(*this);
         Expect('{');
         Value obj = Value::Object();
         SkipWs();
@@ -253,6 +268,7 @@ private:
     }
 
     Value ParseArray() {
+        DepthScope depth(*this);
         Expect('[');
         Value arr = Value::Array();
         SkipWs();
@@ -356,6 +372,7 @@ private:
 
     const std::string& s_;
     size_t pos_ = 0;
+    int depth_ = 0;
 };
 
 }  // namespace

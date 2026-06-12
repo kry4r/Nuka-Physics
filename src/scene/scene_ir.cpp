@@ -65,6 +65,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
 // shape/joint's body node already exist when projected. The record-id <-> entity
 // maps and the BodyId -> node map are rebuilt alongside.
 void SceneIR::RebuildFacade() {
+    facade_dirty_ = false;  // the rebuilt facade reflects the records
     tree_ = SceneGraph();
     ecs_  = Registry();
     body_entity_.clear();
@@ -109,6 +110,7 @@ BodyId SceneIR::AddRigidBody(std::string name) {
 BodyId SceneIR::AddRigidBody(RigidBodyRecord record) {
     const auto id = static_cast<BodyId>(bodies_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     bodies_.push_back(std::move(record));
     ProjectBody(bodies_.back());
     return id;
@@ -124,6 +126,7 @@ ShapeId SceneIR::AddCollisionShape(BodyId body, ShapeType type) {
 ShapeId SceneIR::AddCollisionShape(CollisionShapeRecord record) {
     const auto id = static_cast<ShapeId>(shapes_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     shapes_.push_back(std::move(record));
     ProjectShape(shapes_.back());
     return id;
@@ -140,6 +143,7 @@ JointId SceneIR::AddJoint(std::string name, BodyId parent, BodyId child) {
 JointId SceneIR::AddJoint(JointRecord record) {
     const auto id = static_cast<JointId>(joints_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     joints_.push_back(std::move(record));
     ProjectJoint(joints_.back());
     return id;
@@ -163,6 +167,7 @@ SensorId SceneIR::AddSensor(SensorRecord record) {
 MaterialId SceneIR::AddMaterial(MaterialRecord record) {
     const auto id = static_cast<MaterialId>(materials_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     materials_.push_back(std::move(record));
     ProjectMaterial(materials_.back());
     return id;
@@ -171,6 +176,7 @@ MaterialId SceneIR::AddMaterial(MaterialRecord record) {
 CameraId SceneIR::AddCamera(CameraRecord record) {
     const auto id = static_cast<CameraId>(cameras_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     cameras_.push_back(std::move(record));
     ProjectCamera(cameras_.back());
     return id;
@@ -179,6 +185,7 @@ CameraId SceneIR::AddCamera(CameraRecord record) {
 LightId SceneIR::AddLight(LightRecord record) {
     const auto id = static_cast<LightId>(lights_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     lights_.push_back(std::move(record));
     ProjectLight(lights_.back());
     return id;
@@ -187,6 +194,7 @@ LightId SceneIR::AddLight(LightRecord record) {
 ActuatorId SceneIR::AddActuator(ActuatorRecord record) {
     const auto id = static_cast<ActuatorId>(actuators_.size());
     record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
     actuators_.push_back(std::move(record));
     ProjectActuator(actuators_.back());
     return id;
@@ -275,6 +283,7 @@ RigidBodyRecord& SceneIR::GetBodyMut(BodyId id) {
     if (id >= bodies_.size()) {
         throw std::out_of_range("SceneIR::GetBodyMut - invalid BodyId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return bodies_[id];
 }
 
@@ -282,6 +291,7 @@ JointRecord& SceneIR::GetJointMut(JointId id) {
     if (id >= joints_.size()) {
         throw std::out_of_range("SceneIR::GetJointMut - invalid JointId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return joints_[id];
 }
 
@@ -289,6 +299,7 @@ CollisionShapeRecord& SceneIR::GetShapeMut(ShapeId id) {
     if (id >= shapes_.size()) {
         throw std::out_of_range("SceneIR::GetShapeMut - invalid ShapeId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return shapes_[id];
 }
 
@@ -296,6 +307,7 @@ SensorRecord& SceneIR::GetSensorMut(SensorId id) {
     if (id >= sensors_.size()) {
         throw std::out_of_range("SceneIR::GetSensorMut - invalid SensorId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return sensors_[id];
 }
 
@@ -303,6 +315,7 @@ MaterialRecord& SceneIR::GetMaterialMut(MaterialId id) {
     if (id >= materials_.size()) {
         throw std::out_of_range("SceneIR::GetMaterialMut - invalid MaterialId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return materials_[id];
 }
 
@@ -310,6 +323,7 @@ CameraRecord& SceneIR::GetCameraMut(CameraId id) {
     if (id >= cameras_.size()) {
         throw std::out_of_range("SceneIR::GetCameraMut - invalid CameraId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return cameras_[id];
 }
 
@@ -317,6 +331,7 @@ LightRecord& SceneIR::GetLightMut(LightId id) {
     if (id >= lights_.size()) {
         throw std::out_of_range("SceneIR::GetLightMut - invalid LightId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return lights_[id];
 }
 
@@ -324,6 +339,7 @@ ActuatorRecord& SceneIR::GetActuatorMut(ActuatorId id) {
     if (id >= actuators_.size()) {
         throw std::out_of_range("SceneIR::GetActuatorMut - invalid ActuatorId");
     }
+    facade_dirty_ = true;  // record mutation bypasses write-through
     return actuators_[id];
 }
 
@@ -347,13 +363,31 @@ const std::vector<ContactPairOverride>& SceneIR::ContactPairs() const {
 // ---------------------------------------------------------------------------
 
 EntityId SceneIR::EntityOfBody(BodyId id) const {
+    EnsureFacade();
     return id < body_entity_.size() ? body_entity_[id] : kInvalidEntity;
 }
 EntityId SceneIR::EntityOfShape(ShapeId id) const {
+    EnsureFacade();
     return id < shape_entity_.size() ? shape_entity_[id] : kInvalidEntity;
 }
 EntityId SceneIR::EntityOfJoint(JointId id) const {
+    EnsureFacade();
     return id < joint_entity_.size() ? joint_entity_[id] : kInvalidEntity;
+}
+
+// Lazy facade resync. Get*Mut hands out mutable record references that bypass
+// the Add* write-through; it marks the facade dirty and the next facade read
+// lands here. Re-projection is a pure function of the records, so this is
+// exactly the copy-constructor rebuild, done in place. (const_cast: the facade
+// is a derived cache of the records; rebuilding it does not mutate the
+// logical, record-level state of the scene.)
+void SceneIR::EnsureFacade() const {
+    if (!facade_dirty_) {
+        return;
+    }
+    SceneIR* self = const_cast<SceneIR*>(this);
+    self->facade_dirty_ = false;
+    self->RebuildFacade();
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +469,21 @@ LightComponent::Type LightCompTypeFromLightType(LightType type) {
     return LightComponent::Type::Point;
 }
 
+// Stable node name for an UNNAMED record: derive from the RECORD identity
+// (kind + dense record id), NOT from the SceneGraph's global node-id counter.
+// The graph counter walks differently when the same records are replayed in a
+// different projection order (interleaved import vs grouped rebuild/Load), so
+// counter-derived autonames are not stable scene properties; record-derived
+// ones are (record ids round-trip positionally through .nks). The roundtrip
+// gate asserts EXACT name equality on the strength of this.
+std::string StableAutoName(const char* kind, uint32_t record_id,
+                           const std::string& record_name) {
+    if (!record_name.empty()) {
+        return record_name;
+    }
+    return std::string(kind) + "_" + std::to_string(record_id);
+}
+
 }  // namespace
 
 void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
@@ -496,7 +545,9 @@ void SceneIR::ProjectBody(const RigidBodyRecord& rec) {
             }
         }
         if (segments.empty()) {
-            segments.push_back(rec.name);  // empty name -> one (deduped) node
+            // Empty/'/'-only name: stable record-derived autoname (see
+            // StableAutoName).
+            segments.push_back(StableAutoName("body", rec.id, rec.name));
         }
     }
 
@@ -557,7 +608,8 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
     }
 
     const EntityId entity = ecs_.Create();
-    auto node = tree_.AddEntity(entity, body_node, rec.name);
+    auto node = tree_.AddEntity(entity, body_node,
+                                StableAutoName("geom", rec.id, rec.name));
     ecs_.BindNode(entity, node);
     ecs_.Add(entity, NameComponent{node->name});
     ecs_.Add(entity, TransformComponent{rec.local_transform, math::Vec3{1.0f, 1.0f, 1.0f}});
@@ -611,13 +663,15 @@ void SceneIR::ProjectJoint(const JointRecord& rec) {
     if (child_entity == kInvalidEntity) {
         // No child body resolved: park the joint on its own node at root.
         target = ecs_.Create();
-        auto node = tree_.AddEntity(target, tree_.Root(), rec.name);
+        auto node = tree_.AddEntity(target, tree_.Root(),
+                                    StableAutoName("joint", rec.id, rec.name));
         ecs_.BindNode(target, node);
         ecs_.Add(target, NameComponent{node->name});
     } else if (ecs_.Has<JointComponent>(child_entity)) {
         // Multi-joint body: auxiliary joint entity under the child body node.
         target = ecs_.Create();
-        auto node = tree_.AddEntity(target, child_node, rec.name);
+        auto node = tree_.AddEntity(target, child_node,
+                                    StableAutoName("joint", rec.id, rec.name));
         ecs_.BindNode(target, node);
         ecs_.Add(target, NameComponent{node->name});
     }
@@ -646,7 +700,8 @@ void SceneIR::ProjectCamera(const CameraRecord& rec) {
         parent_node = body_node_[rec.attached_body];
     }
     const EntityId entity = ecs_.Create();
-    auto node = tree_.AddEntity(entity, parent_node, rec.name);
+    auto node = tree_.AddEntity(entity, parent_node,
+                                StableAutoName("camera", rec.id, rec.name));
     ecs_.BindNode(entity, node);
     ecs_.Add(entity, NameComponent{node->name});
 
@@ -665,7 +720,8 @@ void SceneIR::ProjectLight(const LightRecord& rec) {
         parent_node = body_node_[rec.attached_body];
     }
     const EntityId entity = ecs_.Create();
-    auto node = tree_.AddEntity(entity, parent_node, rec.name);
+    auto node = tree_.AddEntity(entity, parent_node,
+                                StableAutoName("light", rec.id, rec.name));
     ecs_.BindNode(entity, node);
     ecs_.Add(entity, NameComponent{node->name});
 

@@ -142,9 +142,10 @@ struct InitialStateComponent {
 };
 
 // CameraComponent / LightComponent mirror the existing scene::CameraRecord /
-// LightRecord (scene/scene_ir.hpp) field-for-field so M2b can map them
-// losslessly. `attached_body` here is an EntityId (the ECS analogue of the IR's
-// BodyId); everything else is identical.
+// LightRecord (scene/scene_ir.hpp). The records' `attached_body` is NOT a
+// component field: attachment is encoded structurally by the scene TREE (the
+// camera/light node is parented under the attached body's node — see
+// SceneIR::ProjectCamera/ProjectLight); every other field maps 1:1.
 
 struct CameraComponent {
     math::Transform local_transform     = math::Transform::Identity();

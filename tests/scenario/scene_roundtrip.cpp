@@ -93,41 +93,15 @@ SceneIR BuildMinimalComposed() {
 }
 
 // -- tree equality: pre-order names + derived paths -----------------------
-// Nodes that the SceneGraph auto-names "Entity <global-id>" (an unnamed shape /
-// joint record, whose record name is empty) are NOT part of the scene's
-// semantic identity: the id is a global counter, so it walks differently when
-// the same records are replayed after a re-import. We normalize those segments
-// to a stable "Entity *" wildcard (both sides MUST be auto-named there) while
-// keeping STRICT equality for every real name and every other path segment. The
-// empty record name itself round-trips faithfully (SecondSaveByteIdentical and
-// the record/cook checks below prove the records are byte-identical).
-bool IsAutoName(const std::string& name) {
-    return name.rfind("Entity ", 0) == 0;
-}
-
-std::string NormalizeSegment(const std::string& seg) {
-    return IsAutoName(seg) ? std::string("Entity *") : seg;
-}
-
-std::string NormalizePath(const std::string& path) {
-    std::string out;
-    size_t start = 0;
-    while (start <= path.size()) {
-        const size_t slash = path.find('/', start);
-        const size_t end = (slash == std::string::npos) ? path.size() : slash;
-        if (!out.empty()) out.push_back('/');
-        out += NormalizeSegment(path.substr(start, end - start));
-        if (slash == std::string::npos) break;
-        start = slash + 1;
-    }
-    return out;
-}
-
+// EXACT equality, including autonamed nodes: an unnamed shape/joint record
+// projects to a RECORD-identity-derived name ("geom_<id>" / "joint_<id>",
+// see SceneIR's StableAutoName), which is a stable scene property that
+// round-trips through .nks. No wildcard normalization.
 void CollectTree(const SceneGraph& tree, std::vector<std::string>& names,
                  std::vector<std::string>& paths) {
     tree.Traverse(tree.Root(), [&](const std::shared_ptr<SceneNode>& n) {
-        names.push_back(NormalizeSegment(n->name));
-        paths.push_back(NormalizePath(tree.PathOf(n)));
+        names.push_back(n->name);
+        paths.push_back(tree.PathOf(n));
     });
 }
 
@@ -136,8 +110,8 @@ void ExpectTreeEqual(const SceneIR& a, const SceneIR& b) {
     CollectTree(a.Tree(), na, pa);
     CollectTree(b.Tree(), nb, pb);
     ASSERT_EQ(na.size(), nb.size()) << "tree node count differs";
-    EXPECT_EQ(na, nb) << "pre-order node names differ (modulo Entity-<id> autonames)";
-    EXPECT_EQ(pa, pb) << "derived node paths differ (modulo Entity-<id> autonames)";
+    EXPECT_EQ(na, nb) << "pre-order node names differ";
+    EXPECT_EQ(pa, pb) << "derived node paths differ";
 }
 
 // -- record equality ------------------------------------------------------
@@ -294,7 +268,8 @@ TEST(SceneRoundtrip, H1CupRoundtrip) {
         auto& s = orig.GetShapeMut(i);
         if (!s.mesh_vertices.empty()) s.decompose_mode = DecomposeMode::Skip;
     }
-    orig = SceneIR(orig);  // rebuild facade after the direct record edits
+    // No manual facade rebuild needed: GetShapeMut marks the facade dirty and
+    // the next facade read (ExpectTreeEqual below) lazily re-projects.
 
     // Same stem ("h1cup") in two sub-dirs so the embedded .nka basename matches.
     const fs::path nks1 = tmp.SubFile("run1", "h1cup.nks");
@@ -359,6 +334,48 @@ TEST(SceneRoundtrip, OverrideLayer) {
     if (base.RigidBodyCount() > 1) {
         EXPECT_FLOAT_EQ(overridden.GetBody(1).local_transform.position.x,
                         base.GetBody(1).local_transform.position.x);
+    }
+}
+
+// 4b. Facade write-through after DIRECT record mutation (pins the M2b
+//     divergence fix): mutating a record via Get*Mut must be reflected by the
+//     facade on its next read, with no manual rebuild. A collision shape whose
+//     contype/conaffinity is flipped to 0/0 must re-project from
+//     CollisionShapeComponent to VisualMeshComponent.
+TEST(SceneRoundtrip, FacadeResyncsAfterRecordMutation) {
+    if (!MinimalAssetsAvailable()) GTEST_SKIP() << "minimal tests/data assets missing";
+
+    SceneIR scene = BuildMinimalComposed();
+
+    // Find a colliding shape (contype/conaffinity not both 0).
+    ShapeId target = scene.ShapeCount();
+    for (ShapeId i = 0; i < scene.ShapeCount(); ++i) {
+        const auto& s = scene.GetShape(i);
+        if (s.contype != 0 || s.conaffinity != 0) { target = i; break; }
+    }
+    ASSERT_LT(target, scene.ShapeCount()) << "no colliding shape in the scene";
+
+    // Facade BEFORE the mutation: a CollisionShapeComponent.
+    {
+        const EntityId e = scene.EntityOfShape(target);
+        ASSERT_NE(e, kInvalidEntity);
+        EXPECT_TRUE(scene.Ecs().Has<CollisionShapeComponent>(e));
+        EXPECT_FALSE(scene.Ecs().Has<VisualMeshComponent>(e));
+    }
+
+    // Mutate the record DIRECTLY (bypasses the Add* write-through).
+    auto& rec = scene.GetShapeMut(target);
+    rec.contype = 0;
+    rec.conaffinity = 0;
+
+    // Facade AFTER: the next facade read must lazily re-project. NOTE the
+    // entity must be re-fetched -- re-projection creates fresh entities.
+    {
+        const EntityId e = scene.EntityOfShape(target);
+        ASSERT_NE(e, kInvalidEntity);
+        EXPECT_TRUE(scene.Ecs().Has<VisualMeshComponent>(e))
+            << "facade did not re-project after a direct record mutation";
+        EXPECT_FALSE(scene.Ecs().Has<CollisionShapeComponent>(e));
     }
 }
 

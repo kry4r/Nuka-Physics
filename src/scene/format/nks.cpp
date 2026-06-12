@@ -3,11 +3,21 @@
 // ---------------------------------------------------------------------------
 // HOST-ONLY. The SceneIR records are the source of truth for cook fidelity; the
 // facade (tree/ECS) is DERIVED from them by the SceneIR write-through. So Save
-// serializes the records (structured as the pre-order node tree so the JSON is
-// tree-shaped and human-readable), and Load replays Add* in the SAME order the
-// facade rebuild uses (materials, bodies, shapes, joints, actuators, sensors,
-// cameras, lights, filters). Replaying produces records identical to the saved
-// ones, so the reconstructed facade tree equals the saved tree by construction.
+// serializes FLAT record arrays (bodies/shapes/joints/... in dense-id order;
+// the body record `name` carries the full tree path, and bodies are stored in
+// tree pre-order since parents precede children), and Load replays Add* in the
+// SAME order the facade rebuild uses (materials, bodies, shapes, joints,
+// actuators, sensors, cameras, lights, filters). Replaying produces records
+// identical to the saved ones, so the reconstructed facade tree equals the
+// saved tree by construction.
+//
+// NOTE (spec §3.7 deviation, surfaced at M2 review): the plan's .nks contract
+// specifies a NESTED `tree` section ({name, <components...>, children:[]} from
+// a SceneGraph pre-order traversal) plus split physics_materials /
+// render_materials sections. This implementation serializes the flat records
+// instead (full fidelity, tree derivable by projection). Converting the
+// on-disk shape to the nested form is a format-level change tracked for the
+// controller/owner to schedule; the format is versioned (nks_version: 1).
 //
 // Mesh geometry (record mesh_vertices/mesh_indices) is offloaded to the sibling
 // .nka as CMSH (collision) / MESH (visual) chunks, deduped by content hash, and
@@ -158,6 +168,18 @@ DecomposeMode DecomposeModeFromName(const std::string& s) {
 // ---------------------------------------------------------------------------
 // math <-> json
 // ---------------------------------------------------------------------------
+// Checked element access: Value::Elements() on a non-array returns an empty
+// vector, so unchecked [i] would be UB on malformed input (override overlays
+// are hand-authored, so this path IS reachable). Throws a json::ParseError
+// instead.
+float FloatAt(const Value& a, size_t i, const char* what) {
+    if (!a.IsArray() || i >= a.Elements().size()) {
+        throw json::ParseError(std::string("nks: expected a float array of at least ") +
+                               std::to_string(i + 1) + " elements for " + what);
+    }
+    return a.Elements()[i].AsFloat();
+}
+
 Value Vec3Json(const math::Vec3& v) {
     Value a = Value::Array();
     a.PushBack(Value::Float(v.x));
@@ -166,8 +188,8 @@ Value Vec3Json(const math::Vec3& v) {
     return a;
 }
 math::Vec3 Vec3FromJson(const Value& a) {
-    return math::Vec3{a.Elements()[0].AsFloat(), a.Elements()[1].AsFloat(),
-                      a.Elements()[2].AsFloat()};
+    return math::Vec3{FloatAt(a, 0, "vec3"), FloatAt(a, 1, "vec3"),
+                      FloatAt(a, 2, "vec3")};
 }
 
 Value QuatJson(const math::Quat& q) {  // (w,x,y,z)
@@ -179,8 +201,8 @@ Value QuatJson(const math::Quat& q) {  // (w,x,y,z)
     return a;
 }
 math::Quat QuatFromJson(const Value& a) {
-    return math::Quat{a.Elements()[0].AsFloat(), a.Elements()[1].AsFloat(),
-                      a.Elements()[2].AsFloat(), a.Elements()[3].AsFloat()};
+    return math::Quat{FloatAt(a, 0, "quat"), FloatAt(a, 1, "quat"),
+                      FloatAt(a, 2, "quat"), FloatAt(a, 3, "quat")};
 }
 
 Value TransformJson(const math::Transform& t) {
@@ -542,9 +564,9 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.contype = static_cast<uint32_t>(s.At("contype").AsInt());
             rec.conaffinity = static_cast<uint32_t>(s.At("conaffinity").AsInt());
             rec.collision_group = static_cast<int32_t>(s.At("collision_group").AsInt());
-            rec.solref[0] = s.At("solref").Elements()[0].AsFloat();
-            rec.solref[1] = s.At("solref").Elements()[1].AsFloat();
-            for (int k = 0; k < 5; ++k) rec.solimp[k] = s.At("solimp").Elements()[k].AsFloat();
+            rec.solref[0] = FloatAt(s.At("solref"), 0, "solref");
+            rec.solref[1] = FloatAt(s.At("solref"), 1, "solref");
+            for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(s.At("solimp"), k, "solimp");
             rec.friction_mu = s.At("friction_mu").AsFloat();
             rec.priority = static_cast<int32_t>(s.At("priority").AsInt());
             rec.solmix = s.At("solmix").AsFloat();
@@ -640,8 +662,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
     // -- filters ------------------------------------------------------------
     if (const Value* excludes = root.Find("exclude_pairs")) {
         for (const Value& e : excludes->Elements()) {
-            scene.AddExcludePair(static_cast<BodyId>(e.Elements()[0].AsInt()),
-                                 static_cast<BodyId>(e.Elements()[1].AsInt()));
+            scene.AddExcludePair(static_cast<BodyId>(FloatAt(e, 0, "exclude_pair")),
+                                 static_cast<BodyId>(FloatAt(e, 1, "exclude_pair")));
         }
     }
     if (const Value* pairs = root.Find("contact_pairs")) {
@@ -651,9 +673,9 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             ov.geom2 = static_cast<ShapeId>(cp.At("geom2").AsInt());
             ov.condim = static_cast<uint8_t>(cp.At("condim").AsInt());
             ov.friction_mu = cp.At("friction_mu").AsFloat();
-            ov.solref[0] = cp.At("solref").Elements()[0].AsFloat();
-            ov.solref[1] = cp.At("solref").Elements()[1].AsFloat();
-            for (int k = 0; k < 5; ++k) ov.solimp[k] = cp.At("solimp").Elements()[k].AsFloat();
+            ov.solref[0] = FloatAt(cp.At("solref"), 0, "solref");
+            ov.solref[1] = FloatAt(cp.At("solref"), 1, "solref");
+            for (int k = 0; k < 5; ++k) ov.solimp[k] = FloatAt(cp.At("solimp"), k, "solimp");
             ov.margin = cp.At("margin").AsFloat();
             ov.gap = cp.At("gap").AsFloat();
             scene.AddContactPair(ov);
@@ -747,9 +769,8 @@ void ApplyOverrides(SceneIR& scene, const Value& overlay) {
             }
         }
     }
-    // Mutating records directly bypassed the write-through; rebuild the facade so
-    // the tree/ECS reflect the overrides. A copy triggers RebuildFacade.
-    scene = SceneIR(scene);
+    // Mutating records via Get*Mut marks the facade dirty; the next facade read
+    // (Tree/Ecs/EntityOf*) lazily re-projects, so no manual rebuild is needed.
 }
 
 std::string ReadTextFile(const std::string& path) {

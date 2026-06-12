@@ -242,6 +242,11 @@ public:
     const LightRecord&          GetLight(LightId id) const;
     const ActuatorRecord&       GetActuator(ActuatorId id) const;
 
+    // Mutable record access. Mutating a record through these BYPASSES the Add*
+    // write-through, so each Get*Mut marks the facade DIRTY; the next facade
+    // read (Tree / Ecs / EntityOf*) lazily re-projects tree_ + ecs_ from the
+    // records. NOTE: the re-projection creates fresh entities/nodes — EntityIds
+    // and SceneNode pointers obtained BEFORE a Get*Mut are invalidated by it.
     RigidBodyRecord&      GetBodyMut(BodyId id);
     JointRecord&          GetJointMut(JointId id);
     CollisionShapeRecord& GetShapeMut(ShapeId id);
@@ -266,11 +271,13 @@ public:
     // -- facade: structural world (M2b) -------------------------------------
     // The scene TREE and the ECS Registry built by the Add* write-through. The
     // tree is the hierarchy authority; the Registry holds the five-component
-    // projection. Both are kept in lock-step with the records.
-    const SceneGraph& Tree() const { return tree_; }
-    SceneGraph&       TreeMut()     { return tree_; }
-    const Registry&   Ecs()  const { return ecs_; }
-    Registry&         EcsMut()      { return ecs_; }
+    // projection. Records are authoritative: Add* write-through keeps the
+    // facade current, and record mutation via Get*Mut marks it dirty so these
+    // readers lazily re-project before returning. There is deliberately NO
+    // mutable facade access (no TreeMut/EcsMut): mutating the derived
+    // representation directly would silently diverge from the records.
+    const SceneGraph& Tree() const { EnsureFacade(); return tree_; }
+    const Registry&   Ecs()  const { EnsureFacade(); return ecs_; }
 
     // record-id -> projected entity (kInvalidEntity if the record produced no
     // entity, which cannot happen for bodies/shapes/joints today).
@@ -282,6 +289,9 @@ private:
     // Rebuild tree_ + ecs_ from the current record vectors (used by the copy
     // ctor / assignment and by the move-from default; see scene_ir.cpp).
     void RebuildFacade();
+
+    // Lazy facade resync: re-projects when a Get*Mut marked the facade dirty.
+    void EnsureFacade() const;
 
     // -- per-record write-through helpers (build the tree + ECS for one
     //    just-appended record). Defined in scene_ir.cpp. -------------------
@@ -307,6 +317,7 @@ private:
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;
     Registry   ecs_;
+    bool       facade_dirty_ = false;  // set by Get*Mut; cleared by EnsureFacade
 
     // record-id -> entity, and BodyId -> its body node (so a child body / shape
     // / joint can be hung under its parent). Index == record id (dense).
