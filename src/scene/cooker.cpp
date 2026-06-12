@@ -8,6 +8,7 @@
 #include "import/cooker/sdf_bake_backend.hpp"
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"  // PackSdfCellKey codec (shared)
+#include "scene/asset/asset_cache.hpp"       // M2c: content-addressed cook cache
 
 #include <algorithm>
 #include <cstdio>
@@ -20,13 +21,14 @@ namespace nuka::scene {
 
 namespace {
 
-// V-HACD content-hash cache dir for the p06 fold-in. Deliberately EMPTY here:
-// the in-process memo (keyed by mesh content hash) already dedups identical
-// meshes within a single cook, which is the win for multi-instance scenes. An
-// on-disk dir would re-open a stale-output risk (the key is over INPUTS, so a
-// decomposition-logic change without an input change would serve a stale file
-// across builds). Empty => memo-only; still routed through DecomposeMeshCached.
-constexpr const char* kDecomposeCacheDir = "";
+// V-HACD content-hash cache dir (M2c). The AssetCache root: DecomposeMeshCached
+// persists "<sha256>.nukacvx" files here, byte-identical to the AssetCache hull
+// layout, so the disk cache and AssetCache share one content-addressed store.
+// The key is over INPUTS (mesh bytes + params), so a hit is bit-identical to a
+// cold cook (the V-HACD determinism test + the cooker goldens prove it). The
+// on-disk store is regenerable and gitignored; a decomposition-logic change is
+// handled by clearing the dir (no input change => same key by design).
+constexpr const char* kDecomposeCacheDir = ".nuka_cache";
 
 math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
     const auto& body = scene.GetBody(body_id);
@@ -102,6 +104,13 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
     // v1.0 GPU backend drops in via DefaultSdfBakeBackend with no caller change).
     const import::cooker::SdfBakeBackend& backend =
         import::cooker::DefaultSdfBakeBackend();
+    // M2c: wrap the cold bake in the content-addressed AssetCache so the cooked
+    // SDF persists to disk (keyed by ComputeSdfCacheKey, the same key the backend
+    // dedups on within a cook). A cache HIT is bit-identical to the cold bake
+    // (the SDF0 (de)serialization is exact), so the ContactMetadata D1 + cooker
+    // goldens stay green. The in-process by_hash map below still dedups within a
+    // single cook; the AssetCache adds cross-cook / cross-process persistence.
+    AssetCache asset_cache(kDecomposeCacheDir);
     std::unordered_map<std::string, uint32_t> by_hash;  // hash -> sdf index
     table.piece_sdf_indices.assign(geom.Count(), kNoSdf);
 
@@ -127,7 +136,9 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
             table.piece_sdf_indices[piece] = it->second;  // dedup: reuse
             continue;
         }
-        const auto sdf = backend.Bake(vptr, vcount, iptr, tri_count, params);
+        const auto sdf = asset_cache.GetOrCookSdf(
+            vptr, vcount, iptr, tri_count, params,
+            [&] { return backend.Bake(vptr, vcount, iptr, tri_count, params); });
         if (sdf.CellCount() == 0u) {
             continue;  // degenerate; leave kNoSdf
         }
