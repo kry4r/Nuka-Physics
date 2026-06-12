@@ -1,6 +1,9 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::scene::SceneGraph - hierarchical scene transform graph
+// nuka::scene::PoseGraph - flat body-pose mirror (legacy local/world transform
+// table). NOT a scene tree: the owner-mandated node tree lives in
+// scene/graph/scene_graph.hpp. This legacy mirror retires in M9 with
+// scene_pipeline; it was renamed from SceneGraph to free that name.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
@@ -11,7 +14,7 @@
 
 namespace nuka::scene {
 
-struct SceneGraphNode {
+struct PoseGraphNode {
     BodyId body_id = kInvalidBody;
     BodyId parent = kInvalidBody;
     std::string name;
@@ -19,16 +22,16 @@ struct SceneGraphNode {
     math::Transform world_transform = math::Transform::Identity();
 };
 
-class SceneGraph {
+class PoseGraph {
 public:
-    BodyId AddNode(SceneGraphNode node);
+    BodyId AddNode(PoseGraphNode node);
     size_t NodeCount() const;
-    const SceneGraphNode& GetNode(BodyId id) const;
-    SceneGraphNode& GetNodeMut(BodyId id);
-    const std::vector<SceneGraphNode>& Nodes() const;
+    const PoseGraphNode& GetNode(BodyId id) const;
+    PoseGraphNode& GetNodeMut(BodyId id);
+    const std::vector<PoseGraphNode>& Nodes() const;
 
 private:
-    std::vector<SceneGraphNode> nodes_;
+    std::vector<PoseGraphNode> nodes_;
 };
 
 } // namespace nuka::scene

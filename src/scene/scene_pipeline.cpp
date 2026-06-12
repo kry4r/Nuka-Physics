@@ -23,10 +23,10 @@ math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
 
 } // namespace
 
-SceneGraph BuildSceneGraph(const SceneIR& scene) {
-    SceneGraph graph;
+PoseGraph BuildPoseGraph(const SceneIR& scene) {
+    PoseGraph graph;
     for (const auto& body : scene.Bodies()) {
-        SceneGraphNode node;
+        PoseGraphNode node;
         node.body_id = body.id;
         node.parent = body.parent_id;
         node.name = body.name;
@@ -39,7 +39,7 @@ SceneGraph BuildSceneGraph(const SceneIR& scene) {
 
 CompiledScene BuildCompiledScene(const SceneIR& scene) {
     CompiledScene compiled;
-    compiled.graph = BuildSceneGraph(scene);
+    compiled.graph = BuildPoseGraph(scene);
 
     const auto cooked = CookScene(scene);
     compiled.physics = runtime::BuildPhysicsWorld(cooked);
