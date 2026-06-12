@@ -26,6 +26,7 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::ContactSlot:    return max_contacts_per_env;
         case FieldPer::RowSlot:        return max_rows_per_env;
         case FieldPer::SlotDof:        return max_contacts_per_env * dofs_per_env;
+        case FieldPer::RowDof:         return max_rows_per_env * dofs_per_env;
         case FieldPer::Particle:       return particles_per_env;
         case FieldPer::DistCon:        return dist_cons_per_env;
         case FieldPer::BendCon:        return bend_cons_per_env;
@@ -50,6 +51,15 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             // GLOBAL foot table (shared by every env, base-relative indices):
             // 5 packed scalars per slot, max_contacts_per_env slots.
             return static_cast<uint64_t>(max_contacts_per_env) * 5ull;
+        }
+        if (id == FieldId::UnionSlots) {
+            // GLOBAL union contact-pair template (shared by every env): 16
+            // packed scalars per contact slot.
+            return static_cast<uint64_t>(max_contacts_per_env) * 16ull;
+        }
+        if (id == FieldId::HullVerts) {
+            // GLOBAL convex-hull vertex pool, xyz packed.
+            return static_cast<uint64_t>(max_hull_verts) * 3ull;
         }
         return static_cast<uint64_t>(env_count);
     }
@@ -187,8 +197,78 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::UnionSlots: {
+            // GLOBAL union contact-pair template: 16 packed scalars per slot
+            // {cls, link, body, condim (u32 bits), offset.xyz, radius,
+            //  box_half.xyz, plane_height, mu, flags (u32 bits), 2 reserved}.
+            auto* p = reinterpret_cast<float*>(dst);
+            const uint32_t slots = capacities.max_contacts_per_env;
+            auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
+            uint32_t row_base = 0;  // per-env row-slot prefix sum (lane 14).
+            for (uint32_t s = 0; s < union_slots.size() && s < slots; ++s) {
+                const UnionSlot& u = union_slots[s];
+                const size_t b = static_cast<size_t>(s) * 16u;
+                put_u32(b + 0, u.cls);
+                put_u32(b + 1, u.link);
+                put_u32(b + 2, u.body);
+                put_u32(b + 3, u.condim);
+                p[b + 4] = u.offset.x;  p[b + 5] = u.offset.y;  p[b + 6] = u.offset.z;
+                p[b + 7] = u.radius;
+                p[b + 8] = u.box_half.x; p[b + 9] = u.box_half.y; p[b + 10] = u.box_half.z;
+                p[b + 11] = u.plane_height;
+                p[b + 12] = u.mu;
+                put_u32(b + 13, u.flags);
+                put_u32(b + 14, row_base);
+                row_base += u.MaxRows();
+            }
+            break;
+        }
+        case FieldId::HullVerts: {
+            if (!hull_verts.empty()) {
+                const size_t n = hull_verts.size() < static_cast<size_t>(
+                                     capacities.max_hull_verts) * 3u
+                                     ? hull_verts.size()
+                                     : static_cast<size_t>(capacities.max_hull_verts) * 3u;
+                std::memcpy(dst, hull_verts.data(), n * sizeof(float));
+            }
+            break;
+        }
+        case FieldId::DofToLink:
+            StampPerLink(dst, dof_to_link, capacities.dofs_per_env, E, sizeof(uint32_t));
+            break;
+        case FieldId::DofToComponent:
+            StampPerLink(dst, dof_to_component, capacities.dofs_per_env, E,
+                         sizeof(uint32_t));
+            break;
+        case FieldId::RowOrder: {
+            if (!schedule_row_order.empty()) {
+                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E;
+                const size_t n = schedule_row_order.size() < cap
+                                     ? schedule_row_order.size() : cap;
+                std::memcpy(dst, schedule_row_order.data(), n * sizeof(uint32_t));
+            }
+            break;
+        }
+        case FieldId::IslandColorSegments: {
+            if (!schedule_color_segments.empty()) {
+                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E * 2u;
+                const size_t n = schedule_color_segments.size() < cap
+                                     ? schedule_color_segments.size() : cap;
+                std::memcpy(dst, schedule_color_segments.data(), n * sizeof(uint32_t));
+            }
+            break;
+        }
+        case FieldId::IslandRowOffsets: {
+            if (!schedule_islands.empty()) {
+                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E * 4u;
+                const size_t n = schedule_islands.size() < cap
+                                     ? schedule_islands.size() : cap;
+                std::memcpy(dst, schedule_islands.data(), n * sizeof(uint32_t));
+            }
+            break;
+        }
         default:
-            // Solve-schedule (M4) / XPBD-template (M6) sections: deterministic 0.
+            // XPBD-template (M6) sections: deterministic 0.
             break;
     }
 }
@@ -214,6 +294,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;
         case FieldId::ArticulationLinkOffset:v.articulation_link_offset = static_cast<uint32_t*>(p); break;
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
+        case FieldId::UnionSlots:            v.union_slots = static_cast<float*>(p); break;
+        case FieldId::HullVerts:             v.hull_verts = static_cast<float*>(p); break;
+        case FieldId::DofToLink:             v.dof_to_link = static_cast<uint32_t*>(p); break;
+        case FieldId::DofToComponent:        v.dof_to_component = static_cast<uint32_t*>(p); break;
         case FieldId::IslandRowOffsets:      v.island_row_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::IslandColorSegments:   v.island_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::RowOrder:              v.row_order = static_cast<uint32_t*>(p); break;
@@ -277,19 +361,43 @@ Model::~Model() {
     }
 }
 
-Model::Model(Model&& other) noexcept
-    : capacities(std::move(other.capacities)),
-      articulation(std::move(other.articulation)),
-      shapes(std::move(other.shapes)),
-      material_buckets(std::move(other.material_buckets)),
-      body_material_bucket(std::move(other.body_material_bucket)),
-      feet(std::move(other.feet)),
-      hold_drives(std::move(other.hold_drives)),
-      ground_height(other.ground_height),
-      friction_coefficient(other.friction_coefficient),
-      baumgarte_max_velocity(other.baumgarte_max_velocity),
-      filter_cross_env(other.filter_cross_env),
-      device_buffer_(other.device_buffer_) {
+namespace {
+
+// Member-wise move of every host table + scalar (the union/M4 additions
+// included). Centralized so the move ctor and move assignment cannot drift.
+void MoveModelMembers(Model& dst, Model&& src) {
+    dst.capacities = std::move(src.capacities);
+    dst.articulation = std::move(src.articulation);
+    dst.shapes = std::move(src.shapes);
+    dst.material_buckets = std::move(src.material_buckets);
+    dst.body_material_bucket = std::move(src.body_material_bucket);
+    dst.feet = std::move(src.feet);
+    dst.hold_drives = std::move(src.hold_drives);
+    dst.ground_height = src.ground_height;
+    dst.friction_coefficient = src.friction_coefficient;
+    dst.baumgarte_max_velocity = src.baumgarte_max_velocity;
+    dst.filter_cross_env = src.filter_cross_env;
+    dst.contact_family = src.contact_family;
+    dst.drive_mode = src.drive_mode;
+    dst.union_slots = std::move(src.union_slots);
+    dst.hull_verts = std::move(src.hull_verts);
+    for (int k = 0; k < 2; ++k) dst.union_solref[k] = src.union_solref[k];
+    for (int k = 0; k < 5; ++k) dst.union_solimp[k] = src.union_solimp[k];
+    dst.table_enabled_default = src.table_enabled_default;
+    dst.body_init = std::move(src.body_init);
+    dst.dof_to_link = std::move(src.dof_to_link);
+    dst.dof_to_component = std::move(src.dof_to_component);
+    dst.schedule_row_order = std::move(src.schedule_row_order);
+    dst.schedule_color_segments = std::move(src.schedule_color_segments);
+    dst.schedule_islands = std::move(src.schedule_islands);
+    dst.schedule_island_count = src.schedule_island_count;
+    dst.schedule_segment_count = src.schedule_segment_count;
+}
+
+}  // namespace
+
+Model::Model(Model&& other) noexcept : device_buffer_(other.device_buffer_) {
+    MoveModelMembers(*this, std::move(other));
     other.device_buffer_ = nullptr;
 }
 
@@ -298,17 +406,7 @@ Model& Model::operator=(Model&& other) noexcept {
         if (device_buffer_ != nullptr) {
             phi::BufferFree(device_buffer_);
         }
-        capacities = std::move(other.capacities);
-        articulation = std::move(other.articulation);
-        shapes = std::move(other.shapes);
-        material_buckets = std::move(other.material_buckets);
-        body_material_bucket = std::move(other.body_material_bucket);
-        feet = std::move(other.feet);
-        hold_drives = std::move(other.hold_drives);
-        ground_height = other.ground_height;
-        friction_coefficient = other.friction_coefficient;
-        baumgarte_max_velocity = other.baumgarte_max_velocity;
-        filter_cross_env = other.filter_cross_env;
+        MoveModelMembers(*this, std::move(other));
         device_buffer_ = other.device_buffer_;
         other.device_buffer_ = nullptr;
     }

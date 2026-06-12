@@ -455,6 +455,11 @@ target_link_libraries(nuka_solver_test
         nuka_articulation
         GTest::gtest_main
 )
+if(CMAKE_CUDA_COMPILER)
+    # M4 re-point: the nk-driven UnifiedSolve oracle scenarios
+    # (test_unified_solve.cpp NkWorld* cases).
+    target_link_libraries(nuka_solver_test PRIVATE nuka_nk nuka_phi2)
+endif()
 
 gtest_discover_tests(nuka_solver_test)
 
@@ -658,6 +663,74 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     add_test(NAME phi2_smoke COMMAND nuka_phi2_smoke_test)
+
+    # --- M4: h1_union_parity — the union scene (factory) through nk::World
+    # (BuildNkUnionModel -> AssembleRows/SolveRowsBlockIsland) vs the legacy
+    # BatchedUnifiedWorld parity oracle (G1c/G1d tolerances) + the StepPlanned
+    # union plan-replay identity. Asset-gated SKIP.
+    add_executable(nuka_h1_union_parity_test
+        scenario/h1_union_parity.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_h1_union_parity_test nuka_codegen)
+    target_compile_definitions(nuka_h1_union_parity_test
+        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_h1_union_parity_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_h1_union_parity_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_h1_union_parity_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- M4: nk_union_n1 — the ≤5 ms/step hard perf gate (N=1 union full
+    # contact, 1000 StepPlanned steps). Asset-gated SKIP.
+    add_executable(nuka_nk_union_n1_test
+        perf/nk_union_n1.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_nk_union_n1_test nuka_codegen)
+    target_compile_definitions(nuka_nk_union_n1_test
+        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_nk_union_n1_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_nk_union_n1_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_nk_union_n1_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     add_executable(nuka_cuda_runtime_test
         runtime/test_cuda_solver.cpp
@@ -1869,6 +1942,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
             nuka_core
             nuka_phi
+            # M4 re-point: the nk SolveRowsBlockIsland harness.
+            nuka_nk
+            nuka_phi2
             GTest::gtest_main
     )
 
@@ -1949,6 +2025,9 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_foot_box_mjx_parity_test
         PRIVATE
+            # M4 re-point: the nk SolveRowsBlockIsland harness.
+            nuka_nk
+            nuka_phi2
             nuka_solver
             nuka_constraint
             nuka_runtime
@@ -2372,6 +2451,7 @@ if(CMAKE_CUDA_COMPILER)
         coresident/test_batched_h1_hand_grasp.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_batched_h1_hand_grasp_test nuka_codegen)
@@ -2388,6 +2468,9 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_batched_h1_hand_grasp_test
         PRIVATE
+            # M4: the nk grasp-parity entry (BuildNkUnionModel -> nk::World).
+            nuka_nk
+            nuka_phi2
             nuka_solver
             nuka_constraint
             nuka_runtime

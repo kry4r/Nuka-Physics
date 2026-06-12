@@ -6,6 +6,8 @@
 
 #include <utility>
 
+#include "nk/solve/schedule.hpp"
+
 namespace nuka::nk {
 
 World::World(Model model, uint32_t env_count, phi::Device* device,
@@ -24,6 +26,12 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     if (bt == nullptr) {
         return;
     }
+
+    // 0. (M4, plan §3.4) Build the worst-case device-resident solve schedule
+    // ONCE on the host (the row_scheduler algorithms migrated to nk/solve) —
+    // BEFORE UploadTo, which stages the triple into the Model device buffer.
+    // Runtime steps never re-color (the plan-replay anchor).
+    SolveSchedule::Build(&model_);
 
     // 1. Upload the Model's constant tables into ONE device buffer + fill view.
     if (model_.UploadTo(bt, &model_view_) != phi::Status::Ok) {
@@ -64,8 +72,54 @@ bool World::SeedInitialState() {
     reset_params_.lambda_stride = cap.max_rows_per_env;
     reset_params_.articulation_count = E;
 
+    // -- M4: movable rigid-body template seeding (env-major replication) -----
+    const uint32_t B = cap.bodies_per_env;
+    if (B > 0 && !model_.body_init.empty()) {
+        std::vector<math::Transform> poses(static_cast<size_t>(B) * E);
+        std::vector<math::Vec3> lin(static_cast<size_t>(B) * E);
+        std::vector<math::Vec3> ang(static_cast<size_t>(B) * E);
+        std::vector<float> inv_mass(static_cast<size_t>(B) * E, 0.0f);
+        std::vector<math::Vec3> inv_inertia(static_cast<size_t>(B) * E);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t b = 0; b < B; ++b) {
+                const Model::BodyInit& src =
+                    b < model_.body_init.size() ? model_.body_init[b]
+                                                : Model::BodyInit{};
+                const size_t at = static_cast<size_t>(e) * B + b;
+                poses[at] = src.pose;
+                lin[at] = src.linear_velocity;
+                ang[at] = src.angular_velocity;
+                inv_mass[at] = src.inv_mass;
+                inv_inertia[at] = src.inv_inertia;
+            }
+        }
+        if (!data_.UploadField(FieldId::BodyPose, poses.data(),
+                               poses.size() * sizeof(math::Transform)) ||
+            !data_.UploadField(FieldId::BodyLinearVelocity, lin.data(),
+                               lin.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::BodyAngularVelocity, ang.data(),
+                               ang.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::BodyInvMass, inv_mass.data(),
+                               inv_mass.size() * sizeof(float)) ||
+            !data_.UploadField(FieldId::BodyInvInertia, inv_inertia.data(),
+                               inv_inertia.size() * sizeof(math::Vec3))) {
+            return false;
+        }
+    }
+
+    // -- M4: the per-env live table toggle (union family; harmless default
+    // elsewhere — the field exists for every model).
+    {
+        std::vector<uint32_t> enabled(E, model_.table_enabled_default ? 1u : 0u);
+        if (!data_.UploadField(FieldId::TableEnabled, enabled.data(),
+                               enabled.size() * sizeof(uint32_t))) {
+            return false;
+        }
+    }
+
     if (L == 0) {
-        return true;  // no articulation: nothing to seed.
+        return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
+               phi::Status::Ok;  // no articulation: bodies-only snapshot.
     }
 
     const ModelArticulation& a = model_.articulation;
@@ -87,6 +141,30 @@ bool World::SeedInitialState() {
         !replicate_f32(FieldId::DriveDamping, model_.hold_drives.damping) ||
         !replicate_f32(FieldId::DriveForceLimit, model_.hold_drives.force_limits)) {
         return false;
+    }
+    // M4 (union family): the SETTLED initial velocity state (the legacy
+    // factory's pre-roll product). Empty templates keep the zero-velocity
+    // arena init (the M3 path, byte-unchanged).
+    if (!a.initial_qdot.empty() && !replicate_f32(FieldId::Qdot, a.initial_qdot)) {
+        return false;
+    }
+    if (!a.initial_link_velocity.empty()) {
+        std::vector<float> host(static_cast<size_t>(L) * E * 6u, 0.0f);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t l = 0; l < L; ++l) {
+                for (uint32_t k = 0; k < 6u; ++k) {
+                    const size_t src = static_cast<size_t>(l) * 6u + k;
+                    if (src < a.initial_link_velocity.size()) {
+                        host[(static_cast<size_t>(e) * L + l) * 6u + k] =
+                            a.initial_link_velocity[src];
+                    }
+                }
+            }
+        }
+        if (!data_.UploadField(FieldId::LinkVelocity, host.data(),
+                               host.size() * sizeof(float))) {
+            return false;
+        }
     }
     {
         std::vector<math::Transform> host(static_cast<size_t>(L) * E);

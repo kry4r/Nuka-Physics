@@ -24,6 +24,14 @@
 //
 // NOTE: this is a .cpp compiled as CUDA (LANGUAGE CUDA in CMakeLists) so the
 // host EXPECT helpers and the __global__ live in one TU.
+//
+// M4 RE-POINT NOTE: the nk AssembleRows op (src/phi/backend_cuda/ops/
+// assemble_rows.cu) calls THIS header's ComputeCompliantRow on device for the
+// union-family row emission — the oracle semantics pinned here therefore pin
+// the nk path too. The end-to-end evidence (the op's emitted row rhs/R equal
+// the host ComputeCompliantRow at the detected depth) lives in
+// tests/solver/test_unified_solve.cpp UnifiedSolve.NkWorldRestingContact-
+// SupportsWeight (the nk re-point section).
 // ---------------------------------------------------------------------------
 
 #include "constraint/solref_solimp.hpp"

@@ -92,6 +92,14 @@ struct ConvexHullView {
     const float* verts = nullptr;   // flat x,y,z triples (count*3 floats)
     uint32_t     vcount = 0u;       // vertex count
     amf::PrimFrame frame;           // mesh-local -> world (baked, HD-clean)
+    // M4 DEVICE-ONLY opt-in: when true, SupportHull runs its vertex scan
+    // WARP-COOPERATIVELY (lanes split the pool, exact lowest-index argmax
+    // reduce — bit-identical result). REQUIREMENT: every caller up the GJK
+    // stack must then execute in FULL-WARP LOCKSTEP (all 32 lanes, converged,
+    // identical inputs) — the nk union narrowphase does exactly that. Host
+    // code and the legacy thread-per-slot device callers leave it false and
+    // take the serial scan, byte-unchanged.
+    bool warp_lockstep = false;
 
     NUKA_CVX_HD Vec3 Vertex(uint32_t i) const {
         const Vec3 l{verts[i * 3u + 0u], verts[i * 3u + 1u], verts[i * 3u + 2u]};
@@ -106,19 +114,68 @@ struct ConvexHullView {
 // body (for the witness / feature id). For analytic primitives the index is a
 // synthetic feature code (we never face-clip a sphere; capsule packs endpoint).
 
-// Hull support: FIXED-ORDER scan, strict `>` -> LOWEST index ties (D1).
+// Hull support: LOWEST-index argmax of v.Dot(dir) (D1). M4 NOTE — the scan is
+// now a 4-WAY INDEPENDENT-CHAIN unroll with an explicit (value, lowest-index)
+// tie-break at the combine. This is EXACTLY the former serial strict-`>`
+// first-win scan's result: every per-vertex dot is computed identically, the
+// max over a set is order-independent, and "lowest index among equal maxima"
+// is precisely what strict-> first-win kept. The split exists for the DEVICE
+// dependency chain (the serial compare-select chain over the 1796-vert cup
+// hull was the measured M4 narrowphase bottleneck); host results are
+// bit-identical.
 NUKA_CVX_HD inline Vec3 SupportHull(const ConvexHullView& h, Vec3 dir,
                                     uint32_t* out_idx) {
-    uint32_t best = 0u;
-    Vec3 best_v = h.Vertex(0u);
-    float best_d = best_v.Dot(dir);
-    for (uint32_t i = 1u; i < h.vcount; ++i) {
-        const Vec3 v = h.Vertex(i);
-        const float d = v.Dot(dir);
-        if (d > best_d) { best_d = d; best_v = v; best = i; }  // strict -> lowest idx
+#if defined(__CUDA_ARCH__)
+    if (h.warp_lockstep) {
+        // WARP-COOPERATIVE scan (see ConvexHullView::warp_lockstep): lanes
+        // split the pool by stride-32, each keeping its subset's lowest-index
+        // strict-> max; the shuffle reduce prefers (higher value, then lower
+        // index) — exactly the serial first-win argmax, bit-identical.
+        const uint32_t lane = threadIdx.x & 31u;
+        float bd = -3.402823466e+38f;
+        uint32_t bi = 0u;
+        for (uint32_t i = lane; i < h.vcount; i += 32u) {
+            const float d = h.Vertex(i).Dot(dir);
+            if (d > bd) { bd = d; bi = i; }
+        }
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            const float od = __shfl_down_sync(0xffffffffu, bd, off);
+            const uint32_t oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (od > bd || (od == bd && oi < bi)) { bd = od; bi = oi; }
+        }
+        bi = __shfl_sync(0xffffffffu, bi, 0);
+        if (out_idx) *out_idx = bi;
+        return h.Vertex(bi);
     }
+#endif
+    // Four EXPLICIT scalar chains (no array indexing — a dynamically indexed
+    // chain array spills to local memory on device, defeating the unroll).
+    const float d0 = h.Vertex(0u).Dot(dir);
+    float cd0 = d0, cd1 = d0, cd2 = d0, cd3 = d0;
+    uint32_t ci0 = 0u, ci1 = 0u, ci2 = 0u, ci3 = 0u;
+    uint32_t i = 0u;
+    for (; i + 4u <= h.vcount; i += 4u) {
+        const float a = h.Vertex(i + 0u).Dot(dir);
+        const float b = h.Vertex(i + 1u).Dot(dir);
+        const float c = h.Vertex(i + 2u).Dot(dir);
+        const float d = h.Vertex(i + 3u).Dot(dir);
+        if (a > cd0) { cd0 = a; ci0 = i + 0u; }  // strict -> lowest idx / chain
+        if (b > cd1) { cd1 = b; ci1 = i + 1u; }
+        if (c > cd2) { cd2 = c; ci2 = i + 2u; }
+        if (d > cd3) { cd3 = d; ci3 = i + 3u; }
+    }
+    for (; i < h.vcount; ++i) {
+        const float d = h.Vertex(i).Dot(dir);
+        if (d > cd0) { cd0 = d; ci0 = i; }
+    }
+    // Combine with the (value, LOWEST index) tie-break == the serial result.
+    uint32_t best = ci0;
+    float best_d = cd0;
+    if (cd1 > best_d || (cd1 == best_d && ci1 < best)) { best_d = cd1; best = ci1; }
+    if (cd2 > best_d || (cd2 == best_d && ci2 < best)) { best_d = cd2; best = ci2; }
+    if (cd3 > best_d || (cd3 == best_d && ci3 < best)) { best_d = cd3; best = ci3; }
     if (out_idx) *out_idx = best;
-    return best_v;
+    return h.Vertex(best);
 }
 
 // Box (as a primitive) support: center + sum_k sign(dot(axis_k,dir))*he_k*axis_k.

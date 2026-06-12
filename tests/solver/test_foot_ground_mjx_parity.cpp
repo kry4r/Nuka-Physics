@@ -106,6 +106,8 @@
 
 #include <gtest/gtest.h>
 
+#include "nk_solve_harness.hpp"  // M4 re-point: the nk SolveRowsBlockIsland path
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -463,7 +465,8 @@ struct ParityResult {
 // free ABA -> seed qdot = a_free*dt -> contact solve -> qacc_total = qdot_post/dt.
 ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cooked,
                        const ContactConfig& cfg, const ContactStepGolden& g,
-                       float ground_height, const nuka::solver::SolverConfig& config) {
+                       float ground_height, const nuka::solver::SolverConfig& config,
+                       bool use_nk = false) {
     ParityResult result;
     auto& host = cooked.host;
     const uint32_t root = host.articulation_link_offset[0];
@@ -617,17 +620,33 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
     }
 
     std::vector<nuka::runtime::rigid::BodyState> empty_bodies;
-    nuka::solver::SolveContext sctx;
-    sctx.rows = &rows;
-    sctx.state = &empty_bodies;
-    sctx.sides = &sides;
-    sctx.dt = kDt;
-    sctx.articulation.art_refs = &art_refs;
-    sctx.articulation.chain_jacobians = &chain_jacobians;
-    sctx.articulation.inertia_m_inv = &minv;
-    sctx.articulation.qdot = &qdot;
-    sctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(sctx, config);
+    if (use_nk) {
+        // M4 RE-POINT: the SAME assembled rows / chain-J / M^-1 / qdot seed
+        // through the nk SolveRowsBlockIsland op (nk_solve_harness.hpp); the
+        // SAME golden gates judge the result.
+        const auto nk_res = nk_harness::NkSolveRows(
+            rows, sides, art_refs, chain_jacobians, minv, qdot, &empty_bodies,
+            kDof, static_cast<uint16_t>(config.velocity_iterations), kDt);
+        EXPECT_TRUE(nk_res.ok) << "nk solve harness failed";
+        if (nk_res.ok) {
+            qdot = nk_res.qdot;
+            for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+                rows.rows[r].lambda = nk_res.lambda[r];
+            }
+        }
+    } else {
+        nuka::solver::SolveContext sctx;
+        sctx.rows = &rows;
+        sctx.state = &empty_bodies;
+        sctx.sides = &sides;
+        sctx.dt = kDt;
+        sctx.articulation.art_refs = &art_refs;
+        sctx.articulation.chain_jacobians = &chain_jacobians;
+        sctx.articulation.inertia_m_inv = &minv;
+        sctx.articulation.qdot = &qdot;
+        sctx.articulation.dof_stride = kDof;
+        nuka::solver::UnifiedSolve(sctx, config);
+    }
 
     // qacc_total = qdot_post / dt (NUKA flat packing).
     for (uint32_t i = 0u; i < kDof; ++i) result.qacc_total[i] = qdot[i] / kDt;
@@ -931,4 +950,67 @@ TEST(FootGroundMjxParity, ParityRunDeterministic) {
                           a.qacc_total.size() * sizeof(float)), 0)
         << "two identical parity runs produced different qacc (nondeterministic)";
     std::printf("[diag] (D1) parity qacc_total byte-identical across 2 runs\n");
+}
+
+// ===========================================================================
+// M4 RE-POINT — the SAME MJX golden gates through the nk SolveRowsBlockIsland
+// op (plan M4: "test_foot_ground_mjx_parity (oracle 口径) 重指"). The state
+// build, the rows, chain-J, M^-1 and the a_free*dt seed are IDENTICAL to the
+// legacy gate above; only the SOLVE runs on the nk device-resident path. The
+// gates reuse the legacy bounds verbatim (base-6 rel 1e-3, per-foot force rel
+// 2e-3) plus a direct nk-vs-legacy qacc cross-check at the FP floor.
+// ===========================================================================
+TEST(FootGroundMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
+    const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
+    const auto golden_path = GoldenPath("go2_foot_contact_step.bin");
+    if (!std::filesystem::exists(scene_path)) GTEST_SKIP() << "go2_float scene not available";
+    if (!std::filesystem::exists(golden_path))
+        GTEST_SKIP() << "contact-step golden not present";
+
+    const auto golden = LoadContactStepGolden(golden_path);
+    ASSERT_GT(golden.configs.size(), 0u);
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const auto cooked = CookGo2Float();
+    const auto cfg_high = MakeConfig(200u);
+    const float ground_height = HomeGroundHeight(context, cooked, golden.configs[0]);
+
+    for (size_t ci = 0u; ci < golden.configs.size(); ++ci) {
+        const auto& cfg = golden.configs[ci];
+        const auto legacy = RunParity(context, cooked, cfg, golden, ground_height,
+                                      cfg_high, /*use_nk=*/false);
+        const auto nk = RunParity(context, cooked, cfg, golden, ground_height,
+                                  cfg_high, /*use_nk=*/true);
+        ASSERT_EQ(nk.row_count, 4u) << "config " << ci << " nk produced != 4 rows";
+
+        std::array<float, 6> golden_on6{};
+        for (uint32_t i = 0u; i < 6u; ++i) golden_on6[i] = cfg.qacc_on[i];
+        const float kScale = 1.0f;
+        float base6_rel = 0.0f;
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            const float den = std::max(kScale, std::fabs(golden_on6[i]));
+            base6_rel = std::max(base6_rel,
+                                 std::fabs(nk.base6_mjx[i] - golden_on6[i]) / den);
+        }
+        float force_rel = 0.0f;
+        for (uint32_t r = 0u; r < nk.row_count && r < cfg.ncon; ++r) {
+            const float den = std::max(1.0f, std::fabs(cfg.normal_force[r]));
+            force_rel = std::max(force_rel,
+                                 std::fabs(nk.foot_force[r] - cfg.normal_force[r]) / den);
+        }
+        float vs_legacy = 0.0f;
+        for (uint32_t i = 0u; i < kDof; ++i) {
+            vs_legacy = std::max(vs_legacy,
+                                 std::fabs(nk.qacc_total[i] - legacy.qacc_total[i]));
+        }
+        std::printf("[nk re-point] config %zu base-6 REL=%.3e force REL=%.3e "
+                    "|qacc nk-legacy|=%.3e\n", ci, base6_rel, force_rel, vs_legacy);
+        EXPECT_LT(base6_rel, 1.0e-3f)
+            << "config " << ci << " nk base-6 contact-ON drifted vs the MJX golden";
+        EXPECT_LT(force_rel, 2.0e-3f)
+            << "config " << ci << " nk per-foot force drifted vs MJX efc_force";
+        // nk-vs-legacy: identical math modulo the hoisted-constant FMA class.
+        EXPECT_LT(vs_legacy, 1.0e-2f)
+            << "config " << ci << " nk solve diverged from the legacy solve far "
+               "beyond the FP-contraction class";
+    }
 }

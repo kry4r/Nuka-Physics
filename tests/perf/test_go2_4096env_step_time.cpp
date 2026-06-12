@@ -381,7 +381,11 @@ TEST(Go2_4096env_StepTime, NkWorldStepPlannedMeetsGatePerEnv) {
     RecordProperty("nk_per_env_step_us", std::to_string(per_env_step_us));
     RecordProperty("gpu", gpu_name);
 
-    nuka::phi::BackendFree(backend);
+    // M4 fix: do NOT BackendFree here — `world` (declared after `backend`) is
+    // destroyed AFTER this point and its dtor frees the captured plan THROUGH
+    // the backend vtable; the explicit free left it dangling (a latent M3b
+    // teardown crash, surfaced once the allocator started reusing the block).
+    // The backend is process-lifetime here, reclaimed at exit.
 
     const double gate_us = EnvDouble("NUKA_PERF_GATE_US", 1000.0);
     const char* validation_gpu = std::getenv("NUKA_PERF_VALIDATION_GPU");

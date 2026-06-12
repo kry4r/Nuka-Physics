@@ -91,6 +91,11 @@ struct ApplyDrivesParams {
     // IMPLICITLY downstream (the production batched + single-env paths). 0 =>
     // explicit -Kd*qdot in the drive (the legacy pre-implicit oracle form).
     uint32_t defer_velocity_damping;
+    // M4: drive mode. 0 = position PD hold drive (ApplyPositionDriveKernel, the
+    // M3 BatchedArticulatedWorld path). 1 = direct torque drive (the union
+    // world's LaunchApplyTorqueDriveKernels port: tau = clamp(drive_target,
+    // +/-drive_force_limit) — drive_target carries the per-link torque).
+    uint32_t mode;
 };
 
 struct AbaForwardParams {
@@ -104,6 +109,9 @@ struct IntegrateVelocityParams {
     float    gravity_z;    // floating-base velocity integrate re-derives a_grav
     uint32_t total_link_count;
     uint32_t articulation_count;
+    // M4: movable rigid-body gravity velocity-kick arm (the union world's
+    // per-body `linear_velocity.z += g*dt` for inv_mass > 0). 0 = no bodies.
+    uint32_t total_body_count;
 };
 
 struct FkWorldPosesParams {
@@ -115,6 +123,9 @@ struct IntegratePositionParams {
     float    dt;
     uint32_t total_link_count;
     uint32_t articulation_count;
+    // M4: movable rigid-body symplectic-Euler position arm (the union world's
+    // IntegrateBodyPosition port). 0 = no bodies.
+    uint32_t total_body_count;
 };
 
 struct CrbaComputeMParams {
@@ -150,6 +161,13 @@ struct ParticleGridBuildParams {
 };
 
 // --- narrowphase / contact rows -----------------------------------------
+// Contact-family selector shared by the narrowphase / assemble / solve params
+// (mirrors nk::ContactFamily; a plain u32 so the POD stays header-light).
+//   0 = FusedFoot (M3 articulation foot pipeline, goldens byte-exact)
+//   1 = UnionCsr  (M4 union compliant-CSR pipeline)
+inline constexpr uint32_t kContactFamilyFusedFoot = 0u;
+inline constexpr uint32_t kContactFamilyUnionCsr  = 1u;
+
 struct NarrowphasePrimitivesParams {
     float contact_margin;
     uint8_t max_contacts_per_pair;
@@ -158,6 +176,12 @@ struct NarrowphasePrimitivesParams {
     uint32_t foot_count;        // active rows of the Model foot_shape table
     uint32_t env_count;
     uint32_t base_link_count;   // links per env (replica stride)
+    // M4 union family (kContactFamilyUnionCsr): per-(env x union-slot) analytic
+    // detection (foot sphere x plane / finger sphere x hull / body box x plane).
+    uint32_t family;            // kContactFamily*
+    uint32_t union_slot_count;  // union slots per env (Model union_slots size)
+    uint32_t bodies_per_env;
+    uint32_t hull_vert_count;   // live verts of the hull_verts pool
 };
 
 // Spec-fixed (M1).
@@ -172,35 +196,46 @@ struct ContactTangentBasisParams {
 
 struct AssembleRowsParams {
     float    dt;
-    uint32_t slot_count;
+    uint32_t slot_count;        // total contact slots (env_count * max_contacts)
     uint32_t max_dof;           // chain-Jacobian dof_stride (== dofs_per_env)
     uint32_t env_count;
     uint32_t articulation_count;
     uint32_t total_link_count;
+    // M4 union family:
+    uint32_t family;            // kContactFamily*
+    uint32_t union_slot_count;  // union slots per env
+    uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
+    uint32_t bodies_per_env;
+    uint32_t base_link_count;   // links per env (replica stride)
+    float    solref[2];         // merged contact solref (union family)
+    float    solimp[5];         // merged contact solimp (union family)
 };
 
-// Spec-fixed (M1).
+// Spec-fixed semantic fields (M1): {dt, vel_iters, pos_iters}. The fields BELOW
+// the spec triplet are the M3b-precedent LAUNCH-GEOMETRY transport (op_schema
+// header note: "ops carry the launch-geometry counts in their params because
+// ModelView/DataView are pure pointer aggregates") plus the per-family solver
+// constants that are Model properties (the fused family's legacy knobs). They
+// are filled by Pipeline::Build from the Model — the three semantic fields
+// keep their spec meaning and position.
 struct SolveRowsBlockIslandParams {
     float dt;
     uint16_t vel_iters;
     uint16_t pos_iters;
-};
-
-// TRANSITIONAL (M3b -> deleted in M4): the params of the ported legacy fused
-// solver `SolveArticulatedContactRows` (ops/solve_articulated.cu), which is
-// ROUTED THROUGH THE SolveRowsBlockIsland PIPELINE SLOT as its interim
-// implementation (the §3.2 enum has no transitional slot). The M4
-// SolveRowsBlockIslandParams above stays spec-fixed and untouched; M4 replaces
-// the interim op + this struct together.
-struct SolveArticulatedParams {
-    float    dt;
+    // -- appended launch geometry + Model-derived solver constants (M4) ------
+    uint32_t family;             // kContactFamily*
+    uint32_t total_islands;      // union family: schedule island count (grid x)
+    uint32_t max_dof;            // dof_stride == the M tile stride
+    uint32_t env_count;
+    uint32_t articulation_count;
+    uint32_t rows_per_env;       // row slots per env (union family)
+    uint32_t base_link_count;    // links per env (qdot scatter)
+    uint32_t total_body_count;   // env-major rigid body count
+    // Fused-family legacy knobs (Model properties; unused by the union family):
     float    friction_coefficient;
     float    baumgarte_max_velocity;
-    uint32_t max_dof;             // dof_stride == the M tile stride
-    uint32_t articulation_count;
-    uint32_t env_count;
     // 1 => apply the implicit joint-damping seed (drive_damping as per-DOF c_j,
-    // requires m_inv == (M + dt*C)^-1). 0 => contacts-only (legacy pre-implicit).
+    // requires m_inv == (M + dt*C)^-1). 0 => contacts-only.
     uint32_t apply_implicit_damping;
 };
 

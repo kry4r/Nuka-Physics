@@ -79,10 +79,6 @@ private:
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
     phi::SolveRowsBlockIslandParams   p_solve_{};
-    // TRANSITIONAL (M3b -> M4): the SolveRowsBlockIsland slot dispatches the
-    // ported legacy fused solver, which takes ITS OWN params POD. M4's real
-    // SolveRowsBlockIsland reverts the OpCall to p_solve_ above.
-    phi::SolveArticulatedParams       p_solve_articulated_{};
     phi::ParticlePredictParams        p_part_predict_{};
     phi::XpbdProjectParams            p_xpbd_{};
     phi::PbfDensityLambdaParams       p_pbf_density_{};

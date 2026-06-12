@@ -204,69 +204,93 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
 // in STATIC SHARED memory (see articulation_contacts.cu for the rationale).
 constexpr uint32_t kMaxFactorDof = kMaxArticulationDof;
 
+// M4 perf note (NUMERICS UNCHANGED — the fused-family goldens pin this op):
+// the LDL^T decomposition stays on lane 0 VERBATIM (its loop carries the
+// factor's data dependence), but the n identity-COLUMN solves that form the
+// explicit inverse are mutually INDEPENDENT serial solves — they are now
+// distributed one-column-per-lane (col = lane, lane+blockDim, ...). Each
+// column's arithmetic (forward / diagonal / backward substitution, loop
+// order, operand order) is the byte-identical single-lane body; only WHICH
+// lane runs it changed, and columns write disjoint Minv elements. Measured:
+// the 51-DOF H1 inverse drops ~1.9 ms -> ~0.1 ms at N=1 (the M4 union
+// red-line's second-largest cost).
 __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
                                                  uint32_t max_dof,
                                                  const float* inertia_M,
                                                  float* out_inertia_M_inv) {
     __shared__ float a[kMaxFactorDof * kMaxFactorDof];
+    __shared__ float d[kMaxFactorDof];
+    __shared__ uint32_t dof_sh;
 
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
+    if (articulation >= state.articulation_count) {
         return;
-    }
-
-    const uint32_t offset = state.articulation_link_offset[articulation];
-    const uint32_t count = state.articulation_link_count[articulation];
-    uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count; ++local) {
-        dof += JointDofCountDevice(state.joint_type[offset + local]);
-    }
-    if (dof > max_dof) {
-        // Defensive MEMORY-SAFETY bound only (see articulation_contacts.cu).
-        dof = max_dof;
     }
 
     const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
     const float* const M = inertia_M + static_cast<size_t>(articulation) * tile_stride;
     float* const Minv = out_inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
-    for (size_t i = 0u; i < tile_stride; ++i) {
+
+    if (lane == 0u) {
+        const uint32_t offset = state.articulation_link_offset[articulation];
+        const uint32_t count = state.articulation_link_count[articulation];
+        uint32_t dof = 0u;
+        for (uint32_t local = 0u; local < count; ++local) {
+            dof += JointDofCountDevice(state.joint_type[offset + local]);
+        }
+        if (dof > max_dof) {
+            // Defensive MEMORY-SAFETY bound only (see articulation_contacts.cu).
+            dof = max_dof;
+        }
+        dof_sh = dof;
+    }
+    __syncthreads();
+    const uint32_t dof = dof_sh;
+
+    // Zero-fill the output tile (parallel pure-0 writes; the column solves
+    // below overwrite the leading dof x dof block).
+    for (size_t i = lane; i < tile_stride; i += blockDim.x) {
         Minv[i] = 0.0f;
     }
     if (dof == 0u) {
         return;
     }
 
-    // Copy the leading dof x dof block into the dense (shared) scratch.
-    for (uint32_t r = 0u; r < dof; ++r) {
-        for (uint32_t c = 0u; c < dof; ++c) {
-            a[r * kMaxFactorDof + c] = M[static_cast<size_t>(r) * max_dof + c];
-        }
-    }
-
-    // Unpivoted LDL^T: A = L D L^T, L unit-lower-triangular, D diagonal.
-    // L stored in the strict lower triangle of `a`, D on its diagonal.
-    float d[kMaxFactorDof];
-    for (uint32_t j = 0u; j < dof; ++j) {
-        float djj = a[j * kMaxFactorDof + j];
-        for (uint32_t k = 0u; k < j; ++k) {
-            djj -= a[j * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
-        }
-        if (djj < kMinDiagonal) {
-            djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
-        }
-        d[j] = djj;
-        for (uint32_t i = j + 1u; i < dof; ++i) {
-            float lij = a[i * kMaxFactorDof + j];
-            for (uint32_t k = 0u; k < j; ++k) {
-                lij -= a[i * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
+    if (lane == 0u) {
+        // Copy the leading dof x dof block into the dense (shared) scratch.
+        for (uint32_t r = 0u; r < dof; ++r) {
+            for (uint32_t c = 0u; c < dof; ++c) {
+                a[r * kMaxFactorDof + c] = M[static_cast<size_t>(r) * max_dof + c];
             }
-            a[i * kMaxFactorDof + j] = lij / djj;
+        }
+
+        // Unpivoted LDL^T: A = L D L^T, L unit-lower-triangular, D diagonal.
+        // L stored in the strict lower triangle of `a`, D on its diagonal.
+        // (VERBATIM single-lane body — the factor's loop-carried dependence.)
+        for (uint32_t j = 0u; j < dof; ++j) {
+            float djj = a[j * kMaxFactorDof + j];
+            for (uint32_t k = 0u; k < j; ++k) {
+                djj -= a[j * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
+            }
+            if (djj < kMinDiagonal) {
+                djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
+            }
+            d[j] = djj;
+            for (uint32_t i = j + 1u; i < dof; ++i) {
+                float lij = a[i * kMaxFactorDof + j];
+                for (uint32_t k = 0u; k < j; ++k) {
+                    lij -= a[i * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
+                }
+                a[i * kMaxFactorDof + j] = lij / djj;
+            }
         }
     }
+    __syncthreads();
 
     // Solve A x = e_col for each identity column to form M^-1 (symmetric).
-    for (uint32_t col = 0u; col < dof; ++col) {
+    // INDEPENDENT columns -> one per lane; per-column math byte-identical.
+    for (uint32_t col = lane; col < dof; col += blockDim.x) {
         float y[kMaxFactorDof];
         // Forward solve L y = e_col.
         for (uint32_t i = 0u; i < dof; ++i) {

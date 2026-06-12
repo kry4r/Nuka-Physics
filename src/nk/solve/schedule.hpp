@@ -1,0 +1,103 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// nk::SolveSchedule — the device-resident island/color row schedule (plan §3.4).
+//
+// Built ONCE on the host at World construction (and Reset, were the topology to
+// change — it cannot: fixed capacities) over the MAX-CAPACITY row slots of the
+// Model's union contact template, then uploaded device-resident as the three
+// Model fields {island_row_offsets, island_color_segments, row_order}. At
+// runtime the SolveRowsBlockIsland kernel walks the triple with ZERO host
+// participation and ZERO re-coloring; per-slot active flags (the watermark)
+// mask empty slots.
+//
+// ALGORITHMS: BuildRowColorPartitions / BuildRowComponentPartitions migrated
+// from src/solver/gpu/row_scheduler.cu (the legacy per-step host scheduler —
+// the 140-200 ms/step pathology this milestone retires), re-keyed from
+// constraint::RowBuffers to the slim ScheduleRow conflict description. The
+// greedy-lowest-color-by-row-index coloring, the dense slot remap, the
+// union-find component pass, and the (color, intra-color) segment emission are
+// SEMANTICALLY IDENTICAL — for the worst-case (all-slots-active) row set the
+// emitted execution order equals what the legacy scheduler produced for the
+// same emission order, which is what makes the nk trajectory track the legacy
+// BatchedUnifiedWorld at the FP floor.
+//
+// ★ THE WORST-CASE-SLOT VALIDITY INVARIANT (the heart of plan replayability).
+// The schedule is computed once with EVERY row slot assumed live. At runtime
+// any SUBSET of slots is active. The schedule stays valid for every subset
+// because:
+//   (1) Coloring: deactivating rows only REMOVES edges from the conflict graph;
+//       a proper coloring of the supergraph is a proper coloring of every
+//       subgraph. No two ACTIVE rows in one color segment ever share mutable
+//       state, whatever the subset.
+//   (2) Order: within the interacting set, rows execute in ascending
+//       (color, slot) order. The legacy per-step scheduler colored the
+//       COMPACTED emission greedily by index, which also yields ascending
+//       emission order within each mutually-conflicting subset — so the
+//       relative update order of every pair of INTERACTING active rows is the
+//       same under both schedules; rows in different components/disjoint state
+//       may interleave differently, which cannot change any float.
+//   (3) Islands: the worst-case connected components are a REFINEMENT bound —
+//       an active subset's true components are sub-unions of the worst-case
+//       islands, so running one block per worst-case island serializes at
+//       least as much as required (never less). Inactive rows early-exit.
+// Hence one fixed schedule serves every step — the CUDA-graph plan never needs
+// recapture (plan §3.2 "拓扑不变永不重捕获").
+// ---------------------------------------------------------------------------
+
+#include <cstdint>
+#include <vector>
+
+namespace nuka::nk {
+
+class Model;
+
+// One row's conflict description (the slim re-key of the legacy RowBuffers +
+// sides + art_refs inputs): up to 2 shared-mutable-state keys (dense body /
+// articulation-tile keys; ~0u = absent, the legacy kInvalidBodyIndex) plus the
+// lambda-group anchor (TotalNormalLambda reads [group_first, ...) — kept as a
+// component edge by construction, exactly like the legacy pass 4).
+struct ScheduleRow {
+    uint32_t key_a = ~0u;
+    uint32_t key_b = ~0u;
+    uint32_t group_first = ~0u;  // global row index of the group anchor
+    uint32_t artic = ~0u;        // articulation index (qdot tile) or ~0u
+};
+
+struct SolveScheduleResult {
+    // row_order: global row ids grouped per island, ascending (color, intra).
+    std::vector<uint32_t> row_order;
+    // segments: {row_order offset, count} u32 pairs, contiguous per island.
+    std::vector<uint32_t> color_segments;
+    // islands: {segment offset, segment count, flags, env} u32 quads.
+    // flags bit0 = the island contains articulation rows (owns the qdot
+    // pack-tile scatter for its env).
+    std::vector<uint32_t> islands;
+    uint32_t island_count = 0;
+    uint32_t segment_count = 0;
+};
+
+class SolveSchedule {
+public:
+    // Build the worst-case schedule for `model` (union family; a FusedFoot /
+    // contact-free model yields an empty schedule) and write the triple +
+    // counts into the model's schedule_* host tables (staged into the Model
+    // device buffer by Model::UploadTo). Deterministic: same model -> byte-same
+    // schedule.
+    static void Build(Model* model);
+
+    // The migrated legacy algorithms (exposed for the schedule equivalence
+    // testing seam; semantics == row_scheduler.cu Build*Partitions).
+    static SolveScheduleResult Partition(const std::vector<ScheduleRow>& rows,
+                                         const std::vector<uint32_t>& row_env);
+};
+
+// The shared slot-layout contract between SolveSchedule and the AssembleRows
+// op: per env, union slot s expands to MaxRows() consecutive row slots laid
+// out as ALL normal rows first (one per worst-case manifold point), then the
+// friction spokes (per point, 2*(condim-1) each, +t0,-t0,+t1,-t1 order) — the
+// EmitCompliantContactRows per-manifold layout on fixed slots. Returns the
+// per-env row-slot base offset of each union slot plus the per-env total
+// (== ModelCapacities::max_rows_per_env after the cook sizes it).
+std::vector<uint32_t> UnionSlotRowBases(const Model& model, uint32_t* rows_per_env);
+
+}  // namespace nuka::nk

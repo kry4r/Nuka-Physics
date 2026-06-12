@@ -17,8 +17,9 @@ void RegisterNkArticulationPipelineOps();
 // Per-TU registrars.
 void RegisterNkAbaOps();              // articulation.cu
 void RegisterNkCrbaOps();             // crba.cu
-void RegisterNkContactsFootOps();     // contacts_foot.cu
-void RegisterNkSolveArticulatedOps(); // solve_articulated.cu (TRANSITIONAL, M4 deletes)
+void RegisterNkContactsFootOps();     // contacts_foot.cu (+contacts_union.cu)
+void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
+void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkReadoutOps();          // readout.cu
 
 } // namespace nuka::phi

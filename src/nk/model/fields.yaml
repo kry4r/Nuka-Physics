@@ -66,7 +66,11 @@ fields:
   - {name: body_pose,     dtype: transform, per: body,         arena: persistent, owner: data,  flags: [diff]}
   - {name: body_inv_mass, dtype: f32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: contact_count, dtype: u32,       per: env,          arena: scratch,    owner: data}
-  - {name: rows,          dtype: f32,       per: row_slot,     arena: scratch,    owner: data,  elem: 16}
+  # M4 re-key (the M3b "rows is 3x oversized" note): `rows` is the FUSED-family
+  # ArticulatedContactRow record, ONE per CONTACT slot (the legacy layout the
+  # ported foot kernels index as rows[env*kMaxFootContactsPerEnv + s]). The
+  # UNION-family CSR row records live in `urows` (per row_slot) below.
+  - {name: rows,          dtype: f32,       per: contact_slot, arena: scratch,    owner: data,  elem: 16}
   - {name: lambda,        dtype: f32,       per: row_slot,     arena: persistent, owner: data}
   - {name: m_inv,         dtype: f32,       per: env_dof2,     arena: scratch,    owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data,  flags: [diff]}
@@ -177,30 +181,82 @@ fields:
   - {name: contact_meff_tangent2, dtype: f32, per: contact_slot, arena: scratch, owner: data}
   # Per-slot contact force readout (legacy contact_force_, {Fn,Ft1,Ft2} per slot).
   - {name: contact_force,   dtype: f32,  per: contact_slot,  arena: scratch, owner: data, elem: 3, flags: [readout]}
+  # M4 UNION-family manifold scratch: up to 4 points per contact slot (box x
+  # plane emits a 4-corner patch; sphere classes emit 1). Kept SEPARATE from the
+  # fused-family contact_* arrays above so the byte-exact ported foot kernels
+  # keep their exact 1-point-per-slot layout.
+  - {name: ucontact_count,  dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
+  - {name: ucontact_point,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_normal, dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_depth,  dtype: f32,  per: contact_slot,  arena: scratch, owner: data, elem: 4}
 
   # =========================================================================
-  # UNIFIED ROW SOLVE — DATA. rows / lambda / m_inv / contact_count above.
-  # row_sides: per-row side descriptors (2 sides x packed ints). chain_jacobian:
-  # the articulation contact chain Jacobian columns. meff: per-row effective mass.
-  # row_count: the row watermark.
+  # UNIFIED ROW SOLVE (M4, union CSR family) — DATA.
+  # urows: the per-row-slot NkRow record (src/nk/solve/nk_row.hpp, 32 f32 =
+  # 128 B: flags/group/rhs/R/bounds/mu + both reaction sides incl. their 6-dof
+  # contact Jacobians). Written by AssembleRows, read/λ-companion by
+  # SolveRowsBlockIsland. chain_jacobian: per-(row_slot x dof) articulation
+  # chain Jacobian row J (COALESCED row-major [slot*dof_stride + k] — within a
+  # color, consecutive ROWS are touched by consecutive threads, and within one
+  # row's serial k-loop the reads stream a contiguous 51-float line, the same
+  # access shape the legacy kernels had). row_minv_jt: the PRECOMPUTED
+  # w = M^-1 J^T companion (same layout) — assembly-time hoisting of the
+  # ArticulationApplyImpulse inner loop (bit-equal: same inner products, same
+  # order, computed once instead of per iteration). row_meff: per-row effective
+  # mass 1/(invA+invB+R) (assembly-time hoisting of ComputeCompliantEffective-
+  # Mass, constant across iterations). row_cj_*: the chain-Jacobian kernel
+  # inputs gathered per row slot (contact link / world point / row direction).
+  # qdot_flat: the per-env flat prefix-sum joint-velocity vector (packed from
+  # link_velocity[root] + qdot before the solve, scattered back after).
+  # row_count: the per-env ACTIVE row watermark.
   # =========================================================================
-  - {name: row_count,       dtype: u32, per: env,      arena: scratch,    owner: data}
-  - {name: row_sides,       dtype: u32, per: row_slot, arena: scratch,    owner: data, elem: 4}
-  - {name: chain_jacobian,  dtype: f32, per: row_slot, arena: scratch,    owner: data, elem: 6}
-  - {name: row_meff,        dtype: f32, per: row_slot, arena: scratch,    owner: data}
-  - {name: row_material,    dtype: u32, per: row_slot, arena: scratch,    owner: data}
+  - {name: row_count,       dtype: u32,  per: env,      arena: scratch,    owner: data}
+  - {name: urows,           dtype: f32,  per: row_slot, arena: scratch,    owner: data, elem: 32}
+  - {name: chain_jacobian,  dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
+  - {name: row_minv_jt,     dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
+  - {name: row_meff,        dtype: f32,  per: row_slot, arena: scratch,    owner: data}
+  - {name: row_cj_link,     dtype: u32,  per: row_slot, arena: scratch,    owner: data}
+  - {name: row_cj_point,    dtype: vec3, per: row_slot, arena: scratch,    owner: data}
+  - {name: row_cj_dir,      dtype: vec3, per: row_slot, arena: scratch,    owner: data}
+  - {name: qdot_flat,       dtype: f32,  per: dof,      arena: scratch,    owner: data}
   # Unfactored CRBA M tile (legacy m_; m_inv above is its LDL^T inverse) + the
   # CRBA composite-inertia scratch (legacy composite_).
   - {name: m,                      dtype: f32,   per: env_dof2, arena: scratch, owner: data}
   - {name: link_composite_inertia, dtype: mat36, per: link,     arena: scratch, owner: data}
 
   # =========================================================================
-  # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct/
-  # Reset by nk::SolveSchedule (row_scheduler migration in M4), device-resident,
-  # never recomputed per step (plan §3.4). Sized by row_slot.
+  # UNION CONTACT TEMPLATE + LIVE TOGGLES (M4) — the union-family contact-pair
+  # tables. union_slots: GLOBAL per-env template table (shared by all envs),
+  # 16 packed f32 per contact slot {class, local_link/body, p0..p13} — see
+  # nk::UnionSlot (src/nk/model/model.hpp) for the packing. hull_verts: the
+  # mesh-local convex-hull vertex pool (cup), xyz-packed. dof_to_link /
+  # dof_to_component: the flat-DOF -> (template-local link, base component)
+  # maps (the DofIndexOf prefix-sum inverse; component == ~0u for scalar
+  # joints). table_enabled: the per-env LIVE cup x table emission toggle
+  # (DATA — SetTableEnabled is a field write, never a graph rebuild).
   # =========================================================================
-  - {name: island_row_offsets,    dtype: u32, per: row_slot, arena: persistent, owner: model}
-  - {name: island_color_segments, dtype: u32, per: row_slot, arena: persistent, owner: model}
+  - {name: union_slots,      dtype: f32, per: scalar, count: "max_contacts_per_env*16", arena: persistent, owner: model}
+  - {name: hull_verts,       dtype: f32, per: scalar, count: "max_hull_verts*3",        arena: persistent, owner: model}
+  - {name: dof_to_link,      dtype: u32, per: dof,    arena: persistent, owner: model}
+  - {name: dof_to_component, dtype: u32, per: dof,    arena: persistent, owner: model}
+  - {name: table_enabled,    dtype: u32, per: env,    arena: persistent, owner: data}
+
+  # =========================================================================
+  # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct
+  # by nk::SolveSchedule (the row_scheduler algorithms migrated to
+  # src/nk/solve/schedule.cpp) over MAX-CAPACITY row slots, uploaded once,
+  # device-resident, never recomputed per step (plan §3.4). Layout:
+  #   row_order[k]              : global row-slot ids, grouped per island, in
+  #                               ascending (color, intra-color) order.
+  #   island_color_segments[s]  : {row_order offset, row count} u32 pair per
+  #                               color segment.
+  #   island_row_offsets[i]     : {segment offset, segment count, flags, env}
+  #                               u32 quad per island (flags bit0 = island has
+  #                               articulation rows -> owns the qdot scatter).
+  # Capacities: islands <= row slots, segments <= row slots.
+  # =========================================================================
+  - {name: island_row_offsets,    dtype: u32, per: row_slot, arena: persistent, owner: model, elem: 4}
+  - {name: island_color_segments, dtype: u32, per: row_slot, arena: persistent, owner: model, elem: 2}
   - {name: row_order,             dtype: u32, per: row_slot, arena: persistent, owner: model}
 
   # =========================================================================
