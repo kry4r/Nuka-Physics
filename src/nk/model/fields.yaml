@@ -1,0 +1,205 @@
+# ===========================================================================
+# nk field registry — THE single source of truth for the device field layout.
+# Consumed by tools/codegen/fields/gen_fields.py -> src/nk/model/generated/
+#   field_ids.hpp / views.hpp / arena_layout.hpp / dlpack_table.hpp
+# (regen via tools/codegen/regen.py; the generated headers are committed).
+#
+# Plan §3.3. Each field is one named device array. The table below is the 1:1
+# transcription of the production stepping paths' device state:
+#   * ArticulationDeviceState (runtime/articulation/articulation_state.hpp) —
+#     Featherstone ABA / FK / CRBA state (per dof / per link / per env).
+#   * runtime::rigid::BodyState (runtime/rigid/body_state.hpp) — movable rigid
+#     body SoA (per body).
+#   * XpbdWorld (runtime/soft/xpbd_world.hpp) — XPBD particle + 4 constraint
+#     families (per particle / per dist_con / per bend_con / per vol_con / ...).
+#   * PbfWorld (runtime/fluid/pbf_world.hpp) — PBF particle SoA (per particle).
+#   * unified row solve — contacts / rows / sides / lambda warm-start / m_inv /
+#     the SolveSchedule island tables / contact_count + row_count watermarks.
+#   * material buckets (CookedContactParamTable upgrade, Isaac bucketing) +
+#     per-body bucket index + RNG state for domain randomization.
+#
+# ---------------------------------------------------------------------------
+# schema (plan §3.3 + the explicit `owner` key M3a adds):
+#   name   : C identifier — the View member name + the FieldId enumerator stem.
+#   dtype  : f32 | u32 | u64 | vec3 | quat | transform | spatial6 | mat36
+#            (pointer element type; transform/quat/vec3/spatial6/mat36 map to
+#             the engine math types via views.hpp typedefs.)
+#   per    : the count-unit the array is sized by —
+#            env | dof | link | body | contact_slot | row_slot | particle |
+#            dist_con | bend_con | vol_con | shape_match_slot | scalar
+#            (plus the §3.3 examples' env_dof2). `scalar` uses an explicit count.
+#   arena  : persistent | scratch | tape   (which of the 3 phi Buffers it lives in)
+#   owner  : model | data
+#            model = immutable cook product (topology / templates / capacities),
+#                    packed into the ONE Model device buffer, exposed via ModelView.
+#            data  = mutable per-World state, lives in the Arena, exposed via DataView.
+#            (Inference rule, applied where omitted: arena fields => data;
+#             explicit `owner: model` marks the cook-constant tables. M3a sets it
+#             explicitly on EVERY field for clarity — no inference is relied on.)
+#   flags  : diff (tape-visible / DLPack-diff) | param (randomizable) | readout
+#   elem   : (optional) element multiplier for a packed-array field (e.g. rows=16
+#            floats per row_slot). Default 1.
+#   count  : (optional) explicit element count expression for per: scalar fields.
+# ===========================================================================
+
+schema:
+  dtype: [f32, u32, u64, vec3, quat, transform, spatial6, mat36]
+  per:   [env, dof, link, body, contact_slot, row_slot, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
+  arena: [persistent, scratch, tape]
+  owner: [model, data]
+  flags: [diff, param, readout]
+
+fields:
+  # =========================================================================
+  # §3.3 VERBATIM examples (kept exactly as the plan snippet authored them).
+  # =========================================================================
+  - {name: q,             dtype: f32,       per: dof,          arena: persistent, owner: data,  flags: [diff]}
+  - {name: qdot,          dtype: f32,       per: dof,          arena: persistent, owner: data,  flags: [diff]}
+  - {name: link_pose,     dtype: transform, per: link,         arena: persistent, owner: data}
+  - {name: base_pose,     dtype: transform, per: env,          arena: persistent, owner: data,  flags: [diff]}
+  - {name: body_pose,     dtype: transform, per: body,         arena: persistent, owner: data,  flags: [diff]}
+  - {name: body_inv_mass, dtype: f32,       per: body,         arena: persistent, owner: data,  flags: [param]}
+  - {name: contact_count, dtype: u32,       per: env,          arena: scratch,    owner: data}
+  - {name: rows,          dtype: f32,       per: row_slot,     arena: scratch,    owner: data,  elem: 16}
+  - {name: lambda,        dtype: f32,       per: row_slot,     arena: persistent, owner: data}
+  - {name: m_inv,         dtype: f32,       per: env_dof2,     arena: scratch,    owner: data}
+  - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data,  flags: [diff]}
+  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*8", arena: persistent, owner: data, flags: [param]}
+  - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
+  - {name: link_contact_wrench, dtype: spatial6, per: link,    arena: scratch,    owner: data,  flags: [readout]}
+
+  # =========================================================================
+  # ARTICULATION dynamics state — DATA (mutable per-step Featherstone state).
+  # Source: ArticulationDeviceState (articulation_state.hpp). q/qdot/base_pose/
+  # link_pose already declared above (the §3.3 examples). The rest follow 1:1.
+  # =========================================================================
+  - {name: qddot,                 dtype: f32,       per: dof,  arena: persistent, owner: data}
+  - {name: tau,                   dtype: f32,       per: dof,  arena: persistent, owner: data}
+  - {name: joint_force,           dtype: f32,       per: dof,  arena: scratch,    owner: data}
+  - {name: joint_diagonal,        dtype: f32,       per: dof,  arena: scratch,    owner: data}
+  - {name: link_velocity,         dtype: spatial6,  per: link, arena: persistent, owner: data,  flags: [diff]}
+  - {name: link_acceleration,     dtype: spatial6,  per: link, arena: scratch,    owner: data}
+  - {name: link_velocity_bias,    dtype: spatial6,  per: link, arena: scratch,    owner: data}
+  - {name: link_xup,              dtype: mat36,     per: link, arena: scratch,    owner: data}
+  - {name: link_articulated_I,    dtype: mat36,     per: link, arena: scratch,    owner: data}
+  - {name: link_bias_force,       dtype: spatial6,  per: link, arena: scratch,    owner: data}
+  - {name: link_u_spatial,        dtype: spatial6,  per: link, arena: scratch,    owner: data}
+
+  # =========================================================================
+  # ARTICULATION topology / inertia / templates — MODEL (cook-constant).
+  # Source: ArticulationDeviceState constant arrays + ArticulationCookedTopology.
+  # These are packed into the ONE Model device buffer and exposed via ModelView.
+  # =========================================================================
+  - {name: link_inertia,          dtype: mat36,     per: link, arena: persistent, owner: model}
+  - {name: link_local_pose,       dtype: transform, per: link, arena: persistent, owner: model}
+  - {name: link_inertial_frame,   dtype: transform, per: link, arena: persistent, owner: model}
+  - {name: joint_motion_subspace, dtype: spatial6,  per: link, arena: persistent, owner: model}
+  - {name: joint_axis,            dtype: vec3,      per: link, arena: persistent, owner: model}
+  - {name: parent_offset,         dtype: vec3,      per: link, arena: persistent, owner: model}
+  - {name: joint_type,            dtype: u32,       per: link, arena: persistent, owner: model}
+  - {name: parent_link,           dtype: u32,       per: link, arena: persistent, owner: model}
+  - {name: link_body,             dtype: u32,       per: link, arena: persistent, owner: model}
+  - {name: link_to_articulation,  dtype: u32,       per: link, arena: persistent, owner: model}
+  - {name: joint_damping,         dtype: f32,       per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_armature,        dtype: f32,       per: link, arena: persistent, owner: model, flags: [param]}
+  # per-env articulation offset tables (one entry per articulation; here keyed by
+  # env since the cook replicates exactly one articulation template per env).
+  - {name: articulation_link_count,  dtype: u32, per: env, arena: persistent, owner: model}
+  - {name: articulation_link_offset, dtype: u32, per: env, arena: persistent, owner: model}
+
+  # =========================================================================
+  # RIGID BODY SoA — DATA. Source: runtime::rigid::BodyState. body_pose +
+  # body_inv_mass declared above (§3.3). The remaining BodyState members follow.
+  # body_pose carries position+orientation; here we keep the linear/angular vel,
+  # accumulated force/torque, and the inverse-inertia diag.
+  # =========================================================================
+  - {name: body_linear_velocity,  dtype: vec3, per: body, arena: persistent, owner: data, flags: [diff]}
+  - {name: body_angular_velocity, dtype: vec3, per: body, arena: persistent, owner: data, flags: [diff]}
+  - {name: body_force,            dtype: vec3, per: body, arena: scratch,    owner: data}
+  - {name: body_torque,           dtype: vec3, per: body, arena: scratch,    owner: data}
+  - {name: body_inv_inertia,      dtype: vec3, per: body, arena: persistent, owner: data, flags: [param]}
+
+  # =========================================================================
+  # BROADPHASE / NARROWPHASE scratch — DATA. AABB set + candidate pairs +
+  # contact manifold. row_count is the row watermark companion of contact_count.
+  # =========================================================================
+  - {name: body_aabb_lo,    dtype: vec3, per: body,          arena: scratch, owner: data}
+  - {name: body_aabb_hi,    dtype: vec3, per: body,          arena: scratch, owner: data}
+  - {name: pair_count,      dtype: u32,  per: env,           arena: scratch, owner: data}
+  - {name: candidate_pairs, dtype: u32,  per: contact_slot,  arena: scratch, owner: data, elem: 2}
+  - {name: contact_point,   dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
+  - {name: contact_normal,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
+  - {name: contact_depth,   dtype: f32,  per: contact_slot,  arena: scratch, owner: data}
+  - {name: contact_tangent, dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 2}
+  - {name: contact_material,dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
+
+  # =========================================================================
+  # UNIFIED ROW SOLVE — DATA. rows / lambda / m_inv / contact_count above.
+  # row_sides: per-row side descriptors (2 sides x packed ints). chain_jacobian:
+  # the articulation contact chain Jacobian columns. meff: per-row effective mass.
+  # row_count: the row watermark.
+  # =========================================================================
+  - {name: row_count,       dtype: u32, per: env,      arena: scratch,    owner: data}
+  - {name: row_sides,       dtype: u32, per: row_slot, arena: scratch,    owner: data, elem: 4}
+  - {name: chain_jacobian,  dtype: f32, per: row_slot, arena: scratch,    owner: data, elem: 6}
+  - {name: row_meff,        dtype: f32, per: row_slot, arena: scratch,    owner: data}
+  - {name: row_material,    dtype: u32, per: row_slot, arena: scratch,    owner: data}
+
+  # =========================================================================
+  # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct/
+  # Reset by nk::SolveSchedule (row_scheduler migration in M4), device-resident,
+  # never recomputed per step (plan §3.4). Sized by row_slot.
+  # =========================================================================
+  - {name: island_row_offsets,    dtype: u32, per: row_slot, arena: persistent, owner: model}
+  - {name: island_color_segments, dtype: u32, per: row_slot, arena: persistent, owner: model}
+  - {name: row_order,             dtype: u32, per: row_slot, arena: persistent, owner: model}
+
+  # =========================================================================
+  # PARTICLE (XPBD soft) — DATA. Source: XpbdWorld. particle_pos above (§3.3).
+  # =========================================================================
+  - {name: particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
+  - {name: particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data, flags: [diff]}
+  - {name: particle_inv_mass, dtype: f32,  per: particle, arena: persistent, owner: data, flags: [param]}
+
+  # --- XPBD DISTANCE constraints (per dist_con) ---
+  - {name: dist_particle_a,    dtype: u32, per: dist_con, arena: persistent, owner: model}
+  - {name: dist_particle_b,    dtype: u32, per: dist_con, arena: persistent, owner: model}
+  - {name: dist_rest_length,   dtype: f32, per: dist_con, arena: persistent, owner: model}
+  - {name: dist_compliance,    dtype: f32, per: dist_con, arena: persistent, owner: model, flags: [param]}
+  - {name: dist_lambda,        dtype: f32, per: dist_con, arena: persistent, owner: data}
+
+  # --- XPBD BEND constraints (per bend_con; 4 particles + 4 gradient vecs) ---
+  - {name: bend_particles,   dtype: u32,  per: bend_con, arena: persistent, owner: model, elem: 4}
+  - {name: bend_gradients,   dtype: vec3, per: bend_con, arena: persistent, owner: model, elem: 4}
+  - {name: bend_compliance,  dtype: f32,  per: bend_con, arena: persistent, owner: model, flags: [param]}
+  - {name: bend_lambda,      dtype: f32,  per: bend_con, arena: persistent, owner: data}
+
+  # --- XPBD VOLUME constraints (per vol_con; 4 particles) ---
+  - {name: vol_particles,    dtype: u32, per: vol_con, arena: persistent, owner: model, elem: 4}
+  - {name: vol_rest_times6,  dtype: f32, per: vol_con, arena: persistent, owner: model}
+  - {name: vol_compliance,   dtype: f32, per: vol_con, arena: persistent, owner: model, flags: [param]}
+  - {name: vol_lambda,       dtype: f32, per: vol_con, arena: persistent, owner: data}
+
+  # =========================================================================
+  # PARTICLE (PBF fluid) — DATA. Source: PbfWorld. The fluid shares particle_pos/
+  # particle_vel with XPBD; PBF-specific scratch is predicted pos / density /
+  # lambda / position deltas.
+  # =========================================================================
+  - {name: pbf_predicted_pos,  dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: pbf_position_delta, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: pbf_density,        dtype: f32,  per: particle, arena: scratch, owner: data}
+  - {name: pbf_lambda,         dtype: f32,  per: particle, arena: scratch, owner: data}
+
+  # =========================================================================
+  # DOMAIN RANDOMIZATION / RNG — DATA. mat_buckets/mat_index above (§3.3).
+  # rng_state: per-env counter-based RNG state (Philox seed/counter).
+  # =========================================================================
+  - {name: rng_state,    dtype: u64, per: env, arena: persistent, owner: data, flags: [param]}
+
+  # =========================================================================
+  # READOUT / RL substrate — DATA. link_contact_wrench above (§3.3).
+  # env_status: per-env status bits (overflow / termination), readable via
+  # ExportObs. obs_buffer: the flat per-env whole-body observation export.
+  # =========================================================================
+  - {name: env_status,   dtype: u32, per: env, arena: scratch, owner: data, flags: [readout]}
+  - {name: obs_buffer,   dtype: f32, per: env, arena: scratch, owner: data, flags: [readout], elem: 64}

@@ -647,6 +647,11 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_phi2_smoke_test
         PRIVATE
             nuka_phi2
+            # M3a: the nk core (Model/Data/World) + CookToModel for the
+            # NkWorldSkeleton acceptance case. nuka_scene_cook transitively pulls
+            # nuka_nk + nuka_scene + nuka_articulation.
+            nuka_nk
+            nuka_scene_cook
             GTest::gtest_main
     )
 

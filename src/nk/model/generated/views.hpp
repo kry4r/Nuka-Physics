@@ -1,0 +1,123 @@
+// GENERATED — do not edit; regen via tools/codegen/regen.py
+// Source of truth: src/nk/model/fields.yaml
+
+#pragma once
+
+// The REAL definitions of nuka::phi::ModelView / nuka::phi::DataView that
+// phi/backend.hpp only FORWARD-DECLARES. Ops receive these by const-ref and
+// read typed device pointers, one per field. Clean owner split: ModelView
+// carries the cook-constant model tables; DataView carries the mutable per-
+// World state. Both are plain aggregates of raw device pointers (filled by
+// nk::Model::UploadTo and nk::Data respectively).
+
+#include <cstdint>
+
+#include "math/vec3.hpp"
+#include "math/quat.hpp"
+#include "math/transform.hpp"
+
+namespace nuka::nk {
+// Spatial / matrix element types for the articulation device state
+// (float[6] spatial vectors, float[36] 6x6 spatial matrices). Trivial
+// aggregates so a typed pointer indexes one element per link/row.
+struct Spatial6 { float v[6]; };
+struct Mat36    { float m[36]; };
+} // namespace nuka::nk
+
+namespace nuka::phi {
+
+// Model-owned, cook-constant tables. Pointers index into the ONE Model
+// device buffer (nk::Model::UploadTo packs + 256B-aligns the sections).
+struct ModelView {
+    ::nuka::nk::Mat36* link_inertia = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::math::Transform* link_local_pose = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::math::Transform* link_inertial_frame = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::nk::Spatial6* joint_motion_subspace = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::math::Vec3* joint_axis = nullptr;  // per:link arena:persistent owner:model
+    ::nuka::math::Vec3* parent_offset = nullptr;  // per:link arena:persistent owner:model
+    uint32_t* joint_type = nullptr;  // per:link arena:persistent owner:model
+    uint32_t* parent_link = nullptr;  // per:link arena:persistent owner:model
+    uint32_t* link_body = nullptr;  // per:link arena:persistent owner:model
+    uint32_t* link_to_articulation = nullptr;  // per:link arena:persistent owner:model
+    float* joint_damping = nullptr;  // per:link arena:persistent owner:model flags:[param]
+    float* joint_armature = nullptr;  // per:link arena:persistent owner:model flags:[param]
+    uint32_t* articulation_link_count = nullptr;  // per:env arena:persistent owner:model
+    uint32_t* articulation_link_offset = nullptr;  // per:env arena:persistent owner:model
+    uint32_t* island_row_offsets = nullptr;  // per:row_slot arena:persistent owner:model
+    uint32_t* island_color_segments = nullptr;  // per:row_slot arena:persistent owner:model
+    uint32_t* row_order = nullptr;  // per:row_slot arena:persistent owner:model
+    uint32_t* dist_particle_a = nullptr;  // per:dist_con arena:persistent owner:model
+    uint32_t* dist_particle_b = nullptr;  // per:dist_con arena:persistent owner:model
+    float* dist_rest_length = nullptr;  // per:dist_con arena:persistent owner:model
+    float* dist_compliance = nullptr;  // per:dist_con arena:persistent owner:model flags:[param]
+    uint32_t* bend_particles = nullptr;  // per:bend_con arena:persistent owner:model elem:4
+    ::nuka::math::Vec3* bend_gradients = nullptr;  // per:bend_con arena:persistent owner:model elem:4
+    float* bend_compliance = nullptr;  // per:bend_con arena:persistent owner:model flags:[param]
+    uint32_t* vol_particles = nullptr;  // per:vol_con arena:persistent owner:model elem:4
+    float* vol_rest_times6 = nullptr;  // per:vol_con arena:persistent owner:model
+    float* vol_compliance = nullptr;  // per:vol_con arena:persistent owner:model flags:[param]
+};
+
+// Data-owned, mutable per-World state. Pointers index into the nk::Arena
+// (Persistent / Scratch / Tape phi Buffers), env-major.
+struct DataView {
+    float* q = nullptr;  // per:dof arena:persistent owner:data flags:[diff]
+    float* qdot = nullptr;  // per:dof arena:persistent owner:data flags:[diff]
+    ::nuka::math::Transform* link_pose = nullptr;  // per:link arena:persistent owner:data
+    ::nuka::math::Transform* base_pose = nullptr;  // per:env arena:persistent owner:data flags:[diff]
+    ::nuka::math::Transform* body_pose = nullptr;  // per:body arena:persistent owner:data flags:[diff]
+    float* body_inv_mass = nullptr;  // per:body arena:persistent owner:data flags:[param]
+    uint32_t* contact_count = nullptr;  // per:env arena:scratch owner:data
+    float* rows = nullptr;  // per:row_slot arena:scratch owner:data elem:16
+    float* lambda = nullptr;  // per:row_slot arena:persistent owner:data
+    float* m_inv = nullptr;  // per:env_dof2 arena:scratch owner:data
+    ::nuka::math::Vec3* particle_pos = nullptr;  // per:particle arena:persistent owner:data flags:[diff]
+    float* mat_buckets = nullptr;  // per:scalar arena:persistent owner:data count:num_buckets*8 flags:[param]
+    uint32_t* mat_index = nullptr;  // per:body arena:persistent owner:data flags:[param]
+    ::nuka::nk::Spatial6* link_contact_wrench = nullptr;  // per:link arena:scratch owner:data flags:[readout]
+    float* qddot = nullptr;  // per:dof arena:persistent owner:data
+    float* tau = nullptr;  // per:dof arena:persistent owner:data
+    float* joint_force = nullptr;  // per:dof arena:scratch owner:data
+    float* joint_diagonal = nullptr;  // per:dof arena:scratch owner:data
+    ::nuka::nk::Spatial6* link_velocity = nullptr;  // per:link arena:persistent owner:data flags:[diff]
+    ::nuka::nk::Spatial6* link_acceleration = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Spatial6* link_velocity_bias = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Mat36* link_xup = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Mat36* link_articulated_I = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Spatial6* link_bias_force = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Spatial6* link_u_spatial = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::math::Vec3* body_linear_velocity = nullptr;  // per:body arena:persistent owner:data flags:[diff]
+    ::nuka::math::Vec3* body_angular_velocity = nullptr;  // per:body arena:persistent owner:data flags:[diff]
+    ::nuka::math::Vec3* body_force = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* body_torque = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* body_inv_inertia = nullptr;  // per:body arena:persistent owner:data flags:[param]
+    ::nuka::math::Vec3* body_aabb_lo = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* body_aabb_hi = nullptr;  // per:body arena:scratch owner:data
+    uint32_t* pair_count = nullptr;  // per:env arena:scratch owner:data
+    uint32_t* candidate_pairs = nullptr;  // per:contact_slot arena:scratch owner:data elem:2
+    ::nuka::math::Vec3* contact_point = nullptr;  // per:contact_slot arena:scratch owner:data
+    ::nuka::math::Vec3* contact_normal = nullptr;  // per:contact_slot arena:scratch owner:data
+    float* contact_depth = nullptr;  // per:contact_slot arena:scratch owner:data
+    ::nuka::math::Vec3* contact_tangent = nullptr;  // per:contact_slot arena:scratch owner:data elem:2
+    uint32_t* contact_material = nullptr;  // per:contact_slot arena:scratch owner:data
+    uint32_t* row_count = nullptr;  // per:env arena:scratch owner:data
+    uint32_t* row_sides = nullptr;  // per:row_slot arena:scratch owner:data elem:4
+    float* chain_jacobian = nullptr;  // per:row_slot arena:scratch owner:data elem:6
+    float* row_meff = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* row_material = nullptr;  // per:row_slot arena:scratch owner:data
+    ::nuka::math::Vec3* particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
+    ::nuka::math::Vec3* particle_vel = nullptr;  // per:particle arena:persistent owner:data flags:[diff]
+    float* particle_inv_mass = nullptr;  // per:particle arena:persistent owner:data flags:[param]
+    float* dist_lambda = nullptr;  // per:dist_con arena:persistent owner:data
+    float* bend_lambda = nullptr;  // per:bend_con arena:persistent owner:data
+    float* vol_lambda = nullptr;  // per:vol_con arena:persistent owner:data
+    ::nuka::math::Vec3* pbf_predicted_pos = nullptr;  // per:particle arena:scratch owner:data
+    ::nuka::math::Vec3* pbf_position_delta = nullptr;  // per:particle arena:scratch owner:data
+    float* pbf_density = nullptr;  // per:particle arena:scratch owner:data
+    float* pbf_lambda = nullptr;  // per:particle arena:scratch owner:data
+    uint64_t* rng_state = nullptr;  // per:env arena:persistent owner:data flags:[param]
+    uint32_t* env_status = nullptr;  // per:env arena:scratch owner:data flags:[readout]
+    float* obs_buffer = nullptr;  // per:env arena:scratch owner:data elem:64 flags:[readout]
+};
+
+} // namespace nuka::phi

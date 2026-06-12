@@ -585,6 +585,13 @@ def render_collidables(collidables: list[Collidable], templates_dir: Path, outpu
     return [registry]
 
 
+# M3a: the nk field-registry pass. ADDITIVE + fully isolated from the row /
+# collidable passes above (separate source yaml, separate generator module,
+# separate output dir). Wired here so `regen.py` is the single regen entry point.
+DEFAULT_FIELDS_YAML = REPO_ROOT / "src" / "nk" / "model" / "fields.yaml"
+DEFAULT_FIELDS_OUTPUT_DIR = REPO_ROOT / "src" / "nk" / "model" / "generated"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
@@ -593,6 +600,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--collidable-schema", type=Path, default=DEFAULT_COLLIDABLE_SCHEMA)
     parser.add_argument("--collidable-classes-dir", type=Path, default=DEFAULT_COLLIDABLE_CLASSES_DIR)
+    parser.add_argument("--fields", type=Path, default=DEFAULT_FIELDS_YAML)
+    parser.add_argument("--fields-output-dir", type=Path, default=DEFAULT_FIELDS_OUTPUT_DIR)
     return parser.parse_args(argv)
 
 
@@ -606,6 +615,19 @@ def main(argv: list[str]) -> int:
         # v0.8 C2a: collidable-type registry pass (additive; isolated dir/schema).
         collidables = load_collidables(args.collidable_schema, args.collidable_classes_dir)
         outputs += render_collidables(collidables, args.templates_dir, args.output_dir)
+        # M3a: the nk field-registry pass (additive; isolated source/output). Lazy
+        # import so the row/collidable passes never depend on the fields module.
+        # Its GenError subclasses Exception; we re-raise it as a CodegenError so
+        # the existing diagnostic + exit-1 contract is preserved.
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "nk_gen_fields", CODEGEN_DIR / "fields" / "gen_fields.py")
+        _gen_fields = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_gen_fields)
+        try:
+            outputs += _gen_fields.generate(args.fields, args.fields_output_dir)
+        except _gen_fields.GenError as exc:
+            raise CodegenError(str(exc)) from exc
     except (CodegenError, jinja2.TemplateError) as exc:
         print(exc, file=sys.stderr)
         return 1

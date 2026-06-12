@@ -1,0 +1,137 @@
+// ---------------------------------------------------------------------------
+// nk::Data implementation (plan §3.3).
+// ---------------------------------------------------------------------------
+
+#include "nk/data/data.hpp"
+
+#include "nk/model/model.hpp"   // ModelCapacities
+
+namespace nuka::nk {
+
+namespace {
+
+// Bind one data-owned field's device pointer into the DataView by FieldId. The
+// switch is exhaustive over the data-owned fields; a model-owned id falls to the
+// default (those are ModelView members, not here).
+void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
+    switch (id) {
+        case FieldId::Q:                   v.q = static_cast<float*>(p); break;
+        case FieldId::Qdot:                v.qdot = static_cast<float*>(p); break;
+        case FieldId::LinkPose:            v.link_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::BasePose:            v.base_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::BodyPose:            v.body_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::BodyInvMass:         v.body_inv_mass = static_cast<float*>(p); break;
+        case FieldId::ContactCount:        v.contact_count = static_cast<uint32_t*>(p); break;
+        case FieldId::Rows:                v.rows = static_cast<float*>(p); break;
+        case FieldId::Lambda:              v.lambda = static_cast<float*>(p); break;
+        case FieldId::MInv:                v.m_inv = static_cast<float*>(p); break;
+        case FieldId::ParticlePos:         v.particle_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::MatBuckets:          v.mat_buckets = static_cast<float*>(p); break;
+        case FieldId::MatIndex:            v.mat_index = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkContactWrench:   v.link_contact_wrench = static_cast<Spatial6*>(p); break;
+        case FieldId::Qddot:               v.qddot = static_cast<float*>(p); break;
+        case FieldId::Tau:                 v.tau = static_cast<float*>(p); break;
+        case FieldId::JointForce:          v.joint_force = static_cast<float*>(p); break;
+        case FieldId::JointDiagonal:       v.joint_diagonal = static_cast<float*>(p); break;
+        case FieldId::LinkVelocity:        v.link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::LinkAcceleration:    v.link_acceleration = static_cast<Spatial6*>(p); break;
+        case FieldId::LinkVelocityBias:    v.link_velocity_bias = static_cast<Spatial6*>(p); break;
+        case FieldId::LinkXup:             v.link_xup = static_cast<Mat36*>(p); break;
+        case FieldId::LinkArticulatedI:    v.link_articulated_I = static_cast<Mat36*>(p); break;
+        case FieldId::LinkBiasForce:       v.link_bias_force = static_cast<Spatial6*>(p); break;
+        case FieldId::LinkUSpatial:        v.link_u_spatial = static_cast<Spatial6*>(p); break;
+        case FieldId::BodyLinearVelocity:  v.body_linear_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyAngularVelocity: v.body_angular_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyForce:           v.body_force = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyTorque:          v.body_torque = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyInvInertia:      v.body_inv_inertia = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyAabbLo:          v.body_aabb_lo = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyAabbHi:          v.body_aabb_hi = static_cast<math::Vec3*>(p); break;
+        case FieldId::PairCount:           v.pair_count = static_cast<uint32_t*>(p); break;
+        case FieldId::CandidatePairs:      v.candidate_pairs = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactPoint:        v.contact_point = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactNormal:       v.contact_normal = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactDepth:        v.contact_depth = static_cast<float*>(p); break;
+        case FieldId::ContactTangent:      v.contact_tangent = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactMaterial:     v.contact_material = static_cast<uint32_t*>(p); break;
+        case FieldId::RowCount:            v.row_count = static_cast<uint32_t*>(p); break;
+        case FieldId::RowSides:            v.row_sides = static_cast<uint32_t*>(p); break;
+        case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;
+        case FieldId::RowMeff:             v.row_meff = static_cast<float*>(p); break;
+        case FieldId::RowMaterial:         v.row_material = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticlePrevPos:     v.particle_prev_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleVel:         v.particle_vel = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleInvMass:     v.particle_inv_mass = static_cast<float*>(p); break;
+        case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
+        case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
+        case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;
+        case FieldId::PbfPredictedPos:     v.pbf_predicted_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::PbfPositionDelta:    v.pbf_position_delta = static_cast<math::Vec3*>(p); break;
+        case FieldId::PbfDensity:          v.pbf_density = static_cast<float*>(p); break;
+        case FieldId::PbfLambda:           v.pbf_lambda = static_cast<float*>(p); break;
+        case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
+        case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;
+        case FieldId::ObsBuffer:           v.obs_buffer = static_cast<float*>(p); break;
+        default: break;  // model-owned field id: not a DataView member.
+    }
+}
+
+}  // namespace
+
+phi::Status Data::Allocate(phi::BufferType* bt, const ModelCapacities& caps,
+                           phi::DataView* out_view) {
+    const phi::Status s = arena_.Allocate(bt, caps);
+    if (s != phi::Status::Ok) {
+        return s;
+    }
+    if (out_view != nullptr) {
+        FillView(out_view);
+    }
+    return phi::Status::Ok;
+}
+
+void Data::FillView(phi::DataView* out_view) const {
+    if (out_view == nullptr) {
+        return;
+    }
+    *out_view = phi::DataView{};
+    for (const Arena::Segment& seg : arena_.Segments()) {
+        BindDataPointer(*out_view, seg.field, arena_.Ptr(seg.field));
+    }
+}
+
+bool Data::Snapshot() {
+    phi::Buffer* p = arena_.PersistentBuffer();
+    if (p == nullptr) {
+        return false;
+    }
+    // Sum the Persistent segments' span (offset 0 .. last segment end). The arena
+    // buffer is exactly arena_bytes_[Persistent]; copy the whole buffer span the
+    // segments cover. We reconstruct the span from the segment table.
+    uint64_t span = 0;
+    for (const Arena::Segment& s : arena_.Segments()) {
+        if (s.arena == 0) {  // Persistent
+            const uint64_t end = s.offset + s.bytes;
+            if (end > span) span = end;
+        }
+    }
+    if (span == 0) {
+        snapshot_persistent_.assign(256, 0u);  // empty-but-allocated marker.
+        phi::BufferDownload(p, snapshot_persistent_.data(), 0, 256);
+        return true;
+    }
+    snapshot_persistent_.assign(span, 0u);
+    phi::BufferDownload(p, snapshot_persistent_.data(), 0, span);
+    return true;
+}
+
+bool Data::Restore() {
+    phi::Buffer* p = arena_.PersistentBuffer();
+    if (p == nullptr || snapshot_persistent_.empty()) {
+        return false;
+    }
+    phi::BufferUpload(p, snapshot_persistent_.data(), 0, snapshot_persistent_.size());
+    return true;
+}
+
+} // namespace nuka::nk
