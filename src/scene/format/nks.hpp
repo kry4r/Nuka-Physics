@@ -8,14 +8,18 @@
 // (<name>.nka) holding the heavy mesh/hull/SDF/texture bytes the JSON references
 // via AssetRef strings ("foo.nka#MESH/0").
 //
-// Save flattens a SceneIR (no imports re-emitted); Load replays the records in a
-// deterministic order (materials, then pre-order bodies, then shapes, joints,
-// actuators, sensors, cameras, lights, filters), reading the .nka mesh chunks
-// back into the record mesh geometry. Same SceneIR => byte-identical .nks + .nka
-// (the M2c roundtrip gate asserts this).
+// Save serializes the SceneGraph in PRE-ORDER as a nested `tree` (no imports
+// re-emitted), reading each node's field VALUES from the record it maps to so
+// cook fidelity is preserved; Load replays the tree in record-id-faithful phases
+// (materials, then bodies, then shapes, then joints, then cameras/lights/
+// actuators, then the record-only sensors / filter sections), reading the .nka
+// mesh chunks back into the record mesh geometry. Same SceneIR => byte-identical
+// .nks + .nka (the M2c roundtrip gate asserts this). See nks.cpp for the
+// record_name<->derived-path inverse and the id-order argument.
 //
 // Determinism guarantees (see json.hpp + nka.hpp):
-//   - tree is pre-order; record-order arrays; insertion-keyed JSON objects.
+//   - tree is pre-order; sibling order == tree tail-append order; insertion-
+//     keyed JSON objects.
 //   - floats render via "%.9g" (binary32-lossless).
 //   - .nka chunk order == first-touch order during Save; deduped by content hash.
 //

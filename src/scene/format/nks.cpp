@@ -1,23 +1,49 @@
 // ---------------------------------------------------------------------------
-// nuka::scene::nks - .nks scene Save/Load implementation (M2c).
+// nuka::scene::nks - .nks scene Save/Load implementation (M2c, §3.7 tree form).
 // ---------------------------------------------------------------------------
-// HOST-ONLY. The SceneIR records are the source of truth for cook fidelity; the
-// facade (tree/ECS) is DERIVED from them by the SceneIR write-through. So Save
-// serializes FLAT record arrays (bodies/shapes/joints/... in dense-id order;
-// the body record `name` carries the full tree path, and bodies are stored in
-// tree pre-order since parents precede children), and Load replays Add* in the
-// SAME order the facade rebuild uses (materials, bodies, shapes, joints,
-// actuators, sensors, cameras, lights, filters). Replaying produces records
-// identical to the saved ones, so the reconstructed facade tree equals the
-// saved tree by construction.
+// HOST-ONLY. The .nks JSON shape follows the owner-amended spec §3.7:
 //
-// NOTE (spec §3.7 deviation, surfaced at M2 review): the plan's .nks contract
-// specifies a NESTED `tree` section ({name, <components...>, children:[]} from
-// a SceneGraph pre-order traversal) plus split physics_materials /
-// render_materials sections. This implementation serializes the flat records
-// instead (full fidelity, tree derivable by projection). Converting the
-// on-disk shape to the nested form is a format-level change tracked for the
-// controller/owner to schedule; the format is versioned (nks_version: 1).
+//   { "nks_version": 1,
+//     "physics_materials": { "<name>": {...} },   // keyed by material name
+//     "render_materials":  { "<name>": {...} },   // keyed by material name
+//     "tree": [ <node>, ... ],                    // SceneGraph pre-order, nested
+//     "sensors": [...], "exclude_pairs": [...], "contact_pairs": [...] }
+//
+// The `tree` section is the SceneGraph serialized in PRE-ORDER via
+// SceneGraph::Traverse: each node is { "name": <single segment>, optional
+// "transform", optional component objects (rigid_body / collision_shape /
+// visual_mesh / joint / actuator / camera / light), "children": [...] }. Sibling
+// order == tree (tail-append) order, so a second Save is byte-identical. Group
+// nodes (path-prefix nodes carrying no component) serialize as {name, children}.
+//
+// FIDELITY: the SceneIR RECORDS remain the cook-fidelity authority. Save walks
+// the tree for STRUCTURE/NAMES/ORDER but reads field VALUES from the record the
+// node maps to (via EntityOfBody/Shape/Joint reverse lookup), so the cook-
+// critical legacy keys (contype/conaffinity/solref/solimp/condim/priority/
+// friction_mu/solmix/margin/gap/decompose_mode + the mesh AssetRef into the
+// sibling .nka) stay on each collision_shape object verbatim.
+//
+// INVERSE (Save<->Load) DESIGN — record_name vs derived path:
+//   ProjectBody splits a body RECORD name on '/' into path-prefix group nodes +
+//   a leaf body node, hung under the parent BODY's node. So a body's DERIVED
+//   path = parent-body-path + '/' + (the record-name segments). On Load we
+//   reconstruct a body's record name by walking up from the body node to (but
+//   excluding) the nearest ancestor BODY node, joining the single segments with
+//   '/'. That reconstructed suffix == the original record name in every case the
+//   importers/Compose produce — EXCEPT when sibling-name dedup renamed a node
+//   (AddEntity auto-suffixes _1/_2). When the derived suffix differs from the
+//   stored original we emit an explicit "record_name" on the body node and Load
+//   prefers it; otherwise name = derived suffix. The SecondSaveByteIdentical and
+//   cook-byte-equality gates enforce this is a true inverse pair.
+//
+// ID ORDER: cook reads Bodies()/Shapes()/Joints() each in dense-id order, so the
+// loaded records must land in the SAME id order as the original. Load replays in
+// the SAME phase order RebuildFacade projects in (materials, then bodies, then
+// shapes, then joints, then cameras/lights/actuators), each phase a pre-order
+// tree walk. Because the importers/Compose add a body then its own shapes/joints
+// before descending, the shapes/joints are grouped by body in body-id order,
+// which equals the per-body pre-order encounter — so the phase-walk reproduces
+// the original dense-id order exactly.
 //
 // Mesh geometry (record mesh_vertices/mesh_indices) is offloaded to the sibling
 // .nka as CMSH (collision) / MESH (visual) chunks, deduped by content hash, and
@@ -39,6 +65,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
@@ -116,15 +143,6 @@ SensorType SensorTypeFromName(const std::string& s) {
     return SensorType::Imu;
 }
 
-const char* LightTypeName(LightType t) {
-    switch (t) {
-        case LightType::Point:       return "point";
-        case LightType::Directional: return "directional";
-        case LightType::Spot:        return "spot";
-        case LightType::Area:        return "area";
-    }
-    return "point";
-}
 LightType LightTypeFromName(const std::string& s) {
     if (s == "point") return LightType::Point;
     if (s == "directional") return LightType::Directional;
@@ -254,6 +272,9 @@ struct MeshSink {
     }
 };
 
+// Serialize a collision/visual shape RECORD into the per-node component object
+// (full cook fidelity: every legacy field stays here verbatim). The node `name`
+// is the geom node's tree name and is set by the caller, not here.
 Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink) {
     Value o = Value::Object();
     o.Set("type", Value::Str(ShapeTypeName(s.type)));
@@ -284,8 +305,26 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink) {
     return o;
 }
 
+// A body's "rigid_body" component object (mass / inertia / parent_id / inertial
+// frame / static flag). parent_id is stored explicitly: the tree carries the
+// kinematic hierarchy structurally, but the cook reads RigidBodyRecord.parent_id
+// directly (ResolveWorldTransform), so it must round-trip verbatim.
+Value SaveRigidBody(const RigidBodyRecord& b) {
+    Value o = Value::Object();
+    o.Set("parent_id", Value::Int(static_cast<int64_t>(b.parent_id)));
+    o.Set("inertial", TransformJson(b.inertial_transform));
+    o.Set("mass", Value::Float(b.mass));
+    o.Set("inertia", Vec3Json(b.inertia));
+    o.Set("is_static", Value::Bool(b.is_static));
+    return o;
+}
+
 Value SaveJoint(const JointRecord& j) {
     Value o = Value::Object();
+    // The joint name is NOT the tree node's name (a joint rides on the CHILD
+    // body's node, or on an auxiliary joint node named after the joint), so it
+    // is stored on the component object itself for an exact record round-trip.
+    o.Set("name", Value::Str(j.name));
     o.Set("type", Value::Str(JointTypeName(j.type)));
     o.Set("parent_body", Value::Int(static_cast<int64_t>(j.parent_body)));
     o.Set("child_body", Value::Int(static_cast<int64_t>(j.child_body)));
@@ -303,6 +342,7 @@ Value SaveJoint(const JointRecord& j) {
 
 Value SaveActuator(const ActuatorRecord& a) {
     Value o = Value::Object();
+    o.Set("name", Value::Str(a.name));
     o.Set("type", Value::Str(ActuatorTypeName(a.type)));
     o.Set("joint_id", Value::Int(static_cast<int64_t>(a.joint_id)));
     o.Set("gain", Value::Float(a.gain));
@@ -320,35 +360,199 @@ Value SaveSensor(const SensorRecord& s) {
     return o;
 }
 
-Value SaveCamera(const CameraRecord& c) {
-    Value o = Value::Object();
-    o.Set("name", Value::Str(c.name));
-    o.Set("attached_body", Value::Int(static_cast<int64_t>(c.attached_body)));
-    o.Set("local", TransformJson(c.local_transform));
-    o.Set("vertical_fov_degrees", Value::Float(c.vertical_fov_degrees));
-    o.Set("near_clip", Value::Float(c.near_clip));
-    o.Set("far_clip", Value::Float(c.far_clip));
-    return o;
-}
+// Cameras / lights serialize from their ECS COMPONENT inline on their own tree
+// node (see SaveNode): the component is a 1:1 projection of the record, the node
+// carries the name, and the attached body is the parent body node — so there is
+// no record-array Save helper for them under the §3.7 tree form.
 
-Value SaveLight(const LightRecord& l) {
+// The authored MaterialRecord (the cook-fidelity authority) carries BOTH render
+// fields (base_color/alpha/roughness/metallic) and a physics field (friction_mu).
+// §3.7 splits these into two keyed sections. We store the record's raw values so
+// Load reconstructs the identical MaterialRecord:
+//   render_materials[name] = {base_color:[r,g,b,a], metallic, roughness}
+//   physics_materials[name] = {static_friction, dynamic_friction}  (== friction_mu)
+// ProjectMaterial maps friction_mu -> both static/dynamic equally, so storing the
+// record value under both (and reading static_friction back into friction_mu) is
+// an exact round-trip — including the <0 "inherit material μ" sentinel.
+Value SaveRenderMaterial(const MaterialRecord& m) {
     Value o = Value::Object();
-    o.Set("name", Value::Str(l.name));
-    o.Set("type", Value::Str(LightTypeName(l.type)));
-    o.Set("attached_body", Value::Int(static_cast<int64_t>(l.attached_body)));
-    o.Set("local", TransformJson(l.local_transform));
-    o.Set("color", Vec3Json(l.color));
-    o.Set("intensity", Value::Float(l.intensity));
-    return o;
-}
-
-Value SaveMaterial(const MaterialRecord& m) {
-    Value o = Value::Object();
-    o.Set("base_color", Vec3Json(m.base_color));
-    o.Set("alpha", Value::Float(m.alpha));
-    o.Set("roughness", Value::Float(m.roughness));
+    Value bc = Value::Array();
+    bc.PushBack(Value::Float(m.base_color.x));
+    bc.PushBack(Value::Float(m.base_color.y));
+    bc.PushBack(Value::Float(m.base_color.z));
+    bc.PushBack(Value::Float(m.alpha));
+    o.Set("base_color", std::move(bc));
     o.Set("metallic", Value::Float(m.metallic));
-    o.Set("friction_mu", Value::Float(m.friction_mu));
+    o.Set("roughness", Value::Float(m.roughness));
+    return o;
+}
+
+Value SavePhysicsMaterial(const MaterialRecord& m) {
+    Value o = Value::Object();
+    o.Set("static_friction", Value::Float(m.friction_mu));
+    o.Set("dynamic_friction", Value::Float(m.friction_mu));
+    return o;
+}
+
+}  // namespace
+
+namespace {
+
+// Reverse maps entity -> record id, plus the record kind a node carries. Built
+// once per Save so the tree walk can fetch the exact record (the cook-fidelity
+// authority) behind each node.
+struct NodeIndex {
+    std::unordered_map<EntityId, BodyId, EntityIdHash>   body;
+    std::unordered_map<EntityId, ShapeId, EntityIdHash>  shape;
+    std::unordered_map<EntityId, JointId, EntityIdHash>  joint;
+    std::unordered_map<EntityId, ActuatorId, EntityIdHash> actuator;
+    std::unordered_map<EntityId, CameraId, EntityIdHash> camera;
+    std::unordered_map<EntityId, LightId, EntityIdHash>  light;
+};
+
+NodeIndex BuildNodeIndex(const SceneIR& scene) {
+    NodeIndex idx;
+    for (BodyId i = 0; i < scene.RigidBodyCount(); ++i) {
+        const EntityId e = scene.EntityOfBody(i);
+        if (e != kInvalidEntity) idx.body.emplace(e, i);
+    }
+    for (ShapeId i = 0; i < scene.ShapeCount(); ++i) {
+        const EntityId e = scene.EntityOfShape(i);
+        if (e != kInvalidEntity) idx.shape.emplace(e, i);
+    }
+    for (JointId i = 0; i < scene.JointCount(); ++i) {
+        const EntityId e = scene.EntityOfJoint(i);
+        if (e != kInvalidEntity) idx.joint.emplace(e, i);
+    }
+    // Actuators / cameras / lights have no EntityOf* accessor; match by component
+    // presence during the tree walk (their fields are self-contained on the node).
+    return idx;
+}
+
+// Walk up from `node` to (but excluding) the nearest ancestor node that maps to
+// a BODY record; join the single segments between them with '/'. That suffix is
+// the body's DERIVED record name (group prefix segments included). Returns ""
+// for a node directly under root with no group prefix only when node==body leaf.
+std::string DerivedBodyName(const SceneGraph& tree, const NodeIndex& idx,
+                            const std::shared_ptr<SceneNode>& body_node) {
+    std::vector<std::string> segs;
+    segs.push_back(body_node->name);
+    auto cur = tree.ParentOf(body_node);
+    while (cur && cur != tree.Root()) {
+        const EntityId e = cur->entity;
+        if (idx.body.find(e) != idx.body.end()) break;  // ancestor body: stop
+        segs.push_back(cur->name);
+        cur = tree.ParentOf(cur);
+    }
+    std::string out;
+    for (size_t i = segs.size(); i-- > 0;) {
+        if (!out.empty()) out += '/';
+        out += segs[i];
+    }
+    return out;
+}
+
+// Serialize one tree node (pre-order, recursive). Reads VALUES from the records
+// the node maps to; structure/names/order from the tree.
+Value SaveNode(const SceneIR& scene, const NodeIndex& idx, MeshSink& sink,
+               const std::shared_ptr<SceneNode>& node) {
+    const SceneGraph& tree = scene.Tree();
+    const Registry& ecs = scene.Ecs();
+    const EntityId e = node->entity;
+
+    Value o = Value::Object();
+    o.Set("name", Value::Str(node->name));
+
+    // -- rigid_body (+ optional record_name when dedup diverged) ------------
+    const auto bit = idx.body.find(e);
+    if (bit != idx.body.end()) {
+        const RigidBodyRecord& b = scene.GetBody(bit->second);
+        // record_name only when the tree-derived suffix differs from the stored
+        // record name (sibling-dedup case). Else the derived path reconstructs it.
+        const std::string derived = DerivedBodyName(tree, idx, node);
+        if (derived != b.name) {
+            o.Set("record_name", Value::Str(b.name));
+        }
+        o.Set("transform", TransformJson(b.local_transform));
+        o.Set("rigid_body", SaveRigidBody(b));
+    }
+
+    // -- collision_shape / visual_mesh -------------------------------------
+    const auto sit = idx.shape.find(e);
+    if (sit != idx.shape.end()) {
+        const CollisionShapeRecord& s = scene.GetShape(sit->second);
+        Value shape = SaveShape(s, sink);
+        // The geom node name = StableAutoName("geom", id, record.name) = the
+        // record name when non-empty (deduped), else "geom_<id>". Store the raw
+        // record name explicitly when it differs from the node name (unnamed
+        // shapes have an empty record name; dedup may rename) so it round-trips
+        // EXACTLY. (ProjectShape re-derives "geom_<id>" from the same id, so an
+        // empty record name reconstructs to the same node name.)
+        if (s.name != node->name) {
+            shape.Set("record_name", Value::Str(s.name));
+        }
+        // A non-colliding geom projects to a VisualMeshComponent (h1 fingers);
+        // everything else to a CollisionShapeComponent. The full-fidelity record
+        // is identical either way — only the key name reflects the projection so
+        // the on-disk node mirrors the facade.
+        if (ecs.Has<VisualMeshComponent>(e)) {
+            o.Set("visual_mesh", std::move(shape));
+        } else {
+            o.Set("collision_shape", std::move(shape));
+        }
+    }
+
+    // -- joint (on the child body node, or an auxiliary joint child node) ---
+    const auto jit = idx.joint.find(e);
+    if (jit != idx.joint.end()) {
+        o.Set("joint", SaveJoint(scene.GetJoint(jit->second)));
+    }
+
+    // -- actuator (component on the joint-bearing entity) -------------------
+    if (ecs.Has<ActuatorComponent>(e)) {
+        for (ActuatorId i = 0; i < scene.ActuatorCount(); ++i) {
+            const ActuatorRecord& a = scene.GetActuator(i);
+            if (a.joint_id != kInvalidJoint && a.joint_id < scene.JointCount() &&
+                scene.EntityOfJoint(a.joint_id) == e) {
+                o.Set("actuator", SaveActuator(a));
+                break;
+            }
+        }
+    }
+
+    // -- camera / light (own node under the attached body) ------------------
+    if (ecs.Has<CameraComponent>(e)) {
+        const CameraComponent* c = ecs.Get<CameraComponent>(e);
+        Value cam = Value::Object();
+        cam.Set("local", TransformJson(c->local_transform));
+        cam.Set("vertical_fov_degrees", Value::Float(c->vertical_fov_degrees));
+        cam.Set("near_clip", Value::Float(c->near_clip));
+        cam.Set("far_clip", Value::Float(c->far_clip));
+        o.Set("camera", std::move(cam));
+    }
+    if (ecs.Has<LightComponent>(e)) {
+        const LightComponent* l = ecs.Get<LightComponent>(e);
+        Value light = Value::Object();
+        const char* tname = "point";
+        switch (l->type) {
+            case LightComponent::Type::Point:       tname = "point"; break;
+            case LightComponent::Type::Directional: tname = "directional"; break;
+            case LightComponent::Type::Spot:        tname = "spot"; break;
+            case LightComponent::Type::Area:        tname = "area"; break;
+        }
+        light.Set("type", Value::Str(tname));
+        light.Set("local", TransformJson(l->local_transform));
+        light.Set("color", Vec3Json(l->color));
+        light.Set("intensity", Value::Float(l->intensity));
+        o.Set("light", std::move(light));
+    }
+
+    // -- children (sibling order == tree tail-append order) -----------------
+    Value children = Value::Array();
+    for (auto child = node->first_child; child; child = child->next_sibling) {
+        children.PushBack(SaveNode(scene, idx, sink, child));
+    }
+    o.Set("children", std::move(children));
     return o;
 }
 
@@ -367,89 +571,34 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     Value root = Value::Object();
     root.Set("nks_version", Value::Int(1));
 
-    // -- materials (keyed by material name) ---------------------------------
+    // -- split materials (keyed by name) ------------------------------------
     {
-        Value mats = Value::Object();
+        Value phys = Value::Object();
+        Value rend = Value::Object();
         for (const MaterialRecord& m : scene.Materials()) {
-            mats.Set(m.name, SaveMaterial(m));
+            phys.Set(m.name, SavePhysicsMaterial(m));
+            rend.Set(m.name, SaveRenderMaterial(m));
         }
-        root.Set("materials", std::move(mats));
+        root.Set("physics_materials", std::move(phys));
+        root.Set("render_materials", std::move(rend));
     }
 
-    // -- bodies (record order; the body name is the full path) --------------
-    // The body record name already encodes the path; on Load the same name
-    // reproduces the same group-node structure, so we serialize records in
-    // dense-id order (a faithful, deterministic, lossless representation).
+    // -- tree (SceneGraph pre-order, nested) --------------------------------
     {
-        Value bodies = Value::Array();
-        for (const RigidBodyRecord& b : scene.Bodies()) {
-            Value o = Value::Object();
-            o.Set("name", Value::Str(b.name));
-            o.Set("parent_id", Value::Int(static_cast<int64_t>(b.parent_id)));
-            o.Set("local", TransformJson(b.local_transform));
-            o.Set("inertial", TransformJson(b.inertial_transform));
-            o.Set("mass", Value::Float(b.mass));
-            o.Set("inertia", Vec3Json(b.inertia));
-            o.Set("is_static", Value::Bool(b.is_static));
-            bodies.PushBack(std::move(o));
+        const NodeIndex idx = BuildNodeIndex(scene);
+        const SceneGraph& tree = scene.Tree();
+        Value nodes = Value::Array();
+        for (auto child = tree.Root()->first_child; child; child = child->next_sibling) {
+            nodes.PushBack(SaveNode(scene, idx, sink, child));
         }
-        root.Set("bodies", std::move(bodies));
+        root.Set("tree", std::move(nodes));
     }
 
-    // -- shapes (record order) ----------------------------------------------
-    {
-        Value shapes = Value::Array();
-        for (const CollisionShapeRecord& s : scene.Shapes()) {
-            Value o = Value::Object();
-            o.Set("name", Value::Str(s.name));
-            o.Set("body_id", Value::Int(static_cast<int64_t>(s.body_id)));
-            // Merge the rest of the fidelity fields.
-            Value detail = SaveShape(s, sink);
-            for (const auto& kv : detail.Items()) {
-                o.Set(kv.first, kv.second);
-            }
-            shapes.PushBack(std::move(o));
-        }
-        root.Set("shapes", std::move(shapes));
-    }
-
-    // -- joints / actuators / sensors / cameras / lights --------------------
-    {
-        Value joints = Value::Array();
-        for (const JointRecord& j : scene.Joints()) {
-            Value o = SaveJoint(j);
-            Value ordered = Value::Object();
-            ordered.Set("name", Value::Str(j.name));
-            for (const auto& kv : o.Items()) ordered.Set(kv.first, kv.second);
-            joints.PushBack(std::move(ordered));
-        }
-        root.Set("joints", std::move(joints));
-    }
-    {
-        Value acts = Value::Array();
-        for (const ActuatorRecord& a : scene.Actuators()) {
-            Value o = SaveActuator(a);
-            Value ordered = Value::Object();
-            ordered.Set("name", Value::Str(a.name));
-            for (const auto& kv : o.Items()) ordered.Set(kv.first, kv.second);
-            acts.PushBack(std::move(ordered));
-        }
-        root.Set("actuators", std::move(acts));
-    }
+    // -- sensors (record-fidelity section: no tree home) --------------------
     {
         Value sensors = Value::Array();
         for (const SensorRecord& s : scene.Sensors()) sensors.PushBack(SaveSensor(s));
         root.Set("sensors", std::move(sensors));
-    }
-    {
-        Value cameras = Value::Array();
-        for (const CameraRecord& c : scene.Cameras()) cameras.PushBack(SaveCamera(c));
-        root.Set("cameras", std::move(cameras));
-    }
-    {
-        Value lights = Value::Array();
-        for (const LightRecord& l : scene.Lights()) lights.PushBack(SaveLight(l));
-        root.Set("lights", std::move(lights));
     }
 
     // -- filters: exclude pairs + contact-pair overrides --------------------
@@ -519,102 +668,263 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         scene = ApplyImports(std::move(scene), *imports, base_dir);
     }
 
-    // -- materials ----------------------------------------------------------
-    if (const Value* mats = root.Find("materials")) {
-        for (const auto& kv : mats->Items()) {
-            const Value& m = kv.second;
-            MaterialRecord rec;
-            rec.name = kv.first;
-            rec.base_color = Vec3FromJson(m.At("base_color"));
-            rec.alpha = m.At("alpha").AsFloat();
-            rec.roughness = m.At("roughness").AsFloat();
-            rec.metallic = m.At("metallic").AsFloat();
-            rec.friction_mu = m.At("friction_mu").AsFloat();
-            scene.AddMaterial(std::move(rec));
+    // -- split materials (keyed by name; physics + render sections) ---------
+    // ProjectMaterial maps friction_mu -> static/dynamic friction equally, so
+    // physics_materials[name].static_friction round-trips the record value. The
+    // two sections share the same key set; iterate render_materials for the name
+    // order (insertion-ordered JSON) and pull friction from physics_materials.
+    {
+        const Value* phys = root.Find("physics_materials");
+        const Value* rend = root.Find("render_materials");
+        if (rend) {
+            for (const auto& kv : rend->Items()) {
+                const Value& rm = kv.second;
+                MaterialRecord rec;
+                rec.name = kv.first;
+                const Value& bc = rm.At("base_color");
+                rec.base_color = math::Vec3{FloatAt(bc, 0, "base_color"),
+                                            FloatAt(bc, 1, "base_color"),
+                                            FloatAt(bc, 2, "base_color")};
+                rec.alpha = FloatAt(bc, 3, "base_color");
+                rec.metallic = rm.At("metallic").AsFloat();
+                rec.roughness = rm.At("roughness").AsFloat();
+                if (phys) {
+                    if (const Value* pm = phys->Find(kv.first)) {
+                        rec.friction_mu = pm->At("static_friction").AsFloat();
+                    }
+                }
+                scene.AddMaterial(std::move(rec));
+            }
         }
     }
 
-    // -- bodies (pre-order: parent_id < child id always, so dense order works) -
-    if (const Value* bodies = root.Find("bodies")) {
-        for (const Value& b : bodies->Elements()) {
-            RigidBodyRecord rec;
-            rec.name = b.At("name").AsString();
-            rec.parent_id = static_cast<BodyId>(b.At("parent_id").AsInt());
-            rec.local_transform = TransformFromJson(b.At("local"));
-            rec.inertial_transform = TransformFromJson(b.At("inertial"));
-            rec.mass = b.At("mass").AsFloat();
-            rec.inertia = Vec3FromJson(b.At("inertia"));
-            rec.is_static = b.At("is_static").AsBool();
-            scene.AddRigidBody(std::move(rec));
-        }
-    }
+    // -- tree: reconstruct records in their ORIGINAL dense-id order. The .nks
+    //    tree groups a body's child BODIES before the body's own geom nodes (the
+    //    facade projection order), whereas the importers add a body then its OWN
+    //    shapes/joints before descending. So a single pre-order pass would NOT
+    //    reproduce the shape/joint id order. Instead we: (1) collect body nodes
+    //    in pre-order (== body-id order for importer/compose scenes — parents
+    //    precede children, sibling order is tail-append), reconstructing each
+    //    body's DERIVED name; then (2) walk bodies in that id order and emit each
+    //    body's OWN direct geom / joint / camera / light / actuator children.
+    //    That body-grouped emission reproduces the import dense-id order exactly,
+    //    which the cook-byte-equality + second-save gates enforce.
+    const Value* tree = root.Find("tree");
+    if (tree && tree->IsArray()) {
+        // A body node + the resolved BodyId Phase 1 assigned it (id order).
+        struct BodyNode {
+            const Value* node;
+            BodyId       id;
+        };
+        std::vector<BodyNode> body_nodes;
 
-    // -- shapes -------------------------------------------------------------
-    if (const Value* shapes = root.Find("shapes")) {
-        for (const Value& s : shapes->Elements()) {
+        // -- Phase 1: bodies (pre-order). The record name is "record_name" when
+        //    present (sibling-dedup case), else the DERIVED suffix: the group-
+        //    prefix segments accumulated since the last body ancestor, plus this
+        //    node's single-segment name. `prefix` threads that suffix down.
+        std::function<void(const Value&, const std::string&)> walk_bodies =
+            [&](const Value& node, const std::string& prefix) {
+                const std::string seg = node.At("name").AsString();
+                const Value* rb = node.Find("rigid_body");
+                std::string child_prefix;
+                if (rb) {
+                    RigidBodyRecord rec;
+                    if (const Value* rn = node.Find("record_name")) {
+                        rec.name = rn->AsString();
+                    } else {
+                        rec.name = prefix.empty() ? seg : (prefix + seg);
+                    }
+                    rec.parent_id = static_cast<BodyId>(rb->At("parent_id").AsInt());
+                    rec.local_transform = TransformFromJson(node.At("transform"));
+                    rec.inertial_transform = TransformFromJson(rb->At("inertial"));
+                    rec.mass = rb->At("mass").AsFloat();
+                    rec.inertia = Vec3FromJson(rb->At("inertia"));
+                    rec.is_static = rb->At("is_static").AsBool();
+                    const BodyId id = scene.AddRigidBody(std::move(rec));
+                    body_nodes.push_back(BodyNode{&node, id});
+                    // A body resets the group prefix for ITS subtree (its node is
+                    // the body node; descendant bodies are placed under it).
+                    child_prefix.clear();
+                } else {
+                    // A group node contributes its segment to the prefix of the
+                    // body nodes beneath it (until the next body resets it).
+                    child_prefix = prefix.empty() ? (seg + "/") : (prefix + seg + "/");
+                }
+                if (const Value* kids = node.Find("children")) {
+                    for (const Value& c : kids->Elements()) {
+                        walk_bodies(c, child_prefix);
+                    }
+                }
+            };
+        for (const Value& top : tree->Elements()) {
+            walk_bodies(top, std::string());
+        }
+
+        // -- Phase 2: shapes. Walk bodies in id order; for each, emit its OWN
+        //    direct geom children (sibling order) -> reproduces shape-id order.
+        auto load_shape = [&](const Value& node, BodyId body_id) {
+            const Value* s = node.Find("collision_shape");
+            if (!s) s = node.Find("visual_mesh");
+            if (!s) return;
             CollisionShapeRecord rec;
-            rec.name = s.At("name").AsString();
-            rec.body_id = static_cast<BodyId>(s.At("body_id").AsInt());
-            rec.material_id = static_cast<MaterialId>(s.At("material_id").AsInt());
-            rec.type = ShapeTypeFromName(s.At("type").AsString());
-            rec.local_transform = TransformFromJson(s.At("local"));
-            rec.half_extents = Vec3FromJson(s.At("half_extents"));
-            rec.radius = s.At("radius").AsFloat();
-            rec.half_height = s.At("half_height").AsFloat();
-            rec.contype = static_cast<uint32_t>(s.At("contype").AsInt());
-            rec.conaffinity = static_cast<uint32_t>(s.At("conaffinity").AsInt());
-            rec.collision_group = static_cast<int32_t>(s.At("collision_group").AsInt());
-            rec.solref[0] = FloatAt(s.At("solref"), 0, "solref");
-            rec.solref[1] = FloatAt(s.At("solref"), 1, "solref");
-            for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(s.At("solimp"), k, "solimp");
-            rec.friction_mu = s.At("friction_mu").AsFloat();
-            rec.priority = static_cast<int32_t>(s.At("priority").AsInt());
-            rec.solmix = s.At("solmix").AsFloat();
-            rec.margin = s.At("margin").AsFloat();
-            rec.gap = s.At("gap").AsFloat();
-            rec.condim = static_cast<uint8_t>(s.At("condim").AsInt());
-            rec.decompose_mode = DecomposeModeFromName(s.At("decompose_mode").AsString());
-            rec.decompose_max_pieces = static_cast<uint32_t>(s.At("decompose_max_pieces").AsInt());
-            if (const Value* mesh = s.Find("mesh")) {
+            if (const Value* rn = s->Find("record_name")) {
+                rec.name = rn->AsString();
+            } else {
+                rec.name = node.At("name").AsString();
+            }
+            rec.body_id = body_id;
+            rec.material_id = static_cast<MaterialId>(s->At("material_id").AsInt());
+            rec.type = ShapeTypeFromName(s->At("type").AsString());
+            rec.local_transform = TransformFromJson(s->At("local"));
+            rec.half_extents = Vec3FromJson(s->At("half_extents"));
+            rec.radius = s->At("radius").AsFloat();
+            rec.half_height = s->At("half_height").AsFloat();
+            rec.contype = static_cast<uint32_t>(s->At("contype").AsInt());
+            rec.conaffinity = static_cast<uint32_t>(s->At("conaffinity").AsInt());
+            rec.collision_group = static_cast<int32_t>(s->At("collision_group").AsInt());
+            rec.solref[0] = FloatAt(s->At("solref"), 0, "solref");
+            rec.solref[1] = FloatAt(s->At("solref"), 1, "solref");
+            for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(s->At("solimp"), k, "solimp");
+            rec.friction_mu = s->At("friction_mu").AsFloat();
+            rec.priority = static_cast<int32_t>(s->At("priority").AsInt());
+            rec.solmix = s->At("solmix").AsFloat();
+            rec.margin = s->At("margin").AsFloat();
+            rec.gap = s->At("gap").AsFloat();
+            rec.condim = static_cast<uint8_t>(s->At("condim").AsInt());
+            rec.decompose_mode = DecomposeModeFromName(s->At("decompose_mode").AsString());
+            rec.decompose_max_pieces =
+                static_cast<uint32_t>(s->At("decompose_max_pieces").AsInt());
+            if (const Value* mesh = s->Find("mesh")) {
                 const AssetRef ref = ParseAssetRef(mesh->AsString());
-                const std::vector<uint8_t> bytes = ensure_nka().LoadChunk(ref.fourcc, ref.index);
+                const std::vector<uint8_t> bytes =
+                    ensure_nka().LoadChunk(ref.fourcc, ref.index);
                 DecodeCollisionMesh(bytes, rec.mesh_vertices, rec.mesh_indices);
             }
             scene.AddCollisionShape(std::move(rec));
+        };
+        // Direct children of root that are geoms (orphan shapes: no body) come
+        // first, mirroring how an orphan shape projects under root.
+        auto direct_children = [](const Value& node) -> const std::vector<Value>* {
+            const Value* kids = node.Find("children");
+            return kids ? &kids->Elements() : nullptr;
+        };
+        for (const BodyNode& bn : body_nodes) {
+            if (const auto* kids = direct_children(*bn.node)) {
+                for (const Value& c : *kids) load_shape(c, bn.id);
+            }
         }
-    }
 
-    // -- joints -------------------------------------------------------------
-    if (const Value* joints = root.Find("joints")) {
-        for (const Value& j : joints->Elements()) {
+        // -- Phase 3: joints. A joint rides on its CHILD body node (a "joint"
+        //    component) or on an auxiliary joint-only child node (multi-joint
+        //    body). Walk bodies in id order; emit the body's own joint, then any
+        //    auxiliary joint-only direct children -> reproduces joint-id order.
+        auto load_joint = [&](const Value* j) {
             JointRecord rec;
-            rec.name = j.At("name").AsString();
-            rec.type = JointTypeFromName(j.At("type").AsString());
-            rec.parent_body = static_cast<BodyId>(j.At("parent_body").AsInt());
-            rec.child_body = static_cast<BodyId>(j.At("child_body").AsInt());
-            rec.axis = Vec3FromJson(j.At("axis"));
-            rec.parent_frame = TransformFromJson(j.At("parent_frame"));
-            rec.child_frame = TransformFromJson(j.At("child_frame"));
-            rec.lower_limit = j.At("lower_limit").AsFloat();
-            rec.upper_limit = j.At("upper_limit").AsFloat();
-            rec.damping = j.At("damping").AsFloat();
-            rec.armature = j.At("armature").AsFloat();
-            rec.stiffness = j.At("stiffness").AsFloat();
-            rec.initial_position = j.At("initial_position").AsFloat();
+            rec.name = j->At("name").AsString();
+            rec.type = JointTypeFromName(j->At("type").AsString());
+            rec.parent_body = static_cast<BodyId>(j->At("parent_body").AsInt());
+            rec.child_body = static_cast<BodyId>(j->At("child_body").AsInt());
+            rec.axis = Vec3FromJson(j->At("axis"));
+            rec.parent_frame = TransformFromJson(j->At("parent_frame"));
+            rec.child_frame = TransformFromJson(j->At("child_frame"));
+            rec.lower_limit = j->At("lower_limit").AsFloat();
+            rec.upper_limit = j->At("upper_limit").AsFloat();
+            rec.damping = j->At("damping").AsFloat();
+            rec.armature = j->At("armature").AsFloat();
+            rec.stiffness = j->At("stiffness").AsFloat();
+            rec.initial_position = j->At("initial_position").AsFloat();
             scene.AddJoint(std::move(rec));
+        };
+        for (const BodyNode& bn : body_nodes) {
+            if (const Value* j = bn.node->Find("joint")) load_joint(j);
+            if (const auto* kids = direct_children(*bn.node)) {
+                for (const Value& c : *kids) {
+                    // Auxiliary joint nodes carry a "joint" but no "rigid_body".
+                    if (!c.Find("rigid_body")) {
+                        if (const Value* j = c.Find("joint")) load_joint(j);
+                    }
+                }
+            }
         }
-    }
 
-    // -- actuators ----------------------------------------------------------
-    if (const Value* acts = root.Find("actuators")) {
-        for (const Value& a : acts->Elements()) {
+        // -- Phase 4: cameras + lights (own direct child node under the attached
+        //    body). attached_body = the owning body id; name = node name. -----
+        for (const BodyNode& bn : body_nodes) {
+            if (const auto* kids = direct_children(*bn.node)) {
+                for (const Value& c : *kids) {
+                    if (const Value* cam = c.Find("camera")) {
+                        CameraRecord rec;
+                        rec.name = c.At("name").AsString();
+                        rec.attached_body = bn.id;
+                        rec.local_transform = TransformFromJson(cam->At("local"));
+                        rec.vertical_fov_degrees = cam->At("vertical_fov_degrees").AsFloat();
+                        rec.near_clip = cam->At("near_clip").AsFloat();
+                        rec.far_clip = cam->At("far_clip").AsFloat();
+                        scene.AddCamera(std::move(rec));
+                    }
+                }
+            }
+        }
+        for (const BodyNode& bn : body_nodes) {
+            if (const auto* kids = direct_children(*bn.node)) {
+                for (const Value& c : *kids) {
+                    if (const Value* lt = c.Find("light")) {
+                        LightRecord rec;
+                        rec.name = c.At("name").AsString();
+                        rec.type = LightTypeFromName(lt->At("type").AsString());
+                        rec.attached_body = bn.id;
+                        rec.local_transform = TransformFromJson(lt->At("local"));
+                        rec.color = Vec3FromJson(lt->At("color"));
+                        rec.intensity = lt->At("intensity").AsFloat();
+                        scene.AddLight(std::move(rec));
+                    }
+                }
+            }
+        }
+        // Root-level (unattached) cameras / lights project under root.
+        for (const Value& top : tree->Elements()) {
+            if (top.Find("rigid_body")) continue;  // body subtrees handled above
+            if (const Value* cam = top.Find("camera")) {
+                CameraRecord rec;
+                rec.name = top.At("name").AsString();
+                rec.local_transform = TransformFromJson(cam->At("local"));
+                rec.vertical_fov_degrees = cam->At("vertical_fov_degrees").AsFloat();
+                rec.near_clip = cam->At("near_clip").AsFloat();
+                rec.far_clip = cam->At("far_clip").AsFloat();
+                scene.AddCamera(std::move(rec));
+            }
+            if (const Value* lt = top.Find("light")) {
+                LightRecord rec;
+                rec.name = top.At("name").AsString();
+                rec.type = LightTypeFromName(lt->At("type").AsString());
+                rec.local_transform = TransformFromJson(lt->At("local"));
+                rec.color = Vec3FromJson(lt->At("color"));
+                rec.intensity = lt->At("intensity").AsFloat();
+                scene.AddLight(std::move(rec));
+            }
+        }
+
+        // -- Phase 5: actuators (a component beside the joint it drives). Walk
+        //    bodies in id order; emit the body's own actuator, then auxiliary
+        //    joint-node actuators -> reproduces actuator-id order.
+        auto load_actuator = [&](const Value* a) {
             ActuatorRecord rec;
-            rec.name = a.At("name").AsString();
-            rec.type = ActuatorTypeFromName(a.At("type").AsString());
-            rec.joint_id = static_cast<JointId>(a.At("joint_id").AsInt());
-            rec.gain = a.At("gain").AsFloat();
-            rec.force_limit = a.At("force_limit").AsFloat();
+            rec.name = a->At("name").AsString();
+            rec.type = ActuatorTypeFromName(a->At("type").AsString());
+            rec.joint_id = static_cast<JointId>(a->At("joint_id").AsInt());
+            rec.gain = a->At("gain").AsFloat();
+            rec.force_limit = a->At("force_limit").AsFloat();
             scene.AddActuator(std::move(rec));
+        };
+        for (const BodyNode& bn : body_nodes) {
+            if (const Value* a = bn.node->Find("actuator")) load_actuator(a);
+            if (const auto* kids = direct_children(*bn.node)) {
+                for (const Value& c : *kids) {
+                    if (!c.Find("rigid_body")) {
+                        if (const Value* a = c.Find("actuator")) load_actuator(a);
+                    }
+                }
+            }
         }
     }
 
@@ -724,18 +1034,26 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
 }
 
 // -- override application ----------------------------------------------------
-// Apply a {"overrides": {"<path>": {<partial component objects>}}} overlay to an
-// already-loaded scene. Matches the override path against each body's tree path
-// and each shape/joint name; patches the corresponding record fields in place.
+// Apply a {"overrides": {"<derived/path>": {<partial component objects>}}}
+// overlay to an already-loaded scene. The override key is the body's DERIVED
+// tree path (parent-body chain + group prefix + record name), which under §3.7
+// is the addressing scheme the `tree` section uses — NOT the (now suffix-only)
+// record name. Patches the matched record fields in place.
 void ApplyOverrides(SceneIR& scene, const Value& overlay) {
     const Value* overrides = overlay.Find("overrides");
     if (!overrides) return;
 
-    // Build path -> body id (the body record name == its tree path) and
-    // name -> shape/joint ids for matching.
+    // Build derived-path -> body id by walking each body's projected node up to
+    // the root (SceneGraph::PathOf). For a root body the derived path == its
+    // record name, so a root-keyed overlay keeps working unchanged.
     std::unordered_map<std::string, BodyId> body_by_path;
+    const SceneGraph& tree = scene.Tree();
     for (BodyId i = 0; i < scene.RigidBodyCount(); ++i) {
-        body_by_path.emplace(scene.GetBody(i).name, i);
+        const EntityId e = scene.EntityOfBody(i);
+        if (e == kInvalidEntity) continue;
+        const auto node = scene.Ecs().NodeOf(e);
+        if (!node) continue;
+        body_by_path.emplace(tree.PathOf(node), i);
     }
 
     for (const auto& kv : overrides->Items()) {
