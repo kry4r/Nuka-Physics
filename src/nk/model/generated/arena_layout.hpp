@@ -97,6 +97,10 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_aabb_hi
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // pair_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 2, 1, 8, 0},  // candidate_pairs
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 9, 1, 36, 0},  // lbvh_nodes
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // lbvh_morton
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // lbvh_index
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // lbvh_visit
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_link
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_point
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_normal
@@ -131,6 +135,15 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_link
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_component
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // table_enabled
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // shape_table
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 8, 0},  // excluded_pairs
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // samp_points
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // samp_ranges
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sdf_headers
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sdf_cell_count
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 8, 0},  // sdf_cell_keys
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sdf_cell_values
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // sdf_cell_gradients
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 4, 1, 16, 0},  // island_row_offsets
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 2, 1, 8, 0},  // island_color_segments
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 1, 1, 4, 0},  // row_order
@@ -154,6 +167,13 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_position_delta
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_density
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_lambda
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_key
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_particle_idx
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_start
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_end
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_offset
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 32, 1, 128, 0},  // grid_neighbor_idx
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // rng_state
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 64, 1, 256, 0},  // obs_buffer

@@ -84,6 +84,10 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyAabbHi, DlpackDtype::kF32, 2, false, false},  // body_aabb_hi
     {FieldId::PairCount, DlpackDtype::kU32, 1, false, false},  // pair_count
     {FieldId::CandidatePairs, DlpackDtype::kU32, 2, false, false},  // candidate_pairs
+    {FieldId::LbvhNodes, DlpackDtype::kF32, 2, false, false},  // lbvh_nodes
+    {FieldId::LbvhMorton, DlpackDtype::kU32, 1, false, false},  // lbvh_morton
+    {FieldId::LbvhIndex, DlpackDtype::kU32, 1, false, false},  // lbvh_index
+    {FieldId::LbvhVisit, DlpackDtype::kU32, 1, false, false},  // lbvh_visit
     {FieldId::ContactLink, DlpackDtype::kU32, 1, false, false},  // contact_link
     {FieldId::ContactPoint, DlpackDtype::kF32, 2, false, false},  // contact_point
     {FieldId::ContactNormal, DlpackDtype::kF32, 2, false, false},  // contact_normal
@@ -118,6 +122,15 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DofToLink, DlpackDtype::kU32, 1, false, false},  // dof_to_link
     {FieldId::DofToComponent, DlpackDtype::kU32, 1, false, false},  // dof_to_component
     {FieldId::TableEnabled, DlpackDtype::kU32, 1, false, false},  // table_enabled
+    {FieldId::ShapeTable, DlpackDtype::kF32, 1, false, false},  // shape_table
+    {FieldId::ExcludedPairs, DlpackDtype::kU64, 1, false, false},  // excluded_pairs
+    {FieldId::SampPoints, DlpackDtype::kF32, 1, false, false},  // samp_points
+    {FieldId::SampRanges, DlpackDtype::kU32, 1, false, false},  // samp_ranges
+    {FieldId::SdfHeaders, DlpackDtype::kF32, 1, false, false},  // sdf_headers
+    {FieldId::SdfCellCount, DlpackDtype::kU32, 1, false, false},  // sdf_cell_count
+    {FieldId::SdfCellKeys, DlpackDtype::kU64, 1, false, false},  // sdf_cell_keys
+    {FieldId::SdfCellValues, DlpackDtype::kF32, 1, false, false},  // sdf_cell_values
+    {FieldId::SdfCellGradients, DlpackDtype::kF32, 2, false, false},  // sdf_cell_gradients
     {FieldId::IslandRowOffsets, DlpackDtype::kU32, 2, false, false},  // island_row_offsets
     {FieldId::IslandColorSegments, DlpackDtype::kU32, 2, false, false},  // island_color_segments
     {FieldId::RowOrder, DlpackDtype::kU32, 1, false, false},  // row_order
@@ -141,6 +154,13 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::PbfPositionDelta, DlpackDtype::kF32, 2, false, false},  // pbf_position_delta
     {FieldId::PbfDensity, DlpackDtype::kF32, 1, false, false},  // pbf_density
     {FieldId::PbfLambda, DlpackDtype::kF32, 1, false, false},  // pbf_lambda
+    {FieldId::GridCellKey, DlpackDtype::kU32, 1, false, false},  // grid_cell_key
+    {FieldId::GridParticleIdx, DlpackDtype::kU32, 1, false, false},  // grid_particle_idx
+    {FieldId::GridCellStart, DlpackDtype::kU32, 1, false, false},  // grid_cell_start
+    {FieldId::GridCellEnd, DlpackDtype::kU32, 1, false, false},  // grid_cell_end
+    {FieldId::GridNeighborOffset, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_offset
+    {FieldId::GridNeighborCount, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_count
+    {FieldId::GridNeighborIdx, DlpackDtype::kU32, 2, false, false},  // grid_neighbor_idx
     {FieldId::RngState, DlpackDtype::kU64, 1, false, false},  // rng_state
     {FieldId::EnvStatus, DlpackDtype::kU32, 1, false, true},  // env_status
     {FieldId::ObsBuffer, DlpackDtype::kF32, 2, false, true},  // obs_buffer

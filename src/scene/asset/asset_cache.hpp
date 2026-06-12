@@ -65,6 +65,15 @@ public:
         const import::cooker::SparseSdfParams& bake_params,
         const SdfCookFn& cook_fn);
 
+    // M5: the SDF sampling-point set (hull verts + edge midpoints, the .nka SAMP
+    // chunk). Keyed by `key` (the caller passes the hull's content hash); the
+    // payload is the .nka SAMP layout (EncodeSamples). `produce` runs on a miss
+    // and returns the flat xyz pool. A HIT is bit-identical to the cold cook —
+    // this is the AssetCache seam that lands SAMP in the .nka when a scene saves.
+    using SampleProducer = std::function<std::vector<float>()>;
+    std::vector<float> GetOrCookSamples(const std::string& key,
+                                        const SampleProducer& produce);
+
 private:
     std::string PathFor(const std::string& key, const char* kind) const;
     static bool ReadFile(const std::string& path, std::vector<uint8_t>& out);

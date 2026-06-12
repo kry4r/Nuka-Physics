@@ -733,6 +733,16 @@ void BatchedUnifiedWorld::Step() {
     }
 }
 
+// DEPRECATED(M9): this per-env CPU narrowphase (BuildContactManifolds box x
+// plane) + the per-env host pair download are SUPERSEDED by the M5 device-
+// resident collision spine (the nk::World union slot-template path —
+// contacts_union.cu's analytic detection + the pair-driven broadphase ops). The
+// plan (M5 §3.5) calls for deleting them, but BatchedUnifiedWorld is STILL the
+// reference oracle for the legacy G1c/G1d parity tests (and h1_union_parity /
+// the grasp parity gate compare nk against it) until M9 retires the coresident
+// directory. So these segments are RETAINED with this banner, NOT deleted — they
+// have a live consumer. M9 removes BatchedUnifiedWorld and this CPU narrowphase
+// together. (Controller ruling, mirrors the M4 row_solver/unified_solve banners.)
 void BatchedUnifiedWorld::ResolveBatchedGroundContact() {
     // Inert unless a static ground is configured AND there is at least one body per
     // env to rest on it. Leaves the velocity untouched -> P2.1 free-fall preserved.

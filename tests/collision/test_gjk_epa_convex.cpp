@@ -28,6 +28,16 @@
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"
 
+// M5 (plan): the SDF precision oracle — drive the NarrowphaseSdf op (SAMP point
+// set x cooked sparse SDF grid) against ANALYTIC truth (sphere x sphere /
+// sphere x box at known separations / penetrations), tolerance <= the bake cell
+// size. The GJK/EPA tests above survive to M9; this is the ADDED SDF-path oracle.
+#include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfPairDev + LaunchNarrowphaseSdf
+#include "phi/buffer_legacy.hpp"
+#include "phi/buffer_transfer.hpp"
+#include "phi/device_context.hpp"
+#include "runtime/sdf/sparse_sdf_query.cuh"     // PackSdfCellKey
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -978,4 +988,249 @@ TEST(GjkEpaConvex, OriginOnBoundary_RotatedOblique) {
             << " depth != support-difference oracle along the normal";
         EXPECT_GT(m.points[0].penetration, 0.0f);
     }
+}
+
+// ===========================================================================
+// M5 — SDF PRECISION ORACLE (plan M5: test_gjk_epa_convex -> SDF precision
+// oracle). Bakes a DENSE analytic narrow-band SDF for a target primitive
+// (sphere / box) at a known cell size into the SparseSdfDevice layout, builds
+// the OTHER shape's sample-point set, drives the NarrowphaseSdf op, and asserts
+// the sampled contact DEPTH + NORMAL match the ANALYTIC truth within a
+// tolerance <= the bake cell size (plan §3.5 precision contract). Also a 2-run
+// byte-identity (D1) check — the same posture the GJK/EPA Determinism case had,
+// re-pointed at the SDF path.
+// ===========================================================================
+namespace {
+
+namespace nsdf = nuka::runtime::sdf;
+namespace nkops = nuka::phi::nkops;
+using nuka::phi::Buffer;
+using nuka::phi::MemoryKind;
+
+// One cooked SDF grid + its sample-point set + a pair list, all device-resident.
+struct SdfOracleScene {
+    // Model device tables.
+    Buffer samp_points, samp_ranges, shape_table;
+    Buffer sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads;
+    Buffer body_pose, pairs;
+    // Data device outputs.
+    Buffer ucount, upoint, unormal, udepth, contact_count;
+    uint32_t pair_count = 0, slot_stride = 0;
+    float cell = 0.0f;
+};
+
+// Bake a DENSE SDF grid covering [lo,hi]^3 at `cell` spacing for an analytic
+// signed-distance functor f(local) -> phi (negative inside). origin at lo.
+template <typename F>
+void BakeAnalyticSdf(Vec3 lo, Vec3 hi, float cell, F&& f,
+                     std::vector<uint64_t>& keys, std::vector<float>& values,
+                     std::vector<Vec3>& grads, uint32_t dims[3], Vec3& origin) {
+    origin = lo;
+    auto dim = [&](float a, float b) {
+        return static_cast<uint32_t>(std::floor((b - a) / cell)) + 2u;
+    };
+    dims[0] = dim(lo.x, hi.x); dims[1] = dim(lo.y, hi.y); dims[2] = dim(lo.z, hi.z);
+    for (uint32_t i = 0; i < dims[0]; ++i)
+        for (uint32_t j = 0; j < dims[1]; ++j)
+            for (uint32_t k = 0; k < dims[2]; ++k) {
+                const Vec3 p{lo.x + i * cell, lo.y + j * cell, lo.z + k * cell};
+                const float phi = f(p);
+                // Central-difference gradient (the cooker's gradient field).
+                const float h = 0.5f * cell;
+                const Vec3 g{(f(Vec3{p.x + h, p.y, p.z}) - f(Vec3{p.x - h, p.y, p.z})) / cell,
+                             (f(Vec3{p.x, p.y + h, p.z}) - f(Vec3{p.x, p.y - h, p.z})) / cell,
+                             (f(Vec3{p.x, p.y, p.z + h}) - f(Vec3{p.x, p.y, p.z - h})) / cell};
+                keys.push_back(nsdf::PackSdfCellKey(i, j, k));
+                values.push_back(phi);
+                grads.push_back(g);
+            }
+    // keys are emitted in ascending (i,j,k) order -> already sorted (D1 binary
+    // search contract). Stable-sort defensively in case the loop order changes.
+}
+
+// Build the device scene: target body 1 holds the SDF (sphere/box) at origin;
+// sampling body 0 holds a single sample point we place at a known world spot.
+SdfOracleScene BuildSdfScene(const std::vector<float>& sample_local,
+                             Transform sample_pose, Transform target_pose,
+                             const std::vector<uint64_t>& keys,
+                             const std::vector<float>& values,
+                             const std::vector<Vec3>& grads,
+                             const uint32_t dims[3], Vec3 origin, float voxel,
+                             float cell) {
+    SdfOracleScene s;
+    s.cell = cell;
+    s.slot_stride = 4u;  // 4 contact slots / env (>= the 1 pair we drive).
+    // SAMP pool + per-body ranges (body 0 owns [0, count); body 1 empty).
+    s.samp_points = nuka::phi::UploadVector(sample_local);
+    std::vector<uint32_t> ranges = {0u, static_cast<uint32_t>(sample_local.size() / 3u),
+                                    0u, 0u};
+    s.samp_ranges = nuka::phi::UploadVector(ranges);
+    // shape_table: 2 bodies x 8 f32 (body 1 carries sdf_grid = 0).
+    std::vector<float> shp(2u * 8u, 0.0f);
+    auto put_u = [&](size_t at, uint32_t v) { std::memcpy(&shp[at], &v, 4); };
+    put_u(8u + 7u, 0u);  // body 1 sdf_grid = 0
+    put_u(0u + 7u, ~0u); // body 0 analytic (no sdf)
+    s.shape_table = nuka::phi::UploadVector(shp);
+    // SDF header: origin.xyz, voxel, dims.xyz(u32 bits), cell_offset(u32 bits).
+    std::vector<float> hdr(8u, 0.0f);
+    hdr[0] = origin.x; hdr[1] = origin.y; hdr[2] = origin.z; hdr[3] = voxel;
+    std::memcpy(&hdr[4], &dims[0], 4); std::memcpy(&hdr[5], &dims[1], 4);
+    std::memcpy(&hdr[6], &dims[2], 4);
+    const uint32_t cell_offset = 0u; std::memcpy(&hdr[7], &cell_offset, 4);
+    s.sdf_headers = nuka::phi::UploadVector(hdr);
+    std::vector<uint32_t> cc = {static_cast<uint32_t>(keys.size())};
+    s.sdf_cell_count = nuka::phi::UploadVector(cc);
+    s.sdf_keys = nuka::phi::UploadVector(keys);
+    s.sdf_values = nuka::phi::UploadVector(values);
+    s.sdf_grads = nuka::phi::UploadVector(grads);
+    // body_pose (env-major, bodies_per_env = 2).
+    std::vector<Transform> poses = {sample_pose, target_pose};
+    s.body_pose = nuka::phi::UploadVector(poses);
+    // one pair: env 0, slot 0, sample body 0 vs target body 1, grid 0.
+    std::vector<nkops::SdfPairDev> prs = {{0u, 0u, 0u, 1u, 0u, 2u}};
+    s.pairs = nuka::phi::UploadVector(prs);
+    s.pair_count = 1u;
+    // outputs (slot_stride slots x {count, 4-pt point/normal/depth}).
+    s.ucount = Buffer(s.slot_stride * sizeof(uint32_t), MemoryKind::Device);
+    s.upoint = Buffer(s.slot_stride * 4u * sizeof(Vec3), MemoryKind::Device);
+    s.unormal = Buffer(s.slot_stride * 4u * sizeof(Vec3), MemoryKind::Device);
+    s.udepth = Buffer(s.slot_stride * 4u * sizeof(float), MemoryKind::Device);
+    s.contact_count = Buffer(sizeof(uint32_t), MemoryKind::Device);
+    std::vector<uint32_t> zero = {0u};
+    s.contact_count.CopyFromHost(zero.data(), sizeof(uint32_t));
+    return s;
+}
+
+// Run the op + download slot 0's first manifold point.
+struct SdfHit { uint32_t count; Vec3 point; Vec3 normal; float depth; };
+SdfHit RunSdfOp(SdfOracleScene& s, float margin = 0.0f) {
+    const auto status = nuka::phi::LaunchNarrowphaseSdf(
+        static_cast<const float*>(s.samp_points.Data()),
+        static_cast<const uint32_t*>(s.samp_ranges.Data()),
+        static_cast<const float*>(s.shape_table.Data()),
+        static_cast<const float*>(s.sdf_headers.Data()),
+        static_cast<const uint32_t*>(s.sdf_cell_count.Data()),
+        static_cast<const uint64_t*>(s.sdf_keys.Data()),
+        static_cast<const float*>(s.sdf_values.Data()),
+        static_cast<const Vec3*>(s.sdf_grads.Data()),
+        static_cast<const Transform*>(s.body_pose.Data()),
+        static_cast<const nkops::SdfPairDev*>(s.pairs.Data()),
+        s.pair_count, /*k=*/4u, margin, s.slot_stride,
+        static_cast<uint32_t*>(s.ucount.Data()),
+        static_cast<Vec3*>(s.upoint.Data()),
+        static_cast<Vec3*>(s.unormal.Data()),
+        static_cast<float*>(s.udepth.Data()),
+        static_cast<uint32_t*>(s.contact_count.Data()),
+        /*stream=*/nullptr);
+    EXPECT_EQ(static_cast<int>(status), static_cast<int>(nuka::phi::Status::Ok));
+    cudaDeviceSynchronize();
+    SdfHit h{};
+    s.ucount.CopyToHost(&h.count, sizeof(uint32_t));
+    s.upoint.CopyToHost(&h.point, sizeof(Vec3));
+    s.unormal.CopyToHost(&h.normal, sizeof(Vec3));
+    s.udepth.CopyToHost(&h.depth, sizeof(float));
+    return h;
+}
+
+}  // namespace
+
+// SPHERE x SPHERE: target = unit sphere (r=0.3) at origin; the SAMPLING shape's
+// single sample point is placed at a known penetration depth along +X. The SDF
+// reports depth = r - |q| at that point; analytic truth = the same.
+TEST(SdfPrecisionOracle, SphereSampleVsSphereSdf_DepthMatchesAnalytic) {
+    const float cell = 0.01f;          // bake cell size = the tolerance bound.
+    const float R = 0.30f;
+    std::vector<uint64_t> keys; std::vector<float> vals; std::vector<Vec3> grads;
+    uint32_t dims[3]; Vec3 origin;
+    BakeAnalyticSdf(Vec3{-0.5f, -0.5f, -0.5f}, Vec3{0.5f, 0.5f, 0.5f}, cell,
+                    [&](Vec3 p) { return std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z) - R; },
+                    keys, vals, grads, dims, origin);
+
+    // Place the sample point at world (0.25, 0, 0): inside the sphere by
+    // R - 0.25 = 0.05. sample body at identity; sample local == world.
+    std::vector<float> sample = {0.25f, 0.0f, 0.0f};
+    SdfOracleScene s = BuildSdfScene(sample, Transform::Identity(),
+                                     Transform::Identity(), keys, vals, grads,
+                                     dims, origin, cell, cell);
+    const SdfHit h = RunSdfOp(s);
+    ASSERT_EQ(h.count, 1u) << "sample inside the sphere -> exactly one contact";
+    EXPECT_NEAR(h.depth, R - 0.25f, cell) << "SDF depth != analytic (R - |q|)";
+    // Normal = +X (gradient points outward along +X at (0.25,0,0)).
+    EXPECT_NEAR(h.normal.x, 1.0f, 0.05f);
+    EXPECT_NEAR(h.normal.y, 0.0f, 0.05f);
+    EXPECT_NEAR(h.normal.z, 0.0f, 0.05f);
+}
+
+// SPHERE-SAMPLE x BOX SDF: target = box he=(0.2,0.2,0.2); sample inside near the
+// +Z face. SDF depth at a point inside an axis box = min face distance.
+TEST(SdfPrecisionOracle, SampleVsBoxSdf_DepthMatchesAnalytic) {
+    const float cell = 0.01f;
+    const Vec3 he{0.20f, 0.20f, 0.20f};
+    auto box_sdf = [&](Vec3 p) {
+        // Inside (negative): -min over faces; this oracle only samples interior.
+        const float dx = he.x - std::fabs(p.x);
+        const float dy = he.y - std::fabs(p.y);
+        const float dz = he.z - std::fabs(p.z);
+        const float inside = std::min(dx, std::min(dy, dz));
+        return -inside;  // negative inside, ~0 at surface.
+    };
+    std::vector<uint64_t> keys; std::vector<float> vals; std::vector<Vec3> grads;
+    uint32_t dims[3]; Vec3 origin;
+    BakeAnalyticSdf(Vec3{-0.4f, -0.4f, -0.4f}, Vec3{0.4f, 0.4f, 0.4f}, cell,
+                    box_sdf, keys, vals, grads, dims, origin);
+
+    // Sample at world (0,0,0.16): inside, depth to +Z face = 0.2 - 0.16 = 0.04.
+    std::vector<float> sample = {0.0f, 0.0f, 0.16f};
+    SdfOracleScene s = BuildSdfScene(sample, Transform::Identity(),
+                                     Transform::Identity(), keys, vals, grads,
+                                     dims, origin, cell, cell);
+    const SdfHit h = RunSdfOp(s);
+    ASSERT_EQ(h.count, 1u);
+    EXPECT_NEAR(h.depth, he.z - 0.16f, cell) << "SDF box depth != min-face analytic";
+    // Normal points out the nearest (+Z) face.
+    EXPECT_NEAR(h.normal.z, 1.0f, 0.1f);
+}
+
+// SEPARATED: sample OUTSIDE the SDF band -> no contact (count 0).
+TEST(SdfPrecisionOracle, SeparatedSampleEmitsNoContact) {
+    const float cell = 0.01f;
+    const float R = 0.20f;
+    std::vector<uint64_t> keys; std::vector<float> vals; std::vector<Vec3> grads;
+    uint32_t dims[3]; Vec3 origin;
+    BakeAnalyticSdf(Vec3{-0.3f, -0.3f, -0.3f}, Vec3{0.3f, 0.3f, 0.3f}, cell,
+                    [&](Vec3 p) { return std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z) - R; },
+                    keys, vals, grads, dims, origin);
+    // Sample at (0.27,0,0): OUTSIDE the sphere (phi = 0.07 > 0) -> no contact.
+    std::vector<float> sample = {0.27f, 0.0f, 0.0f};
+    SdfOracleScene s = BuildSdfScene(sample, Transform::Identity(),
+                                     Transform::Identity(), keys, vals, grads,
+                                     dims, origin, cell, cell);
+    const SdfHit h = RunSdfOp(s);
+    EXPECT_EQ(h.count, 0u) << "a sample outside the surface must NOT emit a contact";
+}
+
+// D1: two runs of the SAME scene -> byte-identical manifold (fixed deepest-K
+// order + the D1 trilinear sampler). Re-points the GjkEpaConvex determinism
+// posture at the SDF path.
+TEST(SdfPrecisionOracle, TwoRunByteIdentity) {
+    const float cell = 0.01f;
+    const float R = 0.30f;
+    std::vector<uint64_t> keys; std::vector<float> vals; std::vector<Vec3> grads;
+    uint32_t dims[3]; Vec3 origin;
+    BakeAnalyticSdf(Vec3{-0.5f, -0.5f, -0.5f}, Vec3{0.5f, 0.5f, 0.5f}, cell,
+                    [&](Vec3 p) { return std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z) - R; },
+                    keys, vals, grads, dims, origin);
+    std::vector<float> sample = {0.10f, 0.10f, 0.05f};  // multi-axis interior.
+    SdfOracleScene s1 = BuildSdfScene(sample, Transform::Identity(),
+                                      Transform::Identity(), keys, vals, grads,
+                                      dims, origin, cell, cell);
+    const SdfHit a = RunSdfOp(s1);
+    SdfOracleScene s2 = BuildSdfScene(sample, Transform::Identity(),
+                                      Transform::Identity(), keys, vals, grads,
+                                      dims, origin, cell, cell);
+    const SdfHit b = RunSdfOp(s2);
+    EXPECT_EQ(a.count, b.count);
+    EXPECT_EQ(std::memcmp(&a.point, &b.point, sizeof(Vec3)), 0);
+    EXPECT_EQ(std::memcmp(&a.normal, &b.normal, sizeof(Vec3)), 0);
+    EXPECT_EQ(std::memcmp(&a.depth, &b.depth, sizeof(float)), 0);
 }

@@ -19,8 +19,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_contacts     = cap.max_rows_per_env > 0;
     const bool has_collidables  = has_bodies || cap.links_per_env > 0;
     const bool is_union = model.contact_family == ContactFamily::UnionCsr;
+    const bool is_pair_driven = model.contact_family == ContactFamily::PairDriven;
     const uint32_t family = is_union ? phi::kContactFamilyUnionCsr
-                                     : phi::kContactFamilyFusedFoot;
+                          : is_pair_driven ? phi::kContactFamilyPairDriven
+                                           : phi::kContactFamilyFusedFoot;
 
     // M3b launch-geometry counts (the views are pure pointer aggregates, so
     // every op carries its counts in the params POD).
@@ -89,15 +91,40 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_collidables) {
+        // M5 broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops do real
+        // work ONLY for the PairDriven family (the union slot-template and fused-
+        // foot families run their own detection and never read candidate_pairs);
+        // they EARLY-EXIT for is_union / fused so the gate-pinned union
+        // StepPlanned graph stays bit-identical to M4. The family + per-env body
+        // geometry travel in the params (the views are pure pointer aggregates).
+        const uint32_t bodies_per_env = cap.bodies_per_env;
         p_aabbs_.margin = cfg.contact_margin;
+        p_aabbs_.family = family;
+        p_aabbs_.env_count = env_count;
+        p_aabbs_.bodies_per_env = bodies_per_env;
         add(phi::NkOp::BuildAabbs, &p_aabbs_);
+
+        p_lbvh_build_.family = family;
+        p_lbvh_build_.env_count = env_count;
+        p_lbvh_build_.bodies_per_env = bodies_per_env;
         add(phi::NkOp::LbvhBuild, &p_lbvh_build_);
+
         p_lbvh_query_.max_pairs = cfg.max_pairs;
+        p_lbvh_query_.family = family;
+        p_lbvh_query_.env_count = env_count;
+        p_lbvh_query_.bodies_per_env = bodies_per_env;
+        p_lbvh_query_.max_contacts_per_env = cap.max_contacts_per_env;
+        p_lbvh_query_.filter_cross_env = model.filter_cross_env ? 1u : 0u;
+        p_lbvh_query_.excluded_count =
+            static_cast<uint32_t>(model.excluded_pairs.size());
         add(phi::NkOp::LbvhQueryPairs, &p_lbvh_query_);
     }
 
     if (has_particles) {
         p_grid_.cell_size = 0.0f;  // resolved from PBF params in M6.
+        p_grid_.query_radius = 0.0f;
+        p_grid_.particle_count = cap.particles_per_env * env_count;
+        for (int k = 0; k < 3; ++k) { p_grid_.grid_min[k] = 0.0f; p_grid_.grid_dims[k] = 0u; }
         add(phi::NkOp::ParticleGridBuild, &p_grid_);
     }
 
@@ -118,6 +145,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
 
         p_np_sdf_.contact_margin = cfg.contact_margin;
         p_np_sdf_.max_contacts_per_pair = 4;
+        p_np_sdf_.family = family;          // PairDriven => sample; else no-op.
+        p_np_sdf_.env_count = env_count;
+        p_np_sdf_.bodies_per_env = cap.bodies_per_env;
+        p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
         // ContactTangentBasis: fused-family only (the union family's tangent

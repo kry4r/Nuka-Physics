@@ -69,6 +69,53 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     return static_cast<uint32_t>(buckets.size() - 1);
 }
 
+// M5 SAMP cook (plan §3.5): build the SDF sampling-point set for one convex-hull
+// piece — the hull vertices PLUS each triangle edge's midpoint (so a coarse hull
+// still samples the SDF densely along its silhouette). Edge midpoints are
+// de-duplicated by the canonical (min,max) vertex pair so a shared edge is
+// emitted once (deterministic; ascending edge order). Appends xyz triples to
+// `out` and returns the count added (the per-body samp_range count). nka
+// EncodeSamples writes this exact xyz pool to the .nka SAMP chunk.
+uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
+                         std::vector<float>& out) {
+    if (piece >= geo.Count()) return 0u;
+    const uint32_t voff = geo.vertex_offsets[piece];
+    const uint32_t vcnt = geo.vertex_counts[piece];
+    const uint32_t ioff = geo.index_offsets[piece];
+    const uint32_t icnt = geo.index_counts[piece];
+    const uint32_t start = static_cast<uint32_t>(out.size() / 3u);
+    // 1. hull vertices.
+    for (uint32_t v = 0; v < vcnt; ++v) {
+        const size_t at = (static_cast<size_t>(voff) + v) * 3u;
+        out.push_back(geo.vertices[at + 0]);
+        out.push_back(geo.vertices[at + 1]);
+        out.push_back(geo.vertices[at + 2]);
+    }
+    // 2. unique triangle-edge midpoints (canonical (lo,hi) dedup, ascending).
+    std::vector<uint64_t> seen;
+    auto edge_key = [](uint32_t a, uint32_t b) -> uint64_t {
+        const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+        return (static_cast<uint64_t>(lo) << 32) | hi;
+    };
+    auto add_edge = [&](uint32_t a, uint32_t b) {
+        const uint64_t k = edge_key(a, b);
+        if (std::find(seen.begin(), seen.end(), k) != seen.end()) return;
+        seen.push_back(k);
+        const size_t pa = (static_cast<size_t>(voff) + a) * 3u;
+        const size_t pb = (static_cast<size_t>(voff) + b) * 3u;
+        out.push_back(0.5f * (geo.vertices[pa + 0] + geo.vertices[pb + 0]));
+        out.push_back(0.5f * (geo.vertices[pa + 1] + geo.vertices[pb + 1]));
+        out.push_back(0.5f * (geo.vertices[pa + 2] + geo.vertices[pb + 2]));
+    };
+    for (uint32_t t = 0; t + 2 < icnt; t += 3u) {
+        const uint32_t i0 = geo.indices[ioff + t + 0];
+        const uint32_t i1 = geo.indices[ioff + t + 1];
+        const uint32_t i2 = geo.indices[ioff + t + 2];
+        add_edge(i0, i1); add_edge(i1, i2); add_edge(i2, i0);
+    }
+    return static_cast<uint32_t>(out.size() / 3u) - start;
+}
+
 }  // namespace
 
 CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
@@ -323,6 +370,97 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
         cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
         cap.max_rows_per_env     = cap.max_contacts_per_env * 4u;
+    }
+
+    // 10. M5 — pair-driven generalized-collision + SDF main-path staging (plan
+    //     §3.5). The shape_table (one PairDrivenShape / collidable body row),
+    //     the SDF sampling-point pool (SAMP cook), the cooked sparse-SDF grids
+    //     (SdfDeviceWorld upload duties moved INTO the Model), and the filter
+    //     exclude-list. A FusedFoot scene with no SdfMesh shape leaves the SDF
+    //     tables empty (max_sdf_* == 0); they are populated for a cooked
+    //     pair-driven SDF scene. These tables are sized AFTER the contact
+    //     capacity (max_bodies_total == bodies_per_env, the shape_table stride).
+    cap.max_bodies_total = cap.bodies_per_env;
+    {
+        // shape_table: one row per body, from its FIRST shape's primitive + the
+        // contype/conaffinity (from the cooked filter groups when present).
+        model.shape_table_rows.assign(cap.bodies_per_env, {});
+        std::vector<uint8_t> body_done(cap.bodies_per_env, 0u);
+        for (uint32_t s = 0; s < model.shapes.size(); ++s) {
+            const nk::ModelShape& sh = model.shapes[s];
+            if (sh.body_row >= cap.bodies_per_env || body_done[sh.body_row]) continue;
+            body_done[sh.body_row] = 1u;
+            nk::Model::PairDrivenShape& row = model.shape_table_rows[sh.body_row];
+            row.kind = sh.kind;
+            // params: sphere r / capsule r,hh / box he.xyz, by kind.
+            row.params[0] = sh.radius;
+            row.params[1] = sh.half_height;
+            row.params[2] = sh.half_extents.z;
+            // box he uses .xyz; overload params for the box kind.
+            if (sh.kind == static_cast<uint8_t>(ShapeType::Box)) {
+                row.params[0] = sh.half_extents.x;
+                row.params[1] = sh.half_extents.y;
+                row.params[2] = sh.half_extents.z;
+            }
+            row.contype = 1u;
+            row.conaffinity = 1u;
+            row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
+        }
+
+        // SDF grids: mirror the cooked CookedSdfTable into the Model SDF tables;
+        // for each SdfMesh / ConvexHull shape carrying a cooked SDF, build the
+        // sampling-point set (CookHullSamples) and bind the body's samp_range +
+        // (for the OTHER body) the sdf_grid index.
+        const CookedSdfTable& sdf = blob.sdfs;
+        const CookedConvexGeometry& geo = blob.convex_geometry;
+        model.samp_ranges.assign(static_cast<size_t>(cap.bodies_per_env) * 2u, 0u);
+        if (sdf.Count() > 0) {
+            // Concatenate the cooked SDF grids into the Model device tables.
+            model.sdf_grids.reserve(sdf.Count());
+            uint32_t cell_cursor = 0;
+            for (uint32_t g = 0; g < sdf.Count(); ++g) {
+                nk::Model::SdfGrid grid;
+                grid.origin = sdf.origins[g];
+                grid.voxel_size = sdf.voxel_sizes[g];
+                grid.dims[0] = sdf.dims_x[g];
+                grid.dims[1] = sdf.dims_y[g];
+                grid.dims[2] = sdf.dims_z[g];
+                grid.cell_offset = cell_cursor;
+                grid.cell_count = sdf.key_counts[g];
+                model.sdf_grids.push_back(grid);
+                const uint32_t off = sdf.key_offsets[g];
+                for (uint32_t c = 0; c < grid.cell_count; ++c) {
+                    model.sdf_cell_keys.push_back(sdf.cell_keys[off + c]);
+                    model.sdf_cell_values.push_back(sdf.cell_values[off + c]);
+                    model.sdf_cell_gradients.push_back(sdf.cell_gradients[off + c]);
+                }
+                cell_cursor += grid.cell_count;
+            }
+            // Per-body: a SdfMesh/hull body carrying a cooked SDF binds sdf_grid;
+            // any body owning a hull piece gets a SAMP slice (the sampling set).
+            for (uint32_t s = 0; s < model.shapes.size(); ++s) {
+                const nk::ModelShape& sh = model.shapes[s];
+                if (sh.body_row >= cap.bodies_per_env) continue;
+                const uint32_t cgi = sh.convex_geometry_index;
+                if (cgi == ~uint32_t(0) || cgi >= geo.Count()) continue;
+                const uint32_t before = static_cast<uint32_t>(model.samp_points.size() / 3u);
+                const uint32_t added = CookHullSamples(geo, cgi, model.samp_points);
+                model.samp_ranges[sh.body_row * 2u + 0u] = before;
+                model.samp_ranges[sh.body_row * 2u + 1u] = added;
+                // If this piece has a cooked SDF, expose it on the body's shape row.
+                if (cgi < sdf.piece_sdf_indices.size() &&
+                    sdf.piece_sdf_indices[cgi] != kNoSdf &&
+                    sh.body_row < model.shape_table_rows.size()) {
+                    model.shape_table_rows[sh.body_row].sdf_grid =
+                        sdf.piece_sdf_indices[cgi];
+                }
+            }
+        }
+        cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
+        cap.max_sdf_grids   = static_cast<uint32_t>(model.sdf_grids.size());
+        cap.max_sdf_cells   = static_cast<uint32_t>(model.sdf_cell_keys.size());
+        cap.max_excluded_pairs =
+            static_cast<uint32_t>(model.excluded_pairs.size());
     }
 
     return result;

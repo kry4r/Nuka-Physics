@@ -44,6 +44,16 @@ struct ModelCapacities {
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
+    // M5 — pair-driven broadphase / SDF main-path capacities (GLOBAL tables,
+    // per-env template, base-relative; the union slot-template family leaves
+    // them 0). Sized by the cooked pair-driven scene; the SDF/SAMP grids are 0
+    // for a scene with no SdfMesh collision shape (the union scene).
+    uint32_t max_bodies_total     = 0;  // collidable body rows / env (shape_table).
+    uint32_t max_excluded_pairs   = 0;  // cooked filter exclude-list length.
+    uint32_t max_samp_points      = 0;  // SDF sampling-point pool size.
+    uint32_t max_sdf_grids        = 0;  // cooked sparse-SDF grid count.
+    uint32_t max_sdf_cells        = 0;  // total cooked narrow-band SDF cells.
+
     // Resolve a FieldPer count-unit to a concrete per-env element count using
     // these capacities (env-major; the env multiplier is applied by the Arena /
     // UploadTo packer, NOT folded in here -- this returns the PER-ENV count).
@@ -135,7 +145,10 @@ struct ModelMaterialBucket {
 //   UnionCsr  — the union compliant-CSR pipeline (feet x ground + finger x
 //               hull + box x plane in ONE solve — the legacy BatchedUnifiedWorld
 //               semantics).
-enum class ContactFamily : uint8_t { FusedFoot = 0, UnionCsr = 1 };
+//   PairDriven — the M5 generalized broadphase->narrowphase pipeline (per-env
+//               LBVH candidate_pairs -> analytic prim dispatch + SDF main path).
+//               ADDITIVE; the union slot-template path is untouched.
+enum class ContactFamily : uint8_t { FusedFoot = 0, UnionCsr = 1, PairDriven = 2 };
 
 // One union contact-pair slot (the per-env contact template, replicated across
 // envs; the legacy BatchedSceneTemplate fingertips/feet/table classes 1:1).
@@ -233,9 +246,40 @@ public:
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.
 
-    // Filter policy (plan §3.3): cross-env collision flag + (future) excluded
-    // pairs. M3a carries the flag; the baked pair lists ride the CookedBlob.
+    // Filter policy (plan §3.3): cross-env collision flag + excluded pairs.
+    // M3a carried the flag; M5 carries the SORTED (lo<<32|hi) device exclude
+    // list (staged into the excluded_pairs field) for the pair-driven query.
     bool filter_cross_env = false;
+    std::vector<uint64_t> excluded_pairs;   // SORTED ascending canonical keys.
+
+    // -- M5: pair-driven generalized collision tables (the union slot-template
+    // family leaves these empty). shape_table_rows: one PairDrivenShape per
+    // collidable body row (cooked from CollisionShapeComponent). samp_points/
+    // samp_ranges: the SDF sampling-point pool + per-body slice. sdf_*: the
+    // cooked sparse narrow-band SDF (mirrors scene::CookedSdfTable). --------
+    struct PairDrivenShape {
+        uint32_t   kind = 0;             // CollisionShapeComponent::Kind.
+        float      params[4] = {0, 0, 0, 0};  // sphere r / capsule r,hh / box he.
+        uint32_t   contype = 1;
+        uint32_t   conaffinity = 1;
+        uint32_t   sdf_grid = ~0u;       // sdf_headers index, or ~0 (analytic).
+    };
+    std::vector<PairDrivenShape> shape_table_rows;
+    std::vector<float>           samp_points;     // xyz packed.
+    std::vector<uint32_t>        samp_ranges;     // {offset,count} per body row.
+    // Cooked sparse-SDF grids (host staging; uploaded by UploadTo into the
+    // sdf_* Model fields — the SdfDeviceWorld upload duties moved INTO Model).
+    struct SdfGrid {
+        math::Vec3 origin{};
+        float      voxel_size = 0.0f;
+        uint32_t   dims[3] = {0, 0, 0};
+        uint32_t   cell_offset = 0;      // base into the flat cell arrays.
+        uint32_t   cell_count = 0;
+    };
+    std::vector<SdfGrid>     sdf_grids;
+    std::vector<uint64_t>    sdf_cell_keys;       // flat ASCENDING per-grid.
+    std::vector<float>       sdf_cell_values;     // flat signed distances.
+    std::vector<math::Vec3>  sdf_cell_gradients;  // flat gradients.
 
     // The field schema is the generated FieldId enum + arena_layout table; Model
     // exposes the capacities the layout multiplies by. (No per-field storage here

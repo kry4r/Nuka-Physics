@@ -18,7 +18,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -186,4 +188,86 @@ TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
                     "ms/step (same scene; %.1fx vs nk)\n",
                     legacy_ms, legacy_ms / ms_per_step);
     }
+}
+
+// ===========================================================================
+// M5 — NK GRASP THROUGHPUT (plan M5 RED LINE: "grasp 聚合 >= 11k env-steps/s").
+//   The A1-era grasp scene (the SAME union(H1 + cup + table) full-contact
+//   topology — feet x ground + fingertips x cup hull + cup-proxy x table) batched
+//   at N=1024 through CookToModel-shaped BuildNkUnionModel -> nk::World ->
+//   StepPlanned (ONE capture, replayed). The aggregate throughput (N * steps /
+//   wall) must clear 11,000 env-steps/s (the baseline the legacy host-O(N)
+//   path could not reach: tests/coresident/test_batched_unified_world_perf.cpp
+//   measured ~10k eps WITH a host PD round-trip per step; the nk path keeps the
+//   whole step device-resident in the graph). The full M5 collision spine
+//   (BuildAabbs/Lbvh*/NarrowphaseSdf) is REGISTERED + in the pipeline; for the
+//   union family it early-exits, so this is the production union path with the
+//   M5 ops present (proving they do not regress the gate).
+// ===========================================================================
+TEST(NkGraspThroughput, BatchedUnionAtLeast11kEnvStepsPerSecond) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    nphi::Device* dev = nphi::InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+
+    coresident::H1UnionScene sc = coresident::BuildH1UnionScene(context);
+    ASSERT_TRUE(sc.place_found);
+    const float dt = coresident::kH1UnionDt;
+
+    constexpr uint32_t kEnvs = 1024u;
+    nk::Model model = coresident::BuildNkUnionModel(sc.tmpl, kEnvs);
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = dt;
+    cfg.gravity[2] = coresident::kH1UnionGravityZ;
+    cfg.vel_iters = 64;
+    cfg.pos_iters = 0;
+    cfg.fold_drive_damping = 0;
+    nk::World world(std::move(model), kEnvs, dev, backend, cfg);
+    ASSERT_TRUE(world.Ready());
+    std::printf("[NK-GRASP-TP] batched union N=%u: links/env=%u slots=%u "
+                "rows/env=%u islands=%u\n", kEnvs, sc.link_count,
+                world.GetModel().capacities.max_contacts_per_env,
+                world.GetModel().capacities.max_rows_per_env,
+                world.GetModel().schedule_island_count);
+
+    // The steady-state RL seam: a constant grip torque uploaded ONCE (the bulk
+    // SetActions posture), then pure StepPlanned. Throughput = N*steps/wall;
+    // no per-step host PD (the aggregate-throughput question, not closed-loop).
+    const uint32_t L = sc.link_count;
+    std::vector<float> torque(static_cast<size_t>(L) * kEnvs, 0.0f);
+    for (uint32_t e = 0; e < kEnvs; ++e)
+        for (uint32_t l = 0; l < L && l < sc.tmpl.grip_torque.size(); ++l)
+            torque[static_cast<size_t>(e) * L + l] = sc.tmpl.grip_torque[l];
+    ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::DriveTarget,
+                                            torque.data(),
+                                            torque.size() * sizeof(float)));
+
+    constexpr uint32_t kWarm = 20u;
+    for (uint32_t s = 0; s < kWarm; ++s) ASSERT_EQ(world.StepPlanned(), nphi::Status::Ok);
+    nphi::BackendSynchronize(backend);
+
+    constexpr uint32_t kSteps = 200u;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t s = 0; s < kSteps; ++s) ASSERT_EQ(world.StepPlanned(), nphi::Status::Ok);
+    nphi::BackendSynchronize(backend);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double wall_s =
+        std::chrono::duration<double>(t1 - t0).count();
+    const double eps = static_cast<double>(kEnvs) * kSteps / wall_s;
+    std::printf("[NK-GRASP-TP RESULT] N=%u x %u steps in %.3f s -> "
+                "%.1f env-steps/s (gate >= 11000; margin %.2fx)\n",
+                kEnvs, kSteps, wall_s, eps, eps / 11000.0);
+
+    // Liveness: the batch did not NaN-collapse.
+    {
+        std::vector<nuka::math::Transform> base(kEnvs);
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BasePose,
+                                                  base.data(),
+                                                  base.size() * sizeof(base[0])));
+        EXPECT_TRUE(std::isfinite(base[0].position.z));
+    }
+
+    EXPECT_GE(eps, 11000.0) << "the plan M5 grasp throughput red line is BROKEN";
 }

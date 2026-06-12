@@ -18,6 +18,8 @@ void RegisterNkArticulationPipelineOps();
 void RegisterNkAbaOps();              // articulation.cu
 void RegisterNkCrbaOps();             // crba.cu
 void RegisterNkContactsFootOps();     // contacts_foot.cu (+contacts_union.cu)
+void RegisterNkBroadphaseOps();       // broadphase.cu (M5)
+void RegisterNkNarrowphaseSdfOps();   // narrowphase_sdf.cu (M5)
 void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
 void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkReadoutOps();          // readout.cu
