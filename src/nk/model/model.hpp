@@ -161,6 +161,13 @@ struct UnionSlot {
         kFootSpherePlane = 1,  // artic sphere (link+offset+radius) x +Z plane.
         kFingerSphereHull = 2, // artic sphere x convex hull on body `body`.
         kBodyBoxPlane   = 3,   // rigid box (body+offset+half) x +Z plane.
+        // M6 particle coupling classes: side a == a PARTICLE sphere (the slot's
+        // `link` field carries the LOCAL particle index; detection forms its
+        // world pos from particle_pos[env*particles_per_env + link]); side b is
+        // a static +Z plane (kParticleSpherePlane) or a rigid box (the slot's
+        // `body` field; kParticleSphereBox). Radius == particle contact radius.
+        kParticleSpherePlane = 4,  // particle sphere x +Z plane (static floor).
+        kParticleSphereBox   = 5,  // particle sphere x rigid box (body+offset+half).
     };
     uint32_t   cls = kInactive;
     uint32_t   link = ~0u;            // template-local link (sphere classes).
@@ -204,6 +211,57 @@ public:
     float ground_height          = 0.0f;
     float friction_coefficient   = 0.8f;   // legacy kContactFriction
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
+
+    // -- M6: particle (XPBD soft + PBF fluid) cook product --------------------
+    // The XPBD constraint templates (dist/bend/vol, owner:model) are staged by
+    // UploadTo; the particle initial state (pos/prev/vel/inv_mass) is seeded by
+    // World::SeedInitialState. PBF params are resolved into the ParticleGridBuild
+    // + Pbf* op params by Pipeline::Build. A scene with no particles leaves these
+    // empty and particles_per_env == 0 (Pipeline emits no particle ops).
+    // Coupled: particles co-step against rigid/artic bodies through the unified
+    // row solve (the kUSlotParticleSphere* contact classes); the internal XPBD
+    // soft constraints (if any) still run. None/Xpbd/Pbf are the standalone modes.
+    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3 };
+    // In Coupled mode, which internal dynamics run alongside the contact coupling:
+    // None (free point masses), Xpbd (soft constraints), Pbf (fluid density).
+    enum class CoupledInternal : uint8_t { None = 0, Xpbd = 1, Pbf = 2 };
+    struct ModelParticles {
+        ParticleMode mode = ParticleMode::None;
+        CoupledInternal coupled_internal = CoupledInternal::None;
+        // Initial per-particle state (env-major replicated by SeedInitialState;
+        // these are the SINGLE-ENV template, length == particles_per_env).
+        std::vector<math::Vec3> initial_pos;
+        std::vector<math::Vec3> initial_vel;
+        std::vector<float>      inv_mass;
+        // XPBD constraint templates (single-env; staged + dispatched per env).
+        std::vector<uint32_t> dist_a, dist_b;     // distance endpoints
+        std::vector<float>    dist_rest, dist_alpha;
+        std::vector<uint32_t> bend_particles;     // 4 / bend constraint
+        std::vector<math::Vec3> bend_gradients;   // 4 / bend constraint
+        std::vector<float>    bend_alpha;
+        std::vector<uint32_t> vol_particles;      // 4 / volume constraint
+        std::vector<float>    vol_rest6, vol_alpha;
+        uint16_t xpbd_iters = 1;
+        // PBF fluid params (Macklin & Mueller 2013 + p10-B polish).
+        float    pbf_rest_density   = 0.0f;   // rho0 (0 disables PBF)
+        float    pbf_support_radius = 0.0f;   // h (== grid query radius / cell)
+        float    pbf_particle_mass  = 0.0f;
+        float    pbf_cfm_epsilon    = 1.0e-6f;
+        uint16_t pbf_iters          = 4;
+        bool     pbf_clamp_overdensity = true;
+        float    pbf_xsph_viscosity = 0.0f;
+        float    pbf_surface_tension= 0.0f;
+        // Uniform grid domain (cook-derived; the grid is built every step over
+        // the predicted positions but sized from this cooked AABB + cell size).
+        math::Vec3 grid_min{0.0f, 0.0f, 0.0f};
+        uint32_t   grid_dims[3] = {0u, 0u, 0u};
+        float      cell_size  = 0.0f;        // == support radius (>= query radius).
+        float      query_radius = 0.0f;      // == support radius.
+        // Boundary floor (z-up; the M5 grid + particle ops are z-up).
+        bool  boundary_enabled = false;
+        float floor_z = 0.0f;
+    };
+    ModelParticles particles;
 
     // -- M4: contact family + union (CSR compliant) tables --------------------
     ContactFamily contact_family = ContactFamily::FusedFoot;

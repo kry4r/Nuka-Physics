@@ -328,6 +328,13 @@ fields:
   - {name: particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data, flags: [diff]}
   - {name: particle_inv_mass, dtype: f32,  per: particle, arena: persistent, owner: data, flags: [param]}
+  # M6 COUPLED mode: the pre-contact (predicted) velocity scratch. CoupledPredict
+  # saves the post-gravity velocity here so CoupledFinalize can compose the PBD
+  # (XPBD/PBF position-projection) velocity with the contact velocity delta:
+  #   v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
+  # Standalone XPBD/PBF never touch it (mode-gated). A dedicated field (NOT a reuse
+  # of pbf_predicted_pos, which the PBF density-projection owns in coupled mode).
+  - {name: particle_v_pre,    dtype: vec3, per: particle, arena: scratch,    owner: data}
 
   # --- XPBD DISTANCE constraints (per dist_con) ---
   - {name: dist_particle_a,    dtype: u32, per: dist_con, arena: persistent, owner: model}

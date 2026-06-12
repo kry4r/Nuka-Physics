@@ -15,9 +15,13 @@
 // nk::World; CookToModel only fills host tables.)
 // ---------------------------------------------------------------------------
 
+#include "math/vec3.hpp"
 #include "nk/model/model.hpp"
 #include "scene/scene_ir.hpp"
 #include "scene/scene_map.hpp"
+
+#include <cstdint>
+#include <vector>
 
 namespace nuka::scene::cook {
 
@@ -29,5 +33,66 @@ struct CookToModelResult {
 // Cook a SceneIR into an nk::Model replicated across `env_count` envs, plus the
 // EntityId<->row SceneMap. env_count must be >= 1 (clamped to 1 if 0).
 CookToModelResult CookToModel(const SceneIR& scene, int env_count);
+
+// ---------------------------------------------------------------------------
+// M6 — particle cook (plan §3.10 "粒子 XPBD/PBF"). Stage an XPBD soft body or a
+// PBF fluid into the nk::Model particle block + set the particle/constraint
+// capacities. The cook layer is PURE C++ (nk_engine lint scope: zero CUDA
+// tokens), so it CANNOT include the legacy runtime::soft/fluid world headers
+// (those pull <cuda_runtime.h>). Instead the cook takes the cookers' PLAIN
+// PRODUCTS as POD arrays (the caller runs import::cooker::CookXpbdSoftBody /
+// CookFluidBox — which ARE the reuse — and hands the de-interleaved constraint
+// arrays + the rest state here). The de-interleave mirrors the legacy
+// UploadXpbdWorld / UploadPbfWorld byte layout, so the device-staged particle /
+// constraint tables (after env-major replication) reproduce the legacy world's
+// layout — the byte-exact port contract for the XPBD/PBF 件套.
+// ---------------------------------------------------------------------------
+
+// One XPBD distance constraint (the de-interleaved XpbdDistanceConstraint).
+struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
+// One XPBD bend constraint (4 particles + 4 cooked gradient vectors K_i).
+struct CookBendCon { uint32_t p[4]; math::Vec3 k[4]; float compliance_alpha; };
+// One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
+struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
+
+struct XpbdCookInput {
+    std::vector<math::Vec3>      positions;     // per-particle rest state
+    std::vector<math::Vec3>      velocities;    // per-particle initial velocity
+    std::vector<float>           inv_mass;      // 1/mass (0 == pinned)
+    std::vector<CookDistanceCon> distance;
+    std::vector<CookBendCon>     bend;
+    std::vector<CookVolumeCon>   volume;
+    uint16_t solver_iterations = 1u;
+};
+
+// Stage an XPBD soft body into the Model (single-env template; SeedInitialState
+// replicates env-major). Sets particles_per_env / dist/bend/vol_cons_per_env.
+void CookXpbdParticles(nk::Model& model, uint32_t env_count,
+                       const XpbdCookInput& in);
+
+struct PbfCookInput {
+    std::vector<math::Vec3> positions;     // CookFluidBox lattice
+    std::vector<math::Vec3> velocities;    // initial velocity (usually zero)
+    std::vector<float>      inv_mass;      // 1/mass (0 == pinned boundary)
+    float    particle_mass   = 0.0f;       // uniform mass = rho0 * spacing^3
+    float    rest_density    = 0.0f;       // rho0
+    float    support_radius  = 0.0f;       // h (== grid cell size + query radius)
+    float    cfm_epsilon     = 1.0e-6f;
+    uint16_t iters           = 4u;
+    bool     clamp_overdensity = true;
+    float    xsph_viscosity  = 0.0f;
+    float    surface_tension = 0.0f;
+    // Uniform grid domain (the op rebuilds the grid each step over the predicted
+    // positions but sizes it from this cooked AABB + cell size == support radius).
+    math::Vec3 grid_min{0.0f, 0.0f, 0.0f};
+    uint32_t   grid_dims[3] = {0u, 0u, 0u};
+    bool       boundary_enabled = false;
+    float      floor_z = 0.0f;             // z-up boundary floor.
+};
+
+// Stage a PBF fluid into the Model (single-env template; SeedInitialState
+// replicates env-major). Sets particles_per_env.
+void CookPbfParticles(nk::Model& model, uint32_t env_count,
+                      const PbfCookInput& in);
 
 } // namespace nuka::scene::cook

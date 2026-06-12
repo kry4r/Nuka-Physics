@@ -178,7 +178,13 @@ struct ParticleGridBuildParams {
     uint32_t particle_count;    // total particles (env-major)
     float    grid_min[3];       // grid lower corner
     uint32_t grid_dims[3];      // grid resolution
+    // M6: which position field the grid is built over. PBF builds the neighbor
+    // list on the PREDICTED positions (legacy StepPbfWorld), so pos_source == 1
+    // routes the op to pbf_predicted_pos; 0 == particle_pos (the M5 default).
+    uint32_t pos_source;        // 0 = particle_pos, 1 = pbf_predicted_pos
 };
+inline constexpr uint32_t kGridPosSourceParticlePos = 0u;
+inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
@@ -208,6 +214,9 @@ struct NarrowphasePrimitivesParams {
     uint32_t union_slot_count;  // union slots per env (Model union_slots size)
     uint32_t bodies_per_env;
     uint32_t hull_vert_count;   // live verts of the hull_verts pool
+    // M6: particle coupling (the kUSlotParticleSphere* union classes form the
+    // particle side's world sphere from particle_pos[env*particles_per_env+link]).
+    uint32_t particles_per_env;
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
@@ -243,6 +252,7 @@ struct AssembleRowsParams {
     uint32_t base_link_count;   // links per env (replica stride)
     float    solref[2];         // merged contact solref (union family)
     float    solimp[5];         // merged contact solimp (union family)
+    uint32_t particles_per_env; // M6 particle coupling (kUSlotParticleSphere*).
 };
 
 // Spec-fixed semantic fields (M1): {dt, vel_iters, pos_iters}. The fields BELOW
@@ -274,27 +284,81 @@ struct SolveRowsBlockIslandParams {
 };
 
 // --- particle (XPBD / PBF) substep --------------------------------------
+// M6 prediction-mode selector (the XPBD vs PBF predict semantics DIVERGE — the
+// XPBD predict folds gravity into the position WITHOUT mutating velocity and
+// snapshots prev_pos, while PBF kicks the velocity by g*dt then predicts into a
+// SEPARATE pbf_predicted_pos buffer). The op param carries the mode so the ONE
+// op TU dispatches the correct legacy kernel body.
+inline constexpr uint32_t kParticleModeNone = 0u;  // no particles (early-exit)
+inline constexpr uint32_t kParticleModeXpbd = 1u;  // XPBD soft/cloth predict
+inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
+// COUPLED mode (M6): particles co-step against rigid/artic bodies through the
+// unified row solve (the ParticleInvMass arm). The contact solve corrects the
+// particle VELOCITY between the position predict and the position finalize (the
+// legacy unified_costep pre/couple/post ordering, reproduced inside the fixed
+// pipeline). pbf_predicted_pos is reused as the v_pre scratch so ParticleFinalize
+// can compose the PBD (XPBD soft-constraint) velocity with the contact velocity
+// delta — exactly v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
+inline constexpr uint32_t kParticleModeCoupled = 3u;
+
+// Common particle launch geometry (the views are pure pointer aggregates, so
+// every particle op carries its counts). particle_count == total env-major
+// particles; the constraint counts are total env-major XPBD constraint slots.
+// Coupled internal-dynamics sub-type (which projected-position buffer the
+// coupled finalize composes): none (free point masses) / xpbd (particle_pos) /
+// pbf (pbf_predicted_pos). Only meaningful when mode == kParticleModeCoupled.
+inline constexpr uint32_t kCoupledInternalNone = 0u;
+inline constexpr uint32_t kCoupledInternalXpbd = 1u;
+inline constexpr uint32_t kCoupledInternalPbf  = 2u;
+
 struct ParticlePredictParams {
-    float dt;
-    float gravity[3];
+    float    dt;
+    float    gravity[3];
+    uint32_t mode;             // kParticleMode*
+    uint32_t particle_count;   // total env-major particles
+    uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
 };
 
 struct XpbdProjectParams {
-    float dt;
-    uint16_t iters;
+    float    dt;
+    uint16_t iters;            // XPBD Gauss-Seidel sweep count
+    uint32_t dist_con_count;   // total env-major distance constraints
+    uint32_t bend_con_count;   // total env-major bend constraints
+    uint32_t vol_con_count;    // total env-major volume constraints
 };
 
 struct PbfDensityLambdaParams {
-    float rest_density;
-    float relaxation;      // CFM-style epsilon
+    float    rest_density;     // rho0
+    float    relaxation;       // CFM-style epsilon (cfm_epsilon)
+    float    support_radius;   // SPH support radius h (== grid query radius)
+    float    particle_mass;    // uniform per-particle mass
+    uint32_t particle_count;
+    uint16_t iters;            // density-projection iterations
+    uint16_t clamp_overdensity;// 1 => clamp C_i >= 0 (no surface cohesion pull)
+    float    dt;               // substep dt (for the boundary clamp + apply)
+    uint32_t boundary_enabled; // 1 => apply the floor clamp in the apply pass
+    float    floor_z;          // boundary floor (the M5 grid is z-up; legacy y).
 };
 
 struct PbfApplyDeltaParams {
-    uint32_t reserved;
+    float    support_radius;
+    float    particle_mass;
+    uint32_t particle_count;
+    uint32_t boundary_enabled;
+    float    floor_z;
 };
 
 struct ParticleFinalizeParams {
-    float dt;
+    float    dt;
+    uint32_t mode;             // kParticleMode*
+    uint32_t particle_count;
+    uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
+    // PBF post-finalize polish (gated inert when the coefficient is 0).
+    float    support_radius;
+    float    particle_mass;
+    float    xsph_viscosity_c;     // XSPH velocity-smoothing coefficient
+    float    surface_tension_gamma;// Akinci cohesion coefficient
+    float    rest_density;         // rho0 (for the XSPH density normalization)
 };
 
 // --- readout / RL substrate ---------------------------------------------

@@ -121,6 +121,7 @@ enum class FieldId : uint16_t {
     ParticlePrevPos,  // particle_prev_pos (per:particle arena:persistent owner:data)
     ParticleVel,  // particle_vel (per:particle arena:persistent owner:data flags:[diff])
     ParticleInvMass,  // particle_inv_mass (per:particle arena:persistent owner:data flags:[param])
+    ParticleVPre,  // particle_v_pre (per:particle arena:scratch owner:data)
     DistParticleA,  // dist_particle_a (per:dist_con arena:persistent owner:model)
     DistParticleB,  // dist_particle_b (per:dist_con arena:persistent owner:model)
     DistRestLength,  // dist_rest_length (per:dist_con arena:persistent owner:model)

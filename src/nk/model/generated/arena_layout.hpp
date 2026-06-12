@@ -150,6 +150,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_prev_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_vel
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_inv_mass
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_v_pre
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_particle_a
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_particle_b
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_rest_length

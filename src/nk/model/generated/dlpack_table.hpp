@@ -137,6 +137,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // particle_prev_pos
     {FieldId::ParticleVel, DlpackDtype::kF32, 2, true, false},  // particle_vel
     {FieldId::ParticleInvMass, DlpackDtype::kF32, 1, false, false},  // particle_inv_mass
+    {FieldId::ParticleVPre, DlpackDtype::kF32, 2, false, false},  // particle_v_pre
     {FieldId::DistParticleA, DlpackDtype::kU32, 1, false, false},  // dist_particle_a
     {FieldId::DistParticleB, DlpackDtype::kU32, 1, false, false},  // dist_particle_b
     {FieldId::DistRestLength, DlpackDtype::kF32, 1, false, false},  // dist_rest_length

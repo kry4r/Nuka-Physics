@@ -76,11 +76,35 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }
 
+    // M6 particle launch geometry + mode (resolved once from the Model).
+    const uint32_t particle_count = cap.particles_per_env * env_count;
+    const uint32_t dist_count = cap.dist_cons_per_env * env_count;
+    const uint32_t bend_count = cap.bend_cons_per_env * env_count;
+    const uint32_t vol_count  = cap.vol_cons_per_env * env_count;
+    const Model::ModelParticles& mp = model.particles;
+    const uint32_t particle_mode =
+        mp.mode == Model::ParticleMode::Xpbd ? phi::kParticleModeXpbd
+        : mp.mode == Model::ParticleMode::Pbf ? phi::kParticleModePbf
+        : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
+                                                  : phi::kParticleModeNone;
+    const uint32_t coupled_internal =
+        mp.coupled_internal == Model::CoupledInternal::Xpbd ? phi::kCoupledInternalXpbd
+        : mp.coupled_internal == Model::CoupledInternal::Pbf ? phi::kCoupledInternalPbf
+                                                             : phi::kCoupledInternalNone;
+    // The PBF density-projection runs when the body IS a fluid: either standalone
+    // PBF mode, or coupled mode with the Pbf internal sub-type.
+    const bool runs_pbf = (particle_mode == phi::kParticleModePbf) ||
+        (particle_mode == phi::kParticleModeCoupled &&
+         coupled_internal == phi::kCoupledInternalPbf);
+
     if (has_particles) {
         p_part_predict_.dt = cfg.dt;
         p_part_predict_.gravity[0] = cfg.gravity[0];
         p_part_predict_.gravity[1] = cfg.gravity[1];
         p_part_predict_.gravity[2] = cfg.gravity[2];
+        p_part_predict_.mode = particle_mode;
+        p_part_predict_.particle_count = particle_count;
+        p_part_predict_.coupled_internal = coupled_internal;
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
     }
 
@@ -121,10 +145,25 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_particles) {
-        p_grid_.cell_size = 0.0f;  // resolved from PBF params in M6.
-        p_grid_.query_radius = 0.0f;
-        p_grid_.particle_count = cap.particles_per_env * env_count;
-        for (int k = 0; k < 3; ++k) { p_grid_.grid_min[k] = 0.0f; p_grid_.grid_dims[k] = 0u; }
+        // M6: resolve the PBF uniform-grid params from the cooked Model. For a
+        // PBF fluid the cell_size/query_radius == the support radius (the M5
+        // grid precondition cell >= query); the grid_min/dims come from the
+        // cooked domain. An XPBD-only scene leaves cell_size 0 -> the build op
+        // early-exits (no PBF neighbors needed). The grid is rebuilt every step
+        // over the PREDICTED positions (pbf_predicted_pos) — but ParticleGridBuild
+        // reads particle_pos; M6 routes it at the PBF predicted positions via the
+        // op reading particle_pos AFTER ParticlePredict... see the note below.
+        p_grid_.cell_size = runs_pbf ? mp.cell_size : 0.0f;
+        p_grid_.query_radius = mp.query_radius;
+        p_grid_.particle_count = particle_count;
+        for (int k = 0; k < 3; ++k) {
+            p_grid_.grid_min[k] = (&mp.grid_min.x)[k];
+            p_grid_.grid_dims[k] = mp.grid_dims[k];
+        }
+        // PBF builds the grid over the predicted positions (ParticlePredict runs
+        // just above, seeding pbf_predicted_pos).
+        p_grid_.pos_source = runs_pbf ? phi::kGridPosSourcePbfPredicted
+                                      : phi::kGridPosSourceParticlePos;
         add(phi::NkOp::ParticleGridBuild, &p_grid_);
     }
 
@@ -141,6 +180,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
+        p_np_prim_.particles_per_env = cap.particles_per_env;  // M6 coupling slots.
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
         p_np_sdf_.contact_margin = cfg.contact_margin;
@@ -187,17 +227,42 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.base_link_count = base_link_count;
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.union_solref[k];
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.union_solimp[k];
+        p_assemble_.particles_per_env = cap.particles_per_env;  // M6 coupling.
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
 
     if (has_particles) {
+        // XpbdProject: the distance/bend/volume sweeps (XPBD soft). Inert for a
+        // PBF-only scene (all constraint counts 0). iters from the cooked Model
+        // (NOT cfg.vel_iters — the XPBD GS sweep count is a soft-body property).
         p_xpbd_.dt = cfg.dt;
-        p_xpbd_.iters = cfg.vel_iters;
+        p_xpbd_.iters = mp.xpbd_iters == 0u ? 1u : mp.xpbd_iters;
+        p_xpbd_.dist_con_count = dist_count;
+        p_xpbd_.bend_con_count = bend_count;
+        p_xpbd_.vol_con_count  = vol_count;
         add(phi::NkOp::XpbdProject, &p_xpbd_);
 
-        p_pbf_density_.rest_density = 1.0f;
-        p_pbf_density_.relaxation = 1.0e-6f;
+        // PbfDensityLambda / PbfApplyDelta: the PBF density-projection. Inert for
+        // an XPBD-only scene (rest_density / support_radius 0). The two ops split
+        // the legacy [density,lambda,delta,apply]xN loop (density-lambda + the in-
+        // loop applies for iters 0..N-2 here; the final apply in PbfApplyDelta).
+        p_pbf_density_.rest_density   = mp.pbf_rest_density;
+        p_pbf_density_.relaxation     = mp.pbf_cfm_epsilon;
+        p_pbf_density_.support_radius = mp.pbf_support_radius;
+        p_pbf_density_.particle_mass  = mp.pbf_particle_mass;
+        p_pbf_density_.particle_count = particle_count;
+        p_pbf_density_.iters          = mp.pbf_iters;
+        p_pbf_density_.clamp_overdensity = mp.pbf_clamp_overdensity ? 1u : 0u;
+        p_pbf_density_.dt             = cfg.dt;
+        p_pbf_density_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
+        p_pbf_density_.floor_z        = mp.floor_z;
         add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
+
+        p_pbf_apply_.support_radius  = mp.pbf_support_radius;
+        p_pbf_apply_.particle_mass   = mp.pbf_particle_mass;
+        p_pbf_apply_.particle_count  = particle_count;
+        p_pbf_apply_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
+        p_pbf_apply_.floor_z         = mp.floor_z;
         add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
     }
 
@@ -233,6 +298,15 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
 
     if (has_particles) {
         p_part_finalize_.dt = cfg.dt;
+        p_part_finalize_.mode = particle_mode;
+        p_part_finalize_.particle_count = particle_count;
+        p_part_finalize_.coupled_internal = coupled_internal;
+        // PBF post-finalize polish (gated inert when the coefficient is 0).
+        p_part_finalize_.support_radius = mp.pbf_support_radius;
+        p_part_finalize_.particle_mass  = mp.pbf_particle_mass;
+        p_part_finalize_.xsph_viscosity_c = mp.pbf_xsph_viscosity;
+        p_part_finalize_.surface_tension_gamma = mp.pbf_surface_tension;
+        p_part_finalize_.rest_density = mp.pbf_rest_density;
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
     }
 

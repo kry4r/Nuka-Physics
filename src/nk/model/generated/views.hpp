@@ -155,6 +155,7 @@ struct DataView {
     ::nuka::math::Vec3* particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
     ::nuka::math::Vec3* particle_vel = nullptr;  // per:particle arena:persistent owner:data flags:[diff]
     float* particle_inv_mass = nullptr;  // per:particle arena:persistent owner:data flags:[param]
+    ::nuka::math::Vec3* particle_v_pre = nullptr;  // per:particle arena:scratch owner:data
     float* dist_lambda = nullptr;  // per:dist_con arena:persistent owner:data
     float* bend_lambda = nullptr;  // per:bend_con arena:persistent owner:data
     float* vol_lambda = nullptr;  // per:vol_con arena:persistent owner:data
