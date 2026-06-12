@@ -187,9 +187,11 @@ TEST(NkParticleEquivalence, PbfRestLatticeDensityNearRho0AndD1) {
         mp.pbf_iters = 4; mp.pbf_clamp_overdensity = true;
         mp.cell_size = h; mp.query_radius = h;
         mp.grid_min = Vec3{c0 - h, c0 - h, c0 - h};
-        // cells (4*4*4 == 64 == P) <= P (the M5 conservative cell bound).
         mp.grid_dims[0] = 4; mp.grid_dims[1] = 4; mp.grid_dims[2] = 4;
         model.capacities.env_count = 1; model.capacities.particles_per_env = P;
+        // Cell capacity sizes grid_cell_start/end (cells x env_count).
+        model.capacities.max_grid_cells =
+            mp.grid_dims[0] * mp.grid_dims[1] * mp.grid_dims[2];
         return model;
     };
     nk::Pipeline::SolverConfig cfg;

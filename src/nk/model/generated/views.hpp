@@ -165,8 +165,8 @@ struct DataView {
     float* pbf_lambda = nullptr;  // per:particle arena:scratch owner:data
     uint32_t* grid_cell_key = nullptr;  // per:particle arena:scratch owner:data
     uint32_t* grid_particle_idx = nullptr;  // per:particle arena:scratch owner:data
-    uint32_t* grid_cell_start = nullptr;  // per:particle arena:scratch owner:data
-    uint32_t* grid_cell_end = nullptr;  // per:particle arena:scratch owner:data
+    uint32_t* grid_cell_start = nullptr;  // per:scalar arena:scratch owner:data count:max_grid_cells*env_count
+    uint32_t* grid_cell_end = nullptr;  // per:scalar arena:scratch owner:data count:max_grid_cells*env_count
     uint32_t* grid_neighbor_offset = nullptr;  // per:particle arena:scratch owner:data
     uint32_t* grid_neighbor_count = nullptr;  // per:particle arena:scratch owner:data
     uint32_t* grid_neighbor_idx = nullptr;  // per:particle arena:scratch owner:data elem:32

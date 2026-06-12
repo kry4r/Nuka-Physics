@@ -164,6 +164,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // just above, seeding pbf_predicted_pos).
         p_grid_.pos_source = runs_pbf ? phi::kGridPosSourcePbfPredicted
                                       : phi::kGridPosSourceParticlePos;
+        // Env-private grids: per-env cell-key offsets + the cooked cell
+        // capacity (the grid_cell_start/end arena sizing the op guards).
+        p_grid_.env_count = env_count;
+        p_grid_.particles_per_env = cap.particles_per_env;
+        p_grid_.cells_capacity = cap.max_grid_cells;
         add(phi::NkOp::ParticleGridBuild, &p_grid_);
     }
 

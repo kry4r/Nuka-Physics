@@ -59,6 +59,13 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BodyAabbHi:          v.body_aabb_hi = static_cast<math::Vec3*>(p); break;
         case FieldId::PairCount:           v.pair_count = static_cast<uint32_t*>(p); break;
         case FieldId::CandidatePairs:      v.candidate_pairs = static_cast<uint32_t*>(p); break;
+        // M5 LBVH broadphase scratch (review fix: these were MISSING — the
+        // LbvhBuild/LbvhQueryPairs ops read them from the DataView and would
+        // have dereferenced null device pointers on the pair-driven path).
+        case FieldId::LbvhNodes:           v.lbvh_nodes = static_cast<float*>(p); break;
+        case FieldId::LbvhMorton:          v.lbvh_morton = static_cast<uint32_t*>(p); break;
+        case FieldId::LbvhIndex:           v.lbvh_index = static_cast<uint32_t*>(p); break;
+        case FieldId::LbvhVisit:           v.lbvh_visit = static_cast<uint32_t*>(p); break;
         case FieldId::ContactLink:         v.contact_link = static_cast<uint32_t*>(p); break;
         case FieldId::ContactPoint:        v.contact_point = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactNormal:       v.contact_normal = static_cast<math::Vec3*>(p); break;

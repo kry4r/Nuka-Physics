@@ -44,7 +44,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -376,14 +376,17 @@ fields:
   # active neighbor watermark; grid_neighbor_idx is the flat CSR neighbor pool
   # (32 slots/particle, the fixed cap so the slice is preallocated — no per-call
   # alloc). grid_cell_start/grid_cell_end are the per-cell [start,end) ranges
-  # into the sorted index (sized per:particle as a conservative cell upper
-  # bound; the op writes only the populated prefix). M6 wires the real PBF
-  # consumer; M5 ships the build op + the arena-resident neighbor CSR it exposes.
+  # into the sorted index, INDEXED BY (env-offset) CELL KEY — sized
+  # max_grid_cells (the cooked per-env dims product) x env_count (review fix:
+  # the prior per:particle sizing OOB-scribbled whenever cells > particles,
+  # because the range kernel scatters by raw cell key, not a compacted prefix).
+  # M6 wires the real PBF consumer; M5 ships the build op + the arena-resident
+  # neighbor CSR it exposes.
   # =========================================================================
   - {name: grid_cell_key,       dtype: u32, per: particle, arena: scratch, owner: data}
   - {name: grid_particle_idx,   dtype: u32, per: particle, arena: scratch, owner: data}
-  - {name: grid_cell_start,     dtype: u32, per: particle, arena: scratch, owner: data}
-  - {name: grid_cell_end,       dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: grid_cell_start,     dtype: u32, per: scalar, count: "max_grid_cells*env_count", arena: scratch, owner: data}
+  - {name: grid_cell_end,       dtype: u32, per: scalar, count: "max_grid_cells*env_count", arena: scratch, owner: data}
   - {name: grid_neighbor_offset,dtype: u32, per: particle, arena: scratch, owner: data}
   - {name: grid_neighbor_count, dtype: u32, per: particle, arena: scratch, owner: data}
   - {name: grid_neighbor_idx,   dtype: u32, per: particle, arena: scratch, owner: data, elem: 32}

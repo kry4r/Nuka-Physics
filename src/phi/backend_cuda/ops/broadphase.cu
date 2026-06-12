@@ -119,13 +119,20 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                   math::Vec3{r, r + s.p[1], r}); break;
         case kKindBox:        he = RotAbs(xf.rotation,
                                   math::Vec3{s.p[0], s.p[1], s.p[2]}); break;
-        case kKindConvexHull: r = s.p[0]; he = {r, r, r}; break;  // bound radius.
-        case kKindSdfMesh:    he = RotAbs(xf.rotation,
-                                  math::Vec3{s.p[0], s.p[1], s.p[2]}); break;
+        // Hull / SDF mesh: conservative BOUND-RADIUS sphere (p[0] = the cooked
+        // max |vertex| — rotation-invariant, so no RotAbs needed).
+        case kKindConvexHull:
+        case kKindSdfMesh:    r = s.p[0]; he = {r, r, r}; break;
         case kKindPlane: default:
             // A plane has effectively-infinite extent; clamp to a large finite
-            // box so the LBVH morton quantization stays sane.
-            he = {1.0e6f, 1.0e-3f, 1.0e6f}; break;
+            // box so the LBVH morton quantization stays sane. The slab is thin
+            // along the plane NORMAL = the body's LOCAL +Y (the amf:: plane
+            // convention, analytical_manifold.hpp: n = frame.cy) — so the
+            // local slab MUST be rotated by the body pose like every other
+            // kind (review fix: the unrotated slab was thin in WORLD Y, which
+            // missed every contact of a z-up ground plane posed with Y->Z).
+            he = RotAbs(xf.rotation, math::Vec3{1.0e6f, 1.0e-3f, 1.0e6f});
+            break;
     }
     const math::Vec3 c = xf.position;
     const float m = margin;
@@ -381,15 +388,27 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
 }
 
 // --- ParticleGridBuild (CSR neighbors) --------------------------------------
+// Cell keys are ENV-OFFSET (key = env*cells_per_env + local key) so each env
+// owns a private cell span: env-major replicated particles occupy identical
+// coordinates, and a shared grid would have every particle neighbor its own
+// clones in other envs (review fix — cross-env coupling). The query kernels
+// below offset the cell_start/cell_end base by env*cells_per_env so the LOCAL
+// keys QueryParticleNeighbors computes index the env's own span. For
+// env_count == 1 the offset is 0 and the behavior is byte-identical to the
+// legacy single-world grid.
 __global__ void GridCellKeysKernel(uint32_t particle_count,
                                    const math::Vec3* __restrict__ pos,
                                    cg::ParticleGridConfigDevice cfg,
+                                   uint32_t particles_per_env,
+                                   uint32_t cells_per_env,
                                    uint32_t* __restrict__ keys,
                                    uint32_t* __restrict__ idx) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) return;
     const math::Vec3 p = pos[i];
-    keys[i] = cg::CellKeyFromPos(make_float3(p.x, p.y, p.z), cfg);
+    const uint32_t env = i / particles_per_env;
+    keys[i] = env * cells_per_env +
+              cg::CellKeyFromPos(make_float3(p.x, p.y, p.z), cfg);
     idx[i] = i;
 }
 
@@ -411,6 +430,8 @@ __global__ void GridCellRangesKernel(uint32_t particle_count,
 __global__ void GridCountKernel(uint32_t particle_count,
                                 const math::Vec3* __restrict__ pos, float radius,
                                 cg::ParticleGridConfigDevice cfg,
+                                uint32_t particles_per_env,
+                                uint32_t cells_per_env,
                                 const uint32_t* __restrict__ cell_start,
                                 const uint32_t* __restrict__ cell_end,
                                 const uint32_t* __restrict__ idx_sorted,
@@ -418,16 +439,20 @@ __global__ void GridCountKernel(uint32_t particle_count,
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) return;
     const math::Vec3 pm = pos[i];
+    const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
     uint32_t scratch[kParticleGridMaxNeighbors];
     const uint32_t n = cg::QueryParticleNeighbors(
-        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start, cell_end,
-        idx_sorted, pos, scratch, kParticleGridMaxNeighbors, nullptr);
+        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
+        cell_end + cbase, idx_sorted, pos, scratch, kParticleGridMaxNeighbors,
+        nullptr);
     counts[i] = n;
 }
 
 __global__ void GridFillKernel(uint32_t particle_count,
                                const math::Vec3* __restrict__ pos, float radius,
                                cg::ParticleGridConfigDevice cfg,
+                               uint32_t particles_per_env,
+                               uint32_t cells_per_env,
                                const uint32_t* __restrict__ cell_start,
                                const uint32_t* __restrict__ cell_end,
                                const uint32_t* __restrict__ idx_sorted,
@@ -438,13 +463,14 @@ __global__ void GridFillKernel(uint32_t particle_count,
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) return;
     const math::Vec3 pm = pos[i];
+    const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
     // Per-particle PRIVATE CSR slice (fixed cap slot_stride per particle); the
     // neighbor query writes them sorted ascending -> D1 by region (no append).
     uint32_t* slice = neighbor_idx + static_cast<size_t>(i) * slot_stride;
     bool overflow = false;
     const uint32_t n = cg::QueryParticleNeighbors(
-        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start, cell_end,
-        idx_sorted, pos, slice, slot_stride, &overflow);
+        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
+        cell_end + cbase, idx_sorted, pos, slice, slot_stride, &overflow);
     counts[i] = n;
     (void)offsets;  // grid_neighbor_offset kept for the M6 flat-CSR consumer.
 }
@@ -556,8 +582,18 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     cfg.grid_min = make_float3(p->grid_min[0], p->grid_min[1], p->grid_min[2]);
     cfg.grid_dims = make_uint3(p->grid_dims[0], p->grid_dims[1], p->grid_dims[2]);
     const uint32_t Np = p->particle_count;
-    const uint32_t cells = p->grid_dims[0] * p->grid_dims[1] * p->grid_dims[2];
-    if (cells == 0u) return Status::Ok;
+    const uint64_t cells64 = static_cast<uint64_t>(p->grid_dims[0]) *
+                             p->grid_dims[1] * p->grid_dims[2];
+    if (cells64 == 0u) return Status::Ok;
+    const uint32_t E = p->env_count == 0u ? 1u : p->env_count;
+    const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
+    // LOUD capacity guards (review fix): the cell-range arrays are sized
+    // max_grid_cells x env_count — a dims product beyond the cooked capacity
+    // would scatter cell keys past the segment (silent arena corruption), and
+    // cells*env_count must fit the u32 env-offset key.
+    if (cells64 > p->cells_capacity) return Status::Failed;
+    if (cells64 * E > 0xFFFFFFFFull) return Status::Failed;
+    const uint32_t cells = static_cast<uint32_t>(cells64);
     const uint32_t blocks = (Np + kBlockSize - 1u) / kBlockSize;
     // M6: PBF builds the neighbor grid on the PREDICTED positions (legacy
     // StepPbfWorld), so pos_source routes the op to pbf_predicted_pos; the M5
@@ -570,12 +606,13 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
             : static_cast<const math::Vec3*>(data.particle_pos);
 
     LaunchCuda(GridCellKeysKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, cfg, data.grid_cell_key, data.grid_particle_idx);
+               Np, pos, cfg, Ppe, cells, data.grid_cell_key,
+               data.grid_particle_idx);
     thrust::stable_sort_by_key(thrust::cuda::par.on(stream),
                                data.grid_cell_key, data.grid_cell_key + Np,
                                data.grid_particle_idx);
-    {  // zero the cell ranges (sized per:particle as a conservative cell bound).
-        const uint32_t zn = (cells < Np ? cells : Np);
+    {  // zero the per-env cell ranges (cells x env_count entries).
+        const uint32_t zn = cells * E;
         const uint32_t b = (zn + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
                    data.grid_cell_start, zn);
@@ -585,14 +622,14 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     LaunchCuda(GridCellRangesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, data.grid_cell_key, data.grid_cell_start, data.grid_cell_end);
     LaunchCuda(GridCountKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, p->query_radius, cfg, data.grid_cell_start,
+               Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_count);
     // Exclusive scan of the count -> flat CSR offset (M6 flat consumer).
     thrust::exclusive_scan(thrust::cuda::par.on(stream),
                            data.grid_neighbor_count, data.grid_neighbor_count + Np,
                            data.grid_neighbor_offset);
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, p->query_radius, cfg, data.grid_cell_start,
+               Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_offset,
                kParticleGridMaxNeighbors, data.grid_neighbor_idx,
                data.grid_neighbor_count);

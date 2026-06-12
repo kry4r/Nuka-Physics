@@ -85,6 +85,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             id == FieldId::SdfCellGradients) {
             return static_cast<uint64_t>(max_sdf_cells);
         }
+        // M6 particle uniform-grid cell ranges: per-env cell count x env_count
+        // (the keys are env-offset, so every env owns a private cell span).
+        if (id == FieldId::GridCellStart || id == FieldId::GridCellEnd) {
+            return static_cast<uint64_t>(max_grid_cells) *
+                   static_cast<uint64_t>(env_count);
+        }
         return static_cast<uint64_t>(env_count);
     }
     const uint64_t per_env = PerEnvCount(lay.per);
@@ -533,6 +539,17 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     if (bt == nullptr || out_view == nullptr) {
         return phi::Status::Failed;
     }
+    // Enforce the excluded-pairs contract AT THE STAGING BOUNDARY: the device
+    // pair-query binary-searches this list, so it MUST be ascending + unique.
+    // No cook fills it yet (M5 leaves it empty); normalizing here makes the
+    // documented invariant structural instead of trusting future callers.
+    // (Sorting an already-sorted list is the identity — zero behavior change.)
+    if (!std::is_sorted(excluded_pairs.begin(), excluded_pairs.end())) {
+        std::sort(excluded_pairs.begin(), excluded_pairs.end());
+    }
+    excluded_pairs.erase(
+        std::unique(excluded_pairs.begin(), excluded_pairs.end()),
+        excluded_pairs.end());
     uint64_t total = 0;
     const std::vector<Segment> segs = ComputeModelSegments(&total);
 
@@ -605,6 +622,16 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.schedule_islands = std::move(src.schedule_islands);
     dst.schedule_island_count = src.schedule_island_count;
     dst.schedule_segment_count = src.schedule_segment_count;
+    // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved
+    // Model silently dropped every pair-driven collision table, staging zeros).
+    dst.excluded_pairs = std::move(src.excluded_pairs);
+    dst.shape_table_rows = std::move(src.shape_table_rows);
+    dst.samp_points = std::move(src.samp_points);
+    dst.samp_ranges = std::move(src.samp_ranges);
+    dst.sdf_grids = std::move(src.sdf_grids);
+    dst.sdf_cell_keys = std::move(src.sdf_cell_keys);
+    dst.sdf_cell_values = std::move(src.sdf_cell_values);
+    dst.sdf_cell_gradients = std::move(src.sdf_cell_gradients);
 }
 
 }  // namespace
