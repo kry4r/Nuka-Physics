@@ -15,6 +15,7 @@
 #include "scene/canonical_types.hpp"
 #include "scene/cooked_blob.hpp"
 #include "scene/cooker.hpp"
+#include "scene/format/json.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
@@ -215,6 +216,24 @@ TEST(SceneRoundtrip, MinimalAlwaysOn) {
     const SceneIR orig = BuildMinimalComposed();
     const std::string nks = tmp.File("minimal.nks").string();
     nks::Save(orig, nks);
+
+    // Format-shape pin (§3.7): the saved JSON root must carry a nested "tree"
+    // section and the split material sections, and must NOT carry the old flat
+    // "bodies" record array (the deviation this change removed).
+    {
+        std::ifstream in(nks, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        const json::Value root = json::Value::Parse(text);
+        EXPECT_TRUE(root.Has("tree")) << "saved .nks lacks the §3.7 \"tree\" section";
+        EXPECT_TRUE(root.Find("tree")->IsArray()) << "\"tree\" must be a node array";
+        EXPECT_TRUE(root.Has("physics_materials"));
+        EXPECT_TRUE(root.Has("render_materials"));
+        EXPECT_FALSE(root.Has("bodies")) << "flat \"bodies\" array must be gone";
+        EXPECT_FALSE(root.Has("shapes")) << "flat \"shapes\" array must be gone";
+        EXPECT_FALSE(root.Has("joints")) << "flat \"joints\" array must be gone";
+    }
+
     const SceneIR loaded = nks::Load(nks);
 
     ExpectTreeEqual(orig, loaded);
