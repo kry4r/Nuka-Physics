@@ -27,14 +27,20 @@
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
 
+// M3a: the REAL ModelView / DataView definitions are now GENERATED. The smoke
+// test includes the generated header instead of defining empty local stubs
+// (ODR hygiene — there is now exactly ONE definition of each view type, used by
+// both the M1 op-dispatch tests and the M3a NkWorldSkeleton test below).
+#include "nk/model/generated/views.hpp"
+
 #include "phi2_smoke_ops.hpp"
 
-// Minimal local definitions for the two forward-declared view types. Empty is
-// sufficient: nothing in M1 dereferences them.
-namespace nuka::phi {
-struct ModelView {};
-struct DataView {};
-} // namespace nuka::phi
+// --- M3a nk core (the NkWorldSkeleton acceptance case) -----------------------
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "scene/cook/cook_to_model.hpp"
+#include "scene/scene_ir.hpp"
 
 namespace {
 
@@ -224,6 +230,96 @@ TEST_F(Phi2SmokeTest, UnregisteredOpReturnsUnsupported) {
     ModelView model{};
     DataView data{};
     EXPECT_EQ(BackendDispatch(backend, model, data, call), Status::Unsupported);
+
+    BackendFree(backend);
+}
+
+// ---------------------------------------------------------------------------
+// M3a acceptance evidence: build a tiny programmatic SceneIR (one body + one
+// sphere shape), CookToModel(env_count=2), construct an nk::World, and assert:
+//   * arena segment layout is DETERMINISTIC (two CookToModel+layout passes
+//     produce identical segment tables),
+//   * FieldPtr is non-null for q / qdot (data-owned) once the World is built,
+//   * Step() returns the EXPECTED per-op Unsupported statuses (no op is
+//     registered for the real pipeline in M3a),
+//   * Reset() does not crash.
+// ---------------------------------------------------------------------------
+TEST_F(Phi2SmokeTest, NkWorldSkeleton) {
+    using namespace nuka;
+
+    // NOTE: the smoke fixture planted the test VecAdd op into the ApplyDrives
+    // slot, but a one-body (no-articulation) scene's pipeline never EMITS
+    // ApplyDrives (it is articulation-only), so the nk pipeline below dispatches
+    // only genuinely-unregistered ops -> all Unsupported, the honest M3a evidence.
+
+    Device* dev = InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    Backend* backend = DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+
+    // --- tiny scene: one dynamic body carrying one sphere collision shape ---
+    auto build_scene = []() {
+        scene::SceneIR s;
+        scene::RigidBodyRecord body;
+        body.name = "ball";
+        body.mass = 1.0f;
+        const scene::BodyId bid = s.AddRigidBody(body);
+        scene::CollisionShapeRecord shape;
+        shape.body_id = bid;
+        shape.type = scene::ShapeType::Sphere;
+        shape.radius = 0.1f;
+        s.AddCollisionShape(shape);
+        return s;
+    };
+
+    // --- determinism: two independent cooks => identical arena segment table ---
+    const scene::SceneIR scene_a = build_scene();
+    const scene::SceneIR scene_b = build_scene();
+    auto cooked_a = scene::cook::CookToModel(scene_a, /*env_count=*/2);
+    auto cooked_b = scene::cook::CookToModel(scene_b, /*env_count=*/2);
+
+    uint64_t bytes_a[3] = {0, 0, 0};
+    uint64_t bytes_b[3] = {0, 0, 0};
+    const auto segs_a = nk::Arena::ComputeSegments(cooked_a.model.capacities, bytes_a);
+    const auto segs_b = nk::Arena::ComputeSegments(cooked_b.model.capacities, bytes_b);
+    ASSERT_EQ(segs_a.size(), segs_b.size());
+    for (size_t i = 0; i < segs_a.size(); ++i) {
+        EXPECT_EQ(segs_a[i].field, segs_b[i].field) << "segment field differs at " << i;
+        EXPECT_EQ(segs_a[i].arena, segs_b[i].arena) << "segment arena differs at " << i;
+        EXPECT_EQ(segs_a[i].offset, segs_b[i].offset) << "segment offset differs at " << i;
+        EXPECT_EQ(segs_a[i].bytes, segs_b[i].bytes) << "segment bytes differs at " << i;
+    }
+    EXPECT_EQ(bytes_a[0], bytes_b[0]);
+    EXPECT_EQ(bytes_a[1], bytes_b[1]);
+    EXPECT_EQ(bytes_a[2], bytes_b[2]);
+
+    // SceneMap: the body + shape entities bound to cooked rows.
+    EXPECT_GT(cooked_a.scene_map.Size(), 0u);
+
+    // --- construct the World (uploads Model, allocates Data, builds Pipeline) ---
+    nk::World world(std::move(cooked_a.model), /*env_count=*/2, dev, backend);
+    ASSERT_TRUE(world.Ready());
+    EXPECT_EQ(world.EnvCount(), 2u);
+
+    // FieldPtr non-null for the data-owned q / qdot.
+    EXPECT_NE(world.FieldPtr(nk::FieldId::Q), nullptr);
+    EXPECT_NE(world.FieldPtr(nk::FieldId::Qdot), nullptr);
+    // body_pose is data-owned; the body the scene authored exists.
+    EXPECT_NE(world.FieldPtr(nk::FieldId::BodyPose), nullptr);
+
+    // Step(): the pipeline has a non-empty op list (the body has a collidable),
+    // and EVERY dispatched op is Unsupported (no real op registered in M3a).
+    const nk::StepResult res = world.Step();
+    EXPECT_GT(res.OpCount(), 0u) << "the one-body scene should emit a non-empty pipeline";
+    EXPECT_EQ(res.CountOf(Status::Unsupported), static_cast<int>(res.OpCount()))
+        << "M3a: every real op must dispatch Unsupported (none are wired yet)";
+
+    // Reset must not crash and returns the ResetEnvs op status (Unsupported).
+    EXPECT_EQ(world.Reset(), Status::Unsupported);
+
+    // A second Step after Reset still works (no state corruption).
+    const nk::StepResult res2 = world.Step();
+    EXPECT_EQ(res2.OpCount(), res.OpCount());
 
     BackendFree(backend);
 }

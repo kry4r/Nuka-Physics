@@ -462,6 +462,63 @@ if(CMAKE_CUDA_COMPILER)
         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
     )
 
+    # -----------------------------------------------------------------------
+    # nuka_nk — the new unified core (M3): Model / Data arena / generated field
+    # views / Pipeline + World skeleton. PURE C++ (zero CUDA tokens; lint scope
+    # nk_engine): all device memory + execution through the phi v2 vtable
+    # (nuka_phi2). The generated field headers (src/nk/model/generated/) are
+    # committed; they are #included as ordinary headers (regen via
+    # tools/codegen/regen.py). Depends only on nuka_phi2 + nuka_math.
+    # -----------------------------------------------------------------------
+    add_library(nuka_nk STATIC
+        nk/model/model.cpp
+        nk/data/arena.cpp
+        nk/data/data.cpp
+        nk/pipeline/pipeline.cpp
+        nk/pipeline/world.cpp
+    )
+    set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_nk
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_nk
+        PUBLIC
+            nuka_phi2
+            nuka_math
+    )
+
+    nuka_set_warnings(nuka_nk)
+
+    # -------------------------------------------------------------------------
+    # nuka_scene_cook — CookToModel (SceneIR -> {nk::Model, SceneMap}). Cleanest
+    # non-cyclic home: depends on nuka_scene (CookScene + SceneIR/SceneMap),
+    # nuka_articulation (CookArticulations), and nuka_nk (the Model tables). Kept
+    # OUTSIDE nuka_scene so that library stays free of the nk / articulation deps.
+    # Pure C++ (src/scene/cook/ is in the nk_engine lint scope); CUDA-gated only
+    # because its nuka_nk dependency lives in this CMAKE_CUDA_COMPILER block.
+    # -------------------------------------------------------------------------
+    add_library(nuka_scene_cook STATIC
+        scene/cook/cook_to_model.cpp
+    )
+    set_target_properties(nuka_scene_cook PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_scene_cook
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_scene_cook
+        PUBLIC
+            nuka_nk
+            nuka_scene
+            nuka_articulation
+    )
+
+    nuka_set_warnings(nuka_scene_cook)
+
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
         # SAP broadphase: O(n^2) pair-slot oracle over a device AABB buffer. The
