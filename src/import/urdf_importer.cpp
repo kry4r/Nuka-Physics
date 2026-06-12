@@ -86,6 +86,9 @@ scene::SceneIR LoadUrdf(const std::string& path) {
 
     // Map from link name -> BodyId for joint resolution
     std::unordered_map<std::string, scene::BodyId> link_map;
+    // Dedup map for synthesized visual materials (URDF <material name=> is a
+    // named, potentially shared, color) -> the MaterialId it was first added as.
+    std::unordered_map<std::string, scene::MaterialId> material_names;
 
     // -- Parse <link> elements ------------------------------------------------
     for (auto* link = robot->FirstChildElement("link");
@@ -179,6 +182,81 @@ scene::SceneIR LoadUrdf(const std::string& path) {
                 if (decomp->QueryIntAttribute("max_pieces", &max_pieces) ==
                         tinyxml2::XML_SUCCESS && max_pieces > 0) {
                     shape.decompose_max_pieces = static_cast<uint32_t>(max_pieces);
+                }
+            }
+
+            scene.AddCollisionShape(std::move(shape));
+        }
+
+        // Parse <visual><geometry> as non-colliding (contype=0/conaffinity=0)
+        // shape records. These project to VisualMeshComponent through the SceneIR
+        // facade (M2b) so render-only geometry survives import; physics is
+        // untouched (collision shapes above own contact). A <visual><material>
+        // with an inline <color rgba="..."/> is synthesized into a MaterialRecord
+        // so the visual color reaches RenderMaterial.
+        for (auto* visual = link->FirstChildElement("visual");
+             visual != nullptr;
+             visual = visual->NextSiblingElement("visual")) {
+
+            auto* geometry = visual->FirstChildElement("geometry");
+            if (!geometry) continue;
+            auto* shape_elem = geometry->FirstChildElement();
+            if (!shape_elem) continue;
+
+            scene::CollisionShapeRecord shape;
+            shape.body_id = body_id;
+            shape.type = UrdfGeomType(shape_elem->Name());
+            shape.contype = 0;       // visual-only: no collision (facade -> VisualMesh)
+            shape.conaffinity = 0;
+            shape.name = visual->Attribute("name") ? visual->Attribute("name") : "";
+
+            if (shape.type == scene::ShapeType::Box) {
+                if (const char* size_attr = shape_elem->Attribute("size")) {
+                    math::Vec3 full_size = ParseVec3(size_attr);
+                    shape.half_extents = math::Vec3{
+                        full_size.x * 0.5f, full_size.y * 0.5f, full_size.z * 0.5f};
+                }
+            } else if (shape.type == scene::ShapeType::Sphere) {
+                shape_elem->QueryFloatAttribute("radius", &shape.radius);
+            } else if (shape.type == scene::ShapeType::Capsule) {
+                shape_elem->QueryFloatAttribute("radius", &shape.radius);
+                float length = 1.0f;
+                shape_elem->QueryFloatAttribute("length", &length);
+                shape.half_height = length * 0.5f;
+            }
+
+            if (auto* vis_origin = visual->FirstChildElement("origin")) {
+                if (const char* xyz = vis_origin->Attribute("xyz")) {
+                    shape.local_transform = math::Transform{
+                        ParseVec3(xyz), math::Quat::Identity()};
+                }
+            }
+
+            // Inline visual material color -> synthesized MaterialRecord. URDF
+            // <material name="..."><color rgba="r g b a"/></material>. A bare
+            // <material name="x"/> reference (no color) is skipped (no color to
+            // carry); duplicate names are deduped by reusing the existing record.
+            if (auto* mat = visual->FirstChildElement("material")) {
+                if (auto* color = mat->FirstChildElement("color")) {
+                    if (const char* rgba = color->Attribute("rgba")) {
+                        std::istringstream ss(rgba);
+                        scene::MaterialRecord mrec;
+                        const char* mname = mat->Attribute("name");
+                        mrec.name = mname ? mname : (link_name + "_vis_mat");
+                        ss >> mrec.base_color.x >> mrec.base_color.y
+                           >> mrec.base_color.z >> mrec.alpha;
+                        const auto found = material_names.find(mrec.name);
+                        if (found != material_names.end()) {
+                            shape.material_id = found->second;
+                        } else {
+                            const scene::MaterialId mid =
+                                scene.AddMaterial(std::move(mrec));
+                            material_names[mat->Attribute("name")
+                                               ? mat->Attribute("name")
+                                               : (link_name + "_vis_mat")] = mid;
+                            shape.material_id = mid;
+                        }
+                    }
                 }
             }
 
