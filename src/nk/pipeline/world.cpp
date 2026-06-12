@@ -151,9 +151,53 @@ bool World::SeedInitialState() {
         }
     }
 
+    // Material bucket table (global; data-owned param field). Seeded for EVERY
+    // world that has buckets — including articulation-less (bodies/particles-
+    // only) worlds, which return early below. (Review fix: this block used to
+    // sit below the L==0 early return, silently skipping the bucket seed for
+    // any world without an articulation — the M5-binding-bug class.)
+    if (cap.num_material_buckets > 0 && !model_.material_buckets.empty()) {
+        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * 8u, 0.0f);
+        for (uint32_t b = 0; b < cap.num_material_buckets &&
+                             b < model_.material_buckets.size(); ++b) {
+            for (int k = 0; k < 8; ++k) {
+                host[static_cast<size_t>(b) * 8u + static_cast<size_t>(k)] =
+                    model_.material_buckets[b].values[k];
+            }
+        }
+        if (!data_.UploadField(FieldId::MatBuckets, host.data(),
+                               host.size() * sizeof(float))) {
+            return false;
+        }
+    }
+    // Per-body material bucket index (data-owned param field; the cooked
+    // Model::body_material_bucket template replicated env-major). (Review fix:
+    // the cook fills body_material_bucket and the mat_index field is declared,
+    // bound, and dlpack-visible, but NOTHING ever uploaded the cooked values —
+    // the M5-binding-bug class. No op consumes it yet; seeding closes the hole
+    // before the first consumer lands.)
+    if (B > 0 && !model_.body_material_bucket.empty()) {
+        std::vector<uint32_t> host(static_cast<size_t>(B) * E, 0u);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t b = 0; b < B; ++b) {
+                host[static_cast<size_t>(e) * B + b] =
+                    b < model_.body_material_bucket.size()
+                        ? model_.body_material_bucket[b] : 0u;
+            }
+        }
+        if (!data_.UploadField(FieldId::MatIndex, host.data(),
+                               host.size() * sizeof(uint32_t))) {
+            return false;
+        }
+    }
+
     if (L == 0) {
+        // No articulation: SnapshotState is a NO-OP today (it early-returns at
+        // total_link_count == 0; body/particle snapshot fields do not exist
+        // yet — the M7 settle consumer extends the snapshot system). Reset on
+        // a bodies/particles-only world therefore restores nothing; honest Ok.
         return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
-               phi::Status::Ok;  // no articulation: bodies-only snapshot.
+               phi::Status::Ok;
     }
 
     const ModelArticulation& a = model_.articulation;
@@ -221,22 +265,6 @@ bool World::SeedInitialState() {
             return false;
         }
     }
-    // Material bucket table (global; data-owned param field).
-    if (cap.num_material_buckets > 0 && !model_.material_buckets.empty()) {
-        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * 8u, 0.0f);
-        for (uint32_t b = 0; b < cap.num_material_buckets &&
-                             b < model_.material_buckets.size(); ++b) {
-            for (int k = 0; k < 8; ++k) {
-                host[static_cast<size_t>(b) * 8u + static_cast<size_t>(k)] =
-                    model_.material_buckets[b].values[k];
-            }
-        }
-        if (!data_.UploadField(FieldId::MatBuckets, host.data(),
-                               host.size() * sizeof(float))) {
-            return false;
-        }
-    }
-
     // Device snapshot of the seeded initial state (the Reset restore source —
     // the legacy creation-time snapshot 1:1).
     return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) == phi::Status::Ok;
@@ -257,8 +285,9 @@ StepResult World::Step() {
     const std::vector<phi::OpCall>& calls = pipeline_.Calls();
     out.status.reserve(calls.size());
     for (const phi::OpCall& call : calls) {
-        // Dispatch honestly: M3a has no ops registered, so every dispatch
-        // returns Unsupported (the expected M3a evidence). Real ops land in M3b+.
+        // One BackendDispatch per OpCall, in the §3.2 fixed order. (Ops the
+        // backend lacks were already dropped by the Build-time supports_op
+        // capability filter, so a healthy step is all-Ok.)
         const phi::Status s = phi::BackendDispatch(backend_, model_view_, data_view_, call);
         out.status.push_back(s);
     }
@@ -275,8 +304,10 @@ phi::Status World::StepPlanned() {
                                        calls.data(),
                                        static_cast<int>(calls.size()));
         if (plan_ == nullptr) {
-            // No capturable plan in M3a (no real ops) — honest Unsupported; the
-            // caller can fall back to Step().
+            // No capturable plan: an op in the list is not graph-captureable
+            // (today: the thrust sorts in ParticleGridBuild / LbvhBuild — the
+            // named PBF Step-only debt). Honest Unsupported; the caller falls
+            // back to Step().
             return phi::Status::Unsupported;
         }
     }

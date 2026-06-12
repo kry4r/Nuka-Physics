@@ -177,11 +177,20 @@ struct ParticleGridBuildParams {
     float    query_radius;      // neighbor search radius
     uint32_t particle_count;    // total particles (env-major)
     float    grid_min[3];       // grid lower corner
-    uint32_t grid_dims[3];      // grid resolution
+    uint32_t grid_dims[3];      // grid resolution (PER ENV)
     // M6: which position field the grid is built over. PBF builds the neighbor
     // list on the PREDICTED positions (legacy StepPbfWorld), so pos_source == 1
     // routes the op to pbf_predicted_pos; 0 == particle_pos (the M5 default).
     uint32_t pos_source;        // 0 = particle_pos, 1 = pbf_predicted_pos
+    // Env-private grids (review fix): cell keys are offset env*cells so envs
+    // never share a cell (env-major replicated particles would otherwise see
+    // their own clones as neighbors). cells_capacity mirrors
+    // ModelCapacities::max_grid_cells (the grid_cell_start/end per-env arena
+    // sizing); the op fails LOUDLY when the live dims product exceeds it or
+    // when cells*env_count overflows the u32 cell key.
+    uint32_t env_count;
+    uint32_t particles_per_env;
+    uint32_t cells_capacity;    // per-env cell capacity (max_grid_cells)
 };
 inline constexpr uint32_t kGridPosSourceParticlePos = 0u;
 inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
@@ -296,8 +305,10 @@ inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
 // unified row solve (the ParticleInvMass arm). The contact solve corrects the
 // particle VELOCITY between the position predict and the position finalize (the
 // legacy unified_costep pre/couple/post ordering, reproduced inside the fixed
-// pipeline). pbf_predicted_pos is reused as the v_pre scratch so ParticleFinalize
-// can compose the PBD (XPBD soft-constraint) velocity with the contact velocity
+// pipeline). The pre-contact velocity is saved into the DEDICATED particle_v_pre
+// scratch field (NOT pbf_predicted_pos, which the PBF density projection owns in
+// coupled mode — see fields.yaml) so ParticleFinalize can compose the PBD
+// (XPBD soft-constraint / PBF density) velocity with the contact velocity
 // delta — exactly v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
 inline constexpr uint32_t kParticleModeCoupled = 3u;
 

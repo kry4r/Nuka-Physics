@@ -170,8 +170,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_lambda
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_key
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_particle_idx
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_start
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_end
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_cell_start
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_cell_end
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_offset
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 32, 1, 128, 0},  // grid_neighbor_idx

@@ -54,6 +54,12 @@ struct ModelCapacities {
     uint32_t max_sdf_grids        = 0;  // cooked sparse-SDF grid count.
     uint32_t max_sdf_cells        = 0;  // total cooked narrow-band SDF cells.
 
+    // M6 — particle uniform-grid cell capacity PER ENV (= the cooked
+    // grid_dims product; 0 for a scene with no PBF grid). Sizes the
+    // grid_cell_start/grid_cell_end arena fields (cells x env_count); the
+    // ParticleGridBuild op fails LOUDLY if the live dims product exceeds it.
+    uint32_t max_grid_cells       = 0;
+
     // Resolve a FieldPer count-unit to a concrete per-env element count using
     // these capacities (env-major; the env multiplier is applied by the Arena /
     // UploadTo packer, NOT folded in here -- this returns the PER-ENV count).

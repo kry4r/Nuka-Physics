@@ -404,14 +404,15 @@ nk::Model BuildFluidModel(uint32_t* out_count, float* out_rho0, float* out_h,
     mp.boundary_enabled = true;        // the PBF floor clamp catches the fall.
     mp.floor_z = floor_z;
     // Grid domain: a box CONTAINING every particle (else QueryParticleNeighbors
-    // clamps them into one edge cell and the neighbor list breaks). cell == h;
-    // cell_count (4*4*3 == 48 == P) <= P (the M5 conservative cell bound).
+    // clamps them into one edge cell and the neighbor list breaks). cell == h.
     mp.grid_min = Vec3{-0.09f, -0.09f, 0.0f};
-    mp.grid_dims[0] = 4; mp.grid_dims[1] = 4; mp.grid_dims[2] = 3;  // 48 == P.
+    mp.grid_dims[0] = 4; mp.grid_dims[1] = 4; mp.grid_dims[2] = 3;
 
     nk::ModelCapacities& cap = model.capacities;
     cap.env_count = 1;
     cap.particles_per_env = P;
+    // Cell capacity sizes grid_cell_start/end (cells x env_count).
+    cap.max_grid_cells = mp.grid_dims[0] * mp.grid_dims[1] * mp.grid_dims[2];
 
     // A rigid box SIDE WALL the spreading fluid pools against: the particle x box
     // contact rows route the PBF particles' reaction through the unified solve (the

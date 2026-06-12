@@ -4,9 +4,9 @@
 //
 // Ctor takes the cook product (nk::Model), the env_count, and the phi::Backend:
 // it uploads the Model into ONE device buffer, allocates the Data arena, and
-// builds the Pipeline (the per-step OpCall list). Step() dispatches each OpCall
-// (surfacing per-op status HONESTLY — in M3a no ops are registered, so every op
-// returns Unsupported, which is the EXPECTED M3a evidence). StepPlanned() builds
+// builds the Pipeline (the per-step OpCall list). Step() dispatches each OpCall,
+// surfacing per-op status HONESTLY (a healthy step is all-Ok; Unsupported means
+// the backend lacks the op). StepPlanned() builds
 // a CUDA-graph plan once then replays it. Reset(env_mask) dispatches ResetEnvs.
 // FieldPtr(FieldId) returns a device pointer (model- or data-owned).
 //
@@ -35,7 +35,7 @@ namespace nuka::nk {
 class SolveSchedule;
 
 // Per-op step outcome — World surfaces the status of EVERY dispatched op so a
-// caller can see which ops are unimplemented (M3a: all Unsupported) vs failed.
+// caller can see which ops are unimplemented (Unsupported) vs failed.
 struct StepResult {
     // Parallel to the Pipeline's OpCall list. status[i] is the dispatch result
     // of call i.
@@ -74,14 +74,16 @@ public:
     bool Ready() const { return ready_; }
     uint32_t EnvCount() const { return model_.capacities.env_count; }
 
-    // Dispatch each OpCall in order; returns the per-op status vector. In M3a all
-    // ops are Unsupported (no op registered) — that is the expected evidence.
+    // Dispatch each OpCall in order; returns the per-op status vector (a
+    // healthy step is all-Ok — the Build-time supports_op filter already
+    // dropped ops the backend lacks).
     StepResult Step();
 
     // Plan path: build a CUDA-graph plan over the OpCall list once, then execute.
-    // Returns the plan_execute status. If plan_create fails (e.g. an op the
-    // backend cannot capture in M3a), returns Status::Unsupported and falls back
-    // to NOT planning (caller can use Step()).
+    // Returns the plan_execute status. If plan_create fails (an op the backend
+    // cannot capture — today the thrust sorts in ParticleGridBuild/LbvhBuild),
+    // returns Status::Unsupported and falls back to NOT planning (caller can
+    // use Step()).
     phi::Status StepPlanned();
 
     // Reset the selected envs DEVICE-SIDE (M3b): an empty list dispatches the

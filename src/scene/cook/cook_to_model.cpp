@@ -402,6 +402,29 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
                 row.params[1] = sh.half_extents.y;
                 row.params[2] = sh.half_extents.z;
             }
+            // Hull / mesh rows: params[0] = the BOUND RADIUS (max |vertex| of
+            // the cooked convex piece) — the broadphase AABB is a conservative
+            // bound sphere (review fix: the default 0.5 sphere radius was
+            // unrelated to the actual hull extent).
+            if ((sh.kind == static_cast<uint8_t>(ShapeType::ConvexHull) ||
+                 sh.kind == static_cast<uint8_t>(ShapeType::TriMesh)) &&
+                sh.convex_geometry_index != ~uint32_t(0) &&
+                sh.convex_geometry_index < blob.convex_geometry.Count()) {
+                const CookedConvexGeometry& g = blob.convex_geometry;
+                const uint32_t piece = sh.convex_geometry_index;
+                const uint32_t voff = g.vertex_offsets[piece];
+                const uint32_t vcnt = g.vertex_counts[piece];
+                float max_sq = 0.0f;
+                for (uint32_t v = 0; v < vcnt; ++v) {
+                    const size_t at = (static_cast<size_t>(voff) + v) * 3u;
+                    const float x = g.vertices[at + 0];
+                    const float y = g.vertices[at + 1];
+                    const float z = g.vertices[at + 2];
+                    const float d = x * x + y * y + z * z;
+                    if (d > max_sq) max_sq = d;
+                }
+                row.params[0] = std::sqrt(max_sq);
+            }
             row.contype = 1u;
             row.conaffinity = 1u;
             row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
@@ -566,6 +589,9 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     mp.floor_z = in.floor_z;
 
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    // Per-env uniform-grid cell capacity (sizes grid_cell_start/end; the
+    // ParticleGridBuild op fails loudly if the live dims exceed it).
+    cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
 }
 
 } // namespace nuka::scene::cook

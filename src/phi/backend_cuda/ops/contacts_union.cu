@@ -60,7 +60,10 @@ __device__ amf::PrimParams GroundPrimDev(float height) {
 // = 24 KB). The C7a cup hull is 1796 verts; the GJK support scans walk the
 // WHOLE pool per iteration, so caching it in shared is the dominant
 // narrowphase win (measured 2.16 ms -> sub-ms at N=1). A hull beyond the cap
-// fails LOUDLY at the op entry (capacity is a Model property; M5 revisits).
+// is NOT an error: `cached` stays 0 and the scan falls back to the GLOBAL
+// vertex pool (same bytes, same result, slower) — a perf cliff, never
+// corruption. (Capacity is a Model property; revisit if a >2048-vert hull
+// ever ships.)
 constexpr uint32_t kMaxSharedHullVerts = 2048u;
 
 // One BLOCK (a single warp) per (env x union slot): the slot's analytic /
