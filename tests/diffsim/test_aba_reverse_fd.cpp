@@ -1517,3 +1517,169 @@ TEST(AbaReverse, D1_TwoRunBitExact) {
         EXPECT_EQ(b1, b2) << "byte mismatch at " << i;
     }
 }
+
+// ===========================================================================
+// M3b nk-arena seam smoke: the SAME single-step adjoint (rung-a configuration)
+// run on nk::World ARENA-backed state through
+// MakeArticulationDeviceStateFromViews — the diffsim pointer-source seam the
+// M3 plan row mandates ("指针源改 arena diff 字段，算法不动"). The forward
+// kernels AND StepBackward run UNTOUCHED; only the pointers change. Gate:
+// qddot + grad_tau + grad_qdot BIT-EXACT vs the legacy-buffer harness.
+// (The full c_abi repoint — WorldRecord holding an nk::World, Tape segments in
+// the arena Tape buffer, backward op family in NkOp — is the M9 switch.)
+// ===========================================================================
+
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+
+TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
+    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    ChainModel model = BuildFixedChain();
+    const float g0 = 9.81f;
+    const uint32_t n = model.link_count;
+    std::vector<float> w(n, 0.0f);
+    w[1] = 0.7f; w[2] = -1.1f; w[3] = 0.5f;
+
+    // --- legacy-buffer reference (the rung-a reverse, verbatim). -------------
+    Harness h(ctx, model);
+    h.SetQ(kBaseQ); h.SetQdot(kBaseQdot); h.SetTau(kBaseTau);
+    h.ForwardAbaOnly(g0);
+    const std::vector<float> ref_qddot = h.GetQddot();
+    h.SnapshotPre(kBaseQ, kBaseQdot);
+    h.ZeroGradSeeds();
+    h.SeedQddot(w);
+    auto in_ref = h.MakeInputs(0.0f, g0);
+    in_ref.has_drive = false; in_ref.has_integrate = false;
+    in_ref.enable_q_channel = false;
+    in_ref.grad_qddot_seed = h.GradQddotSeedPtr();
+    h.RunBackward(in_ref, h.MakeGrads());
+    const std::vector<float> ref_grad_tau = h.GetGradTau();
+    const std::vector<float> ref_grad_qdot = h.GetGradQdot();
+
+    // --- nk::World arena-backed run. -----------------------------------------
+    nuka::phi::Device* dev = nuka::phi::InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    nuka::phi::Backend* backend = nuka::phi::DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+
+    // Transcribe the SAME host state into an nk::Model (the CookToModel
+    // articulation transcription, programmatic).
+    nuka::nk::Model nk_model;
+    {
+        auto& cap = nk_model.capacities;
+        cap.env_count = 1;
+        cap.links_per_env = n;
+        cap.dofs_per_env = 3;          // three revolute DOFs
+        cap.max_contacts_per_env = 4;  // arena sizing only (no contacts here)
+        cap.max_rows_per_env = 12;
+        auto& a = nk_model.articulation;
+        const auto& host = model.host;
+        a.link_count = n;
+        a.parent_link = host.parent_link;
+        a.joint_axis = host.joint_axis;
+        a.parent_offset = host.parent_offset;
+        a.link_local_pose = host.link_local_pose;
+        a.link_inertial_frame = host.link_inertial_frame;
+        a.joint_damping = host.joint_damping;
+        a.joint_armature = host.joint_armature;
+        a.initial_q = host.q;
+        a.initial_link_pose = host.link_pose;
+        a.base_pose = host.base_pose.front();
+        a.link_body = host.link_body;
+        for (auto jt : host.joint_type) {
+            a.joint_type.push_back(static_cast<uint8_t>(jt));
+        }
+        a.link_inertia_spatial.resize(static_cast<size_t>(n) * 36u);
+        for (uint32_t l = 0; l < n; ++l) {
+            for (uint32_t k = 0; k < 36u; ++k) {
+                a.link_inertia_spatial[static_cast<size_t>(l) * 36u + k] =
+                    host.link_inertia[l].I[k];
+            }
+        }
+        a.dof_count = 3;
+    }
+    nuka::nk::World world(std::move(nk_model), 1u, dev, backend);
+    ASSERT_TRUE(world.Ready());
+
+    // THE SEAM: legacy kernel-parameter view over the nk arena.
+    articulation::ArticulationDeviceState state =
+        articulation::MakeArticulationDeviceStateFromViews(
+            world.ModelViewRef(), world.DataViewRef(), n, 1u);
+
+    auto upload = [&](float* dst, const std::vector<float>& v) {
+        ASSERT_EQ(cudaMemcpy(dst, v.data(), v.size() * sizeof(float),
+                             cudaMemcpyHostToDevice), cudaSuccess);
+    };
+    upload(state.q, kBaseQ);
+    upload(state.qdot, kBaseQdot);
+    upload(state.tau, kBaseTau);
+
+    // Forward (the UNTOUCHED legacy launcher on arena-backed state).
+    articulation::FeatherstoneAba::ComputeAccelerations(ctx, state, g0);
+    ctx.stream.Synchronize();
+    std::vector<float> nk_qddot(n, 0.0f);
+    ASSERT_EQ(cudaMemcpy(nk_qddot.data(), state.qddot, n * sizeof(float),
+                         cudaMemcpyDeviceToHost), cudaSuccess);
+
+    // Reverse (StepBackward UNTOUCHED) with its own scratch grad buffers.
+    auto make_buf = [&](size_t count) {
+        nuka::phi::Buffer b(count * sizeof(float), nuka::phi::MemoryKind::Device);
+        std::vector<float> z(count, 0.0f);
+        b.CopyFromHost(z.data(), z.size() * sizeof(float));
+        return b;
+    };
+    nuka::phi::Buffer q_pre = make_buf(n), qdot_pre = make_buf(n);
+    nuka::phi::Buffer v_root_pre = make_buf(static_cast<size_t>(n) * 6u);
+    nuka::phi::Buffer base_pose_pre(sizeof(Transform), nuka::phi::MemoryKind::Device);
+    nuka::phi::Buffer grad_q = make_buf(n), grad_qdot = make_buf(n);
+    nuka::phi::Buffer grad_target = make_buf(n), grad_mass = make_buf(n);
+    nuka::phi::Buffer grad_tau = make_buf(n);
+    nuka::phi::Buffer grad_seed = make_buf(n);
+    nuka::phi::Buffer grad_link_vel = make_buf(static_cast<size_t>(n) * 6u);
+    nuka::phi::Buffer grad_base_pose = make_buf(7);
+    const std::vector<float> dIdm =
+        diffsim::BuildSpatialInertiaMassJacobian(model.mass_params);
+    nuka::phi::Buffer dI_dmass(dIdm.size() * sizeof(float),
+                               nuka::phi::MemoryKind::Device);
+    dI_dmass.CopyFromHost(dIdm.data(), dIdm.size() * sizeof(float));
+    q_pre.CopyFromHost(kBaseQ.data(), n * sizeof(float));
+    qdot_pre.CopyFromHost(kBaseQdot.data(), n * sizeof(float));
+    grad_seed.CopyFromHost(w.data(), n * sizeof(float));
+
+    diffsim::StepBackwardInputs in;
+    in.q_pre = static_cast<const float*>(q_pre.Data());
+    in.qdot_pre = static_cast<const float*>(qdot_pre.Data());
+    in.v_root_pre = static_cast<const float*>(v_root_pre.Data());
+    in.base_pose_pre = static_cast<const Transform*>(base_pose_pre.Data());
+    in.dI_dmass = static_cast<const float*>(dI_dmass.Data());
+    in.dt = 0.0f;
+    in.gravity_z = g0;
+    in.has_drive = false; in.has_integrate = false; in.enable_q_channel = false;
+    in.grad_qddot_seed = static_cast<const float*>(grad_seed.Data());
+
+    diffsim::StepBackwardGrads g;
+    g.grad_q_out = static_cast<float*>(grad_q.Data());
+    g.grad_qdot_out = static_cast<float*>(grad_qdot.Data());
+    g.grad_target_out = static_cast<float*>(grad_target.Data());
+    g.grad_mass_out = static_cast<float*>(grad_mass.Data());
+    g.grad_tau_out = static_cast<float*>(grad_tau.Data());
+    g.grad_link_velocity_out = static_cast<float*>(grad_link_vel.Data());
+    g.grad_base_pose_out = static_cast<float*>(grad_base_pose.Data());
+
+    diffsim::StepBackward(ctx, state, in, g);
+    ctx.stream.Synchronize();
+
+    std::vector<float> nk_grad_tau(n, 0.0f), nk_grad_qdot(n, 0.0f);
+    grad_tau.CopyToHost(nk_grad_tau.data(), n * sizeof(float));
+    grad_qdot.CopyToHost(nk_grad_qdot.data(), n * sizeof(float));
+
+    // BIT-EXACT: the arena pointer source must not change a single float.
+    for (uint32_t i = 0; i < n; ++i) {
+        EXPECT_EQ(nk_qddot[i], ref_qddot[i]) << "qddot[" << i << "]";
+        EXPECT_EQ(nk_grad_tau[i], ref_grad_tau[i]) << "grad_tau[" << i << "]";
+        EXPECT_EQ(nk_grad_qdot[i], ref_grad_qdot[i]) << "grad_qdot[" << i << "]";
+    }
+
+    nuka::phi::BackendFree(backend);
+}

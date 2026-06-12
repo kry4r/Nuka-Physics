@@ -15,7 +15,7 @@
 
 namespace nuka::nk {
 
-enum class DlpackDtype : uint8_t { kF32, kU32, kU64 };
+enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8 };
 
 struct DlpackRow {
     FieldId     field;
@@ -51,13 +51,22 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LinkArticulatedI, DlpackDtype::kF32, 2, false, false},  // link_articulated_I
     {FieldId::LinkBiasForce, DlpackDtype::kF32, 2, false, false},  // link_bias_force
     {FieldId::LinkUSpatial, DlpackDtype::kF32, 2, false, false},  // link_u_spatial
+    {FieldId::JointMotionSubspace, DlpackDtype::kF32, 2, false, false},  // joint_motion_subspace
+    {FieldId::DriveTarget, DlpackDtype::kF32, 1, false, false},  // drive_target
+    {FieldId::DriveStiffness, DlpackDtype::kF32, 1, false, false},  // drive_stiffness
+    {FieldId::DriveDamping, DlpackDtype::kF32, 1, false, false},  // drive_damping
+    {FieldId::DriveForceLimit, DlpackDtype::kF32, 1, false, false},  // drive_force_limit
+    {FieldId::SnapshotQ, DlpackDtype::kF32, 1, false, false},  // snapshot_q
+    {FieldId::SnapshotQdot, DlpackDtype::kF32, 1, false, false},  // snapshot_qdot
+    {FieldId::SnapshotLinkVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_link_velocity
+    {FieldId::SnapshotBasePose, DlpackDtype::kF32, 2, false, false},  // snapshot_base_pose
+    {FieldId::ResetEnvIds, DlpackDtype::kU32, 1, false, false},  // reset_env_ids
     {FieldId::LinkInertia, DlpackDtype::kF32, 2, false, false},  // link_inertia
     {FieldId::LinkLocalPose, DlpackDtype::kF32, 2, false, false},  // link_local_pose
     {FieldId::LinkInertialFrame, DlpackDtype::kF32, 2, false, false},  // link_inertial_frame
-    {FieldId::JointMotionSubspace, DlpackDtype::kF32, 2, false, false},  // joint_motion_subspace
     {FieldId::JointAxis, DlpackDtype::kF32, 2, false, false},  // joint_axis
     {FieldId::ParentOffset, DlpackDtype::kF32, 2, false, false},  // parent_offset
-    {FieldId::JointType, DlpackDtype::kU32, 1, false, false},  // joint_type
+    {FieldId::JointType, DlpackDtype::kU8, 1, false, false},  // joint_type
     {FieldId::ParentLink, DlpackDtype::kU32, 1, false, false},  // parent_link
     {FieldId::LinkBody, DlpackDtype::kU32, 1, false, false},  // link_body
     {FieldId::LinkToArticulation, DlpackDtype::kU32, 1, false, false},  // link_to_articulation
@@ -65,6 +74,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::JointArmature, DlpackDtype::kF32, 1, false, false},  // joint_armature
     {FieldId::ArticulationLinkCount, DlpackDtype::kU32, 1, false, false},  // articulation_link_count
     {FieldId::ArticulationLinkOffset, DlpackDtype::kU32, 1, false, false},  // articulation_link_offset
+    {FieldId::FootShape, DlpackDtype::kF32, 1, false, false},  // foot_shape
     {FieldId::BodyLinearVelocity, DlpackDtype::kF32, 2, true, false},  // body_linear_velocity
     {FieldId::BodyAngularVelocity, DlpackDtype::kF32, 2, true, false},  // body_angular_velocity
     {FieldId::BodyForce, DlpackDtype::kF32, 2, false, false},  // body_force
@@ -74,16 +84,27 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyAabbHi, DlpackDtype::kF32, 2, false, false},  // body_aabb_hi
     {FieldId::PairCount, DlpackDtype::kU32, 1, false, false},  // pair_count
     {FieldId::CandidatePairs, DlpackDtype::kU32, 2, false, false},  // candidate_pairs
+    {FieldId::ContactLink, DlpackDtype::kU32, 1, false, false},  // contact_link
     {FieldId::ContactPoint, DlpackDtype::kF32, 2, false, false},  // contact_point
     {FieldId::ContactNormal, DlpackDtype::kF32, 2, false, false},  // contact_normal
     {FieldId::ContactDepth, DlpackDtype::kF32, 1, false, false},  // contact_depth
-    {FieldId::ContactTangent, DlpackDtype::kF32, 2, false, false},  // contact_tangent
+    {FieldId::ContactTangent1, DlpackDtype::kF32, 2, false, false},  // contact_tangent1
+    {FieldId::ContactTangent2, DlpackDtype::kF32, 2, false, false},  // contact_tangent2
     {FieldId::ContactMaterial, DlpackDtype::kU32, 1, false, false},  // contact_material
+    {FieldId::JacNormal, DlpackDtype::kF32, 1, false, false},  // jac_normal
+    {FieldId::JacTangent1, DlpackDtype::kF32, 1, false, false},  // jac_tangent1
+    {FieldId::JacTangent2, DlpackDtype::kF32, 1, false, false},  // jac_tangent2
+    {FieldId::ContactMeffNormal, DlpackDtype::kF32, 1, false, false},  // contact_meff_normal
+    {FieldId::ContactMeffTangent1, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent1
+    {FieldId::ContactMeffTangent2, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent2
+    {FieldId::ContactForce, DlpackDtype::kF32, 2, false, true},  // contact_force
     {FieldId::RowCount, DlpackDtype::kU32, 1, false, false},  // row_count
     {FieldId::RowSides, DlpackDtype::kU32, 2, false, false},  // row_sides
     {FieldId::ChainJacobian, DlpackDtype::kF32, 2, false, false},  // chain_jacobian
     {FieldId::RowMeff, DlpackDtype::kF32, 1, false, false},  // row_meff
     {FieldId::RowMaterial, DlpackDtype::kU32, 1, false, false},  // row_material
+    {FieldId::M, DlpackDtype::kF32, 1, false, false},  // m
+    {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false, false},  // link_composite_inertia
     {FieldId::IslandRowOffsets, DlpackDtype::kU32, 1, false, false},  // island_row_offsets
     {FieldId::IslandColorSegments, DlpackDtype::kU32, 1, false, false},  // island_color_segments
     {FieldId::RowOrder, DlpackDtype::kU32, 1, false, false},  // row_order

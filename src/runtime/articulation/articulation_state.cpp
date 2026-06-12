@@ -486,6 +486,48 @@ ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& h
     return UploadArticulationState(context, host_state);
 }
 
+ArticulationDeviceState MakeArticulationDeviceStateFromViews(
+    const phi::ModelView& model_view, const phi::DataView& data_view,
+    uint32_t total_link_count, uint32_t articulation_count) {
+    ArticulationDeviceState s;
+    s.link_inertia = reinterpret_cast<LinkSpatialInertia*>(model_view.link_inertia);
+    s.link_velocity = reinterpret_cast<LinkSpatialVel*>(data_view.link_velocity);
+    s.link_acceleration =
+        reinterpret_cast<LinkSpatialAccel*>(data_view.link_acceleration);
+    s.link_xup = reinterpret_cast<LinkSpatialTransform*>(data_view.link_xup);
+    s.link_velocity_bias =
+        reinterpret_cast<LinkSpatialVel*>(data_view.link_velocity_bias);
+    s.link_articulated_I =
+        reinterpret_cast<LinkArticulatedInertia*>(data_view.link_articulated_I);
+    s.link_bias_force = reinterpret_cast<LinkBiasForce*>(data_view.link_bias_force);
+    s.link_u_spatial = reinterpret_cast<LinkBiasForce*>(data_view.link_u_spatial);
+    s.joint_motion_subspace =
+        reinterpret_cast<LinkMotionSubspace*>(data_view.joint_motion_subspace);
+    s.link_pose = data_view.link_pose;
+    s.link_local_pose = model_view.link_local_pose;
+    s.link_inertial_frame = model_view.link_inertial_frame;
+    s.base_pose = data_view.base_pose;
+    s.q = data_view.q;
+    s.qdot = data_view.qdot;
+    s.qddot = data_view.qddot;
+    s.tau = data_view.tau;
+    s.joint_damping = model_view.joint_damping;
+    s.joint_armature = model_view.joint_armature;
+    s.joint_diagonal = data_view.joint_diagonal;
+    s.joint_force = data_view.joint_force;
+    s.joint_axis = model_view.joint_axis;
+    s.parent_offset = model_view.parent_offset;
+    s.joint_type = reinterpret_cast<ArticulationJointType*>(model_view.joint_type);
+    s.parent_link = model_view.parent_link;
+    s.link_body = model_view.link_body;
+    s.link_to_articulation = model_view.link_to_articulation;
+    s.articulation_link_count = model_view.articulation_link_count;
+    s.articulation_link_offset = model_view.articulation_link_offset;
+    s.total_link_count = total_link_count;
+    s.articulation_count = articulation_count;
+    return s;
+}
+
 void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
                                ArticulationHostState* host_state) {
     if (host_state == nullptr) {

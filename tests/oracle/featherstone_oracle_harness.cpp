@@ -1,23 +1,35 @@
 #include "oracle/golden_trajectory.hpp"
 
 #include "import/mjcf_importer.hpp"
+#include "import/usd_importer.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/device_context.hpp"
+#include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
+#include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
+
+// --- M3b nk::World drive (the kernel-port byte-exact gates) -----------------
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/op_schema.hpp"
+#include "scene/cook/cook_to_model.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -458,4 +470,679 @@ TEST(FeatherstoneOracle, FloatingBaseRandomSampleGoldensMatchCudaAba) {
     }
 
     RunFloatingBaseOracle(go2_model, go2_golden, "go2");
+}
+
+// ===========================================================================
+// M3b — nk::World drive. The SAME scenes / goldens / comparison code, driven
+// through the new nk core (CookToModel -> nk::World -> op dispatch). Each test
+// holds the ported kernels to TWO bars at once:
+//   (1) the EXISTING golden tolerance of the legacy test (never loosened), and
+//   (2) BYTE-EXACT equality against the legacy path's output on the same
+//       inputs (the D1 kernel-port contract: EXPECT_EQ on raw floats).
+// ===========================================================================
+
+namespace {
+
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
+
+struct NkBackendFixture {
+    nphi::Device* dev = nullptr;
+    nphi::Backend* backend = nullptr;
+
+    NkBackendFixture() {
+        dev = nphi::InitBestDevice();
+        if (dev != nullptr) {
+            backend = nphi::DeviceInitBackend(dev, nullptr);
+        }
+    }
+    ~NkBackendFixture() {
+        if (backend != nullptr) {
+            nphi::BackendFree(backend);
+        }
+    }
+};
+
+// Cook `model_path` (mjcf) into an nk::Model, mirroring the harness's
+// fixed-base discipline EXACTLY: BuildArticulationHostState-equivalent tables
+// come from CookToModel; the root joint_type is then forced FloatingBase ->
+// Fixed (the same post-build mutation ComputeCudaAbaQddot applies).
+nk::Model CookNkModelFixedBase(const std::filesystem::path& model_path) {
+    const auto scene = nuka::import::LoadMjcf(model_path.string());
+    auto cooked = nuka::scene::cook::CookToModel(scene, /*env_count=*/1);
+    for (auto& jt : cooked.model.articulation.joint_type) {
+        if (jt == static_cast<uint8_t>(
+                      nuka::runtime::articulation::ArticulationJointType::FloatingBase)) {
+            jt = static_cast<uint8_t>(
+                nuka::runtime::articulation::ArticulationJointType::Fixed);
+        }
+    }
+    return std::move(cooked.model);
+}
+
+// Upload one golden record's (q, qdot, tau) into the nk world's per-link
+// fields, dispatch AbaForward alone, and download qddot. The pure-dynamics
+// oracle entry (mirrors ComputeCudaAbaQddot's single ComputeAccelerations).
+std::vector<float> NkAbaQddot(nk::World& world, const float* record,
+                              const nuka::tests::oracle::GoldenTrajectory& golden,
+                              nphi::Backend* backend) {
+    const uint32_t link_count = world.GetModel().capacities.links_per_env;
+    EXPECT_EQ(link_count, golden.qpos_count) << "cooked link count vs golden nq";
+    const float* qpos = record;
+    const float* qvel = qpos + golden.qpos_count;
+    const float* tau = qvel + golden.qvel_count;
+
+    const size_t bytes = static_cast<size_t>(link_count) * sizeof(float);
+    EXPECT_TRUE(world.GetData().UploadField(nk::FieldId::Q, qpos, bytes));
+    EXPECT_TRUE(world.GetData().UploadField(nk::FieldId::Qdot, qvel, bytes));
+    EXPECT_TRUE(world.GetData().UploadField(nk::FieldId::Tau, tau, bytes));
+
+    nphi::AbaForwardParams aba{};
+    aba.gravity[0] = 0.0f;
+    aba.gravity[1] = 0.0f;
+    aba.gravity[2] = -9.81f;  // == the legacy ComputeAccelerations(ctx, st, -9.81f)
+    aba.articulation_count = 1u;
+    aba.total_link_count = link_count;
+    EXPECT_EQ(world.DispatchOp(nphi::NkOp::AbaForward, &aba), nphi::Status::Ok);
+    nphi::BackendSynchronize(backend);
+
+    std::vector<float> qddot(link_count, 0.0f);
+    EXPECT_TRUE(world.GetData().DownloadField(nk::FieldId::Qddot, qddot.data(), bytes));
+    return qddot;
+}
+
+}  // namespace
+
+// (1) Pure-dynamics random-sample goldens (go2 + h1, fixed base) through
+// nk::World: golden tolerance 1e-3 (unchanged) + BIT-EXACT vs the legacy path.
+TEST(FeatherstoneOracle, NkWorldRandomSampleGoldensMatchCudaAbaByteExact) {
+    const auto go2_model =
+        SourcePath(".nuka-assets/mujoco_menagerie/unitree_go2/go2_mjx.xml");
+    const auto h1_model =
+        SourcePath(".nuka-assets/mujoco_menagerie/unitree_h1/h1.xml");
+    const auto go2_golden = GoldenPath("featherstone_go2_random_sample.bin");
+    const auto h1_golden = GoldenPath("featherstone_h1_random_sample.bin");
+    if (!std::filesystem::exists(go2_model) || !std::filesystem::exists(h1_model)) {
+        GTEST_SKIP() << "MuJoCo Menagerie Go2/H1 assets are not available";
+    }
+    if (!std::filesystem::exists(go2_golden) || !std::filesystem::exists(h1_golden)) {
+        GTEST_SKIP() << "v0.1 random-sample golden files are owner-protected and not present";
+    }
+
+    NkBackendFixture fx;
+    ASSERT_NE(fx.dev, nullptr);
+    ASSERT_NE(fx.backend, nullptr);
+
+    const struct {
+        const std::filesystem::path* model;
+        const std::filesystem::path* golden;
+        const char* label;
+    } cases[] = {{&go2_model, &go2_golden, "go2"}, {&h1_model, &h1_golden, "h1"}};
+
+    for (const auto& c : cases) {
+        const auto golden = nuka::tests::oracle::LoadGoldenTrajectory(*c.golden);
+        ASSERT_EQ(golden.kind, nuka::tests::oracle::GoldenKind::RandomQacc);
+        constexpr uint32_t kMaxSamplesCheckedInTest = 32u;
+        const uint32_t sample_count =
+            std::min(golden.sample_count, kMaxSamplesCheckedInTest);
+        ASSERT_GT(sample_count, 0u);
+
+        nk::Model model = CookNkModelFixedBase(*c.model);
+        nk::World world(std::move(model), 1u, fx.dev, fx.backend);
+        ASSERT_TRUE(world.Ready()) << c.label;
+
+        float max_abs = 0.0f;
+        for (uint32_t sample = 0u; sample < sample_count; ++sample) {
+            const float* record = golden.Record(sample);
+            const float* qacc = record + golden.qpos_count +
+                                golden.qvel_count + golden.qvel_count;
+            const auto nk_qddot = NkAbaQddot(world, record, golden, fx.backend);
+            ASSERT_EQ(nk_qddot.size(), golden.qacc_count) << c.label;
+            // (2) BYTE-EXACT vs the legacy single-dispatch path on the SAME record.
+            const auto legacy_qddot = ComputeCudaAbaQddot(*c.model, record, golden);
+            ASSERT_EQ(legacy_qddot.size(), nk_qddot.size()) << c.label;
+            for (uint32_t dof = 0u; dof < golden.qacc_count; ++dof) {
+                EXPECT_EQ(nk_qddot[dof], legacy_qddot[dof])
+                    << c.label << " sample " << sample << " dof " << dof
+                    << ": nk vs legacy qddot NOT byte-exact (D1 port defect)";
+                max_abs = std::max(max_abs, std::abs(nk_qddot[dof] - qacc[dof]));
+            }
+        }
+        EXPECT_LE(max_abs, 1.0e-3f)
+            << c.label << ": nk::World Featherstone ABA qddot differs from MJX golden";
+    }
+}
+
+// (2) Genuine floating-base random-sample golden (go2) through nk::World:
+// same conversions/tolerances as RunFloatingBaseOracle + BIT-EXACT legs/base
+// vs the legacy path.
+TEST(FeatherstoneOracle, NkWorldFloatingBaseGoldensMatchCudaAbaByteExact) {
+    const auto go2_model =
+        SourcePath(".nuka-assets/mujoco_menagerie/unitree_go2/go2_mjx.xml");
+    const auto go2_golden = GoldenPath("featherstone_go2_floating_random_sample.bin");
+    if (!std::filesystem::exists(go2_model)) {
+        GTEST_SKIP() << "MuJoCo Menagerie Go2 assets are not available";
+    }
+    if (!std::filesystem::exists(go2_golden)) {
+        GTEST_SKIP() << "floating-base golden not present";
+    }
+
+    NkBackendFixture fx;
+    ASSERT_NE(fx.dev, nullptr);
+    ASSERT_NE(fx.backend, nullptr);
+
+    const auto golden = nuka::tests::oracle::LoadGoldenTrajectory(go2_golden);
+    ASSERT_EQ(golden.kind, nuka::tests::oracle::GoldenKind::RandomQacc);
+    const uint32_t nq = golden.qpos_count;
+    const uint32_t nv = golden.qvel_count;
+    constexpr uint32_t kMaxSamples = 32u;
+    const uint32_t sample_count = std::min(golden.sample_count, kMaxSamples);
+    ASSERT_GT(sample_count, 0u);
+
+    // Natural cook (root must stay FloatingBase).
+    const auto scene = nuka::import::LoadMjcf(go2_model.string());
+    auto cooked = nuka::scene::cook::CookToModel(scene, 1);
+    ASSERT_FALSE(cooked.model.articulation.joint_type.empty());
+    ASSERT_EQ(cooked.model.articulation.joint_type[0],
+              static_cast<uint8_t>(
+                  nuka::runtime::articulation::ArticulationJointType::FloatingBase));
+    const uint32_t link_count = cooked.model.capacities.links_per_env;
+    const uint32_t leg_dofs = link_count - 1u;
+    ASSERT_EQ(nv, leg_dofs + 6u);
+
+    nk::World world(std::move(cooked.model), 1u, fx.dev, fx.backend);
+    ASSERT_TRUE(world.Ready());
+
+    float leg_max_abs = 0.0f;
+    float base_lin_max_abs = 0.0f;
+    float base_ang_max_abs = 0.0f;
+    for (uint32_t sample = 0u; sample < sample_count; ++sample) {
+        const float* record = golden.Record(sample);
+        const float* qpos = record;
+        const float* qvel = qpos + nq;
+        const float* tau = qvel + nv;
+        const float* qacc = record + static_cast<size_t>(nq) + nv + nv;
+
+        // --- INPUT conversion MJX -> Nuka (mirrors ComputeCudaAbaFloatingBase).
+        nuka::math::Transform base_pose;
+        base_pose.position = nuka::math::Vec3{qpos[0], qpos[1], qpos[2]};
+        nuka::math::Quat base_rot{qpos[3], qpos[4], qpos[5], qpos[6]};
+        {
+            const float n = std::sqrt(base_rot.w * base_rot.w + base_rot.x * base_rot.x +
+                                      base_rot.y * base_rot.y + base_rot.z * base_rot.z);
+            const float inv = n > 0.0f ? 1.0f / n : 1.0f;
+            base_rot.w *= inv; base_rot.x *= inv; base_rot.y *= inv; base_rot.z *= inv;
+        }
+        base_pose.rotation = base_rot;
+
+        const nuka::math::Vec3 v_lin_world{qvel[0], qvel[1], qvel[2]};
+        const nuka::math::Vec3 omega_body{qvel[3], qvel[4], qvel[5]};
+        const nuka::math::Vec3 v_lin_body = RotateByQuatInverse(base_rot, v_lin_world);
+        float root_vel[6] = {omega_body.x, omega_body.y, omega_body.z,
+                             v_lin_body.x, v_lin_body.y, v_lin_body.z};
+
+        std::vector<float> q(link_count, 0.0f), qd(link_count, 0.0f), tq(link_count, 0.0f);
+        for (uint32_t i = 0u; i < leg_dofs; ++i) {
+            q[1u + i] = qpos[7u + i];
+            qd[1u + i] = qvel[6u + i];
+            tq[1u + i] = tau[6u + i];
+        }
+        const size_t bytes = static_cast<size_t>(link_count) * sizeof(float);
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::Q, q.data(), bytes));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::Qdot, qd.data(), bytes));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::Tau, tq.data(), bytes));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BasePose, &base_pose,
+                                                sizeof(base_pose)));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::LinkVelocity, root_vel,
+                                                sizeof(root_vel)));  // root = link 0
+
+        nphi::AbaForwardParams aba{};
+        aba.gravity[2] = -9.81f;
+        aba.articulation_count = 1u;
+        aba.total_link_count = link_count;
+        ASSERT_EQ(world.DispatchOp(nphi::NkOp::AbaForward, &aba), nphi::Status::Ok);
+        nphi::BackendSynchronize(fx.backend);
+
+        std::vector<float> qddot(link_count, 0.0f);
+        float a0[6] = {0, 0, 0, 0, 0, 0};
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Qddot, qddot.data(), bytes));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::LinkAcceleration, a0,
+                                                  sizeof(a0)));  // root = link 0
+
+        // --- OUTPUT conversion Nuka -> MJX (mirrors ComputeCudaAbaFloatingBase).
+        const nuka::math::Vec3 g_world{0.0f, 0.0f, 9.81f};  // -kGravityZ
+        const nuka::math::Vec3 g_body = RotateByQuatInverse(base_rot, g_world);
+        float real[6];
+        real[0] = a0[0]; real[1] = a0[1]; real[2] = a0[2];
+        real[3] = a0[3] - g_body.x;
+        real[4] = a0[4] - g_body.y;
+        real[5] = a0[5] - g_body.z;
+        const nuka::math::Vec3 omega_dot{real[0], real[1], real[2]};
+        const nuka::math::Vec3 a_lin_body_spatial{real[3], real[4], real[5]};
+        const nuka::math::Vec3 omega_cross_v{
+            omega_body.y * v_lin_body.z - omega_body.z * v_lin_body.y,
+            omega_body.z * v_lin_body.x - omega_body.x * v_lin_body.z,
+            omega_body.x * v_lin_body.y - omega_body.y * v_lin_body.x};
+        const nuka::math::Vec3 a_lin_body{
+            a_lin_body_spatial.x + omega_cross_v.x,
+            a_lin_body_spatial.y + omega_cross_v.y,
+            a_lin_body_spatial.z + omega_cross_v.z};
+        const nuka::math::Vec3 a_lin_world = RotateByQuat(base_rot, a_lin_body);
+        const std::array<float, 6> base_accel_mjx = {
+            a_lin_world.x, a_lin_world.y, a_lin_world.z,
+            omega_dot.x, omega_dot.y, omega_dot.z};
+
+        // (2) BYTE-EXACT vs the legacy floating-base path on the SAME record.
+        const auto legacy = ComputeCudaAbaFloatingBase(go2_model, record, nq, nv);
+        ASSERT_EQ(legacy.leg_qddot.size(), leg_dofs);
+        for (uint32_t i = 0u; i < leg_dofs; ++i) {
+            EXPECT_EQ(qddot[1u + i], legacy.leg_qddot[i])
+                << "sample " << sample << " leg dof " << i
+                << ": nk vs legacy NOT byte-exact (D1 port defect)";
+            leg_max_abs = std::max(leg_max_abs,
+                                   std::abs(qddot[1u + i] - qacc[6u + i]));
+        }
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            EXPECT_EQ(real[i], legacy.base_accel_nuka_spatial[i])
+                << "sample " << sample << " base spatial accel " << i
+                << ": nk vs legacy NOT byte-exact (D1 port defect)";
+        }
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            base_lin_max_abs = std::max(base_lin_max_abs,
+                                        std::abs(base_accel_mjx[i] - qacc[i]));
+            base_ang_max_abs = std::max(base_ang_max_abs,
+                                        std::abs(base_accel_mjx[3u + i] - qacc[3u + i]));
+        }
+    }
+
+    std::cout << "[NkFloatingBase go2] over " << sample_count
+              << " samples: leg_max_abs=" << leg_max_abs
+              << "  base_lin_max_abs=" << base_lin_max_abs
+              << "  base_ang_max_abs=" << base_ang_max_abs << std::endl;
+    EXPECT_LE(leg_max_abs, 1.0e-3f);
+    EXPECT_LE(base_lin_max_abs, 1.0e-3f);
+    EXPECT_LE(base_ang_max_abs, 1.0e-3f);
+}
+
+namespace {
+
+// Download the nk world's per-link q (single env) as a vector.
+std::vector<float> NkDownloadQ(nk::World& world) {
+    const uint32_t L = world.GetModel().capacities.links_per_env;
+    std::vector<float> q(static_cast<size_t>(L) * world.EnvCount(), 0.0f);
+    EXPECT_TRUE(world.GetData().DownloadField(nk::FieldId::Q, q.data(),
+                                              q.size() * sizeof(float)));
+    return q;
+}
+
+}  // namespace
+
+// (3) go2_stand_5s through nk::World — THE trajectory golden. Three bars:
+//   (a) BYTE-EXACT vs an in-harness reproduction of the legacy single-env
+//       production step (c_abi StepWorldGpu: drives -> ABA -> integrate ->
+//       (M+dt*C)^-1 implicit damping -> position integrate; contacts OFF),
+//   (b) the EXISTING golden tolerance (1e-4 vs go2_stand_5s.bin, unchanged),
+//   (c) StepPlanned (CUDA-graph plan) == Step over the full 1200 steps,
+//       byte-identical q trajectory (the plan-replay D1 gate).
+TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    const auto golden_path = GoldenPath("go2_stand_5s.bin");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+    if (!std::filesystem::exists(golden_path)) {
+        GTEST_SKIP() << "v0.1 Go2 stand golden trajectory is owner-protected and not present";
+    }
+
+    namespace articulation = nuka::runtime::articulation;
+    constexpr float kDt = 1.0f / 240.0f;
+    constexpr float kGravityZ = -9.81f;
+    constexpr uint32_t kSteps = 1200u;
+
+    NkBackendFixture fx;
+    ASSERT_NE(fx.dev, nullptr);
+    ASSERT_NE(fx.backend, nullptr);
+
+    const auto scene = nuka::import::LoadUsd(scene_path.string());
+
+    // --- nk drive (Step path). Contacts OFF: the legacy single-env path runs
+    // enable_contacts == false, mirrored by clearing the cooked foot table (the
+    // detection then deterministically zero-fills every slot; the transitional
+    // solve degrades to EXACTLY the legacy ApplyImplicitJointDamping float
+    // sequence — documented in articulation_contacts.cu).
+    auto MakeStandWorld = [&]() {
+        auto cooked = nuka::scene::cook::CookToModel(scene, 1);
+        cooked.model.feet.clear();
+        nk::Pipeline::SolverConfig cfg;
+        cfg.dt = kDt;
+        cfg.gravity[2] = kGravityZ;
+        return std::make_unique<nk::World>(std::move(cooked.model), 1u, fx.dev,
+                                           fx.backend, cfg);
+    };
+    auto world = MakeStandWorld();
+    ASSERT_TRUE(world->Ready());
+    const uint32_t L = world->GetModel().capacities.links_per_env;
+    ASSERT_GT(L, 12u);
+
+    std::vector<float> nk_traj;
+    nk_traj.reserve(static_cast<size_t>(kSteps) * L);
+    for (uint32_t step = 0; step < kSteps; ++step) {
+        const nk::StepResult res = world->Step();
+        ASSERT_TRUE(res.AllOk()) << "nk Step op failure at step " << step;
+        const auto q = NkDownloadQ(*world);
+        nk_traj.insert(nk_traj.end(), q.begin(), q.end());
+    }
+
+    // --- (c) StepPlanned twin: byte-identical trajectory over all 1200 steps.
+    auto planned = MakeStandWorld();
+    ASSERT_TRUE(planned->Ready());
+    std::vector<float> plan_traj;
+    plan_traj.reserve(nk_traj.size());
+    for (uint32_t step = 0; step < kSteps; ++step) {
+        ASSERT_EQ(planned->StepPlanned(), nphi::Status::Ok)
+            << "StepPlanned failed at step " << step;
+        const auto q = NkDownloadQ(*planned);
+        plan_traj.insert(plan_traj.end(), q.begin(), q.end());
+    }
+    ASSERT_EQ(plan_traj.size(), nk_traj.size());
+    EXPECT_EQ(std::memcmp(plan_traj.data(), nk_traj.data(),
+                          nk_traj.size() * sizeof(float)),
+              0)
+        << "StepPlanned (CUDA-graph plan) trajectory is NOT byte-identical to Step";
+
+    // --- (a) legacy single-env production-step reproduction, byte-compared.
+    {
+        const auto blob = nuka::scene::CookScene(scene);
+        const auto built = nuka::runtime::BuildWorld(blob);
+        auto host = articulation::BuildArticulationHostState(
+            built.template_view.articulations, built.template_view.body_table);
+        const auto context = nuka::phi::MakeDefaultDeviceContext();
+        auto device = articulation::UploadArticulationState(context, host);
+        const uint32_t max_dof = articulation::ArticulationDofCount(host, 0u);
+        ASSERT_GT(max_dof, 0u);
+
+        // Drives: the nk Model's cooked hold drives ARE BuildHoldDriveTargets'
+        // output (same derivation); reuse them for the legacy device buffers.
+        auto cooked_ref = nuka::scene::cook::CookToModel(scene, 1);
+        const auto& hd = cooked_ref.model.hold_drives;
+        ASSERT_EQ(hd.targets.size(), host.q.size());
+        auto upload_f32 = [](const std::vector<float>& v) {
+            nuka::phi::Buffer b(v.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+            b.CopyFromHost(v.data(), v.size() * sizeof(float));
+            return b;
+        };
+        nuka::phi::Buffer d_targets = upload_f32(hd.targets);
+        nuka::phi::Buffer d_stiffness = upload_f32(hd.stiffness);
+        nuka::phi::Buffer d_damping = upload_f32(hd.damping);
+        nuka::phi::Buffer d_limits = upload_f32(hd.force_limits);
+
+        const uint32_t total_links = host.TotalLinkCount();
+        const size_t tile = static_cast<size_t>(max_dof) * max_dof;
+        nuka::phi::Buffer m(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer m_inv(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer composite(
+            static_cast<size_t>(total_links) * sizeof(articulation::LinkSpatialInertia),
+            nuka::phi::MemoryKind::Device);
+
+        std::vector<float> legacy_traj;
+        legacy_traj.reserve(nk_traj.size());
+        const auto state = device.View();
+        for (uint32_t step = 0; step < kSteps; ++step) {
+            articulation::FeatherstoneAba::ApplyPositionDrives(
+                context, state,
+                static_cast<const float*>(d_targets.Data()),
+                static_cast<const float*>(d_stiffness.Data()),
+                static_cast<const float*>(d_damping.Data()),
+                static_cast<const float*>(d_limits.Data()),
+                /*defer_velocity_damping=*/true);
+            articulation::FeatherstoneAba::ComputeAccelerations(context, state, kGravityZ);
+            articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
+                context, state, kDt, kGravityZ);
+            articulation::FeatherstoneAba::IntegrateVelocity(context, state, kDt);
+            articulation::ComputeArticulationInertiaM(
+                context, state, max_dof,
+                static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
+                static_cast<float*>(m.Data()),
+                static_cast<const float*>(d_damping.Data()), kDt);
+            articulation::FactorArticulationInertiaM(
+                context, state, max_dof,
+                static_cast<const float*>(m.Data()),
+                static_cast<float*>(m_inv.Data()));
+            articulation::ApplyImplicitJointDamping(
+                context, state,
+                static_cast<const float*>(m_inv.Data()),
+                static_cast<const float*>(d_damping.Data()), max_dof, kDt);
+            articulation::FeatherstoneAba::IntegratePosition(context, state, kDt);
+            articulation::FeatherstoneAba::IntegrateFloatingBasePose(context, state, kDt);
+            context.stream.Synchronize();
+            articulation::DownloadArticulationState(device, &host);
+            legacy_traj.insert(legacy_traj.end(), host.q.begin(), host.q.end());
+        }
+        ASSERT_EQ(legacy_traj.size(), nk_traj.size());
+        size_t mismatches = 0;
+        for (size_t i = 0; i < nk_traj.size() && mismatches < 8; ++i) {
+            if (std::memcmp(&nk_traj[i], &legacy_traj[i], sizeof(float)) != 0) {
+                ADD_FAILURE() << "nk vs legacy stand trajectory NOT byte-exact at flat "
+                              << i << " (step " << (i / L) << ", link " << (i % L)
+                              << "): nk=" << nk_traj[i]
+                              << " legacy=" << legacy_traj[i];
+                ++mismatches;
+            }
+        }
+        EXPECT_EQ(mismatches, 0u);
+    }
+
+    // --- (b) the EXISTING golden tolerance (1e-4, NOT loosened).
+    const auto golden = nuka::tests::oracle::LoadGoldenTrajectory(golden_path);
+    ASSERT_EQ(golden.kind, nuka::tests::oracle::GoldenKind::JointTrajectory);
+    ASSERT_EQ(golden.sample_count, kSteps);
+    ASSERT_EQ(golden.qpos_count, L);
+    float max_abs = 0.0f;
+    for (uint32_t step = 0; step < golden.sample_count; ++step) {
+        const float* record = golden.Record(step);
+        const size_t offset = static_cast<size_t>(step) * golden.qpos_count;
+        for (uint32_t joint = 0; joint < golden.qpos_count; ++joint) {
+            max_abs = std::max(max_abs, std::abs(nk_traj[offset + joint] - record[joint]));
+        }
+    }
+    std::cout << "[NkGo2Stand5s] golden max_abs=" << max_abs << std::endl;
+    EXPECT_LE(max_abs, 1.0e-4f)
+        << "nk::World Go2 stand joint trajectory differs from MJX golden";
+}
+
+// (4) The full batched CONTACT chain (FK -> foot narrowphase -> tangent ->
+// CRBA/factor -> chain-J/m_eff/rows -> fused solve -> integrate -> wrench
+// readout) BYTE-EXACT vs the production BatchedArticulatedWorld, N=4 envs,
+// 200 steps, active ground contacts (the perf-gate scene constants).
+TEST(FeatherstoneOracle, NkWorldBatchedContactStepByteExactVsLegacy) {
+    const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
+    if (!std::filesystem::exists(scene_path)) {
+        GTEST_SKIP() << "Go2 stand scene is not available";
+    }
+
+    namespace articulation = nuka::runtime::articulation;
+    namespace gpu = nuka::runtime::gpu;
+    constexpr float kDt = 1.0f / 240.0f;
+    constexpr float kGravityZ = -9.81f;
+    constexpr float kGround = 0.31f;            // perf-gate seat (active contacts)
+    constexpr float kBaumgarteMaxVel = 3.0f;
+    constexpr uint32_t kEnvs = 4u;
+    constexpr uint32_t kSteps = 200u;
+
+    NkBackendFixture fx;
+    ASSERT_NE(fx.dev, nullptr);
+    ASSERT_NE(fx.backend, nullptr);
+
+    const auto scene = nuka::import::LoadUsd(scene_path.string());
+
+    // --- nk world: cooked feet kept; ground/baumgarte = the perf-gate values.
+    auto MakeContactWorld = [&]() {
+        auto cooked = nuka::scene::cook::CookToModel(scene, 1);
+        EXPECT_EQ(cooked.model.feet.size(), 4u) << "go2 cooks 4 foot spheres";
+        cooked.model.ground_height = kGround;
+        cooked.model.baumgarte_max_velocity = kBaumgarteMaxVel;
+        nk::Pipeline::SolverConfig cfg;
+        cfg.dt = kDt;
+        cfg.gravity[2] = kGravityZ;
+        return std::make_unique<nk::World>(std::move(cooked.model), kEnvs, fx.dev,
+                                           fx.backend, cfg);
+    };
+    const auto cooked_ref = nuka::scene::cook::CookToModel(scene, 1);
+    const auto hold = cooked_ref.model.hold_drives;   // copy for the legacy arm
+    const auto feet_tpl = cooked_ref.model.feet;      // copy for the legacy arm
+    auto world_ptr = MakeContactWorld();
+    nk::World& world = *world_ptr;
+    ASSERT_TRUE(world.Ready());
+    const uint32_t L = world.GetModel().capacities.links_per_env;
+    const uint32_t total_links = L * kEnvs;
+
+    for (uint32_t step = 0; step < kSteps; ++step) {
+        const nk::StepResult res = world.Step();
+        ASSERT_TRUE(res.AllOk()) << "nk Step op failure at step " << step;
+    }
+    nphi::BackendSynchronize(fx.backend);
+
+    // --- StepPlanned twin WITH ACTIVE CONTACTS: the CUDA-graph plan must
+    // reproduce the dispatch path byte-for-byte through the full contact chain
+    // (complements the contact-free stand gate's 1200-step identity).
+    {
+        auto planned = MakeContactWorld();
+        ASSERT_TRUE(planned->Ready());
+        for (uint32_t step = 0; step < kSteps; ++step) {
+            ASSERT_EQ(planned->StepPlanned(), nphi::Status::Ok)
+                << "StepPlanned failed at step " << step;
+        }
+        nphi::BackendSynchronize(fx.backend);
+        std::vector<float> q_step(total_links), q_plan(total_links);
+        std::vector<float> l_step(world.GetModel().capacities.max_rows_per_env * kEnvs);
+        std::vector<float> l_plan(l_step.size());
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Q, q_step.data(),
+                                                  q_step.size() * 4));
+        ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Q, q_plan.data(),
+                                                     q_plan.size() * 4));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Lambda, l_step.data(),
+                                                  l_step.size() * 4));
+        ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Lambda, l_plan.data(),
+                                                     l_plan.size() * 4));
+        EXPECT_EQ(std::memcmp(q_step.data(), q_plan.data(), q_step.size() * 4), 0)
+            << "StepPlanned q diverges from Step under active contacts";
+        EXPECT_EQ(std::memcmp(l_step.data(), l_plan.data(), l_step.size() * 4), 0)
+            << "StepPlanned lambda diverges from Step under active contacts";
+    }
+
+    // --- legacy production world (the byte-exact reference).
+    const auto blob = nuka::scene::CookScene(scene);
+    const auto built = nuka::runtime::BuildWorld(blob);
+    auto base_host = articulation::BuildArticulationHostState(
+        built.template_view.articulations, built.template_view.body_table);
+    const uint32_t max_dof = articulation::ArticulationDofCount(base_host, 0u);
+    auto batched_host = articulation::ReplicateArticulationHostState(base_host, kEnvs);
+
+    std::vector<articulation::FootShape> feet;
+    for (const auto& f : feet_tpl) {
+        articulation::FootShape foot;
+        foot.calf_local_link = f.calf_local_link;
+        foot.local_offset = f.local_offset;
+        foot.radius = f.radius;
+        feet.push_back(foot);
+    }
+
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    gpu::BatchedArticulatedWorld bw(context, batched_host, feet, max_dof, kGround);
+
+    auto upload_replicated = [&](const std::vector<float>& base) {
+        std::vector<float> tiled(base.size() * kEnvs);
+        for (uint32_t e = 0; e < kEnvs; ++e) {
+            for (size_t i = 0; i < base.size(); ++i) {
+                tiled[e * base.size() + i] = base[i];
+            }
+        }
+        nuka::phi::Buffer b(tiled.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        b.CopyFromHost(tiled.data(), tiled.size() * sizeof(float));
+        return b;
+    };
+    nuka::phi::Buffer d_targets = upload_replicated(hold.targets);
+    nuka::phi::Buffer d_stiffness = upload_replicated(hold.stiffness);
+    nuka::phi::Buffer d_damping = upload_replicated(hold.damping);
+    nuka::phi::Buffer d_limits = upload_replicated(hold.force_limits);
+
+    gpu::BatchedArticulatedStepParams params;
+    params.drive_targets = static_cast<const float*>(d_targets.Data());
+    params.drive_stiffness = static_cast<const float*>(d_stiffness.Data());
+    params.drive_damping = static_cast<const float*>(d_damping.Data());
+    params.drive_force_limits = static_cast<const float*>(d_limits.Data());
+    params.gravity_z = kGravityZ;
+    params.dt = kDt;
+    params.baumgarte_max_velocity = kBaumgarteMaxVel;
+    for (uint32_t step = 0; step < kSteps; ++step) {
+        bw.Step(params);
+    }
+    context.stream.Synchronize();
+
+    // --- byte-exact comparison: q / qdot / link_velocity / base_pose / lambda /
+    // link contact wrench.
+    articulation::ArticulationHostState legacy_out = batched_host;
+    bw.Download(&legacy_out);
+    const std::vector<float> legacy_lambda = bw.DownloadLambda();
+    const std::vector<float> legacy_wrench = bw.DownloadLinkContactWrench();
+
+    std::vector<float> nk_q(total_links), nk_qdot(total_links);
+    std::vector<float> nk_linkvel(static_cast<size_t>(total_links) * 6u);
+    std::vector<nuka::math::Transform> nk_base(kEnvs);
+    const uint32_t row_slots = world.GetModel().capacities.max_rows_per_env * kEnvs;
+    std::vector<float> nk_lambda(row_slots);
+    std::vector<float> nk_wrench(static_cast<size_t>(total_links) * 6u);
+    auto& d = world.GetData();
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::Q, nk_q.data(), nk_q.size() * 4));
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::Qdot, nk_qdot.data(), nk_qdot.size() * 4));
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::LinkVelocity, nk_linkvel.data(),
+                                nk_linkvel.size() * 4));
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::BasePose, nk_base.data(),
+                                nk_base.size() * sizeof(nuka::math::Transform)));
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::Lambda, nk_lambda.data(),
+                                nk_lambda.size() * 4));
+    ASSERT_TRUE(d.DownloadField(nk::FieldId::LinkContactWrench, nk_wrench.data(),
+                                nk_wrench.size() * 4));
+
+    ASSERT_EQ(legacy_out.q.size(), nk_q.size());
+    ASSERT_EQ(legacy_lambda.size(), nk_lambda.size());
+    size_t mismatches = 0;
+    auto expect_eq = [&](float a, float b, const char* what, size_t i) {
+        if (mismatches < 8 && std::memcmp(&a, &b, sizeof(float)) != 0) {
+            ADD_FAILURE() << what << "[" << i << "] NOT byte-exact: nk=" << a
+                          << " legacy=" << b;
+            ++mismatches;
+        }
+    };
+    for (size_t i = 0; i < nk_q.size(); ++i) {
+        expect_eq(nk_q[i], legacy_out.q[i], "q", i);
+        expect_eq(nk_qdot[i], legacy_out.qdot[i], "qdot", i);
+        for (uint32_t k = 0; k < 6u; ++k) {
+            expect_eq(nk_linkvel[i * 6u + k], legacy_out.link_velocity[i].v[k],
+                      "link_velocity", i * 6u + k);
+        }
+    }
+    for (uint32_t e = 0; e < kEnvs; ++e) {
+        expect_eq(nk_base[e].position.x, legacy_out.base_pose[e].position.x, "base_pos.x", e);
+        expect_eq(nk_base[e].position.y, legacy_out.base_pose[e].position.y, "base_pos.y", e);
+        expect_eq(nk_base[e].position.z, legacy_out.base_pose[e].position.z, "base_pos.z", e);
+        expect_eq(nk_base[e].rotation.w, legacy_out.base_pose[e].rotation.w, "base_rot.w", e);
+        expect_eq(nk_base[e].rotation.x, legacy_out.base_pose[e].rotation.x, "base_rot.x", e);
+        expect_eq(nk_base[e].rotation.y, legacy_out.base_pose[e].rotation.y, "base_rot.y", e);
+        expect_eq(nk_base[e].rotation.z, legacy_out.base_pose[e].rotation.z, "base_rot.z", e);
+    }
+    for (size_t i = 0; i < nk_lambda.size(); ++i) {
+        expect_eq(nk_lambda[i], legacy_lambda[i], "lambda", i);
+    }
+    for (size_t i = 0; i < nk_wrench.size(); ++i) {
+        expect_eq(nk_wrench[i], legacy_wrench[i], "link_contact_wrench", i);
+    }
+    EXPECT_EQ(mismatches, 0u)
+        << "nk batched contact step diverges from BatchedArticulatedWorld";
+
+    // Active-contact sanity: the seat actually fires contacts (the gate is not
+    // vacuously comparing zeros).
+    float lambda_sum = 0.0f;
+    for (float v : nk_lambda) lambda_sum += std::abs(v);
+    EXPECT_GT(lambda_sum, 0.0f) << "no contact impulse — the contact gate is vacuous";
 }

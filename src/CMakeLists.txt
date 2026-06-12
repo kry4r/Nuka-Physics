@@ -442,6 +442,14 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/cuda_backend.cu
         phi/backend_cuda/cuda_buffer.cu
         phi/backend_cuda/ops/registry.cu
+        # M3b articulation pipeline op implementations (line-by-line kernel
+        # ports; see each file's header). solve_articulated.cu is TRANSITIONAL
+        # (deleted in M4 with the real SolveRowsBlockIsland).
+        phi/backend_cuda/ops/articulation.cu
+        phi/backend_cuda/ops/crba.cu
+        phi/backend_cuda/ops/contacts_foot.cu
+        phi/backend_cuda/ops/solve_articulated.cu
+        phi/backend_cuda/ops/readout.cu
     )
     set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

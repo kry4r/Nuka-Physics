@@ -5,6 +5,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/model/generated/views.hpp"  // phi::ModelView/DataView (M3b nk seam)
 #include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "scene/canonical_types.hpp"
@@ -209,5 +210,15 @@ ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& cont
 ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& host_state);
 void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
                                ArticulationHostState* host_state);
+
+// M3b nk seam: build the legacy kernel-parameter view from the nk arena views
+// (the generated phi::ModelView/DataView member names match these fields 1:1
+// BY DESIGN). The ONLY change for a consumer (diffsim StepBackward / Tape /
+// BackwardRunner, c_abi at M9) is where the pointers come from — the kernels
+// and algorithms run UNTOUCHED on arena-backed state. The nk Model stages
+// joint_type as the u8-backed ArticulationJointType, so the alias is exact.
+ArticulationDeviceState MakeArticulationDeviceStateFromViews(
+    const phi::ModelView& model_view, const phi::DataView& data_view,
+    uint32_t total_link_count, uint32_t articulation_count);
 
 } // namespace nuka::runtime::articulation

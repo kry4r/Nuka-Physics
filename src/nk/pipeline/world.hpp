@@ -79,11 +79,17 @@ public:
     // to NOT planning (caller can use Step()).
     phi::Status StepPlanned();
 
-    // Reset the envs selected by `env_mask` (bit e set => reset env e). M3a
-    // dispatches the ResetEnvs op (Unsupported today) and re-zeros the data arena
-    // host-side so the World stays in a clean, crash-free state. Empty mask =>
-    // all envs.
+    // Reset the selected envs DEVICE-SIDE (M3b): an empty list dispatches the
+    // bulk RestoreState op (snapshot -> live + clear qddot/tau/lambda, the
+    // legacy BatchedArticulatedWorld::Reset 1:1); a non-empty list uploads the
+    // ids into the reset_env_ids field and dispatches the per-env masked
+    // ResetEnvs op (the p03 ResetEnvsKernel port). The restore source is the
+    // construction-time SnapshotState (the cooked initial pose).
     phi::Status Reset(const std::vector<uint32_t>& env_ids = {});
+
+    // Dispatch a single op outside the per-step pipeline (oracle harness +
+    // snapshot/restore/obs plumbing). params must match the op's POD.
+    phi::Status DispatchOp(phi::NkOp op, const void* params);
 
     // Device pointer of a field (model- or data-owned); null if absent/unbuilt.
     void* FieldPtr(FieldId id) const;
@@ -97,6 +103,11 @@ public:
     Data&           GetData()     { return data_; }
 
 private:
+    // Seed the Data persistent fields from the Model template (q / link_pose /
+    // base_pose / drive_* / mat_buckets, env-major replication) and take the
+    // device snapshot the Reset path restores. Called once from the ctor.
+    bool SeedInitialState();
+
     Model           model_;
     Data            data_;
     Pipeline        pipeline_;
@@ -106,8 +117,10 @@ private:
     phi::Plan*      plan_ = nullptr;
     bool            ready_ = false;
 
-    // ResetEnvs op params storage (stable address for dispatch).
-    phi::ResetEnvsParams reset_params_{};
+    // Reset/snapshot op params storage (stable addresses for dispatch).
+    phi::ResetEnvsParams     reset_params_{};
+    phi::SnapshotStateParams snapshot_params_{};
+    phi::RestoreStateParams  restore_params_{};
 };
 
 } // namespace nuka::nk

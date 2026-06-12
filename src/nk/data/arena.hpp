@@ -45,6 +45,14 @@ public:
     // unallocated.
     void ZeroAll();
 
+    // Host->field upload / field->host download through BufferI (init-time
+    // seeding + test readback; NOT a per-step path). `byte_offset` is relative
+    // to the field's segment base. Returns false on a bad field / range.
+    bool UploadField(FieldId id, const void* src, uint64_t bytes,
+                     uint64_t byte_offset = 0) const;
+    bool DownloadField(FieldId id, void* dst, uint64_t bytes,
+                       uint64_t byte_offset = 0) const;
+
     // The per-field segment descriptor (one per data-owned field, in FieldId
     // order). Public so the acceptance test can assert determinism.
     struct Segment {

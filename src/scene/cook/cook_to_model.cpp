@@ -26,8 +26,10 @@
 #include "scene/cook/cook_to_model.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 #include "runtime/articulation/articulation_cooker.hpp"
+#include "runtime/articulation/articulation_state.hpp"
 #include "scene/cooker.hpp"
 
 namespace nuka::scene::cook {
@@ -89,44 +91,135 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     cap.bodies_per_env = blob.body_count;
     cap.obs_width = 64;
 
-    // 4. Articulation template (M3a: the FIRST articulation, the single-robot
-    //    scene shape; multi-articulation per env is an M3b extension).
+    // 4. Articulation template (the FIRST articulation, the single-robot scene
+    //    shape; multi-articulation per env is a later extension). M3b: the
+    //    template arrays are the SINGLE-ENV BuildArticulationHostState product
+    //    transcribed 1:1, so the staged Model bytes (after env-major tiling in
+    //    Model::StageModelField) match the legacy UploadArticulationState bytes
+    //    EXACTLY — the byte-exact kernel-port contract.
     if (!arts.empty()) {
-        const runtime::articulation::ArticulationCookedTopology& a = arts.front();
+        namespace articulation = runtime::articulation;
+        const articulation::ArticulationCookedTopology& a = arts.front();
+        const articulation::ArticulationHostState host =
+            articulation::BuildArticulationHostState({a}, blob.bodies);
+
         nk::ModelArticulation& m = model.articulation;
-        m.link_count = static_cast<uint32_t>(a.link_bodies.size());
-        m.root_link  = ~uint32_t(0);
-        m.parent_link.assign(a.parent_links.begin(), a.parent_links.end());
-        m.joint_axis = a.joint_axes;
-        m.parent_offset.clear();  // parent offsets derive from frames in M3b.
-        m.link_local_pose = a.local_poses;
-        m.link_inertial_frame = a.inertial_frames;
-        m.joint_damping = a.joint_dampings;
-        m.joint_armature = a.joint_armatures;
-        m.initial_q = a.initial_positions;
-        m.link_body.reserve(a.link_bodies.size());
-        for (BodyId b : a.link_bodies) m.link_body.push_back(b);
-        m.joint_type.reserve(a.joint_types.size());
-        for (auto jt : a.joint_types) m.joint_type.push_back(static_cast<uint8_t>(jt));
-        // DOF count: a scalar DOF per non-fixed joint (M3a counts revolute/
-        // prismatic as 1; fixed = 0; floating-base = 6). Single-DOF assumption
-        // matches the production gripper/H1 cook.
+        m.link_count = host.TotalLinkCount();
+        m.root_link  = 0u;  // the cooker emits the root first.
+        m.parent_link = host.parent_link;
+        m.joint_axis = host.joint_axis;
+        m.parent_offset = host.parent_offset;
+        m.link_local_pose = host.link_local_pose;
+        m.link_inertial_frame = host.link_inertial_frame;
+        m.joint_damping = host.joint_damping;
+        m.joint_armature = host.joint_armature;
+        m.initial_q = host.q;                  // per LINK (scalar slot / link)
+        m.initial_link_pose = host.link_pose;  // cook rest pose
+        m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
+                                             : host.base_pose.front();
+        m.link_body = host.link_body;
+        m.joint_type.reserve(host.joint_type.size());
+        for (auto jt : host.joint_type) m.joint_type.push_back(static_cast<uint8_t>(jt));
+        m.link_inertia_spatial.resize(static_cast<size_t>(m.link_count) * 36u);
+        for (uint32_t l = 0; l < m.link_count; ++l) {
+            for (uint32_t k = 0; k < 36u; ++k) {
+                m.link_inertia_spatial[static_cast<size_t>(l) * 36u + k] =
+                    host.link_inertia[l].I[k];
+            }
+        }
+        // DOF count (Revolute/Prismatic = 1, Fixed = 0, FloatingBase = 6) — the
+        // legacy ArticulationDofCount semantics (inlined: that symbol lives in
+        // the GPU lib, which the pure cook must not link), i.e. max_dof.
         uint32_t dofs = 0;
-        for (auto jt : a.joint_types) {
+        for (auto jt : host.joint_type) {
             switch (jt) {
-                case runtime::articulation::ArticulationJointType::Fixed: break;
-                case runtime::articulation::ArticulationJointType::FloatingBase: dofs += 6; break;
+                case articulation::ArticulationJointType::Fixed: break;
+                case articulation::ArticulationJointType::FloatingBase: dofs += 6; break;
                 default: dofs += 1; break;
             }
         }
         m.dof_count = dofs;
-        cap.dofs_per_env = dofs;
+        cap.dofs_per_env = m.dof_count;
         cap.links_per_env = m.link_count;
+
+        // Foot shapes: the T2/T6 derivation — every Sphere shape whose owning
+        // body maps to an articulation link is a foot (base-relative indices).
+        for (uint32_t shape = 0; shape < blob.shapes.types.size(); ++shape) {
+            if (blob.shapes.types[shape] != ShapeType::Sphere) {
+                continue;
+            }
+            const BodyId body = shape < blob.shapes.body_ids.size()
+                                    ? blob.shapes.body_ids[shape]
+                                    : kInvalidBody;
+            uint32_t calf_link = ~uint32_t(0);
+            for (uint32_t link = 0; link < m.link_count; ++link) {
+                if (host.link_body[link] == body) {
+                    calf_link = link;
+                    break;
+                }
+            }
+            if (calf_link == ~uint32_t(0)) {
+                continue;
+            }
+            nk::ModelFootShape foot;
+            foot.calf_local_link = calf_link;
+            foot.local_offset = shape < blob.shapes.local_transforms.size()
+                                    ? blob.shapes.local_transforms[shape].position
+                                    : math::Vec3::Zero();
+            foot.radius = shape < blob.shapes.radii.size() ? blob.shapes.radii[shape]
+                                                           : 0.0f;
+            model.feet.push_back(foot);
+        }
+
+        // Hold drives (legacy BuildHoldDriveTargets 1:1): targets = cooked q;
+        // Position actuators seed stiffness = gain, damping = 2*sqrt(gain),
+        // force limits from the actuator table.
+        nk::ModelHoldDrives& d = model.hold_drives;
+        d.targets = host.q;
+        d.stiffness.assign(m.link_count, 0.0f);
+        d.damping.assign(m.link_count, 0.0f);
+        d.force_limits.assign(m.link_count, 0.0f);
+        for (uint32_t act = 0; act < blob.actuator_count; ++act) {
+            if (act >= blob.actuators.joint_ids.size() ||
+                act >= blob.actuators.types.size() ||
+                blob.actuators.types[act] != ActuatorType::Position) {
+                continue;
+            }
+            const JointId joint = blob.actuators.joint_ids[act];
+            if (joint >= blob.joints.child_bodies.size()) {
+                continue;
+            }
+            const BodyId child_body = blob.joints.child_bodies[joint];
+            uint32_t link = ~uint32_t(0);
+            for (uint32_t l = 0; l < m.link_count; ++l) {
+                if (host.link_body[l] == child_body) {
+                    link = l;
+                    break;
+                }
+            }
+            if (link == ~uint32_t(0) ||
+                host.joint_type[link] == articulation::ArticulationJointType::Fixed) {
+                continue;
+            }
+            const float gain = act < blob.actuators.gains.size()
+                                   ? std::max(blob.actuators.gains[act], 0.0f)
+                                   : 0.0f;
+            const float force_limit = act < blob.actuators.force_limits.size()
+                                          ? std::max(blob.actuators.force_limits[act], 0.0f)
+                                          : 0.0f;
+            if (gain > 0.0f) {
+                d.stiffness[link] = gain;
+                d.damping[link] = 2.0f * std::sqrt(gain);  // DefaultDriveDamping.
+            }
+            if (force_limit > 0.0f) {
+                d.force_limits[link] = force_limit;
+            }
+        }
 
         // Bind link entities by template-local link slot. The cooked link_bodies
         // give the owning body row; the SceneMap link binding keys on link_index.
-        for (uint32_t li = 0; li < a.link_bodies.size(); ++li) {
-            const BodyId body = a.link_bodies[li];
+        for (uint32_t li = 0; li < host.link_body.size(); ++li) {
+            const BodyId body = host.link_body[li];
             const EntityId ent = scene.EntityOfBody(body);
             if (ent != kInvalidEntity) {
                 CookedRef ref;
@@ -217,13 +310,20 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     //    collide); the cooked filter pair lists ride the blob for M5.
     model.filter_cross_env = false;
 
-    // 9. Contact / row capacities. M3a sizes them from a conservative bound:
-    //    one contact per (body + link) pair against statics, a small multiple for
-    //    rows. The real sizing comes from the broadphase cook (M5); these give a
-    //    valid, deterministic arena now.
-    const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
-    cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
-    cap.max_rows_per_env     = cap.max_contacts_per_env * 4u;  // normal + friction spokes.
+    // 9. Contact / row capacities. M3b: the articulation foot pipeline's slot
+    //    stride is the legacy kMaxFootContactsPerEnv == 4 (the ported kernels
+    //    hardcode slot_base = env * 4, the byte-exact layout), and the per-slot
+    //    row triple {normal, t1, t2} makes max_rows = 3 * max_contacts (this is
+    //    exactly the legacy lambda buffer layout slot*3 + k). The general
+    //    broadphase-cooked sizing arrives with M5.
+    if (cap.links_per_env > 0) {
+        cap.max_contacts_per_env = 4u;   // == articulation::kMaxFootContactsPerEnv
+        cap.max_rows_per_env     = 12u;  // 3 rows per contact slot.
+    } else {
+        const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
+        cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
+        cap.max_rows_per_env     = cap.max_contacts_per_env * 4u;
+    }
 
     return result;
 }

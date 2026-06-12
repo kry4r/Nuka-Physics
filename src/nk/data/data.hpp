@@ -50,6 +50,16 @@ public:
     void* Ptr(FieldId id) const { return arena_.Ptr(id); }
     template <class T> T* Ptr(FieldId id) const { return arena_.Ptr<T>(id); }
 
+    // Host<->field transfer (init-time seeding / test readback; see Arena).
+    bool UploadField(FieldId id, const void* src, uint64_t bytes,
+                     uint64_t byte_offset = 0) const {
+        return arena_.UploadField(id, src, bytes, byte_offset);
+    }
+    bool DownloadField(FieldId id, void* dst, uint64_t bytes,
+                       uint64_t byte_offset = 0) const {
+        return arena_.DownloadField(id, dst, bytes, byte_offset);
+    }
+
     const Arena& GetArena() const { return arena_; }
     const std::vector<Arena::Segment>& Segments() const { return arena_.Segments(); }
 

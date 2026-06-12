@@ -63,6 +63,11 @@ RegistryEntry* FindCudaEntry() {
 class Phi2SmokeTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        // M3b: force the built-in registration (CUDA entry + the REAL
+        // articulation ops) FIRST, then plant the test op over the ApplyDrives
+        // slot — SetCudaOp is last-wins, so the override is deterministic
+        // regardless of which test runs first.
+        (void)InitBestDevice();
         nuka::phi_smoke::RegisterVecAddOp();  // plant the test op once per test
     }
 };
@@ -224,9 +229,12 @@ TEST_F(Phi2SmokeTest, UnregisteredOpReturnsUnsupported) {
     Backend* backend = DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    // AbaForward has no implementation in M1 -> Unsupported.
-    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::AbaForward));
-    OpCall call{NkOp::AbaForward, nullptr};
+    // LbvhBuild has no implementation until M5 -> Unsupported. (M3b registered
+    // the real AbaForward, so the former probe op is now supported.)
+    EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::AbaForward))
+        << "M3b: the real AbaForward op should be registered";
+    EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::LbvhBuild));
+    OpCall call{NkOp::LbvhBuild, nullptr};
     ModelView model{};
     DataView data{};
     EXPECT_EQ(BackendDispatch(backend, model, data, call), Status::Unsupported);
@@ -249,8 +257,8 @@ TEST_F(Phi2SmokeTest, NkWorldSkeleton) {
 
     // NOTE: the smoke fixture planted the test VecAdd op into the ApplyDrives
     // slot, but a one-body (no-articulation) scene's pipeline never EMITS
-    // ApplyDrives (it is articulation-only), so the nk pipeline below dispatches
-    // only genuinely-unregistered ops -> all Unsupported, the honest M3a evidence.
+    // ApplyDrives (it is articulation-only), so the override cannot collide
+    // with the real M3b pipeline dispatched below.
 
     Device* dev = InitBestDevice();
     ASSERT_NE(dev, nullptr);
@@ -307,15 +315,17 @@ TEST_F(Phi2SmokeTest, NkWorldSkeleton) {
     // body_pose is data-owned; the body the scene authored exists.
     EXPECT_NE(world.FieldPtr(nk::FieldId::BodyPose), nullptr);
 
-    // Step(): the pipeline has a non-empty op list (the body has a collidable),
-    // and EVERY dispatched op is Unsupported (no real op registered in M3a).
+    // Step(): the pipeline has a non-empty op list (the body has a collidable).
+    // M3b: the capability query (§3.1 supports_op) drops the not-yet-implemented
+    // M5/M6 ops at Build, and every EMITTED op is a registered M3b op that
+    // dispatches Ok (no-op gracefully on this articulation-free scene).
     const nk::StepResult res = world.Step();
     EXPECT_GT(res.OpCount(), 0u) << "the one-body scene should emit a non-empty pipeline";
-    EXPECT_EQ(res.CountOf(Status::Unsupported), static_cast<int>(res.OpCount()))
-        << "M3a: every real op must dispatch Unsupported (none are wired yet)";
+    EXPECT_TRUE(res.AllOk())
+        << "M3b: every emitted op is registered and must dispatch Ok";
 
-    // Reset must not crash and returns the ResetEnvs op status (Unsupported).
-    EXPECT_EQ(world.Reset(), Status::Unsupported);
+    // Reset is now the DEVICE-side bulk RestoreState op -> Ok.
+    EXPECT_EQ(world.Reset(), Status::Ok);
 
     // A second Step after Reset still works (no state corruption).
     const nk::StepResult res2 = world.Step();

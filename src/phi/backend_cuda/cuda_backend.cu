@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 
 namespace nuka::phi {
@@ -362,6 +363,10 @@ void RegisterCudaBackendEntry() {
     }
     g_cuda_registered = true;
     RegisterBackend(reinterpret_cast<RegistryEntry*>(&g_cuda_registry_entry));
+    // M3b: explicitly register the articulation pipeline op implementations
+    // (the same static-lib linker de-risk as this entry itself — explicit
+    // calls, never static initializers).
+    RegisterNkArticulationPipelineOps();
 }
 
 } // namespace nuka::phi
