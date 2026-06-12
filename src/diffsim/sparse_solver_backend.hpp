@@ -22,7 +22,7 @@
 // float atomics anywhere; all reductions are fixed-order warp-shuffle butterflies.
 // ---------------------------------------------------------------------------
 
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 // DeterminismLevel { Strong, Weak } already exists engine-wide; reuse it rather
 // than declaring a second one (keeps the D1/D2 contract single-sourced).

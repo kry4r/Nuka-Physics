@@ -23,7 +23,7 @@
 
 #include "collision/cross_system_query.hpp"
 #include "constraint/collidable.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 
 #include <cuda_runtime.h>

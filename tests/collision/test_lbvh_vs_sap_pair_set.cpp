@@ -22,7 +22,7 @@
 #include "collision/dynamic_broadphase.hpp"
 #include "collision/gpu/broadphase.cuh"
 #include "math/transform.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/world_builder.hpp"

@@ -25,7 +25,7 @@
 #include "constraint/reaction_provider.hpp"      // ReactionProviderKind
 #include "constraint/row_articulation_refs.hpp"
 #include "constraint/row_buffers.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "collision/convex_narrowphase.hpp"      // cvx::ConvexHullView (cup hull seam)
 #include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses, ArticulationDofCount, ArticulationJointDofCount

@@ -8,7 +8,7 @@
 #include "constraint/reaction_provider.hpp"  // v0.8 C5a: ReactionProvider math cores
 #include "constraint/row_articulation_refs.hpp"  // v0.8 C5b: RowArticulationRefs (POD)
 #include "math/cuda_vec_ops.cuh"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "solver/gpu/row_scheduler.cuh"
 

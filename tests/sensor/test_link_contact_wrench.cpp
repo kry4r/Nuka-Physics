@@ -21,7 +21,7 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"

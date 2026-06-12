@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 
 namespace nuka::phi {
 

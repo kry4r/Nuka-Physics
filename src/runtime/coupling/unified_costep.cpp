@@ -25,7 +25,7 @@
 #include "constraint/contact_manifold.hpp"       // ContactManifold
 #include "constraint/contact_row_sides.hpp"      // ContactRowSides
 #include "constraint/row_buffers.hpp"            // RowBuffers
-#include "phi/buffer.hpp"                         // phi::Buffer
+#include "phi/buffer_legacy.hpp"                         // phi::Buffer
 #include "phi/buffer_transfer.hpp"               // phi::UploadVector
 #include "runtime/coupling/coupling_row_framework.hpp"  // EmitCouplingRows, CouplingPair
 #include "solver/unified_solve.hpp"              // UnifiedSolve, SolveContext

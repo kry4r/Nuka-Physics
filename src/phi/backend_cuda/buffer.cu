@@ -2,7 +2,7 @@
 // PHI CUDA backend - Buffer implementation
 // ---------------------------------------------------------------------------
 
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 
 #include <cuda_runtime.h>
 #include <stdexcept>

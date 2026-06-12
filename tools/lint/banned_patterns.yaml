@@ -29,6 +29,35 @@ patterns:
     scope: public_headers
     severity: error
 
+  # M1 (PHI v2): the nk engine layer (scene / render / app glue + src/nk core)
+  # must NEVER touch CUDA directly — all device work goes THROUGH the phi v2
+  # backend vtable. These four rules wall the engine off from raw CUDA: no
+  # triple-chevron launches, no cuda* runtime calls, no <cuda_runtime*> include,
+  # and no reach-in to the phi CUDA backend internals.
+  - id: nk_engine_no_chevron_launch
+    description: "<<< triple-chevron kernel launch in nk engine layer (use the phi v2 backend, not raw CUDA)"
+    regex: '<<<'
+    scope: nk_engine
+    severity: error
+
+  - id: nk_engine_no_cuda_runtime_call
+    description: "cuda*() runtime call in nk engine layer (device work must go through the phi v2 backend)"
+    regex: '\bcuda[A-Z]\w*\s*\('
+    scope: nk_engine
+    severity: error
+
+  - id: nk_engine_no_cuda_runtime_include
+    description: "#include <cuda_runtime...> in nk engine layer (engine is CUDA-type-free; go through phi v2)"
+    regex: '#include\s+<cuda_runtime'
+    scope: nk_engine
+    severity: error
+
+  - id: nk_engine_no_phi_backend_include
+    description: "#include \"phi/backend_cuda...\" in nk engine layer (use the phi v2 public surface, not backend internals)"
+    regex: '#include\s+"phi/backend_cuda'
+    scope: nk_engine
+    severity: error
+
 scope_definitions:
   physics_path:
     include:
@@ -96,9 +125,33 @@ scope_definitions:
       - "src/solver/**/*.cu"
       - "src/constraint/**/*.cu"
       - "src/runtime/gpu/**/*.cu"
+      # M1 (PHI v2): op implementations (phi/backend_cuda/ops/**) are the new
+      # per-step physics kernels of the ggml-style backend layer. The plan's
+      # intent "op 实现内禁分配" — ops MUST NOT allocate; the legitimate v2
+      # allocation home is phi/backend_cuda/cuda_buffer.cu (NOT under ops/), so
+      # scoping the cudaMalloc ban to ops/ specifically leaves the allocator
+      # untouched while guarding every op TU.
+      - "src/phi/backend_cuda/ops/**/*.cu"
+      - "src/phi/backend_cuda/ops/**/*.cuh"
     exclude:
       - "src/runtime/world_builder.cpp"
       - "src/import/**"
+
+  # M1 (PHI v2): the nk engine layer. Covers the new nk core + scene + render +
+  # runtime/app glue. These dirs may not all exist yet (M2+ creates them) — the
+  # glob simply matches nothing until they do, which is fine. The ban set keeps
+  # the engine layer CUDA-type-free so it routes ALL device work through the phi
+  # v2 backend vtable (the multi-backend portability invariant).
+  nk_engine:
+    include:
+      - "src/nk/**/*.hpp"
+      - "src/nk/**/*.cpp"
+      - "src/scene/**/*.hpp"
+      - "src/scene/**/*.cpp"
+      - "src/render/**/*.hpp"
+      - "src/render/**/*.cpp"
+      - "src/runtime/app/**/*.hpp"
+      - "src/runtime/app/**/*.cpp"
 
   c_abi_files:
     include:

@@ -5,7 +5,7 @@
 #include "core/diagnostics/invariants_gpu.cuh"
 
 #include "math/cuda_vec_ops.cuh"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 
 #include <cuda_runtime.h>
 

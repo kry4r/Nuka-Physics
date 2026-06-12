@@ -39,7 +39,7 @@
 #include "collision/link_aabb.hpp"
 #include "collision/rigid_candidate_pairs.hpp"
 #include "constraint/collidable.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "phi/device_context.hpp"
 #include "scene/cooked_blob.hpp"   // scene::CookedFilterPolicy (rigid wrapper path)

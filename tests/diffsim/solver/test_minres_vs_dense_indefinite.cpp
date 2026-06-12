@@ -21,7 +21,7 @@
 
 #include "diffsim/solver/minres_backend.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <Eigen/Dense>

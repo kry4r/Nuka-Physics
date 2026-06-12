@@ -17,7 +17,7 @@
 
 #include "collision/aabb.hpp"
 #include "collision/broadphase_lbvh.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 
 #include <gtest/gtest.h>

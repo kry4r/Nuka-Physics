@@ -18,7 +18,7 @@
 #include "collision/gpu/narrowphase_grasp.cuh"
 
 #include "collision/candidate_pair.hpp"        // CandidatePair / CollidableRef / MakeStableKey
-#include "phi/buffer.hpp"                       // phi::Buffer
+#include "phi/buffer_legacy.hpp"                       // phi::Buffer
 #include "phi/device_context.hpp"               // phi::DeviceContext
 #include "scene/contact_filter.hpp"             // scene::MergeContactParams / ContactParamsIn
 

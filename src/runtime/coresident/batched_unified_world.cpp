@@ -37,7 +37,7 @@
 #include "constraint/row_articulation_refs.hpp"  // RowArticulationRefs / RowArticulationSide
 #include "constraint/row_buffers.hpp"          // RowBuffers / RowJacobian6
 #include "constraint/row_builder.hpp"          // EmitCompliantContactRows / inputs
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"             // UploadVector
 #include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses / ArticulationDofCount / ArticulationJointDofCount
 #include "runtime/articulation/articulation_drives.hpp"    // LaunchApplyTorqueDriveKernels

@@ -5,7 +5,7 @@
 
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>

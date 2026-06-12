@@ -603,6 +603,32 @@ if(CMAKE_CUDA_COMPILER)
 
     gtest_discover_tests(nuka_phi_test)
 
+    # --- PHI v2 (M1) scenario gate ----------------------------------------
+    # Exercises the ggml-style multi-backend layer (nuka_phi2) end-to-end:
+    # registry -> device -> backend, buffer roundtrip, dispatch + CUDA-graph
+    # plan replay (D1 byte-identical), event smoke. The op TU is CUDA-language;
+    # the driver is host-only C++ (no CUDA types — phi v2 public headers are
+    # pure C++). Registered via add_test with a `phi2_smoke` name so
+    # `ctest -R phi2_smoke` finds it (gtest_discover_tests names would not
+    # contain that substring).
+    add_executable(nuka_phi2_smoke_test
+        scenario/phi2_smoke.cpp
+        scenario/phi2_smoke_ops.cu
+    )
+
+    target_include_directories(nuka_phi2_smoke_test
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/scenario
+    )
+
+    target_link_libraries(nuka_phi2_smoke_test
+        PRIVATE
+            nuka_phi2
+            GTest::gtest_main
+    )
+
+    add_test(NAME phi2_smoke COMMAND nuka_phi2_smoke_test)
+
     add_executable(nuka_cuda_runtime_test
         runtime/test_cuda_solver.cpp
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.

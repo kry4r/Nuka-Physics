@@ -411,6 +411,44 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # -----------------------------------------------------------------------
+    # nuka_phi2 — PHI v2: ggml-style runtime multi-backend layer (M1).
+    #
+    # Built ALONGSIDE the legacy nuka_phi (which all production paths still
+    # consume until M9). PHI v2 has NO production consumers yet — only the
+    # phi2_smoke scenario gate. Same CUDA-gating / PIC / include / warning
+    # policy as nuka_phi.
+    #
+    # NUKA_PHI2_WITH_CUDA: drives the explicit, linker-safe CUDA registry
+    # self-registration in registry.cpp -> RegisterCudaBackendEntry() (see the
+    # static-lib self-registration de-risk comment there). A non-CUDA build
+    # would compile registry.cpp with the macro undefined and register nothing.
+    # -----------------------------------------------------------------------
+    add_library(nuka_phi2 STATIC
+        phi/registry.cpp
+        phi/backend_cuda/cuda_backend.cu
+        phi/backend_cuda/cuda_buffer.cu
+        phi/backend_cuda/ops/registry.cu
+    )
+    set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_compile_definitions(nuka_phi2 PUBLIC NUKA_PHI2_WITH_CUDA)
+
+    target_include_directories(nuka_phi2
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_phi2
+        PUBLIC
+            CUDA::cudart
+    )
+
+    target_compile_options(nuka_phi2 PRIVATE
+        $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4 /permissive- /WX /wd4819>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
+    )
+
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
         # SAP broadphase: O(n^2) pair-slot oracle over a device AABB buffer. The

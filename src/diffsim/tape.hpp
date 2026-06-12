@@ -36,7 +36,7 @@
 // zero-copy into StepBackwardInputs::drive_targets and grad_actions_out.
 // ---------------------------------------------------------------------------
 
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
