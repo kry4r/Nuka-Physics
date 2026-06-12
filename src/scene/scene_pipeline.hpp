@@ -6,18 +6,18 @@
 #include "render/render_scene.hpp"
 #include "runtime/physics_world.hpp"
 #include "runtime/world_builder.hpp"
-#include "scene/scene_graph.hpp"
+#include "scene/pose_graph.hpp"
 #include "scene/scene_ir.hpp"
 
 namespace nuka::scene {
 
 struct CompiledScene {
-    SceneGraph graph;
+    PoseGraph graph;
     runtime::PhysicsWorld physics;
     render::RenderScene render;
 };
 
-SceneGraph BuildSceneGraph(const SceneIR& scene);
+PoseGraph BuildPoseGraph(const SceneIR& scene);
 CompiledScene BuildCompiledScene(const SceneIR& scene);
 
 void ApplyRuntimeStateToCompiledScene(const runtime::BuiltWorldState& instance,

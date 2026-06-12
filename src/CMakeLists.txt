@@ -70,7 +70,10 @@ add_library(nuka_scene STATIC
     scene/scene_ir.cpp
     scene/scene_compose.cpp
     scene/cooker.cpp
-    scene/scene_graph.cpp
+    scene/pose_graph.cpp
+    scene/graph/scene_graph.cpp
+    scene/ecs/registry.cpp
+    scene/scene_map.cpp
 )
 set_target_properties(nuka_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

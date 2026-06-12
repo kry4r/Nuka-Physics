@@ -1,40 +1,40 @@
 // ---------------------------------------------------------------------------
-// nuka::scene::SceneGraph implementation
+// nuka::scene::PoseGraph implementation
 // ---------------------------------------------------------------------------
 
-#include "scene/scene_graph.hpp"
+#include "scene/pose_graph.hpp"
 
 #include <stdexcept>
 #include <utility>
 
 namespace nuka::scene {
 
-BodyId SceneGraph::AddNode(SceneGraphNode node) {
+BodyId PoseGraph::AddNode(PoseGraphNode node) {
     const auto id = static_cast<BodyId>(nodes_.size());
     node.body_id = id;
     nodes_.push_back(std::move(node));
     return id;
 }
 
-size_t SceneGraph::NodeCount() const {
+size_t PoseGraph::NodeCount() const {
     return nodes_.size();
 }
 
-const SceneGraphNode& SceneGraph::GetNode(BodyId id) const {
+const PoseGraphNode& PoseGraph::GetNode(BodyId id) const {
     if (id >= nodes_.size()) {
-        throw std::out_of_range("SceneGraph::GetNode - invalid BodyId");
+        throw std::out_of_range("PoseGraph::GetNode - invalid BodyId");
     }
     return nodes_[id];
 }
 
-SceneGraphNode& SceneGraph::GetNodeMut(BodyId id) {
+PoseGraphNode& PoseGraph::GetNodeMut(BodyId id) {
     if (id >= nodes_.size()) {
-        throw std::out_of_range("SceneGraph::GetNodeMut - invalid BodyId");
+        throw std::out_of_range("PoseGraph::GetNodeMut - invalid BodyId");
     }
     return nodes_[id];
 }
 
-const std::vector<SceneGraphNode>& SceneGraph::Nodes() const {
+const std::vector<PoseGraphNode>& PoseGraph::Nodes() const {
     return nodes_;
 }
 
