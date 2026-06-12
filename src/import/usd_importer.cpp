@@ -45,6 +45,8 @@ struct UsdPrim {
     float alpha = 1.0f;
     float roughness = 0.5f;
     float metallic = 0.0f;
+    bool has_friction = false;           // physics:dynamicFriction authored?
+    float friction_mu = 1.0f;            // UsdPhysics PhysicsMaterialAPI friction
     float intensity = 1.0f;
     float focal_length = 50.0f;
     float near_clip = 0.01f;
@@ -55,6 +57,7 @@ struct UsdPrim {
     std::string body_path;
     std::string axis_token = "Z";
     std::string nuka_type;
+    std::string purpose;                 // USD `purpose` token: default|render|proxy|guide
     std::string decompose_mode;          // nuka:decompose token
     int decompose_max_pieces = 32;       // nuka:decompose:max_pieces
     bool has_initial_position = false;
@@ -383,6 +386,11 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseFloatValue(line, "inputs:alpha", prim.alpha);
     (void)ParseFloatValue(line, "inputs:roughness", prim.roughness);
     (void)ParseFloatValue(line, "inputs:metallic", prim.metallic);
+    // UsdPhysics PhysicsMaterialAPI: a scalar friction coefficient on a Material
+    // prim. Mapped to MaterialRecord.friction_mu so the cooker can resolve it.
+    if (ParseFloatValue(line, "physics:dynamicFriction", prim.friction_mu)) {
+        prim.has_friction = true;
+    }
     (void)ParseFloatValue(line, "inputs:intensity", prim.intensity);
     (void)ParseFloatValue(line, "focalLength", prim.focal_length);
     (void)ParseFloatValue(line, "clippingRange:min", prim.near_clip);
@@ -393,6 +401,11 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseRelationship(line, "nuka:body", prim.body_path);
     (void)ParseTokenValue(line, "physics:axis", prim.axis_token);
     (void)ParseTokenValue(line, "nuka:type", prim.nuka_type);
+    // USD `uniform token purpose = "render"|"proxy"|"guide"` (default unset).
+    // guide/proxy geometry is skipped at SceneIR build; render forces a geom to
+    // be visual-only (non-colliding). ParseTokenValue keys on the quoted value,
+    // so a bare token decl with no value leaves purpose empty (the default).
+    (void)ParseTokenValue(line, "uniform token purpose", prim.purpose);
     // nuka:decompose:max_pieces (int) must be tried before nuka:decompose
     // (token) since the former line contains the latter as a substring; the
     // token parser requires quotes (absent on the int line) so it is harmless,
@@ -861,6 +874,9 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             material.alpha = prim.alpha;
             material.roughness = prim.roughness;
             material.metallic = prim.metallic;
+            if (prim.has_friction) {
+                material.friction_mu = prim.friction_mu;
+            }
             scene.AddMaterial(std::move(material));
         }
     }
@@ -881,6 +897,14 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
     }
 
     for (const auto& prim : prims) {
+        // USD `purpose`: guide (viewport-only annotations) and proxy (low-detail
+        // collision stand-in) geometry are not part of the render/physics scene
+        // here -- skip them. render-purpose geometry is kept but forced
+        // visual-only below (contype=0, so the facade projects a VisualMesh).
+        const std::string purpose = Lowercase(prim.purpose);
+        if (purpose == "guide" || purpose == "proxy") {
+            continue;
+        }
         scene::ShapeType shape_type = scene::ShapeType::Box;
         if (!ShapeTypeFromUsdPrim(prim, shape_type)) {
             continue;
@@ -909,6 +933,12 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         shape.body_id = body_id;
         shape.type = shape_type;
         shape.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
+        // render-purpose geometry is visual-only: turn collision off so the
+        // SceneIR facade projects it to a VisualMeshComponent (M2b).
+        if (purpose == "render") {
+            shape.contype = 0;
+            shape.conaffinity = 0;
+        }
         if (shape_type == scene::ShapeType::Box) {
             const float half_size = prim.cube_size * 0.5f;
             shape.half_extents = {half_size, half_size, half_size};

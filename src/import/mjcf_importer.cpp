@@ -490,6 +490,24 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             if (it != context.material_ids.end()) {
                 shape.material_id = it->second;
             }
+        } else if (const char* geom_rgba = geom->Attribute("rgba")) {
+            // A geom with an inline rgba but no named <material>: synthesize a
+            // MaterialRecord so the visual color survives the import (it reaches
+            // RenderMaterial through the SceneIR facade). Deduped by the rgba
+            // string so repeated identical colors share one material.
+            const auto found = context.material_ids.find(geom_rgba);
+            if (found != context.material_ids.end()) {
+                shape.material_id = found->second;
+            } else {
+                scene::MaterialRecord record;
+                record.name = std::string("geom_rgba:") + geom_rgba;
+                std::istringstream rgba_ss(geom_rgba);
+                rgba_ss >> record.base_color.x >> record.base_color.y
+                        >> record.base_color.z >> record.alpha;
+                const scene::MaterialId mid = scene.AddMaterial(std::move(record));
+                context.material_ids[geom_rgba] = mid;
+                shape.material_id = mid;
+            }
         }
 
         if (const char* pos = geom->Attribute("pos")) {

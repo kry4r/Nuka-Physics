@@ -1,11 +1,31 @@
 #pragma once
 // ---------------------------------------------------------------------------
 // nuka::scene::SceneIR – Canonical intermediate representation for scenes
+//
+// M2b: SceneIR is now a FACADE with a dual representation. The record vectors
+// below REMAIN the storage and the legacy read API (zero churn for the cooker /
+// render / compose / oracle paths). In addition, every Add* mutator
+// write-through-builds the new structural world: ECS entities + components
+// (scene/ecs) hung on a scene TREE (scene/graph). The tree + Registry are the
+// structural authority that .nks Save/Load (M2c) consumes; the records keep
+// full legacy fidelity (contact metadata, inline mesh geometry, decompose mode
+// stay record-only) while the components carry the five-component projection.
+//
+// Copy semantics: SceneIR is copyable. Because the tree is a shared_ptr node
+// graph (a shallow copy would alias nodes across instances and leave the copy's
+// Registry backrefs pointing into the source tree), the copy ctor / assignment
+// REBUILD tree_ + ecs_ from the record vectors via the same write-through path
+// Add* uses (see scene_ir.cpp). This deep-copy is exactly what Compose() needs
+// for purity (it returns by value and callers assert the base is unchanged).
 // ---------------------------------------------------------------------------
 
 #include "scene/canonical_types.hpp"
+#include "scene/ecs/entity.hpp"
+#include "scene/ecs/registry.hpp"
+#include "scene/graph/scene_graph.hpp"
 #include "math/transform.hpp"
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -164,6 +184,16 @@ struct ContactPairOverride {
 
 class SceneIR {
 public:
+    // -- lifecycle ----------------------------------------------------------
+    // Default-constructible; copy DEEP-rebuilds the facade (tree_ + ecs_) from
+    // the records; move transfers everything. (See the file header + .cpp.)
+    SceneIR();
+    SceneIR(const SceneIR& other);
+    SceneIR& operator=(const SceneIR& other);
+    SceneIR(SceneIR&&) noexcept = default;
+    SceneIR& operator=(SceneIR&&) noexcept = default;
+    ~SceneIR() = default;
+
     // -- mutators -----------------------------------------------------------
     BodyId   AddRigidBody(std::string name);
     BodyId   AddRigidBody(RigidBodyRecord record);
@@ -233,7 +263,36 @@ public:
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
+    // -- facade: structural world (M2b) -------------------------------------
+    // The scene TREE and the ECS Registry built by the Add* write-through. The
+    // tree is the hierarchy authority; the Registry holds the five-component
+    // projection. Both are kept in lock-step with the records.
+    const SceneGraph& Tree() const { return tree_; }
+    SceneGraph&       TreeMut()     { return tree_; }
+    const Registry&   Ecs()  const { return ecs_; }
+    Registry&         EcsMut()      { return ecs_; }
+
+    // record-id -> projected entity (kInvalidEntity if the record produced no
+    // entity, which cannot happen for bodies/shapes/joints today).
+    EntityId EntityOfBody(BodyId id)   const;
+    EntityId EntityOfShape(ShapeId id) const;
+    EntityId EntityOfJoint(JointId id) const;
+
 private:
+    // Rebuild tree_ + ecs_ from the current record vectors (used by the copy
+    // ctor / assignment and by the move-from default; see scene_ir.cpp).
+    void RebuildFacade();
+
+    // -- per-record write-through helpers (build the tree + ECS for one
+    //    just-appended record). Defined in scene_ir.cpp. -------------------
+    void ProjectBody(const RigidBodyRecord& rec);
+    void ProjectShape(const CollisionShapeRecord& rec);
+    void ProjectJoint(const JointRecord& rec);
+    void ProjectMaterial(const MaterialRecord& rec);
+    void ProjectCamera(const CameraRecord& rec);
+    void ProjectLight(const LightRecord& rec);
+    void ProjectActuator(const ActuatorRecord& rec);
+
     std::vector<RigidBodyRecord>      bodies_;
     std::vector<JointRecord>          joints_;
     std::vector<CollisionShapeRecord> shapes_;
@@ -244,6 +303,25 @@ private:
     std::vector<ActuatorRecord>       actuators_;
     std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
     std::vector<ContactPairOverride>       contact_pairs_;
+
+    // -- facade state -------------------------------------------------------
+    SceneGraph tree_;
+    Registry   ecs_;
+
+    // record-id -> entity, and BodyId -> its body node (so a child body / shape
+    // / joint can be hung under its parent). Index == record id (dense).
+    std::vector<EntityId>                    body_entity_;
+    std::vector<EntityId>                    shape_entity_;
+    std::vector<EntityId>                    joint_entity_;
+    std::vector<std::shared_ptr<SceneNode>>  body_node_;
+
+    // MaterialId -> {physics-material id, render-material id} in the Registry's
+    // asset tables. Both default to Registry::kNoSlot until a material projects.
+    struct MaterialIds {
+        uint32_t phys   = Registry::kNoSlot;
+        uint32_t render = Registry::kNoSlot;
+    };
+    std::vector<MaterialIds>                 material_ids_;
 };
 
 } // namespace nuka::scene
