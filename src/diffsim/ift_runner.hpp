@@ -44,7 +44,7 @@
 
 #include "diffsim/kkt_builder.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"

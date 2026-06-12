@@ -31,7 +31,7 @@
 #include "collision/aabb.hpp"
 #include "collision/candidate_pair.hpp"
 #include "collision/rigid_candidate_pairs.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "scene/contact_filter.hpp"
 #include "scene/cooked_blob.hpp"

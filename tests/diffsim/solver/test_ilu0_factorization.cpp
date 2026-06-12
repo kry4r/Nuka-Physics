@@ -17,7 +17,7 @@
 
 #include "diffsim/solver/ilu0_preconditioner.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>

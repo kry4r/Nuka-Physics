@@ -34,7 +34,7 @@
 // a view outlive the SdfDeviceWorld that owns the buffers it points into.
 // ---------------------------------------------------------------------------
 
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "scene/cooked_blob.hpp"

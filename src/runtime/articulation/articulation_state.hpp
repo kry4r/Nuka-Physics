@@ -5,7 +5,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooked_blob.hpp"

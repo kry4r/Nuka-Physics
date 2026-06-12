@@ -4,7 +4,7 @@
 
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
 #include "runtime/articulation/articulation_state.hpp"

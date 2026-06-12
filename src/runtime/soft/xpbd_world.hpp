@@ -42,7 +42,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstddef>

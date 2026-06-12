@@ -18,7 +18,7 @@
 
 #include "sensor/noise/n1_gaussian.hpp"
 #include "sensor/noise/philox.cuh"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>

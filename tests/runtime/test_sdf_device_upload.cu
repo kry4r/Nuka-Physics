@@ -23,7 +23,7 @@
 
 #include "runtime/sdf/sdf_device_world.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "scene/cooked_blob.hpp"

@@ -31,7 +31,7 @@
 
 #include "import/usd_importer.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"

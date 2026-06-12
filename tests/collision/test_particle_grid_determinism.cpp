@@ -12,7 +12,7 @@
 
 #include "collision/particle_uniform_grid.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 
 #include <gtest/gtest.h>

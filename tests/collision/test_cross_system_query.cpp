@@ -18,7 +18,7 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/cross_system_query.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
 
 #include <gtest/gtest.h>

@@ -45,7 +45,7 @@
 #include "diffsim/checkpoint.hpp"
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
-#include "phi/buffer.hpp"
+#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
