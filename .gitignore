@@ -36,6 +36,10 @@ CTestTestfile.cmake
 Testing/
 _deps/
 
+# Content-addressed cook-artifact cache (M2c): regenerable hull/SDF blobs.
+# Keyed by input content hash; safe to delete (re-cooked on demand).
+.nuka_cache/
+
 # IDE / editor
 .idea/
 .vscode/

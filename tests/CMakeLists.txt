@@ -259,6 +259,9 @@ add_executable(nuka_scene_test
     scene/test_scene_pipeline.cpp
     scene/test_contact_metadata_cook.cpp
     scene/test_filter_precedence.cpp
+    # M2c: real-asset H1 x cup x kitchen-counter compose gate (GTEST_SKIPs
+    # without .nuka-assets). Imports + Compose + cook; no programmatic table.
+    scene/test_scene_compose_h1_cup_table.cpp
 )
 
 target_link_libraries(nuka_scene_test
@@ -269,6 +272,26 @@ target_link_libraries(nuka_scene_test
 )
 
 gtest_discover_tests(nuka_scene_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# --- M2c scenario gate: .nks/.nka scene roundtrip fidelity -----------------
+# Import -> Compose -> Save(.nks+.nka) -> Load -> assert structural + cook
+# byte-identity, plus second-save byte-identity, override layer and SceneMap.
+# Registered as a single ctest "SceneRoundtrip" (runs the whole executable).
+add_executable(nuka_scene_roundtrip_test
+    scenario/scene_roundtrip.cpp
+)
+
+target_link_libraries(nuka_scene_roundtrip_test
+    PRIVATE
+        nuka_scene
+        nuka_import
+        nuka_cooker
+        GTest::gtest_main
+)
+
+add_test(NAME SceneRoundtrip
+         COMMAND nuka_scene_roundtrip_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test

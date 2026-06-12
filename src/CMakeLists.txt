@@ -74,6 +74,12 @@ add_library(nuka_scene STATIC
     scene/graph/scene_graph.cpp
     scene/ecs/registry.cpp
     scene/scene_map.cpp
+    # M2c: own asset formats. nka (binary container) + asset_cache (content-
+    # addressed cook cache) + json (self-written minimal). nks.cpp lives in
+    # nuka_import (it calls the importers/Compose) to avoid a dep cycle.
+    scene/asset/nka.cpp
+    scene/asset/asset_cache.cpp
+    scene/format/json.cpp
 )
 set_target_properties(nuka_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -185,6 +191,10 @@ add_library(nuka_import STATIC
     import/usd_importer.cpp
     import/usd_crate_reader.cpp
     import/mesh_file_loader.cpp
+    # M2c: .nks scene Save/Load. Lives here (not nuka_scene) because Load resolves
+    # "imports" via LoadMjcf/LoadUsd/LoadUrdf + Compose; nuka_import already links
+    # nuka_scene so it sees the json/nka/asset_ref surface.
+    scene/format/nks.cpp
 )
 set_target_properties(nuka_import PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
