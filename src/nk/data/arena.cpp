@@ -86,6 +86,53 @@ void* Arena::Ptr(FieldId id) const {
     return nullptr;
 }
 
+namespace {
+
+phi::Buffer* BufferOfSegment(uint8_t arena, phi::Buffer* p, phi::Buffer* s,
+                             phi::Buffer* t) {
+    return (arena == 0) ? p : (arena == 1) ? s : t;
+}
+
+}  // namespace
+
+bool Arena::UploadField(FieldId id, const void* src, uint64_t bytes,
+                        uint64_t byte_offset) const {
+    if (persistent_ == nullptr || src == nullptr) {
+        return false;
+    }
+    for (const Segment& s : segments_) {
+        if (s.field != id) {
+            continue;
+        }
+        if (byte_offset + bytes > s.bytes) {
+            return false;
+        }
+        phi::Buffer* b = BufferOfSegment(s.arena, persistent_, scratch_, tape_);
+        phi::BufferUpload(b, src, s.offset + byte_offset, bytes);
+        return true;
+    }
+    return false;
+}
+
+bool Arena::DownloadField(FieldId id, void* dst, uint64_t bytes,
+                          uint64_t byte_offset) const {
+    if (persistent_ == nullptr || dst == nullptr) {
+        return false;
+    }
+    for (const Segment& s : segments_) {
+        if (s.field != id) {
+            continue;
+        }
+        if (byte_offset + bytes > s.bytes) {
+            return false;
+        }
+        phi::Buffer* b = BufferOfSegment(s.arena, persistent_, scratch_, tape_);
+        phi::BufferDownload(b, dst, s.offset + byte_offset, bytes);
+        return true;
+    }
+    return false;
+}
+
 void Arena::ZeroAll() {
     phi::Buffer* bufs[3] = {persistent_, scratch_, tape_};
     for (int a = 0; a < 3; ++a) {

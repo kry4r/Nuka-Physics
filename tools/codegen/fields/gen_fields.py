@@ -47,6 +47,7 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "f32":       {"cpp": "float",            "code": "kF32", "lanes": 1},
     "u32":       {"cpp": "uint32_t",         "code": "kU32", "lanes": 1},
     "u64":       {"cpp": "uint64_t",         "code": "kU64", "lanes": 1},
+    "u8":        {"cpp": "uint8_t",          "code": "kU8",  "lanes": 1},
     "vec3":      {"cpp": "::nuka::math::Vec3",      "code": "kF32", "lanes": 3},
     "quat":      {"cpp": "::nuka::math::Quat",      "code": "kF32", "lanes": 4},
     "transform": {"cpp": "::nuka::math::Transform", "code": "kF32", "lanes": 7},
@@ -55,8 +56,9 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
 }
 
 VALID_PER = {
-    "env", "dof", "link", "body", "contact_slot", "row_slot", "particle",
-    "dist_con", "bend_con", "vol_con", "shape_match_slot", "env_dof2", "scalar",
+    "env", "dof", "link", "body", "contact_slot", "row_slot", "slot_dof",
+    "particle", "dist_con", "bend_con", "vol_con", "shape_match_slot",
+    "env_dof2", "scalar",
 }
 VALID_ARENA = {"persistent", "scratch", "tape"}
 VALID_OWNER = {"model", "data"}
@@ -229,7 +231,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// The count-unit a field is sized by. ArenaLayout/Model resolve each to a",
         "// concrete element count from the Model capacities x env_count.",
         "enum class FieldPer : uint8_t {",
-        "    Env, Dof, Link, Body, ContactSlot, RowSlot, Particle,",
+        "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, Particle,",
         "    DistCon, BendCon, VolCon, ShapeMatchSlot, EnvDof2, Scalar",
         "};",
         "",
@@ -251,11 +253,12 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
     ]
     per_enum = {
         "env": "Env", "dof": "Dof", "link": "Link", "body": "Body",
-        "contact_slot": "ContactSlot", "row_slot": "RowSlot", "particle": "Particle",
+        "contact_slot": "ContactSlot", "row_slot": "RowSlot", "slot_dof": "SlotDof",
+        "particle": "Particle",
         "dist_con": "DistCon", "bend_con": "BendCon", "vol_con": "VolCon",
         "shape_match_slot": "ShapeMatchSlot", "env_dof2": "EnvDof2", "scalar": "Scalar",
     }
-    scalar_size = {"f32": 4, "u32": 4, "u64": 8, "vec3": 4, "quat": 4,
+    scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
                    "transform": 4, "spatial6": 4, "mat36": 4}
     lines.append("inline constexpr FieldLayout kFieldLayout[kFieldCount] = {")
     for f in fields:
@@ -296,7 +299,7 @@ def gen_dlpack_table(fields: list[dict[str, Any]]) -> str:
         "",
         "namespace nuka::nk {",
         "",
-        "enum class DlpackDtype : uint8_t { kF32, kU32, kU64 };",
+        "enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8 };",
         "",
         "struct DlpackRow {",
         "    FieldId     field;",

@@ -53,26 +53,47 @@ struct ModelCapacities {
     uint64_t ElementCount(FieldId id) const;
 };
 
-// A cook-time articulation template (one per env, replicated). Mirrors the
-// runtime ArticulationCookedTopology / ArticulationDeviceState constant arrays
-// 1:1 so the kernel-port milestone (M3b) can transcribe verbatim.
+// A cook-time articulation template (one per env, replicated). The arrays are
+// the SINGLE-ENV BuildArticulationHostState product transcribed 1:1 (M3b), so
+// the staged Model bytes match the legacy UploadArticulationState bytes exactly
+// (the byte-exact kernel-port contract).
 struct ModelArticulation {
     // per-link topology (length == links_per_env)
-    std::vector<uint32_t>         parent_link;       // kInvalidLink at the root
-    std::vector<uint8_t>          joint_type;        // ArticulationJointType
+    std::vector<uint32_t>         parent_link;       // articulation-LOCAL; ~0u at the root
+    std::vector<uint8_t>          joint_type;        // ArticulationJointType (u8-backed)
     std::vector<math::Vec3>       joint_axis;
-    std::vector<math::Vec3>       parent_offset;
+    std::vector<math::Vec3>       parent_offset;     // parent_frame.position (host-state build)
     std::vector<uint32_t>         link_body;         // owning rigid-body row
     std::vector<math::Transform>  link_local_pose;
     std::vector<math::Transform>  link_inertial_frame;
     std::vector<float>            link_inertia_spatial;  // 36 floats / link (flat)
-    std::vector<float>            joint_motion_subspace; // 6 floats / link (flat)
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
-    std::vector<float>            initial_q;             // per DOF
-    uint32_t                      dof_count  = 0;
+    std::vector<float>            initial_q;             // per LINK (scalar slot per link)
+    std::vector<math::Transform>  initial_link_pose;     // cook rest pose per link
+    math::Transform               base_pose = math::Transform::Identity();  // root world pose
+    uint32_t                      dof_count  = 0;        // generalized DOFs (floating root = 6)
     uint32_t                      link_count = 0;
     uint32_t                      root_link  = ~uint32_t(0);
+};
+
+// One cooked foot-sphere row (legacy articulation::FootShape 1:1: base-relative
+// calf link + sphere center offset in the calf frame + radius). Staged into the
+// foot_shape Model field as 5 packed scalars {link bits, off.xyz, radius}.
+struct ModelFootShape {
+    uint32_t   calf_local_link = 0;
+    math::Vec3 local_offset{};
+    float      radius = 0.0f;
+};
+
+// Cook-seeded PD hold-drive template (per template link; legacy
+// BuildHoldDriveTargets / CookGo2 HoldDrives 1:1). Seeded into the Data
+// drive_* persistent fields at World construction (replicated env-major).
+struct ModelHoldDrives {
+    std::vector<float> targets;       // = initial_q (hold the cooked stance)
+    std::vector<float> stiffness;     // actuator gain (Position actuators)
+    std::vector<float> damping;       // 2*sqrt(gain) (DefaultDriveDamping)
+    std::vector<float> force_limits;
 };
 
 // A cooked shape row (primitive params + optional hull/SDF asset reference).
@@ -105,6 +126,18 @@ public:
     std::vector<ModelShape>         shapes;             // cooked shape rows (per env).
     std::vector<ModelMaterialBucket> material_buckets;  // (num_buckets) bucket table.
     std::vector<uint32_t>           body_material_bucket;  // per body-row bucket index.
+
+    // -- articulation contact pipeline config (M3b foot sphere x ground) -----
+    // feet: derived by CookToModel (every Sphere shape owned by an articulation
+    // link, the T2/T6 derivation). ground_height/friction/baumgarte are scene/
+    // run config a caller may override BEFORE World construction (the Model is
+    // mutable until then). foot count of 0 disables contact generation (the
+    // detection kernel then zero-fills every slot — the single-env oracle path).
+    std::vector<ModelFootShape>     feet;
+    ModelHoldDrives                 hold_drives;
+    float ground_height          = 0.0f;
+    float friction_coefficient   = 0.8f;   // legacy kContactFriction
+    float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.

@@ -121,6 +121,16 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         record->desc.recompute_on_backward = desc->recompute_on_backward;
 
         const auto& ctx = world_record->device->context;
+        // M3b/M9 SEAM: the diffsim machinery consumes ArticulationDeviceState —
+        // a pure pointer view. Today the pointers come from the legacy
+        // ArticulationDeviceBuffers below; when the c_abi switches WorldRecord
+        // to nk::World (M9) this ONE line becomes
+        //   articulation::MakeArticulationDeviceStateFromViews(
+        //       world->ModelViewRef(), world->DataViewRef(), links, artics)
+        // (the arena diff-field pointer source; algorithm/kernels untouched —
+        // proven bit-exact by AbaReverse.NkArenaSeamForwardReverseBitExact).
+        // M9 also moves the Tape action storage into the arena Tape buffer and
+        // op-ifies the backward family (plan §3.10 diffsim row).
         const auto state = world_record->articulation_device.View();
         record->total_link_count = state.total_link_count;
 

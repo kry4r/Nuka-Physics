@@ -35,9 +35,19 @@ public:
         uint16_t pos_iters = 0;
         float    contact_margin = 0.0f;
         uint32_t max_pairs = 0;
+        // M3b articulation-pipeline knobs (both production paths use 1/1; the
+        // friction/baumgarte values default from the Model, see Build()).
+        uint32_t defer_velocity_damping = 1;  // PD drive emits Kp torque only
+        uint32_t fold_drive_damping = 1;      // CRBA folds dt*C -> (M+dt*C)^-1
     };
 
-    void Build(const Model& model, const SolverConfig& cfg);
+    // `device` (optional) enables the ggml-style capability query (§3.1
+    // supports_op): an op the backend has no implementation for is NOT emitted
+    // (M3b: the M5 broadphase + NarrowphaseSdf and M6 particle ops). This keeps
+    // Step() all-Ok and the CUDA-graph plan capturable while later milestones
+    // light the ops up — the op order itself stays the §3.2 fixed order.
+    void Build(const Model& model, const SolverConfig& cfg,
+               phi::Device* device = nullptr);
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
@@ -69,6 +79,10 @@ private:
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
     phi::SolveRowsBlockIslandParams   p_solve_{};
+    // TRANSITIONAL (M3b -> M4): the SolveRowsBlockIsland slot dispatches the
+    // ported legacy fused solver, which takes ITS OWN params POD. M4's real
+    // SolveRowsBlockIsland reverts the OpCall to p_solve_ above.
+    phi::SolveArticulatedParams       p_solve_articulated_{};
     phi::ParticlePredictParams        p_part_predict_{};
     phi::XpbdProjectParams            p_xpbd_{};
     phi::PbfDensityLambdaParams       p_pbf_density_{};

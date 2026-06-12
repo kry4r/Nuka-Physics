@@ -515,6 +515,8 @@ target_link_libraries(nuka_oracle_test
         nuka_import
         $<$<TARGET_EXISTS:nuka_articulation_gpu>:nuka_articulation_gpu>
         $<$<TARGET_EXISTS:nuka_phi>:nuka_phi>
+        # M3b: the nk::World drive entries (CookToModel -> nk core -> phi v2).
+        $<$<TARGET_EXISTS:nuka_scene_cook>:nuka_scene_cook>
         GTest::gtest_main
 )
 
@@ -1442,6 +1444,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
             nuka_core
             nuka_phi
+            # M3b: the nk-arena seam smoke (diffsim kernels on nk::World state).
+            nuka_nk
             GTest::gtest_main
     )
 
@@ -2922,6 +2926,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
             nuka_core
             nuka_phi
+            # M3b: the nk::World StepPlanned perf twin.
+            nuka_scene_cook
             GTest::gtest_main
     )
 

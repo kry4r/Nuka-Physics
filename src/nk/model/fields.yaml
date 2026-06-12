@@ -43,18 +43,24 @@
 # ===========================================================================
 
 schema:
-  dtype: [f32, u32, u64, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
+  dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
 
 fields:
   # =========================================================================
-  # §3.3 VERBATIM examples (kept exactly as the plan snippet authored them).
+  # §3.3 examples. M3b honesty fix vs the plan snippet: the articulation scalar
+  # state (q/qdot/qddot/tau/joint_force/joint_diagonal) is keyed per:LINK, not
+  # per:dof — the legacy ArticulationDeviceState (the 1:1 transcription source)
+  # sizes ALL of them total_link_count and the D1-validated kernels index them
+  # BY LINK (a FloatingBase root's scalar slot is simply unused; its 6 DOFs live
+  # in link_velocity[root]). Re-keying preserves the byte-exact port. dof stays
+  # the capacity unit for the M tile (env_dof2 == max_dof^2).
   # =========================================================================
-  - {name: q,             dtype: f32,       per: dof,          arena: persistent, owner: data,  flags: [diff]}
-  - {name: qdot,          dtype: f32,       per: dof,          arena: persistent, owner: data,  flags: [diff]}
+  - {name: q,             dtype: f32,       per: link,         arena: persistent, owner: data,  flags: [diff]}
+  - {name: qdot,          dtype: f32,       per: link,         arena: persistent, owner: data,  flags: [diff]}
   - {name: link_pose,     dtype: transform, per: link,         arena: persistent, owner: data}
   - {name: base_pose,     dtype: transform, per: env,          arena: persistent, owner: data,  flags: [diff]}
   - {name: body_pose,     dtype: transform, per: body,         arena: persistent, owner: data,  flags: [diff]}
@@ -73,10 +79,10 @@ fields:
   # Source: ArticulationDeviceState (articulation_state.hpp). q/qdot/base_pose/
   # link_pose already declared above (the §3.3 examples). The rest follow 1:1.
   # =========================================================================
-  - {name: qddot,                 dtype: f32,       per: dof,  arena: persistent, owner: data}
-  - {name: tau,                   dtype: f32,       per: dof,  arena: persistent, owner: data}
-  - {name: joint_force,           dtype: f32,       per: dof,  arena: scratch,    owner: data}
-  - {name: joint_diagonal,        dtype: f32,       per: dof,  arena: scratch,    owner: data}
+  - {name: qddot,                 dtype: f32,       per: link, arena: persistent, owner: data}
+  - {name: tau,                   dtype: f32,       per: link, arena: persistent, owner: data}
+  - {name: joint_force,           dtype: f32,       per: link, arena: scratch,    owner: data}
+  - {name: joint_diagonal,        dtype: f32,       per: link, arena: scratch,    owner: data}
   - {name: link_velocity,         dtype: spatial6,  per: link, arena: persistent, owner: data,  flags: [diff]}
   - {name: link_acceleration,     dtype: spatial6,  per: link, arena: scratch,    owner: data}
   - {name: link_velocity_bias,    dtype: spatial6,  per: link, arena: scratch,    owner: data}
@@ -84,6 +90,24 @@ fields:
   - {name: link_articulated_I,    dtype: mat36,     per: link, arena: scratch,    owner: data}
   - {name: link_bias_force,       dtype: spatial6,  per: link, arena: scratch,    owner: data}
   - {name: link_u_spatial,        dtype: spatial6,  per: link, arena: scratch,    owner: data}
+  # joint_motion_subspace is DATA (scratch), not a model table: ABA Pass-1
+  # REWRITES it every step (MotionSubspaceForJoint / the floating-base Zero6)
+  # before the CRBA reads it — a 1:1 port of the legacy mutable buffer.
+  - {name: joint_motion_subspace, dtype: spatial6,  per: link, arena: scratch,    owner: data}
+  # PD drive state (legacy BatchedArticulatedStepParams drive_* device arrays,
+  # link-major). drive_target is the RL action surface; the other three are
+  # cook-seeded hold-drive params (randomizable later).
+  - {name: drive_target,          dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
+  - {name: drive_stiffness,       dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
+  - {name: drive_damping,         dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
+  - {name: drive_force_limit,     dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
+  # Reset/snapshot state (device-resident; backs SnapshotState/RestoreState/
+  # ResetEnvs ops — the legacy BatchedArticulatedWorld snapshot_* buffers 1:1).
+  - {name: snapshot_q,             dtype: f32,       per: link, arena: persistent, owner: data}
+  - {name: snapshot_qdot,          dtype: f32,       per: link, arena: persistent, owner: data}
+  - {name: snapshot_link_velocity, dtype: spatial6,  per: link, arena: persistent, owner: data}
+  - {name: snapshot_base_pose,     dtype: transform, per: env,  arena: persistent, owner: data}
+  - {name: reset_env_ids,          dtype: u32,       per: env,  arena: scratch,    owner: data}
 
   # =========================================================================
   # ARTICULATION topology / inertia / templates — MODEL (cook-constant).
@@ -93,10 +117,11 @@ fields:
   - {name: link_inertia,          dtype: mat36,     per: link, arena: persistent, owner: model}
   - {name: link_local_pose,       dtype: transform, per: link, arena: persistent, owner: model}
   - {name: link_inertial_frame,   dtype: transform, per: link, arena: persistent, owner: model}
-  - {name: joint_motion_subspace, dtype: spatial6,  per: link, arena: persistent, owner: model}
   - {name: joint_axis,            dtype: vec3,      per: link, arena: persistent, owner: model}
   - {name: parent_offset,         dtype: vec3,      per: link, arena: persistent, owner: model}
-  - {name: joint_type,            dtype: u32,       per: link, arena: persistent, owner: model}
+  # u8: the EXACT legacy ArticulationJointType storage (uint8_t-backed enum) so
+  # ops and the diffsim bridge can alias the table as ArticulationJointType*.
+  - {name: joint_type,            dtype: u8,        per: link, arena: persistent, owner: model}
   - {name: parent_link,           dtype: u32,       per: link, arena: persistent, owner: model}
   - {name: link_body,             dtype: u32,       per: link, arena: persistent, owner: model}
   - {name: link_to_articulation,  dtype: u32,       per: link, arena: persistent, owner: model}
@@ -106,6 +131,10 @@ fields:
   # env since the cook replicates exactly one articulation template per env).
   - {name: articulation_link_count,  dtype: u32, per: env, arena: persistent, owner: model}
   - {name: articulation_link_offset, dtype: u32, per: env, arena: persistent, owner: model}
+  # Foot-shape table (legacy articulation::FootShape feet_ buffer 1:1): a GLOBAL
+  # table (shared by all envs, base-relative link indices), 5 scalars per slot
+  # {calf_local_link(u32 bits), offset.xyz, radius}, max_contacts_per_env slots.
+  - {name: foot_shape, dtype: f32, per: scalar, count: "max_contacts_per_env*5", arena: persistent, owner: model}
 
   # =========================================================================
   # RIGID BODY SoA — DATA. Source: runtime::rigid::BodyState. body_pose +
@@ -127,11 +156,27 @@ fields:
   - {name: body_aabb_hi,    dtype: vec3, per: body,          arena: scratch, owner: data}
   - {name: pair_count,      dtype: u32,  per: env,           arena: scratch, owner: data}
   - {name: candidate_pairs, dtype: u32,  per: contact_slot,  arena: scratch, owner: data, elem: 2}
+  - {name: contact_link,    dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_point,   dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_normal,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_depth,   dtype: f32,  per: contact_slot,  arena: scratch, owner: data}
-  - {name: contact_tangent, dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 2}
+  # Split tangent arrays (legacy tangent1_/tangent2_ buffers 1:1; the M3a packed
+  # elem:2 contact_tangent was replaced — separate arrays keep the ported kernel
+  # indexing textually identical).
+  - {name: contact_tangent1,dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
+  - {name: contact_tangent2,dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_material,dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
+  # Per-contact chain Jacobians (legacy jac_normal_/jac_tangent1_/jac_tangent2_,
+  # [slot * dof_stride] row-major) + per-contact effective masses (legacy
+  # meff_*_). per:slot_dof = max_contacts_per_env x dofs_per_env.
+  - {name: jac_normal,         dtype: f32, per: slot_dof,     arena: scratch, owner: data}
+  - {name: jac_tangent1,       dtype: f32, per: slot_dof,     arena: scratch, owner: data}
+  - {name: jac_tangent2,       dtype: f32, per: slot_dof,     arena: scratch, owner: data}
+  - {name: contact_meff_normal,   dtype: f32, per: contact_slot, arena: scratch, owner: data}
+  - {name: contact_meff_tangent1, dtype: f32, per: contact_slot, arena: scratch, owner: data}
+  - {name: contact_meff_tangent2, dtype: f32, per: contact_slot, arena: scratch, owner: data}
+  # Per-slot contact force readout (legacy contact_force_, {Fn,Ft1,Ft2} per slot).
+  - {name: contact_force,   dtype: f32,  per: contact_slot,  arena: scratch, owner: data, elem: 3, flags: [readout]}
 
   # =========================================================================
   # UNIFIED ROW SOLVE — DATA. rows / lambda / m_inv / contact_count above.
@@ -144,6 +189,10 @@ fields:
   - {name: chain_jacobian,  dtype: f32, per: row_slot, arena: scratch,    owner: data, elem: 6}
   - {name: row_meff,        dtype: f32, per: row_slot, arena: scratch,    owner: data}
   - {name: row_material,    dtype: u32, per: row_slot, arena: scratch,    owner: data}
+  # Unfactored CRBA M tile (legacy m_; m_inv above is its LDL^T inverse) + the
+  # CRBA composite-inertia scratch (legacy composite_).
+  - {name: m,                      dtype: f32,   per: env_dof2, arena: scratch, owner: data}
+  - {name: link_composite_inertia, dtype: mat36, per: link,     arena: scratch, owner: data}
 
   # =========================================================================
   # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct/
