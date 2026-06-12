@@ -443,12 +443,16 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/cuda_buffer.cu
         phi/backend_cuda/ops/registry.cu
         # M3b articulation pipeline op implementations (line-by-line kernel
-        # ports; see each file's header). solve_articulated.cu is TRANSITIONAL
-        # (deleted in M4 with the real SolveRowsBlockIsland).
+        # ports; see each file's header). M4 adds the union-family contact
+        # pipeline (contacts_union / assemble_rows / solve_rows — the §3.4
+        # device-resident unified row solve, replacing the transitional
+        # solve_articulated.cu).
         phi/backend_cuda/ops/articulation.cu
         phi/backend_cuda/ops/crba.cu
         phi/backend_cuda/ops/contacts_foot.cu
-        phi/backend_cuda/ops/solve_articulated.cu
+        phi/backend_cuda/ops/contacts_union.cu
+        phi/backend_cuda/ops/assemble_rows.cu
+        phi/backend_cuda/ops/solve_rows.cu
         phi/backend_cuda/ops/readout.cu
     )
     set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -484,6 +488,7 @@ if(CMAKE_CUDA_COMPILER)
         nk/data/data.cpp
         nk/pipeline/pipeline.cpp
         nk/pipeline/world.cpp
+        nk/solve/schedule.cpp
     )
     set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

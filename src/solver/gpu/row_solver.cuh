@@ -1,4 +1,9 @@
 #pragma once
+// DEPRECATED(M9): SURVIVES ONLY for the legacy BatchedUnifiedWorld (the M4-M9
+// parity ORACLE, edited again in M5) + its co-resident/test consumers. The nk
+// core consumes NONE of this: the M4 SolveRowsBlockIsland/AssembleRows ops +
+// nk::SolveSchedule (src/nk/solve/) carry the migrated row math + scheduling.
+// Deleted with src/runtime/coresident/ at M9. Do NOT add new consumers.
 // ---------------------------------------------------------------------------
 // nuka::solver::gpu::row_solver -- CUDA Universal Row solver
 // ---------------------------------------------------------------------------

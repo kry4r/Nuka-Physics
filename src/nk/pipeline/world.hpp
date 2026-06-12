@@ -25,8 +25,13 @@
 
 namespace nuka::nk {
 
-// Forward placeholder for the M4 device-resident solve schedule. World owns it
-// (built at construct / Reset); M3a leaves it empty.
+// The M4 device-resident solve schedule (src/nk/solve/schedule.hpp): built
+// ONCE at construction over the MAX-CAPACITY row slots (worst-case coloring is
+// valid for every runtime subset — schedule.hpp invariant note), staged into
+// the Model device buffer by UploadTo. Reset() does NOT rebuild it: the
+// schedule is a pure function of the fixed capacities/topology, which Reset
+// never changes (plan §3.4 "构建/Reset 时" — same trigger condition, and the
+// condition's inputs are immutable post-build).
 class SolveSchedule;
 
 // Per-op step outcome — World surfaces the status of EVERY dispatched op so a

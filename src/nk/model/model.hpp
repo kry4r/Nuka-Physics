@@ -36,6 +36,7 @@ struct ModelCapacities {
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
+    uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
     uint32_t bend_cons_per_env    = 0;  // XPBD bend-constraint count / env.
@@ -71,6 +72,11 @@ struct ModelArticulation {
     std::vector<float>            joint_armature;
     std::vector<float>            initial_q;             // per LINK (scalar slot per link)
     std::vector<math::Transform>  initial_link_pose;     // cook rest pose per link
+    // M4 (union family): the SETTLED initial velocity state (the legacy
+    // gripper_proto carries it after the factory's oracle settle pre-roll).
+    // Empty == zero-velocity start (the M3 CookToModel path, unchanged).
+    std::vector<float>            initial_qdot;          // per LINK (scalar slot)
+    std::vector<float>            initial_link_velocity; // 6 floats / link (flat)
     math::Transform               base_pose = math::Transform::Identity();  // root world pose
     uint32_t                      dof_count  = 0;        // generalized DOFs (floating root = 6)
     uint32_t                      link_count = 0;
@@ -116,6 +122,53 @@ struct ModelMaterialBucket {
     float values[8] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
 };
 
+// ---------------------------------------------------------------------------
+// M4: the UNION (CSR compliant) contact family — Model-side authoring tables.
+// ---------------------------------------------------------------------------
+
+// Which contact pipeline this Model runs through the AssembleRows /
+// SolveRowsBlockIsland ops:
+//   FusedFoot — the M3 articulation foot pipeline (sphere x ground detection,
+//               ArticulatedContactRow records, the fused block-per-articulation
+//               PGS — the legacy BatchedArticulatedWorld semantics, goldens
+//               byte-exact).
+//   UnionCsr  — the union compliant-CSR pipeline (feet x ground + finger x
+//               hull + box x plane in ONE solve — the legacy BatchedUnifiedWorld
+//               semantics).
+enum class ContactFamily : uint8_t { FusedFoot = 0, UnionCsr = 1 };
+
+// One union contact-pair slot (the per-env contact template, replicated across
+// envs; the legacy BatchedSceneTemplate fingertips/feet/table classes 1:1).
+// Worst-case manifold points: sphere classes -> 1, box x plane -> 4. Each point
+// expands to 1 normal row + (condim>=2 ? 2*(condim-1) : 0) friction-spoke rows
+// (the EmitCompliantContactRows layout: ALL normals first, then ALL spokes).
+struct UnionSlot {
+    enum Class : uint32_t {
+        kInactive       = 0,
+        kFootSpherePlane = 1,  // artic sphere (link+offset+radius) x +Z plane.
+        kFingerSphereHull = 2, // artic sphere x convex hull on body `body`.
+        kBodyBoxPlane   = 3,   // rigid box (body+offset+half) x +Z plane.
+    };
+    uint32_t   cls = kInactive;
+    uint32_t   link = ~0u;            // template-local link (sphere classes).
+    uint32_t   body = ~0u;            // template-local body row (hull owner / box).
+    uint32_t   condim = 3;            // 1 (frictionless) or 3 (4 spokes).
+    math::Vec3 offset{};              // sphere local offset / box-center offset.
+    float      radius = 0.0f;         // sphere radius.
+    math::Vec3 box_half{};            // box half extents (kBodyBoxPlane).
+    float      plane_height = 0.0f;   // +Z plane height (ground / table z).
+    float      mu = 0.5f;             // per-class friction stamp (RowMaterial.friction).
+    uint32_t   flags = 0;             // bit0: emission gated on the table_enabled field.
+
+    // Worst-case manifold points / rows for this slot.
+    uint32_t MaxPoints() const { return cls == kBodyBoxPlane ? 4u : 1u; }
+    uint32_t RowsPerPoint() const {
+        return 1u + (condim >= 2u ? 2u * (condim - 1u) : 0u);
+    }
+    uint32_t MaxRows() const { return MaxPoints() * RowsPerPoint(); }
+};
+inline constexpr uint32_t kUnionSlotGatedOnTable = 1u;  // UnionSlot::flags bit0.
+
 class Model {
 public:
     Model() = default;
@@ -138,6 +191,44 @@ public:
     float ground_height          = 0.0f;
     float friction_coefficient   = 0.8f;   // legacy kContactFriction
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
+
+    // -- M4: contact family + union (CSR compliant) tables --------------------
+    ContactFamily contact_family = ContactFamily::FusedFoot;
+    // Drive mode the ApplyDrives op runs (0 = position PD hold drive, the M3
+    // BatchedArticulatedWorld path; 1 = direct torque drive, the union world's
+    // LaunchApplyTorqueDriveKernels path — drive_target carries the torque).
+    uint32_t drive_mode = 0;
+    std::vector<UnionSlot> union_slots;   // per-env contact-pair template.
+    std::vector<float>     hull_verts;    // mesh-local hull verts (xyz packed).
+    // Merged contact params for the union rows (the legacy BuildContactManifolds
+    // MergeContactParams(default,default) product — per-class mu comes from the
+    // slot's mu stamp, exactly as the legacy class stamp overwrote it).
+    float union_solref[2] = {0.02f, 1.0f};
+    float union_solimp[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
+    bool  table_enabled_default = true;   // seeds the per-env table_enabled field.
+    // Per-env movable rigid body initial state (template; replicated env-major).
+    struct BodyInit {
+        math::Transform pose = math::Transform::Identity();
+        math::Vec3 linear_velocity{};
+        math::Vec3 angular_velocity{};
+        float      inv_mass = 0.0f;
+        math::Vec3 inv_inertia{};
+    };
+    std::vector<BodyInit> body_init;
+    // The flat-DOF -> (template-local link, base component) maps (the legacy
+    // DofIndexOf prefix-sum inverse; component == ~0u for scalar joints). Cooked
+    // by the union cook; staged into the dof_to_link/dof_to_component fields.
+    std::vector<uint32_t> dof_to_link;
+    std::vector<uint32_t> dof_to_component;
+
+    // -- M4: the device-resident solve schedule (filled by nk::SolveSchedule
+    // BEFORE World::UploadTo; staged into the island_row_offsets /
+    // island_color_segments / row_order Model fields). See solve/schedule.hpp.
+    std::vector<uint32_t> schedule_row_order;       // [total rows in order]
+    std::vector<uint32_t> schedule_color_segments;  // pairs {offset, count}
+    std::vector<uint32_t> schedule_islands;         // quads {seg_off, seg_cnt, flags, env}
+    uint32_t schedule_island_count  = 0;
+    uint32_t schedule_segment_count = 0;
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.

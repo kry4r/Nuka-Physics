@@ -648,6 +648,93 @@ __global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
     state.tau[link] = tau;
 }
 
+// M4: the union world's torque drive — LINE-BY-LINE port of
+// articulation_drives.cu ApplyTorqueDriveKernel (tau = clamp(torque_input,
+// +/-limit); no control Kd — physical joint damping runs downstream). The
+// torque input is the drive_target field (the union action surface).
+__global__ void ApplyTorqueDriveKernel(ArticulationDeviceState state,
+                                       const float* torque_input,
+                                       const float* drive_force_limits) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count ||
+        state.joint_type[link] == ArticulationJointType::Fixed) {
+        return;
+    }
+    float tau = torque_input[link];
+    if (drive_force_limits != nullptr) {
+        const float limit = drive_force_limits[link];
+        if (limit > 0.0f) {
+            tau = fminf(fmaxf(tau, -limit), limit);
+        }
+    }
+    state.tau[link] = tau;
+}
+
+// M4: movable rigid-body arms (the union world's cup path, ports of
+// BatchedUnifiedWorld's gravity kick + IntegrateBodyPosition).
+
+// linear_velocity.z += g*dt for movable bodies — the legacy per-body kick.
+__global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
+                                      const float* body_inv_mass,
+                                      uint32_t total_body_count,
+                                      float gravity_z,
+                                      float dt) {
+    const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= total_body_count) {
+        return;
+    }
+    if (body_inv_mass[body] <= 0.0f) {
+        return;
+    }
+    body_linear_velocity[body].z += gravity_z * dt;
+}
+
+// Symplectic-Euler body position step — BYTE-FAITHFUL port of
+// BatchedUnifiedWorld::IntegrateBodyPosition (position += v*dt; the small-angle
+// quaternion advance dq = {1, 0.5*w*dt}; orientation = (q*dq).Normalized() with
+// the host Normalized expression: n = sqrt(.), <1e-12 -> identity, else q/n).
+__global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
+                                            const math::Vec3* body_linear_velocity,
+                                            const math::Vec3* body_angular_velocity,
+                                            const float* body_inv_mass,
+                                            uint32_t total_body_count,
+                                            float dt) {
+    const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= total_body_count) {
+        return;
+    }
+    if (body_inv_mass[body] <= 0.0f) {
+        return;
+    }
+    math::Transform pose = body_pose[body];
+    const math::Vec3 v = body_linear_velocity[body];
+    pose.position.x += v.x * dt;
+    pose.position.y += v.y * dt;
+    pose.position.z += v.z * dt;
+    const math::Vec3 w = body_angular_velocity[body];
+    math::Quat dq;
+    dq.w = 1.0f;
+    dq.x = 0.5f * w.x * dt;
+    dq.y = 0.5f * w.y * dt;
+    dq.z = 0.5f * w.z * dt;
+    // Hamilton product pose.rotation * dq — the host constexpr operator*'s
+    // exact expression (the operator itself is host-only constexpr).
+    const math::Quat lq = pose.rotation;
+    math::Quat q;
+    q.w = lq.w * dq.w - lq.x * dq.x - lq.y * dq.y - lq.z * dq.z;
+    q.x = lq.w * dq.x + lq.x * dq.w + lq.y * dq.z - lq.z * dq.y;
+    q.y = lq.w * dq.y - lq.x * dq.z + lq.y * dq.w + lq.z * dq.x;
+    q.z = lq.w * dq.z + lq.x * dq.y - lq.y * dq.x + lq.z * dq.w;
+    const float n = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (n < 1e-12f) {
+        q.w = 1.0f; q.x = 0.0f; q.y = 0.0f; q.z = 0.0f;
+    } else {
+        q.w /= n; q.x /= n; q.y /= n; q.z /= n;
+    }
+    pose.rotation = q;
+    body_pose[body] = pose;
+}
+
 // --- FkWorldPoses (port of articulation_contacts.cu UpdateWorldLinkPoses) ---
 
 __device__ math::Vec3 AddVec(math::Vec3 a, math::Vec3 b) {
@@ -769,6 +856,14 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
     const ArticulationDeviceState state =
         MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
     const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+    if (p->mode == 1u) {
+        // M4 union path: direct torque drive (drive_target carries the torque).
+        LaunchCuda(ApplyTorqueDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
+                   stream, state,
+                   static_cast<const float*>(data.drive_target),
+                   static_cast<const float*>(data.drive_force_limit));
+        return LaunchOk(stream);
+    }
     LaunchCuda(ApplyPositionDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
                state,
                static_cast<const float*>(data.drive_target),
@@ -805,20 +900,33 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->total_link_count == 0u || p->dt <= 0.0f) {
+    if (p->dt <= 0.0f) {
         return Status::Ok;
     }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->total_link_count, p->articulation_count);
-    const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-    // Joint velocity first, then the floating-base velocity — the production
-    // BatchedArticulatedWorld order (the two write DISJOINT state: qdot vs
-    // link_velocity[root], so the single-env FB-first order is byte-equal).
-    LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks), dim3(kAbaBlockSize),
-               0u, stream, state, p->dt);
-    if (p->articulation_count > 0u) {
-        LaunchCuda(IntegrateFloatingBaseVelocityKernel, dim3(p->articulation_count),
-                   dim3(kAbaBlockSize), 0u, stream, state, p->dt, p->gravity_z);
+    if (p->total_link_count > 0u) {
+        const ArticulationDeviceState state = MakeArticulationDeviceState(
+            model, data, p->total_link_count, p->articulation_count);
+        const uint32_t blocks =
+            (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        // Joint velocity first, then the floating-base velocity — the production
+        // BatchedArticulatedWorld order (the two write DISJOINT state: qdot vs
+        // link_velocity[root], so the single-env FB-first order is byte-equal).
+        LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks),
+                   dim3(kAbaBlockSize), 0u, stream, state, p->dt);
+        if (p->articulation_count > 0u) {
+            LaunchCuda(IntegrateFloatingBaseVelocityKernel, dim3(p->articulation_count),
+                       dim3(kAbaBlockSize), 0u, stream, state, p->dt, p->gravity_z);
+        }
+    }
+    // M4: the movable rigid-body gravity kick (the union world's cup kick —
+    // applied exactly once per step, before the contact solve).
+    if (p->total_body_count > 0u) {
+        const uint32_t blocks =
+            (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        LaunchCuda(BodyGravityKickKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
+                   stream, data.body_linear_velocity,
+                   static_cast<const float*>(data.body_inv_mass),
+                   p->total_body_count, p->gravity_z, p->dt);
     }
     return LaunchOk(stream);
 }
@@ -848,17 +956,31 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->total_link_count == 0u || p->dt <= 0.0f) {
+    if (p->dt <= 0.0f) {
         return Status::Ok;
     }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->total_link_count, p->articulation_count);
-    const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-    LaunchCuda(IntegratePositionArticulationKernel, dim3(blocks), dim3(kAbaBlockSize),
-               0u, stream, state, p->dt);
-    if (p->articulation_count > 0u) {
-        LaunchCuda(IntegrateFloatingBasePoseKernel, dim3(p->articulation_count),
+    if (p->total_link_count > 0u) {
+        const ArticulationDeviceState state = MakeArticulationDeviceState(
+            model, data, p->total_link_count, p->articulation_count);
+        const uint32_t blocks =
+            (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        LaunchCuda(IntegratePositionArticulationKernel, dim3(blocks),
                    dim3(kAbaBlockSize), 0u, stream, state, p->dt);
+        if (p->articulation_count > 0u) {
+            LaunchCuda(IntegrateFloatingBasePoseKernel, dim3(p->articulation_count),
+                       dim3(kAbaBlockSize), 0u, stream, state, p->dt);
+        }
+    }
+    // M4: the movable rigid-body symplectic-Euler position step (the union
+    // world's IntegrateBodyPosition — runs AFTER the contact solve).
+    if (p->total_body_count > 0u) {
+        const uint32_t blocks =
+            (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        LaunchCuda(BodyIntegratePositionKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
+                   stream, data.body_pose, data.body_linear_velocity,
+                   data.body_angular_velocity,
+                   static_cast<const float*>(data.body_inv_mass),
+                   p->total_body_count, p->dt);
     }
     return LaunchOk(stream);
 }
@@ -880,7 +1002,8 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkAbaOps();
     RegisterNkCrbaOps();
     RegisterNkContactsFootOps();
-    RegisterNkSolveArticulatedOps();
+    RegisterNkAssembleRowsOps();
+    RegisterNkSolveRowsOps();
     RegisterNkReadoutOps();
 }
 

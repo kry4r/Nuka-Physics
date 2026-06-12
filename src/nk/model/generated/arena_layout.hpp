@@ -19,7 +19,7 @@ enum class FieldOwner : uint8_t { Model, Data };
 // The count-unit a field is sized by. ArenaLayout/Model resolve each to a
 // concrete element count from the Model capacities x env_count.
 enum class FieldPer : uint8_t {
-    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, Particle,
+    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,
     DistCon, BendCon, VolCon, ShapeMatchSlot, EnvDof2, Scalar
 };
 
@@ -46,7 +46,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // body_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_inv_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // contact_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 16, 1, 64, 0},  // rows
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 16, 1, 64, 0},  // rows
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // lambda
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::EnvDof2, 1, 1, 4, 0},  // m_inv
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_pos
@@ -111,15 +111,28 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_meff_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_meff_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 3, 1, 12, 0},  // contact_force
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // ucontact_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_point
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_normal
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_depth
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // row_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 4, 1, 16, 0},  // row_sides
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 6, 1, 24, 0},  // chain_jacobian
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 32, 1, 128, 0},  // urows
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // row_minv_jt
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_meff
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_material
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Dof, 1, 1, 4, 0},  // qdot_flat
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::EnvDof2, 1, 1, 4, 0},  // m
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_composite_inertia
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 1, 1, 4, 0},  // island_row_offsets
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 1, 1, 4, 0},  // island_color_segments
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // union_slots
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // hull_verts
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_link
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_component
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // table_enabled
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 4, 1, 16, 0},  // island_row_offsets
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 2, 1, 8, 0},  // island_color_segments
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 1, 1, 4, 0},  // row_order
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_prev_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_vel

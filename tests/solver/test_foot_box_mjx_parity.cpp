@@ -82,6 +82,8 @@
 
 #include <gtest/gtest.h>
 
+#include "nk_solve_harness.hpp"  // M4 re-point: the nk SolveRowsBlockIsland path
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -462,7 +464,8 @@ struct ParityResult {
 ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cooked,
                        const FootBoxGolden& g, const FootBoxConfig& cfg,
                        const nuka::solver::SolverConfig& config,
-                       float box_inertia_scale = 1.0f) {
+                       float box_inertia_scale = 1.0f,
+                       bool use_nk = false) {
     ParityResult result;
     auto& host = cooked.host;
     const uint32_t root = host.articulation_link_offset[0];
@@ -636,18 +639,32 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
         result.exact_lambda = (A + R) > 1.0e-12 ? std::max(0.0, b / (A + R)) : 0.0;
     }
 
-    // --- (5) UnifiedSolve: ctx.state=[box], ctx.articulation=go2. ----------------
-    nuka::solver::SolveContext sctx;
-    sctx.rows = &rows;
-    sctx.state = &bodies;
-    sctx.sides = &sides;
-    sctx.dt = kDt;
-    sctx.articulation.art_refs = &art_refs;
-    sctx.articulation.chain_jacobians = &chain_jacobians;
-    sctx.articulation.inertia_m_inv = &minv;
-    sctx.articulation.qdot = &qdot;
-    sctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(sctx, config);
+    // --- (5) the unified two-way solve: legacy UnifiedSolve, or the M4 nk
+    // SolveRowsBlockIsland (the SAME assembled inputs; the SAME gates judge).
+    if (use_nk) {
+        const auto nk_res = nk_harness::NkSolveRows(
+            rows, sides, art_refs, chain_jacobians, minv, qdot, &bodies,
+            kDof, static_cast<uint16_t>(config.velocity_iterations), kDt);
+        EXPECT_TRUE(nk_res.ok) << "nk solve harness failed";
+        if (nk_res.ok) {
+            qdot = nk_res.qdot;
+            for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+                rows.rows[r].lambda = nk_res.lambda[r];
+            }
+        }
+    } else {
+        nuka::solver::SolveContext sctx;
+        sctx.rows = &rows;
+        sctx.state = &bodies;
+        sctx.sides = &sides;
+        sctx.dt = kDt;
+        sctx.articulation.art_refs = &art_refs;
+        sctx.articulation.chain_jacobians = &chain_jacobians;
+        sctx.articulation.inertia_m_inv = &minv;
+        sctx.articulation.qdot = &qdot;
+        sctx.articulation.dof_stride = kDof;
+        nuka::solver::UnifiedSolve(sctx, config);
+    }
 
     // --- qacc_total = qdot_post/dt (articulation -> base-6); box dv/dt (box-6). --
     for (uint32_t i = 0u; i < kDof; ++i) result.qacc_total[i] = qdot[i] / kDt;
@@ -911,4 +928,56 @@ TEST(FootBoxMjxParity, ParityRunDeterministic) {
     EXPECT_EQ(std::memcmp(&a.box_state, &b.box_state, sizeof(BodyState)), 0)
         << "two runs produced a different box BodyState (nondeterministic)";
     std::printf("[diag] (D1) box-6 + base-6 + box BodyState byte-identical across 2 runs\n");
+}
+
+// ===========================================================================
+// M4 RE-POINT — the foot x box co-residence golden gates through the nk
+// SolveRowsBlockIsland op (plan M4 "test_foot_box... (oracle 口径) 重指").
+// SAME assembled inputs, SAME bounds (box-6 rel 5e-3, base-6 rel 2e-3,
+// kernel-vs-exact 1e-4) + an nk-vs-legacy qacc FP-class cross-check.
+// ===========================================================================
+TEST(FootBoxMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
+    const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
+    const auto golden_path = GoldenPath("go2_foot_box_contact_step.bin");
+    if (!std::filesystem::exists(scene_path)) GTEST_SKIP() << "go2_float scene not available";
+    if (!std::filesystem::exists(golden_path)) GTEST_SKIP() << "foot-box golden not present";
+
+    const auto golden = LoadFootBoxGolden(golden_path);
+    ASSERT_GT(golden.configs.size(), 0u);
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const auto cooked = CookGo2Float();
+    const auto cfg_high = MakeConfig(200u);
+
+    for (size_t ci = 0u; ci < golden.configs.size(); ++ci) {
+        const auto& cfg = golden.configs[ci];
+        const auto legacy = RunParity(context, cooked, golden, cfg, cfg_high,
+                                      /*box_inertia_scale=*/1.0f, /*use_nk=*/false);
+        const auto nk = RunParity(context, cooked, golden, cfg, cfg_high,
+                                  /*box_inertia_scale=*/1.0f, /*use_nk=*/true);
+
+        std::array<float, 6> box_on{}, base_on{};
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            box_on[i] = cfg.qacc_on[cfg.box_dof + i];
+            base_on[i] = cfg.qacc_on[cfg.base_dof + i];
+        }
+        const float box6 = Rel6(nk.box6_mjx, box_on);
+        const float base6 = Rel6(nk.base6_mjx, base_on);
+        const double kernel_vs_exact =
+            std::fabs(static_cast<double>(nk.lambda) - nk.exact_lambda) /
+            std::max(1.0, std::fabs(nk.exact_lambda));
+        float vs_legacy = 0.0f;
+        for (uint32_t i = 0u; i < kDof; ++i) {
+            vs_legacy = std::max(vs_legacy,
+                                 std::fabs(nk.qacc_total[i] - legacy.qacc_total[i]));
+        }
+        std::printf("[nk re-point] config %zu BOX-6 REL=%.3e BASE-6 REL=%.3e "
+                    "kernel-vs-exact=%.3e |qacc nk-legacy|=%.3e\n",
+                    ci, box6, base6, kernel_vs_exact, vs_legacy);
+        EXPECT_LT(box6, 5.0e-3f) << "config " << ci << " nk box-6 drifted vs MJX";
+        EXPECT_LT(base6, 2.0e-3f) << "config " << ci << " nk base-6 drifted vs MJX";
+        EXPECT_LT(kernel_vs_exact, 1.0e-4)
+            << "config " << ci << " nk lambda diverged from the exact (A+R) solve";
+        EXPECT_LT(vs_legacy, 1.0e-2f)
+            << "config " << ci << " nk solve diverged from legacy beyond the FP class";
+    }
 }

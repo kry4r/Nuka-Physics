@@ -944,3 +944,162 @@ TEST(BatchedH1HandGrasp, Throughput_LowerBound_Sweep) {
                 "close torque keeps the cup gripped so the contact solve is exercised.)\n");
     SUCCEED();
 }
+
+// ===========================================================================
+// ★ M4 — NK GRASP PARITY (plan M4 gate: "grasp 场景 parity (test_batched_h1_
+// hand_grasp nk 入口)"). The SAME H1-hand grasp scene (MakeH1BatchedTemplate)
+// through BuildNkUnionModel -> nk::World (NarrowphasePrimitives ->
+// AssembleRows -> SolveRowsBlockIsland) in LOCKSTEP against the legacy
+// BatchedUnifiedWorld, each driven by the SAME PD law from ITS OWN state.
+// Tolerances mirror Gate 1's evidenced FP-floor-window formulation, with the
+// M4 reconciliation (see tests/scenario/h1_union_parity.cpp): the nk solver is
+// numerically equivalent, NOT bit-identical (hoisted m_eff / M^-1 J^T +
+// separate-kernel FMA contraction), so the STEP-0 SEED holds the original
+// bars (pos/vel 1e-6, qdot 5e-6) and the 10-step window holds the scaled
+// velocity bars (vel 1e-5, qdot 1e-4). The full run is REPORTED (chaotic —
+// Gate 1's own perturbation control proves byte-parity is impossible here).
+// ===========================================================================
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/pipeline/world.hpp"
+#include "runtime/coresident/h1_union_nk_model.hpp"
+
+TEST(BatchedH1HandGrasp, M4_NkWorldParityFpFloorWindow) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
+    namespace nk = nuka::nk;
+    namespace nphi = nuka::phi;
+    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const CupHull base = LoadCupHull();
+    ASSERT_GT(base.vcount, 0u);
+
+    GraspScene gs = BuildFingerOnlyScene(context, base, kSxy, kSz);
+    ASSERT_TRUE(gs.place.found);
+    const auto tmpl = MakeH1BatchedTemplate(gs);
+    const PdState pd = MakePdTarget(gs, kKp, kKd, kCloseOffset);
+    const uint32_t root_link = gs.host.articulation_link_offset[0];
+    const uint32_t dof_stride = articulation::ArticulationDofCount(gs.host, 0u);
+    const uint32_t L = gs.host.TotalLinkCount();
+
+    nphi::Device* dev = nphi::InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+    {
+        coresident::BatchedUnifiedWorld legacy(context, tmpl, 1u, kGravityZ, kDt);
+        nk::Model model = coresident::BuildNkUnionModel(tmpl, 1u);
+        const uint32_t rows_per_env = model.capacities.max_rows_per_env;
+        const uint32_t slot_count = model.capacities.max_contacts_per_env;
+        nk::Pipeline::SolverConfig cfg;
+        cfg.dt = kDt;
+        cfg.gravity[2] = kGravityZ;
+        cfg.vel_iters = 64;  // the legacy union SolverConfig
+        cfg.pos_iters = 0;
+        cfg.fold_drive_damping = 0;
+        nk::World world(std::move(model), 1u, dev, backend, cfg);
+        ASSERT_TRUE(world.Ready());
+        std::printf("[M4 GRASP] nk world: links=%u dofs=%u slots=%u rows/env=%u islands=%u\n",
+                    L, dof_stride, slot_count, rows_per_env,
+                    world.GetModel().schedule_island_count);
+
+        constexpr uint32_t kRun = 70u;
+        constexpr uint32_t kFloorSteps = 10u;
+        constexpr double kSeedTol = 1.0e-6, kSeedTolQdot = 5.0e-6;   // Gate-1 bars
+        constexpr double kWinTolVel = 1.0e-5, kWinTolQdot = 1.0e-4;  // M4 scaled
+        double seed_dpos = 0.0, seed_dvel = 0.0, seed_dqdot = 0.0;
+        double floor_dpos = 0.0, floor_dvel = 0.0, floor_dqdot = 0.0;
+        double full_dpos = 0.0;
+        uint32_t count_fork = kRun;
+        bool count_open = true;
+        std::vector<float> nk_q(L), nk_qdot(L), nk_torque(L, 0.0f);
+        for (uint32_t l = 0; l < L && l < tmpl.grip_torque.size(); ++l) {
+            nk_torque[l] = tmpl.grip_torque[l];
+        }
+        for (uint32_t s = 0u; s < kRun; ++s) {
+            // legacy: its own closed loop (the Gate-1 driver).
+            DrivePdBatched(legacy, gs, pd, root_link, dof_stride);
+            legacy.Step();
+            // nk: the SAME PD from ITS OWN per-link fields.
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Q, nk_q.data(),
+                                                      L * sizeof(float)));
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Qdot,
+                                                      nk_qdot.data(),
+                                                      L * sizeof(float)));
+            for (uint32_t l : gs.drive_links) {
+                nk_torque[l] =
+                    pd.Kp * (pd.q_target[l] - nk_q[l]) - pd.Kd * nk_qdot[l];
+            }
+            ASSERT_TRUE(world.GetData().UploadField(
+                nk::FieldId::DriveTarget, nk_torque.data(),
+                nk_torque.size() * sizeof(float)));
+            ASSERT_TRUE(world.Step().AllOk()) << "nk op failed at step " << s;
+
+            // compare cup pose/vel + gripper qdot + contact counts.
+            const auto& cup_l = legacy.Body(0u, tmpl.cup_local_index);
+            nuka::math::Transform cup_n{};
+            nuka::math::Vec3 vel_n{};
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyPose,
+                                                      &cup_n, sizeof(cup_n)));
+            ASSERT_TRUE(world.GetData().DownloadField(
+                nk::FieldId::BodyLinearVelocity, &vel_n, sizeof(vel_n)));
+            articulation::ArticulationHostState leg_host = gs.host;
+            legacy.DownloadGripper(0u, &leg_host);
+            std::vector<float> leg_qdot = leg_host.qdot;
+            const double dpos = (cup_n.position - cup_l.position).Length();
+            const double dvel = (vel_n - cup_l.linear_velocity).Length();
+            double dqdot = 0.0;
+            ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Qdot,
+                                                      nk_qdot.data(),
+                                                      L * sizeof(float)));
+            // Compare the REAL joint DOFs only: a FIXED (0-DOF) link's scalar
+            // q/qdot slot is physically DEAD state (FK composes no q for it,
+            // ABA gives it no motion subspace) — the legacy path carries
+            // cosmetic nonzero values there (its integrate sweeps every link
+            // slot), the nk path leaves the cooked zeros. Neither is read by
+            // any physics; the cup/contact parity above is the proof.
+            for (uint32_t l = 0; l < L; ++l) {
+                if (articulation::ArticulationJointDofCount(gs.host.joint_type[l]) == 0u)
+                    continue;
+                dqdot = std::max(dqdot, static_cast<double>(std::fabs(
+                                            nk_qdot[l] - leg_qdot[l])));
+            }
+            uint32_t nk_contacts = 0;
+            {
+                std::vector<uint32_t> counts(slot_count);
+                ASSERT_TRUE(world.GetData().DownloadField(
+                    nk::FieldId::UcontactCount, counts.data(),
+                    counts.size() * sizeof(uint32_t)));
+                for (uint32_t i = 0; i < slot_count; ++i) nk_contacts += counts[i];
+            }
+            const uint32_t leg_contacts = legacy.GraspReports()[0].finger_contacts;
+            if (count_open && nk_contacts != leg_contacts) {
+                count_open = false;
+                count_fork = s;
+            }
+            if (s == 0u) { seed_dpos = dpos; seed_dvel = dvel; seed_dqdot = dqdot; }
+            if (s < kFloorSteps) {
+                floor_dpos = std::max(floor_dpos, dpos);
+                floor_dvel = std::max(floor_dvel, dvel);
+                floor_dqdot = std::max(floor_dqdot, dqdot);
+            }
+            full_dpos = std::max(full_dpos, dpos);
+            if (s <= 12u || s == kRun - 1u) {
+                std::printf("[M4 GRASP] step %2u: |dcup|=%.3e |dvel|=%.3e "
+                            "|dqdot|=%.3e contacts(l=%u n=%u)\n",
+                            s, dpos, dvel, dqdot, leg_contacts, nk_contacts);
+            }
+        }
+        std::printf("[M4 GRASP RESULT] seed: dpos=%.3e dvel=%.3e dqdot=%.3e; "
+                    "window(0..%u): dpos=%.3e dvel=%.3e dqdot=%.3e; full dpos=%.3e "
+                    "count-fork @%u\n",
+                    seed_dpos, seed_dvel, seed_dqdot, kFloorSteps - 1u, floor_dpos,
+                    floor_dvel, floor_dqdot, full_dpos, count_fork);
+        EXPECT_LE(seed_dpos, kSeedTol) << "nk cup POSITION seed off at step 0";
+        EXPECT_LE(seed_dvel, kSeedTol) << "nk cup VELOCITY seed off at step 0";
+        EXPECT_LE(seed_dqdot, kSeedTolQdot) << "nk gripper qdot seed off at step 0";
+        EXPECT_LE(floor_dpos, kSeedTol) << "nk cup POSITION diverged in the window";
+        EXPECT_LE(floor_dvel, kWinTolVel) << "nk cup VELOCITY diverged in the window";
+        EXPECT_LE(floor_dqdot, kWinTolQdot) << "nk gripper qdot diverged in the window";
+        EXPECT_GE(count_fork, kFloorSteps)
+            << "the contact-set COUNT forked INSIDE the FP-floor window";
+    }
+    nphi::BackendFree(backend);
+}

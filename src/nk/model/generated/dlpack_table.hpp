@@ -98,15 +98,28 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactMeffTangent1, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent1
     {FieldId::ContactMeffTangent2, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent2
     {FieldId::ContactForce, DlpackDtype::kF32, 2, false, true},  // contact_force
+    {FieldId::UcontactCount, DlpackDtype::kU32, 1, false, false},  // ucontact_count
+    {FieldId::UcontactPoint, DlpackDtype::kF32, 2, false, false},  // ucontact_point
+    {FieldId::UcontactNormal, DlpackDtype::kF32, 2, false, false},  // ucontact_normal
+    {FieldId::UcontactDepth, DlpackDtype::kF32, 2, false, false},  // ucontact_depth
     {FieldId::RowCount, DlpackDtype::kU32, 1, false, false},  // row_count
-    {FieldId::RowSides, DlpackDtype::kU32, 2, false, false},  // row_sides
-    {FieldId::ChainJacobian, DlpackDtype::kF32, 2, false, false},  // chain_jacobian
+    {FieldId::Urows, DlpackDtype::kF32, 2, false, false},  // urows
+    {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false, false},  // chain_jacobian
+    {FieldId::RowMinvJt, DlpackDtype::kF32, 1, false, false},  // row_minv_jt
     {FieldId::RowMeff, DlpackDtype::kF32, 1, false, false},  // row_meff
-    {FieldId::RowMaterial, DlpackDtype::kU32, 1, false, false},  // row_material
+    {FieldId::RowCjLink, DlpackDtype::kU32, 1, false, false},  // row_cj_link
+    {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false, false},  // row_cj_point
+    {FieldId::RowCjDir, DlpackDtype::kF32, 2, false, false},  // row_cj_dir
+    {FieldId::QdotFlat, DlpackDtype::kF32, 1, false, false},  // qdot_flat
     {FieldId::M, DlpackDtype::kF32, 1, false, false},  // m
     {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false, false},  // link_composite_inertia
-    {FieldId::IslandRowOffsets, DlpackDtype::kU32, 1, false, false},  // island_row_offsets
-    {FieldId::IslandColorSegments, DlpackDtype::kU32, 1, false, false},  // island_color_segments
+    {FieldId::UnionSlots, DlpackDtype::kF32, 1, false, false},  // union_slots
+    {FieldId::HullVerts, DlpackDtype::kF32, 1, false, false},  // hull_verts
+    {FieldId::DofToLink, DlpackDtype::kU32, 1, false, false},  // dof_to_link
+    {FieldId::DofToComponent, DlpackDtype::kU32, 1, false, false},  // dof_to_component
+    {FieldId::TableEnabled, DlpackDtype::kU32, 1, false, false},  // table_enabled
+    {FieldId::IslandRowOffsets, DlpackDtype::kU32, 2, false, false},  // island_row_offsets
+    {FieldId::IslandColorSegments, DlpackDtype::kU32, 2, false, false},  // island_color_segments
     {FieldId::RowOrder, DlpackDtype::kU32, 1, false, false},  // row_order
     {FieldId::ParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // particle_prev_pos
     {FieldId::ParticleVel, DlpackDtype::kF32, 2, true, false},  // particle_vel

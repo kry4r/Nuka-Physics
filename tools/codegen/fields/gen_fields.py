@@ -57,6 +57,7 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
 
 VALID_PER = {
     "env", "dof", "link", "body", "contact_slot", "row_slot", "slot_dof",
+    "row_dof",
     "particle", "dist_con", "bend_con", "vol_con", "shape_match_slot",
     "env_dof2", "scalar",
 }
@@ -231,7 +232,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// The count-unit a field is sized by. ArenaLayout/Model resolve each to a",
         "// concrete element count from the Model capacities x env_count.",
         "enum class FieldPer : uint8_t {",
-        "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, Particle,",
+        "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,",
         "    DistCon, BendCon, VolCon, ShapeMatchSlot, EnvDof2, Scalar",
         "};",
         "",
@@ -254,6 +255,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
     per_enum = {
         "env": "Env", "dof": "Dof", "link": "Link", "body": "Body",
         "contact_slot": "ContactSlot", "row_slot": "RowSlot", "slot_dof": "SlotDof",
+        "row_dof": "RowDof",
         "particle": "Particle",
         "dist_con": "DistCon", "bend_con": "BendCon", "vol_con": "VolCon",
         "shape_match_slot": "ShapeMatchSlot", "env_dof2": "EnvDof2", "scalar": "Scalar",

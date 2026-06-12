@@ -18,6 +18,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_particles    = cap.particles_per_env > 0;
     const bool has_contacts     = cap.max_rows_per_env > 0;
     const bool has_collidables  = has_bodies || cap.links_per_env > 0;
+    const bool is_union = model.contact_family == ContactFamily::UnionCsr;
+    const uint32_t family = is_union ? phi::kContactFamilyUnionCsr
+                                     : phi::kContactFamilyFusedFoot;
 
     // M3b launch-geometry counts (the views are pure pointer aggregates, so
     // every op carries its counts in the params POD).
@@ -49,6 +52,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_apply_drives_.dt = cfg.dt;
         p_apply_drives_.total_link_count = total_link_count;
         p_apply_drives_.defer_velocity_damping = cfg.defer_velocity_damping;
+        p_apply_drives_.mode = model.drive_mode;
         add(phi::NkOp::ApplyDrives, &p_apply_drives_);
 
         p_aba_.gravity[0] = cfg.gravity[0];
@@ -57,11 +61,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_aba_.articulation_count = articulation_cnt;
         p_aba_.total_link_count = total_link_count;
         add(phi::NkOp::AbaForward, &p_aba_);
+    }
 
+    if (has_articulation || has_bodies) {
         p_int_vel_.dt = cfg.dt;
         p_int_vel_.gravity_z = cfg.gravity[2];
         p_int_vel_.total_link_count = total_link_count;
         p_int_vel_.articulation_count = articulation_cnt;
+        // M4: the rigid-body gravity kick rides IntegrateVelocity (the union
+        // world kicks the cup exactly once per step, before the contact solve).
+        p_int_vel_.total_body_count = cap.bodies_per_env * env_count;
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }
 
@@ -99,14 +108,25 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.foot_count = static_cast<uint32_t>(model.feet.size());
         p_np_prim_.env_count = env_count;
         p_np_prim_.base_link_count = base_link_count;
+        p_np_prim_.family = family;
+        p_np_prim_.union_slot_count =
+            static_cast<uint32_t>(model.union_slots.size());
+        p_np_prim_.bodies_per_env = cap.bodies_per_env;
+        p_np_prim_.hull_vert_count =
+            static_cast<uint32_t>(model.hull_verts.size() / 3u);
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
         p_np_sdf_.contact_margin = cfg.contact_margin;
         p_np_sdf_.max_contacts_per_pair = 4;
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
-        p_tangent_.slot_count = slot_count;
-        add(phi::NkOp::ContactTangentBasis, &p_tangent_);
+        // ContactTangentBasis: fused-family only (the union family's tangent
+        // spokes are emitted inside AssembleRows, the EmitCompliantContactRows
+        // per-manifold basis).
+        if (!is_union) {
+            p_tangent_.slot_count = slot_count;
+            add(phi::NkOp::ContactTangentBasis, &p_tangent_);
+        }
     }
 
     if (has_articulation) {
@@ -128,6 +148,14 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.env_count = env_count;
         p_assemble_.articulation_count = articulation_cnt;
         p_assemble_.total_link_count = total_link_count;
+        p_assemble_.family = family;
+        p_assemble_.union_slot_count =
+            static_cast<uint32_t>(model.union_slots.size());
+        p_assemble_.rows_per_env = cap.max_rows_per_env;
+        p_assemble_.bodies_per_env = cap.bodies_per_env;
+        p_assemble_.base_link_count = base_link_count;
+        for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.union_solref[k];
+        for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.union_solimp[k];
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
 
@@ -143,27 +171,32 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_contacts) {
-        // TRANSITIONAL (M3b, LOUD): the SolveRowsBlockIsland slot dispatches
-        // the ported legacy fused articulated solver with ITS OWN params POD
-        // (SolveArticulatedParams). M4's device-resident SolveRowsBlockIsland
-        // restores p_solve_ (the spec-fixed POD) here.
+        // M4: the spec-fixed SolveRowsBlockIslandParams takes over the slot
+        // (the M3b transitional SolveArticulatedParams routing is deleted).
+        // Semantic triplet first; appended launch geometry + the per-family
+        // Model-derived solver constants (see op_schema.hpp).
         p_solve_.dt = cfg.dt;
         p_solve_.vel_iters = cfg.vel_iters;
         p_solve_.pos_iters = cfg.pos_iters;
-        p_solve_articulated_.dt = cfg.dt;
-        p_solve_articulated_.friction_coefficient = model.friction_coefficient;
-        p_solve_articulated_.baumgarte_max_velocity = model.baumgarte_max_velocity;
-        p_solve_articulated_.max_dof = max_dof;
-        p_solve_articulated_.articulation_count = articulation_cnt;
-        p_solve_articulated_.env_count = env_count;
-        p_solve_articulated_.apply_implicit_damping = cfg.fold_drive_damping;
-        add(phi::NkOp::SolveRowsBlockIsland, &p_solve_articulated_);
+        p_solve_.family = family;
+        p_solve_.total_islands = model.schedule_island_count;
+        p_solve_.max_dof = max_dof;
+        p_solve_.env_count = env_count;
+        p_solve_.articulation_count = articulation_cnt;
+        p_solve_.rows_per_env = cap.max_rows_per_env;
+        p_solve_.base_link_count = base_link_count;
+        p_solve_.total_body_count = cap.bodies_per_env * env_count;
+        p_solve_.friction_coefficient = model.friction_coefficient;
+        p_solve_.baumgarte_max_velocity = model.baumgarte_max_velocity;
+        p_solve_.apply_implicit_damping = cfg.fold_drive_damping;
+        add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
     }
 
-    if (has_articulation) {
+    if (has_articulation || has_bodies) {
         p_int_pos_.dt = cfg.dt;
         p_int_pos_.total_link_count = total_link_count;
         p_int_pos_.articulation_count = articulation_cnt;
+        p_int_pos_.total_body_count = cap.bodies_per_env * env_count;
         add(phi::NkOp::IntegratePosition, &p_int_pos_);
     }
 
@@ -172,7 +205,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
     }
 
-    if (has_articulation || has_bodies) {
+    // ReadoutContactWrench: fused-family only in M4 (its kernel reads the
+    // fused contact_* stream; the union family's readout — wrench from the
+    // urows lambdas — is the M5/M9 obs wiring, tests read the fields directly).
+    if ((has_articulation || has_bodies) && !is_union) {
         p_readout_.dt = cfg.dt;
         p_readout_.env_count = env_count;
         p_readout_.base_link_count = base_link_count;

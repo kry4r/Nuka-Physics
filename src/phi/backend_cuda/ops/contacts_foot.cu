@@ -20,6 +20,7 @@
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/union_types.cuh"  // M4: union-family dispatch
 
 namespace nuka::phi {
 
@@ -169,6 +170,11 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
     const auto* p = static_cast<const NarrowphasePrimitivesParams*>(params);
     if (p == nullptr) {
         return Status::Failed;
+    }
+    if (p->family == kContactFamilyUnionCsr) {
+        // M4 union family: per-(env x union-slot) analytic detection
+        // (contacts_union.cu).
+        return LaunchUnionNarrowphase(model, data, *p, stream);
     }
     if (p->env_count == 0u) {
         return Status::Ok;
