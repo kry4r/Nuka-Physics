@@ -3,6 +3,7 @@
 > 状态：owner 已批准方向；本 v3 为交叉评审（ggml / Genesis / Newton / Isaac Lab）后的终版。**写盘后暂停，等 owner 开工信号。** 开工后第一件事：本文件已入库为 `docs/plans/2026-06-11-nk-core-platform-refactor.md`，以它为多 session 执行基准。
 > 纪律：禁止 TDD、禁止新增单测；每个里程碑 = 交付物 + 验收门（oracle/场景/性能），门绿才前进；**本计划不含任何回退方案，每个设计点只有一条承诺路径**。
 > **修订 2026-06-11（owner，开工后）**：§3.6 场景树化——场景以**节点树（SceneGraph）**形式编辑与管理，原生承载机器人层级；`name` 只是单段名字、`path` 由树派生专管；基底参考 owner 的 Mangifera `core/manager/scene-graph.{hpp,cpp}` 并在其上扩充。波及 §2 / §3.7 / §3.9 / M2（已就地改写）。
+> **修订 2026-06-12（owner，M1 验收后）**：CUDA 强相关子系统（solver / RT / diffsim / collision 等）后续必须**逐一抽出后端无关接口 + 实现归 CUDA backend**，不得长期以裸 .cu 存在于引擎侧。新增 §3.10 归位总表；波及 M9（diffsim backward op 化）/ M11（RT 后端接口）。
 
 ---
 
@@ -354,6 +355,22 @@ rec = nuka.Recorder(world, camera=...); rec.capture("out/frames"); rec.to_video(
 
 命名约定（Isaac T4）：`set_*` 只写 host 缓冲，`write_*_to_sim` 落盘设备；`World/GraspWorld/UnionWorld` 三族在 parity 窗口后删除。
 
+### 3.10 CUDA 强相关子系统的后端归位总表（owner 修订 2026-06-12）
+
+原则：**新增/既有 CUDA 能力一律先问"是不是 op"**——是 op 的进 `NkOp`（枚举 + Params + `backend_cuda/ops/` 实现 + `supports_op`）；不是逐步 op（如 RT 的 BLAS/TLAS 构建与 trace dispatch）的也必须有**后端无关接口**，实现归 backend_cuda 侧；`src/nk`/`src/scene`/`src/render`（接口层）/`src/runtime/app` 的零 CUDA token lint 红线永不破。
+
+| 子系统 | 现状（M1 时点） | 接口缝 | 归位里程碑 |
+|---|---|---|---|
+| articulation（ABA/FK/积分/CRBA） | `runtime/articulation/*.cu` 裸 kernel | NkOp：ApplyDrives/AbaForward/Integrate*/Fk/Crba* | M3（已计划） |
+| 碰撞 broadphase/narrowphase | `collision/*.cu` 裸 kernel | NkOp：BuildAabbs/Lbvh*/Narrowphase*/ContactTangentBasis | M5（已计划） |
+| 统一解算 | `solver/gpu/row_solver.cu` | NkOp：AssembleRows/SolveRowsBlockIsland | M4（已计划） |
+| 粒子 XPBD/PBF | `runtime/{soft,fluid}/*.cu` | NkOp：Particle*/Xpbd*/Pbf* | M6（已计划） |
+| 传感读出/obs | `sensor/contact_wrench.cu` 等 | NkOp：ReadoutContactWrench/ExportObs | M3（已计划） |
+| 随机化/噪声 | `sensor/noise/` | NkOp：RandomizeMaterialBuckets/RandomizeBodyParams | M3/M9（已计划） |
+| **diffsim backward** | `diffsim/{step_backward,tape,backward_runner}.cu` 裸 kernel（M3 仅指针源换 arena，算法不动） | ★ backward op 族入 NkOp（AbaBackward/IntegrateBackward/SolveRowsBackward/TapeSnapshot/TapeRestore…，Params 含 checkpoint 引用）+ `backend_cuda/ops/diffsim_backward.cu` | ★ M9（随 c_abi/diffsim 切到 nk::World 同步 op 化，删裸 .cu） |
+| **RT 路径追踪** | 自写 CUDA RT kernel（不 OptiX） | ★ `render::RtBackendI` 后端无关接口（BLAS 构建一次 / TLAS 每帧 / trace dispatch / 输出 buffer 经 BufferI），rt_adapter 只面向接口 | ★ M11（实现归 `backend_cuda/rt/`，自写不 OptiX 不变） |
+| CUDA↔Vulkan 互操作 | 无 | PosePublisher 接口已计划；设备散射 kernel 经 launch.cuh | M11（已计划） |
+
 ---
 
 ## 4. 里程碑（每个 = 新建/修改/删除 + 验收门命令）
@@ -478,7 +495,7 @@ rec = nuka.Recorder(world, camera=...); rec.capture("out/frames"); rec.to_video(
 ### M9 — 切换 + 删除全部遗留 + 测试重组
 
 **新建：** `src/c_abi/scene.cpp` + `src/include/nuka/nuka_scene.h`（`nuka_scene_{load,compose,find,set_local,set_physics_material,settle,save,destroy}`）；`python/nuka/scene.py`。
-**修改：** `src/c_abi/world.cpp`（create 走 Scene→CookToModel→nk::World；删 StepWorldGpu 内联路径）；`src/c_abi/buffer.cpp`（查 `dlpack_table.hpp`，字段枚举二进制语义不变 = RL 硬契约）；`diffsim.cpp/noise.cpp/handle_table.hpp/internal.hpp`（句柄指 nk::World）；`python/src/nuka_ext.cpp`、`python/nuka/{__init__.py,gym/env.py,rl_games/vecenv.py,tasks/*}`、`examples/training/*.py`（入口换新 API）。
+**修改：** `src/c_abi/world.cpp`（create 走 Scene→CookToModel→nk::World；删 StepWorldGpu 内联路径）；`src/c_abi/buffer.cpp`（查 `dlpack_table.hpp`，字段枚举二进制语义不变 = RL 硬契约）；`diffsim.cpp/noise.cpp/handle_table.hpp/internal.hpp`（句柄指 nk::World）；**diffsim backward op 化（§3.10）**：`src/diffsim/{step_backward,tape,backward_runner}.cu` kernel 体迁入 `src/phi/backend_cuda/ops/diffsim_backward.cu`（backward op 族入 NkOp，adjoint FD 测试口径不变），删裸 .cu；`python/src/nuka_ext.cpp`、`python/nuka/{__init__.py,gym/env.py,rl_games/vecenv.py,tasks/*}`、`examples/training/*.py`（入口换新 API）。
 **删除：** `src/c_abi/{grasp_world,union_world}.cpp` + `nuka_grasp.h/nuka_union.h`；`src/runtime/gpu/batched_articulated_world.{cu,hpp}`；`src/runtime/coresident/` 整目录；`src/runtime/{soft,fluid}` 包装类；`src/runtime/sdf/sdf_device_world.*`（上传职能入 Model）；`src/collision/` 中已迁移的 gpu kernel 原文件与 CPU `convex_narrowphase.*`；`src/scene/scene_pipeline.{cpp,hpp}`、`src/render/render_scene.{hpp,cpp}`；`src/phi/buffer_legacy.hpp` + 旧 `phi::{OwnedStream,DeviceContext,UploadVector...}`；剩余全部 UNIT/TDD 测试文件（覆盖清单制：逐文件断言→映射 oracle/场景门→孤儿先折入再删）。
 **测试重组：** `tests/{oracle,scenario,perf,fixtures}` 四目录五可执行（`nuka_oracle_test/nuka_scenario_test/nuka_perf_test/nuka_import_test/nuka_render_test`），label `fast/full/perf`，每可执行 gtest Environment 单次 CUDA init；`tests/CMakeLists.txt` 重写。
 **门：** `ctest -L full && ctest -L perf` 只跑新核心全绿；lint 全仓绿；`git grep -lE "BatchedUnifiedWorld|BatchedArticulatedWorld|BatchedSceneTemplate|UnifiedCoResidentStepper" src/ python/ tests/` 零命中。
@@ -489,7 +506,7 @@ rec = nuka.Recorder(world, camera=...); rec.capture("out/frames"); rec.to_video(
 
 ### M11 —（紧随期）imgui viewer + 互操作 + RT beauty
 
-`src/runtime/app/viewer/{viewer_main,imgui_layer,camera_controller}.{cpp,hpp}`（GLFW+swapchain+imgui：场景树/播放/env 选择/相机/驱动滑块/**拖动实体（MoveEntity 命令→写 Data）**）；`src/runtime/app/cuda_vulkan_interop.cpp`（CudaVulkanInteropPublisher：Vulkan 变换 buffer 注册为 CUDA external memory，设备 kernel 直散射）；`src/render/rt_adapter.hpp/.cpp`（RenderWorldToTwoLevelScene，BLAS 一次/TLAS 每帧，自写不用 OptiX）。门：有显示器机器交互运行；RT still D1；离屏路径仍是 CI 门。
+`src/runtime/app/viewer/{viewer_main,imgui_layer,camera_controller}.{cpp,hpp}`（GLFW+swapchain+imgui：场景树/播放/env 选择/相机/驱动滑块/**拖动实体（MoveEntity 命令→写 Data）**）；`src/runtime/app/cuda_vulkan_interop.cpp`（CudaVulkanInteropPublisher：Vulkan 变换 buffer 注册为 CUDA external memory，设备 kernel 直散射）；`src/render/rt_adapter.hpp/.cpp`（RenderWorldToTwoLevelScene，BLAS 一次/TLAS 每帧，自写不用 OptiX）+ **RT 后端接口化（§3.10）**：`src/render/rt_backend.hpp`（`RtBackendI`：BLAS/TLAS 构建、trace dispatch、输出经 BufferI），CUDA 实现归 `src/phi/backend_cuda/rt/`，render 接口层零 CUDA token。门：有显示器机器交互运行；RT still D1；离屏路径仍是 CI 门。
 
 ---
 
