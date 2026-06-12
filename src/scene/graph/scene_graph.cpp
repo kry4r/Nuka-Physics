@@ -163,11 +163,24 @@ std::shared_ptr<SceneNode> SceneGraph::AddEntity(EntityId entity,
 
 void SceneGraph::AttachSubtree(std::shared_ptr<SceneNode> subtree,
                                std::shared_ptr<SceneNode> parent) {
-    if (!subtree) {
-        return;
+    if (!subtree || subtree == root_) {
+        return;  // never graft a graph's own root under something
     }
     if (!parent) {
         parent = root_;
+    }
+    // Cycle guard: refuse to graft a node under itself or under any of its own
+    // descendants (walking up from `parent` must not reach `subtree`).
+    for (auto cur = parent; cur; cur = cur->parent.lock()) {
+        if (cur == subtree) {
+            return;
+        }
+    }
+    // If the subtree is still attached somewhere, unlink it first. Appending a
+    // still-linked node would otherwise truncate its old sibling chain
+    // (AppendChild resets next_sibling), corrupting the source tree.
+    if (subtree->parent.lock() || subtree->next_sibling) {
+        Detach(subtree);
     }
     AppendChild(parent, subtree);
 }

@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nuka::scene {
@@ -129,6 +130,8 @@ private:
         uint64_t             content_hash = 0;
     };
     std::vector<Chunk> chunks_;
+    // Per-fourcc running count so AddChunk's per-family index is O(1).
+    std::unordered_map<uint32_t, uint32_t> fourcc_counts_;
 };
 
 // ---------------------------------------------------------------------------

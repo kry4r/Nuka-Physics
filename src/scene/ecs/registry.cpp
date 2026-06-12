@@ -4,9 +4,19 @@
 
 #include "scene/ecs/registry.hpp"
 
+#include <cassert>
 #include <utility>
 
 namespace nuka::scene {
+
+// Generational guard for Add: a STALE handle (whose slot was recycled) would
+// otherwise overwrite the new occupant's component and re-point the pool's
+// owner row at the dead handle (silent cross-entity corruption). Adding to a
+// dead/stale entity is a caller bug; the contract is asserted here (Add must
+// return a reference, so there is no error channel — the guard makes the
+// misuse loud instead of silently corrupting).
+#define NUKA_REGISTRY_ADD_GUARD(e)                                       \
+    assert(ValidSlot(e) && "Registry::Add on a dead/stale EntityId")
 
 // -- entity lifecycle -------------------------------------------------------
 
@@ -70,19 +80,19 @@ void Registry::Destroy(EntityId e) {
 
 // -- per-component Add overloads --------------------------------------------
 
-NameComponent&           Registry::Add(EntityId e, NameComponent c)           { return names_.Add(e, std::move(c)); }
-TransformComponent&      Registry::Add(EntityId e, TransformComponent c)      { return transforms_.Add(e, std::move(c)); }
-VisualMeshComponent&     Registry::Add(EntityId e, VisualMeshComponent c)     { return visual_meshes_.Add(e, std::move(c)); }
-CollisionShapeComponent& Registry::Add(EntityId e, CollisionShapeComponent c) { return collision_shapes_.Add(e, std::move(c)); }
-RigidBodyComponent&      Registry::Add(EntityId e, RigidBodyComponent c)      { return rigid_bodies_.Add(e, std::move(c)); }
-JointComponent&          Registry::Add(EntityId e, JointComponent c)          { return joints_.Add(e, std::move(c)); }
-ActuatorComponent&       Registry::Add(EntityId e, ActuatorComponent c)       { return actuators_.Add(e, std::move(c)); }
-SystemKindComponent&     Registry::Add(EntityId e, SystemKindComponent c)     { return system_kinds_.Add(e, std::move(c)); }
-SoftBodyComponent&       Registry::Add(EntityId e, SoftBodyComponent c)       { return soft_bodies_.Add(e, std::move(c)); }
-FluidComponent&          Registry::Add(EntityId e, FluidComponent c)          { return fluids_.Add(e, std::move(c)); }
-InitialStateComponent&   Registry::Add(EntityId e, InitialStateComponent c)   { return initial_states_.Add(e, std::move(c)); }
-CameraComponent&         Registry::Add(EntityId e, CameraComponent c)         { return cameras_.Add(e, std::move(c)); }
-LightComponent&          Registry::Add(EntityId e, LightComponent c)          { return lights_.Add(e, std::move(c)); }
+NameComponent&           Registry::Add(EntityId e, NameComponent c)           { NUKA_REGISTRY_ADD_GUARD(e); return names_.Add(e, std::move(c)); }
+TransformComponent&      Registry::Add(EntityId e, TransformComponent c)      { NUKA_REGISTRY_ADD_GUARD(e); return transforms_.Add(e, std::move(c)); }
+VisualMeshComponent&     Registry::Add(EntityId e, VisualMeshComponent c)     { NUKA_REGISTRY_ADD_GUARD(e); return visual_meshes_.Add(e, std::move(c)); }
+CollisionShapeComponent& Registry::Add(EntityId e, CollisionShapeComponent c) { NUKA_REGISTRY_ADD_GUARD(e); return collision_shapes_.Add(e, std::move(c)); }
+RigidBodyComponent&      Registry::Add(EntityId e, RigidBodyComponent c)      { NUKA_REGISTRY_ADD_GUARD(e); return rigid_bodies_.Add(e, std::move(c)); }
+JointComponent&          Registry::Add(EntityId e, JointComponent c)          { NUKA_REGISTRY_ADD_GUARD(e); return joints_.Add(e, std::move(c)); }
+ActuatorComponent&       Registry::Add(EntityId e, ActuatorComponent c)       { NUKA_REGISTRY_ADD_GUARD(e); return actuators_.Add(e, std::move(c)); }
+SystemKindComponent&     Registry::Add(EntityId e, SystemKindComponent c)     { NUKA_REGISTRY_ADD_GUARD(e); return system_kinds_.Add(e, std::move(c)); }
+SoftBodyComponent&       Registry::Add(EntityId e, SoftBodyComponent c)       { NUKA_REGISTRY_ADD_GUARD(e); return soft_bodies_.Add(e, std::move(c)); }
+FluidComponent&          Registry::Add(EntityId e, FluidComponent c)          { NUKA_REGISTRY_ADD_GUARD(e); return fluids_.Add(e, std::move(c)); }
+InitialStateComponent&   Registry::Add(EntityId e, InitialStateComponent c)   { NUKA_REGISTRY_ADD_GUARD(e); return initial_states_.Add(e, std::move(c)); }
+CameraComponent&         Registry::Add(EntityId e, CameraComponent c)         { NUKA_REGISTRY_ADD_GUARD(e); return cameras_.Add(e, std::move(c)); }
+LightComponent&          Registry::Add(EntityId e, LightComponent c)          { NUKA_REGISTRY_ADD_GUARD(e); return lights_.Add(e, std::move(c)); }
 
 // -- material asset tables --------------------------------------------------
 

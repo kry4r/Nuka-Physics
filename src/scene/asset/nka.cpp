@@ -266,11 +266,9 @@ std::vector<float> DecodeSamples(const std::vector<uint8_t>& bytes) {
 // NkaWriter
 // ---------------------------------------------------------------------------
 uint32_t NkaWriter::AddChunk(uint32_t fourcc, std::vector<uint8_t> payload) {
-    // Per-fourcc index == how many of this family precede us.
-    uint32_t index = 0;
-    for (const auto& c : chunks_) {
-        if (c.fourcc == fourcc) ++index;
-    }
+    // Per-fourcc index == how many of this family precede us (O(1) counter map
+    // instead of rescanning all prior chunks per add).
+    const uint32_t index = fourcc_counts_[fourcc]++;
     Chunk chunk;
     chunk.fourcc = fourcc;
     chunk.content_hash = NkaContentHash(payload);
@@ -358,6 +356,13 @@ NkaFile NkaFile::FromBytes(std::vector<uint8_t> bytes) {
         throw std::runtime_error("nka: unsupported version");
     }
     const auto chunk_count = ReadPod<uint32_t>(file.bytes_, cursor);
+    // Validate the declared TOC fits in the file BEFORE reserving (a corrupt
+    // chunk_count would otherwise drive a multi-GB allocation attempt).
+    constexpr size_t kTocEntrySize = 4 + 8 + 8 + 8;
+    if (static_cast<uint64_t>(chunk_count) * kTocEntrySize >
+        file.bytes_.size() - cursor) {
+        throw std::runtime_error("nka: truncated TOC (chunk_count exceeds file size)");
+    }
     file.toc_.reserve(chunk_count);
     for (uint32_t i = 0; i < chunk_count; ++i) {
         NkaTocEntry e;
@@ -365,6 +370,12 @@ NkaFile NkaFile::FromBytes(std::vector<uint8_t> bytes) {
         e.offset = ReadPod<uint64_t>(file.bytes_, cursor);
         e.size = ReadPod<uint64_t>(file.bytes_, cursor);
         e.content_hash = ReadPod<uint64_t>(file.bytes_, cursor);
+        // Overflow-safe payload bounds check at parse time: offset and size must
+        // each fit in the file, and offset+size must not wrap.
+        if (e.offset > file.bytes_.size() ||
+            e.size > file.bytes_.size() - e.offset) {
+            throw std::runtime_error("nka: corrupt TOC entry (payload out of range)");
+        }
         file.toc_.push_back(e);
     }
     return file;
@@ -383,7 +394,8 @@ std::vector<uint8_t> NkaFile::LoadChunk(uint32_t fourcc, uint32_t index) const {
     for (const auto& e : toc_) {
         if (e.fourcc != fourcc) continue;
         if (seen == index) {
-            if (e.offset + e.size > bytes_.size()) {
+            // (Overflow-safe form; entries are also validated in FromBytes.)
+            if (e.offset > bytes_.size() || e.size > bytes_.size() - e.offset) {
                 throw std::runtime_error("nka: chunk payload out of range");
             }
             return std::vector<uint8_t>(bytes_.begin() + static_cast<ptrdiff_t>(e.offset),

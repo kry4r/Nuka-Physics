@@ -41,9 +41,15 @@ OpFn SetCudaOp(NkOp op, OpFn fn);
 // file-scope initializer that plants `fn` into the `op` slot at static-init.
 // (Kept dlopen-friendly: a TU using this still needs to be referenced, see the
 // nuka_phi2 self-registration de-risk in src/CMakeLists.txt.)
+// The registration variable is named from __COUNTER__ (not from `op`, which is
+// a qualified enumerator like ::nuka::phi::NkOp::ApplyDrives and would not
+// token-paste into a valid identifier).
+#define NK_OP_REG_CONCAT_INNER(a, b) a##b
+#define NK_OP_REG_CONCAT(a, b) NK_OP_REG_CONCAT_INNER(a, b)
 #define REGISTER_NK_OP(op, fn)                                            \
     namespace {                                                          \
-    const ::nuka::phi::OpFn nk_reg_##op =                               \
+    [[maybe_unused]] const ::nuka::phi::OpFn                             \
+        NK_OP_REG_CONCAT(nk_reg_op_, __COUNTER__) =                      \
         (::nuka::phi::SetCudaOp((op), (fn)), (fn));                     \
     } // namespace
 
