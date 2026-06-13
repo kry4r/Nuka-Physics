@@ -17,5 +17,6 @@ machinery that T3 will compose into a task.
 from __future__ import annotations
 
 from . import go2_obs  # noqa: F401
+from . import h1_grasp_choreo  # noqa: F401
 
-__all__ = ["go2_obs"]
+__all__ = ["go2_obs", "h1_grasp_choreo"]
