@@ -83,6 +83,8 @@ uint32_t FindMemoryType(VkPhysicalDevice physical_device,
 // -- a tiny column-major 4x4 matrix (GLSL std140 / VkPushConstant friendly) ---
 // Stored column-major: m[col*4 + row]. Matches GLSL mat4 memory layout so the
 // push-constant block in mesh.vert reads it directly.
+constexpr float kPi = 3.14159265358979323846f;
+
 struct Mat4 {
     std::array<float, 16> m{};
     static Mat4 Identity() {
@@ -208,12 +210,15 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     ubo.camera_pos[2] = eye.z;
     ubo.camera_pos[3] = 1.0f;
 
-    // Hemispheric ambient: a soft cool sky over a warm-dark ground. Lifted enough
-    // that dark (e.g. black-bodied) materials still read their form rather than
-    // crushing to the background.
-    ubo.ambient[0] = 0.20f; ubo.ambient[1] = 0.23f; ubo.ambient[2] = 0.28f; ubo.ambient[3] = 0.0f;
-    ubo.ambient_ground[0] = 0.09f; ubo.ambient_ground[1] = 0.08f;
-    ubo.ambient_ground[2] = 0.07f; ubo.ambient_ground[3] = 0.0f;
+    // Hemispheric ambient: a soft, near-neutral studio sky (a faint cool tint) over
+    // a warm-dark ground bounce. Kept MODERATE -- strong enough (with the shader's
+    // small albedo-independent form floor) that black plastic reads its FORM as a
+    // dark-grey shape, but not so strong it washes the whole model to a flat tone
+    // and kills the white-vs-black material contrast. The KEY light (below) carries
+    // the bright white shells; the ambient just lifts the shadows.
+    ubo.ambient[0] = 0.17f; ubo.ambient[1] = 0.185f; ubo.ambient[2] = 0.215f; ubo.ambient[3] = 0.0f;
+    ubo.ambient_ground[0] = 0.12f; ubo.ambient_ground[1] = 0.10f;
+    ubo.ambient_ground[2] = 0.085f; ubo.ambient_ground[3] = 0.0f;
 
     auto set_dir_light = [](GpuLight& l, const math::Vec3& dir,
                             float r, float g, float b) {
@@ -248,11 +253,15 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
             ++n;
         }
     } else {
-        // Default 3-point rig (world +Z up). Key from the upper front-right,
-        // fill cooler from the front-left, rim/back from behind-above.
-        set_dir_light(ubo.lights[n++], {0.5f, -0.6f, 0.75f}, 3.2f, 3.1f, 2.9f);   // key (warm white)
-        set_dir_light(ubo.lights[n++], {-0.7f, 0.3f, 0.4f}, 0.8f, 0.9f, 1.1f);    // fill (cool)
-        set_dir_light(ubo.lights[n++], {0.1f, 0.8f, 0.5f}, 1.0f, 0.95f, 0.85f);   // rim/back
+        // Default 3-point STUDIO rig (world +Z up; product-shot vibe). A strong
+        // warm KEY from the upper front-right, a softer cool FILL from the front-
+        // left opposing it, and a bright cool-white RIM/back from behind-above so
+        // even a near-black material gets an edge highlight that separates it from
+        // the dark background. Tuned against the shader's ACES tonemap so the key
+        // reads as a clean shading gradient without blowing the highlights.
+        set_dir_light(ubo.lights[n++], { 0.55f, -0.65f, 0.80f}, 4.4f, 4.1f, 3.6f);  // key (warm)
+        set_dir_light(ubo.lights[n++], {-0.75f,  0.35f, 0.45f}, 1.10f, 1.30f, 1.70f); // fill (cool)
+        set_dir_light(ubo.lights[n++], {-0.10f,  0.85f, 0.65f}, 3.0f, 3.2f, 3.8f);   // rim/back (bright cool)
     }
     ubo.counts[0] = n;
     return ubo;
@@ -952,6 +961,64 @@ ResolvedCamera ResolveCamera(const RenderWorld& world, const RasterOptions& opti
     return cam;
 }
 
+// Hero re-frame (M8.5 T4b): a 3/4 product-shot orbit around the scene AABB. The
+// robot fills ~60-70% of the frame with a slightly-above level gaze. Renderer-
+// side only (opt-in via RasterOptions.hero_framing) -- the gates keep the plain
+// auto-frame. Deterministic: a pure function of the AABB + aspect.
+ResolvedCamera HeroFraming(const math::Vec3& aabb_min, const math::Vec3& aabb_max,
+                           bool has_geometry, float aspect) {
+    ResolvedCamera cam;
+    math::Vec3 center{0.0f, 0.0f, 0.5f};
+    float radius = 0.6f;
+    if (has_geometry) {
+        center = (aabb_min + aabb_max) * 0.5f;
+        radius = std::max((aabb_max - aabb_min).Length() * 0.5f, 1e-3f);
+    }
+    // 3/4 hero direction: front-right, a touch above so the robot is seen from a
+    // confident slightly-elevated product angle and enough floor reads BELOW it
+    // (the robot stands ON the ground rather than floating at the horizon).
+    const math::Vec3 dir = math::Vec3{1.0f, -0.85f, 0.62f}.Normalized();
+    // Fill the frame: distance so the AABB sphere subtends ~70% of the smaller FOV
+    // axis. fov_y = 38deg; widen the effective fit on the narrower axis by aspect.
+    const float fov_y = 38.0f * 3.14159265358979323846f / 180.0f;
+    const float fit = std::min(1.0f, aspect);  // portrait/narrow -> pull back
+    const float distance = (radius / std::tan(fov_y * 0.5f)) / std::max(fit, 0.35f) * 1.02f;
+    // Aim slightly above the AABB center (toward the robot's upper body / trunk),
+    // and lift the eye a touch for the 3/4 look.
+    const math::Vec3 aim = center + math::Vec3{0.0f, 0.0f, radius * 0.10f};
+    cam.eye = aim + dir * distance;
+    cam.target = aim;
+    cam.up = {0.0f, 0.0f, 1.0f};
+    cam.fov_degrees = 38.0f;
+    cam.near_clip = std::max(distance * 0.01f, 1e-3f);
+    cam.far_clip = distance * 8.0f + radius * 12.0f;
+    return cam;
+}
+
+// A large ground disc (M8.5 T4b) centered under the scene, normal +Z up, radius
+// scaled to the scene so the robot reads as standing ON something. Lit by the
+// default rig + hemispheric ambient -> a natural soft falloff toward the rim
+// (a studio floor) without per-vertex color. Deterministic vertex order.
+MeshGeometry MakeGroundDisc(float radius, uint32_t segments = 96) {
+    MeshGeometry m;
+    const uint32_t center_idx = 0u;
+    m.positions.push_back(0.0f); m.positions.push_back(0.0f); m.positions.push_back(0.0f);
+    m.normals.push_back(0.0f);   m.normals.push_back(0.0f);   m.normals.push_back(1.0f);
+    for (uint32_t i = 0; i <= segments; ++i) {
+        const float a = 2.0f * kPi * static_cast<float>(i) / static_cast<float>(segments);
+        m.positions.push_back(radius * std::cos(a));
+        m.positions.push_back(radius * std::sin(a));
+        m.positions.push_back(0.0f);
+        m.normals.push_back(0.0f); m.normals.push_back(0.0f); m.normals.push_back(1.0f);
+    }
+    for (uint32_t i = 0; i < segments; ++i) {
+        m.indices.push_back(center_idx);
+        m.indices.push_back(1u + i);
+        m.indices.push_back(1u + i + 1u);
+    }
+    return m;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1073,13 +1140,67 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     }
 
     // -- 2. Resolve camera + build view-projection --------------------------
-    const ResolvedCamera cam =
-        ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
     const float aspect = static_cast<float>(options.width) / static_cast<float>(options.height);
+    // Hero re-framing (beauty/viewer): only when the caller opted in AND there is
+    // no explicit/authored camera to honour. The gates leave hero_framing off, so
+    // their plain auto-frame (and thus their pixels) is untouched.
+    const bool auto_framed =
+        !options.use_camera_override && world.CameraCount() == 0u;
+    const ResolvedCamera cam =
+        (options.hero_framing && auto_framed)
+            ? HeroFraming(aabb_min, aabb_max, has_geometry, aspect)
+            : ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
     const float fov_y = cam.fov_degrees * 3.14159265358979323846f / 180.0f;
     const Mat4 view = LookAt(cam.eye, cam.target, cam.up);
     const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
     const Mat4 view_proj = Multiply(proj, view);
+
+    // -- 2a. Optional ground plane (M8.5 T4b, beauty/viewer; default OFF). ----
+    // Appended AFTER the scene AABB + camera are resolved so its extent does not
+    // perturb the framing. A large dark disc at the bottom of the scene, lit by
+    // the rig (its natural rim falloff reads as a studio floor). Renderer-side
+    // only -> RenderWorld + the M11 path-tracer are untouched, and with the gate
+    // default (draw_ground=false) the recorded draw set is byte-identical to the
+    // M8 oracle.
+    if (options.draw_ground && has_geometry) {
+        const math::Vec3 ext = aabb_max - aabb_min;
+        const float reach = std::max(ext.Length() * 0.5f, 1e-3f);
+        const math::Vec3 ctr = (aabb_min + aabb_max) * 0.5f;
+        // A broad disc whose far edge sits well past the frame so the rim falloff
+        // reads as a horizonless studio sweep rather than a visible plate edge.
+        const MeshGeometry disc = MakeGroundDisc(reach * 16.0f);
+
+        InstanceDraw g;
+        // Sit the disc just under the lowest geometry (a hair below to avoid
+        // z-fighting with a resting foot/contact).
+        math::Transform gt = math::Transform::Identity();
+        gt.position = {ctr.x, ctr.y, aabb_min.z - reach * 0.01f};
+        g.model = TransformToMatrix(gt);
+        // A DARK, fairly matte studio floor with a faint cool tint -- kept low
+        // enough that it grounds the robot without competing with it for the eye.
+        g.base_color[0] = 0.018f; g.base_color[1] = 0.020f; g.base_color[2] = 0.026f;
+        g.base_color[3] = 1.0f;
+        g.metallic = 0.0f; g.roughness = 0.70f; g.opacity = 1.0f;
+
+        const VkDeviceSize gp = disc.positions.size() * sizeof(float);
+        g.vertex_pos = d.CreateBuffer(
+            gp, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        d.UploadBuffer(g.vertex_pos, disc.positions.data(), gp);
+        const VkDeviceSize gn = disc.normals.size() * sizeof(float);
+        g.vertex_nrm = d.CreateBuffer(
+            gn, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        d.UploadBuffer(g.vertex_nrm, disc.normals.data(), gn);
+        const VkDeviceSize gi = disc.indices.size() * sizeof(uint32_t);
+        g.index = d.CreateBuffer(
+            gi, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        d.UploadBuffer(g.index, disc.indices.data(), gi);
+        g.index_count = static_cast<uint32_t>(disc.indices.size());
+        // Draw the ground FIRST so the depth buffer lets the robot occlude it.
+        draws.insert(draws.begin(), std::move(g));
+    }
 
     // -- 2b. Per-frame SceneUbo (camera + light rig) + descriptor set --------
     const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye);

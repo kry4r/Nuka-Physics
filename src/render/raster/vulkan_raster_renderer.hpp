@@ -159,6 +159,24 @@ struct RasterOptions {
     float       camera_fov_degrees  = 45.0f;
     float       camera_near         = 0.05f;
     float       camera_far          = 1000.0f;
+
+    // ----- BEAUTY (M8.5 T4b): grounded look + hero framing -------------------
+    // A tasteful ground plane the robot sits on (a large dark disc with a soft
+    // radial fade toward the horizon), drawn RENDERER-SIDE under the scene at the
+    // bottom of its AABB -- NOT part of RenderWorld (keeps the RenderWorld a pure
+    // data product / the M11 path-tracer + the determinism gates unaffected).
+    //
+    // DEFAULT OFF so the gated synthetic-scene smokes (render_raster_smoke /
+    // render_physics_parity) render the EXACT same instance set as before (their
+    // D1 memcmp + non_bg assertions are unperturbed). The viewer + beauty exe turn
+    // it ON. With a fixed scene+camera the ground draw is itself deterministic.
+    bool        draw_ground = false;
+
+    // When draw_ground is on and the caller leaves auto-framing on (no camera
+    // override and no authored camera), the renderer frames the scene as a 3/4
+    // hero shot (robot filling ~60-70% of the frame, slight level/down gaze). The
+    // beauty/viewer path enables this; the gates keep their plain auto-frame.
+    bool        hero_framing = false;
 };
 
 // ---------------------------------------------------------------------------
