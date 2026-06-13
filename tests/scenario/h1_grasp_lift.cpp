@@ -35,7 +35,7 @@
 // weight_kick = cup_mass·(−gravity_z)·dt = 0.2·9.81·(1/240) ≈ 8.175e-3.
 //
 // PURE .nks: this gate links nuka_scene_cook (the cook) + the coresident bridge
-// (BuildNkUnionModel + the BatchedSceneTemplate struct, both alive to M9), NOT
+// (BuildNkUnionModel + the UnionSceneTemplate struct, both alive to M9), NOT
 // the factory. The inline constexpr scene constants (kH1UnionDt /
 // kH1UnionGravityZ / the asset paths) come from scene/cook/union_scene_constants.hpp
 // (their post-factory home, M7 T6); the factory is fully deleted.
@@ -55,7 +55,7 @@
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/device_context.hpp"
-#include "runtime/coresident/h1_union_nk_model.hpp"
+#include "scene/cook/union_nk_model.hpp"
 #include "scene/cook/union_cook.hpp"
 #include "scene/cook/union_scene_constants.hpp"  // constants (post-factory home)
 #include "scene/format/nks.hpp"
@@ -236,7 +236,7 @@ CookedWorld CookFromNks() {
     CookedWorld cw;
     const nuka::scene::SceneIR scene = nuka::scene::nks::Load(kNksPath);
     cw.cooked = cook::CookSceneToUnionTemplate(scene, 1);
-    const coresident::BatchedSceneTemplate& t = cw.cooked.tmpl;
+    const coresident::UnionSceneTemplate& t = cw.cooked.tmpl;
     const nk::Model model = coresident::BuildNkUnionModel(t, 1u);
     cw.links = cw.cooked.link_count;
     cw.cup_local = t.cup_local_index;

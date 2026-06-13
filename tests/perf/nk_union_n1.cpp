@@ -25,7 +25,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/device_context.hpp"
-#include "runtime/coresident/h1_union_nk_model.hpp"
+#include "scene/cook/union_nk_model.hpp"
 #include "scene/cook/union_cook.hpp"
 #include "scene/cook/union_scene_constants.hpp"
 #include "scene/format/nks.hpp"
@@ -44,7 +44,7 @@ bool AssetsAvailable() {
            std::filesystem::exists(cook::kH1UnionCupDefault);
 }
 
-// Cook the AUTHORED .nks union scene into the BatchedSceneTemplate (replacing
+// Cook the AUTHORED .nks union scene into the UnionSceneTemplate (replacing
 // the deleted factory BuildH1UnionScene — proven equivalent to ~1e-8 by the
 // h1_grasp_lift gate). Same product surface (tmpl + drive tables + grip dofs +
 // scene scalars) the perf gate reads.

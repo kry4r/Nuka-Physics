@@ -670,10 +670,10 @@ if(CMAKE_CUDA_COMPILER)
         scene/cook/settle.cpp
         scene/cook/placement.cpp
         # M7 T4 (THE CRUX): CookSceneToUnionTemplate — the .nks h1_cup_table ->
-        # union BatchedSceneTemplate cook that REPLACES the 1026-line
+        # union UnionSceneTemplate cook that REPLACES the 1026-line
         # h1_union_scene_factory authoring (reads the baked settled IC + grasp
         # config instead of running FK/placement/settle). Produces the
-        # coresident::BatchedSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld
+        # coresident::UnionSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld
         # consume (those + the struct stay alive to M9 per R1/R2/R3). Pure host
         # C++; the coresident dep is header-only product types (no kernels).
         scene/cook/union_cook.cpp

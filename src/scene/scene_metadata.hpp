@@ -10,7 +10,7 @@
 // (30 wrap spheres + 4 foot spheres bound to imported H1 links by NAME+OFFSET)
 // and the DRIVE TABLES are authoring CONFIG, not scene-graph objects: they bind
 // to links the H1 import owns, by name, and reproduce the factory's
-// BatchedSceneTemplate. The .nks `tree` carries the first-class objects (the H1
+// UnionSceneTemplate. The .nks `tree` carries the first-class objects (the H1
 // import, the cup body, the table body); this block carries the factory's ~120
 // empirical constants so T4 can rebuild the union template WITHOUT the factory.
 //

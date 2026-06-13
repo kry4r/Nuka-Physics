@@ -1,13 +1,13 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// DEPRECATED(M9): this whole file (BatchedUnifiedWorld + BatchedSceneTemplate +
+// DEPRECATED(M9): this whole file (BatchedUnifiedWorld + UnionSceneTemplate +
 // H1UnionDriveEntry) lives in src/runtime/coresident/, the legacy directory the
 // plan deletes WHOLE at M9. It is KEPT ALIVE through M8 ON PURPOSE (controller
 // R1/R2): BatchedUnifiedWorld is the union parity ORACLE (h1_union_parity), and
-// the BatchedSceneTemplate STRUCT is the cook's product type (the M7 .nks cook,
-// src/scene/cook/union_cook, produces a BatchedSceneTemplate that
+// the UnionSceneTemplate STRUCT is the cook's product type (the M7 .nks cook,
+// src/scene/cook/union_cook, produces a UnionSceneTemplate that
 // BuildNkUnionModel + BatchedUnifiedWorld consume identically to the now-deleted
-// factory). The M9 exit gate zeroes BatchedSceneTemplate's grep when the native
+// factory). The M9 exit gate zeroes UnionSceneTemplate's grep when the native
 // CookToModel->UnionCsr path lands. Do NOT add NEW non-test consumers.
 // ---------------------------------------------------------------------------
 // nuka::runtime::coresident -- BatchedUnifiedWorld (v0.8 P2). The GENERAL,
@@ -69,7 +69,7 @@
 #include "runtime/articulation/articulation_state.hpp"  // ArticulationHostState / DeviceBuffers
 #include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResidentFingertip / CoResidentCup
 #include "runtime/rigid/body_state.hpp"
-// M9 T3 relocation: H1UnionDriveEntry + BatchedSceneTemplate + kDefaultResetCupJitterM
+// M9 T3 relocation: H1UnionDriveEntry + UnionSceneTemplate + kDefaultResetCupJitterM
 // (the plain-data cook-product structs) were MOVED OUT of this doomed file into
 // src/scene/cook/union_scene_template.hpp so the union cook can drop its dependency
 // on this coresident header. They stay in nuka::runtime::coresident (no layout/
@@ -153,7 +153,7 @@ struct ObsStateBatch {
 class BatchedUnifiedWorld {
 public:
     BatchedUnifiedWorld(const phi::DeviceContext& context,
-                        const BatchedSceneTemplate& scene_template,
+                        const UnionSceneTemplate& scene_template,
                         uint32_t env_count,
                         float gravity_z,
                         float dt);

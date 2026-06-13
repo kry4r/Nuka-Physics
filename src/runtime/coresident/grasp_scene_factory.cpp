@@ -3,7 +3,7 @@
 // PROMOTED VERBATIM from the test helpers (tests/coresident/test_batched_unified_world.cpp
 // LoadGraspCupHull / BuildGraspGripper / BuildGraspSceneBundle / MakeGraspTemplate)
 // so the test can delegate to THIS code and keep its 21 gates byte-identical, and
-// so the C-ABI grasp world builds the SAME validated BatchedSceneTemplate. The ONLY
+// so the C-ABI grasp world builds the SAME validated UnionSceneTemplate. The ONLY
 // change is parametrizing the cup asset path (an argument, not the kCupModelUsda
 // literal). NO physics / numeric change.
 // ---------------------------------------------------------------------------
@@ -172,8 +172,8 @@ GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_forc
     return gs;
 }
 
-BatchedSceneTemplate MakeGraspTemplate(const GraspSceneBundle& gs) {
-    BatchedSceneTemplate tmpl;
+UnionSceneTemplate MakeGraspTemplate(const GraspSceneBundle& gs) {
+    UnionSceneTemplate tmpl;
     tmpl.bodies_per_env = {gs.config.cup_state};
     tmpl.has_grasp = true;
     tmpl.gripper_proto = gs.gripper.host;

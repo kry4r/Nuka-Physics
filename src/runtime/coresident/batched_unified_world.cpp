@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // DEPRECATED(M9): src/runtime/coresident/ is deleted WHOLE at M9. KEPT ALIVE
 // through M8 (controller R1/R2): BatchedUnifiedWorld is the union parity ORACLE
-// (h1_union_parity) and consumes the BatchedSceneTemplate the M7 .nks cook now
+// (h1_union_parity) and consumes the UnionSceneTemplate the M7 .nks cook now
 // produces (the factory that used to author it is DELETED). No NEW consumers.
 // ---------------------------------------------------------------------------
 // nuka::runtime::coresident::BatchedUnifiedWorld -- implementation (v0.8 P2.2).
@@ -191,7 +191,7 @@ amf::PrimParams FootSpherePrim(const Vec3& center, float radius) {
 
 BatchedUnifiedWorld::BatchedUnifiedWorld(
     const phi::DeviceContext& context,
-    const BatchedSceneTemplate& scene_template,
+    const UnionSceneTemplate& scene_template,
     uint32_t env_count,
     float gravity_z,
     float dt)

@@ -157,7 +157,7 @@ struct ModelMaterialBucket {
 enum class ContactFamily : uint8_t { FusedFoot = 0, UnionCsr = 1, PairDriven = 2 };
 
 // One union contact-pair slot (the per-env contact template, replicated across
-// envs; the legacy BatchedSceneTemplate fingertips/feet/table classes 1:1).
+// envs; the legacy UnionSceneTemplate fingertips/feet/table classes 1:1).
 // Worst-case manifold points: sphere classes -> 1, box x plane -> 4. Each point
 // expands to 1 normal row + (condim>=2 ? 2*(condim-1) : 0) friction-spoke rows
 // (the EmitCompliantContactRows layout: ALL normals first, then ALL spokes).
