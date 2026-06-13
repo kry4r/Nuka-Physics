@@ -10,10 +10,6 @@
 // curl held at the settled q, table ON) — the maximal steady contact set
 // (feet + fingers + table rows live every step). The drive torque is constant
 // (uploaded once): the timing loop is pure StepPlanned.
-//
-// Also prints the LEGACY BatchedUnifiedWorld wall on the SAME scene/drive for
-// the before/after record (not a gate — the legacy path is the known
-// pathology this milestone retires).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -29,7 +25,6 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/device_context.hpp"
-#include "runtime/coresident/batched_unified_world.hpp"
 #include "runtime/coresident/h1_union_nk_model.hpp"
 #include "scene/cook/union_cook.hpp"
 #include "scene/cook/union_scene_constants.hpp"
@@ -62,7 +57,6 @@ cook::CookedUnionScene CookUnionScene(int env_count) {
 
 TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
     // NOTE: the backend deliberately outlives this test body (the World's
     // dtor frees its plan through the backend vtable) — freed at process exit.
     nphi::Device* dev = nphi::InitBestDevice();
@@ -185,23 +179,6 @@ TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
     }
 
     EXPECT_LE(ms_per_step, 5.0) << "the plan §5 union N=1 red line is BROKEN";
-
-    // ---- the legacy baseline (printed, not gated) ---------------------------
-    {
-        coresident::BatchedUnifiedWorld legacy(context, sc.tmpl, 1u,
-                                               cook::kH1UnionGravityZ, dt);
-        constexpr uint32_t kLegacySteps = 50u;
-        for (uint32_t s = 0; s < 5u; ++s) legacy.Step();
-        const auto l0 = std::chrono::steady_clock::now();
-        for (uint32_t s = 0; s < kLegacySteps; ++s) legacy.Step();
-        const auto l1 = std::chrono::steady_clock::now();
-        const double legacy_ms =
-            std::chrono::duration<double, std::milli>(l1 - l0).count() /
-            kLegacySteps;
-        std::printf("[NK-UNION-N1] legacy BatchedUnifiedWorld baseline: %.3f "
-                    "ms/step (same scene; %.1fx vs nk)\n",
-                    legacy_ms, legacy_ms / ms_per_step);
-    }
 }
 
 // ===========================================================================

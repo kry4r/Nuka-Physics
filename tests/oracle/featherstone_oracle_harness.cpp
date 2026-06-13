@@ -9,7 +9,6 @@
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
-#include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
 
@@ -952,16 +951,19 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
 
 // (4) The full batched CONTACT chain (FK -> foot narrowphase -> tangent ->
 // CRBA/factor -> chain-J/m_eff/rows -> fused solve -> integrate -> wrench
-// readout) BYTE-EXACT vs the production BatchedArticulatedWorld, N=4 envs,
-// 200 steps, active ground contacts (the perf-gate scene constants).
-TEST(FeatherstoneOracle, NkWorldBatchedContactStepByteExactVsLegacy) {
+// readout) through nk::World, N=4 envs, 200 steps, active ground contacts (the
+// perf-gate scene constants). The CUDA-graph plan (StepPlanned) must reproduce
+// the dispatch path (Step) BYTE-FOR-BYTE through the full contact chain — the
+// active-contact counterpart of the contact-free 1200-step plan-replay gate in
+// NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact. (M3/M4 already certified the
+// nk contact chain byte-exact vs the legacy batched articulated world it
+// replaced; the nk path is now authority, so this gate is nk-only.)
+TEST(FeatherstoneOracle, NkWorldBatchedContactStepPlannedByteExact) {
     const auto scene_path = SourcePath("examples/scenes/go2_stand.usda");
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "Go2 stand scene is not available";
     }
 
-    namespace articulation = nuka::runtime::articulation;
-    namespace gpu = nuka::runtime::gpu;
     constexpr float kDt = 1.0f / 240.0f;
     constexpr float kGravityZ = -9.81f;
     constexpr float kGround = 0.31f;            // perf-gate seat (active contacts)
@@ -987,9 +989,6 @@ TEST(FeatherstoneOracle, NkWorldBatchedContactStepByteExactVsLegacy) {
         return std::make_unique<nk::World>(std::move(cooked.model), kEnvs, fx.dev,
                                            fx.backend, cfg);
     };
-    const auto cooked_ref = nuka::scene::cook::CookToModel(scene, 1);
-    const auto hold = cooked_ref.model.hold_drives;   // copy for the legacy arm
-    const auto feet_tpl = cooked_ref.model.feet;      // copy for the legacy arm
     auto world_ptr = MakeContactWorld();
     nk::World& world = *world_ptr;
     ASSERT_TRUE(world.Ready());
@@ -1005,144 +1004,33 @@ TEST(FeatherstoneOracle, NkWorldBatchedContactStepByteExactVsLegacy) {
     // --- StepPlanned twin WITH ACTIVE CONTACTS: the CUDA-graph plan must
     // reproduce the dispatch path byte-for-byte through the full contact chain
     // (complements the contact-free stand gate's 1200-step identity).
-    {
-        auto planned = MakeContactWorld();
-        ASSERT_TRUE(planned->Ready());
-        for (uint32_t step = 0; step < kSteps; ++step) {
-            ASSERT_EQ(planned->StepPlanned(), nphi::Status::Ok)
-                << "StepPlanned failed at step " << step;
-        }
-        nphi::BackendSynchronize(fx.backend);
-        std::vector<float> q_step(total_links), q_plan(total_links);
-        std::vector<float> l_step(world.GetModel().capacities.max_rows_per_env * kEnvs);
-        std::vector<float> l_plan(l_step.size());
-        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Q, q_step.data(),
-                                                  q_step.size() * 4));
-        ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Q, q_plan.data(),
-                                                     q_plan.size() * 4));
-        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Lambda, l_step.data(),
-                                                  l_step.size() * 4));
-        ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Lambda, l_plan.data(),
-                                                     l_plan.size() * 4));
-        EXPECT_EQ(std::memcmp(q_step.data(), q_plan.data(), q_step.size() * 4), 0)
-            << "StepPlanned q diverges from Step under active contacts";
-        EXPECT_EQ(std::memcmp(l_step.data(), l_plan.data(), l_step.size() * 4), 0)
-            << "StepPlanned lambda diverges from Step under active contacts";
-    }
-
-    // --- legacy production world (the byte-exact reference).
-    const auto blob = nuka::scene::CookScene(scene);
-    const auto built = nuka::runtime::BuildWorld(blob);
-    auto base_host = articulation::BuildArticulationHostState(
-        built.template_view.articulations, built.template_view.body_table);
-    const uint32_t max_dof = articulation::ArticulationDofCount(base_host, 0u);
-    auto batched_host = articulation::ReplicateArticulationHostState(base_host, kEnvs);
-
-    std::vector<articulation::FootShape> feet;
-    for (const auto& f : feet_tpl) {
-        articulation::FootShape foot;
-        foot.calf_local_link = f.calf_local_link;
-        foot.local_offset = f.local_offset;
-        foot.radius = f.radius;
-        feet.push_back(foot);
-    }
-
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
-    gpu::BatchedArticulatedWorld bw(context, batched_host, feet, max_dof, kGround);
-
-    auto upload_replicated = [&](const std::vector<float>& base) {
-        std::vector<float> tiled(base.size() * kEnvs);
-        for (uint32_t e = 0; e < kEnvs; ++e) {
-            for (size_t i = 0; i < base.size(); ++i) {
-                tiled[e * base.size() + i] = base[i];
-            }
-        }
-        nuka::phi::Buffer b(tiled.size() * sizeof(float), nuka::phi::MemoryKind::Device);
-        b.CopyFromHost(tiled.data(), tiled.size() * sizeof(float));
-        return b;
-    };
-    nuka::phi::Buffer d_targets = upload_replicated(hold.targets);
-    nuka::phi::Buffer d_stiffness = upload_replicated(hold.stiffness);
-    nuka::phi::Buffer d_damping = upload_replicated(hold.damping);
-    nuka::phi::Buffer d_limits = upload_replicated(hold.force_limits);
-
-    gpu::BatchedArticulatedStepParams params;
-    params.drive_targets = static_cast<const float*>(d_targets.Data());
-    params.drive_stiffness = static_cast<const float*>(d_stiffness.Data());
-    params.drive_damping = static_cast<const float*>(d_damping.Data());
-    params.drive_force_limits = static_cast<const float*>(d_limits.Data());
-    params.gravity_z = kGravityZ;
-    params.dt = kDt;
-    params.baumgarte_max_velocity = kBaumgarteMaxVel;
+    auto planned = MakeContactWorld();
+    ASSERT_TRUE(planned->Ready());
     for (uint32_t step = 0; step < kSteps; ++step) {
-        bw.Step(params);
+        ASSERT_EQ(planned->StepPlanned(), nphi::Status::Ok)
+            << "StepPlanned failed at step " << step;
     }
-    context.stream.Synchronize();
+    nphi::BackendSynchronize(fx.backend);
 
-    // --- byte-exact comparison: q / qdot / link_velocity / base_pose / lambda /
-    // link contact wrench.
-    articulation::ArticulationHostState legacy_out = batched_host;
-    bw.Download(&legacy_out);
-    const std::vector<float> legacy_lambda = bw.DownloadLambda();
-    const std::vector<float> legacy_wrench = bw.DownloadLinkContactWrench();
-
-    std::vector<float> nk_q(total_links), nk_qdot(total_links);
-    std::vector<float> nk_linkvel(static_cast<size_t>(total_links) * 6u);
-    std::vector<nuka::math::Transform> nk_base(kEnvs);
     const uint32_t row_slots = world.GetModel().capacities.max_rows_per_env * kEnvs;
-    std::vector<float> nk_lambda(row_slots);
-    std::vector<float> nk_wrench(static_cast<size_t>(total_links) * 6u);
-    auto& d = world.GetData();
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::Q, nk_q.data(), nk_q.size() * 4));
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::Qdot, nk_qdot.data(), nk_qdot.size() * 4));
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::LinkVelocity, nk_linkvel.data(),
-                                nk_linkvel.size() * 4));
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::BasePose, nk_base.data(),
-                                nk_base.size() * sizeof(nuka::math::Transform)));
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::Lambda, nk_lambda.data(),
-                                nk_lambda.size() * 4));
-    ASSERT_TRUE(d.DownloadField(nk::FieldId::LinkContactWrench, nk_wrench.data(),
-                                nk_wrench.size() * 4));
-
-    ASSERT_EQ(legacy_out.q.size(), nk_q.size());
-    ASSERT_EQ(legacy_lambda.size(), nk_lambda.size());
-    size_t mismatches = 0;
-    auto expect_eq = [&](float a, float b, const char* what, size_t i) {
-        if (mismatches < 8 && std::memcmp(&a, &b, sizeof(float)) != 0) {
-            ADD_FAILURE() << what << "[" << i << "] NOT byte-exact: nk=" << a
-                          << " legacy=" << b;
-            ++mismatches;
-        }
-    };
-    for (size_t i = 0; i < nk_q.size(); ++i) {
-        expect_eq(nk_q[i], legacy_out.q[i], "q", i);
-        expect_eq(nk_qdot[i], legacy_out.qdot[i], "qdot", i);
-        for (uint32_t k = 0; k < 6u; ++k) {
-            expect_eq(nk_linkvel[i * 6u + k], legacy_out.link_velocity[i].v[k],
-                      "link_velocity", i * 6u + k);
-        }
-    }
-    for (uint32_t e = 0; e < kEnvs; ++e) {
-        expect_eq(nk_base[e].position.x, legacy_out.base_pose[e].position.x, "base_pos.x", e);
-        expect_eq(nk_base[e].position.y, legacy_out.base_pose[e].position.y, "base_pos.y", e);
-        expect_eq(nk_base[e].position.z, legacy_out.base_pose[e].position.z, "base_pos.z", e);
-        expect_eq(nk_base[e].rotation.w, legacy_out.base_pose[e].rotation.w, "base_rot.w", e);
-        expect_eq(nk_base[e].rotation.x, legacy_out.base_pose[e].rotation.x, "base_rot.x", e);
-        expect_eq(nk_base[e].rotation.y, legacy_out.base_pose[e].rotation.y, "base_rot.y", e);
-        expect_eq(nk_base[e].rotation.z, legacy_out.base_pose[e].rotation.z, "base_rot.z", e);
-    }
-    for (size_t i = 0; i < nk_lambda.size(); ++i) {
-        expect_eq(nk_lambda[i], legacy_lambda[i], "lambda", i);
-    }
-    for (size_t i = 0; i < nk_wrench.size(); ++i) {
-        expect_eq(nk_wrench[i], legacy_wrench[i], "link_contact_wrench", i);
-    }
-    EXPECT_EQ(mismatches, 0u)
-        << "nk batched contact step diverges from BatchedArticulatedWorld";
+    std::vector<float> q_step(total_links), q_plan(total_links);
+    std::vector<float> l_step(row_slots), l_plan(row_slots);
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Q, q_step.data(),
+                                              q_step.size() * 4));
+    ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Q, q_plan.data(),
+                                                 q_plan.size() * 4));
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::Lambda, l_step.data(),
+                                              l_step.size() * 4));
+    ASSERT_TRUE(planned->GetData().DownloadField(nk::FieldId::Lambda, l_plan.data(),
+                                                 l_plan.size() * 4));
+    EXPECT_EQ(std::memcmp(q_step.data(), q_plan.data(), q_step.size() * 4), 0)
+        << "StepPlanned q diverges from Step under active contacts";
+    EXPECT_EQ(std::memcmp(l_step.data(), l_plan.data(), l_step.size() * 4), 0)
+        << "StepPlanned lambda diverges from Step under active contacts";
 
     // Active-contact sanity: the seat actually fires contacts (the gate is not
     // vacuously comparing zeros).
     float lambda_sum = 0.0f;
-    for (float v : nk_lambda) lambda_sum += std::abs(v);
+    for (float v : l_step) lambda_sum += std::abs(v);
     EXPECT_GT(lambda_sum, 0.0f) << "no contact impulse — the contact gate is vacuous";
 }
