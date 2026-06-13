@@ -1,16 +1,33 @@
+// ---------------------------------------------------------------------------
+// nuka::c_abi -- the RL zero-copy state-buffer view (M9 T5/T6 cutover).
+//
+// Every public state field is now served DIRECTLY from the ONE generic
+// nk::World's Data/Model arena: device_ptr = world->FieldPtr(field_id),
+// element_count = Model::capacities.ElementCount(field_id) (the logical
+// stride-sized element count, env-major). The per-field stride/dtype/FieldId come
+// from the single source dlpack_table.hpp (the RL binary contract) -- BYTE-
+// IDENTICAL to the legacy path. The legacy single-env host round-trip and the
+// batched-world device-buffer arms are deleted.
+//
+// The 4 control-input fields (TORQUE_INPUT/VELOCITY_TARGET/ACTUATOR_NOLOAD_SPEED/
+// TASK_TARGET) map to kNoFieldId -- they were the non-PD control surface served
+// by the deleted batched world's owned param buffers. Non-PD control is an M10
+// named gap (RL-adjacent, rebuilt on the nk world at M10), so they return
+// NOT_SUPPORTED here rather than aliasing a non-existent buffer.
+// ---------------------------------------------------------------------------
+
 #include "c_abi/dlpack_table.hpp"
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+
+#include "nk/pipeline/world.hpp"
 
 #include <exception>
 
 namespace {
 
 // Stamp the canonical per-field stride + wire dtype from dlpack_table.hpp onto
-// the view. This is the SINGLE source of the RL binary contract's stride/dtype
-// (the data pointer + element_count are still filled by each field arm from its
-// live device buffer; M9 T1 centralizes the descriptor, T5 rewires the source).
-// Returns false if `field` is not a known public field (caller -> NOT_SUPPORTED).
+// the view. The SINGLE source of the RL binary contract's stride/dtype.
 inline bool StampFieldDescriptor(nuka_state_field_t field,
                                  nuka_buffer_view_t* out) {
     const nuka::c_abi::DlpackFieldRow* row =
@@ -42,268 +59,45 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
     if (record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-
-    // TODO(M9-T5): the per-field DATA-SOURCE below still reads the legacy single-
-    // env record buffers / the batched world device buffers. T5 rewires those
-    // pointers to nk::World's Data field (FieldPtr by row.field_id from
-    // dlpack_table.hpp) while this descriptor stamping stays byte-identical.
+    if (!record->world) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
 
     try {
-        // --- Multi-env batched path (env_count > 1) -----------------------
-        // Serve the batched device buffers zero-copy (env-major). All of q/qdot/
-        // drive-targets have length env_count * base_link_count and the IDENTICAL
-        // env-major layout (index env*base_link_count + link). ARTICULATION_LINK_POSE
-        // exposes the live per-link world pose (math::Transform, 7 floats). No host
-        // round-trip / RefreshWorldBuffers on this arm.
-        //
-        // Layout reference (env-major; base_link_count = state.total_link_count /
-        // env_count; the articulation ROOT/base is local link 0, so env e's base is
-        // element e*base_link_count). math::Transform = {Vec3 position(px,py,pz),
-        // Quat rotation(qw,qx,qy,qz)} == 7 contiguous floats / 28 bytes, NO padding;
-        // NOTE the quaternion order is w,x,y,z (w FIRST), not the common xyzw.
-        if (record->batched != nullptr) {
-            auto& batched = *record->batched;
-            if (field == NUKA_FIELD_JOINT_POSITION) {
-                const auto state = batched.View();
-                out->device_ptr = state.q;
-                out->element_count = state.total_link_count;
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_JOINT_VELOCITY) {
-                const auto state = batched.View();
-                out->device_ptr = state.qdot;
-                out->element_count = state.total_link_count;
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_ARTICULATION_LINK_POSE) {
-                // Live per-link WORLD pose, refreshed each Step by the batched
-                // pipeline's UpdateWorldLinkPoses (stage 4). element_count ==
-                // env_count * base_link_count; the base/root of env e is element
-                // e*base_link_count (root == local link 0). Each element is a
-                // math::Transform = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
-                // CAVEAT: UpdateWorldLinkPoses runs from the PRE-integrate q (stage
-                // 4) while q itself is advanced at stage 11 with no later FK, so
-                // after Step() returns link_pose reflects the PREVIOUS step's q
-                // (one-step lag vs JOINT_POSITION). Before the first Step it is the
-                // cooked rest pose (not the assembled FK pose). Both are intrinsic
-                // to the validated T6 step and intentionally not "fixed" here.
-                const auto state = batched.View();
-                out->device_ptr = state.link_pose;
-                out->element_count = state.total_link_count;
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_BASE_POSE) {
-                // AUTHORITATIVE per-env floating-base root world pose: the
-                // internal base_pose[articulation] buffer the integrator advances
-                // (stage 11) and reset_envs restores from the creation snapshot.
-                // element_count == articulation_count == env_count (ONE Transform
-                // per env, NOT per link); each element is a math::Transform == 7
-                // floats [px,py,pz, qw,qx,qy,qz] (quat w-first), the SAME element
-                // layout as ARTICULATION_LINK_POSE's ROOT slot. UNLIKE that field
-                // it carries NO one-step FK lag: it is correct after Step() and --
-                // the property RL autoreset depends on -- correct IMMEDIATELY after
-                // reset_envs with no further step (the lagged ARTICULATION_LINK_POSE
-                // still shows the pre-reset/fallen pose until the next Step's FK).
-                const auto state = batched.View();
-                out->device_ptr = state.base_pose;
-                out->element_count = state.articulation_count;
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_DRIVE_TARGET) {
-                // WRITABLE view aliasing the live per-env PD drive-target buffer
-                // that batched_step_params.drive_targets points at. Writing it in
-                // place (device-to-device or host-to-device) is picked up by the
-                // NEXT nuka_world_step. Same layout as JOINT_POSITION: float[
-                // env_count*base_link_count], env-major. Only actuated links (those
-                // with non-zero drive stiffness) act on their target.
-                if (record->batched_drive_targets_device.Size() == 0u) {
-                    return NUKA_RESULT_NOT_SUPPORTED;
-                }
-                out->device_ptr = record->batched_drive_targets_device.Data();
-                out->element_count =
-                    record->batched_drive_targets_device.Size() / sizeof(float);
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_LINK_VELOCITY) {
-                // READ-only per-link spatial velocity, env-major, SAME indexing
-                // as ARTICULATION_LINK_POSE (element_count == env_count*
-                // base_link_count; env e's root == element e*base_link_count).
-                // Each element is a LinkSpatialVel == 6 floats [wx,wy,wz, vx,vy,vz]
-                // (omega-first). The ROOT slot is the live floating-base spatial
-                // velocity in the ROOT-LINK BODY frame (already body-local; written
-                // post-integrate AND post-contact each Step, so no link_pose-style
-                // lag). Non-root slots are Featherstone per-link-local velocities
-                // and are not the policy observation (see nuka.h).
-                const auto state = batched.View();
-                out->device_ptr = state.link_velocity;
-                out->element_count = state.total_link_count;
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_DRIVE_STIFFNESS ||
-                field == NUKA_FIELD_DRIVE_DAMPING ||
-                field == NUKA_FIELD_DRIVE_FORCE_LIMIT) {
-                // WRITABLE views aliasing the live per-env PD GAIN buffers that
-                // batched_step_params.{drive_stiffness,drive_damping,
-                // drive_force_limits} point at. Writing them in place is picked up
-                // by the NEXT nuka_world_step. Same layout as DRIVE_TARGET:
-                // float[env_count*base_link_count], env-major. Only actuated links
-                // (slots 1..12) use their gains; root/slot-0 is a no-op.
-                const nuka::phi::Buffer& gains =
-                    (field == NUKA_FIELD_DRIVE_STIFFNESS)
-                        ? record->batched_drive_stiffness_device
-                        : (field == NUKA_FIELD_DRIVE_DAMPING)
-                              ? record->batched_drive_damping_device
-                              : record->batched_drive_force_limits_device;
-                if (gains.Size() == 0u) {
-                    return NUKA_RESULT_NOT_SUPPORTED;
-                }
-                out->device_ptr = const_cast<void*>(gains.Data());
-                out->element_count = gains.Size() / sizeof(float);
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_TORQUE_INPUT ||
-                field == NUKA_FIELD_VELOCITY_TARGET ||
-                field == NUKA_FIELD_ACTUATOR_NOLOAD_SPEED) {
-                // v0.5 C-fwd: WRITABLE views aliasing the batched world's owned,
-                // always-allocated control-input buffers (per-link, env-major;
-                // SAME layout as DRIVE_TARGET: float[env_count*base_link_count]).
-                // Writing them in place is picked up by the NEXT nuka_world_step
-                // WHEN the world's control_mode selects the matching mode
-                // (TORQUE_INPUT -> Torque/Actuator, VELOCITY_TARGET -> Velocity,
-                // ACTUATOR_NOLOAD_SPEED -> Actuator); otherwise the buffers exist
-                // but are never read. Allocated for every batched world so the view
-                // always succeeds.
-                const nuka::phi::Buffer& buf =
-                    (field == NUKA_FIELD_TORQUE_INPUT)
-                        ? batched.TorqueInputBuffer()
-                        : (field == NUKA_FIELD_VELOCITY_TARGET)
-                              ? batched.VelocityTargetBuffer()
-                              : batched.ActuatorNoloadSpeedBuffer();
-                if (buf.Size() == 0u) {
-                    return NUKA_RESULT_NOT_SUPPORTED;
-                }
-                out->device_ptr = const_cast<void*>(buf.Data());
-                out->element_count = buf.Size() / sizeof(float);
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_TASK_TARGET) {
-                // v0.5 C-fwd slice 3: WRITABLE per-ENV (NOT per-link) Osc task
-                // target. element_count == env_count, element_stride_bytes ==
-                // 3*sizeof(float) (a {x,y,z} world target per env). Aliases the
-                // batched world's owned, always-allocated buffer (write IN PLACE;
-                // picked up by the NEXT step WHEN control_mode == Osc, else exists
-                // but is never read). Separate branch from the per-link control
-                // fields because the layout/stride differ.
-                const nuka::phi::Buffer& buf = batched.TaskTargetBuffer();
-                if (buf.Size() == 0u) {
-                    return NUKA_RESULT_NOT_SUPPORTED;
-                }
-                out->device_ptr = const_cast<void*>(buf.Data());
-                StampFieldDescriptor(field, out);
-                // element_count derives from the canonical per-env float3 stride.
-                out->element_count = buf.Size() / out->element_stride_bytes;
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_CONTACT_POINTS) {
-                // Vec3 (3 floats) per contact slot; slot_count == env_count *
-                // kMaxFootContactsPerEnv. Inactive slots are zero (see T2 doc).
-                const nuka::phi::Buffer& points = batched.ContactPointBuffer();
-                out->device_ptr = const_cast<void*>(points.Data());
-                out->element_count = batched.SlotCount();
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_LINK_CONTACT_WRENCH) {
-                // p14a: net per-LINK world contact wrench. float[total_link_count*6],
-                // env-major by GLOBAL link index g, [g*6+0..2]=F, [g*6+3..5]=tau
-                // about the link frame origin. element_count == total_link_count,
-                // stride == 6*sizeof(float). Maintained eagerly each Step.
-                const nuka::phi::Buffer& wrench = batched.LinkContactWrenchBuffer();
-                out->device_ptr = const_cast<void*>(wrench.Data());
-                out->element_count = batched.TotalLinkCount();
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_CONTACT_NORMAL) {
-                // p14a: per-slot world unit normal (Vec3). Aliases the internal
-                // contact_normal_ buffer; SAME layout as CONTACT_POINTS.
-                const nuka::phi::Buffer& normal = batched.ContactNormalBuffer();
-                out->device_ptr = const_cast<void*>(normal.Data());
-                out->element_count = batched.SlotCount();
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_CONTACT_FORCE) {
-                // p14a: per-slot contact force {Fn,Ft1,Ft2} = lambda/dt (3 floats),
-                // contact-basis components. SAME layout as CONTACT_POINTS.
-                const nuka::phi::Buffer& force = batched.ContactForceBuffer();
-                out->device_ptr = const_cast<void*>(force.Data());
-                out->element_count = batched.SlotCount();
-                StampFieldDescriptor(field, out);
-                return NUKA_RESULT_OK;
-            }
-            if (field == NUKA_FIELD_CONTACT_LINK) {
-                // p14a: per-slot owning GLOBAL link index (uint32). Aliases the
-                // internal contact_link_ buffer. dtype == 1 (uint32) -- the ONLY
-                // non-float32 field. element_count == slot_count, stride ==
-                // sizeof(uint32). Inactive slots carry ~0u.
-                const nuka::phi::Buffer& link = batched.ContactLinkBuffer();
-                out->device_ptr = const_cast<void*>(link.Data());
-                out->element_count = batched.SlotCount();
-                StampFieldDescriptor(field, out);  // dtype == 1 (uint32) per table
-                return NUKA_RESULT_OK;
-            }
+        // Resolve the public field -> its canonical descriptor (stride/dtype +
+        // the nk::FieldId bridge). An unknown public field => NOT_SUPPORTED.
+        const nuka::c_abi::DlpackFieldRow* row =
+            nuka::c_abi::FindDlpackFieldRow(field);
+        if (row == nullptr) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
 
-        const nuka_result_t refresh_result = nuka::c_abi::RefreshWorldBuffers(*record);
-        if (refresh_result != NUKA_RESULT_OK) {
-            return refresh_result;
+        // The control-input params buffers (TORQUE_INPUT/VELOCITY_TARGET/
+        // ACTUATOR_NOLOAD_SPEED/TASK_TARGET) have no Arena field (kNoFieldId);
+        // their source was the deleted batched world. M10 named gap (non-PD
+        // control). Honest NOT_SUPPORTED rather than a dangling alias.
+        if (row->field_id == nuka::c_abi::kNoFieldId) {
+            return NUKA_RESULT_NOT_SUPPORTED;
         }
 
-        if (field == NUKA_FIELD_JOINT_POSITION) {
-            out->device_ptr = record->joint_position_buffer.Data();
-            out->element_count = record->joint_position_buffer.Size() / sizeof(float);
-            StampFieldDescriptor(field, out);
-            return NUKA_RESULT_OK;
+        // Serve the field DIRECTLY from the nk arena: the live device pointer +
+        // the logical element count (env-major, stride-sized elements). Writable
+        // fields (DriveTarget / the gain buffers) alias the live persistent Data
+        // field -- a write IN PLACE is picked up by the NEXT Step (the RL action
+        // surface contract).
+        void* ptr = record->world->FieldPtr(row->field_id);
+        if (ptr == nullptr) {
+            // Field has no allocated storage in this Model (e.g. a contact/SDF
+            // field on a scene with that capacity == 0). Honest NOT_SUPPORTED.
+            return NUKA_RESULT_NOT_SUPPORTED;
         }
-        if (field == NUKA_FIELD_JOINT_VELOCITY) {
-            out->device_ptr = record->joint_velocity_buffer.Data();
-            out->element_count = record->joint_velocity_buffer.Size() / sizeof(float);
-            StampFieldDescriptor(field, out);
-            return NUKA_RESULT_OK;
-        }
-        if (field == NUKA_FIELD_DRIVE_TARGET) {
-            // WRITABLE single-env PD drive-target buffer. This is the per-step
-            // ACTION the diff-sim tape consumes: nuka_world_step_with_tape
-            // (diffsim.cpp:173-174) reads record->drive_targets_device.Data() as
-            // its action each step, and the production single-env oracle drives
-            // from the SAME buffer (world.cpp:378). Aliasing it here (writable,
-            // device-to-device or host-to-device in place) lets Python set the
-            // tape's per-step action -- the gap that previously returned
-            // NOT_SUPPORTED on the single-env arm (env_count==1 ==> no batched
-            // arm to serve it). Layout: float[base_link_count], link-major; only
-            // actuated links (non-zero drive stiffness) act on their target.
-            // NOTE: record (non-const) ==> Buffer::Data() returns void* directly.
-            if (record->drive_targets_device.Size() == 0u) {
-                return NUKA_RESULT_NOT_SUPPORTED;
-            }
-            out->device_ptr =
-                const_cast<void*>(record->drive_targets_device.Data());
-            out->element_count =
-                record->drive_targets_device.Size() / sizeof(float);
-            StampFieldDescriptor(field, out);
-            return NUKA_RESULT_OK;
-        }
-        return NUKA_RESULT_NOT_SUPPORTED;
+        const uint64_t element_count =
+            record->world->GetModel().capacities.ElementCount(row->field_id);
+
+        out->device_ptr = ptr;
+        out->element_count = element_count;
+        StampFieldDescriptor(field, out);
+        return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

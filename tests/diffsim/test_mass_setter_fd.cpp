@@ -41,6 +41,7 @@
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 #include "diffsim/step_backward.hpp"
+#include "nk/pipeline/world.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cuda_runtime.h>
@@ -113,10 +114,21 @@ nuka_result_t CreateStandWorld(nuka_device_handle device, nuka_world_handle* out
 }
 
 // The world's live articulation device-state view (the buffers the tape evolves).
+// M9: the WorldRecord no longer owns a legacy ArticulationDeviceBuffers -- the
+// live state lives in the nk arena. Build the kernel-parameter view over the
+// arena via the SAME seam the diffsim c_abi uses
+// (MakeArticulationDeviceStateFromViews); link_inertia thus aliases the arena
+// LinkInertia field set_link_mass writes.
 articulation::ArticulationDeviceState DeviceState(nuka_world_handle world) {
     nuka::c_abi::WorldRecord* record = nuka::c_abi::WorldTable().Get(world);
     EXPECT_NE(record, nullptr);
-    return record->articulation_device.View();
+    const uint32_t total_link_count =
+        record->articulation_host.TotalLinkCount();
+    const uint32_t articulation_count =
+        record->articulation_host.ArticulationCount();
+    return articulation::MakeArticulationDeviceStateFromViews(
+        record->world->ModelViewRef(), record->world->DataViewRef(),
+        total_link_count, articulation_count);
 }
 
 // The cooked per-global-link (diagonal_inertia, inertial_frame) -- the SAME

@@ -18,6 +18,8 @@
 #include "diffsim/recompute_orchestrator.hpp"
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/pipeline/world.hpp"
 #include "phi/buffer_legacy.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -109,7 +111,8 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
     if (world_record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    if (world_record->articulation_device.Empty()) {
+    if (!world_record->world ||
+        world_record->articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
     }
     try {
@@ -121,17 +124,24 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         record->desc.recompute_on_backward = desc->recompute_on_backward;
 
         const auto& ctx = world_record->device->context;
-        // M3b/M9 SEAM: the diffsim machinery consumes ArticulationDeviceState —
-        // a pure pointer view. Today the pointers come from the legacy
-        // ArticulationDeviceBuffers below; when the c_abi switches WorldRecord
-        // to nk::World (M9) this ONE line becomes
-        //   articulation::MakeArticulationDeviceStateFromViews(
-        //       world->ModelViewRef(), world->DataViewRef(), links, artics)
-        // (the arena diff-field pointer source; algorithm/kernels untouched —
-        // proven bit-exact by AbaReverse.NkArenaSeamForwardReverseBitExact).
-        // M9 also moves the Tape action storage into the arena Tape buffer and
-        // op-ifies the backward family (plan §3.10 diffsim row).
-        const auto state = world_record->articulation_device.View();
+        // M9 SEAM (now LIVE): the diffsim machinery consumes ArticulationDeviceState
+        // -- a pure pointer view. The pointers now come from the nk arena via
+        // MakeArticulationDeviceStateFromViews(ModelView, DataView, links, artics):
+        // algorithm/kernels are UNTOUCHED (proven bit-exact by
+        // AbaReverse.NkArenaSeamForwardReverseBitExact). The legacy backward .cu
+        // kernels still run on the phi v1 ctx (the legacy DeviceContext stays in
+        // DeviceRecord until the backward op-ifies at T7). The diffsim path is
+        // single-env (the tape tests create env_count == 1), so the host mirror's
+        // single-env link/articulation counts == the arena's.
+        const uint32_t total_link_count =
+            world_record->articulation_host.TotalLinkCount();
+        const uint32_t articulation_count =
+            world_record->articulation_host.ArticulationCount();
+        const auto state =
+            nuka::runtime::articulation::MakeArticulationDeviceStateFromViews(
+                world_record->world->ModelViewRef(),
+                world_record->world->DataViewRef(), total_link_count,
+                articulation_count);
         record->total_link_count = state.total_link_count;
 
         diffsim::RolloutParams rp;
@@ -140,10 +150,14 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
 
         const auto mass_params = BuildMassParams(world_record->articulation_host);
 
+        // The PD gains source: the cook's hold-drive template on the Model (the
+        // legacy BuildHoldDriveTargets 1:1 -- byte-identical stiffness = gain,
+        // damping = 2*sqrt(gain), force_limits). RolloutParams reads them host-side.
+        const nuka::nk::ModelHoldDrives& drives =
+            world_record->world->GetModel().hold_drives;
         record->orchestrator = std::make_unique<diffsim::RecomputeOrchestrator>(
-            ctx, state, rp, world_record->drive_stiffness_host,
-            world_record->drive_damping_host,
-            world_record->drive_force_limits_host, mass_params);
+            ctx, state, rp, drives.stiffness, drives.damping, drives.force_limits,
+            mass_params);
         record->tape = std::make_unique<diffsim::Tape>(ctx, record->desc,
                                                        record->total_link_count);
         // Contact-free path: lambda_width 0 (the R2 slot is present-but-unused).
@@ -178,10 +192,16 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
     }
     try {
         const auto& ctx = world_record->device->context;
-        // The action this step is the world's current DRIVE_TARGET buffer (the
-        // policy writes it through the buffer view before each step).
-        const float* action = static_cast<const float*>(
-            world_record->drive_targets_device.Data());
+        // The action this step is the world's current DRIVE_TARGET arena field
+        // (the policy writes it through the buffer view before each step). The
+        // cook seeds it to the hold-pose targets (SeedInitialState), so an
+        // un-written single-env tape records a constant hold action -- byte-
+        // identical to the legacy drive_targets_device the upload built.
+        const float* action =
+            world_record->world->FieldPtr<float>(nuka::nk::FieldId::DriveTarget);
+        if (action == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
 
         // K-cadence: capture a checkpoint at step 0, then every K steps. In
         // full-tape mode (recompute_on_backward==0), capture EVERY step.
@@ -386,7 +406,8 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
     if (world_record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    if (world_record->articulation_device.Empty()) {
+    if (!world_record->world ||
+        world_record->articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
     }
     auto& host = world_record->articulation_host;
@@ -446,10 +467,11 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
             nuka::runtime::articulation::MakeSpatialInertia(
                 mass, diagonal_inertia, inertial_frame);
 
-        // Update the host mirror (keeps a later DownloadArticulationState /
-        // re-upload consistent) and write the SINGLE link's 6x6 into the live
-        // device link_inertia buffer in place (offset link_index, no realloc).
-        // AbaPass1 reads link_inertia FRESH every step (CopySpatialInertia +
+        // Update the host mirror (keeps BuildMassParams / the DR nominal baseline
+        // consistent) and write the SINGLE link's 6x6 into the live nk arena
+        // LinkInertia field in place (offset link_index, no realloc). The diffsim
+        // seam reads link_inertia from THIS arena field (model_view.link_inertia),
+        // and AbaPass1 reads it FRESH every step (CopySpatialInertia +
         // Mat66MulVec6(I, v)), so the write takes effect on the NEXT step; there
         // is no derived/cached inertia to invalidate. dI/dmass is mass-independent
         // (affine), so the tape's uploaded slope needs no refresh.
@@ -457,8 +479,11 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
 
         const auto& ctx = world_record->device->context;
         auto* device_inertia =
-            static_cast<nuka::runtime::articulation::LinkSpatialInertia*>(
-                world_record->articulation_device.link_inertia.Data());
+            world_record->world->FieldPtr<nuka::runtime::articulation::LinkSpatialInertia>(
+                nuka::nk::FieldId::LinkInertia);
+        if (device_inertia == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
         nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
         cudaError_t copy_status = cudaMemcpyAsync(
             device_inertia + link_index, &new_inertia,

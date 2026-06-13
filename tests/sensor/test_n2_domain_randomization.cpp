@@ -22,6 +22,7 @@
 
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+#include "nk/pipeline/world.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "sensor/noise/n2_domain_randomization.hpp"
 #include "sensor/noise/noise_config.hpp"
@@ -116,7 +117,15 @@ nuka_domain_randomization_desc_t MakeDrDesc(uint64_t seed, int enabled) {
 float DownloadLinkMass(nuka_world_handle world, uint32_t link) {
     nuka::c_abi::WorldRecord* record = nuka::c_abi::WorldTable().Get(world);
     EXPECT_NE(record, nullptr);
-    const auto state = record->articulation_device.View();
+    // M9: the live link_inertia lives in the nk arena (the DR poke writes the
+    // LinkInertia field). Read it through the SAME seam the c_abi uses.
+    const uint32_t total_link_count =
+        record->articulation_host.TotalLinkCount();
+    const uint32_t articulation_count =
+        record->articulation_host.ArticulationCount();
+    const auto state = articulation::MakeArticulationDeviceStateFromViews(
+        record->world->ModelViewRef(), record->world->DataViewRef(),
+        total_link_count, articulation_count);
     articulation::LinkSpatialInertia inertia;
     cudaMemcpy(inertia.I, state.link_inertia[link].I, 36u * sizeof(float),
                cudaMemcpyDeviceToHost);

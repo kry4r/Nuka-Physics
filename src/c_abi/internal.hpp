@@ -8,10 +8,14 @@
 #include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
+// M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
+// nk::World). The diffsim + noise + set_link_mass paths still consume the legacy
+// ArticulationHostState/ArticulationDeviceState VIEW types as a kernel-parameter
+// surface (the M3b seam MakeArticulationDeviceStateFromViews builds that view
+// over the nk arena fields — algorithm/kernels untouched, proven bit-exact by
+// AbaReverse.NkArenaSeamForwardReverseBitExact), so articulation_state.hpp stays.
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/control_mode.hpp"
-#include "runtime/gpu/batched_articulated_world.hpp"
-#include "runtime/world_builder.hpp"
 #include "runtime/step_options.hpp"
 
 #include <memory>
@@ -21,6 +25,11 @@
 namespace nuka::scene {
 class SceneIR;  // scene/scene_ir.hpp -- fwd-declared (held by unique_ptr below).
 }  // namespace nuka::scene
+
+namespace nuka::nk {
+class World;  // nk/pipeline/world.hpp -- fwd-declared (held by unique_ptr below;
+              // complete in world.cpp where the World ctor runs).
+}  // namespace nuka::nk
 
 namespace nuka::c_abi {
 
@@ -61,21 +70,38 @@ struct DeviceRecord {
 };
 
 struct WorldRecord {
+    // M9 T5/T6: the ONE generic live sim — Scene->CookToModel->nk::World. Owns
+    // the device-resident Model+Data+Pipeline. BORROWS the DeviceRecord's phi v2
+    // backend (World::~World -> BackendPlanFree, never frees the backend), so it
+    // MUST be torn down BEFORE the DeviceRecord frees the backend. The two are
+    // separate handles/tables; by the public API contract nuka_world_destroy is
+    // called before nuka_device_destroy. Held by unique_ptr behind a forward
+    // declaration; the ctor/dtor are out-of-line in world.cpp (where nk::World is
+    // complete) so the other C-ABI TUs that touch WorldTable need not see it.
+    std::unique_ptr<nuka::nk::World> world;
+
     DeviceRecord* device = nullptr;
-    runtime::BuiltWorld world;
+
+    // dt / gravity scalars (formerly the legacy WorldStepOptions). Read by the
+    // diffsim RolloutParams + the InvariantWorldView; written by set_gravity_z /
+    // the DR gravity poke. enable_contacts/iters fields are inert here (the nk
+    // Pipeline owns its op schedule) but kept so the InvariantWorldView ctor and
+    // the diffsim/noise paths compile unchanged.
     runtime::WorldStepOptions step_options;
+
+    // --- Transitional diffsim/noise host mirror (M9 named gap; deleted at T7) -
+    // The diffsim backward family + set_link_mass + per-episode DR still consume
+    // the cooked per-link inertia params (mass / diagonal_inertia / inertial_frame
+    // / joint_armature) as HOST data to build dI/dmass + rebuild a link's spatial
+    // inertia in place. These are sourced from the SAME cook the legacy create
+    // used (CookArticulations -> BuildArticulationHostState), so BuildMassParams /
+    // ResolveLinkInertiaParams / CaptureNominalBaseline stay BYTE-IDENTICAL. The
+    // device writes (set_link_mass / DR) go to the nk arena's LinkInertia field
+    // (FieldPtr), NOT a legacy device buffer. Retired when the backward op-ifies
+    // at T7 (the dI/dmass slope then rides the Model). The articulations[] topo +
+    // link_inertia + joint_armature are the only members consumed.
     runtime::articulation::ArticulationHostState articulation_host;
-    runtime::articulation::ArticulationDeviceBuffers articulation_device;
-    std::vector<float> drive_targets_host;
-    std::vector<float> drive_stiffness_host;
-    std::vector<float> drive_damping_host;
-    std::vector<float> drive_force_limits_host;
-    phi::Buffer drive_targets_device;
-    phi::Buffer drive_stiffness_device;
-    phi::Buffer drive_damping_device;
-    phi::Buffer drive_force_limits_device;
-    phi::Buffer joint_position_buffer;
-    phi::Buffer joint_velocity_buffer;
+
     uint32_t simulated_step_count = 0u;
 
     // --- Sparse solver backend selection (v0.7 p01) -----------------------
@@ -85,38 +111,14 @@ struct WorldRecord {
     // land. Read at solver-construction time. A plain host scalar; no device state.
     uint32_t sparse_solver_backend = 0u;
 
-    // --- Single-env implicit joint-damping scratch (Option B unification) ---
-    // The single-env oracle path (StepWorldGpu) now runs the SAME general
-    // implicit joint damping as the batched contacts path. It needs the
-    // per-articulation joint-space inertia M and its inverse (M+dt*C)^-1 plus a
-    // composite-inertia scratch buffer for the CRBA. Allocated lazily on the
-    // first step (mirroring the lazy articulation_device upload) and reused for
-    // every step. `single_env_max_dof` is the articulation's DOF count (== the
-    // M tile stride); 0 until allocated.
-    uint32_t single_env_max_dof = 0u;
-    phi::Buffer single_env_inertia_m;
-    phi::Buffer single_env_inertia_m_inv;
-    phi::Buffer single_env_composite;
-
-    // --- Multi-env batched articulated path (p01-F T7) --------------------
-    // When env_count > 1 the world is driven through the batched articulated-
-    // with-contacts step path (T6) instead of the single-env Featherstone
-    // sequence. `batched` is null for the single-env (env_count == 1) oracle
-    // path, which stays byte-for-byte unchanged. The replicated drive buffers
-    // tile the base hold drives across all envs (link-major, length
-    // env_count * base_link_count) as BatchedArticulatedStepParams requires.
+    // Env count the World was cooked/built at (== nk::World::EnvCount()). Cached
+    // for the DR env-tiling math + the diffsim total_link_count derivation.
     uint32_t env_count = 1u;
-    // v0.5 C-fwd: stage-1 control mode chosen at world creation (default
-    // PDPosition). Non-PD modes require the batched path; the single-env oracle
-    // is PDPosition-only.
+    // Stage-1 control mode chosen at world creation. M9: only PDPosition is wired
+    // onto the generic nk::World; non-PD modes (Torque/Velocity/ComputedTorque/
+    // Osc/Actuator) are an M10 named gap (create rejects them with NOT_SUPPORTED).
     runtime::articulation::ControlMode control_mode =
         runtime::articulation::ControlMode::PDPosition;
-    std::unique_ptr<runtime::gpu::BatchedArticulatedWorld> batched;
-    runtime::gpu::BatchedArticulatedStepParams batched_step_params;
-    phi::Buffer batched_drive_targets_device;
-    phi::Buffer batched_drive_stiffness_device;
-    phi::Buffer batched_drive_damping_device;
-    phi::Buffer batched_drive_force_limits_device;
     core::diagnostics::InvariantSampler invariant_sampler{
         core::diagnostics::InvariantConfig{
             true,
@@ -154,7 +156,22 @@ struct WorldRecord {
     std::vector<float> dr_nominal_link_mass;       // per global link (kg)
     std::vector<float> dr_nominal_joint_armature;  // per global DOF
     float dr_nominal_gravity_z = 0.0f;
-    float dr_nominal_friction = 0.0f;  // batched contact path scalar (inert here)
+    // Nominal contact friction baseline. M9: the legacy batched contact step
+    // params are gone, so the DR friction multiplier no longer has a host scalar
+    // to poke (contact material lives on the nk Model material buckets); kept so
+    // CaptureNominalBaseline + the friction sample compile and stay inert (M10
+    // named gap — RL contact DR is rebuilt on the nk world at M10).
+    float dr_nominal_friction = 0.0f;
+
+    // Out-of-line so the unique_ptr<nk::World> member is destroyed where nk::World
+    // is complete (world.cpp). Declared (not defaulted here) for the same reason
+    // the SceneRecord uses out-of-line special members.
+    WorldRecord();
+    ~WorldRecord();
+    WorldRecord(WorldRecord&&) noexcept;
+    WorldRecord& operator=(WorldRecord&&) noexcept;
+    WorldRecord(const WorldRecord&) = delete;
+    WorldRecord& operator=(const WorldRecord&) = delete;
 };
 
 struct BufferRecord {
@@ -179,7 +196,5 @@ struct SceneRecord {
     SceneRecord(const SceneRecord&) = delete;
     SceneRecord& operator=(const SceneRecord&) = delete;
 };
-
-nuka_result_t RefreshWorldBuffers(WorldRecord& record) noexcept;
 
 } // namespace nuka::c_abi

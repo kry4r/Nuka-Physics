@@ -66,9 +66,16 @@ def test_world_metadata(device):
         assert w.dt > 0.0
 
 
-# v0.5 C-fwd slice 2: ComputedTorque (3) + Actuator (5) construct, step and expose
-# their control buffers through the binding (the engine forward + determinism are
-# covered by the C++ control-mode tests; this is the Python-binding smoke).
+# M10 NAMED GAP (M9 T5 unified-world cutover): non-PD control modes (Torque /
+# Velocity / ComputedTorque / Osc / Actuator) + their TORQUE_INPUT/VELOCITY_TARGET/
+# ACTUATOR_NOLOAD_SPEED/TASK_TARGET control buffers were served by the deleted
+# legacy batched world's owned param buffers. The generic nk::World wires only the
+# PDPosition drive in M9; non-PD control is RL-adjacent (recon ruling #3: ALL RL
+# deferred to M10) and is rebuilt on the nk world at M10. create_from_scene now
+# returns NOT_SUPPORTED for these modes (it does NOT silently mis-actuate), so the
+# binding smokes below are skipped until M10 re-lights the non-PD laws.
+@pytest.mark.skip(reason="M10 named gap: non-PD control modes deferred to M10 "
+                         "(M9 unified-world wires PDPosition only)")
 @pytest.mark.parametrize(
     "mode, field",
     [
@@ -89,6 +96,8 @@ def test_slice2_control_mode_world_steps(device, mode, field):
         assert torch.isfinite(q).all()
 
 
+@pytest.mark.skip(reason="M10 named gap: Osc control mode deferred to M10 "
+                         "(M9 unified-world wires PDPosition only)")
 def test_osc_mode_world_steps(device):
     # Osc (4, p03 R2): operational-space control, forward position task. The
     # binding smoke -- the world constructs in Osc mode (with a task link) and
