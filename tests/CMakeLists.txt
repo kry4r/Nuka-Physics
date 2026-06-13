@@ -3170,4 +3170,28 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
     gtest_discover_tests(nuka_render_physics_parity_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
+    # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
+    # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb
+    # backend) + nuka_render (the borrowed raster renderer). SKIPs cleanly with no
+    # display / no surface ext / no Vulkan device. RUN via:
+    #   VK_ICD_FILENAMES=<lavapipe icd> xvfb-run -a -s '-screen 0 1280x720x24' \
+    #     tests/nuka_viewport_present_smoke_test
+    add_executable(nuka_viewport_present_smoke_test
+        scenario/viewport_present_smoke.cpp
+    )
+    add_dependencies(nuka_viewport_present_smoke_test nuka_render_shaders)
+    target_compile_definitions(nuka_viewport_present_smoke_test
+        PRIVATE NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_viewport_present_smoke_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_viewport_present_smoke_test
+        PRIVATE
+            nuka_present
+            nuka_render
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_viewport_present_smoke_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

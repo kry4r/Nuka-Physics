@@ -234,21 +234,31 @@ struct GpuImage {
 // per-frame draw path.
 // ---------------------------------------------------------------------------
 struct VulkanRasterRenderer::Impl {
+    // M8.5 T2 present configuration. present_capable=false reproduces the M8
+    // offscreen renderer bit-for-bit (zero extra ext, graphics-only queue).
+    bool             present_capable = false;
+    VkSurfaceKHR     probe_surface  = VK_NULL_HANDLE;  // borrowed (NOT owned)
+
     VkInstance       instance       = VK_NULL_HANDLE;
     VkPhysicalDevice physical       = VK_NULL_HANDLE;
-    uint32_t         queue_family   = 0;
+    uint32_t         queue_family   = 0;          // graphics (== present when present_capable)
+    uint32_t         present_family = 0;          // present queue family (== queue_family here)
     VkPhysicalDeviceProperties props{};
     VkDevice         device         = VK_NULL_HANDLE;
     VkQueue          queue          = VK_NULL_HANDLE;
+    VkQueue          present_queue  = VK_NULL_HANDLE;  // == queue (shared family)
     VkCommandPool    command_pool   = VK_NULL_HANDLE;
     VkRenderPass     render_pass    = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline       pipeline       = VK_NULL_HANDLE;
     VkShaderModule   vert_module    = VK_NULL_HANDLE;
     VkShaderModule   frag_module    = VK_NULL_HANDLE;
+    VkDescriptorPool imgui_pool     = VK_NULL_HANDLE;  // lazily created (M8.5 ImGui seam)
     std::string      device_name;
 
-    Impl() {
+    explicit Impl(const RendererConfig& config)
+        : present_capable(config.present_capable),
+          probe_surface(reinterpret_cast<VkSurfaceKHR>(config.surface)) {
         CreateInstance();
         SelectGraphicsDevice();
         device_name = props.deviceName;
@@ -262,6 +272,7 @@ struct VulkanRasterRenderer::Impl {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
         }
+        if (imgui_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, imgui_pool, nullptr);
         if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
         if (pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
@@ -284,7 +295,60 @@ struct VulkanRasterRenderer::Impl {
         VkInstanceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &app_info;
+
+        // OFFSCREEN: zero instance extensions (the G2 oracle, unchanged).
+        // PRESENT:   the surface + xcb-surface instance extensions ONLY when a
+        // present path is requested. We do NOT enable VK_KHR_xlib_surface (the
+        // xcb backend is the chosen D1 windowing path); the headless-surface ext
+        // is enabled OPPORTUNISTICALLY only if the loader advertises it (it does
+        // NOT on the 1.2.131 loader here -- recon 1.3), so the same binary can use
+        // it on a modern CI box. Missing exts are simply not requested.
+        std::vector<const char*> instance_exts;
+        if (present_capable) {
+            const bool has_surface     = InstanceExtensionAvailable("VK_KHR_surface");
+            const bool has_xcb         = InstanceExtensionAvailable("VK_KHR_xcb_surface");
+            const bool has_headless    = InstanceExtensionAvailable("VK_EXT_headless_surface");
+            if (has_surface)  instance_exts.push_back("VK_KHR_surface");
+            if (has_xcb)      instance_exts.push_back("VK_KHR_xcb_surface");
+            if (has_headless) instance_exts.push_back("VK_EXT_headless_surface");
+        }
+        create_info.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());
+        create_info.ppEnabledExtensionNames =
+            instance_exts.empty() ? nullptr : instance_exts.data();
         CheckVk(vkCreateInstance(&create_info, nullptr, &instance), "vkCreateInstance");
+    }
+
+    static bool InstanceExtensionAvailable(const char* name) {
+        uint32_t count = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS ||
+            count == 0u) {
+            return false;
+        }
+        std::vector<VkExtensionProperties> available(count);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &count, available.data()) != VK_SUCCESS) {
+            return false;
+        }
+        for (const auto& ext : available) {
+            if (std::strcmp(ext.extensionName, name) == 0) return true;
+        }
+        return false;
+    }
+
+    static bool DeviceExtensionAvailable(VkPhysicalDevice candidate, const char* name) {
+        uint32_t count = 0;
+        if (vkEnumerateDeviceExtensionProperties(candidate, nullptr, &count, nullptr) != VK_SUCCESS ||
+            count == 0u) {
+            return false;
+        }
+        std::vector<VkExtensionProperties> available(count);
+        if (vkEnumerateDeviceExtensionProperties(candidate, nullptr, &count, available.data()) !=
+            VK_SUCCESS) {
+            return false;
+        }
+        for (const auto& ext : available) {
+            if (std::strcmp(ext.extensionName, name) == 0) return true;
+        }
+        return false;
     }
 
     void SelectGraphicsDevice() {
@@ -305,18 +369,47 @@ struct VulkanRasterRenderer::Impl {
                  VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0u) {
                 continue;
             }
+            // PRESENT: a present-capable device must also expose the swapchain
+            // device extension (offscreen never queries this -> unchanged).
+            if (present_capable &&
+                !DeviceExtensionAvailable(device_candidate, "VK_KHR_swapchain")) {
+                continue;
+            }
             uint32_t family_count = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(device_candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
             vkGetPhysicalDeviceQueueFamilyProperties(device_candidate, &family_count, families.data());
             for (uint32_t family = 0; family < family_count; ++family) {
-                if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0u) {
-                    physical = device_candidate;
-                    queue_family = family;
-                    vkGetPhysicalDeviceProperties(device_candidate, &props);
-                    return;
+                if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0u) {
+                    continue;
                 }
+                // OFFSCREEN: first graphics queue wins (M8 behaviour, unchanged).
+                // PRESENT with a probe surface: the family must ALSO support
+                // present on that surface (the SelectGraphicsDevice present-bug
+                // seam the recon flagged -- now closed via the surface support
+                // query). PRESENT without a surface (e.g. an early probe): accept
+                // the graphics family (the surface is verified later at swapchain
+                // negotiation).
+                if (present_capable && probe_surface != VK_NULL_HANDLE) {
+                    VkBool32 present_support = VK_FALSE;
+                    if (vkGetPhysicalDeviceSurfaceSupportKHR(
+                            device_candidate, family, probe_surface, &present_support) !=
+                            VK_SUCCESS ||
+                        present_support != VK_TRUE) {
+                        continue;
+                    }
+                    present_family = family;
+                }
+                physical = device_candidate;
+                queue_family = family;
+                present_family = family;  // single shared graphics+present family
+                vkGetPhysicalDeviceProperties(device_candidate, &props);
+                return;
             }
+        }
+        if (present_capable) {
+            throw std::runtime_error(
+                "No Vulkan physical device exposes a graphics+present queue (swapchain)");
         }
         throw std::runtime_error("No Vulkan physical device exposes a graphics queue");
     }
@@ -335,8 +428,51 @@ struct VulkanRasterRenderer::Impl {
         create_info.queueCreateInfoCount = 1u;
         create_info.pQueueCreateInfos = &queue_info;
         create_info.pEnabledFeatures = &features;
+
+        // OFFSCREEN: zero device extensions (unchanged). PRESENT: the swapchain
+        // device extension (verified available in SelectGraphicsDevice).
+        std::vector<const char*> device_exts;
+        if (present_capable) {
+            device_exts.push_back("VK_KHR_swapchain");
+        }
+        create_info.enabledExtensionCount = static_cast<uint32_t>(device_exts.size());
+        create_info.ppEnabledExtensionNames =
+            device_exts.empty() ? nullptr : device_exts.data();
+
         CheckVk(vkCreateDevice(physical, &create_info, nullptr, &device), "vkCreateDevice");
         vkGetDeviceQueue(device, queue_family, 0u, &queue);
+        // Single shared graphics+present family -> same queue handle.
+        vkGetDeviceQueue(device, present_family, 0u, &present_queue);
+    }
+
+    // Lazily create the FREE_DESCRIPTOR_SET_BIT descriptor pool ImGui needs. The
+    // offscreen path never calls this, so its allocation footprint is unchanged.
+    VkDescriptorPool EnsureImGuiPool() {
+        if (imgui_pool != VK_NULL_HANDLE) return imgui_pool;
+        // A generous pool sized like the upstream imgui example (combined-image
+        // samplers dominate; the rest are spare headroom).
+        const std::array<VkDescriptorPoolSize, 11> sizes{{
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 64u},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 256u},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64u},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64u},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 64u},
+            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 64u},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64u},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64u},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 64u},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 64u},
+            {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 64u},
+        }};
+        VkDescriptorPoolCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        info.maxSets = 256u;
+        info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+        info.pPoolSizes = sizes.data();
+        CheckVk(vkCreateDescriptorPool(device, &info, nullptr, &imgui_pool),
+                "vkCreateDescriptorPool(imgui)");
+        return imgui_pool;
     }
 
     void CreateCommandPool() {
@@ -690,12 +826,31 @@ ResolvedCamera ResolveCamera(const RenderWorld& world, const RasterOptions& opti
 // ---------------------------------------------------------------------------
 // Public type forwarding (Impl is private; define member fns here).
 // ---------------------------------------------------------------------------
-VulkanRasterRenderer::VulkanRasterRenderer() : impl_(std::make_unique<Impl>()) {}
+VulkanRasterRenderer::VulkanRasterRenderer()
+    : impl_(std::make_unique<Impl>(RendererConfig{})) {}
+VulkanRasterRenderer::VulkanRasterRenderer(const RendererConfig& config)
+    : impl_(std::make_unique<Impl>(config)) {}
 VulkanRasterRenderer::~VulkanRasterRenderer() = default;
 VulkanRasterRenderer::VulkanRasterRenderer(VulkanRasterRenderer&&) noexcept = default;
 VulkanRasterRenderer& VulkanRasterRenderer::operator=(VulkanRasterRenderer&&) noexcept = default;
 
 const std::string& VulkanRasterRenderer::DeviceName() const { return impl_->device_name; }
+
+RendererVulkanHandles VulkanRasterRenderer::VulkanHandles() {
+    Impl& d = *impl_;
+    RendererVulkanHandles handles;
+    handles.instance        = reinterpret_cast<NkVkInstance>(d.instance);
+    handles.physical_device = reinterpret_cast<NkVkPhysicalDevice>(d.physical);
+    handles.device          = reinterpret_cast<NkVkDevice>(d.device);
+    handles.graphics_family = d.queue_family;
+    handles.present_family  = d.present_family;
+    handles.graphics_queue  = reinterpret_cast<NkVkQueue>(d.queue);
+    handles.present_queue   = reinterpret_cast<NkVkQueue>(d.present_queue);
+    handles.offscreen_render_pass = reinterpret_cast<NkVkRenderPass>(d.render_pass);
+    handles.imgui_descriptor_pool = reinterpret_cast<NkVkDescriptorPool>(d.EnsureImGuiPool());
+    handles.api_version     = VK_API_VERSION_1_1;
+    return handles;
+}
 
 VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
                                                    const RasterOptions& options) {

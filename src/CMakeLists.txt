@@ -239,6 +239,62 @@ if(NK_BUILD_VULKAN_VALIDATION)
     nuka_set_warnings(nuka_imgui)
 endif()
 
+# ---------------------------------------------------------------------------
+# nuka_present (M8.5 T2) -- the realtime SWAPCHAIN present renderer + the thin
+# self-written xcb windowing/surface backend (Decision D1).
+#
+# STRATEGY-SPLIT: this is a SEPARATE lib from nuka_render. It links nuka_render
+# (to borrow the present-capable VulkanRasterRenderer for device/queue/handles)
+# but owns the swapchain present path so the offscreen G2 determinism oracle in
+# nuka_render stays pristine. The realtime present loop is legitimately non-D1
+# (vsync / frames-in-flight) and is isolated here.
+#
+# GATED behind NK_BUILD_VULKAN_VALIDATION (Decision D3): the default build-cuda128
+# config never builds it -> libnuka + core untouched. Links libxcb + X11 (the
+# Decision-D1 windowing dep; find_package(X11) is wired in the root CMakeLists
+# under the same gate). The raster forward-pass SPV paths are re-injected here so
+# the present pipeline loads the SAME compiled shaders as the offscreen renderer.
+# HOST-ONLY / zero-CUDA-token: pure C++ / Vulkan / xcb.
+# ---------------------------------------------------------------------------
+if(NK_BUILD_VULKAN_VALIDATION)
+    add_library(nuka_present STATIC
+        render/raster/vulkan_present_renderer.cpp
+        render/window/window_surface.cpp
+    )
+    add_dependencies(nuka_present nuka_render_shaders)
+
+    target_include_directories(nuka_present
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+            ${X11_INCLUDE_DIR}
+    )
+
+    target_compile_definitions(nuka_present
+        PRIVATE
+            NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
+            NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
+    )
+
+    # libxcb: the self-written surface backend uses xcb directly. X11_xcb_LIB is set
+    # by find_package(X11) when the xcb component is present; fall back to the bare
+    # library name otherwise (the dev header + so are verified present at configure).
+    if(X11_xcb_LIB)
+        set(NUKA_XCB_LIB ${X11_xcb_LIB})
+    else()
+        set(NUKA_XCB_LIB xcb)
+    endif()
+
+    target_link_libraries(nuka_present
+        PUBLIC
+            nuka_render
+            Vulkan::Vulkan
+            ${NUKA_XCB_LIB}
+            ${CMAKE_DL_LIBS}
+    )
+
+    nuka_set_warnings(nuka_present)
+endif()
+
 add_library(nuka_scene_pipeline STATIC
     scene/scene_pipeline.cpp
 )

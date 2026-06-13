@@ -37,8 +37,85 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace nuka::render {
+
+// ---------------------------------------------------------------------------
+// Vulkan handle aliases at the API boundary (M8.5 T2 present seam).
+//
+// The offscreen path names NO Vulkan types in its public header (it stays a pure
+// data->report contract). The M8.5 present sibling (vulkan_present_renderer) +
+// the ImGui InitInfo wiring need the renderer's persistent Vulkan handles, so we
+// expose them through a NARROW accessor seam (RendererVulkanHandles below) WITHOUT
+// dragging <vulkan/vulkan.h> into every includer. Vulkan dispatchable handles are
+// opaque pointers; we forward-declare the *_T tags and alias them, ABI-identical
+// to the real handles for a TU that also includes <vulkan/vulkan.h>. A non-Vulkan
+// includer still sees the (offscreen) Render() API unchanged.
+// ---------------------------------------------------------------------------
+struct VkInstance_T;
+struct VkPhysicalDevice_T;
+struct VkDevice_T;
+struct VkQueue_T;
+struct VkRenderPass_T;
+struct VkDescriptorPool_T;
+struct VkSurfaceKHR_T;
+
+using NkVkInstance       = VkInstance_T*;
+using NkVkPhysicalDevice = VkPhysicalDevice_T*;
+using NkVkDevice         = VkDevice_T*;
+using NkVkQueue          = VkQueue_T*;
+using NkVkRenderPass     = VkRenderPass_T*;
+using NkVkDescriptorPool = VkDescriptorPool_T*;
+// VkSurfaceKHR is a non-dispatchable handle: a 64-bit value (a pointer on
+// 64-bit builds). We carry it as a void* at this seam to stay header-light; the
+// present renderer reinterpret_casts it back to VkSurfaceKHR in its .cpp.
+using NkVkSurface        = void*;
+
+// ---------------------------------------------------------------------------
+// RendererVulkanHandles -- the narrow accessor seam (T2/T3).
+//
+// Filled by VulkanRasterRenderer::VulkanHandles(). It exposes exactly the
+// persistent handles the present renderer + ImGui InitInfo need (instance /
+// physical device / device / queue family + queue / the offscreen render pass /
+// a descriptor pool created with FREE_DESCRIPTOR_SET_BIT) -- and NOTHING of the
+// private Impl. The descriptor pool is created lazily on first VulkanHandles()
+// call (the offscreen path never needs one, so the offscreen-only ctor stays
+// allocation-identical until a present consumer asks).
+// ---------------------------------------------------------------------------
+struct RendererVulkanHandles {
+    NkVkInstance       instance         = nullptr;
+    NkVkPhysicalDevice physical_device  = nullptr;
+    NkVkDevice         device           = nullptr;
+    uint32_t           graphics_family  = 0;
+    uint32_t           present_family   = 0;   // == graphics_family when offscreen
+    NkVkQueue          graphics_queue   = nullptr;
+    NkVkQueue          present_queue    = nullptr;
+    NkVkRenderPass     offscreen_render_pass = nullptr;
+    NkVkDescriptorPool imgui_descriptor_pool = nullptr;  // FREE_DESCRIPTOR_SET_BIT
+    uint32_t           api_version      = 0;   // the instance apiVersion (1.1)
+};
+
+// ---------------------------------------------------------------------------
+// RendererConfig -- construction-time configuration (M8.5 T2).
+//
+// The DEFAULT (present_capable=false, surface=nullptr) reproduces the M8
+// offscreen renderer BIT-FOR-BIT: instance created with ZERO extensions, device
+// created with ZERO extensions, the first graphics queue selected with NO present
+// check. This keeps the G2 determinism oracle pristine.
+//
+// When present_capable is true the renderer additionally enables the surface +
+// xcb-surface INSTANCE extensions and the swapchain DEVICE extension, and -- when
+// a `surface` is supplied -- selects a queue family that supports BOTH graphics
+// AND present on that surface (vkGetPhysicalDeviceSurfaceSupportKHR). The present
+// renderer (vulkan_present_renderer) creates the surface FIRST, then constructs
+// the renderer with present_capable=true + that surface so the present-queue
+// check is honoured.
+// ---------------------------------------------------------------------------
+struct RendererConfig {
+    bool        present_capable = false;     // enable surface/swapchain ext + present queue
+    NkVkSurface surface         = nullptr;   // optional probe surface for present-queue selection
+};
 
 // ---------------------------------------------------------------------------
 // RasterOptions -- per-render configuration for the raster path.
@@ -77,7 +154,16 @@ struct RasterOptions {
 // ---------------------------------------------------------------------------
 class VulkanRasterRenderer {
 public:
+    // Offscreen-only construction (M8): zero extra extensions, graphics-only
+    // queue, offscreen render pass. The G2 determinism oracle -- unchanged.
     VulkanRasterRenderer();
+
+    // Present-capable / configurable construction (M8.5 T2). With the default
+    // RendererConfig{} this is byte-equivalent to the offscreen ctor above; with
+    // present_capable=true it enables the surface/swapchain extensions and (given
+    // a surface) a graphics+present queue. The present renderer uses this.
+    explicit VulkanRasterRenderer(const RendererConfig& config);
+
     ~VulkanRasterRenderer();
 
     VulkanRasterRenderer(VulkanRasterRenderer&&) noexcept;
@@ -93,6 +179,13 @@ public:
     // The selected ICD device name (e.g. "llvmpipe (LLVM 12.0.0, 256 bits)"),
     // available after construction -- useful for the de-risk report.
     const std::string& DeviceName() const;
+
+    // The narrow accessor seam (M8.5 T2/T3). Returns the persistent Vulkan
+    // handles the present renderer + ImGui InitInfo need. The first call lazily
+    // creates the FREE_DESCRIPTOR_SET_BIT descriptor pool for ImGui (so the
+    // offscreen-only path never allocates it). Safe to call repeatedly (the pool
+    // is created once). The handles remain valid for the renderer's lifetime.
+    RendererVulkanHandles VulkanHandles();
 
 private:
     struct Impl;
