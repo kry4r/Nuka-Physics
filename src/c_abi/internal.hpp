@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+namespace nuka::scene {
+class SceneIR;  // scene/scene_ir.hpp -- fwd-declared (held by unique_ptr below).
+}  // namespace nuka::scene
+
 namespace nuka::c_abi {
 
 struct DeviceRecord {
@@ -155,6 +159,25 @@ struct WorldRecord {
 
 struct BufferRecord {
     phi::Buffer buffer;
+};
+
+// --- M9 T4: the GENERIC authored-scene record (nuka_scene.h) ----------------
+// Wraps ONE in-memory nuka::scene::SceneIR (the M2b facade). The scene-authoring
+// C-ABI (c_abi/scene.cpp) loads/composes/edits/settles/saves this; the LATER
+// world entry (World.create over Scene->CookToModel->nk::World, M9 T5) builds a
+// world from the same in-memory SceneIR. The SceneIR is held by unique_ptr
+// behind a forward declaration so this header stays free of scene_ir.hpp's
+// include weight (the ctor/dtor are out-of-line in scene.cpp where SceneIR is
+// complete). NOT a special grasp/union type -- it carries whatever was imported.
+struct SceneRecord {
+    std::unique_ptr<nuka::scene::SceneIR> scene;
+
+    SceneRecord();
+    ~SceneRecord();
+    SceneRecord(SceneRecord&&) noexcept;
+    SceneRecord& operator=(SceneRecord&&) noexcept;
+    SceneRecord(const SceneRecord&) = delete;
+    SceneRecord& operator=(const SceneRecord&) = delete;
 };
 
 nuka_result_t RefreshWorldBuffers(WorldRecord& record) noexcept;

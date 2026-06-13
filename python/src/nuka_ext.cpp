@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -29,6 +30,7 @@
 #include "nuka/nuka_noise.h"
 #include "nuka/nuka_union.h"  // v0.8 G2: the H1 whole-body UNION world C ABI
 #include "nuka/nuka_recorder.h"  // M8 T5: the offscreen recorder C ABI (PPM/mp4)
+#include "nuka/nuka_scene.h"  // M9 T4: the GENERIC scene-authoring C ABI
 
 namespace nb = nanobind;
 
@@ -1061,6 +1063,109 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Scene wrapper (RAII) -- M9 T4. The GENERIC scene-authoring surface over
+// nuka_scene.h: load any format (mjcf/urdf/usd/nks) through ONE entry, compose /
+// find / set_local / set_physics_material / settle / save. NOT a special
+// grasp/union type (owner [[unified-world-no-special-grasp-binding]]): behavior
+// comes from the imported scene DATA + a per-scene control script. Nodes are
+// addressed by their DERIVED tree-path STRING (stable across edits); quaternions
+// are (w,x,y,z). Only `settle` touches a device (CUDA-gated -> RuntimeError on a
+// CUDA-less build). Plain C crosses the g++-14/g++-10 boundary, like Recorder.
+// ---------------------------------------------------------------------------
+class Scene {
+public:
+    static Scene* load(const std::string& path) {
+        nuka_scene_handle h = nullptr;
+        check(nuka_scene_load(path.c_str(), &h), "nuka_scene_load");
+        return new Scene(h);
+    }
+
+    // Graft `addon` into this scene at (pos xyz, quat w,x,y,z), via Compose.
+    // Empty pos/quat -> identity component. attach_at is an optional name prefix.
+    void compose(Scene* addon, const std::vector<float>& pos,
+                 const std::vector<float>& quat, const std::string& attach_at) {
+        if (addon == nullptr) {
+            throw std::runtime_error("Scene.compose: addon is None");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("Scene.compose: pos must be 3 floats (xyz)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "Scene.compose: quat must be 4 floats (w,x,y,z)");
+        }
+        check(nuka_scene_compose(h_, addon->h_,
+                                 pos.empty() ? nullptr : pos.data(),
+                                 quat.empty() ? nullptr : quat.data(),
+                                 attach_at.empty() ? nullptr : attach_at.c_str()),
+              "nuka_scene_compose");
+    }
+
+    bool find(const std::string& path) {
+        int found = 0;
+        check(nuka_scene_find(h_, path.c_str(), &found), "nuka_scene_find");
+        return found != 0;
+    }
+
+    // Set a node's local transform; empty pos/quat leaves that component as-is.
+    void set_local(const std::string& path, const std::vector<float>& pos,
+                   const std::vector<float>& quat) {
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("Scene.set_local: pos must be 3 floats (xyz)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "Scene.set_local: quat must be 4 floats (w,x,y,z)");
+        }
+        check(nuka_scene_set_local(h_, path.c_str(),
+                                   pos.empty() ? nullptr : pos.data(),
+                                   quat.empty() ? nullptr : quat.data()),
+              "nuka_scene_set_local");
+    }
+
+    // Set physics-material params on every collision-shape whose derived path
+    // matches `path_regex`. A param < 0 leaves it untouched; static_friction and
+    // dynamic_friction must be equal when both >= 0 (the record is isotropic).
+    // Returns the number of shapes touched. restitution does NOT persist to .nks.
+    uint32_t set_physics_material(const std::string& path_regex,
+                                  float static_friction, float dynamic_friction,
+                                  float restitution) {
+        uint32_t matched = 0u;
+        check(nuka_scene_set_physics_material(h_, path_regex.c_str(),
+                                              static_friction, dynamic_friction,
+                                              restitution, &matched),
+              "nuka_scene_set_physics_material");
+        return matched;
+    }
+
+    // Cook to an nk::World on `device`'s backend, settle `steps` steps, write the
+    // settled state back into the scene. Raises on a CUDA-less build (NOT_SUPPORTED).
+    void settle(Device* device, uint32_t steps, float dt) {
+        if (device == nullptr) {
+            throw std::runtime_error("Scene.settle: device is None");
+        }
+        check(nuka_scene_settle(h_, device->raw(), steps, dt),
+              "nuka_scene_settle");
+    }
+
+    void save(const std::string& nks_path) {
+        check(nuka_scene_save(h_, nks_path.c_str()), "nuka_scene_save");
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_scene_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~Scene() { destroy(); }
+
+private:
+    explicit Scene(nuka_scene_handle h) : h_(h) {}
+    nuka_scene_handle h_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 NB_MODULE(_nuka_ext, m) {
@@ -1623,6 +1728,64 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](Recorder& r) -> Recorder& { return r; })
         .def("__exit__",
              [](Recorder& r, nb::object, nb::object, nb::object) { r.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    // M9 T4: the GENERIC scene-authoring surface (nuka_scene.h). ONE load entry
+    // for any format; uniform compose/find/set_local/set_physics_material/settle/
+    // save. NOT a special grasp/union type.
+    nb::class_<Scene>(m, "Scene")
+        .def_static("load", &Scene::load, nb::arg("path"),
+                    nb::rv_policy::take_ownership,
+                    "Load a scene from `path`, dispatching by file extension "
+                    "(.nks / .xml / .mjcf / .urdf / .usd / .usda). .nks resolves "
+                    "its `imports` internally. Raises on a missing file, an "
+                    "unknown extension, or malformed input.")
+        .def("compose", &Scene::compose, nb::arg("addon"),
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{},
+             nb::arg("attach_at") = std::string(),
+             "Graft `addon` (a Scene) into this scene at the placement (pos "
+             "[x,y,z] + quat [w,x,y,z], in this scene's frame; empty -> identity "
+             "component). attach_at is an optional name prefix for the addon's "
+             "appended records (disambiguates duplicate names). Mutates this "
+             "scene in place; addon is unchanged.")
+        .def("find", &Scene::find, nb::arg("path"),
+             "Return True if a node at the derived tree path `path` exists "
+             "(e.g. 'cup/body', 'h1/right_hand_link'; a leading 'Scene' segment "
+             "is tolerated).")
+        .def("set_local", &Scene::set_local, nb::arg("path"),
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{},
+             "Set the LOCAL transform of the node at `path` (its body/shape "
+             "record). pos [x,y,z] + quat [w,x,y,z]; an empty list leaves that "
+             "component unchanged. Raises if no node matches `path`.")
+        .def("set_physics_material", &Scene::set_physics_material,
+             nb::arg("path_regex"), nb::arg("static_friction") = -1.0f,
+             nb::arg("dynamic_friction") = -1.0f, nb::arg("restitution") = -1.0f,
+             "Set physics-material params on every COLLISION-SHAPE node whose "
+             "derived path matches the regex `path_regex` (full-match). A param "
+             "< 0 leaves it untouched. The record carries a SINGLE isotropic "
+             "friction, so static_friction and dynamic_friction must be EQUAL "
+             "when both are given. restitution is applied to the resolved "
+             "in-memory PhysicsMaterial but is NOT persisted by save() (the .nks "
+             "schema has no restitution field). Returns the number of shapes "
+             "touched.")
+        .def("settle", &Scene::settle, nb::arg("device"),
+             nb::arg("steps") = uint32_t{200}, nb::arg("dt") = 0.0f,
+             "Cook the scene to an nk::World on `device`'s backend, run "
+             "cook::Settle for `steps` deterministic device steps (dt<=0 -> "
+             "1/240), and write the settled state back into the scene so save() "
+             "persists it (the articulation IC -> SceneInitialState; settled "
+             "movable-body poses -> their body records). Raises NOT_SUPPORTED on "
+             "a CUDA-less build (no phi v2 backend) or if the cooked world is "
+             "not Ready.")
+        .def("save", &Scene::save, nb::arg("nks_path"),
+             "Save the scene to `nks_path` (+ a sibling <base>.nka).")
+        .def("destroy", &Scene::destroy, "Destroy the scene handle.")
+        .def("__enter__", [](Scene& s) -> Scene& { return s; })
+        .def("__exit__",
+             [](Scene& s, nb::object, nb::object, nb::object) { s.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 
