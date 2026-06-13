@@ -1164,6 +1164,12 @@ if(CMAKE_CUDA_COMPILER)
         # buildable with zero Vulkan deps. With the flag ON the nuka_app + nuka_render
         # link (added below) bring the real Simulation + VulkanRasterRenderer in.
         c_abi/recorder.cpp
+        # M9 T4: the GENERIC SCENE-AUTHORING C ABI (load/compose/find/set_local/
+        # set_physics_material/settle/save over nuka::scene::SceneIR). Host-only
+        # (zero CUDA tokens); nuka_scene_settle cooks Scene->CookToModel->nk::World
+        # on the device's OWNED phi v2 backend (mirrors recorder.cpp) and runs
+        # cook::Settle. NOT a special grasp/union type -- one entry, any format.
+        c_abi/scene.cpp
         runtime/coresident/batched_unified_world.cpp
         runtime/coresident/unified_coresident_stepper.cpp
         runtime/coresident/grasp_scene_factory.cpp

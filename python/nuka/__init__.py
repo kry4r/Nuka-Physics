@@ -61,6 +61,12 @@ from .noise import (  # noqa: F401
     NOISE_POISSON,
 )
 
+# M9 T4: the GENERIC scene-authoring surface (PURE python wrapper over the
+# _nuka_ext.Scene C-ABI; no torch dep, so eager import is safe -- mirrors noise).
+# ONE entry loads any format (mjcf/urdf/usd/nks); uniform compose/find/set_local/
+# set_physics_material/settle/save. NOT a special grasp/union type.
+from .scene import Scene  # noqa: F401
+
 # Re-export the field enum members at top level for convenience.
 RIGID_BODY_TRANSFORM = Field.RIGID_BODY_TRANSFORM
 ARTICULATION_LINK_POSE = Field.ARTICULATION_LINK_POSE
@@ -155,6 +161,7 @@ __all__ = [
     "Tape",
     "GraspWorld",
     "UnionWorld",
+    "Scene",
     "Field",
     "sync",
     "__engine_version__",
