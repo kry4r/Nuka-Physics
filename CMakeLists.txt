@@ -223,6 +223,50 @@ add_library(nuka_sha256 INTERFACE)
 target_include_directories(nuka_sha256 SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/external/sha256)
 
+# --- Dear ImGui (M8.5 T1): the realtime viewport UI --------------------------
+# Vendored COPIED sources under external/imgui/ (mirror external/vhacd; NOT a
+# submodule) at the pinned tag v1.92.8-docking (see external/imgui/NUKA_VENDOR.md
+# for source/SHA/font/license). Built into the `imgui` static lib here and linked
+# by `nuka_imgui` (src/render/imgui/) -- the nuka-side glue + custom theme.
+#
+# GATED (Decision D3): compiled ONLY when NK_BUILD_VULKAN_VALIDATION is ON. The
+# default build-cuda128 config (flag OFF) never adds this target, never finds X11,
+# and builds libnuka + the core completely unchanged. The vendored ImGui is a
+# SYSTEM include everywhere so its warnings are suppressed and it stays OUT of the
+# zero-CUDA `src/render/**` lint scope. HOST-ONLY C++/Vulkan (no CUDA).
+if(NK_BUILD_VULKAN_VALIDATION)
+    # xcb / X11 dev headers (the windowing dep the T2 surface backend needs --
+    # Decision D1 = self-written xcb, NOT GLFW). We only WIRE the find here; T2
+    # writes the surface code. Required so a missing windowing toolkit fails loudly
+    # at configure rather than at T2 link time.
+    find_package(X11 REQUIRED)
+    if(NOT X11_xcb_FOUND AND NOT EXISTS "/usr/include/xcb/xcb.h")
+        message(FATAL_ERROR
+            "M8.5 viewport needs libxcb dev headers (/usr/include/xcb/xcb.h); "
+            "X11 found but xcb component missing.")
+    endif()
+    message(STATUS "M8.5: ImGui viewport gated ON (NK_BUILD_VULKAN_VALIDATION); "
+                   "X11 at ${X11_INCLUDE_DIR}, xcb header present.")
+
+    add_library(imgui STATIC
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_draw.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_tables.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_widgets.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/imgui_demo.cpp
+        ${CMAKE_SOURCE_DIR}/external/imgui/backends/imgui_impl_vulkan.cpp
+    )
+    # SYSTEM include so ImGui's own warnings never reach -Werror and its sources are
+    # not lint-scoped. The backend includes "imgui.h" relative to the imgui root and
+    # "backends/imgui_impl_vulkan.h", so both external/imgui and external/imgui itself
+    # are on the path.
+    target_include_directories(imgui SYSTEM PUBLIC
+        ${CMAKE_SOURCE_DIR}/external/imgui
+        ${CMAKE_SOURCE_DIR}/external/imgui/backends)
+    target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+    set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
 if(NK_BUILD_TESTS)
     FetchContent_Declare(
         googletest

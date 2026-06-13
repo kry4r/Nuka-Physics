@@ -199,6 +199,46 @@ target_link_libraries(nuka_render
 
 nuka_set_warnings(nuka_render)
 
+# ---------------------------------------------------------------------------
+# nuka_imgui (M8.5 T1) -- the nuka-side Dear ImGui glue + custom theme.
+#
+# Mirrors nuka_render: a STATIC lib that links Vulkan::Vulkan and the vendored
+# `imgui` lib (external/imgui, declared in the root CMakeLists, SYSTEM includes).
+# GATED behind NK_BUILD_VULKAN_VALIDATION (Decision D3): the default build-cuda128
+# config never builds it, so libnuka + core are untouched. HOST-ONLY / zero-CUDA;
+# the vendored ImGui is a SYSTEM include so it stays out of the src/render lint scope.
+#
+# The JetBrains Mono font paths are injected as compile-definitions (the same idiom
+# nuka_render uses for its compiled-SPV paths) so nuka_imgui.cpp loads the vendored
+# TTFs by absolute path at runtime.
+# ---------------------------------------------------------------------------
+if(NK_BUILD_VULKAN_VALIDATION)
+    add_library(nuka_imgui STATIC
+        render/imgui/nuka_imgui.cpp
+    )
+
+    target_include_directories(nuka_imgui
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    # The vendored ImGui headers come in as SYSTEM includes via the `imgui` target's
+    # PUBLIC SYSTEM include dirs -- so nuka_imgui.cpp's #include "imgui.h" resolves
+    # without imgui warnings entering nuka_imgui's -Werror.
+    target_link_libraries(nuka_imgui
+        PUBLIC
+            imgui
+            Vulkan::Vulkan
+    )
+
+    target_compile_definitions(nuka_imgui
+        PRIVATE
+            NUKA_IMGUI_FONT_UI_TTF="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf"
+            NUKA_IMGUI_FONT_HEADING_TTF="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Bold.ttf"
+    )
+
+    nuka_set_warnings(nuka_imgui)
+endif()
+
 add_library(nuka_scene_pipeline STATIC
     scene/scene_pipeline.cpp
 )
