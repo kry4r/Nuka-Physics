@@ -127,7 +127,7 @@ struct BatchedGraspEnvReport {
 };
 
 // ----- A1 RL substrate: the batched per-step OBS readout (the throughput-critical piece) ---
-// Every DEVICE-resident quantity the downstream H1GraspEnv force-closure-HOLD reward needs,
+// Every DEVICE-resident quantity a downstream force-closure-HOLD grasp reward needs,
 // exported in ONE bulk device->host copy per buffer for ALL envs (no per-env loop -> the
 // P2.4b sync-storm elimination is preserved). Cup pose/vel stay on the host accessors
 // Body(env,cup_local) / GraspReports(); this struct carries ONLY the device-resident signals.

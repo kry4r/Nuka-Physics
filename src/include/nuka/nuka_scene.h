@@ -33,7 +33,7 @@
 //
 // QUATERNION LAYOUT -- W FIRST. Every quat[4] is (w, x, y, z), matching
 // nuka::math::Quat{w,x,y,z} (math/quat.hpp) and the repo-wide pose7 convention
-// (union_world.cpp / the .nks "root.quat"). pos[3] is (x, y, z) metres.
+// (the .nks "root.quat"). pos[3] is (x, y, z) metres.
 //
 // CUDA GATING. The whole TU is interface-layer C++ with ZERO CUDA tokens; only
 // nuka_scene_settle actually touches a device (it cooks the scene to an nk::World
@@ -41,7 +41,7 @@
 // build (no phi v2 backend acquired in nuka_device_create) settle returns
 // NUKA_RESULT_NOT_SUPPORTED; every other entry works host-only.
 //
-// WHY A C ABI (not a C++ class bind): same reason as nuka_union.h / nuka_recorder
+// WHY A C ABI (not a C++ class bind): same reason as nuka.h / nuka_recorder
 // .h -- the engine is g++-14, the nanobind binding g++-10; only plain C crosses.
 //
 // ERROR / HANDLE CONVENTIONS mirror nuka.h: NULL out / NULL handle ->

@@ -36,7 +36,7 @@
 // for "no ffmpeg on PATH", NUKA_RESULT_INTERNAL for a non-zero ffmpeg exit) --
 // it NEVER crashes.
 //
-// WHY A C ABI (not a C++ class bind): same reason as nuka_union.h -- the engine
+// WHY A C ABI (not a C++ class bind): same reason as nuka.h -- the engine
 // is g++-14, the nanobind binding g++-10; only plain C crosses.
 //
 // ERROR / HANDLE CONVENTIONS mirror nuka.h (nuka_result_t, zeroed out-params,

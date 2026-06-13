@@ -7,12 +7,12 @@
 //
 // WHY THIS EXISTS (the equivalence guarantee). This logic was previously
 // TEST-ONLY (inline helpers in tests/coresident/test_batched_unified_world.cpp).
-// The C-ABI `nuka_grasp_world_create` MUST build the SAME BatchedSceneTemplate
+// Any consumer building the grasp scene MUST build the SAME BatchedSceneTemplate
 // the 21 nuka_batched_unified_world_test gates exercise -- a subtly different
-// template means a Python PPO env would train on an UNVALIDATED scene (a silent
+// template means a downstream env would run on an UNVALIDATED scene (a silent
 // correctness failure). So the factory is PROMOTED here, compiled into libnuka
 // (g++-14), and the test DELEGATES to it: the 21 gates now run THROUGH this code,
-// keeping their byte-identical results AND certifying the C-ABI scene.
+// keeping their byte-identical results AND certifying the shared scene.
 //
 // PURE HOST. No CUDA in the signatures (CoResidentCup carries plain host vectors;
 // ArticulationHostState is the host SoA mirror). The only device dependency is

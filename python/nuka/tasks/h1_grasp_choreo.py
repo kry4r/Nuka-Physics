@@ -28,15 +28,15 @@ Pure python DATA + logic. It
 
 WHAT THIS MODULE IS NOT (the M8 dependency)
 -------------------------------------------
-The ``.nks`` -> union nk::World C-ABI scene bindings (``nuka.Scene.load`` /
-``scene.find`` / ``scene.settle`` / ``nuka.World``) are an **M8** deliverable
-(plan line 497) and do NOT exist yet. So this module does not step a live world:
-it carries the choreography DATA + the PD torque law + the name->DOF resolution,
-structured so an M8 ``UnionWorld`` (whose ``drive_table(which)`` already exposes
-0=hold/1=rest/2=close, see ``src/c_abi/union_world.cpp``) can drive it. The one
-thing deferred to M8 is the actual ``name -> dof`` map (it comes from the cooked
+This is a per-scene CONTROL SCRIPT for the ONE GENERIC world (the owner's
+unified-world directive: NO special grasp/union world type). It carries the
+choreography DATA + the PD torque law + the name->DOF resolution, structured so
+the generic ``nuka.World`` (cooked from ``.nks`` via ``nuka.Scene``) can be
+driven by it: the three drive tables it exposes (0=hold / 1=rest / 2=close) and
+the phase schedule are exactly what a special world type used to bake in. The
+one input it needs is the actual ``name -> dof`` map (it comes from the cooked
 articulation); :func:`H1GraspChoreography.resolve` takes that map as INPUT so the
-choreography is M8-ready without a fake world.
+choreography binds to the cooked world with no hardcoded device indices.
 
 The torque law mirrors the oracle's ``TableTorque`` EXACTLY::
 

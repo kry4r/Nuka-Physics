@@ -119,8 +119,6 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
-    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_grasp.h
-    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_union.h
     # M8 T5: the offscreen recorder C ABI (PPM P6 capture + ffmpeg mp4). Its
     # IMPLEMENTATION (c_abi/recorder.cpp) is gated behind NK_BUILD_VULKAN_VALIDATION
     # (Decision D5) but the header + the exported symbols are ALWAYS present so the
@@ -1156,21 +1154,6 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/error.cpp
         c_abi/diffsim.cpp
         c_abi/noise.cpp
-        # v0.8 A2: the BATCHED GRASP WORLD C-ABI shim over BatchedUnifiedWorld (the
-        # RL-grasp substrate exposed to Python). Compiles the coresident sources +
-        # the SHARED grasp scene factory (the SAME validated scene the 21
-        # nuka_batched_unified_world_test gates exercise) + the host contact driver
-        # the grasp narrowphase needs, directly into libnuka (g++-14). The binding
-        # (python/src/nuka_ext.cpp, g++-10) binds the C surface only -- no C++ class
-        # ABI crosses the toolchain boundary.
-        c_abi/grasp_world.cpp
-        # v0.8 G2 / M7: the H1 WHOLE-BODY UNION WORLD C-ABI shim. The union scene
-        # is now COOKED from the authored examples/scenes/h1_cup_table.nks via
-        # nuka_scene_cook (CookSceneToUnionTemplate) -- the 1026-line
-        # h1_union_scene_factory it used to call is DELETED (M7 T6); the cook
-        # reads the baked settled IC + grasp config and produces the SAME
-        # BatchedSceneTemplate BatchedUnifiedWorld consumes.
-        c_abi/union_world.cpp
         # M8 T5: the offscreen RECORDER C ABI (frame loop -> raster -> PPM P6 ->
         # ffmpeg mp4). ALWAYS compiled (so the symbols export for the python
         # binding), but its render-touching body is behind NK_BUILD_VULKAN_VALIDATION
@@ -1258,14 +1241,11 @@ if(CMAKE_CUDA_COMPILER)
     # These 170 KB of byte-exact, gate-validated sources were never written under
     # those flags; re-auditing them would risk the byte-identity the 21 gates pin.
     # `-w` is appended AFTER -Werror per source file, so GCC suppresses the warnings
-    # before -Werror can elevate them. The NEW c_abi/grasp_world.cpp shim is
-    # deliberately NOT exempt -- it stays strict to catch real bugs.
+    # before -Werror can elevate them.
     set_source_files_properties(
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
-        # M7: h1_union_scene_factory.cpp DELETED (the .nks cook replaces it); the
-        # NEW c_abi/union_world.cpp shim stays strict.
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
         PROPERTIES COMPILE_OPTIONS "-w"
     )
