@@ -394,11 +394,20 @@ struct ResetEnvsParams {
     uint32_t base_link_count;
     uint32_t lambda_stride;     // row slots per env (== max_rows_per_env)
     uint32_t articulation_count;
+    // M7 T1: movable rigid-body restore arm. body_count is the PER-ENV body
+    // stride (bodies_per_env); ResetEnvsKernel restores each reset env's body
+    // slice [env*body_count, env*body_count+body_count) from the snapshot_body_*
+    // fields. 0 => no bodies (the articulation-only path stays byte-identical).
+    uint32_t body_count;        // bodies per env (snapshot_body_* slice stride)
 };
 
 struct SnapshotStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
+    // M7 T1: env-major total movable rigid-body count (bodies_per_env*env_count).
+    // OpSnapshotState appends the body_pose/lin/ang D2D copies after the four
+    // articulation copies. 0 => no bodies (articulation snapshot byte-identical).
+    uint32_t total_body_count;
 };
 
 // RestoreState: bulk snapshot -> live restore + clear the carried accumulators
@@ -407,6 +416,10 @@ struct RestoreStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
     uint32_t row_slot_count;    // env_count * max_rows_per_env (lambda clear)
+    // M7 T1: env-major total movable rigid-body count (bodies_per_env*env_count).
+    // OpRestoreState appends the body_pose/lin/ang snapshot->live copies after
+    // the articulation restore. 0 => no bodies (articulation restore unchanged).
+    uint32_t total_body_count;
 };
 
 // --- domain randomization -----------------------------------------------

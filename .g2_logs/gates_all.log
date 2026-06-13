@@ -1,0 +1,17 @@
+[gate1] running the C++ recorder: /root/Nuka-Physics/build-cuda128/tests/nuka_h1_union_pyref_test
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = H1UnionPyRef.RecordReferenceTrajectory
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from H1UnionPyRef
+[ RUN      ] H1UnionPyRef.RecordReferenceTrajectory
+Traceback (most recent call last):
+  File "/root/Nuka-Physics/examples/training/g2_union_world_gates.py", line 406, in <module>
+    sys.exit(main())
+  File "/root/Nuka-Physics/examples/training/g2_union_world_gates.py", line 385, in main
+    run_recorder()
+  File "/root/Nuka-Physics/examples/training/g2_union_world_gates.py", line 169, in run_recorder
+    assert r.returncode == 0, f"recorder failed (rc={r.returncode}):\n{r.stderr[-4000:]}"
+AssertionError: recorder failed (rc=-15):
+
+exit=1

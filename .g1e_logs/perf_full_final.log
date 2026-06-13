@@ -1,0 +1,99 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 2 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 2 tests from BatchedUnifiedWorldPerf
+[ RUN      ] BatchedUnifiedWorldPerf.EnvStepsPerSecondAndStageBreakdown
+[PERF] N=1 K=200 env_steps_per_sec=409.2 ms_per_step=2.444 (INCLUDES SetActions+ExportObsState)
+[PERF] N=8 K=200 env_steps_per_sec=2811.3 ms_per_step=2.846 (INCLUDES SetActions+ExportObsState)
+[PERF] N=32 K=200 env_steps_per_sec=6986.1 ms_per_step=4.581 (INCLUDES SetActions+ExportObsState)
+[PERF] N=64 K=100 env_steps_per_sec=8585.4 ms_per_step=7.455 (INCLUDES SetActions+ExportObsState)
+[PERF] N=256 K=25 env_steps_per_sec=9971.8 ms_per_step=25.672 (INCLUDES SetActions+ExportObsState)
+[PERF] N=1024 K=20 env_steps_per_sec=11129.1 ms_per_step=92.011 (INCLUDES SetActions+ExportObsState)
+[PERF-BREAKDOWN N=32 K=200] pose_download=3.743 (0.5%)
+[PERF-BREAKDOWN N=32 K=200] artic_download=36.738 (4.8%)
+[PERF-BREAKDOWN N=32 K=200] crba_minv=5.201 (0.7%)
+[PERF-BREAKDOWN N=32 K=200] chain_jacobian=11.043 (1.5%)
+[PERF-BREAKDOWN N=32 K=200] aba_integrate=2.703 (0.4%)
+[PERF-BREAKDOWN N=32 K=200] narrowphase=128.453 (16.9%)
+[PERF-BREAKDOWN N=32 K=200] row_assembly=42.610 (5.6%)
+[PERF-BREAKDOWN N=32 K=200] row_solver=520.200 (68.5%)
+[PERF-BREAKDOWN N=32 K=200] scatter_integrate=4.755 (0.6%)
+[PERF-BREAKDOWN N=32 K=200] obs_export=3.810 (0.5%)
+[PERF-BREAKDOWN N=32 K=200] ARTIC_SYNC_STORM=56.725 (7.5%)
+[PERF-BREAKDOWN N=32 K=200] SOLVER=520.200 (68.5%)
+[PERF-BREAKDOWN N=32 K=200] SUM_TAGS=759.255 WALL_TOTAL=942.528 (sum/wall=80.6%)
+[PERF-BREAKDOWN N=256 K=20] pose_download=0.480 (0.1%)
+[PERF-BREAKDOWN N=256 K=20] artic_download=4.893 (1.4%)
+[PERF-BREAKDOWN N=256 K=20] crba_minv=0.613 (0.2%)
+[PERF-BREAKDOWN N=256 K=20] chain_jacobian=1.253 (0.4%)
+[PERF-BREAKDOWN N=256 K=20] aba_integrate=0.292 (0.1%)
+[PERF-BREAKDOWN N=256 K=20] narrowphase=20.437 (6.0%)
+[PERF-BREAKDOWN N=256 K=20] row_assembly=31.971 (9.4%)
+[PERF-BREAKDOWN N=256 K=20] row_solver=276.914 (81.7%)
+[PERF-BREAKDOWN N=256 K=20] scatter_integrate=1.248 (0.4%)
+[PERF-BREAKDOWN N=256 K=20] obs_export=0.973 (0.3%)
+[PERF-BREAKDOWN N=256 K=20] ARTIC_SYNC_STORM=7.240 (2.1%)
+[PERF-BREAKDOWN N=256 K=20] SOLVER=276.914 (81.7%)
+[PERF-BREAKDOWN N=256 K=20] SUM_TAGS=339.075 WALL_TOTAL=471.393 (sum/wall=71.9%)
+[PERF-BREAKDOWN N=1024 K=10] pose_download=0.338 (0.1%)
+[PERF-BREAKDOWN N=1024 K=10] artic_download=4.762 (0.7%)
+[PERF-BREAKDOWN N=1024 K=10] crba_minv=0.526 (0.1%)
+[PERF-BREAKDOWN N=1024 K=10] chain_jacobian=0.952 (0.1%)
+[PERF-BREAKDOWN N=1024 K=10] aba_integrate=0.163 (0.0%)
+[PERF-BREAKDOWN N=1024 K=10] narrowphase=22.435 (3.4%)
+[PERF-BREAKDOWN N=1024 K=10] row_assembly=67.750 (10.3%)
+[PERF-BREAKDOWN N=1024 K=10] row_solver=555.885 (84.7%)
+[PERF-BREAKDOWN N=1024 K=10] scatter_integrate=1.909 (0.3%)
+[PERF-BREAKDOWN N=1024 K=10] obs_export=1.528 (0.2%)
+[PERF-BREAKDOWN N=1024 K=10] ARTIC_SYNC_STORM=6.579 (1.0%)
+[PERF-BREAKDOWN N=1024 K=10] SOLVER=555.885 (84.7%)
+[PERF-BREAKDOWN N=1024 K=10] SUM_TAGS=656.249 WALL_TOTAL=923.015 (sum/wall=71.1%)
+[A1 OBS-EXPORT per-step] N=32=0.0190_ms N=256=0.0487_ms N=1024=0.1528_ms (ratio 1024/32=8.0x for 32x envs -- ~linear if ~32x)
+[COLORING N=32] rows=320 ColorCount=10 reps=500 BuildRowColorPartitions=0.7719_ms ValidateNoSharedBodiesPerColor=0.2207_ms (Build+Validate=0.9926_ms)
+[COLORING N=256] rows=2560 ColorCount=10 reps=50 BuildRowColorPartitions=5.0809_ms ValidateNoSharedBodiesPerColor=1.4709_ms (Build+Validate=6.5518_ms)
+[COLORING N=1024] rows=10240 ColorCount=10 reps=10 BuildRowColorPartitions=20.2579_ms ValidateNoSharedBodiesPerColor=5.8428_ms (Build+Validate=26.1007_ms)
+[COLORING-SANITY N=32] Build+Validate=0.9926_ms row_solver_per_step=2.6010_ms (coloring/per_step=38.2%)
+[PERF-VERDICT N=1024] coloring(Build+Validate)=26.1007_ms row_solver_per_step=55.5885_ms -> coloring/per_step=47.0% -> KERNEL/TRANSFER-BOUND
+[PERF-VERDICT] row_solver PER-STEP growth: N=32=2.601_ms N=256=13.846_ms N=1024=55.589_ms (21x for 32x envs) ; coloring growth: N=32=0.9926_ms N=256=6.5518_ms N=1024=26.1007_ms ; O(rows) residual: N=32=1.608_ms N=256=7.294_ms N=1024=29.488_ms
+[A1 GATE-5 N=1024] env_steps_per_sec(WITH obs export)=11129.1  bar=0.85x_baseline=8500.0 (baseline=10000.0)
+[       OK ] BatchedUnifiedWorldPerf.EnvStepsPerSecondAndStageBreakdown (18766 ms)
+[ RUN      ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict
+[UNION-PERF V1 N=32 K=200 rep=0] env_steps_per_sec=50.3 ms_per_step=635.714 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V1 N=32 K=200 rep=1] env_steps_per_sec=50.3 ms_per_step=636.152 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V1 N=32 K=200 rep=2] env_steps_per_sec=50.3 ms_per_step=636.726 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=200 rep=0] env_steps_per_sec=50.2 ms_per_step=637.044 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=200 rep=1] env_steps_per_sec=50.3 ms_per_step=636.430 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=200 rep=2] env_steps_per_sec=50.2 ms_per_step=637.092 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF MEDIAN N=32] V1(Step only)=50.3 eps  V2(+obs)=50.2 eps
+[UNION-PERF V1 N=256 K=25 rep=0] env_steps_per_sec=73.8 ms_per_step=3466.823 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=9,table=1}
+[UNION-PERF V1 N=256 K=25 rep=1] env_steps_per_sec=74.1 ms_per_step=3455.797 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=9,table=1}
+[UNION-PERF V1 N=256 K=25 rep=2] env_steps_per_sec=74.4 ms_per_step=3440.552 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=9,table=1}
+[UNION-PERF V2 N=256 K=25 rep=0] env_steps_per_sec=74.1 ms_per_step=3452.880 (WITH obs export) regime_end{foot=4,finger=9,table=1}
+[UNION-PERF V2 N=256 K=25 rep=1] env_steps_per_sec=74.2 ms_per_step=3449.169 (WITH obs export) regime_end{foot=4,finger=9,table=1}
+[UNION-PERF V2 N=256 K=25 rep=2] env_steps_per_sec=74.3 ms_per_step=3446.535 (WITH obs export) regime_end{foot=4,finger=9,table=1}
+[UNION-PERF MEDIAN N=256] V1(Step only)=74.1 eps  V2(+obs)=74.2 eps
+[UNION-PERF V1 N=1024 K=6 rep=0] env_steps_per_sec=49.7 ms_per_step=20597.916 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=26,table=2}
+[UNION-PERF V1 N=1024 K=6 rep=1] env_steps_per_sec=49.7 ms_per_step=20602.001 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=26,table=2}
+[UNION-PERF V1 N=1024 K=6 rep=2] env_steps_per_sec=49.8 ms_per_step=20550.107 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=26,table=2}
+[UNION-PERF V2 N=1024 K=6 rep=0] env_steps_per_sec=49.7 ms_per_step=20604.298 (WITH obs export) regime_end{foot=4,finger=26,table=2}
+[UNION-PERF V2 N=1024 K=6 rep=1] env_steps_per_sec=49.9 ms_per_step=20505.724 (WITH obs export) regime_end{foot=4,finger=26,table=2}
+[UNION-PERF V2 N=1024 K=6 rep=2] env_steps_per_sec=49.9 ms_per_step=20506.315 (WITH obs export) regime_end{foot=4,finger=26,table=2}
+[UNION-PERF MEDIAN N=1024] V1(Step only)=49.7 eps  V2(+obs)=49.9 eps
+[UNION-PERF-BREAKDOWN N=1024 K=8] pose_download=2.219 (0.0%) per_step=0.2773_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] artic_download=25.668 (0.0%) per_step=3.2086_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] crba_minv=129.743 (0.1%) per_step=16.2178_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] chain_jacobian=68.090 (0.0%) per_step=8.5112_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] aba_integrate=0.322 (0.0%) per_step=0.0402_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] narrowphase=2444.653 (1.6%) per_step=305.5816_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] row_assembly=956.278 (0.6%) per_step=119.5348_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] row_solver=152094.850 (97.6%) per_step=19011.8563_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] scatter_integrate=50.090 (0.0%) per_step=6.2612_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] obs_export=74.132 (0.0%) per_step=9.2665_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] SUM_TAGS=155846.044 WALL_TOTAL=158145.035 (sum/wall=98.5%)
+[UNION-TRAINABILITY VERDICT] best_N=256 best_eps=74.2 (V2, with obs) -> 374.26 h per 100M env-steps ; 24h bar = 1157.4 eps -> RED (margin 0.1x)
+[       OK ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict (6290075 ms)
+[----------] 2 tests from BatchedUnifiedWorldPerf (6308842 ms total)
+
+[----------] Global test environment tear-down
+[==========] 2 tests from 1 test suite ran. (6308842 ms total)
+[  PASSED  ] 2 tests.

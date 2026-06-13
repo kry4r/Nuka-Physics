@@ -49,6 +49,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SnapshotQdot:        v.snapshot_qdot = static_cast<float*>(p); break;
         case FieldId::SnapshotLinkVelocity:v.snapshot_link_velocity = static_cast<Spatial6*>(p); break;
         case FieldId::SnapshotBasePose:    v.snapshot_base_pose = static_cast<math::Transform*>(p); break;
+        // M7 T1: movable rigid-body snapshot fields (restore source for the M7
+        // settle consumer). Bound here so OpSnapshotState/OpRestoreState/
+        // OpResetEnvs see live arena pointers (the M5-binding-bug class).
+        case FieldId::SnapshotBodyPose:    v.snapshot_body_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::SnapshotBodyLinearVelocity:  v.snapshot_body_linear_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::SnapshotBodyAngularVelocity: v.snapshot_body_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::ResetEnvIds:         v.reset_env_ids = static_cast<uint32_t*>(p); break;
         case FieldId::BodyLinearVelocity:  v.body_linear_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyAngularVelocity: v.body_angular_velocity = static_cast<math::Vec3*>(p); break;

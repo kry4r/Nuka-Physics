@@ -113,7 +113,17 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  const LinkSpatialVel* snapshot_link_velocity,
                                  const float* snapshot_q,
                                  const float* snapshot_qdot,
-                                 float* lambda) {
+                                 float* lambda,
+                                 // M7 T1: movable rigid-body restore arm (body
+                                 // slice [env*body_count, +body_count), env-major
+                                 // — matches SeedInitialState's e*B+b body fill).
+                                 uint32_t body_count,
+                                 Transform* body_pose,
+                                 Vec3* body_linear_velocity,
+                                 Vec3* body_angular_velocity,
+                                 const Transform* snapshot_body_pose,
+                                 const Vec3* snapshot_body_linear_velocity,
+                                 const Vec3* snapshot_body_angular_velocity) {
     const uint32_t slot = blockIdx.x;
     if (slot >= id_count) {
         return;
@@ -139,6 +149,15 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
     }
     for (uint32_t i = threadIdx.x; i < lambda_stride; i += blockDim.x) {
         lambda[env * lambda_stride + i] = 0.0f;
+    }
+    // M7 T1: restore this env's body slice (pose + linear/angular velocity) from
+    // the snapshot. body_count == 0 (no bodies) skips the loop entirely, keeping
+    // the articulation-only reset byte-identical.
+    for (uint32_t b = threadIdx.x; b < body_count; b += blockDim.x) {
+        const uint32_t body = env * body_count + b;
+        body_pose[body] = snapshot_body_pose[body];
+        body_linear_velocity[body] = snapshot_body_linear_velocity[body];
+        body_angular_velocity[body] = snapshot_body_angular_velocity[body];
     }
 }
 
@@ -236,7 +255,12 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->count == 0u || p->articulation_count == 0u || p->base_link_count == 0u) {
+    // Proceed if there is ANYTHING per-env to restore: articulation links OR
+    // movable bodies. A bodies-only world (base_link_count == 0, body_count > 0)
+    // still resets its body slice; the kernel's per-link loop just no-ops then.
+    if (p->count == 0u ||
+        ((p->articulation_count == 0u || p->base_link_count == 0u) &&
+         p->body_count == 0u)) {
         return Status::Ok;
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
@@ -251,7 +275,15 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
                reinterpret_cast<const LinkSpatialVel*>(data.snapshot_link_velocity),
                static_cast<const float*>(data.snapshot_q),
                static_cast<const float*>(data.snapshot_qdot),
-               data.lambda);
+               data.lambda,
+               // M7 T1: movable rigid-body restore arm.
+               p->body_count,
+               static_cast<Transform*>(data.body_pose),
+               static_cast<Vec3*>(data.body_linear_velocity),
+               static_cast<Vec3*>(data.body_angular_velocity),
+               static_cast<const Transform*>(data.snapshot_body_pose),
+               static_cast<const Vec3*>(data.snapshot_body_linear_velocity),
+               static_cast<const Vec3*>(data.snapshot_body_angular_velocity));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -261,23 +293,43 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->total_link_count == 0u) {
+    // Nothing to snapshot only when there are NEITHER links NOR bodies (a
+    // bodies-only world like a settled cup-on-table still round-trips bodies).
+    if (p->total_link_count == 0u && p->total_body_count == 0u) {
         return Status::Ok;
     }
     const size_t nl = p->total_link_count;
     const size_t ne = p->env_count;
     // Live -> snapshot (flat D2D in fixed order; the legacy creation-time
-    // snapshot 1:1: base_pose / link_velocity / q / qdot).
-    if (cudaMemcpyAsync(data.snapshot_base_pose, data.base_pose,
-                        ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
-                        stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.snapshot_link_velocity, data.link_velocity,
-                        nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
-                        stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.snapshot_q, data.q, nl * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.snapshot_qdot, data.qdot, nl * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+    // snapshot 1:1: base_pose / link_velocity / q / qdot). Guarded on nl so a
+    // bodies-only world (nl == 0) skips the articulation copies but still
+    // snapshots bodies below — the articulation copies stay byte-identical.
+    if (nl > 0u &&
+        (cudaMemcpyAsync(data.snapshot_base_pose, data.base_pose,
+                         ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_link_velocity, data.link_velocity,
+                         nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_q, data.q, nl * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_qdot, data.qdot, nl * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
+        return Status::Failed;
+    }
+    // M7 T1: APPEND the movable rigid-body snapshot (env-major total body count).
+    // Strictly additive — the articulation copies above are untouched.
+    const size_t nb = p->total_body_count;
+    if (nb > 0u &&
+        (cudaMemcpyAsync(data.snapshot_body_pose, data.body_pose,
+                         nb * sizeof(Transform), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_body_linear_velocity,
+                         data.body_linear_velocity, nb * sizeof(Vec3),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_body_angular_velocity,
+                         data.body_angular_velocity, nb * sizeof(Vec3),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
     return Status::Ok;
@@ -289,31 +341,51 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->total_link_count == 0u) {
+    // Nothing to restore only when there are NEITHER links NOR bodies.
+    if (p->total_link_count == 0u && p->total_body_count == 0u) {
         return Status::Ok;
     }
     const size_t nl = p->total_link_count;
     const size_t ne = p->env_count;
     // Snapshot -> live + clear carried accumulators (qddot / tau / lambda):
-    // the legacy BatchedArticulatedWorld::Reset() 1:1.
-    if (cudaMemcpyAsync(data.base_pose, data.snapshot_base_pose,
-                        ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
-                        stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.link_velocity, data.snapshot_link_velocity,
-                        nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
-                        stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.q, data.snapshot_q, nl * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaMemcpyAsync(data.qdot, data.snapshot_qdot, nl * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaMemsetAsync(data.qddot, 0, nl * sizeof(float), stream) != cudaSuccess ||
-        cudaMemsetAsync(data.tau, 0, nl * sizeof(float), stream) != cudaSuccess) {
+    // the legacy BatchedArticulatedWorld::Reset() 1:1. Guarded on nl so a
+    // bodies-only world (nl == 0) skips the articulation restore but still
+    // restores bodies below — the articulation copies stay byte-identical.
+    if (nl > 0u &&
+        (cudaMemcpyAsync(data.base_pose, data.snapshot_base_pose,
+                         ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.link_velocity, data.snapshot_link_velocity,
+                         nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.q, data.snapshot_q, nl * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.qdot, data.snapshot_qdot, nl * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemsetAsync(data.qddot, 0, nl * sizeof(float), stream) != cudaSuccess ||
+         cudaMemsetAsync(data.tau, 0, nl * sizeof(float), stream) != cudaSuccess)) {
         return Status::Failed;
     }
     if (p->row_slot_count > 0u &&
         cudaMemsetAsync(data.lambda, 0,
                         static_cast<size_t>(p->row_slot_count) * sizeof(float),
                         stream) != cudaSuccess) {
+        return Status::Failed;
+    }
+    // M7 T1: APPEND the movable rigid-body restore (snapshot -> live, env-major
+    // total body count). Strictly additive — the articulation restore above is
+    // untouched. Bodies carry no qddot/tau accumulator, so nothing to clear.
+    const size_t nb = p->total_body_count;
+    if (nb > 0u &&
+        (cudaMemcpyAsync(data.body_pose, data.snapshot_body_pose,
+                         nb * sizeof(Transform), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.body_linear_velocity,
+                         data.snapshot_body_linear_velocity, nb * sizeof(Vec3),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.body_angular_velocity,
+                         data.snapshot_body_angular_velocity, nb * sizeof(Vec3),
+                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
     return Status::Ok;

@@ -1,0 +1,21 @@
+Could not fetch URL https://pypi.tuna.tsinghua.edu.cn/simple/pip/: There was a problem confirming the ssl certificate: HTTPSConnectionPool(host='pypi.tuna.tsinghua.edu.cn', port=443): Max retries exceeded with url: /simple/pip/ (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1017)'))) - skipping
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple/
+Obtaining file:///root/Nuka-Physics/python
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: numpy in /root/miniconda3/envs/nuka-v03/lib/python3.10/site-packages (from nuka==0.3.0) (2.2.6)
+Building wheels for collected packages: nuka
+  Building editable for nuka (pyproject.toml): started
+  Building editable for nuka (pyproject.toml): finished with status 'done'
+  Created wheel for nuka: filename=nuka-0.3.0-cp310-cp310-linux_x86_64.whl size=110129 sha256=7152dff358b62d667e6a3500f347d59411415fa737fde16cd6f90e1ed11775cb
+  Stored in directory: /tmp/pip-ephem-wheel-cache-akrsqzr_/wheels/4f/92/3d/efd0ca9c78d3f42461dd9a802356d9ba99ecdc19b614e933f7
+Successfully built nuka
+Installing collected packages: nuka
+  Attempting uninstall: nuka
+    Found existing installation: nuka 0.3.0
+    Uninstalling nuka-0.3.0:
+      Successfully uninstalled nuka-0.3.0
+Successfully installed nuka-0.3.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.

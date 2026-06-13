@@ -1,0 +1,33 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 5 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 5 tests from UnifiedCoResidentStepper
+[ RUN      ] UnifiedCoResidentStepper.IntegratorClosedFormBallisticSpin
+[GATE1] z: actual=1.51148760 closed-form=1.51148749  err=1.176e-07  xy=0.000e+00
+[GATE1] Z-angle: recovered(wrapped)=1.49997212 closed-form(wrapped)=1.49997184  err=2.764e-07  off-axis=0.000e+00  total angle=1.5000 rad
+[GATE1-bite] wrong-half-angle (missing 0.5) angle err=1.500e+00 (vs tol 5.0e-04, margin 3000x)
+[GATE1-bite] 2%-dt position err=3.504e-02 (vs tol 2.0e-04, margin 175x)
+[       OK ] UnifiedCoResidentStepper.IntegratorClosedFormBallisticSpin (1755 ms)
+[ RUN      ] UnifiedCoResidentStepper.IntegratorConvergesToContinuousPhysics
+[GATE1-converge] |discrete - continuous| z: dt=4e-3 -> 7.849e-03, dt=2e-3 -> 3.925e-03, ratio=2.00 (expect ~2)
+[       OK ] UnifiedCoResidentStepper.IntegratorConvergesToContinuousPhysics (10 ms)
+[ RUN      ] UnifiedCoResidentStepper.MultiStepStabilityAndTwoWayReaction
+[GATE2] foot<->box: contact in 48/48 steps; load (lambda>0) in 36/48 steps; max depth=0.00300 m
+[GATE2] box<->ground: contact in 48/48 steps; load (lambda>0) in 48/48 steps; max depth=0.00300 m
+[GATE2] box speed<=0.0676 m/s; box disp<=0.0027 m; base sink<=0.2001 m; box_reacted=1 artic_reacted=1
+[GATE2] base sink=0.2001 m vs free-fall=0.1962 m (sink must not exceed free fall by much -> no energy injection)
+[       OK ] UnifiedCoResidentStepper.MultiStepStabilityAndTwoWayReaction (186 ms)
+[ RUN      ] UnifiedCoResidentStepper.EnergyNonIncreasing
+[GATE3] step 0: E=65.638567 (artic KE=0.0057 PE=64.9523, box KE=0.0005 PE=0.6801)  dE=-1.757e-02
+[GATE3] step 47: E=64.416317 (artic KE=28.5211 PE=35.1885, box KE=0.0023 PE=0.7044)  dE=-2.735e-02
+[GATE3] E0=65.656138  E_final=64.416317  total dE=-1.239822  max per-step increase=0.000e+00
+[       OK ] UnifiedCoResidentStepper.EnergyNonIncreasing (135 ms)
+[ RUN      ] UnifiedCoResidentStepper.DeterministicTwoRun
+[GATE4] box + base_pose + q + qdot + link_velocity byte-identical across 2 full 40-step rollouts
+[       OK ] UnifiedCoResidentStepper.DeterministicTwoRun (207 ms)
+[----------] 5 tests from UnifiedCoResidentStepper (2295 ms total)
+
+[----------] Global test environment tear-down
+[==========] 5 tests from 1 test suite ran. (2295 ms total)
+[  PASSED  ] 5 tests.
+EXIT=0

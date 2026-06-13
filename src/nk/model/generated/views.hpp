@@ -108,6 +108,9 @@ struct DataView {
     float* snapshot_qdot = nullptr;  // per:link arena:persistent owner:data
     ::nuka::nk::Spatial6* snapshot_link_velocity = nullptr;  // per:link arena:persistent owner:data
     ::nuka::math::Transform* snapshot_base_pose = nullptr;  // per:env arena:persistent owner:data
+    ::nuka::math::Transform* snapshot_body_pose = nullptr;  // per:body arena:persistent owner:data
+    ::nuka::math::Vec3* snapshot_body_linear_velocity = nullptr;  // per:body arena:persistent owner:data
+    ::nuka::math::Vec3* snapshot_body_angular_velocity = nullptr;  // per:body arena:persistent owner:data
     uint32_t* reset_env_ids = nullptr;  // per:env arena:scratch owner:data
     ::nuka::math::Vec3* body_linear_velocity = nullptr;  // per:body arena:persistent owner:data flags:[diff]
     ::nuka::math::Vec3* body_angular_velocity = nullptr;  // per:body arena:persistent owner:data flags:[diff]

@@ -1,0 +1,7 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = *UnionSceneThroughputAndTrainabilityVerdict*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from BatchedUnifiedWorldPerf
+[ RUN      ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict
+[UNION-PERF V1 N=32 K=200 rep=0] env_steps_per_sec=54.0 ms_per_step=592.898 regime_start{foot=4,finger=9,table=1} regime_end{foot=2,finger=9,table=4}

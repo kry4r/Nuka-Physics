@@ -60,6 +60,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SnapshotQdot, DlpackDtype::kF32, 1, false, false},  // snapshot_qdot
     {FieldId::SnapshotLinkVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_link_velocity
     {FieldId::SnapshotBasePose, DlpackDtype::kF32, 2, false, false},  // snapshot_base_pose
+    {FieldId::SnapshotBodyPose, DlpackDtype::kF32, 2, false, false},  // snapshot_body_pose
+    {FieldId::SnapshotBodyLinearVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_body_linear_velocity
+    {FieldId::SnapshotBodyAngularVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_body_angular_velocity
     {FieldId::ResetEnvIds, DlpackDtype::kU32, 1, false, false},  // reset_env_ids
     {FieldId::LinkInertia, DlpackDtype::kF32, 2, false, false},  // link_inertia
     {FieldId::LinkLocalPose, DlpackDtype::kF32, 2, false, false},  // link_local_pose

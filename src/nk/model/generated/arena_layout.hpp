@@ -73,6 +73,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // snapshot_qdot
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // snapshot_link_velocity
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // snapshot_base_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // snapshot_body_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // snapshot_body_linear_velocity
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // snapshot_body_angular_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // reset_env_ids
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 36, 144, 0},  // link_inertia
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 7, 28, 0},  // link_local_pose

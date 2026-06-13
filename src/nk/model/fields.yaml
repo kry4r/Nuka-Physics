@@ -111,6 +111,14 @@ fields:
   - {name: snapshot_qdot,          dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_link_velocity, dtype: spatial6,  per: link, arena: persistent, owner: data}
   - {name: snapshot_base_pose,     dtype: transform, per: env,  arena: persistent, owner: data}
+  # M7 T1: movable rigid-body snapshot state (the restore source for the M7
+  # settle consumer — a bodies-only world like a settled cup-on-table must
+  # round-trip its body pose/velocity on Reset). Mirror the LIVE body_pose /
+  # body_linear_velocity / body_angular_velocity (per:body) 1:1; same
+  # arena/owner as the articulation snapshot_* fields above (the restore source).
+  - {name: snapshot_body_pose,             dtype: transform, per: body, arena: persistent, owner: data}
+  - {name: snapshot_body_linear_velocity,  dtype: vec3,      per: body, arena: persistent, owner: data}
+  - {name: snapshot_body_angular_velocity, dtype: vec3,      per: body, arena: persistent, owner: data}
   - {name: reset_env_ids,          dtype: u32,       per: env,  arena: scratch,    owner: data}
 
   # =========================================================================
