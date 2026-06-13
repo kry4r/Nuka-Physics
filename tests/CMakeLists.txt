@@ -3074,4 +3074,23 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
 
     gtest_discover_tests(nuka_render_test)
+
+    # M8 T3a -- offscreen raster renderer smoke (synthetic RenderWorld; two
+    # renders byte-identical [G2] + non-background pixels > 0 [G3]).
+    add_executable(nuka_render_raster_smoke_test
+        scenario/render_raster_smoke.cpp
+    )
+
+    target_include_directories(nuka_render_raster_smoke_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_render_raster_smoke_test
+        PRIVATE
+            nuka_render
+            GTest::gtest_main
+    )
+
+    gtest_discover_tests(nuka_render_raster_smoke_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

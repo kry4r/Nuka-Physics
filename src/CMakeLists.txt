@@ -127,6 +127,7 @@ add_library(nuka_render STATIC
     render/render_scene.cpp
     render/render_world.cpp
     render/vulkan_renderer.cpp
+    render/raster/vulkan_raster_renderer.cpp
 )
 
 find_program(GLSLC_EXECUTABLE glslc HINTS "$ENV{VULKAN_SDK}/Bin")
@@ -144,11 +145,39 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(nuka_render_shaders DEPENDS "${NUKA_DEBUG_DRAW_SPV}")
+# M8 T3a raster forward-pass shaders (mesh.vert / mesh_pbr.frag) -- same glslc
+# custom_command pattern as the compute debug_draw above.
+set(NUKA_RASTER_MESH_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/mesh.vert")
+set(NUKA_RASTER_MESH_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh.vert.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_MESH_VERT_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_MESH_VERT}" -o "${NUKA_RASTER_MESH_VERT_SPV}"
+    DEPENDS "${NUKA_RASTER_MESH_VERT}"
+    VERBATIM
+)
+
+set(NUKA_RASTER_MESH_FRAG "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/mesh_pbr.frag")
+set(NUKA_RASTER_MESH_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_pbr.frag.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_MESH_FRAG_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_MESH_FRAG}" -o "${NUKA_RASTER_MESH_FRAG_SPV}"
+    DEPENDS "${NUKA_RASTER_MESH_FRAG}"
+    VERBATIM
+)
+
+add_custom_target(nuka_render_shaders DEPENDS
+    "${NUKA_DEBUG_DRAW_SPV}"
+    "${NUKA_RASTER_MESH_VERT_SPV}"
+    "${NUKA_RASTER_MESH_FRAG_SPV}"
+)
 add_dependencies(nuka_render nuka_render_shaders)
 target_compile_definitions(nuka_render
     PRIVATE
         NUKA_VULKAN_DEBUG_DRAW_SPV="${NUKA_DEBUG_DRAW_SPV}"
+        NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
+        NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
 )
 
 target_include_directories(nuka_render
