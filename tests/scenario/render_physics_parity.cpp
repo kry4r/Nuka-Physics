@@ -7,13 +7,25 @@
 // nk::World(model), HostDownloadPublisher + Simulation — runs a few rendered
 // Frame()s, and asserts the three on-CI gate criteria (recon §1.2):
 //
-//   G1 (1:1 physics<->render, plan L336 verbatim): for EVERY RenderInstance whose
-//       pose_source is NOT Static (i.e. physics-driven), independently
+//   G1 (physics-pose liveness + compose, plan L336): for EVERY RenderInstance
+//       whose pose_source is NOT Static (i.e. physics-driven), independently
 //       Data::DownloadField its source FK pose for the selected env and assert
 //           instance.world_xform == downloaded_pose * instance.cached_visual_local
 //       BIT-EXACT (memcmp of the two math::Transforms == 0). Asserted over ALL
 //       such instances (not a sampled subset), and there must be at least 1 — the
 //       gate must NOT vacuously pass on zero physics-driven instances.
+//
+//       SCOPE (honest): this verifies the PUBLISHER LIVENESS + pose-row/field
+//       SELECTION + the world_xform = fk * cached_visual_local MULTIPLY. It does
+//       NOT verify the CONSTRUCTION of cached_visual_local itself: the expected
+//       value reuses the SAME cached_visual_local the publisher consumed, so a bug
+//       in how cached_visual_local is built (LocalRelativeTo / the authored
+//       visual-node offset compose) would pass through both sides identically and
+//       stay invisible here. Independent validation of cached_visual_local lives
+//       in the scene/compose round-trip + the cook tests; do NOT read this gate as
+//       a full end-to-end "physics<->render 1:1" proof of the visual-local term.
+//       (Where a clean direct-on-link instance exists we also pin cached_visual_-
+//       local to a known identity below to partially close this.)
 //
 //   G2 (two renders byte-identical, D1 + Decision D6): VulkanRasterRenderer::Render
 //       the SAME RenderWorld frame TWICE and memcmp the two
@@ -186,7 +198,13 @@ TEST(RenderPhysicsParity, PhysicsRenderParityRenderDeterminismAndCoverage) {
     // -----------------------------------------------------------------------
     const nk::ModelCapacities& caps = w.GetModel().capacities;
     const uint64_t kTf = sizeof(Transform);
-    const uint32_t env = sim.EnvIndex();
+    // Select the SAME wrapped env the publisher used (PosePublisher contract:
+    // env_index is taken modulo env_count). The verifier must not diverge from the
+    // implementation's env selection. env_count==1 today -> this is a no-op and the
+    // memcmp result is unchanged, but it keeps the two in lock-step for M11.
+    const uint32_t env = (caps.env_count > 0u)
+                             ? (sim.EnvIndex() % caps.env_count)
+                             : 0u;
     const render::RenderWorld& live = sim.GetRenderWorld();
 
     uint32_t physics_driven = 0u;   // instances with a non-Static pose_source

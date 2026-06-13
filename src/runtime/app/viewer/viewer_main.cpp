@@ -291,8 +291,25 @@ int main(int argc, char** argv) {
         if (intents.set_play) ui_state.playing = intents.play_value;
         if (intents.reset) ui_state.reset_requested = true;
         if (intents.camera_reset) ui_state.camera_reset = true;
-        if (intents.set_env) { ui_state.env_index = intents.env_value; sim.SetEnvIndex(intents.env_value); }
-        ui_state.step_requested = false;
+        if (intents.set_env) {
+            // Honor the documented PosePublisher wrap contract at the call site:
+            // clamp the requested env into [0, env_count) so an out-of-band SetEnv
+            // never selects past the world's env range (env_count==1 today -> the
+            // value is always pinned to 0).
+            const uint32_t env_count =
+                (caps.env_count > 0u) ? caps.env_count : 1u;
+            const uint32_t env = intents.env_value % env_count;
+            ui_state.env_index = env;
+            sim.SetEnvIndex(env);
+        }
+        // OUT-OF-BAND StepOnce (command_queue.hpp:51): FramePublish drained the
+        // queue AFTER `do_step` was already computed for THIS frame, so a queued
+        // StepOnce cannot be honored same-frame (only the in-UI Step button, which
+        // sets ui_state.step_requested before FramePublish, is). Fold the queued
+        // edge into the NEXT frame's transport so it is not silently dropped.
+        // (We clear step_requested first, then set it from the queued intent, so a
+        // step taken this frame does not leak into the next.)
+        ui_state.step_requested = intents.step_once;
 
         // Reset request: re-frame the camera (a full re-cook is viewer-policy / M11;
         // here Reset re-frames + clears velocity-free, the cheap honest action).

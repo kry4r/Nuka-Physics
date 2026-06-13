@@ -17,6 +17,12 @@ namespace {
 // Standard evdev keycodes under X / Xvfb. `key` arrives as a raw keycode (the xcb
 // backend forwards kp->detail, not a keysym) so we match the physical positions.
 // Shift is tracked so Shift+LMB acts as pan.
+//
+// CAVEAT (hardcoded keycodes / evdev assumption): 50/62 are the LEFT/RIGHT SHIFT
+// keycodes under the common evdev X keymap. Because xcb forwards RAW keycodes
+// (not resolved keysyms), this matching is keymap-dependent and would break on a
+// non-evdev layout. Resolving keysyms properly (e.g. via xcb-keysyms / an
+// xkbcommon map) instead of comparing raw keycodes is a TODO.
 constexpr uint32_t kKeyShiftL = 50u;
 constexpr uint32_t kKeyShiftR = 62u;
 

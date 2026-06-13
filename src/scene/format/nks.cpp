@@ -274,13 +274,23 @@ struct MeshSink {
     // Append a VISUAL mesh (MESH) deduped by content hash; return AssetRef text.
     // M8.5 T5: a non-colliding geom's triangles are routed here (vs CMSH) so the
     // render consumer (render_world.cpp's NkaTagMesh() branch) decodes real
-    // geometry. EncodeMesh carries positions + zero-filled normal/uv streams; the
-    // decoded positions/indices round-trip the source triangles byte-exactly
+    // geometry. EncodeMesh carries positions + normal/uv streams; the decoded
+    // positions/indices round-trip the source triangles byte-exactly
     // (SceneRoundtrip ExpectShapeRecordsEqual still holds). Keyed in the SAME
     // by_hash map as CMSH/SAMP -- the encoded payloads differ by fourcc/layout so
     // there is no cross-family hash collision (a MESH payload is never equal to a
-    // CMSH payload of the same triangles: MESH interleaves the zero normal/uv
-    // streams).
+    // CMSH payload of the same triangles: MESH interleaves the normal/uv streams).
+    //
+    // NORMALS HONESTY (named M9 debt -- cook-real-normals): authored OBJ `vn`
+    // normals ARE present in the source files but are currently DROPPED by the
+    // loader (src/import/mesh_file_loader.cpp LoadObj ignores `vn`), so the
+    // MeshGeometry reaching EncodeMesh has an empty normals stream and EncodeMesh
+    // writes a zero-filled normal stream (src/scene/asset/nka.cpp EncodeMesh). The
+    // render side then SYNTHESIZES per-face/smooth normals from positions at load
+    // time. This is shading-correct for the current demos but is NOT a faithful
+    // round-trip of authored normals. Parsing `vn`, adding a normals field to
+    // MeshGeometry, and threading it through is DEFERRED to M9 because it changes
+    // the cooked .nka byte stream (D1-sensitive vs the frozen goldens).
     std::string AddVisualMesh(const std::vector<float>& verts,
                               const std::vector<uint32_t>& indices) {
         NkaMesh mesh;

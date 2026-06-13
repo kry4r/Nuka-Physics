@@ -53,6 +53,16 @@ public:
     // with `downloaded_pose * cached_visual_local`, reading the FK pose of each
     // instance's pose_source row for `env_index`. Static instances keep their
     // bind-pose world_xform untouched.
+    //
+    // ENV-SELECTION (WRAP) CONTRACT: `env_index` is interpreted MODULO the World's
+    // env_count -- the published env is `(env_count > 0) ? env_index % env_count
+    // : 0`. So any out-of-range index wraps rather than reading out of bounds, and
+    // env_count==0 publishes nothing meaningful. Implementations MUST apply this
+    // same modulo, and any verifier that independently re-downloads a pose row for
+    // comparison MUST select the SAME wrapped env (verifier and implementation
+    // cannot diverge). The parity gate applies the identical modulo for this
+    // reason. (Benign today: every shipped world is env_count==1 so the modulo is a
+    // no-op; the contract guards an M11 device-scatter publisher.)
     virtual void Publish(const nk::World& world, uint32_t env_index,
                          render::RenderWorld& render_world) = 0;
 };
