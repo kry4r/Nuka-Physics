@@ -106,7 +106,7 @@ void LaunchGraspSphereHullNarrowphase(
     // device buffers are allocated PER CALL, and the mesh-local cup verts (time- AND env-
     // invariant) are re-uploaded every step. The P2.4b articulation path pre-allocates its
     // scratch (world_pose_dev_/crba_*) at construction to avoid exactly this; the equivalent
-    // here is for BatchedUnifiedWorld to OWN persistent narrowphase scratch (sizes are all
+    // here is for the legacy coresident union world to OWN persistent narrowphase scratch (sizes are all
     // known at construction: env_count*nfinger slots, cup_vcount verts uploaded ONCE, env_count
     // frames) and pass it in -- a launcher SIGNATURE change (this free function is stateless
     // today). NOT done now because after P2.4c the step is ROW_SOLVER-bound (~79.7% at N=32;

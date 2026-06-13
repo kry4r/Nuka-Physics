@@ -10,7 +10,7 @@
 //   ports of articulation_jacobian.cu / articulation_contacts.cu (D1
 //   byte-exact contract unchanged — the foot goldens pin it).
 //
-//   UNION (kContactFamilyUnionCsr) — the legacy BatchedUnifiedWorld row
+//   UNION (kContactFamilyUnionCsr) — the legacy coresident union world's row
 //   assembly, device-resident on FIXED row slots:
 //     K1 PackQdotFlat        — the per-env flat prefix-sum qdot pack (the
 //                              legacy host qdot[] pack loop 1:1 via the cooked

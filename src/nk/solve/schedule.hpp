@@ -19,7 +19,7 @@
 // SEMANTICALLY IDENTICAL — for the worst-case (all-slots-active) row set the
 // emitted execution order equals what the legacy scheduler produced for the
 // same emission order, which is what makes the nk trajectory track the legacy
-// BatchedUnifiedWorld at the FP floor.
+// coresident union world at the FP floor.
 //
 // ★ THE WORST-CASE-SLOT VALIDITY INVARIANT (the heart of plan replayability).
 // The schedule is computed once with EVERY row slot assumed live. At runtime

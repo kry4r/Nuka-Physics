@@ -3,8 +3,8 @@
 // PHI v2 CUDA backend — M4 union-family (CSR compliant) shared op types.
 //
 // The union contact pipeline (NarrowphasePrimitives union branch ->
-// AssembleRows -> SolveRowsBlockIsland) transcribes the legacy
-// BatchedUnifiedWorld step semantics 1:1:
+// AssembleRows -> SolveRowsBlockIsland) transcribes the legacy coresident
+// union world step semantics 1:1:
 //   * detection = the SAME HD-clean analytic handlers the legacy host /
 //     grasp-GPU narrowphase ran (amf::SpherePlane / amf::BoxPlane /
 //     cvx::SphereHull), now launched device-resident per (env x slot);

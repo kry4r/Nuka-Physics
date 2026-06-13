@@ -28,7 +28,7 @@
 //   - aref is a reference ACCELERATION; the velocity-impulse PGS scales it by dt.
 //   - aref's `vel` is the START-OF-STEP (pre-gravity) constraint velocity (MuJoCo).
 // The nk pipeline feeds vel=0 / invweight=1 into the compliance terms (the legacy
-// BatchedUnifiedWorld's exact production inputs) — at the settled equilibria these
+// coresident union world's exact production inputs) — at the settled equilibria these
 // scenarios assert, the start-of-step velocity is ~0, so the oracle bands hold.
 // Geometry note: the nk union plane class is +Z-up (the production union world's
 // frame); the oracle quantities are axis-free.

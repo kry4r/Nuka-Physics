@@ -226,8 +226,8 @@ Transform BodyWorldTransform(const SceneIR& scene, BodyId body) {
 
 CookedUnionScene CookSceneToUnionTemplate(const SceneIR& scene, int env_count) {
     const uint32_t envs = env_count > 0 ? static_cast<uint32_t>(env_count) : 1u;
-    (void)envs;  // The union template is the PER-ENV scene; BuildNkUnionModel /
-                 // BatchedUnifiedWorld replicate it across envs at construction.
+    (void)envs;  // The union template is the PER-ENV scene; BuildNkUnionModel
+                 // replicates it across envs at construction.
 
     const GraspConfig& grasp = scene.Grasp();
     if (!grasp.present) {

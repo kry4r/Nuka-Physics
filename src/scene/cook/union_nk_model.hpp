@@ -2,11 +2,10 @@
 // ---------------------------------------------------------------------------
 // RELOCATED (M9 T11-core-b1) from src/runtime/coresident/h1_union_nk_model.{hpp,cpp}
 // into src/scene/cook/union_nk_model.{hpp,cpp}: this surviving union-cook bridge
-// must NOT live in the DOOMED coresident directory (T11-core-b2 deletes that dir
+// must NOT live in the legacy coresident directory (T11-core-b2 deleted that dir
 // WHOLE). It depends only on the surviving cook product (UnionSceneTemplate + the
-// CoResident* descriptors, both under src/scene/cook) + nk model headers; it no
-// longer includes any coresident CLASS header (batched_unified_world.hpp /
-// unified_coresident_stepper.hpp).
+// CoResident* descriptors, both under src/scene/cook) + nk model headers; it does
+// not include any of the deleted legacy coresident class headers.
 //
 // LIFETIME: this bridge maps the UnionSceneTemplate the .nks cook
 // (CookSceneToUnionTemplate) produces into the UnionCsr nk::Model the union gates
@@ -19,7 +18,7 @@
 //
 // The TRANSITIONAL cook bridge for the M4 union gates: converts the union scene
 // product (UnionSceneTemplate — the settled gripper_proto + fingertips + feet
-// + cup hull + table, exactly what BatchedUnifiedWorld consumes; now produced by
+// + cup hull + table, the per-env union scene; now produced by
 // the M7 .nks cook, formerly by the deleted factory) into an nk::Model of the
 // UnionCsr contact family, so the SAME scene steps through CookToModel-shaped
 // nk::World ops and the h1_union_parity / nk_union_n1 / h1_grasp_lift gates can

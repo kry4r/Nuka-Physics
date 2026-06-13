@@ -671,7 +671,7 @@ __global__ void ApplyTorqueDriveKernel(ArticulationDeviceState state,
 }
 
 // M4: movable rigid-body arms (the union world's cup path, ports of
-// BatchedUnifiedWorld's gravity kick + IntegrateBodyPosition).
+// the legacy coresident union world's gravity kick + IntegrateBodyPosition).
 
 // linear_velocity.z += g*dt for movable bodies — the legacy per-body kick.
 __global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
@@ -689,8 +689,8 @@ __global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
     body_linear_velocity[body].z += gravity_z * dt;
 }
 
-// Symplectic-Euler body position step — BYTE-FAITHFUL port of
-// BatchedUnifiedWorld::IntegrateBodyPosition (position += v*dt; the small-angle
+// Symplectic-Euler body position step — BYTE-FAITHFUL port of the legacy
+// coresident union world's IntegrateBodyPosition (position += v*dt; the small-angle
 // quaternion advance dq = {1, 0.5*w*dt}; orientation = (q*dq).Normalized() with
 // the host Normalized expression: n = sqrt(.), <1e-12 -> identity, else q/n).
 __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
