@@ -5,10 +5,12 @@ Spec: docs/specs/2026-06-10-h1-whole-body-rl-grasp-spec.md §G2. The world under
 test is ``nuka.UnionWorld`` -- the C-ABI/nanobind exposure of the G1d
 BatchedUnifiedWorld UNION scene (floating-base 51-DOF whole-body H1 + 10.9 cm
 cup settled in the curled right hand + static ground under the feet + static
-table under the cup-proxy), template-constructed by the PRODUCTION
-h1_union_scene_factory (the full deterministic authoring: cook -> stance ->
-seat -> curl -> placement search at seat FK -> 200-step oracle settle pre-roll
-with hand-frame cup carry -> table height off the settled cup bottom).
+table under the cup-proxy), whose BatchedSceneTemplate is now COOKED from the
+AUTHORED examples/scenes/h1_cup_table.nks (scene::nks::Load ->
+scene::cook::CookSceneToUnionTemplate, which READS the baked settled IC + grasp
+config -- the M7 replacement for the deleted 1026-line h1_union_scene_factory's
+cook -> stance -> seat -> curl -> placement-search-at-seat-FK -> 200-step
+oracle-settle authoring).
 
 GATES (hard asserts, runnable headless from the repo root):
   gate1 : python N=4 rollout matches the C++ reference trajectory BYTE-EXACTLY.
@@ -17,8 +19,8 @@ GATES (hard asserts, runnable headless from the repo root):
           records the per-step action bytes + the per-step C-ABI obs export to
           .g2_logs/g2_pyref_n4.bin; python replays the recorded action bytes
           through nuka.UnionWorld on the identical template and compares EVERY
-          exported field byte-for-byte, every step. Both sides construct
-          through libnuka's factory (no cross-compile seam).
+          exported field byte-for-byte, every step. Both sides construct through
+          the same libnuka C-ABI cook of the same .nks (no cross-compile seam).
   bite  : the BITE smoke rides gate1's recording: replay the SAME bytes but
           with the 12 grip columns ZEROED from the CLOSE phase on -> the cup
           must fall (vs the byte-exact replay where it is held). Proves the
@@ -67,7 +69,7 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
-os.chdir(_REPO_ROOT)  # the factory default asset paths are repo-relative.
+os.chdir(_REPO_ROOT)  # the cook's union_scene_constants.hpp defaults are repo-relative.
 
 import nuka  # noqa: E402
 
@@ -93,9 +95,10 @@ def assets_present() -> bool:
 
 
 def make_world(dev, n: int):
-    # Defaults: empty paths -> the factory's repo-relative defaults; 0 dt /
-    # 0 gravity -> the engine constants (1/240, -9.81) -- the SAME sentinel
-    # convention the C++ recorder uses, so the templates are byte-identical.
+    # Defaults: empty paths -> the cook's repo-relative union_scene_constants.hpp
+    # defaults (the .nks + the assets it imports); 0 dt / 0 gravity -> the engine
+    # constants (1/240, -9.81) -- the SAME sentinel convention the C++ recorder
+    # uses, so the cooked templates are byte-identical.
     return nuka.UnionWorld.create(dev, env_count=n)
 
 

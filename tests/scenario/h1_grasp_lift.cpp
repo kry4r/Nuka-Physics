@@ -321,6 +321,11 @@ CupSnap RunHold(nk::World& w, const CookedWorld& cw, uint32_t n_steps,
     uint32_t rec_n = 0u;
     bool any_static = false;
     uint32_t min_finger = ~0u;
+    // HONESTY GUARD (M7 review, one-sided-filter finding): the force balance
+    // below averages ONLY cvi>0 finger-contact steps. Count any late finger-
+    // contact step whose cup vertical impulse is non-positive so we can pin that
+    // the filter drops NOTHING (else the mean would be optimistically inflated).
+    uint32_t late_nonpos = 0u;
     {
         // record the initial cup z (pre-step) for the bounded-fall check.
         Transform pose0;
@@ -340,9 +345,18 @@ CupSnap RunHold(nk::World& w, const CookedWorld& cw, uint32_t n_steps,
                 rec_sum += rep.cup_vertical_impulse;
                 ++rec_n;
             }
+            if (rep.finger_contacts > 0u && rep.cup_vertical_impulse <= 0.0)
+                ++late_nonpos;
             min_finger = std::min(min_finger, rep.finger_contacts);
         }
     }
+    // The one-sided cvi>0 filter must be a no-op: every late finger-contact step
+    // is genuinely supporting (cvi>0). If a regression makes the grip intermittent
+    // (a contact step pushes the cup non-upward), this fires instead of the mean
+    // silently averaging only the favorable steps. (late_nonpos==0 at authoring.)
+    EXPECT_EQ(late_nonpos, 0u)
+        << "one-sided cvi>0 filter dropped " << late_nonpos
+        << " late finger-contact step(s) -> force-balance mean optimistically biased";
     *out_recovered = rec_n ? rec_sum / rec_n : 0.0;
     *out_any_static = any_static;
     *out_min_finger = (min_finger == ~0u) ? 0u : min_finger;
