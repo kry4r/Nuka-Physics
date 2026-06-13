@@ -533,6 +533,14 @@ if(CMAKE_CUDA_COMPILER)
         # rest seat). Pure host C++ (the World device work goes through phi v2).
         scene/cook/settle.cpp
         scene/cook/placement.cpp
+        # M7 T4 (THE CRUX): CookSceneToUnionTemplate — the .nks h1_cup_table ->
+        # union BatchedSceneTemplate cook that REPLACES the 1026-line
+        # h1_union_scene_factory authoring (reads the baked settled IC + grasp
+        # config instead of running FK/placement/settle). Produces the
+        # coresident::BatchedSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld
+        # consume (those + the struct stay alive to M9 per R1/R2/R3). Pure host
+        # C++; the coresident dep is header-only product types (no kernels).
+        scene/cook/union_cook.cpp
     )
     set_target_properties(nuka_scene_cook PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
