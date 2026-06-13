@@ -256,14 +256,16 @@ add_executable(nuka_scene_test
     scene/test_scene_ir.cpp
     scene/test_scene_compose.cpp
     scene/test_scene_cooker.cpp
-    scene/test_scene_pipeline.cpp
     scene/test_contact_metadata_cook.cpp
     scene/test_filter_precedence.cpp
 )
 
+# M9 T11: test_scene_pipeline.cpp (the deleted ScenePipeline orphan) dropped; the
+# remaining 5 scene unit files only need compose/scene_ir/cooker, which live in
+# nuka_scene (NOT nuka_scene_pipeline). Relinked nuka_scene_pipeline -> nuka_scene.
 target_link_libraries(nuka_scene_test
     PRIVATE
-        nuka_scene_pipeline
+        nuka_scene
         nuka_import
         GTest::gtest_main
 )
@@ -699,45 +701,12 @@ if(CMAKE_CUDA_COMPILER)
 
     add_test(NAME phi2_smoke COMMAND nuka_phi2_smoke_test)
 
-    # --- M4: h1_union_parity — the union scene cooked from the AUTHORED .nks
-    # (M7: scene::cook::CookSceneToUnionTemplate, NO factory) through nk::World
-    # (BuildNkUnionModel -> AssembleRows/SolveRowsBlockIsland) vs the legacy
-    # BatchedUnifiedWorld parity oracle (G1c/G1d tolerances) + the StepPlanned
-    # union plan-replay identity. BOTH worlds build from the SAME cooked.tmpl, so
-    # the parity contract holds (cook==factory ~1e-8). Asset-gated SKIP.
-    add_executable(nuka_h1_union_parity_test
-        scenario/h1_union_parity.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_h1_union_parity_test nuka_codegen)
-    target_compile_definitions(nuka_h1_union_parity_test
-        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-    target_include_directories(nuka_h1_union_parity_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_h1_union_parity_test
-        PRIVATE
-            # M7: the cook under test (transitively pulls nuka_nk + nuka_scene +
-            # nuka_articulation; nks::Load is in nuka_import). Listed first so its
-            # symbols win the union_cook TU.
-            nuka_scene_cook
-            nuka_nk
-            nuka_phi2
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-    gtest_discover_tests(nuka_h1_union_parity_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_h1_union_parity_test DELETED (deletion-order step 2). Its nk-vs-
+    # LEGACY BatchedUnifiedWorld step-0/window parity dies with the legacy class
+    # (golden/nk path is authority; the M7 vel-window benign-vs-masking verdict was
+    # rendered in T10 PART A while the oracle was alive). Its UNIQUE non-legacy
+    # coverage -- the union StepPlanned==Step plan-replay D1 -- was FOLDED into
+    # tests/scenario/h1_grasp_lift.cpp (T10 PART B).
 
     # --- M8 T4: render_frame_loop_smoke — the frame-loop SPINE smoke
     # (PosePublisher + systems + Simulation, nuka_app). The G5 render-OFF
@@ -1266,35 +1235,10 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_gjk_epa_convex_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.8 C3d: SDF high-precision tier WIRED into the dispatch table --------
-    # Validates the REAL Sdf-tier handler (NarrowphaseSdf, narrowphase_dispatch.hpp)
-    # -- the FIRST stepping callsite of find_sdf_contact_newton (sdf_contact.hpp,
-    # previously zero-callsite dead code). Cooks two unit-cube SDFs (CookSparseSdf,
-    # nuka_cooker), stacks them in contact (centers symmetric about y=0 so the
-    # handler's center-midpoint guess lands in both narrow bands), drives the
-    # resolved Sdf handler, and asserts: ResolveNarrowphase(..,has_sdf=true) is the
-    # real handler (not the removed stub); the 1-point manifold's normal (+Y = sep
-    # dir for side A) + penetration match the analytical box-on-box contact within
-    # voxel tol; a separated/null pair -> empty manifold; 2-run byte-identity (D1,
-    # memcmp on zeroed buffers). Header-only SDF path (find_sdf_contact_newton is
-    # the inline HD function -- NO device kernel launch), so deps are nuka_cooker +
-    # nuka_codegen + nuka_phi + the src/root includes (NOT nuka_collision_gpu).
-    add_executable(nuka_sdf_tier_wired_test
-        collision/test_sdf_tier_wired.cpp
-    )
-    add_dependencies(nuka_sdf_tier_wired_test nuka_codegen)
-    target_include_directories(nuka_sdf_tier_wired_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}
-            ${CMAKE_SOURCE_DIR}/src
-    )
-    target_link_libraries(nuka_sdf_tier_wired_test
-        PRIVATE
-            nuka_cooker
-            nuka_phi
-            GTest::gtest_main
-    )
-    gtest_discover_tests(nuka_sdf_tier_wired_test)
+    # M9 T11: nuka_sdf_tier_wired_test DELETED -- it tested the LEGACY SDF tier wired
+    # through ResolveNarrowphase + find_sdf_contact_newton (narrowphase_dispatch.hpp +
+    # sdf_contact.*), both deleted in T11 (the new core uses contacts_union.cu). SDF
+    # cook determinism survives separately in tests/import/test_sparse_sdf_determinism.cpp.
 
     # --- v0.8 C5a: contact stream DRIVER (CandidatePair -> ContactManifold) ------
     # Validates the resolver-decoupled host driver (contact_stream_driver.hpp/.cpp,
@@ -2224,227 +2168,13 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_foot_box_mjx_parity_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.8 W1a: the MULTI-STEP unified co-resident contact stepper. A go2 foot
-    # + a movable rigid box co-resident, stepped TOGETHER (predict -> detect ->
-    # solve -> integrate -> repeat) so the contact HOLDS over many steps. REUSES
-    # FeatherstoneAba:: integration verbatim (the production integrator). Compiles
-    # the NEW src/runtime/coresident/unified_coresident_stepper.cpp + the host
-    # contact_stream_driver.cpp directly (same pattern as the subsume / parity /
-    # coresidence tests). 4 gates: (1) integrator-isolation closed-form ballistic
-    # spin (the sharp gate, with a test-side bite proof), (2) multi-step stability +
-    # two-way reaction, (3) V2 energy non-increasing, (4) D1 byte-exact two-run.
-    # VALIDATED-NOT-WIRED. Same dep set as nuka_foot_box_coresidence_test.
-    add_executable(nuka_unified_coresident_stepper_test
-        coresident/test_unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_unified_coresident_stepper_test nuka_codegen)
-
-    target_compile_definitions(nuka_unified_coresident_stepper_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_unified_coresident_stepper_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_unified_coresident_stepper_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_unified_coresident_stepper_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 P2.1/P2.2: BatchedUnifiedWorld -- the GENERAL, scene-driven, BATCHED
-    # world. N parallel envs of co-resident rigid bodies on the env-major buffer
-    # layout the batched UnifiedSolve consumes. P2.1: free-fall (NO contact). P2.2:
-    # the batched box<->static-ground contact phase (per-env narrowphase -> shared
-    # compliant rows with per-env body-id offsets -> ONE UnifiedSolve), byte-identical
-    # to UnifiedCoResidentStepper's box<->ground branch at N=1. ADDITIVE: compiles the
-    # NEW src/runtime/coresident/batched_unified_world.cpp; modifies no production
-    # stepper/solver/golden. P2.2 pulls in the collision/constraint/solver spine, the
-    # host contact_stream_driver.cpp (BuildContactManifolds), and -- for Gate A2's
-    # production anchor -- the unified_coresident_stepper.cpp (read-only co-resident
-    # box-mode oracle; the stepper TU is NOT edited). Same dep set as the co-resident
-    # stepper test target. Gates: P2.1 free-fall x4 + P2.2 A1/A2/B/C/D.
-    add_executable(nuka_batched_unified_world_test
-        coresident/test_batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        # A2: the grasp-scene builders were promoted out of this test into the shared
-        # library factory; the test DELEGATES to them, so it compiles the same TU.
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_batched_unified_world_test nuka_codegen)
-
-    target_compile_definitions(nuka_batched_unified_world_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_batched_unified_world_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_batched_unified_world_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_unified_world_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 P2.4a: the BatchedUnifiedWorld env-steps/sec PERF GATE. A COMMITTED
-    # throughput harness + per-stage wall-clock attribution (a hypothesis test, not a
-    # correctness gate). Links the SAME batched_unified_world.cpp the correctness test
-    # links (so any accidental physics change there surfaces in the 16 gates), drives the
-    # grasp scene, sweeps N in {1,8,32,64,256,1024}, and dumps the N=32 stage breakdown
-    # + the ARTIC_SYNC_STORM vs row_solver verdict. SAME dep set / extra sources as
-    # nuka_batched_unified_world_test. ADDITIVE: a NEW target, no production edits.
-    add_executable(nuka_batched_unified_world_perf_test
-        coresident/test_batched_unified_world_perf.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_batched_unified_world_perf_test nuka_codegen)
-
-    target_compile_definitions(nuka_batched_unified_world_perf_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_batched_unified_world_perf_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_batched_unified_world_perf_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker  # G1e: the union scene's CookScene/CookArticulations path.
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_unified_world_perf_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 C7b-1: the HOLD-AGAINST-GRAVITY grasp SPIKE. A synthetic fixed-base
-    # 2-finger gripper holds the C7a cup (convex hull) against gravity by FINGER
-    # FRICTION ALONE -- NO table. Drives the generalized unified_coresident_stepper
-    # in grasp mode (N fingertip<->cup contacts, condim=3 friction, constant grip
-    # torque through the control->tau->ABA drive path). Gates: STEP-0 drive-path-is-
-    # live probe, the discriminating hold gate (Sigma(finger vert impulse) ~= m*g*dt,
-    # no static row, bounded drift), V2 energy, the grip=0 BITE proof (cup falls),
-    # D1. Reuses the C7a usdc cup (fetch-per-env; SKIP if absent). VALIDATED-NOT-
-    # WIRED. Same dep set as the W1a stepper test (+ compiles the stepper + driver).
-    add_executable(nuka_grasp_hold_spike_test
-        coresident/test_grasp_hold_spike.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_grasp_hold_spike_test nuka_codegen)
-
-    target_compile_definitions(nuka_grasp_hold_spike_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NUKA_GRASP_DIAG
-    )
-
-    target_include_directories(nuka_grasp_hold_spike_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_grasp_hold_spike_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_grasp_hold_spike_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 C7b-2a: the REAL h1_with_hand grasp SPIKE ---------------------
-    # Replaces the synthetic gripper with an imported unitree h1_with_hand hand
-    # (MJCF -> SceneIR -> cook -> ArticulationHostState, base forced Fixed). A real
-    # revolute thumb + opposing finger pinch the C7a cup; constant grip torque
-    # squeezes; the cup is held against gravity AND a disturbance by finger friction
-    # ALONE (NO table). Gates: STEP-ZERO posability (opposing fingertip spheres
-    # straddle the cup), the hold gate (Sigma(finger vert impulse) ~= m*g*dt, no
-    # static row, bounded drift), the grip=0 BITE, the DISTURBANCE cage gate, V2
-    # energy, D1. Asset-gated (SKIP if h1/cup absent). VALIDATED-NOT-WIRED. Same dep
-    # set as the C7b-1 grasp spike (+ the MJCF importer is already in nuka_import).
-    add_executable(nuka_h1_grasp_spike_test
-        coresident/test_h1_grasp_spike.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_h1_grasp_spike_test nuka_codegen)
-
-    target_compile_definitions(nuka_h1_grasp_spike_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_h1_grasp_spike_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_h1_grasp_spike_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_h1_grasp_spike_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: the coresident validated-not-wired test estate DELETED with the
+    # legacy classes (UnifiedCoResidentStepper / BatchedUnifiedWorld / the grasp
+    # scene factory): nuka_unified_coresident_stepper_test, nuka_batched_unified_world_test,
+    # nuka_batched_unified_world_perf_test, nuka_grasp_hold_spike_test,
+    # nuka_h1_grasp_spike_test. Their unique coverage is folded/acceptable-loss per
+    # subagent-plans/m9-t10-coverage-fold.md (broadphase D1 / RNG D1 / Krylov etc.
+    # survive standalone; the grasp force-balance/BITE/D1 lives in h1_grasp_lift).
 
     # --- M7 T6: the 4 H1 grasp DEV-SPIKE tests (power_grasp_lift /
     # scaled_cup_grasp / dense_grasp / grasp_feasibility_probe) were DELETED.
@@ -2452,103 +2182,12 @@ if(CMAKE_CUDA_COMPILER)
     # conjoint honest gate) consolidated into tests/scenario/h1_grasp_lift.cpp
     # (the permanent .nks grasp gate); the rest were SKIP-with-finding spikes.
 
-    # --- v0.8 H1.2: the COOKED H1 HAND cup grasp WRAPPED INTO the batched general world.
-    # Takes the H1.1-PROVEN ~10.9cm finger-only-wrap grasp (the feasibility probe's scene)
-    # and runs it through the BATCHED general world (BatchedUnifiedWorld) at N envs, then
-    # proves the batched H1-hand grasp is BYTE-EXACT (1e-5) vs the N=1 co-resident oracle
-    # (UnifiedCoResidentStepper) on the IDENTICAL scene -- the bigger H1-hand articulation
-    # (~18 links, dof_stride ~12, ~30 fingertips, ~11 contacts) is the surface where the
-    # env-major batching machinery (M^-1 tile @ art_index*dof_stride^2, chain-J over GLOBAL
-    # contact links) must generalize. Gates: G1 N=1 byte-exact parity (cup pose/vel +
-    # gripper qdot), G2 multi-env independence (per-env / mixed / D1), a throughput lower-
-    # bound sweep. Compiles the SAME batched_unified_world.cpp + unified_coresident_stepper.cpp
-    # + contact_stream_driver.cpp as nuka_batched_unified_world_test (accidental physics
-    # changes there surface in the synthetic 17 gates). Asset-gated SKIP. ADDITIVE: a NEW
-    # parallel TU; the feasibility probe + synthetic batched gates are LEFT INTACT.
-    add_executable(nuka_batched_h1_hand_grasp_test
-        coresident/test_batched_h1_hand_grasp.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_batched_h1_hand_grasp_test nuka_codegen)
+    # M9 T11: nuka_batched_h1_hand_grasp_test (batched H1-hand grasp vs co-resident
+    # oracle byte-exact) DELETED with the coresident estate.
 
-    target_compile_definitions(nuka_batched_h1_hand_grasp_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_batched_h1_hand_grasp_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_batched_h1_hand_grasp_test
-        PRIVATE
-            # M4: the nk grasp-parity entry (BuildNkUnionModel -> nk::World).
-            nuka_nk
-            nuka_phi2
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_h1_hand_grasp_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- SG G1: the BATCHED UNION WORLD parity TU (G1a floating-base, NO contact) ---
-    # G1a proves BatchedUnifiedWorld's env-major machinery batches the FLOATING-BASE
-    # whole-body H1 (nuka::demo::LoadFloating, 51 DOF = 6 base + 45 revolute) BYTE-
-    # EXACT (tol 0) vs the N=1 UnifiedCoResidentStepper oracle on the IDENTICAL proto,
-    # with ZERO contact rows (the cup is parked 5 m away and free-falls alongside) --
-    # isolating floating-root replication, per-env IntegrateFloatingBase* activation,
-    # and the SetActions seam over a dof_stride with 6 (dead) base columns. Gates:
-    # (a) N=1 byte-exact over 120 driven free-fall steps, (b) N=8 mixed-action
-    # independence, (c) D1 two-run identity, (d) base action columns 0..5 dead.
-    # G1b..G1d (feet/finger/table union rows) will EXTEND this TU. Asset-gated SKIP.
-    # ADDITIVE parallel TU mirroring the nuka_batched_h1_hand_grasp_test dep set.
-    add_executable(nuka_batched_h1_union_world_test
-        coresident/test_batched_h1_union_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_batched_h1_union_world_test nuka_codegen)
-
-    target_compile_definitions(nuka_batched_h1_union_world_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_batched_h1_union_world_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_batched_h1_union_world_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_h1_union_world_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_batched_h1_union_world_test (SG G1 batched-union parity) DELETED
+    # with the coresident estate -- the BatchedUnifiedWorld vs co-resident oracle
+    # parity dies with the legacy classes (golden/nk path is authority).
 
     # --- M7 T6: the factory byte-equality gate (nuka_h1_union_scene_factory_test)
     # and the transitional cook==factory gate (nuka_union_cook_matches_factory_test)
@@ -2637,138 +2276,11 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_union_cook_golden_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
-    # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
-    # the right hand co-resides a movable cup + static table + N fingertip collidables
-    # -- all in ONE step through the NEW StepStandGrasp() path (foot<->ground +
-    # finger<->cup + cup<->table). R0 = pure stand through the conjunction path (cup
-    # plumbing inert) proves no stand regression; R1 = cup on a table + resting fingers
-    # proves co-residence does not break the stand solve. Reuses the proven bridge-spike
-    # / dense-grasp helpers via h1_demo_shared.hpp + tiny_mlp.hpp (the coresident/ dir).
-    # Additive parallel TU; the bridge spike + dense grasp gates are LEFT INTACT. Same
-    # dep set + the contact_stream_driver.cpp the contact path needs.
-    add_executable(nuka_h1_cup_sequence_demo_test
-        coresident/test_h1_cup_sequence_demo.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_h1_cup_sequence_demo_test nuka_codegen)
-
-    target_compile_definitions(nuka_h1_cup_sequence_demo_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_h1_cup_sequence_demo_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/coresident
-    )
-
-    target_link_libraries(nuka_h1_cup_sequence_demo_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_h1_cup_sequence_demo_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 S3: the TRANSFER-SMOKE GATE (full-DOF floating-base H1 STANDING) ---
-    # Cooks the FULL-DOF FLOATING-BASE h1_with_hand (skip mesh decompose, do NOT
-    # force-fix the base), seats it at the bent stance on 4 foot spheres, and runs the
-    # PORTED h1_balance_gate.py controller (CoP ankle strategy + posture PD on legs +
-    # held torso/arms/fingers, clamped to the MJCF limits) through the NEW StepStand()
-    # path (N foot spheres <-> static ground, condim=3 friction, art<->static rows). The
-    # S3 gate: does the SAME controller that stood the batched reduced-DOF H1 ALSO stand
-    # the full-DOF articulated H1 in the compliant deploy world? Additive parallel TU.
-    # Same dep set + the contact_stream_driver.cpp the contact path needs.
-    add_executable(nuka_h1_costand_transfer_test
-        coresident/test_h1_costand_transfer.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_h1_costand_transfer_test nuka_codegen)
-
-    target_compile_definitions(nuka_h1_costand_transfer_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_h1_costand_transfer_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_h1_costand_transfer_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_h1_costand_transfer_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- v0.8 POLICY->CO-RESIDENT INFERENCE BRIDGE SPIKE -----------------------
-    # The GATE before a multi-week PPO standing campaign: prove the deploy SEAM
-    # (PPO trains a torch NN in the BATCHED reduced-16-DOF world; the demo runs it
-    # in the CO-RESIDENT full-51-DOF C++ world via flat f32 weights + a ~50-line C++
-    # forward, NOT python-bind/ONNX/torch-at-deploy). Piece A = structural leg-index
-    # correspondence (reduced 1..10 == full by-name); Gate 1 = EXACT obs+forward
-    # parity (1e-5) vs the python MLP from bridge_export.py + its anti-green-wash
-    # BITE (permutation + transpose); Gate 2 (SOFT) = closed-loop MLP stand in the
-    # full world. Mirrors nuka_h1_costand_transfer_test's dep set + compiles the
-    # production stepper + the host contact_stream_driver.cpp (EDITS nothing).
-    add_executable(nuka_h1_bridge_spike_test
-        coresident/test_h1_bridge_spike.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_h1_bridge_spike_test nuka_codegen)
-
-    target_compile_definitions(nuka_h1_bridge_spike_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_h1_bridge_spike_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/coresident
-    )
-
-    target_link_libraries(nuka_h1_bridge_spike_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_h1_bridge_spike_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: the H1 co-resident demo/transfer/bridge spikes DELETED with the
+    # coresident estate: nuka_h1_cup_sequence_demo_test (C7b-2 stand+grasp scaffold),
+    # nuka_h1_costand_transfer_test (S3 full-DOF stand transfer),
+    # nuka_h1_bridge_spike_test (PPO->co-resident inference seam). RL-adjacent /
+    # validated-not-wired; rebuild on the nk world at M10 per the SG freeze.
 
     # M6 RE-POINT: the ParticleInvMass reaction arm on the nk path (the device-
     # resident nk::SolveRowsBlockIsland, the union kUSlotParticleSphereBox class).
@@ -2879,51 +2391,10 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_link_contact_wrench_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- p03 per-env RESET primitive (RL autoreset) ------------------------
-    add_executable(nuka_batched_reset_test
-        runtime/test_batched_reset.cpp
-    )
-
-    target_compile_definitions(nuka_batched_reset_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_batched_reset_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_reset_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- p03 episode-boundary fix: authoritative un-lagged base-pose view ---
-    add_executable(nuka_base_pose_view_test
-        runtime/test_base_pose_view.cpp
-    )
-
-    target_compile_definitions(nuka_base_pose_view_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_base_pose_view_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_base_pose_view_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_batched_reset_test (RL autoreset) + nuka_base_pose_view_test
+    # (episode-boundary un-lagged base pose) DELETED -- batched-only / RL-adjacent,
+    # their contracts carried forward to M10 (rebuild on the nk world when RL
+    # returns; see subagent-plans/m9-t10-coverage-fold.md M10 carry-forward).
 
     # --- Batched articulated-with-contacts step path (p01-F T6) -------------
     add_executable(nuka_batched_articulated_world_test
@@ -2948,28 +2419,11 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_batched_articulated_world_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- v0.5 C-fwd: Torque & Velocity control modes ------------------------
-    add_executable(nuka_control_modes_test
-        runtime/test_control_modes.cpp
-    )
-
-    target_compile_definitions(nuka_control_modes_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_control_modes_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_control_modes_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_control_modes_test (velocity / non-PD control mode + per-mode
+    # two-run byte-exact) DELETED -- batched-only / RL-adjacent; the torque-drive
+    # path stays covered by the nk gates (h1_grasp_lift / featherstone oracle), the
+    # velocity-mode contract is carried forward to M10 (rebuild with the M10 non-PD
+    # control surface; see subagent-plans/m9-t10-coverage-fold.md M10 carry-forward).
 
     # --- CUDA-graph step capture/replay bit-identical gate (p01-W3) ---------
     add_executable(nuka_batched_articulated_graph_test

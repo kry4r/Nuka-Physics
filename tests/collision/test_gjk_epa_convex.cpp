@@ -1,8 +1,14 @@
 // ---------------------------------------------------------------------------
 // v0.8 C3c -- convex narrowphase (GJK / EPA / face-clip) tests.
 // ---------------------------------------------------------------------------
-// Drives the REAL Convex-tier handler (NarrowphaseConvex) registered in the C3a
-// dispatch table (narrowphase_dispatch.hpp + convex_narrowphase.hpp):
+// M9 T11 re-point: the legacy host dispatch (narrowphase_dispatch.hpp,
+// ResolveNarrowphase / NarrowphaseConvex) was deleted; the KEPT geometry math is
+// the HD `cvx::` header (collision/convex_narrowphase.hpp). These tests now call
+// the cvx:: handlers DIRECTLY (cvx::ConvexNarrowphase / cvx::SphereHull /
+// cvx::HullPlane), mirroring what NarrowphaseConvex did (plane special-case,
+// sphere special-case, general GJK/EPA path). The dispatch-routing-only test
+// (RoutesToRealConvexHandler) is gone (it tested deleted infra); EVERY geometry
+// assertion below survives unchanged:
 //   - two penetrating tetrahedra (as convex hulls) -> EPA depth + normal vs a
 //     hand oracle.
 //   - two penetrating boxes (as convex hulls) -> depth/normal vs analytic, AND a
@@ -11,16 +17,15 @@
 //   - a clearly-separated pair -> GJK reports no overlap (empty manifold).
 //   - convex (hull) x box / convex (hull) x sphere -> correctness.
 //   - convex (hull) x plane (both orderings) -> the plane special path + sign.
+//   - sphere x hull shallow-pen MONOTONICITY (the UNIQUE C3-hardening regression;
+//     cvx::SphereHull directly).
 //   - 2-run bit-identity (memset+memcmp on the whole manifold) + N>=32 cross-
 //     replica (>=32 identical pairs -> byte-identical manifolds) on a SYMMETRIC,
 //     tie-prone box-box-as-hull config (the EPA-determinism gate).
-//   - routing: ResolveNarrowphase(ConvexHull, ConvexHull, false) == real handler.
 // ---------------------------------------------------------------------------
 
-#include "collision/narrowphase_dispatch.hpp"
 #include "collision/convex_narrowphase.hpp"
 #include "collision/analytical_manifold.hpp"
-#include "constraint/collidable.hpp"
 #include "constraint/contact_manifold.hpp"
 #include "import/usd_importer.hpp"        // cup hull reproducer (C3 hardening regression)
 #include "math/transform.hpp"
@@ -32,10 +37,13 @@
 // set x cooked sparse SDF grid) against ANALYTIC truth (sphere x sphere /
 // sphere x box at known separations / penetrations), tolerance <= the bake cell
 // size. The GJK/EPA tests above survive to M9; this is the ADDED SDF-path oracle.
-#include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfPairDev + LaunchNarrowphaseSdf
+// NOTE (M9 T11): device_context.hpp (which pulls <cuda_runtime.h> -> __forceinline__
+// / cudaStream_t) MUST precede sdf_types.cuh; the deleted narrowphase_dispatch.hpp
+// formerly pulled it in first (via candidate_pair.hpp) — order it explicitly now.
+#include "phi/device_context.hpp"
 #include "phi/buffer_legacy.hpp"
 #include "phi/buffer_transfer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfPairDev + LaunchNarrowphaseSdf
 #include "runtime/sdf/sparse_sdf_query.cuh"     // PackSdfCellKey
 
 #include <gtest/gtest.h>
@@ -47,18 +55,12 @@
 #include <string>
 #include <vector>
 
-using nuka::collision::CandidatePair;
-using nuka::collision::NarrowphaseConvex;
-using nuka::collision::NarrowphaseStubConvex;
-using nuka::collision::ResolveNarrowphase;
-using nuka::collision::ShapeProxyView;
 using nuka::collision::amf::BuildPrimFrame;
 using nuka::collision::amf::PrimParams;
 using nuka::collision::cvx::ConvexHullView;
-using nuka::constraint::CollidableRef;
-using nuka::constraint::CollidableType;
+using nuka::collision::cvx::SupportKind;
+using nuka::collision::cvx::SupportProxy;
 using nuka::constraint::ContactManifold;
-using nuka::constraint::ReactionProviderKind;
 using nuka::math::Quat;
 using nuka::math::Transform;
 using nuka::math::Vec3;
@@ -153,39 +155,79 @@ float OverlapAlong(const std::vector<float>& va, Vec3 pa,
     return SupportMaxWorld(va, pa, -n) + SupportMaxWorld(vb, pb, n);
 }
 
-// Build a candidate pair with ZEROED padding. CollidableRef has 2 pad bytes after
-// its two uint8 enums (type@0, react@1, handle@4 -> bytes 2-3 are padding); a
-// stack temporary leaves those garbage, and StampSides' `out->a = pair.a` would
-// copy that garbage into the manifold -> a memcmp-visible 2-run/replica DIVERGENCE
-// that is a TEST ARTIFACT (production pairs come from zeroed device buffers via the
-// thrust-built CandidatePairStream). memset + FIELD assignment (not `pair.a =
-// CollidableRef{...}`, which re-imports a temporary's padding) keeps the pair, and
-// hence the stamped manifold, byte-stable -- the proper way to exercise the EPA D1
-// gate without a false padding failure.
-CandidatePair MakePair() {
-    CandidatePair pair;
-    std::memset(&pair, 0, sizeof(pair));
-    pair.a.type = CollidableType::RigidBody;
-    pair.a.react = ReactionProviderKind::RigidInvMass;
-    pair.a.handle = 1u;
-    pair.b.type = CollidableType::RigidBody;
-    pair.b.react = ReactionProviderKind::RigidInvMass;
-    pair.b.handle = 2u;
-    return pair;
+// Build a cvx::SupportProxy for one side from its shape type + geometry payload
+// (hull view OR inline primitive params), mirroring the dispatch's MakeConvexProxy.
+SupportProxy MakeProxy(ShapeType t, const ConvexHullView* hull,
+                       const PrimParams& prim) {
+    SupportProxy p;
+    switch (t) {
+        case ShapeType::ConvexHull:
+        case ShapeType::TriMesh:
+        case ShapeType::HeightField:
+            p.kind = SupportKind::Hull;   p.hull = hull; break;
+        case ShapeType::Box:
+            p.kind = SupportKind::Box;    p.prim = &prim; break;
+        case ShapeType::Sphere:
+            p.kind = SupportKind::Sphere; p.prim = &prim; break;
+        case ShapeType::Capsule:
+            p.kind = SupportKind::Capsule; p.prim = &prim; break;
+        case ShapeType::Plane:
+            p.kind = SupportKind::Box;    p.prim = &prim; break;  // unreached
+    }
+    return p;
 }
 
-// Route a hull-vs-hull pair through the resolved dispatch handler. The manifold
-// is memset to 0 first so a 2-run memcmp covers padding + unused point slots.
-ContactManifold RouteHullHull(const ConvexHullView& a, const ConvexHullView& b) {
-    ShapeProxyView g;
-    g.type_a = ShapeType::ConvexHull;
-    g.type_b = ShapeType::ConvexHull;
-    g.geom_a = &a;
-    g.geom_b = &b;
+// Route a pair through the KEPT cvx:: handlers DIRECTLY, faithfully reproducing
+// NarrowphaseConvex's three branches (plane special-case, sphere special-case,
+// general GJK/EPA). The manifold is memset to 0 first so a 2-run memcmp covers
+// padding + unused point slots (the EPA D1 gate). hull_a/hull_b are the hull-side
+// geometry (nullptr when that side is a primitive); prim_a/prim_b the inline prim
+// params (default for the hull side).
+ContactManifold Route(ShapeType ta, const ConvexHullView* hull_a, PrimParams prim_a,
+                      ShapeType tb, const ConvexHullView* hull_b, PrimParams prim_b) {
     ContactManifold out;
     std::memset(&out, 0, sizeof(out));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &out);
+    // --- Plane special case (either side). ---
+    if (ta == ShapeType::Plane || tb == ShapeType::Plane) {
+        const bool plane_is_a = (ta == ShapeType::Plane);
+        const ConvexHullView* hull = plane_is_a ? hull_b : hull_a;
+        const PrimParams& plane = plane_is_a ? prim_a : prim_b;
+        if (hull == nullptr) { out.Clear(); return out; }
+        const Vec3 plane_n =
+            nuka::collision::amf::Norm(plane.frame.cy, Vec3::UnitY());
+        const Vec3 normal_for_hull = plane_is_a ? Vec3{-plane_n.x, -plane_n.y, -plane_n.z}
+                                                : plane_n;
+        nuka::collision::cvx::HullPlane(*hull, plane, normal_for_hull, &out);
+        return out;
+    }
+    // --- Sphere special case (either side) vs a hull. ---
+    if (ta == ShapeType::Sphere || tb == ShapeType::Sphere) {
+        const bool sphere_is_a = (ta == ShapeType::Sphere);
+        const ShapeType hull_t = sphere_is_a ? tb : ta;
+        const ConvexHullView* hull = sphere_is_a ? hull_b : hull_a;
+        if (hull_t == ShapeType::ConvexHull || hull_t == ShapeType::TriMesh ||
+            hull_t == ShapeType::HeightField) {
+            if (hull == nullptr) { out.Clear(); return out; }
+            const PrimParams& sphere = sphere_is_a ? prim_a : prim_b;
+            nuka::collision::cvx::SphereHull(sphere, *hull, sphere_is_a, &out);
+            return out;
+        }
+    }
+    // --- General GJK/EPA/face-clip path. ---
+    SupportProxy A = MakeProxy(ta, hull_a, prim_a);
+    SupportProxy B = MakeProxy(tb, hull_b, prim_b);
+    if ((A.kind == SupportKind::Hull && A.hull == nullptr) ||
+        (B.kind == SupportKind::Hull && B.hull == nullptr)) {
+        out.Clear(); return out;
+    }
+    nuka::collision::cvx::ConvexNarrowphase(A, B, &out);
     return out;
+}
+
+// Route a hull-vs-hull pair through the general cvx path (memset out first).
+ContactManifold RouteHullHull(const ConvexHullView& a, const ConvexHullView& b) {
+    return Route(ShapeType::ConvexHull, &a, PrimParams{},
+                 ShapeType::ConvexHull, &b, PrimParams{});
 }
 
 bool Vec3Near(Vec3 a, Vec3 b, float tol = kTol) {
@@ -241,26 +283,6 @@ void LoadCupHullCenteredAndFaceX(std::vector<float>* verts, float* face_x) {
 }  // namespace
 
 // ===========================================================================
-// Routing sanity.
-// ===========================================================================
-TEST(GjkEpaConvex, RoutesToRealConvexHandler) {
-    auto fn = ResolveNarrowphase(ShapeType::ConvexHull, ShapeType::ConvexHull, false);
-    EXPECT_EQ(fn, &NarrowphaseConvex);
-    EXPECT_NE(fn, &NarrowphaseStubConvex);
-    // convex x box, both orders, also resolve to the real handler.
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::ConvexHull, ShapeType::Box, false),
-              &NarrowphaseConvex);
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::Box, ShapeType::ConvexHull, false),
-              &NarrowphaseConvex);
-    // convex x plane resolves to the real handler (plane special path).
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::ConvexHull, ShapeType::Plane, false),
-              &NarrowphaseConvex);
-    // TriMesh stays the stub (named deferral to v0.9).
-    EXPECT_EQ(ResolveNarrowphase(ShapeType::TriMesh, ShapeType::TriMesh, false),
-              &NarrowphaseStubConvex);
-}
-
-// ===========================================================================
 // Two penetrating tetrahedra -> EPA depth/normal vs hand oracle.
 // ===========================================================================
 // Two tetra (vert reach 0.5 along each axis from BoxVerts-style corners). Place
@@ -297,9 +319,6 @@ TEST(GjkEpaConvex, TetraTetraPenetration) {
             << "found an axis separating tighter than the EPA normal (n not MTV)";
     }
     EXPECT_GT(m.points[0].penetration, 0.0f);
-    // Sides preserved from the pair.
-    EXPECT_EQ(m.a.handle, 1u);
-    EXPECT_EQ(m.b.handle, 2u);
 }
 
 // ===========================================================================
@@ -362,14 +381,8 @@ TEST(GjkEpaConvex, HullVsBoxPrimitive) {
     const auto va = BoxVerts(he);
     const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
     const PrimParams B = MakeBoxPrim(he, Vec3{0.0f, 0.8f, 0.0f});  // overlap on Y=0.2
-    ShapeProxyView g;
-    g.type_a = ShapeType::ConvexHull;
-    g.type_b = ShapeType::Box;
-    g.geom_a = &A;
-    g.prim_b = B;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::ConvexHull, &A, PrimParams{},
+                                    ShapeType::Box, nullptr, B);
     ASSERT_GT(m.point_count, 0u);
     for (uint32_t i = 0; i < m.point_count; ++i) {
         EXPECT_NEAR(m.points[i].penetration, 0.2f, kTol);
@@ -388,14 +401,8 @@ TEST(GjkEpaConvex, HullVsSpherePrimitive) {
     // Sphere radius 0.5 centered at (0.8,0,0): nearest box face is +X at x=0.5,
     // sphere left edge at 0.3 -> overlap 0.2 along +X.
     const PrimParams B = MakeSpherePrim(0.5f, Vec3{0.8f, 0.0f, 0.0f});
-    ShapeProxyView g;
-    g.type_a = ShapeType::ConvexHull;
-    g.type_b = ShapeType::Sphere;
-    g.geom_a = &A;
-    g.prim_b = B;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::ConvexHull, &A, PrimParams{},
+                                    ShapeType::Sphere, nullptr, B);
     ASSERT_EQ(m.point_count, 1u) << "sphere side has no face -> 1-pt witness";
     EXPECT_NEAR(m.points[0].penetration, 0.2f, kTol);
     // sep dir for A (hull) = -X (hull pushes away from sphere on +X side).
@@ -416,12 +423,8 @@ TEST(GjkEpaConvex, SphereCenterInsideHull_SaneBoundedManifold) {
     const auto vh = BoxVerts(he);
     const ConvexHullView H = MakeHull(vh, Vec3{0.0f, 0.0f, 0.0f});
     const PrimParams S = MakeSpherePrim(0.05f, Vec3{0.0f, 0.0f, 0.0f});  // center inside
-    ShapeProxyView g;
-    g.type_a = ShapeType::Sphere; g.type_b = ShapeType::ConvexHull;
-    g.prim_a = S; g.geom_b = &H;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::Sphere, nullptr, S,
+                                    ShapeType::ConvexHull, &H, PrimParams{});
     ASSERT_EQ(m.point_count, 1u) << "center-inside must still emit a contact";
     const float pen = m.points[0].penetration;
     EXPECT_TRUE(std::isfinite(pen)) << "center-inside penetration is non-finite (garbage)";
@@ -505,18 +508,12 @@ TEST(GjkEpaConvex, SphereHullShallowPenetrationIsMonotone) {
     const float cx_start = face_x + kR + 0.005f;     // 5mm separated
     auto run = [&](bool sphere_is_a, float cx) -> ContactManifold {
         const PrimParams S = MakeSpherePrim(kR, Vec3{cx, 0.0f, 0.0f});
-        ShapeProxyView g;
-        ContactManifold m;
-        std::memset(&m, 0, sizeof(m));
         if (sphere_is_a) {
-            g.type_a = ShapeType::Sphere; g.type_b = ShapeType::ConvexHull;
-            g.prim_a = S; g.geom_b = &H;
-        } else {
-            g.type_a = ShapeType::ConvexHull; g.type_b = ShapeType::Sphere;
-            g.geom_a = &H; g.prim_b = S;
+            return Route(ShapeType::Sphere, nullptr, S,
+                         ShapeType::ConvexHull, &H, PrimParams{});
         }
-        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
-        return m;
+        return Route(ShapeType::ConvexHull, &H, PrimParams{},
+                     ShapeType::Sphere, nullptr, S);
     };
 
     for (int side = 0; side < 2; ++side) {
@@ -581,14 +578,8 @@ TEST(GjkEpaConvex, HullVsCapsulePrimitive) {
     // Y; closest approach to the box +X face (x=0.5) is at x = 0.65-0.25 = 0.40 <
     // 0.5 -> overlap 0.10 along +X. (Capsule has no flat face -> 1-pt witness.)
     const PrimParams B = MakeCapsulePrim(0.25f, 0.5f, Vec3{0.65f, 0.0f, 0.0f});
-    ShapeProxyView g;
-    g.type_a = ShapeType::ConvexHull;
-    g.type_b = ShapeType::Capsule;
-    g.geom_a = &A;
-    g.prim_b = B;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::ConvexHull, &A, PrimParams{},
+                                    ShapeType::Capsule, nullptr, B);
     ASSERT_EQ(m.point_count, 1u) << "capsule side has no face -> 1-pt witness";
     EXPECT_NEAR(m.points[0].penetration, 0.10f, kTol);
     // sep dir for A (hull) = -X (hull pushes away from the capsule on +X).
@@ -604,20 +595,12 @@ TEST(GjkEpaConvex, HullVsCapsulePrimitive) {
 TEST(GjkEpaConvex, CapsuleBoxPenetration) {
     // Both sides are PRIMITIVES (no hull): capsule(A) at origin, box(B) at +X.
     // capsule radius 0.25 (right surface x=0.25); box he 0.5 at x=0.6 (left face
-    // x=0.10) -> overlap 0.15 along X. sep dir for A(capsule) = -X.
-    ASSERT_EQ(ResolveNarrowphase(ShapeType::Capsule, ShapeType::Box, false),
-              &NarrowphaseConvex)
-        << "capsule x box must route to the real Convex handler (review fix)";
+    // x=0.10) -> overlap 0.15 along X. sep dir for A(capsule) = -X. capsule x box
+    // has no closed form -> the general GJK/EPA (cvx) path (NOT the analytical stub).
     const PrimParams A = MakeCapsulePrim(0.25f, 0.5f, Vec3{0.0f, 0.0f, 0.0f});
     const PrimParams B = MakeBoxPrim(Vec3{0.5f, 0.5f, 0.5f}, Vec3{0.6f, 0.0f, 0.0f});
-    ShapeProxyView g;
-    g.type_a = ShapeType::Capsule;
-    g.type_b = ShapeType::Box;
-    g.prim_a = A;
-    g.prim_b = B;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::Capsule, nullptr, A,
+                                    ShapeType::Box, nullptr, B);
     ASSERT_GT(m.point_count, 0u) << "capsule x box must produce a contact, not the stub";
     EXPECT_NEAR(m.points[0].penetration, 0.15f, 1.0e-2f);
     EXPECT_TRUE(Vec3Near(m.points[0].normal, Vec3{-1.0f, 0.0f, 0.0f}, 1.0e-2f));
@@ -625,20 +608,12 @@ TEST(GjkEpaConvex, CapsuleBoxPenetration) {
 
 TEST(GjkEpaConvex, CapsuleCapsulePenetration) {
     // Two parallel (axis-Y) capsules, radius 0.3, centers 0.5 apart in X ->
-    // combined radius 0.6 > 0.5 -> overlap 0.1 along X. sep dir for A = -X.
-    ASSERT_EQ(ResolveNarrowphase(ShapeType::Capsule, ShapeType::Capsule, false),
-              &NarrowphaseConvex)
-        << "capsule x capsule must route to the real Convex handler (review fix)";
+    // combined radius 0.6 > 0.5 -> overlap 0.1 along X. sep dir for A = -X. No
+    // closed form -> the general GJK/EPA (cvx) path (NOT the analytical stub).
     const PrimParams A = MakeCapsulePrim(0.3f, 0.5f, Vec3{0.0f, 0.0f, 0.0f});
     const PrimParams B = MakeCapsulePrim(0.3f, 0.5f, Vec3{0.5f, 0.0f, 0.0f});
-    ShapeProxyView g;
-    g.type_a = ShapeType::Capsule;
-    g.type_b = ShapeType::Capsule;
-    g.prim_a = A;
-    g.prim_b = B;
-    ContactManifold m;
-    std::memset(&m, 0, sizeof(m));
-    ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+    const ContactManifold m = Route(ShapeType::Capsule, nullptr, A,
+                                    ShapeType::Capsule, nullptr, B);
     ASSERT_GT(m.point_count, 0u) << "capsule x capsule must produce a contact, not the stub";
     EXPECT_NEAR(m.points[0].penetration, 0.10f, 1.0e-2f);
     // Parallel-axis capsules => the CSO is degenerate (a line of equally-close
@@ -662,14 +637,8 @@ TEST(GjkEpaConvex, HullVsPlane_BothOrders) {
 
     // Order 1: hull = A, plane = B. sep dir for A (hull) = +Y (push hull up).
     {
-        ShapeProxyView g;
-        g.type_a = ShapeType::ConvexHull;
-        g.type_b = ShapeType::Plane;
-        g.geom_a = &H;
-        g.prim_b = P;
-        ContactManifold m;
-        std::memset(&m, 0, sizeof(m));
-        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+        const ContactManifold m = Route(ShapeType::ConvexHull, &H, PrimParams{},
+                                        ShapeType::Plane, nullptr, P);
         ASSERT_GT(m.point_count, 0u);
         EXPECT_EQ(m.point_count, 4u) << "4 bottom corners below plane";
         for (uint32_t i = 0; i < m.point_count; ++i) {
@@ -680,14 +649,8 @@ TEST(GjkEpaConvex, HullVsPlane_BothOrders) {
     // Order 2: plane = A, hull = B. sep dir for A (plane) = -Y (plane pushes the
     // OTHER way; the swapped-slot sign test).
     {
-        ShapeProxyView g;
-        g.type_a = ShapeType::Plane;
-        g.type_b = ShapeType::ConvexHull;
-        g.geom_b = &H;
-        g.prim_a = P;
-        ContactManifold m;
-        std::memset(&m, 0, sizeof(m));
-        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &m);
+        const ContactManifold m = Route(ShapeType::Plane, nullptr, P,
+                                        ShapeType::ConvexHull, &H, PrimParams{});
         ASSERT_GT(m.point_count, 0u);
         for (uint32_t i = 0; i < m.point_count; ++i) {
             EXPECT_NEAR(m.points[i].penetration, 0.1f, kTol);
@@ -710,37 +673,19 @@ TEST(GjkEpaConvex, Determinism_TwoRunAndCrossReplica) {
     const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
     const ConvexHullView B = MakeHull(vb, Vec3{0.0f, 0.9f, 0.0f});  // overlap Y=0.1
 
-    // 2-run bit identity (memset both, memcmp the whole struct incl. padding).
-    ContactManifold m1, m2;
-    std::memset(&m1, 0, sizeof(m1));
-    std::memset(&m2, 0, sizeof(m2));
-    ResolveNarrowphase(ShapeType::ConvexHull, ShapeType::ConvexHull, false)(
-        MakePair(), [&] { ShapeProxyView g; g.type_a = ShapeType::ConvexHull;
-                          g.type_b = ShapeType::ConvexHull; g.geom_a = &A;
-                          g.geom_b = &B; return g; }(), &m1);
-    ResolveNarrowphase(ShapeType::ConvexHull, ShapeType::ConvexHull, false)(
-        MakePair(), [&] { ShapeProxyView g; g.type_a = ShapeType::ConvexHull;
-                          g.type_b = ShapeType::ConvexHull; g.geom_a = &A;
-                          g.geom_b = &B; return g; }(), &m2);
+    // 2-run bit identity (RouteHullHull memsets the manifold before the cvx call,
+    // so the memcmp covers padding + unused point slots).
+    const ContactManifold m1 = RouteHullHull(A, B);
+    const ContactManifold m2 = RouteHullHull(A, B);
     ASSERT_GT(m1.point_count, 0u);
     EXPECT_EQ(std::memcmp(&m1, &m2, sizeof(ContactManifold)), 0)
         << "2-run manifold must be byte-identical (EPA determinism)";
 
     // N>=32 cross-replica: 40 identical pairs in one loop -> all byte-identical.
     constexpr int kReplicas = 40;
-    ContactManifold ref;
-    std::memset(&ref, 0, sizeof(ref));
-    {
-        ShapeProxyView g; g.type_a = ShapeType::ConvexHull;
-        g.type_b = ShapeType::ConvexHull; g.geom_a = &A; g.geom_b = &B;
-        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &ref);
-    }
+    const ContactManifold ref = RouteHullHull(A, B);
     for (int r = 0; r < kReplicas; ++r) {
-        ContactManifold mr;
-        std::memset(&mr, 0, sizeof(mr));
-        ShapeProxyView g; g.type_a = ShapeType::ConvexHull;
-        g.type_b = ShapeType::ConvexHull; g.geom_a = &A; g.geom_b = &B;
-        ResolveNarrowphase(g.type_a, g.type_b, false)(MakePair(), g, &mr);
+        const ContactManifold mr = RouteHullHull(A, B);
         EXPECT_EQ(std::memcmp(&ref, &mr, sizeof(ContactManifold)), 0)
             << "replica " << r << " diverged (EPA determinism gate)";
     }
