@@ -1907,51 +1907,13 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_sensor_noise_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- Floating-base (free 6-DOF root) ABA (p01-F T8a) --------------------
-    add_executable(nuka_floating_base_aba_test
-        runtime/test_floating_base_aba.cpp
-    )
-
-    target_compile_definitions(nuka_floating_base_aba_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_floating_base_aba_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_floating_base_aba_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- Floating-base contact coupling (p01-F T8b) ------------------------
-    add_executable(nuka_floating_base_contact_test
-        runtime/test_floating_base_contact.cpp
-    )
-
-    target_compile_definitions(nuka_floating_base_contact_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_floating_base_contact_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_floating_base_contact_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_floating_base_aba_test (test_floating_base_aba.cpp) +
+    # nuka_floating_base_contact_test (test_floating_base_contact.cpp) DELETED with
+    # the legacy BatchedArticulatedWorld. Floating-base ABA correctness (legs+base
+    # byte-exact vs MJX golden) survives on nk via oracle
+    # NkWorldFloatingBaseGoldensMatchCudaAbaByteExact; the floating-base foot-ground
+    # contact-recoil through the 18-wide chain-J survives via foot_ground_subsume +
+    # h1_grasp_lift + articulation_contact_rows. go2-stance remainder -> M10.
 
     # --- v0.8 C5c-1: floating-base go2 foot<->ground contact through the UNIFIED
     # collision/contact spine (contact_stream_driver -> sphere x plane narrowphase
@@ -1988,6 +1950,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
             nuka_core
             nuka_phi
+            # M9 T11 re-point: the nk SolveRowsBlockIsland harness (sole solve path).
+            nuka_nk
+            nuka_phi2
             GTest::gtest_main
     )
 
@@ -2117,6 +2082,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             nuka_core
             nuka_phi
+            # M9 T11 re-point: the nk SolveRowsBlockIsland harness (sole solve path).
+            nuka_nk
+            nuka_phi2
             GTest::gtest_main
     )
 
@@ -2342,134 +2310,40 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_pbd_costep_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- Go2 PD standing/tracking validation (sim-val.PD) ------------------
-    add_executable(nuka_go2_pd_standing_test
-        runtime/test_go2_pd_standing.cpp
-    )
+    # M9 T11: nuka_go2_pd_standing_test (test_go2_pd_standing.cpp) DELETED with the
+    # legacy BatchedArticulatedWorld. Pure go2-quadruped PD-stance locomotion
+    # precursor -> M10 carry-forward (crouch-hold height tracking, Sigma lambda=Mg/4
+    # per foot, COM-in-foot-polygon static balance, no-tip, 4096-env determinism;
+    # see subagent-plans/m9-t11-articulated-fold.md M10 carry-forward #1). Generic
+    # foot-ground recoil/friction/D1/scale already on nk via foot_ground_subsume +
+    # h1_grasp_lift + articulation_contact_rows + multi_env.
 
-    target_compile_definitions(nuka_go2_pd_standing_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_go2_pd_standing_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_go2_pd_standing_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- p14a (v0.7) any-link contact-force readout (LINK_CONTACT_WRENCH +
-    # per-slot CONTACT_FORCE). Synthetic kernel unit test + Go2 stance Sigma F_z =
-    # Mg integration + D1 two-run byte-exact. Same link set as the Go2 PD test
-    # (nuka_articulation_gpu carries the wrench kernel sensor/contact_wrench.cu).
-    add_executable(nuka_link_contact_wrench_test
-        sensor/test_link_contact_wrench.cpp
-    )
-
-    target_compile_definitions(nuka_link_contact_wrench_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_link_contact_wrench_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_link_contact_wrench_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_link_contact_wrench_test (test_link_contact_wrench.cpp) DELETED
+    # with the legacy BatchedArticulatedWorld. The synthetic ComputeContactWrench-
+    # Outputs kernel arm + the LINK_CONTACT_WRENCH field binary contract survive
+    # (the kernel + multi_env SingleEnvStillSupported); the go2-stance-balances-
+    # weight + graph==wrench arms -> M10 carry-forward (per-link contact-wrench
+    # readback on a seated go2 nk world; ledger M10 carry-forward #2).
 
     # M9 T11: nuka_batched_reset_test (RL autoreset) + nuka_base_pose_view_test
     # (episode-boundary un-lagged base pose) DELETED -- batched-only / RL-adjacent,
     # their contracts carried forward to M10 (rebuild on the nk world when RL
     # returns; see subagent-plans/m9-t10-coverage-fold.md M10 carry-forward).
 
-    # --- Batched articulated-with-contacts step path (p01-F T6) -------------
-    add_executable(nuka_batched_articulated_world_test
-        runtime/test_batched_articulated_world.cpp
-    )
-
-    target_compile_definitions(nuka_batched_articulated_world_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_batched_articulated_world_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_articulated_world_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # M9 T11: nuka_control_modes_test (velocity / non-PD control mode + per-mode
-    # two-run byte-exact) DELETED -- batched-only / RL-adjacent; the torque-drive
-    # path stays covered by the nk gates (h1_grasp_lift / featherstone oracle), the
-    # velocity-mode contract is carried forward to M10 (rebuild with the M10 non-PD
-    # control surface; see subagent-plans/m9-t10-coverage-fold.md M10 carry-forward).
-
-    # --- CUDA-graph step capture/replay bit-identical gate (p01-W3) ---------
-    add_executable(nuka_batched_articulated_graph_test
-        runtime/test_batched_articulated_graph.cpp
-    )
-
-    target_compile_definitions(nuka_batched_articulated_graph_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_batched_articulated_graph_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_articulated_graph_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    # --- Fine-grained (detail) timing breakdown harness (v0.3 p01 Wave-2) ----
-    add_executable(nuka_batched_articulated_world_perf_test
-        runtime/test_batched_articulated_world_perf_detail.cpp
-    )
-
-    target_compile_definitions(nuka_batched_articulated_world_perf_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_batched_articulated_world_perf_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_articulated_world_perf_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # M9 T11: nuka_batched_articulated_world_test (test_batched_articulated_world.cpp),
+    # nuka_batched_articulated_graph_test (test_batched_articulated_graph.cpp), and
+    # nuka_batched_articulated_world_perf_test (test_batched_articulated_world_perf_
+    # detail.cpp) ALL DELETED with the legacy BatchedArticulatedWorld. The class
+    # orchestration (env-major + cross-env/two-run D1 + 4096 scale) survives on nk
+    # via multi_env (DeterminismCrossEnvAndTwoRuns + HeadlineScale4096 +
+    # SingleEnvStillSupported); batched==engine bit-exact + graph==step survive via
+    # oracle NkWorldRandomSampleGoldensMatchCudaAbaByteExact +
+    # NkWorldBatchedContactStepPlannedByteExact (+ h1_grasp_lift plan-replay); perf
+    # via nuka_go2_4096env_step_time_test NkWorldStepPlannedMeetsGatePerEnv. The
+    # perf-detail file was self-documented "measurement harness, not a correctness
+    # gate" (zero physics). The velocity / non-PD control mode + per-mode two-run
+    # byte-exact contract (was nuka_control_modes_test) is carried forward to M10
+    # (rebuild on the nk world; see subagent-plans/m9-t10-coverage-fold.md).
 
     # --- 4096-env Go2 per-env-step perf-GATE regression test (p01 T3.1.6) ----
     # Records the 4096-env per-env-step µs ALWAYS; asserts the §7 gate only on

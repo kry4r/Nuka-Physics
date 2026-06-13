@@ -80,9 +80,10 @@
 #include "runtime/world_builder.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"  // SolverConfig (iters/dt knobs; legacy UnifiedSolve dropped M9 T11)
 
 #include "foot_chain_jacobian.hpp"  // shared FK-refresh-correct ComputeFootChainJ18
+#include "nk_solve_harness.hpp"     // M9 T11: the nk SolveRowsBlockIsland re-point seam
 
 #include <gtest/gtest.h>
 
@@ -528,18 +529,25 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
         result.exact_lambda = lam;
     }
 
-    // --- (5) UnifiedSolve: ctx.state=[box], ctx.articulation=go2 --------------
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &bodies;
-    ctx.sides = &sides;
-    ctx.dt = inputs.dt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_jacobians;
-    ctx.articulation.inertia_m_inv = &minv;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(ctx, config);
+    // --- (5) the co-resident two-way solve: M9 T11 nk-ONLY -- ctx.state=[box],
+    // ctx.articulation=go2 run through the nk SolveRowsBlockIsland op
+    // (nk_solve_harness.hpp). The harness hoists the rigid-side angular Jacobian
+    // jang = (sides.contact_point - box.position[COM]) x jlin IN-HARNESS -- the
+    // SAME off-COM r x n the legacy kernel filled and this gate asserts. The
+    // legacy solver::UnifiedSolve arm (deleted in M9 T11-core) is gone; the SAME
+    // exact-(A+R) / two-way / box-angular / D1 gates judge the result.
+    {
+        const auto nk_res = nk_harness::NkSolveRows(
+            rows, sides, art_refs, chain_jacobians, minv, qdot, &bodies,
+            kDof, static_cast<uint16_t>(config.velocity_iterations), inputs.dt);
+        EXPECT_TRUE(nk_res.ok) << "nk solve harness failed";
+        if (nk_res.ok) {
+            qdot = nk_res.qdot;
+            for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+                rows.rows[r].lambda = nk_res.lambda[r];
+            }
+        }
+    }
 
     // --- read back ------------------------------------------------------------
     result.lambda = rows.rows[0].lambda;
