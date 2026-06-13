@@ -1,18 +1,22 @@
 #pragma once
 // ---------------------------------------------------------------------------
+// DEPRECATED(M9): src/runtime/coresident/ is deleted WHOLE at M9. KEPT ALIVE
+// through M8 (controller R1/R2) — the M7 factory death deletes only the SCENE
+// AUTHORING (h1_union_scene_factory); this bridge survives because it maps the
+// BatchedSceneTemplate the .nks cook (CookSceneToUnionTemplate) now produces
+// into the UnionCsr nk::Model the union gates (h1_union_parity / nk_union_n1 /
+// h1_grasp_lift) step. The native CookToModel->UnionCsr path that retires it is
+// M9. nk core itself never includes coresident headers.
+// ---------------------------------------------------------------------------
 // nuka::runtime::coresident — BatchedSceneTemplate -> nk::Model (M4).
 //
-// The TRANSITIONAL cook bridge for the M4 union gates: converts the legacy
-// union scene authoring product (BatchedSceneTemplate — the settled
-// gripper_proto + fingertips + feet + cup hull + table, exactly what
-// BatchedUnifiedWorld consumes) into an nk::Model of the UnionCsr contact
-// family, so the SAME scene steps through CookToModel-shaped nk::World ops and
-// the h1_union_parity / nk_union_n1 / grasp-parity gates can compare the two
-// worlds on identical initial state.
-//
-// LIFETIME: lives in src/runtime/coresident/ ON PURPOSE — it dies with the
-// factory at M7 (the .nks scene path replaces the template authoring) /
-// the directory at M9. nk core itself never includes coresident headers.
+// The TRANSITIONAL cook bridge for the M4 union gates: converts the union scene
+// product (BatchedSceneTemplate — the settled gripper_proto + fingertips + feet
+// + cup hull + table, exactly what BatchedUnifiedWorld consumes; now produced by
+// the M7 .nks cook, formerly by the deleted factory) into an nk::Model of the
+// UnionCsr contact family, so the SAME scene steps through CookToModel-shaped
+// nk::World ops and the h1_union_parity / nk_union_n1 / h1_grasp_lift gates can
+// compare the two worlds on identical initial state.
 //
 // MAPPING (the legacy semantics, 1:1):
 //   * articulation template  <- gripper_proto (single articulation; incl. the

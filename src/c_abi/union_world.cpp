@@ -2,12 +2,14 @@
 // nuka::c_abi -- C ABI for the H1 WHOLE-BODY UNION WORLD (v0.8 G2). A MINIMAL
 // extern "C" shim over nuka::runtime::coresident::BatchedUnifiedWorld carrying
 // the COMPLETE G1d union scene (floating-base whole-body H1 + settled in-hand
-// cup + ground + table), template-constructed by the PRODUCTION
-// h1_union_scene_factory (the full deterministic authoring incl. the 200-step
-// oracle settle pre-roll). Mirrors the grasp_world.cpp pattern: a local
-// HandleTable, a record holding the world + the borrowed DeviceRecord (the
-// device must outlive the union world), and the shared try/catch ->
-// nuka_result_t convention.
+// cup + ground + table). The scene's BatchedSceneTemplate is COOKED from the
+// AUTHORED examples/scenes/h1_cup_table.nks (M7: scene::nks::Load ->
+// scene::cook::CookSceneToUnionTemplate), which reads the baked settled IC +
+// grasp config -- REPLACING the deleted 1026-line h1_union_scene_factory's
+// FK/placement/200-step-settle authoring (proven equivalent to ~1e-8 by the
+// h1_grasp_lift gate). Mirrors the grasp_world.cpp pattern: a local HandleTable,
+// a record holding the world + the borrowed DeviceRecord (the device must
+// outlive the union world), and the shared try/catch -> nuka_result_t convention.
 // ---------------------------------------------------------------------------
 
 #include "nuka/nuka_union.h"
@@ -18,8 +20,11 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "runtime/coresident/batched_unified_world.hpp"
-#include "runtime/coresident/h1_union_scene_factory.hpp"
 #include "runtime/rigid/body_state.hpp"
+#include "scene/cook/union_cook.hpp"
+#include "scene/cook/union_scene_constants.hpp"
+#include "scene/format/nks.hpp"
+#include "scene/scene_ir.hpp"
 
 #include <cstring>
 #include <exception>
@@ -33,14 +38,15 @@
 namespace nuka::c_abi {
 
 namespace coresident = nuka::runtime::coresident;
+namespace cook = nuka::scene::cook;
 
 // One batched union world bound to a device (the device MUST outlive this
-// record -- the grasp/diffsim contract). Holds the world + the factory scene
+// record -- the grasp/diffsim contract). Holds the world + the cooked scene
 // metadata (drive tables / limits / grip columns) + the last_action echo.
 struct UnionWorldRecord {
     DeviceRecord* device = nullptr;
     std::unique_ptr<coresident::BatchedUnifiedWorld> world;
-    coresident::H1UnionScene scene;  // template + metadata (kept whole; small).
+    cook::CookedUnionScene scene;  // template + metadata (kept whole; small).
     uint32_t env_count = 0u;
     uint32_t action_dim = 0u;        // == dof_stride (51).
     uint32_t num_fingertips = 0u;
@@ -63,6 +69,7 @@ namespace {
 using nuka::c_abi::DeviceRecord;
 using nuka::c_abi::UnionWorldRecord;
 namespace coresident = nuka::runtime::coresident;
+namespace cook = nuka::scene::cook;
 
 nuka::c_abi::HandleTable<nuka_union_world_t, UnionWorldRecord>& UnionWorldTable() {
     static nuka::c_abi::HandleTable<nuka_union_world_t, UnionWorldRecord> table;
@@ -95,33 +102,39 @@ nuka_result_t nuka_union_world_create(nuka_device_handle device,
     if (device_record == nullptr) return NUKA_RESULT_NULL_HANDLE;
 
     // Sentinel defaults (the SAME constants on every host language -- no float-
-    // literal seam): 0 gravity -> -9.81f; <=0 dt -> 1/240f; empty paths -> the
-    // factory's repo-relative defaults.
+    // literal seam): 0 gravity -> -9.81f; <=0 dt -> 1/240f. The scene itself is
+    // the AUTHORED .nks (it imports h1_with_hand + the cup hull); the desc's
+    // mjcf/cup paths now serve only as the file-existence guard for the assets
+    // that scene references (empty -> the repo-relative defaults).
     const std::string mjcf =
         (desc->h1_mjcf_path != nullptr && desc->h1_mjcf_path[0] != '\0')
             ? desc->h1_mjcf_path
-            : coresident::kH1UnionMjcfDefault;
+            : cook::kH1UnionMjcfDefault;
     const std::string cup =
         (desc->cup_usda_path != nullptr && desc->cup_usda_path[0] != '\0')
             ? desc->cup_usda_path
-            : coresident::kH1UnionCupDefault;
+            : cook::kH1UnionCupDefault;
+    const std::string nks_path = cook::kH1UnionNksDefault;
     const float gravity_z =
-        (desc->gravity_z == 0.0f) ? coresident::kH1UnionGravityZ : desc->gravity_z;
+        (desc->gravity_z == 0.0f) ? cook::kH1UnionGravityZ : desc->gravity_z;
     const float dt =
-        (desc->fixed_dt <= 0.0f) ? coresident::kH1UnionDt : desc->fixed_dt;
+        (desc->fixed_dt <= 0.0f) ? cook::kH1UnionDt : desc->fixed_dt;
 
-    if (!std::filesystem::exists(mjcf) || !std::filesystem::exists(cup)) {
+    if (!std::filesystem::exists(nks_path) ||
+        !std::filesystem::exists(mjcf) || !std::filesystem::exists(cup)) {
         return NUKA_RESULT_FILE_NOT_FOUND;
     }
 
     try {
         auto record = std::make_unique<UnionWorldRecord>();
         record->device = device_record;
-        // The FULL deterministic authoring (cook -> seat -> curl -> placement
-        // search -> 200-step oracle settle -> carry -> table) runs HERE, inside
-        // libnuka, on the device's context. Throws LOUDLY on a degenerate scene.
-        record->scene =
-            coresident::BuildH1UnionScene(device_record->context, mjcf, cup);
+        // Load the AUTHORED union scene + COOK it to the BatchedSceneTemplate
+        // (reads the baked settled IC + grasp config -- the M7 replacement for
+        // the factory's FK/placement/200-step-settle). Throws LOUDLY on a
+        // degenerate scene (missing GraspConfig / initial_state).
+        const nuka::scene::SceneIR scene = nuka::scene::nks::Load(nks_path);
+        record->scene = cook::CookSceneToUnionTemplate(
+            scene, static_cast<int>(desc->env_count));
         record->world = std::make_unique<coresident::BatchedUnifiedWorld>(
             device_record->context, record->scene.tmpl, desc->env_count,
             gravity_z, dt);

@@ -31,17 +31,31 @@
 #include "phi/device_context.hpp"
 #include "runtime/coresident/batched_unified_world.hpp"
 #include "runtime/coresident/h1_union_nk_model.hpp"
-#include "runtime/coresident/h1_union_scene_factory.hpp"
+#include "scene/cook/union_cook.hpp"
+#include "scene/cook/union_scene_constants.hpp"
+#include "scene/format/nks.hpp"
+#include "scene/scene_ir.hpp"
 
 namespace {
 
 namespace nk = nuka::nk;
 namespace nphi = nuka::phi;
 namespace coresident = nuka::runtime::coresident;
+namespace cook = nuka::scene::cook;
 
 bool AssetsAvailable() {
-    return std::filesystem::exists(coresident::kH1UnionMjcfDefault) &&
-           std::filesystem::exists(coresident::kH1UnionCupDefault);
+    return std::filesystem::exists(cook::kH1UnionNksDefault) &&
+           std::filesystem::exists(cook::kH1UnionMjcfDefault) &&
+           std::filesystem::exists(cook::kH1UnionCupDefault);
+}
+
+// Cook the AUTHORED .nks union scene into the BatchedSceneTemplate (replacing
+// the deleted factory BuildH1UnionScene — proven equivalent to ~1e-8 by the
+// h1_grasp_lift gate). Same product surface (tmpl + drive tables + grip dofs +
+// scene scalars) the perf gate reads.
+cook::CookedUnionScene CookUnionScene(int env_count) {
+    const nuka::scene::SceneIR scene = nuka::scene::nks::Load(cook::kH1UnionNksDefault);
+    return cook::CookSceneToUnionTemplate(scene, env_count);
 }
 
 }  // namespace
@@ -56,14 +70,14 @@ TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
     nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    coresident::H1UnionScene sc = coresident::BuildH1UnionScene(context);
+    cook::CookedUnionScene sc = CookUnionScene(1);
     ASSERT_TRUE(sc.place_found);
-    const float dt = coresident::kH1UnionDt;
+    const float dt = cook::kH1UnionDt;
 
     nk::Model model = coresident::BuildNkUnionModel(sc.tmpl, 1u);
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = dt;
-    cfg.gravity[2] = coresident::kH1UnionGravityZ;
+    cfg.gravity[2] = cook::kH1UnionGravityZ;
     cfg.vel_iters = 64;
     cfg.pos_iters = 0;
     cfg.fold_drive_damping = 0;
@@ -175,7 +189,7 @@ TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
     // ---- the legacy baseline (printed, not gated) ---------------------------
     {
         coresident::BatchedUnifiedWorld legacy(context, sc.tmpl, 1u,
-                                               coresident::kH1UnionGravityZ, dt);
+                                               cook::kH1UnionGravityZ, dt);
         constexpr uint32_t kLegacySteps = 50u;
         for (uint32_t s = 0; s < 5u; ++s) legacy.Step();
         const auto l0 = std::chrono::steady_clock::now();
@@ -206,21 +220,20 @@ TEST(NkUnionN1, FullContactStepPlannedUnder5msHard) {
 // ===========================================================================
 TEST(NkGraspThroughput, BatchedUnionAtLeast11kEnvStepsPerSecond) {
     if (!AssetsAvailable()) GTEST_SKIP() << "h1_with_hand / cup not present";
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
     nphi::Device* dev = nphi::InitBestDevice();
     ASSERT_NE(dev, nullptr);
     nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    coresident::H1UnionScene sc = coresident::BuildH1UnionScene(context);
+    cook::CookedUnionScene sc = CookUnionScene(static_cast<int>(1024u));
     ASSERT_TRUE(sc.place_found);
-    const float dt = coresident::kH1UnionDt;
+    const float dt = cook::kH1UnionDt;
 
     constexpr uint32_t kEnvs = 1024u;
     nk::Model model = coresident::BuildNkUnionModel(sc.tmpl, kEnvs);
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = dt;
-    cfg.gravity[2] = coresident::kH1UnionGravityZ;
+    cfg.gravity[2] = cook::kH1UnionGravityZ;
     cfg.vel_iters = 64;
     cfg.pos_iters = 0;
     cfg.fold_drive_damping = 0;

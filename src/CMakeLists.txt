@@ -910,13 +910,13 @@ if(CMAKE_CUDA_COMPILER)
         # (python/src/nuka_ext.cpp, g++-10) binds the C surface only -- no C++ class
         # ABI crosses the toolchain boundary.
         c_abi/grasp_world.cpp
-        # v0.8 G2: the H1 WHOLE-BODY UNION WORLD C-ABI shim + the PRODUCTION union
-        # scene factory (the test-proven G1c/G1d authoring incl. the 200-step
-        # oracle settle pre-roll, reproduced verbatim from the shared test header
-        # and guarded by the byte-equality gate in
-        # tests/coresident/test_h1_union_scene_factory.cpp).
+        # v0.8 G2 / M7: the H1 WHOLE-BODY UNION WORLD C-ABI shim. The union scene
+        # is now COOKED from the authored examples/scenes/h1_cup_table.nks via
+        # nuka_scene_cook (CookSceneToUnionTemplate) -- the 1026-line
+        # h1_union_scene_factory it used to call is DELETED (M7 T6); the cook
+        # reads the baked settled IC + grasp config and produces the SAME
+        # BatchedSceneTemplate BatchedUnifiedWorld consumes.
         c_abi/union_world.cpp
-        runtime/coresident/h1_union_scene_factory.cpp
         runtime/coresident/batched_unified_world.cpp
         runtime/coresident/unified_coresident_stepper.cpp
         runtime/coresident/grasp_scene_factory.cpp
@@ -946,6 +946,11 @@ if(CMAKE_CUDA_COMPILER)
             nuka_solver
             nuka_constraint
             nuka_collision_gpu
+            # M7: the C-ABI union world cooks examples/scenes/h1_cup_table.nks
+            # (CookSceneToUnionTemplate) instead of calling the deleted factory.
+            # nuka_scene_cook transitively pulls nuka_nk + nuka_scene +
+            # nuka_articulation; nks::Load lives in nuka_import (already linked).
+            nuka_scene_cook
         PUBLIC
             CUDA::cudart
     )
@@ -980,11 +985,8 @@ if(CMAKE_CUDA_COMPILER)
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
-        # G2: the union scene factory carries VERBATIM copies of the test-side
-        # authoring bodies (h1_demo_shared / h1_union_scene_shared, never written
-        # under the strict flags); re-auditing them would risk the byte-identity
-        # the equality gate pins. The NEW c_abi/union_world.cpp shim stays strict.
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
+        # M7: h1_union_scene_factory.cpp DELETED (the .nks cook replaces it); the
+        # NEW c_abi/union_world.cpp shim stays strict.
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
         PROPERTIES COMPILE_OPTIONS "-w"
     )
