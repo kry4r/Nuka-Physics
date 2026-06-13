@@ -853,7 +853,8 @@ RendererVulkanHandles VulkanRasterRenderer::VulkanHandles() {
 }
 
 VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
-                                                   const RasterOptions& options) {
+                                                   const RasterOptions& options,
+                                                   const OffscreenOverlayFn& overlay) {
     if (options.width == 0u || options.height == 0u) {
         throw std::runtime_error("Vulkan raster render dimensions must be non-zero");
     }
@@ -1027,6 +1028,13 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         vkCmdBindVertexBuffers(cmd, 0u, 2u, vbuffers.data(), offsets.data());
         vkCmdBindIndexBuffer(cmd, draw.index.buffer, 0u, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, draw.index_count, 1u, 0u, 0, 0u);
+    }
+
+    // -- 4b. Optional ImGui overlay (M8.5 T3, GATE-B). Empty for every M8 caller
+    //        -> this branch is skipped and the recorded stream stays byte-identical
+    //        to the G2 oracle. Recorded INSIDE the pass, before EndRenderPass.
+    if (overlay) {
+        overlay(reinterpret_cast<void*>(cmd));
     }
 
     vkCmdEndRenderPass(cmd);

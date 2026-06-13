@@ -83,6 +83,28 @@ public:
     // enabled the latest frame is stored (LatestReport()).
     bool Frame();
 
+    // -- the PRESENT seam (M8.5 T3) -----------------------------------------
+    // Drive ONE frame for the realtime windowed viewer: Input -> Sim -> publish
+    // the selected env's FK poses into the RenderWorld (TransformSync) -- but do
+    // NOT run the offscreen RenderSystem (the viewer draws the RenderWorld itself
+    // via the PresentRenderer's swapchain path). This is the clean seam that lets
+    // the viewer reuse the exact M8 step+publish without duplicating the publish
+    // and without engaging the offscreen (D1) renderer. Unlike Frame(), publish
+    // here is unconditional (the viewer always renders); the G5 offscreen bypass
+    // does not apply because no offscreen draw is issued. `out_intents` (optional)
+    // receives the resolved ViewerControl dispatch from the command queue.
+    // `do_step` may be set false to publish without advancing physics (a paused
+    // viewport that still re-frames / re-publishes on env change). Returns the
+    // step health (true when do_step==false).
+    bool FramePublish(InputIntents* out_intents = nullptr, bool do_step = true) {
+        last_frame_rendered_ = false;
+        input_system_.Run(command_queue_, out_intents);
+        bool step_ok = true;
+        if (do_step) step_ok = sim_system_.Run(world_, planned_);
+        transform_sync_system_.Run(publisher_, world_, env_index_, render_world_);
+        return step_ok;
+    }
+
     // -- introspection -------------------------------------------------------
     render::RenderWorld&                 GetRenderWorld() { return render_world_; }
     const render::RenderWorld&           GetRenderWorld() const { return render_world_; }

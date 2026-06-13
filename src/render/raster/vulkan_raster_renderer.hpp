@@ -36,6 +36,7 @@
 #include "render/vulkan_offscreen_types.hpp"  // VulkanRgba8, VulkanOffscreenReport (shared output)
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -71,6 +72,24 @@ using NkVkDescriptorPool = VkDescriptorPool_T*;
 // 64-bit builds). We carry it as a void* at this seam to stay header-light; the
 // present renderer reinterpret_casts it back to VkSurfaceKHR in its .cpp.
 using NkVkSurface        = void*;
+
+// ---------------------------------------------------------------------------
+// OffscreenOverlayFn (M8.5 T3) -- an OPTIONAL per-render ImGui (or any extra)
+// recording callback for the offscreen path's GATE-B composite. When supplied to
+// Render() it is invoked INSIDE the offscreen render pass (after the scene draw,
+// immediately before vkCmdEndRenderPass) with the active command buffer as an
+// opaque handle (the GATE-B test reinterpret_casts it to VkCommandBuffer for
+// ImGui_ImplVulkan_RenderDrawData). Mirrors PresentRenderer's OverlayRecordFn so
+// the same imgui_layer recording feeds both the windowed present pass and the
+// deterministic offscreen composite.
+//
+// ★ G2 RED-LINE: when the callback is EMPTY (the default every existing caller
+// passes) Render() records a BYTE-FOR-BYTE identical command stream to the M8
+// offscreen oracle -- the overlay branch is skipped entirely, so the G2/
+// render_physics_parity determinism is provably unperturbed. The overlay is an
+// opt-in composite for the viewer-frame smoke ONLY.
+// ---------------------------------------------------------------------------
+using OffscreenOverlayFn = std::function<void(void* command_buffer)>;
 
 // ---------------------------------------------------------------------------
 // RendererVulkanHandles -- the narrow accessor seam (T2/T3).
@@ -174,7 +193,15 @@ public:
     // Render `world` into an offscreen color+depth target and read the color back
     // into report.pixels (row-major, top-left origin, RGBA8). Deterministic:
     // identical (world, options) -> byte-identical report.pixels.
-    VulkanOffscreenReport Render(const RenderWorld& world, const RasterOptions& options = {});
+    //
+    // `overlay` (M8.5 T3, default EMPTY) is an optional record callback run INSIDE
+    // the render pass just before EndRenderPass -- used by the GATE-B viewer-frame
+    // smoke to composite the ImGui UI onto the offscreen scene. When empty (every
+    // M8 caller), the recorded command stream is byte-identical to the M8 oracle
+    // (the G2 red-line): the overlay branch is not entered. With a FIXED ImGui UI
+    // state the composited result is itself deterministic (two renders memcmp==0).
+    VulkanOffscreenReport Render(const RenderWorld& world, const RasterOptions& options = {},
+                                 const OffscreenOverlayFn& overlay = {});
 
     // The selected ICD device name (e.g. "llvmpipe (LLVM 12.0.0, 256 bits)"),
     // available after construction -- useful for the de-risk report.

@@ -37,6 +37,26 @@ struct MoveEntity {
     math::Transform world_xform = math::Transform::Identity();
 };
 
+// A viewer control intent (M8.5 T3): the minimal play/pause/step/reset/camera
+// dispatch the InputSystem applies each frame (recon open-Q 8 -- full drag-to-move
+// stays M11 via MoveEntity above). The viewer's transport buttons drive the UI
+// state directly; this command lets an OUT-OF-BAND producer (a headless driver, a
+// hotkey thread, a test) request the same transport actions through the queue.
+struct ViewerControl {
+    enum class Action : uint8_t {
+        None,
+        TogglePlay,   // flip play/pause
+        Play,
+        Pause,
+        StepOnce,     // advance exactly one frame (implies paused)
+        Reset,        // request a sim reset (re-cook / re-seed; viewer-defined)
+        CameraReset,  // re-frame the camera to the scene AABB
+        SetEnv,       // select env `value` (D4)
+    };
+    Action   action = Action::None;
+    uint32_t value  = 0u;  // payload for SetEnv (the env index)
+};
+
 // A no-op marker (default-constructed Command). Lets the queue hold a valid
 // "nothing" command and keeps Command default-constructible.
 struct NoOp {};
@@ -48,12 +68,13 @@ struct NoOp {};
 // (cf. the ECS component set). New command kinds append a tag + a member.
 // ---------------------------------------------------------------------------
 struct Command {
-    enum class Kind : uint8_t { NoOp, MoveEntity };
+    enum class Kind : uint8_t { NoOp, MoveEntity, ViewerControl };
 
     Kind kind = Kind::NoOp;
 
     // Payload union-by-membership (only the member matching `kind` is valid).
-    MoveEntity move_entity{};
+    MoveEntity    move_entity{};
+    ViewerControl viewer_control{};
 
     Command() = default;
 
@@ -63,6 +84,13 @@ struct Command {
         Command c;
         c.kind = Kind::MoveEntity;
         c.move_entity = MoveEntity{e, xform};
+        return c;
+    }
+
+    static Command MakeViewerControl(ViewerControl::Action a, uint32_t value = 0u) {
+        Command c;
+        c.kind = Kind::ViewerControl;
+        c.viewer_control = ViewerControl{a, value};
         return c;
     }
 };
