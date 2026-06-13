@@ -185,6 +185,26 @@ void StepBackward(const phi::DeviceContext& context,
                   const StepBackwardInputs& inputs,
                   const StepBackwardGrads& grads);
 
+// M9 T7: the SINGLE StepBackward kernel launcher, DEFINED in the phi v2 op TU
+// (phi/backend_cuda/ops/diffsim_backward.cu) where the kernel now lives (as
+// NkOp::StepBackward). The host StepBackward() above + the NkOp dispatch both
+// drive THIS one launcher, so the op path and the direct path are byte-identical
+// by single-source. SAME launch config as the old in-target kernel
+// (<<<articulation_count, 32, 0, stream>>>). enable_q_channel mirrors
+// inputs.enable_q_channel (passed explicitly to match the old call site).
+void LaunchStepBackwardKernel(articulation::ArticulationDeviceState state,
+                              const StepBackwardInputs& inputs,
+                              const StepBackwardGrads& grads,
+                              bool enable_q_channel, cudaStream_t stream);
+
+// M9 T7: the backward runner's cross-step / cross-window grad_mass accumulate
+// (acc[i] += step[i], one thread/link, NO atomics -> D1). DEFINED alongside the
+// StepBackward kernel in the phi v2 op TU so backward_runner stays pure-host
+// (.cpp). SAME launch geometry (256 threads/block) as the deleted
+// backward_runner.cu kernel.
+void LaunchAddInPlace(float* acc, const float* step, uint32_t n,
+                      cudaStream_t stream);
+
 // Builds the per-link d(I[36])/d(mass) Jacobian on the host, from the SAME
 // MakeSpatialInertia mapping the engine uses. Because MakeSpatialInertia is
 // exactly affine in mass for fixed (diagonal_inertia, inertial_frame), the slope

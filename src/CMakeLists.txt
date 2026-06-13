@@ -598,6 +598,12 @@ if(CMAKE_CUDA_COMPILER)
         # the particle side of the unified row solve.
         phi/backend_cuda/ops/particles.cu
         phi/backend_cuda/ops/readout.cu
+        # M9 T7: NkOp::StepBackward — the diffsim contact-free single-step reverse
+        # adjoint, kernel moved VERBATIM from the deleted diffsim/step_backward.cu
+        # (same reduction order / launch config / nvcc flags -> D1 byte-exact).
+        # Also hosts the StepBackward kernel launcher + the backward runner's
+        # grad_mass accumulate kernel so diffsim's backward_runner stays host-only.
+        phi/backend_cuda/ops/diffsim_backward.cu
     )
     set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -1048,12 +1054,16 @@ if(CMAKE_CUDA_COMPILER)
     # p02-B/C: the multi-step tape / checkpoint / recompute orchestrator /
     # backward runner ride on the p02-A single-step adjoint (step_backward).
     add_library(nuka_diffsim STATIC
-        diffsim/step_backward.cu
+        # M9 T7: step_backward.cu's StepBackwardKernel moved to the phi v2 op TU
+        # (NkOp::StepBackward); the host StepBackward() launcher + the host mass
+        # jacobian builder live in step_backward_host.cpp. tape.cu + backward_runner.cu
+        # held only D2D copies / host orchestration (+ one tiny accumulate kernel
+        # relocated to the op TU), so they are now pure-host tape.cpp / backward_runner.cpp.
         diffsim/step_backward_host.cpp
-        diffsim/tape.cu
+        diffsim/tape.cpp
         diffsim/checkpoint.cu
         diffsim/recompute_orchestrator.cu
-        diffsim/backward_runner.cu
+        diffsim/backward_runner.cpp
         # v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend).
         # Warp-per-articulation batched-dense SPD CG; D1 bit-exact, no atomics.
         diffsim/sparse_solver_cg.cu
@@ -1107,6 +1117,11 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation
             nuka_core
             nuka_phi
+            # M9 T7: the StepBackward kernel (NkOp::StepBackward) + its launcher +
+            # the grad_mass-accumulate kernel now live in the phi v2 op TU
+            # (phi/backend_cuda/ops/diffsim_backward.cu); the diffsim host
+            # StepBackward() + BackwardRunner drive them through that launcher.
+            nuka_phi2
             CUDA::cudart
     )
 

@@ -1,6 +1,13 @@
 // ---------------------------------------------------------------------------
 // nuka::diffsim -- Tape implementation (p02-B/C)
 // ---------------------------------------------------------------------------
+//
+// M9 T7: was tape.cu. The tape records only the per-step ACTION slice via plain
+// D2D copies (cudaMemcpyAsync) -- no device kernels -- so it is pure-host
+// orchestration and now compiles as a .cpp (cuda_runtime D2D copies in host TUs
+// are the established c_abi pattern). Semantics UNCHANGED (byte-for-byte the same
+// RecordStep D2D + ActionSlice offsetting).
+// ---------------------------------------------------------------------------
 
 #include "diffsim/tape.hpp"
 

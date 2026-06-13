@@ -1,6 +1,20 @@
 // ---------------------------------------------------------------------------
 // nuka::diffsim -- BackwardRunner implementation (p02-B/C)
 // ---------------------------------------------------------------------------
+//
+// M9 T7: was backward_runner.cu. The runner is pure HOST orchestration of the
+// reverse pass -- checkpoint restore, window roll-forward + cache, descending
+// reverse, and per-step StepBackward dispatch. Its only device kernel was the
+// fixed-order atomic-free grad_mass accumulate (acc += step); that kernel moved
+// VERBATIM to the phi v2 op TU (phi/backend_cuda/ops/diffsim_backward.cu) and is
+// driven here through diffsim::LaunchAddInPlace, so this file is now a .cpp. The
+// reverse loop dispatches NkOp::StepBackward per step through StepBackward()
+// (which drives the SINGLE op-resident kernel). Replay of the forward state uses
+// the orchestrator's CONTACT-FREE op sequence (StepOnce: ApplyDrives mode0
+// defer=false + explicit damping + ABA + integrate -- NOT World::Step), so the
+// grads stay grad-vs-FD bit-exact AND replay-deterministic. Semantics + D2D
+// copies + launch geometry are byte-for-byte UNCHANGED from backward_runner.cu.
+// ---------------------------------------------------------------------------
 
 #include "diffsim/backward_runner.hpp"
 
@@ -22,22 +36,15 @@ void CheckCuda(cudaError_t status, const char* what) {
     }
 }
 
-// Fixed-order, atomic-free accumulate: acc[i] += step[i]. One thread per link,
-// plain load/add/store (NO atomics) -> D1 bit-exact.
-__global__ void AddInPlaceKernel(float* acc, const float* step, uint32_t n) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        acc[i] = acc[i] + step[i];
-    }
-}
-
+// Fixed-order, atomic-free accumulate: acc[i] += step[i]. The kernel itself lives
+// in the phi v2 op TU (diffsim_backward.cu) so this file stays pure-host; the
+// thin launcher (diffsim::LaunchAddInPlace) keeps the SAME 256-threads/block
+// geometry and one-thread-per-link plain load/add/store -> D1 bit-exact.
 void LaunchAdd(const phi::DeviceContext& ctx, float* acc, const float* step,
                uint32_t n) {
-    const uint32_t threads = 256u;
-    const uint32_t blocks = (n + threads - 1u) / threads;
     phi::ScopedDeviceGuard guard(ctx.device_id);
-    AddInPlaceKernel<<<blocks, threads, 0, ctx.stream.Native()>>>(acc, step, n);
-    CheckCuda(cudaGetLastError(), "AddInPlaceKernel launch");
+    LaunchAddInPlace(acc, step, n, ctx.stream.Native());
+    CheckCuda(cudaGetLastError(), "AddInPlace launch");
 }
 
 phi::Buffer ZeroedFloat(const phi::DeviceContext& ctx, size_t count) {
@@ -128,7 +135,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
 
     // 4. StepBackward: seeds carried in grad_q_/grad_qdot_/grad_link_vel_ (the
     //    dL/d state' of step j == dL/d state of step j+1), OVERWRITTEN in place
-    //    with the pre-step seed (dL/d state of step j -> the seed for step j-1).
+    //    with the pre-step seed for step j-1.
     StepBackwardInputs in = orch_.ReconstructInputs(tape, step);
     in.q_pre = static_cast<const float*>(q_pre_.Data());
     in.qdot_pre = static_cast<const float*>(qdot_pre_.Data());

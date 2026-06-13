@@ -1,52 +1,48 @@
 // ---------------------------------------------------------------------------
-// nuka::diffsim -- single-step reverse-mode adjoint (contact-free PD path)
+// PHI v2 CUDA backend — M9 T7: NkOp::StepBackward
+//   the diffsim contact-free single-step reverse-mode adjoint, op-ified.
+//
+// The kernel body (StepBackwardKernel) is moved VERBATIM from the old
+// src/diffsim/step_backward.cu (deleted in M9 T7): SAME reduction order, SAME
+// in-register fixed-order atomic-free tree accumulation, SAME launch config
+// (<<<articulation_count, 32>>>, lane 0 per articulation), SAME helper bodies.
+// Per ruling #2 this is the MONOLITHIC form: AbaBackward / IntegrateBackward /
+// SolveRowsBackward stay INTERNAL device stages of the one kernel (no per-stage
+// device materialization → no extra round-trip → D1 byte-exact AND fastest).
+//
+// BYTE-EXACTNESS: nuka_phi2 and the old nuka_diffsim compile CUDA with the
+// IDENTICAL flag set (-std=c++17 -arch=native -Xcompiler=-fPIC; no --fmad
+// override on either → both nvcc-default --fmad=true; no fast-math; same -O).
+// So FMA contraction + rounding are unchanged by the move (verified against the
+// build-cuda128 flags.make of both targets).
+//
+// TWO entry points reach the ONE kernel (single-source → byte-identical):
+//   * OpStepBackward — the registered NkOp::StepBackward (DispatchOp path):
+//     builds the legacy articulation device-state view from ModelView/DataView
+//     (the layout-identical nkops aliasing) and unpacks StepBackwardParams back
+//     into StepBackwardInputs/StepBackwardGrads.
+//   * LaunchStepBackwardKernel — the plain launcher the diffsim host
+//     StepBackward() (the FD-oracle's direct entry) + BackwardRunner call.
+//
+// This TU also hosts LaunchAddInPlace, the backward runner's fixed-order
+// atomic-free grad_mass accumulate (acc[i] += step[i], one thread/link), moved
+// here verbatim so backward_runner becomes a pure-host .cpp.
+//
+// NO allocation in this TU (lint hot_path_cuda_malloc covers ops/**).
 // ---------------------------------------------------------------------------
-//
-// Hand-written reverse of one forward step:  drive -> ABA(3-pass) -> integrate.
-// ONE thread per articulation, mirroring the forward kernels' single-lane
-// per-articulation loops. The reverse runs the passes in reverse order:
-//
-//   integrate-reverse -> pass3-reverse -> pass2-reverse -> pass1-reverse
-//                        -> drive-reverse
-//
-// Every cross-link adjoint (a child feeding a parent's bias/inertia in forward
-// pass 2; a parent feeding a child's acceleration in forward pass 3) is
-// accumulated in fixed local-link order with plain `+=` -- NO float atomics
-// (correctness + D1 + lint, by construction of the single-thread design).
-//
-// The forward intermediates (link_xup, joint_motion_subspace, link_articulated_I,
-// joint_diagonal, link_u_spatial, joint_force, link_velocity, link_velocity_bias,
-// link_bias_force, link_acceleration, qddot) persist in the device buffers; the
-// reverse reads them. The PRE-step q / qdot are snapshotted by the caller.
-//
-// FIXED-BASE (revolute / fixed joints) is fully implemented incl. the q-channel
-// (the link_xup = JointTransform(q) path). FLOATING-BASE root reverse is
-// implemented for the VELOCITY channel: the 6x6 LDLT-solve adjoint of
-// a_free = Ia^-1(-p) (STAGE B-float) + the root gyroscopic pass-1 reverse
-// (p = v x* (I v), STAGE D-float) + the floating-base linear velocity integrator
-// reverse (v_root' = v_root + (a_free - a_grav)dt, STAGE A-float), seeded through
-// grad_link_velocity_out. The base ORIENTATION channel is now ALSO differentiated
-// (p08b): STAGE A-pose reverses the quaternion POSE integrator (position' / dq /
-// QuatMul / normalize), and STAGE A-float additionally reverses the gravity-
-// rotation a_grav = R(base_rot)^T g dependence; both accumulate dL/d base_rot_pre,
-// and base_pose' is a supported loss seed (grad_base_pose_out). All orientation
-// reads linearize at the PRE-step base orientation (in.base_pose_pre), mirroring
-// v_root_pre. The prismatic joint q-channel is still not wired (revolute-only
-// STAGE E).
-// ---------------------------------------------------------------------------
-
-#include "diffsim/step_backward.hpp"
-#include "diffsim/aba_reverse.cuh"
-
-#include "codegen/generated/maximal_drive_adjoint.cuh"
-#include "math/cuda_spatial_ops.cuh"
-#include "math/cuda_vec_ops.cuh"
-#include "runtime/articulation/articulation_state.hpp"
 
 #include <cuda_runtime.h>
 
-#include <stdexcept>
-#include <string>
+#include "codegen/generated/maximal_drive_adjoint.cuh"
+#include "diffsim/aba_reverse.cuh"
+#include "diffsim/step_backward.hpp"
+#include "math/cuda_spatial_ops.cuh"
+#include "math/cuda_vec_ops.cuh"
+#include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/registry.cuh"
+#include "runtime/articulation/articulation_state.hpp"
 
 namespace nuka::diffsim {
 
@@ -59,13 +55,6 @@ using articulation::ArticulationJointType;
 constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kMinDiagonal = 1.0e-6f;
 constexpr uint32_t kMaxRevLinks = 24u;   // covers go2 (13) + base; bound for scratch
-
-void CheckCuda(cudaError_t result, const char* operation) {
-    if (result != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + " failed: " +
-                                 cudaGetErrorString(result));
-    }
-}
 
 // Reproduce JointTransform's rotation (R = local_rot * joint_rot) and translation
 // exactly enough to recompute the inputs the X-adjoint needs. We only need this
@@ -823,19 +812,110 @@ __global__ void StepBackwardKernel(ArticulationDeviceState state,
     }
 }
 
+// Fixed-order, atomic-free accumulate: acc[i] += step[i]. One thread per link,
+// plain load/add/store (NO atomics) -> D1 bit-exact. VERBATIM from the deleted
+// backward_runner.cu (the cross-step / cross-window grad_mass accumulation).
+__global__ void AddInPlaceKernel(float* acc, const float* step, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        acc[i] = acc[i] + step[i];
+    }
+}
+
 }  // namespace
 
-void StepBackward(const phi::DeviceContext& context,
-                  ArticulationDeviceState state,
-                  const StepBackwardInputs& inputs,
-                  const StepBackwardGrads& grads) {
+// ---------------------------------------------------------------------------
+// The SINGLE kernel launcher both entry points drive. Stream-aware via
+// phi::LaunchCuda. SAME launch config as the deleted step_backward.cu:
+// <<<articulation_count, 32, 0, stream>>>, lane-0-per-articulation.
+// ---------------------------------------------------------------------------
+void LaunchStepBackwardKernel(ArticulationDeviceState state,
+                              const StepBackwardInputs& inputs,
+                              const StepBackwardGrads& grads, bool enable_q_channel,
+                              cudaStream_t stream) {
     if (state.articulation_count == 0u) return;
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
-    // ONE thread per articulation (lane 0); grid over articulations.
-    StepBackwardKernel<<<state.articulation_count, 32u, 0u, stream>>>(
-        state, inputs, grads, inputs.enable_q_channel);
-    CheckCuda(cudaGetLastError(), "StepBackwardKernel launch");
+    nuka::phi::LaunchCuda(StepBackwardKernel, dim3(state.articulation_count),
+                          dim3(32u), 0u, stream, state, inputs, grads,
+                          enable_q_channel);
+}
+
+// The backward runner's grad_mass accumulate (acc += step), exported so the
+// runner stays a pure-host .cpp. SAME launch geometry as the deleted
+// backward_runner.cu (256 threads/block).
+void LaunchAddInPlace(float* acc, const float* step, uint32_t n,
+                      cudaStream_t stream) {
+    if (n == 0u) return;
+    const uint32_t threads = 256u;
+    const uint32_t blocks = (n + threads - 1u) / threads;
+    nuka::phi::LaunchCuda(AddInPlaceKernel, dim3(blocks), dim3(threads), 0u, stream,
+                          acc, step, n);
 }
 
 }  // namespace nuka::diffsim
+
+namespace nuka::phi {
+
+namespace {
+
+// NkOp::StepBackward dispatch entry. Builds the (layout-identical) legacy
+// articulation device-state view from ModelView/DataView via the nkops aliasing,
+// unpacks StepBackwardParams back into StepBackwardInputs/StepBackwardGrads, and
+// launches the SAME kernel the direct host launcher drives (single-source ->
+// byte-identical). The grad buffers + pre-state snapshots live OUTSIDE the arena,
+// so they ride in the params as raw device pointers.
+Status OpStepBackward(const ModelView& model, const DataView& data,
+                      const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const StepBackwardParams*>(params);
+    if (p == nullptr) {
+        return Status::Failed;
+    }
+    if (p->articulation_count == 0u || p->total_link_count == 0u) {
+        return Status::Ok;
+    }
+    // The nkops view is field-for-field layout-identical to the legacy
+    // articulation::ArticulationDeviceState (verified static layout); cast it so
+    // the kernel signature (legacy type, kernel body verbatim) consumes it.
+    const nkops::ArticulationDeviceState nk_state = nkops::MakeArticulationDeviceState(
+        model, data, p->total_link_count, p->articulation_count);
+    const auto& state =
+        reinterpret_cast<const ::nuka::runtime::articulation::ArticulationDeviceState&>(
+            nk_state);
+
+    ::nuka::diffsim::StepBackwardInputs in;
+    in.q_pre = p->q_pre;
+    in.qdot_pre = p->qdot_pre;
+    in.v_root_pre = p->v_root_pre;
+    in.base_pose_pre = static_cast<const math::Transform*>(p->base_pose_pre);
+    in.drive_targets = p->drive_targets;
+    in.drive_stiffness = p->drive_stiffness;
+    in.drive_damping = p->drive_damping;
+    in.drive_force_limits = p->drive_force_limits;
+    in.dI_dmass = p->dI_dmass;
+    in.dt = p->dt;
+    in.gravity_z = p->gravity_z;
+    in.has_drive = (p->has_drive != 0u);
+    in.has_integrate = (p->has_integrate != 0u);
+    in.grad_qddot_seed = p->grad_qddot_seed;
+    in.enable_q_channel = (p->enable_q_channel != 0u);
+
+    ::nuka::diffsim::StepBackwardGrads g;
+    g.grad_q_out = p->grad_q_out;
+    g.grad_qdot_out = p->grad_qdot_out;
+    g.grad_target_out = p->grad_target_out;
+    g.grad_mass_out = p->grad_mass_out;
+    g.grad_tau_out = p->grad_tau_out;
+    g.grad_link_velocity_out = p->grad_link_velocity_out;
+    g.grad_base_pose_out = static_cast<float*>(p->grad_base_pose_out);
+
+    ::nuka::diffsim::LaunchStepBackwardKernel(state, in, g, in.enable_q_channel,
+                                              stream);
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+}
+
+}  // namespace
+
+void RegisterNkDiffsimBackwardOps() {
+    SetCudaOp(NkOp::StepBackward, &OpStepBackward);
+}
+
+}  // namespace nuka::phi
