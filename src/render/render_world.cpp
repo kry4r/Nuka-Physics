@@ -1,10 +1,12 @@
 // ---------------------------------------------------------------------------
 // nuka::render::RenderWorld implementation (M8 manifest #1).
 //
-// BuildRenderWorld walks the ECS Registry for every renderable entity (a
-// VisualMeshComponent OR a CollisionShapeComponent), resolves its mesh (real
-// .nka MESH triangles where present, else a collision-primitive tessellation
-// fallback per Decision D3), its PBR material, its cached visual_local offset
+// BuildRenderWorld walks the ECS Registry for every renderable entity. The
+// authored appearance is the VisualMeshComponent's real .nka MESH triangles;
+// CollisionShapeComponents are rendered as primitive tessellations ONLY in a
+// scene that has no visual meshes at all (a pure-collision / synthetic scene),
+// so a mesh-bearing robot is not occluded by its physics proxies (M8.5 beauty
+// pass). It resolves each instance's PBR material, its cached visual_local offset
 // (the composed node chain from the physics-bound ancestor down to the visual
 // node, Decision D1), and its pose source (LinkPose/BodyPose/Static, resolved
 // ONCE so the per-frame publisher never re-walks SceneMap).
@@ -231,13 +233,65 @@ MeshGeometry MakeCapsule(float r, float hh, uint32_t slices = 16, uint32_t cap_s
     return m;
 }
 
-// Convert a decoded .nka MESH into our backend-agnostic MeshGeometry.
+// Area-weighted SMOOTH vertex normals from positions + indices. Used when a
+// cooked .nka MESH carries no (or all-zero, T5-flagged) normals -- without this
+// the shader's normalize() of a zero normal yields NaN and the surface renders
+// black. Smooth (vertex-averaged) normals read better than flat on the curved
+// robot shells. Deterministic accumulation order (D1-safe).
+std::vector<float> SmoothNormals(const std::vector<float>& positions,
+                                 const std::vector<uint32_t>& indices) {
+    std::vector<float> normals(positions.size(), 0.0f);
+    auto at = [&](uint32_t v, int c) { return positions[static_cast<size_t>(v) * 3 + c]; };
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const uint32_t a = indices[i], b = indices[i + 1], c = indices[i + 2];
+        const math::Vec3 pa{at(a, 0), at(a, 1), at(a, 2)};
+        const math::Vec3 pb{at(b, 0), at(b, 1), at(b, 2)};
+        const math::Vec3 pc{at(c, 0), at(c, 1), at(c, 2)};
+        // Un-normalized cross => area-weighted contribution (larger faces weigh more).
+        const math::Vec3 fn{
+            (pb.y - pa.y) * (pc.z - pa.z) - (pb.z - pa.z) * (pc.y - pa.y),
+            (pb.z - pa.z) * (pc.x - pa.x) - (pb.x - pa.x) * (pc.z - pa.z),
+            (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x)};
+        for (uint32_t v : {a, b, c}) {
+            normals[static_cast<size_t>(v) * 3 + 0] += fn.x;
+            normals[static_cast<size_t>(v) * 3 + 1] += fn.y;
+            normals[static_cast<size_t>(v) * 3 + 2] += fn.z;
+        }
+    }
+    for (size_t v = 0; v + 2 < normals.size(); v += 3) {
+        const float len = std::sqrt(normals[v] * normals[v] +
+                                    normals[v + 1] * normals[v + 1] +
+                                    normals[v + 2] * normals[v + 2]);
+        if (len > 1e-12f) {
+            normals[v] /= len; normals[v + 1] /= len; normals[v + 2] /= len;
+        } else {
+            normals[v] = 0.0f; normals[v + 1] = 0.0f; normals[v + 2] = 1.0f;
+        }
+    }
+    return normals;
+}
+
+// True when the normal stream is missing, length-mismatched, or DEGENERATE
+// (every component ~0 -- the T5 zero-filled-normals cook gap).
+bool NormalsUnusable(const std::vector<float>& positions, const std::vector<float>& normals) {
+    if (normals.size() != positions.size() || normals.empty()) return true;
+    for (float c : normals) {
+        if (std::fabs(c) > 1e-6f) return false;  // a real normal exists -> usable
+    }
+    return true;  // all-zero
+}
+
+// Convert a decoded .nka MESH into our backend-agnostic MeshGeometry. Synthesizes
+// smooth normals when the cooked stream is absent or all-zero so downstream
+// shading (raster + M11 RT) never normalizes a zero vector.
 MeshGeometry FromNkaMesh(const scene::NkaMesh& src) {
     MeshGeometry m;
     m.positions = src.positions;
-    m.normals   = src.normals;
     m.uvs       = src.uvs;
     m.indices   = src.indices;
+    m.normals   = NormalsUnusable(src.positions, src.normals)
+                      ? SmoothNormals(src.positions, src.indices)
+                      : src.normals;
     return m;
 }
 
@@ -294,12 +348,25 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         return component_material_id;
     };
 
+    // A CollisionShapeComponent is a PHYSICS proxy, not an authored visual. When
+    // the scene cooked REAL .nka visual meshes (go2 / h1), those meshes ARE the
+    // robot's appearance, and the collision proxies are redundant geometry that
+    // (a) double-draws over the real meshes with the flat default-grey material,
+    // and (b) is frequently the WRONG size (e.g. a go2 foot's collision box is a
+    // 1m cube) -- so they read as oversized white blobs occluding the model.
+    //
+    // Rule (M8.5 beauty pass): render collision-shape primitives ONLY when the
+    // scene produced NO real visual-mesh geometry (a pure-collision / synthetic
+    // scene, e.g. the h1_cup_table light scene whose VisualMeshComponents carry
+    // EMPTY .nka refs, or the gates' primitive worlds -- those still show their
+    // collision geometry). Once >=1 visual mesh resolves to real triangles, the
+    // collision proxies are suppressed so the real geometry stands alone. The
+    // counter below is filled by the visual-mesh loop (a component existing is NOT
+    // enough -- its MESH ref must actually load), so a no-mesh light scene keeps
+    // its collision render and the parity/smoke gates are unperturbed.
+    uint32_t loaded_visual_meshes = 0u;
+
     // -- emit one RenderInstance per renderable entity -----------------------
-    // A renderable entity is one carrying EITHER a VisualMeshComponent (a
-    // non-colliding geom; mesh from its .nka MESH ref when present, else a unit
-    // box placeholder) OR a CollisionShapeComponent (rendered as its primitive
-    // tessellation -- this is what makes the go2/h1 cooked scenes show geometry
-    // today, since no MESH chunks are bound yet; Decision D3).
     auto build_common = [&](scene::EntityId e, uint32_t mesh_id, uint32_t material_id) {
         RenderInstance inst;
         inst.entity             = e;
@@ -324,38 +391,33 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     // VisualMeshComponent entities.
     registry.ForEach<scene::VisualMeshComponent>(
         [&](scene::EntityId e, const scene::VisualMeshComponent& vis) {
-            uint32_t mesh_id;
-            if (!vis.mesh.Empty() && vis.mesh.fourcc == scene::NkaTagMesh()) {
-                std::shared_ptr<scene::NkaFile> file = open_nka(vis.mesh.nka_path);
-                bool loaded = false;
-                if (file && file->CountChunks(scene::NkaTagMesh()) > vis.mesh.index) {
-                    mesh_id = world.meshes.InternNkaMesh(vis.mesh, [&]() {
-                        return FromNkaMesh(scene::DecodeMesh(
-                            file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
-                    });
-                    loaded = true;
-                }
-                if (!loaded) {
-                    mesh_id = world.meshes.InternPrimitive(
-                        PrimKey("vis_placeholder", 0.05f, 0.05f, 0.05f),
-                        []() { return MakeBox(0.05f, 0.05f, 0.05f); });
-                }
-            } else {
-                // No bound MESH geometry (the cook leaves visual mesh refs empty
-                // pre-M2c): a small unit-box placeholder so the instance always
-                // has renderable triangles (fidelity is asset-gated, not blocked).
-                mesh_id = world.meshes.InternPrimitive(
-                    PrimKey("vis_placeholder", 0.05f, 0.05f, 0.05f),
-                    []() { return MakeBox(0.05f, 0.05f, 0.05f); });
+            if (vis.mesh.Empty() || vis.mesh.fourcc != scene::NkaTagMesh()) {
+                // No bound MESH geometry: rather than emit a placeholder box that
+                // occludes the real geometry, skip this visual node entirely. Its
+                // appearance is asset-gated; a missing ref renders nothing, not a
+                // misleading cube.
+                return;
             }
+            std::shared_ptr<scene::NkaFile> file = open_nka(vis.mesh.nka_path);
+            if (!file || file->CountChunks(scene::NkaTagMesh()) <= vis.mesh.index) {
+                // The MESH ref points at a missing/short container: skip (no box).
+                return;
+            }
+            const uint32_t mesh_id = world.meshes.InternNkaMesh(vis.mesh, [&]() {
+                return FromNkaMesh(scene::DecodeMesh(
+                    file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
+            });
+            ++loaded_visual_meshes;  // a real mesh resolved -> suppress collision proxies
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // CollisionShapeComponent entities -> primitive tessellation fallback. Hull /
-    // SDF kinds carry no inline params (geometry lives record-side / in .nka),
-    // so they render as a unit-box placeholder; box/sphere/capsule tessellate
-    // from their params.
+    // CollisionShapeComponent entities -> primitive tessellation fallback. Only
+    // emitted when NO real visual mesh loaded (loaded_visual_meshes == 0; otherwise
+    // the visual meshes ARE the appearance and the collision proxies are redundant
+    // / wrong-sized occluders). box/sphere/capsule tessellate from their params;
+    // hull/SDF kinds carry no host geometry and are SKIPPED (no oversized box).
     using CK = scene::CollisionShapeComponent::Kind;
+    if (loaded_visual_meshes == 0u)
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
             uint32_t mesh_id;
@@ -385,13 +447,10 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 case CK::ConvexHull:
                 case CK::SdfMesh:
                 default: {
-                    // No host geometry available from the Registry alone -> a unit
-                    // box placeholder (the cooked hull/SDF triangles bind to .nka
-                    // MESH in a later asset pass; tracked as the D3 fidelity debt).
-                    mesh_id = world.meshes.InternPrimitive(
-                        PrimKey("hull_placeholder", 0.05f, 0.05f, 0.05f),
-                        []() { return MakeBox(0.05f, 0.05f, 0.05f); });
-                    break;
+                    // No host geometry available from the Registry alone: skip
+                    // rather than emit a misleading placeholder box (the cooked
+                    // hull/SDF triangles bind to .nka MESH in a later asset pass).
+                    return;
                 }
             }
             // CollisionShapeComponent carries only a PHYSICS material id, not a

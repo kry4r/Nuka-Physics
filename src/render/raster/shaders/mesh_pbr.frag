@@ -138,7 +138,24 @@ void main() {
     // ground color by the normal's up-axis (world +Z is up in this scene).
     float hemi = n.z * 0.5 + 0.5;
     vec3  ambient_color = mix(scene.ambient_ground.rgb, scene.ambient.rgb, hemi);
-    vec3  ambient = ambient_color * albedo * (1.0 - metallic * 0.5);
+
+    // Diffuse ambient is albedo-tinted (a black body absorbs it) -- this term
+    // carries the bright/dark material distinction (white shell vs black plastic),
+    // so keep it the DOMINANT ambient and do NOT let the recovery terms below
+    // flatten it. Two SMALL albedo-INDEPENDENT terms then recover form on a near-
+    // black surface so it reads as a shaded DARK-grey shape (not #000) while
+    // staying clearly darker than the light parts:
+    //  (1) a specular/reflective ambient on the dielectric+metal F0 (the surface
+    //      reflects the environment regardless of albedo), Fresnel-boosted at
+    //      grazing angles so silhouettes get a soft rim-glow against the dark bg;
+    //  (2) a faint constant "form floor" scaled by the GGX gloss so an unlit black
+    //      face is separated from the background -- kept low to preserve contrast.
+    vec3  diffuse_ambient = ambient_color * albedo * (1.0 - metallic);
+    float fresnel_rim     = pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 4.0);
+    vec3  spec_ambient    = ambient_color * (f0 + (max(vec3(1.0 - roughness), f0) - f0) * fresnel_rim) * 0.6;
+    float gloss           = 1.0 - roughness;
+    vec3  form_floor      = ambient_color * (0.035 + 0.05 * gloss * gloss);
+    vec3  ambient         = diffuse_ambient + spec_ambient + form_floor;
 
     vec3 color = lo + ambient + vEmissive.rgb;
 
