@@ -27,15 +27,18 @@
 // BuildNkUnionModel(cooked.tmpl) and BatchedUnifiedWorld(cooked.tmpl) behave
 // identically to the factory's. The native CookToModel->UnionCsr path is M9.
 //
-// nk_engine lint scope: CUDA-type-free host C++. Depends on the coresident
-// headers ONLY for the plain-data product types (BatchedSceneTemplate,
-// H1UnionDriveEntry, CoResident* descriptors) — no kernels, no device.
+// nk_engine lint scope: CUDA-type-free host C++. Depends ONLY on the relocated
+// plain-data product types (BatchedSceneTemplate, H1UnionDriveEntry, in
+// src/scene/cook/union_scene_template.hpp; CoResident* descriptors pulled in
+// transitively) — NO kernels, NO device, NO dependency on the doomed coresident
+// directory (the M9 T3 decouple: union_cook no longer includes
+// runtime/coresident/batched_unified_world.hpp).
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
 #include <vector>
 
-#include "runtime/coresident/batched_unified_world.hpp"     // BatchedSceneTemplate + H1UnionDriveEntry
+#include "scene/cook/union_scene_template.hpp"  // BatchedSceneTemplate + H1UnionDriveEntry
 #include "scene/scene_ir.hpp"
 
 namespace nuka::scene::cook {

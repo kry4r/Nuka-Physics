@@ -22,8 +22,8 @@
 
 #include "math/vec3.hpp"
 #include "runtime/articulation/articulation_state.hpp"   // ArticulationHostState
-#include "runtime/coresident/batched_unified_world.hpp"   // BatchedSceneTemplate
 #include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResident{Cup,Fingertip} / GraspConfig
+#include "scene/cook/union_scene_template.hpp"   // BatchedSceneTemplate (M9 T3 relocation)
 #include "runtime/rigid/body_state.hpp"
 
 #include <cstdint>
