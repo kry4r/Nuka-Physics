@@ -3132,4 +3132,42 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
 
     gtest_discover_tests(nuka_render_raster_smoke_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # M8 T7 -- render_physics_parity: THE M8 EXIT GATE. Builds the real H1 union
+    # fixture (Load(.nks) -> CookToModel -> nk::World + BuildRenderWorld +
+    # Simulation, the render_frame_loop_smoke path) and asserts G1 (1:1
+    # physics<->render bit-exact over ALL physics-driven instances), G2 (two
+    # renders byte-identical, RAW pixels), G3 (non-background pixels > 0). Reads
+    # poses from nk::World::DownloadField directly (Decision D2). Asset-gated SKIP;
+    # the whole gate is behind NK_BUILD_VULKAN_VALIDATION (real Vulkan device).
+    # Links the nk physics libs + nuka_render + nuka_app (mirrors the
+    # render_frame_loop_smoke link set + the raster renderer).
+    add_executable(nuka_render_physics_parity_test
+        scenario/render_physics_parity.cpp
+    )
+    add_dependencies(nuka_render_physics_parity_test nuka_codegen)
+    target_compile_definitions(nuka_render_physics_parity_test
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_render_physics_parity_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_render_physics_parity_test
+        PRIVATE
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_render_physics_parity_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
