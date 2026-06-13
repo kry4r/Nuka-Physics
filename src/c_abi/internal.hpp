@@ -4,6 +4,7 @@
 
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
+#include "phi/backend.hpp"
 #include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
@@ -20,8 +21,39 @@
 namespace nuka::c_abi {
 
 struct DeviceRecord {
+    // --- Legacy phi v1 per-handle device context (M9 delete-list) -----------
+    // Still used by the legacy single-/multi-env stepper paths until those are
+    // switched off in later M9 tasks (T5). Do NOT remove in T2.
     phi::DeviceContext context;
     std::unique_ptr<phi::OwnedStream> owned_stream;
+
+    // --- phi v2 owned device/backend (M9 T2) -------------------------------
+    // An OWNED phi v2 Backend (and the registry-owned Device it was init'd on),
+    // acquired in nuka_device_create. These feed the future nk::World ctor +
+    // cook::Settle from the C-ABI:
+    //   TODO(M9-T4): nuka_scene.cpp's settle() calls cook::Settle on this backend.
+    //   TODO(M9-T5): world.cpp create builds nk::World(model, n, phi_device,
+    //                backend, cfg) from these (mirroring recorder.cpp).
+    // LIFETIME (mirrors RecorderRecord, commit fcae2a6): the Backend is OWNED
+    // and freed in the destructor; nk::World only BORROWS it
+    // (World::~World -> BackendPlanFree(backend_), never frees the backend), so
+    // any future borrowing member must be torn down BEFORE the BackendFree. The
+    // Device is registry-OWNED (RegistryEntryGetDevice / InitBestDevice) and is
+    // NOT freed here. Null when no phi v2 device/backend is available (e.g. no
+    // CUDA backend registered); the legacy paths still function in that case.
+    phi::Device* phi_device = nullptr;   // registry-owned; do NOT free
+    phi::Backend* backend = nullptr;     // OWNED; BackendFree'd in dtor
+
+    ~DeviceRecord() {
+        // No phi v2 World borrows this backend yet (that arrives in T5); freeing
+        // it directly here is correct for T2. When T5 adds an owned nk::World to
+        // DeviceRecord, reset() it BEFORE this BackendFree (see lifetime note).
+        if (backend != nullptr) {
+            phi::BackendFree(backend);
+            backend = nullptr;
+        }
+        // phi_device is registry-owned; not freed.
+    }
 };
 
 struct WorldRecord {
