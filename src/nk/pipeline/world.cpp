@@ -61,16 +61,24 @@ bool World::SeedInitialState() {
     const uint32_t L = cap.links_per_env;
     const uint32_t E = cap.env_count;
 
-    // Fill the reset/snapshot params (stable addresses for dispatch).
+    // Fill the reset/snapshot params (stable addresses for dispatch). The body
+    // arm (M7 T1): SnapshotState/RestoreState carry the env-major TOTAL body
+    // count (bodies_per_env*env_count); ResetEnvs carries the PER-ENV body
+    // stride. All 0 when the world has no movable bodies (articulation-only
+    // worlds keep the byte-identical snapshot/restore/reset).
+    const uint32_t total_body_count = cap.bodies_per_env * E;
     snapshot_params_.total_link_count = L * E;
     snapshot_params_.env_count = E;
+    snapshot_params_.total_body_count = total_body_count;
     restore_params_.total_link_count = L * E;
     restore_params_.env_count = E;
     restore_params_.row_slot_count = cap.max_rows_per_env * E;
+    restore_params_.total_body_count = total_body_count;
     reset_params_.count = 0;
     reset_params_.base_link_count = L;
     reset_params_.lambda_stride = cap.max_rows_per_env;
     reset_params_.articulation_count = E;
+    reset_params_.body_count = cap.bodies_per_env;
 
     // -- M4: movable rigid-body template seeding (env-major replication) -----
     const uint32_t B = cap.bodies_per_env;
@@ -192,10 +200,14 @@ bool World::SeedInitialState() {
     }
 
     if (L == 0) {
-        // No articulation: SnapshotState is a NO-OP today (it early-returns at
-        // total_link_count == 0; body/particle snapshot fields do not exist
-        // yet — the M7 settle consumer extends the snapshot system). Reset on
-        // a bodies/particles-only world therefore restores nothing; honest Ok.
+        // No articulation, but the world may still have movable BODIES (e.g. a
+        // settled cup-on-table). The body state was already seeded above
+        // (BodyPose / BodyLinearVelocity / BodyAngularVelocity), and
+        // snapshot_params_.total_body_count is set, so SnapshotState now
+        // CAPTURES the body slice (M7 T1) — Reset restores the settled cup pose.
+        // (Particle snapshot/restore is still out of scope here — the named M8
+        // RL-reset debt.) When there are no bodies either, SnapshotState is a
+        // genuine no-op; honest Ok.
         return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
                phi::Status::Ok;
     }

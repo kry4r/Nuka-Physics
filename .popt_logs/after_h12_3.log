@@ -1,0 +1,51 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 3 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 3 tests from BatchedH1HandGrasp
+[ RUN      ] BatchedH1HandGrasp.Gate1_N1_ByteExactVsCoResidentOracle
+[H1.2 GATE1] H1 hand: links=46 dof_stride=12 fingertips=30 drive_links=12 (vs synthetic 2-DOF gripper: links=3 dof=2 fingertips=2)
+[H1.2 GATE1] step   0: |dpos|=0.000e+00 |dvel|=1.118e-07 |dqdot|=4.768e-07 contacts(o=30 b=30) cup_z(b=1.194898 o=1.194898) vimp(o=6.6367e-03 b=6.6366e-03)
+[H1.2 GATE1] step   1: |dpos|=0.000e+00 |dvel|=1.697e-07 |dqdot|=4.768e-07 contacts(o=30 b=30) cup_z(b=1.195025 o=1.195025) vimp(o=1.5818e-02 b=1.5818e-02)
+[H1.2 GATE1] step   2: |dpos|=0.000e+00 |dvel|=2.252e-07 |dqdot|=5.066e-07 contacts(o=30 b=30) cup_z(b=1.195215 o=1.195215) vimp(o=1.1183e-02 b=1.1183e-02)
+[H1.2 GATE1] step   3: |dpos|=0.000e+00 |dvel|=3.725e-09 |dqdot|=7.153e-07 contacts(o=30 b=30) cup_z(b=1.195386 o=1.195386) vimp(o=7.2780e-03 b=7.2780e-03)
+[H1.2 GATE1] step   4: |dpos|=0.000e+00 |dvel|=2.041e-07 |dqdot|=9.537e-07 contacts(o=30 b=30) cup_z(b=1.195597 o=1.195597) vimp(o=1.0073e-02 b=1.0073e-02)
+[H1.2 GATE1] step   5: |dpos|=0.000e+00 |dvel|=2.342e-07 |dqdot|=9.537e-07 contacts(o=30 b=30) cup_z(b=1.195761 o=1.195761) vimp(o=5.9561e-03 b=5.9561e-03)
+[H1.2 GATE1] step   6: |dpos|=0.000e+00 |dvel|=2.110e-07 |dqdot|=9.537e-07 contacts(o=30 b=30) cup_z(b=1.195912 o=1.195912) vimp(o=7.5333e-03 b=7.5334e-03)
+[H1.2 GATE1] step   7: |dpos|=0.000e+00 |dvel|=9.541e-08 |dqdot|=1.907e-06 contacts(o=30 b=30) cup_z(b=1.196127 o=1.196127) vimp(o=1.1205e-02 b=1.1205e-02)
+[H1.2 GATE1] step   8: |dpos|=0.000e+00 |dvel|=1.475e-07 |dqdot|=2.861e-06 contacts(o=30 b=30) cup_z(b=1.196437 o=1.196437) vimp(o=1.2801e-02 b=1.2801e-02)
+[H1.2 GATE1] step   9: |dpos|=0.000e+00 |dvel|=4.561e-07 |dqdot|=1.431e-06 contacts(o=30 b=30) cup_z(b=1.196708 o=1.196708) vimp(o=6.2760e-03 b=6.2760e-03)
+[H1.2 GATE1] step  10: |dpos|=0.000e+00 |dvel|=6.664e-08 |dqdot|=1.907e-06 contacts(o=29 b=29) cup_z(b=1.196907 o=1.196907) vimp(o=4.7109e-03 b=4.7109e-03)
+[H1.2 GATE1] step  11: |dpos|=0.000e+00 |dvel|=1.075e-07 |dqdot|=2.384e-06 contacts(o=29 b=29) cup_z(b=1.197078 o=1.197078) vimp(o=6.8230e-03 b=6.8230e-03)
+[H1.2 GATE1] step  12: |dpos|=3.892e-04 |dvel|=9.340e-02 |dqdot|=3.698e-01 contacts(o=27 b=27) cup_z(b=1.197216 o=1.197391) vimp(o=1.5026e-02 b=6.6040e-03)
+[H1.2 GATE1] step  13: |dpos|=3.647e-04 |dvel|=8.013e-02 |dqdot|=5.988e-01 contacts(o=27 b=27) cup_z(b=1.197332 o=1.197431) vimp(o=-4.9386e-03 b=7.1220e-03)
+[H1.2 GATE1] step  14: |dpos|=5.137e-04 |dvel|=3.692e-02 |dqdot|=5.637e-01 contacts(o=25 b=25) cup_z(b=1.197354 o=1.197464) vimp(o=7.8328e-03 b=3.6888e-03)
+[H1.2 GATE1] step  15: |dpos|=6.564e-04 |dvel|=3.489e-02 |dqdot|=5.316e-01 contacts(o=25 b=25) cup_z(b=1.197361 o=1.197474) vimp(o=7.0683e-03 b=7.4238e-03)
+[H1.2 GATE1] step  16: |dpos|=9.178e-04 |dvel|=7.120e-02 |dqdot|=5.423e-01 contacts(o=24 b=23) cup_z(b=1.197383 o=1.197511) vimp(o=9.4306e-03 b=8.8808e-03)
+[H1.2 GATE1] step  17: |dpos|=9.919e-04 |dvel|=1.949e-02 |dqdot|=4.311e-01 contacts(o=19 b=19) cup_z(b=1.197402 o=1.197515) vimp(o=6.6261e-03 b=8.0642e-03)
+[H1.2 GATE1] step  18: |dpos|=1.457e-04 |dvel|=2.521e-01 |dqdot|=1.887e-01 contacts(o=19 b=18) cup_z(b=1.197420 o=1.197536) vimp(o=9.0058e-03 b=8.1267e-03)
+[H1.2 GATE1] step  69: |dpos|=6.708e-04 |dvel|=1.011e-03 |dqdot|=9.505e-02 contacts(o=6 b=6) cup_z(b=1.193939 o=1.194060) vimp(o=8.2164e-03 b=8.2253e-03)
+[H1.2 GATE1 RESULT] FP-FLOOR WINDOW (steps 0-9): max|dpos|=0.000e+00 max|dvel|=4.561e-07 max|dqdot|=2.861e-06 (HARD tol pos/vel 1e-06 qdot 5e-06). FULL RUN (70 steps): max|dpos|=1.544e-03 max|dvel|=2.521e-01 max|dqdot|=5.988e-01 (REPORTED, chaotic). contact-count fork @ step 16. contact 70/70.
+[H1.2 GATE1 CHAOS CONTROL] two SAME-code oracles, cup IC nudged 1e-7 m: self max|dpos|=6.142e-03 max|dvel|=2.908e-01 (stable 17/70). The 1e-7 seed grows to the SAME order as batched-vs-oracle -> the table-free marginal grasp is chaotic at the FP floor; full-run byte-parity is impossible for ANY two paths.
+[       OK ] BatchedH1HandGrasp.Gate1_N1_ByteExactVsCoResidentOracle (230690 ms)
+[ RUN      ] BatchedH1HandGrasp.Gate2_MultiEnvIndependence_N8
+[H1.2 GATE2 PER-ENV] N=8: every env byte-exact vs its own N=1 run; all held; adjacent envs differ
+[H1.2 GATE2 MIXED] N=8 (held=even, no-contact=odd): every env byte-exact vs its own N=1 run; held hold, no-contact free-fall
+[H1.2 GATE2 D1] N=8: two identical H1-hand rollouts byte-exact (cup + q/qdot)
+[       OK ] BatchedH1HandGrasp.Gate2_MultiEnvIndependence_N8 (91994 ms)
+[ RUN      ] BatchedH1HandGrasp.Throughput_LowerBound_Sweep
+
+[H1.2 THROUGHPUT] === LOWER BOUND (fixed-base H1 hand, links=46 dof_stride=12 fingertips=30; cmp synthetic 2-DOF ~9.8k env-steps/sec). The whole-body 53-DOF+table world is HEAVIER -> this is NOT the final number. ===
+[H1.2 THROUGHPUT]        N | wall_ms/step |  env-steps/sec
+[H1.2 THROUGHPUT]        1 |       55.564 |             18
+[H1.2 THROUGHPUT]        8 |       67.464 |            119
+[H1.2 THROUGHPUT]       32 |       90.484 |            354
+[H1.2 THROUGHPUT]      256 |      334.704 |            765
+[H1.2 THROUGHPUT]     1024 |     1228.129 |            834
+[H1.2 THROUGHPUT] (NOTE: drive = one bulk SetActions + Step/step, the steady-state RL seam. A LOWER BOUND on the eventual feasibility number -- the fixed-base hand is far lighter than the whole-body 53-DOF+table world; constant close torque keeps the cup gripped so the contact solve is exercised.)
+[       OK ] BatchedH1HandGrasp.Throughput_LowerBound_Sweep (152542 ms)
+[----------] 3 tests from BatchedH1HandGrasp (475226 ms total)
+
+[----------] Global test environment tear-down
+[==========] 3 tests from 1 test suite ran. (475226 ms total)
+[  PASSED  ] 3 tests.
+EXIT=0

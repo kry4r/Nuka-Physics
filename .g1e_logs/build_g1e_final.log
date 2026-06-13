@@ -1,0 +1,56 @@
+[  5%] Built target nuka_core
+[ 11%] Built target tinyxml2
+[ 17%] Built target nuka_collision
+[ 23%] Built target nuka_constraint
+[ 35%] Built target nuka_phi
+[ 35%] Built target gtest
+[ 35%] Built target nuka_codegen
+[ 35%] Built target nuka_cooker
+[ 35%] Built target gtest_main
+[ 41%] Built target nuka_scene
+[ 41%] Built target nuka_row_solver_gpu
+[ 47%] Built target nuka_articulation
+[ 52%] Built target nuka_solver
+[ 64%] Built target nuka_articulation_gpu
+[ 76%] Built target nuka_import
+[ 82%] Built target nuka_runtime
+[ 94%] Built target nuka_collision_gpu
+[100%] Built target nuka_batched_h1_union_world_test
+[  5%] Built target nuka_constraint
+[ 11%] Built target nuka_core
+[ 17%] Built target nuka_phi
+[ 17%] Built target nuka_cooker
+[ 23%] Built target nuka_collision
+[ 23%] Built target nuka_codegen
+[ 29%] Built target gtest
+[ 35%] Built target tinyxml2
+[ 41%] Built target nuka_scene
+[ 41%] Built target nuka_row_solver_gpu
+[ 41%] Built target gtest_main
+[ 47%] Built target nuka_solver
+[ 52%] Built target nuka_articulation
+[ 64%] Built target nuka_import
+[ 76%] Built target nuka_collision_gpu
+[ 88%] Built target nuka_articulation_gpu
+[ 94%] Built target nuka_runtime
+[100%] Built target nuka_batched_unified_world_test
+[  0%] Built target nuka_codegen
+[  5%] Built target tinyxml2
+[ 11%] Built target nuka_constraint
+[ 17%] Built target nuka_core
+[ 17%] Built target nuka_cooker
+[ 23%] Built target nuka_collision
+[ 29%] Built target nuka_phi
+[ 35%] Built target gtest
+[ 41%] Built target nuka_scene
+[ 41%] Built target nuka_row_solver_gpu
+[ 41%] Built target gtest_main
+[ 58%] Built target nuka_import
+[ 58%] Built target nuka_articulation
+[ 64%] Built target nuka_solver
+[ 76%] Built target nuka_collision_gpu
+[ 88%] Built target nuka_articulation_gpu
+[ 94%] Built target nuka_runtime
+[ 94%] Building CXX object tests/CMakeFiles/nuka_batched_unified_world_perf_test.dir/coresident/test_batched_unified_world_perf.cpp.o
+[ 94%] Linking CXX executable nuka_batched_unified_world_perf_test
+[100%] Built target nuka_batched_unified_world_perf_test

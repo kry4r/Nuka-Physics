@@ -1,0 +1,42 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = *G1d_TableLiftUnion_N1*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from BatchedH1UnionWorld
+[ RUN      ] BatchedH1UnionWorld.G1d_TableLiftUnion_N1_FpFloorWindowAndImpulseTriangleVsOracle
+[G1d GATE-A] table-lift union: table_z=1.0037 (cup0_z=1.0779 proxy_half_z=0.0761) m_cup*g*dt=0.00818 (m_r+m_c)*g*dt=2.1445 feet=4 fingertips=30
+[G1d GATE-A] step   0 REST: |dcup|=0.000e+00 |dvel|=5.735e-08 |dqdot|=4.470e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=4 b=4) Tλ/mgdt=13.405 Fλ/mgdt=-8.805 feetλ/mgdt=1.064 cup_z=1.0785
+[G1d GATE-A] step   1 REST: |dcup|=0.000e+00 |dvel|=2.218e-07 |dqdot|=5.960e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=3 b=3) Tλ/mgdt=3.686 Fλ/mgdt=-2.391 feetλ/mgdt=1.071 cup_z=1.0791
+[G1d GATE-A] step   2 REST: |dcup|=0.000e+00 |dvel|=1.317e-07 |dqdot|=5.960e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=3 b=3) Tλ/mgdt=1.584 Fλ/mgdt=-0.986 feetλ/mgdt=1.067 cup_z=1.0797
+[G1d GATE-A] step   3 REST: |dcup|=0.000e+00 |dvel|=4.220e-07 |dqdot|=9.537e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=5.386 Fλ/mgdt=-4.082 feetλ/mgdt=1.058 cup_z=1.0804
+[G1d GATE-A] step   4 REST: |dcup|=0.000e+00 |dvel|=3.412e-07 |dqdot|=7.153e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=3.306 Fλ/mgdt=-1.927 feetλ/mgdt=1.051 cup_z=1.0811
+[G1d GATE-A] step   5 REST: |dcup|=0.000e+00 |dvel|=2.577e-07 |dqdot|=7.153e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=4.118 Fλ/mgdt=-3.050 feetλ/mgdt=1.043 cup_z=1.0818
+[G1d GATE-A] step   6 REST: |dcup|=0.000e+00 |dvel|=3.549e-07 |dqdot|=9.537e-07 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=0.000 Fλ/mgdt=0.034 feetλ/mgdt=1.037 cup_z=1.0824
+[G1d GATE-A] step   7 REST: |dcup|=0.000e+00 |dvel|=3.846e-07 |dqdot|=2.623e-06 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=0.847 Fλ/mgdt=-0.609 feetλ/mgdt=1.031 cup_z=1.0828
+[G1d GATE-A] step   8 REST: |dcup|=1.490e-08 |dvel|=4.841e-07 |dqdot|=2.861e-06 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=1.825 Fλ/mgdt=-1.253 feetλ/mgdt=1.026 cup_z=1.0832
+[G1d GATE-A] step   9 REST: |dcup|=1.490e-08 |dvel|=5.532e-07 |dqdot|=2.861e-06 contacts(o=30 b=30) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=3.357 Fλ/mgdt=-1.783 feetλ/mgdt=1.021 cup_z=1.0836
+[G1d GATE-A] step  10 REST: |dcup|=1.490e-08 |dvel|=6.111e-07 |dqdot|=2.623e-06 contacts(o=30 b=30) feet(o=4 b=4) table(o=1 b=1) Tλ/mgdt=1.204 Fλ/mgdt=-0.848 feetλ/mgdt=1.017 cup_z=1.0840
+[G1d GATE-A] step  11 REST: |dcup|=9.424e-08 |dvel|=2.766e-05 |dqdot|=2.098e-05 contacts(o=30 b=30) feet(o=4 b=4) table(o=1 b=1) Tλ/mgdt=3.540 Fλ/mgdt=-2.607 feetλ/mgdt=1.012 cup_z=1.0843
+[G1d GATE-A] step  49 REST: |dcup|=8.225e-03 |dvel|=5.033e-02 |dqdot|=1.996e-01 contacts(o=2 b=3) feet(o=4 b=4) table(o=4 b=2) Tλ/mgdt=6.220 Fλ/mgdt=-4.863 feetλ/mgdt=0.985 cup_z=1.0830
+[G1d GATE-A] step  99 REST: |dcup|=1.433e-02 |dvel|=1.577e-02 |dqdot|=3.187e-01 contacts(o=3 b=3) feet(o=4 b=4) table(o=1 b=1) Tλ/mgdt=3.901 Fλ/mgdt=-2.902 feetλ/mgdt=0.990 cup_z=1.0855
+[G1d GATE-A] step 149 CLOS: |dcup|=1.220e-02 |dvel|=4.412e-03 |dqdot|=3.178e-01 contacts(o=6 b=6) feet(o=4 b=4) table(o=2 b=2) Tλ/mgdt=4.137 Fλ/mgdt=-3.132 feetλ/mgdt=0.983 cup_z=1.0822
+[G1d GATE-A] step 180 LIFT: |dcup|=1.167e-02 |dvel|=6.906e-03 |dqdot|=3.176e-01 contacts(o=6 b=5) feet(o=4 b=4) table(o=0 b=0) Tλ/mgdt=0.000 Fλ/mgdt=0.200 feetλ/mgdt=0.986 cup_z=1.0818
+[G1d GATE-A] step 199 LIFT: |dcup|=1.177e-02 |dvel|=2.058e-02 |dqdot|=2.604e-01 contacts(o=6 b=5) feet(o=4 b=4) table(o=0 b=0) Tλ/mgdt=0.000 Fλ/mgdt=0.996 feetλ/mgdt=1.004 cup_z=1.0658
+[G1d GATE-A] step 249 LIFT: |dcup|=1.438e-02 |dvel|=1.753e-02 |dqdot|=1.169e-01 contacts(o=6 b=5) feet(o=4 b=4) table(o=0 b=0) Tλ/mgdt=0.000 Fλ/mgdt=1.073 feetλ/mgdt=1.002 cup_z=1.0369
+[G1d GATE-A] step 299 LIFT: |dcup|=1.536e-02 |dvel|=4.931e-03 |dqdot|=4.808e-02 contacts(o=6 b=5) feet(o=4 b=4) table(o=0 b=0) Tλ/mgdt=0.000 Fλ/mgdt=0.984 feetλ/mgdt=1.000 cup_z=1.0384
+[G1d GATE-A RESULT] FP-FLOOR WINDOW (steps 0-9): max|dcup|=1.490e-08 max|dvel|=5.532e-07 max|dqdot|=2.861e-06 max|dbase|=9.313e-10. FULL RUN: max|dcup|=1.538e-02 max|dvel|=3.607e-01 max|dqdot|=5.943e-01 (REPORTED, chaotic). count fork @ 17. IMPULSE TRIANGLE: rest Tλ=3.9260 tri=1.0097 feet=0.9901 | lift table rows=0 |Tλ|=0.000e+00 | late Fλ=1.0100 feet=1.0005. rest finger-steps=100/100 first-engage @ 100 all3-steps=175 close table-steps=80/80. cup_z 1.0779 ->(toggle) 1.0819 -> 1.0384 (sink 0.044) base_z=0.9749
+/root/Nuka-Physics/tests/coresident/test_batched_h1_union_world.cpp:1407: Failure
+Expected: (rest_table_ratio) < (1.3), actual: 3.9259746726740481 vs 1.3
+table impulse far above the cup weight
+
+[G1d GATE-A CHAOS CONTROL] two SAME-code oracles through the SAME lift choreography, cup IC nudged 1e-7 m: self max|dpos|=1.540e-02 max|dvel|=3.607e-01 (vs batched-vs-oracle full-run max|dpos|=1.538e-02)
+[  FAILED  ] BatchedH1UnionWorld.G1d_TableLiftUnion_N1_FpFloorWindowAndImpulseTriangleVsOracle (473829 ms)
+[----------] 1 test from BatchedH1UnionWorld (473829 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (473830 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] BatchedH1UnionWorld.G1d_TableLiftUnion_N1_FpFloorWindowAndImpulseTriangleVsOracle
+
+ 1 FAILED TEST

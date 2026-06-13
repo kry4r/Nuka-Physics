@@ -1,0 +1,53 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = *UnionSceneThroughputAndTrainabilityVerdict*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from BatchedUnifiedWorldPerf
+[ RUN      ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict
+[UNION-PERF V1 N=32 K=128 rep=0] env_steps_per_sec=48.1 ms_per_step=664.663 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V1 N=32 K=128 rep=1] env_steps_per_sec=48.1 ms_per_step=665.793 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V1 N=32 K=128 rep=2] env_steps_per_sec=48.0 ms_per_step=666.703 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=128 rep=0] env_steps_per_sec=48.1 ms_per_step=665.900 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=128 rep=1] env_steps_per_sec=48.1 ms_per_step=665.836 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF V2 N=32 K=128 rep=2] env_steps_per_sec=48.1 ms_per_step=665.139 (WITH obs export) regime_end{foot=4,finger=6,table=2}
+[UNION-PERF MEDIAN N=32] V1(Step only)=48.1 eps  V2(+obs)=48.1 eps
+[UNION-PERF V1 N=256 K=16 rep=0] env_steps_per_sec=61.3 ms_per_step=4175.419 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=16,table=1}
+[UNION-PERF V1 N=256 K=16 rep=1] env_steps_per_sec=61.4 ms_per_step=4170.362 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=16,table=1}
+[UNION-PERF V1 N=256 K=16 rep=2] env_steps_per_sec=60.7 ms_per_step=4218.142 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=16,table=1}
+[UNION-PERF V2 N=256 K=16 rep=0] env_steps_per_sec=61.3 ms_per_step=4175.625 (WITH obs export) regime_end{foot=4,finger=16,table=1}
+[UNION-PERF V2 N=256 K=16 rep=1] env_steps_per_sec=61.5 ms_per_step=4160.388 (WITH obs export) regime_end{foot=4,finger=16,table=1}
+[UNION-PERF V2 N=256 K=16 rep=2] env_steps_per_sec=61.4 ms_per_step=4171.389 (WITH obs export) regime_end{foot=4,finger=16,table=1}
+[UNION-PERF MEDIAN N=256] V1(Step only)=61.3 eps  V2(+obs)=61.4 eps
+[UNION-PERF V1 N=1024 K=4 rep=0] env_steps_per_sec=47.2 ms_per_step=21713.870 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=28,table=1}
+[UNION-PERF V1 N=1024 K=4 rep=1] env_steps_per_sec=47.0 ms_per_step=21805.040 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=28,table=1}
+[UNION-PERF V1 N=1024 K=4 rep=2] env_steps_per_sec=47.2 ms_per_step=21715.379 regime_start{foot=4,finger=30,table=2} regime_end{foot=4,finger=28,table=1}
+[UNION-PERF V2 N=1024 K=4 rep=0] env_steps_per_sec=46.9 ms_per_step=21850.939 (WITH obs export) regime_end{foot=4,finger=28,table=1}
+[UNION-PERF V2 N=1024 K=4 rep=1] env_steps_per_sec=46.6 ms_per_step=21951.715 (WITH obs export) regime_end{foot=4,finger=28,table=1}
+[UNION-PERF V2 N=1024 K=4 rep=2] env_steps_per_sec=46.9 ms_per_step=21833.724 (WITH obs export) regime_end{foot=4,finger=28,table=1}
+[UNION-PERF MEDIAN N=1024] V1(Step only)=47.2 eps  V2(+obs)=46.9 eps
+[UNION-PERF-BREAKDOWN N=1024 K=8] pose_download=2.168 (0.0%) per_step=0.2710_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] artic_download=25.643 (0.0%) per_step=3.2054_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] crba_minv=128.027 (0.1%) per_step=16.0033_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] chain_jacobian=58.281 (0.0%) per_step=7.2851_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] aba_integrate=0.265 (0.0%) per_step=0.0331_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] narrowphase=2435.875 (1.6%) per_step=304.4843_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] row_assembly=884.819 (0.6%) per_step=110.6024_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] row_solver=151297.423 (97.6%) per_step=18912.1779_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] scatter_integrate=49.731 (0.0%) per_step=6.2164_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] obs_export=63.474 (0.0%) per_step=7.9342_ms
+[UNION-PERF-BREAKDOWN N=1024 K=8] SUM_TAGS=154945.705 WALL_TOTAL=157026.242 (sum/wall=98.7%)
+[UNION-TRAINABILITY VERDICT] best_N=256 best_eps=61.4 (V2, with obs) -> 452.62 h per 100M env-steps ; 24h bar = 1157.4 eps -> RED (margin 0.1x)
+/root/Nuka-Physics/tests/coresident/test_batched_unified_world_perf.cpp:967: Failure
+Expected: (best_eps) > (kUnionFloorEps), actual: 61.37044378537972 vs 200
+union throughput (61.37044378537972 eps best-N) fell below the conservative 200 floor -- a gross perf regression in the union step path
+
+[  FAILED  ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict (5746388 ms)
+[----------] 1 test from BatchedUnifiedWorldPerf (5746388 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (5746388 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] BatchedUnifiedWorldPerf.UnionSceneThroughputAndTrainabilityVerdict
+
+ 1 FAILED TEST

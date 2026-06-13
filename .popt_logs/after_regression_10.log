@@ -1,0 +1,39 @@
+Running main() from /root/Nuka-Physics/build-cuda128/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 10 tests from 4 test suites.
+[----------] Global test environment set-up.
+[----------] 3 tests from FreeFallRegression
+[ RUN      ] FreeFallRegression.EnergyDriftStaysBounded
+[       OK ] FreeFallRegression.EnergyDriftStaysBounded (0 ms)
+[ RUN      ] FreeFallRegression.PositionMatchesKinematicFormula
+[       OK ] FreeFallRegression.PositionMatchesKinematicFormula (0 ms)
+[ RUN      ] FreeFallRegression.VelocityMatchesExpected
+[       OK ] FreeFallRegression.VelocityMatchesExpected (0 ms)
+[----------] 3 tests from FreeFallRegression (0 ms total)
+
+[----------] 2 tests from Go2Stand
+[ RUN      ] Go2Stand.CAbiStepsFiveSecondsAndIsDeterministic
+[       OK ] Go2Stand.CAbiStepsFiveSecondsAndIsDeterministic (2093 ms)
+[ RUN      ] Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance
+[       OK ] Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance (478 ms)
+[----------] 2 tests from Go2Stand (2571 ms total)
+
+[----------] 3 tests from RestStackRegression
+[ RUN      ] RestStackRegression.PenetrationIsBounded
+[       OK ] RestStackRegression.PenetrationIsBounded (0 ms)
+[ RUN      ] RestStackRegression.TopBoxStaysAboveBottomBox
+[       OK ] RestStackRegression.TopBoxStaysAboveBottomBox (0 ms)
+[ RUN      ] RestStackRegression.BottomBoxStaysAboveGround
+[       OK ] RestStackRegression.BottomBoxStaysAboveGround (0 ms)
+[----------] 3 tests from RestStackRegression (1 ms total)
+
+[----------] 2 tests from TwoLinkArmRegression
+[ RUN      ] TwoLinkArmRegression.JointMaintainsConnectivity
+[       OK ] TwoLinkArmRegression.JointMaintainsConnectivity (1 ms)
+[ RUN      ] TwoLinkArmRegression.AnchorPointsCoincide
+[       OK ] TwoLinkArmRegression.AnchorPointsCoincide (1 ms)
+[----------] 2 tests from TwoLinkArmRegression (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 10 tests from 4 test suites ran. (2576 ms total)
+[  PASSED  ] 10 tests.
+EXIT=0
