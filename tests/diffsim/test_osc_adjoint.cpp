@@ -53,10 +53,9 @@
 #include "math/vec3.hpp"
 #include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
+#include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_drives.hpp"
 #include "runtime/articulation/articulation_state.hpp"
-#include "runtime/articulation/control_mode.hpp"
-#include "runtime/gpu/batched_articulated_world.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
 
@@ -77,16 +76,12 @@
 namespace {
 
 namespace articulation = nuka::runtime::articulation;
-namespace gpu = nuka::runtime::gpu;
 namespace diffsim = nuka::diffsim;
 using nuka::math::Quat;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 
 constexpr uint32_t kInvalidLink = ~0u;
-constexpr float kGravityOff = 0.0f;
-constexpr float kDt = 1.0f / 240.0f;
-constexpr float kGroundFarAway = -1000.0f;
 
 std::filesystem::path SourcePath(const char* relative_path) {
     return std::filesystem::path(NUKA_SOURCE_DIR) / relative_path;
@@ -790,11 +785,13 @@ TEST(OscAdjoint, SaturatedComponentZeroGrad) {
 }
 
 // ---------------------------------------------------------------------------
-// Go2 directional smoke (NON-FD): the adjoint runs end-to-end on the REAL engine's
-// device state (a warm-stepped single-env Go2 OSC world, calf task link) and
-// produces finite, deterministic grads. This is NOT an FD gate (the calf-origin J
-// is rank-2 -> floored A -> fp32-ill-conditioned; see the file header); it only
-// confirms the adjoint integrates with the live engine state buffers.
+// Go2 directional smoke (NON-FD): the adjoint runs end-to-end on a REAL cooked
+// Go2 device state (the engine's own BuildWorld -> BuildArticulationHostState ->
+// UploadArticulationState pipeline, calf task link) and produces finite,
+// deterministic grads. This is NOT an FD gate (the calf-origin J is rank-2 ->
+// floored A -> fp32-ill-conditioned; see the file header); it only confirms the
+// adjoint integrates with the real engine's link_pose/q/qdot/joint_axis buffers
+// (the synthetic rigs hand-build those; this proves the cooked geometry path).
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -845,9 +842,13 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
     const uint32_t task_link = cooked.feet.empty() ? 0u : cooked.feet.front().calf_local_link;
     ASSERT_NE(task_link, 0u);
 
-    gpu::BatchedArticulatedWorld bw(context, base, cooked.feet, max_dof, kGroundFarAway,
-                                    gpu::DeterminismLevel::Strong,
-                                    articulation::ControlMode::Osc, task_link);
+    // Real cooked Go2 device state: the engine's own host-state -> device upload
+    // (link_pose/q/qdot/joint_axis populated from the cook). No stepping world is
+    // needed -- the adjoint reads the geometry/state buffers, and a finiteness
+    // smoke on the cooked rest pose exercises the same real-engine path the
+    // synthetic rigs cannot (cooked geometry vs hand-built buffers).
+    auto device = articulation::UploadArticulationState(context, base);
+    context.stream.Synchronize();
 
     std::vector<float> stiff(base_link_count, 0.0f), damp(base_link_count, 0.0f);
     stiff[task_link] = 200.0f;
@@ -859,16 +860,7 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
     nuka::phi::Buffer tgt_dev(tgt.size() * sizeof(float), nuka::phi::MemoryKind::Device);
     tgt_dev.CopyFromHost(tgt.data(), tgt.size() * sizeof(float));
 
-    gpu::BatchedArticulatedStepParams params;
-    params.gravity_z = kGravityOff;
-    params.dt = kDt;
-    params.drive_stiffness = static_cast<const float*>(stiff_dev.Data());
-    params.drive_damping = static_cast<const float*>(damp_dev.Data());
-    params.task_target = static_cast<const float*>(tgt_dev.Data());
-    bw.Step(params);
-    context.stream.Synchronize();
-
-    // A synthetic SPD M^-1 tile (the world's private m_inv_ has no accessor; the
+    // A synthetic SPD M^-1 tile (the cook's M^-1 is rebuilt per step; the
     // gain/target channels are M^-1-provenance-independent). The adjoint just needs
     // to run on the real link_pose/q/qdot/joint_axis buffers.
     nuka::phi::Buffer minv_dev(static_cast<size_t>(max_dof) * max_dof * sizeof(float),
@@ -889,7 +881,7 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
     grads.grad_kd = static_cast<float*>(gkd.Data());
     grads.grad_target = static_cast<float*>(gtgt.Data());
 
-    articulation::ArticulationDeviceState st = bw.View();
+    articulation::ArticulationDeviceState st = device.View();
     diffsim::LaunchOscAdjointGainTarget(
         context, st, max_dof, task_link,
         static_cast<const float*>(minv_dev.Data()),
