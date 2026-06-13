@@ -396,6 +396,12 @@ struct PresentRenderer::Impl {
         }
 
         CreateCommandPool();
+        // Shader modules are extent/format-independent -> create ONCE here (not in
+        // CreatePipeline, which reruns on every swapchain recreate). They are freed
+        // only in ~Impl. This avoids orphaning 2 modules per resize on the
+        // long-running viewer (CreatePipeline used to recreate them unconditionally
+        // while DestroySwapchainDependents never freed them).
+        CreateShaderModules();
         NegotiateSurface();
         CreateSwapchain();
         CreatePresentRenderPass();
@@ -463,9 +469,15 @@ struct PresentRenderer::Impl {
         CheckVk(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &format_count, formats.data()),
                 "vkGetPhysicalDeviceSurfaceFormatsKHR(list)");
 
-        // Preference order: B8G8R8A8/R8G8B8A8 SRGB, then UNORM, then whatever the
-        // driver lists first (or the wildcard format if the driver returns
-        // VK_FORMAT_UNDEFINED meaning "any").
+        // Preference order: B8G8R8A8/R8G8B8A8 UNORM FIRST, then the _SRGB picks,
+        // then whatever the driver lists first (or the wildcard if it returns
+        // VK_FORMAT_UNDEFINED meaning "any"). UNORM is preferred deliberately: the
+        // SHARED mesh_pbr.frag ALREADY applies LinearToSrgb manually (matching the
+        // offscreen UNORM oracle), so a true _SRGB swapchain would double-encode
+        // (washed-out present). Picking UNORM keeps the shader's manual encode the
+        // single authoritative sRGB step -> present matches the offscreen byte
+        // semantics. The color_space stays VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+        // (display expects sRGB-encoded bytes, which the shader produces).
         auto pick = [&](VkFormat fmt, VkColorSpaceKHR space) -> bool {
             for (const auto& f : formats) {
                 if (f.format == fmt && f.colorSpace == space) {
@@ -478,12 +490,12 @@ struct PresentRenderer::Impl {
         };
         const VkColorSpaceKHR srgb = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
-            surface_format = VK_FORMAT_B8G8R8A8_SRGB;
+            surface_format = VK_FORMAT_B8G8R8A8_UNORM;
             color_space = srgb;
-        } else if (!pick(VK_FORMAT_B8G8R8A8_SRGB, srgb) &&
-                   !pick(VK_FORMAT_R8G8B8A8_SRGB, srgb) &&
-                   !pick(VK_FORMAT_B8G8R8A8_UNORM, srgb) &&
-                   !pick(VK_FORMAT_R8G8B8A8_UNORM, srgb)) {
+        } else if (!pick(VK_FORMAT_B8G8R8A8_UNORM, srgb) &&
+                   !pick(VK_FORMAT_R8G8B8A8_UNORM, srgb) &&
+                   !pick(VK_FORMAT_B8G8R8A8_SRGB, srgb) &&
+                   !pick(VK_FORMAT_R8G8B8A8_SRGB, srgb)) {
             surface_format = formats[0].format;
             color_space = formats[0].colorSpace;
         }
@@ -694,12 +706,23 @@ struct PresentRenderer::Impl {
         return module;
     }
 
+    // Create the (extent/format-independent) vert+frag modules once at ctor time.
+    // Guarded so it is a no-op if somehow re-entered. Destroyed in ~Impl.
+    void CreateShaderModules() {
+        if (vert_module == VK_NULL_HANDLE) {
+            vert_module = CreateShaderModule(NUKA_RASTER_MESH_VERT_SPV);
+        }
+        if (frag_module == VK_NULL_HANDLE) {
+            frag_module = CreateShaderModule(NUKA_RASTER_MESH_FRAG_SPV);
+        }
+    }
+
     void CreatePipeline() {
         // Same shaders + push-block layout as the offscreen pipeline, but built
         // against the PRESENT render pass (different attachment format -> a
-        // separate, render-pass-compatible pipeline).
-        vert_module = CreateShaderModule(NUKA_RASTER_MESH_VERT_SPV);
-        frag_module = CreateShaderModule(NUKA_RASTER_MESH_FRAG_SPV);
+        // separate, render-pass-compatible pipeline). The shader modules are
+        // created once (CreateShaderModules at ctor) and REUSED across swapchain
+        // recreates -> no per-resize module leak.
 
         // Set 0, binding 0: per-frame SceneUbo (camera + light rig). Same layout
         // as the offscreen renderer (shared shaders).
@@ -1129,6 +1152,14 @@ struct PresentRenderer::Impl {
         submit.commandBufferCount = 1u;
         submit.pCommandBuffers = &cmd;
         submit.signalSemaphoreCount = 1u;
+        // NOTE: render_finished is indexed by frame-in-flight, NOT by swapchain
+        // image. That is only safe because this frame's per-frame fence wait
+        // (vkWaitForFences at the top of DrawFrame + the free-wait below)
+        // fully serializes each frame slot's submit->present before the slot is
+        // reused, so a render_finished[frame] can never be in two presents at
+        // once. A proper per-image render_finished[] (one per swapchain image,
+        // signalled by the present-image producer) is the correct fix and is
+        // deferred (M9 present-render-finished per-image variant).
         submit.pSignalSemaphores = &render_finished[frame];
         CheckVk(vkResetFences(device, 1u, &in_flight[frame]), "vkResetFences");
         CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, in_flight[frame]), "vkQueueSubmit(present)");

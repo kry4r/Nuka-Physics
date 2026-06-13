@@ -130,6 +130,13 @@ The ICD here is **lavapipe / llvmpipe (CPU Vulkan)** — no NVIDIA Vulkan on thi
 Asset-gated tests SKIP if `examples/scenes/h1_cup_table.nks` + the imported
 MJCF/USD assets are absent. Renderer-construction failures SKIP cleanly.
 
+> **Asset note (h1_with_hand .nka deferral):** the cooked `h1_with_hand` `.nka`
+> (~88 MB of STL/OBJ geometry) is intentionally **NOT committed** pending an LFS
+> decision. `examples/scenes/go2.nks`/`.nka` is the committed pipeline proof, and
+> h1 is reproduced on demand from the source MJCF via `nuka_cook_scene` (the
+> `VisualMeshCook.H1WithHandRendersRealMeshes` gate cooks+renders it live when the
+> assets are present, else SKIPs).
+
 | Target | How to run (from repo root) |
 |---|---|
 | `nuka_render_raster_smoke_test` | direct (offscreen, no display): `build-viewer/tests/nuka_render_raster_smoke_test` |

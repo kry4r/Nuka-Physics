@@ -69,14 +69,44 @@ namespace nphi = nuka::phi;
 // the Simulation. Order of declaration matters for destruction -- the Simulation
 // references the world + publisher + renderer, so it must be destroyed FIRST;
 // declare it LAST (members destruct in reverse declaration order).
+//
+// LIFETIME: the phi v2 Backend created in nuka_recorder_create is OWNED here
+// (nk::World only BORROWS it -- World::~World calls BackendPlanFree(backend_) but
+// never frees the backend itself). The backend must therefore OUTLIVE the World.
+// A C++ destructor BODY runs BEFORE the members are destroyed, so we cannot just
+// BackendFree in the body and rely on member-order; we explicitly tear down the
+// borrowing members (sim -> world, in dependency order) in the body FIRST, then
+// free the backend while it is still valid. The remaining members (publisher /
+// renderer / raster_options / scalars) own no backend reference and destruct
+// normally afterwards. The phi Device is registry-OWNED (RegistryEntryGetDevice)
+// and is NOT freed here.
 struct RecorderRecord {
     DeviceRecord* device = nullptr;          // borrowed; must outlive the record
+    nphi::Device* phi_device = nullptr;      // registry-owned; do NOT free
+    nphi::Backend* backend = nullptr;        // OWNED; freed in dtor AFTER world
     std::unique_ptr<nk::World> world;        // the nk-backed physics world (D2)
     std::unique_ptr<app::HostDownloadPublisher> publisher;
     std::unique_ptr<render::VulkanRasterRenderer> renderer;
     render::RasterOptions raster_options;
     std::unique_ptr<app::Simulation> sim;    // destruct first (declared last)
     uint32_t frame_index = 0u;               // continues across capture() calls
+
+    RecorderRecord() = default;
+
+    ~RecorderRecord() {
+        // Tear the backend-borrowing stack down in dependency order BEFORE freeing
+        // the backend: the Simulation references the world, and the world borrows
+        // the backend (World::~World -> BackendPlanFree(backend_)).
+        sim.reset();
+        renderer.reset();
+        publisher.reset();
+        world.reset();
+        if (backend != nullptr) {
+            nphi::BackendFree(backend);
+            backend = nullptr;
+        }
+        // phi_device is registry-owned; not freed.
+    }
 };
 
 #else  // !NK_BUILD_VULKAN_VALIDATION
@@ -150,6 +180,31 @@ bool WritePpmP6(const std::string& path,
     return ok;
 }
 
+// Select the phi v2 Device for the requested CUDA ordinal. Walks the registry's
+// devices counting across backends until `ordinal` is reached; falls back to
+// InitBestDevice() (the first available device) when the ordinal is out of range
+// or negative. This replaces an unconditional InitBestDevice() (which silently
+// routed every recorder to device 0) so the validated device_record ordinal is
+// actually honored.
+nphi::Device* SelectDeviceByOrdinal(int ordinal) {
+    if (ordinal >= 0) {
+        int seen = 0;
+        const size_t backend_count = nphi::BackendCount();
+        for (size_t b = 0u; b < backend_count; ++b) {
+            nphi::RegistryEntry* entry = nphi::GetBackend(b);
+            if (entry == nullptr) continue;
+            const size_t dev_count = nphi::RegistryEntryDeviceCount(entry);
+            for (size_t d = 0u; d < dev_count; ++d) {
+                if (seen == ordinal) {
+                    return nphi::RegistryEntryGetDevice(entry, d);
+                }
+                ++seen;
+            }
+        }
+    }
+    return nphi::InitBestDevice();  // fallback: first available device.
+}
+
 #endif  // NK_BUILD_VULKAN_VALIDATION
 
 }  // namespace
@@ -195,10 +250,16 @@ nuka_result_t nuka_recorder_create(nuka_device_handle device,
             render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
 
         // The device's phi v2 backend (the same seam the frame-loop smoke uses).
-        nphi::Device* dev = nphi::InitBestDevice();
+        // Honor the validated device_record's CUDA ordinal instead of an
+        // unconditional InitBestDevice()->device-0 routing.
+        nphi::Device* dev = SelectDeviceByOrdinal(device_record->context.device_id);
         if (dev == nullptr) return NUKA_RESULT_NOT_SUPPORTED;
         nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
         if (backend == nullptr) return NUKA_RESULT_NOT_SUPPORTED;
+        // Take ownership immediately so any early return below still frees it via
+        // the RecorderRecord destructor (BackendFree ordered after world teardown).
+        record->phi_device = dev;
+        record->backend = backend;
 
         nk::Pipeline::SolverConfig cfg;
         cfg.dt = (desc->dt > 0.0f) ? desc->dt : (1.0f / 240.0f);

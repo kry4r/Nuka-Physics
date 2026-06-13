@@ -135,6 +135,10 @@ TEST(VisualMeshCook, Go2RendersRealMeshes) {
 }
 
 // h1_with_hand -- the demo hero (49 visual STL/OBJ). Skips without assets.
+// NOTE: the cooked h1_with_hand .nka (~88MB of STL/OBJ geometry) is intentionally
+// NOT committed pending an LFS decision; go2.nka is the committed pipeline proof
+// and h1 is reproduced on demand from the source MJCF via nuka_cook_scene (this
+// test cooks+renders it live when the assets are present, else SKIPs).
 TEST(VisualMeshCook, H1WithHandRendersRealMeshes) {
     if (!fs::exists(kH1Mjcf)) GTEST_SKIP() << "h1_with_hand MJCF missing: " << kH1Mjcf;
     EXPECT_GT(RunCookAndRender(kH1Mjcf, "h1_with_hand"), 0u);

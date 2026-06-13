@@ -236,6 +236,10 @@ MeshGeometry LoadObj(const std::string& path) {
             }
         }
         // vt / vn / mtllib / usemtl / g / o / s / # and others: ignored.
+        // NOTE (M9 cook-real-normals debt): `vn` authored normals ARE present in
+        // these files but are dropped here -> MeshGeometry.normals stays empty ->
+        // EncodeMesh zero-fills -> render synthesizes normals. Parsing `vn` and
+        // threading it through is deferred (it changes cooked .nka bytes; D1).
     }
 
     if (g.vertices.empty()) {

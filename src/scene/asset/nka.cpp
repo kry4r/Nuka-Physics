@@ -87,7 +87,12 @@ std::vector<uint8_t> EncodeMesh(const NkaMesh& mesh) {
     // positions (3f / vert)
     AppendBytes(out, mesh.positions.data(), mesh.positions.size() * sizeof(float));
 
-    // normals (3f / vert) -- write zeros when absent so the stream count is fixed
+    // normals (3f / vert) -- write zeros when absent so the stream count is fixed.
+    // NOTE (M9 cook-real-normals debt): authored OBJ `vn` normals exist in source
+    // files but are currently DROPPED by the loader (mesh_file_loader.cpp LoadObj
+    // ignores `vn`), so mesh.normals is empty here and we zero-fill; the render
+    // side synthesizes normals at load. Faithfully carrying authored normals is
+    // DEFERRED to M9 (it would change this cooked .nka byte stream -> D1-sensitive).
     if (!mesh.normals.empty()) {
         AppendBytes(out, mesh.normals.data(), mesh.normals.size() * sizeof(float));
     } else {
