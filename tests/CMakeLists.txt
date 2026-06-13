@@ -293,6 +293,24 @@ add_test(NAME SceneRoundtrip
          COMMAND nuka_scene_roundtrip_test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
+# examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
+# + initial_state + settle) and asserts byte-identical re-save + section
+# exposure. Same lightweight deps as SceneRoundtrip (no factory).
+add_executable(nuka_nks_grasp_scene_roundtrip_test
+    scenario/nks_grasp_scene_roundtrip.cpp
+)
+target_link_libraries(nuka_nks_grasp_scene_roundtrip_test
+    PRIVATE
+        nuka_scene
+        nuka_import
+        nuka_cooker
+        GTest::gtest_main
+)
+add_test(NAME NksGraspSceneRoundtrip
+         COMMAND nuka_nks_grasp_scene_roundtrip_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test
     runtime/test_world_build.cpp

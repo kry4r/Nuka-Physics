@@ -1,0 +1,1883 @@
+{
+  "nks_version": 1,
+  "physics_materials": {
+    "mat_cup": {
+      "static_friction": 0.800000012,
+      "dynamic_friction": 0.800000012
+    },
+    "mat_table": {
+      "static_friction": 0.600000024,
+      "dynamic_friction": 0.600000024
+    }
+  },
+  "render_materials": {
+    "mat_cup": {
+      "base_color": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    },
+    "mat_table": {
+      "base_color": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    }
+  },
+  "imports": [
+    {
+      "file": "../../.nuka-assets/newton_assets/unitree_h1/mjcf/h1_with_hand.xml",
+      "attach_at": "h1"
+    }
+  ],
+  "tree": [
+    {
+      "name": "cup",
+      "children": [
+        {
+          "name": "body",
+          "transform": {
+            "pos": [
+              0.418096572,
+              -0.195925653,
+              1.0778718
+            ],
+            "quat": [
+              0.999862671,
+              -0.000200898896,
+              -0.0138257248,
+              -0.00913648121
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 4294967295,
+            "inertial": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "mass": 0.200000003,
+            "inertia": [
+              0.000580887485,
+              0.000580887485,
+              0.000388800603
+            ],
+            "is_static": false
+          },
+          "children": [
+            {
+              "name": "cup/collision",
+              "collision_shape": {
+                "type": "convex_hull",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 0,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 0,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.800000012,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.0,
+                "gap": 0.0,
+                "condim": 3,
+                "decompose_mode": "skip",
+                "decompose_max_pieces": 32
+              },
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "table",
+      "children": [
+        {
+          "name": "body",
+          "transform": {
+            "pos": [
+              0.418096572,
+              -0.195925653,
+              0.753731728
+            ],
+            "quat": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 4294967295,
+            "inertial": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "mass": 1.0,
+            "inertia": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "is_static": true
+          },
+          "children": [
+            {
+              "name": "table/collision",
+              "collision_shape": {
+                "type": "box",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.25
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 1,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 0,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.0,
+                "gap": 0.0,
+                "condim": 3,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32
+              },
+              "children": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "sensors": [],
+  "exclude_pairs": [],
+  "contact_pairs": [],
+  "initial_state": {
+    "h1": {
+      "qpos": [
+        0.0,
+        5.86376555e-05,
+        0.000566752045,
+        -0.340077966,
+        0.873445034,
+        -0.438387275,
+        6.47418565e-05,
+        0.000566510367,
+        -0.338619709,
+        0.870462477,
+        -0.436829627,
+        0.00144445745,
+        0.0467252955,
+        -8.41070578e-05,
+        0.000155391856,
+        0.0372704417,
+        0.000141795535,
+        2.4477813e-05,
+        6.79595469e-05,
+        7.55331848e-06,
+        2.96341182e-06,
+        -2.07232645e-07,
+        -1.86067155e-07,
+        -1.8093337e-07,
+        -1.23487766e-07,
+        -1.30047397e-07,
+        -1.54167807e-08,
+        -3.64211665e-08,
+        8.86894114e-08,
+        0.0466124527,
+        0.000352062169,
+        3.25458241e-05,
+        0.0372556411,
+        -0.000346994901,
+        1.0009762,
+        0.500392079,
+        0.424084157,
+        0.424023509,
+        0.560035586,
+        0.660015106,
+        0.560022354,
+        0.660010278,
+        0.559996605,
+        0.659998834,
+        0.559980035,
+        0.659992874
+      ],
+      "root": {
+        "pos": [
+          0.0105636185,
+          0.00120278273,
+          0.971539557
+        ],
+        "quat": [
+          0.998565018,
+          -0.000847083691,
+          -0.0535443537,
+          -2.17124016e-05
+        ]
+      }
+    }
+  },
+  "settle": {
+    "steps": 200,
+    "dt": 0.00416666688,
+    "holds": [
+      {
+        "dofs": "h1/.*",
+        "mode": "pd",
+        "kp": 50.0,
+        "kd": 4.0
+      }
+    ]
+  },
+  "grasp": {
+    "gravity_z": -9.81000042,
+    "dt": 0.00416666688,
+    "finger_mu": 0.800000012,
+    "table_mu": 0.600000024,
+    "foot_mu": 0.800000012,
+    "cup_mass": 0.200000003,
+    "cup_scale_xy": 1.79999995,
+    "cup_scale_z": 1.79999995,
+    "cup_hull": "h1_cup_table.nka#SAMP/0",
+    "cup_broadphase_id": 7000,
+    "wrap_spheres": [
+      {
+        "link": "h1/R_index_proximal",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9000
+      },
+      {
+        "link": "h1/R_index_proximal",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9001
+      },
+      {
+        "link": "h1/R_index_proximal",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9002
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9003
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9004
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9005
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9006
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9007
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9008
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9009
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9010
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9011
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9012
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9013
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9014
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9015
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9016
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9017
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9018
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9019
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9020
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "offset": [
+          0.00600000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9021
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "offset": [
+          0.0160000008,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9022
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "offset": [
+          0.0260000005,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "finger",
+        "broadphase_id": 9023
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "offset": [
+          0.00400000019,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9024
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "offset": [
+          0.0120000001,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9025
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "offset": [
+          0.0199999996,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9026
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "offset": [
+          0.00400000019,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9027
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "offset": [
+          0.0120000001,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9028
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "offset": [
+          0.0199999996,
+          0.0,
+          0.0
+        ],
+        "radius": 0.00600000005,
+        "region": "thumb",
+        "broadphase_id": 9029
+      }
+    ],
+    "foot_spheres": [
+      {
+        "link": "h1/left_ankle_link",
+        "offset": [
+          0.100000001,
+          0.0,
+          -0.0549999997
+        ],
+        "radius": 0.0250000004,
+        "region": "foot",
+        "broadphase_id": 12000
+      },
+      {
+        "link": "h1/left_ankle_link",
+        "offset": [
+          -0.100000001,
+          0.0,
+          -0.0549999997
+        ],
+        "radius": 0.0250000004,
+        "region": "foot",
+        "broadphase_id": 12001
+      },
+      {
+        "link": "h1/right_ankle_link",
+        "offset": [
+          0.100000001,
+          0.0,
+          -0.0549999997
+        ],
+        "radius": 0.0250000004,
+        "region": "foot",
+        "broadphase_id": 12002
+      },
+      {
+        "link": "h1/right_ankle_link",
+        "offset": [
+          -0.100000001,
+          0.0,
+          -0.0549999997
+        ],
+        "radius": 0.0250000004,
+        "region": "foot",
+        "broadphase_id": 12003
+      }
+    ],
+    "ground_height": 0.0,
+    "ground_broadphase_id": 8000,
+    "table_height": 1.00373173,
+    "table_broadphase_id": 8500,
+    "cup_table_proxy_half": [
+      0.0540000424,
+      0.0540000424,
+      0.0761400536
+    ],
+    "cup_table_proxy_offset": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "cup_table_proxy_id": 7001,
+    "grip_links": [
+      "h1/R_thumb_proximal_base",
+      "h1/R_thumb_proximal",
+      "h1/R_thumb_intermediate",
+      "h1/R_thumb_distal",
+      "h1/R_index_proximal",
+      "h1/R_index_intermediate",
+      "h1/R_middle_proximal",
+      "h1/R_middle_intermediate",
+      "h1/R_ring_proximal",
+      "h1/R_ring_intermediate",
+      "h1/R_pinky_proximal",
+      "h1/R_pinky_intermediate"
+    ],
+    "drive_hold": [
+      {
+        "link": "h1/left_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/torso_link",
+        "target": 0.00144445745,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_pitch_link",
+        "target": 0.0467252955,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_roll_link",
+        "target": -8.41070578e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_yaw_link",
+        "target": 0.000155391856,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_elbow_link",
+        "target": 0.0372704417,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hand_link",
+        "target": 0.000141795535,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal_base",
+        "target": 2.4477813e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal",
+        "target": 6.79595469e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_intermediate",
+        "target": 7.55331848e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_distal",
+        "target": 2.96341182e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_proximal",
+        "target": -2.07232645e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_intermediate",
+        "target": -1.86067155e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_proximal",
+        "target": -1.8093337e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_intermediate",
+        "target": -1.23487766e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_proximal",
+        "target": -1.30047397e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_intermediate",
+        "target": -1.54167807e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_proximal",
+        "target": -3.64211665e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_intermediate",
+        "target": 8.86894114e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_pitch_link",
+        "target": 0.0466124527,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_roll_link",
+        "target": 0.000352062169,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_yaw_link",
+        "target": 3.25458241e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_elbow_link",
+        "target": 0.0372556411,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hand_link",
+        "target": -0.000346994901,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 6.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/R_thumb_proximal_base",
+        "target": 1.0009762,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_proximal",
+        "target": 0.500392079,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "target": 0.424084157,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "target": 0.424023509,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_proximal",
+        "target": 0.560035586,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "target": 0.660015106,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "target": 0.560022354,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "target": 0.660010278,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "target": 0.559996605,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "target": 0.659998834,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "target": 0.559980035,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "target": 0.659992874,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/left_ankle_link",
+        "target": -0.465751708,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_ankle_link",
+        "target": -0.464202493,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      }
+    ],
+    "drive_rest": [
+      {
+        "link": "h1/left_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/torso_link",
+        "target": 0.00144445745,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_pitch_link",
+        "target": 0.0467252955,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_roll_link",
+        "target": -8.41070578e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_yaw_link",
+        "target": 0.000155391856,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_elbow_link",
+        "target": 0.0372704417,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hand_link",
+        "target": 0.000141795535,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal_base",
+        "target": 2.4477813e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal",
+        "target": 6.79595469e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_intermediate",
+        "target": 7.55331848e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_distal",
+        "target": 2.96341182e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_proximal",
+        "target": -2.07232645e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_intermediate",
+        "target": -1.86067155e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_proximal",
+        "target": -1.8093337e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_intermediate",
+        "target": -1.23487766e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_proximal",
+        "target": -1.30047397e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_intermediate",
+        "target": -1.54167807e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_proximal",
+        "target": -3.64211665e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_intermediate",
+        "target": 8.86894114e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_pitch_link",
+        "target": 0.0466124527,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_roll_link",
+        "target": 0.000352062169,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_yaw_link",
+        "target": 3.25458241e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_elbow_link",
+        "target": 0.0372556411,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hand_link",
+        "target": -0.000346994901,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 6.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/R_thumb_proximal_base",
+        "target": 0.750976205,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_proximal",
+        "target": 0.250392079,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "target": 0.174084157,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "target": 0.174023509,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_proximal",
+        "target": 0.310035586,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "target": 0.410015106,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "target": 0.310022354,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "target": 0.410010278,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "target": 0.309996605,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "target": 0.409998834,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "target": 0.309980035,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "target": 0.409992874,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/left_ankle_link",
+        "target": -0.465751708,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_ankle_link",
+        "target": -0.464202493,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      }
+    ],
+    "drive_close": [
+      {
+        "link": "h1/left_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_yaw_link",
+        "target": 0.0,
+        "kp": 150.0,
+        "kd": 8.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_roll_link",
+        "target": 0.0,
+        "kp": 200.0,
+        "kd": 12.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hip_pitch_link",
+        "target": -0.400000006,
+        "kp": 200.0,
+        "kd": 14.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_knee_link",
+        "target": 0.699999988,
+        "kp": 300.0,
+        "kd": 18.0,
+        "tlim": 300.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/torso_link",
+        "target": 0.00144445745,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 200.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_pitch_link",
+        "target": 0.0467252955,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_roll_link",
+        "target": -8.41070578e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_shoulder_yaw_link",
+        "target": 0.000155391856,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_elbow_link",
+        "target": 0.0372704417,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/left_hand_link",
+        "target": 0.000141795535,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal_base",
+        "target": 2.4477813e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_proximal",
+        "target": 6.79595469e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_intermediate",
+        "target": 7.55331848e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_thumb_distal",
+        "target": 2.96341182e-06,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_proximal",
+        "target": -2.07232645e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_index_intermediate",
+        "target": -1.86067155e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_proximal",
+        "target": -1.8093337e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_middle_intermediate",
+        "target": -1.23487766e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_proximal",
+        "target": -1.30047397e-07,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_ring_intermediate",
+        "target": -1.54167807e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_proximal",
+        "target": -3.64211665e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/L_pinky_intermediate",
+        "target": 8.86894114e-08,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 1.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_pitch_link",
+        "target": 0.0466124527,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_roll_link",
+        "target": 0.000352062169,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_shoulder_yaw_link",
+        "target": 3.25458241e-05,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_elbow_link",
+        "target": 0.0372556411,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 18.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_hand_link",
+        "target": -0.000346994901,
+        "kp": 50.0,
+        "kd": 4.0,
+        "tlim": 6.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/R_thumb_proximal_base",
+        "target": 1.18097615,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_proximal",
+        "target": 0.680392087,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_intermediate",
+        "target": 0.604084134,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_thumb_distal",
+        "target": 0.604023516,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_proximal",
+        "target": 0.740035594,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_index_intermediate",
+        "target": 0.840015113,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_proximal",
+        "target": 0.740022361,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_middle_intermediate",
+        "target": 0.840010285,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_proximal",
+        "target": 0.739996612,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_ring_intermediate",
+        "target": 0.839998841,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_proximal",
+        "target": 0.739980042,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/R_pinky_intermediate",
+        "target": 0.839992881,
+        "kp": 4.0,
+        "kd": 0.400000006,
+        "tlim": 0.0,
+        "grip": 1
+      },
+      {
+        "link": "h1/left_ankle_link",
+        "target": -0.465751708,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      },
+      {
+        "link": "h1/right_ankle_link",
+        "target": -0.464202493,
+        "kp": 400.0,
+        "kd": 30.0,
+        "tlim": 40.0,
+        "grip": 0
+      }
+    ],
+    "dof_torque_limit": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      200.0,
+      200.0,
+      200.0,
+      300.0,
+      40.0,
+      200.0,
+      200.0,
+      200.0,
+      300.0,
+      40.0,
+      200.0,
+      40.0,
+      40.0,
+      18.0,
+      18.0,
+      6.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      40.0,
+      40.0,
+      18.0,
+      18.0,
+      6.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "total_mass": 52.2652874,
+    "dof_stride": 51,
+    "base_dof": 6,
+    "poly_cx": 0.0770272762,
+    "ankle_settle_tau": [
+      -10.9457769,
+      -10.9491453
+    ],
+    "close_offset": 0.180000007,
+    "rest_back_offset": -0.25
+  }
+}

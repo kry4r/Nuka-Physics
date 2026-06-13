@@ -270,6 +270,26 @@ struct MeshSink {
         by_hash.emplace(hash, text);
         return text;
     }
+
+    // Append a sample point cloud (SAMP) deduped by content hash; return AssetRef
+    // text. Used for the grasp block's exact scaled+COM-centered cup hull verts
+    // (a vertex cloud with no topology -- CoResidentCup.hull_verts 1:1). Keyed in
+    // the SAME by_hash map as CMSH (content hashes are over the encoded payload,
+    // which is fourcc-distinct, so there is no cross-family collision risk).
+    std::string AddSamples(const std::vector<float>& xyz) {
+        const std::vector<uint8_t> payload = EncodeSamples(xyz);
+        const uint64_t hash = NkaContentHash(payload);
+        const auto it = by_hash.find(hash);
+        if (it != by_hash.end()) return it->second;
+        const uint32_t index = writer.AddChunk(NkaTagSamp(), payload);
+        AssetRef ref;
+        ref.nka_path = nka_basename;
+        ref.fourcc = NkaTagSamp();
+        ref.index = index;
+        const std::string text = ToString(ref);
+        by_hash.emplace(hash, text);
+        return text;
+    }
 };
 
 // Serialize a collision/visual shape RECORD into the per-node component object
@@ -391,6 +411,126 @@ Value SavePhysicsMaterial(const MaterialRecord& m) {
     Value o = Value::Object();
     o.Set("static_friction", Value::Float(m.friction_mu));
     o.Set("dynamic_friction", Value::Float(m.friction_mu));
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// M7 metadata sections: initial_state / settle / grasp (authored, not records).
+// All emitted in a DETERMINISTIC order (std::map keys are sorted; vector order
+// is the authored order) so a second Save is byte-identical.
+// ---------------------------------------------------------------------------
+
+// initial_state: { "<node-path>": { "qpos":[...], "root":{pos,quat} }, ... }.
+// SceneInitialState is a std::map, so Items()-style iteration is key-sorted.
+Value SaveInitialState(const SceneInitialState& is) {
+    Value o = Value::Object();
+    for (const auto& kv : is) {
+        Value e = Value::Object();
+        Value q = Value::Array();
+        for (float v : kv.second.qpos) q.PushBack(Value::Float(v));
+        e.Set("qpos", std::move(q));
+        e.Set("root", TransformJson(kv.second.root));
+        o.Set(kv.first, std::move(e));
+    }
+    return o;
+}
+
+// settle: { "steps":N, "dt":d, "holds":[{ "dofs":pat, "mode":"pd", "kp":, "kd":}] }.
+Value SaveSettle(const cook::SettleSpec& s) {
+    Value o = Value::Object();
+    o.Set("steps", Value::Int(static_cast<int64_t>(s.steps)));
+    o.Set("dt", Value::Float(s.dt));
+    Value holds = Value::Array();
+    for (const cook::SettleSpec::Hold& h : s.holds) {
+        Value ho = Value::Object();
+        ho.Set("dofs", Value::Str(h.dof_pattern));
+        ho.Set("mode", Value::Str("pd"));  // the only Mode today.
+        ho.Set("kp", Value::Float(h.kp));
+        ho.Set("kd", Value::Float(h.kd));
+        holds.PushBack(std::move(ho));
+    }
+    o.Set("holds", std::move(holds));
+    return o;
+}
+
+Value SaveContactSphere(const GraspContactSphere& s) {
+    Value o = Value::Object();
+    o.Set("link", Value::Str(s.link_name));
+    o.Set("offset", Vec3Json(s.local_offset));
+    o.Set("radius", Value::Float(s.radius));
+    o.Set("region", Value::Str(s.region));
+    o.Set("broadphase_id", Value::Int(static_cast<int64_t>(s.broadphase_id)));
+    return o;
+}
+
+Value SaveDriveTable(const std::vector<GraspDriveEntry>& tbl) {
+    Value a = Value::Array();
+    for (const GraspDriveEntry& e : tbl) {
+        Value o = Value::Object();
+        o.Set("link", Value::Str(e.link_name));
+        o.Set("target", Value::Float(e.target));
+        o.Set("kp", Value::Float(e.kp));
+        o.Set("kd", Value::Float(e.kd));
+        o.Set("tlim", Value::Float(e.tlim));
+        o.Set("grip", Value::Int(static_cast<int64_t>(e.grip)));
+        a.PushBack(std::move(o));
+    }
+    return a;
+}
+
+// grasp: the union config block. The exact cup hull verts are offloaded to the
+// .nka as a SAMP chunk via the shared sink (deduped) so the heavy float cloud
+// stays out of the JSON; everything else is JSON. Emitted in a fixed key order.
+Value SaveGrasp(const GraspConfig& g, MeshSink& sink) {
+    Value o = Value::Object();
+    o.Set("gravity_z", Value::Float(g.gravity_z));
+    o.Set("dt", Value::Float(g.dt));
+    o.Set("finger_mu", Value::Float(g.finger_mu));
+    o.Set("table_mu", Value::Float(g.table_mu));
+    o.Set("foot_mu", Value::Float(g.foot_mu));
+
+    o.Set("cup_mass", Value::Float(g.cup_mass));
+    o.Set("cup_scale_xy", Value::Float(g.cup_scale_xy));
+    o.Set("cup_scale_z", Value::Float(g.cup_scale_z));
+    if (!g.cup_hull_verts.empty()) {
+        o.Set("cup_hull", Value::Str(sink.AddSamples(g.cup_hull_verts)));
+    }
+    o.Set("cup_broadphase_id", Value::Int(static_cast<int64_t>(g.cup_broadphase_id)));
+
+    Value wrap = Value::Array();
+    for (const GraspContactSphere& s : g.wrap_spheres) wrap.PushBack(SaveContactSphere(s));
+    o.Set("wrap_spheres", std::move(wrap));
+    Value feet = Value::Array();
+    for (const GraspContactSphere& s : g.foot_spheres) feet.PushBack(SaveContactSphere(s));
+    o.Set("foot_spheres", std::move(feet));
+
+    o.Set("ground_height", Value::Float(g.ground_height));
+    o.Set("ground_broadphase_id", Value::Int(static_cast<int64_t>(g.ground_broadphase_id)));
+    o.Set("table_height", Value::Float(g.table_height));
+    o.Set("table_broadphase_id", Value::Int(static_cast<int64_t>(g.table_broadphase_id)));
+    o.Set("cup_table_proxy_half", Vec3Json(g.cup_table_proxy_half));
+    o.Set("cup_table_proxy_offset", Vec3Json(g.cup_table_proxy_offset));
+    o.Set("cup_table_proxy_id", Value::Int(static_cast<int64_t>(g.cup_table_proxy_id)));
+
+    Value grip = Value::Array();
+    for (const std::string& l : g.grip_links) grip.PushBack(Value::Str(l));
+    o.Set("grip_links", std::move(grip));
+
+    o.Set("drive_hold", SaveDriveTable(g.drive_hold));
+    o.Set("drive_rest", SaveDriveTable(g.drive_rest));
+    o.Set("drive_close", SaveDriveTable(g.drive_close));
+
+    Value tlim = Value::Array();
+    for (float v : g.dof_torque_limit) tlim.PushBack(Value::Float(v));
+    o.Set("dof_torque_limit", std::move(tlim));
+
+    o.Set("total_mass", Value::Float(g.total_mass));
+    o.Set("dof_stride", Value::Int(static_cast<int64_t>(g.dof_stride)));
+    o.Set("base_dof", Value::Int(static_cast<int64_t>(g.base_dof)));
+    o.Set("poly_cx", Value::Float(g.poly_cx));
+    o.Set("ankle_settle_tau", FloatArray(g.ankle_settle_tau, 2));
+    o.Set("close_offset", Value::Float(g.close_offset));
+    o.Set("rest_back_offset", Value::Float(g.rest_back_offset));
     return o;
 }
 
@@ -627,6 +767,19 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
             pairs.PushBack(std::move(o));
         }
         root.Set("contact_pairs", std::move(pairs));
+    }
+
+    // -- M7 metadata: initial_state / settle / grasp (only when present) -----
+    // Emitted only when authored so a non-grasp scene's .nks is unchanged (the
+    // existing SecondSaveByteIdentical / H1CupRoundtrip fixtures stay byte-equal).
+    if (!scene.InitialState().empty()) {
+        root.Set("initial_state", SaveInitialState(scene.InitialState()));
+    }
+    if (scene.Settle().steps != 0 || !scene.Settle().holds.empty()) {
+        root.Set("settle", SaveSettle(scene.Settle()));
+    }
+    if (scene.Grasp().present) {
+        root.Set("grasp", SaveGrasp(scene.Grasp(), sink));
     }
 
     // -- write .nks + sibling .nka ------------------------------------------
@@ -990,6 +1143,110 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             ov.gap = cp.At("gap").AsFloat();
             scene.AddContactPair(ov);
         }
+    }
+
+    // -- M7 metadata: initial_state / settle / grasp ------------------------
+    if (const Value* is = root.Find("initial_state")) {
+        SceneInitialState& dst = scene.InitialStateMut();
+        for (const auto& kv : is->Items()) {
+            ArticulationInitialState rec;
+            if (const Value* q = kv.second.Find("qpos")) {
+                for (const Value& v : q->Elements()) rec.qpos.push_back(v.AsFloat());
+            }
+            rec.root = TransformFromJson(kv.second.At("root"));
+            dst.emplace(kv.first, std::move(rec));
+        }
+    }
+    if (const Value* st = root.Find("settle")) {
+        cook::SettleSpec& spec = scene.SettleMut();
+        spec.steps = static_cast<int>(st->At("steps").AsInt());
+        spec.dt = st->At("dt").AsFloat();
+        if (const Value* holds = st->Find("holds")) {
+            for (const Value& h : holds->Elements()) {
+                cook::SettleSpec::Hold hold;
+                hold.dof_pattern = h.At("dofs").AsString();
+                hold.mode = cook::SettleSpec::Hold::Mode::PD;  // "pd" is the only mode.
+                if (const Value* kp = h.Find("kp")) hold.kp = kp->AsFloat();
+                if (const Value* kd = h.Find("kd")) hold.kd = kd->AsFloat();
+                spec.holds.push_back(std::move(hold));
+            }
+        }
+    }
+    if (const Value* g = root.Find("grasp")) {
+        GraspConfig& gc = scene.GraspMut();
+        gc.present = true;
+        gc.gravity_z = g->At("gravity_z").AsFloat();
+        gc.dt = g->At("dt").AsFloat();
+        gc.finger_mu = g->At("finger_mu").AsFloat();
+        gc.table_mu = g->At("table_mu").AsFloat();
+        gc.foot_mu = g->At("foot_mu").AsFloat();
+
+        gc.cup_mass = g->At("cup_mass").AsFloat();
+        gc.cup_scale_xy = g->At("cup_scale_xy").AsFloat();
+        gc.cup_scale_z = g->At("cup_scale_z").AsFloat();
+        if (const Value* hull = g->Find("cup_hull")) {
+            gc.cup_hull_ref = hull->AsString();
+            const AssetRef ref = ParseAssetRef(gc.cup_hull_ref);
+            gc.cup_hull_verts = DecodeSamples(ensure_nka().LoadChunk(ref.fourcc, ref.index));
+        }
+        gc.cup_broadphase_id = static_cast<uint32_t>(g->At("cup_broadphase_id").AsInt());
+
+        auto load_sphere = [](const Value& s) {
+            GraspContactSphere sp;
+            sp.link_name = s.At("link").AsString();
+            sp.local_offset = Vec3FromJson(s.At("offset"));
+            sp.radius = s.At("radius").AsFloat();
+            sp.region = s.At("region").AsString();
+            sp.broadphase_id = static_cast<uint32_t>(s.At("broadphase_id").AsInt());
+            return sp;
+        };
+        if (const Value* wrap = g->Find("wrap_spheres")) {
+            for (const Value& s : wrap->Elements()) gc.wrap_spheres.push_back(load_sphere(s));
+        }
+        if (const Value* feet = g->Find("foot_spheres")) {
+            for (const Value& s : feet->Elements()) gc.foot_spheres.push_back(load_sphere(s));
+        }
+
+        gc.ground_height = g->At("ground_height").AsFloat();
+        gc.ground_broadphase_id = static_cast<uint32_t>(g->At("ground_broadphase_id").AsInt());
+        gc.table_height = g->At("table_height").AsFloat();
+        gc.table_broadphase_id = static_cast<uint32_t>(g->At("table_broadphase_id").AsInt());
+        gc.cup_table_proxy_half = Vec3FromJson(g->At("cup_table_proxy_half"));
+        gc.cup_table_proxy_offset = Vec3FromJson(g->At("cup_table_proxy_offset"));
+        gc.cup_table_proxy_id = static_cast<uint32_t>(g->At("cup_table_proxy_id").AsInt());
+
+        if (const Value* grip = g->Find("grip_links")) {
+            for (const Value& l : grip->Elements()) gc.grip_links.push_back(l.AsString());
+        }
+
+        auto load_drive = [](const Value& a, std::vector<GraspDriveEntry>& dst) {
+            for (const Value& e : a.Elements()) {
+                GraspDriveEntry d;
+                d.link_name = e.At("link").AsString();
+                d.target = e.At("target").AsFloat();
+                d.kp = e.At("kp").AsFloat();
+                d.kd = e.At("kd").AsFloat();
+                d.tlim = e.At("tlim").AsFloat();
+                d.grip = static_cast<uint8_t>(e.At("grip").AsInt());
+                dst.push_back(d);
+            }
+        };
+        if (const Value* d = g->Find("drive_hold")) load_drive(*d, gc.drive_hold);
+        if (const Value* d = g->Find("drive_rest")) load_drive(*d, gc.drive_rest);
+        if (const Value* d = g->Find("drive_close")) load_drive(*d, gc.drive_close);
+
+        if (const Value* tlim = g->Find("dof_torque_limit")) {
+            for (const Value& v : tlim->Elements()) gc.dof_torque_limit.push_back(v.AsFloat());
+        }
+
+        gc.total_mass = g->At("total_mass").AsDouble();
+        gc.dof_stride = static_cast<uint32_t>(g->At("dof_stride").AsInt());
+        gc.base_dof = static_cast<uint32_t>(g->At("base_dof").AsInt());
+        gc.poly_cx = g->At("poly_cx").AsFloat();
+        gc.ankle_settle_tau[0] = FloatAt(g->At("ankle_settle_tau"), 0, "ankle_settle_tau");
+        gc.ankle_settle_tau[1] = FloatAt(g->At("ankle_settle_tau"), 1, "ankle_settle_tau");
+        gc.close_offset = g->At("close_offset").AsFloat();
+        gc.rest_back_offset = g->At("rest_back_offset").AsFloat();
     }
 }
 

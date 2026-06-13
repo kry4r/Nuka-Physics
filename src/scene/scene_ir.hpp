@@ -20,9 +20,11 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/canonical_types.hpp"
+#include "scene/cook/settle_spec.hpp"   // SettleSpec (plain data; persisted IC seam)
 #include "scene/ecs/entity.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
+#include "scene/scene_metadata.hpp"     // SceneInitialState, GraspConfig
 #include "math/transform.hpp"
 
 #include <memory>
@@ -268,6 +270,20 @@ public:
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
+    // -- authored scene METADATA (M7: not cook-fidelity records) -------------
+    // The per-articulation settled IC (initial_state, R4-baked), the
+    // deterministic-settle directive (settle), and the union GRASP config block
+    // (the externalized factory constants). Persisted by .nks Save/Load (T3),
+    // consumed by the union-slot cook (T4). NOT part of the facade (the tree /
+    // Registry / cook are unaffected): plain authoring data copied verbatim by
+    // the copy ctor / assignment. Mutable access does NOT mark the facade dirty.
+    const SceneInitialState&     InitialState() const { return initial_state_; }
+    SceneInitialState&           InitialStateMut() { return initial_state_; }
+    const cook::SettleSpec&      Settle() const { return settle_; }
+    cook::SettleSpec&            SettleMut() { return settle_; }
+    const GraspConfig&           Grasp() const { return grasp_; }
+    GraspConfig&                 GraspMut() { return grasp_; }
+
     // -- facade: structural world (M2b) -------------------------------------
     // The scene TREE and the ECS Registry built by the Add* write-through. The
     // tree is the hierarchy authority; the Registry holds the five-component
@@ -313,6 +329,11 @@ private:
     std::vector<ActuatorRecord>       actuators_;
     std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
     std::vector<ContactPairOverride>       contact_pairs_;
+
+    // -- authored metadata (M7; not facade-derived, copied verbatim) --------
+    SceneInitialState  initial_state_;
+    cook::SettleSpec   settle_;
+    GraspConfig        grasp_;
 
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;
