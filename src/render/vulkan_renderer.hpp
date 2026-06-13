@@ -5,16 +5,13 @@
 
 #include "math/vec3.hpp"
 #include "render/render_scene.hpp"
+#include "render/vulkan_offscreen_types.hpp"  // RenderBackend, VulkanRgba8, VulkanOffscreenReport
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace nuka::render {
-
-enum class RenderBackend {
-    Vulkan
-};
 
 struct VulkanRendererReport {
     RenderBackend backend = RenderBackend::Vulkan;
@@ -46,31 +43,12 @@ struct VulkanDebugDrawCommand {
     uint32_t color = 0xFFFFFFFFu;
 };
 
-struct VulkanRgba8 {
-    uint8_t r = 0;
-    uint8_t g = 0;
-    uint8_t b = 0;
-    uint8_t a = 255;
-};
-
 struct VulkanOffscreenOptions {
     uint32_t width = 640;
     uint32_t height = 360;
     float view_scale = 180.0f;
     math::Vec3 view_center = {0.0f, 0.0f, 0.25f};
     VulkanRgba8 background = {10, 12, 16, 255};
-};
-
-struct VulkanOffscreenReport {
-    RenderBackend backend = RenderBackend::Vulkan;
-    bool production_backend = true;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t command_count = 0;
-    uint32_t physical_device_count = 0;
-    std::string selected_device_name;
-    size_t non_background_pixel_count = 0;
-    std::vector<VulkanRgba8> pixels;
 };
 
 VulkanRendererReport ProbeVulkanRenderer();
