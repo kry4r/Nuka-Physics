@@ -19,6 +19,8 @@
 
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/pipeline/world.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "sensor/noise/n1_gaussian.hpp"
@@ -97,7 +99,11 @@ void CaptureNominalBaseline(nuka::c_abi::WorldRecord& record) {
     }
     record.dr_nominal_joint_armature = host.joint_armature;  // per-DOF copy
     record.dr_nominal_gravity_z = record.step_options.gravity.z;
-    record.dr_nominal_friction = record.batched_step_params.friction_coefficient;
+    // M9: the legacy batched contact step params are gone; contact friction lives
+    // on the nk Model material buckets. The DR friction multiplier has no host
+    // scalar to poke -> the nominal stays 0 (inert). M10 named gap (RL contact DR
+    // rebuilt on the nk world at M10).
+    record.dr_nominal_friction = 0.0f;
     record.dr_baseline_captured = true;
 }
 
@@ -113,7 +119,7 @@ nuka_result_t ApplyPerEpisodeRandomization(
     if (!cfg.enabled) {
         return NUKA_RESULT_OK;  // byte no-op -> oracle safe
     }
-    if (record.articulation_device.Empty()) {
+    if (!record.world || record.articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no link inertia to scale
     }
     if (record.device == nullptr) {
@@ -122,45 +128,53 @@ nuka_result_t ApplyPerEpisodeRandomization(
     CaptureNominalBaseline(record);
 
     auto& host = record.articulation_host;
-    const uint32_t total_links = host.TotalLinkCount();
+    // The host mirror is SINGLE-ENV (CaptureArticulationHostMirror cooks the first
+    // articulation only); the live nk arena LinkInertia/JointArmature fields are
+    // env-replicated (links_per_env * env_count). The DR multiplier is per-env, so
+    // we iterate the arena's full env-major span: per-env link count == the host
+    // mirror's link count, which is the env-major tile stride.
+    const uint32_t links_per_env = host.TotalLinkCount();
     const uint32_t env_count = (record.env_count == 0u) ? 1u : record.env_count;
-    // Links/DOFs are tiled env-major (ReplicateArticulationHostState appends
-    // replica e after e-1), so per-env link count = total_links / env_count.
-    const uint32_t links_per_env =
-        (env_count > 0u) ? (total_links / env_count) : total_links;
+    const uint32_t total_links = links_per_env * env_count;
 
     const auto& ctx = record.device->context;
     nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
 
-    auto* device_inertia = static_cast<articulation::LinkSpatialInertia*>(
-        record.articulation_device.link_inertia.Data());
+    auto* device_inertia =
+        record.world->FieldPtr<articulation::LinkSpatialInertia>(
+            nuka::nk::FieldId::LinkInertia);
 
     // --- mass: rebuild each link's spatial inertia from nominal*mult ----------
-    // Per-env multiplier; applied to every link in that env replica.
+    // Per-env multiplier; applied to every link in that env replica. The host
+    // mirror + nominal baseline are SINGLE-ENV (indexed by `local`); the live nk
+    // arena LinkInertia field is env-replicated (indexed by the global `link`).
     for (uint32_t env = 0u; env < env_count; ++env) {
         const noise::SampledRandomization sampled =
             noise::SampleEpisodeRandomization(cfg, env);
         for (uint32_t local = 0u; local < links_per_env; ++local) {
             const uint32_t link = env * links_per_env + local;
-            if (link >= total_links || link >= host.link_inertia.size()) {
+            if (link >= total_links || local >= host.link_inertia.size()) {
                 continue;
             }
             const float nominal =
-                (link < record.dr_nominal_link_mass.size())
-                    ? record.dr_nominal_link_mass[link]
-                    : MassFromInertia(host.link_inertia[link]);
+                (local < record.dr_nominal_link_mass.size())
+                    ? record.dr_nominal_link_mass[local]
+                    : MassFromInertia(host.link_inertia[local]);
             const float new_mass = nominal * sampled.mass_multiplier;
             if (!(new_mass > 0.0f)) {
                 continue;  // MakeSpatialInertia zeroes a non-positive mass
             }
             nuka::math::Vec3 diag{0.0f, 0.0f, 0.0f};
             nuka::math::Transform frame = nuka::math::Transform::Identity();
-            if (!ResolveLinkInertiaParams(host, link, &diag, &frame)) {
+            if (!ResolveLinkInertiaParams(host, local, &diag, &frame)) {
                 continue;
             }
             const articulation::LinkSpatialInertia new_inertia =
                 articulation::MakeSpatialInertia(new_mass, diag, frame);
-            host.link_inertia[link] = new_inertia;  // keep host mirror in sync
+            // Keep the single-env host mirror in sync (overwritten each env, last
+            // env's value wins -- the legacy behavior, the mirror is only the
+            // diffsim dI/dmass source which DR does not gate on).
+            host.link_inertia[local] = new_inertia;
             if (device_inertia != nullptr) {
                 cudaError_t copy_status = cudaMemcpyAsync(
                     device_inertia + link, &new_inertia,
@@ -173,41 +187,38 @@ nuka_result_t ApplyPerEpisodeRandomization(
         }
     }
 
-    // --- joint armature: nominal + offset, per-DOF (env-tiled) ---------------
-    // Present on the articulation state but INERT in the contact-free tape
-    // forward; set for RL completeness + a consistent host/device mirror.
-    if (!host.joint_armature.empty()) {
-        const uint32_t total_dof =
-            static_cast<uint32_t>(host.joint_armature.size());
+    // --- joint armature: nominal + offset, per-link (env-tiled) --------------
+    // The arena JointArmature field is per:link (env-replicated). The host mirror
+    // + nominal baseline are single-env (indexed by `local`). Present on the
+    // articulation state but INERT in the contact-free tape forward; set for RL
+    // completeness + a consistent host/device mirror.
+    auto* device_armature =
+        record.world->FieldPtr<float>(nuka::nk::FieldId::JointArmature);
+    if (!host.joint_armature.empty() && device_armature != nullptr) {
         const uint32_t dof_per_env =
-            (env_count > 0u) ? (total_dof / env_count) : total_dof;
+            static_cast<uint32_t>(host.joint_armature.size());
         bool armature_changed = false;
         for (uint32_t env = 0u; env < env_count; ++env) {
             const noise::SampledRandomization sampled =
                 noise::SampleEpisodeRandomization(cfg, env);
             for (uint32_t local = 0u; local < dof_per_env; ++local) {
-                const uint32_t dof = env * dof_per_env + local;
-                if (dof >= total_dof) {
-                    continue;
-                }
-                const float nominal =
-                    (dof < record.dr_nominal_joint_armature.size())
-                        ? record.dr_nominal_joint_armature[dof]
+                const float nominal_n =
+                    (local < record.dr_nominal_joint_armature.size())
+                        ? record.dr_nominal_joint_armature[local]
                         : 0.0f;
-                host.joint_armature[dof] = nominal + sampled.joint_armature_offset;
+                const float value = nominal_n + sampled.joint_armature_offset;
+                host.joint_armature[local] = value;  // single-env mirror sync
+                const uint32_t dof = env * dof_per_env + local;
+                cudaError_t copy_status = cudaMemcpyAsync(
+                    device_armature + dof, &value, sizeof(float),
+                    cudaMemcpyHostToDevice, ctx.stream.Native());
+                if (copy_status != cudaSuccess) {
+                    return NUKA_RESULT_INTERNAL;
+                }
                 armature_changed = true;
             }
         }
-        if (armature_changed &&
-            record.articulation_device.joint_armature.Data() != nullptr) {
-            cudaError_t copy_status = cudaMemcpyAsync(
-                record.articulation_device.joint_armature.Data(),
-                host.joint_armature.data(), total_dof * sizeof(float),
-                cudaMemcpyHostToDevice, ctx.stream.Native());
-            if (copy_status != cudaSuccess) {
-                return NUKA_RESULT_INTERNAL;
-            }
-        }
+        (void)armature_changed;
     }
 
     // --- gravity.z: nominal + offset (one world scalar; env 0's sample) ------
@@ -218,17 +229,13 @@ nuka_result_t ApplyPerEpisodeRandomization(
             noise::SampleEpisodeRandomization(cfg, 0u);
         record.step_options.gravity.z =
             record.dr_nominal_gravity_z + sampled.gravity_z_offset;
-        // friction_coefficient lives on the BATCHED contact path's step params;
-        // mirror env 0's friction multiplier there for the batched RL case. The
-        // single-env contact-free tape has no contact solve -> inert.
-        if (record.batched != nullptr) {
-            // friction is a MULTIPLIER against the captured nominal (idempotent
-            // across resets). The single-env contact-free tape has no contact
-            // solve -> inert; this serves the batched RL case.
-            record.batched_step_params.friction_coefficient =
-                record.dr_nominal_friction * sampled.friction_multiplier;
-        }
-        // restitution_offset: no engine buffer in the contact-free path -> inert.
+        // friction_multiplier: M9 named gap. The legacy batched contact step
+        // params (the only friction host scalar) are gone; contact friction now
+        // lives on the nk Model material buckets, which DR does not yet poke. The
+        // single-env contact-free diffsim tape has no contact solve -> inert
+        // either way. RL contact DR (incl. friction) is rebuilt on the nk world
+        // at M10. restitution_offset: likewise no buffer in this path -> inert.
+        (void)sampled;
     }
 
     ctx.stream.Synchronize();

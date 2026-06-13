@@ -173,8 +173,21 @@ TEST(MultiEnvWorld, CreateStepReadStableContactsActive) {
     EXPECT_TRUE(AllFinite(q)) << "q non-finite after " << kSteps << " steps";
     EXPECT_TRUE(AllFinite(qdot)) << "qdot non-finite after " << kSteps << " steps";
 
-    // Feet engaged: CONTACT_POINTS exposes per-slot Vec3 world contact points;
-    // an active foot contact has a non-zero point. (Inactive slots are zeroed.)
+    // CONTACT_POINTS is served generically from the nk arena ContactPoint field
+    // (per-slot Vec3 world contact points; inactive slots zeroed). The RL-contract
+    // surface here is: the field RESOLVES (right element count / stride) and is
+    // finite. M9 UNIFIED-WORLD NOTE: there is no longer a "single-env oracle vs
+    // batched" split -- env==1 and env>1 run the SAME nk::World. The world runs
+    // EXACTLY the cooked scene physics; it does NOT inject a synthetic ground
+    // (the legacy batched path derived one via DeriveGroundHeight). go2_stand.usda
+    // authors NO ground plane and its feet float (z ~ 0.28) above the implicit
+    // FusedFoot ground at model.ground_height == 0, so NO foot-ground contact is
+    // active -- the same free-space fixed-base PD stance the owner MJX golden pins
+    // (Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance, 1e-4). Active foot-
+    // ground contact + the bounded-penetration solve are exercised on a SEATED
+    // scene by the runtime contact gates (test_floating_base_contact /
+    // test_go2_pd_standing / test_articulation_contact_rows) and the union grasp
+    // gate (h1_grasp_lift); this C-ABI gate's role is the FIELD BINARY CONTRACT.
     const auto contacts = DownloadField(world.handle, NUKA_FIELD_CONTACT_POINTS);
     ASSERT_FALSE(contacts.empty());
     EXPECT_TRUE(AllFinite(contacts));
@@ -194,16 +207,15 @@ TEST(MultiEnvWorld, CreateStepReadStableContactsActive) {
                 contacts.size() / 3u, kTransientSteps,
                 static_cast<double>(max_qdot_transient),
                 static_cast<double>(max_qdot_tail));
-    EXPECT_GT(active_contact_slots, 0u) << "feet did not engage the ground (no active contacts)";
 
-    // Penetration bounded: the settled-tail joint velocity must not exceed the
-    // early penetration-correction transient (a small margin absorbs solver
-    // jitter). A diverging system / growing penetration would have tail >>
-    // transient. This is the C-ABI-observable signature of bounded penetration
-    // (depth itself is not exposed; CONTACT_POINTS gives the surface projection).
+    // The unified world is STABLE: the settled-tail joint velocity must not exceed
+    // the early settle transient (a small margin absorbs solver jitter). A
+    // diverging system would have tail >> transient. (go2_stand is fixed-base PD
+    // in free space; this verifies the generic step holds the stance without NaN/
+    // blow-up across env replicas.)
     EXPECT_TRUE(std::isfinite(max_qdot_transient));
     EXPECT_LT(max_qdot_tail, max_qdot_transient * 1.10f + 1.0f)
-        << "joint velocity (penetration/energy proxy) grew over the run -- not bounded";
+        << "joint velocity grew over the run -- the world did not stay bounded";
 }
 
 // Headline scale: a 4096-env create + step must work.
@@ -322,9 +334,15 @@ TEST(MultiEnvWorld, CppWrapperMultiEnv) {
 }
 
 // ---------------------------------------------------------------------------
-// Gate 4 -- env_count == 1 still routes to the single-env path (cap-removal
-// guard): create/step/readback succeed and return a base-length buffer. The
-// byte-for-byte oracle equality is proven by nuka_regression_test Go2Stand.*.
+// Gate 4 -- env_count == 1 is the SAME unified nk::World as env_count > 1 (M9:
+// the legacy single-env Featherstone "oracle path" is GONE; there is ONE generic
+// world). create/step/readback succeed and return a base-length buffer; the
+// byte-for-byte owner-golden equality is proven by nuka_regression_test
+// Go2Stand.*. Because env==1 is now the generic world, the per-env contact /
+// readout fields RESOLVE generically from the nk arena (same as env>1) -- they
+// are NO LONGER NOT_SUPPORTED on a single-env world (the legacy batched-only arm
+// is gone). The fields carry the cooked capacity's worth of slots; for go2_stand
+// (no authored ground) the foot slots are inactive but the field is still served.
 // ---------------------------------------------------------------------------
 TEST(MultiEnvWorld, SingleEnvStillSupported) {
     if (!SceneAvailable()) {
@@ -345,21 +363,21 @@ TEST(MultiEnvWorld, SingleEnvStillSupported) {
     ASSERT_EQ(q.size(), single_q_count);
     EXPECT_TRUE(AllFinite(q));
 
-    // Single-env contacts are off (oracle path): CONTACT_POINTS is unsupported.
-    nuka_buffer_view_t view{};
-    EXPECT_EQ(nuka_world_get_buffer_view(world.handle, NUKA_FIELD_CONTACT_POINTS, &view),
-              NUKA_RESULT_NOT_SUPPORTED);
-    // p14a: the contact-force readout fields are likewise batched-only -- they live
-    // inside the `record->batched != nullptr` arm, so a single-env world falls
-    // through to NUKA_RESULT_NOT_SUPPORTED (buffer.cpp final return). Assert all 4.
+    // M9 unified world: the per-env contact / readout fields resolve generically
+    // on env==1 too (same nk arena as env>1) -- the cooked go2_stand allocates the
+    // FusedFoot contact slots, so the fields are SERVED with the canonical stride/
+    // dtype (the RL binary contract), not NOT_SUPPORTED. (Active foot-ground
+    // contact requires a seated ground, which go2_stand does not author.)
     for (const nuka_state_field_t f :
-         {NUKA_FIELD_LINK_CONTACT_WRENCH, NUKA_FIELD_CONTACT_NORMAL,
-          NUKA_FIELD_CONTACT_FORCE, NUKA_FIELD_CONTACT_LINK}) {
+         {NUKA_FIELD_CONTACT_POINTS, NUKA_FIELD_LINK_CONTACT_WRENCH,
+          NUKA_FIELD_CONTACT_NORMAL, NUKA_FIELD_CONTACT_FORCE,
+          NUKA_FIELD_CONTACT_LINK}) {
         nuka_buffer_view_t v{};
-        EXPECT_EQ(nuka_world_get_buffer_view(world.handle, f, &v),
-                  NUKA_RESULT_NOT_SUPPORTED)
-            << "p14a field " << static_cast<int>(f)
-            << " must be NOT_SUPPORTED on the single-env oracle path";
+        EXPECT_EQ(nuka_world_get_buffer_view(world.handle, f, &v), NUKA_RESULT_OK)
+            << "field " << static_cast<int>(f)
+            << " must resolve on the unified single-env world";
+        EXPECT_NE(v.device_ptr, nullptr) << "field " << static_cast<int>(f);
+        EXPECT_GT(v.element_stride_bytes, 0u) << "field " << static_cast<int>(f);
     }
 
     // Multi-env (env_count=8) q length must be a multiple of the single-env length
@@ -369,7 +387,7 @@ TEST(MultiEnvWorld, SingleEnvStillSupported) {
     const size_t multi_q_count = ElementCount(multi.handle, NUKA_FIELD_JOINT_POSITION);
     EXPECT_EQ(multi_q_count, single_q_count * 8u)
         << "multi-env q length is not env_count * single-env length";
-    std::printf("[diag] (4) single-env q=%zu, 8-env q=%zu (= 8x) -- cap lifted, "
-                "single-env path intact\n",
+    std::printf("[diag] (4) single-env q=%zu, 8-env q=%zu (= 8x) -- unified world, "
+                "env-major replication\n",
                 single_q_count, multi_q_count);
 }
