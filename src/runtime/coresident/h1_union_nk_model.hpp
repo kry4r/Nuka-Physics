@@ -34,7 +34,7 @@
 // ---------------------------------------------------------------------------
 
 #include "nk/model/model.hpp"
-#include "runtime/coresident/batched_unified_world.hpp"  // BatchedSceneTemplate
+#include "scene/cook/union_scene_template.hpp"  // BatchedSceneTemplate (M9 T3 relocation)
 
 namespace nuka::runtime::coresident {
 
