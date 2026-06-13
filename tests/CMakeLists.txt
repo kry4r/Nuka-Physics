@@ -2637,32 +2637,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_union_cook_golden_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- SG G2: the C++ REFERENCE RECORDER for the python byte-parity gate ---------
-    # Drives the union world THROUGH THE C ABI (links libnuka -- the exact code path
-    # the python binding calls, so the python replay has no cross-compile seam) with
-    # the closed-loop lift choreography and records per-step action bytes + the
-    # C-ABI obs export to .g2_logs/g2_pyref_n4.bin. The python gate harness
-    # (examples/training/g2_union_world_gates.py) runs this binary then replays.
-    if(TARGET nuka)
-        add_executable(nuka_h1_union_pyref_test
-            coresident/test_h1_union_pyref.cpp
-        )
-
-        target_include_directories(nuka_h1_union_pyref_test
-            PRIVATE
-                ${CMAKE_SOURCE_DIR}/src/include
-        )
-
-        target_link_libraries(nuka_h1_union_pyref_test
-            PRIVATE
-                nuka
-                GTest::gtest_main
-        )
-
-        gtest_discover_tests(nuka_h1_union_pyref_test
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    endif()
-
     # --- v0.8 C7b-2 SHOWCASE: the H1 cup-sequence DEMO scaffold (R0/R1) ---
     # The conjunction gate: a floating-base H1 STANDS (RL leg policy + hold-PD) WHILE
     # the right hand co-resides a movable cup + static table + N fingertip collidables

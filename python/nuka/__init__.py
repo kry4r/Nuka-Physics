@@ -31,11 +31,6 @@ from ._nuka_ext import (  # noqa: F401
     Field,
     World,
     Tape,
-    # v0.8 A2: the batched grasp world (BatchedUnifiedWorld) -- the RL-grasp substrate.
-    GraspWorld,
-    # v0.8 G2: the H1 whole-body UNION world (BatchedUnifiedWorld, G1d union scene:
-    # floating-base 51-DOF H1 + settled in-hand cup + ground + table, ONE solve).
-    UnionWorld,
     sync,
     __engine_version__,
     DETERMINISM_STRONG,
@@ -159,8 +154,6 @@ __all__ = [
     "Device",
     "World",
     "Tape",
-    "GraspWorld",
-    "UnionWorld",
     "Scene",
     "Field",
     "sync",
