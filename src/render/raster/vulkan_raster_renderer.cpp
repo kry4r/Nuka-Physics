@@ -163,11 +163,100 @@ Mat4 Perspective(float fov_y_radians, float aspect, float z_near, float z_far) {
     return r;
 }
 
+// Per-draw push constant (M8.5 T4): the object->world model matrix plus the
+// per-draw material scalars. The view_proj + light rig live in the per-frame
+// SceneUbo (set 0) so the push block stays under the 128-byte guaranteed limit
+// (112 bytes here: 64 + 16 + 16 + 16). Mirrors mesh.vert / mesh_pbr.frag.
 struct PushBlock {
-    float mvp[16];
     float model[16];
-    float base_color[4];
+    float base_color[4];   // rgb albedo + a opacity
+    float mr[4];           // x metallic, y roughness, z opacity, w pad
+    float emissive[4];     // rgb emissive, a pad
 };
+static_assert(sizeof(PushBlock) == 112, "PushBlock must stay <=128 push-constant bytes");
+
+// std140-laid-out per-frame scene uniform (camera + light rig). Must match the
+// SceneUbo block in mesh.vert / mesh_pbr.frag byte-for-byte.
+constexpr int kMaxUboLights = 8;
+struct GpuLight {
+    float direction[4];  // xyz dir TOWARD light, w = is_directional (1/0)
+    float position[4];   // xyz world pos (point), w = range (unused)
+    float color[4];      // rgb radiance (color*intensity), w unused
+};
+struct SceneUbo {
+    float    view_proj[16];
+    float    camera_pos[4];     // xyz eye
+    float    ambient[4];        // rgb hemispheric sky, w ground mix (unused in shader path)
+    float    ambient_ground[4]; // rgb hemispheric ground
+    int32_t  counts[4];         // x active light count
+    GpuLight lights[kMaxUboLights];
+};
+static_assert(sizeof(SceneUbo) == 512, "SceneUbo must match the std140 shader block");
+
+// Build the per-frame SceneUbo. Lights come from world.lights when authored;
+// otherwise a deterministic renderer-side default 3-point key/fill/rim rig +
+// hemispheric ambient is injected (Decision D4 / recon 5.3) so cooked robot
+// scenes with no authored <light> still render with a grounded, lit look. This
+// default lives RENDERER-SIDE (not in BuildRenderWorld) so the RenderWorld stays
+// a pure data product and the M11 path-tracer is unaffected.
+SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
+                       const math::Vec3& eye) {
+    SceneUbo ubo{};
+    std::memcpy(ubo.view_proj, view_proj.m.data(), sizeof(ubo.view_proj));
+    ubo.camera_pos[0] = eye.x;
+    ubo.camera_pos[1] = eye.y;
+    ubo.camera_pos[2] = eye.z;
+    ubo.camera_pos[3] = 1.0f;
+
+    // Hemispheric ambient: a soft cool sky over a warm-dark ground. Lifted enough
+    // that dark (e.g. black-bodied) materials still read their form rather than
+    // crushing to the background.
+    ubo.ambient[0] = 0.20f; ubo.ambient[1] = 0.23f; ubo.ambient[2] = 0.28f; ubo.ambient[3] = 0.0f;
+    ubo.ambient_ground[0] = 0.09f; ubo.ambient_ground[1] = 0.08f;
+    ubo.ambient_ground[2] = 0.07f; ubo.ambient_ground[3] = 0.0f;
+
+    auto set_dir_light = [](GpuLight& l, const math::Vec3& dir,
+                            float r, float g, float b) {
+        const math::Vec3 d = dir.Normalized();
+        l.direction[0] = d.x; l.direction[1] = d.y; l.direction[2] = d.z;
+        l.direction[3] = 1.0f;  // directional
+        l.position[0] = l.position[1] = l.position[2] = 0.0f; l.position[3] = 0.0f;
+        l.color[0] = r; l.color[1] = g; l.color[2] = b; l.color[3] = 0.0f;
+    };
+
+    int n = 0;
+    if (!world.lights.empty()) {
+        for (const RenderLight& rl : world.lights) {
+            if (n >= kMaxUboLights) break;
+            GpuLight& l = ubo.lights[n];
+            const math::Vec3 col = rl.color * rl.intensity;
+            if (rl.type == scene::LightComponent::Type::Directional) {
+                // The light's local forward (-Z) points along the beam; the
+                // shader wants the direction TOWARD the light, so negate.
+                const math::Vec3 fwd =
+                    rl.world_xform.TransformDirection({0.0f, 0.0f, -1.0f});
+                set_dir_light(l, fwd * -1.0f, col.x, col.y, col.z);
+            } else {
+                const math::Vec3 p = rl.world_xform.position;
+                l.direction[0] = l.direction[1] = l.direction[2] = 0.0f;
+                l.direction[3] = 0.0f;  // point
+                l.position[0] = p.x; l.position[1] = p.y; l.position[2] = p.z;
+                l.position[3] = 0.0f;
+                l.color[0] = col.x; l.color[1] = col.y; l.color[2] = col.z;
+                l.color[3] = 0.0f;
+            }
+            ++n;
+        }
+    } else {
+        // Default 3-point rig (world +Z up). Key from the upper front-right,
+        // fill cooler from the front-left, rim/back from behind-above.
+        set_dir_light(ubo.lights[n++], {0.5f, -0.6f, 0.75f}, 3.2f, 3.1f, 2.9f);   // key (warm white)
+        set_dir_light(ubo.lights[n++], {-0.7f, 0.3f, 0.4f}, 0.8f, 0.9f, 1.1f);    // fill (cool)
+        set_dir_light(ubo.lights[n++], {0.1f, 0.8f, 0.5f}, 1.0f, 0.95f, 0.85f);   // rim/back
+    }
+    ubo.counts[0] = n;
+    return ubo;
+}
 
 // -- flat-normal synthesis for a mesh whose normals stream is empty ----------
 std::vector<float> SynthesizeFlatNormals(const std::vector<float>& positions,
@@ -249,11 +338,13 @@ struct VulkanRasterRenderer::Impl {
     VkQueue          present_queue  = VK_NULL_HANDLE;  // == queue (shared family)
     VkCommandPool    command_pool   = VK_NULL_HANDLE;
     VkRenderPass     render_pass    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;  // set 0: per-frame SceneUbo
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline       pipeline       = VK_NULL_HANDLE;
     VkShaderModule   vert_module    = VK_NULL_HANDLE;
     VkShaderModule   frag_module    = VK_NULL_HANDLE;
     VkDescriptorPool imgui_pool     = VK_NULL_HANDLE;  // lazily created (M8.5 ImGui seam)
+    VkDescriptorPool scene_pool     = VK_NULL_HANDLE;  // lazily created (per-frame SceneUbo set)
     std::string      device_name;
 
     explicit Impl(const RendererConfig& config)
@@ -273,8 +364,10 @@ struct VulkanRasterRenderer::Impl {
             vkDeviceWaitIdle(device);
         }
         if (imgui_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, imgui_pool, nullptr);
+        if (scene_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, scene_pool, nullptr);
         if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
         if (pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        if (scene_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr);
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
         if (frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, frag_module, nullptr);
         if (render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, render_pass, nullptr);
@@ -475,6 +568,23 @@ struct VulkanRasterRenderer::Impl {
         return imgui_pool;
     }
 
+    // Lazily create a small descriptor pool for the per-frame SceneUbo set. It is
+    // SEPARATE from the ImGui pool (recon §4: do not share). FREE_DESCRIPTOR_SET so
+    // each Render() allocates + frees one set deterministically.
+    VkDescriptorPool EnsureScenePool() {
+        if (scene_pool != VK_NULL_HANDLE) return scene_pool;
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8u};
+        VkDescriptorPoolCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        info.maxSets = 8u;
+        info.poolSizeCount = 1u;
+        info.pPoolSizes = &size;
+        CheckVk(vkCreateDescriptorPool(device, &info, nullptr, &scene_pool),
+                "vkCreateDescriptorPool(scene)");
+        return scene_pool;
+    }
+
     void CreateCommandPool() {
         VkCommandPoolCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -541,13 +651,30 @@ struct VulkanRasterRenderer::Impl {
         vert_module = CreateShaderModule(NUKA_RASTER_MESH_VERT_SPV);
         frag_module = CreateShaderModule(NUKA_RASTER_MESH_FRAG_SPV);
 
+        // Set 0, binding 0: the per-frame SceneUbo (camera + light rig), read by
+        // both the vertex (view_proj) and fragment (camera + lights) stages.
+        VkDescriptorSetLayoutBinding ubo_binding{};
+        ubo_binding.binding = 0u;
+        ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ubo_binding.descriptorCount = 1u;
+        ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set_info.bindingCount = 1u;
+        set_info.pBindings = &ubo_binding;
+        CheckVk(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &scene_set_layout),
+                "vkCreateDescriptorSetLayout(scene)");
+
+        // Push constant now feeds both stages (model -> vert, material -> frag).
         VkPushConstantRange push_range{};
-        push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         push_range.offset = 0u;
         push_range.size = sizeof(PushBlock);
 
         VkPipelineLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.setLayoutCount = 1u;
+        layout_info.pSetLayouts = &scene_set_layout;
         layout_info.pushConstantRangeCount = 1u;
         layout_info.pPushConstantRanges = &push_range;
         CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout),
@@ -765,6 +892,10 @@ struct InstanceDraw {
     uint32_t index_count = 0;
     Mat4 model;
     float base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
+    float metallic = 0.0f;
+    float roughness = 0.5f;
+    float opacity = 1.0f;
+    float emissive[3] = {0.0f, 0.0f, 0.0f};
 };
 
 // Resolve the camera (eye/target/up/fov) for this render. Priority:
@@ -890,6 +1021,12 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
             draw.base_color[1] = mat.base_color[1];
             draw.base_color[2] = mat.base_color[2];
             draw.base_color[3] = mat.base_color[3];
+            draw.metallic = mat.metallic;
+            draw.roughness = mat.roughness;
+            draw.opacity = mat.opacity;
+            draw.emissive[0] = mat.emissive[0];
+            draw.emissive[1] = mat.emissive[1];
+            draw.emissive[2] = mat.emissive[2];
         }
 
         // Positions.
@@ -943,6 +1080,34 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     const Mat4 view = LookAt(cam.eye, cam.target, cam.up);
     const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
     const Mat4 view_proj = Multiply(proj, view);
+
+    // -- 2b. Per-frame SceneUbo (camera + light rig) + descriptor set --------
+    const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye);
+    GpuBuffer ubo_buffer = d.CreateBuffer(
+        sizeof(SceneUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    d.UploadBuffer(ubo_buffer, &scene_ubo, sizeof(SceneUbo));
+
+    VkDescriptorPool scene_pool = d.EnsureScenePool();
+    VkDescriptorSet scene_set = VK_NULL_HANDLE;
+    {
+        VkDescriptorSetAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = scene_pool;
+        alloc.descriptorSetCount = 1u;
+        alloc.pSetLayouts = &d.scene_set_layout;
+        CheckVk(vkAllocateDescriptorSets(d.device, &alloc, &scene_set),
+                "vkAllocateDescriptorSets(scene)");
+        VkDescriptorBufferInfo buffer_info{ubo_buffer.buffer, 0u, sizeof(SceneUbo)};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = scene_set;
+        write.dstBinding = 0u;
+        write.descriptorCount = 1u;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write.pBufferInfo = &buffer_info;
+        vkUpdateDescriptorSets(d.device, 1u, &write, 0u, nullptr);
+    }
 
     // -- 3. Offscreen color + depth targets + framebuffer -------------------
     GpuImage color = d.CreateImage(
@@ -1002,6 +1167,8 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline_layout,
+                            0u, 1u, &scene_set, 0u, nullptr);
 
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -1016,11 +1183,18 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
 
     for (const InstanceDraw& draw : draws) {
         PushBlock push{};
-        const Mat4 mvp = Multiply(view_proj, draw.model);
-        std::memcpy(push.mvp, mvp.m.data(), sizeof(push.mvp));
         std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
         std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
-        vkCmdPushConstants(cmd, d.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
+        push.mr[0] = draw.metallic;
+        push.mr[1] = draw.roughness;
+        push.mr[2] = draw.opacity;
+        push.mr[3] = 0.0f;
+        push.emissive[0] = draw.emissive[0];
+        push.emissive[1] = draw.emissive[1];
+        push.emissive[2] = draw.emissive[2];
+        push.emissive[3] = 0.0f;
+        vkCmdPushConstants(cmd, d.pipeline_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                            sizeof(PushBlock), &push);
 
         std::array<VkBuffer, 2> vbuffers{draw.vertex_pos.buffer, draw.vertex_nrm.buffer};
@@ -1065,6 +1239,8 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkUnmapMemory(d.device, readback.memory);
 
     // -- 6. Teardown per-frame resources ------------------------------------
+    vkFreeDescriptorSets(d.device, scene_pool, 1u, &scene_set);
+    d.DestroyBuffer(ubo_buffer);
     d.DestroyBuffer(readback);
     vkDestroyFramebuffer(d.device, framebuffer, nullptr);
     d.DestroyImage(depth);
