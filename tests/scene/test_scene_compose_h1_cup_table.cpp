@@ -1,9 +1,30 @@
 // ---------------------------------------------------------------------------
-// H1 cup demo kitchen scene compose gate.
+// H1 cup demo kitchen scene — the FULL .nks pipeline gate (M7 T5b).
 // ---------------------------------------------------------------------------
 // Compose the imported kitchen MJCF scene, the H1 MJCF, and the USD cup into one
-// SceneIR. The cup support is a real imported kitchen counter collision top; no
-// programmatic/simple table scaffold is allowed in this gate.
+// SceneIR (the cup support is a REAL imported kitchen counter collision top — no
+// programmatic table scaffold), seat the cup on the counter with the SHARED
+// cook::FindRestPlacement (T2) drop-to-rest primitive, then route the composed
+// scene through the WHOLE own-format pipeline:
+//
+//     Compose -> Save(.nks + .nka) -> [re-Save byte-identity] -> Load
+//             -> CookToModel -> nk::World -> Step.
+//
+// The gate asserts the scene authors, persists (byte-identically on re-save),
+// reloads (preserving the cook counts + the cup-on-counter rest placement),
+// cooks to an nk::Model with the right capacities, and steps without error.
+//
+// KITCHEN-SCALE COOK GAP (flagged, not silently dropped): the 412 KB kitchen
+// MJCF composes to ~374 bodies / ~1700 shapes / ~113 joints. The generic
+// CookToModel takes only the FIRST cooked articulation (cook_to_model.cpp: "the
+// FIRST articulation, the single-robot scene shape"), so the whole-body 51-DOF
+// H1 is NOT cooked as one coherent articulation here (it cooks to a small
+// articulation + hundreds of free rigid bodies). The cook+World+Step is
+// therefore scoped to "builds + steps a few frames + capacities mirror the
+// records"; the full H1-under-kitchen union grasp world is the dedicated
+// h1_cup_table.nks union path (M7 T4 union_cook / h1_grasp_lift), NOT this
+// kitchen-compose gate. This gate proves the GENERIC .nks pipeline end-to-end on
+// a real composed scene; the per-cell grasp physics live in the union gate.
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
@@ -11,9 +32,16 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 #include "scene/canonical_types.hpp"
+#include "scene/cook/cook_to_model.hpp"
+#include "scene/cook/placement.hpp"
 #include "scene/cooked_blob.hpp"
 #include "scene/cooker.hpp"
+#include "scene/format/json.hpp"
+#include "scene/format/nks.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
 
@@ -22,7 +50,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -32,6 +64,10 @@ using nuka::math::Quat;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 using namespace nuka::scene;
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
+namespace cook = nuka::scene::cook;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -252,11 +288,18 @@ Transform MakeH1Placement(const SceneIR& h1, const Vec3& hand_target) {
 struct Composed {
     SceneIR scene;
     Transform h1_placement;
-    Transform cup_placement;
-    SupportSurface support;
+    Transform cup_placement;     // the cup ROOT world transform after rest-seat.
+    SupportSurface support;      // resolved against the COMPOSED scene.
+    ShapeId composed_support_shape = kInvalidShape;
+    BodyId cup_body = kInvalidBody;
     float cup_root_relative_min_z = 0.0f;
 };
 
+// Compose kitchen + H1 + cup, then SEAT the cup on the imported counter top with
+// the shared cook::FindRestPlacement (T2) drop-to-rest. The cup is composed in
+// parked, then its record local_transform is set to the rest placement (a ROOT
+// body, so the placement IS its world transform). The H1 hand is placed within
+// reach of the seated cup. Deterministic (pure geometry; no RNG).
 Composed ComposeAll() {
     Composed out;
 
@@ -264,30 +307,121 @@ Composed ComposeAll() {
     const SceneIR h1 = LoadH1ClearedMesh();
     const SceneIR cup = LoadCupSingleHull();
 
-    out.support = FindKitchenCounterSupport(kitchen);
+    // Resolve the counter top + the cup geometry on the standalone scenes (so the
+    // reach/placement targets are known before composing).
+    const SupportSurface kitchen_support = FindKitchenCounterSupport(kitchen);
     out.cup_root_relative_min_z = CupRootRelativeMinZ(cup);
 
+    // XY target: the front-of-counter offset (same as the legacy gate).
     const float front_offset =
-        std::min(0.18f, std::max(0.0f, out.support.half_extents.y - 0.08f));
-    const Vec3 cup_xy = out.support.world.TransformPoint({0.0f, -front_offset, 0.0f});
-    out.cup_placement = Transform{
-        Vec3{cup_xy.x, cup_xy.y,
-             out.support.top_z - out.cup_root_relative_min_z + kCupClearance},
-        Quat::Identity()};
+        std::min(0.18f, std::max(0.0f, kitchen_support.half_extents.y - 0.08f));
+    const Vec3 cup_xy =
+        kitchen_support.world.TransformPoint({0.0f, -front_offset, 0.0f});
 
-    const Vec3 cup_root = out.cup_placement.position;
-    const Vec3 hand_target{cup_root.x, cup_root.y, cup_root.z + 0.12f};
+    // Hand target above the cup seat (z resolved from the counter top + cup geom).
+    const float cup_root_z =
+        kitchen_support.top_z - out.cup_root_relative_min_z + kCupClearance;
+    const Vec3 hand_target{cup_xy.x, cup_xy.y, cup_root_z + 0.12f};
     out.h1_placement = MakeH1Placement(h1, hand_target);
 
+    // Compose: kitchen base + H1 (placed) + cup (parked; seated below).
     SceneIR scene = kitchen;
     scene = Compose(scene, h1, out.h1_placement, kH1Prefix);
-    scene = Compose(scene, cup, out.cup_placement, kCupPrefix);
+    scene = Compose(scene, cup, Transform::Identity(), kCupPrefix);
+
+    // Resolve the counter support + the cup body against the COMPOSED scene.
+    out.support = FindKitchenCounterSupport(scene);
+    out.composed_support_shape = out.support.shape_id;
+    const int cup_body = FindBody(scene, kCupPrefix + kCupRootBody);
+    if (cup_body < 0) {
+        throw std::runtime_error("composed scene missing cup root " + kCupRootBody);
+    }
+    out.cup_body = static_cast<BodyId>(cup_body);
+
+    // SEAT the cup with the shared rest-placement primitive (replaces the legacy
+    // in-file drop-to-rest): the cup bottom rests at counter_top + clearance, at
+    // the front-of-counter XY target. The cup is a ROOT body so the returned root
+    // transform is applied directly as its record local_transform.
+    out.cup_placement = cook::FindRestPlacement(
+        scene, out.cup_body, out.composed_support_shape, cup_xy, kCupClearance);
+    scene.GetBodyMut(out.cup_body).local_transform = out.cup_placement;
+
     out.scene = std::move(scene);
     return out;
 }
 
+// A fresh temp dir per run (hermetic). Mirrors scene_roundtrip's TempDir.
+class TempDir {
+public:
+    TempDir() {
+        char tmpl[] = "/tmp/nks_compose_h1_cup_XXXXXX";
+        char* p = ::mkdtemp(tmpl);
+        if (!p) throw std::runtime_error("mkdtemp failed");
+        path_ = p;
+    }
+    ~TempDir() {
+        std::error_code ec;
+        fs::remove_all(path_, ec);
+    }
+    // A fresh sub-dir (created) so the SAME scene saved twice has an identical
+    // embedded sibling .nka BASENAME (byte-identity is determinism, not path).
+    fs::path SubFile(const std::string& subdir, const std::string& name) const {
+        const fs::path d = path_ / subdir;
+        std::error_code ec;
+        fs::create_directories(d, ec);
+        return d / name;
+    }
+
+private:
+    fs::path path_;
+};
+
+std::vector<uint8_t> ReadBytes(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+// The cup root world transform + its bottom z, recomputed from a (loaded) scene.
+struct CupSeat {
+    Transform root_world = Transform::Identity();
+    float bottom_z = 0.0f;
+};
+CupSeat CupSeatOf(const SceneIR& scene, float cup_root_relative_min_z) {
+    const int cup_body = FindBody(scene, kCupPrefix + kCupRootBody);
+    CupSeat seat;
+    if (cup_body < 0) return seat;
+    seat.root_world = WorldOf(scene, cup_body);
+    seat.bottom_z =
+        seat.root_world.TransformPoint({0.0f, 0.0f, cup_root_relative_min_z}).z;
+    return seat;
+}
+
+// --- shared CUDA backend (outlives the World dtors; freed at process exit) -----
+struct Backend {
+    nphi::Device* dev = nullptr;
+    nphi::Backend* backend = nullptr;
+};
+nphi::DeviceContext& ProcessContext() {
+    static nphi::DeviceContext ctx = nphi::MakeDefaultDeviceContext();
+    return ctx;
+}
+Backend GetBackend() {
+    static Backend b = [] {
+        Backend r;
+        ProcessContext();
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return b;
+}
+
 }  // namespace
 
+// ===========================================================================
+// (1) SceneIR compose — counts add across the three imported sources.
+// ===========================================================================
 TEST(SceneComposeH1CupKitchen, CountsAddAcrossThreeSources) {
     if (!AssetsAvailable()) GTEST_SKIP() << "kitchen / H1 / cup assets not present";
 
@@ -347,6 +481,11 @@ TEST(SceneComposeH1CupKitchen, ComposedSceneCooksWithMirroredCounts) {
     EXPECT_GE(blob.convex_geometry.Count(), 1u);
 }
 
+// ===========================================================================
+// (2) Rest placement — the cup is seated on the imported counter top with the
+//     SHARED cook::FindRestPlacement (T2) primitive (replaces the in-file
+//     drop-to-rest): cup bottom rests at counter_top + clearance, within bounds.
+// ===========================================================================
 TEST(SceneComposeH1CupKitchen, CupRestsOnKitchenCounterTop) {
     if (!AssetsAvailable()) GTEST_SKIP() << "kitchen / H1 / cup assets not present";
 
@@ -356,16 +495,14 @@ TEST(SceneComposeH1CupKitchen, CupRestsOnKitchenCounterTop) {
     const int cup_body = FindBody(out, kCupPrefix + kCupRootBody);
     ASSERT_GE(cup_body, 0) << "composed scene must contain " << kCupPrefix + kCupRootBody;
 
-    const Transform cup_world = WorldOf(out, cup_body);
-    const Vec3 cup_bottom =
-        cup_world.TransformPoint({0.0f, 0.0f, composed.cup_root_relative_min_z});
+    const CupSeat seat = CupSeatOf(out, composed.cup_root_relative_min_z);
     const Vec3 cup_in_support =
-        composed.support.world.Inverse().TransformPoint(cup_world.position);
+        composed.support.world.Inverse().TransformPoint(seat.root_world.position);
 
-    EXPECT_NEAR(cup_bottom.z, composed.support.top_z + kCupClearance, 1e-4f)
-        << "cup bottom z=" << cup_bottom.z
+    EXPECT_NEAR(seat.bottom_z, composed.support.top_z + kCupClearance, 1e-4f)
+        << "cup bottom z=" << seat.bottom_z
         << " kitchen counter top z=" << composed.support.top_z;
-    EXPECT_GE(cup_bottom.z, composed.support.top_z - 1e-4f)
+    EXPECT_GE(seat.bottom_z, composed.support.top_z - 1e-4f)
         << "cup must not penetrate the kitchen counter";
     EXPECT_LE(std::fabs(cup_in_support.x), composed.support.half_extents.x - 0.02f);
     EXPECT_LE(std::fabs(cup_in_support.y), composed.support.half_extents.y - 0.02f);
@@ -398,6 +535,132 @@ TEST(SceneComposeH1CupKitchen, CupWithinRightHandReachBand) {
     EXPECT_GT(dist, 0.0f);
 }
 
+// ===========================================================================
+// (3) THE .nks PIPELINE — Save(.nks+.nka) -> re-Save byte-identity -> Load.
+//     The composed+seated scene authors, persists byte-identically on a second
+//     save, and reloads preserving the cook counts + the cup rest placement.
+// ===========================================================================
+TEST(SceneComposeH1CupKitchen, NksRoundTripsByteIdenticalAndPreservesCounts) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "kitchen / H1 / cup assets not present";
+
+    const Composed composed = ComposeAll();
+    const SceneIR& orig = composed.scene;
+    TempDir tmp;
+
+    // Same stem in two sub-dirs so the embedded .nka basename matches across the
+    // two saves (so byte-identity is a pure determinism check).
+    const fs::path nks1 = tmp.SubFile("run1", "h1_cup_kitchen.nks");
+    nks::Save(orig, nks1.string());
+
+    // Format-shape pin: the saved JSON carries the §3.7 nested "tree" + split
+    // material sections (no legacy flat record arrays).
+    {
+        std::ifstream in(nks1, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        const json::Value root = json::Value::Parse(text);
+        EXPECT_TRUE(root.Has("tree")) << "saved .nks lacks the \"tree\" section";
+        EXPECT_TRUE(root.Has("physics_materials"));
+        EXPECT_FALSE(root.Has("bodies")) << "flat \"bodies\" array must be gone";
+    }
+
+    const SceneIR loaded = nks::Load(nks1.string());
+
+    // Re-save the reloaded scene: byte-identical .nks + .nka (determinism).
+    const fs::path nks2 = tmp.SubFile("run2", "h1_cup_kitchen.nks");
+    nks::Save(loaded, nks2.string());
+    EXPECT_EQ(ReadBytes(nks1), ReadBytes(nks2)) << ".nks not byte-identical on re-save";
+    EXPECT_EQ(ReadBytes(tmp.SubFile("run1", "h1_cup_kitchen.nka")),
+              ReadBytes(tmp.SubFile("run2", "h1_cup_kitchen.nka")))
+        << ".nka not byte-identical on re-save";
+
+    // The reload preserves the record counts and the cooked counts.
+    EXPECT_EQ(orig.RigidBodyCount(), loaded.RigidBodyCount());
+    EXPECT_EQ(orig.JointCount(), loaded.JointCount());
+    EXPECT_EQ(orig.ShapeCount(), loaded.ShapeCount());
+    EXPECT_EQ(orig.MaterialCount(), loaded.MaterialCount());
+    EXPECT_EQ(orig.ActuatorCount(), loaded.ActuatorCount());
+
+    const CookedBlob co = CookScene(orig);
+    const CookedBlob cl = CookScene(loaded);
+    EXPECT_EQ(co.body_count, cl.body_count);
+    EXPECT_EQ(co.joint_count, cl.joint_count);
+    EXPECT_EQ(co.shape_count, cl.shape_count);
+    EXPECT_EQ(co.convex_geometry.Count(), cl.convex_geometry.Count());
+
+    // The cup rest placement survives the .nks round-trip (the seated cup bottom
+    // is still at counter_top + clearance after Save -> Load).
+    const SupportSurface loaded_support = FindKitchenCounterSupport(loaded);
+    const CupSeat seat = CupSeatOf(loaded, composed.cup_root_relative_min_z);
+    EXPECT_NEAR(seat.bottom_z, loaded_support.top_z + kCupClearance, 1e-4f)
+        << "cup rest placement not preserved through the .nks round-trip";
+}
+
+// ===========================================================================
+// (4) COOK + STEP — Load(.nks) -> CookToModel -> nk::World -> Step. Scoped to
+//     "builds + steps + capacities mirror the records" (see the KITCHEN-SCALE
+//     COOK GAP banner at the top of this file). The full H1-under-kitchen union
+//     grasp world is the dedicated h1_cup_table.nks union path, NOT this gate.
+// ===========================================================================
+TEST(SceneComposeH1CupKitchen, CooksToWorldAndStepsThroughNks) {
+    if (!AssetsAvailable()) GTEST_SKIP() << "kitchen / H1 / cup assets not present";
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+
+    const Composed composed = ComposeAll();
+    TempDir tmp;
+    const fs::path nks = tmp.SubFile("cook", "h1_cup_kitchen.nks");
+    nks::Save(composed.scene, nks.string());
+
+    // The cook+step runs on the RELOADED scene (the whole .nks pipeline).
+    const SceneIR loaded = nks::Load(nks.string());
+    cook::CookToModelResult cooked = cook::CookToModel(loaded, /*env_count=*/1);
+    nk::Model& model = cooked.model;
+    const nk::ModelCapacities& cap = model.capacities;
+
+    // Capacities mirror the records: one body row per rigid body.
+    EXPECT_EQ(cap.bodies_per_env, static_cast<uint32_t>(loaded.RigidBodyCount()));
+    EXPECT_GT(cap.bodies_per_env, 0u);
+
+    // KITCHEN-SCALE COOK GAP — FLAGGED (not silently dropped): the generic cook
+    // takes only the FIRST cooked articulation, so the whole-body 51-DOF H1 is
+    // NOT one coherent articulation here. Surface the cooked vs expected DOFs so
+    // the gap is visible in the gate log (the union h1_grasp_lift gate owns the
+    // real 51-DOF grasp world). NON-FATAL: this gate proves the GENERIC pipeline.
+    std::printf("[compose-cook GAP] cooked articulation links=%u dofs=%u (the H1 "
+                "alone is 51-DOF); movable free body_init rows seeded under the "
+                "single-articulation cook=%zu of %u bodies. The full H1-under-"
+                "kitchen union grasp world is the dedicated h1_cup_table.nks union "
+                "path, not this kitchen-compose gate.\n",
+                cap.links_per_env, cap.dofs_per_env,
+                [&] {
+                    size_t n = 0;
+                    for (const auto& bi : model.body_init)
+                        if (bi.inv_mass > 0.0f) ++n;
+                    return n;
+                }(),
+                cap.bodies_per_env);
+
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = 1.0f / 240.0f;
+    cfg.gravity[0] = 0.0f;
+    cfg.gravity[1] = 0.0f;
+    cfg.gravity[2] = -9.81f;
+
+    Backend b = GetBackend();
+    nk::World world(std::move(model), 1u, b.dev, b.backend, cfg);
+    ASSERT_TRUE(world.Ready()) << "the composed kitchen+H1+cup scene did not cook "
+                                  "to a Ready nk::World";
+
+    // Step a few frames: the cooked world steps without a device error.
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(world.Step().AllOk())
+            << "Step " << i << " failed on the composed-kitchen world";
+    }
+}
+
+// ===========================================================================
+// (5) Determinism — two composes produce identical records + cook counts.
+// ===========================================================================
 TEST(SceneComposeH1CupKitchen, DeterministicAcrossRuns) {
     if (!AssetsAvailable()) GTEST_SKIP() << "kitchen / H1 / cup assets not present";
 
