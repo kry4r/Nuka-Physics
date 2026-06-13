@@ -557,3 +557,97 @@ TEST(H1GraspLift, GraspHoldBiteDisturbanceFromNks) {
 
     nphi::BackendFree(backend);
 }
+
+// ===========================================================================
+// PLAN-REPLAY D1 — folded from h1_union_parity (M9 T10, before T11 deletes it).
+//
+// h1_union_parity's UNIQUE non-legacy coverage was an nk twin replaying the
+// RECORDED per-step action stream through StepPlanned() (the CUDA-graph plan:
+// ONE capture, kHoldSteps replays with AssembleRows/SolveRowsBlockIsland inside
+// the graph) landing BYTE-IDENTICAL to the Step() world — i.e. that the planned
+// graph path reproduces the eager Step() path EXACTLY on the full H1 UNION
+// articulation+contact scene (51-DOF floating base + feet + 30 fingertips + cup
+// + table). The grasp gate's existing D1 above is a two-run Step()-vs-Step()
+// check (run-to-run determinism); coupled_grasp_soft asserts StepPlanned==Step
+// but only on the TET/PARTICLE coupled scene, NOT the union articulation
+// row-solve graph. This test folds that union-scene plan==step byte-identity
+// onto the pure .nks cook so the coverage survives h1_union_parity's deletion.
+// ===========================================================================
+TEST(H1GraspLift, GraspPlanReplayByteIdenticalFromNks) {
+    if (!AssetsAvailable())
+        GTEST_SKIP() << "h1_cup_table.nks / h1_with_hand / cup not present";
+
+    nphi::Device* dev = nphi::InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+
+    CookedWorld cw = CookFromNks();
+    ASSERT_EQ(cw.cooked.dof_stride, 51u);
+    const nk::Pipeline::SolverConfig cfg = UnionCfg(cw.dt);
+
+    // ---- the Step() world: run the hold choreography, RECORD the per-step
+    // DriveTarget stream (DriveStep computes the closed-loop torque from the
+    // world's OWN q/qdot and uploads it; the post-call `torque` buffer IS the
+    // DriveTarget uploaded that step — exactly what h1_union_parity records). ---
+    std::vector<std::vector<float>> recorded_torque;
+    recorded_torque.reserve(kHoldSteps);
+    CupSnap eager;
+    {
+        nk::Model m = FreshModel(cw);
+        nk::World w(std::move(m), 1u, dev, backend, cfg);
+        ASSERT_TRUE(w.Ready());
+        std::vector<float> torque = InitTorque(cw);
+        std::vector<float> q(cw.links), qdot(cw.links);
+        for (uint32_t s = 0; s < kHoldSteps; ++s) {
+            DriveStep(w, cw, s, /*kill_grip=*/false, &torque, &q, &qdot);
+            recorded_torque.push_back(torque);  // the DriveTarget uploaded at s.
+        }
+        eager = SnapCup(w, cw.links, cw.cup_local);
+    }
+    ASSERT_EQ(recorded_torque.size(), kHoldSteps);
+
+    // ---- the StepPlanned() twin: replay the RECORDED stream through the
+    // CUDA-graph plan (ONE capture, kHoldSteps replays). Table off at kLiftAt
+    // exactly as the Step() world did inside DriveStep. ----
+    CupSnap planned;
+    {
+        nk::Model m = FreshModel(cw);
+        nk::World w(std::move(m), 1u, dev, backend, cfg);
+        ASSERT_TRUE(w.Ready());
+        for (uint32_t s = 0; s < kHoldSteps; ++s) {
+            if (s == kLiftAt) {
+                const uint32_t off = 0u;
+                ASSERT_TRUE(w.GetData().UploadField(nk::FieldId::TableEnabled,
+                                                    &off, sizeof(uint32_t)));
+            }
+            ASSERT_TRUE(w.GetData().UploadField(
+                nk::FieldId::DriveTarget, recorded_torque[s].data(),
+                recorded_torque[s].size() * sizeof(float)));
+            ASSERT_EQ(w.StepPlanned(), nphi::Status::Ok)
+                << "plan execute failed at step " << s;
+        }
+        planned = SnapCup(w, cw.links, cw.cup_local);
+    }
+
+    const int pose_cmp = std::memcmp(&eager.pose, &planned.pose, sizeof(Transform));
+    const int vel_cmp = std::memcmp(&eager.vel, &planned.vel, sizeof(Vec3));
+    const int angvel_cmp =
+        std::memcmp(&eager.angvel, &planned.angvel, sizeof(Vec3));
+    ASSERT_EQ(eager.qdot.size(), planned.qdot.size());
+    const int qdot_cmp = std::memcmp(eager.qdot.data(), planned.qdot.data(),
+                                     eager.qdot.size() * sizeof(float));
+    std::printf("[H1-GRASP-LIFT] plan-replay D1: %u StepPlanned replays vs Step -> "
+                "cup pose memcmp=%d vel=%d angvel=%d qdot=%d (0 == byte-identical)\n",
+                kHoldSteps, pose_cmp, vel_cmp, angvel_cmp, qdot_cmp);
+    EXPECT_EQ(pose_cmp, 0)
+        << "plan-replay: cup final pose diverged from Step on the union scene";
+    EXPECT_EQ(vel_cmp, 0)
+        << "plan-replay: cup final velocity diverged from Step";
+    EXPECT_EQ(angvel_cmp, 0)
+        << "plan-replay: cup final angular velocity diverged from Step";
+    EXPECT_EQ(qdot_cmp, 0)
+        << "plan-replay: gripper qdot diverged from Step (StepPlanned != Step)";
+
+    nphi::BackendFree(backend);
+}
