@@ -1,5 +1,10 @@
 // ---------------------------------------------------------------------------
-// nuka::render::vulkan_renderer implementation
+// nuka::render::vulkan_renderer implementation -- DEBUG OVERLAY path (M8 T8).
+//
+// This is the SECONDARY / debug-overlay render path (compute-only 2D wireframe
+// outlines). The PRIMARY offscreen renderer is the forward-PBR triangle raster
+// path in render/raster/vulkan_raster_renderer.*; this file only draws debug
+// overlays. See vulkan_renderer.hpp for the role / naming rationale.
 // ---------------------------------------------------------------------------
 
 #include "render/vulkan_renderer.hpp"
@@ -851,7 +856,7 @@ private:
 
 } // namespace
 
-VulkanRendererReport ProbeVulkanRenderer() {
+VulkanOverlayBackendReport ProbeVulkanOverlayBackend() {
     uint32_t loader_api_version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion(&loader_api_version) != VK_SUCCESS) {
         loader_api_version = VK_API_VERSION_1_0;
@@ -882,7 +887,7 @@ VulkanRendererReport ProbeVulkanRenderer() {
                 "vkEnumeratePhysicalDevices(list)");
     }
 
-    VulkanRendererReport report;
+    VulkanOverlayBackendReport report;
     report.backend = RenderBackend::Vulkan;
     report.production_backend = true;
     report.instance_api_version_major = VK_VERSION_MAJOR(loader_api_version);
@@ -900,17 +905,17 @@ VulkanRendererReport ProbeVulkanRenderer() {
     return report;
 }
 
-VulkanOffscreenReport RenderDebugDrawListVulkan(
+VulkanOffscreenReport RenderDebugOverlayVulkan(
     const std::vector<VulkanDebugDrawCommand>& commands,
     const VulkanOffscreenOptions& options) {
     VulkanOffscreenRenderer renderer;
     return renderer.Render(commands, options);
 }
 
-VulkanOffscreenReport RenderSceneVulkan(
+VulkanOffscreenReport RenderSceneDebugOverlayVulkan(
     const RenderScene& scene,
     const VulkanOffscreenOptions& options) {
-    return RenderDebugDrawListVulkan(BuildRenderSceneCommands(scene), options);
+    return RenderDebugOverlayVulkan(BuildRenderSceneCommands(scene), options);
 }
 
 } // namespace nuka::render
