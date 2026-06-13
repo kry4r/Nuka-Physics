@@ -125,6 +125,7 @@ set(NUKA_PUBLIC_HEADERS
 
 add_library(nuka_render STATIC
     render/render_scene.cpp
+    render/render_world.cpp
     render/vulkan_renderer.cpp
 )
 
