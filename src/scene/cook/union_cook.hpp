@@ -17,18 +17,18 @@
 // 4 foot contact spheres + the three PD drive tables straight out of the
 // GraspConfig block, and the settled cup pose straight off the cup tree node.
 // The cook therefore reproduces MakeUnionTemplate's OUTPUT (the
-// BatchedSceneTemplate) WITHOUT the factory's empirical FK/placement/settle
+// UnionSceneTemplate) WITHOUT the factory's empirical FK/placement/settle
 // machinery — proven equivalent by the permanent grasp gate
 // tests/scenario/h1_grasp_lift.cpp (T5; the transitional cook==factory gate that
 // originally pinned the ~1e-8 equivalence was deleted with the factory in T6).
 //
-// PER CONTROLLER R1/R2/R3 the cook PRODUCES a coresident::BatchedSceneTemplate
+// PER CONTROLLER R1/R2/R3 the cook PRODUCES a coresident::UnionSceneTemplate
 // (the struct + BuildNkUnionModel + BatchedUnifiedWorld all stay alive to M9):
 // BuildNkUnionModel(cooked.tmpl) and BatchedUnifiedWorld(cooked.tmpl) behave
 // identically to the factory's. The native CookToModel->UnionCsr path is M9.
 //
 // nk_engine lint scope: CUDA-type-free host C++. Depends ONLY on the relocated
-// plain-data product types (BatchedSceneTemplate, H1UnionDriveEntry, in
+// plain-data product types (UnionSceneTemplate, H1UnionDriveEntry, in
 // src/scene/cook/union_scene_template.hpp; CoResident* descriptors pulled in
 // transitively) — NO kernels, NO device, NO dependency on the doomed coresident
 // directory (the M9 T3 decouple: union_cook no longer includes
@@ -38,7 +38,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "scene/cook/union_scene_template.hpp"  // BatchedSceneTemplate + H1UnionDriveEntry
+#include "scene/cook/union_scene_template.hpp"  // UnionSceneTemplate + H1UnionDriveEntry
 #include "scene/scene_ir.hpp"
 
 namespace nuka::scene::cook {
@@ -48,9 +48,9 @@ namespace nuka::scene::cook {
 // cook so T5's re-pointed consumers — the parity oracle / perf gate / C-ABI —
 // and T6's factory deletion work). Field-for-field the metadata an RL substrate
 // + the parity oracle read off BuildH1UnionScene's result, with `tmpl` the
-// BatchedSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld consume.
+// UnionSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld consume.
 struct CookedUnionScene {
-    runtime::coresident::BatchedSceneTemplate tmpl;
+    runtime::coresident::UnionSceneTemplate tmpl;
 
     // Articulation shape metadata.
     uint32_t dof_stride = 0u;   // 51 == 6 base + 45 joints (the action width).

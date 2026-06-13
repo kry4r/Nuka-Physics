@@ -1,11 +1,11 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::runtime::coresident -- H1UnionDriveEntry + BatchedSceneTemplate.
+// nuka::runtime::coresident -- H1UnionDriveEntry + UnionSceneTemplate.
 //
 // COOK-PRODUCT PLAIN-DATA STRUCTS, relocated here in M9 T3 (controller
 // refinement) out of the DOOMED src/runtime/coresident/batched_unified_world.hpp.
 // They are the PRODUCT TYPES of the .nks union cook (src/scene/cook/union_cook,
-// CookSceneToUnionTemplate -> CookedUnionScene.tmpl IS a BatchedSceneTemplate,
+// CookSceneToUnionTemplate -> CookedUnionScene.tmpl IS a UnionSceneTemplate,
 // .drive_hold/rest/close ARE std::vector<H1UnionDriveEntry>), consumed identically
 // by BuildNkUnionModel + BatchedUnifiedWorld + the C-ABI union/grasp worlds + the
 // parity/perf/grasp gates. They are PLAIN DATA -- no kernels, no device handles,
@@ -23,7 +23,7 @@
 // without building the not-yet-existent native CookToModel->UnionCsr cook.
 //
 // LIFETIME. Alive until the union path migrates to the native nk cook (the M9 exit
-// gate zeroes BatchedSceneTemplate's grep when CookToModel->UnionCsr lands). The
+// gate zeroes UnionSceneTemplate's grep when CookToModel->UnionCsr lands). The
 // coresident dir + the BatchedUnifiedWorld class die at T11; these structs survive
 // here (still consumed) until that native cook replaces them. The transitional
 // batched_unified_world.hpp #includes THIS header (it no longer DEFINES these
@@ -40,8 +40,8 @@
 
 #include "math/vec3.hpp"
 #include "runtime/articulation/articulation_state.hpp"   // ArticulationHostState
-#include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResident* descriptors
 #include "runtime/rigid/body_state.hpp"
+#include "scene/cook/coresident_descriptors.hpp"  // CoResident{Fingertip,Cup,FootSphere,Ground}
 
 #include <cstdint>
 #include <vector>
@@ -49,7 +49,7 @@
 namespace nuka::runtime::coresident {
 
 // The cup XY reset-jitter half-box default (m, ~+/-2.5 cm). Hoisted to namespace
-// scope so BatchedSceneTemplate (defined before BatchedUnifiedWorld) can default its
+// scope so UnionSceneTemplate (defined before BatchedUnifiedWorld) can default its
 // per-axis jitter fields to it, AND so BatchedUnifiedWorld::kResetCupJitterM (the
 // named constant the gate test reads) can alias it -- the SAME literal both places.
 inline constexpr float kDefaultResetCupJitterM = 0.025f;
@@ -64,7 +64,7 @@ inline constexpr float kDefaultResetCupJitterM = 0.025f;
 //
 // RELOCATED here (M7 T6) from the now-deleted h1_union_scene_factory.hpp: it is
 // a plain-data product type the union cook (CookedUnionScene) + the C-ABI union
-// world + the parity/perf gates carry alongside the BatchedSceneTemplate, so it
+// world + the parity/perf gates carry alongside the UnionSceneTemplate, so it
 // belongs with the template (alive to M9 per R1/R2).
 struct H1UnionDriveEntry {
     uint32_t link = ~0u;   // device link index.
@@ -80,7 +80,7 @@ struct H1UnionDriveEntry {
 // scope: rigid bodies only. (P2.2+ extends with articulation proto, fingertips,
 // cup hull, and static colliders -- additive fields, no layout churn for the
 // rigid SoA which stays the leading env-major block.)
-struct BatchedSceneTemplate {
+struct UnionSceneTemplate {
     // The k rigid bodies that make up ONE env (e.g. the cup). Replicated into the
     // env-major SoA at construction; per-env initial-condition perturbation is then
     // applied via BodyMut() before the first Step().

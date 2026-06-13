@@ -40,7 +40,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "runtime/coresident/h1_union_nk_model.hpp"
+#include "scene/cook/union_nk_model.hpp"
 #include "scene/cook/union_cook.hpp"
 #include "scene/cook/union_scene_constants.hpp"  // constants (post-factory home)
 #include "scene/format/nks.hpp"
@@ -287,7 +287,7 @@ TEST(UnionCookGolden, CookMatchesCommittedGolden) {
 
     const nuka::scene::SceneIR scene = nuka::scene::nks::Load(kNksPath);
     const cook::CookedUnionScene c = cook::CookSceneToUnionTemplate(scene, 1);
-    const coresident::BatchedSceneTemplate& t = c.tmpl;
+    const coresident::UnionSceneTemplate& t = c.tmpl;
 
     // ----- shape metadata (EXACT) -----
     EXPECT_EQ(c.dof_stride, kDofStride);

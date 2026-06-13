@@ -1,14 +1,14 @@
 // ---------------------------------------------------------------------------
-// DEPRECATED(M9): src/runtime/coresident/ is deleted WHOLE at M9. KEPT ALIVE
-// through M8 (R1/R2): this bridge maps the BatchedSceneTemplate the M7 .nks cook
+// RELOCATED (M9 T11-core-b1) out of the DOOMED src/runtime/coresident/ into
+// src/scene/cook/. This bridge maps the UnionSceneTemplate the M7 .nks cook
 // produces into the UnionCsr nk::Model the union gates step. The native
 // CookToModel->UnionCsr path that retires it is M9.
 // ---------------------------------------------------------------------------
-// BatchedSceneTemplate -> nk::Model (M4 transitional cook bridge).
-// See h1_union_nk_model.hpp for the mapping contract.
+// UnionSceneTemplate -> nk::Model (M4 transitional cook bridge).
+// See union_nk_model.hpp for the mapping contract.
 // ---------------------------------------------------------------------------
 
-#include "runtime/coresident/h1_union_nk_model.hpp"
+#include "scene/cook/union_nk_model.hpp"
 
 #include <stdexcept>
 
@@ -26,7 +26,7 @@ uint32_t JointDof(articulation::ArticulationJointType t) {
 
 }  // namespace
 
-nk::Model BuildNkUnionModel(const BatchedSceneTemplate& tmpl, uint32_t env_count) {
+nk::Model BuildNkUnionModel(const UnionSceneTemplate& tmpl, uint32_t env_count) {
     if (!tmpl.has_grasp) {
         throw std::runtime_error(
             "BuildNkUnionModel: the union family needs the grasp articulation "

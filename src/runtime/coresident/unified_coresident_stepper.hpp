@@ -47,6 +47,7 @@
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/rigid/body_state.hpp"
+#include "scene/cook/coresident_descriptors.hpp"  // CoResident{Fingertip,Cup,FootSphere,Ground}
 #include "scene/cooked_blob.hpp"                  // scene::CookedShapeTable
 #include "solver/solver_config.hpp"              // SolverConfig
 
@@ -70,20 +71,7 @@ struct CoResidentBox {
     uint32_t   broadphase_body_id = 9000u;  // distinct from every go2 link body id.
 };
 
-// A STATIC ground plane the box rests on -- routed THROUGH the unified spine, NOT a
-// hand-coded clamp. The box<->ground contact is detected (box AABB vs the plane),
-// narrowphased (C3b analytical box x plane), emitted (EmitCompliantContactRows, box
-// side RigidInvMass / ground side StaticNull), and solved (UnifiedSolve) in the SAME
-// pipeline as the foot<->box pair. This is the support the grasp-hold scene needs: a
-// movable box on a static ground, with the falling foot pressing DOWN onto it -> the
-// contact force builds + HOLDS instead of both bodies free-falling together (two
-// unsupported free-falling bodies separate -- physically correct, but not a "hold").
-// The box reacts two-way to BOTH the foot above and the ground below; the ground is
-// immovable (StaticNull: invM=0, no-op apply). The plane normal is world +Z.
-struct CoResidentGround {
-    float    height = 0.0f;          // plane z (the box bottom rests on this).
-    uint32_t broadphase_id = 8000u;  // distinct from box + every go2 link body id.
-};
+// CoResidentGround relocated to scene/cook/coresident_descriptors.hpp (M9 T11-core-b1).
 
 // Per-step report (the gates read this).
 struct CoResidentStepReport {
@@ -173,24 +161,8 @@ struct CoResidentEnergy {
 // The foot+box+ground case is just one instantiation of this generic substrate;
 // the W1a constructor below is preserved BYTE-FOR-BYTE.
 
-// One fingertip contact: a sphere collidable on an articulation link.
-struct CoResidentFingertip {
-    uint32_t   link = ~0u;          // the ArticulationLink handle (broadphase id).
-    math::Vec3 local_offset{};      // sphere center in the link frame.
-    float      radius = 0.0f;
-    uint32_t   broadphase_handle = ~0u;  // same as `link` (the cross-pair handle).
-};
-
-// A movable rigid CUP whose collision shape is a CONVEX HULL (the C7a cup). The
-// hull vertices are MESH-LOCAL (cook-time constant); each step the stepper rebuilds
-// a world-space ConvexHullView from these + the cup's live BodyState pose.
-struct CoResidentCup {
-    std::vector<float> hull_verts;          // flat x,y,z triples, MESH-LOCAL, constant.
-    uint32_t           broadphase_body_id = 7000u;  // distinct from every link id.
-    uint32_t           VertexCount() const {
-        return static_cast<uint32_t>(hull_verts.size() / 3u);
-    }
-};
+// CoResidentFingertip + CoResidentCup relocated to
+// scene/cook/coresident_descriptors.hpp (M9 T11-core-b1).
 
 // The grasp-spike configuration. NO ground (the cup is held by friction alone).
 struct GraspConfig {
@@ -234,16 +206,8 @@ struct GraspConfig {
 // body_count=0, coloring key 0+0 -- the subsume recipe), (c) condim=3 so the feet
 // have FRICTION (don't slip). The W1a Step() + StepGrasp() are byte-for-byte unchanged.
 
-// One foot collision sphere on an articulation ankle link (mirrors CoResidentFingertip
-// but contacts the STATIC ground, not a movable cup). A foot polygon is N of these
-// (e.g. 2 spheres per ankle -- toe + heel -- on a 2-foot biped == the 4-corner polygon).
-struct CoResidentFootSphere {
-    uint32_t   link = ~0u;          // the ArticulationLink handle (ankle link).
-    math::Vec3 local_offset{};      // sphere center in the ankle-link frame.
-    float      radius = 0.0f;
-    uint32_t   broadphase_handle = ~0u;  // UNIQUE per sphere (resolver picks geometry);
-                                         // the chain-J uses `link` (the real ankle link).
-};
+// CoResidentFootSphere relocated to scene/cook/coresident_descriptors.hpp
+// (M9 T11-core-b1).
 
 // The STANDING config: N foot spheres on a static +Z ground, condim=3 friction, a
 // DRIVE-torque path (the balance controller drives the legs through SetGripTorque).

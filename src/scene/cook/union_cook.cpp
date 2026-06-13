@@ -32,7 +32,7 @@
 //     GraspConfig; the cook re-resolves each drive entry's link_name -> device
 //     link + flat DOF column.
 //
-// DOF-COUNT INLINING (== cook_to_model.cpp / h1_union_nk_model.cpp): the
+// DOF-COUNT INLINING (== cook_to_model.cpp / union_nk_model.cpp): the
 // ArticulationJointDofCount / DofIndexOf symbols live in the GPU lib
 // (articulation_contacts.cu); this pure-cook TU inlines the joint-DOF switch
 // (Fixed->0, FloatingBase->6, else->1) so it links only nuka_articulation.
@@ -51,8 +51,8 @@
 #include "math/vec3.hpp"
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
-#include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResident* descriptors
 #include "runtime/rigid/body_state.hpp"
+#include "scene/cook/coresident_descriptors.hpp"  // CoResident{Fingertip,Cup,FootSphere,Ground}
 #include "scene/cooker.hpp"
 
 namespace nuka::scene::cook {
@@ -331,8 +331,8 @@ CookedUnionScene CookSceneToUnionTemplate(const SceneIR& scene, int env_count) {
                            grasp.cup_table_proxy_half.y > 0.0f ||
                            grasp.cup_table_proxy_half.z > 0.0f;
 
-    // ----- assemble the BatchedSceneTemplate (== MakeUnionTemplate :566) -------
-    coresident::BatchedSceneTemplate& tmpl = out.tmpl;
+    // ----- assemble the UnionSceneTemplate (== MakeUnionTemplate :566) -------
+    coresident::UnionSceneTemplate& tmpl = out.tmpl;
     tmpl.bodies_per_env = {cup};
     tmpl.has_grasp = true;
     tmpl.gripper_proto = proto;

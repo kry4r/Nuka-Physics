@@ -753,7 +753,7 @@ if(CMAKE_CUDA_COMPILER)
     # Asset-gated SKIP.
     add_executable(nuka_nk_union_n1_test
         perf/nk_union_n1.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
@@ -2168,13 +2168,13 @@ if(CMAKE_CUDA_COMPILER)
     # NO factory. Reproduces the dev-spike force-balance / BITE / disturbance / D1
     # assertions (previously proven only by the factory-fed co-resident spikes) on
     # the cooked-from-.nks union world. Links the cook + the M9-alive coresident
-    # bridge (h1_union_nk_model + batched_unified_world for the BatchedSceneTemplate
+    # bridge (union_nk_model + batched_unified_world for the UnionSceneTemplate
     # struct + contact_stream_driver it includes); the scene constants come from
     # scene/cook/union_scene_constants.hpp (the factory is fully deleted, M7 T6).
     # Asset-gated SKIP.
     add_executable(nuka_h1_grasp_lift_test
         scenario/h1_grasp_lift.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
@@ -2210,11 +2210,11 @@ if(CMAKE_CUDA_COMPILER)
     # every regression-sensitive cooked field to a COMMITTED, NEVER-regenerated
     # golden (EXACT ints/order, TIGHT-NEAR floats) + the BuildNkUnionModel union
     # slot order/count. Links the cook + the M9-alive coresident bridge
-    # (h1_union_nk_model + batched_unified_world for the BatchedSceneTemplate struct
+    # (union_nk_model + batched_unified_world for the UnionSceneTemplate struct
     # + contact_stream_driver it includes), NOT the factory. Asset-gated SKIP.
     add_executable(nuka_union_cook_golden_test
         scenario/union_cook_golden.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )

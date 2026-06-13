@@ -7,7 +7,7 @@
 //
 // WHY THIS EXISTS (the equivalence guarantee). This logic was previously
 // TEST-ONLY (inline helpers in tests/coresident/test_batched_unified_world.cpp).
-// Any consumer building the grasp scene MUST build the SAME BatchedSceneTemplate
+// Any consumer building the grasp scene MUST build the SAME UnionSceneTemplate
 // the 21 nuka_batched_unified_world_test gates exercise -- a subtly different
 // template means a downstream env would run on an UNVALIDATED scene (a silent
 // correctness failure). So the factory is PROMOTED here, compiled into libnuka
@@ -23,7 +23,7 @@
 #include "math/vec3.hpp"
 #include "runtime/articulation/articulation_state.hpp"   // ArticulationHostState
 #include "runtime/coresident/unified_coresident_stepper.hpp"  // CoResident{Cup,Fingertip} / GraspConfig
-#include "scene/cook/union_scene_template.hpp"   // BatchedSceneTemplate (M9 T3 relocation)
+#include "scene/cook/union_scene_template.hpp"   // UnionSceneTemplate (M9 T3 relocation)
 #include "runtime/rigid/body_state.hpp"
 
 #include <cstdint>
@@ -78,7 +78,7 @@ GraspGripper BuildGraspGripper(const math::Vec3& base_pos, float cup_half_x,
 struct GraspSceneBundle {
     GraspGripper gripper;
     GraspConfig  config;
-    // A5a: per-axis cup RESET-JITTER half-box (m) carried into the BatchedSceneTemplate
+    // A5a: per-axis cup RESET-JITTER half-box (m) carried into the UnionSceneTemplate
     // (read by ResetEnvs). Default == kDefaultResetCupJitterM so MakeGraspTemplate yields
     // the legacy isotropic +/-2.5 cm jitter byte-identically.
     float reset_jitter_x = kDefaultResetCupJitterM;
@@ -111,9 +111,9 @@ GraspSceneBundle BuildGraspSceneBundle(const GraspCupHull& hull, float grip_forc
                                        float reset_jitter_x = kDefaultResetCupJitterM,
                                        float reset_jitter_y = kDefaultResetCupJitterM);
 
-// Populate a BatchedSceneTemplate from the bundle (cup == the single per-env body,
+// Populate a UnionSceneTemplate from the bundle (cup == the single per-env body,
 // cup_local_index 0; the gripper proto + fingertips + grip torque + friction). The
 // SAME inputs the A2 oracle uses -> an N=1 BatchedUnifiedWorld is byte-exact.
-BatchedSceneTemplate MakeGraspTemplate(const GraspSceneBundle& bundle);
+UnionSceneTemplate MakeGraspTemplate(const GraspSceneBundle& bundle);
 
 }  // namespace nuka::runtime::coresident
