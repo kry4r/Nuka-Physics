@@ -1,5 +1,15 @@
 #pragma once
 // ---------------------------------------------------------------------------
+// DEPRECATED(M9): this whole file (BatchedUnifiedWorld + BatchedSceneTemplate +
+// H1UnionDriveEntry) lives in src/runtime/coresident/, the legacy directory the
+// plan deletes WHOLE at M9. It is KEPT ALIVE through M8 ON PURPOSE (controller
+// R1/R2): BatchedUnifiedWorld is the union parity ORACLE (h1_union_parity), and
+// the BatchedSceneTemplate STRUCT is the cook's product type (the M7 .nks cook,
+// src/scene/cook/union_cook, produces a BatchedSceneTemplate that
+// BuildNkUnionModel + BatchedUnifiedWorld consume identically to the now-deleted
+// factory). The M9 exit gate zeroes BatchedSceneTemplate's grep when the native
+// CookToModel->UnionCsr path lands. Do NOT add NEW non-test consumers.
+// ---------------------------------------------------------------------------
 // nuka::runtime::coresident -- BatchedUnifiedWorld (v0.8 P2). The GENERAL,
 // scene-driven, BATCHED world: N parallel envs, each a co-resident articulation
 // + movable rigid bodies + statics, stepped TOGETHER through the unified
@@ -70,6 +80,28 @@ namespace nuka::runtime::coresident {
 // per-axis jitter fields to it, AND so BatchedUnifiedWorld::kResetCupJitterM (the
 // named constant the gate test reads) can alias it -- the SAME literal both places.
 inline constexpr float kDefaultResetCupJitterM = 0.025f;
+
+// One entry of a reference PD drive table (the python-facing choreography seam):
+// tau = kp*(target - q[dof]) - kd*qdot[dof], clamped to +/-tlim when tlim > 0.
+// `dof` is the flat action column (DofIndexOf order, the SetActions layout);
+// `grip` marks the 12 wrap-driven close links (the BITE kill-switch columns).
+// The exported q/qdot at column `dof` ARE the link's q/qdot, so a host/python PD
+// can be computed straight off the obs export. A choreography aid only -- G3's
+// RL policy replaces every table.
+//
+// RELOCATED here (M7 T6) from the now-deleted h1_union_scene_factory.hpp: it is
+// a plain-data product type the union cook (CookedUnionScene) + the C-ABI union
+// world + the parity/perf gates carry alongside the BatchedSceneTemplate, so it
+// belongs with the template (alive to M9 per R1/R2).
+struct H1UnionDriveEntry {
+    uint32_t link = ~0u;   // device link index.
+    uint32_t dof = ~0u;    // flat action/obs column (prefix-sum DofIndexOf).
+    float target = 0.0f;
+    float kp = 0.0f;
+    float kd = 0.0f;
+    float tlim = 0.0f;     // physical |tau| clamp (0 -> unclamped).
+    uint8_t grip = 0u;     // 1 == a wrap-driven grip-close link.
+};
 
 // The per-env scene template, replicated across all envs at construction. P2.1
 // scope: rigid bodies only. (P2.2+ extends with articulation proto, fingertips,

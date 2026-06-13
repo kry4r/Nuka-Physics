@@ -1,4 +1,9 @@
 // ---------------------------------------------------------------------------
+// DEPRECATED(M9): src/runtime/coresident/ is deleted WHOLE at M9. KEPT ALIVE
+// through M8 (R1/R2): this bridge maps the BatchedSceneTemplate the M7 .nks cook
+// produces into the UnionCsr nk::Model the union gates step. The native
+// CookToModel->UnionCsr path that retires it is M9.
+// ---------------------------------------------------------------------------
 // BatchedSceneTemplate -> nk::Model (M4 transitional cook bridge).
 // See h1_union_nk_model.hpp for the mapping contract.
 // ---------------------------------------------------------------------------

@@ -18,9 +18,9 @@
 // GraspConfig block, and the settled cup pose straight off the cup tree node.
 // The cook therefore reproduces MakeUnionTemplate's OUTPUT (the
 // BatchedSceneTemplate) WITHOUT the factory's empirical FK/placement/settle
-// machinery — proven equivalent by the transitional gate
-// tests/scenario/union_cook_matches_factory.cpp (T6 deletes it; the permanent
-// gate is h1_grasp_lift, T5).
+// machinery — proven equivalent by the permanent grasp gate
+// tests/scenario/h1_grasp_lift.cpp (T5; the transitional cook==factory gate that
+// originally pinned the ~1e-8 equivalence was deleted with the factory in T6).
 //
 // PER CONTROLLER R1/R2/R3 the cook PRODUCES a coresident::BatchedSceneTemplate
 // (the struct + BuildNkUnionModel + BatchedUnifiedWorld all stay alive to M9):
@@ -35,8 +35,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "runtime/coresident/batched_unified_world.hpp"     // BatchedSceneTemplate
-#include "runtime/coresident/h1_union_scene_factory.hpp"     // H1UnionDriveEntry
+#include "runtime/coresident/batched_unified_world.hpp"     // BatchedSceneTemplate + H1UnionDriveEntry
 #include "scene/scene_ir.hpp"
 
 namespace nuka::scene::cook {

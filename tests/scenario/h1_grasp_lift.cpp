@@ -11,9 +11,10 @@
 //   → coresident::BuildNkUnionModel(cooked.tmpl, env_count)    (the M4 bridge)
 //   → nk::World                                                (the device core)
 //
-// The cook reads the baked settled IC + grasp config (proven equivalent to the
-// 1026-line h1_union_scene_factory's FK/placement/200-step-settle product to
-// ~1e-8 by union_cook_matches_factory). This gate then drives the SAME
+// The cook reads the baked settled IC + grasp config (it reproduced the now-
+// deleted 1026-line h1_union_scene_factory's FK/placement/200-step-settle
+// product to ~1e-8, the equivalence the transitional T4 gate pinned before T6
+// deleted both it and the factory). This gate then drives the SAME
 // approach→close→lift choreography the parity oracle uses (TableTorque /
 // SnapNk / ReportNk, lifted here) on the .nks-cooked world and asserts the
 // grasp physics:
@@ -35,9 +36,9 @@
 //
 // PURE .nks: this gate links nuka_scene_cook (the cook) + the coresident bridge
 // (BuildNkUnionModel + the BatchedSceneTemplate struct, both alive to M9), NOT
-// the factory. h1_union_scene_factory.hpp is included ONLY for the inline
-// constexpr scene constants (kH1UnionDt / kH1UnionGravityZ / the asset paths);
-// BuildH1UnionScene is never called and the factory .cpp is not compiled in.
+// the factory. The inline constexpr scene constants (kH1UnionDt /
+// kH1UnionGravityZ / the asset paths) come from scene/cook/union_scene_constants.hpp
+// (their post-factory home, M7 T6); the factory is fully deleted.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -55,8 +56,8 @@
 #include "nk/solve/nk_row.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/coresident/h1_union_nk_model.hpp"
-#include "runtime/coresident/h1_union_scene_factory.hpp"  // constants ONLY
 #include "scene/cook/union_cook.hpp"
+#include "scene/cook/union_scene_constants.hpp"  // constants (post-factory home)
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
 
@@ -74,8 +75,8 @@ constexpr const char* kNksPath = "examples/scenes/h1_cup_table.nks";
 
 bool AssetsAvailable() {
     return std::filesystem::exists(kNksPath) &&
-           std::filesystem::exists(coresident::kH1UnionMjcfDefault) &&
-           std::filesystem::exists(coresident::kH1UnionCupDefault);
+           std::filesystem::exists(cook::kH1UnionMjcfDefault) &&
+           std::filesystem::exists(cook::kH1UnionCupDefault);
 }
 
 // ---- the dev-spike constants (test_h1_dense_grasp.cpp / feasibility probe) ----
@@ -243,7 +244,7 @@ CookedWorld CookFromNks() {
     cw.slot_count = model.capacities.max_contacts_per_env;
     cw.n_feet = static_cast<uint32_t>(t.feet.size());
     cw.n_fingers = static_cast<uint32_t>(t.fingertips.size());
-    cw.dt = coresident::kH1UnionDt;
+    cw.dt = cook::kH1UnionDt;
     return cw;
 }
 
@@ -261,7 +262,7 @@ nk::Pipeline::SolverConfig UnionCfg(float dt) {
     cfg.dt = dt;
     cfg.gravity[0] = 0.0f;
     cfg.gravity[1] = 0.0f;
-    cfg.gravity[2] = coresident::kH1UnionGravityZ;
+    cfg.gravity[2] = cook::kH1UnionGravityZ;
     cfg.vel_iters = 64;
     cfg.pos_iters = 0;
     cfg.fold_drive_damping = 0;
@@ -370,7 +371,7 @@ TEST(H1GraspLift, GraspHoldBiteDisturbanceFromNks) {
     ASSERT_EQ(cw.n_fingers, 30u);
     const double weight_kick =
         static_cast<double>(cw.cooked.cup_mass) *
-        static_cast<double>(-coresident::kH1UnionGravityZ) *
+        static_cast<double>(-cook::kH1UnionGravityZ) *
         static_cast<double>(cw.dt);
 
     // ===== placement_found (R4: the authored scene baked a placed cup) =====
@@ -437,7 +438,7 @@ TEST(H1GraspLift, GraspHoldBiteDisturbanceFromNks) {
         bite_drop = bite_z_pre - post.pose.position.z;
         falls = (bite_drop > 0.02) || (bite_vz < -0.10);
     }
-    const double free_fall = 0.5 * (-coresident::kH1UnionGravityZ) *
+    const double free_fall = 0.5 * (-cook::kH1UnionGravityZ) *
                              (kFall * cw.dt) * (kFall * cw.dt);
     std::printf("[H1-GRASP-LIFT] bite_drops: z_pre=%.5f drop=%.5f (free_fall=%.4f) "
                 "vz=%.4f -> %s\n",
@@ -471,7 +472,7 @@ TEST(H1GraspLift, GraspHoldBiteDisturbanceFromNks) {
         const Vec3 push_dir{1.0f, 0.0f, 0.0f};
         const Vec3 tilt_axis{-push_dir.y, push_dir.x, 0.0f};
         const Vec3 dv_step =
-            push_dir * (kFcLatAccelG * (-coresident::kH1UnionGravityZ) * cw.dt);
+            push_dir * (kFcLatAccelG * (-cook::kH1UnionGravityZ) * cw.dt);
 
         const uint32_t kTotal = kFcPushSteps + kFcReleaseSettle;
         for (uint32_t s = 0; s < kTotal; ++s) {

@@ -1,4 +1,9 @@
 // ---------------------------------------------------------------------------
+// DEPRECATED(M9): src/runtime/coresident/ is deleted WHOLE at M9. KEPT ALIVE
+// through M8 (controller R1/R2): BatchedUnifiedWorld is the union parity ORACLE
+// (h1_union_parity) and consumes the BatchedSceneTemplate the M7 .nks cook now
+// produces (the factory that used to author it is DELETED). No NEW consumers.
+// ---------------------------------------------------------------------------
 // nuka::runtime::coresident::BatchedUnifiedWorld -- implementation (v0.8 P2.2).
 // ---------------------------------------------------------------------------
 // P2.1 scope: per-env MOVABLE RIGID BODIES under gravity (free-fall, no contact,

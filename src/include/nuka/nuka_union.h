@@ -8,12 +8,12 @@
 // hand, feet on a static ground, and a static table seated under the cup-proxy
 // -- feet x ground + finger x cup + cup-proxy x table resolved in ONE solve.
 //
-// CONSTRUCTION runs the FULL deterministic authoring inside libnuka (the G2
-// "settle-pre-roll seam"): MJCF cook -> bent stance -> base seat at FK -> right-
-// hand curl -> placement search at the seat FK -> 200-step ORACLE SETTLE
-// pre-roll (stance PD + ankle CoP law + curl hold) -> hand-frame cup carry ->
-// table height 2 mm into the settled cup bottom. Same inputs -> byte-same
-// initial state (D1). See src/runtime/coresident/h1_union_scene_factory.hpp.
+// CONSTRUCTION cooks the AUTHORED examples/scenes/h1_cup_table.nks inside
+// libnuka (M7): scene::nks::Load -> scene::cook::CookSceneToUnionTemplate reads
+// the BAKED settled stance IC + the in-hand cup placement + the grasp config
+// (the 200-step-settle product the factory used to compute at construction is
+// now stored once as scene data). Same .nks -> byte-same initial state (D1).
+// See src/scene/cook/union_cook.hpp.
 //
 // WHY A C ABI (not a C++ class bind): same reason as nuka_grasp.h -- the
 // engine is g++-14, the nanobind binding g++-10; only plain C crosses.
