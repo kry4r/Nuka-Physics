@@ -1,11 +1,23 @@
 // ---------------------------------------------------------------------------
-// v0.8 C5b-core: the ArticulationChainJ reaction arm wired into UnifiedSolve.
+// v0.8 C5b-core: the ArticulationChainJ reaction arm -- the nk-core re-point
+// (M9 T11-articulated-fold).
 // ---------------------------------------------------------------------------
+// The legacy `solver::UnifiedSolve` host driver + `solver/gpu/row_scheduler.*`
+// are deleted in M9 T11-core; this test holds the SAME ArticulationChainJ
+// three-leg reaction physics on the NEW nk core. The hand-built compliant rows
+// (constraint::RowBuffers + ContactRowSides + RowArticulationRefs + flat
+// chain-J / M^-1 / qdot) are driven through the nk SolveRowsBlockIsland op via
+// the M4 re-point harness (tests/solver/nk_solve_harness.hpp) -- the SAME
+// already-assembled inputs, the SAME closed-form chain oracle judges the result.
+// The coloring/serialization witness (Case 2) re-points to the migrated
+// nk::SolveSchedule::Partition (the row_scheduler algorithm now lives in
+// src/nk/solve/), asserting same-articulation contacts serialize into >=2 color
+// segments -- the exact migrated equivalent of the legacy ColorCount()>=2.
+//
 // C5b-core wires the reduced-coordinate Featherstone chain-J reaction (the C4c
-// ArticulationReactionState math) into the compliant branch of the UnifiedSolve
-// row_solver kernel -- the linchpin C5c (foot-ground) blocks on. C5a wired the
-// rigid/static arms; this exercises the THREE articulation legs end-to-end on
-// the GPU:
+// ArticulationReactionState math) into the compliant branch of the solve -- the
+// linchpin C5c (foot-ground) blocks on. C5a wired the rigid/static arms; this
+// exercises the THREE articulation legs end-to-end on the GPU:
 //   (1) Jv0      = sum_r chain_J[r] * qdot0[r]   (the NEW per-side Jv, which the
 //                  shared ComputeJv would have dropped),
 //   (2) denom    = J M^-1 J^T  (the effective-mass leg),
@@ -40,9 +52,10 @@
 #include "constraint/row.hpp"
 #include "constraint/row_articulation_refs.hpp"
 #include "constraint/row_buffers.hpp"
+#include "nk/solve/schedule.hpp"
+#include "nk_solve_harness.hpp"
 #include "runtime/rigid/body_state.hpp"
-#include "solver/gpu/row_scheduler.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"
 
 #include <gtest/gtest.h>
 
@@ -236,18 +249,13 @@ TEST(LinkRigidTwoWay, SingleArticulationContactMatchesClosedForm) {
 
     std::vector<float> qdot = qdot0;  // MUTABLE; downloaded after the solve.
 
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &bodies;
-    ctx.sides = &sides;
-    ctx.dt = dt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_j;  // one slot -> dof floats.
-    ctx.articulation.inertia_m_inv = &Minv;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kDof;
-
-    nuka::solver::UnifiedSolve(ctx, OneIterConfig());
+    // nk re-point: drive the already-assembled rows through SolveRowsBlockIsland.
+    const auto res = nk_harness::NkSolveRows(
+        rows, sides, art_refs, chain_j, Minv, qdot0, &bodies, kDof,
+        static_cast<uint16_t>(OneIterConfig().velocity_iterations), dt);
+    ASSERT_TRUE(res.ok) << "nk solve harness failed";
+    qdot = res.qdot;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) rows.rows[r].lambda = res.lambda[r];
 
     // --- Assertions: all three legs ----------------------------------------
     EXPECT_NEAR(rows.rows[0].lambda, oracle.lambda, kTol)
@@ -304,27 +312,40 @@ TEST(LinkRigidTwoWay, TwoContactsSameArticulationSerializeAndAreConsistent) {
             RowArticulationSide{kArtIndex, slot}, RowArticulationSide{});
     }
 
-    // --- Coloring: same coloring key -> the two rows must be in different colors.
-    const nuka::solver::gpu::RowColorPartitions partitions =
-        nuka::solver::gpu::BuildRowColorPartitions(rows);
-    EXPECT_TRUE(nuka::solver::gpu::ValidateNoSharedBodiesPerColor(rows, partitions))
-        << "same-articulation rows must serialize into conflict-free colors";
-    EXPECT_GE(partitions.ColorCount(), 2u)
-        << "two same-articulation contacts must be in >= 2 colors (serialized)";
+    // --- Coloring: same coloring key -> the two rows must serialize into
+    //     different color segments. Re-pointed to the migrated nk schedule
+    //     (nk::SolveSchedule::Partition; the row_scheduler algorithm now lives in
+    //     src/nk/solve/). The two rows share one articulation conflict key, so the
+    //     greedy coloring must place them in DISTINCT color segments within ONE
+    //     island -> segment_count >= 2 (the migrated equivalent of the legacy
+    //     ColorCount()>=2 + ValidateNoSharedBodiesPerColor).
+    {
+        std::vector<nuka::nk::ScheduleRow> srows(rows.RowCount());
+        std::vector<uint32_t> row_env(rows.RowCount(), 0u);
+        for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+            const auto pair = rows.BodiesForRow(r);
+            srows[r].key_a = pair.body_a;
+            srows[r].key_b = pair.body_b;
+            srows[r].group_first = rows.materials[r].group_id;
+            srows[r].artic = art_refs[r].a.art_index;
+        }
+        const nuka::nk::SolveScheduleResult sched =
+            nuka::nk::SolveSchedule::Partition(srows, row_env);
+        EXPECT_GE(sched.segment_count, 2u)
+            << "two same-articulation contacts must serialize into >= 2 color "
+               "segments (the migrated nk schedule did not serialize them)";
+        EXPECT_EQ(sched.island_count, 1u)
+            << "the two same-articulation rows must form ONE island";
+    }
 
-    // --- Run the kernel solve.
+    // --- Run the nk solve.
     std::vector<float> qdot = qdot0;
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &bodies;
-    ctx.sides = &sides;
-    ctx.dt = dt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_jacobians;
-    ctx.articulation.inertia_m_inv = &Minv;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(ctx, OneIterConfig());
+    const auto res = nk_harness::NkSolveRows(
+        rows, sides, art_refs, chain_jacobians, Minv, qdot0, &bodies, kDof,
+        static_cast<uint16_t>(OneIterConfig().velocity_iterations), dt);
+    ASSERT_TRUE(res.ok) << "nk solve harness failed";
+    qdot = res.qdot;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) rows.rows[r].lambda = res.lambda[r];
 
     // --- Reference: apply the two rows SEQUENTIALLY (Gauss-Seidel), each its own
     //     1-iter closed form, the second seeing the first's qdot update.
@@ -388,17 +409,12 @@ TEST(LinkRigidTwoWay, MixedArticulationRigidTwoWayReacts) {
         RowArticulationSide{kArtIndex, 0u}, RowArticulationSide{});
 
     std::vector<float> qdot = qdot0;
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &bodies;
-    ctx.sides = &sides;
-    ctx.dt = dt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_j;
-    ctx.articulation.inertia_m_inv = &Minv;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(ctx, OneIterConfig());
+    const auto res = nk_harness::NkSolveRows(
+        rows, sides, art_refs, chain_j, Minv, qdot0, &bodies, kDof,
+        static_cast<uint16_t>(OneIterConfig().velocity_iterations), dt);
+    ASSERT_TRUE(res.ok) << "nk solve harness failed";
+    qdot = res.qdot;
+    for (uint32_t r = 0u; r < rows.RowCount(); ++r) rows.rows[r].lambda = res.lambda[r];
 
     const float lambda = rows.rows[0].lambda;
     EXPECT_GT(lambda, 0.0f) << "no impulse -> neither side reacts";
@@ -471,17 +487,12 @@ TEST(LinkRigidTwoWay, DeterministicTwoRunByteExact) {
             RowArticulationSide{0u, 0u}, RowArticulationSide{});
 
         std::vector<float> qdot = qdot0;  // reset to qdot0 each run.
-        nuka::solver::SolveContext ctx;
-        ctx.rows = &rows;
-        ctx.state = &bodies;
-        ctx.sides = &sides;
-        ctx.dt = dt;
-        ctx.articulation.art_refs = &art_refs;
-        ctx.articulation.chain_jacobians = &chain_j;
-        ctx.articulation.inertia_m_inv = &Minv;
-        ctx.articulation.qdot = &qdot;
-        ctx.articulation.dof_stride = kDof;
-        nuka::solver::UnifiedSolve(ctx, OneIterConfig());
+        const auto res = nk_harness::NkSolveRows(
+            rows, sides, art_refs, chain_j, Minv, qdot0, &bodies, kDof,
+            static_cast<uint16_t>(OneIterConfig().velocity_iterations), dt);
+        ASSERT_TRUE(res.ok) << "nk solve harness failed";
+        qdot = res.qdot;
+        for (uint32_t r = 0u; r < rows.RowCount(); ++r) rows.rows[r].lambda = res.lambda[r];
 
         *qdot_out = qdot;
         *body_out = bodies[0];
@@ -494,7 +505,7 @@ TEST(LinkRigidTwoWay, DeterministicTwoRunByteExact) {
 
     ASSERT_EQ(qa.size(), qb.size());
     EXPECT_EQ(std::memcmp(qa.data(), qb.data(), qa.size() * sizeof(float)), 0)
-        << "two identical UnifiedSolve runs produced different qdot (nondeterministic)";
+        << "two identical nk solve runs produced different qdot (nondeterministic)";
     EXPECT_EQ(std::memcmp(&ba, &bb, sizeof(BodyState)), 0)
-        << "two identical UnifiedSolve runs produced different bodies (nondeterministic)";
+        << "two identical nk solve runs produced different bodies (nondeterministic)";
 }
