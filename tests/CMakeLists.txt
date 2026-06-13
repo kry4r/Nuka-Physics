@@ -2663,6 +2663,48 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_union_scene_factory_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- M7 T4 (THE CRUX): union_cook == factory equivalence gate ------------------
+    # TRANSITIONAL — deleted in T6 with the factory; the permanent gate is
+    # h1_grasp_lift (T5). Asserts CookSceneToUnionTemplate(Load("h1_cup_table.nks"))
+    # reproduces BuildH1UnionScene(ctx): the .nks-reading union-slot cook
+    # (nuka_scene_cook) produces the SAME BatchedSceneTemplate the 1026-line
+    # h1_union_scene_factory authored via FK/placement/200-step settle. Links BOTH
+    # the factory (compiled in, like the parity gate) AND nuka_scene_cook, plus
+    # smokes BuildNkUnionModel(cooked.tmpl). Asset-gated SKIP.
+    add_executable(nuka_union_cook_matches_factory_test
+        scenario/union_cook_matches_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_scene_factory.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_union_cook_matches_factory_test nuka_codegen)
+    target_compile_definitions(nuka_union_cook_matches_factory_test
+        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_union_cook_matches_factory_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_union_cook_matches_factory_test
+        PRIVATE
+            # the cook under test (transitively pulls nuka_nk + nuka_scene +
+            # nuka_articulation) — listed first so its symbols win the union_cook TU.
+            nuka_scene_cook
+            nuka_nk
+            nuka_phi2
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_union_cook_matches_factory_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- SG G2: the C++ REFERENCE RECORDER for the python byte-parity gate ---------
     # Drives the union world THROUGH THE C ABI (links libnuka -- the exact code path
     # the python binding calls, so the python replay has no cross-compile seam) with
