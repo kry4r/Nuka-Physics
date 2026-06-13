@@ -1008,6 +1008,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkSolveRowsOps();
     RegisterNkParticleOps();
     RegisterNkReadoutOps();
+    RegisterNkDiffsimBackwardOps();  // M9 T7: NkOp::StepBackward
 }
 
 } // namespace nuka::phi

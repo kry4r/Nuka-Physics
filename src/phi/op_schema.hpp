@@ -7,7 +7,8 @@
 // op-specific parameter block that travels with an OpCall (phi/backend.hpp).
 //
 // CONTRACT (M1, frozen plan spec):
-//   * NkOp has exactly 28 named ops + a trailing `Count` sentinel.
+//   * NkOp has exactly 29 named ops + a trailing `Count` sentinel. (M9 T7
+//     appended StepBackward, the diffsim contact-free single-step adjoint.)
 //   * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
 //     spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
 //     carry a minimal plausible field set where obvious, or a reserved POD
@@ -68,6 +69,9 @@ enum class NkOp : uint16_t {
     // --- domain randomization -------------------------------------------
     RandomizeMaterialBuckets, // per-env material bucket randomization
     RandomizeBodyParams,      // per-env body/inertia randomization
+
+    // --- differentiable rollout (M9 T7) ---------------------------------
+    StepBackward,          // diffsim contact-free single-step reverse adjoint
 
     Count                  // sentinel: number of ops (NOT an op)
 };
@@ -430,6 +434,51 @@ struct RandomizeMaterialBucketsParams {
 struct RandomizeBodyParamsParams {
     uint64_t seed;
     float range;           // +/- fractional perturbation
+};
+
+// --- differentiable rollout (M9 T7) -------------------------------------
+// StepBackward: the contact-free single-step reverse adjoint. The articulation
+// device state (q/qdot/link_*/joint_*) comes from ModelView/DataView like every
+// other articulation op; the EXTRA buffers the adjoint needs are caller-owned
+// scratch that does NOT live in the arena (the per-step pre-state snapshots, the
+// drive descriptors, the dI/dmass slope, and the in/out gradient buffers), so
+// they travel as raw device pointers in the params. The pointer/scalar/flag set
+// MIRRORS diffsim::StepBackwardInputs + StepBackwardGrads 1:1 (see
+// diffsim/step_backward.hpp); the op unpacks them back into those two structs and
+// launches the SINGLE kernel the direct host launcher also drives (so the op path
+// and the direct path are byte-identical by single-source). math::Transform*
+// fields are carried as void* to keep op_schema.hpp math-header-free; the op
+// reinterpret_casts them (the layout is fixed: Vec3 position + Quat rotation).
+struct StepBackwardParams {
+    uint32_t total_link_count;
+    uint32_t articulation_count;
+    float    dt;
+    float    gravity_z;
+    // flags (uint32_t to stay trivially-copyable + header-light).
+    uint32_t has_drive;        // 1 => convert dL/dtau through the PD drive
+    uint32_t has_integrate;    // 1 => reverse the velocity+position integrators
+    uint32_t enable_q_channel; // 1 => back-prop the link_xup = JointTransform(q) path
+    // --- StepBackwardInputs pointers (const device buffers) --------------
+    const float* q_pre;
+    const float* qdot_pre;
+    const float* v_root_pre;     // may be null (fixed-base fallback)
+    const void*  base_pose_pre;  // const math::Transform* (orientation channel; may be null)
+    const float* drive_targets;
+    const float* drive_stiffness;
+    const float* drive_damping;
+    const float* drive_force_limits;
+    const float* dI_dmass;
+    const float* grad_qddot_seed; // read only when has_integrate == 0; may be null
+    // --- StepBackwardGrads pointers (in/out device buffers) --------------
+    float* grad_q_out;
+    float* grad_qdot_out;
+    float* grad_target_out;
+    float* grad_mass_out;
+    float* grad_tau_out;
+    float* grad_link_velocity_out;
+    // per-articulation base-pose adjoint (7 floats/art: 3 pos + 4 quat); void* to
+    // mirror StepBackwardGrads::grad_base_pose_out (a float*); may be null.
+    void*  grad_base_pose_out;
 };
 
 } // namespace nuka::phi

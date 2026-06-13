@@ -20,9 +20,36 @@
 
 #include "diffsim/step_backward.hpp"
 
+#include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
+#include <cuda_runtime.h>
+
+#include <stdexcept>
+#include <string>
+
 namespace nuka::diffsim {
+
+// M9 T7: the host StepBackward() entry (the FD oracle's + BackwardRunner's direct
+// caller). It used to launch StepBackwardKernel<<<...>>> inline in step_backward.cu;
+// now it drives the SINGLE kernel launcher in the phi v2 op TU (where the kernel
+// lives as NkOp::StepBackward). SAME ScopedDeviceGuard + stream + launch config +
+// post-launch error check as the deleted step_backward.cu host body -> the direct
+// path stays byte-identical AND is single-source with the NkOp dispatch.
+void StepBackward(const phi::DeviceContext& context,
+                  articulation::ArticulationDeviceState state,
+                  const StepBackwardInputs& inputs,
+                  const StepBackwardGrads& grads) {
+    if (state.articulation_count == 0u) return;
+    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = context.stream.Native();
+    LaunchStepBackwardKernel(state, inputs, grads, inputs.enable_q_channel, stream);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("StepBackwardKernel launch") +
+                                 " failed: " + cudaGetErrorString(err));
+    }
+}
 
 std::vector<float> BuildSpatialInertiaMassJacobian(
     const std::vector<LinkMassParams>& links) {
