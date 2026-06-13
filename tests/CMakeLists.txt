@@ -2538,6 +2538,46 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_grasp_lift_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- union_cook_golden — the cook-fidelity GOLDEN regression gate --------------
+    # REPLACES the M7-deleted nuka_union_cook_matches_factory_test (cook==factory
+    # ~1e-8). Cooks Load("h1_cup_table.nks") -> CookSceneToUnionTemplate and pins
+    # every regression-sensitive cooked field to a COMMITTED, NEVER-regenerated
+    # golden (EXACT ints/order, TIGHT-NEAR floats) + the BuildNkUnionModel union
+    # slot order/count. Links the cook + the M9-alive coresident bridge
+    # (h1_union_nk_model + batched_unified_world for the BatchedSceneTemplate struct
+    # + contact_stream_driver it includes), NOT the factory. Asset-gated SKIP.
+    add_executable(nuka_union_cook_golden_test
+        scenario/union_cook_golden.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/h1_union_nk_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
+        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
+    )
+    add_dependencies(nuka_union_cook_golden_test nuka_codegen)
+    target_compile_definitions(nuka_union_cook_golden_test
+        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_union_cook_golden_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_union_cook_golden_test
+        PRIVATE
+            # the cook under test (transitively pulls nuka_nk + nuka_scene +
+            # nuka_articulation) — listed first so its symbols win the union_cook TU.
+            nuka_scene_cook
+            nuka_nk
+            nuka_phi2
+            nuka_solver
+            nuka_constraint
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_union_cook_golden_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- SG G2: the C++ REFERENCE RECORDER for the python byte-parity gate ---------
     # Drives the union world THROUGH THE C ABI (links libnuka -- the exact code path
     # the python binding calls, so the python replay has no cross-compile seam) with
