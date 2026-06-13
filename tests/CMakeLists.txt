@@ -308,6 +308,26 @@ add_test(NAME NksGraspSceneRoundtrip
          COMMAND nuka_nks_grasp_scene_roundtrip_test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# --- M8.5 T5: the VISUAL-MESH COOK gate. Cooks go2 (+ h1_with_hand if present)
+# import -> .nks/.nka Save -> Load -> BuildRenderWorld and asserts the robot
+# renders as REAL .nka MESH triangles (MeshSource::NkaMesh), not placeholder
+# boxes. Scene-side only (no Vulkan device needed); links nuka_render for
+# BuildRenderWorld (the consumer) which is host-only.
+add_executable(nuka_visual_mesh_cook_smoke_test
+    scenario/visual_mesh_cook_smoke.cpp
+)
+target_link_libraries(nuka_visual_mesh_cook_smoke_test
+    PRIVATE
+        nuka_scene
+        nuka_import
+        nuka_render
+        nuka_cooker
+        GTest::gtest_main
+)
+add_test(NAME VisualMeshCook
+         COMMAND nuka_visual_mesh_cook_smoke_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test
     runtime/test_world_build.cpp
