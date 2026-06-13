@@ -143,11 +143,73 @@ Mat4 Perspective(float fov_y_radians, float aspect, float z_near, float z_far) {
     return r;
 }
 
+// M8.5 T4: mirrors the offscreen renderer's PushBlock + SceneUbo (same shaders).
 struct PushBlock {
-    float mvp[16];
     float model[16];
     float base_color[4];
+    float mr[4];        // x metallic, y roughness, z opacity, w pad
+    float emissive[4];  // rgb emissive, a pad
 };
+static_assert(sizeof(PushBlock) == 112, "PushBlock must stay <=128 push-constant bytes");
+
+constexpr int kMaxUboLights = 8;
+struct GpuLight {
+    float direction[4];
+    float position[4];
+    float color[4];
+};
+struct SceneUbo {
+    float    view_proj[16];
+    float    camera_pos[4];
+    float    ambient[4];
+    float    ambient_ground[4];
+    int32_t  counts[4];
+    GpuLight lights[kMaxUboLights];
+};
+static_assert(sizeof(SceneUbo) == 512, "SceneUbo must match the std140 shader block");
+
+// Build the per-frame SceneUbo (camera + light rig). Same default 3-point rig +
+// hemispheric ambient as the offscreen renderer (kept in sync deliberately).
+SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
+                       const math::Vec3& eye) {
+    SceneUbo ubo{};
+    std::memcpy(ubo.view_proj, view_proj.m.data(), sizeof(ubo.view_proj));
+    ubo.camera_pos[0] = eye.x; ubo.camera_pos[1] = eye.y;
+    ubo.camera_pos[2] = eye.z; ubo.camera_pos[3] = 1.0f;
+    ubo.ambient[0] = 0.20f; ubo.ambient[1] = 0.23f; ubo.ambient[2] = 0.28f; ubo.ambient[3] = 0.0f;
+    ubo.ambient_ground[0] = 0.09f; ubo.ambient_ground[1] = 0.08f;
+    ubo.ambient_ground[2] = 0.07f; ubo.ambient_ground[3] = 0.0f;
+    auto set_dir = [](GpuLight& l, const math::Vec3& dir, float r, float g, float b) {
+        const math::Vec3 d = dir.Normalized();
+        l.direction[0] = d.x; l.direction[1] = d.y; l.direction[2] = d.z; l.direction[3] = 1.0f;
+        l.position[0] = l.position[1] = l.position[2] = l.position[3] = 0.0f;
+        l.color[0] = r; l.color[1] = g; l.color[2] = b; l.color[3] = 0.0f;
+    };
+    int n = 0;
+    if (!world.lights.empty()) {
+        for (const RenderLight& rl : world.lights) {
+            if (n >= kMaxUboLights) break;
+            GpuLight& l = ubo.lights[n];
+            const math::Vec3 col = rl.color * rl.intensity;
+            if (rl.type == scene::LightComponent::Type::Directional) {
+                const math::Vec3 fwd = rl.world_xform.TransformDirection({0.0f, 0.0f, -1.0f});
+                set_dir(l, fwd * -1.0f, col.x, col.y, col.z);
+            } else {
+                const math::Vec3 p = rl.world_xform.position;
+                l.direction[0] = l.direction[1] = l.direction[2] = 0.0f; l.direction[3] = 0.0f;
+                l.position[0] = p.x; l.position[1] = p.y; l.position[2] = p.z; l.position[3] = 0.0f;
+                l.color[0] = col.x; l.color[1] = col.y; l.color[2] = col.z; l.color[3] = 0.0f;
+            }
+            ++n;
+        }
+    } else {
+        set_dir(ubo.lights[n++], {0.5f, -0.6f, 0.75f}, 3.2f, 3.1f, 2.9f);
+        set_dir(ubo.lights[n++], {-0.7f, 0.3f, 0.4f}, 0.8f, 0.9f, 1.1f);
+        set_dir(ubo.lights[n++], {0.1f, 0.8f, 0.5f}, 1.0f, 0.95f, 0.85f);
+    }
+    ubo.counts[0] = n;
+    return ubo;
+}
 
 std::vector<float> SynthesizeFlatNormals(const std::vector<float>& positions,
                                          const std::vector<uint32_t>& indices) {
@@ -258,11 +320,18 @@ struct PresentRenderer::Impl {
     VkImageView    depth_view = VK_NULL_HANDLE;
 
     VkRenderPass     present_pass = VK_NULL_HANDLE;
+    VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;  // set 0: per-frame SceneUbo
+    VkDescriptorPool scene_pool = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline       pipeline = VK_NULL_HANDLE;
     VkShaderModule   vert_module = VK_NULL_HANDLE;
     VkShaderModule   frag_module = VK_NULL_HANDLE;
     VkCommandPool    command_pool = VK_NULL_HANDLE;
+    // Per-frame-in-flight SceneUbo buffer + descriptor set (one per frame so the
+    // in-flight frame's uniform is not overwritten by the next).
+    struct UboSlot { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+                     VkDescriptorSet set = VK_NULL_HANDLE; };
+    std::array<UboSlot, kFramesInFlight> ubo_slots{};
 
     // Per-frame-in-flight sync + command buffers.
     std::array<VkSemaphore, kFramesInFlight>     image_available{};
@@ -333,6 +402,7 @@ struct PresentRenderer::Impl {
         CreateDepthResources();
         CreateFramebuffers();
         CreatePipeline();
+        CreateSceneDescriptors();
         CreateSyncObjects();
         AllocateCommandBuffers();
 
@@ -351,6 +421,12 @@ struct PresentRenderer::Impl {
             if (render_finished[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, render_finished[i], nullptr);
             if (in_flight[i] != VK_NULL_HANDLE) vkDestroyFence(device, in_flight[i], nullptr);
         }
+        for (auto& slot : ubo_slots) {
+            if (slot.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, slot.buffer, nullptr);
+            if (slot.memory != VK_NULL_HANDLE) vkFreeMemory(device, slot.memory, nullptr);
+        }
+        if (scene_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, scene_pool, nullptr);
+        if (scene_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr);
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
         if (frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, frag_module, nullptr);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
@@ -625,12 +701,28 @@ struct PresentRenderer::Impl {
         vert_module = CreateShaderModule(NUKA_RASTER_MESH_VERT_SPV);
         frag_module = CreateShaderModule(NUKA_RASTER_MESH_FRAG_SPV);
 
+        // Set 0, binding 0: per-frame SceneUbo (camera + light rig). Same layout
+        // as the offscreen renderer (shared shaders).
+        VkDescriptorSetLayoutBinding ubo_binding{};
+        ubo_binding.binding = 0u;
+        ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ubo_binding.descriptorCount = 1u;
+        ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set_info.bindingCount = 1u;
+        set_info.pBindings = &ubo_binding;
+        CheckVk(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &scene_set_layout),
+                "vkCreateDescriptorSetLayout(present-scene)");
+
         VkPushConstantRange push_range{};
-        push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         push_range.offset = 0u;
         push_range.size = sizeof(PushBlock);
         VkPipelineLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.setLayoutCount = 1u;
+        layout_info.pSetLayouts = &scene_set_layout;
         layout_info.pushConstantRangeCount = 1u;
         layout_info.pPushConstantRanges = &push_range;
         CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout),
@@ -724,6 +816,40 @@ struct PresentRenderer::Impl {
                 "vkCreateGraphicsPipelines(present)");
     }
 
+    // Persistent per-frame-in-flight SceneUbo buffers + descriptor sets.
+    void CreateSceneDescriptors() {
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = kFramesInFlight;
+        pool_info.poolSizeCount = 1u;
+        pool_info.pPoolSizes = &size;
+        CheckVk(vkCreateDescriptorPool(device, &pool_info, nullptr, &scene_pool),
+                "vkCreateDescriptorPool(present-scene)");
+        for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+            UboSlot& slot = ubo_slots[i];
+            const GpuBuffer b = CreateHostBuffer(sizeof(SceneUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            slot.buffer = b.buffer;
+            slot.memory = b.memory;
+            VkDescriptorSetAllocateInfo alloc{};
+            alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            alloc.descriptorPool = scene_pool;
+            alloc.descriptorSetCount = 1u;
+            alloc.pSetLayouts = &scene_set_layout;
+            CheckVk(vkAllocateDescriptorSets(device, &alloc, &slot.set),
+                    "vkAllocateDescriptorSets(present-scene)");
+            VkDescriptorBufferInfo buffer_info{slot.buffer, 0u, sizeof(SceneUbo)};
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = slot.set;
+            write.dstBinding = 0u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            write.pBufferInfo = &buffer_info;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+    }
+
     void CreateSyncObjects() {
         VkSemaphoreCreateInfo sem_info{};
         sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -760,6 +886,10 @@ struct PresentRenderer::Impl {
         if (depth_memory != VK_NULL_HANDLE) { vkFreeMemory(device, depth_memory, nullptr); depth_memory = VK_NULL_HANDLE; }
         if (pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, pipeline, nullptr); pipeline = VK_NULL_HANDLE; }
         if (pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, pipeline_layout, nullptr); pipeline_layout = VK_NULL_HANDLE; }
+        // scene_set_layout is (re)created by CreatePipeline; destroy it here so a
+        // swapchain recreate does not leak it. The persistent scene_pool + ubo_slots
+        // sets stay valid (a byte-identical re-created layout remains bind-compatible).
+        if (scene_set_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr); scene_set_layout = VK_NULL_HANDLE; }
         if (present_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, present_pass, nullptr); present_pass = VK_NULL_HANDLE; }
         for (VkImageView v : image_views) {
             if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
@@ -824,6 +954,10 @@ struct PresentRenderer::Impl {
         uint32_t  index_count = 0;
         Mat4      model;
         float     base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
+        float     metallic = 0.0f;
+        float     roughness = 0.5f;
+        float     opacity = 1.0f;
+        float     emissive[3] = {0.0f, 0.0f, 0.0f};
     };
 
     PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
@@ -873,6 +1007,12 @@ struct PresentRenderer::Impl {
                 draw.base_color[1] = mat.base_color[1];
                 draw.base_color[2] = mat.base_color[2];
                 draw.base_color[3] = mat.base_color[3];
+                draw.metallic = mat.metallic;
+                draw.roughness = mat.roughness;
+                draw.opacity = mat.opacity;
+                draw.emissive[0] = mat.emissive[0];
+                draw.emissive[1] = mat.emissive[1];
+                draw.emissive[2] = mat.emissive[2];
             }
             const VkDeviceSize pos_bytes = geo.positions.size() * sizeof(float);
             draw.pos = CreateHostBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -908,6 +1048,16 @@ struct PresentRenderer::Impl {
         const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
         const Mat4 view_proj = Multiply(proj, view);
 
+        // Upload this frame's SceneUbo (camera + light rig) into the frame slot.
+        const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye);
+        {
+            void* mapped = nullptr;
+            CheckVk(vkMapMemory(device, ubo_slots[frame].memory, 0, sizeof(SceneUbo), 0, &mapped),
+                    "vkMapMemory(present-scene-ubo)");
+            std::memcpy(mapped, &scene_ubo, sizeof(SceneUbo));
+            vkUnmapMemory(device, ubo_slots[frame].memory);
+        }
+
         // -- record ----------------------------------------------------------
         VkCommandBuffer cmd = command_buffers[frame];
         CheckVk(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
@@ -932,6 +1082,8 @@ struct PresentRenderer::Impl {
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                                0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
         VkViewport viewport{};
         viewport.x = 0.0f; viewport.y = 0.0f;
         viewport.width = static_cast<float>(extent.width);
@@ -943,11 +1095,14 @@ struct PresentRenderer::Impl {
 
         for (const InstanceDraw& draw : draws) {
             PushBlock push{};
-            const Mat4 mvp = Multiply(view_proj, draw.model);
-            std::memcpy(push.mvp, mvp.m.data(), sizeof(push.mvp));
             std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
             std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
-            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0u,
+            push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
+            push.mr[2] = draw.opacity;  push.mr[3] = 0.0f;
+            push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
+            push.emissive[2] = draw.emissive[2]; push.emissive[3] = 0.0f;
+            vkCmdPushConstants(cmd, pipeline_layout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
             std::array<VkBuffer, 2> vbuffers{draw.pos.buffer, draw.nrm.buffer};
             std::array<VkDeviceSize, 2> offsets{0u, 0u};
