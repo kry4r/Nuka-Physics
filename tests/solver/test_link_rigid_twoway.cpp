@@ -23,8 +23,8 @@
 //   (2) denom    = J M^-1 J^T  (the effective-mass leg),
 //   (3) apply    = qdot += M^-1 J^T dlambda  (the DOF apply leg).
 //
-// The ArticulationReactionState data is built BY HAND (no BatchedArticulatedWorld
-// / device CRBA) so the M^-1 tile + chain-J row + qdot are exact + known. The
+// The ArticulationReactionState data is built BY HAND (no batched world / device
+// CRBA) so the M^-1 tile + chain-J row + qdot are exact + known. The
 // C4c ArticulationEffectiveInvMass / ArticulationApplyImpulse math is already
 // byte-proven (nuka_reaction_providers_test), so any mismatch here localizes to
 // the WIRING (the threading / dispatch / the new ComputeCompliantJv).

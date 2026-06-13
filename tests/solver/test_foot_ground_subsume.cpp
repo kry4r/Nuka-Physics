@@ -33,7 +33,7 @@
 // production kernel scatters it to link_velocity[root].
 //
 // SCOPE (C5c-1, VALIDATED-NOT-WIRED). No production path is flipped (world_stepper
-// / BatchedArticulatedWorld / the production AppendContactGroup/BuildContactRows/
+// / the production AppendContactGroup/BuildContactRows/
 // SolveArticulatedContactRows are untouched). No golden / generated / memory edit.
 // Self-validated WITHOUT MJX. Explicitly DEFERRED:
 //   - C5c-2: MJX single-step base-6 qacc parity for this unified path.
@@ -60,10 +60,10 @@
 #include "runtime/world_builder.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"
-#include "solver/gpu/row_scheduler.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"  // SolverConfig (iters/dt knobs; legacy UnifiedSolve dropped M9 T11)
 
 #include "foot_chain_jacobian.hpp"  // shared ComputeFootChainJ18 (FK-refresh-correct)
+#include "nk_solve_harness.hpp"     // M9 T11: the nk SolveRowsBlockIsland re-point seam
 
 #include <gtest/gtest.h>
 
@@ -183,8 +183,8 @@ Vec3 FootWorldCenter(const std::vector<Transform>& poses,
     return calf.position + calf.rotation.Rotate(foot.local_offset);
 }
 
-// Reusable on-device CRBA -> 18x18 M^-1 for ONE articulation (the standalone
-// analogue of BatchedArticulatedWorld stages 8-9). REUSES the production CRBA +
+// Reusable on-device CRBA -> 18x18 M^-1 for ONE articulation (a standalone
+// composite-inertia + factorization pass). REUSES the production CRBA +
 // factorization -- no hand-rolled second inertia. Requires ABA pass-1 to have run
 // (link_xup / motion subspace current), so we run ComputeAccelerations first.
 std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& context,
@@ -422,19 +422,24 @@ UnifiedFootGroundResult RunUnifiedFootGround(const nuka::phi::DeviceContext& con
     qdot[5] = base_vz0;  // downward base vertical velocity (body frame == world).
     result.qdot0 = qdot;
 
-    // --- C5b-core UnifiedSolve: the compliant contact solve ------------------
-    std::vector<nuka::runtime::rigid::BodyState> empty_bodies;  // articulation-only.
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &empty_bodies;             // EMPTY: the C5c-1 articulation-only case.
-    ctx.sides = &sides;
-    ctx.dt = inputs.dt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_jacobians;
-    ctx.articulation.inertia_m_inv = &minv;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kDof;
-    nuka::solver::UnifiedSolve(ctx, config);
+    // --- C5b-core compliant contact solve: M9 T11 nk-ONLY -- the SAME assembled
+    // rows / chain-J / M^-1 / seeded flat qdot run through the nk SolveRows-
+    // BlockIsland op (nk_solve_harness.hpp). The legacy solver::UnifiedSolve arm
+    // (deleted in M9 T11-core) is gone; the SAME 18-wide-J / base-recoil / foot-
+    // normal-velocity / D1 gates judge the result. Articulation-only -> no bodies.
+    std::vector<nuka::runtime::rigid::BodyState> empty_bodies;
+    {
+        const auto nk_res = nk_harness::NkSolveRows(
+            rows, sides, art_refs, chain_jacobians, minv, qdot, &empty_bodies,
+            kDof, static_cast<uint16_t>(config.velocity_iterations), inputs.dt);
+        EXPECT_TRUE(nk_res.ok) << "nk solve harness failed";
+        if (nk_res.ok) {
+            qdot = nk_res.qdot;
+            for (uint32_t r = 0u; r < rows.RowCount(); ++r) {
+                rows.rows[r].lambda = nk_res.lambda[r];
+            }
+        }
+    }
 
     result.qdot = qdot;
     result.foot_lambda.resize(rows.RowCount());

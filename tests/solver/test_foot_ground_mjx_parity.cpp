@@ -99,14 +99,13 @@
 #include "runtime/world_builder.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"
-#include "solver/gpu/row_scheduler.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"  // SolverConfig (iters/dt knobs; legacy UnifiedSolve dropped M9 T11)
 
 #include "foot_chain_jacobian.hpp"  // shared ComputeFootChainJ18 (FK-refresh-correct)
 
 #include <gtest/gtest.h>
 
-#include "nk_solve_harness.hpp"  // M4 re-point: the nk SolveRowsBlockIsland path
+#include "nk_solve_harness.hpp"  // M9 T11: the ONLY solve path -- nk SolveRowsBlockIsland
 
 #include <algorithm>
 #include <array>
@@ -465,8 +464,7 @@ struct ParityResult {
 // free ABA -> seed qdot = a_free*dt -> contact solve -> qacc_total = qdot_post/dt.
 ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cooked,
                        const ContactConfig& cfg, const ContactStepGolden& g,
-                       float ground_height, const nuka::solver::SolverConfig& config,
-                       bool use_nk = false) {
+                       float ground_height, const nuka::solver::SolverConfig& config) {
     ParityResult result;
     auto& host = cooked.host;
     const uint32_t root = host.articulation_link_offset[0];
@@ -620,10 +618,11 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
     }
 
     std::vector<nuka::runtime::rigid::BodyState> empty_bodies;
-    if (use_nk) {
-        // M4 RE-POINT: the SAME assembled rows / chain-J / M^-1 / qdot seed
-        // through the nk SolveRowsBlockIsland op (nk_solve_harness.hpp); the
-        // SAME golden gates judge the result.
+    // M9 T11 nk-ONLY: the SAME assembled rows / chain-J / M^-1 / qdot seed run
+    // through the nk SolveRowsBlockIsland op (nk_solve_harness.hpp); the SAME
+    // golden gates judge the result. The legacy solver::UnifiedSolve arm (deleted
+    // in M9 T11-core) is gone -- this is the M4 re-point made the sole path.
+    {
         const auto nk_res = nk_harness::NkSolveRows(
             rows, sides, art_refs, chain_jacobians, minv, qdot, &empty_bodies,
             kDof, static_cast<uint16_t>(config.velocity_iterations), kDt);
@@ -634,18 +633,6 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
                 rows.rows[r].lambda = nk_res.lambda[r];
             }
         }
-    } else {
-        nuka::solver::SolveContext sctx;
-        sctx.rows = &rows;
-        sctx.state = &empty_bodies;
-        sctx.sides = &sides;
-        sctx.dt = kDt;
-        sctx.articulation.art_refs = &art_refs;
-        sctx.articulation.chain_jacobians = &chain_jacobians;
-        sctx.articulation.inertia_m_inv = &minv;
-        sctx.articulation.qdot = &qdot;
-        sctx.articulation.dof_stride = kDof;
-        nuka::solver::UnifiedSolve(sctx, config);
     }
 
     // qacc_total = qdot_post / dt (NUKA flat packing).
@@ -953,12 +940,12 @@ TEST(FootGroundMjxParity, ParityRunDeterministic) {
 }
 
 // ===========================================================================
-// M4 RE-POINT — the SAME MJX golden gates through the nk SolveRowsBlockIsland
-// op (plan M4: "test_foot_ground_mjx_parity (oracle 口径) 重指"). The state
-// build, the rows, chain-J, M^-1 and the a_free*dt seed are IDENTICAL to the
-// legacy gate above; only the SOLVE runs on the nk device-resident path. The
-// gates reuse the legacy bounds verbatim (base-6 rel 1e-3, per-foot force rel
-// 2e-3) plus a direct nk-vs-legacy qacc cross-check at the FP floor.
+// M4 RE-POINT (now the SOLE path, M9 T11) — the MJX golden gates through the nk
+// SolveRowsBlockIsland op (plan M4: "test_foot_ground_mjx_parity (oracle 口径)
+// 重指"). RunParity already runs ONLY the nk device-resident solve; this arm
+// re-holds the MJX bounds (base-6 rel 1e-3, per-foot force rel 2e-3) at the
+// high-iter operating point. The legacy nk-vs-UnifiedSolve cross-check was
+// dropped with the legacy class.
 // ===========================================================================
 TEST(FootGroundMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
     const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
@@ -976,10 +963,8 @@ TEST(FootGroundMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
 
     for (size_t ci = 0u; ci < golden.configs.size(); ++ci) {
         const auto& cfg = golden.configs[ci];
-        const auto legacy = RunParity(context, cooked, cfg, golden, ground_height,
-                                      cfg_high, /*use_nk=*/false);
         const auto nk = RunParity(context, cooked, cfg, golden, ground_height,
-                                  cfg_high, /*use_nk=*/true);
+                                  cfg_high);
         ASSERT_EQ(nk.row_count, 4u) << "config " << ci << " nk produced != 4 rows";
 
         std::array<float, 6> golden_on6{};
@@ -997,20 +982,11 @@ TEST(FootGroundMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
             force_rel = std::max(force_rel,
                                  std::fabs(nk.foot_force[r] - cfg.normal_force[r]) / den);
         }
-        float vs_legacy = 0.0f;
-        for (uint32_t i = 0u; i < kDof; ++i) {
-            vs_legacy = std::max(vs_legacy,
-                                 std::fabs(nk.qacc_total[i] - legacy.qacc_total[i]));
-        }
-        std::printf("[nk re-point] config %zu base-6 REL=%.3e force REL=%.3e "
-                    "|qacc nk-legacy|=%.3e\n", ci, base6_rel, force_rel, vs_legacy);
+        std::printf("[nk re-point] config %zu base-6 REL=%.3e force REL=%.3e\n",
+                    ci, base6_rel, force_rel);
         EXPECT_LT(base6_rel, 1.0e-3f)
             << "config " << ci << " nk base-6 contact-ON drifted vs the MJX golden";
         EXPECT_LT(force_rel, 2.0e-3f)
             << "config " << ci << " nk per-foot force drifted vs MJX efc_force";
-        // nk-vs-legacy: identical math modulo the hoisted-constant FMA class.
-        EXPECT_LT(vs_legacy, 1.0e-2f)
-            << "config " << ci << " nk solve diverged from the legacy solve far "
-               "beyond the FP-contraction class";
     }
 }

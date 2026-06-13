@@ -75,14 +75,13 @@
 #include "runtime/world_builder.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooker.hpp"
-#include "solver/gpu/row_scheduler.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"  // SolverConfig (iters/dt knobs; legacy UnifiedSolve dropped M9 T11)
 
 #include "foot_chain_jacobian.hpp"  // shared FK-refresh-correct ComputeFootChainJ18
 
 #include <gtest/gtest.h>
 
-#include "nk_solve_harness.hpp"  // M4 re-point: the nk SolveRowsBlockIsland path
+#include "nk_solve_harness.hpp"  // M9 T11: the ONLY solve path -- nk SolveRowsBlockIsland
 
 #include <algorithm>
 #include <array>
@@ -464,8 +463,7 @@ struct ParityResult {
 ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cooked,
                        const FootBoxGolden& g, const FootBoxConfig& cfg,
                        const nuka::solver::SolverConfig& config,
-                       float box_inertia_scale = 1.0f,
-                       bool use_nk = false) {
+                       float box_inertia_scale = 1.0f) {
     ParityResult result;
     auto& host = cooked.host;
     const uint32_t root = host.articulation_link_offset[0];
@@ -639,9 +637,11 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
         result.exact_lambda = (A + R) > 1.0e-12 ? std::max(0.0, b / (A + R)) : 0.0;
     }
 
-    // --- (5) the unified two-way solve: legacy UnifiedSolve, or the M4 nk
-    // SolveRowsBlockIsland (the SAME assembled inputs; the SAME gates judge).
-    if (use_nk) {
+    // --- (5) the unified two-way solve: M9 T11 nk-ONLY -- the SAME assembled
+    // inputs run through the nk SolveRowsBlockIsland op; the SAME gates judge.
+    // The legacy solver::UnifiedSolve arm (deleted in M9 T11-core) is gone --
+    // this is the M4 re-point made the sole path.
+    {
         const auto nk_res = nk_harness::NkSolveRows(
             rows, sides, art_refs, chain_jacobians, minv, qdot, &bodies,
             kDof, static_cast<uint16_t>(config.velocity_iterations), kDt);
@@ -652,18 +652,6 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
                 rows.rows[r].lambda = nk_res.lambda[r];
             }
         }
-    } else {
-        nuka::solver::SolveContext sctx;
-        sctx.rows = &rows;
-        sctx.state = &bodies;
-        sctx.sides = &sides;
-        sctx.dt = kDt;
-        sctx.articulation.art_refs = &art_refs;
-        sctx.articulation.chain_jacobians = &chain_jacobians;
-        sctx.articulation.inertia_m_inv = &minv;
-        sctx.articulation.qdot = &qdot;
-        sctx.articulation.dof_stride = kDof;
-        nuka::solver::UnifiedSolve(sctx, config);
     }
 
     // --- qacc_total = qdot_post/dt (articulation -> base-6); box dv/dt (box-6). --
@@ -931,10 +919,11 @@ TEST(FootBoxMjxParity, ParityRunDeterministic) {
 }
 
 // ===========================================================================
-// M4 RE-POINT — the foot x box co-residence golden gates through the nk
-// SolveRowsBlockIsland op (plan M4 "test_foot_box... (oracle 口径) 重指").
-// SAME assembled inputs, SAME bounds (box-6 rel 5e-3, base-6 rel 2e-3,
-// kernel-vs-exact 1e-4) + an nk-vs-legacy qacc FP-class cross-check.
+// M4 RE-POINT (now the SOLE path, M9 T11) — the foot x box co-residence golden
+// gates through the nk SolveRowsBlockIsland op (plan M4 "test_foot_box...
+// (oracle 口径) 重指"). RunParity already runs ONLY the nk solve; this arm
+// re-holds the MJX bounds (box-6 rel 5e-3, base-6 rel 2e-3, kernel-vs-exact
+// 1e-4). The legacy nk-vs-UnifiedSolve cross-check was dropped with the class.
 // ===========================================================================
 TEST(FootBoxMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
     const auto scene_path = SourcePath("examples/scenes/go2_float.usda");
@@ -950,10 +939,8 @@ TEST(FootBoxMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
 
     for (size_t ci = 0u; ci < golden.configs.size(); ++ci) {
         const auto& cfg = golden.configs[ci];
-        const auto legacy = RunParity(context, cooked, golden, cfg, cfg_high,
-                                      /*box_inertia_scale=*/1.0f, /*use_nk=*/false);
         const auto nk = RunParity(context, cooked, golden, cfg, cfg_high,
-                                  /*box_inertia_scale=*/1.0f, /*use_nk=*/true);
+                                  /*box_inertia_scale=*/1.0f);
 
         std::array<float, 6> box_on{}, base_on{};
         for (uint32_t i = 0u; i < 6u; ++i) {
@@ -965,19 +952,12 @@ TEST(FootBoxMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
         const double kernel_vs_exact =
             std::fabs(static_cast<double>(nk.lambda) - nk.exact_lambda) /
             std::max(1.0, std::fabs(nk.exact_lambda));
-        float vs_legacy = 0.0f;
-        for (uint32_t i = 0u; i < kDof; ++i) {
-            vs_legacy = std::max(vs_legacy,
-                                 std::fabs(nk.qacc_total[i] - legacy.qacc_total[i]));
-        }
         std::printf("[nk re-point] config %zu BOX-6 REL=%.3e BASE-6 REL=%.3e "
-                    "kernel-vs-exact=%.3e |qacc nk-legacy|=%.3e\n",
-                    ci, box6, base6, kernel_vs_exact, vs_legacy);
+                    "kernel-vs-exact=%.3e\n",
+                    ci, box6, base6, kernel_vs_exact);
         EXPECT_LT(box6, 5.0e-3f) << "config " << ci << " nk box-6 drifted vs MJX";
         EXPECT_LT(base6, 2.0e-3f) << "config " << ci << " nk base-6 drifted vs MJX";
         EXPECT_LT(kernel_vs_exact, 1.0e-4)
             << "config " << ci << " nk lambda diverged from the exact (A+R) solve";
-        EXPECT_LT(vs_legacy, 1.0e-2f)
-            << "config " << ci << " nk solve diverged from legacy beyond the FP class";
     }
 }
