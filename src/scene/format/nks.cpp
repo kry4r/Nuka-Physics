@@ -271,6 +271,35 @@ struct MeshSink {
         return text;
     }
 
+    // Append a VISUAL mesh (MESH) deduped by content hash; return AssetRef text.
+    // M8.5 T5: a non-colliding geom's triangles are routed here (vs CMSH) so the
+    // render consumer (render_world.cpp's NkaTagMesh() branch) decodes real
+    // geometry. EncodeMesh carries positions + zero-filled normal/uv streams; the
+    // decoded positions/indices round-trip the source triangles byte-exactly
+    // (SceneRoundtrip ExpectShapeRecordsEqual still holds). Keyed in the SAME
+    // by_hash map as CMSH/SAMP -- the encoded payloads differ by fourcc/layout so
+    // there is no cross-family hash collision (a MESH payload is never equal to a
+    // CMSH payload of the same triangles: MESH interleaves the zero normal/uv
+    // streams).
+    std::string AddVisualMesh(const std::vector<float>& verts,
+                              const std::vector<uint32_t>& indices) {
+        NkaMesh mesh;
+        mesh.positions = verts;
+        mesh.indices = indices;
+        const std::vector<uint8_t> payload = EncodeMesh(mesh);
+        const uint64_t hash = NkaContentHash(payload);
+        const auto it = by_hash.find(hash);
+        if (it != by_hash.end()) return it->second;
+        const uint32_t index = writer.AddChunk(NkaTagMesh(), payload);
+        AssetRef ref;
+        ref.nka_path = nka_basename;
+        ref.fourcc = NkaTagMesh();
+        ref.index = index;
+        const std::string text = ToString(ref);
+        by_hash.emplace(hash, text);
+        return text;
+    }
+
     // Append a sample point cloud (SAMP) deduped by content hash; return AssetRef
     // text. Used for the grasp block's exact scaled+COM-centered cup hull verts
     // (a vertex cloud with no topology -- CoResidentCup.hull_verts 1:1). Keyed in
@@ -295,7 +324,12 @@ struct MeshSink {
 // Serialize a collision/visual shape RECORD into the per-node component object
 // (full cook fidelity: every legacy field stays here verbatim). The node `name`
 // is the geom node's tree name and is set by the caller, not here.
-Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink) {
+// `is_visual` mirrors the facade projection (the node carries a
+// VisualMeshComponent vs a CollisionShapeComponent): a VISUAL geom's triangles
+// route to a .nka MESH chunk (M8.5 T5 visual-mesh cook), a colliding geom's to
+// CMSH -- ALL OTHER fields, including the "mesh" AssetRef key name, are written
+// identically, so a collision shape's on-disk bytes are UNCHANGED by this.
+Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
     Value o = Value::Object();
     o.Set("type", Value::Str(ShapeTypeName(s.type)));
     o.Set("local", TransformJson(s.local_transform));
@@ -318,9 +352,15 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink) {
     o.Set("condim", Value::Int(s.condim));
     o.Set("decompose_mode", Value::Str(DecomposeModeName(s.decompose_mode)));
     o.Set("decompose_max_pieces", Value::Int(s.decompose_max_pieces));
-    // Inline mesh geometry -> .nka CMSH chunk (deduped); store the AssetRef text.
+    // Inline mesh geometry -> .nka MESH (visual-only) / CMSH (colliding) chunk,
+    // deduped; store the AssetRef text under the same "mesh" key. Routing matches
+    // the facade projection so a non-colliding geom (the h1/go2 visual meshes)
+    // becomes a render-decodable MESH chunk, while every colliding mesh's CMSH
+    // routing -- and its on-disk bytes -- stay exactly as before.
     if (!s.mesh_vertices.empty() && !s.mesh_indices.empty()) {
-        o.Set("mesh", Value::Str(sink.AddCollisionMesh(s.mesh_vertices, s.mesh_indices)));
+        o.Set("mesh", Value::Str(is_visual
+                                     ? sink.AddVisualMesh(s.mesh_vertices, s.mesh_indices)
+                                     : sink.AddCollisionMesh(s.mesh_vertices, s.mesh_indices)));
     }
     return o;
 }
@@ -621,7 +661,8 @@ Value SaveNode(const SceneIR& scene, const NodeIndex& idx, MeshSink& sink,
     const auto sit = idx.shape.find(e);
     if (sit != idx.shape.end()) {
         const CollisionShapeRecord& s = scene.GetShape(sit->second);
-        Value shape = SaveShape(s, sink);
+        const bool is_visual = ecs.Has<VisualMeshComponent>(e);
+        Value shape = SaveShape(s, sink, is_visual);
         // The geom node name = StableAutoName("geom", id, record.name) = the
         // record name when non-empty (deduped), else "geom_<id>". Store the raw
         // record name explicitly when it differs from the node name (unnamed
@@ -635,7 +676,7 @@ Value SaveNode(const SceneIR& scene, const NodeIndex& idx, MeshSink& sink,
         // everything else to a CollisionShapeComponent. The full-fidelity record
         // is identical either way — only the key name reflects the projection so
         // the on-disk node mirrors the facade.
-        if (ecs.Has<VisualMeshComponent>(e)) {
+        if (is_visual) {
             o.Set("visual_mesh", std::move(shape));
         } else {
             o.Set("collision_shape", std::move(shape));
@@ -917,6 +958,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         //    direct geom children (sibling order) -> reproduces shape-id order.
         auto load_shape = [&](const Value& node, BodyId body_id) {
             const Value* s = node.Find("collision_shape");
+            const bool is_visual = (s == nullptr);  // visual_mesh nodes have no collision_shape
             if (!s) s = node.Find("visual_mesh");
             if (!s) return;
             CollisionShapeRecord rec;
@@ -951,8 +993,26 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 const AssetRef ref = ParseAssetRef(mesh->AsString());
                 const std::vector<uint8_t> bytes =
                     ensure_nka().LoadChunk(ref.fourcc, ref.index);
-                DecodeCollisionMesh(bytes, rec.mesh_vertices, rec.mesh_indices);
+                if (ref.fourcc == NkaTagMesh()) {
+                    // M8.5 T5: a VISUAL geom's triangles live in a MESH chunk.
+                    // Decode the source triangles back into the record (so the
+                    // SceneRoundtrip mesh-equality + cook gates hold) AND remember
+                    // the resolved AssetRef so ProjectShape can wire it onto the
+                    // VisualMeshComponent for the render consumer. The on-disk ref
+                    // stores only the basename (deterministic, location-free); we
+                    // rewrite nka_path to the full sibling .nka path here so the
+                    // render-time open_nka() resolves regardless of the CWD.
+                    const NkaMesh m = DecodeMesh(bytes);
+                    rec.mesh_vertices = m.positions;
+                    rec.mesh_indices = m.indices;
+                    AssetRef resolved = ref;
+                    resolved.nka_path = nka_path;
+                    rec.visual_mesh_ref = ToString(resolved);
+                } else {
+                    DecodeCollisionMesh(bytes, rec.mesh_vertices, rec.mesh_indices);
+                }
             }
+            (void)is_visual;  // routing is driven by the chunk fourcc above
             scene.AddCollisionShape(std::move(rec));
         };
         // Direct children of root that are geoms (orphan shapes: no body) come

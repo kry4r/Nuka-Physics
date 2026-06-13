@@ -1279,4 +1279,21 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     nuka_set_warnings(nuka_aba_cuda_probe)
+
+    # M8.5 T5: the visual-mesh cook CLI. HOST-ONLY (import -> .nks/.nka Save),
+    # routes visual-only geoms to .nka MESH chunks so robots render as real
+    # triangle geometry. Used to (re)generate examples/scenes/go2.nks etc.
+    add_executable(nuka_cook_scene
+        ${CMAKE_SOURCE_DIR}/tools/scene/cook_scene.cpp
+    )
+    target_include_directories(nuka_cook_scene
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_cook_scene
+        PRIVATE
+            nuka_import
+            nuka_scene
+    )
+    nuka_set_warnings(nuka_cook_scene)
 endif()

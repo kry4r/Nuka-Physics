@@ -73,6 +73,18 @@ struct CollisionShapeRecord {
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
 
+    // -- Visual-mesh asset reference (M8.5 T5: the visual-mesh cook) ---------
+    // For a VISUAL-only geom (contype==0 && conaffinity==0) carrying triangle
+    // geometry, .nks Save routes the triangles to a .nka MESH chunk (vs the CMSH
+    // chunk a colliding mesh uses) and stores the resolved AssetRef TEXT here at
+    // Load time ("<nka-path>#MESH/<idx>", with nka_path the full sibling path).
+    // ProjectShape parses it into VisualMeshComponent.mesh so the render consumer
+    // (render_world.cpp) decodes real triangles instead of a placeholder box.
+    // NOT serialized as a record field (the on-disk authority is the JSON "mesh"
+    // ref on the visual_mesh node); empty for collision shapes and for visual
+    // geoms with no triangles.
+    std::string           visual_mesh_ref;
+
     // -- Contact metadata (v0.8 C1a) ----------------------------------------
     // Per-SHAPE contact parameters, matching MuJoCo's per-geom semantics
     // (per-shape strictly generalizes per-material and gives a material-less

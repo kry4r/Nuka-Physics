@@ -633,11 +633,17 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
 
     // Projection: a non-colliding geom (contype==0 && conaffinity==0) is a
     // VISUAL-only mesh (the h1 finger pattern); everything else is a collision
-    // shape. Geometry itself stays record-side until M2c binds .nka refs, so the
-    // component mesh / cooked AssetRefs are left empty here.
+    // shape. M8.5 T5 (the visual-mesh cook): when the record carries a resolved
+    // MESH AssetRef (set by nks Load from the visual_mesh node's "mesh" ref), bind
+    // it onto VisualMeshComponent.mesh so the render consumer (render_world.cpp)
+    // decodes real triangles instead of a placeholder box. Empty ref => the
+    // consumer keeps the prior placeholder-box behavior (no regression).
     if (rec.contype == 0 && rec.conaffinity == 0) {
         VisualMeshComponent vis;
         vis.render_material_id = render_id;
+        if (!rec.visual_mesh_ref.empty()) {
+            vis.mesh = ParseAssetRef(rec.visual_mesh_ref);
+        }
         ecs_.Add(entity, std::move(vis));
     } else {
         CollisionShapeComponent cs;

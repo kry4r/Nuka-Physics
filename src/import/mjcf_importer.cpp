@@ -98,6 +98,12 @@ struct MjcfGeneralDefaults {
 // friction_mu default is the -1 "inherit material μ" sentinel, not MuJoCo's
 // 1.0 — so per-field presence tracking is required.)
 struct MjcfGeomDefaults {
+    // M8.5 T5: the geom `type` can be set by a <default><geom type=...> class
+    // (e.g. go2's class="visual" -> type="mesh"); the geom element itself then
+    // omits the attr. Capture it so the geom loop resolves mesh geoms whose type
+    // lives ONLY on the class default -- otherwise their STL/OBJ never loads and
+    // the visual-mesh cook produces an empty .nka.
+    bool has_type = false;          std::string type;
     bool has_contype = false;       uint32_t contype = 1;
     bool has_conaffinity = false;   uint32_t conaffinity = 1;
     bool has_group = false;         int32_t group = 0;
@@ -261,6 +267,10 @@ void ApplyGeomDefault(const tinyxml2::XMLElement* geom_elem, MjcfDefaultClass* d
     }
     MjcfGeomDefaults& g = defaults->geom;
 
+    if (const char* type_str = geom_elem->Attribute("type")) {
+        g.type = type_str;
+        g.has_type = true;
+    }
     if (geom_elem->QueryUnsignedAttribute("contype", &g.contype) == tinyxml2::XML_SUCCESS) {
         g.has_contype = true;
     }
@@ -406,9 +416,15 @@ void ParseMeshAssets(tinyxml2::XMLElement* mujoco,
 
         const char* name = mesh->Attribute("name");
         const char* file = mesh->Attribute("file");
-        if (!name || !file) {
+        if (!file) {
             continue;
         }
+        // MuJoCo rule: when <mesh> omits `name`, the mesh name DEFAULTS to the
+        // file's basename without extension (so a geom's `mesh="base_0"` resolves
+        // a <mesh file="base_0.obj"/>). go2's asset block relies on this; without
+        // it the 16 visual meshes never load and the visual-mesh cook is empty.
+        std::string mesh_name = name ? std::string(name)
+                                     : std::filesystem::path(file).stem().string();
 
         MjcfMeshAsset record;
         // std::filesystem::operator/ resets to the right operand if it is
@@ -417,7 +433,7 @@ void ParseMeshAssets(tinyxml2::XMLElement* mujoco,
         if (const char* scale = mesh->Attribute("scale")) {
             record.scale = ParseVec3(scale);
         }
-        context.mesh_assets[name] = std::move(record);
+        context.mesh_assets[mesh_name] = std::move(record);
     }
 }
 
@@ -483,7 +499,24 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         scene::CollisionShapeRecord shape;
         shape.body_id = body_id;
         shape.name = geom->Attribute("name") ? geom->Attribute("name") : "";
-        shape.type = MjcfGeomType(geom->Attribute("type"));
+
+        // Resolve the geom class FIRST so the type can fall back to the class
+        // default's type (M8.5 T5: e.g. go2's class="visual" sets type="mesh"
+        // while the geom element omits it). The contact-attr precedence below
+        // re-reads `gd` for the rest of the fields (unchanged).
+        const char* geom_class = geom->Attribute("class");
+        const MjcfGeomDefaults& gd =
+            DefaultClassOrRoot(context.defaults, geom_class ? geom_class : child_class).geom;
+        // Type precedence (low -> high): record default (Box) < class default
+        // (if authored) < the geom's own explicit `type`. An explicit geom type
+        // wins; otherwise the class default supplies it.
+        if (const char* geom_type = geom->Attribute("type")) {
+            shape.type = MjcfGeomType(geom_type);
+        } else if (gd.has_type) {
+            shape.type = MjcfGeomType(gd.type.c_str());
+        } else {
+            shape.type = MjcfGeomType(nullptr);
+        }
 
         if (const char* material_name = geom->Attribute("material")) {
             const auto it = context.material_ids.find(material_name);
@@ -565,12 +598,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         // -- C1b collision/contact attributes --------------------------------
         // Precedence (low -> high): the CollisionShapeRecord's C1a defaults
         // (already MuJoCo's) < the resolved <default> class's <geom> attrs
-        // (presence-gated) < the geom's own explicit attrs. Geom class resolves
-        // exactly like joints: the geom's own `class` attr, else the body's
-        // (inherited) `childclass`.
-        const char* geom_class = geom->Attribute("class");
-        const MjcfGeomDefaults& gd =
-            DefaultClassOrRoot(context.defaults, geom_class ? geom_class : child_class).geom;
+        // (presence-gated) < the geom's own explicit attrs. `gd` (the resolved
+        // geom-class default) was bound above for the type fallback; reuse it.
         if (gd.has_contype)     { shape.contype = gd.contype; }
         if (gd.has_conaffinity) { shape.conaffinity = gd.conaffinity; }
         if (gd.has_group)       { shape.collision_group = gd.group; }

@@ -1,0 +1,4086 @@
+{
+  "nks_version": 1,
+  "physics_materials": {
+    "metal": {
+      "static_friction": 1.0,
+      "dynamic_friction": 1.0
+    },
+    "black": {
+      "static_friction": 1.0,
+      "dynamic_friction": 1.0
+    },
+    "white": {
+      "static_friction": 1.0,
+      "dynamic_friction": 1.0
+    },
+    "gray": {
+      "static_friction": 1.0,
+      "dynamic_friction": 1.0
+    }
+  },
+  "render_materials": {
+    "metal": {
+      "base_color": [
+        0.899999976,
+        0.949999988,
+        0.949999988,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    },
+    "black": {
+      "base_color": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    },
+    "white": {
+      "base_color": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    },
+    "gray": {
+      "base_color": [
+        0.671705008,
+        0.692426026,
+        0.774269998,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.5
+    }
+  },
+  "tree": [
+    {
+      "name": "base",
+      "transform": {
+        "pos": [
+          0.0,
+          0.0,
+          0.444999993
+        ],
+        "quat": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "rigid_body": {
+        "parent_id": 4294967295,
+        "inertial": {
+          "pos": [
+            0.0211120006,
+            0.0,
+            -0.00536599988
+          ],
+          "quat": [
+            -0.000543471018,
+            0.713434994,
+            -0.00173768995,
+            0.700718999
+          ]
+        },
+        "mass": 6.921,
+        "inertia": [
+          0.107027002,
+          0.0980771035,
+          0.0244530998
+        ],
+        "is_static": false
+      },
+      "children": [
+        {
+          "name": "geom_0",
+          "visual_mesh": {
+            "type": "trimesh",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 1,
+            "contype": 0,
+            "conaffinity": 0,
+            "collision_group": 2,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "mesh": "go2.nka#MESH/0",
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_1",
+          "visual_mesh": {
+            "type": "trimesh",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 1,
+            "contype": 0,
+            "conaffinity": 0,
+            "collision_group": 2,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "mesh": "go2.nka#MESH/1",
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_2",
+          "visual_mesh": {
+            "type": "trimesh",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 1,
+            "contype": 0,
+            "conaffinity": 0,
+            "collision_group": 2,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "mesh": "go2.nka#MESH/2",
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_3",
+          "visual_mesh": {
+            "type": "trimesh",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 2,
+            "contype": 0,
+            "conaffinity": 0,
+            "collision_group": 2,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "mesh": "go2.nka#MESH/3",
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_4",
+          "visual_mesh": {
+            "type": "trimesh",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 3,
+            "contype": 0,
+            "conaffinity": 0,
+            "collision_group": 2,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "mesh": "go2.nka#MESH/4",
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_5",
+          "collision_shape": {
+            "type": "box",
+            "local": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.188099995,
+              0.0467500016,
+              0.057
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 4294967295,
+            "contype": 1,
+            "conaffinity": 1,
+            "collision_group": 3,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_6",
+          "collision_shape": {
+            "type": "capsule",
+            "local": {
+              "pos": [
+                0.284999996,
+                0.0,
+                0.00999999978
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "radius": 0.0500000007,
+            "half_height": 0.0450000018,
+            "material_id": 4294967295,
+            "contype": 1,
+            "conaffinity": 1,
+            "collision_group": 3,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "geom_7",
+          "collision_shape": {
+            "type": "box",
+            "local": {
+              "pos": [
+                0.293000013,
+                0.0,
+                -0.0599999987
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "half_extents": [
+              0.0469999984,
+              0.0,
+              0.0
+            ],
+            "radius": 0.5,
+            "half_height": 0.5,
+            "material_id": 4294967295,
+            "contype": 1,
+            "conaffinity": 1,
+            "collision_group": 3,
+            "solref": [
+              0.0199999996,
+              1.0
+            ],
+            "solimp": [
+              0.899999976,
+              0.949999988,
+              0.00100000005,
+              0.5,
+              2.0
+            ],
+            "friction_mu": 0.600000024,
+            "priority": 0,
+            "solmix": 1.0,
+            "margin": 0.00100000005,
+            "gap": 0.0,
+            "condim": 1,
+            "decompose_mode": "auto",
+            "decompose_max_pieces": 32,
+            "record_name": ""
+          },
+          "children": []
+        },
+        {
+          "name": "FL_hip",
+          "transform": {
+            "pos": [
+              0.193399996,
+              0.0465000011,
+              0.0
+            ],
+            "quat": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 0,
+            "inertial": {
+              "pos": [
+                -0.00540000014,
+                0.00193999999,
+                -0.000104999999
+              ],
+              "quat": [
+                0.497013927,
+                0.499244928,
+                0.505461931,
+                0.498236954
+              ]
+            },
+            "mass": 0.677999973,
+            "inertia": [
+              0.000884030014,
+              0.000596003025,
+              0.000479967013
+            ],
+            "is_static": false
+          },
+          "joint": {
+            "name": "FL_hip_joint",
+            "type": "revolute",
+            "parent_body": 0,
+            "child_body": 1,
+            "axis": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "parent_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "child_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "lower_limit": -1.04719996,
+            "upper_limit": 1.04719996,
+            "damping": 2.0,
+            "armature": 0.00999999978,
+            "stiffness": 0.0,
+            "initial_position": 0.0
+          },
+          "actuator": {
+            "name": "FL_hip",
+            "type": "motor",
+            "joint_id": 0,
+            "gain": 1.0,
+            "force_limit": 0.0
+          },
+          "children": [
+            {
+              "name": "geom_8",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 0,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/5",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_9",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 3,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/6",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_10",
+              "collision_shape": {
+                "type": "capsule",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0799999982,
+                    0.0
+                  ],
+                  "quat": [
+                    0.707106769,
+                    0.707106769,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.0460000001,
+                "half_height": 0.0199999996,
+                "material_id": 4294967295,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 3,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "FL_thigh",
+              "transform": {
+                "pos": [
+                  0.0,
+                  0.0954999998,
+                  0.0
+                ],
+                "quat": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "rigid_body": {
+                "parent_id": 1,
+                "inertial": {
+                  "pos": [
+                    -0.00374000007,
+                    -0.0222999994,
+                    -0.0326999985
+                  ],
+                  "quat": [
+                    0.829532862,
+                    0.0847634897,
+                    -0.0200631972,
+                    0.551622927
+                  ]
+                },
+                "mass": 1.15199995,
+                "inertia": [
+                  0.00594973005,
+                  0.00584148988,
+                  0.000878787017
+                ],
+                "is_static": false
+              },
+              "joint": {
+                "name": "FL_thigh_joint",
+                "type": "revolute",
+                "parent_body": 1,
+                "child_body": 2,
+                "axis": [
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                "parent_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "child_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "lower_limit": -1.57079995,
+                "upper_limit": 3.49070001,
+                "damping": 2.0,
+                "armature": 0.00999999978,
+                "stiffness": 0.0,
+                "initial_position": 0.0
+              },
+              "actuator": {
+                "name": "FL_thigh",
+                "type": "motor",
+                "joint_id": 1,
+                "gain": 1.0,
+                "force_limit": 0.0
+              },
+              "children": [
+                {
+                  "name": "geom_11",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 0,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/7",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_12",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 3,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/8",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_13",
+                  "collision_shape": {
+                    "type": "box",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        -0.1065
+                      ],
+                      "quat": [
+                        0.707106829,
+                        0.0,
+                        0.707106829,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.1065,
+                      0.0122499997,
+                      0.0170000009
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 4294967295,
+                    "contype": 1,
+                    "conaffinity": 1,
+                    "collision_group": 3,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "FL_calf",
+                  "transform": {
+                    "pos": [
+                      0.0,
+                      0.0,
+                      -0.213
+                    ],
+                    "quat": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ]
+                  },
+                  "rigid_body": {
+                    "parent_id": 2,
+                    "inertial": {
+                      "pos": [
+                        0.00629595015,
+                        -0.000622120977,
+                        -0.141416997
+                      ],
+                      "quat": [
+                        0.710671663,
+                        0.00154098927,
+                        -0.0045008678,
+                        0.703507662
+                      ]
+                    },
+                    "mass": 0.241352007,
+                    "inertia": [
+                      0.00149010005,
+                      0.00146356004,
+                      5.31397018e-05
+                    ],
+                    "is_static": false
+                  },
+                  "joint": {
+                    "name": "FL_calf_joint",
+                    "type": "revolute",
+                    "parent_body": 2,
+                    "child_body": 3,
+                    "axis": [
+                      0.0,
+                      1.0,
+                      0.0
+                    ],
+                    "parent_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "child_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "lower_limit": -2.72270012,
+                    "upper_limit": -0.837759972,
+                    "damping": 2.0,
+                    "armature": 0.00999999978,
+                    "stiffness": 0.0,
+                    "initial_position": 0.0
+                  },
+                  "actuator": {
+                    "name": "FL_calf",
+                    "type": "motor",
+                    "joint_id": 2,
+                    "gain": 1.0,
+                    "force_limit": 0.0
+                  },
+                  "children": [
+                    {
+                      "name": "geom_14",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 3,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/9",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_15",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/10",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_16",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.00800000038,
+                            0.0,
+                            -0.0599999987
+                          ],
+                          "quat": [
+                            0.99449265,
+                            0.0,
+                            -0.10480696,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0120000001,
+                        "half_height": 0.0599999987,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_17",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.0199999996,
+                            0.0,
+                            -0.148000002
+                          ],
+                          "quat": [
+                            0.999687552,
+                            0.0,
+                            0.0249973889,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0109999999,
+                        "half_height": 0.0324999988,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_18",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            -0.213
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/11",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "FL",
+                      "collision_shape": {
+                        "type": "box",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.0149999997,
+                          1.0,
+                          0.0219999999,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.800000012,
+                        "priority": 1,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 6,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32
+                      },
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FR_hip",
+          "transform": {
+            "pos": [
+              0.193399996,
+              -0.0465000011,
+              0.0
+            ],
+            "quat": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 0,
+            "inertial": {
+              "pos": [
+                -0.00540000014,
+                -0.00193999999,
+                -0.000104999999
+              ],
+              "quat": [
+                0.498236954,
+                0.505461931,
+                0.499244928,
+                0.497013927
+              ]
+            },
+            "mass": 0.677999973,
+            "inertia": [
+              0.000884030014,
+              0.000596003025,
+              0.000479967013
+            ],
+            "is_static": false
+          },
+          "joint": {
+            "name": "FR_hip_joint",
+            "type": "revolute",
+            "parent_body": 0,
+            "child_body": 4,
+            "axis": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "parent_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "child_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "lower_limit": -1.04719996,
+            "upper_limit": 1.04719996,
+            "damping": 2.0,
+            "armature": 0.00999999978,
+            "stiffness": 0.0,
+            "initial_position": 0.0
+          },
+          "actuator": {
+            "name": "FR_hip",
+            "type": "motor",
+            "joint_id": 3,
+            "gain": 1.0,
+            "force_limit": 0.0
+          },
+          "children": [
+            {
+              "name": "geom_20",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    4.63268007e-05,
+                    1.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 0,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/5",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_21",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    4.63268007e-05,
+                    1.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 3,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/6",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_22",
+              "collision_shape": {
+                "type": "capsule",
+                "local": {
+                  "pos": [
+                    0.0,
+                    -0.0799999982,
+                    0.0
+                  ],
+                  "quat": [
+                    0.707106829,
+                    0.707106829,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.0460000001,
+                "half_height": 0.0199999996,
+                "material_id": 4294967295,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 3,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "FR_thigh",
+              "transform": {
+                "pos": [
+                  0.0,
+                  -0.0954999998,
+                  0.0
+                ],
+                "quat": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "rigid_body": {
+                "parent_id": 4,
+                "inertial": {
+                  "pos": [
+                    -0.00374000007,
+                    0.0222999994,
+                    -0.0326999985
+                  ],
+                  "quat": [
+                    0.551622927,
+                    -0.0200631972,
+                    0.0847634897,
+                    0.829532862
+                  ]
+                },
+                "mass": 1.15199995,
+                "inertia": [
+                  0.00594973005,
+                  0.00584148988,
+                  0.000878787017
+                ],
+                "is_static": false
+              },
+              "joint": {
+                "name": "FR_thigh_joint",
+                "type": "revolute",
+                "parent_body": 4,
+                "child_body": 5,
+                "axis": [
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                "parent_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "child_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "lower_limit": -1.57079995,
+                "upper_limit": 3.49070001,
+                "damping": 2.0,
+                "armature": 0.00999999978,
+                "stiffness": 0.0,
+                "initial_position": 0.0
+              },
+              "actuator": {
+                "name": "FR_thigh",
+                "type": "motor",
+                "joint_id": 4,
+                "gain": 1.0,
+                "force_limit": 0.0
+              },
+              "children": [
+                {
+                  "name": "geom_23",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 0,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/12",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_24",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 3,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/13",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_25",
+                  "collision_shape": {
+                    "type": "box",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        -0.1065
+                      ],
+                      "quat": [
+                        0.707106829,
+                        0.0,
+                        0.707106829,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.1065,
+                      0.0122499997,
+                      0.0170000009
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 4294967295,
+                    "contype": 1,
+                    "conaffinity": 1,
+                    "collision_group": 3,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "FR_calf",
+                  "transform": {
+                    "pos": [
+                      0.0,
+                      0.0,
+                      -0.213
+                    ],
+                    "quat": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ]
+                  },
+                  "rigid_body": {
+                    "parent_id": 5,
+                    "inertial": {
+                      "pos": [
+                        0.00629595015,
+                        0.000622120977,
+                        -0.141416997
+                      ],
+                      "quat": [
+                        0.703507662,
+                        -0.0045008678,
+                        0.00154098927,
+                        0.710671663
+                      ]
+                    },
+                    "mass": 0.241352007,
+                    "inertia": [
+                      0.00149010005,
+                      0.00146356004,
+                      5.31397018e-05
+                    ],
+                    "is_static": false
+                  },
+                  "joint": {
+                    "name": "FR_calf_joint",
+                    "type": "revolute",
+                    "parent_body": 5,
+                    "child_body": 6,
+                    "axis": [
+                      0.0,
+                      1.0,
+                      0.0
+                    ],
+                    "parent_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "child_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "lower_limit": -2.72270012,
+                    "upper_limit": -0.837759972,
+                    "damping": 2.0,
+                    "armature": 0.00999999978,
+                    "stiffness": 0.0,
+                    "initial_position": 0.0
+                  },
+                  "actuator": {
+                    "name": "FR_calf",
+                    "type": "motor",
+                    "joint_id": 5,
+                    "gain": 1.0,
+                    "force_limit": 0.0
+                  },
+                  "children": [
+                    {
+                      "name": "geom_26",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 3,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/14",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_27",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/15",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_28",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.00999999978,
+                            0.0,
+                            -0.0599999987
+                          ],
+                          "quat": [
+                            0.995004177,
+                            0.0,
+                            -0.099833414,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0130000003,
+                        "half_height": 0.0599999987,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_29",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.0199999996,
+                            0.0,
+                            -0.148000002
+                          ],
+                          "quat": [
+                            0.999687552,
+                            0.0,
+                            0.0249973889,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0109999999,
+                        "half_height": 0.0324999988,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_30",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            -0.213
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/11",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "FR",
+                      "collision_shape": {
+                        "type": "box",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.0149999997,
+                          1.0,
+                          0.0219999999,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.800000012,
+                        "priority": 1,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 6,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32
+                      },
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "RL_hip",
+          "transform": {
+            "pos": [
+              -0.193399996,
+              0.0465000011,
+              0.0
+            ],
+            "quat": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 0,
+            "inertial": {
+              "pos": [
+                0.00540000014,
+                0.00193999999,
+                -0.000104999999
+              ],
+              "quat": [
+                0.505461931,
+                0.498236954,
+                0.497013927,
+                0.499244928
+              ]
+            },
+            "mass": 0.677999973,
+            "inertia": [
+              0.000884030014,
+              0.000596003025,
+              0.000479967013
+            ],
+            "is_static": false
+          },
+          "joint": {
+            "name": "RL_hip_joint",
+            "type": "revolute",
+            "parent_body": 0,
+            "child_body": 7,
+            "axis": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "parent_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "child_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "lower_limit": -1.04719996,
+            "upper_limit": 1.04719996,
+            "damping": 2.0,
+            "armature": 0.00999999978,
+            "stiffness": 0.0,
+            "initial_position": 0.0
+          },
+          "actuator": {
+            "name": "RL_hip",
+            "type": "motor",
+            "joint_id": 6,
+            "gain": 1.0,
+            "force_limit": 0.0
+          },
+          "children": [
+            {
+              "name": "geom_32",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    4.63268007e-05,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 0,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/5",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_33",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    4.63268007e-05,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 3,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/6",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_34",
+              "collision_shape": {
+                "type": "capsule",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0799999982,
+                    0.0
+                  ],
+                  "quat": [
+                    0.707106829,
+                    0.707106829,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.0460000001,
+                "half_height": 0.0199999996,
+                "material_id": 4294967295,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 3,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "RL_thigh",
+              "transform": {
+                "pos": [
+                  0.0,
+                  0.0954999998,
+                  0.0
+                ],
+                "quat": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "rigid_body": {
+                "parent_id": 7,
+                "inertial": {
+                  "pos": [
+                    -0.00374000007,
+                    -0.0222999994,
+                    -0.0326999985
+                  ],
+                  "quat": [
+                    0.829532862,
+                    0.0847634897,
+                    -0.0200631972,
+                    0.551622927
+                  ]
+                },
+                "mass": 1.15199995,
+                "inertia": [
+                  0.00594973005,
+                  0.00584148988,
+                  0.000878787017
+                ],
+                "is_static": false
+              },
+              "joint": {
+                "name": "RL_thigh_joint",
+                "type": "revolute",
+                "parent_body": 7,
+                "child_body": 8,
+                "axis": [
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                "parent_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "child_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "lower_limit": -0.523599982,
+                "upper_limit": 4.53789997,
+                "damping": 2.0,
+                "armature": 0.00999999978,
+                "stiffness": 0.0,
+                "initial_position": 0.0
+              },
+              "actuator": {
+                "name": "RL_thigh",
+                "type": "motor",
+                "joint_id": 7,
+                "gain": 1.0,
+                "force_limit": 0.0
+              },
+              "children": [
+                {
+                  "name": "geom_35",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 0,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/7",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_36",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 3,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/8",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_37",
+                  "collision_shape": {
+                    "type": "box",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        -0.1065
+                      ],
+                      "quat": [
+                        0.707106829,
+                        0.0,
+                        0.707106829,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.1065,
+                      0.0122499997,
+                      0.0170000009
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 4294967295,
+                    "contype": 1,
+                    "conaffinity": 1,
+                    "collision_group": 3,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "RL_calf",
+                  "transform": {
+                    "pos": [
+                      0.0,
+                      0.0,
+                      -0.213
+                    ],
+                    "quat": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ]
+                  },
+                  "rigid_body": {
+                    "parent_id": 8,
+                    "inertial": {
+                      "pos": [
+                        0.00629595015,
+                        -0.000622120977,
+                        -0.141416997
+                      ],
+                      "quat": [
+                        0.710671663,
+                        0.00154098927,
+                        -0.0045008678,
+                        0.703507662
+                      ]
+                    },
+                    "mass": 0.241352007,
+                    "inertia": [
+                      0.00149010005,
+                      0.00146356004,
+                      5.31397018e-05
+                    ],
+                    "is_static": false
+                  },
+                  "joint": {
+                    "name": "RL_calf_joint",
+                    "type": "revolute",
+                    "parent_body": 8,
+                    "child_body": 9,
+                    "axis": [
+                      0.0,
+                      1.0,
+                      0.0
+                    ],
+                    "parent_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "child_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "lower_limit": -2.72270012,
+                    "upper_limit": -0.837759972,
+                    "damping": 2.0,
+                    "armature": 0.00999999978,
+                    "stiffness": 0.0,
+                    "initial_position": 0.0
+                  },
+                  "actuator": {
+                    "name": "RL_calf",
+                    "type": "motor",
+                    "joint_id": 8,
+                    "gain": 1.0,
+                    "force_limit": 0.0
+                  },
+                  "children": [
+                    {
+                      "name": "geom_38",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 3,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/9",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_39",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/10",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_40",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.00999999978,
+                            0.0,
+                            -0.0599999987
+                          ],
+                          "quat": [
+                            0.995004177,
+                            0.0,
+                            -0.099833414,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0130000003,
+                        "half_height": 0.0599999987,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_41",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.0199999996,
+                            0.0,
+                            -0.148000002
+                          ],
+                          "quat": [
+                            0.999687552,
+                            0.0,
+                            0.0249973889,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0109999999,
+                        "half_height": 0.0324999988,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_42",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            -0.213
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/11",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "RL",
+                      "collision_shape": {
+                        "type": "box",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.0149999997,
+                          1.0,
+                          0.0219999999,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.800000012,
+                        "priority": 1,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 6,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32
+                      },
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "RR_hip",
+          "transform": {
+            "pos": [
+              -0.193399996,
+              -0.0465000011,
+              0.0
+            ],
+            "quat": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "rigid_body": {
+            "parent_id": 0,
+            "inertial": {
+              "pos": [
+                0.00540000014,
+                -0.00193999999,
+                -0.000104999999
+              ],
+              "quat": [
+                0.499244928,
+                0.497013927,
+                0.498236954,
+                0.505461931
+              ]
+            },
+            "mass": 0.677999973,
+            "inertia": [
+              0.000884030014,
+              0.000596003025,
+              0.000479967013
+            ],
+            "is_static": false
+          },
+          "joint": {
+            "name": "RR_hip_joint",
+            "type": "revolute",
+            "parent_body": 0,
+            "child_body": 10,
+            "axis": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "parent_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "child_frame": {
+              "pos": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "quat": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "lower_limit": -1.04719996,
+            "upper_limit": 1.04719996,
+            "damping": 2.0,
+            "armature": 0.00999999978,
+            "stiffness": 0.0,
+            "initial_position": 0.0
+          },
+          "actuator": {
+            "name": "RR_hip",
+            "type": "motor",
+            "joint_id": 9,
+            "gain": 1.0,
+            "force_limit": 0.0
+          },
+          "children": [
+            {
+              "name": "geom_44",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    2.14616991e-09,
+                    4.63268007e-05,
+                    4.63268007e-05,
+                    -1.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 0,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/5",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_45",
+              "visual_mesh": {
+                "type": "trimesh",
+                "local": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    2.14616991e-09,
+                    4.63268007e-05,
+                    4.63268007e-05,
+                    -1.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.5,
+                "half_height": 0.5,
+                "material_id": 3,
+                "contype": 0,
+                "conaffinity": 0,
+                "collision_group": 2,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "mesh": "go2.nka#MESH/6",
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "geom_46",
+              "collision_shape": {
+                "type": "capsule",
+                "local": {
+                  "pos": [
+                    0.0,
+                    -0.0799999982,
+                    0.0
+                  ],
+                  "quat": [
+                    0.707106829,
+                    0.707106829,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "half_extents": [
+                  0.5,
+                  0.5,
+                  0.5
+                ],
+                "radius": 0.0460000001,
+                "half_height": 0.0199999996,
+                "material_id": 4294967295,
+                "contype": 1,
+                "conaffinity": 1,
+                "collision_group": 3,
+                "solref": [
+                  0.0199999996,
+                  1.0
+                ],
+                "solimp": [
+                  0.899999976,
+                  0.949999988,
+                  0.00100000005,
+                  0.5,
+                  2.0
+                ],
+                "friction_mu": 0.600000024,
+                "priority": 0,
+                "solmix": 1.0,
+                "margin": 0.00100000005,
+                "gap": 0.0,
+                "condim": 1,
+                "decompose_mode": "auto",
+                "decompose_max_pieces": 32,
+                "record_name": ""
+              },
+              "children": []
+            },
+            {
+              "name": "RR_thigh",
+              "transform": {
+                "pos": [
+                  0.0,
+                  -0.0954999998,
+                  0.0
+                ],
+                "quat": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "rigid_body": {
+                "parent_id": 10,
+                "inertial": {
+                  "pos": [
+                    -0.00374000007,
+                    0.0222999994,
+                    -0.0326999985
+                  ],
+                  "quat": [
+                    0.551622927,
+                    -0.0200631972,
+                    0.0847634897,
+                    0.829532862
+                  ]
+                },
+                "mass": 1.15199995,
+                "inertia": [
+                  0.00594973005,
+                  0.00584148988,
+                  0.000878787017
+                ],
+                "is_static": false
+              },
+              "joint": {
+                "name": "RR_thigh_joint",
+                "type": "revolute",
+                "parent_body": 10,
+                "child_body": 11,
+                "axis": [
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                "parent_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "child_frame": {
+                  "pos": [
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  "quat": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ]
+                },
+                "lower_limit": -0.523599982,
+                "upper_limit": 4.53789997,
+                "damping": 2.0,
+                "armature": 0.00999999978,
+                "stiffness": 0.0,
+                "initial_position": 0.0
+              },
+              "actuator": {
+                "name": "RR_thigh",
+                "type": "motor",
+                "joint_id": 10,
+                "gain": 1.0,
+                "force_limit": 0.0
+              },
+              "children": [
+                {
+                  "name": "geom_47",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 0,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/12",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_48",
+                  "visual_mesh": {
+                    "type": "trimesh",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.5,
+                      0.5,
+                      0.5
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 3,
+                    "contype": 0,
+                    "conaffinity": 0,
+                    "collision_group": 2,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "mesh": "go2.nka#MESH/13",
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "geom_49",
+                  "collision_shape": {
+                    "type": "box",
+                    "local": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        -0.1065
+                      ],
+                      "quat": [
+                        0.707106829,
+                        0.0,
+                        0.707106829,
+                        0.0
+                      ]
+                    },
+                    "half_extents": [
+                      0.1065,
+                      0.0122499997,
+                      0.0170000009
+                    ],
+                    "radius": 0.5,
+                    "half_height": 0.5,
+                    "material_id": 4294967295,
+                    "contype": 1,
+                    "conaffinity": 1,
+                    "collision_group": 3,
+                    "solref": [
+                      0.0199999996,
+                      1.0
+                    ],
+                    "solimp": [
+                      0.899999976,
+                      0.949999988,
+                      0.00100000005,
+                      0.5,
+                      2.0
+                    ],
+                    "friction_mu": 0.600000024,
+                    "priority": 0,
+                    "solmix": 1.0,
+                    "margin": 0.00100000005,
+                    "gap": 0.0,
+                    "condim": 1,
+                    "decompose_mode": "auto",
+                    "decompose_max_pieces": 32,
+                    "record_name": ""
+                  },
+                  "children": []
+                },
+                {
+                  "name": "RR_calf",
+                  "transform": {
+                    "pos": [
+                      0.0,
+                      0.0,
+                      -0.213
+                    ],
+                    "quat": [
+                      1.0,
+                      0.0,
+                      0.0,
+                      0.0
+                    ]
+                  },
+                  "rigid_body": {
+                    "parent_id": 11,
+                    "inertial": {
+                      "pos": [
+                        0.00629595015,
+                        0.000622120977,
+                        -0.141416997
+                      ],
+                      "quat": [
+                        0.703507662,
+                        -0.0045008678,
+                        0.00154098927,
+                        0.710671663
+                      ]
+                    },
+                    "mass": 0.241352007,
+                    "inertia": [
+                      0.00149010005,
+                      0.00146356004,
+                      5.31397018e-05
+                    ],
+                    "is_static": false
+                  },
+                  "joint": {
+                    "name": "RR_calf_joint",
+                    "type": "revolute",
+                    "parent_body": 11,
+                    "child_body": 12,
+                    "axis": [
+                      0.0,
+                      1.0,
+                      0.0
+                    ],
+                    "parent_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "child_frame": {
+                      "pos": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "quat": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ]
+                    },
+                    "lower_limit": -2.72270012,
+                    "upper_limit": -0.837759972,
+                    "damping": 2.0,
+                    "armature": 0.00999999978,
+                    "stiffness": 0.0,
+                    "initial_position": 0.0
+                  },
+                  "actuator": {
+                    "name": "RR_calf",
+                    "type": "motor",
+                    "joint_id": 11,
+                    "gain": 1.0,
+                    "force_limit": 0.0
+                  },
+                  "children": [
+                    {
+                      "name": "geom_50",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 3,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/14",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_51",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/15",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_52",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.00999999978,
+                            0.0,
+                            -0.0599999987
+                          ],
+                          "quat": [
+                            0.995004177,
+                            0.0,
+                            -0.099833414,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0130000003,
+                        "half_height": 0.0599999987,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_53",
+                      "collision_shape": {
+                        "type": "capsule",
+                        "local": {
+                          "pos": [
+                            0.0199999996,
+                            0.0,
+                            -0.148000002
+                          ],
+                          "quat": [
+                            0.999687552,
+                            0.0,
+                            0.0249973889,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.0109999999,
+                        "half_height": 0.0324999988,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "geom_54",
+                      "visual_mesh": {
+                        "type": "trimesh",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            -0.213
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 1,
+                        "contype": 0,
+                        "conaffinity": 0,
+                        "collision_group": 2,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.899999976,
+                          0.949999988,
+                          0.00100000005,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.600000024,
+                        "priority": 0,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 1,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32,
+                        "mesh": "go2.nka#MESH/11",
+                        "record_name": ""
+                      },
+                      "children": []
+                    },
+                    {
+                      "name": "RR",
+                      "collision_shape": {
+                        "type": "box",
+                        "local": {
+                          "pos": [
+                            0.0,
+                            0.0,
+                            0.0
+                          ],
+                          "quat": [
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0
+                          ]
+                        },
+                        "half_extents": [
+                          0.5,
+                          0.5,
+                          0.5
+                        ],
+                        "radius": 0.5,
+                        "half_height": 0.5,
+                        "material_id": 4294967295,
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "collision_group": 3,
+                        "solref": [
+                          0.0199999996,
+                          1.0
+                        ],
+                        "solimp": [
+                          0.0149999997,
+                          1.0,
+                          0.0219999999,
+                          0.5,
+                          2.0
+                        ],
+                        "friction_mu": 0.800000012,
+                        "priority": 1,
+                        "solmix": 1.0,
+                        "margin": 0.00100000005,
+                        "gap": 0.0,
+                        "condim": 6,
+                        "decompose_mode": "auto",
+                        "decompose_max_pieces": 32
+                      },
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "sensors": [],
+  "exclude_pairs": [],
+  "contact_pairs": []
+}
