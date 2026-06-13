@@ -150,8 +150,8 @@ CupSnap SnapCup(nk::World& w, uint32_t links, uint32_t cup_local) {
     return s;
 }
 
-// Inject a velocity impulse on the cup (the nk equivalent of
-// UnifiedCoResidentStepper::ApplyCupImpulse: dv on linear, dw on angular,
+// Inject a velocity impulse on the cup (the nk equivalent of the legacy
+// coresident stepper's ApplyCupImpulse: dv on linear, dw on angular,
 // applied BEFORE the next Step()'s contact phase).
 void ApplyCupImpulse(nk::World& w, uint32_t cup_local, const Vec3& dv,
                      const Vec3& dw) {
@@ -269,8 +269,8 @@ nk::Pipeline::SolverConfig UnionCfg(float dt) {
     return cfg;
 }
 
-// Seed the per-link torque buffer with the template grip torque (the
-// BatchedUnifiedWorld action_torque_host_ init the parity gate mirrors).
+// Seed the per-link torque buffer with the template grip torque (the legacy
+// coresident world's action_torque_host_ init the parity gate mirrors).
 std::vector<float> InitTorque(const CookedWorld& cw) {
     std::vector<float> t(cw.links, 0.0f);
     const auto& g = cw.cooked.tmpl.grip_torque;

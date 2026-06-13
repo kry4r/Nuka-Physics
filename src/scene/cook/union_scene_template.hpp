@@ -3,31 +3,27 @@
 // nuka::runtime::coresident -- H1UnionDriveEntry + UnionSceneTemplate.
 //
 // COOK-PRODUCT PLAIN-DATA STRUCTS, relocated here in M9 T3 (controller
-// refinement) out of the DOOMED src/runtime/coresident/batched_unified_world.hpp.
+// refinement) out of the (now-deleted) legacy coresident union-world header.
 // They are the PRODUCT TYPES of the .nks union cook (src/scene/cook/union_cook,
 // CookSceneToUnionTemplate -> CookedUnionScene.tmpl IS a UnionSceneTemplate,
-// .drive_hold/rest/close ARE std::vector<H1UnionDriveEntry>), consumed identically
-// by BuildNkUnionModel + BatchedUnifiedWorld + the C-ABI union/grasp worlds + the
-// parity/perf/grasp gates. They are PLAIN DATA -- no kernels, no device handles,
-// no phi::Buffer, no CUDA types -- which is exactly WHY they can live under
-// src/scene/cook (the host-only cook directory) while their old home in the
-// coresident dir is deleted.
+// .drive_hold/rest/close ARE std::vector<H1UnionDriveEntry>), consumed by
+// BuildNkUnionModel + the C-ABI union/grasp worlds + the parity/perf/grasp gates.
+// They are PLAIN DATA -- no kernels, no device handles, no phi::Buffer, no CUDA
+// types -- which is exactly WHY they can live under src/scene/cook (the host-only
+// cook directory) now that the old coresident dir is deleted.
 //
-// WHY THE MOVE. M9 deletes the coresident directory WHOLE (incl. the
-// BatchedUnifiedWorld class) at T11. union_cook MUST NOT depend on that doomed
-// directory (the decouple), and the C-ABI union path + the surviving union gates
-// must keep reading these product types. Relocating the two plain-data structs
-// here (a structural move ONLY -- byte-identical field layout, same order, same
-// types, same nuka::runtime::coresident namespace so every consumer's
-// `coresident::` qualifier keeps resolving) unblocks the coresident-dir delete
-// without building the not-yet-existent native CookToModel->UnionCsr cook.
+// WHY THE MOVE. M9 deleted the legacy coresident directory WHOLE at T11. union_cook
+// MUST NOT depend on that doomed directory (the decouple), and the C-ABI union path
+// + the surviving union gates must keep reading these product types. Relocating the
+// two plain-data structs here (a structural move ONLY -- byte-identical field
+// layout, same order, same types, same nuka::runtime::coresident namespace so every
+// consumer's `coresident::` qualifier keeps resolving) unblocked the coresident-dir
+// delete without building the not-yet-existent native CookToModel->UnionCsr cook.
 //
 // LIFETIME. Alive until the union path migrates to the native nk cook (the M9 exit
 // gate zeroes UnionSceneTemplate's grep when CookToModel->UnionCsr lands). The
-// coresident dir + the BatchedUnifiedWorld class die at T11; these structs survive
-// here (still consumed) until that native cook replaces them. The transitional
-// batched_unified_world.hpp #includes THIS header (it no longer DEFINES these
-// structs but still SEES them, since BatchedUnifiedWorld consumes them).
+// legacy coresident dir is deleted (T11-core-b2); these structs survive here (still
+// consumed) until that native cook replaces them.
 //
 // NAMESPACE NOTE. Kept in nuka::runtime::coresident (NOT moved to
 // nuka::scene::cook) ON PURPOSE: the structs reference the CoResident* descriptors
@@ -49,9 +45,9 @@
 namespace nuka::runtime::coresident {
 
 // The cup XY reset-jitter half-box default (m, ~+/-2.5 cm). Hoisted to namespace
-// scope so UnionSceneTemplate (defined before BatchedUnifiedWorld) can default its
-// per-axis jitter fields to it, AND so BatchedUnifiedWorld::kResetCupJitterM (the
-// named constant the gate test reads) can alias it -- the SAME literal both places.
+// scope so UnionSceneTemplate can default its per-axis jitter fields to it. (It
+// formerly also aliased the legacy coresident world's kResetCupJitterM constant,
+// which is gone with that class -- the literal now lives only here.)
 inline constexpr float kDefaultResetCupJitterM = 0.025f;
 
 // One entry of a reference PD drive table (the python-facing choreography seam):
@@ -109,8 +105,8 @@ struct UnionSceneTemplate {
     // Each step: re-apply the constant grip torque to tau (the drive path) -> ABA ->
     // velocity integrate (gripper + cup gravity kick) -> per-finger sphere x cup-hull
     // narrowphase -> EmitCompliantContactRows(condim=3) -> per-row finger chain-J +
-    // cup body index -> ONE UnifiedSolve -> scatter qdot -> position integrate. This
-    // is the N=1 batched analog of UnifiedCoResidentStepper::StepGrasp (the validated
+    // cup body index -> ONE union solve -> scatter qdot -> position integrate. This
+    // is the N=1 batched analog of the legacy coresident grasp step (the validated
     // oracle); P2.3b adds an env loop + env-major tile concatenation, no restructure.
     bool has_grasp = false;  // false -> NO grasp (P2.1/P2.2 path preserved byte-exact).
 

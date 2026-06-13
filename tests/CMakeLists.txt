@@ -465,14 +465,16 @@ target_link_libraries(nuka_compliant_rows_test
 gtest_discover_tests(nuka_compliant_rows_test)
 
 # --- Solver tests ----------------------------------------------------------
+# M9 T11-core-b2: test_row_scheduler_bridge.cpp (legacy BuildRowColorPartitions +
+# DiffTestBridge/row_solver.cu replay) and test_row_scheduler_coloring_equivalence.cpp
+# (the legacy O(rows^2)->O(rows*K) coloring-rewrite gate) were DELETED with the
+# legacy solver trio. The coloring algorithm migrated to nk BuildColors (inside
+# nk::SolveSchedule::Partition) and is exercised end-to-end by the byte-exact nk
+# union gates + the nk_solve_harness foot_*/link_rigid device-solve tests.
 add_executable(nuka_solver_test
-    solver/test_row_scheduler_bridge.cpp
-    # Row-coloring O(rows*K) rewrite EQUIVALENCE gate: production
-    # BuildRowColorPartitions / ValidateNoSharedBodiesPerColor vs a test-local
-    # O(rows^2) reference, byte-identical over synthetic cliques + randomized
-    # rows (incl. invalid-body / body_a==body_b traps) + dense/all-invalid edges.
-    solver/test_row_scheduler_coloring_equivalence.cpp
-    # v0.8 C5a: UnifiedSolve end-to-end (compliant contact + pyramid + D1).
+    # M4 re-point: the nk-driven UnifiedSolve oracle scenarios
+    # (test_unified_solve.cpp NkWorld* cases mirror every deleted UnifiedSolve.*
+    # assertion via the nk path).
     solver/test_unified_solve.cpp
     # v0.8 C5b-core: ArticulationChainJ reaction arm wired into UnifiedSolve
     # (closed-form chain oracle + same-articulation coloring + link<->rigid two-
@@ -702,7 +704,7 @@ if(CMAKE_CUDA_COMPILER)
     add_test(NAME phi2_smoke COMMAND nuka_phi2_smoke_test)
 
     # M9 T11: nuka_h1_union_parity_test DELETED (deletion-order step 2). Its nk-vs-
-    # LEGACY BatchedUnifiedWorld step-0/window parity dies with the legacy class
+    # legacy coresident union-world step-0/window parity dies with the legacy class
     # (golden/nk path is authority; the M7 vel-window benign-vs-masking verdict was
     # rendered in T10 PART A while the oracle was alive). Its UNIQUE non-legacy
     # coverage -- the union StepPlanned==Step plan-replay D1 -- was FOLDED into
@@ -751,11 +753,14 @@ if(CMAKE_CUDA_COMPILER)
     # contact, 1000 StepPlanned steps). M7: the union scene is cooked from the
     # authored .nks (scene::cook::CookSceneToUnionTemplate), NO factory.
     # Asset-gated SKIP.
+    # M9 T11-core-b2: the legacy coresident .cpp (batched_unified_world /
+    # unified_coresident_stepper) are GONE. The union bridge is now self-contained
+    # in src/scene/cook/ (union_nk_model.cpp + the UnionSceneTemplate/CoResident*
+    # descriptors in the cook headers); this gate only needs union_nk_model.cpp +
+    # the contact_stream_driver it links.
     add_executable(nuka_nk_union_n1_test
         perf/nk_union_n1.cpp
         ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_nk_union_n1_test nuka_codegen)
@@ -882,7 +887,10 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     add_executable(nuka_cuda_runtime_test
-        runtime/test_cuda_solver.cpp
+        # M9 T11-core-b2: test_cuda_solver.cpp (legacy CudaRowSolver device-kernel
+        # tests) deleted with row_solver.cu; the nk device solve is covered by
+        # test_unified_solve.cpp NkWorld* + the nk_solve_harness foot_*/link_rigid
+        # device-solve gates.
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
         runtime/test_xpbd_distance_oracle.cpp
         # v0.7 p09-B: XPBD bend (cloth) + volume (tet) sim invariants + grad-C FD.
@@ -2137,7 +2145,7 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # M9 T11: the coresident validated-not-wired test estate DELETED with the
-    # legacy classes (UnifiedCoResidentStepper / BatchedUnifiedWorld / the grasp
+    # legacy classes (the co-resident stepper / the batched union world / the grasp
     # scene factory): nuka_unified_coresident_stepper_test, nuka_batched_unified_world_test,
     # nuka_batched_unified_world_perf_test, nuka_grasp_hold_spike_test,
     # nuka_h1_grasp_spike_test. Their unique coverage is folded/acceptable-loss per
@@ -2154,7 +2162,7 @@ if(CMAKE_CUDA_COMPILER)
     # oracle byte-exact) DELETED with the coresident estate.
 
     # M9 T11: nuka_batched_h1_union_world_test (SG G1 batched-union parity) DELETED
-    # with the coresident estate -- the BatchedUnifiedWorld vs co-resident oracle
+    # with the coresident estate -- the batched union world vs co-resident oracle
     # parity dies with the legacy classes (golden/nk path is authority).
 
     # --- M7 T6: the factory byte-equality gate (nuka_h1_union_scene_factory_test)
@@ -2167,15 +2175,14 @@ if(CMAKE_CUDA_COMPILER)
     # CookSceneToUnionTemplate (nuka_scene_cook) -> BuildNkUnionModel -> nk::World,
     # NO factory. Reproduces the dev-spike force-balance / BITE / disturbance / D1
     # assertions (previously proven only by the factory-fed co-resident spikes) on
-    # the cooked-from-.nks union world. Links the cook + the M9-alive coresident
-    # bridge (union_nk_model + batched_unified_world for the UnionSceneTemplate
-    # struct + contact_stream_driver it includes); the scene constants come from
-    # scene/cook/union_scene_constants.hpp (the factory is fully deleted, M7 T6).
-    # Asset-gated SKIP.
+    # the cooked-from-.nks union world. Links the cook + the self-contained union
+    # bridge (union_nk_model.cpp; the UnionSceneTemplate struct now lives in
+    # scene/cook/union_scene_template.hpp + contact_stream_driver it links); the
+    # scene constants come from scene/cook/union_scene_constants.hpp (the factory
+    # AND the legacy coresident .cpp are fully deleted). Asset-gated SKIP.
     add_executable(nuka_h1_grasp_lift_test
         scenario/h1_grasp_lift.cpp
         ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_h1_grasp_lift_test nuka_codegen)
@@ -2209,13 +2216,13 @@ if(CMAKE_CUDA_COMPILER)
     # ~1e-8). Cooks Load("h1_cup_table.nks") -> CookSceneToUnionTemplate and pins
     # every regression-sensitive cooked field to a COMMITTED, NEVER-regenerated
     # golden (EXACT ints/order, TIGHT-NEAR floats) + the BuildNkUnionModel union
-    # slot order/count. Links the cook + the M9-alive coresident bridge
-    # (union_nk_model + batched_unified_world for the UnionSceneTemplate struct
-    # + contact_stream_driver it includes), NOT the factory. Asset-gated SKIP.
+    # slot order/count. Links the cook + the self-contained union bridge
+    # (union_nk_model.cpp; the UnionSceneTemplate struct now lives in
+    # scene/cook/union_scene_template.hpp + contact_stream_driver it links), NOT
+    # the factory and NOT the deleted legacy coresident .cpp. Asset-gated SKIP.
     add_executable(nuka_union_cook_golden_test
         scenario/union_cook_golden.cpp
         ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
     )
     add_dependencies(nuka_union_cook_golden_test nuka_codegen)
@@ -2392,7 +2399,9 @@ if(CMAKE_CUDA_COMPILER)
     )
 
 add_executable(nuka_cuda_perf_test
-    perf/test_cuda_solver_timing.cpp
+    # M9 T11-core-b2: test_cuda_solver_timing.cpp (legacy row_solver.cu timing)
+    # deleted; nk solve throughput is gated by nk_union_n1 (<=5ms) + the go2 4096-env
+    # step-time perf gate.
     perf/test_lbvh_50k_bodies.cpp
     perf/test_1m_particles_grid_perf.cpp
 )

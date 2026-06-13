@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // PHI v2 CUDA backend — M4 UNION-family narrowphase (NarrowphasePrimitives
 // union branch): one thread per (env x union contact slot), running the SAME
-// HD-clean analytic handlers the legacy BatchedUnifiedWorld used —
+// HD-clean analytic handlers the legacy coresident union world used —
 //   foot   : amf::SpherePlane  (the legacy HOST C3b foot narrowphase)
 //   finger : cvx::SphereHull   (the legacy GPU grasp narrowphase kernel body)
 //   table  : amf::BoxPlane     (the legacy HOST C3b cup-proxy x table)

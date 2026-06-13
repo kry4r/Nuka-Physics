@@ -23,16 +23,14 @@
 // originally pinned the ~1e-8 equivalence was deleted with the factory in T6).
 //
 // PER CONTROLLER R1/R2/R3 the cook PRODUCES a coresident::UnionSceneTemplate
-// (the struct + BuildNkUnionModel + BatchedUnifiedWorld all stay alive to M9):
-// BuildNkUnionModel(cooked.tmpl) and BatchedUnifiedWorld(cooked.tmpl) behave
-// identically to the factory's. The native CookToModel->UnionCsr path is M9.
+// (the struct + BuildNkUnionModel stay alive to M9): BuildNkUnionModel(cooked.tmpl)
+// behaves identically to the factory's. The native CookToModel->UnionCsr path is M9.
 //
 // nk_engine lint scope: CUDA-type-free host C++. Depends ONLY on the relocated
 // plain-data product types (UnionSceneTemplate, H1UnionDriveEntry, in
 // src/scene/cook/union_scene_template.hpp; CoResident* descriptors pulled in
-// transitively) — NO kernels, NO device, NO dependency on the doomed coresident
-// directory (the M9 T3 decouple: union_cook no longer includes
-// runtime/coresident/batched_unified_world.hpp).
+// transitively) — NO kernels, NO device, NO dependency on the (now-deleted)
+// legacy coresident directory.
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
@@ -48,7 +46,7 @@ namespace nuka::scene::cook {
 // cook so T5's re-pointed consumers — the parity oracle / perf gate / C-ABI —
 // and T6's factory deletion work). Field-for-field the metadata an RL substrate
 // + the parity oracle read off BuildH1UnionScene's result, with `tmpl` the
-// UnionSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld consume.
+// UnionSceneTemplate BuildNkUnionModel consumes.
 struct CookedUnionScene {
     runtime::coresident::UnionSceneTemplate tmpl;
 

@@ -70,7 +70,6 @@ add_library(nuka_scene STATIC
     scene/scene_ir.cpp
     scene/scene_compose.cpp
     scene/cooker.cpp
-    scene/pose_graph.cpp
     scene/graph/scene_graph.cpp
     scene/ecs/registry.cpp
     scene/scene_map.cpp
@@ -293,23 +292,10 @@ if(NK_BUILD_VULKAN_VALIDATION)
     nuka_set_warnings(nuka_present)
 endif()
 
-add_library(nuka_scene_pipeline STATIC
-    scene/scene_pipeline.cpp
-)
-
-target_include_directories(nuka_scene_pipeline
-    PUBLIC
-        ${CMAKE_SOURCE_DIR}/src
-)
-
-target_link_libraries(nuka_scene_pipeline
-    PUBLIC
-        nuka_scene
-        nuka_runtime
-        nuka_render
-)
-
-nuka_set_warnings(nuka_scene_pipeline)
+# M9 T11-core-b2: nuka_scene_pipeline (scene/scene_pipeline.cpp + the co-orphaned
+# scene/pose_graph.*) deleted. Its sole consumer (test_scene_pipeline.cpp) was
+# dropped in T11 and the remaining scene units relinked to nuka_scene; render uses
+# its OWN render::BuildRenderScene, never scene::ScenePipeline. ZERO live consumers.
 
 # ---------------------------------------------------------------------------
 # nuka_import – MJCF and URDF importers
@@ -385,27 +371,28 @@ target_link_libraries(nuka_constraint
 nuka_set_warnings(nuka_constraint)
 
 # ---------------------------------------------------------------------------
-# nuka_solver – Iterative rigid body constraint solver (PGS)
+# nuka_solver – constraint-solver config carrier (header-only).
 # ---------------------------------------------------------------------------
-add_library(nuka_solver STATIC
-    solver/diff_test_bridge.cpp
-    # v0.8 C5a: UnifiedSolve standalone entry (validated-not-wired).
-    solver/unified_solve.cpp
-)
-set_target_properties(nuka_solver PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# M9 T11-core-b2: the legacy row solver/scheduler estate (row_solver.cu /
+# row_scheduler.* / unified_solve.* / diff_test_bridge.*) was deleted -- the
+# algorithm migrated to src/nk/solve/schedule.hpp + the phi assemble_rows/
+# solve_rows ops in M4. The only surviving source here is solver_config.hpp
+# (the SolverConfig tuning POD the foot_*/link_rigid nk gates still reference),
+# so nuka_solver is now an INTERFACE library that just carries the `src` include
+# path. All `target_link_libraries(... nuka_solver)` consumers keep resolving
+# `solver/solver_config.hpp` unchanged.
+add_library(nuka_solver INTERFACE)
 
 target_include_directories(nuka_solver
-    PUBLIC
+    INTERFACE
         ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(nuka_solver
-    PUBLIC
+    INTERFACE
         nuka_constraint
         nuka_math
 )
-
-nuka_set_warnings(nuka_solver)
 
 # ---------------------------------------------------------------------------
 # nuka_articulation – Articulation graphs and joint drives
@@ -673,9 +660,9 @@ if(CMAKE_CUDA_COMPILER)
         # union UnionSceneTemplate cook that REPLACES the 1026-line
         # h1_union_scene_factory authoring (reads the baked settled IC + grasp
         # config instead of running FK/placement/settle). Produces the
-        # coresident::UnionSceneTemplate BuildNkUnionModel / BatchedUnifiedWorld
-        # consume (those + the struct stay alive to M9 per R1/R2/R3). Pure host
-        # C++; the coresident dep is header-only product types (no kernels).
+        # coresident::UnionSceneTemplate BuildNkUnionModel consumes (that + the
+        # struct stay alive to M9 per R1/R2/R3). Pure host C++; the coresident dep
+        # is header-only product types (no kernels).
         scene/cook/union_cook.cpp
     )
     set_target_properties(nuka_scene_cook PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -984,33 +971,10 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
-    add_library(nuka_row_solver_gpu STATIC
-        solver/gpu/row_scheduler.cu
-        solver/gpu/row_solver.cu
-    )
-    set_target_properties(nuka_row_solver_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    target_include_directories(nuka_row_solver_gpu
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_row_solver_gpu
-        PUBLIC
-            nuka_constraint
-            nuka_phi
-    )
-
-    target_compile_definitions(nuka_solver
-        PUBLIC
-            NUKA_HAS_CUDA_RUNTIME=1
-    )
-
-    target_link_libraries(nuka_solver
-        PUBLIC
-            nuka_phi
-            nuka_row_solver_gpu
-    )
+    # M9 T11-core-b2: nuka_row_solver_gpu (row_scheduler.cu / row_solver.cu) and
+    # the nuka_solver CUDA define/link it fed are GONE -- the legacy GPU row solve
+    # migrated to the phi assemble_rows/solve_rows ops (M4). nuka_solver is now a
+    # header-only INTERFACE carrier (solver_config.hpp); no CUDA backing.
 
     add_library(nuka_articulation_gpu STATIC
         runtime/articulation/featherstone_aba.cu
@@ -1168,9 +1132,6 @@ if(CMAKE_CUDA_COMPILER)
         # on the device's OWNED phi v2 backend (mirrors recorder.cpp) and runs
         # cook::Settle. NOT a special grasp/union type -- one entry, any format.
         c_abi/scene.cpp
-        runtime/coresident/batched_unified_world.cpp
-        runtime/coresident/unified_coresident_stepper.cpp
-        runtime/coresident/grasp_scene_factory.cpp
         collision/contact_stream_driver.cpp
     )
 
@@ -1191,9 +1152,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_diffsim
             nuka_sensor_noise
             nuka_phi
-            # v0.8 A2: the unified collision/contact spine the BatchedUnifiedWorld
-            # grasp path needs (the same delta the nuka_batched_unified_world_test
-            # target adds over the previous libnuka link set).
+            # nuka_solver: header-only carrier for solver/solver_config.hpp (the
+            # legacy row solver/scheduler it once backed is deleted, M9 T11-core-b2);
+            # nuka_constraint = the unified collision/contact row types.
             nuka_solver
             nuka_constraint
             nuka_collision_gpu
@@ -1234,18 +1195,14 @@ if(CMAKE_CUDA_COMPILER)
 
     nuka_set_warnings(nuka)
 
-    # v0.8 A2: the PROMOTED coresident physics sources (+ the host contact driver)
-    # keep the warning posture of their authoring home (the test target, which does
-    # NOT apply nuka_set_warnings) rather than getting the library's strict
-    # -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror imposed by promotion.
-    # These 170 KB of byte-exact, gate-validated sources were never written under
-    # those flags; re-auditing them would risk the byte-identity the 21 gates pin.
-    # `-w` is appended AFTER -Werror per source file, so GCC suppresses the warnings
-    # before -Werror can elevate them.
+    # v0.8 A2: the host contact driver keeps the warning posture of its authoring
+    # home (the test target, which does NOT apply nuka_set_warnings) rather than
+    # getting the library's strict -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    # -Werror imposed by promotion. This byte-exact, gate-validated source was never
+    # written under those flags; re-auditing it would risk the byte-identity the
+    # gates pin. `-w` is appended AFTER -Werror per source file, so GCC suppresses
+    # the warnings before -Werror can elevate them.
     set_source_files_properties(
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/batched_unified_world.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/unified_coresident_stepper.cpp
-        ${CMAKE_SOURCE_DIR}/src/runtime/coresident/grasp_scene_factory.cpp
         ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
         PROPERTIES COMPILE_OPTIONS "-w"
     )

@@ -2,8 +2,8 @@
 
 This is the GATE before a multi-week PPO standing campaign. PPO will train a
 PyTorch NN in the BATCHED reduced-16-DOF world (Python, ``nuka.World``); the
-demo runs that policy in the CO-RESIDENT full-51-DOF world (C++
-``UnifiedCoResidentStepper``, NOT bound to Python). The deploy bridge is NOT
+demo runs that policy in the CO-RESIDENT full-51-DOF world (the legacy C++
+co-resident stepper, NOT bound to Python). The deploy bridge is NOT
 python-bind / NOT ONNX / NOT torch-at-deploy: it is flat f32 weights + a ~50-line
 C++ forward pass. This script is the TRAIN side of that bridge:
 

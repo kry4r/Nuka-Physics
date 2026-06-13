@@ -4,15 +4,14 @@
 // structs (CoResidentFingertip / CoResidentCup / CoResidentFootSphere /
 // CoResidentGround).
 //
-// RELOCATED here (M9 T11-core-b1) out of the DOOMED
-// src/runtime/coresident/unified_coresident_stepper.hpp (which T11-core-b2
-// DELETES with the rest of the coresident directory). These four structs are
-// the PLAIN-DATA contact descriptors the surviving union cook carries:
-// UnionSceneTemplate holds the fingertips / cup / feet / ground; BuildNkUnionModel
-// reads them to emit the UnionCsr slots. They are PURE DATA -- no kernels, no
-// device handles, no phi::Buffer, no CUDA types -- which is exactly why they can
-// live under src/scene/cook (the host-only cook directory) while their old home
-// in the coresident dir is deleted.
+// RELOCATED here (M9 T11-core-b1) out of the legacy coresident union-world
+// stepper header, which T11-core-b2 DELETED with the rest of the coresident
+// directory. These four structs are the PLAIN-DATA contact descriptors the
+// surviving union cook carries: UnionSceneTemplate holds the fingertips / cup /
+// feet / ground; BuildNkUnionModel reads them to emit the UnionCsr slots. They
+// are PURE DATA -- no kernels, no device handles, no phi::Buffer, no CUDA types --
+// which is exactly why they can live under src/scene/cook (the host-only cook
+// directory) now that their old home in the coresident dir is deleted.
 //
 // NAMESPACE NOTE. Kept in nuka::runtime::coresident (NOT moved to
 // nuka::scene::cook) ON PURPOSE: every consumer already qualifies these types as
@@ -22,9 +21,9 @@
 // it is a transitional artifact that disappears when the native CookToModel->
 // UnionCsr cook replaces these structs.
 //
-// The transitional unified_coresident_stepper.hpp (alive until T11-core-b2)
-// #includes THIS header so its still-present class + GraspConfig / StandConfig
-// keep compiling -- it no longer DEFINES these four structs.
+// (Until T11-core-b2 the legacy coresident stepper header #included THIS one so
+// its class + grasp/stand configs kept compiling; that class is now deleted and
+// these four structs are owned solely by the cook.)
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"

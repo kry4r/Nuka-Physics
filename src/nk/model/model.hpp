@@ -149,8 +149,8 @@ struct ModelMaterialBucket {
 //               PGS — the legacy BatchedArticulatedWorld semantics, goldens
 //               byte-exact).
 //   UnionCsr  — the union compliant-CSR pipeline (feet x ground + finger x
-//               hull + box x plane in ONE solve — the legacy BatchedUnifiedWorld
-//               semantics).
+//               hull + box x plane in ONE solve — the legacy coresident union
+//               world semantics).
 //   PairDriven — the M5 generalized broadphase->narrowphase pipeline (per-env
 //               LBVH candidate_pairs -> analytic prim dispatch + SDF main path).
 //               ADDITIVE; the union slot-template path is untouched.
