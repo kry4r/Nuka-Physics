@@ -527,6 +527,12 @@ if(CMAKE_CUDA_COMPILER)
     # -------------------------------------------------------------------------
     add_library(nuka_scene_cook STATIC
         scene/cook/cook_to_model.cpp
+        # M7 T2: the reusable cook primitives — the deterministic settle (runs an
+        # already-built nk::World, PD-holds named dof patterns, snapshots +
+        # downloads the settled IC) and the geometric rest-placement (drop-to-
+        # rest seat). Pure host C++ (the World device work goes through phi v2).
+        scene/cook/settle.cpp
+        scene/cook/placement.cpp
     )
     set_target_properties(nuka_scene_cook PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

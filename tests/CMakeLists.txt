@@ -753,6 +753,32 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_coupled_grasp_soft_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- M7 T2: cook_settle_determinism — the "settle two runs byte-identical"
+    # milestone gate for the reusable cook primitives (src/scene/cook/settle.* +
+    # placement.*). A tiny CookToModel articulation + an injected movable cup is
+    # settled twice; the InitialStateComponent qpos + settled body poses must be
+    # byte-identical. Plus FindRestPlacement seats a cup on a table. Asset-light
+    # (programmatic scene; runs anywhere a CUDA backend is present).
+    add_executable(nuka_cook_settle_determinism_test
+        scenario/cook_settle_determinism.cpp
+    )
+    add_dependencies(nuka_cook_settle_determinism_test nuka_codegen)
+    target_include_directories(nuka_cook_settle_determinism_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_cook_settle_determinism_test
+        PRIVATE
+            nuka_nk
+            # nuka_scene_cook transitively pulls nuka_nk + nuka_scene +
+            # nuka_articulation (CookToModel / Settle / FindRestPlacement).
+            nuka_scene_cook
+            nuka_phi2
+            nuka_phi
+            nuka_core
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_cook_settle_determinism_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- M6: nk standalone-particle equivalence to the legacy XPBD/PBF oracle bars
     # (the nk mode==Xpbd / Pbf path reproduces the distance period / tet volume /
     # rest-lattice density + D1; the legacy 4件套/5件套 stay green testing the
