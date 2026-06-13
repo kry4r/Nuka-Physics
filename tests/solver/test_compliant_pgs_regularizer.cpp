@@ -1,9 +1,19 @@
 // ---------------------------------------------------------------------------
-// v0.8 C5b-core: compliant-PGS regularizer R-SWEEP regression guard.
+// v0.8 C5b-core: compliant-PGS regularizer R-SWEEP guard -- the nk-core re-point
+// (M9 T11-articulated-fold).
 // ---------------------------------------------------------------------------
-// Commit 210c11f fixed SolveCompliantVelocityRow (src/solver/gpu/row_solver.cu)
-// so the regularized Gauss-Seidel update carries the matching -R*old_impulse
-// feedback term:
+// The legacy `solver::UnifiedSolve` host driver + `solver/gpu/row_solver.cu` are
+// deleted in M9 T11-core; the regularized-PGS compliant update (the 210c11f
+// -R*old_impulse feedback term) was migrated into the nk SolveRowsBlockIsland op
+// (src/phi/backend_cuda/ops/solve_rows.cu). This guard now drives the SAME
+// coupled full-rank-SPD compliant system through the nk op via the M4 re-point
+// harness (tests/solver/nk_solve_harness.hpp) and holds the SAME R-sweep
+// gates: kernel lambda == double-precision dense (A+diag(R))lambda=b across R/A
+// from ~1e-3 to ~1e+1, the large-R discriminator vs the pre-fix A*lambda=b fixed
+// point, and D1 -- the regularizer's R-independence is asserted on the nk path.
+//
+// Commit 210c11f fixed the regularized Gauss-Seidel update so it carries the
+// matching -R*old_impulse feedback term:
 //     lambda = effective_mass * (rhs_v - jv - compliance_alpha*old_impulse)
 // WITHOUT that term the per-row increment's fixed point is A*lambda = b (the R
 // in the denominator cancels), so the kernel converges to a point ~R/A above the
@@ -46,8 +56,9 @@
 #include "constraint/row.hpp"
 #include "constraint/row_articulation_refs.hpp"
 #include "constraint/row_buffers.hpp"
+#include "nk_solve_harness.hpp"
 #include "runtime/rigid/body_state.hpp"
-#include "solver/unified_solve.hpp"
+#include "solver/solver_config.hpp"
 
 #include <gtest/gtest.h>
 
@@ -317,24 +328,20 @@ std::vector<float> RunKernel(const std::vector<float>& Minv_f,
         AppendRow(&rows, &sides, &art_refs, body_count, slot, aref_f[slot], R);
     }
 
-    std::vector<float> qdot(qdot0_f);  // MUTABLE live slice (one articulation)
-
-    nuka::solver::SolveContext ctx;
-    ctx.rows = &rows;
-    ctx.state = &bodies;
-    ctx.sides = &sides;
-    ctx.dt = kDt;
-    ctx.articulation.art_refs = &art_refs;
-    ctx.articulation.chain_jacobians = &chain_jacobians_f;
-    ctx.articulation.inertia_m_inv = &Minv_f;
-    ctx.articulation.qdot = &qdot;
-    ctx.articulation.dof_stride = kN;
-
-    nuka::solver::UnifiedSolve(ctx, ConvergedConfig());
+    // nk re-point: drive the assembled coupled compliant rows through the nk
+    // SolveRowsBlockIsland op (the migrated regularized-PGS update).
+    const auto res = nk_harness::NkSolveRows(
+        rows, sides, art_refs, chain_jacobians_f, Minv_f, qdot0_f, &bodies, kN,
+        static_cast<uint16_t>(ConvergedConfig().velocity_iterations), kDt);
+    EXPECT_TRUE(res.ok) << "nk solve harness failed";
 
     std::vector<float> lambda(kN, 0.0f);
-    for (uint32_t i = 0; i < kN; ++i) lambda[i] = rows.rows[i].lambda;
-    if (qdot_out != nullptr) *qdot_out = qdot;  // the mutated live joint velocities
+    if (res.ok) {
+        for (uint32_t i = 0; i < kN; ++i) lambda[i] = res.lambda[i];
+        if (qdot_out != nullptr) *qdot_out = res.qdot;  // mutated joint velocities
+    } else if (qdot_out != nullptr) {
+        *qdot_out = qdot0_f;
+    }
     return lambda;
 }
 
@@ -526,9 +533,9 @@ TEST(CompliantPgsRegularizer, DeterministicTwoRunByteExact) {
     const std::vector<float> b = RunKernel(in.Minv, in.chain_jacobians, in.qdot0, aref, R, &qb);
     ASSERT_EQ(a.size(), b.size());
     EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), 0)
-        << "two identical UnifiedSolve runs produced different lambda (nondeterministic)";
+        << "two identical nk solve runs produced different lambda (nondeterministic)";
     // Also cover the apply path: the MUTATED live qdot slice must be byte-identical.
     ASSERT_EQ(qa.size(), qb.size());
     EXPECT_EQ(std::memcmp(qa.data(), qb.data(), qa.size() * sizeof(float)), 0)
-        << "two identical UnifiedSolve runs produced different qdot (nondeterministic apply)";
+        << "two identical nk solve runs produced different qdot (nondeterministic apply)";
 }
