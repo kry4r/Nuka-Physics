@@ -39,19 +39,63 @@ class World;
 namespace nuka::runtime::app {
 
 // ---------------------------------------------------------------------------
-// InputSystem - drains the CommandQueue once per frame (M8 stub).
+// InputIntents - the resolved control intents the InputSystem extracted from one
+// drained command batch (M8.5 T3). The Simulation/viewer reads these to apply the
+// transport (play/pause/step/reset/env) + camera-reset. Edge flags: each is true
+// at most once per Run(). MoveEntity stays an M11 stub (full drag-to-move), but
+// the play/pause/camera dispatch is real now (recon open-Q 8).
+// ---------------------------------------------------------------------------
+struct InputIntents {
+    bool     toggle_play   = false;
+    bool     set_play      = false;   // explicit Play/Pause requested
+    bool     play_value    = true;    // the value for set_play
+    bool     step_once     = false;
+    bool     reset         = false;
+    bool     camera_reset  = false;
+    bool     set_env       = false;
+    uint32_t env_value     = 0u;
+    uint32_t move_entity_count = 0u;  // M11 seam: how many MoveEntity were seen.
+};
+
+// ---------------------------------------------------------------------------
+// InputSystem - drains the CommandQueue once per frame and resolves intents.
 //
-// M8 just consumes the batch so producers never back up; handlers are no-ops
-// with a clean seam for the M11 viewer's MoveEntity (the consumed batch is
-// returned so a future handler can act on it without re-touching the queue).
+// M8.5: a REAL minimal dispatch of the ViewerControl commands (play/pause/step/
+// reset/camera/env) into an InputIntents the caller applies. MoveEntity is still
+// counted-but-not-applied (full drag-to-move is M11); the returned batch is kept
+// available for a future handler without re-touching the queue.
 // ---------------------------------------------------------------------------
 class InputSystem {
 public:
-    // Drain + return the pending commands (FIFO). M8: no side effects beyond the
-    // drain. M11: dispatch MoveEntity et al. here.
-    std::vector<Command> Run(CommandQueue& queue) {
+    // Drain the queue, fold ViewerControl commands into `out_intents` (last write
+    // wins for play state; edge flags latch), and return the raw batch (FIFO).
+    std::vector<Command> Run(CommandQueue& queue, InputIntents* out_intents = nullptr) {
         std::vector<Command> batch = queue.Drain();
-        // M8 stub: no command applied. (Seam: iterate `batch`, switch on Kind.)
+        if (out_intents == nullptr) return batch;
+        for (const Command& c : batch) {
+            switch (c.kind) {
+                case Command::Kind::ViewerControl: {
+                    using A = ViewerControl::Action;
+                    switch (c.viewer_control.action) {
+                        case A::TogglePlay:  out_intents->toggle_play = true; break;
+                        case A::Play:        out_intents->set_play = true; out_intents->play_value = true; break;
+                        case A::Pause:       out_intents->set_play = true; out_intents->play_value = false; break;
+                        case A::StepOnce:    out_intents->step_once = true; break;
+                        case A::Reset:       out_intents->reset = true; break;
+                        case A::CameraReset: out_intents->camera_reset = true; break;
+                        case A::SetEnv:      out_intents->set_env = true;
+                                             out_intents->env_value = c.viewer_control.value; break;
+                        case A::None:        break;
+                    }
+                    break;
+                }
+                case Command::Kind::MoveEntity:
+                    ++out_intents->move_entity_count;  // M11 seam: not applied yet.
+                    break;
+                case Command::Kind::NoOp:
+                    break;
+            }
+        }
         return batch;
     }
 };

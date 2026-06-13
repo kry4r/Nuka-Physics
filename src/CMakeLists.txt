@@ -731,6 +731,72 @@ if(CMAKE_CUDA_COMPILER)
 
     nuka_set_warnings(nuka_app)
 
+    # -------------------------------------------------------------------------
+    # nuka_viewer (M8.5 T3) -- the windowed realtime viewer: imgui_layer (the
+    # custom-beautified UI panels) + camera_controller (orbit/pan/zoom) + the
+    # `nuka_viewer` exe (viewer_main). Drives Simulation::FramePublish (step +
+    # publish) and presents each frame via nuka_present, with the imgui_layer as
+    # the present-pass overlay. GATED behind NK_BUILD_VULKAN_VALIDATION (D3): the
+    # default build-cuda128 config never sees it (opt-in, like the recorder). It
+    # links nuka_present (swapchain + xcb), nuka_imgui (Dear ImGui glue + theme),
+    # nuka_app (the frame-loop spine), and the nk physics libs (for the cook +
+    # nk::World fixture). HOST-ONLY / zero-CUDA-token.
+    # -------------------------------------------------------------------------
+    if(NK_BUILD_VULKAN_VALIDATION)
+        add_library(nuka_viewer STATIC
+            runtime/app/viewer/camera_controller.cpp
+            runtime/app/viewer/imgui_layer.cpp
+        )
+        set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(nuka_viewer
+            PUBLIC
+                ${CMAKE_SOURCE_DIR}/src
+        )
+        target_compile_definitions(nuka_viewer PUBLIC NK_BUILD_VULKAN_VALIDATION)
+        # imgui_layer.cpp includes the vendored ImGui (SYSTEM via the `imgui`
+        # target); camera_controller is pure host math (nuka_app/render types).
+        target_link_libraries(nuka_viewer
+            PUBLIC
+                nuka_app
+                nuka_present
+                nuka_imgui
+                imgui
+        )
+        nuka_set_warnings(nuka_viewer)
+
+        add_executable(nuka_viewer_exe
+            runtime/app/viewer/viewer_main.cpp
+        )
+        add_dependencies(nuka_viewer_exe nuka_render_shaders)
+        set_target_properties(nuka_viewer_exe PROPERTIES OUTPUT_NAME nuka_viewer)
+        target_include_directories(nuka_viewer_exe
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src
+        )
+        target_compile_definitions(nuka_viewer_exe PRIVATE NK_BUILD_VULKAN_VALIDATION)
+        target_link_libraries(nuka_viewer_exe
+            PRIVATE
+                nuka_viewer
+                nuka_present
+                nuka_imgui
+                nuka_app
+                nuka_scene_cook
+                nuka_render
+                nuka_nk
+                nuka_phi2
+                nuka_runtime
+                nuka_import
+                nuka_cooker
+                nuka_articulation_gpu
+                nuka_collision_gpu
+                nuka_core
+                nuka_phi
+                imgui
+                Vulkan::Vulkan
+        )
+        nuka_set_warnings(nuka_viewer_exe)
+    endif()
+
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
         # SAP broadphase: O(n^2) pair-slot oracle over a device AABB buffer. The

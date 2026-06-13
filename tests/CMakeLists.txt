@@ -3194,4 +3194,32 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
     gtest_discover_tests(nuka_viewport_present_smoke_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # M8.5 GATE-B -- viewer_frame_smoke: the RUN-VERIFIED OFFSCREEN viewer-frame
+    # composite. Renders a synthetic RenderWorld + the REAL imgui_layer panels
+    # (fixed UI state) into the offscreen image via the Render(world,opts,overlay)
+    # seam, asserts ImDrawData.CmdListsCount>0, non_bg>0, two composited renders
+    # byte-identical (D1), dumps /tmp/m8_5_viewer_frame.ppm. Links nuka_viewer
+    # (imgui_layer + camera_controller) + nuka_imgui + nuka_render. SKIPs with no
+    # Vulkan device. No window needed (imgui_impl_vulkan draws to an offscreen pass).
+    add_executable(nuka_viewer_frame_smoke_test
+        scenario/viewer_frame_smoke.cpp
+    )
+    add_dependencies(nuka_viewer_frame_smoke_test nuka_render_shaders)
+    target_compile_definitions(nuka_viewer_frame_smoke_test
+        PRIVATE NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_viewer_frame_smoke_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_viewer_frame_smoke_test
+        PRIVATE
+            nuka_viewer
+            nuka_imgui
+            nuka_present
+            nuka_render
+            nuka_scene
+            imgui
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_viewer_frame_smoke_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
