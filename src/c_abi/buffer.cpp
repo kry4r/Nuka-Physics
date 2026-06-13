@@ -1,7 +1,29 @@
+#include "c_abi/dlpack_table.hpp"
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 
 #include <exception>
+
+namespace {
+
+// Stamp the canonical per-field stride + wire dtype from dlpack_table.hpp onto
+// the view. This is the SINGLE source of the RL binary contract's stride/dtype
+// (the data pointer + element_count are still filled by each field arm from its
+// live device buffer; M9 T1 centralizes the descriptor, T5 rewires the source).
+// Returns false if `field` is not a known public field (caller -> NOT_SUPPORTED).
+inline bool StampFieldDescriptor(nuka_state_field_t field,
+                                 nuka_buffer_view_t* out) {
+    const nuka::c_abi::DlpackFieldRow* row =
+        nuka::c_abi::FindDlpackFieldRow(field);
+    if (row == nullptr) {
+        return false;
+    }
+    out->element_stride_bytes = row->element_stride_bytes;
+    out->dtype = row->dtype;
+    return true;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -20,6 +42,11 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
     if (record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
+
+    // TODO(M9-T5): the per-field DATA-SOURCE below still reads the legacy single-
+    // env record buffers / the batched world device buffers. T5 rewires those
+    // pointers to nk::World's Data field (FieldPtr by row.field_id from
+    // dlpack_table.hpp) while this descriptor stamping stays byte-identical.
 
     try {
         // --- Multi-env batched path (env_count > 1) -----------------------
@@ -40,16 +67,14 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const auto state = batched.View();
                 out->device_ptr = state.q;
                 out->element_count = state.total_link_count;
-                out->element_stride_bytes = sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_JOINT_VELOCITY) {
                 const auto state = batched.View();
                 out->device_ptr = state.qdot;
                 out->element_count = state.total_link_count;
-                out->element_stride_bytes = sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_ARTICULATION_LINK_POSE) {
@@ -67,9 +92,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const auto state = batched.View();
                 out->device_ptr = state.link_pose;
                 out->element_count = state.total_link_count;
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(sizeof(nuka::math::Transform));
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_BASE_POSE) {
@@ -87,9 +110,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const auto state = batched.View();
                 out->device_ptr = state.base_pose;
                 out->element_count = state.articulation_count;
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(sizeof(nuka::math::Transform));
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_DRIVE_TARGET) {
@@ -105,8 +126,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 out->device_ptr = record->batched_drive_targets_device.Data();
                 out->element_count =
                     record->batched_drive_targets_device.Size() / sizeof(float);
-                out->element_stride_bytes = sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_LINK_VELOCITY) {
@@ -122,10 +142,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const auto state = batched.View();
                 out->device_ptr = state.link_velocity;
                 out->element_count = state.total_link_count;
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(
-                        sizeof(nuka::runtime::articulation::LinkSpatialVel));
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_DRIVE_STIFFNESS ||
@@ -148,8 +165,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 }
                 out->device_ptr = const_cast<void*>(gains.Data());
                 out->element_count = gains.Size() / sizeof(float);
-                out->element_stride_bytes = sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_TORQUE_INPUT ||
@@ -175,8 +191,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 }
                 out->device_ptr = const_cast<void*>(buf.Data());
                 out->element_count = buf.Size() / sizeof(float);
-                out->element_stride_bytes = sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_TASK_TARGET) {
@@ -192,9 +207,9 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                     return NUKA_RESULT_NOT_SUPPORTED;
                 }
                 out->device_ptr = const_cast<void*>(buf.Data());
-                out->element_count = buf.Size() / (3u * sizeof(float));
-                out->element_stride_bytes = 3u * sizeof(float);
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
+                // element_count derives from the canonical per-env float3 stride.
+                out->element_count = buf.Size() / out->element_stride_bytes;
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_CONTACT_POINTS) {
@@ -203,9 +218,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const nuka::phi::Buffer& points = batched.ContactPointBuffer();
                 out->device_ptr = const_cast<void*>(points.Data());
                 out->element_count = batched.SlotCount();
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(points.Size() / batched.SlotCount());
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_LINK_CONTACT_WRENCH) {
@@ -216,9 +229,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const nuka::phi::Buffer& wrench = batched.LinkContactWrenchBuffer();
                 out->device_ptr = const_cast<void*>(wrench.Data());
                 out->element_count = batched.TotalLinkCount();
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(wrench.Size() / batched.TotalLinkCount());
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_CONTACT_NORMAL) {
@@ -227,9 +238,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const nuka::phi::Buffer& normal = batched.ContactNormalBuffer();
                 out->device_ptr = const_cast<void*>(normal.Data());
                 out->element_count = batched.SlotCount();
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(normal.Size() / batched.SlotCount());
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_CONTACT_FORCE) {
@@ -238,9 +247,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const nuka::phi::Buffer& force = batched.ContactForceBuffer();
                 out->device_ptr = const_cast<void*>(force.Data());
                 out->element_count = batched.SlotCount();
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(force.Size() / batched.SlotCount());
-                out->dtype = 0u;
+                StampFieldDescriptor(field, out);
                 return NUKA_RESULT_OK;
             }
             if (field == NUKA_FIELD_CONTACT_LINK) {
@@ -251,9 +258,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const nuka::phi::Buffer& link = batched.ContactLinkBuffer();
                 out->device_ptr = const_cast<void*>(link.Data());
                 out->element_count = batched.SlotCount();
-                out->element_stride_bytes =
-                    static_cast<uint32_t>(link.Size() / batched.SlotCount());
-                out->dtype = 1u;  // uint32
+                StampFieldDescriptor(field, out);  // dtype == 1 (uint32) per table
                 return NUKA_RESULT_OK;
             }
             return NUKA_RESULT_NOT_SUPPORTED;
@@ -267,15 +272,13 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
         if (field == NUKA_FIELD_JOINT_POSITION) {
             out->device_ptr = record->joint_position_buffer.Data();
             out->element_count = record->joint_position_buffer.Size() / sizeof(float);
-            out->element_stride_bytes = sizeof(float);
-            out->dtype = 0u;
+            StampFieldDescriptor(field, out);
             return NUKA_RESULT_OK;
         }
         if (field == NUKA_FIELD_JOINT_VELOCITY) {
             out->device_ptr = record->joint_velocity_buffer.Data();
             out->element_count = record->joint_velocity_buffer.Size() / sizeof(float);
-            out->element_stride_bytes = sizeof(float);
-            out->dtype = 0u;
+            StampFieldDescriptor(field, out);
             return NUKA_RESULT_OK;
         }
         if (field == NUKA_FIELD_DRIVE_TARGET) {
@@ -297,8 +300,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                 const_cast<void*>(record->drive_targets_device.Data());
             out->element_count =
                 record->drive_targets_device.Size() / sizeof(float);
-            out->element_stride_bytes = sizeof(float);
-            out->dtype = 0u;
+            StampFieldDescriptor(field, out);
             return NUKA_RESULT_OK;
         }
         return NUKA_RESULT_NOT_SUPPORTED;
