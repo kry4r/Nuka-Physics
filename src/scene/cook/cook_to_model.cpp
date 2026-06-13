@@ -31,10 +31,85 @@
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cooker.hpp"
+#include "scene/ecs/components.hpp"
+#include "scene/graph/scene_graph.hpp"
 
 namespace nuka::scene::cook {
 
 namespace {
+
+// M7 T5b — resolve the AUTHORED initial-condition for the cooked articulation
+// (the settle product, controller ruling R4: BAKED). Two sources, in priority:
+//   (1) the InitialStateComponent set on the articulation root entity by
+//       ApplySettleToRegistry (the ECS/settle writeback path), and
+//   (2) the SceneIR's `initial_state` map keyed by a tree node PATH (the .nks
+//       persisted IC): match the articulation root's node path, then any ancestor
+//       PREFIX of it (the import attach prefix, e.g. "h1"), and finally — when the
+//       map carries exactly one entry whose qpos length equals the cooked link
+//       count — that sole entry (a single-articulation scene).
+// `qpos` is per-LINK (length == link_count) and `root` is the settled base pose,
+// matching model.articulation.initial_q / base_pose. Returns false (a strict
+// no-op: the cook-rest pose is kept) when no IC of the right length is authored —
+// the case for EVERY existing golden/scene that does not author an IC.
+bool ResolveAuthoredIC(const SceneIR& scene, uint32_t root_body, uint32_t link_count,
+                       std::vector<float>& out_qpos, math::Transform& out_root) {
+    const EntityId root_ent = root_body != ~uint32_t(0)
+                                  ? scene.EntityOfBody(root_body)
+                                  : kInvalidEntity;
+
+    // (1) InitialStateComponent on the root entity (the settle writeback).
+    if (root_ent != kInvalidEntity) {
+        if (const InitialStateComponent* ic =
+                scene.Ecs().Get<InitialStateComponent>(root_ent)) {
+            if (ic->qpos.size() == link_count) {
+                out_qpos = ic->qpos;
+                out_root = ic->root;
+                return true;
+            }
+        }
+    }
+
+    // (2) the SceneIR's `initial_state` map (the persisted .nks IC).
+    const SceneInitialState& map = scene.InitialState();
+    if (map.empty()) return false;
+
+    // Derive the root link's node path (so we can match by exact path or prefix).
+    std::string root_path;
+    if (root_ent != kInvalidEntity) {
+        if (const auto node = scene.Ecs().NodeOf(root_ent)) {
+            root_path = scene.Tree().PathOf(node);
+        }
+    }
+    // Exact-path match, then ancestor-prefix match (e.g. "h1" for "h1/pelvis").
+    if (!root_path.empty()) {
+        if (const auto it = map.find(root_path); it != map.end() &&
+                                                 it->second.qpos.size() == link_count) {
+            out_qpos = it->second.qpos;
+            out_root = it->second.root;
+            return true;
+        }
+        for (const auto& [key, art_ic] : map) {
+            if (art_ic.qpos.size() != link_count) continue;
+            // `key` is an ancestor prefix of root_path iff root_path starts with
+            // key followed by the path separator '/'.
+            if (root_path.size() > key.size() &&
+                root_path.compare(0, key.size(), key) == 0 &&
+                root_path[key.size()] == '/') {
+                out_qpos = art_ic.qpos;
+                out_root = art_ic.root;
+                return true;
+            }
+        }
+    }
+    // Sole-entry fallback (a single-articulation scene): the only IC whose qpos
+    // length matches the cooked link count.
+    if (map.size() == 1u && map.begin()->second.qpos.size() == link_count) {
+        out_qpos = map.begin()->second.qpos;
+        out_root = map.begin()->second.root;
+        return true;
+    }
+    return false;
+}
 
 // Find or append a material bucket matching the cooked contact-param row `i`.
 // Returns the bucket index. Dedup is by exact float equality (cook is
@@ -138,6 +213,14 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     cap.bodies_per_env = blob.body_count;
     cap.obs_width = 64;
 
+    // M7 T5b — which body rows are owned by the articulation (driven by FK, NOT
+    // free rigid bodies). The movable-body body_init pass below MUST keep these
+    // rows at inv_mass 0 so the rigid-body gravity-kick / IntegrateBodyPosition
+    // arms (which run over bodies_per_env, gated on body_inv_mass > 0) stay
+    // no-ops for them — exactly today's behavior (an articulation-only world has
+    // an EMPTY body_init, so SeedInitialState skips the body block entirely).
+    std::vector<uint8_t> body_is_articulation_link(blob.body_count, 0u);
+
     // 4. Articulation template (the FIRST articulation, the single-robot scene
     //    shape; multi-articulation per env is a later extension). M3b: the
     //    template arrays are the SINGLE-ENV BuildArticulationHostState product
@@ -165,6 +248,36 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
                                              : host.base_pose.front();
         m.link_body = host.link_body;
+
+        // Mark every body row owned by an articulation link (so the movable
+        // body_init pass skips them — they are integrated by FK, not as free
+        // rigid bodies).
+        for (uint32_t lb : host.link_body) {
+            if (lb < body_is_articulation_link.size()) {
+                body_is_articulation_link[lb] = 1u;
+            }
+        }
+
+        // M7 T5b — seed the AUTHORED settled IC (qpos -> initial_q per-link, root
+        // -> base pose), OVERRIDING the cook-rest pose just set above. A strict
+        // no-op when no IC is authored (ResolveAuthoredIC returns false): every
+        // existing golden/scene keeps the cook-rest pose byte-for-byte. The root
+        // link's owning body row is host.link_body[m.root_link] (root_link == 0).
+        // `has_authored_ic` is reused below so the PD hold drive targets pin the
+        // SETTLED stance (not the cook-rest q) when an IC is authored.
+        bool has_authored_ic = false;
+        {
+            const uint32_t root_body =
+                m.root_link < host.link_body.size() ? host.link_body[m.root_link]
+                                                    : ~uint32_t(0);
+            std::vector<float> ic_qpos;
+            math::Transform ic_root = math::Transform::Identity();
+            if (ResolveAuthoredIC(scene, root_body, m.link_count, ic_qpos, ic_root)) {
+                m.initial_q = ic_qpos;
+                m.base_pose = ic_root;
+                has_authored_ic = true;
+            }
+        }
         m.joint_type.reserve(host.joint_type.size());
         for (auto jt : host.joint_type) m.joint_type.push_back(static_cast<uint8_t>(jt));
         m.link_inertia_spatial.resize(static_cast<size_t>(m.link_count) * 36u);
@@ -222,7 +335,10 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         // Position actuators seed stiffness = gain, damping = 2*sqrt(gain),
         // force limits from the actuator table.
         nk::ModelHoldDrives& d = model.hold_drives;
-        d.targets = host.q;
+        // Hold the SETTLED stance (m.initial_q) when an IC was authored, else the
+        // cook-rest q (== host.q): m.initial_q is host.q verbatim when no IC,
+        // keeping this byte-identical for every existing scene.
+        d.targets = has_authored_ic ? m.initial_q : host.q;
         d.stiffness.assign(m.link_count, 0.0f);
         d.damping.assign(m.link_count, 0.0f);
         d.force_limits.assign(m.link_count, 0.0f);
@@ -351,6 +467,67 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         }
         ref.body_row = b;
         smap.Bind(ent, ref);
+    }
+
+    // 7b. M7 T5b — movable rigid-body body_init (pose + inv_mass + inv_inertia),
+    //     so a generic .nks-cooked MOVABLE cup falls/rests under gravity instead
+    //     of being frozen at the arena's zero-init Identity (inv_mass 0). Matches
+    //     BuildNkUnionModel's cup body_init fill (pose/inv_mass/inv_inertia from
+    //     the body record) so the generic path agrees with the union path.
+    //
+    //     GUARD (the no-regression contract): body_init stays EMPTY unless the
+    //     scene has >=1 genuinely-MOVABLE FREE rigid body (a body row that is not
+    //     an articulation link, not static, with mass > 0 / inv_mass > 0). For
+    //     every existing golden/scene (articulation-only feet, particle, the
+    //     coupled_grasp_soft static box wall) no such body exists -> body_init
+    //     stays empty -> SeedInitialState skips the body block -> BYTE-IDENTICAL.
+    //
+    //     When a movable free body IS present, body_init is sized to ALL body
+    //     rows (env-major layout: SeedInitialState indexes body_init[b]); every
+    //     row gets its cooked world pose, but STATIC and ARTICULATION-LINK rows
+    //     keep inv_mass / inv_inertia 0 (the body integrate arms remain no-ops
+    //     for them, so the articulation is untouched). Only the free movable
+    //     bodies carry a non-zero inv_mass and so respond to gravity + contacts.
+    {
+        bool any_movable_free = false;
+        for (uint32_t b = 0; b < blob.body_count; ++b) {
+            const bool is_link = b < body_is_articulation_link.size() &&
+                                 body_is_articulation_link[b] != 0u;
+            const bool is_static = b < blob.bodies.is_static.size() &&
+                                   blob.bodies.is_static[b] != 0u;
+            const float inv_mass = b < blob.bodies.inv_masses.size()
+                                       ? blob.bodies.inv_masses[b]
+                                       : 0.0f;
+            if (!is_link && !is_static && inv_mass > 0.0f) {
+                any_movable_free = true;
+                break;
+            }
+        }
+        if (any_movable_free) {
+            model.body_init.assign(blob.body_count, nk::Model::BodyInit{});
+            for (uint32_t b = 0; b < blob.body_count; ++b) {
+                nk::Model::BodyInit& bi = model.body_init[b];
+                // Pose: the body's cooked WORLD pose (ResolveWorldTransform). For
+                // a free movable body this is its local->world seat; the union
+                // path uses the same record-derived pose.
+                if (b < blob.bodies.poses.size()) bi.pose = blob.bodies.poses[b];
+                // Velocities start at rest (the cook seeds no initial body vel).
+                bi.linear_velocity = math::Vec3::Zero();
+                bi.angular_velocity = math::Vec3::Zero();
+                // inv_mass / inv_inertia: ONLY for genuinely-movable free bodies;
+                // static + articulation-link rows stay frozen (inv_mass 0).
+                const bool is_link = b < body_is_articulation_link.size() &&
+                                     body_is_articulation_link[b] != 0u;
+                const bool is_static = b < blob.bodies.is_static.size() &&
+                                       blob.bodies.is_static[b] != 0u;
+                if (!is_link && !is_static) {
+                    if (b < blob.bodies.inv_masses.size())
+                        bi.inv_mass = blob.bodies.inv_masses[b];
+                    if (b < blob.bodies.inv_inertias.size())
+                        bi.inv_inertia = blob.bodies.inv_inertias[b];
+                }
+            }
+        }
     }
 
     // 8. Filter policy (cross-env collision flag). M3a defaults OFF (envs do not

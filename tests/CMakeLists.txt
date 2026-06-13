@@ -259,9 +259,6 @@ add_executable(nuka_scene_test
     scene/test_scene_pipeline.cpp
     scene/test_contact_metadata_cook.cpp
     scene/test_filter_precedence.cpp
-    # M2c: real-asset H1 x cup x kitchen-counter compose gate (GTEST_SKIPs
-    # without .nuka-assets). Imports + Compose + cook; no programmatic table.
-    scene/test_scene_compose_h1_cup_table.cpp
 )
 
 target_link_libraries(nuka_scene_test
@@ -795,6 +792,35 @@ if(CMAKE_CUDA_COMPILER)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_cook_settle_determinism_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # --- M7 T5b: the H1 x cup x kitchen-counter compose gate, UPGRADED to the
+    # FULL .nks pipeline (Compose -> FindRestPlacement seat -> Save(.nks+.nka) ->
+    # re-Save byte-identity -> Load -> CookToModel -> nk::World -> Step). GTEST_SKIPs
+    # without .nuka-assets / a CUDA backend. Moved out of nuka_scene_test (CUDA-free)
+    # into the CUDA region for the cook+World step. Flags the kitchen-scale cook gap
+    # (single-articulation cook can't represent the whole-body H1; the union
+    # h1_cup_table.nks path owns the real grasp world).
+    add_executable(nuka_scene_compose_h1_cup_table_test
+        scene/test_scene_compose_h1_cup_table.cpp
+    )
+    add_dependencies(nuka_scene_compose_h1_cup_table_test nuka_codegen)
+    target_include_directories(nuka_scene_compose_h1_cup_table_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_scene_compose_h1_cup_table_test
+        PRIVATE
+            nuka_nk
+            # nuka_scene_cook transitively pulls nuka_nk + nuka_scene +
+            # nuka_articulation (CookToModel / FindRestPlacement / CookScene + the
+            # .nks Save/Load live in nuka_scene).
+            nuka_scene_cook
+            nuka_import
+            nuka_phi2
+            nuka_phi
+            nuka_core
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_scene_compose_h1_cup_table_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # --- M6: nk standalone-particle equivalence to the legacy XPBD/PBF oracle bars
