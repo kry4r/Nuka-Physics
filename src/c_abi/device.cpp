@@ -1,10 +1,48 @@
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 
+#include "phi/backend.hpp"
+
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <exception>
 #include <memory>
+
+namespace {
+
+namespace nphi = nuka::phi;
+
+// Select the phi v2 Device for the requested CUDA ordinal. Walks the registry's
+// devices counting across backends until `ordinal` is reached; falls back to
+// InitBestDevice() (the first available device) when the ordinal is out of range
+// or negative. Mirrors recorder.cpp's SelectDeviceByOrdinal (commit fcae2a6) so
+// the validated DeviceRecord ordinal is honored instead of unconditionally
+// routing every device to device 0. NOTE: BackendCount()/GetBackend()/
+// InitBestDevice() each call EnsureBuiltinBackends() internally, which runs
+// RegisterCudaBackendEntry() exactly once (phi/registry.cpp) -- this is what
+// closes the static-lib backend-drop trap, so no explicit registration call is
+// needed here.
+nphi::Device* SelectDeviceByOrdinal(int ordinal) {
+    if (ordinal >= 0) {
+        int seen = 0;
+        const size_t backend_count = nphi::BackendCount();
+        for (size_t b = 0u; b < backend_count; ++b) {
+            nphi::RegistryEntry* entry = nphi::GetBackend(b);
+            if (entry == nullptr) continue;
+            const size_t dev_count = nphi::RegistryEntryDeviceCount(entry);
+            for (size_t d = 0u; d < dev_count; ++d) {
+                if (seen == ordinal) {
+                    return nphi::RegistryEntryGetDevice(entry, d);
+                }
+                ++seen;
+            }
+        }
+    }
+    return nphi::InitBestDevice();  // fallback: first available device.
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -32,6 +70,28 @@ nuka_result_t nuka_device_create(const nuka_device_desc_t* desc,
             stream = record->owned_stream->Native();
         }
         record->context = nuka::phi::MakeDeviceContext(device_id, stream);
+
+        // --- phi v2 device/backend acquisition (M9 T2) ---------------------
+        // Acquire the OWNED phi v2 Backend on the requested CUDA ordinal so the
+        // C-ABI can later build an nk::World + call cook::Settle (T4/T5). Mirrors
+        // recorder.cpp (commit fcae2a6): honor the validated ordinal via
+        // SelectDeviceByOrdinal, then take ownership IMMEDIATELY so any failure
+        // path frees the backend through the DeviceRecord destructor. The Device
+        // is registry-owned (not freed); the Backend is freed in ~DeviceRecord.
+        // TODO(M9-T5): feed record->phi_device + record->backend into the
+        //              nk::World ctor in world.cpp create.
+        // TODO(M9-T4): use them for cook::Settle in nuka_scene.cpp.
+        nphi::Device* dev = SelectDeviceByOrdinal(device_id);
+        if (dev == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;  // no phi v2 backend/device.
+        }
+        nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
+        if (backend == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        record->phi_device = dev;     // registry-owned; not freed.
+        record->backend = backend;    // OWNED; freed by ~DeviceRecord.
+
         *out = nuka::c_abi::DeviceTable().Insert(std::move(record));
         return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
