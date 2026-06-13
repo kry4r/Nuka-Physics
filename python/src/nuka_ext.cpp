@@ -28,6 +28,7 @@
 #include "nuka/nuka_grasp.h"  // v0.8 A2: the batched grasp world C ABI (BatchedUnifiedWorld)
 #include "nuka/nuka_noise.h"
 #include "nuka/nuka_union.h"  // v0.8 G2: the H1 whole-body UNION world C ABI
+#include "nuka/nuka_recorder.h"  // M8 T5: the offscreen recorder C ABI (PPM/mp4)
 
 namespace nb = nanobind;
 
@@ -1003,6 +1004,63 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Recorder wrapper (RAII) -- M8 T5. Drives the host frame loop over an nk::World
+// cooked from `scene_path`, through the offscreen Vulkan raster renderer, and
+// captures frames to PPM P6 + muxes an mp4 via ffmpeg. On a Vulkan-less libnuka
+// every C entry returns NUKA_RESULT_NOT_SUPPORTED -> create() raises cleanly, so
+// the binding still IMPORTS but Recorder is unavailable at runtime (Decision D5).
+// ---------------------------------------------------------------------------
+class Recorder {
+public:
+    static Recorder* create(Device* device, const std::string& scene_path,
+                            uint32_t width, uint32_t height, uint32_t env_index,
+                            float dt) {
+        if (device == nullptr) {
+            throw std::runtime_error("Recorder.create: device is None");
+        }
+        nuka_recorder_desc_t desc{};
+        desc.scene_path = scene_path.empty() ? nullptr : scene_path.c_str();
+        desc.width = width;          // 0 -> 1920 (D6 default)
+        desc.height = height;        // 0 -> 1080
+        desc.env_index = env_index;  // D4: default 0
+        desc.dt = dt;                // <= 0 -> 1/240f
+        desc.use_camera_override = 0u;  // use the scene camera / auto-frame
+        nuka_recorder_handle h = nullptr;
+        check(nuka_recorder_create(device->raw(), &desc, &h),
+              "nuka_recorder_create");
+        return new Recorder(h);
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_recorder_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~Recorder() { destroy(); }
+
+    // Drive n_frames Frame()s, writing frame_%06d.ppm into out_dir.
+    void capture(uint32_t n_frames, const std::string& out_dir) {
+        check(nuka_recorder_capture(h_, n_frames, out_dir.c_str()),
+              "nuka_recorder_capture");
+    }
+
+    // Mux out_dir/frame_%06d.ppm -> out_mp4 at fps. Raises on missing/failing
+    // ffmpeg (the C side returns NOT_SUPPORTED / INTERNAL -- never crashes).
+    void to_video(const std::string& out_dir, const std::string& out_mp4,
+                  uint32_t fps) {
+        check(nuka_recorder_to_video(h_, out_dir.c_str(), out_mp4.c_str(), fps),
+              "nuka_recorder_to_video");
+    }
+
+    uint32_t frame_count() const { return nuka_recorder_frame_count(h_); }
+
+private:
+    explicit Recorder(nuka_recorder_handle h) : h_(h) {}
+    nuka_recorder_handle h_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 NB_MODULE(_nuka_ext, m) {
@@ -1528,6 +1586,43 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](UnionWorld& w) -> UnionWorld& { return w; })
         .def("__exit__",
              [](UnionWorld& w, nb::object, nb::object, nb::object) { w.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    // M8 T5: the offscreen Recorder. On a Vulkan-less libnuka create() raises
+    // (the C entries return NUKA_RESULT_NOT_SUPPORTED) -- the binding still
+    // imports; only the runtime call fails (Decision D5).
+    nb::class_<Recorder>(m, "Recorder")
+        .def_static("create", &Recorder::create, nb::arg("device"),
+                    nb::arg("scene_path"), nb::arg("width") = uint32_t{0},
+                    nb::arg("height") = uint32_t{0},
+                    nb::arg("env_index") = uint32_t{0}, nb::arg("dt") = 0.0f,
+                    nb::rv_policy::take_ownership,
+                    "Create an offscreen recorder over an nk::World cooked from "
+                    "scene_path (an authored .nks). It builds the RenderWorld from "
+                    "the SAME cook's Registry + SceneMap and stands up the Vulkan "
+                    "forward raster renderer. width/height=0 -> 1920x1080 (D6); "
+                    "env_index selects the rendered env (D4, default 0); dt<=0 -> "
+                    "1/240. Raises if libnuka was built without Vulkan, if the "
+                    "scene/assets are missing, or if no Vulkan graphics device is "
+                    "present.")
+        .def("capture", &Recorder::capture, nb::arg("n_frames"),
+             nb::arg("out_dir"),
+             "Drive n_frames frames (step + publish + render) and write each "
+             "frame to out_dir/frame_%06d.ppm (binary PPM P6). The frame index "
+             "continues across capture() calls so a multi-segment rollout muxes "
+             "contiguously. out_dir is created if absent.")
+        .def("to_video", &Recorder::to_video, nb::arg("out_dir"),
+             nb::arg("out_mp4"), nb::arg("fps") = uint32_t{30},
+             "Mux out_dir/frame_%06d.ppm -> out_mp4 via ffmpeg at fps (default "
+             "30; libx264/yuv420p). Raises cleanly if ffmpeg is absent or the "
+             "mux fails (the C side never crashes).")
+        .def("destroy", &Recorder::destroy, "Destroy the recorder.")
+        .def_prop_ro("frame_count", &Recorder::frame_count,
+                     "Total frames captured so far on this recorder.")
+        .def("__enter__", [](Recorder& r) -> Recorder& { return r; })
+        .def("__exit__",
+             [](Recorder& r, nb::object, nb::object, nb::object) { r.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 

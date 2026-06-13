@@ -121,6 +121,12 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_grasp.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_union.h
+    # M8 T5: the offscreen recorder C ABI (PPM P6 capture + ffmpeg mp4). Its
+    # IMPLEMENTATION (c_abi/recorder.cpp) is gated behind NK_BUILD_VULKAN_VALIDATION
+    # (Decision D5) but the header + the exported symbols are ALWAYS present so the
+    # python binding imports on a Vulkan-less build (every entry returns
+    # NUKA_RESULT_NOT_SUPPORTED there).
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_recorder.h
 )
 
 add_library(nuka_render STATIC
@@ -988,6 +994,14 @@ if(CMAKE_CUDA_COMPILER)
         # reads the baked settled IC + grasp config and produces the SAME
         # BatchedSceneTemplate BatchedUnifiedWorld consumes.
         c_abi/union_world.cpp
+        # M8 T5: the offscreen RECORDER C ABI (frame loop -> raster -> PPM P6 ->
+        # ffmpeg mp4). ALWAYS compiled (so the symbols export for the python
+        # binding), but its render-touching body is behind NK_BUILD_VULKAN_VALIDATION
+        # (Decision D5): with the flag OFF this TU pulls NO Vulkan/render headers
+        # and every entry returns NUKA_RESULT_NOT_SUPPORTED -> libnuka stays
+        # buildable with zero Vulkan deps. With the flag ON the nuka_app + nuka_render
+        # link (added below) bring the real Simulation + VulkanRasterRenderer in.
+        c_abi/recorder.cpp
         runtime/coresident/batched_unified_world.cpp
         runtime/coresident/unified_coresident_stepper.cpp
         runtime/coresident/grasp_scene_factory.cpp
@@ -1033,6 +1047,17 @@ if(CMAKE_CUDA_COMPILER)
     # v0.8 A2: the grasp path compiles batched_unified_world.cpp, which includes the
     # GENERATED collidable registry (candidate_pair.hpp) -- ensure codegen runs first.
     add_dependencies(nuka nuka_codegen)
+
+    # M8 T5 (Decision D5): the offscreen recorder. ONLY when NK_BUILD_VULKAN_VALIDATION
+    # is ON does c_abi/recorder.cpp compile its real body + link the frame-loop
+    # (nuka_app) and the offscreen raster renderer (nuka_render). With the flag OFF
+    # the recorder TU is a pure stub (NUKA_RESULT_NOT_SUPPORTED, no Vulkan headers),
+    # so libnuka builds with NO Vulkan dependency and the python binding still imports.
+    if(NK_BUILD_VULKAN_VALIDATION)
+        set_source_files_properties(c_abi/recorder.cpp PROPERTIES
+            COMPILE_DEFINITIONS NK_BUILD_VULKAN_VALIDATION)
+        target_link_libraries(nuka PRIVATE nuka_app nuka_render)
+    endif()
 
     set_target_properties(nuka PROPERTIES
         OUTPUT_NAME nuka
