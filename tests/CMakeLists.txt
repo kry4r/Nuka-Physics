@@ -719,6 +719,45 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_h1_union_parity_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- M8 T4: render_frame_loop_smoke — the frame-loop SPINE smoke
+    # (PosePublisher + systems + Simulation, nuka_app). The G5 render-OFF
+    # byte-identity assertion runs in the DEFAULT build (NOT behind the Vulkan
+    # flag); the G1 publish-contract + non-bg-pixels assertions are #ifdef'd on
+    # NK_BUILD_VULKAN_VALIDATION inside the source (they need a real raster
+    # device). The executable links nuka_app (the spine under test) + the .nks
+    # cook path (CookToModel in nuka_scene_cook, nks::Load in nuka_import) +
+    # nuka_render (BuildRenderWorld / RenderWorld). Asset-gated SKIP.
+    add_executable(nuka_render_frame_loop_smoke_test
+        scenario/render_frame_loop_smoke.cpp
+    )
+    add_dependencies(nuka_render_frame_loop_smoke_test nuka_codegen)
+    target_compile_definitions(nuka_render_frame_loop_smoke_test
+        PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    if(NK_BUILD_VULKAN_VALIDATION)
+        target_compile_definitions(nuka_render_frame_loop_smoke_test
+            PRIVATE NK_BUILD_VULKAN_VALIDATION)
+    endif()
+    target_include_directories(nuka_render_frame_loop_smoke_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_render_frame_loop_smoke_test
+        PRIVATE
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_render_frame_loop_smoke_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # --- M4: nk_union_n1 — the ≤5 ms/step hard perf gate (N=1 union full
     # contact, 1000 StepPlanned steps). M7: the union scene is cooked from the
     # authored .nks (scene::cook::CookSceneToUnionTemplate), NO factory.

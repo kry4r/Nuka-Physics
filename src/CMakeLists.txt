@@ -588,6 +588,47 @@ if(CMAKE_CUDA_COMPILER)
 
     nuka_set_warnings(nuka_scene_cook)
 
+    # -------------------------------------------------------------------------
+    # nuka_app — M8 host frame-loop spine (runtime/app/): PosePublisher +
+    # systems + Simulation. Steps an nk::World and (when a renderer is attached
+    # + enabled) publishes its FK poses into a render::RenderWorld and rasters an
+    # offscreen frame. Lives in this CUDA block because it consumes nuka_nk.
+    #
+    # Pure host C++ (src/runtime/app/** is in the zero-CUDA-token lint scope):
+    # the only device touch is nk::World::GetData().DownloadField (host readback)
+    # through nuka_nk's phi v2 vtable. The render dependency is gated per
+    # Decision D5 — the VulkanRasterRenderer::Render draw call in systems.cpp is
+    # compiled only when NK_BUILD_VULKAN_VALIDATION is defined, so a Vulkan-less
+    # toolchain still links (RenderSystem::Run is then inert and Simulation never
+    # attaches a renderer). nuka_render is linked for the shared RenderWorld /
+    # RasterOptions / VulkanOffscreenReport types (Vulkan is a REQUIRED package
+    # for this tree, so the link is always satisfiable here).
+    # -------------------------------------------------------------------------
+    add_library(nuka_app STATIC
+        runtime/app/pose_publisher.cpp
+        runtime/app/systems.cpp
+        runtime/app/simulation.cpp
+    )
+    set_target_properties(nuka_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    target_include_directories(nuka_app
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+
+    target_link_libraries(nuka_app
+        PUBLIC
+            nuka_nk
+            nuka_render
+            nuka_scene
+    )
+
+    if(NK_BUILD_VULKAN_VALIDATION)
+        target_compile_definitions(nuka_app PUBLIC NK_BUILD_VULKAN_VALIDATION)
+    endif()
+
+    nuka_set_warnings(nuka_app)
+
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
         # SAP broadphase: O(n^2) pair-slot oracle over a device AABB buffer. The
