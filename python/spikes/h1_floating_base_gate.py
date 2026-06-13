@@ -18,18 +18,18 @@ order, plus a Python-layer one:
       -- cooker.cpp:29), so every cold create_from_scene re-cooks all 49 meshes
       from scratch: many MINUTES, CPU-bound, single-threaded (measured >8 min,
       still running, vs go2's 0.01 s with 0 meshes). This cook is WASTED for the
-      batched trainable path -- BatchedArticulatedWorld's ctor takes only
-      (host articulation state, FootShape feet, ground_height) and never consumes
-      the mesh SDFs (batched_articulated_world.hpp:142-150; ArticulationHostState
-      carries NO shapes). Fix: skip mesh-collision cook for the batched path, OR
+      batched trainable path -- the legacy batched articulated world's ctor took
+      only (host articulation state, FootShape feet, ground_height) and never
+      consumed the mesh SDFs (ArticulationHostState carries NO shapes). Fix: skip
+      mesh-collision cook for the batched path, OR
       persist the decomposition+SDF cache to disk, OR strip colliders.
 
   [2] DOF CAP (the HARD engine stop -- the real gate-killer).
       The batched contact solver's on-thread PGS working vectors are capped at
       kMaxContactSolverDof = 18u (articulation_contacts.hpp:292-294), commented
       "6-DOF floating base + 12 revolute = 18" -- i.e. sized for GO2. H1 is 51
-      DOF (6 floating base + 45 hinge joints). BatchedArticulatedWorld's ctor
-      throws "max_dof out of range" (batched_articulated_world.cu:120) for any
+      DOF (6 floating base + 45 hinge joints). The legacy batched articulated
+      world's ctor threw "max_dof out of range" for any
       max_dof > 18 -> create_from_scene returns INTERNAL (100).
       ISOLATED EMPIRICALLY (two variants below, identical except for DOF):
         * mesh-stripped + sphere-foot H1, 51 DOF  -> INTERNAL(100), construct fails
@@ -166,7 +166,7 @@ def case_batched_stripped_sphere(dev, env_count=64, n_steps=300):
                   f"{type(e).__name__}: {e}", flush=True)
             print("    => This is blocker [2]: H1 is 51 DOF (6 floating + 45 "
                   "hinge) > kMaxContactSolverDof=18 (articulation_contacts.hpp:294, "
-                  "sized for go2's 6+12). batched_articulated_world.cu:120 throws "
+                  "sized for go2's 6+12). The legacy batched articulated ctor threw "
                   "'max_dof out of range' -> INTERNAL(100). The mesh cook [1] is "
                   "OUT of the picture here (0 meshes, ~instant), and the sphere "
                   "feet cleared [3], so this is the irreducible HARD engine stop.")

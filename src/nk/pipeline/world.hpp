@@ -88,7 +88,7 @@ public:
 
     // Reset the selected envs DEVICE-SIDE (M3b): an empty list dispatches the
     // bulk RestoreState op (snapshot -> live + clear qddot/tau/lambda, the
-    // legacy BatchedArticulatedWorld::Reset 1:1); a non-empty list uploads the
+    // legacy batched articulated Reset 1:1); a non-empty list uploads the
     // ids into the reset_env_ids field and dispatches the per-env masked
     // ResetEnvs op (the p03 ResetEnvsKernel port). The restore source is the
     // construction-time SnapshotState (the cooked initial pose).

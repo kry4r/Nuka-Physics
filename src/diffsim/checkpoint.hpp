@@ -6,7 +6,7 @@
 // A Checkpoint captures the AUTHORITATIVE per-env state at one forward step --
 // exactly the buffers that diverge across a Step and are NOT recomputed from
 // scratch before they are read, i.e. the SAME set the engine's Reset snapshot
-// owns (batched_articulated_world.cu ~L268-301):
+// owns (the ResetEnvs port in phi/backend_cuda/ops/readout.cu):
 //
 //   base_pose[articulation_count]    -- floating-base world pose
 //   link_velocity[total_link_count]  -- base + per-link spatial velocities

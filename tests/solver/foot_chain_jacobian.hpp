@@ -14,8 +14,8 @@
 // ComputeContactChainJacobians reads state.link_pose (the WORLD link poses), but
 // UploadArticulationState leaves link_pose at the STATIC COOKED rest pose (q=0,
 // base at cook origin). The production pipeline refreshes it from the current q
-// each step (batched_articulated_world.cu stage 4: UpdateWorldLinkPoses -> copy
-// into state.link_pose) BEFORE the chain-J. We mirror that here: the caller passes
+// each step (the legacy batched articulated step stage 4: UpdateWorldLinkPoses ->
+// copy into state.link_pose) BEFORE the chain-J. We mirror that here: the caller passes
 // the FK world poses (already computed via ForwardKinematics) which we write into a
 // COPY of the host state's link_pose before upload. WITHOUT this refresh the leg
 // joint anchors collapse to the base origin and the leg columns degenerate to
