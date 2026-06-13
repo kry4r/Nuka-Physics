@@ -96,7 +96,7 @@ struct ApplyDrivesParams {
     // explicit -Kd*qdot in the drive (the legacy pre-implicit oracle form).
     uint32_t defer_velocity_damping;
     // M4: drive mode. 0 = position PD hold drive (ApplyPositionDriveKernel, the
-    // M3 BatchedArticulatedWorld path). 1 = direct torque drive (the union
+    // M3 batched articulated path). 1 = direct torque drive (the union
     // world's LaunchApplyTorqueDriveKernels port: tau = clamp(drive_target,
     // +/-drive_force_limit) — drive_target carries the per-link torque).
     uint32_t mode;
@@ -415,7 +415,7 @@ struct SnapshotStateParams {
 };
 
 // RestoreState: bulk snapshot -> live restore + clear the carried accumulators
-// (qddot / tau / lambda), the legacy BatchedArticulatedWorld::Reset 1:1.
+// (qddot / tau / lambda), the legacy batched articulated Reset 1:1.
 struct RestoreStateParams {
     uint32_t total_link_count;
     uint32_t env_count;

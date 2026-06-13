@@ -4,7 +4,7 @@
 // The C-ABI world is now exactly ONE nk::World built from
 // Scene -> CookToModel -> nk::World (mirroring c_abi/recorder.cpp's proven
 // create+ownership pattern). The two legacy steppers (single-env Featherstone
-// StepWorldGpu + multi-env BatchedArticulatedWorld) are GONE: there is no
+// StepWorldGpu + the multi-env batched articulated world) are GONE: there is no
 // special world type and no per-case physics path (owner's highest directive --
 // a GENERAL solver, no "case 特惠"). create cooks the authored scene, builds an
 // nk::World on the DeviceRecord's already-owned phi v2 device/backend (M9 T2),

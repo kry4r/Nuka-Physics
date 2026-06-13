@@ -909,7 +909,7 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
         const uint32_t blocks =
             (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
         // Joint velocity first, then the floating-base velocity — the production
-        // BatchedArticulatedWorld order (the two write DISJOINT state: qdot vs
+        // batched articulated order (the two write DISJOINT state: qdot vs
         // link_velocity[root], so the single-env FB-first order is byte-equal).
         LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks),
                    dim3(kAbaBlockSize), 0u, stream, state, p->dt);

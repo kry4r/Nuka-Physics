@@ -458,8 +458,8 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
         // Defensive MEMORY-SAFETY bound only, NOT a truncation policy: the M
         // tile holds just the leading max_dof block (there is nothing beyond
         // it to invert), every production caller passes max_dof == the
-        // articulation's exact DOF count (BatchedArticulatedWorld asserts
-        // equality at construction; the coresident worlds compute dof_stride
+        // articulation's exact DOF count (the legacy batched articulated world
+        // asserted equality at construction; the coresident worlds compute dof_stride
         // from ArticulationDofCount), and the host launcher rejects
         // max_dof > kMaxArticulationDof with a LOUD throw. Unreachable via
         // host-validated inputs -- the old silent 18-clamp (which WELDED real

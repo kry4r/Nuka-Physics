@@ -146,7 +146,7 @@ struct ModelMaterialBucket {
 // SolveRowsBlockIsland ops:
 //   FusedFoot — the M3 articulation foot pipeline (sphere x ground detection,
 //               ArticulatedContactRow records, the fused block-per-articulation
-//               PGS — the legacy BatchedArticulatedWorld semantics, goldens
+//               PGS — the legacy batched articulated foot semantics, goldens
 //               byte-exact).
 //   UnionCsr  — the union compliant-CSR pipeline (feet x ground + finger x
 //               hull + box x plane in ONE solve — the legacy coresident union
@@ -272,7 +272,7 @@ public:
     // -- M4: contact family + union (CSR compliant) tables --------------------
     ContactFamily contact_family = ContactFamily::FusedFoot;
     // Drive mode the ApplyDrives op runs (0 = position PD hold drive, the M3
-    // BatchedArticulatedWorld path; 1 = direct torque drive, the union world's
+    // batched articulated path; 1 = direct torque drive, the union world's
     // LaunchApplyTorqueDriveKernels path — drive_target carries the torque).
     uint32_t drive_mode = 0;
     std::vector<UnionSlot> union_slots;   // per-env contact-pair template.

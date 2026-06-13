@@ -57,8 +57,8 @@ namespace nuka::sensor {
 // Inputs (all device pointers; raw so this TU depends only on nuka_core/nuka_phi
 // + math, never on the runtime/articulation headers):
 //   lambda          [slot_count * 3] float -- solved per-slot impulses
-//                   {lambda_n,lambda_t1,lambda_t2}, slot-major (the
-//                   BatchedArticulatedWorld lambda_ buffer / DownloadLambda layout).
+//                   {lambda_n,lambda_t1,lambda_t2}, slot-major (the legacy
+//                   batched articulated lambda_ buffer / DownloadLambda layout).
 //   contact_point   [slot_count] Vec3 -- world contact point per slot.
 //   contact_normal  [slot_count] Vec3 -- world unit normal per slot.
 //   tangent1        [slot_count] Vec3 -- world friction tangent 1 per slot.

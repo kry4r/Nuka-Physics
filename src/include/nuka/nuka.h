@@ -130,8 +130,8 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_CONTACT_POINTS = 5,
     // WRITABLE (batched/multi-env path only). The per-env PD position-drive
     // target buffer the batched step reads every Step. The buffer view returned
-    // for this field aliases the live device buffer that
-    // BatchedArticulatedStepParams::drive_targets points at, so a caller may
+    // for this field aliases the live device buffer the batched drive params'
+    // drive_targets point at, so a caller may
     // write it IN PLACE (zero-copy) and the NEXT nuka_world_step picks up the
     // new targets. Layout is IDENTICAL to NUKA_FIELD_JOINT_POSITION: a
     // float[env_count * base_link_count], env-major, index
@@ -189,7 +189,7 @@ typedef enum nuka_state_field_t {
     //     for a live base.)
     NUKA_FIELD_LINK_VELOCITY = 7,
     // WRITABLE (batched/multi-env path only). The per-env PD drive GAIN buffers
-    // the batched step reads every Step (BatchedArticulatedStepParams::
+    // the batched step reads every Step (the batched drive params'
     // drive_stiffness / drive_damping / drive_force_limits point straight at them).
     // The view aliases the live device buffer so a caller may write it IN PLACE
     // (zero-copy) and the NEXT nuka_world_step picks up the new gains -- IDENTICAL

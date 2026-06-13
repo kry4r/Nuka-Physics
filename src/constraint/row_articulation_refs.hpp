@@ -15,8 +15,8 @@
 // (which puts these in SolveContext) can consume it WITHOUT a heavy include. No
 // dependency beyond <cstdint>.
 //
-// LAYOUT (global buffers, uniform dof_stride = max DOF; env-major, matching
-// BatchedArticulatedWorld). For a row SIDE whose `art_index != kInvalidArtIndex`:
+// LAYOUT (global buffers, uniform dof_stride = max DOF; env-major, matching the
+// batched articulated layout). For a row SIDE whose `art_index != kInvalidArtIndex`:
 //   chain_jacobian row  -> chain_jacobians + chain_jac_slot * dof_stride   [dof_stride]
 //   M^-1 tile           -> inertia_m_inv   + art_index    * dof_stride^2   [dof_stride^2]
 //   live qdot slice     -> qdot            + art_index    * dof_stride     [dof_stride] (MUTABLE)

@@ -306,7 +306,6 @@ constexpr uint32_t kMaxArticulationDof = 64u;
 // LEGACY 18-DOF cap (6-DOF floating base + 12 revolute = the Go2). The contact
 // solve itself now sizes by kMaxArticulationDof above; this constant remains
 // ONLY for its named consumers whose scratch is genuinely pinned at 18:
-//   * BatchedArticulatedWorld's construction gate (legacy world, Go2-shaped),
 //   * the ComputedTorque/Osc drive kernels' dense scratch (articulation_drives.cu)
 //     -- which must stay in lockstep with their diffsim adjoint,
 //   * the diffsim KKT/IFT/Osc-adjoint __shared__ tiles (kkt_builder.cu /

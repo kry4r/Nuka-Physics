@@ -26,7 +26,7 @@
 #include "phi/device_context.hpp"
 // DeterminismLevel { Strong, Weak } already exists engine-wide; reuse it rather
 // than declaring a second one (keeps the D1/D2 contract single-sourced).
-#include "runtime/gpu/batched_articulated_world.hpp"
+#include "runtime/articulation/determinism_level.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -35,7 +35,7 @@
 namespace nuka::diffsim {
 
 // Reuse the engine's single DeterminismLevel (Strong = D1 bit-exact, the
-// default; Weak = D2 escape hatch). Defined in runtime/gpu/batched_articulated_world.hpp.
+// default; Weak = D2 escape hatch). Defined in runtime/articulation/determinism_level.hpp.
 using nuka::runtime::gpu::DeterminismLevel;
 
 // Compile-time cap on a single block's dimension: kMaxFootContactsPerEnv(4) * 3

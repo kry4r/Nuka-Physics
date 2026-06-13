@@ -8,9 +8,9 @@
 // and Actuator (DC-motor torque-speed envelope). The legacy PDPosition mode
 // stays in featherstone_aba.{cu,hpp} (ApplyPositionDrives) and is NOT touched, so
 // the PD path's instruction / FP order -- and the go2_stand golden -- is
-// byte-for-byte unchanged. The HOST-SIDE dispatcher in
-// batched_articulated_world.cu / c_abi/world.cpp selects PDPosition (existing
-// launcher) vs these by ControlMode (control_mode.hpp).
+// byte-for-byte unchanged. The HOST-SIDE dispatcher (the phi backend drive op /
+// c_abi/world.cpp) selects PDPosition (existing launcher) vs these by ControlMode
+// (control_mode.hpp).
 //
 // Both kernels mirror ApplyPositionDriveKernel's shape EXACTLY: a flat per-link
 // grid, each thread owns one link and writes only its own tau[link] -- no

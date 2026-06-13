@@ -1917,7 +1917,7 @@ if(CMAKE_CUDA_COMPILER)
 
     # M9 T11: nuka_floating_base_aba_test (test_floating_base_aba.cpp) +
     # nuka_floating_base_contact_test (test_floating_base_contact.cpp) DELETED with
-    # the legacy BatchedArticulatedWorld. Floating-base ABA correctness (legs+base
+    # the legacy batched articulated world. Floating-base ABA correctness (legs+base
     # byte-exact vs MJX golden) survives on nk via oracle
     # NkWorldFloatingBaseGoldensMatchCudaAbaByteExact; the floating-base foot-ground
     # contact-recoil through the 18-wide chain-J survives via foot_ground_subsume +
@@ -2318,7 +2318,7 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # M9 T11: nuka_go2_pd_standing_test (test_go2_pd_standing.cpp) DELETED with the
-    # legacy BatchedArticulatedWorld. Pure go2-quadruped PD-stance locomotion
+    # legacy batched articulated world. Pure go2-quadruped PD-stance locomotion
     # precursor -> M10 carry-forward (crouch-hold height tracking, Sigma lambda=Mg/4
     # per foot, COM-in-foot-polygon static balance, no-tip, 4096-env determinism;
     # see subagent-plans/m9-t11-articulated-fold.md M10 carry-forward #1). Generic
@@ -2326,7 +2326,7 @@ if(CMAKE_CUDA_COMPILER)
     # h1_grasp_lift + articulation_contact_rows + multi_env.
 
     # M9 T11: nuka_link_contact_wrench_test (test_link_contact_wrench.cpp) DELETED
-    # with the legacy BatchedArticulatedWorld. The synthetic ComputeContactWrench-
+    # with the legacy batched articulated world. The synthetic ComputeContactWrench-
     # Outputs kernel arm + the LINK_CONTACT_WRENCH field binary contract survive
     # (the kernel + multi_env SingleEnvStillSupported); the go2-stance-balances-
     # weight + graph==wrench arms -> M10 carry-forward (per-link contact-wrench
@@ -2340,7 +2340,7 @@ if(CMAKE_CUDA_COMPILER)
     # M9 T11: nuka_batched_articulated_world_test (test_batched_articulated_world.cpp),
     # nuka_batched_articulated_graph_test (test_batched_articulated_graph.cpp), and
     # nuka_batched_articulated_world_perf_test (test_batched_articulated_world_perf_
-    # detail.cpp) ALL DELETED with the legacy BatchedArticulatedWorld. The class
+    # detail.cpp) ALL DELETED with the legacy batched articulated world. The class
     # orchestration (env-major + cross-env/two-run D1 + 4096 scale) survives on nk
     # via multi_env (DeterminismCrossEnvAndTwoRuns + HeadlineScale4096 +
     # SingleEnvStillSupported); batched==engine bit-exact + graph==step survive via
@@ -2380,23 +2380,13 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_go2_4096env_step_time_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-    # --- Parameterized perf-harness CLI (v0.3 p01 Wave-2 #4) ----------------
-    # NOT a gtest: a standalone CLI that drives the real batched articulated
-    # stepper over a chosen env count / step count and prints the engine
-    # PerfRecorder JSON (schema_version + per_tag + gpu/n_envs/steps) to stdout.
-    # This is the `--harness` binary tools/perf/run_perf_baseline.py invokes.
-    add_executable(nuka_perf_harness
-        ${CMAKE_SOURCE_DIR}/tools/perf/perf_harness.cpp
-    )
-
-    target_link_libraries(nuka_perf_harness
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-    )
+    # M9 T11: nuka_perf_harness (tools/perf/perf_harness.cpp) DELETED with the
+    # legacy batched articulated world -- it was a measurement-only CLI that
+    # constructed + stepped that class (mirroring the already-deleted
+    # test_batched_articulated_world_perf_detail.cpp). The live 4096-env per-env
+    # step-time perf gate is nuka_go2_4096env_step_time_test (nk StepPlanned).
+    # (tools/perf/run_perf_baseline.py / compare_perf_runs.py reference the
+    # removed --harness binary and are now orphaned legacy tooling.)
 
 add_executable(nuka_cuda_perf_test
     # M9 T11-core-b2: test_cuda_solver_timing.cpp (legacy row_solver.cu timing)

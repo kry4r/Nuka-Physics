@@ -56,7 +56,7 @@ namespace nuka::diffsim {
 namespace articulation = nuka::runtime::articulation;
 
 // The engine-side contact buffers a single converged contact step exposes (the
-// BatchedArticulatedWorld members of the same name), plus the device state for
+// batched articulated step's contact members of the same name), plus the device state for
 // the dof column -> global qdot index map. All raw device pointers borrowed from
 // the caller; the runner does not own them.
 struct IftContactInputs {

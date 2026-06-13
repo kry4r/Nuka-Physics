@@ -20,7 +20,7 @@
 //   -> q' = q + qdot'*dt                             (IntegratePosition)
 //      base_pose' advanced                            (IntegrateFloatingBasePose)
 //
-// CRITICAL: this is NOT BatchedArticulatedWorld::Step(). Step() applies DEFERRED
+// CRITICAL: this is NOT the full batched articulated Step(). That Step() applies DEFERRED
 // drive damping folded into an implicit (M+dt*C)^-1 solve and runs the full
 // contact/CRBA pipeline unconditionally -- a DIFFERENT function the p02-A adjoint
 // does not model. Using Step() as the forward would pass replay-bit-exact but

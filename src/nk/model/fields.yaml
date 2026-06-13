@@ -98,7 +98,7 @@ fields:
   # REWRITES it every step (MotionSubspaceForJoint / the floating-base Zero6)
   # before the CRBA reads it — a 1:1 port of the legacy mutable buffer.
   - {name: joint_motion_subspace, dtype: spatial6,  per: link, arena: scratch,    owner: data}
-  # PD drive state (legacy BatchedArticulatedStepParams drive_* device arrays,
+  # PD drive state (legacy batched articulated drive_* device arrays,
   # link-major). drive_target is the RL action surface; the other three are
   # cook-seeded hold-drive params (randomizable later).
   - {name: drive_target,          dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
@@ -106,7 +106,7 @@ fields:
   - {name: drive_damping,         dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
   - {name: drive_force_limit,     dtype: f32,       per: link, arena: persistent, owner: data,  flags: [param]}
   # Reset/snapshot state (device-resident; backs SnapshotState/RestoreState/
-  # ResetEnvs ops — the legacy BatchedArticulatedWorld snapshot_* buffers 1:1).
+  # ResetEnvs ops — the legacy batched articulated snapshot_* buffers 1:1).
   - {name: snapshot_q,             dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_qdot,          dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_link_velocity, dtype: spatial6,  per: link, arena: persistent, owner: data}

@@ -4,9 +4,9 @@
 //
 // ReadoutContactWrench is a LINE-BY-LINE PORT of src/sensor/contact_wrench.cu
 // (ContactForceKernel + LinkContactWrenchKernel). ResetEnvs is a LINE-BY-LINE
-// PORT of the p03 ResetEnvsKernel in src/runtime/gpu/batched_articulated_world
-// .cu. SnapshotState / RestoreState are the device-side forms of the legacy
-// snapshot D2D copies / Reset() restore (replacing the M3a host-mediated
+// PORT of the p03 ResetEnvsKernel (the per-env RL-autoreset primitive).
+// SnapshotState / RestoreState are the device-side forms of the legacy snapshot
+// D2D copies / Reset() restore (replacing the M3a host-mediated
 // Data::Snapshot/Restore): flat stream-ordered cudaMemcpyAsync/MemsetAsync in
 // fixed address order — trivially D1.
 //
@@ -102,7 +102,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
     out_link_wrench[out + 5u] = torque.z;
 }
 
-// --- src/runtime/gpu/batched_articulated_world.cu ResetEnvsKernel (verbatim) -
+// --- p03 ResetEnvsKernel (per-env RL-autoreset primitive, verbatim) ----------
 
 __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  const uint32_t* env_ids,
@@ -348,7 +348,7 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
     const size_t nl = p->total_link_count;
     const size_t ne = p->env_count;
     // Snapshot -> live + clear carried accumulators (qddot / tau / lambda):
-    // the legacy BatchedArticulatedWorld::Reset() 1:1. Guarded on nl so a
+    // the legacy per-env Reset() restore 1:1. Guarded on nl so a
     // bodies-only world (nl == 0) skips the articulation restore but still
     // restores bodies below — the articulation copies stay byte-identical.
     if (nl > 0u &&

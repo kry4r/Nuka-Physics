@@ -12,7 +12,7 @@
 // Velocity. Slice 2 ADDS ComputedTorque (inverse-dynamics / computed-torque PD)
 // and Actuator (DC-motor torque-speed envelope). Slice 3 (p03 R2) ADDS Osc
 // (operational-space control: forward, position-task mode). The C ABI / the
-// BatchedArticulatedWorld constructor reject any value ABOVE Actuator so an
+// world-construction boundary reject any value ABOVE Actuator so an
 // unimplemented mode is never silently mis-actuated; ALL six enumerators
 // {0,1,2,3,4,5} are now implemented (the set is contiguous).
 //
