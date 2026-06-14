@@ -46,6 +46,14 @@
 #include "phi/buffer_transfer_v2.hpp"
 #include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfPairDev + LaunchNarrowphaseSdf
 #include "runtime/sdf/sparse_sdf_query.cuh"     // PackSdfCellKey
+// COL-5 / R16 coverage-fold: the cooked-SDF-table -> device round-trip + cell-count
+// assertion that test_sdf_device_upload.cu used to provide (deleted with
+// SdfDeviceWorld). CookSparseSdf cooks a real mesh into a scene::CookedSdfTable; we
+// mirror it into the Model sdf_cell_* concatenation layout (the SAME path
+// cook_to_model.cpp:614-638 walks) and round-trip it through a v2 device buffer.
+#include "import/cooker/sparse_sdf_cooker.hpp"  // CookSparseSdf / SparseSdfData
+#include "scene/cooked_blob.hpp"                 // scene::CookedSdfTable
+#include "tests/import/sdf_test_meshes.hpp"      // SphereMesh / UnitCubeMesh
 
 #include <gtest/gtest.h>
 
@@ -1218,4 +1226,102 @@ TEST(SdfPrecisionOracle, TwoRunByteIdentity) {
     EXPECT_EQ(std::memcmp(&a.point, &b.point, sizeof(Vec3)), 0);
     EXPECT_EQ(std::memcmp(&a.normal, &b.normal, sizeof(Vec3)), 0);
     EXPECT_EQ(std::memcmp(&a.depth, &b.depth, sizeof(float)), 0);
+}
+
+// ===========================================================================
+// COL-5 / R16 COVERAGE-FOLD: cooked-SDF-table -> device round-trip + cell-count.
+// Absorbs the UNIQUE coverage of the deleted tests/runtime/test_sdf_device_upload.cu
+// (the only assertion that a *cooked* scene::CookedSdfTable survives a host->device
+// copy with the right cell count). SdfDeviceWorld's upload duty now lives in
+// nk::Model (cook_to_model.cpp:614-638 concatenates the cooked grids into
+// model.sdf_cell_{keys,values,gradients}); this test walks that EXACT concatenation
+// layout from a real CookSparseSdf output, uploads the flat cell arrays through the
+// phi-v2 device buffer (stream-0, byte-identical to the legacy sync memcpy), reads
+// them back, and asserts the per-cell bytes survive + the total cell count matches
+// the sum of per-grid key_counts. Pure host->device copy => trivially D1.
+// ===========================================================================
+TEST(SdfPrecisionOracle, CookedTableDeviceRoundTripAndCellCount) {
+    using nuka::import::cooker::CookSparseSdf;
+    using nuka::import::cooker::SparseSdfData;
+    using nuka::import::cooker::SparseSdfParams;
+
+    auto cook = [](const nuka::test::TestMesh& mesh, float voxel) {
+        SparseSdfParams p;
+        p.voxel_size = voxel;
+        p.band_voxels = 2u;
+        return CookSparseSdf(mesh.vertices.data(),
+                             static_cast<uint32_t>(mesh.vertices.size() / 3),
+                             mesh.indices.data(),
+                             static_cast<uint32_t>(mesh.indices.size() / 3), p);
+    };
+
+    // A 2-grid cooked table (sphere + cube), exercising the per-grid
+    // key_offsets/key_counts slicing the Model concatenation depends on.
+    const SparseSdfData sphere =
+        cook(nuka::test::SphereMesh(0.0f, 0.0f, 0.0f, 1.0f, 48, 96), 0.06f);
+    const SparseSdfData cube = cook(nuka::test::UnitCubeMesh(), 0.04f);
+    ASSERT_GT(sphere.CellCount(), 0u);
+    ASSERT_GT(cube.CellCount(), 0u);
+
+    nuka::scene::CookedSdfTable table;
+    auto append = [&](const SparseSdfData& sdf) {
+        table.origins.push_back({sdf.origin[0], sdf.origin[1], sdf.origin[2]});
+        table.voxel_sizes.push_back(sdf.voxel_size);
+        table.dims_x.push_back(sdf.dims[0]);
+        table.dims_y.push_back(sdf.dims[1]);
+        table.dims_z.push_back(sdf.dims[2]);
+        table.key_offsets.push_back(static_cast<uint32_t>(table.cell_keys.size()));
+        table.key_counts.push_back(sdf.CellCount());
+        table.cell_keys.insert(table.cell_keys.end(), sdf.cell_keys.begin(),
+                               sdf.cell_keys.end());
+        table.cell_values.insert(table.cell_values.end(), sdf.cell_values.begin(),
+                                 sdf.cell_values.end());
+        for (uint32_t n = 0; n < sdf.CellCount(); ++n) {
+            table.cell_gradients.push_back({sdf.cell_gradients[3 * n + 0],
+                                            sdf.cell_gradients[3 * n + 1],
+                                            sdf.cell_gradients[3 * n + 2]});
+        }
+    };
+    append(sphere);
+    append(cube);
+
+    // Mirror cook_to_model.cpp's concatenation into the Model device tables (a
+    // straight copy here since AppendSdf already concatenated; this is the layout
+    // model.sdf_cell_* receives and model.cpp memcpys into the arena verbatim).
+    std::vector<uint64_t> model_keys = table.cell_keys;
+    std::vector<float> model_values = table.cell_values;
+    std::vector<Vec3> model_grads = table.cell_gradients;
+
+    uint32_t expected_cells = 0u;
+    for (uint32_t g = 0; g < table.Count(); ++g) expected_cells += table.key_counts[g];
+    ASSERT_EQ(model_keys.size(), expected_cells);
+    ASSERT_EQ(model_values.size(), expected_cells);
+    ASSERT_EQ(model_grads.size(), expected_cells);
+
+    // Host->device round-trip through the phi-v2 stream-0 device buffer.
+    OwnedDeviceBuffer d_keys = UploadOwned(model_keys);
+    OwnedDeviceBuffer d_values = UploadOwned(model_values);
+    OwnedDeviceBuffer d_grads = UploadOwned(model_grads);
+
+    std::vector<uint64_t> back_keys(expected_cells);
+    std::vector<float> back_values(expected_cells);
+    std::vector<Vec3> back_grads(expected_cells);
+    d_keys.CopyToHost(back_keys.data(), back_keys.size() * sizeof(uint64_t));
+    d_values.CopyToHost(back_values.data(), back_values.size() * sizeof(float));
+    d_grads.CopyToHost(back_grads.data(), back_grads.size() * sizeof(Vec3));
+
+    EXPECT_EQ(std::memcmp(back_keys.data(), model_keys.data(),
+                          back_keys.size() * sizeof(uint64_t)), 0)
+        << "cooked SDF cell_keys did not survive the device round-trip";
+    EXPECT_EQ(std::memcmp(back_values.data(), model_values.data(),
+                          back_values.size() * sizeof(float)), 0)
+        << "cooked SDF cell_values did not survive the device round-trip";
+    EXPECT_EQ(std::memcmp(back_grads.data(), model_grads.data(),
+                          back_grads.size() * sizeof(Vec3)), 0)
+        << "cooked SDF cell_gradients did not survive the device round-trip";
+
+    // Cell-count assertion (the SdfDeviceWorld::CellCount() check, re-pointed at
+    // the Model concatenation): per-grid counts sum to the flat array length.
+    EXPECT_EQ(table.Count(), 2u);
+    EXPECT_EQ(expected_cells, sphere.CellCount() + cube.CellCount());
 }

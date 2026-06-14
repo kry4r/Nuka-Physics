@@ -13,7 +13,8 @@
 // ---------------------------------------------------------------------------
 
 #include "sensor/noise/n1_poisson.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType
+#include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload
 #include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
@@ -27,11 +28,36 @@ namespace {
 
 namespace noise = nuka::sensor::noise;
 
+// BUF-11/BUF-13: file-local RAII over the phi-v2 opaque Buffer*, mirroring the
+// legacy phi::Buffer surface (sized-ctor + Data/CopyFromHost/CopyToHost) so the
+// RunPoisson body stays byte-identical after the BUF sweep. Stream-0
+// DeviceBufferType -> NULL-stream transfers byte+ordering identical to the legacy
+// synchronous memcpy; the noise kernel still runs on ctx.stream UNCHANGED.
+class OwnedDeviceBuffer {
+public:
+    explicit OwnedDeviceBuffer(size_t bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
 std::vector<float> RunPoisson(const nuka::phi::DeviceContext& ctx,
                               uint32_t count, float lambda, uint64_t seed,
                               uint64_t seq) {
     std::vector<float> host(count, 0.0f);  // add-to-zero so output == count
-    nuka::phi::Buffer d(static_cast<size_t>(count) * sizeof(float));
+    OwnedDeviceBuffer d(static_cast<size_t>(count) * sizeof(float));
     d.CopyFromHost(host.data(), host.size() * sizeof(float));
     noise::LaunchPoissonNoise(ctx, static_cast<float*>(d.Data()), count, lambda,
                               seed, seq);

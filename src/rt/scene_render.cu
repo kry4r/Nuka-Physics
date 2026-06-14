@@ -20,8 +20,9 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/lbvh_node.cuh"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
+#include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
+#include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/device_context.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
@@ -41,6 +42,46 @@ namespace nuka::rt {
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
+
+// RT-7 (M11): file-local RAII over the phi-v2 opaque Buffer*, mirroring the legacy
+// phi::Buffer surface (default-ctor + sized-ctor + Data/CopyFromHost/CopyToHost,
+// move-only) so the render bodies below stay byte-identical after the BUF
+// sweep. Bound to the stream-0 DeviceBufferType (NULL/default stream) -> transfers
+// are byte+ordering identical to the legacy synchronous memcpy. The RT kernels keep
+// running on their existing stream UNCHANGED; this is the buffer-handle swap ONLY.
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    // (No CopyFromHost: this TU's uploads all go through UploadOwned; only the
+    // AOV download path uses CopyToHost.)
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedBuffer(phi::UploadVectorV2(
+        phi::DeviceBufferType(phi::InitBestDevice()), values));
+}
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -375,7 +416,7 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     // SDFs: upload each cooked SDF's cell arrays, build a device header whose
     // pointers point at the uploaded buffers. Keep the device buffers alive for
     // the kernel launch.
-    std::vector<phi::Buffer> sdf_keys_bufs, sdf_vals_bufs, sdf_grad_bufs;
+    std::vector<OwnedBuffer> sdf_keys_bufs, sdf_vals_bufs, sdf_grad_bufs;
     std::vector<runtime::sdf::SparseSdfDevice> sdf_hdrs;
     std::vector<collision::AABB> sdf_aabbs;
     std::vector<float> sdf_eps;
@@ -386,9 +427,9 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
         prims.push_back({static_cast<uint32_t>(PrimKind::Sdf),
                          static_cast<uint32_t>(sdf_hdrs.size()), sd.material_id});
 
-        sdf_keys_bufs.push_back(phi::UploadVector(sd.keys));
-        sdf_vals_bufs.push_back(phi::UploadVector(sd.values));
-        sdf_grad_bufs.push_back(phi::UploadVector(sd.gradients));
+        sdf_keys_bufs.push_back(UploadOwned(sd.keys));
+        sdf_vals_bufs.push_back(UploadOwned(sd.values));
+        sdf_grad_bufs.push_back(UploadOwned(sd.gradients));
 
         runtime::sdf::SparseSdfDevice hdr = sd.header;
         hdr.cell_keys = static_cast<const uint64_t*>(sdf_keys_bufs.back().Data());
@@ -408,17 +449,17 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     }
 
     // Upload geometry buffers.
-    phi::Buffer d_prims = phi::UploadVector(prims);
-    phi::Buffer d_tri_v0 = phi::UploadVector(tri_v0.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v0);
-    phi::Buffer d_tri_v1 = phi::UploadVector(tri_v1.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v1);
-    phi::Buffer d_tri_v2 = phi::UploadVector(tri_v2.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v2);
-    phi::Buffer d_sph_c = phi::UploadVector(sph_center.empty() ? std::vector<math::Vec3>{math::Vec3{}} : sph_center);
-    phi::Buffer d_sph_r = phi::UploadVector(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
-    phi::Buffer d_sdf_hdr = phi::UploadVector(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
-    phi::Buffer d_sdf_aabb = phi::UploadVector(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
-    phi::Buffer d_sdf_eps = phi::UploadVector(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
-    phi::Buffer d_sdf_iters = phi::UploadVector(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
-    phi::Buffer d_mats = phi::UploadVector(scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
+    OwnedBuffer d_prims = UploadOwned(prims);
+    OwnedBuffer d_tri_v0 = UploadOwned(tri_v0.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v0);
+    OwnedBuffer d_tri_v1 = UploadOwned(tri_v1.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v1);
+    OwnedBuffer d_tri_v2 = UploadOwned(tri_v2.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v2);
+    OwnedBuffer d_sph_c = UploadOwned(sph_center.empty() ? std::vector<math::Vec3>{math::Vec3{}} : sph_center);
+    OwnedBuffer d_sph_r = UploadOwned(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
+    OwnedBuffer d_sdf_hdr = UploadOwned(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
+    OwnedBuffer d_sdf_aabb = UploadOwned(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
+    OwnedBuffer d_sdf_eps = UploadOwned(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
+    OwnedBuffer d_sdf_iters = UploadOwned(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
+    OwnedBuffer d_mats = UploadOwned(scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
 
     DevScene dev;
     dev.prims = static_cast<const DevPrim*>(d_prims.Data());
@@ -435,7 +476,7 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     dev.materials = static_cast<const Material*>(d_mats.Data());
 
     // Build the LBVH over the per-prim AABBs (retain nodes).
-    phi::Buffer d_boxes = phi::UploadVector(aabbs);
+    OwnedBuffer d_boxes = UploadOwned(aabbs);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
     auto tree = collision::gpu::BuildLbvhForQuery(dev_boxes, leaf_count);
     if (!tree.HasNodes()) {
@@ -444,12 +485,12 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     const LbvhNode* nodes = tree.DeviceNodes();
 
     // Output AOV buffers (device).
-    phi::Buffer d_color(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_depth(pixels * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_normal(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_albedo(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_uv(pixels * 2u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_prim(pixels * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_color(pixels * 3u * sizeof(float));
+    OwnedBuffer d_depth(pixels * sizeof(float));
+    OwnedBuffer d_normal(pixels * 3u * sizeof(float));
+    OwnedBuffer d_albedo(pixels * 3u * sizeof(float));
+    OwnedBuffer d_uv(pixels * 2u * sizeof(float));
+    OwnedBuffer d_prim(pixels * sizeof(uint32_t));
 
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,

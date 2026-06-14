@@ -18,9 +18,10 @@ namespace nuka::collision::gpu {
 
 namespace {
 
-// Buffer helpers come from phi/buffer_transfer.hpp. This SAP path now consumes a
-// caller-provided device AABB buffer directly (the per-shape AABB derivation that
-// used to live here was tied to the removed whole-world device container), so the
+// Buffer helpers come from phi/buffer_transfer_v2.hpp (the phi-v2 Buffer*). This
+// SAP path now consumes a caller-provided device AABB buffer directly (the
+// per-shape AABB derivation that used to live here was tied to the removed
+// whole-world device container), so the
 // only device math needed is the AABB overlap test below.
 
 __device__ bool Overlaps(collision::AABB a, collision::AABB b) {

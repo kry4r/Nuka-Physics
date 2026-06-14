@@ -33,8 +33,9 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
+#include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
+#include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/device_context.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
@@ -56,6 +57,47 @@ namespace nuka::rt {
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
+
+// RT-7 (M11): file-local RAII over the phi-v2 opaque Buffer*, mirroring the legacy
+// phi::Buffer surface (default-ctor + sized-ctor + Data/CopyFromHost/CopyToHost,
+// move-only) so the render bodies + the GpuScene buffer-holding struct below stay
+// byte-identical after the BUF sweep. Bound to the stream-0
+// DeviceBufferType (NULL/default stream) -> transfers are byte+ordering identical to
+// the legacy synchronous memcpy. The RT kernels keep running on their existing
+// stream UNCHANGED; this is the buffer-handle swap ONLY.
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    // (No CopyFromHost: this TU's uploads all go through UploadOwned; only the
+    // AOV download path uses CopyToHost.)
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedBuffer(phi::UploadVectorV2(
+        phi::DeviceBufferType(phi::InitBestDevice()), values));
+}
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -393,16 +435,16 @@ collision::AABB SphAabb(const SpherePrim& s) {
 }
 
 // All device buffers + retained tree owning ONE mesh's BLAS. Move-only via the
-// move-only members (phi::Buffer, LbvhBroadphaseResult).
+// move-only members (OwnedBuffer, LbvhBroadphaseResult).
 struct BlasDevice {
     // Uploaded LOCAL prim arrays (kept alive for the kernel's lifetime).
-    phi::Buffer d_prims;
-    phi::Buffer d_tri_v0, d_tri_v1, d_tri_v2;
-    phi::Buffer d_sph_c, d_sph_r;
-    phi::Buffer d_sdf_hdr, d_sdf_aabb, d_sdf_eps, d_sdf_iters;
+    OwnedBuffer d_prims;
+    OwnedBuffer d_tri_v0, d_tri_v1, d_tri_v2;
+    OwnedBuffer d_sph_c, d_sph_r;
+    OwnedBuffer d_sdf_hdr, d_sdf_aabb, d_sdf_eps, d_sdf_iters;
     // SDF cell arrays (one buffer per SDF; their device pointers are baked into
     // the uploaded SparseSdfDevice headers).
-    std::vector<phi::Buffer> sdf_keys_bufs, sdf_vals_bufs, sdf_grad_bufs;
+    std::vector<OwnedBuffer> sdf_keys_bufs, sdf_vals_bufs, sdf_grad_bufs;
 
     // Retained BLAS tree (rigid -> never refit).
     collision::gpu::LbvhBroadphaseResult tree;
@@ -468,9 +510,9 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
         prims.push_back({static_cast<uint32_t>(PrimKind::Sdf),
                          static_cast<uint32_t>(sdf_hdrs.size())});
 
-        out.sdf_keys_bufs.push_back(phi::UploadVector(sd.keys));
-        out.sdf_vals_bufs.push_back(phi::UploadVector(sd.values));
-        out.sdf_grad_bufs.push_back(phi::UploadVector(sd.gradients));
+        out.sdf_keys_bufs.push_back(UploadOwned(sd.keys));
+        out.sdf_vals_bufs.push_back(UploadOwned(sd.values));
+        out.sdf_grad_bufs.push_back(UploadOwned(sd.gradients));
 
         runtime::sdf::SparseSdfDevice hdr = sd.header;
         hdr.cell_keys = static_cast<const uint64_t*>(out.sdf_keys_bufs.back().Data());
@@ -505,16 +547,16 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
     out.local_bound = bound;
 
     // Upload local prim buffers (empty kinds get a 1-element dummy, as p13 does).
-    out.d_prims = phi::UploadVector(prims);
-    out.d_tri_v0 = phi::UploadVector(tri_v0.empty() ? std::vector<Vec3>{Vec3{}} : tri_v0);
-    out.d_tri_v1 = phi::UploadVector(tri_v1.empty() ? std::vector<Vec3>{Vec3{}} : tri_v1);
-    out.d_tri_v2 = phi::UploadVector(tri_v2.empty() ? std::vector<Vec3>{Vec3{}} : tri_v2);
-    out.d_sph_c = phi::UploadVector(sph_center.empty() ? std::vector<Vec3>{Vec3{}} : sph_center);
-    out.d_sph_r = phi::UploadVector(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
-    out.d_sdf_hdr = phi::UploadVector(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
-    out.d_sdf_aabb = phi::UploadVector(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
-    out.d_sdf_eps = phi::UploadVector(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
-    out.d_sdf_iters = phi::UploadVector(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
+    out.d_prims = UploadOwned(prims);
+    out.d_tri_v0 = UploadOwned(tri_v0.empty() ? std::vector<Vec3>{Vec3{}} : tri_v0);
+    out.d_tri_v1 = UploadOwned(tri_v1.empty() ? std::vector<Vec3>{Vec3{}} : tri_v1);
+    out.d_tri_v2 = UploadOwned(tri_v2.empty() ? std::vector<Vec3>{Vec3{}} : tri_v2);
+    out.d_sph_c = UploadOwned(sph_center.empty() ? std::vector<Vec3>{Vec3{}} : sph_center);
+    out.d_sph_r = UploadOwned(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
+    out.d_sdf_hdr = UploadOwned(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
+    out.d_sdf_aabb = UploadOwned(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
+    out.d_sdf_eps = UploadOwned(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
+    out.d_sdf_iters = UploadOwned(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
 
     out.view.prims = static_cast<const DevPrim*>(out.d_prims.Data());
     out.view.prim_count = out.leaf_count;
@@ -529,7 +571,7 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
     out.view.sdf_iters = static_cast<const int*>(out.d_sdf_iters.Data());
 
     // Build the BLAS over the LOCAL per-prim AABBs (retain the tree).
-    phi::Buffer d_boxes = phi::UploadVector(aabbs);
+    OwnedBuffer d_boxes = UploadOwned(aabbs);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
     out.tree = collision::gpu::BuildLbvhForQuery(dev_boxes, out.leaf_count);
     if (!out.tree.HasNodes()) {
@@ -626,12 +668,12 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
     }
 
     // Upload the instance table + the materials.
-    phi::Buffer d_instances = phi::UploadVector(dev_instances);
-    phi::Buffer d_mats = phi::UploadVector(
+    OwnedBuffer d_instances = UploadOwned(dev_instances);
+    OwnedBuffer d_mats = UploadOwned(
         scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
 
     // Build the TLAS over the instance world-AABBs (retained; lives until sync).
-    phi::Buffer d_tlas_boxes = phi::UploadVector(tlas_aabbs);
+    OwnedBuffer d_tlas_boxes = UploadOwned(tlas_aabbs);
     const auto* dev_tlas_boxes = static_cast<const collision::AABB*>(d_tlas_boxes.Data());
     auto tlas = collision::gpu::BuildLbvhForQuery(dev_tlas_boxes, inst_count);
     if (!tlas.HasNodes()) {
@@ -640,12 +682,12 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
     const LbvhNode* tlas_nodes = tlas.DeviceNodes();
 
     // Output AOV buffers (device).
-    phi::Buffer d_color(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_depth(pixels * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_normal(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_albedo(pixels * 3u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_uv(pixels * 2u * sizeof(float), phi::MemoryKind::Device);
-    phi::Buffer d_prim(pixels * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_color(pixels * 3u * sizeof(float));
+    OwnedBuffer d_depth(pixels * sizeof(float));
+    OwnedBuffer d_normal(pixels * 3u * sizeof(float));
+    OwnedBuffer d_albedo(pixels * 3u * sizeof(float));
+    OwnedBuffer d_uv(pixels * 2u * sizeof(float));
+    OwnedBuffer d_prim(pixels * sizeof(uint32_t));
 
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,

@@ -5,7 +5,8 @@
 #include "core/diagnostics/invariants_gpu.cuh"
 
 #include "math/cuda_vec_ops.cuh"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType
+#include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferDownload / BufferFree
 
 #include <cuda_runtime.h>
 
@@ -161,7 +162,15 @@ void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
     }
 
     phi::ScopedDeviceGuard guard(context.device_id);
-    phi::Buffer reduction(sizeof(DeviceReductionSlot), phi::MemoryKind::Device);
+    // BUF-10/BUF-13: the reduction slot is a phi-v2 opaque Buffer* bound to the
+    // stream-0 DeviceBufferType (NULL/default stream -> the download below is
+    // byte+ordering identical to the legacy synchronous cudaMemcpy). The kernel
+    // still runs on context.stream EXACTLY as before; the explicit
+    // context.stream.Synchronize() guarantees the kernel completes before the
+    // (self-syncing) BufferDownload reads the slot.
+    phi::Buffer* reduction =
+        phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()),
+                         sizeof(DeviceReductionSlot));
     const cudaStream_t stream = context.stream.Native();
     constexpr uint32_t kBlockSize = 256u;
     ComputeRigidBodyInvariantKernel<<<1u,
@@ -175,12 +184,17 @@ void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
         inverse_masses,
         inverse_inertias,
         gravity,
-        static_cast<DeviceReductionSlot*>(reduction.Data()));
-    CheckCuda(cudaGetLastError(), "ComputeRigidBodyInvariantKernel launch");
+        static_cast<DeviceReductionSlot*>(phi::BufferBase(reduction)));
+    const cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        phi::BufferFree(reduction);
+        CheckCuda(launch_err, "ComputeRigidBodyInvariantKernel launch");
+    }
     context.stream.Synchronize();
 
     DeviceReductionSlot host_slot;
-    reduction.CopyToHost(&host_slot, sizeof(host_slot));
+    phi::BufferDownload(reduction, &host_slot, 0, sizeof(host_slot));
+    phi::BufferFree(reduction);
     out_snapshot->energy = host_slot.energy;
     out_snapshot->linear_momentum = host_slot.linear_momentum;
     out_snapshot->angular_momentum = host_slot.angular_momentum;

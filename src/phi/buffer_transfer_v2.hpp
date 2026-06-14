@@ -2,10 +2,8 @@
 // ---------------------------------------------------------------------------
 // nuka::phi — PHI v2 host-side typed Buffer* <-> std::vector transfer helpers.
 //
-// The v2 analogue of buffer_transfer.hpp (legacy). A consumer migrates from the
-// legacy header to THIS one in a single TU. A TU MUST NEVER include both: the
-// name `nuka::phi::Buffer` collides between buffer_legacy.hpp (`class Buffer`,
-// RAII) and buffer.hpp (`struct Buffer`, opaque v2 handle) — same FQN.
+// The ONE host-side transfer header (its legacy RAII predecessor was deleted in the
+// M11 BUF sweep). Operates on the opaque v2 `Buffer*` (phi/buffer.hpp).
 //
 // Allocation is backend-owned via a BufferType*:
 //   * DeviceBufferType(device)        -> the device-level DEFAULT type, bound to

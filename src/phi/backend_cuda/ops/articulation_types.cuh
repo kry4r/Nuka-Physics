@@ -6,10 +6,11 @@
 // (runtime/articulation/articulation_state.hpp + articulation_contacts.hpp).
 // They were duplicated here (NOT #included) because the ops layer includes the
 // PHI v2 phi/buffer.hpp (opaque `struct Buffer`), which used to collide with the
-// legacy `class phi::Buffer` that articulation_state.hpp pulled in via
-// phi/buffer_legacy.hpp. That collision is now GONE -- articulation_state.hpp
-// migrated to the v2 phi/buffer.hpp (M11 buffer sweep) -- so these PODs can fold
-// to the single runtime definition. NAMED DEBT (M11 OD-18, fast-follow): the
+// legacy `class phi::Buffer` that articulation_state.hpp pulled in via the
+// (now-deleted) legacy buffer header. That collision is now GONE -- the legacy
+// RAII buffer was removed in the M11 BUF sweep and articulation_state.hpp is on the
+// v2 phi/buffer.hpp -- so these PODs can fold to the single runtime definition.
+// NAMED DEBT (M11 OD-18, fast-follow): the
 // collapse is deferred to keep the buffer sweep's blast radius off the byte-D1
 // ops kernel layer; the layouts are byte-identical (static_asserts below guard
 // the contract) so no behavioral risk while the duplication remains.
