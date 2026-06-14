@@ -60,6 +60,23 @@ struct ViewerUiState {
     uint32_t env_index     = 0u;      // selected env (D4)
     uint32_t selected_inst = ~0u;     // scene-tree selection (highlight only)
 
+    // VIEW-3: the entity the picker selected (the RenderInstance's entity index);
+    // ~0u == nothing selected. The Entity panel reads this; the picker writes it.
+    uint32_t selected_entity = ~0u;
+
+    // VIEW-2: the GENERIC per-DOF drive-target editor state. `drive_targets[d]` is
+    // the slider value for DOF d of the SELECTED env; `drive_dirty[d]` latches when
+    // a slider moved this frame so the viewer uploads ONLY changed DOFs (per-DOF
+    // FieldId::DriveTarget UploadField, env-major offset env*per_env + d). NEVER a
+    // hardcoded grasp/choreography table (OD-7: a flat per-DOF editor). `dof_labels`
+    // is the OPTIONAL cooked name->dof labelling (cosmetic); empty -> "dof N".
+    // For GATE-B (R12) these are pre-seeded to FIXED values so RecordUi is
+    // deterministic (no time/animation input).
+    std::vector<float>       drive_targets;
+    std::vector<uint8_t>     drive_dirty;   // per-DOF "changed this frame" latch
+    std::vector<std::string> dof_labels;    // optional, size 0 or == drive_targets
+    bool                     show_drive_panel = true;
+
     // One-shot edge flags set by RecordUi(), consumed + cleared by the viewer.
     bool play_toggled    = false;
     bool step_requested  = false;

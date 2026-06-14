@@ -107,9 +107,24 @@ public:
     // step health (true when do_step==false).
     bool FramePublish(InputIntents* out_intents = nullptr, bool do_step = true) {
         last_frame_rendered_ = false;
-        input_system_.Run(command_queue_, out_intents);
+        // Drain the queue. When the caller does not want the intents back we still
+        // need the MoveEntity payloads to apply the drag, so drain into a local.
+        InputIntents local;
+        InputIntents* intents = out_intents ? out_intents : &local;
+        input_system_.Run(command_queue_, intents);
+        // VIEW-4: apply drag-to-move LIVE through the general path (entity ->
+        // nk::Data::UploadField) BEFORE the step so it perturbs THIS frame. Never
+        // touches the SceneIR / .nks (R13).
+        for (const MoveEntity& m : intents->move_entities) {
+            ApplyMoveEntity(world_, render_world_, env_index_, m);
+        }
+        // VIEW-6: honor a QUEUED StepOnce in the SAME frame it is pushed. The
+        // queue is drained ABOVE (inside Run), so `intents->step_once` is known
+        // before the step decision -- fold it in so an out-of-band StepOnce no
+        // longer lags one frame behind the in-UI Step button.
+        const bool step_now = do_step || intents->step_once;
         bool step_ok = true;
-        if (do_step) step_ok = sim_system_.Run(world_, planned_);
+        if (step_now) step_ok = sim_system_.Run(world_, planned_);
         transform_sync_system_.Run(*publisher_, world_, env_index_, render_world_);
         return step_ok;
     }

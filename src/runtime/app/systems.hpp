@@ -42,8 +42,10 @@ namespace nuka::runtime::app {
 // InputIntents - the resolved control intents the InputSystem extracted from one
 // drained command batch (M8.5 T3). The Simulation/viewer reads these to apply the
 // transport (play/pause/step/reset/env) + camera-reset. Edge flags: each is true
-// at most once per Run(). MoveEntity stays an M11 stub (full drag-to-move), but
-// the play/pause/camera dispatch is real now (recon open-Q 8).
+// at most once per Run(). The MoveEntity payloads (the M11 viewer's drag-to-move)
+// are collected verbatim into `move_entities` so the caller can apply them through
+// the GENERAL command path (ApplyMoveEntity -> nk::Data::UploadField); the count
+// is kept for diagnostics.
 // ---------------------------------------------------------------------------
 struct InputIntents {
     bool     toggle_play   = false;
@@ -54,8 +56,34 @@ struct InputIntents {
     bool     camera_reset  = false;
     bool     set_env       = false;
     uint32_t env_value     = 0u;
-    uint32_t move_entity_count = 0u;  // M11 seam: how many MoveEntity were seen.
+    uint32_t move_entity_count = 0u;  // how many MoveEntity were seen this batch.
+    std::vector<MoveEntity> move_entities;  // M11: the drag-to-move payloads (FIFO).
 };
+
+// ---------------------------------------------------------------------------
+// ApplyMoveEntity (VIEW-4) -- the GENERAL drag-to-move handler.
+//
+// Resolves `cmd.entity` to its cooked Data row + kind using the SAME pose_source
+// the publisher reads (RenderInstance::pose_source, baked once at BuildRenderWorld
+// from the cook's SceneMap CookedRef), then writes the requested world transform
+// LIVE into the running nk::Data for the selected env:
+//   * Body  -> UploadField(BodyPose, env*bodies_per_env + row); zero
+//              BodyLinearVelocity/BodyAngularVelocity for that body (OD-6).
+//   * Base  -> the articulation FLOATING root (the instance resolves to the root
+//              link). UploadField(BasePose, env) so FK re-propagates from the new
+//              base; zero the root link's LinkVelocity (6 floats) (OD-6).
+//   * an interior articulation link -> NO-OP (its pose is an FK output, not an
+//     independent Data row -- a live teleport would be overwritten next step).
+//
+// HARD R13: this writes RUNTIME Data ONLY (Data::UploadField). It NEVER touches
+// the SceneIR / nuka_scene_set_local / Save -- the frozen .nks is never mutated.
+// HARD highest-directive: this is the GENERAL path (entity -> Data field), NOT a
+// per-demo "grab the cup" shim; it works for ANY Body / floating base.
+//
+// Returns true if a pose was applied (a resolvable Body/Base entity was found),
+// false if the entity is unknown / Static / an interior link (no-op).
+bool ApplyMoveEntity(nk::World& world, const render::RenderWorld& render_world,
+                     uint32_t env_index, const MoveEntity& cmd);
 
 // ---------------------------------------------------------------------------
 // InputSystem - drains the CommandQueue once per frame and resolves intents.
@@ -90,7 +118,11 @@ public:
                     break;
                 }
                 case Command::Kind::MoveEntity:
-                    ++out_intents->move_entity_count;  // M11 seam: not applied yet.
+                    ++out_intents->move_entity_count;
+                    // VIEW-4: collect the payload; the caller (Simulation) applies
+                    // it through ApplyMoveEntity (entity -> nk::Data, the general
+                    // path) BEFORE the step so the drag perturbs THIS frame.
+                    out_intents->move_entities.push_back(c.move_entity);
                     break;
                 case Command::Kind::NoOp:
                     break;

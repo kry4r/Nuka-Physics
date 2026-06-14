@@ -248,17 +248,11 @@ NukaImGuiContext& NukaImGuiContext::operator=(NukaImGuiContext&& other) noexcept
     return *this;
 }
 
-bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
-    if (initialized_) return false;
+namespace {
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-
-    ApplyNukaTheme();
-    LoadNukaFonts();
-
-    // Map the flat nuka init bundle into the upstream nested InitInfo. RenderPass /
-    // Subpass / MSAA live in PipelineInfoMain since imgui 1.92's 2025/09/26 change.
+// Map the flat nuka init bundle into the upstream nested InitInfo. RenderPass /
+// Subpass / MSAA live in PipelineInfoMain since imgui 1.92's 2025/09/26 change.
+ImGui_ImplVulkan_InitInfo ToVulkanInitInfo(const NukaImGuiInitInfo& info) {
     ImGui_ImplVulkan_InitInfo vk{};
     vk.ApiVersion     = info.api_version != 0 ? info.api_version : VK_API_VERSION_1_0;
     vk.Instance       = reinterpret_cast<VkInstance>(info.instance);
@@ -276,13 +270,43 @@ bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
                               ? info.msaa_samples
                               : static_cast<uint32_t>(VK_SAMPLE_COUNT_1_BIT);
     vk.PipelineInfoMain.MSAASamples = static_cast<VkSampleCountFlagBits>(msaa);
+    return vk;
+}
 
+}  // namespace
+
+bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
+    if (initialized_) return false;
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+
+    ApplyNukaTheme();
+    LoadNukaFonts();
+
+    ImGui_ImplVulkan_InitInfo vk = ToVulkanInitInfo(info);
     if (!ImGui_ImplVulkan_Init(&vk)) {
         ImGui::DestroyContext();
         return false;
     }
 
     initialized_ = true;
+    return true;
+}
+
+bool NukaImGuiContext::RebuildForRenderPass(const NukaImGuiInitInfo& info) {
+    if (!initialized_) return false;
+    // Re-init ONLY the Vulkan backend half against the new render pass; the ImGui
+    // context (docking layout, theme, fonts, panel state) is left intact. The font
+    // atlas re-uploads lazily on the next NewFrame.
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplVulkan_InitInfo vk = ToVulkanInitInfo(info);
+    if (!ImGui_ImplVulkan_Init(&vk)) {
+        // The backend is now down but the context survives; mark uninitialized so
+        // RenderDrawData/NewFrame no-op rather than touch a dead backend.
+        initialized_ = false;
+        return false;
+    }
     return true;
 }
 

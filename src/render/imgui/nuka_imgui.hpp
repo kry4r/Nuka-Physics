@@ -146,6 +146,18 @@ public:
     // Tear down the Vulkan backend + destroy the ImGui context. Idempotent.
     void Shutdown();
 
+    // VIEW-5: rebind the ImGui Vulkan backend to a (re)created swapchain render
+    // pass. After PresentFrameResult::Recreated the present renderer destroys + re-
+    // creates its VkRenderPass, leaving the ImGui backend pipeline bound to a STALE
+    // pass (a validation error / no-draw at best). This re-inits ONLY the Vulkan
+    // backend half (ImGui_ImplVulkan_Shutdown + _Init) against `info.render_pass` /
+    // min/image counts WITHOUT destroying the ImGui context -- so the docking
+    // layout, theme, fonts, and all panel state survive the resize. The font atlas
+    // is re-uploaded lazily on the next NewFrame (>=1.92 texture lifecycle). No-op
+    // (returns false) if not yet initialized. The caller passes the SAME
+    // NukaImGuiInitInfo it built from the present renderer's CURRENT handles.
+    bool RebuildForRenderPass(const NukaImGuiInitInfo& info);
+
     bool IsInitialized() const { return initialized_; }
 
 private:
