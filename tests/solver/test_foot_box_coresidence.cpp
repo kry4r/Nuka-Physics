@@ -69,8 +69,9 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
@@ -98,6 +99,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace articulation = nuka::runtime::articulation;
 namespace amf = nuka::collision::amf;
@@ -198,8 +237,7 @@ std::vector<Transform> ForwardKinematics(const nuka::phi::DeviceContext& context
                                          const articulation::ArticulationHostState& host) {
     const uint32_t link_count = host.TotalLinkCount();
     auto device = articulation::UploadArticulationState(context, host);
-    nuka::phi::Buffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform),
-                               nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
     articulation::UpdateWorldLinkPoses(context, device.View(),
                                        static_cast<Transform*>(pose_buf.Data()));
     context.stream.Synchronize();
@@ -222,13 +260,10 @@ std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& conte
     auto view = device.View();
     const uint32_t link_count = host.TotalLinkCount();
     articulation::FeatherstoneAba::ComputeAccelerations(context, view, kGravityZ);
-    nuka::phi::Buffer composite(
-        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m(static_cast<size_t>(kDof) * kDof * sizeof(float),
-                        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_inv(static_cast<size_t>(kDof) * kDof * sizeof(float),
-                            nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite(
+        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
+    OwnedDeviceBuffer m(static_cast<size_t>(kDof) * kDof * sizeof(float));
+    OwnedDeviceBuffer m_inv(static_cast<size_t>(kDof) * kDof * sizeof(float));
     articulation::ComputeArticulationInertiaM(
         context, view, kDof,
         static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
@@ -338,8 +373,9 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
     std::vector<uint32_t> rigid_body_ids = {kBoxRigidBodyId};
     std::vector<uint32_t> rigid_contypes = {1u};
     std::vector<uint32_t> rigid_conaff = {1u};
-    nuka::phi::Buffer d_rigid = nuka::phi::UploadVector(rigid_aabbs);
-    const AABB* d_rigid_ptr = static_cast<const AABB*>(d_rigid.Data());
+    nuka::phi::Buffer* d_rigid = nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), rigid_aabbs);
+    const AABB* d_rigid_ptr = static_cast<const AABB*>(nuka::phi::BufferBase(d_rigid));
 
     // --- (2) commit 2: the cross-type CandidatePair stream -------------------
     auto stream = nuka::collision::BuildArticulationRigidCandidatePairs(
@@ -348,6 +384,7 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
         links, link_contypes.data(), link_conaff.data(),
         /*excluded_body_pairs=*/{});
     const auto pairs = stream.DownloadPairs();
+    nuka::phi::BufferFree(d_rigid);  // pairs downloaded; d_rigid no longer borrowed.
 
     // --- assert the (foot, box) cross-type pair is present (broadphase found it,
     // we did NOT hand-build it). The foot side is ArticulationLink handle=link idx;

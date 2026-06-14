@@ -413,6 +413,12 @@ target_link_libraries(nuka_articulation
     PUBLIC
         nuka_constraint
         nuka_scene
+        # M11 buffer sweep: articulation_state.cpp's UploadArticulationState now
+        # allocates phi v2 Buffer* from the device-level DEFAULT type, so it needs
+        # phi v2's InitBestDevice / DeviceBufferType / Buffer wrappers (registry +
+        # cuda backend). PUBLIC so every consumer (test exes, runtime libs) resolves
+        # these transitively without per-target link edits.
+        nuka_phi2
 )
 
 nuka_set_warnings(nuka_articulation)

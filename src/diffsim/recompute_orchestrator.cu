@@ -4,6 +4,7 @@
 
 #include "diffsim/recompute_orchestrator.hpp"
 
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
 #include "runtime/articulation/featherstone_aba.hpp"
 
 #include <cuda_runtime.h>
@@ -22,12 +23,18 @@ void CheckCuda(cudaError_t status, const char* what) {
     }
 }
 
-phi::Buffer UploadFloat(const phi::DeviceContext& ctx,
-                        const std::vector<float>& v) {
-    phi::Buffer b(v.size() * sizeof(float), phi::MemoryKind::Device);
+// Allocate a v2 device Buffer* (device-level DEFAULT type) and upload the host
+// floats on ctx.stream via a raw cudaMemcpyAsync over the base pointer -- the
+// SAME stream (and byte-for-byte the same copy) the legacy UploadFloat used; the
+// gains are then read by the PD kernels on that same stream.
+phi::Buffer* UploadFloat(const phi::DeviceContext& ctx,
+                         const std::vector<float>& v) {
+    phi::Buffer* b = phi::BufferAlloc(
+        phi::DeviceBufferType(phi::InitBestDevice()), v.size() * sizeof(float));
     if (!v.empty()) {
         phi::ScopedDeviceGuard guard(ctx.device_id);
-        CheckCuda(cudaMemcpyAsync(b.Data(), v.data(), v.size() * sizeof(float),
+        CheckCuda(cudaMemcpyAsync(phi::BufferBase(b), v.data(),
+                                  v.size() * sizeof(float),
                                   cudaMemcpyHostToDevice, ctx.stream.Native()),
                   "UploadFloat");
     }
@@ -64,6 +71,13 @@ RecomputeOrchestrator::RecomputeOrchestrator(
     const std::vector<float> dIdm = BuildSpatialInertiaMassJacobian(mass_params);
     dI_dmass_ = UploadFloat(context_, dIdm);
     context_.stream.Synchronize();
+}
+
+RecomputeOrchestrator::~RecomputeOrchestrator() {
+    if (stiffness_ != nullptr) { phi::BufferFree(stiffness_); }
+    if (damping_ != nullptr) { phi::BufferFree(damping_); }
+    if (force_limits_ != nullptr) { phi::BufferFree(force_limits_); }
+    if (dI_dmass_ != nullptr) { phi::BufferFree(dI_dmass_); }
 }
 
 void RecomputeOrchestrator::StepOnce(const float* device_actions) {

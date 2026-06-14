@@ -27,11 +27,14 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "scene/cooked_blob.hpp"
+
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -52,6 +55,44 @@ using nuka::math::Transform;
 using nuka::math::Vec3;
 
 constexpr uint32_t kInvalidLink = ~0u;
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Allocated from the
+// device-level DEFAULT (stream-0) type; CopyFromHost/CopyToHost run on stream 0
+// exactly like the legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 // ---------------------------------------------------------------------------
 // A fixed-base 3-link revolute chain. Link 0 is a FIXED root (anchor, qddot=0);
@@ -207,8 +248,7 @@ public:
         v_root_pre_ = MakeDeviceFloat(std::vector<float>(n_ * 6u, 0.0f));
         // p08b orientation channel: per-articulation base-pose snapshot + grad.
         art_count_ = model.host.articulation_link_offset.size();
-        base_pose_pre_ = nuka::phi::Buffer(
-            art_count_ * sizeof(Transform), nuka::phi::MemoryKind::Device);
+        base_pose_pre_ = OwnedDeviceBuffer(art_count_ * sizeof(Transform));
         // grad_base_pose_out: 7 floats per articulation (3 pos + 4 quat).
         grad_base_pose_ = MakeDeviceFloat(std::vector<float>(art_count_ * 7u, 0.0f));
     }
@@ -349,10 +389,10 @@ public:
                          const std::vector<float>& kd,
                          const std::vector<float>& flim,
                          float gravity_z, float dt) {
-        nuka::phi::Buffer bt = MakeDeviceFloat(targets);
-        nuka::phi::Buffer bp = MakeDeviceFloat(kp);
-        nuka::phi::Buffer bd = MakeDeviceFloat(kd);
-        nuka::phi::Buffer bl = MakeDeviceFloat(flim);
+        OwnedDeviceBuffer bt = MakeDeviceFloat(targets);
+        OwnedDeviceBuffer bp = MakeDeviceFloat(kp);
+        OwnedDeviceBuffer bd = MakeDeviceFloat(kd);
+        OwnedDeviceBuffer bl = MakeDeviceFloat(flim);
         articulation::FeatherstoneAba::ApplyPositionDrives(
             ctx_, View(), static_cast<const float*>(bt.Data()),
             static_cast<const float*>(bp.Data()), static_cast<const float*>(bd.Data()),
@@ -424,8 +464,8 @@ public:
     void Sync() { ctx_.stream.Synchronize(); }
 
 private:
-    nuka::phi::Buffer MakeDeviceFloat(const std::vector<float>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer MakeDeviceFloat(const std::vector<float>& v) {
+        OwnedDeviceBuffer b(v.size() * sizeof(float));
         if (!v.empty()) b.CopyFromHost(v.data(), v.size() * sizeof(float));
         return b;
     }
@@ -441,7 +481,7 @@ private:
                              cudaMemcpyDeviceToHost), cudaSuccess);
         return v;
     }
-    std::vector<float> DownloadBuf(const nuka::phi::Buffer& b) {
+    std::vector<float> DownloadBuf(const OwnedDeviceBuffer& b) {
         std::vector<float> v(b.Size() / sizeof(float), 0.0f);
         b.CopyToHost(v.data(), b.Size());
         return v;
@@ -452,7 +492,7 @@ private:
     articulation::ArticulationDeviceBuffers device_;
     uint32_t n_ = 0u;
     size_t art_count_ = 0u;
-    nuka::phi::Buffer dI_dmass_, grad_q_, grad_qdot_, grad_target_, grad_mass_,
+    OwnedDeviceBuffer dI_dmass_, grad_q_, grad_qdot_, grad_target_, grad_mass_,
         grad_tau_, grad_qddot_seed_, grad_link_vel_, q_pre_, qdot_pre_, v_root_pre_,
         base_pose_pre_, grad_base_pose_;
 };
@@ -792,13 +832,13 @@ TEST(AbaReverse, RungE_FullStep_dAction_dMass) {
     auto in = h.MakeInputs(dt, g0);
     in.has_drive = true; in.has_integrate = true; in.enable_q_channel = true;
     // drive descriptors for the drive reverse.
-    nuka::phi::Buffer bt(targets.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bt(targets.size() * sizeof(float));
     bt.CopyFromHost(targets.data(), targets.size() * sizeof(float));
-    nuka::phi::Buffer bp(kp.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bp(kp.size() * sizeof(float));
     bp.CopyFromHost(kp.data(), kp.size() * sizeof(float));
-    nuka::phi::Buffer bd(kd.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bd(kd.size() * sizeof(float));
     bd.CopyFromHost(kd.data(), kd.size() * sizeof(float));
-    nuka::phi::Buffer bl(flim.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bl(flim.size() * sizeof(float));
     bl.CopyFromHost(flim.data(), flim.size() * sizeof(float));
     in.drive_targets = static_cast<const float*>(bt.Data());
     in.drive_stiffness = static_cast<const float*>(bp.Data());
@@ -1488,13 +1528,13 @@ TEST(AbaReverse, D1_TwoRunBitExact) {
         h.SeedGradQ(wq); h.SeedGradQdot(wqd);
         auto in = h.MakeInputs(dt, g0);
         in.has_drive = true; in.has_integrate = true; in.enable_q_channel = true;
-        nuka::phi::Buffer bt(targets.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bt(targets.size() * sizeof(float));
         bt.CopyFromHost(targets.data(), targets.size() * sizeof(float));
-        nuka::phi::Buffer bp(kp.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bp(kp.size() * sizeof(float));
         bp.CopyFromHost(kp.data(), kp.size() * sizeof(float));
-        nuka::phi::Buffer bd(kd.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bd(kd.size() * sizeof(float));
         bd.CopyFromHost(kd.data(), kd.size() * sizeof(float));
-        nuka::phi::Buffer bl(flim.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bl(flim.size() * sizeof(float));
         bl.CopyFromHost(flim.data(), flim.size() * sizeof(float));
         in.drive_targets = static_cast<const float*>(bt.Data());
         in.drive_stiffness = static_cast<const float*>(bp.Data());
@@ -1624,24 +1664,23 @@ TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
 
     // Reverse (StepBackward UNTOUCHED) with its own scratch grad buffers.
     auto make_buf = [&](size_t count) {
-        nuka::phi::Buffer b(count * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer b(count * sizeof(float));
         std::vector<float> z(count, 0.0f);
         b.CopyFromHost(z.data(), z.size() * sizeof(float));
         return b;
     };
-    nuka::phi::Buffer q_pre = make_buf(n), qdot_pre = make_buf(n);
-    nuka::phi::Buffer v_root_pre = make_buf(static_cast<size_t>(n) * 6u);
-    nuka::phi::Buffer base_pose_pre(sizeof(Transform), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer grad_q = make_buf(n), grad_qdot = make_buf(n);
-    nuka::phi::Buffer grad_target = make_buf(n), grad_mass = make_buf(n);
-    nuka::phi::Buffer grad_tau = make_buf(n);
-    nuka::phi::Buffer grad_seed = make_buf(n);
-    nuka::phi::Buffer grad_link_vel = make_buf(static_cast<size_t>(n) * 6u);
-    nuka::phi::Buffer grad_base_pose = make_buf(7);
+    OwnedDeviceBuffer q_pre = make_buf(n), qdot_pre = make_buf(n);
+    OwnedDeviceBuffer v_root_pre = make_buf(static_cast<size_t>(n) * 6u);
+    OwnedDeviceBuffer base_pose_pre(sizeof(Transform));
+    OwnedDeviceBuffer grad_q = make_buf(n), grad_qdot = make_buf(n);
+    OwnedDeviceBuffer grad_target = make_buf(n), grad_mass = make_buf(n);
+    OwnedDeviceBuffer grad_tau = make_buf(n);
+    OwnedDeviceBuffer grad_seed = make_buf(n);
+    OwnedDeviceBuffer grad_link_vel = make_buf(static_cast<size_t>(n) * 6u);
+    OwnedDeviceBuffer grad_base_pose = make_buf(7);
     const std::vector<float> dIdm =
         diffsim::BuildSpatialInertiaMassJacobian(model.mass_params);
-    nuka::phi::Buffer dI_dmass(dIdm.size() * sizeof(float),
-                               nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer dI_dmass(dIdm.size() * sizeof(float));
     dI_dmass.CopyFromHost(dIdm.data(), dIdm.size() * sizeof(float));
     q_pre.CopyFromHost(kBaseQ.data(), n * sizeof(float));
     qdot_pre.CopyFromHost(kBaseQdot.data(), n * sizeof(float));

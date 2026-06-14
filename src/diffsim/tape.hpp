@@ -29,14 +29,17 @@
 // the reverse is a single pass with no recompute -- the CI oracle the
 // checkpoint path is validated against.
 //
-// All device storage is phi::Buffer (NO DeviceVector). The action buffer is one
-// contiguous device array of [max_tape_entries * total_link_count] floats,
+// All device storage is a phi v2 Buffer* (NO DeviceVector). The action buffer is
+// one contiguous device array of [max_tape_entries * total_link_count] floats,
 // env-major within each step (the SAME per-link env-major layout the engine's
 // drive_targets use), so step k's action slice is a plain pointer offset --
-// zero-copy into StepBackwardInputs::drive_targets and grad_actions_out.
+// zero-copy into StepBackwardInputs::drive_targets and grad_actions_out. The
+// Buffer* is allocated from the device-level DEFAULT (stream-0) BufferType; the
+// per-step action D2D copy runs on context.stream (raw cudaMemcpyAsync over the
+// Buffer's base pointer -- unchanged), the kernels read it on the same stream.
 // ---------------------------------------------------------------------------
 
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -115,8 +118,12 @@ public:
 
     // Device base pointer of the contiguous action buffer (all steps).
     const float* ActionBuffer() const {
-        return static_cast<const float*>(actions_.Data());
+        return static_cast<const float*>(phi::BufferBase(actions_));
     }
+
+    ~Tape();
+    Tape(const Tape&) = delete;
+    Tape& operator=(const Tape&) = delete;
 
 private:
     const phi::DeviceContext& context_;
@@ -124,7 +131,7 @@ private:
     uint32_t total_link_count_ = 0u;
     uint32_t step_count_ = 0u;
 
-    phi::Buffer actions_;             // float[max_tape_entries * total_link_count]
+    phi::Buffer* actions_ = nullptr;  // float[max_tape_entries * total_link_count]
     std::vector<TapeEntry> entries_;  // host records, one per step
 };
 

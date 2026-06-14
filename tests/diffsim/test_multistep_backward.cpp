@@ -36,7 +36,8 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
@@ -59,6 +60,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace articulation = nuka::runtime::articulation;
 namespace diffsim = nuka::diffsim;
@@ -263,8 +302,7 @@ public:
         tape_->Reset();
         cm_->Reset();
         steps_since_cp_ = 0u;
-        action_buf_ = nuka::phi::Buffer(n_ * sizeof(float),
-                                        nuka::phi::MemoryKind::Device);
+        action_buf_ = OwnedDeviceBuffer(n_ * sizeof(float));
         const bool full_tape = (desc_.recompute_on_backward == 0u);
         for (uint32_t s = 0u; s < actions.size(); ++s) {
             Upload(static_cast<float*>(action_buf_.Data()), actions[s]);
@@ -319,13 +357,12 @@ public:
         Sync();
     }
 
-    nuka::phi::Buffer MakeOutputActions(uint32_t step_count) {
-        nuka::phi::Buffer b(static_cast<size_t>(step_count) * n_ * sizeof(float),
-                            nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer MakeOutputActions(uint32_t step_count) {
+        OwnedDeviceBuffer b(static_cast<size_t>(step_count) * n_ * sizeof(float));
         return b;
     }
-    nuka::phi::Buffer MakeOutputMass() {
-        return nuka::phi::Buffer(n_ * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer MakeOutputMass() {
+        return OwnedDeviceBuffer(n_ * sizeof(float));
     }
 
     void Sync() { ctx_.stream.Synchronize(); }
@@ -341,7 +378,7 @@ public:
         cudaMemcpy(v.data(), src, count * sizeof(float), cudaMemcpyDeviceToHost);
         return v;
     }
-    std::vector<float> DownloadBuf(const nuka::phi::Buffer& b) {
+    std::vector<float> DownloadBuf(const OwnedDeviceBuffer& b) {
         std::vector<float> v(b.Size() / sizeof(float), 0.0f);
         b.CopyToHost(v.data(), b.Size());
         return v;
@@ -354,7 +391,7 @@ private:
     uint32_t n_ = 0u;
     diffsim::TapeDesc desc_;
     uint32_t steps_since_cp_ = 0u;
-    nuka::phi::Buffer action_buf_;
+    OwnedDeviceBuffer action_buf_;
     std::unique_ptr<diffsim::RecomputeOrchestrator> orch_;
     std::unique_ptr<diffsim::Tape> tape_;
     std::unique_ptr<diffsim::CheckpointManager> cm_;
@@ -479,10 +516,8 @@ TEST(MultiStepBackward, CheckpointVsFullTape_BitIdentical) {
         // Seed a nontrivial loss on the final state.
         std::vector<float> sq(model.link_count, 0.0f), sqd(model.link_count, 0.0f);
         for (uint32_t k : model.dof_links) { sq[k] = 0.6f; sqd[k] = -0.3f; }
-        nuka::phi::Buffer bsq(model.link_count * sizeof(float),
-                              nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer bsqd(model.link_count * sizeof(float),
-                               nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bsq(model.link_count * sizeof(float));
+        OwnedDeviceBuffer bsqd(model.link_count * sizeof(float));
         bsq.CopyFromHost(sq.data(), sq.size() * sizeof(float));
         bsqd.CopyFromHost(sqd.data(), sqd.size() * sizeof(float));
         seeds.grad_q_final = static_cast<const float*>(bsq.Data());
@@ -544,8 +579,8 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
     h.Record(actions);
     auto ga = h.MakeOutputActions(N);
     auto gm = h.MakeOutputMass();
-    nuka::phi::Buffer bsq(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer bsqd(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bsq(model.link_count * sizeof(float));
+    OwnedDeviceBuffer bsqd(model.link_count * sizeof(float));
     bsq.CopyFromHost(wq.data(), wq.size() * sizeof(float));
     bsqd.CopyFromHost(wqd.data(), wqd.size() * sizeof(float));
     diffsim::BackwardSeeds seeds;
@@ -577,8 +612,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
         RolloutHarness hh(ctx, m, dt, g, d2);
         hh.SetState(q0, qd0);
         // Forward roll via StepOnce on uploaded actions.
-        nuka::phi::Buffer ab(model.link_count * sizeof(float),
-                             nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer ab(model.link_count * sizeof(float));
         for (uint32_t s = 0u; s < N; ++s) {
             hh.Upload(static_cast<float*>(ab.Data()), acts[s]);
             hh.Orch().StepOnce(static_cast<const float*>(ab.Data()));
@@ -685,12 +719,12 @@ TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
     h.Record(actions);
     auto ga = h.MakeOutputActions(N);
     auto gm = h.MakeOutputMass();
-    nuka::phi::Buffer bsqd(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bsqd(model.link_count * sizeof(float));
     bsqd.CopyFromHost(wqd.data(), wqd.size() * sizeof(float));
     // grad_link_velocity_final: seed wrv on the root 6-vector (zero elsewhere).
     std::vector<float> glv(model.link_count * 6u, 0.0f);
     for (uint32_t i = 0u; i < 6u; ++i) glv[i] = wrv[i];
-    nuka::phi::Buffer bglv(glv.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bglv(glv.size() * sizeof(float));
     bglv.CopyFromHost(glv.data(), glv.size() * sizeof(float));
     diffsim::BackwardSeeds seeds;
     seeds.grad_qdot_final = static_cast<const float*>(bsqd.Data());
@@ -720,8 +754,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
         std::array<float, 6> rv = rootv0;
         if (rootv_comp >= 0) rv[rootv_comp] += rootv_delta;
         hh.SetRootVel(rv);
-        nuka::phi::Buffer ab(model.link_count * sizeof(float),
-                             nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer ab(model.link_count * sizeof(float));
         for (uint32_t s = 0u; s < N; ++s) {
             hh.Upload(static_cast<float*>(ab.Data()), acts[s]);
             hh.Orch().StepOnce(static_cast<const float*>(ab.Data()));
@@ -805,8 +838,8 @@ TEST(MultiStepBackward, D1_TwoRunBitExact) {
         auto gm = h.MakeOutputMass();
         std::vector<float> wq(model.link_count, 0.0f), wqd(model.link_count, 0.0f);
         for (uint32_t k : model.dof_links) { wq[k] = 0.5f; wqd[k] = -0.4f; }
-        nuka::phi::Buffer bsq(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer bsqd(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer bsq(model.link_count * sizeof(float));
+        OwnedDeviceBuffer bsqd(model.link_count * sizeof(float));
         bsq.CopyFromHost(wq.data(), wq.size() * sizeof(float));
         bsqd.CopyFromHost(wqd.data(), wqd.size() * sizeof(float));
         diffsim::BackwardSeeds seeds;
@@ -862,7 +895,7 @@ TEST(MultiStepBackward, MemoryCost_1000Step_K100) {
     auto gm = h.MakeOutputMass();
     std::vector<float> wq(model.link_count, 0.0f);
     for (uint32_t k : model.dof_links) wq[k] = 0.3f;
-    nuka::phi::Buffer bsq(model.link_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer bsq(model.link_count * sizeof(float));
     bsq.CopyFromHost(wq.data(), wq.size() * sizeof(float));
     diffsim::BackwardSeeds seeds;
     seeds.grad_q_final = static_cast<const float*>(bsq.Data());
@@ -963,7 +996,7 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
     const uint32_t N = 40u;
     // Action = hold the rest pose (drive_target = q0).
     std::vector<float> hold = host.q;
-    nuka::phi::Buffer ab(n * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer ab(n * sizeof(float));
     ab.CopyFromHost(hold.data(), n * sizeof(float));
 
     uint32_t since = 0u;

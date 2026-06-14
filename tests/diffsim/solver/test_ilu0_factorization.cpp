@@ -17,7 +17,8 @@
 
 #include "diffsim/solver/ilu0_preconditioner.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
@@ -30,13 +31,51 @@
 
 namespace {
 
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
+
 namespace diffsim = nuka::diffsim;
 constexpr uint32_t kMd = diffsim::kMaxBlockDim;
 constexpr uint32_t kStride = kMd * kMd;
 
 template <typename T>
-nuka::phi::Buffer UploadBuffer(const std::vector<T>& host) {
-    nuka::phi::Buffer buf(host.size() * sizeof(T), nuka::phi::MemoryKind::Device);
+OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
+    OwnedDeviceBuffer buf(host.size() * sizeof(T));
     buf.CopyFromHost(host.data(), host.size() * sizeof(T));
     return buf;
 }
@@ -148,12 +187,10 @@ TEST(Ilu0, DeviceMatchesHostAndIsBitExact) {
     for (uint32_t i = 0u; i < n; ++i)
         for (uint32_t j = 0u; j < n; ++j) a_blk[i * kMd + j] = A_dense[i * n + j];
 
-    nuka::phi::Buffer d_a = UploadBuffer(a_blk);
-    nuka::phi::Buffer d_dims = UploadBuffer(dims);
-    nuka::phi::Buffer d_lu(static_cast<size_t>(kStride) * sizeof(float),
-                           nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_lu2(static_cast<size_t>(kStride) * sizeof(float),
-                            nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer d_a = UploadBuffer(a_blk);
+    OwnedDeviceBuffer d_dims = UploadBuffer(dims);
+    OwnedDeviceBuffer d_lu(static_cast<size_t>(kStride) * sizeof(float));
+    OwnedDeviceBuffer d_lu2(static_cast<size_t>(kStride) * sizeof(float));
 
     diffsim::LaunchIlu0FactorizeTest(
         ctx, static_cast<const float*>(d_a.Data()),
@@ -215,13 +252,11 @@ TEST(Ilu0, ApplyMatchesHostAndIsBitExact) {
             lu_blk[i * kMd + j] = static_cast<float>(lu_host[i * n + j]);
         r_blk[i] = static_cast<float>(r64[i]);
     }
-    nuka::phi::Buffer d_lu = UploadBuffer(lu_blk);
-    nuka::phi::Buffer d_r = UploadBuffer(r_blk);
-    nuka::phi::Buffer d_dims = UploadBuffer(dims);
-    nuka::phi::Buffer d_z(static_cast<size_t>(kMd) * sizeof(float),
-                          nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_z2(static_cast<size_t>(kMd) * sizeof(float),
-                           nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer d_lu = UploadBuffer(lu_blk);
+    OwnedDeviceBuffer d_r = UploadBuffer(r_blk);
+    OwnedDeviceBuffer d_dims = UploadBuffer(dims);
+    OwnedDeviceBuffer d_z(static_cast<size_t>(kMd) * sizeof(float));
+    OwnedDeviceBuffer d_z2(static_cast<size_t>(kMd) * sizeof(float));
 
     diffsim::LaunchIlu0ApplyTest(ctx, static_cast<const float*>(d_lu.Data()),
                                  static_cast<const uint32_t*>(d_dims.Data()),

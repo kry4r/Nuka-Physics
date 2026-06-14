@@ -52,7 +52,8 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
@@ -70,6 +71,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace diffsim = nuka::diffsim;
 namespace art = nuka::runtime::articulation;
@@ -150,7 +189,7 @@ struct ContactStep {
     art::ArticulationDeviceBuffers buffers;
     art::ArticulationDeviceState view;
     // Owned device contact buffers (IFT borrows these).
-    nuka::phi::Buffer rows_buf, jn_buf, jt1_buf, jt2_buf, minv_buf;
+    OwnedDeviceBuffer rows_buf, jn_buf, jt1_buf, jt2_buf, minv_buf;
     // Host readback.
     std::vector<float> qdot_free;   // pre-solve (== host.qdot input)
     std::vector<float> qdot_post;   // post-solve
@@ -185,11 +224,10 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
     s.view = s.buffers.View();
     art::FeatherstoneAba::ComputeAccelerations(ctx, s.view, 0.0f);
 
-    nuka::phi::Buffer composite(
-        static_cast<size_t>(host.TotalLinkCount()) * sizeof(art::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-    s.minv_buf = nuka::phi::Buffer(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite(
+        static_cast<size_t>(host.TotalLinkCount()) * sizeof(art::LinkSpatialInertia));
+    OwnedDeviceBuffer m_buf(tile * sizeof(float));
+    s.minv_buf = OwnedDeviceBuffer(tile * sizeof(float));
     art::ComputeArticulationInertiaM(
         ctx, s.view, max_dof,
         static_cast<art::LinkSpatialInertia*>(composite.Data()),
@@ -198,17 +236,17 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
                                     static_cast<const float*>(m_buf.Data()),
                                     static_cast<float*>(s.minv_buf.Data()));
 
-    nuka::phi::Buffer link_buf(slot_count * sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer depth_buf(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer link_buf(slot_count * sizeof(uint32_t));
+    OwnedDeviceBuffer point_buf(slot_count * sizeof(Vec3));
+    OwnedDeviceBuffer normal_buf(slot_count * sizeof(Vec3));
+    OwnedDeviceBuffer depth_buf(slot_count * sizeof(float));
     link_buf.CopyFromHost(link.data(), slot_count * sizeof(uint32_t));
     point_buf.CopyFromHost(point.data(), slot_count * sizeof(Vec3));
     normal_buf.CopyFromHost(normal.data(), slot_count * sizeof(Vec3));
     depth_buf.CopyFromHost(depth.data(), slot_count * sizeof(float));
 
-    nuka::phi::Buffer t1_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer t2_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer t1_buf(slot_count * sizeof(Vec3));
+    OwnedDeviceBuffer t2_buf(slot_count * sizeof(Vec3));
     art::ComputeContactTangentBasis(ctx,
                                     static_cast<const uint32_t*>(link_buf.Data()),
                                     static_cast<const Vec3*>(normal_buf.Data()), env,
@@ -216,9 +254,9 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
                                     static_cast<Vec3*>(t2_buf.Data()));
 
     const size_t jac_len = static_cast<size_t>(slot_count) * max_dof;
-    s.jn_buf = nuka::phi::Buffer(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
-    s.jt1_buf = nuka::phi::Buffer(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
-    s.jt2_buf = nuka::phi::Buffer(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
+    s.jn_buf = OwnedDeviceBuffer(jac_len * sizeof(float));
+    s.jt1_buf = OwnedDeviceBuffer(jac_len * sizeof(float));
+    s.jt2_buf = OwnedDeviceBuffer(jac_len * sizeof(float));
     art::ComputeContactChainJacobians(ctx, s.view,
                                       static_cast<const uint32_t*>(link_buf.Data()),
                                       static_cast<const Vec3*>(point_buf.Data()),
@@ -238,9 +276,9 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
                                       slot_count, max_dof,
                                       static_cast<float*>(s.jt2_buf.Data()));
 
-    nuka::phi::Buffer meff_n(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer meff_t1(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer meff_t2(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer meff_n(slot_count * sizeof(float));
+    OwnedDeviceBuffer meff_t1(slot_count * sizeof(float));
+    OwnedDeviceBuffer meff_t2(slot_count * sizeof(float));
     art::ComputeContactEffectiveMass(ctx, s.view,
                                      static_cast<const uint32_t*>(link_buf.Data()),
                                      static_cast<const float*>(s.jn_buf.Data()),
@@ -260,8 +298,7 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
                                      slot_count, max_dof,
                                      static_cast<float*>(meff_t2.Data()));
 
-    s.rows_buf = nuka::phi::Buffer(slot_count * sizeof(art::ArticulatedContactRow),
-                                   nuka::phi::MemoryKind::Device);
+    s.rows_buf = OwnedDeviceBuffer(slot_count * sizeof(art::ArticulatedContactRow));
     art::AssembleArticulatedContactRows(
         ctx, s.view, static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
@@ -273,8 +310,7 @@ ContactStep RunContactStep(const nuka::phi::DeviceContext& ctx,
 
     s.qdot_free = host.qdot;
 
-    nuka::phi::Buffer lambda_buf(slot_count * 3u * sizeof(float),
-                                 nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer lambda_buf(slot_count * 3u * sizeof(float));
     std::vector<float> lambda0(slot_count * 3u, 0.0f);
     lambda_buf.CopyFromHost(lambda0.data(), lambda0.size() * sizeof(float));
 
@@ -313,12 +349,11 @@ struct IftOut {
 IftOut RunIft(const nuka::phi::DeviceContext& ctx, ContactStep& s,
               const std::vector<float>& g, bool adaptive_routing = false) {
     const uint32_t n_link = s.view.total_link_count;
-    nuka::phi::Buffer g_buf(n_link * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer g_buf(n_link * sizeof(float));
     g_buf.CopyFromHost(g.data(), n_link * sizeof(float));
-    nuka::phi::Buffer gqf_buf(n_link * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer gbc_buf(static_cast<size_t>(s.view.articulation_count) * kMd *
-                                  sizeof(float),
-                              nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer gqf_buf(n_link * sizeof(float));
+    OwnedDeviceBuffer gbc_buf(static_cast<size_t>(s.view.articulation_count) * kMd *
+                                  sizeof(float));
 
     diffsim::IftContactInputs in;
     in.rows = static_cast<const art::ArticulatedContactRow*>(s.rows_buf.Data());
@@ -507,7 +542,10 @@ TEST(IftContactGradient, MatchesDenseReference) {
             static_cast<const float*>(s.minv_buf.Data()), 1u, s.dof, sys, bufs);
         ctx.stream.Synchronize();
         std::vector<float> Adev(kMd * kMd, 0.0f);
-        bufs.values.CopyToHost(Adev.data(), Adev.size() * sizeof(float));
+        // bufs is the production ContactDelassusBuffers (v2 Buffer*); settled by the
+        // Synchronize above -> read via BufferDownload.
+        nuka::phi::BufferDownload(bufs.values, Adev.data(), 0,
+                                 Adev.size() * sizeof(float));
         double maxd = 0.0, sca = 1e-12;
         for (uint32_t i = 0u; i < n; ++i)
             for (uint32_t j = 0u; j < n; ++j) sca = std::max(sca, std::abs(A(i, j)));
@@ -772,12 +810,11 @@ TEST(IftContactGradient, BackwardRunnerSeamGate) {
     EXPECT_EQ(runner.gradient_mode(), diffsim::GradientMode::ContactFree);
 
     const uint32_t n_link = s.view.total_link_count;
-    nuka::phi::Buffer g_buf(n_link * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer g_buf(n_link * sizeof(float));
     g_buf.CopyFromHost(g.data(), n_link * sizeof(float));
-    nuka::phi::Buffer gqf_buf(n_link * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer gbc_buf(static_cast<size_t>(s.view.articulation_count) * kMd *
-                                  sizeof(float),
-                              nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer gqf_buf(n_link * sizeof(float));
+    OwnedDeviceBuffer gbc_buf(static_cast<size_t>(s.view.articulation_count) * kMd *
+                                  sizeof(float));
 
     diffsim::IftContactInputs in;
     in.rows = static_cast<const art::ArticulatedContactRow*>(s.rows_buf.Data());
@@ -849,13 +886,10 @@ TEST(IftContactGradient, PerfIftVsPgs) {
     art::FeatherstoneAba::ComputeAccelerations(ctx, view, 0.0f);
 
     // Per-articulation M -> M^-1 (one tile per env, stride dof^2).
-    nuka::phi::Buffer composite(
-        static_cast<size_t>(host.TotalLinkCount()) * sizeof(art::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_buf(static_cast<size_t>(n_env) * tile * sizeof(float),
-                            nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer minv_buf(static_cast<size_t>(n_env) * tile * sizeof(float),
-                               nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite(
+        static_cast<size_t>(host.TotalLinkCount()) * sizeof(art::LinkSpatialInertia));
+    OwnedDeviceBuffer m_buf(static_cast<size_t>(n_env) * tile * sizeof(float));
+    OwnedDeviceBuffer minv_buf(static_cast<size_t>(n_env) * tile * sizeof(float));
     art::ComputeArticulationInertiaM(ctx, view, max_dof,
                                      static_cast<art::LinkSpatialInertia*>(composite.Data()),
                                      static_cast<float*>(m_buf.Data()));
@@ -878,36 +912,36 @@ TEST(IftContactGradient, PerfIftVsPgs) {
         depth[slot0] = 0.02f;
     }
     auto up_u32 = [&](const std::vector<uint32_t>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(uint32_t), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer b(v.size() * sizeof(uint32_t));
         b.CopyFromHost(v.data(), v.size() * sizeof(uint32_t));
         return b;
     };
     auto up_v3 = [&](const std::vector<Vec3>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(Vec3), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer b(v.size() * sizeof(Vec3));
         b.CopyFromHost(v.data(), v.size() * sizeof(Vec3));
         return b;
     };
     auto up_f = [&](const std::vector<float>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer b(v.size() * sizeof(float));
         b.CopyFromHost(v.data(), v.size() * sizeof(float));
         return b;
     };
-    nuka::phi::Buffer link_buf = up_u32(link);
-    nuka::phi::Buffer point_buf = up_v3(point);
-    nuka::phi::Buffer normal_buf = up_v3(normal);
-    nuka::phi::Buffer depth_buf = up_f(depth);
+    OwnedDeviceBuffer link_buf = up_u32(link);
+    OwnedDeviceBuffer point_buf = up_v3(point);
+    OwnedDeviceBuffer normal_buf = up_v3(normal);
+    OwnedDeviceBuffer depth_buf = up_f(depth);
 
-    nuka::phi::Buffer t1_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer t2_buf(slot_count * sizeof(Vec3), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer t1_buf(slot_count * sizeof(Vec3));
+    OwnedDeviceBuffer t2_buf(slot_count * sizeof(Vec3));
     art::ComputeContactTangentBasis(ctx, static_cast<const uint32_t*>(link_buf.Data()),
                                     static_cast<const Vec3*>(normal_buf.Data()), n_env,
                                     static_cast<Vec3*>(t1_buf.Data()),
                                     static_cast<Vec3*>(t2_buf.Data()));
 
     const size_t jac_len = static_cast<size_t>(slot_count) * max_dof;
-    nuka::phi::Buffer jn_buf(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jt1_buf(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jt2_buf(jac_len * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer jn_buf(jac_len * sizeof(float));
+    OwnedDeviceBuffer jt1_buf(jac_len * sizeof(float));
+    OwnedDeviceBuffer jt2_buf(jac_len * sizeof(float));
     art::ComputeContactChainJacobians(ctx, view, static_cast<const uint32_t*>(link_buf.Data()),
                                       static_cast<const Vec3*>(point_buf.Data()),
                                       static_cast<const Vec3*>(normal_buf.Data()), slot_count,
@@ -921,9 +955,9 @@ TEST(IftContactGradient, PerfIftVsPgs) {
                                       static_cast<const Vec3*>(t2_buf.Data()), slot_count,
                                       max_dof, static_cast<float*>(jt2_buf.Data()));
 
-    nuka::phi::Buffer meff_n(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer meff_t1(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer meff_t2(slot_count * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer meff_n(slot_count * sizeof(float));
+    OwnedDeviceBuffer meff_t1(slot_count * sizeof(float));
+    OwnedDeviceBuffer meff_t2(slot_count * sizeof(float));
     art::ComputeContactEffectiveMass(ctx, view, static_cast<const uint32_t*>(link_buf.Data()),
                                      static_cast<const float*>(jn_buf.Data()),
                                      static_cast<const float*>(minv_buf.Data()), slot_count,
@@ -937,8 +971,7 @@ TEST(IftContactGradient, PerfIftVsPgs) {
                                      static_cast<const float*>(minv_buf.Data()), slot_count,
                                      max_dof, static_cast<float*>(meff_t2.Data()));
 
-    nuka::phi::Buffer rows_buf(slot_count * sizeof(art::ArticulatedContactRow),
-                               nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer rows_buf(slot_count * sizeof(art::ArticulatedContactRow));
     art::AssembleArticulatedContactRows(
         ctx, view, static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
@@ -950,10 +983,9 @@ TEST(IftContactGradient, PerfIftVsPgs) {
 
     // Cotangent g for the IFT path (global link layout).
     std::vector<float> g(view.total_link_count, 0.5f);
-    nuka::phi::Buffer g_buf = up_f(g);
-    nuka::phi::Buffer gqf_buf(view.total_link_count * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer gbc_buf(static_cast<size_t>(n_env) * kMd * sizeof(float),
-                              nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer g_buf = up_f(g);
+    OwnedDeviceBuffer gqf_buf(view.total_link_count * sizeof(float));
+    OwnedDeviceBuffer gbc_buf(static_cast<size_t>(n_env) * kMd * sizeof(float));
 
     diffsim::IftContactInputs in;
     in.rows = static_cast<const art::ArticulatedContactRow*>(rows_buf.Data());
@@ -971,7 +1003,7 @@ TEST(IftContactGradient, PerfIftVsPgs) {
 
     // Fresh lambda each PGS launch (the solve mutates state.qdot + lambda in place;
     // we re-upload a zero lambda + reset qdot each rep so the work is identical).
-    nuka::phi::Buffer lambda_buf(slot_count * 3u * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer lambda_buf(slot_count * 3u * sizeof(float));
     std::vector<float> lambda0(slot_count * 3u, 0.0f);
 
     auto time_ms = [&](auto&& fn, uint32_t reps) {

@@ -25,7 +25,8 @@
 
 #include "diffsim/sparse_solver_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <Eigen/Dense>
@@ -40,6 +41,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace diffsim = nuka::diffsim;
 constexpr uint32_t kMd = diffsim::kMaxBlockDim;  // 12 (architectural block cap)
@@ -102,8 +141,8 @@ void PackBatch(const std::vector<Block>& blocks, std::vector<float>& values,
 }
 
 template <typename T>
-nuka::phi::Buffer UploadBuffer(const std::vector<T>& host) {
-    nuka::phi::Buffer buf(host.size() * sizeof(T), nuka::phi::MemoryKind::Device);
+OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
+    OwnedDeviceBuffer buf(host.size() * sizeof(T));
     buf.CopyFromHost(host.data(), host.size() * sizeof(T));
     return buf;
 }
@@ -115,11 +154,10 @@ std::vector<float> RunSolve(const nuka::phi::DeviceContext& ctx,
                             diffsim::Preconditioner precond, uint32_t max_iter,
                             bool fixed_iters) {
     const uint32_t bc = static_cast<uint32_t>(dims.size());
-    nuka::phi::Buffer d_values = UploadBuffer(values);
-    nuka::phi::Buffer d_dims = UploadBuffer(dims);
-    nuka::phi::Buffer d_b = UploadBuffer(rhs);
-    nuka::phi::Buffer d_x(static_cast<size_t>(bc) * kMd * sizeof(float),
-                          nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer d_values = UploadBuffer(values);
+    OwnedDeviceBuffer d_dims = UploadBuffer(dims);
+    OwnedDeviceBuffer d_b = UploadBuffer(rhs);
+    OwnedDeviceBuffer d_x(static_cast<size_t>(bc) * kMd * sizeof(float));
 
     diffsim::BatchedDenseSpdSystem system;
     system.block_count = bc;
@@ -314,19 +352,14 @@ DiagSolveOutputs RunSolveWithDiag(const nuka::phi::DeviceContext& ctx,
                                   diffsim::Preconditioner precond,
                                   uint32_t max_iter, uint32_t cap) {
     const uint32_t bc = static_cast<uint32_t>(dims.size());
-    nuka::phi::Buffer d_values = UploadBuffer(values);
-    nuka::phi::Buffer d_dims = UploadBuffer(dims);
-    nuka::phi::Buffer d_b = UploadBuffer(rhs);
-    nuka::phi::Buffer d_x(static_cast<size_t>(bc) * kMd * sizeof(float),
-                          nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_iters(static_cast<size_t>(bc) * sizeof(uint32_t),
-                              nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_resid(static_cast<size_t>(bc) * sizeof(float),
-                              nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_status(static_cast<size_t>(bc) * sizeof(uint8_t),
-                               nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer d_hist(static_cast<size_t>(bc) * cap * sizeof(float),
-                             nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer d_values = UploadBuffer(values);
+    OwnedDeviceBuffer d_dims = UploadBuffer(dims);
+    OwnedDeviceBuffer d_b = UploadBuffer(rhs);
+    OwnedDeviceBuffer d_x(static_cast<size_t>(bc) * kMd * sizeof(float));
+    OwnedDeviceBuffer d_iters(static_cast<size_t>(bc) * sizeof(uint32_t));
+    OwnedDeviceBuffer d_resid(static_cast<size_t>(bc) * sizeof(float));
+    OwnedDeviceBuffer d_status(static_cast<size_t>(bc) * sizeof(uint8_t));
+    OwnedDeviceBuffer d_hist(static_cast<size_t>(bc) * cap * sizeof(float));
     // Pre-fill the history with a fixed sentinel so untouched tail entries are
     // deterministic across runs (the kernel only writes the iters it runs).
     std::vector<float> hist_init(static_cast<size_t>(bc) * cap, -1.0f);

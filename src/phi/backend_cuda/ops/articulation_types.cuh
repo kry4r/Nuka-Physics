@@ -2,13 +2,17 @@
 // ---------------------------------------------------------------------------
 // PHI v2 CUDA backend — M3b articulation op shared types.
 //
-// VERBATIM local copies of the legacy articulation device-state types
+// VERBATIM local copies of the articulation device-state types
 // (runtime/articulation/articulation_state.hpp + articulation_contacts.hpp).
-// They are duplicated here (NOT #included) because the ops layer includes the
-// PHI v2 phi/buffer.hpp (opaque `struct Buffer`), which collides with the
-// legacy `class phi::Buffer` that articulation_state.hpp pulls in via
-// phi/buffer_legacy.hpp. The duplication is transitional: M9 deletes the
-// legacy runtime/articulation files and these become the single definition.
+// They were duplicated here (NOT #included) because the ops layer includes the
+// PHI v2 phi/buffer.hpp (opaque `struct Buffer`), which used to collide with the
+// legacy `class phi::Buffer` that articulation_state.hpp pulled in via
+// phi/buffer_legacy.hpp. That collision is now GONE -- articulation_state.hpp
+// migrated to the v2 phi/buffer.hpp (M11 buffer sweep) -- so these PODs can fold
+// to the single runtime definition. NAMED DEBT (M11 OD-18, fast-follow): the
+// collapse is deferred to keep the buffer sweep's blast radius off the byte-D1
+// ops kernel layer; the layouts are byte-identical (static_asserts below guard
+// the contract) so no behavioral risk while the duplication remains.
 //
 // LAYOUT CONTRACT (the byte-exact port hinges on it):
 //   * every struct is the exact legacy layout (float[6]/float[36] PODs);

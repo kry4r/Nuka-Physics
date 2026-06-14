@@ -19,6 +19,7 @@
 #include "diffsim/backward_runner.hpp"
 
 #include "math/transform.hpp"
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
 
 #include <cuda_runtime.h>
 
@@ -47,10 +48,14 @@ void LaunchAdd(const phi::DeviceContext& ctx, float* acc, const float* step,
     CheckCuda(cudaGetLastError(), "AddInPlace launch");
 }
 
-phi::Buffer ZeroedFloat(const phi::DeviceContext& ctx, size_t count) {
-    phi::Buffer b(count * sizeof(float), phi::MemoryKind::Device);
+// Allocate a v2 device Buffer* (device-level DEFAULT type) and zero it on
+// ctx.stream via a raw cudaMemsetAsync over the base pointer -- the SAME stream
+// (and byte-for-byte the same memset) the legacy ZeroedFloat used.
+phi::Buffer* ZeroedFloat(const phi::DeviceContext& ctx, size_t count) {
+    phi::Buffer* b = phi::BufferAlloc(
+        phi::DeviceBufferType(phi::InitBestDevice()), count * sizeof(float));
     phi::ScopedDeviceGuard guard(ctx.device_id);
-    CheckCuda(cudaMemsetAsync(b.Data(), 0, count * sizeof(float),
+    CheckCuda(cudaMemsetAsync(phi::BufferBase(b), 0, count * sizeof(float),
                               ctx.stream.Native()),
               "ZeroedFloat memset");
     return b;
@@ -72,6 +77,22 @@ BackwardRunner::BackwardRunner(const phi::DeviceContext& context,
     grad_mass_step_ = ZeroedFloat(context_, n);
     grad_mass_acc_ = ZeroedFloat(context_, n);
     grad_tau_ = ZeroedFloat(context_, n);
+}
+
+BackwardRunner::~BackwardRunner() {
+    if (q_pre_ != nullptr) { phi::BufferFree(q_pre_); }
+    if (qdot_pre_ != nullptr) { phi::BufferFree(qdot_pre_); }
+    if (v_root_pre_ != nullptr) { phi::BufferFree(v_root_pre_); }
+    if (grad_q_ != nullptr) { phi::BufferFree(grad_q_); }
+    if (grad_qdot_ != nullptr) { phi::BufferFree(grad_qdot_); }
+    if (grad_link_vel_ != nullptr) { phi::BufferFree(grad_link_vel_); }
+    if (grad_mass_step_ != nullptr) { phi::BufferFree(grad_mass_step_); }
+    if (grad_mass_acc_ != nullptr) { phi::BufferFree(grad_mass_acc_); }
+    if (grad_tau_ != nullptr) { phi::BufferFree(grad_tau_); }
+    if (win_q_ != nullptr) { phi::BufferFree(win_q_); }
+    if (win_qdot_ != nullptr) { phi::BufferFree(win_qdot_); }
+    if (win_base_pose_ != nullptr) { phi::BufferFree(win_base_pose_); }
+    if (win_link_vel_ != nullptr) { phi::BufferFree(win_link_vel_); }
 }
 
 void BackwardRunner::ApplyIftContactSeed(const IftContactInputs& inputs,
@@ -104,10 +125,10 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
     //    PRE-step values; StepOnce below overwrites the live q/qdot).
     {
         phi::ScopedDeviceGuard guard(context_.device_id);
-        CheckCuda(cudaMemcpyAsync(q_pre_.Data(), state.q, n * sizeof(float),
+        CheckCuda(cudaMemcpyAsync(phi::BufferBase(q_pre_), state.q, n * sizeof(float),
                                   cudaMemcpyDeviceToDevice, stream),
                   "snapshot q_pre");
-        CheckCuda(cudaMemcpyAsync(qdot_pre_.Data(), state.qdot, n * sizeof(float),
+        CheckCuda(cudaMemcpyAsync(phi::BufferBase(qdot_pre_), state.qdot, n * sizeof(float),
                                   cudaMemcpyDeviceToDevice, stream),
                   "snapshot qdot_pre");
         // Snapshot the PRE-INTEGRATION root spatial velocity. The forward's
@@ -115,7 +136,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
         // link_velocity[root] in place (v_pre -> v_post); the root gyroscopic
         // adjoint must linearize at v_pre. Whole-buffer copy (LinkSpatialVel is
         // float[6], no padding) -> v_root_pre_[link*6 .. +6).
-        CheckCuda(cudaMemcpyAsync(v_root_pre_.Data(), state.link_velocity,
+        CheckCuda(cudaMemcpyAsync(phi::BufferBase(v_root_pre_), state.link_velocity,
                                   n * sizeof(articulation::LinkSpatialVel),
                                   cudaMemcpyDeviceToDevice, stream),
                   "snapshot v_root_pre");
@@ -129,7 +150,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
     // 3. Zero grad_tau (StepBackward STAGES dL/dtau here; caller must pre-zero).
     {
         phi::ScopedDeviceGuard guard(context_.device_id);
-        CheckCuda(cudaMemsetAsync(grad_tau_.Data(), 0, n * sizeof(float), stream),
+        CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_tau_), 0, n * sizeof(float), stream),
                   "zero grad_tau");
     }
 
@@ -137,13 +158,13 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
     //    dL/d state' of step j == dL/d state of step j+1), OVERWRITTEN in place
     //    with the pre-step seed for step j-1.
     StepBackwardInputs in = orch_.ReconstructInputs(tape, step);
-    in.q_pre = static_cast<const float*>(q_pre_.Data());
-    in.qdot_pre = static_cast<const float*>(qdot_pre_.Data());
-    in.v_root_pre = static_cast<const float*>(v_root_pre_.Data());
+    in.q_pre = static_cast<const float*>(phi::BufferBase(q_pre_));
+    in.qdot_pre = static_cast<const float*>(phi::BufferBase(qdot_pre_));
+    in.v_root_pre = static_cast<const float*>(phi::BufferBase(v_root_pre_));
 
     StepBackwardGrads g;
-    g.grad_q_out = static_cast<float*>(grad_q_.Data());
-    g.grad_qdot_out = static_cast<float*>(grad_qdot_.Data());
+    g.grad_q_out = static_cast<float*>(phi::BufferBase(grad_q_));
+    g.grad_qdot_out = static_cast<float*>(phi::BufferBase(grad_qdot_));
     // grad_target_out: write this step's action gradient DIRECTLY into the output
     // slice for step `step` (StepBackward OVERWRITES it per call; distinct slices
     // per step -> no accumulation needed).
@@ -151,15 +172,15 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
                         static_cast<size_t>(step) * total_link_count_;
     // grad_mass_out: StepBackward OVERWRITES this per call, so point it at the
     // per-step scratch and accumulate into grad_mass_acc_ afterwards.
-    g.grad_mass_out = static_cast<float*>(grad_mass_step_.Data());
-    g.grad_tau_out = static_cast<float*>(grad_tau_.Data());
-    g.grad_link_velocity_out = static_cast<float*>(grad_link_vel_.Data());
+    g.grad_mass_out = static_cast<float*>(phi::BufferBase(grad_mass_step_));
+    g.grad_tau_out = static_cast<float*>(phi::BufferBase(grad_tau_));
+    g.grad_link_velocity_out = static_cast<float*>(phi::BufferBase(grad_link_vel_));
 
     StepBackward(context_, state, in, g);
 
     // 6. grad_mass_acc_ += grad_mass_step_ (fixed-order, atomic-free, D1).
-    LaunchAdd(context_, static_cast<float*>(grad_mass_acc_.Data()),
-              static_cast<const float*>(grad_mass_step_.Data()),
+    LaunchAdd(context_, static_cast<float*>(phi::BufferBase(grad_mass_acc_)),
+              static_cast<const float*>(phi::BufferBase(grad_mass_step_)),
               total_link_count_);
 }
 
@@ -180,37 +201,37 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
     {
         phi::ScopedDeviceGuard guard(context_.device_id);
         if (seeds.grad_q_final) {
-            CheckCuda(cudaMemcpyAsync(grad_q_.Data(), seeds.grad_q_final,
+            CheckCuda(cudaMemcpyAsync(phi::BufferBase(grad_q_), seeds.grad_q_final,
                                       n * sizeof(float), cudaMemcpyDeviceToDevice,
                                       stream),
                       "seed grad_q_final");
         } else {
-            CheckCuda(cudaMemsetAsync(grad_q_.Data(), 0, n * sizeof(float), stream),
+            CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_q_), 0, n * sizeof(float), stream),
                       "zero grad_q_final");
         }
         if (seeds.grad_qdot_final) {
-            CheckCuda(cudaMemcpyAsync(grad_qdot_.Data(), seeds.grad_qdot_final,
+            CheckCuda(cudaMemcpyAsync(phi::BufferBase(grad_qdot_), seeds.grad_qdot_final,
                                       n * sizeof(float), cudaMemcpyDeviceToDevice,
                                       stream),
                       "seed grad_qdot_final");
         } else {
-            CheckCuda(cudaMemsetAsync(grad_qdot_.Data(), 0, n * sizeof(float),
+            CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_qdot_), 0, n * sizeof(float),
                                       stream),
                       "zero grad_qdot_final");
         }
         if (seeds.grad_link_velocity_final) {
-            CheckCuda(cudaMemcpyAsync(grad_link_vel_.Data(),
+            CheckCuda(cudaMemcpyAsync(phi::BufferBase(grad_link_vel_),
                                       seeds.grad_link_velocity_final,
                                       n * 6u * sizeof(float),
                                       cudaMemcpyDeviceToDevice, stream),
                       "seed grad_link_velocity_final");
         } else {
-            CheckCuda(cudaMemsetAsync(grad_link_vel_.Data(), 0,
+            CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_link_vel_), 0,
                                       n * 6u * sizeof(float), stream),
                       "zero grad_link_velocity_final");
         }
         // grad_mass accumulator starts at zero (accumulates over all steps).
-        CheckCuda(cudaMemsetAsync(grad_mass_acc_.Data(), 0, n * sizeof(float),
+        CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_mass_acc_), 0, n * sizeof(float),
                                   stream),
                   "zero grad_mass_acc");
     }
@@ -222,17 +243,20 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
                            : tape.Desc().checkpoint_interval;
     if (window_capacity_ < k) {
         window_capacity_ = k;
-        win_q_ = phi::Buffer(static_cast<size_t>(k) * n * sizeof(float),
-                             phi::MemoryKind::Device);
-        win_qdot_ = phi::Buffer(static_cast<size_t>(k) * n * sizeof(float),
-                                phi::MemoryKind::Device);
-        win_base_pose_ = phi::Buffer(
-            static_cast<size_t>(k) * articulation_count_ *
-                sizeof(nuka::math::Transform),
-            phi::MemoryKind::Device);
-        win_link_vel_ = phi::Buffer(
-            static_cast<size_t>(k) * n * sizeof(articulation::LinkSpatialVel),
-            phi::MemoryKind::Device);
+        // Grow-on-demand realloc: free any prior (smaller) window buffers first,
+        // then allocate the new size from the device-level DEFAULT type.
+        phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+        if (win_q_ != nullptr) { phi::BufferFree(win_q_); }
+        if (win_qdot_ != nullptr) { phi::BufferFree(win_qdot_); }
+        if (win_base_pose_ != nullptr) { phi::BufferFree(win_base_pose_); }
+        if (win_link_vel_ != nullptr) { phi::BufferFree(win_link_vel_); }
+        win_q_ = phi::BufferAlloc(bt, static_cast<size_t>(k) * n * sizeof(float));
+        win_qdot_ = phi::BufferAlloc(bt, static_cast<size_t>(k) * n * sizeof(float));
+        win_base_pose_ = phi::BufferAlloc(
+            bt, static_cast<size_t>(k) * articulation_count_ *
+                    sizeof(nuka::math::Transform));
+        win_link_vel_ = phi::BufferAlloc(
+            bt, static_cast<size_t>(k) * n * sizeof(articulation::LinkSpatialVel));
     }
 
     const articulation::ArticulationDeviceState state = orch_.State();
@@ -270,14 +294,14 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
         // step (the state at the START of step base_step + w) into cache slot w.
         for (uint32_t w = 0u; w < window_len; ++w) {
             phi::ScopedDeviceGuard guard(context_.device_id);
-            float* wq = static_cast<float*>(win_q_.Data()) +
+            float* wq = static_cast<float*>(phi::BufferBase(win_q_)) +
                         static_cast<size_t>(w) * n;
-            float* wqd = static_cast<float*>(win_qdot_.Data()) +
+            float* wqd = static_cast<float*>(phi::BufferBase(win_qdot_)) +
                          static_cast<size_t>(w) * n;
-            auto* wbp = static_cast<nuka::math::Transform*>(win_base_pose_.Data()) +
+            auto* wbp = static_cast<nuka::math::Transform*>(phi::BufferBase(win_base_pose_)) +
                         static_cast<size_t>(w) * articulation_count_;
             auto* wlv =
-                static_cast<articulation::LinkSpatialVel*>(win_link_vel_.Data()) +
+                static_cast<articulation::LinkSpatialVel*>(phi::BufferBase(win_link_vel_)) +
                 static_cast<size_t>(w) * n;
             CheckCuda(cudaMemcpyAsync(wq, state.q, n * sizeof(float),
                                       cudaMemcpyDeviceToDevice, stream),
@@ -307,15 +331,15 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
             const uint32_t step = base_step + wi;
             {
                 phi::ScopedDeviceGuard guard(context_.device_id);
-                const float* wq = static_cast<const float*>(win_q_.Data()) +
+                const float* wq = static_cast<const float*>(phi::BufferBase(win_q_)) +
                                   static_cast<size_t>(wi) * n;
-                const float* wqd = static_cast<const float*>(win_qdot_.Data()) +
+                const float* wqd = static_cast<const float*>(phi::BufferBase(win_qdot_)) +
                                    static_cast<size_t>(wi) * n;
                 const auto* wbp = static_cast<const nuka::math::Transform*>(
-                                      win_base_pose_.Data()) +
+                                      phi::BufferBase(win_base_pose_)) +
                                   static_cast<size_t>(wi) * articulation_count_;
                 const auto* wlv = static_cast<const articulation::LinkSpatialVel*>(
-                                      win_link_vel_.Data()) +
+                                      phi::BufferBase(win_link_vel_)) +
                                   static_cast<size_t>(wi) * n;
                 CheckCuda(cudaMemcpyAsync(state.q, wq, n * sizeof(float),
                                           cudaMemcpyDeviceToDevice, stream),
@@ -342,7 +366,7 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
     // -- Publish the accumulated mass gradient. --
     {
         phi::ScopedDeviceGuard guard(context_.device_id);
-        CheckCuda(cudaMemcpyAsync(out.grad_mass, grad_mass_acc_.Data(),
+        CheckCuda(cudaMemcpyAsync(out.grad_mass, phi::BufferBase(grad_mass_acc_),
                                   n * sizeof(float), cudaMemcpyDeviceToDevice,
                                   stream),
                   "publish grad_mass");

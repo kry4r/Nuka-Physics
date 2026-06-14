@@ -865,23 +865,30 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
         auto cooked_ref = nuka::scene::cook::CookToModel(scene, 1);
         const auto& hd = cooked_ref.model.hold_drives;
         ASSERT_EQ(hd.targets.size(), host.q.size());
-        auto upload_f32 = [](const std::vector<float>& v) {
-            nuka::phi::Buffer b(v.size() * sizeof(float), nuka::phi::MemoryKind::Device);
-            b.CopyFromHost(v.data(), v.size() * sizeof(float));
+        // phi v2 device buffers from the device-level DEFAULT (stream-0) type --
+        // BufferUpload runs on stream 0, the SAME (null) stream the context uses,
+        // exactly like the legacy CopyFromHost. Owned Buffer* freed at scope end.
+        nuka::phi::BufferType* bt =
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice());
+        auto upload_f32 = [bt](const std::vector<float>& v) {
+            nuka::phi::Buffer* b = nuka::phi::BufferAlloc(bt, v.size() * sizeof(float));
+            if (!v.empty()) {
+                nuka::phi::BufferUpload(b, v.data(), 0, v.size() * sizeof(float));
+            }
             return b;
         };
-        nuka::phi::Buffer d_targets = upload_f32(hd.targets);
-        nuka::phi::Buffer d_stiffness = upload_f32(hd.stiffness);
-        nuka::phi::Buffer d_damping = upload_f32(hd.damping);
-        nuka::phi::Buffer d_limits = upload_f32(hd.force_limits);
+        nuka::phi::Buffer* d_targets = upload_f32(hd.targets);
+        nuka::phi::Buffer* d_stiffness = upload_f32(hd.stiffness);
+        nuka::phi::Buffer* d_damping = upload_f32(hd.damping);
+        nuka::phi::Buffer* d_limits = upload_f32(hd.force_limits);
 
         const uint32_t total_links = host.TotalLinkCount();
         const size_t tile = static_cast<size_t>(max_dof) * max_dof;
-        nuka::phi::Buffer m(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer m_inv(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer composite(
-            static_cast<size_t>(total_links) * sizeof(articulation::LinkSpatialInertia),
-            nuka::phi::MemoryKind::Device);
+        nuka::phi::Buffer* m = nuka::phi::BufferAlloc(bt, tile * sizeof(float));
+        nuka::phi::Buffer* m_inv = nuka::phi::BufferAlloc(bt, tile * sizeof(float));
+        nuka::phi::Buffer* composite = nuka::phi::BufferAlloc(
+            bt,
+            static_cast<size_t>(total_links) * sizeof(articulation::LinkSpatialInertia));
 
         std::vector<float> legacy_traj;
         legacy_traj.reserve(nk_traj.size());
@@ -889,10 +896,10 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
         for (uint32_t step = 0; step < kSteps; ++step) {
             articulation::FeatherstoneAba::ApplyPositionDrives(
                 context, state,
-                static_cast<const float*>(d_targets.Data()),
-                static_cast<const float*>(d_stiffness.Data()),
-                static_cast<const float*>(d_damping.Data()),
-                static_cast<const float*>(d_limits.Data()),
+                static_cast<const float*>(nuka::phi::BufferBase(d_targets)),
+                static_cast<const float*>(nuka::phi::BufferBase(d_stiffness)),
+                static_cast<const float*>(nuka::phi::BufferBase(d_damping)),
+                static_cast<const float*>(nuka::phi::BufferBase(d_limits)),
                 /*defer_velocity_damping=*/true);
             articulation::FeatherstoneAba::ComputeAccelerations(context, state, kGravityZ);
             articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
@@ -900,22 +907,26 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
             articulation::FeatherstoneAba::IntegrateVelocity(context, state, kDt);
             articulation::ComputeArticulationInertiaM(
                 context, state, max_dof,
-                static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
-                static_cast<float*>(m.Data()),
-                static_cast<const float*>(d_damping.Data()), kDt);
+                static_cast<articulation::LinkSpatialInertia*>(nuka::phi::BufferBase(composite)),
+                static_cast<float*>(nuka::phi::BufferBase(m)),
+                static_cast<const float*>(nuka::phi::BufferBase(d_damping)), kDt);
             articulation::FactorArticulationInertiaM(
                 context, state, max_dof,
-                static_cast<const float*>(m.Data()),
-                static_cast<float*>(m_inv.Data()));
+                static_cast<const float*>(nuka::phi::BufferBase(m)),
+                static_cast<float*>(nuka::phi::BufferBase(m_inv)));
             articulation::ApplyImplicitJointDamping(
                 context, state,
-                static_cast<const float*>(m_inv.Data()),
-                static_cast<const float*>(d_damping.Data()), max_dof, kDt);
+                static_cast<const float*>(nuka::phi::BufferBase(m_inv)),
+                static_cast<const float*>(nuka::phi::BufferBase(d_damping)), max_dof, kDt);
             articulation::FeatherstoneAba::IntegratePosition(context, state, kDt);
             articulation::FeatherstoneAba::IntegrateFloatingBasePose(context, state, kDt);
             context.stream.Synchronize();
             articulation::DownloadArticulationState(device, &host);
             legacy_traj.insert(legacy_traj.end(), host.q.begin(), host.q.end());
+        }
+        for (nuka::phi::Buffer* b : {d_targets, d_stiffness, d_damping, d_limits,
+                                     m, m_inv, composite}) {
+            nuka::phi::BufferFree(b);
         }
         ASSERT_EQ(legacy_traj.size(), nk_traj.size());
         size_t mismatches = 0;

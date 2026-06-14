@@ -27,13 +27,15 @@
 // if lambda is not restored, the regenerated forward diverges). Reserving +
 // wiring the slot now keeps the Checkpoint layout stable across the p02-D land.
 //
-// All storage is phi::Buffer (NO DeviceVector). Capacity (max_checkpoints) is
-// sized once; Capture/Restore are D2D copies on the context stream (D1: a flat
-// contiguous copy has no float arithmetic and a fixed byte order).
+// All storage is a phi v2 Buffer* (NO DeviceVector). Capacity (max_checkpoints)
+// is sized once from the device-level DEFAULT (stream-0) BufferType; Capture/
+// Restore are D2D copies on the context stream (raw cudaMemcpyAsync over the
+// base pointers -- D1: a flat contiguous copy has no float arithmetic and a
+// fixed byte order).
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -89,6 +91,10 @@ public:
     // are monotone in step, so this is a fixed-order scan (D1, host-side).
     bool NearestCheckpointBefore(uint32_t target_step, uint32_t* out_slot) const;
 
+    ~CheckpointManager();
+    CheckpointManager(const CheckpointManager&) = delete;
+    CheckpointManager& operator=(const CheckpointManager&) = delete;
+
 private:
     const phi::DeviceContext& context_;
     uint32_t max_checkpoints_ = 0u;
@@ -98,11 +104,11 @@ private:
     uint32_t count_ = 0u;
 
     // Contiguous per-buffer storage; slot s lives at offset s*width.
-    phi::Buffer base_pose_;       // Transform[max_checkpoints * articulation_count]
-    phi::Buffer link_velocity_;   // LinkSpatialVel[max_checkpoints * total_link_count]
-    phi::Buffer q_;               // float[max_checkpoints * total_link_count]
-    phi::Buffer qdot_;            // float[max_checkpoints * total_link_count]
-    phi::Buffer lambda_;          // float[max_checkpoints * lambda_width] (R2)
+    phi::Buffer* base_pose_ = nullptr;     // Transform[max_checkpoints * articulation_count]
+    phi::Buffer* link_velocity_ = nullptr; // LinkSpatialVel[max_checkpoints * total_link_count]
+    phi::Buffer* q_ = nullptr;             // float[max_checkpoints * total_link_count]
+    phi::Buffer* qdot_ = nullptr;          // float[max_checkpoints * total_link_count]
+    phi::Buffer* lambda_ = nullptr;        // float[max_checkpoints * lambda_width] (R2)
 
     std::vector<uint32_t> slot_steps_;  // host: slot -> forward step index
 };

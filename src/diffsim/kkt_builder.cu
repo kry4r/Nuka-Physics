@@ -29,12 +29,49 @@
 
 #include "diffsim/kkt_builder.hpp"
 
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
 #include <string>
 
 namespace nuka::diffsim {
+
+// --- ContactDelassusBuffers RAII (v2 Buffer* ownership) --------------------
+ContactDelassusBuffers::~ContactDelassusBuffers() {
+    if (values != nullptr) { phi::BufferFree(values); }
+    if (block_dim != nullptr) { phi::BufferFree(block_dim); }
+}
+
+ContactDelassusBuffers::ContactDelassusBuffers(
+    ContactDelassusBuffers&& other) noexcept
+    : values(other.values),
+      block_dim(other.block_dim),
+      values_bytes(other.values_bytes),
+      block_dim_bytes(other.block_dim_bytes) {
+    other.values = nullptr;
+    other.block_dim = nullptr;
+    other.values_bytes = 0u;
+    other.block_dim_bytes = 0u;
+}
+
+ContactDelassusBuffers& ContactDelassusBuffers::operator=(
+    ContactDelassusBuffers&& other) noexcept {
+    if (this != &other) {
+        if (values != nullptr) { phi::BufferFree(values); }
+        if (block_dim != nullptr) { phi::BufferFree(block_dim); }
+        values = other.values;
+        block_dim = other.block_dim;
+        values_bytes = other.values_bytes;
+        block_dim_bytes = other.block_dim_bytes;
+        other.values = nullptr;
+        other.block_dim = nullptr;
+        other.values_bytes = 0u;
+        other.block_dim_bytes = 0u;
+    }
+    return *this;
+}
 
 namespace {
 
@@ -186,8 +223,18 @@ void BuildContactDelassusSystem(const phi::DeviceContext& context,
     out_system.values = nullptr;
     out_system.block_dim = nullptr;
     if (block_count == 0u) {
-        out_buffers.values = phi::Buffer();
-        out_buffers.block_dim = phi::Buffer();
+        // Release any prior allocation; an empty system owns nothing (matches the
+        // legacy assignment of a fresh default Buffer).
+        if (out_buffers.values != nullptr) {
+            phi::BufferFree(out_buffers.values);
+            out_buffers.values = nullptr;
+            out_buffers.values_bytes = 0u;
+        }
+        if (out_buffers.block_dim != nullptr) {
+            phi::BufferFree(out_buffers.block_dim);
+            out_buffers.block_dim = nullptr;
+            out_buffers.block_dim_bytes = 0u;
+        }
         return;
     }
     if (rows == nullptr || jac_normal == nullptr || jac_tangent1 == nullptr ||
@@ -217,15 +264,23 @@ void BuildContactDelassusSystem(const phi::DeviceContext& context,
     const size_t values_bytes =
         static_cast<size_t>(block_count) * kBlockStride * sizeof(float);
     const size_t block_dim_bytes = static_cast<size_t>(block_count) * sizeof(uint32_t);
-    if (out_buffers.values.Size() < values_bytes) {
-        out_buffers.values = phi::Buffer(values_bytes, phi::MemoryKind::Device);
+    // R8: reuse the existing allocation when it is large enough; only (re)allocate
+    // on growth. The tracked *_bytes fields stand in for the opaque Buffer's lost
+    // Size(). Free the too-small buffer before the new alloc.
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+    if (out_buffers.values_bytes < values_bytes) {
+        if (out_buffers.values != nullptr) { phi::BufferFree(out_buffers.values); }
+        out_buffers.values = phi::BufferAlloc(bt, values_bytes);
+        out_buffers.values_bytes = values_bytes;
     }
-    if (out_buffers.block_dim.Size() < block_dim_bytes) {
-        out_buffers.block_dim = phi::Buffer(block_dim_bytes, phi::MemoryKind::Device);
+    if (out_buffers.block_dim_bytes < block_dim_bytes) {
+        if (out_buffers.block_dim != nullptr) { phi::BufferFree(out_buffers.block_dim); }
+        out_buffers.block_dim = phi::BufferAlloc(bt, block_dim_bytes);
+        out_buffers.block_dim_bytes = block_dim_bytes;
     }
 
-    float* values = static_cast<float*>(out_buffers.values.Data());
-    uint32_t* block_dim = static_cast<uint32_t*>(out_buffers.block_dim.Data());
+    float* values = static_cast<float*>(phi::BufferBase(out_buffers.values));
+    uint32_t* block_dim = static_cast<uint32_t*>(phi::BufferBase(out_buffers.block_dim));
 
     // Zero the ENTIRE values span first: the D1 two-run memcmp gate compares the
     // full block_count*144 buffer, so every padding lane (>= n) and every empty

@@ -47,7 +47,8 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
@@ -64,6 +65,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace articulation = nuka::runtime::articulation;
 using nuka::math::Quat;
@@ -205,11 +244,10 @@ DeviceMResult RunDeviceM(const nuka::phi::DeviceContext& context,
 
     const uint32_t link_count = host.TotalLinkCount();
     const size_t tile = static_cast<size_t>(max_dof) * max_dof;
-    nuka::phi::Buffer composite_buf(
-        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer minv_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite_buf(
+        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
+    OwnedDeviceBuffer m_buf(tile * sizeof(float));
+    OwnedDeviceBuffer minv_buf(tile * sizeof(float));
 
     articulation::ComputeArticulationInertiaM(
         context, view, max_dof,
@@ -336,9 +374,8 @@ TEST(DofAbove18Honesty, EffectiveMassUsesFullChain) {
         auto device = articulation::UploadArticulationState(context, host);
         auto view = device.View();
         articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
-        nuka::phi::Buffer pose_buf(
-            static_cast<size_t>(link_count) * sizeof(Transform),
-            nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer pose_buf(
+            static_cast<size_t>(link_count) * sizeof(Transform));
         articulation::UpdateWorldLinkPoses(context, view,
                                            static_cast<Transform*>(pose_buf.Data()));
         context.stream.Synchronize();
@@ -351,11 +388,10 @@ TEST(DofAbove18Honesty, EffectiveMassUsesFullChain) {
     auto view = device.View();
     articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
 
-    nuka::phi::Buffer composite_buf(
-        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer minv_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite_buf(
+        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
+    OwnedDeviceBuffer m_buf(tile * sizeof(float));
+    OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
         context, view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
@@ -369,12 +405,11 @@ TEST(DofAbove18Honesty, EffectiveMassUsesFullChain) {
     const Vec3 contact_point =
         host.link_pose[last].TransformPoint({0.05f, 0.0f, -0.02f});
     const Vec3 contact_normal{0.0f, 0.0f, 1.0f};
-    nuka::phi::Buffer link_idx_buf(sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jac_buf(static_cast<size_t>(max_dof) * sizeof(float),
-                              nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer meff_buf(sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer link_idx_buf(sizeof(uint32_t));
+    OwnedDeviceBuffer point_buf(sizeof(Vec3));
+    OwnedDeviceBuffer normal_buf(sizeof(Vec3));
+    OwnedDeviceBuffer jac_buf(static_cast<size_t>(max_dof) * sizeof(float));
+    OwnedDeviceBuffer meff_buf(sizeof(float));
     link_idx_buf.CopyFromHost(&last, sizeof(uint32_t));
     point_buf.CopyFromHost(&contact_point, sizeof(Vec3));
     normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
@@ -462,11 +497,10 @@ TEST(DofAbove18Honesty, ImplicitDampingReachesDofAbove18) {
     auto view = device.View();
     articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
     const size_t tile = static_cast<size_t>(dof) * dof;
-    nuka::phi::Buffer composite_buf(
-        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia),
-        nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer m_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer minv_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer composite_buf(
+        static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
+    OwnedDeviceBuffer m_buf(tile * sizeof(float));
+    OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
         context, view, dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
@@ -522,8 +556,8 @@ TEST(DofAbove18Honesty, LoudFailBeyondMaxArticulationDof) {
     auto view = device.View();
 
     const size_t tile = static_cast<size_t>(dof) * dof;
-    nuka::phi::Buffer m_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer minv_buf(tile * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer m_buf(tile * sizeof(float));
+    OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     std::vector<float> zeros(tile, 0.0f);
     m_buf.CopyFromHost(zeros.data(), zeros.size() * sizeof(float));
 

@@ -50,10 +50,11 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace nuka::diffsim {
@@ -66,9 +67,23 @@ namespace articulation = nuka::runtime::articulation;
 // BatchedDenseSpdSystem's raw pointers are borrowed from these buffers, so this
 // MUST outlive any use of the system (the buffers must not be moved/destroyed
 // while the system is live -- the classic raw-pointer-into-owner contract).
+//
+// R8: the *_bytes fields track each Buffer*'s allocated size so
+// BuildContactDelassusSystem keeps its allocate-once / reuse-if-large-enough
+// contract (the opaque v2 Buffer has no Size()). RAII frees the v2 buffers; the
+// struct is move-only (it owns device memory), like the legacy RAII-Buffer form.
 struct ContactDelassusBuffers {
-    phi::Buffer values;     // float[block_count * kMaxBlockDim^2], row-major blocks
-    phi::Buffer block_dim;  // uint32_t[block_count], n_b per articulation
+    phi::Buffer* values = nullptr;     // float[block_count * kMaxBlockDim^2], row-major blocks
+    phi::Buffer* block_dim = nullptr;  // uint32_t[block_count], n_b per articulation
+    std::size_t values_bytes = 0u;     // allocated size of `values` (R8 reuse guard)
+    std::size_t block_dim_bytes = 0u;  // allocated size of `block_dim`
+
+    ContactDelassusBuffers() = default;
+    ~ContactDelassusBuffers();
+    ContactDelassusBuffers(ContactDelassusBuffers&&) noexcept;
+    ContactDelassusBuffers& operator=(ContactDelassusBuffers&&) noexcept;
+    ContactDelassusBuffers(const ContactDelassusBuffers&) = delete;
+    ContactDelassusBuffers& operator=(const ContactDelassusBuffers&) = delete;
 };
 
 // Build the batched dense SPD Delassus operator A_b = J_b M_b^-1 J_b^T from the

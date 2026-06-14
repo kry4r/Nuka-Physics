@@ -56,7 +56,7 @@
 #include "diffsim/recompute_orchestrator.hpp"
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -108,6 +108,11 @@ public:
     BackwardRunner(const phi::DeviceContext& context,
                    RecomputeOrchestrator& orchestrator);
 
+    // Frees the v2 scratch/seed/window Buffer* members (out-of-line).
+    ~BackwardRunner();
+    BackwardRunner(const BackwardRunner&) = delete;
+    BackwardRunner& operator=(const BackwardRunner&) = delete;
+
     // Runs the full reverse pass over `tape` (step_count = tape.StepCount()),
     // restoring per-step state from `cm` (the checkpoints captured during the
     // forward), and writing grad_actions + grad_mass into `out`. `seeds` provides
@@ -155,25 +160,27 @@ private:
     GradientMode gradient_mode_ = GradientMode::ContactFree;
     std::unique_ptr<IftRunner> ift_;
 
-    // Persistent reverse-pass scratch (sized at construction).
-    phi::Buffer q_pre_;          // float[total_link_count]
-    phi::Buffer qdot_pre_;       // float[total_link_count]
-    phi::Buffer v_root_pre_;     // float[total_link_count*6] (pre-integration root vel)
-    phi::Buffer grad_q_;         // float[total_link_count]   (carried seed)
-    phi::Buffer grad_qdot_;      // float[total_link_count]   (carried seed)
-    phi::Buffer grad_link_vel_;  // float[total_link_count*6] (carried seed)
-    phi::Buffer grad_mass_step_; // float[total_link_count]   (per-step overwrite)
-    phi::Buffer grad_mass_acc_;  // float[total_link_count]   (running sum)
-    phi::Buffer grad_tau_;       // float[total_link_count]   (per-step, zeroed)
+    // Persistent reverse-pass scratch (sized at construction). phi v2 Buffer*;
+    // device-level DEFAULT (stream-0) allocation, all kernel reads/writes run on
+    // context_.stream over the base pointers (raw launches, unchanged).
+    phi::Buffer* q_pre_ = nullptr;          // float[total_link_count]
+    phi::Buffer* qdot_pre_ = nullptr;       // float[total_link_count]
+    phi::Buffer* v_root_pre_ = nullptr;     // float[total_link_count*6] (pre-integration root vel)
+    phi::Buffer* grad_q_ = nullptr;         // float[total_link_count]   (carried seed)
+    phi::Buffer* grad_qdot_ = nullptr;      // float[total_link_count]   (carried seed)
+    phi::Buffer* grad_link_vel_ = nullptr;  // float[total_link_count*6] (carried seed)
+    phi::Buffer* grad_mass_step_ = nullptr; // float[total_link_count]   (per-step overwrite)
+    phi::Buffer* grad_mass_acc_ = nullptr;  // float[total_link_count]   (running sum)
+    phi::Buffer* grad_tau_ = nullptr;       // float[total_link_count]   (per-step, zeroed)
 
     // Per-window state cache for the checkpoint mode: snapshots q/qdot/base_pose/
     // link_velocity at the START of each step in a window so the descending-order
     // reverse can restore the exact pre-state of each step. Sized for one window
     // (checkpoint_interval steps); reused per window.
-    phi::Buffer win_q_;          // float[K * total_link_count]
-    phi::Buffer win_qdot_;       // float[K * total_link_count]
-    phi::Buffer win_base_pose_;  // Transform[K * articulation_count]
-    phi::Buffer win_link_vel_;   // LinkSpatialVel[K * total_link_count]
+    phi::Buffer* win_q_ = nullptr;          // float[K * total_link_count]
+    phi::Buffer* win_qdot_ = nullptr;       // float[K * total_link_count]
+    phi::Buffer* win_base_pose_ = nullptr;  // Transform[K * articulation_count]
+    phi::Buffer* win_link_vel_ = nullptr;   // LinkSpatialVel[K * total_link_count]
     uint32_t window_capacity_ = 0u;
     uint32_t articulation_count_ = 0u;
 };
