@@ -145,4 +145,14 @@ RegistryEntry* GetBackend(size_t i);
 // Returns nullptr if no backend/device is available.
 Device*        InitBestDevice();
 
+// --- Backend-bound buffer types (impl in the backend; CUDA-free here) -----
+// The buffer types whose transfers run on the backend's MAIN stream. Use these
+// when a consumer's kernels/ops run on backend->main (e.g. the diffsim op path),
+// so transfers and compute share one stream. Contrast DeviceBufferType(device),
+// which returns the device-level DEFAULT type bound to the NULL/default stream
+// (stream 0). Stream choice is the D1 anchor — pick the type whose stream matches
+// the consumer's kernels (m11-recon.md R1). Return nullptr on a null backend.
+BufferType*    BackendDeviceBufferType(Backend*);
+BufferType*    BackendHostBufferType(Backend*);
+
 } // namespace nuka::phi
