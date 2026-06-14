@@ -2506,4 +2506,33 @@ if(NK_BUILD_VULKAN_VALIDATION)
     gtest_discover_tests(nuka_viewer_frame_smoke_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
+
+    # M11 INT-9 -- interop_fallback_smoke: the BUILD-LINK + graceful-degrade
+    # acceptance gate for the CUDA<->Vulkan zero-copy interop publisher. Links the
+    # exportable-SSBO (nuka_render), the publisher + weak fallback (nuka_app), and
+    # the STRONG CUDA scatter (nuka_phi2_interop). On this lavapipe box the SSBO
+    # export is unsupported -> the publisher degrades to HostDownloadPublisher; the
+    # test asserts that fallback path. (Real zero-copy is owner-verified on display.)
+    add_executable(nuka_interop_fallback_smoke_test
+        scenario/interop_fallback_smoke.cpp
+    )
+    add_dependencies(nuka_interop_fallback_smoke_test nuka_render_shaders)
+    target_compile_definitions(nuka_interop_fallback_smoke_test
+        PRIVATE NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_interop_fallback_smoke_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_interop_fallback_smoke_test
+        PRIVATE
+            nuka_app
+            nuka_phi2_interop
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_scene
+            Vulkan::Vulkan
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_interop_fallback_smoke_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "fast_full")
 endif()

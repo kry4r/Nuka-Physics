@@ -52,7 +52,7 @@ public:
     Simulation(nk::World& world, PosePublisher& publisher,
                render::RenderWorld render_world)
         : world_(world),
-          publisher_(publisher),
+          publisher_(&publisher),
           render_world_(std::move(render_world)) {}
 
     // -- rendering control ---------------------------------------------------
@@ -67,6 +67,15 @@ public:
     }
     void DisableRendering() { render_enabled_ = false; }
     bool RenderEnabled() const { return render_enabled_; }
+
+    // -- publisher swap (M11 INT-8) -----------------------------------------
+    // Re-point the PosePublisher behind the abstraction. The viewer uses this to
+    // swap from the bootstrap HostDownloadPublisher to the zero-copy
+    // CudaVulkanInteropPublisher ONCE the present renderer's exportable SSBO is
+    // imported -- or to keep HostDownloadPublisher when interop is unavailable
+    // (the graceful-fallback path on this lavapipe box). The new publisher is NOT
+    // owned (it must outlive the Simulation, exactly like the ctor publisher).
+    void SetPublisher(PosePublisher& publisher) { publisher_ = &publisher; }
 
     // -- selection / step mode ----------------------------------------------
     void     SetEnvIndex(uint32_t env_index) { env_index_ = env_index; }  // D4
@@ -101,7 +110,7 @@ public:
         input_system_.Run(command_queue_, out_intents);
         bool step_ok = true;
         if (do_step) step_ok = sim_system_.Run(world_, planned_);
-        transform_sync_system_.Run(publisher_, world_, env_index_, render_world_);
+        transform_sync_system_.Run(*publisher_, world_, env_index_, render_world_);
         return step_ok;
     }
 
@@ -114,7 +123,7 @@ public:
 
 private:
     nk::World&        world_;
-    PosePublisher&    publisher_;
+    PosePublisher*    publisher_;  // not owned; rebindable via SetPublisher (INT-8)
     render::RenderWorld render_world_;
     CommandQueue      command_queue_;
 

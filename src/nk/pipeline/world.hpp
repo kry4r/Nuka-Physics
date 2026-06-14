@@ -109,6 +109,14 @@ public:
     const Model&    GetModel()    const { return model_; }
     Data&           GetData()     { return data_; }
 
+    // The phi v2 backend this World is bound to (M11 INT-3). phi::Backend is an
+    // OPAQUE handle (phi/backend.hpp) -- NOT a CUDA token, so exposing it keeps
+    // the nk-engine zero-CUDA red-line green. The M11 CUDA<->Vulkan interop
+    // publisher (runtime/app/cuda_vulkan_interop) reads it to drive the
+    // device-scatter on the SAME backend (stream) the World's ops run on; it
+    // touches no CUDA type. Null when the World is unbuilt.
+    phi::Backend* Backend() const { return backend_; }
+
 private:
     // Seed the Data persistent fields from the Model template (q / link_pose /
     // base_pose / drive_* / mat_buckets, env-major replication) and take the

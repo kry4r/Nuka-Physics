@@ -36,10 +36,13 @@
 
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
+#include "phi/interop_scatter.hpp"  // ExternalMemoryDesc (CUDA-free seam, INT-8)
 #include "render/imgui/nuka_imgui.hpp"
+#include "render/raster/interop_transform_ssbo.hpp"  // exportable SSBO (INT-4)
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
+#include "runtime/app/cuda_vulkan_interop.hpp"  // CudaVulkanInteropPublisher (INT-6)
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
@@ -187,6 +190,39 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[nuka_viewer] PresentRenderer ctor failed: %s\n", e.what());
         return 6;
+    }
+
+    // ---- 2b. CUDA<->Vulkan interop publisher (M11 INT-8) -- zero-copy device
+    // scatter behind the PosePublisher seam, with GRACEFUL FALLBACK to
+    // HostDownloadPublisher. On this lavapipe/CPU-Vulkan box the exportable SSBO is
+    // unsupported (vkGetMemoryFdKHR absent) -> TryEnable returns false -> we keep
+    // `publisher` (HostDownloadPublisher). On a display+NVIDIA machine the SSBO
+    // exports an OPAQUE_FD, the CUDA scatter imports it, and the sim publishes the
+    // physics device state with NO D2H copy. The interop publisher + SSBO must
+    // outlive `sim` (declared at function scope).
+    render::RendererVulkanHandles vk_handles = present->VulkanHandles();
+    render::InteropTransformSsbo  interop_ssbo;
+    app::CudaVulkanInteropPublisher interop_publisher;
+    bool interop_active = false;
+    if (nphi::CudaVkScatterAvailable()) {
+        const uint32_t cap = std::max<uint32_t>(sim.GetRenderWorld().InstanceCount(), 1u);
+        if (interop_ssbo.Create(reinterpret_cast<VkDevice>(vk_handles.device),
+                                reinterpret_cast<VkPhysicalDevice>(vk_handles.physical_device),
+                                cap)) {
+            nphi::ExternalMemoryDesc mem;
+            mem.fd = interop_ssbo.TakeExportedFd();
+            mem.size_bytes = interop_ssbo.SizeBytes();
+            mem.dedicated = interop_ssbo.Dedicated();
+            interop_active = interop_publisher.TryEnable(
+                sim.GetWorld(), sim.GetRenderWorld(), mem, cap);
+        }
+    }
+    if (interop_active) {
+        sim.SetPublisher(interop_publisher);  // zero-copy device scatter
+        std::printf("[nuka_viewer] CUDA<->Vulkan interop ACTIVE (zero-copy transform SSBO)\n");
+    } else {
+        std::printf("[nuka_viewer] interop unavailable -> HostDownloadPublisher "
+                    "(graceful fallback; expected on lavapipe / no external-memory-fd)\n");
     }
 
     // ---- 3. ImGui context bound to the present pass + the renderer pool --------
