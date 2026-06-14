@@ -4,14 +4,14 @@
 // V2 (engine self-check, no oracle): the PBF substep must NEITHER GAIN NOR LOSE
 // particles across a step -- the particle count is exactly invariant for the whole
 // run, with the FULL polish path active (XSPH viscosity + surface-tension cohesion
-// both ON, gravity + a floor). M9 T11 re-points this from the legacy PbfWorld to
+// both ON, gravity + a floor). M9 T11 re-points this from the legacy PBF stepper to
 // nk::World: the downloaded state's position/velocity buffer lengths stay equal to
 // the cooked particles_per_env (the nk capacity is fixed at cook time -- a particle
 // can never be created/destroyed mid-run) every step, and every particle is finite.
 // rho0 is calibrated from the engine host kernel (the legacy helper, unchanged).
 // ---------------------------------------------------------------------------
 
-#include "runtime/fluid/pbf_world.hpp"  // PbfParticleSet / ComputePbfDensities (host calib)
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet / PbfParams / host ComputePbfDensities
 
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -34,8 +34,6 @@ using nuka::math::Vec3;
 using nuka::runtime::fluid::ComputePbfDensities;
 using nuka::runtime::fluid::PbfParams;
 using nuka::runtime::fluid::PbfParticleSet;
-using nuka::runtime::fluid::PbfWorld;
-using nuka::runtime::fluid::UploadPbfWorld;
 
 // nk backend context (shared singleton, the nk_particle_equivalence pattern).
 struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
@@ -93,8 +91,7 @@ TEST(PbfV2Invariant, ParticleCountConservedWithPolishOn) {
         cps.positions = lat.positions;
         cps.velocities.assign(lat.positions.size(), Vec3{0.0f, 0.0f, 0.0f});
         cps.particle_mass = 1.0f;
-        PbfWorld cw = UploadPbfWorld(cps);
-        const std::vector<float> rho = ComputePbfDensities(cw, cal);
+        const std::vector<float> rho = ComputePbfDensities(cps, cal);  // host calib
         rho0 = rho[LatIdx(lat, lat.nx / 2u, lat.ny / 2u, lat.nz / 2u)];
     }
     ASSERT_GT(rho0, 0.0f);

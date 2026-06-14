@@ -1,50 +1,134 @@
 // ---------------------------------------------------------------------------
-// v0.7 p09-B: XPBD VOLUME (id 8) tet tests -- signed-volume preservation.
+// v0.7 p09-B: XPBD VOLUME (id 8) tet tests -- signed-volume preservation,
+// M9 T11 Phase-2b RE-POINTED to nk (the legacy XPBD soft stepper is
+// deleted; the volume solve is op-ified onto the unified nk core -- particles.cu
+// XpbdVolumeKernel, run inside nk::World's particle solve). The grad-C FD gate is
+// PURE HOST (stepper-independent) and unchanged; the volume-restore + block-volume
+// gates move from the legacy stepper to nk::World (cook -> World -> Step).
 //
 // The V3 FD adjoint gate (test_adjoint_fd_xpbd_volume) validates the multilinear
 // XPBD multiplier law, BLIND to the determinant gradient grad C. This suite is
 // where grad C is exercised:
 //
-//   1. Determinant gradient: a host central-difference of C = det(.) - 6*V_rest
-//      wrt each tet-vertex coordinate matches the analytic cross-product gradients
-//      the solver uses (rel-err < 1e-3), and the per-vertex gradients sum to ~0
-//      (momentum conservation).
-//   2. ISOLATED volume restoration: a tet with NO edge constraints, COMPRESSED
-//      below rest volume, is driven back to its rest volume by the volume
-//      constraint ALONE (the discriminating test -- 6 stiff edges would already
-//      determine the shape and mask a zeroed volume gradient).
-//   3. Multi-tet block: a small tet soft body under gravity keeps each tet's
+//   1. Determinant gradient (HOST): a host central-difference of C = det(.) -
+//      6*V_rest wrt each tet-vertex coordinate matches the analytic cross-product
+//      gradients the solver uses (rel-err < 1e-3), and the per-vertex gradients
+//      sum to ~0 (momentum conservation).
+//   2. ISOLATED volume restoration (nk): a tet with NO edge constraints,
+//      COMPRESSED below rest volume, is driven back to its rest volume by the
+//      volume constraint ALONE (the discriminating test -- 6 stiff edges would
+//      already determine the shape and mask a zeroed volume gradient).
+//   3. Multi-tet block (nk): a small tet soft body under gravity keeps each tet's
 //      volume near rest (drift bounded), stays finite.
-//   4. D1 two-run byte-exactness of the volume forward.
+//   4. D1 two-run byte-exactness of the volume forward (nk).
 //
 // A full Vellum golden is DEFERRED to p15; these are ANALYTIC/physical invariants.
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XpbdConstraintSet/XpbdParticleSet (CUDA-free PODs)
 #include "runtime/soft/tetmesh_topology.hpp"
-#include "runtime/soft/xpbd_world.hpp"
 
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstring>
+#include <tuple>
 #include <vector>
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 using nuka::runtime::soft::BuildTetMeshConstraints;
-using nuka::runtime::soft::StepXpbdWorld;
 using nuka::runtime::soft::TetMeshTet;
 using nuka::runtime::soft::TetMeshTopologyOptions;
 using nuka::runtime::soft::TetSignedVolumeTimes6;
-using nuka::runtime::soft::UploadXpbdWorld;
 using nuka::runtime::soft::XpbdConstraintSet;
 using nuka::runtime::soft::XpbdParticleSet;
-using nuka::runtime::soft::XpbdStepOptions;
-using nuka::runtime::soft::XpbdWorld;
-using nuka::runtime::soft::XpbdWorldState;
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
+
+// Downloaded particle state (replaces the legacy soft world state).
+struct XpbdState {
+    std::vector<Vec3> positions;
+    std::vector<Vec3> velocities;
+};
+
+// Cook an XpbdParticleSet + XpbdConstraintSet (distance + volume rows) into an
+// nk::Model (mode = Xpbd), transcribing the de-interleaved SoA exactly as
+// CookXpbdParticles does (dist a/b/rest/alpha; volume 4-particle + rest6 + alpha).
+nk::Model BuildNkTetModel(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
+                          uint16_t iters) {
+    nk::Model model;
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Xpbd;
+    mp.initial_pos = ps.positions;
+    mp.initial_vel = ps.velocities;
+    mp.inv_mass = ps.inv_masses;
+    mp.xpbd_iters = iters == 0u ? 1u : iters;
+    const uint32_t dn = static_cast<uint32_t>(cs.distance.size());
+    for (uint32_t c = 0; c < dn; ++c) {
+        mp.dist_a.push_back(cs.distance[c].particle_a);
+        mp.dist_b.push_back(cs.distance[c].particle_b);
+        mp.dist_rest.push_back(cs.distance[c].rest_length);
+        mp.dist_alpha.push_back(cs.distance[c].compliance_alpha);
+    }
+    const uint32_t vn = static_cast<uint32_t>(cs.volume.size());
+    for (uint32_t c = 0; c < vn; ++c) {
+        for (uint32_t j = 0; j < 4u; ++j) {
+            mp.vol_particles.push_back(cs.volume[c].particle[j]);
+        }
+        mp.vol_rest6.push_back(cs.volume[c].rest_volume_times6);
+        mp.vol_alpha.push_back(cs.volume[c].compliance_alpha);
+    }
+    nk::ModelCapacities& cap = model.capacities;
+    cap.env_count = 1;
+    cap.particles_per_env = static_cast<uint32_t>(ps.positions.size());
+    cap.dist_cons_per_env = dn;
+    cap.vol_cons_per_env = vn;
+    return model;
+}
+
+// Run an nk tet world for kSteps with the given gravity/dt and download state.
+XpbdState RunNkTet(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
+                   uint16_t iters, Vec3 gravity, float dt, uint32_t kSteps) {
+    NkCtx c = GetNkCtx();
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = dt;
+    cfg.gravity[0] = gravity.x; cfg.gravity[1] = gravity.y; cfg.gravity[2] = gravity.z;
+    nk::World world(BuildNkTetModel(ps, cs, iters), 1u, c.dev, c.backend, cfg);
+    EXPECT_TRUE(world.Ready());
+    const uint32_t P = world.GetModel().capacities.particles_per_env;
+    for (uint32_t s = 0; s < kSteps; ++s) world.Step();
+    XpbdState st;
+    st.positions.resize(P);
+    st.velocities.resize(P);
+    world.GetData().DownloadField(nk::FieldId::ParticlePos, st.positions.data(),
+                                  P * sizeof(Vec3));
+    world.GetData().DownloadField(nk::FieldId::ParticleVel, st.velocities.data(),
+                                  P * sizeof(Vec3));
+    return st;
+}
 
 // A unit-ish reference tet (matches the solver's p0..p3 ordering).
 struct RefTet {
@@ -56,8 +140,8 @@ struct RefTet {
 
 } // namespace
 
-// Gate 1: analytic determinant gradients == host central-difference, and the
-// four per-vertex gradients sum to ~0 (momentum conservation).
+// Gate 1 (HOST, stepper-independent): analytic determinant gradients == host
+// central-difference, and the four per-vertex gradients sum to ~0 (momentum).
 TEST(XpbdVolumeTet, DeterminantGradientMatchesFdAndSumsToZero) {
     RefTet t;
     std::vector<Vec3> p = {t.p0, t.p1, t.p2, t.p3};
@@ -103,13 +187,14 @@ TEST(XpbdVolumeTet, DeterminantGradientMatchesFdAndSumsToZero) {
     }
 }
 
-// Gate 2: ISOLATED volume restoration. One tet, NO edge constraints, COMPRESSED
-// to 60% of rest volume (uniform scale about the centroid), zero gravity. The
-// volume constraint alone must drive the volume back toward rest. With zero edge
-// constraints there is nothing else preserving the shape, so a zeroed volume
-// gradient would leave the tet compressed -- this test would fail. (Stiff edges
-// would mask it; that is why we omit them.)
+// Gate 2 (nk): ISOLATED volume restoration. One tet, NO edge constraints,
+// COMPRESSED to 60% of rest volume (uniform scale about the centroid), zero
+// gravity. The volume constraint alone must drive the volume back toward rest. With
+// zero edge constraints there is nothing else preserving the shape, so a zeroed
+// volume gradient would leave the tet compressed -- this test would fail. (Stiff
+// edges would mask it; that is why we omit them.)
 TEST(XpbdVolumeTet, IsolatedVolumeConstraintRestoresRestVolume) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     RefTet t;
     const std::vector<Vec3> rest = {t.p0, t.p1, t.p2, t.p3};
     const float rest_v6 = TetSignedVolumeTimes6(rest[0], rest[1], rest[2], rest[3]);
@@ -140,23 +225,16 @@ TEST(XpbdVolumeTet, IsolatedVolumeConstraintRestoresRestVolume) {
     // Rest value stored by the cook builder must equal the rest det exactly.
     EXPECT_NEAR(cs.volume[0].rest_volume_times6, rest_v6, 1.0e-5f);
 
-    XpbdWorld world = UploadXpbdWorld(particles, cs);
-    XpbdStepOptions so;
-    so.gravity = Vec3{0.0f, 0.0f, 0.0f};
-    so.dt = 1.0f / 240.0f;
-    so.step_count = 1u;
-    so.solver_iterations = 10u;
-
     const float compressed_v6 =
         TetSignedVolumeTimes6(particles.positions[0], particles.positions[1],
                               particles.positions[2], particles.positions[3]);
     ASSERT_LT(std::fabs(compressed_v6), std::fabs(rest_v6))
         << "setup sanity: compressed volume must start below rest";
 
-    for (uint32_t s = 0; s < 200u; ++s) {
-        StepXpbdWorld(world, so);
-    }
-    const XpbdWorldState st = world.DownloadState();
+    // nk path: gravity OFF (isolate the constraint), 10 GS iters, 200 steps.
+    const XpbdState st = RunNkTet(particles, cs, /*iters=*/10u,
+                                  Vec3{0.0f, 0.0f, 0.0f}, 1.0f / 240.0f,
+                                  /*kSteps=*/200u);
     const float final_v6 = TetSignedVolumeTimes6(st.positions[0], st.positions[1],
                                                  st.positions[2], st.positions[3]);
 
@@ -201,9 +279,10 @@ TetBlock MakeTwoTetBlock() {
 
 } // namespace
 
-// Gate 3 (multi-tet invariant) + Gate 4 (D1): a small tet block under gravity
-// keeps each tet's volume near rest and is two-run byte-exact.
+// Gate 3 (nk, multi-tet invariant) + Gate 4 (nk, D1): a small tet block under
+// gravity keeps each tet's volume near rest and is two-run byte-exact.
 TEST(XpbdVolumeTet, BlockPreservesVolumeUnderGravityAndIsByteExact) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     auto run = []() {
         TetBlock b = MakeTwoTetBlock();
         TetMeshTopologyOptions opts;
@@ -218,21 +297,16 @@ TEST(XpbdVolumeTet, BlockPreservesVolumeUnderGravityAndIsByteExact) {
         }
         std::vector<TetMeshTet> tets = b.tets;
 
-        XpbdWorld world = UploadXpbdWorld(b.particles, cs);
-        XpbdStepOptions so;
-        so.gravity = Vec3{0.0f, 0.0f, -9.81f};
-        so.dt = 1.0f / 240.0f;
-        so.step_count = 1u;
-        so.solver_iterations = 20u;
-        for (uint32_t s = 0; s < 300u; ++s) {
-            StepXpbdWorld(world, so);
-        }
-        return std::make_tuple(world.DownloadState(), tets, rest_v6);
+        // nk path: gravity (z-down) + stiff edges/volume, 20 GS iters, 300 steps.
+        const XpbdState st = RunNkTet(b.particles, cs, /*iters=*/20u,
+                                      Vec3{0.0f, 0.0f, -9.81f}, 1.0f / 240.0f,
+                                      /*kSteps=*/300u);
+        return std::make_tuple(st, tets, rest_v6);
     };
 
     const auto a = run();
     const auto b = run();
-    const XpbdWorldState& sa = std::get<0>(a);
+    const XpbdState& sa = std::get<0>(a);
 
     for (const Vec3& p : sa.positions) {
         ASSERT_TRUE(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z));
@@ -252,7 +326,7 @@ TEST(XpbdVolumeTet, BlockPreservesVolumeUnderGravityAndIsByteExact) {
     EXPECT_LT(max_rel, 0.05f) << "max relative volume drift " << max_rel;
 
     // D1 two-run byte-exact.
-    const XpbdWorldState& sb = std::get<0>(b);
+    const XpbdState& sb = std::get<0>(b);
     EXPECT_EQ(std::memcmp(sa.positions.data(), sb.positions.data(),
                           sa.positions.size() * sizeof(Vec3)),
               0)

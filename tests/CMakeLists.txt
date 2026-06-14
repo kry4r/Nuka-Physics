@@ -935,8 +935,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation_gpu
             # M9 T11: the re-pointed XPBD shape-match / bend-cloth / distance /
             # volume + PBF + cross-system contact tests cook a scene -> nk::World ->
-            # Step on the nk particle ops (the legacy XpbdWorld/PbfWorld are deleted
-            # in Phase 2; the cook is the scene-cook layer).
+            # Step on the nk particle ops (the legacy soft/fluid steppers were
+            # DELETED in Phase 2b; the cook is the scene-cook layer).
             nuka_nk
             nuka_scene_cook
             nuka_phi2
@@ -1006,8 +1006,8 @@ if(CMAKE_CUDA_COMPILER)
     # (Macklin & Mueller 2013): rest-density block, over-compressed relaxation,
     # single column -> stable pool, density-drift volume conservation, and D1
     # two-run byte-exact. NOT a Flex golden (Flex oracle deferred to p15). rho0 is
-    # calibrated numerically from the engine's own Poly6 kernel. Links
-    # nuka_runtime_gpu (PbfWorld lives there; reuses the p05 particle grid).
+    # calibrated numerically from the engine's own host Poly6 kernel (the CUDA-free
+    # ComputePbfDensities in fluid_cooker_types.hpp); the forward runs on nk::World.
     # p10-B adds the polish-layer gates: XSPH viscosity (variance reduction +
     # off-gate skip + D1), surface-tension cohesion (blob contraction + off-gate +
     # D1 + stability), and the PBF V2 particle-count invariant (count conserved
@@ -1024,9 +1024,9 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_pbf_test
         PRIVATE
             nuka_runtime_gpu
-            # M9 T11: the re-pointed PBF viscosity / surface-tension / v2-invariant
-            # tests cook a fluid -> nk::World -> Step on the nk particle ops (the
-            # legacy PbfWorld stays alive this phase for density/volume tests).
+            # M9 T11 Phase 2b: ALL PBF tests cook a fluid -> nk::World -> Step on the
+            # nk particle ops; rho0 calibration uses the CUDA-free host
+            # ComputePbfDensities. The legacy soft/fluid steppers were DELETED.
             nuka_nk
             nuka_phi2
             nuka_phi

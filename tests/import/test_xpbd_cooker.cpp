@@ -22,10 +22,10 @@
 
 #include "import/cooker/xpbd_cooker.hpp"
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XPBD constraint PODs (CUDA-free)
 #include "math/vec3.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"
-#include "runtime/soft/xpbd_world.hpp"
 
 #include <gtest/gtest.h>
 

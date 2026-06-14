@@ -7,8 +7,8 @@
 // infra (cross_system_query.hpp particle->rigid LBVH query + particle_uniform_grid
 // .hpp particle->particle grid) and reframe their CSR output into the C2a unified
 // CandidatePairStream, gated by the SystemPairMatrix. These are NOT wired into the
-// production world (the PBD co-step wiring is C6a; xpbd_world/pbf_world/world_stepper
-// are untouched). EXCLUDED here: articulation-link<->anything (needs per-link AABB
+// production world (the PBD co-step wiring is C6a; the legacy soft/fluid steppers
+// were op-ified onto nk). EXCLUDED here: articulation-link<->anything (needs per-link AABB
 // that does not yet exist -- the C5b-prereq long-pole).
 //
 // THE REFRAME (NO append atomic, NO scan):

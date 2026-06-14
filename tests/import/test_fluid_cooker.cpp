@@ -22,8 +22,8 @@
 
 #include "import/cooker/fluid_cooker.hpp"
 
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet (CUDA-free)
 #include "math/vec3.hpp"
-#include "runtime/fluid/pbf_world.hpp"
 
 #include <gtest/gtest.h>
 

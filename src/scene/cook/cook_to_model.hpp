@@ -43,7 +43,7 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count);
 // PRODUCTS as POD arrays (the caller runs import::cooker::CookXpbdSoftBody /
 // CookFluidBox — which ARE the reuse — and hands the de-interleaved constraint
 // arrays + the rest state here). The de-interleave mirrors the legacy
-// UploadXpbdWorld / UploadPbfWorld byte layout, so the device-staged particle /
+// soft-upload / fluid-upload byte layout, so the device-staged particle /
 // constraint tables (after env-major replication) reproduce the legacy world's
 // layout — the byte-exact port contract for the XPBD/PBF 件套.
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
 
 // M9 T11 Phase 2 — id-10 cross-system contact params for the co-residence cook.
 // The class-blind unilateral non-penetration co-step over the FULL [soft | fluid]
-// union (op-ified runtime::coupling::StepParticleParticleCoupling). d_min ==
+// union (op-ified cross-system particle co-step). d_min ==
 // 2*contact_radius (uniform radius); <= 0 disables the op (the default). The cook
 // widens the union grid query_radius/cell_size to >= d_min so the neighbor list
 // covers every contact pair (the grid is built over the union by ParticleGridBuild).

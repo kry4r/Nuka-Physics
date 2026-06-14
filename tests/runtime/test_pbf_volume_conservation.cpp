@@ -1,5 +1,11 @@
 // ---------------------------------------------------------------------------
-// v0.7 p10-A GATE 3: PBF volume conservation (one-sided incompressibility).
+// v0.7 p10-A GATE 3: PBF volume conservation (one-sided incompressibility),
+// M9 T11 Phase-2b RE-POINTED to nk (the legacy PBF fluid stepper is
+// deleted; the PBF substep is op-ified onto the unified nk core). rho0 calibration
+// + the per-step density readout use the CUDA-FREE host ComputePbfDensities
+// (fluid_cooker_types.hpp); the forward sim runs on nk::World (cook -> Step). The
+// gravity/floor axis is the nk z-axis (legacy used y); the invariants are
+// axis-agnostic.
 //
 // Incompressibility <=> volume conservation, but the FAITHFUL test for an
 // INVISCID free-surface fluid is ONE-SIDED. Two distinct scenes prove the two
@@ -19,30 +25,46 @@
 //
 // Why not a geometric point-cloud volume: convex hull / occupied-cell counting is
 // ill-defined for a free-surface fluid and a time sink; the density proxy is
-// rigorous and well-defined. The cap guard (max_truncated_particle_count == 0)
-// holds in both scenes.
+// rigorous and well-defined.
 // ---------------------------------------------------------------------------
 
-#include "runtime/fluid/pbf_world.hpp"
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet / PbfParams / host ComputePbfDensities
 
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 using nuka::runtime::fluid::ComputePbfDensities;
 using nuka::runtime::fluid::PbfParams;
 using nuka::runtime::fluid::PbfParticleSet;
-using nuka::runtime::fluid::PbfStepOptions;
-using nuka::runtime::fluid::PbfWorld;
-using nuka::runtime::fluid::PbfWorldState;
-using nuka::runtime::fluid::StepPbfWorld;
-using nuka::runtime::fluid::UploadPbfWorld;
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
 
 struct Lattice {
     std::vector<Vec3> positions;
@@ -93,12 +115,95 @@ float InteriorMeanDensity(const std::vector<float>& rho,
     return static_cast<float>(sum / static_cast<double>(interior.size()));
 }
 
+// nk PBF cook params (the subset the re-pointed conservation gates set).
+struct NkPbfCook {
+    PbfParticleSet ps;
+    float rho0 = 0.0f, h = 0.0f;
+    uint16_t iters = 5u;
+    bool clamp = true;
+    Vec3 gravity{0.0f, 0.0f, 0.0f};
+    bool boundary = false;
+    float floor_z = 0.0f;
+};
+
+nk::Model BuildNkPbfModel(const NkPbfCook& in) {
+    nk::Model model;
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Pbf;
+    mp.initial_pos = in.ps.positions;
+    mp.initial_vel = in.ps.velocities;
+    if (mp.initial_vel.size() != mp.initial_pos.size())
+        mp.initial_vel.assign(mp.initial_pos.size(), Vec3::Zero());
+    const float im = in.ps.particle_mass > 0.0f ? 1.0f / in.ps.particle_mass : 0.0f;
+    mp.inv_mass.assign(mp.initial_pos.size(), im);
+    mp.pbf_rest_density = in.rho0;
+    mp.pbf_support_radius = in.h;
+    mp.pbf_particle_mass = in.ps.particle_mass;
+    mp.pbf_iters = in.iters == 0u ? 1u : in.iters;
+    mp.pbf_clamp_overdensity = in.clamp;
+    mp.pbf_surface_tension = 0.0f;
+    mp.cell_size = in.h;
+    mp.query_radius = in.h;
+    mp.boundary_enabled = in.boundary;
+    mp.floor_z = in.floor_z;
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (const Vec3& p : in.ps.positions) {
+        lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+        hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+    }
+    mp.grid_min = Vec3{lo.x - in.h, lo.y - in.h, lo.z - in.h};
+    auto dim = [&](float span) {
+        return static_cast<uint32_t>(std::floor(span / in.h)) + 4u;
+    };
+    mp.grid_dims[0] = dim(hi.x - lo.x);
+    mp.grid_dims[1] = dim(hi.y - lo.y);
+    mp.grid_dims[2] = dim(hi.z - lo.z);
+    model.capacities.env_count = 1;
+    model.capacities.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    model.capacities.max_grid_cells =
+        mp.grid_dims[0] * mp.grid_dims[1] * mp.grid_dims[2];
+    return model;
+}
+
+struct NkPbfRunner {
+    nk::World world;
+    uint32_t P = 0u;
+    NkPbfRunner(const NkPbfCook& in, float dt)
+        : world([&] {
+              NkCtx c = GetNkCtx();
+              nk::Pipeline::SolverConfig cfg;
+              cfg.dt = dt;
+              cfg.gravity[0] = in.gravity.x; cfg.gravity[1] = in.gravity.y;
+              cfg.gravity[2] = in.gravity.z;
+              return nk::World(BuildNkPbfModel(in), 1u, c.dev, c.backend, cfg);
+          }()) {
+        P = world.GetModel().capacities.particles_per_env;
+    }
+    void Step() { world.Step(); }
+    void DownloadPositions(std::vector<Vec3>& pos) {
+        pos.resize(P);
+        world.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
+                                      P * sizeof(Vec3));
+    }
+};
+
+// Host density-only pass on a downloaded config (the rho0-calibration recipe).
+std::vector<float> HostDensities(const std::vector<Vec3>& pos, float mass,
+                                 const PbfParams& params) {
+    PbfParticleSet ps;
+    ps.positions = pos;
+    ps.velocities.assign(pos.size(), Vec3{0.0f, 0.0f, 0.0f});
+    ps.particle_mass = mass;
+    return ComputePbfDensities(ps, params);
+}
+
 } // namespace
 
 // Scene (A): bulk rest block, NO gravity, NO free surface dynamics -> the
 // interior bulk volume V = N*m / rho_mean must hold near its t0 value. This is the
 // clean two-sided "volume conserved" number. Particle count invariant throughout.
 TEST(PbfVolumeConservation, BulkRestBlockHoldsVolume) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
     const Lattice lat = MakeLattice(14u, 14u, 14u, dx, Vec3{0.0f, 0.0f, 0.0f});
@@ -109,11 +214,10 @@ TEST(PbfVolumeConservation, BulkRestBlockHoldsVolume) {
     params.solver_iterations = 5u;
     params.clamp_to_overdensity = true;
 
-    // Calibrate rho0 from the deep-interior rest density.
+    // Calibrate rho0 from the deep-interior rest density (host).
     {
         PbfParticleSet cal = MakeParticles(lat, 1.0f);
-        PbfWorld cal_world = UploadPbfWorld(cal);
-        const std::vector<float> rho = ComputePbfDensities(cal_world, params);
+        const std::vector<float> rho = ComputePbfDensities(cal, params);
         params.rest_density_rho0 =
             rho[LatIdx(lat, lat.nx / 2u, lat.ny / 2u, lat.nz / 2u)];
     }
@@ -123,27 +227,25 @@ TEST(PbfVolumeConservation, BulkRestBlockHoldsVolume) {
     ASSERT_FALSE(interior.empty());
     const uint32_t initial_count = static_cast<uint32_t>(lat.positions.size());
 
-    PbfParticleSet ps = MakeParticles(lat, 1.0f);
-    PbfWorld world = UploadPbfWorld(ps);
-    const float rho_mean_0 =
-        InteriorMeanDensity(ComputePbfDensities(world, params), interior);
+    NkPbfCook in;
+    in.ps = MakeParticles(lat, 1.0f);
+    in.rho0 = params.rest_density_rho0; in.h = h; in.iters = 5u; in.clamp = true;
+    in.gravity = Vec3{0.0f, 0.0f, 0.0f};  // bulk: no gravity, no free surface.
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
 
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, 0.0f, 0.0f};  // bulk: no gravity, no free surface.
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
+    const float rho_mean_0 =
+        InteriorMeanDensity(ComputePbfDensities(in.ps, params), interior);
 
     const uint32_t kSteps = 200u;
     float max_drift_pct = 0.0f;
+    std::vector<Vec3> pos;
     for (uint32_t s = 0; s < kSteps; ++s) {
-        const auto report = StepPbfWorld(world, params, options);
-        ASSERT_EQ(report.max_truncated_particle_count, 0u)
-            << "neighbor cap truncated at step " << s;
-        const PbfWorldState st = world.DownloadState();
-        ASSERT_EQ(static_cast<uint32_t>(st.positions.size()), initial_count);
+        runner.Step();
+        runner.DownloadPositions(pos);
+        ASSERT_EQ(static_cast<uint32_t>(pos.size()), initial_count);
         if ((s + 1u) % 25u == 0u) {
             const float rho_mean =
-                InteriorMeanDensity(ComputePbfDensities(world, params), interior);
+                InteriorMeanDensity(HostDensities(pos, 1.0f, params), interior);
             // V = N*m/rho_mean, so |dV/V| = |drho/rho|. Report density drift %.
             const float drift =
                 std::fabs(rho_mean - rho_mean_0) / rho_mean_0 * 100.0f;
@@ -163,11 +265,14 @@ TEST(PbfVolumeConservation, BulkRestBlockHoldsVolume) {
 // density must never EXCEED rho0 beyond a tolerance (the projection relieves any
 // impact over-compression). Free-surface under-density from inviscid spreading is
 // NOT a volume violation (so this gate does not bound the under-density). Particle
-// count invariant. Reports the worst interior over-density seen.
+// count invariant. Reports the worst interior over-density seen. The gravity/floor
+// axis is z (legacy used y).
 TEST(PbfVolumeConservation, ColumnInteriorNeverOverCompresses) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
-    const Lattice lat = MakeLattice(10u, 16u, 10u, dx, Vec3{0.0f, 0.15f, 0.0f});
+    // Tall axis (gravity axis) is z: nx=10, ny=10, nz=16.
+    const Lattice lat = MakeLattice(10u, 10u, 16u, dx, Vec3{0.0f, 0.0f, 0.15f});
 
     PbfParams params;
     params.support_radius_h = h;
@@ -177,8 +282,7 @@ TEST(PbfVolumeConservation, ColumnInteriorNeverOverCompresses) {
 
     {
         PbfParticleSet cal = MakeParticles(lat, 1.0f);
-        PbfWorld cal_world = UploadPbfWorld(cal);
-        const std::vector<float> rho = ComputePbfDensities(cal_world, params);
+        const std::vector<float> rho = ComputePbfDensities(cal, params);
         params.rest_density_rho0 =
             rho[LatIdx(lat, lat.nx / 2u, lat.ny / 2u, lat.nz / 2u)];
     }
@@ -188,27 +292,23 @@ TEST(PbfVolumeConservation, ColumnInteriorNeverOverCompresses) {
     ASSERT_FALSE(interior.empty());
     const uint32_t initial_count = static_cast<uint32_t>(lat.positions.size());
 
-    PbfParticleSet ps = MakeParticles(lat, 1.0f);
-    PbfWorld world = UploadPbfWorld(ps);
-
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, -9.81f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    options.boundary.enabled = true;
-    options.boundary.floor_y = 0.0f;
+    NkPbfCook in;
+    in.ps = MakeParticles(lat, 1.0f);
+    in.rho0 = params.rest_density_rho0; in.h = h; in.iters = 5u; in.clamp = true;
+    in.gravity = Vec3{0.0f, 0.0f, -9.81f};
+    in.boundary = true; in.floor_z = 0.0f;
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
 
     const uint32_t kSteps = 300u;
     float max_over_density_pct = 0.0f;  // worst interior (rho/rho0 - 1) > 0.
+    std::vector<Vec3> pos;
     for (uint32_t s = 0; s < kSteps; ++s) {
-        const auto report = StepPbfWorld(world, params, options);
-        ASSERT_EQ(report.max_truncated_particle_count, 0u)
-            << "neighbor cap truncated at step " << s;
-        const PbfWorldState st = world.DownloadState();
-        ASSERT_EQ(static_cast<uint32_t>(st.positions.size()), initial_count);
+        runner.Step();
+        runner.DownloadPositions(pos);
+        ASSERT_EQ(static_cast<uint32_t>(pos.size()), initial_count);
 
         if ((s + 1u) % 20u == 0u) {
-            const std::vector<float> rho = ComputePbfDensities(world, params);
+            const std::vector<float> rho = HostDensities(pos, 1.0f, params);
             for (uint32_t i : interior) {
                 const float over =
                     (rho[i] / params.rest_density_rho0 - 1.0f) * 100.0f;

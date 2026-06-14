@@ -332,7 +332,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
 
         // M9 T11 Phase 2: the id-10 cross-system particle-particle contact co-step
-        // (the op-ified StepParticleParticleCoupling). Runs AFTER ParticleFinalize
+        // (the op-ified cross-system particle co-step). Runs AFTER ParticleFinalize
         // (incl. the fluid-slice polish), correcting the committed union positions
         // (particle_pos) over the union grid CSR built this step. ONLY the SoftFluid
         // mode emits real work; the single-system Xpbd/Pbf paths carry the op only

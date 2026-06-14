@@ -10,9 +10,9 @@
 #     Featherstone ABA / FK / CRBA state (per dof / per link / per env).
 #   * runtime::rigid::BodyState (runtime/rigid/body_state.hpp) — movable rigid
 #     body SoA (per body).
-#   * XpbdWorld (runtime/soft/xpbd_world.hpp) — XPBD particle + 4 constraint
+#   * XPBD soft (op-ified on nk, particles.cu) — XPBD particle + 4 constraint
 #     families (per particle / per dist_con / per bend_con / per vol_con / ...).
-#   * PbfWorld (runtime/fluid/pbf_world.hpp) — PBF particle SoA (per particle).
+#   * PBF fluid (op-ified on nk, particles.cu) — PBF particle SoA (per particle).
 #   * unified row solve — contacts / rows / sides / lambda warm-start / m_inv /
 #     the SolveSchedule island tables / contact_count + row_count watermarks.
 #   * material buckets (CookedContactParamTable upgrade, Isaac bucketing) +
@@ -335,7 +335,7 @@ fields:
   - {name: row_order,             dtype: u32, per: row_slot, arena: persistent, owner: model}
 
   # =========================================================================
-  # PARTICLE (XPBD soft) — DATA. Source: XpbdWorld. particle_pos above (§3.3).
+  # PARTICLE (XPBD soft) — DATA. Source: nk soft ops. particle_pos above (§3.3).
   # =========================================================================
   - {name: particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data, flags: [diff]}
@@ -369,11 +369,10 @@ fields:
 
   # =========================================================================
   # M9 T11 — XPBD SHAPE-MATCH (id 9) cluster constraints (Mueller et al. 2005).
-  # The 4th XPBD row family, ported byte-faithfully from the legacy
-  # runtime::soft::XpbdWorld shape-match sweep (xpbd_world.cu
+  # The 4th XPBD row family, op-ified on the nk core (particles.cu
   # SolveShapeMatchConstraintsKernel). A cluster of VARIABLE size is pulled
-  # toward the best rigid transform of its rest shape. CSR layout (mirrors the
-  # legacy UploadXpbdWorld flatten 1:1):
+  # toward the best rigid transform of its rest shape. CSR layout (the legacy
+  # soft-upload flatten 1:1):
   #   PER-CLUSTER (per: shape_match_slot):
   #     sm_cluster_offset  : base into the flat member pool for this cluster.
   #     sm_cluster_size    : member count n_c of this cluster.
@@ -399,7 +398,7 @@ fields:
   - {name: sm_mass,           dtype: f32,  per: shape_match_member, arena: persistent, owner: model}
 
   # =========================================================================
-  # PARTICLE (PBF fluid) — DATA. Source: PbfWorld. The fluid shares particle_pos/
+  # PARTICLE (PBF fluid) — DATA. Source: nk fluid ops. The fluid shares particle_pos/
   # particle_vel with XPBD; PBF-specific scratch is predicted pos / density /
   # lambda / position deltas.
   # =========================================================================

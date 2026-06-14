@@ -261,7 +261,7 @@ public:
         std::vector<uint32_t> vol_particles;      // 4 / volume constraint
         std::vector<float>    vol_rest6, vol_alpha;
         // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (single-env; CSR
-        // layout, mirrors the legacy UploadXpbdWorld flatten 1:1). Per-cluster:
+        // layout, mirrors the legacy soft-upload flatten 1:1). Per-cluster:
         // sm_cluster_offset/size into the flat member pool, sm_stiffness goal-pull
         // fraction, sm_rest_centroid c0. Per-member (flat sum_c n_c pool):
         // sm_particles index, sm_rest_q = x_i^0 - c0, sm_mass weight m_i.
@@ -298,7 +298,7 @@ public:
         bool  boundary_enabled = false;
         float floor_z = 0.0f;
         // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
-        // (the op-ified runtime::coupling::StepParticleParticleCoupling). The
+        // (the op-ified cross-system particle-particle co-step). The
         // class-blind unilateral non-penetration co-step runs AFTER finalize over
         // the FULL [soft | fluid] union; ONLY the SoftFluid mode emits it. d_min
         // == 2*contact_radius (uniform radius); <= 0 disables the op. The grid
