@@ -22,7 +22,7 @@
 
 #include "collision/aabb.hpp"
 #include "math/vec3.hpp"
-#include "rt/ray_box.cuh"  // RtSafeInvDir (shared NaN-guarded inverse direction)
+#include "phi/backend_cuda/rt/ray_box.cuh"  // RtSafeInvDir (shared NaN-guarded inverse direction)
 #include "runtime/sdf/sparse_sdf_query.cuh"
 
 #include <cstdint>

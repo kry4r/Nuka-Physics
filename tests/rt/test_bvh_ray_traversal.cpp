@@ -15,7 +15,7 @@
 #include "math/vec3.hpp"
 #include "rt/bvh_ray_traversal.hpp"
 #include "rt/camera.hpp"
-#include "rt/ray_box.cuh" // host-callable: RayBoxIntersect / RtClosestHitUpdate / kNoPrim
+#include "phi/backend_cuda/rt/ray_box.cuh" // host-callable: RayBoxIntersect / RtClosestHitUpdate / kNoPrim
 
 #include <gtest/gtest.h>
 

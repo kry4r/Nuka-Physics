@@ -129,6 +129,11 @@ set(NUKA_PUBLIC_HEADERS
 add_library(nuka_render STATIC
     render/render_scene.cpp
     render/render_world.cpp
+    # M11 RT-4 (§3.10): host, CUDA-free adapter mapping RenderWorld -> the
+    # self-written path-tracer scene-desc POD (rt::TwoLevelScene). Zero CUDA
+    # token (src/render red-line); the CUDA backend is reached only via the
+    # render::RtBackendI interface (render/rt_backend.hpp).
+    render/rt_adapter.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
 )
@@ -932,41 +937,54 @@ if(CMAKE_CUDA_COMPILER)
     # depth, box leaves). NO OptiX / NO closed SDK. NAMED CONSUMER that wires the
     # retained LBVH (BuildLbvhForQuery) into the runtime renderer. Stackless
     # parent-pointer ray traversal, one thread per pixel, ZERO atomics -> D1
-    # byte-exact. --fmad=false: the leaf slab test (rt/ray_box.cuh) is a shared
-    # __host__ __device__ function whose t must match the CPU oracle bit-for-bit;
-    # forbidding FMA contraction on the device side guarantees host==device
-    # arithmetic (the oracle TU pairs this with -ffp-contract=off).
+    # byte-exact. --fmad=false: the leaf slab test (phi/backend_cuda/rt/ray_box.cuh)
+    # is a shared __host__ __device__ function whose t must match the CPU oracle
+    # bit-for-bit; forbidding FMA contraction on the device side guarantees
+    # host==device arithmetic (the oracle TU pairs this with -ffp-contract=off).
     # v0.7 p13: the sensor renderer (scene_render.cu) -- real per-primitive leaf
     # intersections (triangle/sphere/sparse-SDF) + Lambert+GGX shade + hard
-    # shadows + full AOV framebuffer. Shares nuka_rt_gpu's --fmad=false so the
+    # shadows + full AOV framebuffer. Shares nuka_phi2_rt's --fmad=false so the
     # fp64-internal intersections stay bit-exact vs the CPU oracle. Links
     # nuka_cooker (no link dep here; the SDF cell arrays are passed in by the
     # caller via SparseSdfDevice) -- only the runtime sampler header is used.
     # v0.7 G1-A: the self-written TWO-LEVEL (TLAS/BLAS) tracer
-    # (rt/two_level_render.cu). Nests the p12 stackless rt::TraverseRay two deep:
+    # (two_level_render.cu). Nests the p12 stackless rt::TraverseRay two deep:
     # a per-frame TLAS over instance world-AABBs whose leaf transforms the ray to
     # each instance's local frame and runs an INNER traversal over that instance's
     # once-built BLAS. RIGID two-level core (p16 demo: H1 + cup + table + USD =
     # many rigid mesh instances). Shares --fmad=false so the fp64 leaf math +
     # fp32 QuatInvRotate stay bit-exact vs the host oracle (-ffp-contract=off).
-    add_library(nuka_rt_gpu STATIC
-        rt/bvh_ray_traversal.cu
-        rt/scene_render.cu
-        rt/two_level_render.cu
+    #
+    # M11 RT-CMAKE/RT-3 (§3.10): the 3 device .cu + 6 .cuh are HOMED to
+    # src/phi/backend_cuda/rt/ (the CUDA backend layer); the CUDA-free scene-desc
+    # POD / interface headers stay in src/rt (interface-types dir). This DEDICATED
+    # lib keeps --fmad=false: it MUST NOT be folded into nuka_phi2 (nvcc default
+    # --fmad=true would silently diverge every RT golden). Renamed nuka_rt_gpu ->
+    # nuka_phi2_rt to mark it as the RT slice of the CUDA backend.
+    add_library(nuka_phi2_rt STATIC
+        phi/backend_cuda/rt/bvh_ray_traversal.cu
+        phi/backend_cuda/rt/scene_render.cu
+        phi/backend_cuda/rt/two_level_render.cu
+        # M11 RT-1/RT-3 (§3.10): the CONCRETE CUDA impl of render::RtBackendI.
+        # Host C++ (no kernel launch) that WRAPS BuildTwoLevelScene/RenderFrame;
+        # homed in the CUDA backend layer. Linking nuka_phi2_rt provides the
+        # strong CreateCudaRtBackend definition. Built here so it shares the
+        # lib's include dirs; --fmad=false only affects the CUDA .cu above.
+        phi/backend_cuda/rt/rt_backend_cuda.cpp
     )
-    set_target_properties(nuka_rt_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_options(nuka_rt_gpu PRIVATE
+    set_target_properties(nuka_phi2_rt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(nuka_phi2_rt PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
     )
-    target_include_directories(nuka_rt_gpu
+    target_include_directories(nuka_phi2_rt
         PUBLIC
             ${CMAKE_SOURCE_DIR}/src
     )
-    target_link_libraries(nuka_rt_gpu
+    target_link_libraries(nuka_phi2_rt
         PUBLIC
             nuka_collision
             nuka_collision_gpu
-            # RT-7 (M11): the rt/*.cu device buffers are phi-v2 opaque Buffer*
+            # RT-7 (M11): the rt device buffers are phi-v2 opaque Buffer*
             # (stream-0); nuka_phi2 supplies BufferAlloc/InitBestDevice/cuda_buffer.
             # nuka_phi stays for the scoped device guard (BUF-14).
             nuka_phi

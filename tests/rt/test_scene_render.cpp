@@ -19,11 +19,11 @@
 #include "math/vec3.hpp"
 #include "rt/camera.hpp"
 #include "rt/framebuffer.hpp"
-#include "rt/intersect_primitives.cuh" // host-callable shared intersections
+#include "phi/backend_cuda/rt/intersect_primitives.cuh" // host-callable shared intersections
 #include "rt/material.hpp"
-#include "rt/ray_box.cuh"              // host-callable: kNoPrim/RtMissDepth/RtClosestHitUpdate/RayBoxIntersect
+#include "phi/backend_cuda/rt/ray_box.cuh"              // host-callable: kNoPrim/RtMissDepth/RtClosestHitUpdate/RayBoxIntersect
 #include "rt/scene_render.hpp"
-#include "rt/shading.cuh"              // host-callable ShadeDirect
+#include "phi/backend_cuda/rt/shading.cuh"              // host-callable ShadeDirect
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "tests/import/sdf_test_meshes.hpp"
 

@@ -41,13 +41,13 @@
 #include "math/vec3.hpp"
 #include "rt/camera.hpp"
 #include "rt/framebuffer.hpp"
-#include "rt/instance_transform.cuh"   // host-callable QuatRotate/QuatInvRotate/TransformRayToLocal
-#include "rt/intersect_primitives.cuh" // host-callable shared intersections
+#include "phi/backend_cuda/rt/instance_transform.cuh"   // host-callable QuatRotate/QuatInvRotate/TransformRayToLocal
+#include "phi/backend_cuda/rt/intersect_primitives.cuh" // host-callable shared intersections
 #include "rt/material.hpp"
-#include "rt/prim_id.cuh"              // host-callable PackPrimId/UnpackPrimId
-#include "rt/ray_box.cuh"             // host-callable kNoPrim/RtMissDepth/RtClosestHitUpdate
+#include "phi/backend_cuda/rt/prim_id.cuh"              // host-callable PackPrimId/UnpackPrimId
+#include "phi/backend_cuda/rt/ray_box.cuh"             // host-callable kNoPrim/RtMissDepth/RtClosestHitUpdate
 #include "rt/scene_render.hpp"         // flat p13 Scene + RenderScene (Oracle 2)
-#include "rt/shading.cuh"             // host-callable ShadeDirect
+#include "phi/backend_cuda/rt/shading.cuh"             // host-callable ShadeDirect
 #include "rt/two_level_render.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "tests/import/sdf_test_meshes.hpp"

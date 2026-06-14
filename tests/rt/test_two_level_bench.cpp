@@ -74,7 +74,7 @@
 #include "rt/camera.hpp"
 #include "rt/framebuffer.hpp"
 #include "rt/material.hpp"
-#include "rt/ray_box.cuh"            // host-callable kNoPrim sentinel
+#include "phi/backend_cuda/rt/ray_box.cuh"            // host-callable kNoPrim sentinel
 #include "rt/scene_render.hpp"       // flat p13 Scene + RenderScene (baseline)
 #include "rt/two_level_render.hpp"   // G1-A BuildTwoLevelScene + RenderFrame
 

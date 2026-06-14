@@ -32,9 +32,9 @@
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/scoped_device_guard.hpp"
-#include "rt/bvh_traverse_impl.cuh"
+#include "phi/backend_cuda/rt/bvh_traverse_impl.cuh"
+#include "phi/backend_cuda/rt/ray_box.cuh"
 #include "rt/camera.hpp"
-#include "rt/ray_box.cuh"
 
 #include <cuda_runtime.h>
 

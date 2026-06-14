@@ -37,13 +37,13 @@
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/scoped_device_guard.hpp"
-#include "rt/bvh_traverse_impl.cuh"
+#include "phi/backend_cuda/rt/bvh_traverse_impl.cuh"
+#include "phi/backend_cuda/rt/instance_transform.cuh"
+#include "phi/backend_cuda/rt/intersect_primitives.cuh"
+#include "phi/backend_cuda/rt/prim_id.cuh"
+#include "phi/backend_cuda/rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/shading.cuh"
 #include "rt/camera.hpp"
-#include "rt/instance_transform.cuh"
-#include "rt/intersect_primitives.cuh"
-#include "rt/prim_id.cuh"
-#include "rt/ray_box.cuh"
-#include "rt/shading.cuh"
 
 #include <cuda_runtime.h>
 
