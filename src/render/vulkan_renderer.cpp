@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -192,93 +191,6 @@ HostDebugCommand ToHostCommand(const VulkanDebugDrawCommand& command) {
     out.size[1] = command.size.y;
     out.size[2] = command.size.z;
     return out;
-}
-
-float Clamp01(float value) {
-    return std::clamp(value, 0.0f, 1.0f);
-}
-
-uint8_t FloatColorToByte(float value) {
-    return static_cast<uint8_t>(std::round(Clamp01(value) * 255.0f));
-}
-
-uint32_t PackRgba8(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-    return (static_cast<uint32_t>(r) << 24u) |
-        (static_cast<uint32_t>(g) << 16u) |
-        (static_cast<uint32_t>(b) << 8u) |
-        static_cast<uint32_t>(a);
-}
-
-uint32_t MaterialColorToU32(const RenderMaterial& material) {
-    return PackRgba8(FloatColorToByte(material.base_color.x),
-                     FloatColorToByte(material.base_color.y),
-                     FloatColorToByte(material.base_color.z),
-                     FloatColorToByte(material.alpha));
-}
-
-const RenderMaterial* FindMaterial(const RenderScene& scene, scene::MaterialId material_id) {
-    const auto it = std::find_if(
-        scene.materials.begin(),
-        scene.materials.end(),
-        [material_id](const RenderMaterial& material) {
-            return material.material_id == material_id;
-        });
-    return it != scene.materials.end() ? &(*it) : nullptr;
-}
-
-uint32_t MeshColor(const RenderScene& scene, const RenderMeshInstance& mesh) {
-    if (const auto* material = FindMaterial(scene, mesh.material_id)) {
-        return MaterialColorToU32(*material);
-    }
-    return 0xFFFFFFFFu;
-}
-
-math::Vec3 BoxLikeHalfExtents(const RenderMeshInstance& mesh) {
-    if (mesh.shape_type == scene::ShapeType::Plane) {
-        return {std::max(mesh.half_extents.x, 0.5f),
-                std::max(mesh.half_extents.y, 0.5f),
-                0.0f};
-    }
-    return mesh.half_extents;
-}
-
-VulkanDebugDrawCommand ToVulkanCommand(const RenderScene& scene,
-                                       const RenderMeshInstance& mesh) {
-    VulkanDebugDrawCommand command;
-    command.position = mesh.world_transform.position;
-    command.color = MeshColor(scene, mesh);
-
-    switch (mesh.shape_type) {
-    case scene::ShapeType::Sphere:
-        command.type = VulkanDebugDrawCommandType::Sphere;
-        command.radius = mesh.radius;
-        break;
-    case scene::ShapeType::Capsule:
-        command.type = VulkanDebugDrawCommandType::Capsule;
-        command.radius = mesh.radius;
-        command.half_height = mesh.half_height;
-        command.end = mesh.world_transform.TransformDirection(math::Vec3::UnitZ());
-        break;
-    case scene::ShapeType::Box:
-    case scene::ShapeType::Plane:
-    case scene::ShapeType::ConvexHull:
-    case scene::ShapeType::TriMesh:
-    case scene::ShapeType::HeightField:
-        command.type = VulkanDebugDrawCommandType::Box;
-        command.size = BoxLikeHalfExtents(mesh);
-        break;
-    }
-
-    return command;
-}
-
-std::vector<VulkanDebugDrawCommand> BuildRenderSceneCommands(const RenderScene& scene) {
-    std::vector<VulkanDebugDrawCommand> commands;
-    commands.reserve(scene.mesh_instances.size());
-    for (const auto& mesh : scene.mesh_instances) {
-        commands.push_back(ToVulkanCommand(scene, mesh));
-    }
-    return commands;
 }
 
 size_t CountNonBackground(const std::vector<VulkanRgba8>& pixels,
@@ -910,12 +822,6 @@ VulkanOffscreenReport RenderDebugOverlayVulkan(
     const VulkanOffscreenOptions& options) {
     VulkanOffscreenRenderer renderer;
     return renderer.Render(commands, options);
-}
-
-VulkanOffscreenReport RenderSceneDebugOverlayVulkan(
-    const RenderScene& scene,
-    const VulkanOffscreenOptions& options) {
-    return RenderDebugOverlayVulkan(BuildRenderSceneCommands(scene), options);
 }
 
 } // namespace nuka::render

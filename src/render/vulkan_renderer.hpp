@@ -12,18 +12,21 @@
 // VkGraphicsPipeline + depth + PBR materials). Whole-scene "render this scene"
 // requests should go through THAT renderer; this file only draws debug overlays.
 //
-// To make the demotion explicit the public entry points are now named with an
-// `Overlay` / `Debug` intent:
+// This overlay path consumes a `VulkanDebugDrawCommand` LIST directly. The
+// pre-RenderWorld scene-overlay wrappers (RenderSceneDebugOverlayVulkan /
+// RenderSceneVulkan, fed from the deleted render::RenderScene) were removed in
+// M11; callers build the command list themselves and hand it to
+// RenderDebugOverlayVulkan.
+//
+// Public entry points (named with an `Overlay` / `Debug` intent):
 //   * ProbeVulkanOverlayBackend  -- probe the compute device for the overlay path
 //   * RenderDebugOverlayVulkan   -- rasterize a debug-draw command list (overlay)
-//   * RenderSceneDebugOverlayVulkan -- draw a RenderScene as debug wireframe overlay
-// The pre-demotion names (ProbeVulkanRenderer / RenderDebugDrawListVulkan /
-// RenderSceneVulkan) are retained as thin compatibility aliases so existing
-// callers + the compute-path tests keep working unchanged.
+// The pre-demotion names (ProbeVulkanRenderer / RenderDebugDrawListVulkan) are
+// retained as thin compatibility aliases so existing callers + the compute-path
+// tests keep working unchanged.
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "render/render_scene.hpp"
 #include "render/vulkan_offscreen_types.hpp"  // RenderBackend, VulkanRgba8, VulkanOffscreenReport
 
 #include <cstdint>
@@ -84,12 +87,6 @@ VulkanOffscreenReport RenderDebugOverlayVulkan(
     const std::vector<VulkanDebugDrawCommand>& commands,
     const VulkanOffscreenOptions& options = {});
 
-// Draw a RenderScene as a debug wireframe overlay (NOT the primary shaded image;
-// for that use render/raster/vulkan_raster_renderer.*).
-VulkanOffscreenReport RenderSceneDebugOverlayVulkan(
-    const RenderScene& scene,
-    const VulkanOffscreenOptions& options = {});
-
 // -- Compatibility aliases for the pre-demotion names ------------------------
 // Existing callers + the compute-path tests use these; they forward to the
 // Overlay entry points above.
@@ -100,11 +97,6 @@ inline VulkanOffscreenReport RenderDebugDrawListVulkan(
     const std::vector<VulkanDebugDrawCommand>& commands,
     const VulkanOffscreenOptions& options = {}) {
     return RenderDebugOverlayVulkan(commands, options);
-}
-inline VulkanOffscreenReport RenderSceneVulkan(
-    const RenderScene& scene,
-    const VulkanOffscreenOptions& options = {}) {
-    return RenderSceneDebugOverlayVulkan(scene, options);
 }
 
 } // namespace nuka::render
