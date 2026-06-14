@@ -58,11 +58,9 @@ private:
 
 struct DeviceRecord;
 struct WorldRecord;
-struct BufferRecord;
 
 HandleTable<nuka_device_t, DeviceRecord>& DeviceTable();
 HandleTable<nuka_world_t, WorldRecord>& WorldTable();
-HandleTable<nuka_buffer_t, BufferRecord>& BufferTable();
 
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept;
 nuka_result_t RunNoThrow(void (*fn)(void*), void* user) noexcept;
