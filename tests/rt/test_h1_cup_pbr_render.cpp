@@ -11,7 +11,7 @@
 #include "math/vec3.hpp"
 #include "rt/camera.hpp"
 #include "rt/framebuffer.hpp"
-#include "rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/ray_box.cuh"
 #include "rt/two_level_render.hpp"
 
 #include <gtest/gtest.h>

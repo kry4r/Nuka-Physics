@@ -22,7 +22,7 @@
 
 #include "collision/lbvh_node.cuh"
 #include "math/vec3.hpp"
-#include "rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/ray_box.cuh"
 
 namespace nuka::rt {
 

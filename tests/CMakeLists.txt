@@ -849,7 +849,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_cooker
             nuka_articulation_gpu
             nuka_collision_gpu
-            nuka_rt_gpu
+            nuka_phi2_rt
             nuka_core
             nuka_phi
             CUDA::cudart
@@ -1409,7 +1409,7 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_link_libraries(nuka_rt_traversal_test
         PRIVATE
-            nuka_rt_gpu
+            nuka_phi2_rt
             nuka_collision_gpu
             nuka_phi
             GTest::gtest_main
@@ -1439,7 +1439,7 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_link_libraries(nuka_rt_scene_render_test
         PRIVATE
-            nuka_rt_gpu
+            nuka_phi2_rt
             nuka_collision_gpu
             nuka_cooker
             nuka_phi
@@ -1476,7 +1476,7 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_link_libraries(nuka_rt_two_level_test
         PRIVATE
-            nuka_rt_gpu
+            nuka_phi2_rt
             nuka_collision_gpu
             nuka_cooker
             nuka_phi
@@ -1498,13 +1498,43 @@ if(CMAKE_CUDA_COMPILER)
     )
     target_link_libraries(nuka_h1_cup_pbr_render_test
         PRIVATE
-            nuka_rt_gpu
+            nuka_phi2_rt
             nuka_collision_gpu
             nuka_cooker
             nuka_phi
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_h1_cup_pbr_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
+    # --- M11 RT-5: the RenderWorld -> rt_adapter -> RtBackendI offscreen D1 gate.
+    # Drives the §3.10 backend-agnostic RT interface (render::RtBackendI, impl in
+    # nuka_phi2_rt) from a RenderWorld through the host CUDA-free adapter
+    # (render::RenderWorldToTwoLevelScene, in nuka_render). Asserts: (a) two
+    # dispatches 6-AOV byte-identical (D1), (b) adapter scene == hand-built oracle
+    # 6-AOV byte-exact (faithful mapping), (b') BufferI device-output path ==
+    # host-convenience download (OD-12 output contract), (c) non-trivial coverage.
+    # Built -ffp-contract=off to stay consistent with the rt kernel --fmad=false.
+    # In the CUDA region OUTSIDE NK_BUILD_VULKAN (this box runs CUDA RT locally).
+    add_executable(nuka_rt_render_world_test
+        rt/test_render_world_rt.cpp
+    )
+    set_source_files_properties(rt/test_render_world_rt.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_render_world_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_render_world_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_render
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_render_world_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
     # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
