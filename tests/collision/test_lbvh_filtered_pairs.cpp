@@ -31,8 +31,9 @@
 #include "collision/aabb.hpp"
 #include "collision/candidate_pair.hpp"
 #include "collision/rigid_candidate_pairs.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "scene/contact_filter.hpp"
 #include "scene/cooked_blob.hpp"
 #include "scene/cooker.hpp"
@@ -49,6 +50,36 @@
 using namespace nuka;
 
 namespace {
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface the test bodies use so they
+// stay byte-identical after the buffer sweep.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 using CanonPair = std::pair<uint32_t, uint32_t>;
 
@@ -84,9 +115,9 @@ std::vector<collision::CandidatePair> RunBuilder(
     const std::vector<collision::AABB>& aabbs, const scene::CookedBlob& blob) {
     const uint32_t shape_count = static_cast<uint32_t>(aabbs.size());
     const collision::AABB* dev = nullptr;
-    phi::Buffer d_aabbs;
+    OwnedDeviceBuffer d_aabbs;
     if (shape_count > 0u) {
-        d_aabbs = phi::UploadVector(aabbs);
+        d_aabbs = UploadOwned(aabbs);
         dev = static_cast<const collision::AABB*>(d_aabbs.Data());
     }
     auto stream = collision::BuildRigidCandidatePairs(

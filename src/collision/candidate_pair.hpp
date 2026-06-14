@@ -36,7 +36,7 @@
 // ---------------------------------------------------------------------------
 
 #include "constraint/collidable.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -92,12 +92,13 @@ struct CandidatePair {
 class CandidatePairStream {
 public:
     CandidatePairStream() = default;
-    CandidatePairStream(uint32_t count, phi::Buffer pairs);
+    CandidatePairStream(uint32_t count, phi::Buffer* pairs);
+    ~CandidatePairStream();
 
     CandidatePairStream(const CandidatePairStream&) = delete;
     CandidatePairStream& operator=(const CandidatePairStream&) = delete;
-    CandidatePairStream(CandidatePairStream&&) noexcept = default;
-    CandidatePairStream& operator=(CandidatePairStream&&) noexcept = default;
+    CandidatePairStream(CandidatePairStream&& other) noexcept;
+    CandidatePairStream& operator=(CandidatePairStream&& other) noexcept;
 
     uint32_t Count() const { return count_; }
 
@@ -108,8 +109,8 @@ public:
     std::vector<CandidatePair> DownloadPairs() const;
 
 private:
-    uint32_t    count_ = 0u;
-    phi::Buffer pairs_;
+    uint32_t     count_ = 0u;
+    phi::Buffer* pairs_ = nullptr;  // phi v2 opaque handle; freed in the dtor.
 };
 
 // Build a sorted CandidatePairStream from an UNSORTED host-provided pair set.

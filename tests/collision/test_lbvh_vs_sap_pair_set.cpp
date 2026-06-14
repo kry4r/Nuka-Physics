@@ -22,14 +22,16 @@
 #include "collision/dynamic_broadphase.hpp"
 #include "collision/gpu/broadphase.cuh"
 #include "math/transform.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <random>
 #include <set>
@@ -39,6 +41,36 @@
 using namespace nuka;
 
 namespace {
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface used by the test bodies so they
+// stay byte-identical after the buffer sweep.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 using CanonPair = std::pair<uint32_t, uint32_t>;
 
@@ -153,7 +185,7 @@ void ExpectLbvhEqualsSapOnScene(const scene::SceneIR& scene) {
     const std::vector<collision::AABB> aabbs = ComputeSceneAabbs(scene);
     const uint32_t n = static_cast<uint32_t>(aabbs.size());
 
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* device_aabbs = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     auto sap = collision::gpu::BuildCudaBroadphase(device_aabbs, n);
@@ -192,7 +224,7 @@ TEST(LbvhVsSap, SamePairSetOn50kRandomAabbs) {
     }
 
     // Upload to device.
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* device_aabbs = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     // Generous pair cap (cheap: 16 bytes/pair). The CPU oracle confirms the true
@@ -224,7 +256,7 @@ TEST(LbvhVsSap, D1TwoRunByteExactPairList) {
         aabbs[i].min = {cx - ex, cy - ey, cz - ez};
         aabbs[i].max = {cx + ex, cy + ey, cz + ez};
     }
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* device_aabbs = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     auto run1 = collision::gpu::BuildLbvhBroadphase(device_aabbs, kCount, 2u * 1024u * 1024u);

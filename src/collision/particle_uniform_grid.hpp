@@ -27,7 +27,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -77,17 +77,18 @@ public:
                        uint32_t neighbor_capacity,
                        uint32_t total_neighbors,
                        uint32_t truncated_particle_count,
-                       phi::Buffer sorted_particle_idx,
-                       phi::Buffer cell_start,
-                       phi::Buffer cell_end,
-                       phi::Buffer neighbor_offsets,
-                       phi::Buffer neighbor_counts,
-                       phi::Buffer neighbor_indices);
+                       phi::Buffer* sorted_particle_idx,
+                       phi::Buffer* cell_start,
+                       phi::Buffer* cell_end,
+                       phi::Buffer* neighbor_offsets,
+                       phi::Buffer* neighbor_counts,
+                       phi::Buffer* neighbor_indices);
+    ~ParticleGridResult();
 
     ParticleGridResult(const ParticleGridResult&) = delete;
     ParticleGridResult& operator=(const ParticleGridResult&) = delete;
-    ParticleGridResult(ParticleGridResult&&) noexcept = default;
-    ParticleGridResult& operator=(ParticleGridResult&&) noexcept = default;
+    ParticleGridResult(ParticleGridResult&& other) noexcept;
+    ParticleGridResult& operator=(ParticleGridResult&& other) noexcept;
 
     uint32_t ParticleCount() const { return particle_count_; }
     uint32_t CellCount() const { return cell_count_; }
@@ -118,12 +119,12 @@ private:
     uint32_t neighbor_capacity_ = 0;
     uint32_t total_neighbors_ = 0;
     uint32_t truncated_particle_count_ = 0;
-    phi::Buffer sorted_particle_idx_;
-    phi::Buffer cell_start_;
-    phi::Buffer cell_end_;
-    phi::Buffer neighbor_offsets_;
-    phi::Buffer neighbor_counts_;
-    phi::Buffer neighbor_indices_;
+    phi::Buffer* sorted_particle_idx_ = nullptr;  // phi v2 handles; freed in dtor.
+    phi::Buffer* cell_start_ = nullptr;
+    phi::Buffer* cell_end_ = nullptr;
+    phi::Buffer* neighbor_offsets_ = nullptr;
+    phi::Buffer* neighbor_counts_ = nullptr;
+    phi::Buffer* neighbor_indices_ = nullptr;
 };
 
 // Build the uniform grid over `particle_count` device-resident positions and

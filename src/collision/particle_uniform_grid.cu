@@ -22,7 +22,8 @@
 #include "collision/particle_uniform_grid.hpp"
 
 #include "collision/particle_grid_traversal.cuh"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"            // InitBestDevice, DeviceBufferType
+#include "phi/buffer_transfer_v2.hpp" // DownloadVectorV2
 
 #include <cuda_runtime.h>
 
@@ -51,7 +52,38 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-using ::nuka::phi::DownloadVector;
+// File-local RAII over a phi v2 opaque Buffer*. Stream-0 device buffer type:
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy. Frees on every path (incl. CheckCuda throw paths). Base()/Handle()
+// mirror the legacy Data(); Release() hands the long-lived result members their
+// owned handle.
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_), bytes_(o.bytes_) {
+        o.buf_ = nullptr; o.bytes_ = 0u;
+    }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    void*  Base()   const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    size_t Bytes()  const { return bytes_; }
+    phi::Buffer* Handle() const { return buf_; }
+    phi::Buffer* Release() { phi::Buffer* b = buf_; buf_ = nullptr; bytes_ = 0u; return b; }
+private:
+    phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 ParticleGridConfigDevice ToDevice(const ParticleGridConfig& cfg) {
     ParticleGridConfigDevice d;
@@ -172,51 +204,125 @@ ParticleGridResult::ParticleGridResult(uint32_t particle_count,
                                        uint32_t neighbor_capacity,
                                        uint32_t total_neighbors,
                                        uint32_t truncated_particle_count,
-                                       phi::Buffer sorted_particle_idx,
-                                       phi::Buffer cell_start,
-                                       phi::Buffer cell_end,
-                                       phi::Buffer neighbor_offsets,
-                                       phi::Buffer neighbor_counts,
-                                       phi::Buffer neighbor_indices)
+                                       phi::Buffer* sorted_particle_idx,
+                                       phi::Buffer* cell_start,
+                                       phi::Buffer* cell_end,
+                                       phi::Buffer* neighbor_offsets,
+                                       phi::Buffer* neighbor_counts,
+                                       phi::Buffer* neighbor_indices)
     : particle_count_(particle_count)
     , cell_count_(cell_count)
     , neighbor_capacity_(neighbor_capacity)
     , total_neighbors_(total_neighbors)
     , truncated_particle_count_(truncated_particle_count)
-    , sorted_particle_idx_(std::move(sorted_particle_idx))
-    , cell_start_(std::move(cell_start))
-    , cell_end_(std::move(cell_end))
-    , neighbor_offsets_(std::move(neighbor_offsets))
-    , neighbor_counts_(std::move(neighbor_counts))
-    , neighbor_indices_(std::move(neighbor_indices)) {}
+    , sorted_particle_idx_(sorted_particle_idx)
+    , cell_start_(cell_start)
+    , cell_end_(cell_end)
+    , neighbor_offsets_(neighbor_offsets)
+    , neighbor_counts_(neighbor_counts)
+    , neighbor_indices_(neighbor_indices) {}
+
+ParticleGridResult::~ParticleGridResult() {
+    if (sorted_particle_idx_ != nullptr) { phi::BufferFree(sorted_particle_idx_); }
+    if (cell_start_          != nullptr) { phi::BufferFree(cell_start_); }
+    if (cell_end_            != nullptr) { phi::BufferFree(cell_end_); }
+    if (neighbor_offsets_    != nullptr) { phi::BufferFree(neighbor_offsets_); }
+    if (neighbor_counts_     != nullptr) { phi::BufferFree(neighbor_counts_); }
+    if (neighbor_indices_    != nullptr) { phi::BufferFree(neighbor_indices_); }
+}
+
+ParticleGridResult::ParticleGridResult(ParticleGridResult&& other) noexcept
+    : particle_count_(other.particle_count_)
+    , cell_count_(other.cell_count_)
+    , neighbor_capacity_(other.neighbor_capacity_)
+    , total_neighbors_(other.total_neighbors_)
+    , truncated_particle_count_(other.truncated_particle_count_)
+    , sorted_particle_idx_(other.sorted_particle_idx_)
+    , cell_start_(other.cell_start_)
+    , cell_end_(other.cell_end_)
+    , neighbor_offsets_(other.neighbor_offsets_)
+    , neighbor_counts_(other.neighbor_counts_)
+    , neighbor_indices_(other.neighbor_indices_) {
+    other.particle_count_ = 0u;
+    other.cell_count_ = 0u;
+    other.neighbor_capacity_ = 0u;
+    other.total_neighbors_ = 0u;
+    other.truncated_particle_count_ = 0u;
+    other.sorted_particle_idx_ = nullptr;
+    other.cell_start_ = nullptr;
+    other.cell_end_ = nullptr;
+    other.neighbor_offsets_ = nullptr;
+    other.neighbor_counts_ = nullptr;
+    other.neighbor_indices_ = nullptr;
+}
+
+ParticleGridResult& ParticleGridResult::operator=(ParticleGridResult&& other) noexcept {
+    if (this != &other) {
+        if (sorted_particle_idx_ != nullptr) { phi::BufferFree(sorted_particle_idx_); }
+        if (cell_start_          != nullptr) { phi::BufferFree(cell_start_); }
+        if (cell_end_            != nullptr) { phi::BufferFree(cell_end_); }
+        if (neighbor_offsets_    != nullptr) { phi::BufferFree(neighbor_offsets_); }
+        if (neighbor_counts_     != nullptr) { phi::BufferFree(neighbor_counts_); }
+        if (neighbor_indices_    != nullptr) { phi::BufferFree(neighbor_indices_); }
+        particle_count_ = other.particle_count_;
+        cell_count_ = other.cell_count_;
+        neighbor_capacity_ = other.neighbor_capacity_;
+        total_neighbors_ = other.total_neighbors_;
+        truncated_particle_count_ = other.truncated_particle_count_;
+        sorted_particle_idx_ = other.sorted_particle_idx_;
+        cell_start_ = other.cell_start_;
+        cell_end_ = other.cell_end_;
+        neighbor_offsets_ = other.neighbor_offsets_;
+        neighbor_counts_ = other.neighbor_counts_;
+        neighbor_indices_ = other.neighbor_indices_;
+        other.particle_count_ = 0u;
+        other.cell_count_ = 0u;
+        other.neighbor_capacity_ = 0u;
+        other.total_neighbors_ = 0u;
+        other.truncated_particle_count_ = 0u;
+        other.sorted_particle_idx_ = nullptr;
+        other.cell_start_ = nullptr;
+        other.cell_end_ = nullptr;
+        other.neighbor_offsets_ = nullptr;
+        other.neighbor_counts_ = nullptr;
+        other.neighbor_indices_ = nullptr;
+    }
+    return *this;
+}
 
 const uint32_t* ParticleGridResult::DeviceSortedParticleIndex() const {
-    return static_cast<const uint32_t*>(sorted_particle_idx_.Data());
+    return static_cast<const uint32_t*>(
+        sorted_particle_idx_ != nullptr ? phi::BufferBase(sorted_particle_idx_) : nullptr);
 }
 const uint32_t* ParticleGridResult::DeviceCellStart() const {
-    return static_cast<const uint32_t*>(cell_start_.Data());
+    return static_cast<const uint32_t*>(
+        cell_start_ != nullptr ? phi::BufferBase(cell_start_) : nullptr);
 }
 const uint32_t* ParticleGridResult::DeviceCellEnd() const {
-    return static_cast<const uint32_t*>(cell_end_.Data());
+    return static_cast<const uint32_t*>(
+        cell_end_ != nullptr ? phi::BufferBase(cell_end_) : nullptr);
 }
 const uint32_t* ParticleGridResult::DeviceNeighborOffsets() const {
-    return static_cast<const uint32_t*>(neighbor_offsets_.Data());
+    return static_cast<const uint32_t*>(
+        neighbor_offsets_ != nullptr ? phi::BufferBase(neighbor_offsets_) : nullptr);
 }
 const uint32_t* ParticleGridResult::DeviceNeighborCounts() const {
-    return static_cast<const uint32_t*>(neighbor_counts_.Data());
+    return static_cast<const uint32_t*>(
+        neighbor_counts_ != nullptr ? phi::BufferBase(neighbor_counts_) : nullptr);
 }
 const uint32_t* ParticleGridResult::DeviceNeighborIndices() const {
-    return static_cast<const uint32_t*>(neighbor_indices_.Data());
+    return static_cast<const uint32_t*>(
+        neighbor_indices_ != nullptr ? phi::BufferBase(neighbor_indices_) : nullptr);
 }
 
 std::vector<uint32_t> ParticleGridResult::DownloadNeighborOffsets() const {
-    return DownloadVector<uint32_t>(neighbor_offsets_, particle_count_);
+    return phi::DownloadVectorV2<uint32_t>(neighbor_offsets_, particle_count_);
 }
 std::vector<uint32_t> ParticleGridResult::DownloadNeighborCounts() const {
-    return DownloadVector<uint32_t>(neighbor_counts_, particle_count_);
+    return phi::DownloadVectorV2<uint32_t>(neighbor_counts_, particle_count_);
 }
 std::vector<uint32_t> ParticleGridResult::DownloadNeighborIndices() const {
-    return DownloadVector<uint32_t>(neighbor_indices_, total_neighbors_);
+    return phi::DownloadVectorV2<uint32_t>(neighbor_indices_, total_neighbors_);
 }
 
 ParticleGridConfig MakeParticleGridConfig(math::Vec3 world_min,
@@ -255,69 +361,69 @@ ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
     const ParticleGridConfigDevice cfg = ToDevice(config);
 
     if (particle_count == 0u || cell_count == 0u) {
-        phi::Buffer e0(0u, phi::MemoryKind::Device);
-        phi::Buffer e1(0u, phi::MemoryKind::Device);
-        phi::Buffer e2(0u, phi::MemoryKind::Device);
-        phi::Buffer e3(0u, phi::MemoryKind::Device);
-        phi::Buffer e4(0u, phi::MemoryKind::Device);
-        phi::Buffer e5(0u, phi::MemoryKind::Device);
+        OwnedBuffer e0(0u);
+        OwnedBuffer e1(0u);
+        OwnedBuffer e2(0u);
+        OwnedBuffer e3(0u);
+        OwnedBuffer e4(0u);
+        OwnedBuffer e5(0u);
         return ParticleGridResult(particle_count, cell_count,
                                   kParticleGridMaxNeighbors, 0u, 0u,
-                                  std::move(e0), std::move(e1), std::move(e2),
-                                  std::move(e3), std::move(e4), std::move(e5));
+                                  e0.Release(), e1.Release(), e2.Release(),
+                                  e3.Release(), e4.Release(), e5.Release());
     }
 
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
 
     // --- 1. Cell keys -------------------------------------------------------
-    phi::Buffer d_keys(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
-    phi::Buffer d_sorted_idx(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_keys(particle_count * sizeof(uint32_t));
+    OwnedBuffer d_sorted_idx(particle_count * sizeof(uint32_t));
     ComputeCellKeysKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count, positions, cfg,
-        static_cast<uint32_t*>(d_keys.Data()),
-        static_cast<uint32_t*>(d_sorted_idx.Data()));
+        static_cast<uint32_t*>(d_keys.Base()),
+        static_cast<uint32_t*>(d_sorted_idx.Base()));
     CheckCuda(cudaGetLastError(), "ComputeCellKeysKernel launch");
 
     // --- 2. Stable radix sort by cell key (D1) ------------------------------
     thrust::stable_sort_by_key(
         thrust::cuda::par.on(stream),
-        static_cast<uint32_t*>(d_keys.Data()),
-        static_cast<uint32_t*>(d_keys.Data()) + particle_count,
-        static_cast<uint32_t*>(d_sorted_idx.Data()));
+        static_cast<uint32_t*>(d_keys.Base()),
+        static_cast<uint32_t*>(d_keys.Base()) + particle_count,
+        static_cast<uint32_t*>(d_sorted_idx.Base()));
     CheckCuda(cudaGetLastError(), "stable_sort_by_key cell keys");
 
     // --- 3. Cell ranges -----------------------------------------------------
-    phi::Buffer d_cell_start(cell_count * sizeof(uint32_t), phi::MemoryKind::Device);
-    phi::Buffer d_cell_end(cell_count * sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemsetAsync(d_cell_start.Data(), 0, cell_count * sizeof(uint32_t), stream),
+    OwnedBuffer d_cell_start(cell_count * sizeof(uint32_t));
+    OwnedBuffer d_cell_end(cell_count * sizeof(uint32_t));
+    CheckCuda(cudaMemsetAsync(d_cell_start.Base(), 0, cell_count * sizeof(uint32_t), stream),
               "memset cell_start");
-    CheckCuda(cudaMemsetAsync(d_cell_end.Data(), 0, cell_count * sizeof(uint32_t), stream),
+    CheckCuda(cudaMemsetAsync(d_cell_end.Base(), 0, cell_count * sizeof(uint32_t), stream),
               "memset cell_end");
     BuildCellRangesKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count,
-        static_cast<const uint32_t*>(d_keys.Data()),
-        static_cast<uint32_t*>(d_cell_start.Data()),
-        static_cast<uint32_t*>(d_cell_end.Data()));
+        static_cast<const uint32_t*>(d_keys.Base()),
+        static_cast<uint32_t*>(d_cell_start.Base()),
+        static_cast<uint32_t*>(d_cell_end.Base()));
     CheckCuda(cudaGetLastError(), "BuildCellRangesKernel launch");
 
     // --- 4. Count neighbors (pass 1) ----------------------------------------
-    phi::Buffer d_counts(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_counts(particle_count * sizeof(uint32_t));
     CountNeighborsKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count, positions, query_radius, cfg,
-        static_cast<const uint32_t*>(d_cell_start.Data()),
-        static_cast<const uint32_t*>(d_cell_end.Data()),
-        static_cast<const uint32_t*>(d_sorted_idx.Data()),
+        static_cast<const uint32_t*>(d_cell_start.Base()),
+        static_cast<const uint32_t*>(d_cell_end.Base()),
+        static_cast<const uint32_t*>(d_sorted_idx.Base()),
         kParticleGridMaxNeighbors,
-        static_cast<uint32_t*>(d_counts.Data()));
+        static_cast<uint32_t*>(d_counts.Base()));
     CheckCuda(cudaGetLastError(), "CountNeighborsKernel launch");
 
     // --- 5. Exclusive scan -> CSR offsets (D1) ------------------------------
-    phi::Buffer d_offsets(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_offsets(particle_count * sizeof(uint32_t));
     thrust::exclusive_scan(
         thrust::cuda::par.on(stream),
-        static_cast<const uint32_t*>(d_counts.Data()),
-        static_cast<const uint32_t*>(d_counts.Data()) + particle_count,
-        static_cast<uint32_t*>(d_offsets.Data()));
+        static_cast<const uint32_t*>(d_counts.Base()),
+        static_cast<const uint32_t*>(d_counts.Base()) + particle_count,
+        static_cast<uint32_t*>(d_offsets.Base()));
     CheckCuda(cudaGetLastError(), "exclusive_scan counts");
 
     // Total neighbors = offsets[last] + counts[last].
@@ -326,8 +432,8 @@ ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
     uint32_t last_count = 0u;
     // Read the final offset + count from the device tails.
     {
-        const auto* off_dev = static_cast<const uint32_t*>(d_offsets.Data());
-        const auto* cnt_dev = static_cast<const uint32_t*>(d_counts.Data());
+        const auto* off_dev = static_cast<const uint32_t*>(d_offsets.Base());
+        const auto* cnt_dev = static_cast<const uint32_t*>(d_counts.Base());
         CheckCuda(cudaMemcpy(&last_offset, off_dev + (particle_count - 1u),
                              sizeof(uint32_t), cudaMemcpyDeviceToHost),
                   "copy last offset");
@@ -338,36 +444,35 @@ ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
     const uint32_t total_neighbors = last_offset + last_count;
 
     // --- 6. Fill neighbors (pass 2) -----------------------------------------
-    phi::Buffer d_neighbors(
-        (total_neighbors == 0u ? 1u : total_neighbors) * sizeof(uint32_t),
-        phi::MemoryKind::Device);
-    phi::Buffer d_truncated(sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemsetAsync(d_truncated.Data(), 0, sizeof(uint32_t), stream),
+    OwnedBuffer d_neighbors(
+        (total_neighbors == 0u ? 1u : total_neighbors) * sizeof(uint32_t));
+    OwnedBuffer d_truncated(sizeof(uint32_t));
+    CheckCuda(cudaMemsetAsync(d_truncated.Base(), 0, sizeof(uint32_t), stream),
               "memset truncated");
     FillNeighborsKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count, positions, query_radius, cfg,
-        static_cast<const uint32_t*>(d_cell_start.Data()),
-        static_cast<const uint32_t*>(d_cell_end.Data()),
-        static_cast<const uint32_t*>(d_sorted_idx.Data()),
+        static_cast<const uint32_t*>(d_cell_start.Base()),
+        static_cast<const uint32_t*>(d_cell_end.Base()),
+        static_cast<const uint32_t*>(d_sorted_idx.Base()),
         kParticleGridMaxNeighbors,
-        static_cast<const uint32_t*>(d_offsets.Data()),
-        static_cast<uint32_t*>(d_neighbors.Data()),
-        static_cast<uint32_t*>(d_truncated.Data()));
+        static_cast<const uint32_t*>(d_offsets.Base()),
+        static_cast<uint32_t*>(d_neighbors.Base()),
+        static_cast<uint32_t*>(d_truncated.Base()));
     CheckCuda(cudaGetLastError(), "FillNeighborsKernel launch");
 
     context.stream.Synchronize();
     uint32_t truncated = 0u;
-    d_truncated.CopyToHost(&truncated, sizeof(truncated));
+    phi::BufferDownload(d_truncated.Handle(), &truncated, 0, sizeof(truncated));
 
     return ParticleGridResult(particle_count, cell_count,
                               kParticleGridMaxNeighbors, total_neighbors,
                               truncated,
-                              std::move(d_sorted_idx),
-                              std::move(d_cell_start),
-                              std::move(d_cell_end),
-                              std::move(d_offsets),
-                              std::move(d_counts),
-                              std::move(d_neighbors));
+                              d_sorted_idx.Release(),
+                              d_cell_start.Release(),
+                              d_cell_end.Release(),
+                              d_offsets.Release(),
+                              d_counts.Release(),
+                              d_neighbors.Release());
 }
 
 ParticleGridResult BuildParticleUniformGrid(const math::Vec3* positions,

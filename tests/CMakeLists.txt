@@ -1146,6 +1146,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime_gpu
             nuka_runtime
             nuka_phi
+            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
             GTest::gtest_main
     )
 
@@ -1166,6 +1167,7 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_collision_gpu
             nuka_phi
+            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
             GTest::gtest_main
     )
 
@@ -1216,6 +1218,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             nuka_scene
             nuka_phi
+            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_lbvh_filtered_pairs_test
@@ -1245,6 +1248,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             nuka_scene
             nuka_phi
+            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_link_rigid_candidate_pairs_test
@@ -1396,6 +1400,7 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_collision_gpu
             nuka_phi
+            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_cross_system_matrix_test

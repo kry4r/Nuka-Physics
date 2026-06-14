@@ -29,7 +29,7 @@
 
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -57,17 +57,18 @@ public:
     LbvhBroadphaseResult(uint32_t leaf_count,
                          uint32_t pair_count,
                          uint32_t pair_capacity,
-                         phi::Buffer pairs);
+                         phi::Buffer* pairs);
     LbvhBroadphaseResult(uint32_t leaf_count,
                          uint32_t pair_count,
                          uint32_t pair_capacity,
-                         phi::Buffer pairs,
-                         phi::Buffer nodes);
+                         phi::Buffer* pairs,
+                         phi::Buffer* nodes);
+    ~LbvhBroadphaseResult();
 
     LbvhBroadphaseResult(const LbvhBroadphaseResult&) = delete;
     LbvhBroadphaseResult& operator=(const LbvhBroadphaseResult&) = delete;
-    LbvhBroadphaseResult(LbvhBroadphaseResult&&) noexcept = default;
-    LbvhBroadphaseResult& operator=(LbvhBroadphaseResult&&) noexcept = default;
+    LbvhBroadphaseResult(LbvhBroadphaseResult&& other) noexcept;
+    LbvhBroadphaseResult& operator=(LbvhBroadphaseResult&& other) noexcept;
 
     uint32_t LeafCount() const { return leaf_count_; }
     uint32_t PairCount() const { return pair_count_; }
@@ -98,8 +99,8 @@ private:
     uint32_t leaf_count_ = 0;
     uint32_t pair_count_ = 0;
     uint32_t pair_capacity_ = 0;
-    phi::Buffer pairs_;
-    phi::Buffer nodes_; // retained tree (empty unless retain_nodes was set)
+    phi::Buffer* pairs_ = nullptr;  // phi v2 opaque handle; freed in the dtor.
+    phi::Buffer* nodes_ = nullptr;  // retained tree (null unless retain_nodes set).
 };
 
 // Build an LBVH over `count` device-resident AABBs and return the compact,

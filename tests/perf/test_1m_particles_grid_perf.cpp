@@ -16,8 +16,9 @@
 
 #include "collision/particle_uniform_grid.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 
 #include <gtest/gtest.h>
 
@@ -31,6 +32,35 @@
 using namespace nuka;
 
 namespace {
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface the test body uses.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 std::vector<math::Vec3> MakeCloud(uint32_t n, uint32_t seed, float box) {
     std::mt19937 rng(seed);
@@ -55,7 +85,7 @@ TEST(ParticleGridPerf, Build1MParticlesAndQuery) {
     const float box = 100.0f; // -> ~100^3 ~= 1M cells
 
     const auto pts = MakeCloud(kCount, 0xC0FFEEu, box);
-    phi::Buffer d_pos = phi::UploadVector(pts);
+    OwnedDeviceBuffer d_pos = UploadOwned(pts);
     const auto* dev = static_cast<const math::Vec3*>(d_pos.Data());
 
     const math::Vec3 lo{0.0f, 0.0f, 0.0f};

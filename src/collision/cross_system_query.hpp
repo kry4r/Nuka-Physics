@@ -24,7 +24,7 @@
 
 #include "collision/broadphase_lbvh.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -46,14 +46,15 @@ public:
                            uint32_t candidate_capacity,
                            uint32_t total_candidates,
                            uint32_t truncated_particle_count,
-                           phi::Buffer candidate_offsets,
-                           phi::Buffer candidate_counts,
-                           phi::Buffer candidate_indices);
+                           phi::Buffer* candidate_offsets,
+                           phi::Buffer* candidate_counts,
+                           phi::Buffer* candidate_indices);
+    ~CrossSystemQueryResult();
 
     CrossSystemQueryResult(const CrossSystemQueryResult&) = delete;
     CrossSystemQueryResult& operator=(const CrossSystemQueryResult&) = delete;
-    CrossSystemQueryResult(CrossSystemQueryResult&&) noexcept = default;
-    CrossSystemQueryResult& operator=(CrossSystemQueryResult&&) noexcept = default;
+    CrossSystemQueryResult(CrossSystemQueryResult&& other) noexcept;
+    CrossSystemQueryResult& operator=(CrossSystemQueryResult&& other) noexcept;
 
     uint32_t ParticleCount() const { return particle_count_; }
     uint32_t CandidateCapacity() const { return candidate_capacity_; }
@@ -73,9 +74,9 @@ private:
     uint32_t candidate_capacity_ = 0;
     uint32_t total_candidates_ = 0;
     uint32_t truncated_particle_count_ = 0;
-    phi::Buffer candidate_offsets_;
-    phi::Buffer candidate_counts_;
-    phi::Buffer candidate_indices_;
+    phi::Buffer* candidate_offsets_ = nullptr;  // phi v2 handles; freed in the dtor.
+    phi::Buffer* candidate_counts_ = nullptr;
+    phi::Buffer* candidate_indices_ = nullptr;
 };
 
 // Query each of `particle_count` device-resident particle positions against the

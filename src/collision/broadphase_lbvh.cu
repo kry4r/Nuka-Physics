@@ -11,7 +11,8 @@
 #include "collision/lbvh_node.cuh"
 #include "collision/lbvh_traversal.cuh"
 #include "collision/morton_codes.cuh"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"            // InitBestDevice, DeviceBufferType
+#include "phi/buffer_transfer_v2.hpp" // DownloadVectorV2
 
 #include <cuda_runtime.h>
 
@@ -40,7 +41,48 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-using ::nuka::phi::DownloadVector;
+// File-local RAII over a phi v2 opaque Buffer*. Wraps the stream-0 device buffer
+// type (NULL-stream transfers are byte+ordering identical to the legacy
+// synchronous memcpy this replaces) so the scoped allocations below still free
+// on every path (including the CheckCuda throw paths) exactly as the legacy RAII
+// Buffer did. Move-only; Base()/Bytes() mirror the legacy Data()/Size().
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_), bytes_(o.bytes_) {
+        o.buf_ = nullptr; o.bytes_ = 0u;
+    }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    void*  Base()  const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    size_t Bytes() const { return bytes_; }
+    phi::Buffer* Handle() const { return buf_; }
+    // Release ownership of the underlying handle to the caller (for the result's
+    // long-lived pairs_/nodes_ members).
+    phi::Buffer* Release() { phi::Buffer* b = buf_; buf_ = nullptr; bytes_ = 0u; return b; }
+private:
+    phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
+
+// Download `count` elements from an OwnedBuffer into a host vector. BufferDownload
+// self-syncs the NULL/default stream (stream 0) -- byte+ordering identical to the
+// legacy DownloadVector's synchronous stream-0 cudaMemcpy this replaces.
+template <typename T>
+std::vector<T> DownloadOwned(const OwnedBuffer& buf, uint32_t count) {
+    return phi::DownloadVectorV2<T>(buf.Handle(), count);
+}
 
 // --- Scene-bound reduction --------------------------------------------------
 // Block-reduced min/max of AABB centers, written out per-block; the host folds
@@ -278,39 +320,78 @@ float3 Fold(const std::vector<float3>& mins, bool is_max) {
 LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
                                            uint32_t pair_count,
                                            uint32_t pair_capacity,
-                                           phi::Buffer pairs)
+                                           phi::Buffer* pairs)
     : leaf_count_(leaf_count)
     , pair_count_(pair_count)
     , pair_capacity_(pair_capacity)
-    , pairs_(std::move(pairs)) {}
+    , pairs_(pairs) {}
 
 LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
                                            uint32_t pair_count,
                                            uint32_t pair_capacity,
-                                           phi::Buffer pairs,
-                                           phi::Buffer nodes)
+                                           phi::Buffer* pairs,
+                                           phi::Buffer* nodes)
     : leaf_count_(leaf_count)
     , pair_count_(pair_count)
     , pair_capacity_(pair_capacity)
-    , pairs_(std::move(pairs))
-    , nodes_(std::move(nodes)) {}
+    , pairs_(pairs)
+    , nodes_(nodes) {}
+
+LbvhBroadphaseResult::~LbvhBroadphaseResult() {
+    if (pairs_ != nullptr) { phi::BufferFree(pairs_); }
+    if (nodes_ != nullptr) { phi::BufferFree(nodes_); }
+}
+
+LbvhBroadphaseResult::LbvhBroadphaseResult(LbvhBroadphaseResult&& other) noexcept
+    : leaf_count_(other.leaf_count_)
+    , pair_count_(other.pair_count_)
+    , pair_capacity_(other.pair_capacity_)
+    , pairs_(other.pairs_)
+    , nodes_(other.nodes_) {
+    other.leaf_count_ = 0u;
+    other.pair_count_ = 0u;
+    other.pair_capacity_ = 0u;
+    other.pairs_ = nullptr;
+    other.nodes_ = nullptr;
+}
+
+LbvhBroadphaseResult& LbvhBroadphaseResult::operator=(LbvhBroadphaseResult&& other) noexcept {
+    if (this != &other) {
+        if (pairs_ != nullptr) { phi::BufferFree(pairs_); }
+        if (nodes_ != nullptr) { phi::BufferFree(nodes_); }
+        leaf_count_ = other.leaf_count_;
+        pair_count_ = other.pair_count_;
+        pair_capacity_ = other.pair_capacity_;
+        pairs_ = other.pairs_;
+        nodes_ = other.nodes_;
+        other.leaf_count_ = 0u;
+        other.pair_count_ = 0u;
+        other.pair_capacity_ = 0u;
+        other.pairs_ = nullptr;
+        other.nodes_ = nullptr;
+    }
+    return *this;
+}
 
 const collision::CollisionPair* LbvhBroadphaseResult::DevicePairs() const {
-    return static_cast<const collision::CollisionPair*>(pairs_.Data());
+    return static_cast<const collision::CollisionPair*>(
+        pairs_ != nullptr ? phi::BufferBase(pairs_) : nullptr);
 }
 
 const LbvhNode* LbvhBroadphaseResult::DeviceNodes() const {
-    if (nodes_.Size() == 0u) {
+    if (nodes_ == nullptr || NodeCount() == 0u) {
         return nullptr;
     }
-    return static_cast<const LbvhNode*>(nodes_.Data());
+    return static_cast<const LbvhNode*>(phi::BufferBase(nodes_));
 }
 
-bool LbvhBroadphaseResult::HasNodes() const { return nodes_.Size() != 0u; }
+bool LbvhBroadphaseResult::HasNodes() const {
+    return nodes_ != nullptr && NodeCount() != 0u;
+}
 
 std::vector<collision::CollisionPair> LbvhBroadphaseResult::DownloadPairs() const {
     const uint32_t n = std::min(pair_count_, pair_capacity_);
-    return DownloadVector<collision::CollisionPair>(pairs_, n);
+    return phi::DownloadVectorV2<collision::CollisionPair>(pairs_, n);
 }
 
 // Shared build implementation. `retain_nodes` selects whether the built tree is
@@ -327,26 +408,26 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
 
     if (count < 2u) {
         // 0 or 1 body => no pairs possible.
-        phi::Buffer empty(0u, phi::MemoryKind::Device);
+        OwnedBuffer empty(0u);
         if (retain_nodes && count == 1u) {
             // A 1-leaf tree has a single node (the leaf itself). Retain it so the
             // cross-system query can still report that one body as a candidate.
             // The single sorted-index is trivially {0}; reuse InitNodesKernel.
-            phi::Buffer nodes(sizeof(LbvhNode), phi::MemoryKind::Device);
-            phi::Buffer index(sizeof(uint32_t), phi::MemoryKind::Device);
-            CheckCuda(cudaMemsetAsync(index.Data(), 0, sizeof(uint32_t), stream),
+            OwnedBuffer nodes(sizeof(LbvhNode));
+            OwnedBuffer index(sizeof(uint32_t));
+            CheckCuda(cudaMemsetAsync(index.Base(), 0, sizeof(uint32_t), stream),
                       "cudaMemsetAsync n=1 index");
             InitNodesKernel<<<1u, kBlockSize, 0, stream>>>(
                 1u, device_aabbs,
-                static_cast<uint32_t*>(index.Data()),
-                static_cast<LbvhNode*>(nodes.Data()));
+                static_cast<uint32_t*>(index.Base()),
+                static_cast<LbvhNode*>(nodes.Base()));
             CheckCuda(cudaGetLastError(), "InitNodesKernel launch (n=1)");
             context.stream.Synchronize();
-            phi::Buffer empty_pairs(0u, phi::MemoryKind::Device);
-            return LbvhBroadphaseResult(count, 0u, 0u, std::move(empty_pairs),
-                                        std::move(nodes));
+            OwnedBuffer empty_pairs(0u);
+            return LbvhBroadphaseResult(count, 0u, 0u, empty_pairs.Release(),
+                                        nodes.Release());
         }
-        return LbvhBroadphaseResult(count, 0u, 0u, std::move(empty));
+        return LbvhBroadphaseResult(count, 0u, 0u, empty.Release());
     }
 
     // Compact-pair output capacity. Default heuristic: 32 * count (typical
@@ -365,19 +446,19 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
     const uint32_t blocks = (count + kBlockSize - 1u) / kBlockSize;
 
     // --- 1. Scene-bound reduction over AABB centers -------------------------
-    phi::Buffer d_block_min(blocks * sizeof(float3), phi::MemoryKind::Device);
-    phi::Buffer d_block_max(blocks * sizeof(float3), phi::MemoryKind::Device);
+    OwnedBuffer d_block_min(blocks * sizeof(float3));
+    OwnedBuffer d_block_max(blocks * sizeof(float3));
     ReduceCenterBoundsKernel<<<blocks, kBlockSize, 0, stream>>>(
         count, device_aabbs,
-        static_cast<float3*>(d_block_min.Data()),
-        static_cast<float3*>(d_block_max.Data()));
+        static_cast<float3*>(d_block_min.Base()),
+        static_cast<float3*>(d_block_max.Base()));
     CheckCuda(cudaGetLastError(), "ReduceCenterBoundsKernel launch");
 
     // The reduction kernel runs on the work stream; synchronize before the
     // host-side (default-stream) download so the per-block partials are valid.
     context.stream.Synchronize();
-    const auto h_block_min = DownloadVector<float3>(d_block_min, blocks);
-    const auto h_block_max = DownloadVector<float3>(d_block_max, blocks);
+    const auto h_block_min = DownloadOwned<float3>(d_block_min, blocks);
+    const auto h_block_max = DownloadOwned<float3>(d_block_max, blocks);
 
     const float3 scene_min = Fold(h_block_min, /*is_max=*/false);
     const float3 scene_max = Fold(h_block_max, /*is_max=*/true);
@@ -387,12 +468,12 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
     inv_extent.z = (scene_max.z > scene_min.z) ? 1.0f / (scene_max.z - scene_min.z) : 0.0f;
 
     // --- 2. Morton codes + index ------------------------------------------
-    phi::Buffer d_morton(count * sizeof(uint32_t), phi::MemoryKind::Device);
-    phi::Buffer d_index(count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_morton(count * sizeof(uint32_t));
+    OwnedBuffer d_index(count * sizeof(uint32_t));
     ComputeMortonKernel<<<blocks, kBlockSize, 0, stream>>>(
         count, device_aabbs, scene_min, inv_extent,
-        static_cast<uint32_t*>(d_morton.Data()),
-        static_cast<uint32_t*>(d_index.Data()));
+        static_cast<uint32_t*>(d_morton.Base()),
+        static_cast<uint32_t*>(d_index.Base()));
     CheckCuda(cudaGetLastError(), "ComputeMortonKernel launch");
 
     // --- 3. Deterministic radix sort by Morton key ------------------------
@@ -400,86 +481,85 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
     // deterministic across runs). This gives D1 byte-exact sorted order.
     thrust::stable_sort_by_key(
         thrust::cuda::par.on(stream),
-        static_cast<uint32_t*>(d_morton.Data()),
-        static_cast<uint32_t*>(d_morton.Data()) + count,
-        static_cast<uint32_t*>(d_index.Data()));
+        static_cast<uint32_t*>(d_morton.Base()),
+        static_cast<uint32_t*>(d_morton.Base()) + count,
+        static_cast<uint32_t*>(d_index.Base()));
     CheckCuda(cudaGetLastError(), "stable_sort_by_key");
 
     // --- 4. Allocate nodes + visit counters --------------------------------
     const uint32_t node_count = 2u * count - 1u;
     const uint32_t internal_count = count - 1u;
-    phi::Buffer d_nodes(node_count * sizeof(LbvhNode), phi::MemoryKind::Device);
-    phi::Buffer d_visit(internal_count * sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemsetAsync(d_visit.Data(), 0, internal_count * sizeof(uint32_t), stream),
+    OwnedBuffer d_nodes(node_count * sizeof(LbvhNode));
+    OwnedBuffer d_visit(internal_count * sizeof(uint32_t));
+    CheckCuda(cudaMemsetAsync(d_visit.Base(), 0, internal_count * sizeof(uint32_t), stream),
               "cudaMemsetAsync visit");
 
     // --- 5. Init nodes, build internal nodes, propagate AABBs --------------
     const uint32_t node_blocks = (node_count + kBlockSize - 1u) / kBlockSize;
     InitNodesKernel<<<node_blocks, kBlockSize, 0, stream>>>(
         count, device_aabbs,
-        static_cast<uint32_t*>(d_index.Data()),
-        static_cast<LbvhNode*>(d_nodes.Data()));
+        static_cast<uint32_t*>(d_index.Base()),
+        static_cast<LbvhNode*>(d_nodes.Base()));
     CheckCuda(cudaGetLastError(), "InitNodesKernel launch");
 
     const uint32_t internal_blocks = (internal_count + kBlockSize - 1u) / kBlockSize;
     BuildInternalNodesKernel<<<internal_blocks, kBlockSize, 0, stream>>>(
         count,
-        static_cast<uint32_t*>(d_morton.Data()),
-        static_cast<LbvhNode*>(d_nodes.Data()));
+        static_cast<uint32_t*>(d_morton.Base()),
+        static_cast<LbvhNode*>(d_nodes.Base()));
     CheckCuda(cudaGetLastError(), "BuildInternalNodesKernel launch");
 
     PropagateAabbsKernel<<<blocks, kBlockSize, 0, stream>>>(
         count,
-        static_cast<LbvhNode*>(d_nodes.Data()),
-        static_cast<uint32_t*>(d_visit.Data()));
+        static_cast<LbvhNode*>(d_nodes.Base()),
+        static_cast<uint32_t*>(d_visit.Base()));
     CheckCuda(cudaGetLastError(), "PropagateAabbsKernel launch");
 
     // --- 6. Overlap traversal -> compact pair list -------------------------
-    phi::Buffer d_pairs(pair_capacity * sizeof(collision::CollisionPair),
-                        phi::MemoryKind::Device);
-    phi::Buffer d_pair_count(sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemsetAsync(d_pair_count.Data(), 0, sizeof(uint32_t), stream),
+    OwnedBuffer d_pairs(pair_capacity * sizeof(collision::CollisionPair));
+    OwnedBuffer d_pair_count(sizeof(uint32_t));
+    CheckCuda(cudaMemsetAsync(d_pair_count.Base(), 0, sizeof(uint32_t), stream),
               "cudaMemsetAsync pair count");
 
     LbvhPairQueryKernel<<<blocks, kBlockSize, 0, stream>>>(
         count,
-        static_cast<const LbvhNode*>(d_nodes.Data()),
-        static_cast<collision::CollisionPair*>(d_pairs.Data()),
-        static_cast<uint32_t*>(d_pair_count.Data()),
+        static_cast<const LbvhNode*>(d_nodes.Base()),
+        static_cast<collision::CollisionPair*>(d_pairs.Base()),
+        static_cast<uint32_t*>(d_pair_count.Base()),
         pair_capacity);
     CheckCuda(cudaGetLastError(), "LbvhPairQueryKernel launch");
 
     context.stream.Synchronize();
 
     uint32_t pair_count = 0u;
-    d_pair_count.CopyToHost(&pair_count, sizeof(pair_count));
+    phi::BufferDownload(d_pair_count.Handle(), &pair_count, 0, sizeof(pair_count));
     const uint32_t valid = std::min(pair_count, pair_capacity);
 
     // --- 7. Deterministic sort of the compact pair list -------------------
     // Pack (a,b) into a uint64 key = (a<<32)|b and stable-sort; this removes the
     // nondeterministic emit order so the output is byte-identical across runs.
     if (valid > 1u) {
-        phi::Buffer d_keys(valid * sizeof(uint64_t), phi::MemoryKind::Device);
+        OwnedBuffer d_keys(valid * sizeof(uint64_t));
         const uint32_t pack_blocks = (valid + kBlockSize - 1u) / kBlockSize;
         PackKeysKernel<<<pack_blocks, kBlockSize, 0, stream>>>(
-            static_cast<const collision::CollisionPair*>(d_pairs.Data()),
-            static_cast<uint64_t*>(d_keys.Data()),
+            static_cast<const collision::CollisionPair*>(d_pairs.Base()),
+            static_cast<uint64_t*>(d_keys.Base()),
             valid);
         CheckCuda(cudaGetLastError(), "PackKeysKernel launch");
         thrust::stable_sort_by_key(
             thrust::cuda::par.on(stream),
-            static_cast<uint64_t*>(d_keys.Data()),
-            static_cast<uint64_t*>(d_keys.Data()) + valid,
-            static_cast<collision::CollisionPair*>(d_pairs.Data()));
+            static_cast<uint64_t*>(d_keys.Base()),
+            static_cast<uint64_t*>(d_keys.Base()) + valid,
+            static_cast<collision::CollisionPair*>(d_pairs.Base()));
         CheckCuda(cudaGetLastError(), "stable_sort pairs");
         context.stream.Synchronize();
     }
 
     if (retain_nodes) {
         return LbvhBroadphaseResult(count, valid, pair_capacity,
-                                    std::move(d_pairs), std::move(d_nodes));
+                                    d_pairs.Release(), d_nodes.Release());
     }
-    return LbvhBroadphaseResult(count, valid, pair_capacity, std::move(d_pairs));
+    return LbvhBroadphaseResult(count, valid, pair_capacity, d_pairs.Release());
 }
 
 LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
