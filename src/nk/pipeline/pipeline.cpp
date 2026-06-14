@@ -330,6 +330,23 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_finalize_.n_soft_particles = n_soft;
         p_part_finalize_.particles_per_env = per_env_particles;
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
+
+        // M9 T11 Phase 2: the id-10 cross-system particle-particle contact co-step
+        // (the op-ified StepParticleParticleCoupling). Runs AFTER ParticleFinalize
+        // (incl. the fluid-slice polish), correcting the committed union positions
+        // (particle_pos) over the union grid CSR built this step. ONLY the SoftFluid
+        // mode emits real work; the single-system Xpbd/Pbf paths carry the op only
+        // as an inert no-op (mode-gated early-exit) so they stay byte-identical.
+        p_pp_contact_.contact_distance_d_min =
+            particle_mode == phi::kParticleModeSoftFluid ? mp.pp_contact_d_min : 0.0f;
+        p_pp_contact_.compliance_alpha = mp.pp_contact_compliance;
+        p_pp_contact_.solver_iterations =
+            mp.pp_contact_iters == 0u ? 1u : mp.pp_contact_iters;
+        p_pp_contact_.mode = particle_mode;
+        p_pp_contact_.particle_count = particle_count;
+        p_pp_contact_.n_soft_particles = n_soft;
+        p_pp_contact_.particles_per_env = per_env_particles;
+        add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
     }
 
     // ReadoutContactWrench: fused-family only in M4 (its kernel reads the

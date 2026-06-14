@@ -933,10 +933,12 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime_gpu
             nuka_runtime
             nuka_articulation_gpu
-            # M9 T11: the re-pointed XPBD shape-match / bend-cloth tests cook a
-            # scene -> nk::World -> Step on the nk particle ops (the legacy
-            # XpbdWorld stays alive this phase for the distance/volume tests).
+            # M9 T11: the re-pointed XPBD shape-match / bend-cloth / distance /
+            # volume + PBF + cross-system contact tests cook a scene -> nk::World ->
+            # Step on the nk particle ops (the legacy XpbdWorld/PbfWorld are deleted
+            # in Phase 2; the cook is the scene-cook layer).
             nuka_nk
+            nuka_scene_cook
             nuka_phi2
             nuka_phi
             nuka_core
