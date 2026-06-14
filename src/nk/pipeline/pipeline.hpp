@@ -84,6 +84,7 @@ private:
     phi::PbfDensityLambdaParams       p_pbf_density_{};
     phi::PbfApplyDeltaParams          p_pbf_apply_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
+    phi::ParticleParticleContactParams p_pp_contact_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
 };
 

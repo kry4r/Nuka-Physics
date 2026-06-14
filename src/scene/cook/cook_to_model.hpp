@@ -106,6 +106,18 @@ struct PbfCookInput {
 void CookPbfParticles(nk::Model& model, uint32_t env_count,
                       const PbfCookInput& in);
 
+// M9 T11 Phase 2 — id-10 cross-system contact params for the co-residence cook.
+// The class-blind unilateral non-penetration co-step over the FULL [soft | fluid]
+// union (op-ified runtime::coupling::StepParticleParticleCoupling). d_min ==
+// 2*contact_radius (uniform radius); <= 0 disables the op (the default). The cook
+// widens the union grid query_radius/cell_size to >= d_min so the neighbor list
+// covers every contact pair (the grid is built over the union by ParticleGridBuild).
+struct SoftFluidContactInput {
+    float    contact_d_min      = 0.0f;  // 2*contact_radius (<= 0 => no cross-contact)
+    float    compliance_alpha   = 0.0f;  // XPBD alpha (0 == rigid)
+    uint32_t solver_iterations  = 1u;    // Jacobi gather+apply sweeps (>= 1)
+};
+
 // M9 T11 two-system cook: stage BOTH a soft (XPBD) particle set AND a fluid (PBF)
 // particle set co-resident into ONE Model with a contiguous [soft | fluid] layout
 // (the soft particles occupy [0, n_soft), the fluid [n_soft, particles_per_env)).
@@ -115,8 +127,11 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
 // STRICT SUPERSET: a soft-only cook (fluid empty) is byte-identical to
 // CookXpbdParticles + the shape-match block; a fluid-only cook (soft empty,
 // n_soft 0) is byte-identical to CookPbfParticles. The two single-system cooks
-// remain the canonical paths; this is the co-residence composer.
+// remain the canonical paths; this is the co-residence composer. The optional
+// `contact` block enables the id-10 cross-system non-penetration co-step over the
+// union (default-off => Phase-1 behavior: the two slices co-step independently).
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
-                            const XpbdCookInput& soft, const PbfCookInput& fluid);
+                            const XpbdCookInput& soft, const PbfCookInput& fluid,
+                            const SoftFluidContactInput& contact = {});
 
 } // namespace nuka::scene::cook

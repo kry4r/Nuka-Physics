@@ -297,6 +297,16 @@ public:
         // Boundary floor (z-up; the M5 grid + particle ops are z-up).
         bool  boundary_enabled = false;
         float floor_z = 0.0f;
+        // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
+        // (the op-ified runtime::coupling::StepParticleParticleCoupling). The
+        // class-blind unilateral non-penetration co-step runs AFTER finalize over
+        // the FULL [soft | fluid] union; ONLY the SoftFluid mode emits it. d_min
+        // == 2*contact_radius (uniform radius); <= 0 disables the op. The grid
+        // neighbor list (built over query_radius) must cover d_min, so the cook
+        // sets query_radius/cell_size >= d_min for a SoftFluid scene.
+        float    pp_contact_d_min      = 0.0f;   // 2*contact_radius (0 => off)
+        float    pp_contact_compliance = 0.0f;   // XPBD alpha (0 => rigid)
+        uint32_t pp_contact_iters      = 1u;     // Jacobi gather+apply sweeps
     };
     ModelParticles particles;
 

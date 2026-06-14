@@ -622,8 +622,13 @@ __global__ void PbfFinalizeKernel(uint32_t particle_count,
     positions[i] = pp;
 }
 
-// XSPH viscosity compute (read-only into the delta scratch). Verbatim.
+// XSPH viscosity compute (read-only into the delta scratch). Verbatim, plus the
+// M9 T11 SoftFluid fluid-slice scope (a soft owner gets no XSPH delta; a soft
+// neighbor is skipped in the sum). Single-system PBF passes n_soft == 0 so
+// SfIsSoft is always false -> BYTE-IDENTICAL to the legacy XSPH.
 __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
+                                   uint32_t n_soft,
+                                   uint32_t per_env,
                                    const math::Vec3* __restrict__ positions,
                                    const math::Vec3* __restrict__ velocities,
                                    const float* __restrict__ density,
@@ -637,6 +642,10 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
     if (i >= particle_count) {
         return;
     }
+    if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
+        out_dv[i] = math::Vec3{0.0f, 0.0f, 0.0f};  // SoftFluid: no fluid XSPH delta.
+        return;
+    }
     const math::Vec3 pi = positions[i];
     const math::Vec3 vi = velocities[i];
     const uint32_t base = i * kNeighborStride;
@@ -644,6 +653,9 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
     math::Vec3 acc{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (n_soft > 0u && SfIsSoft(j, n_soft, per_env)) {
+            continue;  // SoftFluid: skip soft neighbors in the fluid XSPH sum.
+        }
         const math::Vec3 r = Sub(pi, positions[j]);
         const float r2 = Dot(r, r);
         const float w = fl::Poly6FromR2(r2, coeffs);
@@ -660,7 +672,8 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
     out_dv[i] = math::Vec3{acc.x * c, acc.y * c, acc.z * c};
 }
 
-// XSPH viscosity apply (own-index). Verbatim.
+// XSPH viscosity apply (own-index). Verbatim. A SoftFluid soft owner had its
+// out_dv zeroed in the compute pass, so the own-index add is a no-op for it.
 __global__ void PbfApplyVelocityDeltaKernel(uint32_t particle_count,
                                             math::Vec3* __restrict__ velocities,
                                             const math::Vec3* __restrict__ dv) {
@@ -673,8 +686,12 @@ __global__ void PbfApplyVelocityDeltaKernel(uint32_t particle_count,
     velocities[i] = math::Vec3{v.x + d.x, v.y + d.y, v.z + d.z};
 }
 
-// cohesion velocity nudge (Akinci cohesion only). Verbatim.
+// cohesion velocity nudge (Akinci cohesion only). Verbatim, plus the M9 T11
+// SoftFluid fluid-slice scope (a soft owner gets no cohesion nudge; a soft
+// neighbor is skipped). Single-system PBF (n_soft == 0) is BYTE-IDENTICAL.
 __global__ void PbfCohesionKernel(uint32_t particle_count,
+                                  uint32_t n_soft,
+                                  uint32_t per_env,
                                   const math::Vec3* __restrict__ positions,
                                   math::Vec3* __restrict__ velocities,
                                   float particle_mass,
@@ -687,12 +704,18 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
     if (i >= particle_count) {
         return;
     }
+    if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
+        return;  // SoftFluid: a soft owner is not nudged by fluid cohesion.
+    }
     const math::Vec3 pi = positions[i];
     const uint32_t base = i * kNeighborStride;
     const uint32_t n = neighbor_counts[i];
     math::Vec3 force{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (n_soft > 0u && SfIsSoft(j, n_soft, per_env)) {
+            continue;  // SoftFluid: skip soft neighbors in the fluid cohesion sum.
+        }
         const math::Vec3 r = Sub(pi, positions[j]);
         const float dist = sqrtf(Dot(r, r));
         if (dist <= 0.0f) {
@@ -884,6 +907,91 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
 }
 
 // =============================================================================
+// id-10 CROSS-SYSTEM particle-particle CONTACT (M9 T11 Phase 2). VERBATIM port of
+// runtime/coupling/particle_particle_contact.cu ComputeHalfCorrectionKernel +
+// ApplyCorrectionKernel onto the nk arena. The CLASS-BLIND unilateral
+// non-penetration row does NOT branch on soft/fluid (SfIsSoft is unused here): the
+// math is identical for soft<->soft, fluid<->fluid, soft<->fluid. The ONLY change
+// from the legacy is the neighbor read: the M5 arena grid writes a PRIVATE
+// per-particle slice (neighbor_idx[i*32 + k], count[i]) instead of the legacy flat
+// CSR (neighbor_offsets[i] + k); the k-loop order (ascending neighbor index) is
+// identical so the fixed-order __fadd_rn reduction is D1-unchanged. The grid is
+// built over the FULL union by ParticleGridBuild (already arena-resident); no
+// second grid is assembled. inv_mass is the union particle_inv_mass (the cook
+// seeds the fluid slice = 1/particle_mass exactly as the legacy FillPbfInvMass).
+// =============================================================================
+
+// pass A: compute each union particle's HALF correction (Jacobi gather, read-only
+// on positions). One thread per union particle i; for every penetrating neighbor j
+// accumulate i's own half of the mass-weighted symmetric projection. VERBATIM body
+// from the legacy kernel; base = i*kNeighborStride is the only indexing change.
+__global__ void PpContactHalfCorrectionKernel(
+    uint32_t union_count,
+    const math::Vec3* __restrict__ positions,
+    const float* __restrict__ inv_mass,
+    float d_min,
+    float alpha_tilde,
+    const uint32_t* __restrict__ neighbor_counts,
+    const uint32_t* __restrict__ neighbor_indices,
+    math::Vec3* __restrict__ out_delta) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= union_count) {
+        return;
+    }
+    const math::Vec3 pi = positions[i];
+    const float wi = inv_mass[i];
+    const uint32_t base = i * kNeighborStride;
+    const uint32_t n = neighbor_counts[i];
+
+    float dx = 0.0f;
+    float dy = 0.0f;
+    float dz = 0.0f;
+    for (uint32_t k = 0u; k < n; ++k) {
+        const uint32_t j = neighbor_indices[base + k];
+        const math::Vec3 r = Sub(pi, positions[j]);  // p_i - p_j
+        const float dist = sqrtf(Dot(r, r));
+        if (dist <= 0.0f) {
+            continue;  // coincident: no contact normal (degenerate; skip).
+        }
+        const float c = dist - d_min;
+        if (c >= 0.0f) {
+            continue;  // separating: unilateral contact is inactive.
+        }
+        const float wj = inv_mass[j];
+        const float wsum = wi + wj + alpha_tilde;
+        if (wsum <= 0.0f) {
+            continue;  // both pinned (w_i = w_j = 0, a~ = 0): no correction.
+        }
+        const float dl = (-c) / wsum;          // XPBD multiplier (lambda warm 0).
+        const float inv_dist = 1.0f / dist;    // n = r/dist; fold into the scale.
+        const float scale = wi * dl * inv_dist;  // i's half: + w_i * n * dl.
+        dx = __fadd_rn(dx, r.x * scale);
+        dy = __fadd_rn(dy, r.y * scale);
+        dz = __fadd_rn(dz, r.z * scale);
+    }
+    out_delta[i] = math::Vec3{dx, dy, dz};
+}
+
+// pass B: apply the accumulated half corrections (own-index write -> race-free, no
+// atomics, D1). INERT byte-identity: when the gathered delta is exactly zero (no
+// in-range penetrating pair) the position is left UNTOUCHED (so a SoftFluid scene
+// with no cross pairs is byte-identical to running the two subsystems alone).
+__global__ void PpContactApplyKernel(uint32_t union_count,
+                                     math::Vec3* __restrict__ positions,
+                                     const math::Vec3* __restrict__ delta) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= union_count) {
+        return;
+    }
+    const math::Vec3 d = delta[i];
+    if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f) {
+        return;  // no correction: leave the position bit-untouched (inert path).
+    }
+    const math::Vec3 p = positions[i];
+    positions[i] = math::Vec3{p.x + d.x, p.y + d.y, p.z + d.z};
+}
+
+// =============================================================================
 // op entry points
 // =============================================================================
 
@@ -1051,29 +1159,50 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     }
     if (p->mode == kParticleModeSoftFluid) {
         // SoftFluid finalize: soft slice => XPBD correct (v from particle_pos);
-        // fluid slice => PBF finalize (v from pbf_predicted_pos, commit). The
-        // post-finalize polish (XSPH/cohesion) reuses THIS step's neighbor grid;
-        // it would also nudge soft velocities, so the SoftFluid polish is
-        // DEFERRED to Phase 2 (it must be fluid-slice-scoped alongside the id-10
-        // co-step). Phase 1 SoftFluid runs the un-polished fluid (gamma/visc 0).
+        // fluid slice => PBF finalize (v from pbf_predicted_pos, commit). Then the
+        // post-finalize polish (XSPH/cohesion), FLUID-SLICE-SCOPED via n_soft so it
+        // never nudges a soft velocity (the soft slice is left exactly as the XPBD
+        // correct set it). The polish reuses THIS step's neighbor grid + the
+        // position-delta scratch, the same as the single-system PBF path below.
         LaunchCuda(SoftFluidFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
                    data.particle_prev_pos, data.pbf_predicted_pos, data.particle_vel,
                    data.particle_inv_mass, p->dt);
+        if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
+            const fl::PbfKernelCoeffs coeffs =
+                fl::MakePbfKernelCoeffs(p->support_radius);
+            LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                       N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
+                       data.particle_vel, data.pbf_density, p->particle_mass,
+                       p->xsph_viscosity_c, coeffs, data.grid_neighbor_count,
+                       data.grid_neighbor_idx, data.pbf_position_delta);
+            LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize),
+                       0u, stream, N, data.particle_vel, data.pbf_position_delta);
+        }
+        if (p->surface_tension_gamma > 0.0f && p->support_radius > 0.0f) {
+            const fl::PbfCohesionCoeffs ccoeffs =
+                fl::MakePbfCohesionCoeffs(p->support_radius);
+            LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                       N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
+                       data.particle_vel, p->particle_mass, p->surface_tension_gamma,
+                       p->dt, ccoeffs, data.grid_neighbor_count,
+                       data.grid_neighbor_idx);
+        }
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
     // PBF: finalize v from the corrected predicted positions + commit, then the
     // gated post-finalize polish (XSPH viscosity / Akinci cohesion) — exactly the
     // legacy StepPbfWorld order. The polish reuses THIS step's neighbor grid (the
     // M5 arena CSR, still live) and the position-delta scratch (free post-finalize).
+    // n_soft == 0 here (single-system) so the fluid-slice guards are inert.
     LaunchCuda(PbfFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                N, data.particle_pos, data.pbf_predicted_pos, data.particle_vel,
                data.particle_inv_mass, 1.0f / p->dt);
     if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
         const fl::PbfKernelCoeffs coeffs = fl::MakePbfKernelCoeffs(p->support_radius);
         LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.particle_pos, data.particle_vel, data.pbf_density,
-                   p->particle_mass, p->xsph_viscosity_c, coeffs,
+                   N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
+                   data.pbf_density, p->particle_mass, p->xsph_viscosity_c, coeffs,
                    data.grid_neighbor_count, data.grid_neighbor_idx,
                    data.pbf_position_delta);
         LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u,
@@ -1083,9 +1212,48 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         const fl::PbfCohesionCoeffs ccoeffs =
             fl::MakePbfCohesionCoeffs(p->support_radius);
         LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.particle_pos, data.particle_vel, p->particle_mass,
-                   p->surface_tension_gamma, p->dt, ccoeffs,
+                   N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
+                   p->particle_mass, p->surface_tension_gamma, p->dt, ccoeffs,
                    data.grid_neighbor_count, data.grid_neighbor_idx);
+    }
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+}
+
+// OpParticleParticleContact (M9 T11 Phase 2): the id-10 cross-system contact
+// co-step. Runs AFTER ParticleFinalize (incl. the fluid-slice polish), operating
+// on the committed union positions (particle_pos). Only SoftFluid carries this op;
+// the single-system Xpbd/Pbf paths never emit it (byte-identity preserved). The
+// Jacobi double-buffer (gather into pbf_position_delta, then own-index apply) is
+// re-launched solver_iterations times over the SAME union grid -- exactly the
+// legacy inner loop. No host grid is built: the union grid CSR is already
+// arena-resident (ParticleGridBuild ran this step over the full union). When no
+// pair is within d_min the gathered delta is zero and the apply leaves positions
+// untouched (inert byte-identity).
+Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& data,
+                                 const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ParticleParticleContactParams*>(params);
+    if (p == nullptr) return Status::Failed;
+    // Emitted only for SoftFluid; inert for a zero/negative d_min or no particles.
+    if (p->mode != kParticleModeSoftFluid || p->particle_count == 0u ||
+        p->contact_distance_d_min <= 0.0f) {
+        return Status::Ok;
+    }
+    const uint32_t N = p->particle_count;
+    const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
+    const uint32_t iters = p->solver_iterations == 0u ? 1u : p->solver_iterations;
+    const float alpha_tilde = p->compliance_alpha;  // a~ at dt=1 (position-based).
+    for (uint32_t it = 0u; it < iters; ++it) {
+        // JACOBI: gather every half from the SAME pre-correction positions (pass A,
+        // read-only on particle_pos), THEN apply own-index (pass B). The launch
+        // boundary is the barrier that makes this race-free + D1. The half-
+        // correction scratch reuses pbf_position_delta (free post-finalize; the
+        // XSPH polish that also uses it already ran + applied in OpParticleFinalize).
+        LaunchCuda(PpContactHalfCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
+                   stream, N, data.particle_pos, data.particle_inv_mass,
+                   p->contact_distance_d_min, alpha_tilde, data.grid_neighbor_count,
+                   data.grid_neighbor_idx, data.pbf_position_delta);
+        LaunchCuda(PpContactApplyKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   N, data.particle_pos, data.pbf_position_delta);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1098,6 +1266,7 @@ void RegisterNkParticleOps() {
     SetCudaOp(NkOp::PbfDensityLambda, &OpPbfDensityLambda);
     SetCudaOp(NkOp::PbfApplyDelta, &OpPbfApplyDelta);
     SetCudaOp(NkOp::ParticleFinalize, &OpParticleFinalize);
+    SetCudaOp(NkOp::ParticleParticleContact, &OpParticleParticleContact);
 }
 
 }  // namespace nuka::phi

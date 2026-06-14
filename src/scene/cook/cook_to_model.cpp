@@ -819,7 +819,8 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
 // ---------------------------------------------------------------------------
 
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
-                            const XpbdCookInput& soft, const PbfCookInput& fluid) {
+                            const XpbdCookInput& soft, const PbfCookInput& fluid,
+                            const SoftFluidContactInput& contact) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
@@ -827,7 +828,9 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
     // byte-identical to the single-system cook (so the existing single-system
     // gates and goldens are unaffected). Only when BOTH sides are present do we
-    // build the [soft | fluid] composite + set the SoftFluid mode.
+    // build the [soft | fluid] composite + set the SoftFluid mode. The cross-system
+    // contact is a SoftFluid-only feature (it needs both slices), so a single-
+    // system fast path never carries it.
     const uint32_t n_soft = static_cast<uint32_t>(soft.positions.size());
     const uint32_t n_fluid = static_cast<uint32_t>(fluid.positions.size());
     if (n_fluid == 0u) {
@@ -880,7 +883,21 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     mp.boundary_enabled = fluid.boundary_enabled;
     mp.floor_z = fluid.floor_z;
 
-    // 4) The co-residence schema: mode + split index + the new total particle
+    // 4) id-10 cross-system contact (M9 T11 Phase 2): the class-blind unilateral
+    //    non-penetration co-step over the FULL union. The neighbor grid is built
+    //    over query_radius, so it must cover d_min for the contact pass to see
+    //    every penetrating pair; widen the grid cell/query radius to >= d_min when
+    //    contact is enabled (a no-op when d_min <= the fluid support radius).
+    mp.pp_contact_d_min      = contact.contact_d_min;
+    mp.pp_contact_compliance = contact.compliance_alpha;
+    mp.pp_contact_iters = contact.solver_iterations == 0u ? 1u
+                                                          : contact.solver_iterations;
+    if (mp.pp_contact_d_min > 0.0f && mp.pp_contact_d_min > mp.query_radius) {
+        mp.cell_size    = mp.pp_contact_d_min;
+        mp.query_radius = mp.pp_contact_d_min;
+    }
+
+    // 5) The co-residence schema: mode + split index + the new total particle
     //    count. The grid is sized over the FULL union per-env (the soft particles
     //    occupy grid cells too, but the fluid density solve skips them via n_soft).
     mp.mode = nk::Model::ParticleMode::SoftFluid;

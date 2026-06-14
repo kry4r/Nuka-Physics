@@ -7,8 +7,10 @@
 // op-specific parameter block that travels with an OpCall (phi/backend.hpp).
 //
 // CONTRACT (M1, frozen plan spec):
-//   * NkOp has exactly 29 named ops + a trailing `Count` sentinel. (M9 T7
-//     appended StepBackward, the diffsim contact-free single-step adjoint.)
+//   * NkOp has exactly 30 named ops + a trailing `Count` sentinel. (M9 T7
+//     appended StepBackward, the diffsim contact-free single-step adjoint; M9
+//     T11 Phase 2 appended ParticleParticleContact, the id-10 cross-system
+//     particle-particle non-penetration co-step.)
 //   * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
 //     spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
 //     carry a minimal plausible field set where obvious, or a reserved POD
@@ -72,6 +74,9 @@ enum class NkOp : uint16_t {
 
     // --- differentiable rollout (M9 T7) ---------------------------------
     StepBackward,          // diffsim contact-free single-step reverse adjoint
+
+    // --- cross-system particle contact (M9 T11 Phase 2) -----------------
+    ParticleParticleContact, // id-10 class-blind unilateral non-penetration co-step
 
     Count                  // sentinel: number of ops (NOT an op)
 };
@@ -404,6 +409,33 @@ struct ParticleFinalizeParams {
     // M9 T11 SoftFluid: the per-env [soft | fluid] split + per-env stride. The
     // SoftFluid finalize branches per-particle (soft => XPBD correct; fluid =>
     // PBF finalize). The polish passes are scoped to the fluid slice. 0 == single.
+    uint32_t n_soft_particles;
+    uint32_t particles_per_env;
+};
+
+// M9 T11 Phase 2 — id-10 cross-system particle-particle CONTACT (the op-ified
+// legacy runtime::coupling::StepParticleParticleCoupling). A class-blind
+// unilateral non-penetration row over the FULL [soft | fluid] union (the row math
+// does NOT branch on soft vs fluid). Mirrors ParticleParticleContactParams 1:1
+// (contact_distance_d_min / compliance_alpha / solver_iterations) + the particle
+// launch geometry. Emitted ONLY in kParticleModeSoftFluid (the single-system Xpbd/
+// Pbf paths never carry this op, so they stay byte-identical). Reads particle_pos
+// (the committed union positions post-finalize) + particle_inv_mass + the union
+// grid CSR; writes a per-particle Jacobi half-correction into pbf_position_delta
+// (free at the post-finalize slot) then applies it own-index (no float atomics).
+struct ParticleParticleContactParams {
+    // Minimum contact distance d_min == 2*contact_radius (uniform-radius). A pair
+    // (i,j) penetrates iff |p_i - p_j| < d_min. <= 0 => the op is inert.
+    float    contact_distance_d_min;
+    // XPBD compliance alpha (1/stiffness); 0 == rigid (the full -C correction).
+    // The position-based co-step uses alpha_tilde = compliance_alpha (dt folded 1).
+    float    compliance_alpha;
+    uint32_t solver_iterations; // full Jacobi gather+apply sweeps per call (>=1).
+    uint32_t mode;              // kParticleMode* (only SoftFluid runs the op).
+    uint32_t particle_count;    // total env-major union particles.
+    // The per-env [soft | fluid] split + stride; the contact row is class-blind so
+    // these are carried only for symmetry with the other particle ops + future
+    // per-env scoping. The id-10 math reads the FULL union (no soft/fluid branch).
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
 };
