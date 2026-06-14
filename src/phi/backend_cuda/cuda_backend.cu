@@ -369,6 +369,23 @@ cudaStream_t CudaBackendMainStream(CudaBackend* b) {
 }
 
 // ---------------------------------------------------------------------------
+// Backend-bound buffer-type accessors (declared in phi/backend.hpp). These hand
+// out the backend's own device_bt / host_bt, whose vtables resolve the async
+// stream to backend->main (cuda_buffer.cu). The buffer-sweep consumers that run
+// their ops on backend->main allocate from these (vs DeviceBufferType(device),
+// the stream-0 default type). CUDA-free at the call site (BufferType* is opaque).
+// ---------------------------------------------------------------------------
+BufferType* BackendDeviceBufferType(Backend* b) {
+    if (b == nullptr) { return nullptr; }
+    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->device_bt);
+}
+
+BufferType* BackendHostBufferType(Backend* b) {
+    if (b == nullptr) { return nullptr; }
+    return reinterpret_cast<BufferType*>(&reinterpret_cast<CudaBackend*>(b)->host_bt);
+}
+
+// ---------------------------------------------------------------------------
 // Explicit registration entry point (the static-lib self-registration de-risk).
 // Called from registry.cpp::InitBestDevice() under NUKA_PHI2_WITH_CUDA so the
 // linker never drops this TU. Idempotent.
