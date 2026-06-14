@@ -135,6 +135,13 @@ add_library(nuka_render STATIC
     render/rt_adapter.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
+    # M11 INT-4 (OD-2): the OPT-IN, default-OFF exportable per-instance transform
+    # SSBO (VK_KHR_external_memory_fd + OPAQUE_FD export) for the CUDA<->Vulkan
+    # zero-copy render path. Pure C++/Vulkan, ZERO CUDA token (src/render red-line);
+    # the CUDA importer reaches the exported fd only through the CUDA-free
+    # phi::ExternalMemoryDesc seam. Inert (Supported()==false) on an ICD without
+    # external-memory-fd (lavapipe) so every D1 offscreen gate stays byte-identical.
+    render/raster/interop_transform_ssbo.cpp
 )
 
 find_program(GLSLC_EXECUTABLE glslc HINTS "$ENV{VULKAN_SDK}/Bin")
@@ -174,10 +181,25 @@ add_custom_command(
     VERBATIM
 )
 
+# M11 INT-5 (OD-2): the INSTANCED vertex-shader variant (reads the per-instance
+# model matrix from the device-local interop SSBO by gl_InstanceIndex). The DEFAULT
+# mesh.vert per-draw pipeline (the D1 oracle path) is unchanged; this is the
+# opt-in, interop-only 2nd pipeline variant.
+set(NUKA_RASTER_MESH_INSTANCED_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/mesh_instanced.vert")
+set(NUKA_RASTER_MESH_INSTANCED_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_instanced.vert.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_MESH_INSTANCED_VERT}" -o "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
+    DEPENDS "${NUKA_RASTER_MESH_INSTANCED_VERT}"
+    VERBATIM
+)
+
 add_custom_target(nuka_render_shaders DEPENDS
     "${NUKA_DEBUG_DRAW_SPV}"
     "${NUKA_RASTER_MESH_VERT_SPV}"
     "${NUKA_RASTER_MESH_FRAG_SPV}"
+    "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
 )
 add_dependencies(nuka_render nuka_render_shaders)
 target_compile_definitions(nuka_render
@@ -185,6 +207,7 @@ target_compile_definitions(nuka_render
         NUKA_VULKAN_DEBUG_DRAW_SPV="${NUKA_DEBUG_DRAW_SPV}"
         NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
         NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
+        NUKA_RASTER_MESH_INSTANCED_VERT_SPV="${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
 )
 
 target_include_directories(nuka_render
@@ -715,6 +738,15 @@ if(CMAKE_CUDA_COMPILER)
         runtime/app/pose_publisher.cpp
         runtime/app/systems.cpp
         runtime/app/simulation.cpp
+        # M11 INT-6 (OD-2): the zero-copy CUDA<->Vulkan interop publisher (app
+        # layer, ZERO CUDA token -- it includes ONLY the CUDA-free
+        # phi::InteropScatterI seam). The device scatter + cudaImportExternalMemory
+        # live in nuka_phi2_interop (linked by the viewer exe).
+        runtime/app/cuda_vulkan_interop.cpp
+        # M11 INT-1: the WEAK fallback for the interop-scatter factory, so nuka_app
+        # links STANDALONE (returns "no interop") when nuka_phi2_interop is not
+        # linked. The strong symbol in the CUDA lib wins when it is.
+        runtime/app/interop_scatter_fallback.cpp
     )
     set_target_properties(nuka_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -789,6 +821,12 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_render
                 nuka_nk
                 nuka_phi2
+                # M11 INT-8: the CUDA interop scatter (strong CreateCudaVkScatter,
+                # wins over nuka_app's weak fallback). Listed BEFORE nuka_app via the
+                # link order so the strong symbol resolves; with whole-archive-free
+                # static linking the strong def is pulled because viewer_main
+                # references CreateCudaVkScatter.
+                nuka_phi2_interop
                 nuka_runtime
                 nuka_import
                 nuka_cooker
@@ -991,6 +1029,44 @@ if(CMAKE_CUDA_COMPILER)
             nuka_phi2
             CUDA::cudart
     )
+
+    # -----------------------------------------------------------------------
+    # nuka_phi2_interop (M11 §3.E INT-2/INT-7) -- the CUDA<->Vulkan interop slice
+    # of the CUDA backend: the device transform-scatter kernel +
+    # cudaImportExternalMemory + external semaphores. The ONLY place the interop
+    # CUDA tokens live. Implements the CUDA-FREE phi::InteropScatterI and provides
+    # the STRONG CreateCudaVkScatter / CudaVkScatterAvailable that win over the
+    # app-layer weak fallback when this lib is linked (the windowed viewer exe).
+    #
+    # --fmad=false: the scatter composes world_xform = fk * cached_visual_local +
+    # lowers it to a column-major mat4 with arithmetic intended to match the host
+    # composition (HostDownloadPublisher + the renderer's TransformToMatrix); FMA
+    # contraction off keeps the device add/mul faithful (R14). NOT in any golden;
+    # this is a build-link deliverable (real zero-copy is owner-verified on a
+    # display+NVIDIA box -- a CUDA-GPU cannot share memory with lavapipe/CPU).
+    #
+    # GATED behind NK_BUILD_VULKAN_VALIDATION: the interop path is a viewer-only
+    # optimization; the default build-cuda128 never builds it (the app/render libs
+    # link standalone via the weak fallback).
+    # -----------------------------------------------------------------------
+    if(NK_BUILD_VULKAN_VALIDATION)
+        add_library(nuka_phi2_interop STATIC
+            phi/backend_cuda/interop/cuda_vk_scatter.cu
+        )
+        set_target_properties(nuka_phi2_interop PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(nuka_phi2_interop PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        )
+        target_include_directories(nuka_phi2_interop
+            PUBLIC
+                ${CMAKE_SOURCE_DIR}/src
+        )
+        target_link_libraries(nuka_phi2_interop
+            PUBLIC
+                nuka_phi2
+                CUDA::cudart
+        )
+    endif()
 
     # M9 T11-core-b2: nuka_row_solver_gpu (row_scheduler.cu / row_solver.cu) and
     # the nuka_solver CUDA define/link it fed are GONE -- the legacy GPU row solve

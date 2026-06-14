@@ -36,7 +36,7 @@ bool Simulation::Frame() {
         // 3a. TransformSync: publish the selected env's FK poses into the
         //     RenderWorld as downloaded_pose ∘ cached_visual_local (G1). This is
         //     where the (host-download) D2H copy lives -- reached ONLY here.
-        transform_sync_system_.Run(publisher_, world_, env_index_, render_world_);
+        transform_sync_system_.Run(*publisher_, world_, env_index_, render_world_);
 
         // 3b. Render: raster the RenderWorld; keep the latest report for the
         //     recorder / gate to grab. No-op (returns false) if no renderer is
