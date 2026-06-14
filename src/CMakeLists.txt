@@ -516,11 +516,15 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
+    # BUF-13 (M11): the legacy RAII Buffer impl (phi/backend_cuda/buffer.cu) + its
+    # two host headers were DELETED -- the last consumers (sdf/rt/sensor/
+    # invariants_gpu/test_capabilities) migrated to the opaque phi-v2 Buffer*
+    # (nuka_phi2). nuka_phi survives carrying DeviceContext / OwnedStream / Device /
+    # platform-contract (still consumed widely until BUF-14).
     add_library(nuka_phi STATIC
         phi/device_context.cpp
         phi/platform_contract.cpp
         phi/backend_cuda/device.cu
-        phi/backend_cuda/buffer.cu
         phi/backend_cuda/owned_stream.cu
     )
     set_target_properties(nuka_phi PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -826,10 +830,11 @@ if(CMAKE_CUDA_COMPILER)
         # carve) + the uniform mass = rest_density*spacing^3. Now depends only on the
         # CUDA-free import/cooker/fluid_cooker_types.hpp PODs.
         import/cooker/fluid_cooker.cpp
-        # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
-        # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
-        # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
-        runtime/sdf/sdf_device_world.cu
+        # COL-5 (M11): runtime/sdf/sdf_device_world.cu DELETED. Its sole duty (upload
+        # a cooked scene::CookedSdfTable to the device) now lives in nk::Model
+        # (model.hpp sdf_cell_* + cook_to_model.cpp + narrowphase_sdf.cu LoadSdfGrid);
+        # the cooked-table->device round-trip + cell-count coverage folded into the
+        # SDF precision oracle (tests/collision/test_gjk_epa_convex.cpp).
     )
     set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -843,9 +848,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_solver
             nuka_phi
-            # phi v2: collision/gpu/broadphase.cu (the SAP oracle) now allocates via
-            # the opaque phi-v2 Buffer* (stream-0). The sibling sdf_device_world.cu TU
-            # still uses buffer_legacy (its own dispatch) -- distinct TUs, no clash.
+            # phi v2: collision/gpu/broadphase.cu (the SAP oracle) allocates via the
+            # opaque phi-v2 Buffer* (stream-0). All nuka_runtime_gpu TUs are on phi-v2.
             nuka_phi2
             # nuka_collision_gpu: retained for the SAP broadphase oracle + the
             # candidate-pair / particle-grid primitives surviving consumers link
@@ -919,9 +923,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_constraint
             nuka_phi
             # phi v2: broadphase_lbvh / particle_uniform_grid / cross_system_query /
-            # candidate_pair / rigid+particle candidate pairs now allocate via the
-            # opaque phi-v2 Buffer* (stream-0 DeviceBufferType). buffer_legacy stays
-            # available for the sibling TUs (sdf_contact*) until their dispatch.
+            # candidate_pair / rigid+particle candidate pairs allocate via the opaque
+            # phi-v2 Buffer* (stream-0 DeviceBufferType). All TUs are on phi-v2.
             nuka_phi2
             CUDA::cudart
     )
@@ -964,7 +967,11 @@ if(CMAKE_CUDA_COMPILER)
         PUBLIC
             nuka_collision
             nuka_collision_gpu
+            # RT-7 (M11): the rt/*.cu device buffers are phi-v2 opaque Buffer*
+            # (stream-0); nuka_phi2 supplies BufferAlloc/InitBestDevice/cuda_buffer.
+            # nuka_phi stays for MakeDefaultDeviceContext / OwnedStream (BUF-14).
             nuka_phi
+            nuka_phi2
             CUDA::cudart
     )
 

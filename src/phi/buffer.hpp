@@ -2,15 +2,14 @@
 // ---------------------------------------------------------------------------
 // PHI v2 — buffer interface (ggml_backend_buffer analogue).
 //
-// This is the v2 REWRITE of phi/buffer.hpp. The legacy RAII Buffer/BufferView
-// (consumed by all current production paths) was renamed to
-// phi/buffer_legacy.hpp and is untouched until M9. The v2 contract here is a
-// pure-vtable, opaque-handle design: `BufferType` is the allocator factory
-// (one per backend memory class — device / pinned-host), `Buffer` is an
-// allocation. Both are OPAQUE structs whose real definitions live in the
-// backend implementation (phi/backend_cuda/cuda_buffer.cu); each carries its
-// vtable pointer as its first member so the free-function wrappers below can
-// dispatch without seeing the backend's CUDA types.
+// The ONE buffer interface (the legacy RAII Buffer/BufferView was deleted in the
+// M11 BUF sweep; this is the sole survivor). The v2 contract here is a pure-vtable,
+// opaque-handle design: `BufferType` is the allocator factory (one per backend
+// memory class — device / pinned-host), `Buffer` is an allocation. Both are OPAQUE
+// structs whose real definitions live in the backend implementation
+// (phi/backend_cuda/cuda_buffer.cu); each carries its vtable pointer as its first
+// member so the free-function wrappers below can dispatch without seeing the
+// backend's CUDA types.
 //
 // PURE C++ — zero CUDA types. No STL in the public surface.
 // ---------------------------------------------------------------------------

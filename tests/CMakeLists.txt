@@ -715,6 +715,10 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_phi_test
         PRIVATE
             nuka_phi
+            # BUF-13: test_capabilities's buffer tests are now the phi-v2 surface
+            # (BufferAlloc/InitBestDevice); nuka_phi2 supplies them. nuka_phi stays
+            # for Capabilities/Device/OwnedStream (BUF-14).
+            nuka_phi2
             GTest::gtest_main
     )
 
@@ -1079,33 +1083,12 @@ if(CMAKE_CUDA_COMPILER)
         PROPERTIES LABELS "full")
 
     # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
-    # Cooks known meshes' narrow-band SDFs on the host (p07), uploads via
-    # SdfDeviceWorld, launches the shipping p07 sampler kernel through the
-    # uploaded device SparseSdfDevice views, and asserts GPU == host sampler
-    # (near-equal; out-of-band sentinel exact) + D1 two-run byte-identical.
-    # The test holds a __global__, so it is a .cu (CUDA language). Needs both
-    # the repo root (tests/import/sdf_*.hpp) and src on the include path.
-    add_executable(nuka_sdf_device_test
-        runtime/test_sdf_device_upload.cu
-    )
-
-    target_include_directories(nuka_sdf_device_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_sdf_device_test
-        PRIVATE
-            nuka_runtime_gpu
-            nuka_cooker
-            nuka_scene
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_sdf_device_test
-        PROPERTIES LABELS "full")
+    # COL-5 (M11): nuka_sdf_device_test (runtime/test_sdf_device_upload.cu) DELETED
+    # with SdfDeviceWorld. The cooked-table->device round-trip + cell-count coverage
+    # it provided is folded into the SDF precision oracle
+    # (SdfPrecisionOracle.CookedTableDeviceRoundTripAndCellCount in
+    # collision/test_gjk_epa_convex.cpp); device SDF sampling is covered by the rest
+    # of that oracle (NarrowphaseSdf op over uploaded cell tables).
 
     # --- v0.8 C4a: MuJoCo _efc_row solref/solimp compliance port -----------
     # Tests src/constraint/solref_solimp.hpp (header-only HD). Two regimes:
@@ -1146,7 +1129,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime_gpu
             nuka_runtime
             nuka_phi
-            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
+            nuka_phi2  # phi-v2 buffer (collision broadphase on the phi-v2 Buffer*)
             GTest::gtest_main
     )
 
@@ -1167,7 +1150,7 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_collision_gpu
             nuka_phi
-            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
+            nuka_phi2  # phi-v2 buffer (collision broadphase on the phi-v2 Buffer*)
             GTest::gtest_main
     )
 
@@ -1218,7 +1201,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             nuka_scene
             nuka_phi
-            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
+            nuka_phi2  # phi-v2 buffer (collision broadphase on the phi-v2 Buffer*)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_lbvh_filtered_pairs_test
@@ -1248,7 +1231,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             nuka_scene
             nuka_phi
-            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
+            nuka_phi2  # phi-v2 buffer (collision broadphase on the phi-v2 Buffer*)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_link_rigid_candidate_pairs_test
@@ -1400,7 +1383,7 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_collision_gpu
             nuka_phi
-            nuka_phi2  # phi-v2 buffer (collision broadphase migrated off buffer_legacy)
+            nuka_phi2  # phi-v2 buffer (collision broadphase on the phi-v2 Buffer*)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_cross_system_matrix_test
@@ -2012,7 +1995,11 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_sensor_noise_test
         PRIVATE
             nuka_sensor_noise
+            # BUF-13: the n1 noise tests' device buffers are phi-v2 (stream-0);
+            # nuka_phi2 supplies BufferAlloc/InitBestDevice. nuka_phi stays for the
+            # DeviceContext used by the noise launchers (BUF-14).
             nuka_phi
+            nuka_phi2
             CUDA::cudart
             GTest::gtest_main
     )

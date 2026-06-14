@@ -6,7 +6,8 @@
 
 #include "phi/capabilities.hpp"
 #include "phi/device.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType (v2)
+#include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload (v2)
 #include "phi/owned_stream.hpp"
 
 #include <cstring>
@@ -33,33 +34,48 @@ TEST(PhiDevice, DeviceInfoNameNotEmpty) {
     EXPECT_EQ(info.device_id, 0);
 }
 
-// ---- Buffer --------------------------------------------------------------
+// ---- Buffer (PHI v2) -----------------------------------------------------
+// BUF-11/BUF-13: the legacy RAII phi::Buffer was deleted in the M11 BUF
+// sweep; this is the v2 buffer-capabilities smoke that preserves the original
+// coverage intent (allocate a device buffer + host round-trip). The opaque-handle
+// v2 surface is BufferAlloc(DeviceBufferType(InitBestDevice()), bytes) ->
+// BufferUpload/BufferDownload -> BufferFree. (The fuller v2 buffer + op-dispatch
+// gate lives in tests/scenario/phi2_smoke.cpp.)
 
-TEST(PhiBuffer, AllocateAndHostRoundTrip) {
+TEST(PhiBuffer, V2AllocateAndHostRoundTrip) {
+    using namespace nuka::phi;
     constexpr size_t N = 64;
     std::vector<float> src(N, 3.14f);
     std::vector<float> dst(N, 0.0f);
 
-    nuka::phi::Buffer buf(N * sizeof(float), nuka::phi::MemoryKind::Device);
-    EXPECT_EQ(buf.Size(), N * sizeof(float));
-    EXPECT_NE(buf.Data(), nullptr);
+    Device* dev = InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    BufferType* bt = DeviceBufferType(dev);
+    ASSERT_NE(bt, nullptr);
 
-    buf.CopyFromHost(src.data(), N * sizeof(float));
-    buf.CopyToHost(dst.data(), N * sizeof(float));
+    Buffer* buf = BufferAlloc(bt, N * sizeof(float));
+    ASSERT_NE(buf, nullptr);
+    EXPECT_NE(BufferBase(buf), nullptr);
+
+    BufferUpload(buf, src.data(), /*off=*/0, N * sizeof(float));
+    BufferDownload(buf, dst.data(), /*off=*/0, N * sizeof(float));
 
     for (size_t i = 0; i < N; ++i) {
         EXPECT_FLOAT_EQ(dst[i], 3.14f);
     }
+    BufferFree(buf);
 }
 
-TEST(PhiBuffer, MoveSemantics) {
-    nuka::phi::Buffer a(128, nuka::phi::MemoryKind::Device);
-    EXPECT_NE(a.Data(), nullptr);
-
-    nuka::phi::Buffer b(std::move(a));
-    EXPECT_NE(b.Data(), nullptr);
-    EXPECT_EQ(a.Data(), nullptr);
-    EXPECT_EQ(a.Size(), 0u);
+TEST(PhiBuffer, V2ZeroByteAllocIsSafe) {
+    using namespace nuka::phi;
+    Device* dev = InitBestDevice();
+    ASSERT_NE(dev, nullptr);
+    BufferType* bt = DeviceBufferType(dev);
+    ASSERT_NE(bt, nullptr);
+    // A zero-byte allocation must not crash and must be Free-able (mirrors the
+    // UploadVectorV2 empty-vector path several production consumers rely on).
+    Buffer* buf = BufferAlloc(bt, 0u);
+    EXPECT_NO_THROW({ if (buf != nullptr) BufferFree(buf); });
 }
 
 // ---- Owned stream --------------------------------------------------------
