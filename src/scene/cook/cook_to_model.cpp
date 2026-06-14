@@ -723,10 +723,53 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
         mp.vol_alpha[c] = in.volume[c].compliance_alpha;
     }
 
+    // M9 T11 SHAPE-MATCH (id 9): flatten the variable-size clusters into the CSR
+    // (offset, size) layout over flat particle / rest-offset / weight pools. Cook
+    // the rest centroid c0 = (sum_i m_i x_i^0)/sum_i m_i and the per-member rest
+    // OFFSET q_i = x_i^0 - c0 ONCE -- BYTE-FAITHFUL to the legacy UploadXpbdWorld
+    // shape-match flatten (same fixed-order ascending accumulation).
+    const uint32_t scn = static_cast<uint32_t>(in.shape_match.size());
+    mp.sm_cluster_offset.clear(); mp.sm_cluster_size.clear();
+    mp.sm_stiffness.clear(); mp.sm_rest_centroid.clear();
+    mp.sm_particles.clear(); mp.sm_rest_q.clear(); mp.sm_mass.clear();
+    mp.sm_cluster_offset.resize(scn); mp.sm_cluster_size.resize(scn);
+    mp.sm_stiffness.resize(scn); mp.sm_rest_centroid.resize(scn);
+    for (uint32_t cl = 0; cl < scn; ++cl) {
+        const CookShapeMatchCluster& smc = in.shape_match[cl];
+        const size_t n = smc.particle.size();
+        // Cook c0 = (sum_i m_i x_i^0)/sum_i m_i (fixed-order ascending sum).
+        float mass_sum = 0.0f;
+        math::Vec3 c0{0.0f, 0.0f, 0.0f};
+        for (size_t j = 0; j < n; ++j) {
+            const float mi = j < smc.cluster_mass.size() ? smc.cluster_mass[j] : 1.0f;
+            mass_sum += mi;
+            if (j < smc.rest_positions.size()) c0 = c0 + smc.rest_positions[j] * mi;
+        }
+        if (mass_sum > 0.0f) c0 = c0 * (1.0f / mass_sum);
+        mp.sm_cluster_offset[cl] = static_cast<uint32_t>(mp.sm_particles.size());
+        mp.sm_cluster_size[cl] = static_cast<uint32_t>(n);
+        mp.sm_stiffness[cl] = smc.stiffness;
+        mp.sm_rest_centroid[cl] = c0;
+        for (size_t j = 0; j < n; ++j) {
+            mp.sm_particles.push_back(smc.particle[j]);
+            const math::Vec3 x0 = j < smc.rest_positions.size()
+                                      ? smc.rest_positions[j] : math::Vec3::Zero();
+            mp.sm_rest_q.push_back(x0 - c0);  // q_i = x_i^0 - c0
+            mp.sm_mass.push_back(j < smc.cluster_mass.size() ? smc.cluster_mass[j]
+                                                             : 1.0f);
+        }
+    }
+
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     cap.dist_cons_per_env = dn;
     cap.bend_cons_per_env = bn;
     cap.vol_cons_per_env  = vn;
+    cap.shape_match_slots_per_env   = scn;
+    cap.shape_match_members_per_env =
+        static_cast<uint32_t>(mp.sm_particles.size());
+    // n_soft_particles is left at its default (0); it is only consulted for the
+    // SoftFluid mode (CookSoftFluidParticles sets it). The single-system Xpbd
+    // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
 }
 
 void CookPbfParticles(nk::Model& model, uint32_t env_count,
@@ -769,6 +812,82 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     // Per-env uniform-grid cell capacity (sizes grid_cell_start/end; the
     // ParticleGridBuild op fails loudly if the live dims exceed it).
     cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
+}
+
+// ---------------------------------------------------------------------------
+// M9 T11 two-system cook: soft (XPBD) + fluid (PBF) co-resident in ONE Model.
+// ---------------------------------------------------------------------------
+
+void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
+                            const XpbdCookInput& soft, const PbfCookInput& fluid) {
+    const uint32_t envs = env_count > 0 ? env_count : 1u;
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+
+    // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
+    // byte-identical to the single-system cook (so the existing single-system
+    // gates and goldens are unaffected). Only when BOTH sides are present do we
+    // build the [soft | fluid] composite + set the SoftFluid mode.
+    const uint32_t n_soft = static_cast<uint32_t>(soft.positions.size());
+    const uint32_t n_fluid = static_cast<uint32_t>(fluid.positions.size());
+    if (n_fluid == 0u) {
+        // Soft-only: identical to the canonical XPBD cook (incl. shape-match).
+        CookXpbdParticles(model, env_count, soft);
+        return;
+    }
+    if (n_soft == 0u) {
+        // Fluid-only: identical to the canonical PBF cook.
+        CookPbfParticles(model, env_count, fluid);
+        return;
+    }
+
+    // 1) Cook the SOFT set first (fills the XPBD + shape-match templates, sets
+    //    particles_per_env = n_soft, mode = Xpbd). The soft constraint indices
+    //    already point into [0, n_soft) -- exactly where the soft particles land.
+    CookXpbdParticles(model, env_count, soft);
+
+    nk::Model::ModelParticles& mp = model.particles;
+
+    // 2) APPEND the fluid particles AFTER the soft set ([soft | fluid] layout).
+    //    The fluid particles are NOT referenced by any soft constraint, so no
+    //    index remap is needed; the SoftFluid PBF ops scope the density solve to
+    //    the fluid slice [n_soft, n_soft+n_fluid) by the n_soft split.
+    const float fluid_im =
+        fluid.particle_mass > 0.0f ? 1.0f / fluid.particle_mass : 0.0f;
+    for (uint32_t i = 0; i < n_fluid; ++i) {
+        mp.initial_pos.push_back(fluid.positions[i]);
+        mp.initial_vel.push_back(
+            i < fluid.velocities.size() ? fluid.velocities[i] : math::Vec3::Zero());
+        mp.inv_mass.push_back(
+            i < fluid.inv_mass.size() ? fluid.inv_mass[i] : fluid_im);
+    }
+
+    // 3) Carry the PBF fluid params + uniform-grid domain (the fluid slice solve).
+    mp.pbf_rest_density   = fluid.rest_density;
+    mp.pbf_support_radius = fluid.support_radius;
+    mp.pbf_particle_mass  = fluid.particle_mass;
+    mp.pbf_cfm_epsilon    = fluid.cfm_epsilon;
+    mp.pbf_iters          = fluid.iters == 0u ? 1u : fluid.iters;
+    mp.pbf_clamp_overdensity = fluid.clamp_overdensity;
+    mp.pbf_xsph_viscosity = fluid.xsph_viscosity;
+    mp.pbf_surface_tension= fluid.surface_tension;
+    mp.grid_min = fluid.grid_min;
+    mp.grid_dims[0] = fluid.grid_dims[0];
+    mp.grid_dims[1] = fluid.grid_dims[1];
+    mp.grid_dims[2] = fluid.grid_dims[2];
+    mp.cell_size = fluid.support_radius;
+    mp.query_radius = fluid.support_radius;
+    mp.boundary_enabled = fluid.boundary_enabled;
+    mp.floor_z = fluid.floor_z;
+
+    // 4) The co-residence schema: mode + split index + the new total particle
+    //    count. The grid is sized over the FULL union per-env (the soft particles
+    //    occupy grid cells too, but the fluid density solve skips them via n_soft).
+    mp.mode = nk::Model::ParticleMode::SoftFluid;
+    mp.n_soft_particles = n_soft;
+    cap.particles_per_env = n_soft + n_fluid;
+    cap.max_grid_cells =
+        fluid.grid_dims[0] * fluid.grid_dims[1] * fluid.grid_dims[2];
 }
 
 } // namespace nuka::scene::cook

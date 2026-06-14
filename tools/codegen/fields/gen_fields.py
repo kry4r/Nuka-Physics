@@ -59,6 +59,7 @@ VALID_PER = {
     "env", "dof", "link", "body", "contact_slot", "row_slot", "slot_dof",
     "row_dof",
     "particle", "dist_con", "bend_con", "vol_con", "shape_match_slot",
+    "shape_match_member",
     "env_dof2", "scalar",
 }
 VALID_ARENA = {"persistent", "scratch", "tape"}
@@ -233,7 +234,8 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// concrete element count from the Model capacities x env_count.",
         "enum class FieldPer : uint8_t {",
         "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,",
-        "    DistCon, BendCon, VolCon, ShapeMatchSlot, EnvDof2, Scalar",
+        "    DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,",
+        "    Scalar",
         "};",
         "",
         "struct FieldLayout {",
@@ -258,7 +260,8 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "row_dof": "RowDof",
         "particle": "Particle",
         "dist_con": "DistCon", "bend_con": "BendCon", "vol_con": "VolCon",
-        "shape_match_slot": "ShapeMatchSlot", "env_dof2": "EnvDof2", "scalar": "Scalar",
+        "shape_match_slot": "ShapeMatchSlot", "shape_match_member": "ShapeMatchMember",
+        "env_dof2": "EnvDof2", "scalar": "Scalar",
     }
     scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
                    "transform": 4, "spatial6": 4, "mat36": 4}

@@ -26,8 +26,12 @@
 #             the engine math types via views.hpp typedefs.)
 #   per    : the count-unit the array is sized by —
 #            env | dof | link | body | contact_slot | row_slot | particle |
-#            dist_con | bend_con | vol_con | shape_match_slot | scalar
+#            dist_con | bend_con | vol_con | shape_match_slot | shape_match_member
+#            | scalar
 #            (plus the §3.3 examples' env_dof2). `scalar` uses an explicit count.
+#            shape_match_slot = per-CLUSTER arrays (offset/count/stiffness/centroid);
+#            shape_match_member = per flat-cluster-MEMBER arrays (the CSR particle /
+#            rest-offset / weight pool, sized sum_c n_c per env).
 #   arena  : persistent | scratch | tape   (which of the 3 phi Buffers it lives in)
 #   owner  : model | data
 #            model = immutable cook product (topology / templates / capacities),
@@ -44,7 +48,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, env_dof2, scalar]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -362,6 +366,37 @@ fields:
   - {name: vol_rest_times6,  dtype: f32, per: vol_con, arena: persistent, owner: model}
   - {name: vol_compliance,   dtype: f32, per: vol_con, arena: persistent, owner: model, flags: [param]}
   - {name: vol_lambda,       dtype: f32, per: vol_con, arena: persistent, owner: data}
+
+  # =========================================================================
+  # M9 T11 — XPBD SHAPE-MATCH (id 9) cluster constraints (Mueller et al. 2005).
+  # The 4th XPBD row family, ported byte-faithfully from the legacy
+  # runtime::soft::XpbdWorld shape-match sweep (xpbd_world.cu
+  # SolveShapeMatchConstraintsKernel). A cluster of VARIABLE size is pulled
+  # toward the best rigid transform of its rest shape. CSR layout (mirrors the
+  # legacy UploadXpbdWorld flatten 1:1):
+  #   PER-CLUSTER (per: shape_match_slot):
+  #     sm_cluster_offset  : base into the flat member pool for this cluster.
+  #     sm_cluster_size    : member count n_c of this cluster.
+  #     sm_stiffness       : goal-pull fraction s in [0,1] (XPBD shape-match
+  #                          stiffness; from compliance_alpha).
+  #     sm_rest_centroid   : cooked rest centroid c0 (kept for completeness; the
+  #                          per-member q_i is already c0-offset, so the kernel
+  #                          does not re-read it -- exactly the legacy kernel).
+  #   PER-MEMBER (per: shape_match_member; the flat sum_c n_c pool):
+  #     sm_particles       : member particle index (env-major OFFSET like the
+  #                          dist/bend/vol particle fields: +e*particles_per_env).
+  #     sm_rest_q          : q_i = x_i^0 - c0 (rest offset; cooked once).
+  #     sm_mass            : m_i shape-match WEIGHT (independent of inv_mass).
+  # All owner:model (cook-constant); shape matching carries NO Lagrange
+  # multiplier, so there is no per-step data-owned lambda field.
+  # =========================================================================
+  - {name: sm_cluster_offset, dtype: u32,  per: shape_match_slot,   arena: persistent, owner: model}
+  - {name: sm_cluster_size,   dtype: u32,  per: shape_match_slot,   arena: persistent, owner: model}
+  - {name: sm_stiffness,      dtype: f32,  per: shape_match_slot,   arena: persistent, owner: model, flags: [param]}
+  - {name: sm_rest_centroid,  dtype: vec3, per: shape_match_slot,   arena: persistent, owner: model}
+  - {name: sm_particles,      dtype: u32,  per: shape_match_member, arena: persistent, owner: model}
+  - {name: sm_rest_q,         dtype: vec3, per: shape_match_member, arena: persistent, owner: model}
+  - {name: sm_mass,           dtype: f32,  per: shape_match_member, arena: persistent, owner: model}
 
   # =========================================================================
   # PARTICLE (PBF fluid) — DATA. Source: PbfWorld. The fluid shares particle_pos/

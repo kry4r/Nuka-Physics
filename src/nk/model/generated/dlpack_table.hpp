@@ -154,6 +154,13 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VolRestTimes6, DlpackDtype::kF32, 1, false, false},  // vol_rest_times6
     {FieldId::VolCompliance, DlpackDtype::kF32, 1, false, false},  // vol_compliance
     {FieldId::VolLambda, DlpackDtype::kF32, 1, false, false},  // vol_lambda
+    {FieldId::SmClusterOffset, DlpackDtype::kU32, 1, false, false},  // sm_cluster_offset
+    {FieldId::SmClusterSize, DlpackDtype::kU32, 1, false, false},  // sm_cluster_size
+    {FieldId::SmStiffness, DlpackDtype::kF32, 1, false, false},  // sm_stiffness
+    {FieldId::SmRestCentroid, DlpackDtype::kF32, 2, false, false},  // sm_rest_centroid
+    {FieldId::SmParticles, DlpackDtype::kU32, 1, false, false},  // sm_particles
+    {FieldId::SmRestQ, DlpackDtype::kF32, 2, false, false},  // sm_rest_q
+    {FieldId::SmMass, DlpackDtype::kF32, 1, false, false},  // sm_mass
     {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false, false},  // pbf_predicted_pos
     {FieldId::PbfPositionDelta, DlpackDtype::kF32, 2, false, false},  // pbf_position_delta
     {FieldId::PbfDensity, DlpackDtype::kF32, 1, false, false},  // pbf_density

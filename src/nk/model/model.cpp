@@ -32,7 +32,8 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::DistCon:        return dist_cons_per_env;
         case FieldPer::BendCon:        return bend_cons_per_env;
         case FieldPer::VolCon:         return vol_cons_per_env;
-        case FieldPer::ShapeMatchSlot: return 0u;
+        case FieldPer::ShapeMatchSlot:   return shape_match_slots_per_env;
+        case FieldPer::ShapeMatchMember: return shape_match_members_per_env;
         case FieldPer::EnvDof2:        return dofs_per_env * dofs_per_env;
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
@@ -476,6 +477,59 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, particles.vol_alpha, capacities.vol_cons_per_env, E,
                          sizeof(float));
             break;
+        // ---------------------------------------------------------------
+        // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (owner:model).
+        // The single-env CSR template is replicated env-major. The per-cluster
+        // member OFFSET is shifted by e*members_per_env (the device member pool
+        // is env-major) and the per-member PARTICLE index by e*particles_per_env
+        // (the device particle arrays are env-major). The legacy single-world
+        // CSR layout tiled E times -- byte-faithful to UploadXpbdWorld's flatten.
+        // ---------------------------------------------------------------
+        case FieldId::SmClusterOffset: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t cn = capacities.shape_match_slots_per_env;
+            const uint32_t mn = capacities.shape_match_members_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < cn && c < particles.sm_cluster_offset.size();
+                     ++c) {
+                    p[static_cast<size_t>(e) * cn + c] =
+                        particles.sm_cluster_offset[c] + e * mn;
+                }
+            }
+            break;
+        }
+        case FieldId::SmClusterSize:
+            StampPerLink(dst, particles.sm_cluster_size,
+                         capacities.shape_match_slots_per_env, E, sizeof(uint32_t));
+            break;
+        case FieldId::SmStiffness:
+            StampPerLink(dst, particles.sm_stiffness,
+                         capacities.shape_match_slots_per_env, E, sizeof(float));
+            break;
+        case FieldId::SmRestCentroid:
+            StampPerLink(dst, particles.sm_rest_centroid,
+                         capacities.shape_match_slots_per_env, E, sizeof(math::Vec3));
+            break;
+        case FieldId::SmParticles: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t mn = capacities.shape_match_members_per_env;
+            const uint32_t pn = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t m = 0; m < mn && m < particles.sm_particles.size(); ++m) {
+                    p[static_cast<size_t>(e) * mn + m] =
+                        particles.sm_particles[m] + e * pn;
+                }
+            }
+            break;
+        }
+        case FieldId::SmRestQ:
+            StampPerLink(dst, particles.sm_rest_q,
+                         capacities.shape_match_members_per_env, E, sizeof(math::Vec3));
+            break;
+        case FieldId::SmMass:
+            StampPerLink(dst, particles.sm_mass,
+                         capacities.shape_match_members_per_env, E, sizeof(float));
+            break;
         default:
             // Unpopulated model sections: deterministic 0.
             break;
@@ -529,6 +583,13 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::VolParticles:          v.vol_particles = static_cast<uint32_t*>(p); break;
         case FieldId::VolRestTimes6:         v.vol_rest_times6 = static_cast<float*>(p); break;
         case FieldId::VolCompliance:         v.vol_compliance = static_cast<float*>(p); break;
+        case FieldId::SmClusterOffset:       v.sm_cluster_offset = static_cast<uint32_t*>(p); break;
+        case FieldId::SmClusterSize:         v.sm_cluster_size = static_cast<uint32_t*>(p); break;
+        case FieldId::SmStiffness:           v.sm_stiffness = static_cast<float*>(p); break;
+        case FieldId::SmRestCentroid:        v.sm_rest_centroid = static_cast<math::Vec3*>(p); break;
+        case FieldId::SmParticles:           v.sm_particles = static_cast<uint32_t*>(p); break;
+        case FieldId::SmRestQ:               v.sm_rest_q = static_cast<math::Vec3*>(p); break;
+        case FieldId::SmMass:                v.sm_mass = static_cast<float*>(p); break;
         default: break;  // a data-owned field id: not a ModelView member.
     }
 }

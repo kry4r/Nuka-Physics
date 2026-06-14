@@ -41,6 +41,10 @@ struct ModelCapacities {
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
     uint32_t bend_cons_per_env    = 0;  // XPBD bend-constraint count / env.
     uint32_t vol_cons_per_env     = 0;  // XPBD volume-constraint count / env.
+    // M9 T11 shape-match (XPBD id 9) capacities: per-env cluster slot count +
+    // the total flat cluster-MEMBER pool size (sum_c n_c). 0 == no shape-match.
+    uint32_t shape_match_slots_per_env   = 0;  // XPBD shape-match cluster count / env.
+    uint32_t shape_match_members_per_env = 0;  // flat cluster-member pool / env.
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -227,7 +231,16 @@ public:
     // Coupled: particles co-step against rigid/artic bodies through the unified
     // row solve (the kUSlotParticleSphere* contact classes); the internal XPBD
     // soft constraints (if any) still run. None/Xpbd/Pbf are the standalone modes.
-    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3 };
+    // M9 T11 SoftFluid: ONE Model holds BOTH a soft (XPBD) particle set AND a
+    // fluid (PBF) particle set co-resident in a contiguous [soft | fluid] layout
+    // with split index n_soft_particles (the fluid occupies [n_soft, P)). The
+    // XPBD solve runs over the soft slice (edge-based constraints reference only
+    // soft particle indices) and the PBF density/lambda/neighbor solve is SCOPED
+    // to the fluid slice. This mirrors the co-step's existing [xpbd | pbf] union
+    // (split n_x) 1:1, so the Phase-2 id-10 cross-contact port is near-verbatim
+    // (global g < n_soft => soft, else fluid).
+    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3,
+                                        SoftFluid = 4 };
     // In Coupled mode, which internal dynamics run alongside the contact coupling:
     // None (free point masses), Xpbd (soft constraints), Pbf (fluid density).
     enum class CoupledInternal : uint8_t { None = 0, Xpbd = 1, Pbf = 2 };
@@ -247,7 +260,25 @@ public:
         std::vector<float>    bend_alpha;
         std::vector<uint32_t> vol_particles;      // 4 / volume constraint
         std::vector<float>    vol_rest6, vol_alpha;
+        // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (single-env; CSR
+        // layout, mirrors the legacy UploadXpbdWorld flatten 1:1). Per-cluster:
+        // sm_cluster_offset/size into the flat member pool, sm_stiffness goal-pull
+        // fraction, sm_rest_centroid c0. Per-member (flat sum_c n_c pool):
+        // sm_particles index, sm_rest_q = x_i^0 - c0, sm_mass weight m_i.
+        std::vector<uint32_t>   sm_cluster_offset;  // per cluster
+        std::vector<uint32_t>   sm_cluster_size;    // per cluster (n_c)
+        std::vector<float>      sm_stiffness;       // per cluster (s in [0,1])
+        std::vector<math::Vec3> sm_rest_centroid;   // per cluster (c0)
+        std::vector<uint32_t>   sm_particles;       // flat pool (sum n_c)
+        std::vector<math::Vec3> sm_rest_q;          // flat pool (q_i = x_i^0 - c0)
+        std::vector<float>      sm_mass;            // flat pool (m_i weight)
         uint16_t xpbd_iters = 1;
+        // M9 T11 two-system [soft | fluid] split index: the fluid particles
+        // occupy [n_soft_particles, particles_per_env). For SoftFluid mode the
+        // PBF density/lambda/neighbor ops are scoped to the fluid slice; the XPBD
+        // constraints (edge-based) reference only the soft slice. For the
+        // single-system modes (Xpbd/Pbf/Coupled) it is 0 (Xpbd) or unused.
+        uint32_t n_soft_particles = 0u;
         // PBF fluid params (Macklin & Mueller 2013 + p10-B polish).
         float    pbf_rest_density   = 0.0f;   // rho0 (0 disables PBF)
         float    pbf_support_radius = 0.0f;   // h (== grid query radius / cell)

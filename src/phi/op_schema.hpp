@@ -315,6 +315,16 @@ inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
 // (XPBD soft-constraint / PBF density) velocity with the contact velocity
 // delta — exactly v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
 inline constexpr uint32_t kParticleModeCoupled = 3u;
+// M9 T11 SOFT+FLUID co-residence mode: ONE Model holds a soft (XPBD) particle
+// set in [0, n_soft) and a fluid (PBF) particle set in [n_soft, particles_per_env)
+// per env (contiguous [soft | fluid] split, mirrors the co-step's [xpbd | pbf]
+// union with split n_x 1:1). The predict/finalize ops branch per-particle on the
+// within-env local index vs n_soft (soft => XPBD predict/correct; fluid => PBF
+// predict/finalize). The PBF density/lambda/neighbor solve is SCOPED to the fluid
+// slice (a soft particle must NOT contribute to fluid density); the XPBD
+// constraints are edge-based so they only touch the soft slice. The id-10
+// cross-contact (Phase 2) runs over the FULL union.
+inline constexpr uint32_t kParticleModeSoftFluid = 4u;
 
 // Common particle launch geometry (the views are pure pointer aggregates, so
 // every particle op carries its counts). particle_count == total env-major
@@ -332,6 +342,11 @@ struct ParticlePredictParams {
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;   // total env-major particles
     uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
+    // M9 T11 SoftFluid: the per-env [soft | fluid] split + per-env stride. The
+    // SoftFluid predict/finalize kernels branch per-particle on (i % per_env) vs
+    // n_soft. 0 for the single-system modes (unused).
+    uint32_t n_soft_particles; // per-env soft count (split index)
+    uint32_t particles_per_env;// per-env particle stride
 };
 
 struct XpbdProjectParams {
@@ -340,6 +355,10 @@ struct XpbdProjectParams {
     uint32_t dist_con_count;   // total env-major distance constraints
     uint32_t bend_con_count;   // total env-major bend constraints
     uint32_t vol_con_count;    // total env-major volume constraints
+    // M9 T11: total env-major shape-match cluster count (XPBD id 9). 0 == none.
+    // Solved LAST in the XPBD sweep (after dist/bend/vol), the legacy
+    // StepXpbdWorld order, so it pulls the projected config toward the rigid goal.
+    uint32_t shape_match_cluster_count;
 };
 
 struct PbfDensityLambdaParams {
@@ -353,6 +372,11 @@ struct PbfDensityLambdaParams {
     float    dt;               // substep dt (for the boundary clamp + apply)
     uint32_t boundary_enabled; // 1 => apply the floor clamp in the apply pass
     float    floor_z;          // boundary floor (the M5 grid is z-up; legacy y).
+    // M9 T11 SoftFluid: scope the density/lambda solve to the fluid slice. A soft
+    // particle (within-env local index < n_soft) must NOT contribute to fluid
+    // density. 0 == single-system PBF (every particle is fluid).
+    uint32_t n_soft_particles;  // per-env soft count (fluid slice = [n_soft, per_env))
+    uint32_t particles_per_env; // per-env particle stride
 };
 
 struct PbfApplyDeltaParams {
@@ -361,6 +385,9 @@ struct PbfApplyDeltaParams {
     uint32_t particle_count;
     uint32_t boundary_enabled;
     float    floor_z;
+    // M9 T11 SoftFluid: fluid slice scope (see PbfDensityLambdaParams).
+    uint32_t n_soft_particles;
+    uint32_t particles_per_env;
 };
 
 struct ParticleFinalizeParams {
@@ -374,6 +401,11 @@ struct ParticleFinalizeParams {
     float    xsph_viscosity_c;     // XSPH velocity-smoothing coefficient
     float    surface_tension_gamma;// Akinci cohesion coefficient
     float    rest_density;         // rho0 (for the XSPH density normalization)
+    // M9 T11 SoftFluid: the per-env [soft | fluid] split + per-env stride. The
+    // SoftFluid finalize branches per-particle (soft => XPBD correct; fluid =>
+    // PBF finalize). The polish passes are scoped to the fluid slice. 0 == single.
+    uint32_t n_soft_particles;
+    uint32_t particles_per_env;
 };
 
 // --- readout / RL substrate ---------------------------------------------
