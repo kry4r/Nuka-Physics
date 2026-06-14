@@ -23,7 +23,9 @@
 // downstream for BOTH modes; neither kernel applies a control Kd.
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 namespace nuka::runtime::articulation {
@@ -33,7 +35,7 @@ namespace nuka::runtime::articulation {
 // same layout as drive_targets). `drive_force_limits` may be null (no clamp);
 // `torque_input` null is a no-op (tau left as-is). No control Kd is applied --
 // physical joint damping is handled by the orthogonal implicit-damping path.
-void LaunchApplyTorqueDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyTorqueDriveKernels(cudaStream_t stream, int device_id,
                                    ArticulationDeviceState state,
                                    const float* torque_input,
                                    const float* drive_force_limits);
@@ -43,7 +45,7 @@ void LaunchApplyTorqueDriveKernels(const phi::DeviceContext& context,
 // drive_stiffness is reused as the velocity gain Kp_v. `velocity_target` /
 // `drive_stiffness` null is a no-op; `drive_force_limits` null disables the
 // clamp. No control Kd here either (the implicit joint damping still runs).
-void LaunchApplyVelocityDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyVelocityDriveKernels(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      const float* velocity_target,
                                      const float* drive_stiffness,
@@ -80,7 +82,7 @@ void LaunchApplyVelocityDriveKernels(const phi::DeviceContext& context,
 // float atomics => D1. The floating-base 6 DOFs are never actuated; the clamp is
 // the same |tau| <= drive_force_limits[link]. Any null required pointer
 // (q_target/inertia_M_inv/qddot_free) is a no-op (tau left as-is).
-void LaunchApplyComputedTorqueDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyComputedTorqueDriveKernels(cudaStream_t stream, int device_id,
                                            ArticulationDeviceState state,
                                            uint32_t max_dof,
                                            const float* inertia_M_inv,
@@ -102,7 +104,7 @@ void LaunchApplyComputedTorqueDriveKernels(const phi::DeviceContext& context,
 // qdot_noload <= 0 (uninitialized / fixed) falls back to the plain
 // drive_force_limits clamp (== Torque mode), so a zero-init buffer is safe.
 // torque_input null is a no-op. Flat per-link grid, no atomics => D1.
-void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyActuatorDriveKernels(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      const float* torque_input,
                                      const float* drive_force_limits,
@@ -143,7 +145,7 @@ void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
 // task Jacobian's floating-base columns are NOT built (fixed-base scenes only --
 // a floating root contributes no task columns here); gravity/bias compensation is
 // NOT added (the law holds the task only under gravity-off / external comp).
-void LaunchApplyOscDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyOscDriveKernels(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 uint32_t osc_task_link,

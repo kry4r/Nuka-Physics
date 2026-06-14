@@ -77,8 +77,8 @@ private:
 };
 
 // Download `count` elements from an OwnedBuffer into a host vector. BufferDownload
-// self-syncs the NULL/default stream (stream 0) -- byte+ordering identical to the
-// legacy DownloadVector's synchronous stream-0 cudaMemcpy this replaces.
+// self-syncs the NULL/default stream (stream 0) -- byte+ordering identical to a
+// synchronous stream-0 cudaMemcpy.
 template <typename T>
 std::vector<T> DownloadOwned(const OwnedBuffer& buf, uint32_t count) {
     return phi::DownloadVectorV2<T>(buf.Handle(), count);
@@ -398,13 +398,12 @@ std::vector<collision::CollisionPair> LbvhBroadphaseResult::DownloadPairs() cons
 // kept in the result (cross-system query) or destroyed (default pair-only path).
 // The compute pipeline is IDENTICAL in both cases -- the flag only affects what
 // the result HOLDS at the end -- so the default path stays byte-identical to p04.
-static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
+static LbvhBroadphaseResult BuildLbvhImpl(cudaStream_t stream, int device_id,
                                           const collision::AABB* device_aabbs,
                                           uint32_t count,
                                           uint32_t max_pairs_hint,
                                           bool retain_nodes) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     if (count < 2u) {
         // 0 or 1 body => no pairs possible.
@@ -422,7 +421,7 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
                 static_cast<uint32_t*>(index.Base()),
                 static_cast<LbvhNode*>(nodes.Base()));
             CheckCuda(cudaGetLastError(), "InitNodesKernel launch (n=1)");
-            context.stream.Synchronize();
+            cudaStreamSynchronize(stream);
             OwnedBuffer empty_pairs(0u);
             return LbvhBroadphaseResult(count, 0u, 0u, empty_pairs.Release(),
                                         nodes.Release());
@@ -456,7 +455,7 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
 
     // The reduction kernel runs on the work stream; synchronize before the
     // host-side (default-stream) download so the per-block partials are valid.
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     const auto h_block_min = DownloadOwned<float3>(d_block_min, blocks);
     const auto h_block_max = DownloadOwned<float3>(d_block_max, blocks);
 
@@ -529,7 +528,7 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
         pair_capacity);
     CheckCuda(cudaGetLastError(), "LbvhPairQueryKernel launch");
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     uint32_t pair_count = 0u;
     phi::BufferDownload(d_pair_count.Handle(), &pair_count, 0, sizeof(pair_count));
@@ -552,7 +551,7 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
             static_cast<uint64_t*>(d_keys.Base()) + valid,
             static_cast<collision::CollisionPair*>(d_pairs.Base()));
         CheckCuda(cudaGetLastError(), "stable_sort pairs");
-        context.stream.Synchronize();
+        cudaStreamSynchronize(stream);
     }
 
     if (retain_nodes) {
@@ -562,34 +561,32 @@ static LbvhBroadphaseResult BuildLbvhImpl(const phi::DeviceContext& context,
     return LbvhBroadphaseResult(count, valid, pair_capacity, d_pairs.Release());
 }
 
-LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
+LbvhBroadphaseResult BuildLbvhBroadphase(cudaStream_t stream, int device_id,
                                          const collision::AABB* device_aabbs,
                                          uint32_t count,
                                          uint32_t max_pairs_hint) {
-    return BuildLbvhImpl(context, device_aabbs, count, max_pairs_hint,
+    return BuildLbvhImpl(stream, device_id, device_aabbs, count, max_pairs_hint,
                          /*retain_nodes=*/false);
 }
 
-LbvhBroadphaseResult BuildLbvhForQuery(const phi::DeviceContext& context,
+LbvhBroadphaseResult BuildLbvhForQuery(cudaStream_t stream, int device_id,
                                        const collision::AABB* device_aabbs,
                                        uint32_t count,
                                        uint32_t max_pairs_hint) {
-    return BuildLbvhImpl(context, device_aabbs, count, max_pairs_hint,
+    return BuildLbvhImpl(stream, device_id, device_aabbs, count, max_pairs_hint,
                          /*retain_nodes=*/true);
 }
 
 LbvhBroadphaseResult BuildLbvhForQuery(const collision::AABB* device_aabbs,
                                        uint32_t count,
                                        uint32_t max_pairs_hint) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildLbvhForQuery(context, device_aabbs, count, max_pairs_hint);
+        return BuildLbvhForQuery(/*stream=*/nullptr, /*device_id=*/0, device_aabbs, count, max_pairs_hint);
 }
 
 LbvhBroadphaseResult BuildLbvhBroadphase(const collision::AABB* device_aabbs,
                                          uint32_t count,
                                          uint32_t max_pairs_hint) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildLbvhBroadphase(context, device_aabbs, count, max_pairs_hint);
+        return BuildLbvhBroadphase(/*stream=*/nullptr, /*device_id=*/0, device_aabbs, count, max_pairs_hint);
 }
 
 } // namespace nuka::collision::gpu

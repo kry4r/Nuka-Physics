@@ -22,7 +22,9 @@
 // float atomics anywhere; all reductions are fixed-order warp-shuffle butterflies.
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 // DeterminismLevel { Strong, Weak } already exists engine-wide; reuse it rather
 // than declaring a second one (keeps the D1/D2 contract single-sourced).
 #include "runtime/articulation/determinism_level.hpp"
@@ -189,7 +191,7 @@ public:
 // v0.7 p02 registers "self_minres" / "minres" (symmetric indefinite). Throws
 // std::invalid_argument on an unknown name.
 std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
-    std::string_view name, const phi::DeviceContext& context,
+    std::string_view name, cudaStream_t stream, int device_id,
     DeterminismLevel determinism = DeterminismLevel::Strong);
 
 // ---------------------------------------------------------------------------
@@ -220,7 +222,7 @@ std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
 // backend key -- the auto-router is a convenience, the explicit key is the escape.
 //
 // Enqueues on the context stream; the caller synchronizes + reads the flag back.
-void DetectBatchedIndefinite(const phi::DeviceContext& context,
+void DetectBatchedIndefinite(cudaStream_t stream, int device_id,
                              const BatchedDenseSpdSystem& system,
                              uint32_t* out_indefinite_flag);
 

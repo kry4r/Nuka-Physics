@@ -30,7 +30,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/world_builder.hpp"
@@ -214,16 +215,17 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
         q = 0.0f;
     }
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // Runs the device FK on the given host state and downloads the world poses.
     auto run_device_fk = [&](const articulation::ArticulationHostState& state) {
         const uint32_t links = state.TotalLinkCount();
-        auto device = articulation::UploadArticulationState(context, state);
+        auto device = articulation::UploadArticulationState(context, context_dev, state);
         OwnedDeviceBuffer pose_buf(static_cast<size_t>(links) * sizeof(Transform));
         articulation::UpdateWorldLinkPoses(
-            context, device.View(), static_cast<Transform*>(pose_buf.Data()));
-        context.stream.Synchronize();
+            context, context_dev, device.View(), static_cast<Transform*>(pose_buf.Data()));
+        cudaStreamSynchronize(context);
         std::vector<Transform> world(links);
         pose_buf.CopyToHost(world.data(), world.size() * sizeof(Transform));
         return world;
@@ -315,12 +317,12 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
     auto batched = articulation::ReplicateArticulationHostState(base, kEnvCount);
     ASSERT_EQ(batched.TotalLinkCount(), base_link_count * kEnvCount);
 
-    auto batched_device = articulation::UploadArticulationState(context, batched);
+    auto batched_device = articulation::UploadArticulationState(context, context_dev, batched);
     const uint32_t total_links = batched.TotalLinkCount();
 
     OwnedDeviceBuffer pose_buf(static_cast<size_t>(total_links) * sizeof(Transform));
     articulation::UpdateWorldLinkPoses(
-        context, batched_device.View(), static_cast<Transform*>(pose_buf.Data()));
+        context, context_dev, batched_device.View(), static_cast<Transform*>(pose_buf.Data()));
 
     // Ground plane just ABOVE the rest feet so all four penetrate. From the FK
     // sanity check the rest foot z is ~0.232; pick a ground above the centers.
@@ -338,7 +340,7 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
     OwnedDeviceBuffer count_buf(kEnvCount * sizeof(uint32_t));
 
     articulation::DetectFootGroundContacts(
-        context,
+        context, context_dev,
         static_cast<const Transform*>(pose_buf.Data()),
         static_cast<const articulation::FootShape*>(feet_buf.Data()),
         foot_count,
@@ -350,7 +352,7 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
         static_cast<Vec3*>(normal_buf.Data()),
         static_cast<float*>(depth_buf.Data()),
         static_cast<uint32_t*>(count_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     std::vector<uint32_t> counts(kEnvCount);
     std::vector<uint32_t> links(slot_count);
@@ -418,7 +420,7 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
     // its slots must be cleared (link == kInvalidLink, zeroed point/normal/depth).
     constexpr float kGroundBelow = 0.0f;
     articulation::DetectFootGroundContacts(
-        context,
+        context, context_dev,
         static_cast<const Transform*>(pose_buf.Data()),
         static_cast<const articulation::FootShape*>(feet_buf.Data()),
         foot_count,
@@ -430,7 +432,7 @@ TEST(ArticulationContacts, FkRestPoseAndDeterministicFootContacts) {
         static_cast<Vec3*>(normal_buf.Data()),
         static_cast<float*>(depth_buf.Data()),
         static_cast<uint32_t*>(count_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     count_buf.CopyToHost(counts.data(), counts.size() * sizeof(uint32_t));
     link_buf.CopyToHost(links.data(), links.size() * sizeof(uint32_t));

@@ -28,7 +28,7 @@ __global__ void GaussianNoiseKernel(float* __restrict__ data, uint32_t count,
 
 }  // namespace
 
-void LaunchGaussianNoise(const phi::DeviceContext& ctx, float* data,
+void LaunchGaussianNoise(cudaStream_t stream, int device_id, float* data,
                          uint32_t count, float mean, float stddev,
                          uint64_t seed, uint64_t seq) {
     if (data == nullptr || count == 0u) {
@@ -36,7 +36,7 @@ void LaunchGaussianNoise(const phi::DeviceContext& ctx, float* data,
     }
     constexpr uint32_t kBlock = 256u;
     const uint32_t grid = (count + kBlock - 1u) / kBlock;
-    GaussianNoiseKernel<<<grid, kBlock, 0, ctx.stream.Native()>>>(
+    GaussianNoiseKernel<<<grid, kBlock, 0, stream>>>(
         data, count, mean, stddev, seed, seq);
 }
 

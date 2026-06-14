@@ -22,12 +22,13 @@ void CheckCuda(cudaError_t status, const char* what) {
 }
 }  // namespace
 
-CheckpointManager::CheckpointManager(const phi::DeviceContext& context,
+CheckpointManager::CheckpointManager(cudaStream_t stream, int device_id,
                                      uint32_t max_checkpoints,
                                      uint32_t articulation_count,
                                      uint32_t total_link_count,
                                      uint32_t lambda_width)
-    : context_(context),
+    : stream_(stream),
+      device_id_(device_id),
       max_checkpoints_(max_checkpoints),
       articulation_count_(articulation_count),
       total_link_count_(total_link_count),
@@ -80,8 +81,8 @@ uint32_t CheckpointManager::Capture(
             std::to_string(max_checkpoints_) + ")");
     }
     const uint32_t slot = count_;
-    const cudaStream_t stream = context_.stream.Native();
-    phi::ScopedDeviceGuard guard(context_.device_id);
+    const cudaStream_t stream = stream_;
+    phi::ScopedDeviceGuard guard(device_id_);
 
     auto* base_dst = static_cast<nuka::math::Transform*>(phi::BufferBase(base_pose_)) +
                      static_cast<size_t>(slot) * articulation_count_;
@@ -142,8 +143,8 @@ void CheckpointManager::Restore(
         throw std::out_of_range(
             "nuka::diffsim::CheckpointManager::Restore: slot out of range");
     }
-    const cudaStream_t stream = context_.stream.Native();
-    phi::ScopedDeviceGuard guard(context_.device_id);
+    const cudaStream_t stream = stream_;
+    phi::ScopedDeviceGuard guard(device_id_);
 
     const auto* base_src =
         static_cast<const nuka::math::Transform*>(phi::BufferBase(base_pose_)) +

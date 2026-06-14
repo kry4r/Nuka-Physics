@@ -49,7 +49,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -233,14 +234,14 @@ struct DeviceMResult {
 // Upload -> ABA Pass-1 (link_xup / motion subspaces current) -> CRBA M ->
 // LDL^T inverse -> download. Mirrors RunDeviceM in test_articulation_inertia_m.
 // `with_damping` folds dt*C into the joint diagonals (the implicit-damping M).
-DeviceMResult RunDeviceM(const nuka::phi::DeviceContext& context,
+DeviceMResult RunDeviceM(cudaStream_t context, int context_dev,
                          const articulation::ArticulationHostState& host,
                          uint32_t max_dof,
                          bool with_damping = false,
                          float dt = 0.0f) {
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, 0.0f);
 
     const uint32_t link_count = host.TotalLinkCount();
     const size_t tile = static_cast<size_t>(max_dof) * max_dof;
@@ -250,15 +251,15 @@ DeviceMResult RunDeviceM(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer minv_buf(tile * sizeof(float));
 
     articulation::ComputeArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()),
         with_damping ? view.joint_damping : nullptr, dt);
     articulation::FactorArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     DeviceMResult result;
     result.M.resize(tile);
@@ -275,8 +276,9 @@ void CheckFactorHonesty(const articulation::ArticulationHostState& host,
     ASSERT_EQ(dof, expected_dof);
     const uint32_t max_dof = dof;
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
-    const auto res = RunDeviceM(context, host, max_dof);
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
+    const auto res = RunDeviceM(context, context_dev, host, max_dof);
 
     // The CRBA must have filled the FULL dof block (sanity that the input M is
     // not itself truncated): every diagonal is strictly positive.
@@ -366,38 +368,39 @@ TEST(DofAbove18Honesty, EffectiveMassUsesFullChain) {
     const uint32_t link_count = host.TotalLinkCount();
     const size_t tile = static_cast<size_t>(max_dof) * max_dof;
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // FK world poses, then write them into link_pose (the chain-J kernel reads
     // link_pose for axis_world/lever -- the stage-4 refresh convention).
     {
-        auto device = articulation::UploadArticulationState(context, host);
+        auto device = articulation::UploadArticulationState(context, context_dev, host);
         auto view = device.View();
-        articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, 0.0f);
         OwnedDeviceBuffer pose_buf(
             static_cast<size_t>(link_count) * sizeof(Transform));
-        articulation::UpdateWorldLinkPoses(context, view,
+        articulation::UpdateWorldLinkPoses(context, context_dev, view,
                                            static_cast<Transform*>(pose_buf.Data()));
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         std::vector<Transform> world(link_count);
         pose_buf.CopyToHost(world.data(), world.size() * sizeof(Transform));
         host.link_pose = world;
     }
 
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, 0.0f);
 
     OwnedDeviceBuffer composite_buf(
         static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
     OwnedDeviceBuffer m_buf(tile * sizeof(float));
     OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, max_dof, static_cast<const float*>(m_buf.Data()),
+        context, context_dev, view, max_dof, static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
 
     // Contact on the LAST link, slightly off-origin, vertical normal.
@@ -415,16 +418,16 @@ TEST(DofAbove18Honesty, EffectiveMassUsesFullChain) {
     normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
 
     articulation::ComputeContactChainJacobians(
-        context, view, static_cast<const uint32_t*>(link_idx_buf.Data()),
+        context, context_dev, view, static_cast<const uint32_t*>(link_idx_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()), 1u, max_dof,
         static_cast<float*>(jac_buf.Data()));
     articulation::ComputeContactEffectiveMass(
-        context, view, static_cast<const uint32_t*>(link_idx_buf.Data()),
+        context, context_dev, view, static_cast<const uint32_t*>(link_idx_buf.Data()),
         static_cast<const float*>(jac_buf.Data()),
         static_cast<const float*>(minv_buf.Data()), 1u, max_dof,
         static_cast<float*>(meff_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     std::vector<float> M(tile);
     std::vector<float> jac(max_dof);
@@ -486,32 +489,33 @@ TEST(DofAbove18Honesty, ImplicitDampingReachesDofAbove18) {
     }
     ASSERT_EQ(dof_to_link.size(), dof);
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // (M + dt*C) and its host inverse (for the reference update).
-    const auto res = RunDeviceM(context, host, dof, /*with_damping=*/true, kDt);
+    const auto res = RunDeviceM(context, context_dev, host, dof, /*with_damping=*/true, kDt);
     const auto minv_ref = HostInvert(res.M, dof, dof);
 
     // Device: factor + ApplyImplicitJointDamping in one upload session.
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, 0.0f);
     const size_t tile = static_cast<size_t>(dof) * dof;
     OwnedDeviceBuffer composite_buf(
         static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
     OwnedDeviceBuffer m_buf(tile * sizeof(float));
     OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, dof,
+        context, context_dev, view, dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()), view.joint_damping, kDt);
     articulation::FactorArticulationInertiaM(
-        context, view, dof, static_cast<const float*>(m_buf.Data()),
+        context, context_dev, view, dof, static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
     articulation::ApplyImplicitJointDamping(
-        context, view, static_cast<const float*>(minv_buf.Data()),
+        context, context_dev, view, static_cast<const float*>(minv_buf.Data()),
         view.joint_damping, dof, kDt);
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     articulation::ArticulationHostState download = host;
     articulation::DownloadArticulationState(device, &download);
@@ -551,8 +555,9 @@ TEST(DofAbove18Honesty, LoudFailBeyondMaxArticulationDof) {
     const uint32_t dof = articulation::ArticulationDofCount(host, 0u);
     ASSERT_EQ(dof, 65u);
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
-    auto device = articulation::UploadArticulationState(context, host);
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
 
     const size_t tile = static_cast<size_t>(dof) * dof;
@@ -563,7 +568,7 @@ TEST(DofAbove18Honesty, LoudFailBeyondMaxArticulationDof) {
 
     EXPECT_THROW(
         articulation::FactorArticulationInertiaM(
-            context, view, dof, static_cast<const float*>(m_buf.Data()),
+            context, context_dev, view, dof, static_cast<const float*>(m_buf.Data()),
             static_cast<float*>(minv_buf.Data())),
         std::runtime_error)
         << "FactorArticulationInertiaM accepted " << dof
@@ -571,7 +576,7 @@ TEST(DofAbove18Honesty, LoudFailBeyondMaxArticulationDof) {
 
     EXPECT_THROW(
         articulation::ApplyImplicitJointDamping(
-            context, view, static_cast<const float*>(minv_buf.Data()),
+            context, context_dev, view, static_cast<const float*>(minv_buf.Data()),
             view.joint_damping, dof, 1.0f / 240.0f),
         std::runtime_error)
         << "ApplyImplicitJointDamping accepted " << dof << " DOFs";

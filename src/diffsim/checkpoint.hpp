@@ -36,7 +36,9 @@
 
 #include "math/transform.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
@@ -56,7 +58,7 @@ public:
     // floats per env (R2 reserve; pass 0 on the contact-free path -- the slot is
     // still present, just zero-width). lambda_width is the engine's
     // slot_count*3 / env (== kMaxFootContactsPerEnv*3) when contacts land.
-    CheckpointManager(const phi::DeviceContext& context,
+    CheckpointManager(cudaStream_t stream, int device_id,
                       uint32_t max_checkpoints, uint32_t articulation_count,
                       uint32_t total_link_count, uint32_t lambda_width = 0u);
 
@@ -96,7 +98,8 @@ public:
     CheckpointManager& operator=(const CheckpointManager&) = delete;
 
 private:
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     uint32_t max_checkpoints_ = 0u;
     uint32_t articulation_count_ = 0u;
     uint32_t total_link_count_ = 0u;

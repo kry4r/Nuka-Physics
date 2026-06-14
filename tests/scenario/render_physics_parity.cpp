@@ -65,7 +65,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "render/raster/vulkan_raster_renderer.hpp"
 #include "render/render_world.hpp"
 #include "runtime/app/pose_publisher.hpp"
@@ -102,14 +102,12 @@ struct Backend {
     bool ok() const { return dev != nullptr && backend != nullptr; }
 };
 Backend GetBackend() {
-    static nphi::DeviceContext ctx = nphi::MakeDefaultDeviceContext();
     static Backend b = [] {
         Backend r;
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;
     }();
-    (void)ctx;
     return b;
 }
 

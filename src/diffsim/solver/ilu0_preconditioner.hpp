@@ -42,15 +42,9 @@
 
 #include <cstdint>
 
-#ifdef __CUDACC__
-#include <cuda_runtime.h>
-#endif
+#include <cuda_runtime.h>  // cudaStream_t (Launch*Test signatures, BUF-14)
 
 namespace nuka {
-namespace phi {
-struct DeviceContext;
-}  // namespace phi
-
 namespace diffsim {
 
 // Relative pivot floor for ILU(0): a |U[k][k]| at or below kIluPivotRelEps *
@@ -151,11 +145,11 @@ __device__ __forceinline__ void Ilu0FactorizeDevice(const double* __restrict__ a
 // the caller owns + synchronizes. `lu`/`a` are block-major (stride kMaxBlockDim^2,
 // row-major n x n); `r`/`z` are block-major (stride kMaxBlockDim).
 // ---------------------------------------------------------------------------
-void LaunchIlu0FactorizeTest(const phi::DeviceContext& context, const float* a,
+void LaunchIlu0FactorizeTest(cudaStream_t stream, int device_id, const float* a,
                              const uint32_t* block_dim, float* lu,
                              uint32_t block_count);
 
-void LaunchIlu0ApplyTest(const phi::DeviceContext& context, const float* lu,
+void LaunchIlu0ApplyTest(cudaStream_t stream, int device_id, const float* lu,
                          const uint32_t* block_dim, const float* r, float* z,
                          uint32_t block_count);
 

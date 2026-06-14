@@ -40,7 +40,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -120,10 +121,10 @@ struct DeviceArticulation {
     articulation::ArticulationDeviceState view;
 };
 
-DeviceArticulation Upload(const nuka::phi::DeviceContext& context,
+DeviceArticulation Upload(cudaStream_t context, int context_dev,
                           const articulation::ArticulationHostState& host) {
     DeviceArticulation world;
-    world.buffers = articulation::UploadArticulationState(context, host);
+    world.buffers = articulation::UploadArticulationState(context, context_dev, host);
     world.view = world.buffers.View();
     return world;
 }
@@ -151,7 +152,7 @@ struct SolveResult {
 // step needed -- the kernel reads qdot as the free velocity and writes back the
 // corrected one). Contacts are supplied directly (env-major, fixed stride) so a
 // gate can inject exactly one. `dt` drives the Baumgarte bias.
-SolveResult RunSolve(const nuka::phi::DeviceContext& context,
+SolveResult RunSolve(cudaStream_t context, int context_dev,
                      const articulation::ArticulationHostState& host,
                      uint32_t env_count,
                      uint32_t max_dof,
@@ -169,8 +170,8 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     result.slot_count = slot_count;
     const size_t tile = static_cast<size_t>(max_dof) * max_dof;
 
-    auto world = Upload(context, host);
-    articulation::FeatherstoneAba::ComputeAccelerations(context, world.view, gravity_z);
+    auto world = Upload(context, context_dev, host);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, world.view, gravity_z);
 
     // M and M^-1.
     OwnedDeviceBuffer composite_buf(
@@ -179,11 +180,11 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer m_buf(static_cast<size_t>(artic_count) * tile * sizeof(float));
     OwnedDeviceBuffer minv_buf(static_cast<size_t>(artic_count) * tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, world.view, max_dof,
+        context, context_dev, world.view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()));
     articulation::FactorArticulationInertiaM(
-        context, world.view, max_dof,
+        context, context_dev, world.view, max_dof,
         static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
 
@@ -201,7 +202,7 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer t1_buf(slot_count * sizeof(Vec3));
     OwnedDeviceBuffer t2_buf(slot_count * sizeof(Vec3));
     articulation::ComputeContactTangentBasis(
-        context,
+        context, context_dev,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
         env_count,
@@ -215,19 +216,19 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer jt1_buf(jac_len * sizeof(float));
     OwnedDeviceBuffer jt2_buf(jac_len * sizeof(float));
     articulation::ComputeContactChainJacobians(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
         slot_count, max_dof, static_cast<float*>(jn_buf.Data()));
     articulation::ComputeContactChainJacobians(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
         static_cast<const Vec3*>(t1_buf.Data()),
         slot_count, max_dof, static_cast<float*>(jt1_buf.Data()));
     articulation::ComputeContactChainJacobians(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
         static_cast<const Vec3*>(t2_buf.Data()),
@@ -238,19 +239,19 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer meff_t1_buf(slot_count * sizeof(float));
     OwnedDeviceBuffer meff_t2_buf(slot_count * sizeof(float));
     articulation::ComputeContactEffectiveMass(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const float*>(jn_buf.Data()),
         static_cast<const float*>(minv_buf.Data()),
         slot_count, max_dof, static_cast<float*>(meff_n_buf.Data()));
     articulation::ComputeContactEffectiveMass(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const float*>(jt1_buf.Data()),
         static_cast<const float*>(minv_buf.Data()),
         slot_count, max_dof, static_cast<float*>(meff_t1_buf.Data()));
     articulation::ComputeContactEffectiveMass(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const float*>(jt2_buf.Data()),
         static_cast<const float*>(minv_buf.Data()),
@@ -260,7 +261,7 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer rows_buf(
         slot_count * sizeof(articulation::ArticulatedContactRow));
     articulation::AssembleArticulatedContactRows(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const uint32_t*>(link_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
         static_cast<const float*>(depth_buf.Data()),
@@ -285,7 +286,7 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
 
     // Solve (fused apply: modifies state.qdot in place; writes lambda for read-back).
     articulation::SolveArticulatedContactRows(
-        context, world.view,
+        context, context_dev, world.view,
         static_cast<const articulation::ArticulatedContactRow*>(rows_buf.Data()),
         static_cast<const float*>(jn_buf.Data()),
         static_cast<const float*>(jt1_buf.Data()),
@@ -294,7 +295,7 @@ SolveResult RunSolve(const nuka::phi::DeviceContext& context,
         env_count, max_dof, dt,
         static_cast<float*>(lambda_buf.Data()),
         friction_coefficient);
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     // Download outputs.
     articulation::ArticulationHostState download = host;
@@ -451,7 +452,8 @@ float ContactNormalVelocityFK(const Transform& link_world,
 // Gate 1 -- PRIMARY hand-computable magnitude anchor.
 // ---------------------------------------------------------------------------
 TEST(ArticulationContactRows, PendulumHandComputedLambdaAndImpulse) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     const float kMass = 2.0f;
     const float kLength = 0.5f;
     const float kDt = 0.01f;
@@ -482,7 +484,7 @@ TEST(ArticulationContactRows, PendulumHandComputedLambdaAndImpulse) {
         for (auto& v : host.qdot) {
             v = 0.0f;
         }
-        const auto res = RunSolve(context, host, 1u, max_dof, link, point, norm,
+        const auto res = RunSolve(context, context_dev, host, 1u, max_dof, link, point, norm,
                                   depth, 0.0f, kDt, /*warm_start=*/false);
 
         // Hand values.
@@ -533,7 +535,7 @@ TEST(ArticulationContactRows, PendulumHandComputedLambdaAndImpulse) {
         for (auto& v : host.qdot) {
             v = kQdotFree;
         }
-        const auto res = RunSolve(context, host, 1u, max_dof, link, point, norm,
+        const auto res = RunSolve(context, context_dev, host, 1u, max_dof, link, point, norm,
                                   depth, 0.0f, kDt, /*warm_start=*/false);
         const float jv_free = res.normal_jac[0] * kQdotFree;
         const float bias =
@@ -558,7 +560,8 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         GTEST_SKIP() << "Go2 stand scene is not available";
     }
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2();
     auto& base = cooked.host;
     const uint32_t base_link_count = base.TotalLinkCount();
@@ -601,13 +604,13 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
     // Jacobian, which reads state.link_pose, is consistent with M). Mirrors the
     // inertia_m test (lines 429-432).
     auto refresh_link_pose = [&](articulation::ArticulationHostState& host) {
-        auto world = Upload(context, host);
-        articulation::FeatherstoneAba::ComputeAccelerations(context, world.view, kGravity);
+        auto world = Upload(context, context_dev, host);
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, world.view, kGravity);
         OwnedDeviceBuffer pose_buf(
             static_cast<size_t>(host.TotalLinkCount()) * sizeof(Transform));
         articulation::UpdateWorldLinkPoses(
-            context, world.view, static_cast<Transform*>(pose_buf.Data()));
-        context.stream.Synchronize();
+            context, context_dev, world.view, static_cast<Transform*>(pose_buf.Data()));
+        cudaStreamSynchronize(context);
         std::vector<Transform> world_pose(host.TotalLinkCount());
         pose_buf.CopyToHost(world_pose.data(), world_pose.size() * sizeof(Transform));
         for (uint32_t link = 0u; link < host.TotalLinkCount(); ++link) {
@@ -626,11 +629,11 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
     };
     auto detect = [&](const articulation::ArticulationHostState& host,
                       uint32_t env_count, float ground_height) {
-        auto world = Upload(context, host);
+        auto world = Upload(context, context_dev, host);
         const uint32_t links = host.TotalLinkCount();
         OwnedDeviceBuffer pose_buf(static_cast<size_t>(links) * sizeof(Transform));
         articulation::UpdateWorldLinkPoses(
-            context, world.view, static_cast<Transform*>(pose_buf.Data()));
+            context, context_dev, world.view, static_cast<Transform*>(pose_buf.Data()));
         OwnedDeviceBuffer feet_buf(cooked.feet.size() * sizeof(articulation::FootShape));
         feet_buf.CopyFromHost(cooked.feet.data(),
                               cooked.feet.size() * sizeof(articulation::FootShape));
@@ -641,7 +644,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         OwnedDeviceBuffer depth_buf(slot_count * sizeof(float));
         OwnedDeviceBuffer count_buf(env_count * sizeof(uint32_t));
         articulation::DetectFootGroundContacts(
-            context, static_cast<const Transform*>(pose_buf.Data()),
+            context, context_dev, static_cast<const Transform*>(pose_buf.Data()),
             static_cast<const articulation::FootShape*>(feet_buf.Data()),
             static_cast<uint32_t>(cooked.feet.size()), env_count, base_link_count,
             ground_height,
@@ -650,7 +653,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
             static_cast<Vec3*>(normal_buf.Data()),
             static_cast<float*>(depth_buf.Data()),
             static_cast<uint32_t*>(count_buf.Data()));
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         Contacts c;
         c.link.resize(slot_count);
         c.point.resize(slot_count);
@@ -697,7 +700,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
     std::printf("[diag] (4) active foot contacts = %u\n", active);
 
     {
-        const auto res = RunSolve(context, pressed, 1u, max_dof, c1.link, c1.point,
+        const auto res = RunSolve(context, context_dev, pressed, 1u, max_dof, c1.link, c1.point,
                                   c1.normal, c1.depth, kGravity, kDt,
                                   /*warm_start=*/false);
         uint32_t loaded = 0u;
@@ -746,9 +749,9 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         auto post = pressed;
         post.qdot = res.qdot_post;
         const auto world_pose = refresh_link_pose(post);
-        auto world = Upload(context, post);
-        articulation::FeatherstoneAba::ComputeAccelerations(context, world.view, kGravity);
-        context.stream.Synchronize();
+        auto world = Upload(context, context_dev, post);
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, world.view, kGravity);
+        cudaStreamSynchronize(context);
         articulation::ArticulationHostState dl = post;
         articulation::DownloadArticulationState(world.buffers, &dl);
 
@@ -815,7 +818,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         norm[0] = Vec3{0.0f, 0.0f, 1.0f};
         depth[0] = inject_depth;
 
-        const auto res = RunSolve(context, host, 1u, max_dof, link, point, norm,
+        const auto res = RunSolve(context, context_dev, host, 1u, max_dof, link, point, norm,
                                   depth, kGravity, kDt, /*warm_start=*/false);
 
         // Independent topology walk: the ancestor links of inject_link up to the
@@ -888,7 +891,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
             }
             last_total_depth = total_depth;
 
-            const auto res = RunSolve(context, host, 1u, max_dof, c.link, c.point,
+            const auto res = RunSolve(context, context_dev, host, 1u, max_dof, c.link, c.point,
                                       c.normal, c.depth, kGravity, kDt,
                                       /*warm_start=*/false);
             // qdot+ must be finite.
@@ -923,10 +926,10 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         }
         refresh_link_pose(host);
         const auto c = detect(host, 1u, kGround);
-        const auto run_a = RunSolve(context, host, 1u, max_dof, c.link, c.point,
+        const auto run_a = RunSolve(context, context_dev, host, 1u, max_dof, c.link, c.point,
                                     c.normal, c.depth, kGravity, kDt,
                                     /*warm_start=*/false);
-        const auto run_b = RunSolve(context, host, 1u, max_dof, c.link, c.point,
+        const auto run_b = RunSolve(context, context_dev, host, 1u, max_dof, c.link, c.point,
                                     c.normal, c.depth, kGravity, kDt,
                                     /*warm_start=*/false);
         ASSERT_EQ(run_a.qdot_post.size(), run_b.qdot_post.size());
@@ -945,7 +948,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
         ASSERT_EQ(batched.ArticulationCount(), kEnvCount);
         refresh_link_pose(batched);
         const auto cb = detect(batched, kEnvCount, kGround);
-        const auto rb = RunSolve(context, batched, kEnvCount, max_dof, cb.link,
+        const auto rb = RunSolve(context, context_dev, batched, kEnvCount, max_dof, cb.link,
                                  cb.point, cb.normal, cb.depth, kGravity, kDt,
                                  /*warm_start=*/false);
         size_t qdot_mismatches = 0u;
@@ -1095,7 +1098,7 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
             for (uint32_t l = 0u; l < host.TotalLinkCount(); ++l) {
                 host.link_pose[l] = world_pose0[l];
             }
-            const auto res = RunSolve(context, host, 1u, max_dof, link, point, norm,
+            const auto res = RunSolve(context, context_dev, host, 1u, max_dof, link, point, norm,
                                       depth, kGravity, kDt, /*warm_start=*/false, mu);
             FrictionDiag d;
             d.lambda_n = res.lambda[0];
@@ -1112,9 +1115,9 @@ TEST(ArticulationContactRows, Go2CouplingFkResidualStructureDeterminismFriction)
             for (uint32_t l = 0u; l < post.TotalLinkCount(); ++l) {
                 post.link_pose[l] = world_pose0[l];
             }
-            auto world = Upload(context, post);
-            articulation::FeatherstoneAba::ComputeAccelerations(context, world.view, kGravity);
-            context.stream.Synchronize();
+            auto world = Upload(context, context_dev, post);
+            articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, world.view, kGravity);
+            cudaStreamSynchronize(context);
             articulation::ArticulationHostState dl = post;
             articulation::DownloadArticulationState(world.buffers, &dl);
             d.vt_t1 = ContactNormalVelocityFK(world_pose0[inject_link],

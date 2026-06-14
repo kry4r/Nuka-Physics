@@ -15,7 +15,7 @@
 
 #include "collision/lbvh_node.cuh"
 #include "collision/lbvh_refit.cuh"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 
 #include <cuda_runtime.h>
 
@@ -79,7 +79,7 @@ __global__ void RefitPropagateKernel(uint32_t leaf_count,
 
 } // namespace
 
-void RefitLbvh(const phi::DeviceContext& context,
+void RefitLbvh(cudaStream_t stream, int device_id,
                LbvhNode* device_nodes,
                const collision::AABB* device_new_aabbs,
                uint32_t leaf_count,
@@ -87,8 +87,7 @@ void RefitLbvh(const phi::DeviceContext& context,
     if (leaf_count < 2u) {
         return;
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t internal_count = leaf_count - 1u;
     const uint32_t blocks = (leaf_count + kBlockSize - 1u) / kBlockSize;
 

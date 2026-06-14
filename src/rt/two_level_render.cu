@@ -36,7 +36,7 @@
 #include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
 #include "rt/instance_transform.cuh"
@@ -590,15 +590,16 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene) {
     }
 
     // Ensure the device context is live (the BLAS uploads need a device + stream).
-    auto context = phi::MakeDefaultDeviceContext();
-    phi::ScopedDeviceGuard guard(context.device_id);
+    const cudaStream_t stream = nullptr;  // default stream 0
+    const int device_id = 0;
+    phi::ScopedDeviceGuard guard(device_id);
 
     TwoLevelSceneDevice device;
     device.GetImpl()->meshes.reserve(scene.meshes.size());
     for (const auto& mesh : scene.meshes) {
         device.GetImpl()->meshes.push_back(BuildBlas(mesh));
     }
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     return device;
 }
 
@@ -619,9 +620,9 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
         return fb;
     }
 
-    auto context = phi::MakeDefaultDeviceContext();
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    const cudaStream_t stream = nullptr;  // default stream 0
+    const int device_id = 0;
+    phi::ScopedDeviceGuard guard(device_id);
 
     TwoLevelSceneDevice::Impl* impl = device.GetImpl();
     const uint32_t inst_count = static_cast<uint32_t>(scene.instances.size());
@@ -704,7 +705,7 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
         static_cast<float*>(d_uv.Data()),
         static_cast<uint32_t*>(d_prim.Data()));
     CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
     d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));

@@ -63,13 +63,14 @@ nuka_result_t nuka_device_create(const nuka_device_desc_t* desc,
         if (cuda_result != cudaSuccess) {
             return NUKA_RESULT_CUDA_ERROR;
         }
+        record->device_id = device_id;
 
-        cudaStream_t stream = static_cast<cudaStream_t>(desc->cuda_stream);
-        if (stream == nullptr) {
-            record->owned_stream = std::make_unique<nuka::phi::OwnedStream>();
-            stream = record->owned_stream->Native();
-        }
-        record->context = nuka::phi::MakeDeviceContext(device_id, stream);
+        // BUF-14: the legacy orchestration that used to run on a per-handle
+        // OWNED stream now runs on STREAM 0 (the NULL/default stream). desc->
+        // cuda_stream is accepted by the public ABI but the legacy paths only
+        // ever ran their kernels + explicit syncs on the handle's stream, which
+        // is now stream 0; the NULL stream serializes with the v2 backend's
+        // blocking `main` stream exactly as the owned stream did before.
 
         // --- phi v2 device/backend acquisition (M9 T2) ---------------------
         // Acquire the OWNED phi v2 Backend on the requested CUDA ordinal so the

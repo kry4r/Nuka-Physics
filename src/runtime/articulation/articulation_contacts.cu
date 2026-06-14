@@ -1120,7 +1120,7 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 } // namespace
 
-void UpdateWorldLinkPoses(const phi::DeviceContext& context,
+void UpdateWorldLinkPoses(cudaStream_t stream, int device_id,
                           ArticulationDeviceState state,
                           math::Transform* out_world_pose) {
     if (state.articulation_count == 0u || state.total_link_count == 0u) {
@@ -1130,8 +1130,7 @@ void UpdateWorldLinkPoses(const phi::DeviceContext& context,
         throw std::runtime_error("UpdateWorldLinkPoses requires an output buffer");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     // One block per articulation; the forward pass runs on a single lane (the
     // parent->child dependency is sequential within an articulation).
     UpdateWorldLinkPosesKernel<<<state.articulation_count, 32u, 0u, stream>>>(
@@ -1139,7 +1138,7 @@ void UpdateWorldLinkPoses(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "UpdateWorldLinkPosesKernel launch");
 }
 
-void DetectFootGroundContacts(const phi::DeviceContext& context,
+void DetectFootGroundContacts(cudaStream_t stream, int device_id,
                               const math::Transform* world_pose,
                               const FootShape* feet,
                               uint32_t foot_count,
@@ -1165,8 +1164,7 @@ void DetectFootGroundContacts(const phi::DeviceContext& context,
             "DetectFootGroundContacts requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (env_count + kBlockSize - 1u) / kBlockSize;
     DetectFootGroundContactsKernel<<<block_count, kBlockSize, 0u, stream>>>(
@@ -1210,7 +1208,7 @@ uint32_t ArticulationDofCount(const ArticulationHostState& host, uint32_t articu
     return dof;
 }
 
-void ComputeArticulationInertiaM(const phi::DeviceContext& context,
+void ComputeArticulationInertiaM(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  uint32_t max_dof,
                                  LinkSpatialInertia* composite_inertia_scratch,
@@ -1225,8 +1223,7 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
             "ComputeArticulationInertiaM requires device scratch and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     // joint_damping (per-DOF c_j) + dt are optional: non-null folds dt*C into the
     // joint diagonals so the factored inverse is (M + dt*C)^-1 (implicit joint
     // damping). null/0 leaves M as the pure CRBA inertia (single-env path + the
@@ -1236,7 +1233,7 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "ComputeArticulationInertiaMKernel launch");
 }
 
-void FactorArticulationInertiaM(const phi::DeviceContext& context,
+void FactorArticulationInertiaM(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 const float* inertia_M,
@@ -1259,14 +1256,13 @@ void FactorArticulationInertiaM(const phi::DeviceContext& context,
             "FactorArticulationInertiaM requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     FactorArticulationInertiaMKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state, max_dof, inertia_M, out_inertia_M_inv);
     CheckCuda(cudaGetLastError(), "FactorArticulationInertiaMKernel launch");
 }
 
-void ApplyImplicitJointDamping(const phi::DeviceContext& context,
+void ApplyImplicitJointDamping(cudaStream_t stream, int device_id,
                                ArticulationDeviceState state,
                                const float* inertia_M_inv,
                                const float* joint_damping,
@@ -1286,8 +1282,7 @@ void ApplyImplicitJointDamping(const phi::DeviceContext& context,
             "ApplyImplicitJointDamping requires a device inertia_M_inv buffer");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     // One block per articulation, single lane (matches the solve kernel launch
     // shape). joint_damping==nullptr || dt<=0 -> the kernel leaves qdot unchanged.
     ApplyImplicitJointDampingKernel<<<state.articulation_count, 32u, 0u, stream>>>(
@@ -1295,7 +1290,7 @@ void ApplyImplicitJointDamping(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "ApplyImplicitJointDampingKernel launch");
 }
 
-void ComputeContactEffectiveMass(const phi::DeviceContext& context,
+void ComputeContactEffectiveMass(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  const uint32_t* contact_link_indices,
                                  const float* chain_jacobian,
@@ -1312,8 +1307,7 @@ void ComputeContactEffectiveMass(const phi::DeviceContext& context,
             "ComputeContactEffectiveMass requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (contact_count + kBlockSize - 1u) / kBlockSize;
     ComputeContactEffectiveMassKernel<<<block_count, kBlockSize, 0u, stream>>>(
@@ -1327,7 +1321,7 @@ void ComputeContactEffectiveMass(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "ComputeContactEffectiveMassKernel launch");
 }
 
-void ComputeContactTangentBasis(const phi::DeviceContext& context,
+void ComputeContactTangentBasis(cudaStream_t stream, int device_id,
                                 const uint32_t* contact_link,
                                 const math::Vec3* contact_normal,
                                 uint32_t env_count,
@@ -1342,8 +1336,7 @@ void ComputeContactTangentBasis(const phi::DeviceContext& context,
             "ComputeContactTangentBasis requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t slot_count = env_count * kMaxFootContactsPerEnv;
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (slot_count + kBlockSize - 1u) / kBlockSize;
@@ -1352,7 +1345,7 @@ void ComputeContactTangentBasis(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "ComputeContactTangentBasisKernel launch");
 }
 
-void AssembleArticulatedContactRows(const phi::DeviceContext& context,
+void AssembleArticulatedContactRows(cudaStream_t stream, int device_id,
                                     ArticulationDeviceState state,
                                     const uint32_t* contact_link,
                                     const math::Vec3* contact_normal,
@@ -1374,8 +1367,7 @@ void AssembleArticulatedContactRows(const phi::DeviceContext& context,
             "AssembleArticulatedContactRows requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t slot_count = env_count * kMaxFootContactsPerEnv;
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (slot_count + kBlockSize - 1u) / kBlockSize;
@@ -1392,7 +1384,7 @@ void AssembleArticulatedContactRows(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "AssembleArticulatedContactRowsKernel launch");
 }
 
-void SolveArticulatedContactRows(const phi::DeviceContext& context,
+void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  const ArticulatedContactRow* rows,
                                  const float* normal_jacobian,
@@ -1427,8 +1419,7 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
     // the 1-articulation-per-env design).
     (void)env_count;
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     SolveArticulatedContactRowsKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state,
         rows,

@@ -72,7 +72,8 @@
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer_v2.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -233,14 +234,14 @@ CookedFloat CookGo2Float() {
     return result;
 }
 
-std::vector<Transform> ForwardKinematics(const nuka::phi::DeviceContext& context,
+std::vector<Transform> ForwardKinematics(cudaStream_t context, int context_dev,
                                          const articulation::ArticulationHostState& host) {
     const uint32_t link_count = host.TotalLinkCount();
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
-    articulation::UpdateWorldLinkPoses(context, device.View(),
+    articulation::UpdateWorldLinkPoses(context, context_dev, device.View(),
                                        static_cast<Transform*>(pose_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<Transform> poses(link_count);
     pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
     return poses;
@@ -253,25 +254,25 @@ Vec3 FootWorldCenter(const std::vector<Transform>& poses, const articulation::Fo
 
 // 18x18 M^-1 via the production CRBA (reuse, not hand-rolled). Requires ABA pass-1
 // (link_xup current), so we run ComputeAccelerations first.
-std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& context,
+std::vector<float> ComputeInverseInertia18(cudaStream_t context, int context_dev,
                                            const articulation::ArticulationHostState& host) {
     const float kGravityZ = -9.81f;
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
     const uint32_t link_count = host.TotalLinkCount();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, kGravityZ);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, kGravityZ);
     OwnedDeviceBuffer composite(
         static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
     OwnedDeviceBuffer m(static_cast<size_t>(kDof) * kDof * sizeof(float));
     OwnedDeviceBuffer m_inv(static_cast<size_t>(kDof) * kDof * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, kDof,
+        context, context_dev, view, kDof,
         static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
         static_cast<float*>(m.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, kDof, static_cast<const float*>(m.Data()),
+        context, context_dev, view, kDof, static_cast<const float*>(m.Data()),
         static_cast<float*>(m_inv.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<float> out(static_cast<size_t>(kDof) * kDof);
     m_inv.CopyToHost(out.data(), out.size() * sizeof(float));
     return out;
@@ -342,14 +343,14 @@ Vec3 PlaceBoxUnderFoot(const Vec3& foot_center, float foot_radius, float x_offse
     return c;
 }
 
-CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
+CoResidenceResult RunCoResidence(cudaStream_t context, int context_dev,
                                  const CookedFloat& cooked,
                                  const nuka::solver::SolverConfig& config) {
     CoResidenceResult result;
     const auto& host = cooked.host;
 
     // --- FK -> foot world centers (the material contact points) --------------
-    const auto poses = ForwardKinematics(context, host);
+    const auto poses = ForwardKinematics(context, context_dev, host);
 
     // Pick foot 0 (FL) as the single contacting foot.
     const articulation::FootShape& foot = cooked.feet[0];
@@ -379,7 +380,7 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
 
     // --- (2) commit 2: the cross-type CandidatePair stream -------------------
     auto stream = nuka::collision::BuildArticulationRigidCandidatePairs(
-        context, d_rigid_ptr, static_cast<uint32_t>(rigid_aabbs.size()),
+        context, context_dev, d_rigid_ptr, static_cast<uint32_t>(rigid_aabbs.size()),
         rigid_body_ids.data(), rigid_contypes.data(), rigid_conaff.data(),
         links, link_contypes.data(), link_conaff.data(),
         /*excluded_body_pairs=*/{});
@@ -480,9 +481,9 @@ CoResidenceResult RunCoResidence(const nuka::phi::DeviceContext& context,
     // dir for the foot side); we project the chain-J on it (the reduced-coordinate
     // reaction the kernel uses). --------------------------------------------------
     const Vec3 foot_normal = result.j_foot.linear;
-    const std::vector<float> minv = ComputeInverseInertia18(context, host);
+    const std::vector<float> minv = ComputeInverseInertia18(context, context_dev, host);
     const std::vector<float> chain_j = nuka::test::ComputeFootChainJ18(
-        context, host, poses, foot.calf_local_link, result.contact_point, foot_normal, kDof);
+        context, context_dev, host, poses, foot.calf_local_link, result.contact_point, foot_normal, kDof);
     std::vector<float> chain_jacobians = chain_j;  // one slot.
 
     // --- wire art_refs (foot side) + body_indices (box side -> BodyState 0;
@@ -624,14 +625,15 @@ TEST(FootBoxCoResidence, BothArmsFireAndBoxVelocityChanges) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
     ASSERT_FALSE(cooked.feet.empty());
 
-    const auto out = RunCoResidence(context, cooked, ConvergedConfig());
+    const auto out = RunCoResidence(context, context_dev, cooked, ConvergedConfig());
 
     // --- broadphase + driver plumbing (de-orphans commits 1 + 2) -------------
     EXPECT_TRUE(out.pair_found)
@@ -719,14 +721,15 @@ TEST(FootBoxCoResidence, BoxRotatesUnderOffCenterContact) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
     ASSERT_FALSE(cooked.feet.empty());
 
-    const auto out = RunCoResidence(context, cooked, ConvergedConfig());
+    const auto out = RunCoResidence(context, context_dev, cooked, ConvergedConfig());
 
     // Precondition: the contact is genuinely off the box COM (a real lever), so a
     // correct rigid contact MUST give the box angular velocity.
@@ -768,15 +771,16 @@ TEST(FootBoxCoResidence, Deterministic_TwoRun) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
     ASSERT_FALSE(cooked.feet.empty());
 
-    const auto a = RunCoResidence(context, cooked, ConvergedConfig());
-    const auto b = RunCoResidence(context, cooked, ConvergedConfig());
+    const auto a = RunCoResidence(context, context_dev, cooked, ConvergedConfig());
+    const auto b = RunCoResidence(context, context_dev, cooked, ConvergedConfig());
 
     ASSERT_TRUE(a.pair_found && b.pair_found);
     ASSERT_EQ(a.qdot_after.size(), b.qdot_after.size());

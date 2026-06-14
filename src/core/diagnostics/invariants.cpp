@@ -219,7 +219,7 @@ InvariantSampler::InvariantSampler(const InvariantConfig& cfg) : cfg_(cfg) {
     }
 }
 
-void InvariantSampler::Sample(const phi::DeviceContext&,
+void InvariantSampler::Sample(cudaStream_t,
                               const runtime::PhysicsWorld& world,
                               uint32_t step_index,
                               std::vector<InvariantSample>* out_violations) {

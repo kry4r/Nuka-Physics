@@ -9,7 +9,7 @@
 
 #include "sensor/contact_wrench.hpp"
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 
 #include <cuda_runtime.h>
 
@@ -110,7 +110,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
 
 }  // namespace
 
-void ComputeContactWrench(const phi::DeviceContext& context,
+void ComputeContactWrench(cudaStream_t stream, int device_id,
                           const float* lambda,
                           const math::Vec3* contact_point,
                           const math::Vec3* contact_normal,
@@ -132,8 +132,7 @@ void ComputeContactWrench(const phi::DeviceContext& context,
     // force = impulse / dt; a non-positive dt yields a defined zero readout.
     const float inv_dt = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     constexpr uint32_t kBlock = 128u;
 

@@ -23,7 +23,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -137,7 +138,7 @@ OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
     return buf;
 }
 
-std::vector<float> RunMinres(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunMinres(cudaStream_t ctx, int ctx_dev,
                              const std::vector<float>& values,
                              const std::vector<uint32_t>& dims,
                              const std::vector<float>& rhs,
@@ -160,10 +161,10 @@ std::vector<float> RunMinres(const nuka::phi::DeviceContext& ctx,
     params.tol = 1.0e-7f;
     params.run_to_fixed_iters = fixed_iters;
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(static_cast<size_t>(bc) * kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -231,7 +232,8 @@ std::vector<Block> MakeIndefiniteBatch() {
 // INDEFINITE symmetric systems within 1e-5. Absolute-Jacobi preconditioner (SPD,
 // the valid choice for indefinite MINRES), run to enough fixed iters to converge.
 TEST(MinresVsDenseIndefinite, AgreesWithFullPivLu) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeIndefiniteBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -240,7 +242,7 @@ TEST(MinresVsDenseIndefinite, AgreesWithFullPivLu) {
     // n<=12 so 200 fixed iters >> n guarantees MINRES exhausts the Krylov space
     // (exact in <= n steps in fp64; the extra iters are no-ops after breakdown).
     const std::vector<float> x =
-        RunMinres(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
+        RunMinres(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
                   true);
     double worst_resid = 0.0;
     const double rel = MaxRelErr(blocks, x, worst_resid);
@@ -296,7 +298,7 @@ Block MakePsdNullBlock(uint32_t n, std::mt19937& rng) {
     return Block{n, 1.0, A, b};
 }
 
-uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
+uint32_t RunDetect(cudaStream_t ctx, int ctx_dev,
                    const std::vector<Block>& blocks) {
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -312,9 +314,9 @@ uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
     system.values = static_cast<const float*>(d_values.Data());
     system.block_dim = static_cast<const uint32_t*>(d_dims.Data());
 
-    diffsim::DetectBatchedIndefinite(ctx, system,
+    diffsim::DetectBatchedIndefinite(ctx, ctx_dev, system,
                                      static_cast<uint32_t*>(d_flag.Data()));
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
     uint32_t flag = 0u;
     d_flag.CopyToHost(&flag, sizeof(uint32_t));
     return flag;
@@ -326,14 +328,15 @@ uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
 // IFT path is unchanged -- the regression tests alone cannot (MINRES would pass
 // them too); only flag==0 guarantees the CG branch is taken.
 TEST(MinresVsDenseIndefinite, IndefiniteDetectorBytesafe) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     std::mt19937 rng(0xD37u);
 
     // (a) SPD batch incl. an ill-conditioned kappa=1e6 block -> MUST NOT flag.
     std::vector<Block> spd;
     for (double kappa : {1.0e0, 1.0e3, 1.0e6})
         for (uint32_t n = 1u; n <= kMd; ++n) spd.push_back(MakeSpdBlock(n, kappa, rng));
-    EXPECT_EQ(RunDetect(ctx, spd), 0u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, spd), 0u)
         << "indefinite detector FALSE-POSITIVE on an SPD batch (would mis-route the "
            "SPD IFT path to MINRES and break the byte-identical guarantee)";
 
@@ -341,20 +344,20 @@ TEST(MinresVsDenseIndefinite, IndefiniteDetectorBytesafe) {
     //     byte-safety-critical case: a ~0 pivot is NOT strictly negative).
     std::vector<Block> psd;
     for (uint32_t n = 2u; n <= kMd; ++n) psd.push_back(MakePsdNullBlock(n, rng));
-    EXPECT_EQ(RunDetect(ctx, psd), 0u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, psd), 0u)
         << "indefinite detector FALSE-POSITIVE on a PSD null-direction batch";
 
     // (c) genuinely indefinite batch -> MUST flag.
     std::vector<Block> indef;
     for (uint32_t n = 2u; n <= kMd; ++n) indef.push_back(MakeIndefiniteBlock(n, 1.0e2, rng));
-    EXPECT_EQ(RunDetect(ctx, indef), 1u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, indef), 1u)
         << "indefinite detector FALSE-NEGATIVE on a genuinely indefinite batch";
 
     // (d) a single indefinite block mixed into an otherwise-SPD batch -> flag (the
     //     whole-batch routing trigger).
     std::vector<Block> mixed = spd;
     mixed.push_back(MakeIndefiniteBlock(6u, 1.0e2, rng));
-    EXPECT_EQ(RunDetect(ctx, mixed), 1u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, mixed), 1u)
         << "one indefinite block in an SPD batch must flag (whole-batch routing)";
 
     std::printf("[MinresVsDenseIndefinite] detector byte-safe: SPD/PSD->0, "
@@ -363,7 +366,8 @@ TEST(MinresVsDenseIndefinite, IndefiniteDetectorBytesafe) {
 
 // D1: two MINRES solves of the same indefinite batch are byte-identical.
 TEST(MinresVsDenseIndefinite, BitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeIndefiniteBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -371,10 +375,10 @@ TEST(MinresVsDenseIndefinite, BitExact) {
 
     for (bool fixed : {false, true}) {
         const std::vector<float> x1 =
-            RunMinres(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
+            RunMinres(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
                       fixed);
         const std::vector<float> x2 =
-            RunMinres(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
+            RunMinres(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
                       fixed);
         ASSERT_EQ(x1.size(), x2.size());
         EXPECT_EQ(std::memcmp(x1.data(), x2.data(), x1.size() * sizeof(float)), 0)

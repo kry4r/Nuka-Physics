@@ -30,7 +30,8 @@
 #include "diffsim/solver/cg_diagnostics.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -116,7 +117,7 @@ struct SolveOut {
     Eigen::VectorXd x;
 };
 
-SolveOut SolveWithDiag(const nuka::phi::DeviceContext& ctx,
+SolveOut SolveWithDiag(cudaStream_t ctx, int ctx_dev,
                        const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                        diffsim::Preconditioner precond, uint32_t max_iter) {
     const uint32_t n = static_cast<uint32_t>(A.rows());
@@ -150,10 +151,10 @@ SolveOut SolveWithDiag(const nuka::phi::DeviceContext& ctx,
     params.diagnostics.final_rel_resid = static_cast<float*>(d_resid.Data());
     params.diagnostics.status = static_cast<uint8_t*>(d_status.Data());
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     SolveOut out;
     std::vector<float> x(kMd, 0.0f);
@@ -190,7 +191,8 @@ double RelErr(const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
 }
 
 TEST(BlockJacobiTuning, QualitySweepVsConditioning) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     constexpr uint32_t n = kMd;  // 12: the largest island the cap allows
     constexpr uint32_t max_iter = 200u;
     std::mt19937 rng(0xB10C4u);
@@ -209,9 +211,9 @@ TEST(BlockJacobiTuning, QualitySweepVsConditioning) {
         for (uint32_t i = 0u; i < n; ++i) b(i) = u(rng);
 
         const SolveOut jac =
-            SolveWithDiag(ctx, A, b, diffsim::Preconditioner::Jacobi, max_iter);
+            SolveWithDiag(ctx, ctx_dev, A, b, diffsim::Preconditioner::Jacobi, max_iter);
         const SolveOut blk =
-            SolveWithDiag(ctx, A, b, diffsim::Preconditioner::BlockJacobi, max_iter);
+            SolveWithDiag(ctx, ctx_dev, A, b, diffsim::Preconditioner::BlockJacobi, max_iter);
         const double jac_err = RelErr(A, b, jac.x);
         const double blk_err = RelErr(A, b, blk.x);
 
@@ -245,7 +247,8 @@ TEST(BlockJacobiTuning, QualitySweepVsConditioning) {
 // Exercises the host-side diagnostics summarizer (SummarizeCgDiagnostics) over a
 // multi-block batch: it must aggregate iters / residual / status deterministically.
 TEST(BlockJacobiTuning, HostSummarizerAggregatesBatch) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     std::mt19937 rng(0x5A1ADu);
     constexpr uint32_t bc = 6u;
     std::vector<float> values(static_cast<size_t>(bc) * kStride, 0.0f);
@@ -285,10 +288,10 @@ TEST(BlockJacobiTuning, HostSummarizerAggregatesBatch) {
     params.diagnostics.final_rel_resid = static_cast<float*>(d_resid.Data());
     params.diagnostics.status = static_cast<uint8_t*>(d_status.Data());
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<uint32_t> iters(bc, 0u);
     std::vector<float> resid(bc, 0.0f);
@@ -324,7 +327,8 @@ TEST(BlockJacobiTuning, HostSummarizerAggregatesBatch) {
 // alpha=0 freeze prevents a NaN blow-up). This is the runtime SPD-failure detection
 // the brief requires ("keep symmetry/SPD detection"), proven to engage.
 TEST(BlockJacobiTuning, DivergenceFlagFiresOnNonSpd) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     constexpr uint32_t n = 6u;
     std::mt19937 rng(0xDEADu);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
@@ -341,7 +345,7 @@ TEST(BlockJacobiTuning, DivergenceFlagFiresOnNonSpd) {
     // Jacobi here: BlockJacobi's modified Cholesky treats a negative pivot as a null
     // direction (a different, also-finite path); the divergence SIGNAL we are
     // validating is the CG SPD guard (pAp<0), exercised by genuine CG iteration.
-    const SolveOut out = SolveWithDiag(ctx, A, b, diffsim::Preconditioner::Jacobi, 64u);
+    const SolveOut out = SolveWithDiag(ctx, ctx_dev, A, b, diffsim::Preconditioner::Jacobi, 64u);
 
     std::printf("[BlockJacobiTuning] non-SPD (neg-def): status=0x%02x iters=%u "
                 "final_rel_resid=%.3e\n", out.status, out.iters, out.final_rel_resid);

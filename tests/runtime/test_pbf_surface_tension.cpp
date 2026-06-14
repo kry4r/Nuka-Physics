@@ -21,7 +21,7 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 
 #include <gtest/gtest.h>
 
@@ -43,8 +43,6 @@ struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
 NkCtx GetNkCtx() {
     static NkCtx c = [] {
         NkCtx r;
-        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
-        (void)keep;
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;

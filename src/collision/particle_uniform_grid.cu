@@ -349,13 +349,12 @@ ParticleGridConfig MakeParticleGridConfig(math::Vec3 world_min,
     return cfg;
 }
 
-ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
+ParticleGridResult BuildParticleUniformGrid(cudaStream_t stream, int device_id,
                                             const math::Vec3* positions,
                                             uint32_t particle_count,
                                             const ParticleGridConfig& config,
                                             float query_radius) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     const uint32_t cell_count = config.CellCount();
     const ParticleGridConfigDevice cfg = ToDevice(config);
@@ -427,7 +426,7 @@ ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "exclusive_scan counts");
 
     // Total neighbors = offsets[last] + counts[last].
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     uint32_t last_offset = 0u;
     uint32_t last_count = 0u;
     // Read the final offset + count from the device tails.
@@ -460,7 +459,7 @@ ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
         static_cast<uint32_t*>(d_truncated.Base()));
     CheckCuda(cudaGetLastError(), "FillNeighborsKernel launch");
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     uint32_t truncated = 0u;
     phi::BufferDownload(d_truncated.Handle(), &truncated, 0, sizeof(truncated));
 
@@ -479,8 +478,7 @@ ParticleGridResult BuildParticleUniformGrid(const math::Vec3* positions,
                                             uint32_t particle_count,
                                             const ParticleGridConfig& config,
                                             float query_radius) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildParticleUniformGrid(context, positions, particle_count, config,
+        return BuildParticleUniformGrid(/*stream=*/nullptr, /*device_id=*/0, positions, particle_count, config,
                                     query_radius);
 }
 

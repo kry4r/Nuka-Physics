@@ -47,7 +47,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -180,7 +181,7 @@ struct DevicePendulum {
     uint32_t dof = 0u;
 };
 
-DevicePendulum RunDevicePendulum(const nuka::phi::DeviceContext& context,
+DevicePendulum RunDevicePendulum(cudaStream_t context, int context_dev,
                                  const articulation::ArticulationHostState& host,
                                  uint32_t contact_link,
                                  Vec3 contact_point,
@@ -191,9 +192,9 @@ DevicePendulum RunDevicePendulum(const nuka::phi::DeviceContext& context,
     const uint32_t max_dof = dof;
     const size_t tile = static_cast<size_t>(max_dof) * max_dof;
 
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, 0.0f);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, 0.0f);
 
     OwnedDeviceBuffer composite_buf(
         static_cast<size_t>(host.TotalLinkCount()) *
@@ -201,11 +202,11 @@ DevicePendulum RunDevicePendulum(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer m_buf(tile * sizeof(float));
     OwnedDeviceBuffer minv_buf(tile * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
 
@@ -220,20 +221,20 @@ DevicePendulum RunDevicePendulum(const nuka::phi::DeviceContext& context,
     normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
 
     articulation::ComputeContactChainJacobians(
-        context, view,
+        context, context_dev, view,
         static_cast<const uint32_t*>(link_idx_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
         static_cast<const Vec3*>(normal_buf.Data()),
         contact_count, max_dof,
         static_cast<float*>(jac_buf.Data()));
     articulation::ComputeContactEffectiveMass(
-        context, view,
+        context, context_dev, view,
         static_cast<const uint32_t*>(link_idx_buf.Data()),
         static_cast<const float*>(jac_buf.Data()),
         static_cast<const float*>(minv_buf.Data()),
         contact_count, max_dof,
         static_cast<float*>(meff_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     out.M.resize(tile);
     out.Minv.resize(tile);
@@ -381,7 +382,8 @@ TEST(ReactionProviders, StaticNullIsZeroAndNoOp) {
 //   * M verified == I_a before the contraction is trusted.
 // ===========================================================================
 TEST(ReactionProviders, ArticulationChainJMatchesHandComputedPendulum) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // Revolute axis = world X; diagonal inertia (Ix,Iy,Iz) = (7, 11, 13).
     // The single DOF is rotation about X, so the hand CRBA M (1x1) == Ix = 7.
@@ -417,7 +419,7 @@ TEST(ReactionProviders, ArticulationChainJMatchesHandComputedPendulum) {
     const float expected_dqdot = (J_hand / I_a) * dlambda;
 
     // --- DEVICE BUILD (the proven CRBA M^-1 + chain-J the provider consumes) -
-    const auto dev = RunDevicePendulum(context, host, revolute_link,
+    const auto dev = RunDevicePendulum(context, context_dev, host, revolute_link,
                                        contact_point, contact_normal);
     ASSERT_EQ(dev.dof, 1u) << "pendulum must have exactly one DOF";
 
@@ -480,7 +482,8 @@ TEST(ReactionProviders, ArticulationChainJMatchesHandComputedPendulum) {
 // D1: 2-run byte-identity of every effective_inv_mass AND every applied delta.
 // ===========================================================================
 TEST(ReactionProviders, DeterministicAcrossTwoRuns) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // Build the pendulum + device M^-1/chain-J once (the device build is the only
     // potential nondeterminism source; the providers themselves are pure host
@@ -493,7 +496,7 @@ TEST(ReactionProviders, DeterministicAcrossTwoRuns) {
     const Vec3 contact_normal{0.0f, 0.0f, 1.0f};
 
     auto run_once = [&]() {
-        const auto dev = RunDevicePendulum(context, host, 1u, contact_point,
+        const auto dev = RunDevicePendulum(context, context_dev, host, 1u, contact_point,
                                            contact_normal);
         struct Outcome {
             float rigid_eff;

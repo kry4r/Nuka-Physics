@@ -5,12 +5,10 @@
 
 #include "math/vec3.hpp"
 
+#include <cuda_runtime.h>  // cudaStream_t
+
 #include <cstdint>
 #include <vector>
-
-namespace nuka::phi {
-struct DeviceContext;
-} // namespace nuka::phi
 
 namespace nuka::runtime {
 struct PhysicsWorld;
@@ -75,7 +73,7 @@ class InvariantSampler {
 public:
     explicit InvariantSampler(const InvariantConfig& cfg);
 
-    void Sample(const phi::DeviceContext& ctx,
+    void Sample(cudaStream_t stream,
                 const runtime::PhysicsWorld& world,
                 uint32_t step_index,
                 std::vector<InvariantSample>* out_violations);

@@ -3,7 +3,9 @@
 // n1_poisson.hpp -- launch decl for in-place Poisson sensor noise (v0.5 p04 N1)
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -20,7 +22,7 @@ namespace nuka::sensor::noise {
 // Pure function of (seed, element_idx, seq) => D1 two-run bit-exact and replay-
 // stable. No atomics, one element per thread, __restrict__. Launches on
 // ctx.stream (not synced here). See philox.cuh PoissonSample (Knuth's method).
-void LaunchPoissonNoise(const phi::DeviceContext& ctx, float* data,
+void LaunchPoissonNoise(cudaStream_t stream, int device_id, float* data,
                         uint32_t count, float lambda, uint64_t seed,
                         uint64_t seq);
 

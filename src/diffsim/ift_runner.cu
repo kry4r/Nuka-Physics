@@ -323,10 +323,11 @@ __global__ void DistributeKernel(const ArticulatedContactRow* __restrict__ rows,
 
 }  // namespace
 
-IftRunner::IftRunner(const phi::DeviceContext& context, DeterminismLevel determinism)
-    : context_(context),
+IftRunner::IftRunner(cudaStream_t stream, int device_id, DeterminismLevel determinism)
+    : stream_(stream),
+      device_id_(device_id),
       determinism_(determinism),
-      solver_(MakeSparseSolverBackend("cg", context, determinism)) {}
+      solver_(MakeSparseSolverBackend("cg", stream, device_id, determinism)) {}
 
 IftRunner::~IftRunner() {
     if (rhs_ != nullptr) { phi::BufferFree(rhs_); }
@@ -351,8 +352,8 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
             std::to_string(kMaxDof) + ")");
     }
 
-    phi::ScopedDeviceGuard guard(context_.device_id);
-    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id_);
+    const cudaStream_t stream = stream_;
 
     // Seed grad_qdot_free with g (the pass-through baseline): DOFs with no active
     // contact keep g, active DOFs are overwritten with g - J^T z in DistributeKernel.
@@ -364,7 +365,7 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
 
     // (1) Build A = J M^-1 J^T (committed kkt_builder; same active set + gather).
     BatchedDenseSpdSystem system;
-    BuildContactDelassusSystem(context_, inputs.rows, inputs.jac_normal,
+    BuildContactDelassusSystem(stream_, device_id_, inputs.rows, inputs.jac_normal,
                                inputs.jac_tangent1, inputs.jac_tangent2,
                                inputs.m_inv, bc, inputs.dof_stride, system,
                                delassus_);
@@ -433,7 +434,7 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
 // ---------------------------------------------------------------------------
 void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, float* z,
                               const SolveParams& params) {
-    const cudaStream_t stream = context_.stream.Native();
+    const cudaStream_t stream = stream_;
 
     // p03-A NON-SYMMETRIC AUTO-ROUTING (runs FIRST, AHEAD of the symmetric indefinite
     // detector). DetectBatchedNonSymmetric is a READ-ONLY scan: a block is non-symmetric
@@ -451,7 +452,7 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
     uint32_t* ns_flag = static_cast<uint32_t*>(phi::BufferBase(nonsym_flag_));
     CheckCuda(cudaMemsetAsync(ns_flag, 0, sizeof(uint32_t), stream),
               "zero non-symmetric flag");
-    DetectBatchedNonSymmetric(context_, system, ns_flag);
+    DetectBatchedNonSymmetric(stream_, device_id_, system, ns_flag);
     uint32_t nonsymmetric = 0u;
     CheckCuda(cudaStreamSynchronize(stream), "sync non-symmetric detect");
     // R9: the detector kernel already completed on `stream` (the sync above), so
@@ -464,7 +465,7 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
         // calls). NOTE: never reached on the bit-symmetric Delassus contact path.
         if (gmres_solver_ == nullptr) {
             gmres_solver_ =
-                MakeSparseSolverBackend("self_gmres", context_, determinism_);
+                MakeSparseSolverBackend("self_gmres", stream_, device_id_, determinism_);
         }
         SolveParams gp;
         gp.preconditioner = Preconditioner::Jacobi;
@@ -489,7 +490,7 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
         uint32_t* flag = static_cast<uint32_t*>(phi::BufferBase(indef_flag_));
         CheckCuda(cudaMemsetAsync(flag, 0, sizeof(uint32_t), stream),
                   "zero indefinite flag");
-        DetectBatchedIndefinite(context_, system, flag);
+        DetectBatchedIndefinite(stream_, device_id_, system, flag);
         uint32_t indefinite = 0u;
         CheckCuda(cudaStreamSynchronize(stream), "sync indefinite detect");
         // R9: detector kernel done on `stream` (sync above) -> BufferDownload reads
@@ -501,7 +502,7 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
             // Jacobi). Lazily construct the backend (reused across Run calls).
             if (minres_solver_ == nullptr) {
                 minres_solver_ =
-                    MakeSparseSolverBackend("self_minres", context_, determinism_);
+                    MakeSparseSolverBackend("self_minres", stream_, device_id_, determinism_);
             }
             SolveParams mp;
             mp.preconditioner = Preconditioner::Jacobi;  // absolute-Jacobi (SPD precond)

@@ -30,7 +30,9 @@
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -110,7 +112,7 @@ private:
 // `max_pairs_hint` caps the compact output buffer. 0 => use a default heuristic
 // (clamped). If the true overlap count exceeds the cap the result is truncated;
 // the perf/diff tests size the cap conservatively.
-LbvhBroadphaseResult BuildLbvhBroadphase(const phi::DeviceContext& context,
+LbvhBroadphaseResult BuildLbvhBroadphase(cudaStream_t stream, int device_id,
                                          const collision::AABB* device_aabbs,
                                          uint32_t count,
                                          uint32_t max_pairs_hint = 0u);
@@ -124,7 +126,7 @@ LbvhBroadphaseResult BuildLbvhBroadphase(const collision::AABB* device_aabbs,
 // BuildLbvhBroadphase; the only difference is the result keeps the node buffer
 // (DeviceNodes() / HasNodes()) instead of destroying it. The pair list is still
 // produced (callers that only need the tree can ignore it).
-LbvhBroadphaseResult BuildLbvhForQuery(const phi::DeviceContext& context,
+LbvhBroadphaseResult BuildLbvhForQuery(cudaStream_t stream, int device_id,
                                        const collision::AABB* device_aabbs,
                                        uint32_t count,
                                        uint32_t max_pairs_hint = 0u);

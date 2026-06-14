@@ -25,7 +25,9 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -85,7 +87,7 @@ private:
 // query AABB is its position expanded by `query_radius`. Emits candidate rigid
 // body indices (original body ids), capped + sorted per particle.
 CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions,
     uint32_t particle_count,
     float query_radius,

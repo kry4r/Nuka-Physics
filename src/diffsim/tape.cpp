@@ -29,9 +29,10 @@ void CheckCuda(cudaError_t status, const char* what) {
 }
 }  // namespace
 
-Tape::Tape(const phi::DeviceContext& context, const TapeDesc& desc,
+Tape::Tape(cudaStream_t stream, int device_id, const TapeDesc& desc,
            uint32_t total_link_count)
-    : context_(context), desc_(desc), total_link_count_(total_link_count) {
+    : stream_(stream), device_id_(device_id), desc_(desc),
+      total_link_count_(total_link_count) {
     if (total_link_count_ == 0u) {
         throw std::invalid_argument("nuka::diffsim::Tape: total_link_count == 0");
     }
@@ -74,12 +75,12 @@ uint32_t Tape::RecordStep(const float* device_actions, uint32_t has_checkpoint,
     const uint32_t step = step_count_;
     float* dst = ActionSlice(step);
     if (device_actions != nullptr) {
-        phi::ScopedDeviceGuard guard(context_.device_id);
+        phi::ScopedDeviceGuard guard(device_id_);
         CheckCuda(cudaMemcpyAsync(dst, device_actions,
                                   static_cast<size_t>(total_link_count_) *
                                       sizeof(float),
                                   cudaMemcpyDeviceToDevice,
-                                  context_.stream.Native()),
+                                  stream_),
                   "RecordStep action D2D");
     }
     TapeEntry entry;

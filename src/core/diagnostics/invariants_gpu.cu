@@ -144,7 +144,7 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 } // namespace
 
-void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
+void ComputeRigidBodyInvariantSnapshot(cudaStream_t stream, int device_id,
                                        uint32_t body_count,
                                        const math::Transform* poses,
                                        const math::Vec3* linear_velocities,
@@ -161,17 +161,16 @@ void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
         return;
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
+    phi::ScopedDeviceGuard guard(device_id);
     // BUF-10/BUF-13: the reduction slot is a phi-v2 opaque Buffer* bound to the
     // stream-0 DeviceBufferType (NULL/default stream -> the download below is
     // byte+ordering identical to the legacy synchronous cudaMemcpy). The kernel
     // still runs on context.stream EXACTLY as before; the explicit
-    // context.stream.Synchronize() guarantees the kernel completes before the
+    // cudaStreamSynchronize(stream) guarantees the kernel completes before the
     // (self-syncing) BufferDownload reads the slot.
     phi::Buffer* reduction =
         phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()),
                          sizeof(DeviceReductionSlot));
-    const cudaStream_t stream = context.stream.Native();
     constexpr uint32_t kBlockSize = 256u;
     ComputeRigidBodyInvariantKernel<<<1u,
                                       kBlockSize,
@@ -190,7 +189,7 @@ void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
         phi::BufferFree(reduction);
         CheckCuda(launch_err, "ComputeRigidBodyInvariantKernel launch");
     }
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     DeviceReductionSlot host_slot;
     phi::BufferDownload(reduction, &host_slot, 0, sizeof(host_slot));

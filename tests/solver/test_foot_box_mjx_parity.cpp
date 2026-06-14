@@ -67,7 +67,8 @@
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer_v2.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -376,14 +377,14 @@ CookedFloat CookGo2Float() {
     return result;
 }
 
-std::vector<Transform> ForwardKinematics(const nuka::phi::DeviceContext& context,
+std::vector<Transform> ForwardKinematics(cudaStream_t context, int context_dev,
                                          const articulation::ArticulationHostState& host) {
     const uint32_t link_count = host.TotalLinkCount();
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
-    articulation::UpdateWorldLinkPoses(context, device.View(),
+    articulation::UpdateWorldLinkPoses(context, context_dev, device.View(),
                                        static_cast<Transform*>(pose_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<Transform> poses(link_count);
     pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
     return poses;
@@ -395,24 +396,24 @@ Vec3 FootWorldCenter(const std::vector<Transform>& poses, const articulation::Fo
 }
 
 // 18x18 M^-1 via the production CRBA (reuse, not hand-rolled).
-std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& context,
+std::vector<float> ComputeInverseInertia18(cudaStream_t context, int context_dev,
                                            const articulation::ArticulationHostState& host) {
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
     const uint32_t link_count = host.TotalLinkCount();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, kGravityZ);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, kGravityZ);
     OwnedDeviceBuffer composite(
         static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
     OwnedDeviceBuffer m(static_cast<size_t>(kDof) * kDof * sizeof(float));
     OwnedDeviceBuffer m_inv(static_cast<size_t>(kDof) * kDof * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, kDof,
+        context, context_dev, view, kDof,
         static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
         static_cast<float*>(m.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, kDof, static_cast<const float*>(m.Data()),
+        context, context_dev, view, kDof, static_cast<const float*>(m.Data()),
         static_cast<float*>(m_inv.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<float> out(static_cast<size_t>(kDof) * kDof);
     m_inv.CopyToHost(out.data(), out.size() * sizeof(float));
     return out;
@@ -452,13 +453,13 @@ struct FreeAba {
     std::vector<float> leg_qddot;
     std::array<float, kDof> flat{};
 };
-FreeAba ComputeFreeAba(const nuka::phi::DeviceContext& context,
+FreeAba ComputeFreeAba(cudaStream_t context, int context_dev,
                        articulation::ArticulationHostState host,  // by value.
                        const Quat& base_rot) {
     const uint32_t root = host.articulation_link_offset[0];
-    auto device = articulation::UploadArticulationState(context, host);
-    articulation::FeatherstoneAba::ComputeAccelerations(context, device.View(), kGravityZ);
-    context.stream.Synchronize();
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, device.View(), kGravityZ);
+    cudaStreamSynchronize(context);
     articulation::DownloadArticulationState(device, &host);
     FreeAba out;
     const uint32_t link_count = host.articulation_link_count[0];
@@ -497,7 +498,7 @@ struct ParityResult {
 // Build the foot<->box co-resident state from the golden, then:
 //   free ABA -> seed qdot = a_free*dt; box seed = gravity*dt; solve; qacc=dv/dt.
 // box_inertia_scale lets the bite-check perturb the box inertia (default 1.0).
-ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cooked,
+ParityResult RunParity(cudaStream_t context, int context_dev, CookedFloat cooked,
                        const FootBoxGolden& g, const FootBoxConfig& cfg,
                        const nuka::solver::SolverConfig& config,
                        float box_inertia_scale = 1.0f) {
@@ -528,13 +529,13 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
     const Vec3 omega_body{0.0f, 0.0f, 0.0f}, v_lin_body{0.0f, 0.0f, 0.0f};
 
     // --- Free ABA (a_free + GATE-0 base-6); free box qacc = gravity only. -------
-    const FreeAba afree = ComputeFreeAba(context, host, base_rot);
+    const FreeAba afree = ComputeFreeAba(context, context_dev, host, base_rot);
     result.base6_free_mjx = NukaSpatialToMjx(afree.base_spatial.data(), base_rot, omega_body, v_lin_body);
     result.box6_free_mjx = {0.0f, 0.0f, kGravityZ, 0.0f, 0.0f, 0.0f};
 
     // --- FK -> the contacting foot (FL = foot[0]); the box from the golden. -----
-    const auto poses = ForwardKinematics(context, host);
-    const std::vector<float> minv = ComputeInverseInertia18(context, host);
+    const auto poses = ForwardKinematics(context, context_dev, host);
+    const std::vector<float> minv = ComputeInverseInertia18(context, context_dev, host);
     const articulation::FootShape& foot = cooked.feet[0];
     const Vec3 foot_center = FootWorldCenter(poses, foot);
     const Vec3 box_center{cfg.box_pos[0], cfg.box_pos[1], cfg.box_pos[2]};
@@ -551,7 +552,7 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
         nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), rigid_aabbs);
     const AABB* d_rigid_ptr = static_cast<const AABB*>(nuka::phi::BufferBase(d_rigid));
     auto stream = nuka::collision::BuildArticulationRigidCandidatePairs(
-        context, d_rigid_ptr, static_cast<uint32_t>(rigid_aabbs.size()),
+        context, context_dev, d_rigid_ptr, static_cast<uint32_t>(rigid_aabbs.size()),
         rigid_body_ids.data(), rigid_contypes.data(), rigid_conaff.data(),
         links, link_contypes.data(), link_conaff.data(), /*excluded_body_pairs=*/{});
     const auto pairs = stream.DownloadPairs();
@@ -617,7 +618,7 @@ ParityResult RunParity(const nuka::phi::DeviceContext& context, CookedFloat cook
     // --- the 18-wide foot chain-J on the foot's contact normal. -----------------
     const Vec3 foot_normal = j_foot.linear;
     const std::vector<float> chain_j = nuka::test::ComputeFootChainJ18(
-        context, host, poses, foot.calf_local_link, result.contact_point, foot_normal, kDof);
+        context, context_dev, host, poses, foot.calf_local_link, result.contact_point, foot_normal, kDof);
     std::vector<float> chain_jacobians = chain_j;
 
     // --- art_refs + body_indices (box -> BodyState 0; foot -> coloring key). -----
@@ -755,7 +756,8 @@ TEST(FootBoxMjxParity, BoxAndBaseSixContactQaccMatchesMjx) {
     ASSERT_EQ(golden.nv, 24u);  // base 6 + legs 12 + box 6.
     ASSERT_GT(golden.configs.size(), 0u);
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     ASSERT_EQ(cooked.host.ArticulationCount(), 1u);
     ASSERT_FALSE(cooked.feet.empty());
@@ -791,8 +793,8 @@ TEST(FootBoxMjxParity, BoxAndBaseSixContactQaccMatchesMjx) {
                     "dist=%.5f  f_n=%.4f N\n",
                     con[0], con[1], con[2], con[3], con[4], con[5], con[6], cfg.normal_force[0]);
 
-        const auto def = RunParity(context, cooked, golden, cfg, cfg_default);
-        const auto high = RunParity(context, cooked, golden, cfg, cfg_high);
+        const auto def = RunParity(context, context_dev, cooked, golden, cfg, cfg_default);
+        const auto high = RunParity(context, context_dev, cooked, golden, cfg, cfg_high);
         EXPECT_TRUE(high.pair_found) << "broadphase did not emit the (foot, box) pair";
         ASSERT_EQ(high.row_count, 1u) << "config " << ci << " Nuka produced != 1 contact row";
 
@@ -903,7 +905,8 @@ TEST(FootBoxMjxParity, BoxInertiaPerturbationFailsTheGate) {
 
     const auto golden = LoadFootBoxGolden(golden_path);
     ASSERT_GT(golden.configs.size(), 0u);
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     ASSERT_FALSE(cooked.feet.empty());
     const auto& cfg = golden.configs[0];
@@ -912,8 +915,8 @@ TEST(FootBoxMjxParity, BoxInertiaPerturbationFailsTheGate) {
     std::array<float, 6> box_on{};
     for (uint32_t i = 0u; i < 6u; ++i) box_on[i] = cfg.qacc_on[cfg.box_dof + i];
 
-    const auto correct = RunParity(context, cooked, golden, cfg, config, /*scale=*/1.0f);
-    const auto wrong = RunParity(context, cooked, golden, cfg, config, /*scale=*/1.05f);
+    const auto correct = RunParity(context, context_dev, cooked, golden, cfg, config, /*scale=*/1.0f);
+    const auto wrong = RunParity(context, context_dev, cooked, golden, cfg, config, /*scale=*/1.05f);
     const float err_correct = Rel6(correct.box6_mjx, box_on);
     const float err_wrong = Rel6(wrong.box6_mjx, box_on);
     std::printf("[diag] BITE: box-6 rel err correct=%.3e  +5%%-inertia=%.3e (tol=5e-3)\n",
@@ -941,13 +944,14 @@ TEST(FootBoxMjxParity, ParityRunDeterministic) {
 
     const auto golden = LoadFootBoxGolden(golden_path);
     ASSERT_GT(golden.configs.size(), 0u);
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     ASSERT_FALSE(cooked.feet.empty());
     const auto config = MakeConfig(64u);
 
-    const auto a = RunParity(context, cooked, golden, golden.configs[0], config);
-    const auto b = RunParity(context, cooked, golden, golden.configs[0], config);
+    const auto a = RunParity(context, context_dev, cooked, golden, golden.configs[0], config);
+    const auto b = RunParity(context, context_dev, cooked, golden, golden.configs[0], config);
     EXPECT_EQ(std::memcmp(a.box6_mjx.data(), b.box6_mjx.data(), 6u * sizeof(float)), 0)
         << "two runs produced different box-6 qacc (nondeterministic)";
     EXPECT_EQ(std::memcmp(a.base6_mjx.data(), b.base6_mjx.data(), 6u * sizeof(float)), 0)
@@ -972,13 +976,14 @@ TEST(FootBoxMjxParity, NkSolveRowsBlockIslandMatchesMjx) {
 
     const auto golden = LoadFootBoxGolden(golden_path);
     ASSERT_GT(golden.configs.size(), 0u);
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     const auto cooked = CookGo2Float();
     const auto cfg_high = MakeConfig(200u);
 
     for (size_t ci = 0u; ci < golden.configs.size(); ++ci) {
         const auto& cfg = golden.configs[ci];
-        const auto nk = RunParity(context, cooked, golden, cfg, cfg_high,
+        const auto nk = RunParity(context, context_dev, cooked, golden, cfg, cfg_high,
                                   /*box_inertia_scale=*/1.0f);
 
         std::array<float, 6> box_on{}, base_on{};

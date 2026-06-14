@@ -40,7 +40,9 @@
 // ---------------------------------------------------------------------------
 
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -83,7 +85,7 @@ class Tape {
 public:
     // total_link_count: per-step action width (env-major per-link, the engine's
     // drive layout). The action buffer is [max_tape_entries * total_link_count].
-    Tape(const phi::DeviceContext& context, const TapeDesc& desc,
+    Tape(cudaStream_t stream, int device_id, const TapeDesc& desc,
          uint32_t total_link_count);
 
     const TapeDesc& Desc() const { return desc_; }
@@ -126,7 +128,8 @@ public:
     Tape& operator=(const Tape&) = delete;
 
 private:
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     TapeDesc desc_;
     uint32_t total_link_count_ = 0u;
     uint32_t step_count_ = 0u;

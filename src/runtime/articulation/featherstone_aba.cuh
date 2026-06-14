@@ -7,17 +7,17 @@
 
 namespace nuka::runtime::articulation {
 
-void LaunchFeatherstoneAbaKernels(const phi::DeviceContext& context,
+void LaunchFeatherstoneAbaKernels(cudaStream_t stream, int device_id,
                                   ArticulationDeviceState state,
                                   float gravity_z);
-void LaunchApplyPositionDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyPositionDriveKernels(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      const float* drive_targets,
                                      const float* drive_stiffness,
                                      const float* drive_damping,
                                      const float* drive_force_limits,
                                      bool defer_velocity_damping = false);
-void LaunchIntegrateArticulationKernels(const phi::DeviceContext& context,
+void LaunchIntegrateArticulationKernels(cudaStream_t stream, int device_id,
                                         ArticulationDeviceState state,
                                         float dt);
 

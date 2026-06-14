@@ -53,7 +53,7 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_drives.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -186,7 +186,8 @@ struct SyntheticArticulation {
     static constexpr uint32_t kMaxDof = 3u;
     static constexpr uint32_t kTaskLink = 3u;
 
-    nuka::phi::DeviceContext context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     OwnedDeviceBuffer link_pose_dev;
     OwnedDeviceBuffer joint_axis_dev;
@@ -267,7 +268,7 @@ struct SyntheticArticulation {
         target = Vec3{link_pose[3].position.x + 0.08f,
                       link_pose[3].position.y - 0.05f,
                       link_pose[3].position.z + 0.06f};
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
     }
 
     articulation::ArticulationDeviceState State() {
@@ -306,13 +307,13 @@ struct SyntheticArticulation {
         if (use_limit) limit_dev.CopyFromHost(limits.data(), limits.size() * sizeof(float));
         articulation::ArticulationDeviceState st = State();
         articulation::LaunchApplyOscDriveKernels(
-            context, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
             static_cast<const float*>(damp_dev.Data()),
             use_limit ? static_cast<const float*>(limit_dev.Data()) : nullptr);
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         std::vector<float> tau(kLinks, 0.0f);
         cudaMemcpy(tau.data(), tau_dev.Data(), kLinks * sizeof(float),
                    cudaMemcpyDeviceToHost);
@@ -342,14 +343,14 @@ struct SyntheticArticulation {
 
         articulation::ArticulationDeviceState st = State();
         diffsim::LaunchOscAdjointGainTarget(
-            context, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
             static_cast<const float*>(damp_dev.Data()),
             use_limit ? static_cast<const float*>(limit_dev.Data()) : nullptr,
             static_cast<const float*>(gtau_dev.Data()), g);
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
 
         Grads out;
         cudaMemcpy(&out.grad_kp, gkp.Data(), sizeof(float), cudaMemcpyDeviceToHost);
@@ -357,7 +358,7 @@ struct SyntheticArticulation {
         float tg[3] = {0, 0, 0};
         cudaMemcpy(tg, gtgt.Data(), 3u * sizeof(float), cudaMemcpyDeviceToHost);
         out.grad_target = Vec3{tg[0], tg[1], tg[2]};
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         return out;
     }
 };
@@ -404,7 +405,8 @@ struct RevoluteArticulation {
     static constexpr uint32_t kNdof = 3u;
     static constexpr uint32_t kTaskLink = 3u;
 
-    nuka::phi::DeviceContext context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     OwnedDeviceBuffer link_pose_dev;
     OwnedDeviceBuffer joint_axis_dev;
@@ -497,7 +499,7 @@ struct RevoluteArticulation {
         limit_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
 
         target = Vec3{x_task.x + 0.08f, x_task.y - 0.05f, x_task.z + 0.06f};
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
     }
 
     // Build the active 3x3 J (revolute columns) on the host, EXACTLY as the kernel
@@ -583,12 +585,12 @@ struct RevoluteArticulation {
         SetGainsTarget(kp_, kd_, tgt);
         articulation::ArticulationDeviceState st = State();
         articulation::LaunchApplyOscDriveKernels(
-            context, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
             static_cast<const float*>(damp_dev.Data()), nullptr);
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         std::vector<float> tau(kLinks, 0.0f);
         cudaMemcpy(tau.data(), tau_dev.Data(), kLinks * sizeof(float),
                    cudaMemcpyDeviceToHost);
@@ -611,13 +613,13 @@ struct RevoluteArticulation {
 
         articulation::ArticulationDeviceState st = State();
         diffsim::LaunchOscAdjointGainTarget(
-            context, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
             static_cast<const float*>(damp_dev.Data()), nullptr,
             static_cast<const float*>(gtau_dev.Data()), g);
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
 
         Grads out;
         cudaMemcpy(&out.grad_kp, gkp.Data(), sizeof(float), cudaMemcpyDeviceToHost);
@@ -625,7 +627,7 @@ struct RevoluteArticulation {
         float tg[3] = {0, 0, 0};
         cudaMemcpy(tg, gtgt.Data(), 3u * sizeof(float), cudaMemcpyDeviceToHost);
         out.grad_target = Vec3{tg[0], tg[1], tg[2]};
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
         return out;
     }
 };
@@ -873,7 +875,8 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "Go2 stand scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2();
     auto base = cooked.host;
     const uint32_t max_dof = articulation::ArticulationDofCount(base, 0u);
@@ -886,8 +889,8 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
     // needed -- the adjoint reads the geometry/state buffers, and a finiteness
     // smoke on the cooked rest pose exercises the same real-engine path the
     // synthetic rigs cannot (cooked geometry vs hand-built buffers).
-    auto device = articulation::UploadArticulationState(context, base);
-    context.stream.Synchronize();
+    auto device = articulation::UploadArticulationState(context, context_dev, base);
+    cudaStreamSynchronize(context);
 
     std::vector<float> stiff(base_link_count, 0.0f), damp(base_link_count, 0.0f);
     stiff[task_link] = 200.0f;
@@ -921,19 +924,19 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
 
     articulation::ArticulationDeviceState st = device.View();
     diffsim::LaunchOscAdjointGainTarget(
-        context, st, max_dof, task_link,
+        context, context_dev, st, max_dof, task_link,
         static_cast<const float*>(minv_dev.Data()),
         static_cast<const float*>(tgt_dev.Data()),
         static_cast<const float*>(stiff_dev.Data()),
         static_cast<const float*>(damp_dev.Data()),
         nullptr, static_cast<const float*>(gtau_dev.Data()), grads);
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     float kp_g = 0, kd_g = 0, tg[3] = {0, 0, 0};
     cudaMemcpy(&kp_g, gkp.Data(), sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&kd_g, gkd.Data(), sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(tg, gtgt.Data(), 3u * sizeof(float), cudaMemcpyDeviceToHost);
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::printf("[OscAdjoint] Go2 engine-state grads: kp=% .3e kd=% .3e t=(%.3e,%.3e,%.3e)\n",
                 kp_g, kd_g, tg[0], tg[1], tg[2]);
     EXPECT_TRUE(std::isfinite(kp_g) && std::isfinite(kd_g) && std::isfinite(tg[0]) &&

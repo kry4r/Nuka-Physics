@@ -30,7 +30,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -144,7 +145,7 @@ OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
 // the default backend uses m=30 (one cycle for n<=12); the restart-coverage test
 // uses the "self_gmres" backend with the SolveParams unchanged and relies on the
 // factory default of m=30, so for the small-m path we use the explicit backend ctor.
-std::vector<float> RunGmres(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunGmres(cudaStream_t ctx, int ctx_dev,
                             diffsim::SparseLinearSolver& solver,
                             const std::vector<float>& values,
                             const std::vector<uint32_t>& dims,
@@ -170,7 +171,7 @@ std::vector<float> RunGmres(const nuka::phi::DeviceContext& ctx,
 
     solver.Solve(system, static_cast<const float*>(d_b.Data()),
                  static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(static_cast<size_t>(bc) * kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -236,16 +237,17 @@ std::vector<Block> MakeNonSymmetricBatch() {
 // on genuinely NON-SYMMETRIC systems within 1e-5. For n<=12 the m=30 cycle converges
 // without restarting (exact in <= n fp64 Arnoldi steps).
 TEST(GmresVsDenseNonSymmetric, AgreesWithPartialPivLu) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeNonSymmetricBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
     PackBatch(blocks, values, dims, rhs);
 
     // Default factory backend (restart m=30).
-    auto solver = diffsim::MakeSparseSolverBackend("self_gmres", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_gmres", ctx, ctx_dev);
     const std::vector<float> x =
-        RunGmres(ctx, *solver, values, dims, rhs, diffsim::Preconditioner::Jacobi,
+        RunGmres(ctx, ctx_dev, *solver, values, dims, rhs, diffsim::Preconditioner::Jacobi,
                  200u, true);
     double worst_resid = 0.0;
     const double rel = MaxRelErr(blocks, x, worst_resid);
@@ -263,7 +265,8 @@ TEST(GmresVsDenseNonSymmetric, AgreesWithPartialPivLu) {
 // n=12 (3 cycles). This is the only test that exercises the restart machinery (the
 // default m=30 always converges in one cycle for n<=12).
 TEST(GmresVsDenseNonSymmetric, RestartSmallMConverges) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeNonSymmetricBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -271,9 +274,9 @@ TEST(GmresVsDenseNonSymmetric, RestartSmallMConverges) {
 
     // Explicit small restart length m=4 (< n for most blocks). Many outer cycles are
     // budgeted (max_iter=200 -> ceil(200/4)=50 cycles >> what convergence needs).
-    diffsim::SelfWrittenGmresBackend gmres4(ctx, /*restart=*/4u);
+    diffsim::SelfWrittenGmresBackend gmres4(ctx, ctx_dev, /*restart=*/4u);
     const std::vector<float> x =
-        RunGmres(ctx, gmres4, values, dims, rhs, diffsim::Preconditioner::Jacobi,
+        RunGmres(ctx, ctx_dev, gmres4, values, dims, rhs, diffsim::Preconditioner::Jacobi,
                  200u, false);
     double worst_resid = 0.0;
     const double rel = MaxRelErr(blocks, x, worst_resid);
@@ -300,7 +303,7 @@ Block MakeSymmetricBlock(uint32_t n, std::mt19937& rng) {
     return Block{n, A, b};
 }
 
-uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
+uint32_t RunDetect(cudaStream_t ctx, int ctx_dev,
                    const std::vector<Block>& blocks) {
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -316,9 +319,9 @@ uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
     system.values = static_cast<const float*>(d_values.Data());
     system.block_dim = static_cast<const uint32_t*>(d_dims.Data());
 
-    diffsim::DetectBatchedNonSymmetric(ctx, system,
+    diffsim::DetectBatchedNonSymmetric(ctx, ctx_dev, system,
                                        static_cast<uint32_t*>(d_flag.Data()));
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
     uint32_t flag = 0u;
     d_flag.CopyToHost(&flag, sizeof(uint32_t));
     return flag;
@@ -331,13 +334,14 @@ uint32_t RunDetect(const nuka::phi::DeviceContext& ctx,
 // alone cannot (GMRES would solve a symmetric system too); only flag==0 guarantees
 // the symmetric branch is taken.
 TEST(GmresVsDenseNonSymmetric, NonSymmetricDetectorBytesafe) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     std::mt19937 rng(0x5A5Au);
 
     // (a) exactly-symmetric SPD batch -> MUST NOT flag.
     std::vector<Block> sym;
     for (uint32_t n = 1u; n <= kMd; ++n) sym.push_back(MakeSymmetricBlock(n, rng));
-    EXPECT_EQ(RunDetect(ctx, sym), 0u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, sym), 0u)
         << "non-symmetric detector FALSE-POSITIVE on a symmetric batch (would mis-"
            "route the symmetric IFT path to GMRES and break byte-identity)";
 
@@ -345,14 +349,14 @@ TEST(GmresVsDenseNonSymmetric, NonSymmetricDetectorBytesafe) {
     std::vector<Block> nonsym;
     for (uint32_t n = 2u; n <= kMd; ++n)
         nonsym.push_back(MakeNonSymmetricBlock(n, 1.0, rng));
-    EXPECT_EQ(RunDetect(ctx, nonsym), 1u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, nonsym), 1u)
         << "non-symmetric detector FALSE-NEGATIVE on a genuinely non-symmetric batch";
 
     // (c) a single non-symmetric block mixed into an otherwise-symmetric batch ->
     //     flag (the whole-batch routing trigger).
     std::vector<Block> mixed = sym;
     mixed.push_back(MakeNonSymmetricBlock(6u, 1.0, rng));
-    EXPECT_EQ(RunDetect(ctx, mixed), 1u)
+    EXPECT_EQ(RunDetect(ctx, ctx_dev, mixed), 1u)
         << "one non-symmetric block in a symmetric batch must flag (whole-batch route)";
 
     std::printf("[GmresVsDenseNonSymmetric] detector byte-safe: symmetric->0, "
@@ -362,21 +366,22 @@ TEST(GmresVsDenseNonSymmetric, NonSymmetricDetectorBytesafe) {
 // D1: two GMRES solves of the same non-symmetric batch are byte-identical (both the
 // one-cycle m=30 path and the multi-cycle m=4 restart path).
 TEST(GmresVsDenseNonSymmetric, BitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeNonSymmetricBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
     PackBatch(blocks, values, dims, rhs);
 
     for (uint32_t m : {30u, 4u}) {
-        diffsim::SelfWrittenGmresBackend g1(ctx, m);
-        diffsim::SelfWrittenGmresBackend g2(ctx, m);
+        diffsim::SelfWrittenGmresBackend g1(ctx, ctx_dev, m);
+        diffsim::SelfWrittenGmresBackend g2(ctx, ctx_dev, m);
         for (bool fixed : {false, true}) {
             const std::vector<float> x1 = RunGmres(
-                ctx, g1, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
+                ctx, ctx_dev, g1, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
                 fixed);
             const std::vector<float> x2 = RunGmres(
-                ctx, g2, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
+                ctx, ctx_dev, g2, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u,
                 fixed);
             ASSERT_EQ(x1.size(), x2.size());
             EXPECT_EQ(std::memcmp(x1.data(), x2.data(), x1.size() * sizeof(float)), 0)

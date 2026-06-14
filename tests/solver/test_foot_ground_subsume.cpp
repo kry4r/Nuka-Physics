@@ -53,7 +53,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -200,14 +201,14 @@ CookedFloat CookGo2Float() {
 }
 
 // Run FK at the current host state and return the world pose of every link.
-std::vector<Transform> ForwardKinematics(const nuka::phi::DeviceContext& context,
+std::vector<Transform> ForwardKinematics(cudaStream_t context, int context_dev,
                                          const articulation::ArticulationHostState& host) {
     const uint32_t link_count = host.TotalLinkCount();
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
-    articulation::UpdateWorldLinkPoses(context, device.View(),
+    articulation::UpdateWorldLinkPoses(context, context_dev, device.View(),
                                        static_cast<Transform*>(pose_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<Transform> poses(link_count);
     pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
     return poses;
@@ -225,27 +226,27 @@ Vec3 FootWorldCenter(const std::vector<Transform>& poses,
 // composite-inertia + factorization pass). REUSES the production CRBA +
 // factorization -- no hand-rolled second inertia. Requires ABA pass-1 to have run
 // (link_xup / motion subspace current), so we run ComputeAccelerations first.
-std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& context,
+std::vector<float> ComputeInverseInertia18(cudaStream_t context, int context_dev,
                                            const articulation::ArticulationHostState& host,
                                            float gravity_z) {
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
     const uint32_t link_count = host.TotalLinkCount();
     // ABA pass-1 populates link_xup + the spatial motion subspace CRBA needs.
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, gravity_z);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, gravity_z);
 
     OwnedDeviceBuffer composite(
         static_cast<size_t>(link_count) * sizeof(articulation::LinkSpatialInertia));
     OwnedDeviceBuffer m(static_cast<size_t>(kDof) * kDof * sizeof(float));
     OwnedDeviceBuffer m_inv(static_cast<size_t>(kDof) * kDof * sizeof(float));
     articulation::ComputeArticulationInertiaM(
-        context, view, kDof,
+        context, context_dev, view, kDof,
         static_cast<articulation::LinkSpatialInertia*>(composite.Data()),
         static_cast<float*>(m.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, kDof, static_cast<const float*>(m.Data()),
+        context, context_dev, view, kDof, static_cast<const float*>(m.Data()),
         static_cast<float*>(m_inv.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<float> out(static_cast<size_t>(kDof) * kDof);
     m_inv.CopyToHost(out.data(), out.size() * sizeof(float));
     return out;
@@ -256,13 +257,13 @@ std::vector<float> ComputeInverseInertia18(const nuka::phi::DeviceContext& conte
 // from the passed FK world poses (the subsume copy formerly omitted this; for the
 // +Z-normal coplanar-feet scenario here the refresh is invisible to the base-column
 // assertions, but it is the correct version -- the named-debt fold).
-std::vector<float> ComputeFootChainJ18(const nuka::phi::DeviceContext& context,
+std::vector<float> ComputeFootChainJ18(cudaStream_t context, int context_dev,
                                        const articulation::ArticulationHostState& host,
                                        const std::vector<Transform>& fk_world_poses,
                                        uint32_t contact_link,
                                        const Vec3& contact_point,
                                        const Vec3& contact_normal) {
-    return nuka::test::ComputeFootChainJ18(context, host, fk_world_poses,
+    return nuka::test::ComputeFootChainJ18(context, context_dev, host, fk_world_poses,
                                            contact_link, contact_point, contact_normal,
                                            kDof);
 }
@@ -330,7 +331,7 @@ float ChainJv(const std::vector<float>& j, const std::vector<float>& qdot) {
     return jv;
 }
 
-UnifiedFootGroundResult RunUnifiedFootGround(const nuka::phi::DeviceContext& context,
+UnifiedFootGroundResult RunUnifiedFootGround(cudaStream_t context, int context_dev,
                                              const CookedFloat& cooked,
                                              float ground_height,
                                              float base_vz0,
@@ -343,11 +344,11 @@ UnifiedFootGroundResult RunUnifiedFootGround(const nuka::phi::DeviceContext& con
     result.base_origin = host.base_pose[0].position;
 
     // --- FK -> foot world centers (the material contact points) --------------
-    const auto poses = ForwardKinematics(context, host);
+    const auto poses = ForwardKinematics(context, context_dev, host);
 
     // --- 18x18 M^-1 via production CRBA (reuse, not hand-rolled) --------------
     const float kGravityZ = -9.81f;
-    const std::vector<float> minv = ComputeInverseInertia18(context, host, kGravityZ);
+    const std::vector<float> minv = ComputeInverseInertia18(context, context_dev, host, kGravityZ);
 
     // --- (foot, ground) CandidatePairs + ShapeResolvers ----------------------
     const Vec3 kUp{0.0f, 0.0f, 1.0f};
@@ -420,7 +421,7 @@ UnifiedFootGroundResult RunUnifiedFootGround(const nuka::phi::DeviceContext& con
     result.contact_depth.resize(manifolds.size());
     for (size_t m = 0u; m < manifolds.size(); ++m) {
         const std::vector<float> j =
-            ComputeFootChainJ18(context, host, poses, foot_calf_link[m], foot_point[m], kUp);
+            ComputeFootChainJ18(context, context_dev, host, poses, foot_calf_link[m], foot_point[m], kUp);
         chain_jacobians.insert(chain_jacobians.end(), j.begin(), j.end());
         result.foot_J[m] = j;
         result.contact_depth[m] =
@@ -504,8 +505,8 @@ nuka::solver::SolverConfig ConvergedConfig() {
 
 // Seat the ground a hair above the rest foot bottom so the feet start just
 // penetrating (a small, solvable depth). Mirrors test_floating_base_contact.
-float SeatGround(const nuka::phi::DeviceContext& context, const CookedFloat& cooked) {
-    const auto poses = ForwardKinematics(context, cooked.host);
+float SeatGround(cudaStream_t context, int context_dev, const CookedFloat& cooked) {
+    const auto poses = ForwardKinematics(context, context_dev, cooked.host);
     float min_bottom = std::numeric_limits<float>::infinity();
     for (const auto& foot : cooked.feet) {
         const Vec3 center = FootWorldCenter(poses, foot);
@@ -537,7 +538,8 @@ TEST(FootGroundSubsume, FootChainJacobianHas18WideBaseColumns) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     auto& host = cooked.host;
     ASSERT_EQ(host.ArticulationCount(), 1u);
@@ -551,7 +553,7 @@ TEST(FootGroundSubsume, FootChainJacobianHas18WideBaseColumns) {
     // exactly the analytic +Z foot-point Jacobian.
     host.base_pose[0].rotation = Quat::Identity();
     const Vec3 base_origin = host.base_pose[0].position;
-    const auto poses = ForwardKinematics(context, host);
+    const auto poses = ForwardKinematics(context, context_dev, host);
 
     const Vec3 kUp{0.0f, 0.0f, 1.0f};
     double max_base_col_err = 0.0;
@@ -560,7 +562,7 @@ TEST(FootGroundSubsume, FootChainJacobianHas18WideBaseColumns) {
     for (const auto& foot : cooked.feet) {
         const Vec3 center = FootWorldCenter(poses, foot);
         const std::vector<float> j =
-            ComputeFootChainJ18(context, host, poses, foot.calf_local_link, center, kUp);
+            ComputeFootChainJ18(context, context_dev, host, poses, foot.calf_local_link, center, kUp);
         ASSERT_EQ(j.size(), static_cast<size_t>(kDof));
 
         const float lever_x = center.x - base_origin.x;
@@ -607,17 +609,18 @@ TEST(FootGroundSubsume, ContactRecoilsFloatingBaseThroughUnifiedSpine) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
 
-    const float ground_height = SeatGround(context, cooked);
+    const float ground_height = SeatGround(context, context_dev, cooked);
     const float kBaseVz0 = -1.0f;  // downward (body z == world z at identity).
 
     const auto out =
-        RunUnifiedFootGround(context, cooked, ground_height, kBaseVz0, ConvergedConfig());
+        RunUnifiedFootGround(context, context_dev, cooked, ground_height, kBaseVz0, ConvergedConfig());
 
     // Driver produced one normal row per foot (frictionless condim=1).
     ASSERT_EQ(out.row_count, static_cast<uint32_t>(cooked.feet.size()))
@@ -703,13 +706,14 @@ TEST(FootGroundSubsume, FootNormalVelocitiesDrivenToTargetAndBaseFeelsIt) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
 
-    const float ground_height = SeatGround(context, cooked);
+    const float ground_height = SeatGround(context, context_dev, cooked);
     const float kGravityZ = -9.81f;
     const float dt = 1.0f / 240.0f;
 
@@ -723,7 +727,7 @@ TEST(FootGroundSubsume, FootNormalVelocitiesDrivenToTargetAndBaseFeelsIt) {
     // approaching (Jv_before < 0 == closing): the compliant solve must arrest it.
     const float base_vz0 = -1.0f;
     const auto out =
-        RunUnifiedFootGround(context, cooked, ground_height, base_vz0, ConvergedConfig());
+        RunUnifiedFootGround(context, context_dev, cooked, ground_height, base_vz0, ConvergedConfig());
     ASSERT_GE(out.row_count, 4u);
 
     // (A) Per-foot constraint satisfaction: the post-solve normal velocity is
@@ -783,15 +787,16 @@ TEST(FootGroundSubsume, UnifiedSpineDeterministicTwoRun) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto cooked = CookGo2Float();
     cooked.host.base_pose[0].rotation = Quat::Identity();
     for (auto& v : cooked.host.link_velocity) for (float& c : v.v) c = 0.0f;
     for (float& qd : cooked.host.qdot) qd = 0.0f;
-    const float ground_height = SeatGround(context, cooked);
+    const float ground_height = SeatGround(context, context_dev, cooked);
 
-    const auto a = RunUnifiedFootGround(context, cooked, ground_height, -1.0f, ConvergedConfig());
-    const auto b = RunUnifiedFootGround(context, cooked, ground_height, -1.0f, ConvergedConfig());
+    const auto a = RunUnifiedFootGround(context, context_dev, cooked, ground_height, -1.0f, ConvergedConfig());
+    const auto b = RunUnifiedFootGround(context, context_dev, cooked, ground_height, -1.0f, ConvergedConfig());
 
     ASSERT_EQ(a.qdot.size(), b.qdot.size());
     ASSERT_EQ(a.foot_lambda.size(), b.foot_lambda.size());

@@ -100,12 +100,12 @@ __global__ void Ilu0ApplyTestKernel(const float* __restrict__ lu,
 
 // Host launcher for the device triangular-solve test kernel. Device pointers; the
 // caller owns + synchronizes (mirrors the rest of diffsim).
-void LaunchIlu0ApplyTest(const phi::DeviceContext& context, const float* lu,
+void LaunchIlu0ApplyTest(cudaStream_t stream, int device_id, const float* lu,
                          const uint32_t* block_dim, const float* r, float* z,
                          uint32_t block_count) {
     if (block_count == 0u) return;
-    phi::ScopedDeviceGuard guard(context.device_id);
-    Ilu0ApplyTestKernel<<<block_count, kWarpSize, 0u, context.stream.Native()>>>(
+    phi::ScopedDeviceGuard guard(device_id);
+    Ilu0ApplyTestKernel<<<block_count, kWarpSize, 0u, stream>>>(
         lu, block_dim, r, z, block_count);
 }
 

@@ -37,7 +37,6 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"  // MakeDefaultDeviceContext (sets cudaSetDevice)
 
 namespace {
 
@@ -54,18 +53,10 @@ struct Backend {
     nphi::Device* dev = nullptr;
     nphi::Backend* backend = nullptr;
 };
-// Hold the default device context ALIVE for the whole process (the thrust grid
-// sort in ParticleGridBuild runs on the active device — the context's
-// ScopedDeviceGuard / cudaSetDevice must stay in effect).
-nuka::phi::DeviceContext& ProcessContext() {
-    static nuka::phi::DeviceContext ctx = nuka::phi::MakeDefaultDeviceContext();
-    return ctx;
-}
-
 Backend GetBackend() {
     static Backend b = [] {
         Backend r;
-        ProcessContext();  // set the active CUDA device for this process.
+        // BUF-14: InitBestDevice() sets the active CUDA device for this process.
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;

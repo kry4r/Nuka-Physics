@@ -20,7 +20,8 @@
 #include "sensor/noise/philox.cuh"
 #include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -58,15 +59,15 @@ private:
     nuka::phi::Buffer* buf_ = nullptr;
 };
 
-std::vector<float> RunGaussian(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunGaussian(cudaStream_t ctx, int ctx_dev,
                                uint32_t count, float mean, float stddev,
                                uint64_t seed, uint64_t seq) {
     std::vector<float> host(count, 0.0f);  // add-to-zero so output == sample
     OwnedDeviceBuffer d(static_cast<size_t>(count) * sizeof(float));
     d.CopyFromHost(host.data(), host.size() * sizeof(float));
-    noise::LaunchGaussianNoise(ctx, static_cast<float*>(d.Data()), count, mean,
+    noise::LaunchGaussianNoise(ctx, ctx_dev, static_cast<float*>(d.Data()), count, mean,
                                stddev, seed, seq);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
     d.CopyToHost(host.data(), host.size() * sizeof(float));
     return host;
 }
@@ -113,15 +114,16 @@ TEST(N1GaussianNoise, PhiloxKnownAnswerVectors) {
 
 // 2. D1: two separate launches with the same args are memcmp-identical.
 TEST(N1GaussianNoise, DeterminismTwoRunBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 100000u;
     const float mean = 0.5f;
     const float stddev = 0.02f;
     const uint64_t seed = 0x1234abcd5678ef90ull;
     const uint64_t seq = 7u;
 
-    const std::vector<float> a = RunGaussian(ctx, count, mean, stddev, seed, seq);
-    const std::vector<float> b = RunGaussian(ctx, count, mean, stddev, seed, seq);
+    const std::vector<float> a = RunGaussian(ctx, ctx_dev, count, mean, stddev, seed, seq);
+    const std::vector<float> b = RunGaussian(ctx, ctx_dev, count, mean, stddev, seed, seq);
 
     ASSERT_EQ(a.size(), b.size());
     EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), 0)
@@ -130,13 +132,14 @@ TEST(N1GaussianNoise, DeterminismTwoRunBitExact) {
 
 // 3. Statistical sanity: mean ~= mean, stddev ~= stddev over a large buffer.
 TEST(N1GaussianNoise, StatisticalMeanAndStddev) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 100000u;
     const float mean = 0.5f;
     const float stddev = 0.02f;
     const uint64_t seed = 0xdeadbeefcafef00dull;
 
-    const std::vector<float> s = RunGaussian(ctx, count, mean, stddev, seed, 0u);
+    const std::vector<float> s = RunGaussian(ctx, ctx_dev, count, mean, stddev, seed, 0u);
 
     double sum = 0.0;
     for (float v : s) sum += static_cast<double>(v);
@@ -164,16 +167,17 @@ TEST(N1GaussianNoise, StatisticalMeanAndStddev) {
 
 // 4. Independence: seed, seq, and element index all change the noise.
 TEST(N1GaussianNoise, IndependenceSeedSeqElement) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 4096u;
     const float mean = 0.0f;
     const float stddev = 1.0f;
 
-    const std::vector<float> base = RunGaussian(ctx, count, mean, stddev, 1u, 0u);
+    const std::vector<float> base = RunGaussian(ctx, ctx_dev, count, mean, stddev, 1u, 0u);
     const std::vector<float> diff_seed =
-        RunGaussian(ctx, count, mean, stddev, 2u, 0u);
+        RunGaussian(ctx, ctx_dev, count, mean, stddev, 2u, 0u);
     const std::vector<float> diff_seq =
-        RunGaussian(ctx, count, mean, stddev, 1u, 1u);
+        RunGaussian(ctx, ctx_dev, count, mean, stddev, 1u, 1u);
 
     // Different seed -> different noise (buffers must differ).
     EXPECT_NE(std::memcmp(base.data(), diff_seed.data(),

@@ -68,7 +68,9 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <vector>
@@ -180,7 +182,7 @@ struct StepBackwardGrads {
 // grad_q_out / grad_qdot_out / grad_target_out / grad_mass_out /
 // grad_link_velocity_out. ONE thread per articulation (mirrors the forward),
 // fixed-order atomic-free accumulation -> D1 bit-exact.
-void StepBackward(const phi::DeviceContext& context,
+void StepBackward(cudaStream_t stream, int device_id,
                   articulation::ArticulationDeviceState state,
                   const StepBackwardInputs& inputs,
                   const StepBackwardGrads& grads);

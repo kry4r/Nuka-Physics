@@ -29,7 +29,7 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "scene/cooked_blob.hpp"
@@ -227,9 +227,9 @@ ChainModel BuildFloatingChain() {
 // ---------------------------------------------------------------------------
 class Harness {
 public:
-    Harness(const nuka::phi::DeviceContext& ctx, const ChainModel& model)
-        : ctx_(ctx), model_(model) {
-        device_ = articulation::UploadArticulationState(ctx_, model.host);
+    Harness(cudaStream_t ctx, int ctx_dev, const ChainModel& model)
+        : ctx_(ctx), ctx_dev_(ctx_dev), model_(model) {
+        device_ = articulation::UploadArticulationState(ctx_, ctx_dev_, model.host);
         n_ = model.link_count;
         // dI/dmass (host -> device).
         const std::vector<float> dIdm =
@@ -266,13 +266,13 @@ public:
 
     // Floating-base root spatial velocity (6 floats at link_velocity[0]).
     void SetRootVel(const std::array<float, 6>& v) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(View().link_velocity, v.data(), 6u * sizeof(float),
                              cudaMemcpyHostToDevice), cudaSuccess);
     }
     std::array<float, 6> GetRootVel() {
         std::array<float, 6> v{};
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         EXPECT_EQ(cudaMemcpy(v.data(), View().link_velocity, 6u * sizeof(float),
                              cudaMemcpyDeviceToHost), cudaSuccess);
         return v;
@@ -280,35 +280,35 @@ public:
     // Floating-base forward: ABA + floating-base velocity integrate + joint vel +
     // joint pos integrate (the contact-free floating step, matching StepFloating).
     void ForwardFloating(float gravity_z, float dt) {
-        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, View(), gravity_z);
+        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, ctx_dev_, View(), gravity_z);
         // Snapshot the PRE-INTEGRATION root spatial velocity: the next kernel
         // (IntegrateFloatingBaseVelocity) overwrites link_velocity[root] in place
         // (v_pre -> v_post). The root gyroscopic adjoint must linearize at v_pre,
         // so StepBackward reads this snapshot (in.v_root_pre), not the live state.
         SnapshotVRootPre();
-        articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(ctx_, View(), dt,
+        articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(ctx_, ctx_dev_, View(), dt,
                                                                      gravity_z);
-        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, View(), dt);
-        articulation::FeatherstoneAba::IntegratePosition(ctx_, View(), dt);
+        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, ctx_dev_, View(), dt);
+        articulation::FeatherstoneAba::IntegratePosition(ctx_, ctx_dev_, View(), dt);
         // p08b: snapshot the PRE-POSE-INTEGRATION base orientation, then integrate
         // the quaternion pose. The orientation adjoint linearizes at base_pose_pre
         // (the pose kernel overwrites base_pose in place, pre->post), mirroring
         // v_root_pre. Snapshot must precede the pose kernel.
         SnapshotBasePosePre();
-        articulation::FeatherstoneAba::IntegrateFloatingBasePose(ctx_, View(), dt);
+        articulation::FeatherstoneAba::IntegrateFloatingBasePose(ctx_, ctx_dev_, View(), dt);
         Sync();
     }
     // Copy the live link_velocity buffer (LinkSpatialVel == float[6], no padding)
     // into the v_root_pre scratch the reverse reads.
     void SnapshotVRootPre() {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(v_root_pre_.Data(), View().link_velocity,
                              n_ * sizeof(articulation::LinkSpatialVel),
                              cudaMemcpyDeviceToDevice),
                   cudaSuccess);
     }
     void SeedGradRootVel(const std::array<float, 6>& s) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(grad_link_vel_.Data(), s.data(), 6u * sizeof(float),
                              cudaMemcpyHostToDevice), cudaSuccess);
     }
@@ -323,13 +323,13 @@ public:
     // -- p08b orientation-channel helpers (articulation 0) --
     // Set the live base_pose[0] (position + rotation) for the floating root.
     void SetBasePose(const Transform& pose) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(View().base_pose, &pose, sizeof(Transform),
                              cudaMemcpyHostToDevice), cudaSuccess);
     }
     Transform GetBasePose() {
         Transform pose;
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         EXPECT_EQ(cudaMemcpy(&pose, View().base_pose, sizeof(Transform),
                              cudaMemcpyDeviceToHost), cudaSuccess);
         return pose;
@@ -337,7 +337,7 @@ public:
     // Copy the live base_pose buffer into the base_pose_pre snapshot (the reverse
     // reads in.base_pose_pre); called by ForwardFloating BEFORE the pose kernel.
     void SnapshotBasePosePre() {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(base_pose_pre_.Data(), View().base_pose,
                              art_count_ * sizeof(Transform),
                              cudaMemcpyDeviceToDevice),
@@ -345,7 +345,7 @@ public:
     }
     // Seed grad_base_pose_out[0] = [dL/d position'(3), dL/d rotation'(4)].
     void SeedGradBasePose(const std::array<float, 7>& s) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(grad_base_pose_.Data(), s.data(), 7u * sizeof(float),
                              cudaMemcpyHostToDevice), cudaSuccess);
     }
@@ -364,7 +364,7 @@ public:
         const articulation::LinkSpatialInertia I =
             articulation::MakeSpatialInertia(mass, lp.diagonal_inertia,
                                              lp.inertial_frame);
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         articulation::LinkSpatialInertia* dst = View().link_inertia + link;
         ASSERT_EQ(cudaMemcpy(dst, &I, sizeof(I), cudaMemcpyHostToDevice),
                   cudaSuccess);
@@ -373,14 +373,14 @@ public:
     // -- forward composition (contact-free, fixed base) --
     // ABA only (rungs a/b/c + M^-1): tau already set, ComputeAccelerations.
     void ForwardAbaOnly(float gravity_z) {
-        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, View(), gravity_z);
+        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, ctx_dev_, View(), gravity_z);
         Sync();
     }
     // ABA + integrate (rung d): tau set, then accel + vel + pos integrate.
     void ForwardAbaIntegrate(float gravity_z, float dt) {
-        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, View(), gravity_z);
-        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, View(), dt);
-        articulation::FeatherstoneAba::IntegratePosition(ctx_, View(), dt);
+        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, ctx_dev_, View(), gravity_z);
+        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, ctx_dev_, View(), dt);
+        articulation::FeatherstoneAba::IntegratePosition(ctx_, ctx_dev_, View(), dt);
         Sync();
     }
     // drive + ABA + integrate (rung e): the full single step.
@@ -394,12 +394,12 @@ public:
         OwnedDeviceBuffer bd = MakeDeviceFloat(kd);
         OwnedDeviceBuffer bl = MakeDeviceFloat(flim);
         articulation::FeatherstoneAba::ApplyPositionDrives(
-            ctx_, View(), static_cast<const float*>(bt.Data()),
+            ctx_, ctx_dev_, View(), static_cast<const float*>(bt.Data()),
             static_cast<const float*>(bp.Data()), static_cast<const float*>(bd.Data()),
             static_cast<const float*>(bl.Data()), /*defer_velocity_damping=*/false);
-        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, View(), gravity_z);
-        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, View(), dt);
-        articulation::FeatherstoneAba::IntegratePosition(ctx_, View(), dt);
+        articulation::FeatherstoneAba::ComputeAccelerations(ctx_, ctx_dev_, View(), gravity_z);
+        articulation::FeatherstoneAba::IntegrateVelocity(ctx_, ctx_dev_, View(), dt);
+        articulation::FeatherstoneAba::IntegratePosition(ctx_, ctx_dev_, View(), dt);
         Sync();
     }
 
@@ -458,10 +458,10 @@ public:
 
     void RunBackward(const diffsim::StepBackwardInputs& in,
                      const diffsim::StepBackwardGrads& g) {
-        diffsim::StepBackward(ctx_, View(), in, g);
+        diffsim::StepBackward(ctx_, ctx_dev_, View(), in, g);
         Sync();
     }
-    void Sync() { ctx_.stream.Synchronize(); }
+    void Sync() { cudaStreamSynchronize(ctx_); }
 
 private:
     OwnedDeviceBuffer MakeDeviceFloat(const std::vector<float>& v) {
@@ -470,13 +470,13 @@ private:
         return b;
     }
     void Upload(float* dst, const std::vector<float>& v) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         ASSERT_EQ(cudaMemcpy(dst, v.data(), v.size() * sizeof(float),
                              cudaMemcpyHostToDevice), cudaSuccess);
     }
     std::vector<float> Download(const float* src) {
         std::vector<float> v(n_, 0.0f);
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         EXPECT_EQ(cudaMemcpy(v.data(), src, n_ * sizeof(float),
                              cudaMemcpyDeviceToHost), cudaSuccess);
         return v;
@@ -487,7 +487,8 @@ private:
         return v;
     }
 
-    const nuka::phi::DeviceContext& ctx_;
+    cudaStream_t ctx_ = nullptr;
+    int ctx_dev_ = 0;
     const ChainModel& model_;
     articulation::ArticulationDeviceBuffers device_;
     uint32_t n_ = 0u;
@@ -539,9 +540,10 @@ const std::vector<float> kBaseTau = {0.0f, 0.50f, -0.30f, 0.20f};
 // grad_tau=row i). Symmetric to ~1e-6, no FD truncation noise.
 // ===========================================================================
 TEST(AbaReverse, ExactMInverseCrossCheck) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 0.0f;
 
@@ -598,9 +600,10 @@ TEST(AbaReverse, ExactMInverseCrossCheck) {
 // gravity ON, nonzero qdot. Scalar loss L = sum_k w_k * qddot_k.
 // ===========================================================================
 TEST(AbaReverse, RungA_dQddot_dTau_dQdot) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f;
     // loss weights on qddot (one per DOF).
@@ -653,9 +656,10 @@ TEST(AbaReverse, RungA_dQddot_dTau_dQdot) {
 // gravity ON, qdot ON. Reverse (enable_q_channel) vs central FD on q.
 // ===========================================================================
 TEST(AbaReverse, RungA_dQddot_dQ_Xpath) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f;
     std::vector<float> w(h.N(), 0.0f);
@@ -696,9 +700,10 @@ TEST(AbaReverse, RungA_dQddot_dQ_Xpath) {
 // MakeSpatialInertia) that dI/dmass slopes. NONZERO COM -> full coupling.
 // ===========================================================================
 TEST(AbaReverse, RungB_dQddot_dMass) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f;
     std::vector<float> w(h.N(), 0.0f);
@@ -747,9 +752,10 @@ TEST(AbaReverse, RungB_dQddot_dMass) {
 // loss on post-step q' and qdot'. Reverse (has_integrate=true) vs central FD.
 // ===========================================================================
 TEST(AbaReverse, RungD_Integrate_dTau_dQdot) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f, dt = 0.01f;
     std::vector<float> wq(h.N(), 0.0f), wqd(h.N(), 0.0f);
@@ -803,9 +809,10 @@ TEST(AbaReverse, RungD_Integrate_dTau_dQdot) {
 // action = drive_targets. drive + ABA + integrate, gravity on. Reverse vs FD.
 // ===========================================================================
 TEST(AbaReverse, RungE_FullStep_dAction_dMass) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f, dt = 0.01f;
     const std::vector<float> kp = {0.0f, 25.0f, 20.0f, 15.0f};
@@ -887,9 +894,10 @@ TEST(AbaReverse, RungE_FullStep_dAction_dMass) {
 // pass-1 path. Reverse vs central FD. gravity ON, nonzero root velocity + qdot.
 // ===========================================================================
 TEST(AbaReverse, RungC_Floating_dTau_dMass) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;  // {1,2}
     const float g0 = 9.81f, dt = 0.01f;
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
@@ -1009,9 +1017,10 @@ TEST(AbaReverse, RungC_Floating_dTau_dMass) {
 // make (a_free-a_grav) big. This test FAILS if the linearization point regresses.
 // ===========================================================================
 TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;  // {1,2}
     const float g0 = 9.81f, dt = 0.05f;  // LARGE dt -> big |v_post - v_pre|
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
@@ -1148,9 +1157,10 @@ TEST(AbaReverse, RungC_Floating_LargeDt_LinearizationPoint) {
 // changes over the step and the channel is exercised. gravity ON.
 // ===========================================================================
 TEST(AbaReverse, RungF_Floating_OrientationChannel) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;  // {1,2}
     const float g0 = 9.81f, dt = 0.02f;
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
@@ -1283,9 +1293,10 @@ TEST(AbaReverse, RungF_Floating_OrientationChannel) {
 // RungC_Floating_LargeDt_LinearizationPoint for the orientation channel.
 // ===========================================================================
 TEST(AbaReverse, RungF_Floating_OrientationLinearizationPoint) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f, dt = 0.08f;  // LARGE dt -> big |base_rot_post - pre|
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
@@ -1399,9 +1410,10 @@ TEST(AbaReverse, RungF_Floating_OrientationLinearizationPoint) {
 // wrv) so the legacy path produces nonzero output to compare against.
 // ===========================================================================
 TEST(AbaReverse, RungF_Floating_ZeroSeedOrientationInvariant) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const float g0 = 9.81f, dt = 0.05f;  // large dt -> exercises orientation paths
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
     const std::vector<float> qd0 = {0.0f, 0.40f, -0.25f};
@@ -1458,9 +1470,10 @@ TEST(AbaReverse, RungF_Floating_ZeroSeedOrientationInvariant) {
 // across two runs. Compares grad_tau + grad_mass + grad_link_velocity[0:6].
 // ===========================================================================
 TEST(AbaReverse, D1_Floating_TwoRunBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const std::vector<uint32_t>& dofs = model.dof_links;
     const float g0 = 9.81f, dt = 0.01f;
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f};
@@ -1508,9 +1521,10 @@ TEST(AbaReverse, D1_Floating_TwoRunBitExact) {
 // atomics, fixed order). Compare grad_action + grad_mass byte-for-byte.
 // ===========================================================================
 TEST(AbaReverse, D1_TwoRunBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     const float g0 = 9.81f, dt = 0.01f;
     const std::vector<float> kp = {0.0f, 25.0f, 20.0f, 15.0f};
     const std::vector<float> kd = {0.0f, 1.5f, 1.2f, 0.9f};
@@ -1574,7 +1588,8 @@ TEST(AbaReverse, D1_TwoRunBitExact) {
 #include "phi/backend.hpp"
 
 TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float g0 = 9.81f;
     const uint32_t n = model.link_count;
@@ -1582,7 +1597,7 @@ TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
     w[1] = 0.7f; w[2] = -1.1f; w[3] = 0.5f;
 
     // --- legacy-buffer reference (the rung-a reverse, verbatim). -------------
-    Harness h(ctx, model);
+    Harness h(ctx, ctx_dev, model);
     h.SetQ(kBaseQ); h.SetQdot(kBaseQdot); h.SetTau(kBaseTau);
     h.ForwardAbaOnly(g0);
     const std::vector<float> ref_qddot = h.GetQddot();
@@ -1656,8 +1671,8 @@ TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
     upload(state.tau, kBaseTau);
 
     // Forward (the UNTOUCHED legacy launcher on arena-backed state).
-    articulation::FeatherstoneAba::ComputeAccelerations(ctx, state, g0);
-    ctx.stream.Synchronize();
+    articulation::FeatherstoneAba::ComputeAccelerations(ctx, ctx_dev, state, g0);
+    cudaStreamSynchronize(ctx);
     std::vector<float> nk_qddot(n, 0.0f);
     ASSERT_EQ(cudaMemcpy(nk_qddot.data(), state.qddot, n * sizeof(float),
                          cudaMemcpyDeviceToHost), cudaSuccess);
@@ -1706,8 +1721,8 @@ TEST(AbaReverse, NkArenaSeamForwardReverseBitExact) {
     g.grad_link_velocity_out = static_cast<float*>(grad_link_vel.Data());
     g.grad_base_pose_out = static_cast<float*>(grad_base_pose.Data());
 
-    diffsim::StepBackward(ctx, state, in, g);
-    ctx.stream.Synchronize();
+    diffsim::StepBackward(ctx, ctx_dev, state, in, g);
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> nk_grad_tau(n, 0.0f), nk_grad_qdot(n, 0.0f);
     grad_tau.CopyToHost(nk_grad_tau.data(), n * sizeof(float));

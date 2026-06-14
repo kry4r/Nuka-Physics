@@ -212,7 +212,7 @@ __global__ void BuildDelassusKernel(const ArticulatedContactRow* __restrict__ ro
 
 }  // namespace
 
-void BuildContactDelassusSystem(const phi::DeviceContext& context,
+void BuildContactDelassusSystem(cudaStream_t stream, int device_id,
                                 const ArticulatedContactRow* rows,
                                 const float* jac_normal, const float* jac_tangent1,
                                 const float* jac_tangent2, const float* m_inv,
@@ -248,8 +248,7 @@ void BuildContactDelassusSystem(const phi::DeviceContext& context,
             "(must be 1.." + std::to_string(kMaxDof) + ")");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     // CALLER-OWNED, REUSABLE output buffers (perf: no per-Run cudaMalloc/free in the
     // steady state). The previous version allocated fresh `values`/`block_dim` on

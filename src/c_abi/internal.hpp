@@ -5,8 +5,6 @@
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
-#include "phi/owned_stream.hpp"
 // M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
 // nk::World). The diffsim + noise + set_link_mass paths still consume the legacy
 // ArticulationHostState/ArticulationDeviceState VIEW types as a kernel-parameter
@@ -33,11 +31,15 @@ class World;  // nk/pipeline/world.hpp -- fwd-declared (held by unique_ptr below
 namespace nuka::c_abi {
 
 struct DeviceRecord {
-    // --- Legacy phi v1 per-handle device context (M9 delete-list) -----------
-    // Still used by the legacy single-/multi-env stepper paths until those are
-    // switched off in later M9 tasks (T5). Do NOT remove in T2.
-    phi::DeviceContext context;
-    std::unique_ptr<phi::OwnedStream> owned_stream;
+    // --- CUDA device ordinal (BUF-14) ---------------------------------------
+    // The validated CUDA device this handle was created on. Read by the legacy
+    // diffsim/noise orchestration (ScopedDeviceGuard) + recorder.cpp's
+    // SelectDeviceByOrdinal. The legacy orchestration that used to own a created
+    // stream now runs on STREAM 0 (the NULL/default stream): single-stream
+    // ordering + NULL-stream implicit serialization preserve the exact
+    // happens-before the owned stream gave, and the v2 backward op (on
+    // backend->main) coordinates with stream 0 via that same implicit sync.
+    int device_id = 0;
 
     // --- phi v2 owned device/backend (M9 T2) -------------------------------
     // An OWNED phi v2 Backend (and the registry-owned Device it was init'd on),

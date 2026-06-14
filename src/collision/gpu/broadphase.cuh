@@ -6,7 +6,9 @@
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -53,7 +55,7 @@ private:
 // Run the SAP O(n^2) pair-slot broadphase directly over a device AABB buffer
 // (the oracle entry for the LBVH differential gate). The AABBs are the caller's;
 // the result borrows nothing from them (its own device pair buffers are built).
-CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
+CudaBroadphaseResult BuildCudaBroadphase(cudaStream_t stream, int device_id,
                                          const collision::AABB* device_aabbs,
                                          uint32_t shape_count);
 CudaBroadphaseResult BuildCudaBroadphase(const collision::AABB* device_aabbs,

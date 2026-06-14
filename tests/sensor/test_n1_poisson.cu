@@ -15,7 +15,8 @@
 #include "sensor/noise/n1_poisson.hpp"
 #include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -53,15 +54,15 @@ private:
     nuka::phi::Buffer* buf_ = nullptr;
 };
 
-std::vector<float> RunPoisson(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunPoisson(cudaStream_t ctx, int ctx_dev,
                               uint32_t count, float lambda, uint64_t seed,
                               uint64_t seq) {
     std::vector<float> host(count, 0.0f);  // add-to-zero so output == count
     OwnedDeviceBuffer d(static_cast<size_t>(count) * sizeof(float));
     d.CopyFromHost(host.data(), host.size() * sizeof(float));
-    noise::LaunchPoissonNoise(ctx, static_cast<float*>(d.Data()), count, lambda,
+    noise::LaunchPoissonNoise(ctx, ctx_dev, static_cast<float*>(d.Data()), count, lambda,
                               seed, seq);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
     d.CopyToHost(host.data(), host.size() * sizeof(float));
     return host;
 }
@@ -70,14 +71,15 @@ std::vector<float> RunPoisson(const nuka::phi::DeviceContext& ctx,
 
 // 1. D1: two separate launches with the same args are memcmp-identical.
 TEST(N1PoissonNoise, DeterminismTwoRunBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 100000u;
     const float lambda = 4.0f;
     const uint64_t seed = 0x0badf00d12345678ull;
     const uint64_t seq = 3u;
 
-    const std::vector<float> a = RunPoisson(ctx, count, lambda, seed, seq);
-    const std::vector<float> b = RunPoisson(ctx, count, lambda, seed, seq);
+    const std::vector<float> a = RunPoisson(ctx, ctx_dev, count, lambda, seed, seq);
+    const std::vector<float> b = RunPoisson(ctx, ctx_dev, count, lambda, seed, seq);
 
     ASSERT_EQ(a.size(), b.size());
     EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), 0)
@@ -86,12 +88,13 @@ TEST(N1PoissonNoise, DeterminismTwoRunBitExact) {
 
 // 2. Poisson mean == variance == lambda (the distinguishing signature).
 TEST(N1PoissonNoise, StatisticalMeanAndVariance) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 100000u;
     const float lambda = 4.0f;
     const uint64_t seed = 0xfeedface99887766ull;
 
-    const std::vector<float> s = RunPoisson(ctx, count, lambda, seed, 0u);
+    const std::vector<float> s = RunPoisson(ctx, ctx_dev, count, lambda, seed, 0u);
 
     double sum = 0.0;
     for (float v : s) sum += static_cast<double>(v);
@@ -116,13 +119,14 @@ TEST(N1PoissonNoise, StatisticalMeanAndVariance) {
 
 // 3. Independence across seed and seq.
 TEST(N1PoissonNoise, IndependenceSeedSeq) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 4096u;
     const float lambda = 5.0f;
 
-    const std::vector<float> base = RunPoisson(ctx, count, lambda, 1u, 0u);
-    const std::vector<float> diff_seed = RunPoisson(ctx, count, lambda, 2u, 0u);
-    const std::vector<float> diff_seq = RunPoisson(ctx, count, lambda, 1u, 1u);
+    const std::vector<float> base = RunPoisson(ctx, ctx_dev, count, lambda, 1u, 0u);
+    const std::vector<float> diff_seed = RunPoisson(ctx, ctx_dev, count, lambda, 2u, 0u);
+    const std::vector<float> diff_seq = RunPoisson(ctx, ctx_dev, count, lambda, 1u, 1u);
 
     EXPECT_NE(std::memcmp(base.data(), diff_seed.data(),
                           base.size() * sizeof(float)),
@@ -136,11 +140,12 @@ TEST(N1PoissonNoise, IndependenceSeedSeq) {
 
 // 4. Each sample is a non-negative integer count.
 TEST(N1PoissonNoise, NonNegativeIntegerCounts) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t count = 8192u;
     const float lambda = 3.0f;
 
-    const std::vector<float> s = RunPoisson(ctx, count, lambda, 42u, 0u);
+    const std::vector<float> s = RunPoisson(ctx, ctx_dev, count, lambda, 42u, 0u);
     for (float v : s) {
         EXPECT_GE(v, 0.0f);
         EXPECT_EQ(v, std::floor(v)) << "Poisson sample is not integer-valued";

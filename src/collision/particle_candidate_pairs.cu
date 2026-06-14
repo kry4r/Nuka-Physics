@@ -129,9 +129,9 @@ __global__ void ReframeParticleParticleKernel(
 // (same stable_key after the canonical sort). Verbatim the C2b dedup posture: a
 // no-op when there are no duplicates. Centralizes the download->dedup tail of
 // both builders.
-CandidatePairStream BuildAndDedup(const phi::DeviceContext& context,
+CandidatePairStream BuildAndDedup(cudaStream_t stream, int device_id,
                                   const std::vector<CandidatePair>& survivors) {
-    CandidatePairStream stream_out = BuildCandidatePairStream(context, survivors);
+    CandidatePairStream stream_out = BuildCandidatePairStream(stream, device_id, survivors);
 
     const auto sorted = stream_out.DownloadPairs();
     bool has_dup = false;
@@ -151,36 +151,35 @@ CandidatePairStream BuildAndDedup(const phi::DeviceContext& context,
             unique_pairs.push_back(sorted[i]);
         }
     }
-    return BuildCandidatePairStream(context, unique_pairs);
+    return BuildCandidatePairStream(stream, device_id, unique_pairs);
 }
 
 } // namespace
 
 CandidatePairStream BuildParticleRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions, uint32_t particle_count,
     SystemKind particle_system,
     const gpu::LbvhBroadphaseResult& rigid_tree,
     const uint32_t* rigid_shape_body_ids,
     float query_radius,
     const SystemPairMatrix& matrix) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     // --- SystemPairMatrix gate (testable seam) ------------------------------
     if (!scene::IsSystemPairEnabled(matrix, particle_system, SystemKind::Rigid)) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
     if (particle_count == 0u) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     // --- raw cross-system query (already D1 CSR) ----------------------------
     auto query = gpu::QueryParticlesAgainstRigidLbvh(
-        context, particle_positions, particle_count, query_radius, rigid_tree);
+        stream, device_id, particle_positions, particle_count, query_radius, rigid_tree);
     const uint32_t total = query.TotalCandidates();
     if (total == 0u) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     // Reaction-provider kinds read off the generated registry (no hard-coded enum).
@@ -212,14 +211,14 @@ CandidatePairStream BuildParticleRigidCandidatePairs(
         particle_react, rigid_react,
         static_cast<CandidatePair*>(phi::BufferBase(d_out)));
     CheckCuda(cudaGetLastError(), "ReframeParticleRigidKernel launch");
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     std::vector<CandidatePair> survivors(total);
     phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
     phi::BufferFree(d_body_ids);
     phi::BufferFree(d_out);
 
-    return BuildAndDedup(context, survivors);
+    return BuildAndDedup(stream, device_id, survivors);
 }
 
 CandidatePairStream BuildParticleRigidCandidatePairs(
@@ -229,36 +228,34 @@ CandidatePairStream BuildParticleRigidCandidatePairs(
     const uint32_t* rigid_shape_body_ids,
     float query_radius,
     const SystemPairMatrix& matrix) {
-    auto context = phi::MakeDefaultDeviceContext();
     return BuildParticleRigidCandidatePairs(
-        context, particle_positions, particle_count, particle_system, rigid_tree,
-        rigid_shape_body_ids, query_radius, matrix);
+        /*stream=*/nullptr, /*device_id=*/0, particle_positions, particle_count,
+        particle_system, rigid_tree, rigid_shape_body_ids, query_radius, matrix);
 }
 
 CandidatePairStream BuildParticleParticleCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions, uint32_t particle_count,
     SystemKind particle_system,
     const gpu::ParticleGridConfig& config,
     float query_radius,
     const SystemPairMatrix& matrix) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     // --- SystemPairMatrix gate (same-system, e.g. Fluid<->Fluid) ------------
     if (!scene::IsSystemPairEnabled(matrix, particle_system, particle_system)) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
     if (particle_count == 0u) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     // --- raw uniform-grid neighbor query (already D1 CSR) --------------------
     auto grid = gpu::BuildParticleUniformGrid(
-        context, particle_positions, particle_count, config, query_radius);
+        stream, device_id, particle_positions, particle_count, config, query_radius);
     const uint32_t total = grid.TotalNeighbors();
     if (total == 0u) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     const ReactionProviderKind particle_react =
@@ -279,7 +276,7 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
         particle_react,
         static_cast<CandidatePair*>(phi::BufferBase(d_out)));
     CheckCuda(cudaGetLastError(), "ReframeParticleParticleKernel launch");
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     std::vector<CandidatePair> survivors(total);
     phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
@@ -287,7 +284,7 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
 
     // Canonical (i<j) emit means i->j and j->i are byte-identical pairs; the
     // adjacent dedup in BuildAndDedup collapses each double-listing to one i<j.
-    return BuildAndDedup(context, survivors);
+    return BuildAndDedup(stream, device_id, survivors);
 }
 
 CandidatePairStream BuildParticleParticleCandidatePairs(
@@ -296,10 +293,9 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
     const gpu::ParticleGridConfig& config,
     float query_radius,
     const SystemPairMatrix& matrix) {
-    auto context = phi::MakeDefaultDeviceContext();
     return BuildParticleParticleCandidatePairs(
-        context, particle_positions, particle_count, particle_system, config,
-        query_radius, matrix);
+        /*stream=*/nullptr, /*device_id=*/0, particle_positions, particle_count,
+        particle_system, config, query_radius, matrix);
 }
 
 } // namespace nuka::collision

@@ -361,7 +361,7 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
 
 }  // namespace
 
-void LaunchOscAdjointGainTarget(const phi::DeviceContext& context,
+void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 uint32_t osc_task_link,
@@ -381,8 +381,7 @@ void LaunchOscAdjointGainTarget(const phi::DeviceContext& context,
         out_grads.grad_target == nullptr) {
         return;
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     OscAdjointGainTargetKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state, max_dof, osc_task_link, inertia_M_inv, task_target, kp, kd,
         drive_force_limits, grad_tau, out_grads.grad_kp, out_grads.grad_kd,

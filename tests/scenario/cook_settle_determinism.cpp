@@ -31,7 +31,8 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/cook/placement.hpp"
 #include "scene/cook/settle.hpp"
@@ -54,14 +55,10 @@ struct Backend {
     nphi::Device* dev = nullptr;
     nphi::Backend* backend = nullptr;
 };
-nuka::phi::DeviceContext& ProcessContext() {
-    static nuka::phi::DeviceContext ctx = nuka::phi::MakeDefaultDeviceContext();
-    return ctx;
-}
 Backend GetBackend() {
     static Backend b = [] {
         Backend r;
-        ProcessContext();
+        // BUF-14: CUDA init is handled by InitBestDevice() (no device context).
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;

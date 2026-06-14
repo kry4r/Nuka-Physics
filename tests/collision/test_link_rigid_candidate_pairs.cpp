@@ -42,7 +42,8 @@
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer_v2.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "scene/cooked_blob.hpp"   // scene::CookedFilterPolicy (rigid wrapper path)
 
 #include <gtest/gtest.h>
@@ -150,7 +151,8 @@ struct MixedScene {
 };
 
 std::vector<collision::CandidatePair> RunMixed(const MixedScene& s) {
-    auto context = phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     const uint32_t rc = static_cast<uint32_t>(s.rigid_aabbs.size());
     const collision::AABB* dev = nullptr;
     OwnedDeviceBuffer d_rigid;
@@ -159,7 +161,7 @@ std::vector<collision::CandidatePair> RunMixed(const MixedScene& s) {
         dev = static_cast<const collision::AABB*>(d_rigid.Data());
     }
     auto stream = collision::BuildArticulationRigidCandidatePairs(
-        context, dev, rc,
+        context, context_dev, dev, rc,
         s.rigid_body_ids.data(), s.rigid_contypes.data(), s.rigid_conaff.data(),
         s.links, s.link_contypes.data(), s.link_conaff.data(),
         s.excluded);
@@ -312,7 +314,8 @@ TEST(LinkRigidCandidatePairs, ExcludeDropsCrossTypePair) {
 // wrapper IS core+explicit-merge, so we compare with an empty explicit policy.)
 // ---------------------------------------------------------------------------
 TEST(LinkRigidCandidatePairs, RigidWrapperMatchesTaggedCore) {
-    auto context = phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // 5 boxes; a dense overlapping chain.
     std::vector<collision::AABB> aabbs;
@@ -332,7 +335,7 @@ TEST(LinkRigidCandidatePairs, RigidWrapperMatchesTaggedCore) {
     scene::CookedFilterPolicy policy;
     policy.excluded_body_pairs = excluded;  // canonical (min,max) ascending.
     auto wrapper_stream = collision::BuildRigidCandidatePairs(
-        context, dev, 5u, body_ids.data(), contypes.data(), conaff.data(), policy);
+        context, context_dev, dev, 5u, body_ids.data(), contypes.data(), conaff.data(), policy);
     const auto wrapper = wrapper_stream.DownloadPairs();
 
     // --- Tagged-core path: all-RigidBody tags, handle==body_id, no extras. ---
@@ -346,7 +349,7 @@ TEST(LinkRigidCandidatePairs, RigidWrapperMatchesTaggedCore) {
     tags.contypes      = contypes.data();
     tags.conaffinities = conaff.data();
     auto core_stream = collision::BuildCandidatePairsTagged(
-        context, dev, 5u, tags, excluded, {});
+        context, context_dev, dev, 5u, tags, excluded, {});
     const auto core = core_stream.DownloadPairs();
 
     ASSERT_EQ(wrapper.size(), core.size());
@@ -369,7 +372,8 @@ TEST(LinkRigidCandidatePairs, RigidWrapperMatchesTaggedCore) {
 // pair genuinely overlaps + passes bitmask, so the device path emits it too.
 // ---------------------------------------------------------------------------
 TEST(LinkRigidCandidatePairs, ExplicitPairKeepsDeviceCanonicalLayout) {
-    auto context = phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // Two overlapping boxes, bodies 10 (shape 0) and 20 (shape 1).
     std::vector<collision::AABB> aabbs = {BoxAt({0.0f, 0.0f, 0.0f}, 0.5f),
@@ -392,7 +396,7 @@ TEST(LinkRigidCandidatePairs, ExplicitPairKeepsDeviceCanonicalLayout) {
     policy.explicit_pairs.push_back(ep);
 
     auto stream = collision::BuildRigidCandidatePairs(
-        context, dev, 2u, body_ids.data(), contypes.data(), conaff.data(), policy);
+        context, context_dev, dev, 2u, body_ids.data(), contypes.data(), conaff.data(), policy);
     const auto pairs = stream.DownloadPairs();
 
     ASSERT_EQ(pairs.size(), 1u) << "expected exactly one deduped body-pair";
@@ -439,7 +443,8 @@ TEST(LinkRigidCandidatePairs, D1TwoRunByteExact) {
 // single oversized handle.
 // ---------------------------------------------------------------------------
 TEST(LinkRigidCandidatePairs, HandleGuardThrowsOnOversizedHandle) {
-    auto context = phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     std::vector<collision::AABB> aabbs = {BoxAt({0.0f, 0.0f, 0.0f}, 0.5f),
                                           BoxAt({0.4f, 0.0f, 0.0f}, 0.5f)};
     OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
@@ -461,7 +466,7 @@ TEST(LinkRigidCandidatePairs, HandleGuardThrowsOnOversizedHandle) {
     tags.conaffinities = conaff.data();
 
     EXPECT_THROW(
-        collision::BuildCandidatePairsTagged(context, dev, 2u, tags, {}, {}),
+        collision::BuildCandidatePairsTagged(context, context_dev, dev, 2u, tags, {}, {}),
         std::runtime_error);
 
     // Boundary: the maximal valid handle (2^28 - 1) must NOT throw.
@@ -469,7 +474,7 @@ TEST(LinkRigidCandidatePairs, HandleGuardThrowsOnOversizedHandle) {
     tags.handles = ok_handles.data();
     EXPECT_NO_THROW({
         auto stream = collision::BuildCandidatePairsTagged(
-            context, dev, 2u, tags, {}, {});
+            context, context_dev, dev, 2u, tags, {}, {});
         (void)stream;
     });
 }

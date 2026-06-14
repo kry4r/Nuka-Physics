@@ -20,7 +20,8 @@
 #include "diffsim/sparse_solver_cg.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -135,7 +136,7 @@ OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
 
 // Runs the CG backend on a packed batch and returns the solution x (host,
 // block-major stride kMd, padding included).
-std::vector<float> RunSolve(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunSolve(cudaStream_t ctx, int ctx_dev,
                             const std::vector<float>& values,
                             const std::vector<uint32_t>& dims,
                             const std::vector<float>& rhs,
@@ -158,10 +159,10 @@ std::vector<float> RunSolve(const nuka::phi::DeviceContext& ctx,
     params.tol = 1.0e-6f;
     params.run_to_fixed_iters = fixed_iters;
 
-    auto solver = diffsim::MakeSparseSolverBackend("cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(static_cast<size_t>(bc) * kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -203,7 +204,8 @@ double MaxRelErr(const std::vector<Block>& blocks, const std::vector<float>& x) 
 }
 
 TEST(CgVsDense, AgreesWithEigenLdlt) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -217,7 +219,7 @@ TEST(CgVsDense, AgreesWithEigenLdlt) {
     // solver). fp64 internal arithmetic keeps the converged componentwise rel-err
     // well under 1e-6. (BlockJacobi below is the exact island solve regardless.)
     const std::vector<float> x_jacobi =
-        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 64u, true);
+        RunSolve(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 64u, true);
     const double rel_jacobi = MaxRelErr(blocks, x_jacobi);
     std::printf("[CgVsDense] Jacobi      max componentwise rel-err = %.3e\n", rel_jacobi);
     EXPECT_LT(rel_jacobi, 1.0e-6) << "Jacobi-preconditioned CG vs Eigen::LDLT";
@@ -225,14 +227,15 @@ TEST(CgVsDense, AgreesWithEigenLdlt) {
     // BlockJacobi: the exact per-block Cholesky island solve -> converges in <=1
     // iteration; expect near machine-exact.
     const std::vector<float> x_block =
-        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
+        RunSolve(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
     const double rel_block = MaxRelErr(blocks, x_block);
     std::printf("[CgVsDense] BlockJacobi max componentwise rel-err = %.3e\n", rel_block);
     EXPECT_LT(rel_block, 1.0e-6) << "BlockJacobi (exact Cholesky) CG vs Eigen::LDLT";
 }
 
 TEST(CgDeterminism, BitExactSameInputs) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -244,9 +247,9 @@ TEST(CgDeterminism, BitExactSameInputs) {
          {diffsim::Preconditioner::Jacobi, diffsim::Preconditioner::BlockJacobi}) {
         for (bool fixed : {false, true}) {
             const std::vector<float> x1 =
-                RunSolve(ctx, values, dims, rhs, precond, 64u, fixed);
+                RunSolve(ctx, ctx_dev, values, dims, rhs, precond, 64u, fixed);
             const std::vector<float> x2 =
-                RunSolve(ctx, values, dims, rhs, precond, 64u, fixed);
+                RunSolve(ctx, ctx_dev, values, dims, rhs, precond, 64u, fixed);
             ASSERT_EQ(x1.size(), x2.size());
             // Raw-bit comparison: byte-identical output is the R6 D1 gate.
             const int cmp =
@@ -277,7 +280,8 @@ TEST(CgDeterminism, BitExactSameInputs) {
 // and is not exactly A^+ rhs, but it IS an exact solution on the range (which is what
 // the IFT path needs -- the null direction carries zero gradient).
 TEST(CgVsDense, ObliqueRankDeficientBlockIsFiniteAndRangeCorrect) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     constexpr uint32_t n = 3u;
 
     // Non-axis-aligned orthonormal Q (a rotation built from a fixed generic axis/angle
@@ -314,7 +318,7 @@ TEST(CgVsDense, ObliqueRankDeficientBlockIsFiniteAndRangeCorrect) {
 
     // BlockJacobi = the modified-Cholesky island solve (the IFT solve path).
     const std::vector<float> x =
-        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
+        RunSolve(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
 
     // (1) FINITENESS: every active component finite (the NaN lock-out). Padding too.
     for (uint32_t i = 0u; i < kMd; ++i)

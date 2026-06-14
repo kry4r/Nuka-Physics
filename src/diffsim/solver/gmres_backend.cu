@@ -381,10 +381,11 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 }  // namespace
 
-SelfWrittenGmresBackend::SelfWrittenGmresBackend(const phi::DeviceContext& context,
+SelfWrittenGmresBackend::SelfWrittenGmresBackend(cudaStream_t stream, int device_id,
                                                  uint32_t restart,
                                                  DeterminismLevel determinism)
-    : context_(context),
+    : stream_(stream),
+      device_id_(device_id),
       restart_((restart < 1u) ? 1u : restart),
       determinism_(determinism) {}
 
@@ -398,8 +399,8 @@ void SelfWrittenGmresBackend::Solve(const BatchedDenseSpdSystem& system,
             "nuka::diffsim::SelfWrittenGmresBackend::Solve: null system/vector "
             "pointer");
     }
-    phi::ScopedDeviceGuard guard(context_.device_id);
-    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id_);
+    const cudaStream_t stream = stream_;
 
     SolveGmresKernel<<<system.block_count, kWarpSize, 0u, stream>>>(
         system.values, system.block_dim, b, x, system.block_count,
@@ -408,7 +409,7 @@ void SelfWrittenGmresBackend::Solve(const BatchedDenseSpdSystem& system,
     CheckCuda(cudaGetLastError(), "SolveGmresKernel launch");
 }
 
-void DetectBatchedNonSymmetric(const phi::DeviceContext& context,
+void DetectBatchedNonSymmetric(cudaStream_t stream, int device_id,
                                const BatchedDenseSpdSystem& system,
                                uint32_t* out_nonsymmetric_flag) {
     if (system.block_count == 0u || out_nonsymmetric_flag == nullptr) return;
@@ -416,8 +417,7 @@ void DetectBatchedNonSymmetric(const phi::DeviceContext& context,
         throw std::invalid_argument(
             "nuka::diffsim::DetectBatchedNonSymmetric: null system pointer");
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     DetectNonSymmetricKernel<<<system.block_count, kWarpSize, 0u, stream>>>(
         system.values, system.block_dim, system.block_count, out_nonsymmetric_flag);
     CheckCuda(cudaGetLastError(), "DetectNonSymmetricKernel launch");

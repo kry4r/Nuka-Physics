@@ -82,10 +82,9 @@ std::vector<CandidatePair> CandidatePairStream::DownloadPairs() const {
     return out;
 }
 
-CandidatePairStream BuildCandidatePairStream(const phi::DeviceContext& context,
+CandidatePairStream BuildCandidatePairStream(cudaStream_t stream, int device_id,
                                              const std::vector<CandidatePair>& unsorted_pairs) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
     // identical to the legacy synchronous memcpy (the upload completes before the
@@ -118,14 +117,13 @@ CandidatePairStream BuildCandidatePairStream(const phi::DeviceContext& context,
         static_cast<CandidatePair*>(phi::BufferBase(d_pairs)));
     CheckCuda(cudaGetLastError(), "stable_sort_by_key candidate pairs");
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     phi::BufferFree(d_keys);
     return CandidatePairStream(count, d_pairs);
 }
 
 CandidatePairStream BuildCandidatePairStream(const std::vector<CandidatePair>& unsorted_pairs) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildCandidatePairStream(context, unsorted_pairs);
+        return BuildCandidatePairStream(/*stream=*/nullptr, /*device_id=*/0, unsorted_pairs);
 }
 
 } // namespace nuka::collision

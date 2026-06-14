@@ -516,16 +516,15 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
-    # BUF-13 (M11): the legacy RAII Buffer impl (phi/backend_cuda/buffer.cu) + its
-    # two host headers were DELETED -- the last consumers (sdf/rt/sensor/
-    # invariants_gpu/test_capabilities) migrated to the opaque phi-v2 Buffer*
-    # (nuka_phi2). nuka_phi survives carrying DeviceContext / OwnedStream / Device /
-    # platform-contract (still consumed widely until BUF-14).
+    # BUF-14 (M11): the legacy phi v1 device-context / owned-stream / stream-view
+    # abstraction was DELETED -- every consumer now threads a raw cudaStream_t
+    # (stream 0) + int device_id. nuka_phi survives carrying the relocated
+    # scoped device guard + Device + platform-contract (BUF-13 already moved every
+    # buffer consumer to the opaque phi-v2 Buffer* in nuka_phi2).
     add_library(nuka_phi STATIC
-        phi/device_context.cpp
+        phi/scoped_device_guard.cpp
         phi/platform_contract.cpp
         phi/backend_cuda/device.cu
-        phi/backend_cuda/owned_stream.cu
     )
     set_target_properties(nuka_phi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -969,7 +968,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
             # RT-7 (M11): the rt/*.cu device buffers are phi-v2 opaque Buffer*
             # (stream-0); nuka_phi2 supplies BufferAlloc/InitBestDevice/cuda_buffer.
-            # nuka_phi stays for MakeDefaultDeviceContext / OwnedStream (BUF-14).
+            # nuka_phi stays for the scoped device guard (BUF-14).
             nuka_phi
             nuka_phi2
             CUDA::cudart

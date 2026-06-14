@@ -42,7 +42,9 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <string_view>
 
@@ -50,7 +52,7 @@ namespace nuka::diffsim {
 
 class SelfWrittenCgBackend final : public SparseLinearSolver {
 public:
-    explicit SelfWrittenCgBackend(const phi::DeviceContext& context,
+    explicit SelfWrittenCgBackend(cudaStream_t stream, int device_id,
                                   DeterminismLevel determinism = DeterminismLevel::Strong);
 
     void Solve(const BatchedDenseSpdSystem& system, const float* b, float* x,
@@ -59,7 +61,8 @@ public:
     std::string_view Name() const override { return "cg"; }
 
 private:
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     DeterminismLevel determinism_;
 };
 

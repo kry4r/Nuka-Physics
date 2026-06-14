@@ -203,11 +203,10 @@ std::vector<collision::CollisionPair> CudaBroadphaseResult::DownloadPairs() cons
     return active_pairs;
 }
 
-CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
+CudaBroadphaseResult BuildCudaBroadphase(cudaStream_t stream, int device_id,
                                          const collision::AABB* device_aabbs,
                                          uint32_t shape_count) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     const uint32_t pair_slot_count = shape_count > 1u
         ? (shape_count * (shape_count - 1u)) / 2u
@@ -223,7 +222,7 @@ CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
               "cudaMemsetAsync pair count");
 
     if (shape_count == 0u) {
-        context.stream.Synchronize();
+        cudaStreamSynchronize(stream);
         return CudaBroadphaseResult(0, 0,
                                     aabbs.Release(),
                                     pairs.Release(),
@@ -248,7 +247,7 @@ CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
         CheckCuda(cudaGetLastError(), "GeneratePairSlotsKernel launch");
     }
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     return CudaBroadphaseResult(shape_count,
                                 pair_slot_count,
                                 aabbs.Release(),
@@ -259,8 +258,7 @@ CudaBroadphaseResult BuildCudaBroadphase(const phi::DeviceContext& context,
 
 CudaBroadphaseResult BuildCudaBroadphase(const collision::AABB* device_aabbs,
                                          uint32_t shape_count) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildCudaBroadphase(context, device_aabbs, shape_count);
+        return BuildCudaBroadphase(/*stream=*/nullptr, /*device_id=*/0, device_aabbs, shape_count);
 }
 
 } // namespace nuka::collision::gpu

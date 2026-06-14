@@ -27,7 +27,8 @@
 #include "diffsim/sparse_solver_cg.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -147,7 +148,7 @@ OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
     return buf;
 }
 
-std::vector<float> RunSolve(const nuka::phi::DeviceContext& ctx,
+std::vector<float> RunSolve(cudaStream_t ctx, int ctx_dev,
                             const std::vector<float>& values,
                             const std::vector<uint32_t>& dims,
                             const std::vector<float>& rhs,
@@ -170,10 +171,10 @@ std::vector<float> RunSolve(const nuka::phi::DeviceContext& ctx,
     params.tol = 1.0e-6f;
     params.run_to_fixed_iters = fixed_iters;
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(static_cast<size_t>(bc) * kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -265,7 +266,8 @@ std::vector<Block> MakeWorseConditionedBatch() {
 }
 
 TEST(CgVsDenseGeneral, AgreesWithEigenLdltOnWorseConditioned) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeWorseConditionedBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -278,7 +280,7 @@ TEST(CgVsDenseGeneral, AgreesWithEigenLdltOnWorseConditioned) {
     // ~kappa*eps input-precision floor. Jacobi runs to a fixed 200 iters (>> n) so
     // CG fully converges even at kappa~1e6; BlockJacobi is the exact island solve.
     const std::vector<float> x_jacobi =
-        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u, true);
+        RunSolve(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u, true);
     const double rel_jacobi = MaxRelErr(blocks, x_jacobi);
     std::printf("[CgVsDenseGeneral] Jacobi      vs fp32-LDLT (kappa up to 1e6) "
                 "max rel-err = %.3e\n", rel_jacobi);
@@ -286,7 +288,7 @@ TEST(CgVsDenseGeneral, AgreesWithEigenLdltOnWorseConditioned) {
         << "Jacobi CG vs Eigen LDLT (fp32-sourced) on worse-conditioned SPD blocks";
 
     const std::vector<float> x_block = RunSolve(
-        ctx, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
+        ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::BlockJacobi, 64u, false);
     const double rel_block = MaxRelErr(blocks, x_block);
     std::printf("[CgVsDenseGeneral] BlockJacobi vs fp32-LDLT (kappa up to 1e6) "
                 "max rel-err = %.3e\n", rel_block);
@@ -312,7 +314,8 @@ TEST(CgVsDenseGeneral, AgreesWithEigenLdltOnWorseConditioned) {
 }
 
 TEST(CgVsDenseGeneral, BitExactOnWorseConditioned) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeWorseConditionedBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -322,9 +325,9 @@ TEST(CgVsDenseGeneral, BitExactOnWorseConditioned) {
          {diffsim::Preconditioner::Jacobi, diffsim::Preconditioner::BlockJacobi}) {
         for (bool fixed : {false, true}) {
             const std::vector<float> x1 =
-                RunSolve(ctx, values, dims, rhs, precond, 200u, fixed);
+                RunSolve(ctx, ctx_dev, values, dims, rhs, precond, 200u, fixed);
             const std::vector<float> x2 =
-                RunSolve(ctx, values, dims, rhs, precond, 200u, fixed);
+                RunSolve(ctx, ctx_dev, values, dims, rhs, precond, 200u, fixed);
             ASSERT_EQ(x1.size(), x2.size());
             const int cmp =
                 std::memcmp(x1.data(), x2.data(), x1.size() * sizeof(float));
@@ -345,7 +348,7 @@ struct DiagSolveOutputs {
     std::vector<float> history;
 };
 
-DiagSolveOutputs RunSolveWithDiag(const nuka::phi::DeviceContext& ctx,
+DiagSolveOutputs RunSolveWithDiag(cudaStream_t ctx, int ctx_dev,
                                   const std::vector<float>& values,
                                   const std::vector<uint32_t>& dims,
                                   const std::vector<float>& rhs,
@@ -380,10 +383,10 @@ DiagSolveOutputs RunSolveWithDiag(const nuka::phi::DeviceContext& ctx,
     params.diagnostics.residual_history = static_cast<float*>(d_hist.Data());
     params.diagnostics.history_cap = cap;
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     DiagSolveOutputs o;
     o.x.assign(static_cast<size_t>(bc) * kMd, 0.0f);
@@ -404,7 +407,8 @@ DiagSolveOutputs RunSolveWithDiag(const nuka::phi::DeviceContext& ctx,
 // status / residual_history). The diagnostics are new kernel writes, so the D1 gate
 // must cover them, not just the diagnostics-off x path.
 TEST(CgVsDenseGeneral, DiagnosticsOnIsBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Block> blocks = MakeWorseConditionedBatch();
     std::vector<float> values, rhs;
     std::vector<uint32_t> dims;
@@ -414,9 +418,9 @@ TEST(CgVsDenseGeneral, DiagnosticsOnIsBitExact) {
     for (auto precond :
          {diffsim::Preconditioner::Jacobi, diffsim::Preconditioner::BlockJacobi}) {
         const DiagSolveOutputs a =
-            RunSolveWithDiag(ctx, values, dims, rhs, precond, 200u, cap);
+            RunSolveWithDiag(ctx, ctx_dev, values, dims, rhs, precond, 200u, cap);
         const DiagSolveOutputs b =
-            RunSolveWithDiag(ctx, values, dims, rhs, precond, 200u, cap);
+            RunSolveWithDiag(ctx, ctx_dev, values, dims, rhs, precond, 200u, cap);
         EXPECT_EQ(std::memcmp(a.x.data(), b.x.data(), a.x.size() * sizeof(float)), 0)
             << "diag-on x not bit-exact, precond=" << static_cast<int>(precond);
         EXPECT_EQ(std::memcmp(a.iters.data(), b.iters.data(),
@@ -437,9 +441,9 @@ TEST(CgVsDenseGeneral, DiagnosticsOnIsBitExact) {
     // (the opt-in side-channel must not perturb the solution -- the no-IFT-
     // regression guarantee). RunSolve (no diag) vs the diag-on x above.
     const std::vector<float> x_off =
-        RunSolve(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u, false);
+        RunSolve(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi, 200u, false);
     const DiagSolveOutputs on =
-        RunSolveWithDiag(ctx, values, dims, rhs, diffsim::Preconditioner::Jacobi,
+        RunSolveWithDiag(ctx, ctx_dev, values, dims, rhs, diffsim::Preconditioner::Jacobi,
                          200u, cap);
     ASSERT_EQ(x_off.size(), on.x.size());
     EXPECT_EQ(std::memcmp(x_off.data(), on.x.data(), x_off.size() * sizeof(float)), 0)

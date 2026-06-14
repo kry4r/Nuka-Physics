@@ -3,11 +3,12 @@
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
-#include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/cooker.hpp"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -131,14 +132,15 @@ int main(int argc, char** argv) {
             host_state.tau[link] = sample.tau;
         }
 
-        const auto context = nuka::phi::MakeDefaultDeviceContext();
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const int device_id = 0;
         auto device_state =
-            nuka::runtime::articulation::UploadArticulationState(context, host_state);
+            nuka::runtime::articulation::UploadArticulationState(stream, device_id, host_state);
         nuka::runtime::articulation::FeatherstoneAba::ComputeAccelerations(
-            context,
+            stream, device_id,
             device_state.View(),
             input.gravity_z);
-        context.stream.Synchronize();
+        cudaStreamSynchronize(stream);
 
         nuka::runtime::articulation::ArticulationHostState out_state;
         nuka::runtime::articulation::DownloadArticulationState(device_state, &out_state);

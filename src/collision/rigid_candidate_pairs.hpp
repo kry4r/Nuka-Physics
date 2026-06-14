@@ -45,7 +45,9 @@
 #include "collision/aabb.hpp"
 #include "collision/candidate_pair.hpp"
 #include "collision/link_aabb.hpp"   // LinkShapeAabbs (the articulation side input)
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "scene/cooked_blob.hpp"
 
 #include <cstdint>
@@ -113,7 +115,7 @@ struct CandidateAabbTags {
 //   tags.* arrays must each have `count` entries, parallel to `device_aabbs`.
 //   `count == 0` -> empty stream (extra_survivors still merged).
 CandidatePairStream BuildCandidatePairsTagged(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* device_aabbs, uint32_t count,
     const CandidateAabbTags& tags,
     const std::vector<std::pair<uint32_t, uint32_t>>& excluded_body_pairs,
@@ -136,7 +138,7 @@ CandidatePairStream BuildCandidatePairsTagged(
 // All three HOST arrays must have `shape_count` entries (parallel to the cooked
 // shape table). `shape_count == 0` -> empty stream.
 CandidatePairStream BuildRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* device_shape_aabbs, uint32_t shape_count,
     const uint32_t* shape_body_ids,
     const uint32_t* shape_contypes,
@@ -178,7 +180,7 @@ CandidatePairStream BuildRigidCandidatePairs(
 // BuildRigidCandidatePairs for the rigid<->rigid sub-stream. Throws if any handle
 // (rigid body id OR link index) >= 2^28.
 CandidatePairStream BuildArticulationRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* rigid_aabbs, uint32_t rigid_count,
     const uint32_t* rigid_body_ids,
     const uint32_t* rigid_contypes,

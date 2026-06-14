@@ -252,7 +252,7 @@ nuka_result_t nuka_recorder_create(nuka_device_handle device,
         // The device's phi v2 backend (the same seam the frame-loop smoke uses).
         // Honor the validated device_record's CUDA ordinal instead of an
         // unconditional InitBestDevice()->device-0 routing.
-        nphi::Device* dev = SelectDeviceByOrdinal(device_record->context.device_id);
+        nphi::Device* dev = SelectDeviceByOrdinal(device_record->device_id);
         if (dev == nullptr) return NUKA_RESULT_NOT_SUPPORTED;
         nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
         if (backend == nullptr) return NUKA_RESULT_NOT_SUPPORTED;

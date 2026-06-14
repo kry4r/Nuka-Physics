@@ -311,13 +311,12 @@ std::vector<uint32_t> CrossSystemQueryResult::DownloadCandidateIndices() const {
 }
 
 CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions,
     uint32_t particle_count,
     float query_radius,
     const LbvhBroadphaseResult& rigid_tree) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     const uint32_t leaf_count = rigid_tree.LeafCount();
     const LbvhNode* nodes = rigid_tree.DeviceNodes();
@@ -343,7 +342,7 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
                   "memset offsets (empty tree)");
         CheckCuda(cudaMemsetAsync(d_counts.Base(), 0, particle_count * sizeof(uint32_t), stream),
                   "memset counts (empty tree)");
-        context.stream.Synchronize();
+        cudaStreamSynchronize(stream);
         OwnedBuffer d_cand(sizeof(uint32_t));
         return CrossSystemQueryResult(particle_count, kCrossSystemMaxCandidates,
                                       0u, 0u, d_offsets.Release(),
@@ -369,7 +368,7 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
         static_cast<uint32_t*>(d_offsets.Base()));
     CheckCuda(cudaGetLastError(), "exclusive_scan candidate counts");
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     uint32_t last_offset = 0u;
     uint32_t last_count = 0u;
     {
@@ -398,7 +397,7 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
         static_cast<uint32_t*>(d_truncated.Base()));
     CheckCuda(cudaGetLastError(), "FillCandidatesKernel launch");
 
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     uint32_t truncated = 0u;
     phi::BufferDownload(d_truncated.Handle(), &truncated, 0, sizeof(truncated));
 
@@ -413,8 +412,7 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
     uint32_t particle_count,
     float query_radius,
     const LbvhBroadphaseResult& rigid_tree) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return QueryParticlesAgainstRigidLbvh(context, particle_positions,
+        return QueryParticlesAgainstRigidLbvh(/*stream=*/nullptr, /*device_id=*/0, particle_positions,
                                           particle_count, query_radius,
                                           rigid_tree);
 }

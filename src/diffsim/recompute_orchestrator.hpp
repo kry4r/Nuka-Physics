@@ -46,7 +46,9 @@
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
@@ -69,7 +71,7 @@ public:
     // dI_dmass are uploaded once and reused every step; the per-step actions come
     // from the tape. `mass_params` (length total_link_count) builds the
     // representation-consistent dI/dmass slope for grad_mass.
-    RecomputeOrchestrator(const phi::DeviceContext& context,
+    RecomputeOrchestrator(cudaStream_t stream, int device_id,
                           articulation::ArticulationDeviceState state,
                           const RolloutParams& params,
                           const std::vector<float>& drive_stiffness,
@@ -115,7 +117,8 @@ public:
     RecomputeOrchestrator& operator=(const RecomputeOrchestrator&) = delete;
 
 private:
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     articulation::ArticulationDeviceState state_;
     RolloutParams params_;
     uint32_t total_link_count_ = 0u;

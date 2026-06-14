@@ -43,7 +43,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/world_builder.hpp"
@@ -137,14 +138,14 @@ CookedFloat CookGo2Float() {
 
 // Run FK at the current host state and return the world pose of every link.
 // (Same idiom as test_foot_ground_subsume.cpp ForwardKinematics.)
-std::vector<Transform> ForwardKinematics(const nuka::phi::DeviceContext& context,
+std::vector<Transform> ForwardKinematics(cudaStream_t context, int context_dev,
                                          const articulation::ArticulationHostState& host) {
     const uint32_t link_count = host.TotalLinkCount();
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
-    articulation::UpdateWorldLinkPoses(context, device.View(),
+    articulation::UpdateWorldLinkPoses(context, context_dev, device.View(),
                                        static_cast<Transform*>(pose_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<Transform> poses(link_count);
     pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
     return poses;
@@ -195,7 +196,8 @@ void ApplyPosePerturbation(articulation::ArticulationHostState& host, int pose_i
 }
 
 TEST(LinkAabb, BoundsUnderFkPoseSweep) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     const auto base_cooked = CookGo2Float();
     const auto foot_shapes = FootSphereShapes(base_cooked);
     ASSERT_GE(foot_shapes.size(), 1u) << "go2_float must expose foot spheres";
@@ -212,7 +214,7 @@ TEST(LinkAabb, BoundsUnderFkPoseSweep) {
     for (int pose = 0; pose < 4; ++pose) {
         auto cooked = base_cooked;  // fresh copy -> apply this pose's perturbation.
         ApplyPosePerturbation(cooked.host, pose);
-        const auto poses = ForwardKinematics(context, cooked.host);
+        const auto poses = ForwardKinematics(context, context_dev, cooked.host);
 
         // FK link poses + the shape->body->link map feed the host convenience.
         const auto extracted =
@@ -485,11 +487,12 @@ TEST(LinkAabb, CapsuleAabbContainsEndpoints) {
 // --- D1 determinism ------------------------------------------------------------
 
 TEST(LinkAabb, DeterministicTwoRun) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     const auto cooked = CookGo2Float();
 
     auto run = [&]() {
-        const auto poses = ForwardKinematics(context, cooked.host);
+        const auto poses = ForwardKinematics(context, context_dev, cooked.host);
         return ExtractLinkShapeAabbs(cooked.shapes, poses, cooked.host.link_body);
     };
     const LinkShapeAabbs a = run();
@@ -524,7 +527,8 @@ __global__ void DeviceCoreKernel(Transform link, Transform local,
 }
 
 TEST(LinkAabb, DeviceCoreMatchesHost) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     const Transform link{Vec3{0.7f, -1.3f, 0.9f},
                          Quat::FromAxisAngle(Vec3{0.2f, 0.7f, 0.68f}, 0.55f)};
@@ -543,10 +547,10 @@ TEST(LinkAabb, DeviceCoreMatchesHost) {
 
     // Device.
     OwnedDeviceBuffer out_buf(3 * sizeof(AABB));
-    DeviceCoreKernel<<<1, 3, 0, context.stream.Native()>>>(
+    DeviceCoreKernel<<<1, 3, 0, context>>>(
         link, local, half_extents, radius, half_height,
         static_cast<AABB*>(out_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     AABB dev_out[3];
     out_buf.CopyToHost(dev_out, sizeof(dev_out));
 

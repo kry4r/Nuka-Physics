@@ -27,7 +27,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/world_builder.hpp"
@@ -272,8 +273,9 @@ TEST(ContactChainJacobian, Go2LegMatchesAnalyticThreeLinkChain) {
     ASSERT_GT(dof_stride, 0u);
 
     // --- Upload state, set up contact buffers, run the kernel. ----------------
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
-    auto device = articulation::UploadArticulationState(context, host);
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
 
     const uint32_t contact_count = 1u;
     const uint32_t contact_link = calf;  // global link index of the contact link
@@ -288,7 +290,7 @@ TEST(ContactChainJacobian, Go2LegMatchesAnalyticThreeLinkChain) {
     normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
 
     articulation::ComputeContactChainJacobians(
-        context,
+        context, context_dev,
         device.View(),
         static_cast<const uint32_t*>(link_idx_buf.Data()),
         static_cast<const Vec3*>(point_buf.Data()),
@@ -296,7 +298,7 @@ TEST(ContactChainJacobian, Go2LegMatchesAnalyticThreeLinkChain) {
         contact_count,
         dof_stride,
         static_cast<float*>(out_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     std::vector<float> out(dof_stride, 0.0f);
     out_buf.CopyToHost(out.data(), out.size() * sizeof(float));

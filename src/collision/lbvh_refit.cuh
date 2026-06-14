@@ -9,7 +9,9 @@
 
 #include "collision/aabb.hpp"
 #include "collision/lbvh_node.cuh"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -19,7 +21,7 @@ namespace nuka::collision::gpu {
 // 2N-1 node array produced by BuildLbvhBroadphase) using the fresh per-body
 // bounds in `device_new_aabbs` (indexed by ORIGINAL body id). `device_visit_
 // scratch` must hold at least (leaf_count-1) uint32 (zeroed internally).
-void RefitLbvh(const phi::DeviceContext& context,
+void RefitLbvh(cudaStream_t stream, int device_id,
                LbvhNode* device_nodes,
                const collision::AABB* device_new_aabbs,
                uint32_t leaf_count,

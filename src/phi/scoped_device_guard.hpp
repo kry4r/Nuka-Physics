@@ -1,27 +1,14 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// PHI - per-handle CUDA device context
+// PHI - scoped CUDA active-device guard
 // ---------------------------------------------------------------------------
-
-#include "phi/platform_contract.hpp"
-#include "phi/stream_view.hpp"
-
-#include <cuda_runtime.h>
 
 namespace nuka::phi {
 
-struct DeviceContext {
-    int device_id = 0;
-    StreamView stream;
-    PlatformContract contract = {};
-};
-
-DeviceContext MakeDeviceContext(int device_id,
-                                cudaStream_t external_stream,
-                                const PlatformContract& contract = {});
-
-DeviceContext MakeDefaultDeviceContext();
-
+// Sets the active CUDA device on construction and restores the prior device on
+// destruction (no-op when the requested device already matches). Engine kernel
+// entry points wrap their launches in this so a caller's active device is never
+// clobbered.
 class ScopedDeviceGuard {
 public:
     explicit ScopedDeviceGuard(int device_id);

@@ -219,13 +219,12 @@ __global__ void CompactKernel(uint32_t pair_count,
 // caller-supplied extra survivors -> sorted D1 stream -> adjacent dedup.
 // ---------------------------------------------------------------------------
 CandidatePairStream BuildCandidatePairsTagged(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* device_aabbs, uint32_t count,
     const CandidateAabbTags& tags,
     const std::vector<std::pair<uint32_t, uint32_t>>& excluded_body_pairs,
     const std::vector<CandidatePair>& extra_survivors) {
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
 
     // --- Host-side handle-guard (C2-named-debt consumer) --------------------
     // A handle >= 2^28 would alias the type bits in PackSideKey (candidate_pair.hpp
@@ -257,7 +256,7 @@ CandidatePairStream BuildCandidatePairsTagged(
         // RETAIN nothing extra; we only need the sorted compact AABB-pair list.
         // The LBVH emits ORIGINAL-input-order indices (proven C2), so each tag
         // array indexes straight by the pair's body_a / body_b.
-        auto lbvh = collision::gpu::BuildLbvhBroadphase(context, device_aabbs, count);
+        auto lbvh = collision::gpu::BuildLbvhBroadphase(stream, device_id, device_aabbs, count);
         const uint32_t pair_count = lbvh.PairCount();
 
         // Upload the per-AABB tag arrays the kernels index by input id.
@@ -326,7 +325,7 @@ CandidatePairStream BuildCandidatePairsTagged(
                 static_cast<uint32_t*>(d_scan.Base()));
             CheckCuda(cudaGetLastError(), "exclusive_scan keep flags");
 
-            context.stream.Synchronize();
+            cudaStreamSynchronize(stream);
             uint32_t last_scan = 0u;
             uint32_t last_flag = 0u;
             {
@@ -353,14 +352,14 @@ CandidatePairStream BuildCandidatePairsTagged(
                     static_cast<const uint32_t*>(d_scan.Base()),
                     static_cast<CandidatePair*>(d_out.Base()));
                 CheckCuda(cudaGetLastError(), "CompactKernel launch");
-                context.stream.Synchronize();
+                cudaStreamSynchronize(stream);
 
                 const size_t base = survivors.size();
                 survivors.resize(base + survivor_count);
                 phi::BufferDownload(d_out.Handle(), survivors.data() + base, 0,
                                     survivor_count * sizeof(CandidatePair));
             } else {
-                context.stream.Synchronize();
+                cudaStreamSynchronize(stream);
             }
         }
     }
@@ -371,7 +370,7 @@ CandidatePairStream BuildCandidatePairsTagged(
     survivors.insert(survivors.end(), extra_survivors.begin(), extra_survivors.end());
 
     // --- Build the sorted D1 stream (C2a stamps stable_key + stable_sort) ----
-    CandidatePairStream stream_out = BuildCandidatePairStream(context, survivors);
+    CandidatePairStream stream_out = BuildCandidatePairStream(stream, device_id, survivors);
 
     // --- Dedup adjacent identical pairs -------------------------------------
     // After the C2a sort, identical pairs (a multi-shape collidable's per-shape-pair
@@ -397,7 +396,7 @@ CandidatePairStream BuildCandidatePairsTagged(
             unique_pairs.push_back(sorted[i]);
         }
     }
-    return BuildCandidatePairStream(context, unique_pairs);
+    return BuildCandidatePairStream(stream, device_id, unique_pairs);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,14 +406,14 @@ CandidatePairStream BuildCandidatePairsTagged(
 // and passed as extra survivors; cross-type explicit pairs are out of scope.
 // ---------------------------------------------------------------------------
 CandidatePairStream BuildRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* device_shape_aabbs, uint32_t shape_count,
     const uint32_t* shape_body_ids,
     const uint32_t* shape_contypes,
     const uint32_t* shape_conaffinities,
     const scene::CookedFilterPolicy& policy) {
     if (shape_count == 0u && policy.explicit_pairs.empty()) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     // The RigidBody reaction provider kind, read off the generated registry so
@@ -465,7 +464,7 @@ CandidatePairStream BuildRigidCandidatePairs(
         extra.push_back(out);
     }
 
-    return BuildCandidatePairsTagged(context, device_shape_aabbs, shape_count,
+    return BuildCandidatePairsTagged(stream, device_id, device_shape_aabbs, shape_count,
                                      tags, policy.excluded_body_pairs, extra);
 }
 
@@ -475,8 +474,7 @@ CandidatePairStream BuildRigidCandidatePairs(
     const uint32_t* shape_contypes,
     const uint32_t* shape_conaffinities,
     const scene::CookedFilterPolicy& policy) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return BuildRigidCandidatePairs(context, device_shape_aabbs, shape_count,
+        return BuildRigidCandidatePairs(/*stream=*/nullptr, /*device_id=*/0, device_shape_aabbs, shape_count,
                                     shape_body_ids, shape_contypes,
                                     shape_conaffinities, policy);
 }
@@ -489,7 +487,7 @@ CandidatePairStream BuildRigidCandidatePairs(
 // are out of scope).
 // ---------------------------------------------------------------------------
 CandidatePairStream BuildArticulationRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const collision::AABB* rigid_aabbs, uint32_t rigid_count,
     const uint32_t* rigid_body_ids,
     const uint32_t* rigid_contypes,
@@ -501,7 +499,7 @@ CandidatePairStream BuildArticulationRigidCandidatePairs(
     const uint32_t link_count = static_cast<uint32_t>(links.aabbs.size());
     const uint32_t total = rigid_count + link_count;
     if (total == 0u) {
-        return BuildCandidatePairStream(context, {});
+        return BuildCandidatePairStream(stream, device_id, {});
     }
 
     const ReactionProviderKind rigid_react =
@@ -568,7 +566,7 @@ CandidatePairStream BuildArticulationRigidCandidatePairs(
     tags.conaffinities = conaff.data();
 
     return BuildCandidatePairsTagged(
-        context, static_cast<const collision::AABB*>(d_aabbs.Base()), total,
+        stream, device_id, static_cast<const collision::AABB*>(d_aabbs.Base()), total,
         tags, excluded_body_pairs, {});
 }
 

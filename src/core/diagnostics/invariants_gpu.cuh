@@ -5,7 +5,9 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -20,7 +22,7 @@ struct DeviceInvariantSnapshot {
     float max_position_abs = 0.0f;
 };
 
-void ComputeRigidBodyInvariantSnapshot(const phi::DeviceContext& context,
+void ComputeRigidBodyInvariantSnapshot(cudaStream_t stream, int device_id,
                                        uint32_t body_count,
                                        const math::Transform* poses,
                                        const math::Vec3* linear_velocities,

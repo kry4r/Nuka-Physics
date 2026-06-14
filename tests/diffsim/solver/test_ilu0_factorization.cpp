@@ -19,7 +19,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -174,7 +175,8 @@ TEST(Ilu0, GenuinelyIncompleteArrowhead) {
 
 // (3) DEVICE factor == host factor (fp32), and D1 two-run byte-exact.
 TEST(Ilu0, DeviceMatchesHostAndIsBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t n = 4u;
     const std::vector<float> A_dense = {
         4, 1, 0, 0,
@@ -193,14 +195,14 @@ TEST(Ilu0, DeviceMatchesHostAndIsBitExact) {
     OwnedDeviceBuffer d_lu2(static_cast<size_t>(kStride) * sizeof(float));
 
     diffsim::LaunchIlu0FactorizeTest(
-        ctx, static_cast<const float*>(d_a.Data()),
+        ctx, ctx_dev, static_cast<const float*>(d_a.Data()),
         static_cast<const uint32_t*>(d_dims.Data()),
         static_cast<float*>(d_lu.Data()), 1u);
     diffsim::LaunchIlu0FactorizeTest(
-        ctx, static_cast<const float*>(d_a.Data()),
+        ctx, ctx_dev, static_cast<const float*>(d_a.Data()),
         static_cast<const uint32_t*>(d_dims.Data()),
         static_cast<float*>(d_lu2.Data()), 1u);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> lu_dev(kStride, 0.0f), lu_dev2(kStride, 0.0f);
     d_lu.CopyToHost(lu_dev.data(), lu_dev.size() * sizeof(float));
@@ -229,7 +231,8 @@ TEST(Ilu0, DeviceMatchesHostAndIsBitExact) {
 // (4) ILU(0) APPLY (forward/backward triangular solve) inverts L U: device solve
 // of (L U) z = r matches the host reference, and is D1 bit-exact.
 TEST(Ilu0, ApplyMatchesHostAndIsBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t n = 5u;
     // SPD tridiagonal -> ILU(0) well-defined, apply is a genuine (L U)^-1.
     std::vector<double> a64(static_cast<size_t>(n) * n, 0.0);
@@ -258,15 +261,15 @@ TEST(Ilu0, ApplyMatchesHostAndIsBitExact) {
     OwnedDeviceBuffer d_z(static_cast<size_t>(kMd) * sizeof(float));
     OwnedDeviceBuffer d_z2(static_cast<size_t>(kMd) * sizeof(float));
 
-    diffsim::LaunchIlu0ApplyTest(ctx, static_cast<const float*>(d_lu.Data()),
+    diffsim::LaunchIlu0ApplyTest(ctx, ctx_dev, static_cast<const float*>(d_lu.Data()),
                                  static_cast<const uint32_t*>(d_dims.Data()),
                                  static_cast<const float*>(d_r.Data()),
                                  static_cast<float*>(d_z.Data()), 1u);
-    diffsim::LaunchIlu0ApplyTest(ctx, static_cast<const float*>(d_lu.Data()),
+    diffsim::LaunchIlu0ApplyTest(ctx, ctx_dev, static_cast<const float*>(d_lu.Data()),
                                  static_cast<const uint32_t*>(d_dims.Data()),
                                  static_cast<const float*>(d_r.Data()),
                                  static_cast<float*>(d_z2.Data()), 1u);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> z_dev(kMd, 0.0f), z_dev2(kMd, 0.0f);
     d_z.CopyToHost(z_dev.data(), z_dev.size() * sizeof(float));
