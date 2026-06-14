@@ -1245,12 +1245,19 @@ if(CMAKE_CUDA_COMPILER)
         collision/test_narrowphase_dispatch.cpp
     )
     add_dependencies(nuka_narrowphase_dispatch_test nuka_codegen)
+    # M11 COL-1: the salvaged SDF-tier gate (folded in) cooks a unit-cube SDF via
+    # nuka_cooker (CookSparseSdf) and includes tests/import/sdf_{host_sampler,
+    # test_meshes}.hpp -> add the repo-root include + nuka_cooker. The SDF forward
+    # path is header-inline (find_sdf_contact_newton, NUKA_SDF_HD) so NO
+    # nuka_collision_gpu is needed.
     target_include_directories(nuka_narrowphase_dispatch_test
         PRIVATE
+            ${CMAKE_SOURCE_DIR}
             ${CMAKE_SOURCE_DIR}/src
     )
     target_link_libraries(nuka_narrowphase_dispatch_test
         PRIVATE
+            nuka_cooker
             nuka_phi
             GTest::gtest_main
     )
