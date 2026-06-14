@@ -17,8 +17,9 @@
 
 #include "collision/aabb.hpp"
 #include "collision/broadphase_lbvh.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 
 #include <gtest/gtest.h>
 
@@ -31,6 +32,35 @@
 using namespace nuka;
 
 namespace {
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface the test body uses.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 std::vector<collision::AABB> MakeRandomAabbs(uint32_t count, uint32_t seed) {
     std::mt19937 rng(seed);
@@ -55,7 +85,7 @@ TEST(LbvhPerf, Build50kBodiesAndQuery) {
     constexpr uint32_t kCap = 4u * 1024u * 1024u;
 
     const auto aabbs = MakeRandomAabbs(kCount, 0xC0FFEEu);
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* device_aabbs = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     // Warmup (CUDA context + Thrust temp-alloc caching).

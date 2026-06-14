@@ -13,7 +13,8 @@
 
 #include "collision/candidate_pair.hpp"
 
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"            // InitBestDevice, DeviceBufferType
+#include "phi/buffer_transfer_v2.hpp" // UploadVectorV2
 
 #include <cuda_runtime.h>
 
@@ -39,17 +40,44 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 } // namespace
 
-CandidatePairStream::CandidatePairStream(uint32_t count, phi::Buffer pairs)
-    : count_(count), pairs_(std::move(pairs)) {}
+CandidatePairStream::CandidatePairStream(uint32_t count, phi::Buffer* pairs)
+    : count_(count), pairs_(pairs) {}
+
+CandidatePairStream::~CandidatePairStream() {
+    if (pairs_ != nullptr) {
+        phi::BufferFree(pairs_);
+    }
+}
+
+CandidatePairStream::CandidatePairStream(CandidatePairStream&& other) noexcept
+    : count_(other.count_), pairs_(other.pairs_) {
+    other.count_ = 0u;
+    other.pairs_ = nullptr;
+}
+
+CandidatePairStream& CandidatePairStream::operator=(CandidatePairStream&& other) noexcept {
+    if (this != &other) {
+        if (pairs_ != nullptr) {
+            phi::BufferFree(pairs_);
+        }
+        count_ = other.count_;
+        pairs_ = other.pairs_;
+        other.count_ = 0u;
+        other.pairs_ = nullptr;
+    }
+    return *this;
+}
 
 const CandidatePair* CandidatePairStream::DevicePairs() const {
-    return static_cast<const CandidatePair*>(pairs_.Data());
+    return static_cast<const CandidatePair*>(
+        pairs_ != nullptr ? phi::BufferBase(pairs_) : nullptr);
 }
 
 std::vector<CandidatePair> CandidatePairStream::DownloadPairs() const {
     std::vector<CandidatePair> out(count_);
-    if (count_ > 0u) {
-        pairs_.CopyToHost(out.data(), static_cast<size_t>(count_) * sizeof(CandidatePair));
+    if (count_ > 0u && pairs_ != nullptr) {
+        phi::BufferDownload(pairs_, out.data(), 0,
+                            static_cast<size_t>(count_) * sizeof(CandidatePair));
     }
     return out;
 }
@@ -59,9 +87,14 @@ CandidatePairStream BuildCandidatePairStream(const phi::DeviceContext& context,
     phi::ScopedDeviceGuard guard(context.device_id);
     const cudaStream_t stream = context.stream.Native();
 
+    // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
+    // identical to the legacy synchronous memcpy (the upload completes before the
+    // work-stream thrust sort reads it, exactly as the legacy path relied on).
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+
     const uint32_t count = static_cast<uint32_t>(unsorted_pairs.size());
     if (count == 0u) {
-        return CandidatePairStream(0u, phi::Buffer(0u, phi::MemoryKind::Device));
+        return CandidatePairStream(0u, phi::BufferAlloc(bt, 0u));
     }
 
     // Stamp each pair's canonical stable_key on the host (MakeStableKey is HD; on
@@ -75,18 +108,19 @@ CandidatePairStream BuildCandidatePairStream(const phi::DeviceContext& context,
     }
 
     // Upload keys + pairs, then radix stable_sort_by_key ascending on the key.
-    phi::Buffer d_keys = phi::UploadVector(keys);
-    phi::Buffer d_pairs = phi::UploadVector(staged);
+    phi::Buffer* d_keys = phi::UploadVectorV2(bt, keys);
+    phi::Buffer* d_pairs = phi::UploadVectorV2(bt, staged);
 
     thrust::stable_sort_by_key(
         thrust::cuda::par.on(stream),
-        static_cast<uint64_t*>(d_keys.Data()),
-        static_cast<uint64_t*>(d_keys.Data()) + count,
-        static_cast<CandidatePair*>(d_pairs.Data()));
+        static_cast<uint64_t*>(phi::BufferBase(d_keys)),
+        static_cast<uint64_t*>(phi::BufferBase(d_keys)) + count,
+        static_cast<CandidatePair*>(phi::BufferBase(d_pairs)));
     CheckCuda(cudaGetLastError(), "stable_sort_by_key candidate pairs");
 
     context.stream.Synchronize();
-    return CandidatePairStream(count, std::move(d_pairs));
+    phi::BufferFree(d_keys);
+    return CandidatePairStream(count, d_pairs);
 }
 
 CandidatePairStream BuildCandidatePairStream(const std::vector<CandidatePair>& unsorted_pairs) {

@@ -5,7 +5,7 @@
 
 #include "collision/aabb.hpp"
 #include "collision/dynamic_broadphase.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 
 #include <cstdint>
@@ -18,15 +18,16 @@ public:
     CudaBroadphaseResult() = default;
     CudaBroadphaseResult(uint32_t shape_count,
                          uint32_t pair_slot_count,
-                         phi::Buffer aabbs,
-                         phi::Buffer pairs,
-                         phi::Buffer pair_active_flags,
-                         phi::Buffer pair_count);
+                         phi::Buffer* aabbs,
+                         phi::Buffer* pairs,
+                         phi::Buffer* pair_active_flags,
+                         phi::Buffer* pair_count);
+    ~CudaBroadphaseResult();
 
     CudaBroadphaseResult(const CudaBroadphaseResult&) = delete;
     CudaBroadphaseResult& operator=(const CudaBroadphaseResult&) = delete;
-    CudaBroadphaseResult(CudaBroadphaseResult&&) noexcept = default;
-    CudaBroadphaseResult& operator=(CudaBroadphaseResult&&) noexcept = default;
+    CudaBroadphaseResult(CudaBroadphaseResult&& other) noexcept;
+    CudaBroadphaseResult& operator=(CudaBroadphaseResult&& other) noexcept;
 
     uint32_t ShapeCount() const { return shape_count_; }
     uint32_t PairSlotCount() const { return pair_slot_count_; }
@@ -43,10 +44,10 @@ public:
 private:
     uint32_t shape_count_ = 0;
     uint32_t pair_slot_count_ = 0;
-    phi::Buffer aabbs_;
-    phi::Buffer pairs_;
-    phi::Buffer pair_active_flags_;
-    phi::Buffer pair_count_;
+    phi::Buffer* aabbs_ = nullptr;  // phi v2 handles; freed in the dtor.
+    phi::Buffer* pairs_ = nullptr;
+    phi::Buffer* pair_active_flags_ = nullptr;
+    phi::Buffer* pair_count_ = nullptr;
 };
 
 // Run the SAP O(n^2) pair-slot broadphase directly over a device AABB buffer

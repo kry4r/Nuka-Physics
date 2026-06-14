@@ -39,8 +39,9 @@
 #include "collision/link_aabb.hpp"
 #include "collision/rigid_candidate_pairs.hpp"
 #include "constraint/collidable.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "phi/device_context.hpp"
 #include "scene/cooked_blob.hpp"   // scene::CookedFilterPolicy (rigid wrapper path)
 
@@ -59,6 +60,36 @@ using constraint::CollidableType;
 using constraint::ReactionProviderKind;
 
 namespace {
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface the test bodies use so they
+// stay byte-identical after the buffer sweep.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 // An axis-aligned box of half-extent `h` centered at `c` (the {min,max} route the
 // AABB API doc sanctions), so overlaps are exactly under our control.
@@ -122,9 +153,9 @@ std::vector<collision::CandidatePair> RunMixed(const MixedScene& s) {
     auto context = phi::MakeDefaultDeviceContext();
     const uint32_t rc = static_cast<uint32_t>(s.rigid_aabbs.size());
     const collision::AABB* dev = nullptr;
-    phi::Buffer d_rigid;
+    OwnedDeviceBuffer d_rigid;
     if (rc > 0u) {
-        d_rigid = phi::UploadVector(s.rigid_aabbs);
+        d_rigid = UploadOwned(s.rigid_aabbs);
         dev = static_cast<const collision::AABB*>(d_rigid.Data());
     }
     auto stream = collision::BuildArticulationRigidCandidatePairs(
@@ -294,7 +325,7 @@ TEST(LinkRigidCandidatePairs, RigidWrapperMatchesTaggedCore) {
     std::vector<uint32_t> conaff(5u, 1u);
     std::vector<std::pair<uint32_t, uint32_t>> excluded = {{51u, 52u}};
 
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* dev = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     // --- Wrapper path (policy carries the exclude, no explicit pairs). -------
@@ -346,7 +377,7 @@ TEST(LinkRigidCandidatePairs, ExplicitPairKeepsDeviceCanonicalLayout) {
     std::vector<uint32_t> body_ids = {10u, 20u};
     std::vector<uint32_t> contypes(2u, 1u);
     std::vector<uint32_t> conaff(2u, 1u);
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* dev = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     // Explicit <pair> with geoms ordered so the wrapper builds a DESCENDING-handle
@@ -411,7 +442,7 @@ TEST(LinkRigidCandidatePairs, HandleGuardThrowsOnOversizedHandle) {
     auto context = phi::MakeDefaultDeviceContext();
     std::vector<collision::AABB> aabbs = {BoxAt({0.0f, 0.0f, 0.0f}, 0.5f),
                                           BoxAt({0.4f, 0.0f, 0.0f}, 0.5f)};
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    OwnedDeviceBuffer d_aabbs = UploadOwned(aabbs);
     const auto* dev = static_cast<const collision::AABB*>(d_aabbs.Data());
 
     const uint32_t kBad = collision::kCandidateHandleMask + 1u;  // 2^28 exactly.

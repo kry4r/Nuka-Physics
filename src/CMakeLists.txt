@@ -843,6 +843,10 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_solver
             nuka_phi
+            # phi v2: collision/gpu/broadphase.cu (the SAP oracle) now allocates via
+            # the opaque phi-v2 Buffer* (stream-0). The sibling sdf_device_world.cu TU
+            # still uses buffer_legacy (its own dispatch) -- distinct TUs, no clash.
+            nuka_phi2
             # nuka_collision_gpu: retained for the SAP broadphase oracle + the
             # candidate-pair / particle-grid primitives surviving consumers link
             # transitively (the deleted PBF/co-step's particle-grid use is gone, but
@@ -914,6 +918,11 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision
             nuka_constraint
             nuka_phi
+            # phi v2: broadphase_lbvh / particle_uniform_grid / cross_system_query /
+            # candidate_pair / rigid+particle candidate pairs now allocate via the
+            # opaque phi-v2 Buffer* (stream-0 DeviceBufferType). buffer_legacy stays
+            # available for the sibling TUs (sdf_contact*) until their dispatch.
+            nuka_phi2
             CUDA::cudart
     )
 

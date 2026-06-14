@@ -26,8 +26,9 @@
 #include "collision/particle_candidate_pairs.hpp"
 #include "collision/particle_uniform_grid.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "scene/cooked_blob.hpp"
 
 #include <gtest/gtest.h>
@@ -53,6 +54,36 @@ using nuka::scene::SystemPairMatrix;
 
 namespace {
 
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface the test bodies use so they
+// stay byte-identical after the buffer sweep.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
+
 // A canonical (type,handle)-pair set extracted from a stream by its stable_key.
 // stable_key packs ONLY type+handle (canonical min/max), so it uniquely names the
 // unordered pair regardless of react -- the right key to compare sets on.
@@ -66,7 +97,7 @@ std::set<uint64_t> StreamKeySet(const CandidatePairStream& s) {
 
 // Build an LBVH (retain nodes) over a host AABB set.
 struct RigidScene {
-    phi::Buffer d_aabbs;                 // keep alive for the tree's lifetime
+    OwnedDeviceBuffer d_aabbs;           // keep alive for the tree's lifetime
     collision::gpu::LbvhBroadphaseResult tree;
 };
 
@@ -166,14 +197,14 @@ TEST(CrossSystemMatrix, ParticleRigidEquivalence) {
     particles.push_back({8.0f, 0.0f, 0.0f});  // sees both co-located shapes -> body 99
     const float radius = 0.4f;
 
-    phi::Buffer d_rigid = phi::UploadVector(rigid);
+    OwnedDeviceBuffer d_rigid = UploadOwned(rigid);
     auto tree = collision::gpu::BuildLbvhForQuery(
         static_cast<const collision::AABB*>(d_rigid.Data()),
         static_cast<uint32_t>(rigid.size()));
     ASSERT_TRUE(tree.HasNodes());
     ASSERT_EQ(tree.LeafCount(), rigid.size());
 
-    phi::Buffer d_part = phi::UploadVector(particles);
+    OwnedDeviceBuffer d_part = UploadOwned(particles);
     const auto* dev_part = static_cast<const math::Vec3*>(d_part.Data());
 
     // Raw query (oracle source) + the builder, on the SAME scene.
@@ -215,7 +246,7 @@ TEST(CrossSystemMatrix, ParticleParticleEquivalence) {
             pts.push_back({static_cast<float>(x), static_cast<float>(y), 0.0f});
     const float radius = 1.5f;
 
-    phi::Buffer d_pos = phi::UploadVector(pts);
+    OwnedDeviceBuffer d_pos = UploadOwned(pts);
     const auto* dev = static_cast<const math::Vec3*>(d_pos.Data());
     const auto cfg = MakeCfg(pts, radius);
 
@@ -251,11 +282,11 @@ TEST(CrossSystemMatrix, MatrixGateParticleRigid) {
         particles.push_back({static_cast<float>(i % 4) * 2.0f, 0.0f, 0.0f});
     const float radius = 0.4f;
 
-    phi::Buffer d_rigid = phi::UploadVector(rigid);
+    OwnedDeviceBuffer d_rigid = UploadOwned(rigid);
     auto tree = collision::gpu::BuildLbvhForQuery(
         static_cast<const collision::AABB*>(d_rigid.Data()),
         static_cast<uint32_t>(rigid.size()));
-    phi::Buffer d_part = phi::UploadVector(particles);
+    OwnedDeviceBuffer d_part = UploadOwned(particles);
     const auto* dev_part = static_cast<const math::Vec3*>(d_part.Data());
 
     SystemPairMatrix enabled;  // default all-true
@@ -279,7 +310,7 @@ TEST(CrossSystemMatrix, MatrixGateParticleParticle) {
             pts.push_back({static_cast<float>(x), static_cast<float>(y), 0.0f});
     const float radius = 1.5f;
 
-    phi::Buffer d_pos = phi::UploadVector(pts);
+    OwnedDeviceBuffer d_pos = UploadOwned(pts);
     const auto* dev = static_cast<const math::Vec3*>(d_pos.Data());
     const auto cfg = MakeCfg(pts, radius);
 
@@ -313,11 +344,11 @@ TEST(CrossSystemMatrix, D1TwoRunByteExactParticleRigid) {
     for (auto& p : particles) p = {dx(rng), dyz(rng), dyz(rng)};
     const float radius = 0.4f;
 
-    phi::Buffer d_rigid = phi::UploadVector(rigid);
+    OwnedDeviceBuffer d_rigid = UploadOwned(rigid);
     auto tree = collision::gpu::BuildLbvhForQuery(
         static_cast<const collision::AABB*>(d_rigid.Data()),
         static_cast<uint32_t>(rigid.size()));
-    phi::Buffer d_part = phi::UploadVector(particles);
+    OwnedDeviceBuffer d_part = UploadOwned(particles);
     const auto* dev_part = static_cast<const math::Vec3*>(d_part.Data());
     SystemPairMatrix matrix;
 
@@ -341,7 +372,7 @@ TEST(CrossSystemMatrix, D1TwoRunByteExactParticleParticle) {
     for (auto& p : pts) p = {d(rng), d(rng), d(rng)};
     const float radius = 0.8f;
 
-    phi::Buffer d_pos = phi::UploadVector(pts);
+    OwnedDeviceBuffer d_pos = UploadOwned(pts);
     const auto* dev = static_cast<const math::Vec3*>(d_pos.Data());
     const auto cfg = MakeCfg(pts, radius);
     SystemPairMatrix matrix;
@@ -365,7 +396,7 @@ TEST(CrossSystemMatrix, D1TwoRunByteExactParticleParticle) {
 TEST(CrossSystemMatrix, ZeroParticlesEmpty) {
     std::vector<collision::AABB> rigid = {BoxAabb({0.0f, 0.0f, 0.0f}, 0.5f)};
     const std::vector<uint32_t> body_ids = {0u};
-    phi::Buffer d_rigid = phi::UploadVector(rigid);
+    OwnedDeviceBuffer d_rigid = UploadOwned(rigid);
     auto tree = collision::gpu::BuildLbvhForQuery(
         static_cast<const collision::AABB*>(d_rigid.Data()), 1u);
     SystemPairMatrix matrix;

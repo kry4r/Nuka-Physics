@@ -41,8 +41,9 @@
 // / cudaStream_t) MUST precede sdf_types.cuh; the deleted narrowphase_dispatch.hpp
 // formerly pulled it in first (via candidate_pair.hpp) — order it explicitly now.
 #include "phi/device_context.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
+#include "phi/buffer_transfer_v2.hpp"
 #include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfPairDev + LaunchNarrowphaseSdf
 #include "runtime/sdf/sparse_sdf_query.cuh"     // PackSdfCellKey
 
@@ -949,17 +950,56 @@ namespace {
 
 namespace nsdf = nuka::runtime::sdf;
 namespace nkops = nuka::phi::nkops;
-using nuka::phi::Buffer;
-using nuka::phi::MemoryKind;
+
+// Test-only RAII over the phi v2 opaque Buffer* (stream-0 DeviceBufferType;
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy). Mirrors the legacy phi::Buffer surface (default-ctor + sized-ctor +
+// Data/CopyFromHost/CopyToHost, move-only) the SDF oracle harness uses so it
+// stays byte-identical after the buffer sweep.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    explicit OwnedDeviceBuffer(nuka::phi::Buffer* buf) : buf_(buf) {}
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+};
+
+template <typename T>
+OwnedDeviceBuffer UploadOwned(const std::vector<T>& values) {
+    return OwnedDeviceBuffer(nuka::phi::UploadVectorV2(
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), values));
+}
 
 // One cooked SDF grid + its sample-point set + a pair list, all device-resident.
 struct SdfOracleScene {
     // Model device tables.
-    Buffer samp_points, samp_ranges, shape_table;
-    Buffer sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads;
-    Buffer body_pose, pairs;
+    OwnedDeviceBuffer samp_points, samp_ranges, shape_table;
+    OwnedDeviceBuffer sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads;
+    OwnedDeviceBuffer body_pose, pairs;
     // Data device outputs.
-    Buffer ucount, upoint, unormal, udepth, contact_count;
+    OwnedDeviceBuffer ucount, upoint, unormal, udepth, contact_count;
     uint32_t pair_count = 0, slot_stride = 0;
     float cell = 0.0f;
 };
@@ -1006,41 +1046,41 @@ SdfOracleScene BuildSdfScene(const std::vector<float>& sample_local,
     s.cell = cell;
     s.slot_stride = 4u;  // 4 contact slots / env (>= the 1 pair we drive).
     // SAMP pool + per-body ranges (body 0 owns [0, count); body 1 empty).
-    s.samp_points = nuka::phi::UploadVector(sample_local);
+    s.samp_points = UploadOwned(sample_local);
     std::vector<uint32_t> ranges = {0u, static_cast<uint32_t>(sample_local.size() / 3u),
                                     0u, 0u};
-    s.samp_ranges = nuka::phi::UploadVector(ranges);
+    s.samp_ranges = UploadOwned(ranges);
     // shape_table: 2 bodies x 8 f32 (body 1 carries sdf_grid = 0).
     std::vector<float> shp(2u * 8u, 0.0f);
     auto put_u = [&](size_t at, uint32_t v) { std::memcpy(&shp[at], &v, 4); };
     put_u(8u + 7u, 0u);  // body 1 sdf_grid = 0
     put_u(0u + 7u, ~0u); // body 0 analytic (no sdf)
-    s.shape_table = nuka::phi::UploadVector(shp);
+    s.shape_table = UploadOwned(shp);
     // SDF header: origin.xyz, voxel, dims.xyz(u32 bits), cell_offset(u32 bits).
     std::vector<float> hdr(8u, 0.0f);
     hdr[0] = origin.x; hdr[1] = origin.y; hdr[2] = origin.z; hdr[3] = voxel;
     std::memcpy(&hdr[4], &dims[0], 4); std::memcpy(&hdr[5], &dims[1], 4);
     std::memcpy(&hdr[6], &dims[2], 4);
     const uint32_t cell_offset = 0u; std::memcpy(&hdr[7], &cell_offset, 4);
-    s.sdf_headers = nuka::phi::UploadVector(hdr);
+    s.sdf_headers = UploadOwned(hdr);
     std::vector<uint32_t> cc = {static_cast<uint32_t>(keys.size())};
-    s.sdf_cell_count = nuka::phi::UploadVector(cc);
-    s.sdf_keys = nuka::phi::UploadVector(keys);
-    s.sdf_values = nuka::phi::UploadVector(values);
-    s.sdf_grads = nuka::phi::UploadVector(grads);
+    s.sdf_cell_count = UploadOwned(cc);
+    s.sdf_keys = UploadOwned(keys);
+    s.sdf_values = UploadOwned(values);
+    s.sdf_grads = UploadOwned(grads);
     // body_pose (env-major, bodies_per_env = 2).
     std::vector<Transform> poses = {sample_pose, target_pose};
-    s.body_pose = nuka::phi::UploadVector(poses);
+    s.body_pose = UploadOwned(poses);
     // one pair: env 0, slot 0, sample body 0 vs target body 1, grid 0.
     std::vector<nkops::SdfPairDev> prs = {{0u, 0u, 0u, 1u, 0u, 2u}};
-    s.pairs = nuka::phi::UploadVector(prs);
+    s.pairs = UploadOwned(prs);
     s.pair_count = 1u;
     // outputs (slot_stride slots x {count, 4-pt point/normal/depth}).
-    s.ucount = Buffer(s.slot_stride * sizeof(uint32_t), MemoryKind::Device);
-    s.upoint = Buffer(s.slot_stride * 4u * sizeof(Vec3), MemoryKind::Device);
-    s.unormal = Buffer(s.slot_stride * 4u * sizeof(Vec3), MemoryKind::Device);
-    s.udepth = Buffer(s.slot_stride * 4u * sizeof(float), MemoryKind::Device);
-    s.contact_count = Buffer(sizeof(uint32_t), MemoryKind::Device);
+    s.ucount = OwnedDeviceBuffer(s.slot_stride * sizeof(uint32_t));
+    s.upoint = OwnedDeviceBuffer(s.slot_stride * 4u * sizeof(Vec3));
+    s.unormal = OwnedDeviceBuffer(s.slot_stride * 4u * sizeof(Vec3));
+    s.udepth = OwnedDeviceBuffer(s.slot_stride * 4u * sizeof(float));
+    s.contact_count = OwnedDeviceBuffer(sizeof(uint32_t));
     std::vector<uint32_t> zero = {0u};
     s.contact_count.CopyFromHost(zero.data(), sizeof(uint32_t));
     return s;

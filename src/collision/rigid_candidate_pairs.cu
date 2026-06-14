@@ -24,7 +24,9 @@
 
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/dynamic_broadphase.hpp"  // collision::CollisionPair
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"                    // InitBestDevice, DeviceBufferType
+#include "phi/buffer.hpp"                     // Buffer*, BufferBase/Free
+#include "phi/buffer_transfer_v2.hpp"         // UploadVectorV2
 #include "scene/contact_filter.hpp"           // PassesContactBitmask
 
 #include <cuda_runtime.h>
@@ -55,6 +57,35 @@ void CheckCuda(cudaError_t result, const char* operation) {
                                  cudaGetErrorString(result));
     }
 }
+
+// File-local RAII over a phi v2 opaque Buffer*. Stream-0 device buffer type:
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy. Frees on every path (incl. CheckCuda throw paths). Base()/Handle()
+// mirror the legacy Data()/handle.
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    // Adopt an already-allocated handle (e.g. from UploadVectorV2).
+    static OwnedBuffer Adopt(phi::Buffer* b) { OwnedBuffer o; o.buf_ = b; return o; }
+    void* Base() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    phi::Buffer* Handle() const { return buf_; }
+private:
+    phi::Buffer* buf_ = nullptr;
+};
 
 // Device binary search of the sorted canonical excluded_body_pairs list. The list
 // is uploaded as two parallel arrays (lo[], hi[]) with lo <= hi per entry and the
@@ -240,12 +271,15 @@ CandidatePairStream BuildCandidatePairsTagged(
         std::vector<uint32_t> body_ids(tags.body_ids, tags.body_ids + count);
         std::vector<uint32_t> contypes(tags.contypes, tags.contypes + count);
         std::vector<uint32_t> conaff(tags.conaffinities, tags.conaffinities + count);
-        phi::Buffer d_types    = phi::UploadVector(types);
-        phi::Buffer d_reacts   = phi::UploadVector(reacts);
-        phi::Buffer d_handles  = phi::UploadVector(handles);
-        phi::Buffer d_body_ids = phi::UploadVector(body_ids);
-        phi::Buffer d_contypes = phi::UploadVector(contypes);
-        phi::Buffer d_conaff   = phi::UploadVector(conaff);
+        // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
+        // identical to the legacy synchronous memcpy.
+        phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+        OwnedBuffer d_types    = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, types));
+        OwnedBuffer d_reacts   = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, reacts));
+        OwnedBuffer d_handles  = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, handles));
+        OwnedBuffer d_body_ids = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, body_ids));
+        OwnedBuffer d_contypes = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, contypes));
+        OwnedBuffer d_conaff   = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, conaff));
 
         // Upload the sorted canonical exclude list as two parallel uint32 arrays
         // so the device binary search needs no std::pair ((min,max), ascending).
@@ -256,50 +290,48 @@ CandidatePairStream BuildCandidatePairsTagged(
             excl_lo[i] = excluded_body_pairs[i].first;
             excl_hi[i] = excluded_body_pairs[i].second;
         }
-        // Allocate >=1 element so Data() is a valid (unused-when-count-0) pointer.
-        phi::Buffer d_excl_lo(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
-                              phi::MemoryKind::Device);
-        phi::Buffer d_excl_hi(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t),
-                              phi::MemoryKind::Device);
+        // Allocate >=1 element so Base() is a valid (unused-when-count-0) pointer.
+        OwnedBuffer d_excl_lo(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t));
+        OwnedBuffer d_excl_hi(std::max<uint32_t>(excl_count, 1u) * sizeof(uint32_t));
         if (excl_count > 0u) {
-            d_excl_lo.CopyFromHost(excl_lo.data(), excl_count * sizeof(uint32_t));
-            d_excl_hi.CopyFromHost(excl_hi.data(), excl_count * sizeof(uint32_t));
+            phi::BufferUpload(d_excl_lo.Handle(), excl_lo.data(), 0,
+                              excl_count * sizeof(uint32_t));
+            phi::BufferUpload(d_excl_hi.Handle(), excl_hi.data(), 0,
+                              excl_count * sizeof(uint32_t));
         }
 
         if (pair_count > 0u) {
             const uint32_t blocks = (pair_count + kBlockSize - 1u) / kBlockSize;
 
             // --- Pass 1: keep flags -----------------------------------------
-            phi::Buffer d_flags(pair_count * sizeof(uint32_t),
-                                phi::MemoryKind::Device);
+            OwnedBuffer d_flags(pair_count * sizeof(uint32_t));
             KeepFlagKernel<<<blocks, kBlockSize, 0, stream>>>(
                 pair_count, lbvh.DevicePairs(),
-                static_cast<const uint32_t*>(d_types.Data()),
-                static_cast<const uint32_t*>(d_body_ids.Data()),
-                static_cast<const uint32_t*>(d_contypes.Data()),
-                static_cast<const uint32_t*>(d_conaff.Data()),
-                static_cast<const uint32_t*>(d_excl_lo.Data()),
-                static_cast<const uint32_t*>(d_excl_hi.Data()),
+                static_cast<const uint32_t*>(d_types.Base()),
+                static_cast<const uint32_t*>(d_body_ids.Base()),
+                static_cast<const uint32_t*>(d_contypes.Base()),
+                static_cast<const uint32_t*>(d_conaff.Base()),
+                static_cast<const uint32_t*>(d_excl_lo.Base()),
+                static_cast<const uint32_t*>(d_excl_hi.Base()),
                 excl_count,
-                static_cast<uint32_t*>(d_flags.Data()));
+                static_cast<uint32_t*>(d_flags.Base()));
             CheckCuda(cudaGetLastError(), "KeepFlagKernel launch");
 
             // --- Exclusive scan -> per-pair output slot ---------------------
-            phi::Buffer d_scan(pair_count * sizeof(uint32_t),
-                               phi::MemoryKind::Device);
+            OwnedBuffer d_scan(pair_count * sizeof(uint32_t));
             thrust::exclusive_scan(
                 thrust::cuda::par.on(stream),
-                static_cast<const uint32_t*>(d_flags.Data()),
-                static_cast<const uint32_t*>(d_flags.Data()) + pair_count,
-                static_cast<uint32_t*>(d_scan.Data()));
+                static_cast<const uint32_t*>(d_flags.Base()),
+                static_cast<const uint32_t*>(d_flags.Base()) + pair_count,
+                static_cast<uint32_t*>(d_scan.Base()));
             CheckCuda(cudaGetLastError(), "exclusive_scan keep flags");
 
             context.stream.Synchronize();
             uint32_t last_scan = 0u;
             uint32_t last_flag = 0u;
             {
-                const auto* scan_dev = static_cast<const uint32_t*>(d_scan.Data());
-                const auto* flag_dev = static_cast<const uint32_t*>(d_flags.Data());
+                const auto* scan_dev = static_cast<const uint32_t*>(d_scan.Base());
+                const auto* flag_dev = static_cast<const uint32_t*>(d_flags.Base());
                 CheckCuda(cudaMemcpy(&last_scan, scan_dev + (pair_count - 1u),
                                      sizeof(uint32_t), cudaMemcpyDeviceToHost),
                           "copy last scan");
@@ -311,23 +343,22 @@ CandidatePairStream BuildCandidatePairsTagged(
 
             if (survivor_count > 0u) {
                 // --- Pass 2: compact into tagged CandidatePairs -------------
-                phi::Buffer d_out(survivor_count * sizeof(CandidatePair),
-                                  phi::MemoryKind::Device);
+                OwnedBuffer d_out(survivor_count * sizeof(CandidatePair));
                 CompactKernel<<<blocks, kBlockSize, 0, stream>>>(
                     pair_count, lbvh.DevicePairs(),
-                    static_cast<const uint32_t*>(d_types.Data()),
-                    static_cast<const uint32_t*>(d_reacts.Data()),
-                    static_cast<const uint32_t*>(d_handles.Data()),
-                    static_cast<const uint32_t*>(d_flags.Data()),
-                    static_cast<const uint32_t*>(d_scan.Data()),
-                    static_cast<CandidatePair*>(d_out.Data()));
+                    static_cast<const uint32_t*>(d_types.Base()),
+                    static_cast<const uint32_t*>(d_reacts.Base()),
+                    static_cast<const uint32_t*>(d_handles.Base()),
+                    static_cast<const uint32_t*>(d_flags.Base()),
+                    static_cast<const uint32_t*>(d_scan.Base()),
+                    static_cast<CandidatePair*>(d_out.Base()));
                 CheckCuda(cudaGetLastError(), "CompactKernel launch");
                 context.stream.Synchronize();
 
                 const size_t base = survivors.size();
                 survivors.resize(base + survivor_count);
-                d_out.CopyToHost(survivors.data() + base,
-                                 survivor_count * sizeof(CandidatePair));
+                phi::BufferDownload(d_out.Handle(), survivors.data() + base, 0,
+                                    survivor_count * sizeof(CandidatePair));
             } else {
                 context.stream.Synchronize();
             }
@@ -498,7 +529,10 @@ CandidatePairStream BuildArticulationRigidCandidatePairs(
         for (uint32_t i = 0u; i < rigid_count; ++i) aabbs.push_back(rigid_host[i]);
         for (uint32_t i = 0u; i < link_count; ++i) aabbs.push_back(links.aabbs[i]);
     }
-    phi::Buffer d_aabbs = phi::UploadVector(aabbs);
+    // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
+    // identical to the legacy synchronous memcpy.
+    OwnedBuffer d_aabbs = OwnedBuffer::Adopt(phi::UploadVectorV2(
+        phi::DeviceBufferType(phi::InitBestDevice()), aabbs));
 
     // Parallel tag arrays over the concatenated order.
     std::vector<CollidableType>       types(total);
@@ -534,7 +568,7 @@ CandidatePairStream BuildArticulationRigidCandidatePairs(
     tags.conaffinities = conaff.data();
 
     return BuildCandidatePairsTagged(
-        context, static_cast<const collision::AABB*>(d_aabbs.Data()), total,
+        context, static_cast<const collision::AABB*>(d_aabbs.Base()), total,
         tags, excluded_body_pairs, {});
 }
 

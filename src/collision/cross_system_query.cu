@@ -21,7 +21,8 @@
 
 #include "collision/aabb.hpp"
 #include "collision/lbvh_node.cuh"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"            // InitBestDevice, DeviceBufferType
+#include "phi/buffer_transfer_v2.hpp" // DownloadVectorV2
 
 #include <cuda_runtime.h>
 
@@ -47,7 +48,38 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
-using ::nuka::phi::DownloadVector;
+// File-local RAII over a phi v2 opaque Buffer*. Stream-0 device buffer type:
+// NULL-stream transfers are byte+ordering identical to the legacy synchronous
+// memcpy. Frees on every path (incl. the CheckCuda throw paths). Base()/Handle()
+// mirror the legacy Data(); Release() hands the long-lived result members their
+// owned handle.
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_), bytes_(o.bytes_) {
+        o.buf_ = nullptr; o.bytes_ = 0u;
+    }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    void*  Base()   const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    size_t Bytes()  const { return bytes_; }
+    phi::Buffer* Handle() const { return buf_; }
+    phi::Buffer* Release() { phi::Buffer* b = buf_; buf_ = nullptr; bytes_ = 0u; return b; }
+private:
+    phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 // AABB overlap (device). Same predicate as collision::AABB::Overlaps and the
 // LBVH traversal's LbvhOverlaps; inlined here so this TU does not include
@@ -199,34 +231,83 @@ CrossSystemQueryResult::CrossSystemQueryResult(uint32_t particle_count,
                                                uint32_t candidate_capacity,
                                                uint32_t total_candidates,
                                                uint32_t truncated_particle_count,
-                                               phi::Buffer candidate_offsets,
-                                               phi::Buffer candidate_counts,
-                                               phi::Buffer candidate_indices)
+                                               phi::Buffer* candidate_offsets,
+                                               phi::Buffer* candidate_counts,
+                                               phi::Buffer* candidate_indices)
     : particle_count_(particle_count)
     , candidate_capacity_(candidate_capacity)
     , total_candidates_(total_candidates)
     , truncated_particle_count_(truncated_particle_count)
-    , candidate_offsets_(std::move(candidate_offsets))
-    , candidate_counts_(std::move(candidate_counts))
-    , candidate_indices_(std::move(candidate_indices)) {}
+    , candidate_offsets_(candidate_offsets)
+    , candidate_counts_(candidate_counts)
+    , candidate_indices_(candidate_indices) {}
+
+CrossSystemQueryResult::~CrossSystemQueryResult() {
+    if (candidate_offsets_ != nullptr) { phi::BufferFree(candidate_offsets_); }
+    if (candidate_counts_  != nullptr) { phi::BufferFree(candidate_counts_); }
+    if (candidate_indices_ != nullptr) { phi::BufferFree(candidate_indices_); }
+}
+
+CrossSystemQueryResult::CrossSystemQueryResult(CrossSystemQueryResult&& other) noexcept
+    : particle_count_(other.particle_count_)
+    , candidate_capacity_(other.candidate_capacity_)
+    , total_candidates_(other.total_candidates_)
+    , truncated_particle_count_(other.truncated_particle_count_)
+    , candidate_offsets_(other.candidate_offsets_)
+    , candidate_counts_(other.candidate_counts_)
+    , candidate_indices_(other.candidate_indices_) {
+    other.particle_count_ = 0u;
+    other.candidate_capacity_ = 0u;
+    other.total_candidates_ = 0u;
+    other.truncated_particle_count_ = 0u;
+    other.candidate_offsets_ = nullptr;
+    other.candidate_counts_ = nullptr;
+    other.candidate_indices_ = nullptr;
+}
+
+CrossSystemQueryResult& CrossSystemQueryResult::operator=(CrossSystemQueryResult&& other) noexcept {
+    if (this != &other) {
+        if (candidate_offsets_ != nullptr) { phi::BufferFree(candidate_offsets_); }
+        if (candidate_counts_  != nullptr) { phi::BufferFree(candidate_counts_); }
+        if (candidate_indices_ != nullptr) { phi::BufferFree(candidate_indices_); }
+        particle_count_ = other.particle_count_;
+        candidate_capacity_ = other.candidate_capacity_;
+        total_candidates_ = other.total_candidates_;
+        truncated_particle_count_ = other.truncated_particle_count_;
+        candidate_offsets_ = other.candidate_offsets_;
+        candidate_counts_ = other.candidate_counts_;
+        candidate_indices_ = other.candidate_indices_;
+        other.particle_count_ = 0u;
+        other.candidate_capacity_ = 0u;
+        other.total_candidates_ = 0u;
+        other.truncated_particle_count_ = 0u;
+        other.candidate_offsets_ = nullptr;
+        other.candidate_counts_ = nullptr;
+        other.candidate_indices_ = nullptr;
+    }
+    return *this;
+}
 
 const uint32_t* CrossSystemQueryResult::DeviceCandidateOffsets() const {
-    return static_cast<const uint32_t*>(candidate_offsets_.Data());
+    return static_cast<const uint32_t*>(
+        candidate_offsets_ != nullptr ? phi::BufferBase(candidate_offsets_) : nullptr);
 }
 const uint32_t* CrossSystemQueryResult::DeviceCandidateCounts() const {
-    return static_cast<const uint32_t*>(candidate_counts_.Data());
+    return static_cast<const uint32_t*>(
+        candidate_counts_ != nullptr ? phi::BufferBase(candidate_counts_) : nullptr);
 }
 const uint32_t* CrossSystemQueryResult::DeviceCandidateIndices() const {
-    return static_cast<const uint32_t*>(candidate_indices_.Data());
+    return static_cast<const uint32_t*>(
+        candidate_indices_ != nullptr ? phi::BufferBase(candidate_indices_) : nullptr);
 }
 std::vector<uint32_t> CrossSystemQueryResult::DownloadCandidateOffsets() const {
-    return DownloadVector<uint32_t>(candidate_offsets_, particle_count_);
+    return phi::DownloadVectorV2<uint32_t>(candidate_offsets_, particle_count_);
 }
 std::vector<uint32_t> CrossSystemQueryResult::DownloadCandidateCounts() const {
-    return DownloadVector<uint32_t>(candidate_counts_, particle_count_);
+    return phi::DownloadVectorV2<uint32_t>(candidate_counts_, particle_count_);
 }
 std::vector<uint32_t> CrossSystemQueryResult::DownloadCandidateIndices() const {
-    return DownloadVector<uint32_t>(candidate_indices_, total_candidates_);
+    return phi::DownloadVectorV2<uint32_t>(candidate_indices_, total_candidates_);
 }
 
 CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
@@ -242,12 +323,12 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
     const LbvhNode* nodes = rigid_tree.DeviceNodes();
 
     auto make_empty = [&]() {
-        phi::Buffer e0(0u, phi::MemoryKind::Device);
-        phi::Buffer e1(0u, phi::MemoryKind::Device);
-        phi::Buffer e2(0u, phi::MemoryKind::Device);
+        OwnedBuffer e0(0u);
+        OwnedBuffer e1(0u);
+        OwnedBuffer e2(0u);
         return CrossSystemQueryResult(particle_count, kCrossSystemMaxCandidates,
-                                      0u, 0u, std::move(e0), std::move(e1),
-                                      std::move(e2));
+                                      0u, 0u, e0.Release(), e1.Release(),
+                                      e2.Release());
     };
 
     if (particle_count == 0u || leaf_count == 0u || nodes == nullptr) {
@@ -256,44 +337,44 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
             return make_empty();
         }
         // Still emit zero-count CSR for every particle so offsets are well-formed.
-        phi::Buffer d_offsets(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
-        phi::Buffer d_counts(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
-        CheckCuda(cudaMemsetAsync(d_offsets.Data(), 0, particle_count * sizeof(uint32_t), stream),
+        OwnedBuffer d_offsets(particle_count * sizeof(uint32_t));
+        OwnedBuffer d_counts(particle_count * sizeof(uint32_t));
+        CheckCuda(cudaMemsetAsync(d_offsets.Base(), 0, particle_count * sizeof(uint32_t), stream),
                   "memset offsets (empty tree)");
-        CheckCuda(cudaMemsetAsync(d_counts.Data(), 0, particle_count * sizeof(uint32_t), stream),
+        CheckCuda(cudaMemsetAsync(d_counts.Base(), 0, particle_count * sizeof(uint32_t), stream),
                   "memset counts (empty tree)");
         context.stream.Synchronize();
-        phi::Buffer d_cand(sizeof(uint32_t), phi::MemoryKind::Device);
+        OwnedBuffer d_cand(sizeof(uint32_t));
         return CrossSystemQueryResult(particle_count, kCrossSystemMaxCandidates,
-                                      0u, 0u, std::move(d_offsets),
-                                      std::move(d_counts), std::move(d_cand));
+                                      0u, 0u, d_offsets.Release(),
+                                      d_counts.Release(), d_cand.Release());
     }
 
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
 
     // --- Pass 1: count ------------------------------------------------------
-    phi::Buffer d_counts(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_counts(particle_count * sizeof(uint32_t));
     CountCandidatesKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count, particle_positions, query_radius, nodes, leaf_count,
         kCrossSystemMaxCandidates,
-        static_cast<uint32_t*>(d_counts.Data()));
+        static_cast<uint32_t*>(d_counts.Base()));
     CheckCuda(cudaGetLastError(), "CountCandidatesKernel launch");
 
     // --- Exclusive scan -> offsets ------------------------------------------
-    phi::Buffer d_offsets(particle_count * sizeof(uint32_t), phi::MemoryKind::Device);
+    OwnedBuffer d_offsets(particle_count * sizeof(uint32_t));
     thrust::exclusive_scan(
         thrust::cuda::par.on(stream),
-        static_cast<const uint32_t*>(d_counts.Data()),
-        static_cast<const uint32_t*>(d_counts.Data()) + particle_count,
-        static_cast<uint32_t*>(d_offsets.Data()));
+        static_cast<const uint32_t*>(d_counts.Base()),
+        static_cast<const uint32_t*>(d_counts.Base()) + particle_count,
+        static_cast<uint32_t*>(d_offsets.Base()));
     CheckCuda(cudaGetLastError(), "exclusive_scan candidate counts");
 
     context.stream.Synchronize();
     uint32_t last_offset = 0u;
     uint32_t last_count = 0u;
     {
-        const auto* off_dev = static_cast<const uint32_t*>(d_offsets.Data());
-        const auto* cnt_dev = static_cast<const uint32_t*>(d_counts.Data());
+        const auto* off_dev = static_cast<const uint32_t*>(d_offsets.Base());
+        const auto* cnt_dev = static_cast<const uint32_t*>(d_counts.Base());
         CheckCuda(cudaMemcpy(&last_offset, off_dev + (particle_count - 1u),
                              sizeof(uint32_t), cudaMemcpyDeviceToHost),
                   "copy last offset");
@@ -304,28 +385,27 @@ CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
     const uint32_t total_candidates = last_offset + last_count;
 
     // --- Pass 2: fill -------------------------------------------------------
-    phi::Buffer d_cand(
-        (total_candidates == 0u ? 1u : total_candidates) * sizeof(uint32_t),
-        phi::MemoryKind::Device);
-    phi::Buffer d_truncated(sizeof(uint32_t), phi::MemoryKind::Device);
-    CheckCuda(cudaMemsetAsync(d_truncated.Data(), 0, sizeof(uint32_t), stream),
+    OwnedBuffer d_cand(
+        (total_candidates == 0u ? 1u : total_candidates) * sizeof(uint32_t));
+    OwnedBuffer d_truncated(sizeof(uint32_t));
+    CheckCuda(cudaMemsetAsync(d_truncated.Base(), 0, sizeof(uint32_t), stream),
               "memset truncated");
     FillCandidatesKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count, particle_positions, query_radius, nodes, leaf_count,
         kCrossSystemMaxCandidates,
-        static_cast<const uint32_t*>(d_offsets.Data()),
-        static_cast<uint32_t*>(d_cand.Data()),
-        static_cast<uint32_t*>(d_truncated.Data()));
+        static_cast<const uint32_t*>(d_offsets.Base()),
+        static_cast<uint32_t*>(d_cand.Base()),
+        static_cast<uint32_t*>(d_truncated.Base()));
     CheckCuda(cudaGetLastError(), "FillCandidatesKernel launch");
 
     context.stream.Synchronize();
     uint32_t truncated = 0u;
-    d_truncated.CopyToHost(&truncated, sizeof(truncated));
+    phi::BufferDownload(d_truncated.Handle(), &truncated, 0, sizeof(truncated));
 
     return CrossSystemQueryResult(particle_count, kCrossSystemMaxCandidates,
                                   total_candidates, truncated,
-                                  std::move(d_offsets), std::move(d_counts),
-                                  std::move(d_cand));
+                                  d_offsets.Release(), d_counts.Release(),
+                                  d_cand.Release());
 }
 
 CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(

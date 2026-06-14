@@ -23,8 +23,9 @@
 
 #include "collision/cross_system_query.hpp"
 #include "constraint/collidable.hpp"
-#include "phi/buffer_legacy.hpp"
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"            // InitBestDevice, DeviceBufferType
+#include "phi/buffer.hpp"             // Buffer*, BufferBase/Download/Free
+#include "phi/buffer_transfer_v2.hpp" // UploadVectorV2
 
 #include <cuda_runtime.h>
 
@@ -188,28 +189,35 @@ CandidatePairStream BuildParticleRigidCandidatePairs(
     const ReactionProviderKind rigid_react =
         constraint::GetCollidableTypeInfo(CollidableType::RigidBody).react;
 
+    // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
+    // identical to the legacy synchronous memcpy (the upload completes before the
+    // work-stream kernel reads it, exactly as the legacy path relied on).
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+
     // Upload the shape->body map (length == rigid shape count == LBVH leaf count).
     const uint32_t shape_count = rigid_tree.LeafCount();
     std::vector<uint32_t> body_ids(rigid_shape_body_ids,
                                    rigid_shape_body_ids + shape_count);
-    phi::Buffer d_body_ids = phi::UploadVector(body_ids);
+    phi::Buffer* d_body_ids = phi::UploadVectorV2(bt, body_ids);
 
     // --- reframe every CSR entry into its offset slot (NO scan, NO atomic) ---
-    phi::Buffer d_out(total * sizeof(CandidatePair), phi::MemoryKind::Device);
+    phi::Buffer* d_out = phi::BufferAlloc(bt, total * sizeof(CandidatePair));
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
     ReframeParticleRigidKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count,
         query.DeviceCandidateOffsets(),
         query.DeviceCandidateCounts(),
         query.DeviceCandidateIndices(),
-        static_cast<const uint32_t*>(d_body_ids.Data()),
+        static_cast<const uint32_t*>(phi::BufferBase(d_body_ids)),
         particle_react, rigid_react,
-        static_cast<CandidatePair*>(d_out.Data()));
+        static_cast<CandidatePair*>(phi::BufferBase(d_out)));
     CheckCuda(cudaGetLastError(), "ReframeParticleRigidKernel launch");
     context.stream.Synchronize();
 
     std::vector<CandidatePair> survivors(total);
-    d_out.CopyToHost(survivors.data(), total * sizeof(CandidatePair));
+    phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
+    phi::BufferFree(d_body_ids);
+    phi::BufferFree(d_out);
 
     return BuildAndDedup(context, survivors);
 }
@@ -256,8 +264,12 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
     const ReactionProviderKind particle_react =
         constraint::GetCollidableTypeInfo(CollidableType::Particle).react;
 
+    // Stream-0 device buffer type: NULL-stream transfers are byte+ordering
+    // identical to the legacy synchronous memcpy.
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+
     // --- reframe every neighbor (canonical min,max) into its offset slot -----
-    phi::Buffer d_out(total * sizeof(CandidatePair), phi::MemoryKind::Device);
+    phi::Buffer* d_out = phi::BufferAlloc(bt, total * sizeof(CandidatePair));
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
     ReframeParticleParticleKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count,
@@ -265,12 +277,13 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
         grid.DeviceNeighborCounts(),
         grid.DeviceNeighborIndices(),
         particle_react,
-        static_cast<CandidatePair*>(d_out.Data()));
+        static_cast<CandidatePair*>(phi::BufferBase(d_out)));
     CheckCuda(cudaGetLastError(), "ReframeParticleParticleKernel launch");
     context.stream.Synchronize();
 
     std::vector<CandidatePair> survivors(total);
-    d_out.CopyToHost(survivors.data(), total * sizeof(CandidatePair));
+    phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
+    phi::BufferFree(d_out);
 
     // Canonical (i<j) emit means i->j and j->i are byte-identical pairs; the
     // adjacent dedup in BuildAndDedup collapses each double-listing to one i<j.
