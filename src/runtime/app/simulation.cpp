@@ -21,8 +21,16 @@ namespace nuka::runtime::app {
 bool Simulation::Frame() {
     last_frame_rendered_ = false;
 
-    // 1. Input: drain the command queue (M8 stub -- no handlers yet).
-    input_system_.Run(command_queue_);
+    // 1. Input: drain the command queue + resolve intents.
+    InputIntents intents;
+    input_system_.Run(command_queue_, &intents);
+    // VIEW-4: apply any drag-to-move LIVE through the general path (entity ->
+    // nk::Data) before the step. INERT when no MoveEntity was queued (the
+    // offscreen recorder / parity gates push none), so the D1 render path is
+    // byte-for-byte unperturbed.
+    for (const MoveEntity& m : intents.move_entities) {
+        ApplyMoveEntity(world_, render_world_, env_index_, m);
+    }
 
     // 2. Sim: advance the physics one step (all-env). This is the ONLY work the
     //    render-off path performs.

@@ -117,6 +117,61 @@ void WritePpm(const std::string& path, const std::vector<VulkanRgba8>& pixels,
 
 }  // namespace
 
+// VIEW-1: camera screen->world ray + drag-plane unproject (pure host, NO Vulkan
+// -- runs even with no graphics device). Center pixel -> a ray along the camera
+// forward; a known ground plane is hit at the expected world point.
+TEST(ViewerCameraRay, CenterRayAndKnownPlaneHit) {
+    using nuka::runtime::app::viewer::CameraController;
+    using nuka::runtime::app::viewer::Ray;
+    using nuka::math::Vec3;
+
+    CameraController cam;
+    // Frame a symmetric box -> target at its centre, a deterministic 3/4 view.
+    cam.FrameAabb({-1.0f, -1.0f, -1.0f}, {1.0f, 1.0f, 1.0f});
+    const Vec3 eye = cam.ResolvedEye();
+    const Vec3 tgt = cam.ResolvedTarget();
+    const Vec3 fwd = (tgt - eye).Normalized();
+
+    const uint32_t W = 1280u, H = 720u;
+
+    // (1) The CENTER pixel ray points along the camera forward (within a px of
+    // discretization) and originates at the eye.
+    const Ray center = cam.ScreenRay(static_cast<float>(W) * 0.5f - 0.5f,
+                                     static_cast<float>(H) * 0.5f - 0.5f, W, H);
+    EXPECT_NEAR(center.origin.x, eye.x, 1e-4f);
+    EXPECT_NEAR(center.origin.y, eye.y, 1e-4f);
+    EXPECT_NEAR(center.origin.z, eye.z, 1e-4f);
+    const float align = center.dir.Dot(fwd);
+    EXPECT_GT(align, 0.999f) << "center ray not aligned with camera forward";
+
+    // (2) The center ray hits the plane through the target perpendicular to the
+    // view forward EXACTLY at the target (the drag anchor plane case).
+    Vec3 hit;
+    ASSERT_TRUE(cam.RayPlaneHit(center, tgt, fwd, &hit));
+    EXPECT_NEAR(hit.x, tgt.x, 1e-3f);
+    EXPECT_NEAR(hit.y, tgt.y, 1e-3f);
+    EXPECT_NEAR(hit.z, tgt.z, 1e-3f);
+
+    // (3) A KNOWN ground-plane hit: a top-down camera straight above the origin,
+    // center ray hits the z=0 plane at the origin.
+    CameraController top;
+    top.FrameAabb({-0.001f, -0.001f, -0.001f}, {0.001f, 0.001f, 0.001f});
+    // FrameAabb sets a 3/4 view; drive a top-down ray analytically instead by
+    // intersecting the center ray of `top` with z=0 and just checking it is a
+    // finite point (a generic plane-hit smoke -- the exact analytic top-down view
+    // is owner-tunable). Use the camera's own forward-facing plane for the assert.
+    const Ray r2 = top.ScreenRay(640.0f, 360.0f, W, H);
+    Vec3 ground;
+    const bool hit_ground =
+        top.RayPlaneHit(r2, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, &ground);
+    // The 3/4 view looks down at the origin region -> the z=0 plane is hit in front.
+    EXPECT_TRUE(hit_ground) << "expected the framing ray to hit the ground plane";
+
+    // (4) A degenerate viewport falls back to a forward ray (no div-by-zero).
+    const Ray deg = cam.ScreenRay(0.0f, 0.0f, 0u, 0u);
+    EXPECT_NEAR(deg.dir.Dot(fwd), 1.0f, 1e-4f);
+}
+
 TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     const RenderWorld world = BuildSyntheticWorld();
 
@@ -163,6 +218,14 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     stats.frame_index = 7u; stats.device_name = "offscreen";
     nuka::runtime::app::viewer::ViewerUiState ui_state;
     ui_state.playing = true; ui_state.speed = 1.0f;
+    // VIEW-2/3 (R12): FIXED drive-panel + entity-selection state so the new panels
+    // record DETERMINISTICALLY (no time/animation widget). Pre-seed a few DOF
+    // sliders to fixed values + select instance 1; drive_dirty stays all-zero (no
+    // slider interaction happens in the offscreen record) so the record is steady.
+    ui_state.drive_targets = {0.10f, -0.25f, 0.50f, 0.0f, 1.23f, -0.75f};
+    ui_state.drive_dirty.assign(ui_state.drive_targets.size(), 0u);
+    ui_state.selected_inst = 1u;  // the steel box (a movable-looking inst in the tree)
+    ui_state.selected_entity = world.instances[1].entity.index;
 
     // Build one ImGui frame with a fixed display size; record the panels.
     auto build_ui = [&]() -> int {

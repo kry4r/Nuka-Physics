@@ -113,9 +113,15 @@ static void BuildDefaultDockLayout(ImGuiID dockspace_id) {
     ImGuiID right = ImGui::DockBuilderSplitNode(central, ImGuiDir_Right, 0.26f, nullptr, &central);
     ImGuiID left_bottom = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.55f, nullptr, &left);
 
+    ImGuiID right_bottom =
+        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.55f, nullptr, &right);
+
     ImGui::DockBuilderDockWindow("Stats", left);
     ImGui::DockBuilderDockWindow("Scene", left_bottom);
     ImGui::DockBuilderDockWindow("Camera", right);
+    // VIEW-2/3: the Drive editor + the Entity inspector share the lower-right node.
+    ImGui::DockBuilderDockWindow("Drive", right_bottom);
+    ImGui::DockBuilderDockWindow("Entity", right_bottom);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -317,6 +323,87 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::TextColored(kTextDim, "LMB drag  orbit");
         ImGui::TextColored(kTextDim, "MMB / Shift  pan");
         ImGui::TextColored(kTextDim, "wheel  zoom");
+        ImGui::TextColored(kTextDim, "Ctrl+LMB  pick / drag entity");
+    }
+    ImGui::End();
+
+    // ======================================================================
+    // DRIVE PANEL (VIEW-2) -- a GENERIC per-DOF drive-target editor. One slider
+    // per DOF; moving a slider latches drive_dirty[d] so the viewer uploads ONLY
+    // that DOF into FieldId::DriveTarget (env-major). NEVER a hardcoded grasp /
+    // choreography table (OD-7 / highest directive). With a FIXED ui_state this
+    // records deterministically (GATE-B / R12).
+    // ======================================================================
+    if (ImGui::Begin("Drive")) {
+        SectionHeader("Drive Targets");
+        const size_t n = ui_state.drive_targets.size();
+        if (n == 0u) {
+            ImGui::TextColored(kTextDim, "no articulation DOFs");
+        } else {
+            ImGui::TextColored(kTextDim, "%zu DOF  (env %u)", n, ui_state.env_index);
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            if (ui_state.drive_dirty.size() != n) ui_state.drive_dirty.assign(n, 0u);
+            const bool have_labels = (ui_state.dof_labels.size() == n);
+            for (size_t d = 0; d < n; ++d) {
+                char id[24];
+                std::snprintf(id, sizeof(id), "##drive%zu", d);
+                char label[64];
+                if (have_labels && !ui_state.dof_labels[d].empty()) {
+                    std::snprintf(label, sizeof(label), "%s", ui_state.dof_labels[d].c_str());
+                } else {
+                    std::snprintf(label, sizeof(label), "dof %zu", d);
+                }
+                ImGui::TextColored(kTextDim, "%s", label);
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat(id, &ui_state.drive_targets[d], -3.1416f,
+                                       3.1416f, "%.3f")) {
+                    ui_state.drive_dirty[d] = 1u;  // mark for upload by the viewer
+                }
+            }
+        }
+    }
+    ImGui::End();
+
+    // ======================================================================
+    // ENTITY PANEL (VIEW-3) -- inspector for the picked entity (selected_entity /
+    // selected_inst). Read-only readout of the selection the ray-picker set; the
+    // drag handler moves it via the command queue (MoveEntity). Fixed selection
+    // records deterministically (GATE-B).
+    // ======================================================================
+    if (ImGui::Begin("Entity")) {
+        SectionHeader("Selection");
+        if (ui_state.selected_inst == ~0u ||
+            ui_state.selected_inst >= world.InstanceCount()) {
+            ImGui::TextColored(kTextDim, "nothing selected");
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            ImGui::TextColored(kTextDim, "Ctrl+LMB a body to pick");
+        } else {
+            const render::RenderInstance& inst =
+                world.instances[ui_state.selected_inst];
+            char buf[80];
+            std::snprintf(buf, sizeof(buf), "%u", inst.entity.index);
+            StatRow("entity", buf, kAccent);
+            const char* kind = "static";
+            switch (inst.pose_source.kind) {
+                case render::PoseSource::Kind::Link:   kind = "link";   break;
+                case render::PoseSource::Kind::Body:   kind = "body";   break;
+                case render::PoseSource::Kind::Base:   kind = "base";   break;
+                case render::PoseSource::Kind::Static: kind = "static"; break;
+            }
+            StatRow("pose src", kind, kText);
+            std::snprintf(buf, sizeof(buf), "%u", inst.pose_source.row);
+            StatRow("row", buf, kTextDim);
+            const math::Vec3 p = inst.world_xform.position;
+            std::snprintf(buf, sizeof(buf), "%.3f  %.3f  %.3f", p.x, p.y, p.z);
+            StatRow("pos", buf, kText);
+            const bool movable = inst.pose_source.kind == render::PoseSource::Kind::Body ||
+                                 inst.pose_source.kind == render::PoseSource::Kind::Base;
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            if (movable)
+                Badge("MOVABLE", ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.22f), kAccent);
+            else
+                Badge("FIXED", kBgRaised, kTextDim);
+        }
     }
     ImGui::End();
 }

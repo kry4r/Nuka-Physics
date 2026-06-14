@@ -42,6 +42,7 @@
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
+#include "runtime/app/command_queue.hpp"        // MoveEntity command (VIEW-4)
 #include "runtime/app/cuda_vulkan_interop.hpp"  // CudaVulkanInteropPublisher (INT-6)
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
@@ -49,7 +50,12 @@
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/format/nks.hpp"
+#include "scene/graph/scene_graph.hpp"          // SceneGraph::SetSelected (VIEW-3)
 #include "scene/scene_ir.hpp"
+
+#include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget (VIEW-2)
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -125,6 +131,69 @@ int ToImGuiMouseButton(uint32_t b) {
     if (b == 0u) return 0;       // left
     if (b == 2u) return 1;       // right
     return 2;                    // middle
+}
+
+// World-space AABB of one render instance (transform its mesh positions). Empty
+// (lo>hi) when the instance has no geometry.
+void InstanceAabb(const render::RenderInstance& inst, const render::RenderWorld& w,
+                  nuka::math::Vec3* lo, nuka::math::Vec3* hi) {
+    const float fmax = std::numeric_limits<float>::max();
+    *lo = {fmax, fmax, fmax};
+    *hi = {-fmax, -fmax, -fmax};
+    if (inst.mesh_id == render::kNoId || inst.mesh_id >= w.meshes.Count()) return;
+    const render::MeshGeometry& geo = w.meshes.Geometry(inst.mesh_id);
+    for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
+        const nuka::math::Vec3 local{geo.positions[v], geo.positions[v + 1],
+                                     geo.positions[v + 2]};
+        const nuka::math::Vec3 p = inst.world_xform.TransformPoint(local);
+        lo->x = std::min(lo->x, p.x); lo->y = std::min(lo->y, p.y); lo->z = std::min(lo->z, p.z);
+        hi->x = std::max(hi->x, p.x); hi->y = std::max(hi->y, p.y); hi->z = std::max(hi->z, p.z);
+    }
+}
+
+// Ray vs AABB slab test. Returns the near hit distance t>=0 in *t_out and true on
+// a hit in front of the ray.
+bool RayAabb(const viewer::Ray& ray, const nuka::math::Vec3& lo,
+             const nuka::math::Vec3& hi, float* t_out) {
+    float tmin = 0.0f;
+    float tmax = std::numeric_limits<float>::max();
+    const float o[3] = {ray.origin.x, ray.origin.y, ray.origin.z};
+    const float d[3] = {ray.dir.x, ray.dir.y, ray.dir.z};
+    const float lo3[3] = {lo.x, lo.y, lo.z};
+    const float hi3[3] = {hi.x, hi.y, hi.z};
+    for (int a = 0; a < 3; ++a) {
+        if (std::fabs(d[a]) < 1e-8f) {
+            if (o[a] < lo3[a] || o[a] > hi3[a]) return false;  // parallel + outside
+        } else {
+            const float inv = 1.0f / d[a];
+            float t1 = (lo3[a] - o[a]) * inv;
+            float t2 = (hi3[a] - o[a]) * inv;
+            if (t1 > t2) std::swap(t1, t2);
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            if (tmin > tmax) return false;
+        }
+    }
+    if (t_out) *t_out = tmin;
+    return true;
+}
+
+// Pick the nearest MOVABLE instance the ray hits. Returns its index or ~0u.
+uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w) {
+    uint32_t best = ~0u;
+    float best_t = std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i < w.InstanceCount(); ++i) {
+        const render::RenderInstance& inst = w.instances[i];
+        const bool movable = inst.pose_source.kind == render::PoseSource::Kind::Body ||
+                             inst.pose_source.kind == render::PoseSource::Kind::Base;
+        if (!movable) continue;  // only movable bodies are draggable
+        nuka::math::Vec3 lo, hi;
+        InstanceAabb(inst, w, &lo, &hi);
+        if (lo.x > hi.x) continue;  // empty
+        float t;
+        if (RayAabb(ray, lo, hi, &t) && t < best_t) { best_t = t; best = i; }
+    }
+    return best;
 }
 
 }  // namespace
@@ -259,6 +328,24 @@ int main(int argc, char** argv) {
         camera.FrameAabb(lo, hi);
     }
 
+    // VIEW-2: seed the GENERIC per-DOF drive-target editor from the cooked
+    // DriveTarget field for env 0 (DriveTarget is per:link -> links_per_env floats
+    // per env). The slider edits feed FieldId::DriveTarget LIVE each frame. This is
+    // a flat per-DOF editor, NOT a hardcoded choreography (OD-7).
+    if (caps.links_per_env > 0u) {
+        ui_state.drive_targets.assign(caps.links_per_env, 0.0f);
+        ui_state.drive_dirty.assign(caps.links_per_env, 0u);
+        sim.GetWorld().GetData().DownloadField(
+            nk::FieldId::DriveTarget, ui_state.drive_targets.data(),
+            static_cast<uint64_t>(caps.links_per_env) * sizeof(float), 0);
+    }
+
+    // VIEW-3: a viewer-owned editor SceneGraph honoring the SceneGraph::SetSelected
+    // seam. The SceneIR (`scene`) is RETAINED at function scope (its Ecs() resolves
+    // entity->node); `editor_graph` shares those nodes via the registry backref, so
+    // SetSelected(weak) tracks the picked node without copying the tree.
+    nuka::scene::SceneGraph editor_graph;
+
     std::printf("[nuka_viewer] backend=%s device=%s images=%u scene=%s dof=%u instances=%u\n",
                 present->Report().backend_name.c_str(), present->DeviceName().c_str(),
                 present->SwapchainImageCount(), scene_path.c_str(), caps.dofs_per_env,
@@ -273,6 +360,16 @@ int main(int argc, char** argv) {
     bool last_step_healthy = true;
     const auto frame_budget = std::chrono::duration<double>(1.0 / 60.0);
 
+    // VIEW-3/4: picker + drag state. Ctrl is tracked by raw evdev keycode (37/105),
+    // matching camera_controller's Shift handling -- the OD-8 keysyms caveat applies
+    // (raw keycodes are keymap-dependent; documented, blocks no gate).
+    constexpr uint32_t kKeyCtrlL = 37u;
+    constexpr uint32_t kKeyCtrlR = 105u;
+    bool     ctrl_down = false;
+    uint32_t drag_inst = ~0u;          // the instance being dragged (~0u == none)
+    float    last_mouse_x = 0.0f;
+    float    last_mouse_y = 0.0f;
+
     std::vector<window::WindowEvent> events;
     while (!present->ShouldClose()) {
         if (max_frames > 0 && static_cast<int>(frame_index) >= max_frames) break;
@@ -281,11 +378,15 @@ int main(int argc, char** argv) {
         events.clear();
         present->PollEvents(events);
         ImGuiIO& io = ImGui::GetIO();
+        const uint32_t vp_w = present->Report().width;
+        const uint32_t vp_h = present->Report().height;
         for (const window::WindowEvent& ev : events) {
             switch (ev.type) {
                 case window::WindowEvent::Type::MouseMove:
                     io.AddMousePosEvent(static_cast<float>(ev.mouse_x),
                                         static_cast<float>(ev.mouse_y));
+                    last_mouse_x = static_cast<float>(ev.mouse_x);
+                    last_mouse_y = static_cast<float>(ev.mouse_y);
                     break;
                 case window::WindowEvent::Type::MouseButton:
                     io.AddMouseButtonEvent(ToImGuiMouseButton(ev.button), ev.pressed);
@@ -293,13 +394,66 @@ int main(int argc, char** argv) {
                 case window::WindowEvent::Type::Scroll:
                     io.AddMouseWheelEvent(0.0f, static_cast<float>(ev.scroll_delta));
                     break;
+                case window::WindowEvent::Type::Key:
+                    if (ev.key == kKeyCtrlL || ev.key == kKeyCtrlR) ctrl_down = ev.pressed;
+                    break;
                 default:
                     break;
             }
-            // Camera gets the event only if ImGui is not capturing that input.
-            camera.HandleEvent(ev, /*allow_drag=*/!io.WantCaptureMouse,
+
+            // -- VIEW-3/4: Ctrl+LMB pick + drag (only when ImGui isn't capturing
+            // the mouse and Ctrl is held -> never fights the orbit camera). --------
+            const bool over_ui = io.WantCaptureMouse;
+            if (ctrl_down && !over_ui) {
+                if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
+                    if (ev.pressed) {
+                        const viewer::Ray ray = camera.ScreenRay(
+                            static_cast<float>(ev.mouse_x),
+                            static_cast<float>(ev.mouse_y), vp_w, vp_h);
+                        const uint32_t hit = PickInstance(ray, sim.GetRenderWorld());
+                        drag_inst = hit;
+                        if (hit != ~0u) {
+                            ui_state.selected_inst = hit;
+                            const nuka::scene::EntityId e =
+                                sim.GetRenderWorld().instances[hit].entity;
+                            ui_state.selected_entity = e.index;
+                            // VIEW-3: honor the SceneGraph editor-selection seam.
+                            editor_graph.SetSelected(scene.Ecs().NodeOf(e));
+                        }
+                    } else {
+                        drag_inst = ~0u;  // release ends the drag
+                    }
+                } else if (ev.type == window::WindowEvent::Type::MouseMove &&
+                           drag_inst != ~0u &&
+                           drag_inst < sim.GetRenderWorld().InstanceCount()) {
+                    // VIEW-4: unproject the cursor onto a view-facing plane through
+                    // the dragged entity's current position, then push a MoveEntity
+                    // (the GENERAL path: command_queue -> ApplyMoveEntity -> Data).
+                    const render::RenderInstance& inst =
+                        sim.GetRenderWorld().instances[drag_inst];
+                    const nuka::math::Vec3 anchor = inst.world_xform.position;
+                    const viewer::Ray ray = camera.ScreenRay(
+                        static_cast<float>(ev.mouse_x),
+                        static_cast<float>(ev.mouse_y), vp_w, vp_h);
+                    const nuka::math::Vec3 fwd =
+                        (camera.ResolvedTarget() - camera.ResolvedEye()).Normalized();
+                    nuka::math::Vec3 hit;
+                    if (camera.RayPlaneHit(ray, anchor, fwd, &hit)) {
+                        nuka::math::Transform xf = inst.world_xform;
+                        xf.position = hit;  // keep rotation; teleport position
+                        sim.Commands().Push(nuka::runtime::app::Command::MakeMoveEntity(
+                            inst.entity, xf));
+                    }
+                }
+            }
+
+            // Camera gets the event only if ImGui is not capturing that input AND a
+            // Ctrl-drag is not in progress (so picking never spins the camera).
+            const bool cam_allow = !io.WantCaptureMouse && !(ctrl_down);
+            camera.HandleEvent(ev, /*allow_drag=*/cam_allow,
                                /*allow_scroll=*/!io.WantCaptureMouse);
         }
+        (void)last_mouse_x; (void)last_mouse_y;
 
         // -- timing -------------------------------------------------------------
         const auto now = Clock::now();
@@ -335,14 +489,12 @@ int main(int argc, char** argv) {
             ui_state.env_index = env;
             sim.SetEnvIndex(env);
         }
-        // OUT-OF-BAND StepOnce (command_queue.hpp:51): FramePublish drained the
-        // queue AFTER `do_step` was already computed for THIS frame, so a queued
-        // StepOnce cannot be honored same-frame (only the in-UI Step button, which
-        // sets ui_state.step_requested before FramePublish, is). Fold the queued
-        // edge into the NEXT frame's transport so it is not silently dropped.
-        // (We clear step_requested first, then set it from the queued intent, so a
-        // step taken this frame does not leak into the next.)
-        ui_state.step_requested = intents.step_once;
+        // VIEW-6: the in-UI Step button (ui_state.step_requested) was consumed by
+        // `do_step` this frame -> clear the one-shot edge. An OUT-OF-BAND queued
+        // StepOnce is now honored SAME-FRAME inside FramePublish (the queue is
+        // drained before the step decision), so it must NOT also be folded into the
+        // next frame (that would double-step). Just clear the transport edge.
+        ui_state.step_requested = false;
 
         // Reset request: re-frame the camera (a full re-cook is viewer-policy / M11;
         // here Reset re-frames + clears velocity-free, the cheap honest action).
@@ -381,6 +533,26 @@ int main(int argc, char** argv) {
         ui.RecordUi(sim.GetRenderWorld(), stats, camera, ui_state);
         ImGui::Render();
 
+        // VIEW-2: upload any drive sliders that moved this frame into the LIVE nk
+        // Data (FieldId::DriveTarget, env-major: env*links_per_env + dof). Per-DOF
+        // upload of ONLY the changed rows; the general write path (UploadField),
+        // never a choreography table. R13: runtime Data only, never the .nks.
+        if (caps.links_per_env > 0u &&
+            ui_state.drive_dirty.size() == ui_state.drive_targets.size()) {
+            const uint32_t per_env = caps.links_per_env;
+            const uint32_t env =
+                (caps.env_count > 0u) ? (ui_state.env_index % caps.env_count) : 0u;
+            for (uint32_t d = 0; d < ui_state.drive_targets.size(); ++d) {
+                if (!ui_state.drive_dirty[d]) continue;
+                const uint64_t at =
+                    (static_cast<uint64_t>(env) * per_env + d) * sizeof(float);
+                sim.GetWorld().GetData().UploadField(
+                    nk::FieldId::DriveTarget, &ui_state.drive_targets[d],
+                    sizeof(float), at);
+                ui_state.drive_dirty[d] = 0u;
+            }
+        }
+
         // -- camera override + present (overlay = the imgui draw data) ----------
         render::RasterOptions opts;
         opts.width  = present->Report().width;
@@ -395,6 +567,32 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[nuka_viewer] present error at frame %llu\n",
                          static_cast<unsigned long long>(frame_index));
             break;
+        }
+        if (r == render::PresentFrameResult::Recreated) {
+            // VIEW-5: the swapchain (and its present render pass) was rebuilt on
+            // OUT_OF_DATE/SUBOPTIMAL (resize). The ImGui Vulkan backend's pipeline
+            // is now bound to the STALE pass -> rebind it to the renderer's CURRENT
+            // present pass + image counts so the overlay keeps drawing. The ImGui
+            // context (docking layout / panels) survives the rebind.
+            render::RendererVulkanHandles rh = present->VulkanHandles();
+            nuka::render::imgui::NukaImGuiInitInfo rinfo;
+            rinfo.api_version     = rh.api_version;
+            rinfo.instance        = reinterpret_cast<NukaVkInstance>(rh.instance);
+            rinfo.physical_device = reinterpret_cast<NukaVkPhysicalDevice>(rh.physical_device);
+            rinfo.device          = reinterpret_cast<NukaVkDevice>(rh.device);
+            rinfo.queue_family    = rh.graphics_family;
+            rinfo.queue           = reinterpret_cast<NukaVkQueue>(rh.graphics_queue);
+            rinfo.descriptor_pool = reinterpret_cast<NukaVkDescriptorPool>(rh.imgui_descriptor_pool);
+            rinfo.min_image_count = present->MinImageCount();
+            rinfo.image_count     = present->SwapchainImageCount();
+            rinfo.render_pass     = reinterpret_cast<NukaVkRenderPass>(present->PresentRenderPass());
+            rinfo.subpass         = 0u;
+            if (!imgui.RebuildForRenderPass(rinfo)) {
+                std::fprintf(stderr, "[nuka_viewer] ImGui rebind after swapchain "
+                             "recreate failed at frame %llu\n",
+                             static_cast<unsigned long long>(frame_index));
+                break;
+            }
         }
         if (r == render::PresentFrameResult::Presented) ++presented;
 

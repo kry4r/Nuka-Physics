@@ -35,6 +35,17 @@ namespace nuka::runtime::app::viewer {
 namespace window = nuka::render::window;
 
 // ---------------------------------------------------------------------------
+// Ray -- a world-space pick ray (origin + unit direction). VIEW-1 picker math.
+// Pure value type; no Vulkan/CUDA. Built from the resolved camera basis so it
+// matches the raster renderer's right-handed LookAt convention EXACTLY (forward
+// = normalize(target-eye), right = forward x up, true-up = right x forward).
+// ---------------------------------------------------------------------------
+struct Ray {
+    math::Vec3 origin{};
+    math::Vec3 dir{0.0f, 0.0f, -1.0f};  // unit
+};
+
+// ---------------------------------------------------------------------------
 // CameraController -- spherical-orbit interactive camera state.
 //
 // Angles are radians. `yaw` rotates about the world up axis (+Z, the nuka
@@ -72,6 +83,24 @@ public:
     float      Yaw() const { return yaw_; }
     float      Pitch() const { return pitch_; }
     float      Distance() const { return distance_; }
+
+    // ---- picker math (VIEW-1; pure host, no Vulkan) ------------------------
+    // Build the world-space pick ray through pixel (px, py) of a viewport of
+    // (width, height) px. (px, py) is in window coords (origin top-left, +y
+    // DOWN, the xcb/ImGui convention). The ray uses the SAME camera basis +
+    // fov the renderer's LookAt/Perspective use, so a screen click unprojects
+    // onto the geometry the user sees. width/height/fov degenerate -> a forward
+    // ray from the eye. Deterministic (no time input) for the GATE-B record.
+    Ray ScreenRay(float px, float py, uint32_t width, uint32_t height) const;
+
+    // Intersect `ray` with the plane through `plane_point` whose normal is
+    // `plane_normal` (need not be unit). On a hit in front of the ray origin,
+    // writes the world-space hit point to *out and returns true; returns false
+    // for a back-facing / parallel / behind-origin hit. The drag handler uses a
+    // plane through the grabbed entity perpendicular to the view forward so the
+    // entity tracks the cursor at a constant view depth.
+    bool RayPlaneHit(const Ray& ray, const math::Vec3& plane_point,
+                     const math::Vec3& plane_normal, math::Vec3* out) const;
 
     // ---- public tunables the imgui panel reads/writes ----------------------
     float fov_degrees = 45.0f;   // the fov slider in the camera panel drives this

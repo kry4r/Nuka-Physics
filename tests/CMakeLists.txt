@@ -878,6 +878,10 @@ if(CMAKE_CUDA_COMPILER)
         coupling/test_pbd_costep_unified.cpp
         scenario/h1_grasp_lift.cpp
         scenario/union_cook_golden.cpp
+        # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
+        # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
+        # runs in build-cuda128 alongside the other scenario gates.
+        scenario/viewer_move_entity.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test
@@ -890,6 +894,11 @@ if(CMAKE_CUDA_COMPILER)
             # symbols resolve against the cook for h1_grasp_lift / union_cook_golden).
             nuka_test_validated_sources
             nuka_scene_cook
+            # M11 VIEW-4/6: the frame-loop spine (Simulation / systems / publisher /
+            # ApplyMoveEntity) for viewer_move_entity. nuka_app pulls nuka_render for
+            # the RenderWorld POD types (Vulkan is a required package -> link OK even
+            # with NK_BUILD_VULKAN_VALIDATION OFF; RenderSystem is then inert).
+            nuka_app
             nuka_nk
             nuka_phi2
             nuka_solver

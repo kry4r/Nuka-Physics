@@ -116,6 +116,50 @@ void CameraController::WriteOptions(render::RasterOptions& out) const {
     out.camera_fov_degrees  = fov_degrees;
 }
 
+Ray CameraController::ScreenRay(float px, float py, uint32_t width,
+                                uint32_t height) const {
+    Ray ray;
+    const math::Vec3 eye = ResolvedEye();
+    ray.origin = eye;
+    if (width == 0u || height == 0u) {
+        ray.dir = (target_ - eye).Normalized();
+        return ray;
+    }
+    // Camera basis -- EXACTLY the raster renderer's right-handed LookAt:
+    //   forward = normalize(target - eye); right = forward x up; up = right x forward.
+    const math::Vec3 world_up{0.0f, 0.0f, 1.0f};
+    math::Vec3 fwd = (target_ - eye).Normalized();
+    math::Vec3 right = fwd.Cross(world_up);
+    if (right.LengthSq() < 1e-8f) right = math::Vec3{1.0f, 0.0f, 0.0f};
+    right = right.Normalized();
+    const math::Vec3 up = right.Cross(fwd).Normalized();
+
+    // NDC in [-1, 1], y UP (window py is top-left/+y-down -> flip). Pixel centers
+    // at +0.5 so the central pixel maps near the optical axis.
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    const float ndc_x = (2.0f * (px + 0.5f) / static_cast<float>(width)) - 1.0f;
+    const float ndc_y = 1.0f - (2.0f * (py + 0.5f) / static_cast<float>(height));
+    const float fov_rad =
+        std::max(fov_degrees, 1.0f) * 3.14159265358979323846f / 180.0f;
+    const float tan_half_y = std::tan(fov_rad * 0.5f);
+    const float tan_half_x = tan_half_y * aspect;
+
+    math::Vec3 dir = fwd + right * (ndc_x * tan_half_x) + up * (ndc_y * tan_half_y);
+    ray.dir = dir.Normalized();
+    return ray;
+}
+
+bool CameraController::RayPlaneHit(const Ray& ray, const math::Vec3& plane_point,
+                                   const math::Vec3& plane_normal,
+                                   math::Vec3* out) const {
+    const float denom = ray.dir.Dot(plane_normal);
+    if (std::fabs(denom) < 1e-8f) return false;  // parallel
+    const float t = (plane_point - ray.origin).Dot(plane_normal) / denom;
+    if (!(t > 0.0f)) return false;  // behind / on the origin
+    if (out) *out = ray.origin + ray.dir * t;
+    return true;
+}
+
 void CameraController::FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max) {
     const math::Vec3 center{0.5f * (aabb_min.x + aabb_max.x),
                             0.5f * (aabb_min.y + aabb_max.y),
