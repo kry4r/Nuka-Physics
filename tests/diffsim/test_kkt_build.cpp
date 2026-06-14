@@ -29,7 +29,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 
 #include <Eigen/Dense>
@@ -156,7 +157,7 @@ struct BuildResult {
     std::vector<uint32_t> dims;      // block_count
 };
 
-BuildResult RunBuild(const nuka::phi::DeviceContext& ctx,
+BuildResult RunBuild(cudaStream_t ctx, int ctx_dev,
                      const std::vector<Articulation>& batch) {
     const uint32_t bc = static_cast<uint32_t>(batch.size());
     const uint32_t slot_count = bc * kSlots;
@@ -211,12 +212,12 @@ BuildResult RunBuild(const nuka::phi::DeviceContext& ctx,
     diffsim::BatchedDenseSpdSystem system;
     diffsim::ContactDelassusBuffers buffers;
     diffsim::BuildContactDelassusSystem(
-        ctx, static_cast<const art::ArticulatedContactRow*>(d_rows.Data()),
+        ctx, ctx_dev, static_cast<const art::ArticulatedContactRow*>(d_rows.Data()),
         static_cast<const float*>(d_jn.Data()),
         static_cast<const float*>(d_jt1.Data()),
         static_cast<const float*>(d_jt2.Data()),
         static_cast<const float*>(d_minv.Data()), bc, kDof, system, buffers);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     BuildResult res;
     res.values.assign(static_cast<size_t>(bc) * kStride, 0.0f);
@@ -260,9 +261,10 @@ std::vector<Articulation> MakeBatch() {
 }
 
 TEST(KktBuild, MatchesHostGram) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Articulation> batch = MakeBatch();
-    const BuildResult r = RunBuild(ctx, batch);
+    const BuildResult r = RunBuild(ctx, ctx_dev, batch);
 
     double max_rel = 0.0;
     double max_sym = 0.0;
@@ -328,10 +330,11 @@ TEST(KktBuild, MatchesHostGram) {
 }
 
 TEST(KktBuild, BitExactSameInputs) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const std::vector<Articulation> batch = MakeBatch();
-    const BuildResult r1 = RunBuild(ctx, batch);
-    const BuildResult r2 = RunBuild(ctx, batch);
+    const BuildResult r1 = RunBuild(ctx, ctx_dev, batch);
+    const BuildResult r2 = RunBuild(ctx, ctx_dev, batch);
     ASSERT_EQ(r1.values.size(), r2.values.size());
     ASSERT_EQ(r1.dims.size(), r2.dims.size());
     // Raw-bit comparison over the FULL values span (incl. all padding + empty

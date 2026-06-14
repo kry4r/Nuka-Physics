@@ -37,7 +37,9 @@
 
 #include "constraint/collidable.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -117,7 +119,7 @@ private:
 // Computes each pair's stable_key (canonical), uploads, and thrust::stable_sorts
 // ascending by stable_key -> a D1 byte-exact stream. The reusable builder C2b/C2c
 // call after their private-slice broadphase fill. `count == 0` -> empty stream.
-CandidatePairStream BuildCandidatePairStream(const phi::DeviceContext& context,
+CandidatePairStream BuildCandidatePairStream(cudaStream_t stream, int device_id,
                                              const std::vector<CandidatePair>& unsorted_pairs);
 
 // Default-context overload (mirrors the cross_system_query.hpp pair).

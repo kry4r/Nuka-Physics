@@ -33,7 +33,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -179,13 +180,13 @@ struct DeviceMResult {
 
 // Uploads `host`, runs ABA (so link_xup / motion subspaces / link_velocity are
 // current for `host.qdot`), then M, then the LDL^T inverse; downloads all three.
-DeviceMResult RunDeviceM(const nuka::phi::DeviceContext& context,
+DeviceMResult RunDeviceM(cudaStream_t context, int context_dev,
                          const articulation::ArticulationHostState& host,
                          uint32_t max_dof,
                          float gravity_z) {
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     auto view = device.View();
-    articulation::FeatherstoneAba::ComputeAccelerations(context, view, gravity_z);
+    articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, gravity_z);
 
     const uint32_t link_count = host.TotalLinkCount();
     const uint32_t artic_count = host.ArticulationCount();
@@ -197,14 +198,14 @@ DeviceMResult RunDeviceM(const nuka::phi::DeviceContext& context,
     OwnedDeviceBuffer minv_buf(static_cast<size_t>(artic_count) * tile * sizeof(float));
 
     articulation::ComputeArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
         static_cast<float*>(m_buf.Data()));
     articulation::FactorArticulationInertiaM(
-        context, view, max_dof,
+        context, context_dev, view, max_dof,
         static_cast<const float*>(m_buf.Data()),
         static_cast<float*>(minv_buf.Data()));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 
     DeviceMResult result;
     result.M.resize(static_cast<size_t>(artic_count) * tile);
@@ -241,7 +242,8 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
     ASSERT_EQ(dof_to_link.size(), dof);
 
     const float kGravity = 0.0f;  // gravity does not enter M; keep velocities clean.
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // ---------------------------------------------------------------------
     // (a) M correctness via the kinetic-energy identity, at a BENT pose.
@@ -269,7 +271,7 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
             qdot_local[i] = v;
             host.qdot[dof_to_link[i]] = v;
         }
-        const auto res = RunDeviceM(context, host, max_dof, kGravity);
+        const auto res = RunDeviceM(context, context_dev, host, max_dof, kGravity);
 
         const uint32_t offset = host.articulation_link_offset[0];
         const uint32_t count = host.articulation_link_count[0];
@@ -302,7 +304,7 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         for (auto& v : host.qdot) {
             v = 0.0f;
         }
-        const auto res = RunDeviceM(context, host, max_dof, kGravity);
+        const auto res = RunDeviceM(context, context_dev, host, max_dof, kGravity);
         const uint32_t offset = host.articulation_link_offset[0];
         const uint32_t count = host.articulation_link_count[0];
 
@@ -313,7 +315,7 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
             for (uint32_t i = 0u; i < dof; ++i) {
                 probe.qdot[dof_to_link[i]] = qdot_local[i];
             }
-            const auto r = RunDeviceM(context, probe, max_dof, kGravity);
+            const auto r = RunDeviceM(context, context_dev, probe, max_dof, kGravity);
             return HostKineticEnergy(r.link_velocity, probe.link_inertia,
                                      offset, offset + count);
         };
@@ -374,8 +376,8 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         for (auto& v : host.qdot) {
             v = 0.0f;
         }
-        const auto run_a = RunDeviceM(context, host, max_dof, kGravity);
-        const auto run_b = RunDeviceM(context, host, max_dof, kGravity);
+        const auto run_a = RunDeviceM(context, context_dev, host, max_dof, kGravity);
+        const auto run_b = RunDeviceM(context, context_dev, host, max_dof, kGravity);
         ASSERT_EQ(run_a.M.size(), run_b.M.size());
         for (size_t i = 0u; i < run_a.M.size(); ++i) {
             EXPECT_EQ(run_a.M[i], run_b.M[i]) << "M not bit-identical across runs at " << i;
@@ -389,7 +391,7 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         constexpr uint32_t kEnvCount = 64u;
         auto batched = articulation::ReplicateArticulationHostState(host, kEnvCount);
         ASSERT_EQ(batched.ArticulationCount(), kEnvCount);
-        const auto batched_res = RunDeviceM(context, batched, max_dof, kGravity);
+        const auto batched_res = RunDeviceM(context, context_dev, batched, max_dof, kGravity);
         for (uint32_t env = 1u; env < kEnvCount; ++env) {
             for (size_t i = 0u; i < tile; ++i) {
                 ASSERT_EQ(batched_res.M[env * tile + i], batched_res.M[i])
@@ -413,7 +415,7 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         for (auto& v : host.qdot) {
             v = 0.0f;
         }
-        const auto res = RunDeviceM(context, host, max_dof, kGravity);
+        const auto res = RunDeviceM(context, context_dev, host, max_dof, kGravity);
 
         // No NaN/Inf anywhere in M or M^-1; diagonal strictly positive.
         for (uint32_t r = 0u; r < dof; ++r) {
@@ -447,15 +449,15 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         // -- effective mass for a vertical foot contact --------------------
         // World poses for the (straight) pose, then a chain Jacobian for a
         // vertical contact at a foot, then m_eff = 1 / (J M^-1 J^T).
-        auto device = articulation::UploadArticulationState(context, host);
+        auto device = articulation::UploadArticulationState(context, context_dev, host);
         auto view = device.View();
-        articulation::FeatherstoneAba::ComputeAccelerations(context, view, kGravity);
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, kGravity);
 
         OwnedDeviceBuffer pose_buf(
             static_cast<size_t>(base_link_count) * sizeof(Transform));
         articulation::UpdateWorldLinkPoses(
-            context, view, static_cast<Transform*>(pose_buf.Data()));
-        context.stream.Synchronize();
+            context, context_dev, view, static_cast<Transform*>(pose_buf.Data()));
+        cudaStreamSynchronize(context);
         std::vector<Transform> world(base_link_count);
         pose_buf.CopyToHost(world.data(), world.size() * sizeof(Transform));
 
@@ -464,9 +466,9 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         for (uint32_t link = 0u; link < base_link_count; ++link) {
             host.link_pose[link] = world[link];
         }
-        device = articulation::UploadArticulationState(context, host);
+        device = articulation::UploadArticulationState(context, context_dev, host);
         view = device.View();
-        articulation::FeatherstoneAba::ComputeAccelerations(context, view, kGravity);
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, view, kGravity);
 
         // Rebuild M / M^-1 against the FK-updated state (pose unchanged, so M is
         // the same; this keeps the M^-1 buffer consistent with `view`).
@@ -476,11 +478,11 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         OwnedDeviceBuffer m_buf(tile * sizeof(float));
         OwnedDeviceBuffer minv_buf(tile * sizeof(float));
         articulation::ComputeArticulationInertiaM(
-            context, view, max_dof,
+            context, context_dev, view, max_dof,
             static_cast<articulation::LinkSpatialInertia*>(composite_buf.Data()),
             static_cast<float*>(m_buf.Data()));
         articulation::FactorArticulationInertiaM(
-            context, view, max_dof,
+            context, context_dev, view, max_dof,
             static_cast<const float*>(m_buf.Data()),
             static_cast<float*>(minv_buf.Data()));
 
@@ -520,20 +522,20 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
         normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
 
         articulation::ComputeContactChainJacobians(
-            context, view,
+            context, context_dev, view,
             static_cast<const uint32_t*>(link_idx_buf.Data()),
             static_cast<const Vec3*>(point_buf.Data()),
             static_cast<const Vec3*>(normal_buf.Data()),
             contact_count, max_dof,
             static_cast<float*>(jac_buf.Data()));
         articulation::ComputeContactEffectiveMass(
-            context, view,
+            context, context_dev, view,
             static_cast<const uint32_t*>(link_idx_buf.Data()),
             static_cast<const float*>(jac_buf.Data()),
             static_cast<const float*>(minv_buf.Data()),
             contact_count, max_dof,
             static_cast<float*>(meff_buf.Data()));
-        context.stream.Synchronize();
+        cudaStreamSynchronize(context);
 
         float m_eff = 0.0f;
         meff_buf.CopyToHost(&m_eff, sizeof(float));
@@ -569,13 +571,13 @@ TEST(ArticulationInertiaM, CrbaMatchesKineticEnergyAndFactorizationIsDeterminist
             OwnedDeviceBuffer tiny_jac_buf(static_cast<size_t>(max_dof) * sizeof(float));
             tiny_jac_buf.CopyFromHost(tiny_j.data(), tiny_j.size() * sizeof(float));
             articulation::ComputeContactEffectiveMass(
-                context, view,
+                context, context_dev, view,
                 static_cast<const uint32_t*>(link_idx_buf.Data()),
                 static_cast<const float*>(tiny_jac_buf.Data()),
                 static_cast<const float*>(minv_buf.Data()),
                 contact_count, max_dof,
                 static_cast<float*>(meff_buf.Data()));
-            context.stream.Synchronize();
+            cudaStreamSynchronize(context);
             float clamped_m_eff = 0.0f;
             meff_buf.CopyToHost(&clamped_m_eff, sizeof(float));
             std::printf("[diag] (c) clamped (near-zero J) m_eff = %.6g kg\n",

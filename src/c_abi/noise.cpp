@@ -21,7 +21,7 @@
 #include "c_abi/internal.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "sensor/noise/n1_gaussian.hpp"
 #include "sensor/noise/n1_poisson.hpp"
@@ -137,8 +137,9 @@ nuka_result_t ApplyPerEpisodeRandomization(
     const uint32_t env_count = (record.env_count == 0u) ? 1u : record.env_count;
     const uint32_t total_links = links_per_env * env_count;
 
-    const auto& ctx = record.device->context;
-    nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+    const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+    const int device_id = record.device->device_id;
+    nuka::phi::ScopedDeviceGuard guard(device_id);
 
     auto* device_inertia =
         record.world->FieldPtr<articulation::LinkSpatialInertia>(
@@ -179,7 +180,7 @@ nuka_result_t ApplyPerEpisodeRandomization(
                 cudaError_t copy_status = cudaMemcpyAsync(
                     device_inertia + link, &new_inertia,
                     sizeof(articulation::LinkSpatialInertia),
-                    cudaMemcpyHostToDevice, ctx.stream.Native());
+                    cudaMemcpyHostToDevice, stream);
                 if (copy_status != cudaSuccess) {
                     return NUKA_RESULT_INTERNAL;
                 }
@@ -211,7 +212,7 @@ nuka_result_t ApplyPerEpisodeRandomization(
                 const uint32_t dof = env * dof_per_env + local;
                 cudaError_t copy_status = cudaMemcpyAsync(
                     device_armature + dof, &value, sizeof(float),
-                    cudaMemcpyHostToDevice, ctx.stream.Native());
+                    cudaMemcpyHostToDevice, stream);
                 if (copy_status != cudaSuccess) {
                     return NUKA_RESULT_INTERNAL;
                 }
@@ -238,7 +239,7 @@ nuka_result_t ApplyPerEpisodeRandomization(
         (void)sampled;
     }
 
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(stream);
     return NUKA_RESULT_OK;
 }
 
@@ -329,7 +330,8 @@ nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world,
         if (record->device == nullptr) {
             return NUKA_RESULT_NULL_HANDLE;
         }
-        const nuka::phi::DeviceContext& ctx = record->device->context;
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const int device_id = record->device->device_id;
         float* data = static_cast<float*>(view.device_ptr);
         // Sensor buffers are small (<< 2^32 floats); guard the narrowing.
         if (view.element_count > 0xFFFFFFFFull) {
@@ -340,17 +342,17 @@ nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world,
 
         switch (cfg.kind) {
             case noise::NoiseKind::Gaussian:
-                noise::LaunchGaussianNoise(ctx, data, count, cfg.param1,
+                noise::LaunchGaussianNoise(stream, device_id, data, count, cfg.param1,
                                            cfg.param2, cfg.seed, seq);
                 break;
             case noise::NoiseKind::Poisson:
-                noise::LaunchPoissonNoise(ctx, data, count, cfg.param1, cfg.seed,
+                noise::LaunchPoissonNoise(stream, device_id, data, count, cfg.param1, cfg.seed,
                                           seq);
                 break;
             case noise::NoiseKind::None:
                 return NUKA_RESULT_OK;  // unreachable (guarded above)
         }
-        ctx.stream.Synchronize();
+        cudaStreamSynchronize(stream);
         record->noise_seq[f] = seq + 1u;  // advance for the next apply
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {

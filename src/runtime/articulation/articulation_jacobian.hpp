@@ -4,14 +4,16 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
 
 namespace nuka::runtime::articulation {
 
-void ComputeLinkPointJacobians(const phi::DeviceContext& context,
+void ComputeLinkPointJacobians(cudaStream_t stream, int device_id,
                                ArticulationDeviceState state,
                                const uint32_t* contact_link_indices,
                                const math::Vec3* contact_point_world,
@@ -41,7 +43,7 @@ void ComputeLinkPointJacobians(const phi::DeviceContext& context,
 // articulation's link order (Revolute=Prismatic=1, Fixed=0, future
 // FloatingBase=6). The caller must zero `out_chain_jacobian` before the call;
 // the kernel only writes the columns of the contact's ancestor chain.
-void ComputeContactChainJacobians(const phi::DeviceContext& context,
+void ComputeContactChainJacobians(cudaStream_t stream, int device_id,
                                   ArticulationDeviceState state,
                                   const uint32_t* contact_link_indices,
                                   const math::Vec3* contact_point_world,

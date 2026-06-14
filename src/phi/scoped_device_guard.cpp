@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
-// PHI - per-handle CUDA device context
+// PHI - scoped CUDA active-device guard
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 
 #include <cuda_runtime.h>
 
@@ -21,25 +21,6 @@ void CheckCuda(cudaError_t error, const char* label) {
 }
 
 } // namespace
-
-void StreamView::Synchronize() const {
-    CheckCuda(cudaStreamSynchronize(handle_), "cudaStreamSynchronize");
-}
-
-DeviceContext MakeDeviceContext(int device_id,
-                                cudaStream_t external_stream,
-                                const PlatformContract& contract) {
-    DeviceContext context;
-    context.device_id = device_id;
-    context.stream = StreamView{external_stream};
-    context.contract = contract;
-    context.contract.cuda_device_id = device_id;
-    return context;
-}
-
-DeviceContext MakeDefaultDeviceContext() {
-    return MakeDeviceContext(0, nullptr, PlatformContract{});
-}
 
 ScopedDeviceGuard::ScopedDeviceGuard(int device_id) {
     CheckCuda(cudaGetDevice(&prior_device_), "cudaGetDevice");

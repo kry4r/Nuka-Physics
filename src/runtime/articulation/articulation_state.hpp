@@ -7,8 +7,10 @@
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // phi::ModelView/DataView (M3b nk seam)
 #include "phi/buffer.hpp"                 // phi v2 opaque Buffer* + free-fn wrappers
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "scene/canonical_types.hpp"
+
+#include <cuda_runtime.h>  // cudaStream_t
 #include "scene/cooked_blob.hpp"
 
 #include <cstdint>
@@ -161,7 +163,7 @@ struct ArticulationHostState {
 // upload a host state, run kernels, and read it back. The 29 members are phi v2
 // opaque Buffer* (allocated from the device-level DEFAULT, stream-0 BufferType in
 // UploadArticulationState -- byte+ordering identical to the legacy stream-0
-// CopyFromHost/ToHost) with RAII teardown below.
+// host->device copy) with RAII teardown below.
 struct ArticulationDeviceBuffers {
     phi::Buffer* link_inertia = nullptr;
     phi::Buffer* link_velocity = nullptr;
@@ -222,7 +224,7 @@ ArticulationHostState BuildArticulationHostState(
 // parallel. See the implementation for the local-vs-global index reasoning.
 ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState& base,
                                                      uint32_t env_count);
-ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& context,
+ArticulationDeviceBuffers UploadArticulationState(cudaStream_t stream, int device_id,
                                                   const ArticulationHostState& host_state);
 ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& host_state);
 void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,

@@ -136,12 +136,12 @@ __global__ void Ilu0FactorizeTestKernel(const float* __restrict__ a,
 }  // namespace
 
 // Host launcher for the device ILU(0) factorization test kernel.
-void LaunchIlu0FactorizeTest(const phi::DeviceContext& context, const float* a,
+void LaunchIlu0FactorizeTest(cudaStream_t stream, int device_id, const float* a,
                              const uint32_t* block_dim, float* lu,
                              uint32_t block_count) {
     if (block_count == 0u) return;
-    phi::ScopedDeviceGuard guard(context.device_id);
-    Ilu0FactorizeTestKernel<<<block_count, kWarpSize, 0u, context.stream.Native()>>>(
+    phi::ScopedDeviceGuard guard(device_id);
+    Ilu0FactorizeTestKernel<<<block_count, kWarpSize, 0u, stream>>>(
         a, block_dim, lu, block_count);
 }
 

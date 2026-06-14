@@ -13,7 +13,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -75,7 +76,7 @@ OwnedDeviceBuffer UploadBuffer(const std::vector<T>& host) {
 }
 
 // Solve a single dense symmetric block (n x n) with self-written MINRES.
-std::vector<float> SolveOne(const nuka::phi::DeviceContext& ctx,
+std::vector<float> SolveOne(cudaStream_t ctx, int ctx_dev,
                             const std::vector<float>& dense_nn, uint32_t n,
                             const std::vector<float>& b) {
     std::vector<float> values(kStride, 0.0f);
@@ -101,10 +102,10 @@ std::vector<float> SolveOne(const nuka::phi::DeviceContext& ctx,
     params.tol = 1.0e-7f;
     params.run_to_fixed_iters = true;
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -127,7 +128,8 @@ double Residual(const std::vector<float>& dense_nn, uint32_t n,
 }
 
 TEST(MinresIndefinite, KnownTestProblem) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     // Symmetric indefinite 3x3: eigenvalues {+4, +1, -2} (mixed sign).
     //   diag(1, 3, -1) rotated a little to couple the rows.
     const uint32_t n = 3u;
@@ -136,20 +138,21 @@ TEST(MinresIndefinite, KnownTestProblem) {
         1.0f,  1.0f,  1.0f,
         0.0f,  1.0f, -2.0f};  // symmetric, det<0 -> indefinite
     const std::vector<float> b = {1.0f, -2.0f, 0.5f};
-    const std::vector<float> x = SolveOne(ctx, A, n, b);
+    const std::vector<float> x = SolveOne(ctx, ctx_dev, A, n, b);
     const double rel = Residual(A, n, b, x);
     std::printf("[MinresIndefinite] 3x3 indefinite: ||Ax-b||/||b|| = %.3e\n", rel);
     EXPECT_LT(rel, 1.0e-5) << "MINRES failed on a known indefinite 3x3";
 }
 
 TEST(MinresIndefinite, SaddlePointKkt) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     // 2x2 saddle point [[H, c],[c, 0]] with H>0: POSITIVE+ZERO diagonal but
     // INDEFINITE (det = -c^2 < 0). The case a raw-diagonal detector mis-routes.
     const uint32_t n = 2u;
     const std::vector<float> A = {3.0f, 2.0f, 2.0f, 0.0f};
     const std::vector<float> b = {1.0f, 1.0f};
-    const std::vector<float> x = SolveOne(ctx, A, n, b);
+    const std::vector<float> x = SolveOne(ctx, ctx_dev, A, n, b);
     const double rel = Residual(A, n, b, x);
     std::printf("[MinresIndefinite] 2x2 saddle (pos diag, indefinite): "
                 "||Ax-b||/||b|| = %.3e\n", rel);
@@ -157,13 +160,14 @@ TEST(MinresIndefinite, SaddlePointKkt) {
 }
 
 TEST(MinresIndefinite, BitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t n = 3u;
     const std::vector<float> A = {2.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f,
                                   0.0f, 1.0f, -2.0f};
     const std::vector<float> b = {1.0f, -2.0f, 0.5f};
-    const std::vector<float> x1 = SolveOne(ctx, A, n, b);
-    const std::vector<float> x2 = SolveOne(ctx, A, n, b);
+    const std::vector<float> x1 = SolveOne(ctx, ctx_dev, A, n, b);
+    const std::vector<float> x2 = SolveOne(ctx, ctx_dev, A, n, b);
     EXPECT_EQ(std::memcmp(x1.data(), x2.data(), x1.size() * sizeof(float)), 0)
         << "MINRES not byte-identical two-run on the indefinite 3x3";
     std::printf("[MinresIndefinite] two-run byte-identical\n");

@@ -37,7 +37,8 @@
 #include "diffsim/sparse_solver_cg.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
 #include <gtest/gtest.h>
@@ -117,7 +118,7 @@ Eigen::MatrixXd MakeSpd(uint32_t n, double kappa, std::mt19937& rng) {
 }
 
 // Run Jacobi CG to EXACTLY k fixed iterations on a single block; return x_k (host).
-Eigen::VectorXd SolveKIters(const nuka::phi::DeviceContext& ctx,
+Eigen::VectorXd SolveKIters(cudaStream_t ctx, int ctx_dev,
                             const Eigen::MatrixXd& A, const Eigen::VectorXd& b,
                             uint32_t k) {
     const uint32_t n = static_cast<uint32_t>(A.rows());
@@ -144,10 +145,10 @@ Eigen::VectorXd SolveKIters(const nuka::phi::DeviceContext& ctx,
     params.max_iter = k;
     params.run_to_fixed_iters = true;  // exactly k iters -> x_k
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -162,7 +163,8 @@ double ANorm(const Eigen::MatrixXd& A, const Eigen::VectorXd& e) {
 }
 
 TEST(CgConvergenceRate, AnormBoundHoldsInformativeRegime) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     constexpr uint32_t n = kMd;       // 12 -> the most CG iterations the cap allows
     const double kappa = 100.0;       // sqrt(kappa)=10 < n -> bound is informative
     std::mt19937 rng(0xCA11Bu);
@@ -186,7 +188,7 @@ TEST(CgConvergenceRate, AnormBoundHoldsInformativeRegime) {
 
     bool any_informative = false;
     for (uint32_t k = 1u; k <= n; ++k) {
-        const Eigen::VectorXd xk = SolveKIters(ctx, A, b, k);
+        const Eigen::VectorXd xk = SolveKIters(ctx, ctx_dev, A, b, k);
         const double ek = ANorm(A, x_star - xk);
         const double bound = 2.0 * std::pow(rho, static_cast<double>(k)) * e0;
         const double eff_bound = std::max(bound, floor_abs);
@@ -212,7 +214,8 @@ TEST(CgConvergenceRate, AnormBoundHoldsInformativeRegime) {
 // trajectory the diagnostics expose for the general path). This both EXERCISES the
 // diagnostics buffer and documents the convergence trajectory.
 TEST(CgConvergenceRate, ResidualHistoryDiagnosticIsCapturedAndFinite) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     constexpr uint32_t n = kMd;
     const double kappa = 100.0;
     std::mt19937 rng(0x1570Au);
@@ -262,10 +265,10 @@ TEST(CgConvergenceRate, ResidualHistoryDiagnosticIsCapturedAndFinite) {
     params.diagnostics.residual_history = static_cast<float*>(d_hist.Data());
     params.diagnostics.history_cap = cap;
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_cg", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     uint32_t iters = 0u;
     float final_resid = 0.0f;

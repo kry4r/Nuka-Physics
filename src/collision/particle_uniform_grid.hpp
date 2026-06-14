@@ -28,7 +28,9 @@
 
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
@@ -141,7 +143,7 @@ private:
 //
 // Self is excluded from each particle's neighbor list. Neighbors are capped at
 // kParticleGridMaxNeighbors per particle (lowest-index subset; surplus counted).
-ParticleGridResult BuildParticleUniformGrid(const phi::DeviceContext& context,
+ParticleGridResult BuildParticleUniformGrid(cudaStream_t stream, int device_id,
                                             const math::Vec3* positions,
                                             uint32_t particle_count,
                                             const ParticleGridConfig& config,

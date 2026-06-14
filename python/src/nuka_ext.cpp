@@ -87,11 +87,11 @@ using Uint32Array = nb::ndarray<nb::pytorch, uint32_t>;
 class Device {
 public:
     // stream_ptr: optional caller-supplied cudaStream_t (as a uintptr_t). 0 =>
-    // null => the engine creates+owns a default stream. A non-zero value is
-    // adopted verbatim as the device-context stream (see src/c_abi/device.cpp:
-    // when desc.cuda_stream != nullptr the engine skips its OwnedStream and runs
-    // every kernel on the supplied stream) -- this is how a torch
-    // cuda_stream flows in so torch ops + physics share ordering with no
+    // null => the legacy orchestration runs on stream 0 (the NULL/default
+    // stream; see src/c_abi/device.cpp). The desc.cuda_stream field is accepted
+    // by the ABI but BUF-14 routes the legacy paths through stream 0, which
+    // serializes with the phi-v2 backend's blocking `main` stream via NULL-stream
+    // implicit sync -- so torch ops + physics still share ordering with no
     // explicit cudaStreamSynchronize.
     static Device* create(uint32_t ordinal, uintptr_t stream_ptr) {
         nuka_device_desc_t desc{};

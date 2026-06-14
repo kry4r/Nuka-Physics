@@ -35,7 +35,7 @@
 namespace nuka::phi {
 
 // Allocate a device Buffer* from `bt` and upload a host vector. An empty vector
-// allocates a zero-byte Buffer and skips the copy (mirrors legacy UploadVector).
+// allocates a zero-byte Buffer and skips the copy.
 template <typename T>
 Buffer* UploadVectorV2(BufferType* bt, const std::vector<T>& values) {
     Buffer* buffer = BufferAlloc(bt, values.size() * sizeof(T));
@@ -45,8 +45,7 @@ Buffer* UploadVectorV2(BufferType* bt, const std::vector<T>& values) {
     return buffer;
 }
 
-// Download `count` elements from a device Buffer* into a new vector (mirrors the
-// by-count legacy DownloadVector overload).
+// Download `count` elements from a device Buffer* into a new vector.
 template <typename T>
 std::vector<T> DownloadVectorV2(Buffer* buffer, std::uint32_t count) {
     std::vector<T> values(count);

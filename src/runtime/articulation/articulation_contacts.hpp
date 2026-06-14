@@ -31,7 +31,9 @@
 // ---------------------------------------------------------------------------
 
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
@@ -55,7 +57,7 @@ struct FootShape {
 // (A) Recompute world poses for every link from the current q. `out_world_pose`
 // must be a device buffer of length state.total_link_count. One block per
 // articulation, single forward pass over the links.
-void UpdateWorldLinkPoses(const phi::DeviceContext& context,
+void UpdateWorldLinkPoses(cudaStream_t stream, int device_id,
                           ArticulationDeviceState state,
                           math::Transform* out_world_pose);
 
@@ -128,7 +130,7 @@ constexpr float kEffectiveMassDenomEpsilon = 1.0e-9f;
 // damping unconditionally stably. null/0 -> pure CRBA M (unit tests / single-env
 // path unchanged). The free floating-base DOFs are never damped (kernel skips the
 // floating root), matching c_j=0 on the base in the solve.
-void ComputeArticulationInertiaM(const phi::DeviceContext& context,
+void ComputeArticulationInertiaM(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  uint32_t max_dof,
                                  LinkSpatialInertia* composite_inertia_scratch,
@@ -144,7 +146,7 @@ void ComputeArticulationInertiaM(const phi::DeviceContext& context,
 // kMaxArticulationDof (the factor scratch ceiling) AND equal every
 // articulation's exact DOF count; exceeding the ceiling throws LOUDLY here
 // (G0: never a silent clamp -- the old 18-cap silently welded DOFs past it).
-void FactorArticulationInertiaM(const phi::DeviceContext& context,
+void FactorArticulationInertiaM(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 const float* inertia_M,
@@ -162,7 +164,7 @@ void FactorArticulationInertiaM(const phi::DeviceContext& context,
 // articulation, single lane, fixed loop order, no atomics => D1-deterministic;
 // bit-for-bit identical to the batched contacts-OFF solve. joint_damping==nullptr
 // || dt<=0 -> qdot unchanged.
-void ApplyImplicitJointDamping(const phi::DeviceContext& context,
+void ApplyImplicitJointDamping(cudaStream_t stream, int device_id,
                                ArticulationDeviceState state,
                                const float* inertia_M_inv,
                                const float* joint_damping,
@@ -176,7 +178,7 @@ void ApplyImplicitJointDamping(const phi::DeviceContext& context,
 // contact selects its articulation's M^-1 tile via
 // link_to_articulation[contact_link]. `out_effective_mass` is a device buffer of
 // length contact_count. Invalid/empty contacts (link out of range) write 0.
-void ComputeContactEffectiveMass(const phi::DeviceContext& context,
+void ComputeContactEffectiveMass(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  const uint32_t* contact_link_indices,
                                  const float* chain_jacobian,
@@ -325,7 +327,7 @@ constexpr uint32_t kMaxContactSolverDof = 18u;
 // re-running ComputeContactChainJacobians with the tangent directions as the
 // "normal" (so the assembled tangent rows reuse the proven J builder). `dof_stride`
 // must equal max_dof. One thread per contact slot. No atomics.
-void AssembleArticulatedContactRows(const phi::DeviceContext& context,
+void AssembleArticulatedContactRows(cudaStream_t stream, int device_id,
                                     ArticulationDeviceState state,
                                     const uint32_t* contact_link,
                                     const math::Vec3* contact_normal,
@@ -343,7 +345,7 @@ void AssembleArticulatedContactRows(const phi::DeviceContext& context,
 // branch-stable basis (fixed reference axis). The caller feeds out_tangent1 /
 // out_tangent2 to ComputeContactChainJacobians as the contact "normal" to obtain
 // the tangent chain-Jacobian rows. One thread per contact slot.
-void ComputeContactTangentBasis(const phi::DeviceContext& context,
+void ComputeContactTangentBasis(cudaStream_t stream, int device_id,
                                 const uint32_t* contact_link,
                                 const math::Vec3* contact_normal,
                                 uint32_t env_count,
@@ -377,7 +379,7 @@ void ComputeContactTangentBasis(const phi::DeviceContext& context,
 // joint damping and contacts share one consistent (M+dt*C)^-1 admittance. null ->
 // no implicit damping (prior behaviour, bit-for-bit). It is a per-DOF coefficient
 // applied in fixed order with no atomics, so it preserves D1 determinism.
-void SolveArticulatedContactRows(const phi::DeviceContext& context,
+void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
                                  ArticulationDeviceState state,
                                  const ArticulatedContactRow* rows,
                                  const float* normal_jacobian,
@@ -412,7 +414,7 @@ void SolveArticulatedContactRows(const phi::DeviceContext& context,
 // Unused trailing slots are cleared: link = ~0u (kInvalidLink, which downstream
 // chain-Jacobian consumers skip), point/normal = 0, depth = 0. `foot_count` must
 // be <= kMaxFootContactsPerEnv.
-void DetectFootGroundContacts(const phi::DeviceContext& context,
+void DetectFootGroundContacts(cudaStream_t stream, int device_id,
                               const math::Transform* world_pose,
                               const FootShape* feet,
                               uint32_t foot_count,

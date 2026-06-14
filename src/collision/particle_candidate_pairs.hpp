@@ -43,7 +43,9 @@
 #include "collision/candidate_pair.hpp"          // CandidatePairStream
 #include "collision/particle_uniform_grid.hpp"   // ParticleGridConfig
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "scene/cooked_blob.hpp"                  // SystemKind, SystemPairMatrix
 
 #include <cstdint>
@@ -72,7 +74,7 @@ using scene::SystemPairMatrix;
 //
 // `particle_count == 0` or the gate-off -> empty stream (no kernel launch).
 CandidatePairStream BuildParticleRigidCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions, uint32_t particle_count,
     SystemKind particle_system,
     const gpu::LbvhBroadphaseResult& rigid_tree,
@@ -103,7 +105,7 @@ CandidatePairStream BuildParticleRigidCandidatePairs(
 //
 // `particle_count == 0` or gate-off -> empty stream (no kernel launch).
 CandidatePairStream BuildParticleParticleCandidatePairs(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const math::Vec3* particle_positions, uint32_t particle_count,
     SystemKind particle_system,
     const gpu::ParticleGridConfig& config,

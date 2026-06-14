@@ -45,7 +45,9 @@
 #include "diffsim/kkt_builder.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -101,7 +103,7 @@ struct IftContactGrads {
 // Run calls of the same shape).
 class IftRunner {
 public:
-    explicit IftRunner(const phi::DeviceContext& context,
+    explicit IftRunner(cudaStream_t stream, int device_id,
                        DeterminismLevel determinism = DeterminismLevel::Strong);
 
     // Run the IFT contact-gradient reverse. `g` is the downstream cotangent
@@ -136,7 +138,8 @@ private:
     void RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, float* z,
                        const SolveParams& params);
 
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     DeterminismLevel determinism_;
     std::unique_ptr<SparseLinearSolver> solver_;       // CG (SPD), the default path
     // v0.7 p02: lazily-constructed MINRES backend, used ONLY when the assembled KKT

@@ -26,7 +26,8 @@
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 
 #include <gtest/gtest.h>
 
@@ -101,7 +102,7 @@ std::vector<double> MakeIllConditionedSparse(uint32_t n) {
     return A;
 }
 
-double RunResidual(const nuka::phi::DeviceContext& ctx, const std::vector<double>& A,
+double RunResidual(cudaStream_t ctx, int ctx_dev, const std::vector<double>& A,
                    uint32_t n, const std::vector<double>& b,
                    diffsim::Preconditioner precond, uint32_t max_iter) {
     std::vector<float> values(kStride, 0.0f), rhs(kMd, 0.0f);
@@ -127,10 +128,10 @@ double RunResidual(const nuka::phi::DeviceContext& ctx, const std::vector<double
     params.tol = 1.0e-8f;  // tight; we measure iters to reach kTargetResid below
     params.run_to_fixed_iters = false;  // allow deterministic early exit
 
-    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx);
+    auto solver = diffsim::MakeSparseSolverBackend("self_minres", ctx, ctx_dev);
     solver->Solve(system, static_cast<const float*>(d_b.Data()),
                   static_cast<float*>(d_x.Data()), params);
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     std::vector<float> x(kMd, 0.0f);
     d_x.CopyToHost(x.data(), x.size() * sizeof(float));
@@ -148,19 +149,20 @@ double RunResidual(const nuka::phi::DeviceContext& ctx, const std::vector<double
 
 // Smallest max_iter whose solution reaches the target relative residual (the
 // backend exits early at tol, so increasing max_iter == letting it run more iters).
-uint32_t ItersToReach(const nuka::phi::DeviceContext& ctx,
+uint32_t ItersToReach(cudaStream_t ctx, int ctx_dev,
                       const std::vector<double>& A, uint32_t n,
                       const std::vector<double>& b, diffsim::Preconditioner precond,
                       double target, uint32_t iter_cap) {
     for (uint32_t k = 1u; k <= iter_cap; ++k) {
-        const double resid = RunResidual(ctx, A, n, b, precond, k);
+        const double resid = RunResidual(ctx, ctx_dev, A, n, b, precond, k);
         if (resid <= target) return k;
     }
     return iter_cap + 1u;  // did not reach within cap
 }
 
 TEST(Ilu0VsJacobi, FewerIterations) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const uint32_t n = 12u;
     const std::vector<double> A = MakeIllConditionedSparse(n);
     std::vector<double> b(n);
@@ -169,9 +171,9 @@ TEST(Ilu0VsJacobi, FewerIterations) {
     constexpr double kTarget = 1.0e-5;
     constexpr uint32_t kCap = 60u;
     const uint32_t it_jacobi =
-        ItersToReach(ctx, A, n, b, diffsim::Preconditioner::Jacobi, kTarget, kCap);
+        ItersToReach(ctx, ctx_dev, A, n, b, diffsim::Preconditioner::Jacobi, kTarget, kCap);
     const uint32_t it_ilu0 = ItersToReach(
-        ctx, A, n, b, diffsim::Preconditioner::BlockJacobi /*=ILU(0)*/, kTarget, kCap);
+        ctx, ctx_dev, A, n, b, diffsim::Preconditioner::BlockJacobi /*=ILU(0)*/, kTarget, kCap);
 
     std::printf("[Ilu0VsJacobi] iters to reach %.0e: Jacobi=%u  ILU(0)=%u\n",
                 kTarget, it_jacobi, it_ilu0);

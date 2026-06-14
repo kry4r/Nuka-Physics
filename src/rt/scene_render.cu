@@ -23,7 +23,7 @@
 #include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
 #include "rt/intersect_primitives.cuh"
@@ -382,9 +382,9 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
         return fb;
     }
 
-    auto context = phi::MakeDefaultDeviceContext();
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    const cudaStream_t stream = nullptr;  // default stream 0
+    const int device_id = 0;
+    phi::ScopedDeviceGuard guard(device_id);
 
     // Build the flat prim table + per-prim AABBs in declaration order:
     // triangles, then spheres, then SDFs.
@@ -504,7 +504,7 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
         static_cast<float*>(d_uv.Data()),
         static_cast<uint32_t*>(d_prim.Data()));
     CheckCuda(cudaGetLastError(), "RenderSceneKernel launch");
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
     d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));

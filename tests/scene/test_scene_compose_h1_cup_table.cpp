@@ -34,7 +34,7 @@
 #include "math/vec3.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/cook/placement.hpp"
@@ -402,14 +402,10 @@ struct Backend {
     nphi::Device* dev = nullptr;
     nphi::Backend* backend = nullptr;
 };
-nphi::DeviceContext& ProcessContext() {
-    static nphi::DeviceContext ctx = nphi::MakeDefaultDeviceContext();
-    return ctx;
-}
 Backend GetBackend() {
     static Backend b = [] {
         Backend r;
-        ProcessContext();
+        // BUF-14: InitBestDevice() sets the active CUDA device for this process.
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;

@@ -20,7 +20,7 @@
 
 #include "diffsim/step_backward.hpp"
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cuda_runtime.h>
@@ -36,13 +36,12 @@ namespace nuka::diffsim {
 // lives as NkOp::StepBackward). SAME ScopedDeviceGuard + stream + launch config +
 // post-launch error check as the deleted step_backward.cu host body -> the direct
 // path stays byte-identical AND is single-source with the NkOp dispatch.
-void StepBackward(const phi::DeviceContext& context,
+void StepBackward(cudaStream_t stream, int device_id,
                   articulation::ArticulationDeviceState state,
                   const StepBackwardInputs& inputs,
                   const StepBackwardGrads& grads) {
     if (state.articulation_count == 0u) return;
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     LaunchStepBackwardKernel(state, inputs, grads, inputs.enable_q_channel, stream);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

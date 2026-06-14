@@ -37,10 +37,10 @@
 // set x cooked sparse SDF grid) against ANALYTIC truth (sphere x sphere /
 // sphere x box at known separations / penetrations), tolerance <= the bake cell
 // size. The GJK/EPA tests above survive to M9; this is the ADDED SDF-path oracle.
-// NOTE (M9 T11): device_context.hpp (which pulls <cuda_runtime.h> -> __forceinline__
-// / cudaStream_t) MUST precede sdf_types.cuh; the deleted narrowphase_dispatch.hpp
-// formerly pulled it in first (via candidate_pair.hpp) — order it explicitly now.
-#include "phi/device_context.hpp"
+// NOTE (M9 T11 / BUF-14): <cuda_runtime.h> (__forceinline__ / cudaStream_t) MUST
+// precede sdf_types.cuh; the deleted narrowphase_dispatch.hpp formerly pulled it
+// in first (via candidate_pair.hpp) — order it explicitly now.
+#include <cuda_runtime.h>
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
 #include "phi/buffer_transfer_v2.hpp"

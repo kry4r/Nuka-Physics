@@ -62,7 +62,9 @@
 //   * J + M^-1 read coalesced; __restrict__ pointers; fixed-order fp32 reductions.
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
@@ -112,7 +114,7 @@ struct OscAdjointParamGrads {
 // Enqueues on the context stream; the caller synchronizes (mirrors diffsim).
 // Any null required pointer (inertia_M_inv / task_target / grad_tau, or all three
 // out buffers) is a no-op.
-void LaunchOscAdjointGainTarget(const phi::DeviceContext& context,
+void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
                                 articulation::ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 uint32_t osc_task_link,

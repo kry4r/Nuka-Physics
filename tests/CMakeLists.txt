@@ -702,22 +702,17 @@ if(CMAKE_CUDA_COMPILER)
 
     add_executable(nuka_phi_test
         phi/test_capabilities.cpp
-        phi/test_device_context_per_handle.cpp
         phi/test_platform_contract.cpp
-        phi/test_stream_view_external.cpp
-    )
-
-    set_source_files_properties(
-        phi/test_stream_view_external.cpp
-        PROPERTIES LANGUAGE CUDA
     )
 
     target_link_libraries(nuka_phi_test
         PRIVATE
+            # nuka_phi supplies Capabilities / Device / PlatformContract; the
+            # BUF-14 sweep deleted the legacy device-context / owned-stream /
+            # stream-view types (and their pure-type tests).
             nuka_phi
-            # BUF-13: test_capabilities's buffer tests are now the phi-v2 surface
-            # (BufferAlloc/InitBestDevice); nuka_phi2 supplies them. nuka_phi stays
-            # for Capabilities/Device/OwnedStream (BUF-14).
+            # BUF-13: test_capabilities's buffer tests are the phi-v2 surface
+            # (BufferAlloc/InitBestDevice); nuka_phi2 supplies them.
             nuka_phi2
             GTest::gtest_main
     )
@@ -1996,8 +1991,8 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_sensor_noise
             # BUF-13: the n1 noise tests' device buffers are phi-v2 (stream-0);
-            # nuka_phi2 supplies BufferAlloc/InitBestDevice. nuka_phi stays for the
-            # DeviceContext used by the noise launchers (BUF-14).
+            # nuka_phi2 supplies BufferAlloc/InitBestDevice. nuka_phi stays for
+            # the scoped device guard the noise launchers use (BUF-14).
             nuka_phi
             nuka_phi2
             CUDA::cudart

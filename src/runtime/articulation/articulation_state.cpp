@@ -15,10 +15,9 @@ namespace nuka::runtime::articulation {
 
 namespace {
 
-// phi v2 transfer helpers (UploadVectorV2 / out-param DownloadVectorV2) replace
-// the legacy UploadVector / DownloadVector(buffer, vector<T>* out). The v2 forms
-// take an explicit element `count` (the opaque v2 Buffer has no Size()); the
-// caller derives every count from the device-buffer dimensions
+// phi v2 transfer helpers (UploadVectorV2 / out-param DownloadVectorV2). The v2
+// forms take an explicit element `count` (the opaque v2 Buffer has no Size());
+// the caller derives every count from the device-buffer dimensions
 // (total_link_count / articulation_count), which mirror the host_state that was
 // uploaded. Byte math is unchanged (size*sizeof(T)).
 using ::nuka::phi::DownloadVectorV2;
@@ -542,15 +541,15 @@ ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState
     return result;
 }
 
-ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& context,
+ArticulationDeviceBuffers UploadArticulationState(cudaStream_t stream, int device_id,
                                                   const ArticulationHostState& host_state) {
-    phi::ScopedDeviceGuard guard(context.device_id);
+    (void)stream;  // v2 transfers run on the device-level DEFAULT (stream 0).
+    phi::ScopedDeviceGuard guard(device_id);
     // The device-level DEFAULT (stream-0) BufferType: v2 upload transfers run on
     // stream 0 exactly like the legacy synchronous CopyFromHost cudaMemcpy. The
-    // returned Buffer*'s pointers feed kernels launched on the caller's
-    // context.stream (raw cudaMemcpyAsync / launches, unchanged) -- the test
-    // harness coordinates upload vs kernel via NULL-stream implicit sync, the
-    // legacy oracle path.
+    // returned Buffer*'s pointers feed kernels launched on the caller's stream
+    // (raw cudaMemcpyAsync / launches, unchanged) -- the test harness coordinates
+    // upload vs kernel via NULL-stream implicit sync, the legacy oracle path.
     phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
     ArticulationDeviceBuffers result;
     result.total_link_count = host_state.TotalLinkCount();
@@ -588,8 +587,7 @@ ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& cont
 }
 
 ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& host_state) {
-    auto context = phi::MakeDefaultDeviceContext();
-    return UploadArticulationState(context, host_state);
+    return UploadArticulationState(/*stream=*/nullptr, /*device_id=*/0, host_state);
 }
 
 ArticulationDeviceState MakeArticulationDeviceStateFromViews(

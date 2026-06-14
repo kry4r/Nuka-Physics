@@ -24,7 +24,7 @@
 
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "scene/cook/union_nk_model.hpp"
 #include "scene/cook/union_cook.hpp"
 #include "scene/cook/union_scene_constants.hpp"

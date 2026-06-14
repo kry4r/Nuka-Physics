@@ -41,7 +41,9 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -70,7 +72,7 @@ namespace nuka::sensor {
 //   kMaxFootContactsPerEnv == env_count * max_foot_contacts_per_env;
 //   total_link_count == env_count * base_link_count). dt is the step dt
 //   (force = impulse / dt); dt > 0 required (a non-positive dt yields zero forces).
-void ComputeContactWrench(const phi::DeviceContext& context,
+void ComputeContactWrench(cudaStream_t stream, int device_id,
                           const float* lambda,
                           const math::Vec3* contact_point,
                           const math::Vec3* contact_normal,

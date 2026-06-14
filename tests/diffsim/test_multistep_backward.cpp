@@ -38,7 +38,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "runtime/world_builder.hpp"
@@ -249,22 +250,22 @@ ChainModel BuildFloatingChain() {
 // ---------------------------------------------------------------------------
 class RolloutHarness {
 public:
-    RolloutHarness(const nuka::phi::DeviceContext& ctx, const ChainModel& model,
+    RolloutHarness(cudaStream_t ctx, int ctx_dev, const ChainModel& model,
                    float dt, float gravity_z, const diffsim::TapeDesc& desc)
-        : ctx_(ctx), model_(model) {
-        device_ = articulation::UploadArticulationState(ctx_, model.host);
+        : ctx_(ctx), ctx_dev_(ctx_dev), model_(model) {
+        device_ = articulation::UploadArticulationState(ctx_, ctx_dev_, model.host);
         n_ = model.link_count;
         diffsim::RolloutParams rp;
         rp.dt = dt;
         rp.gravity_z = gravity_z;
         orch_ = std::make_unique<diffsim::RecomputeOrchestrator>(
-            ctx_, device_.View(), rp, model.stiffness, model.damping,
+            ctx_, ctx_dev_, device_.View(), rp, model.stiffness, model.damping,
             model.force_limits, model.mass_params);
-        tape_ = std::make_unique<diffsim::Tape>(ctx_, desc, n_);
+        tape_ = std::make_unique<diffsim::Tape>(ctx_, ctx_dev_, desc, n_);
         cm_ = std::make_unique<diffsim::CheckpointManager>(
-            ctx_, desc.max_checkpoints, device_.View().articulation_count, n_,
+            ctx_, ctx_dev_, desc.max_checkpoints, device_.View().articulation_count, n_,
             /*lambda_width=*/0u);
-        runner_ = std::make_unique<diffsim::BackwardRunner>(ctx_, *orch_);
+        runner_ = std::make_unique<diffsim::BackwardRunner>(ctx_, ctx_dev_, *orch_);
         desc_ = desc;
     }
 
@@ -284,13 +285,13 @@ public:
 
     // Floating-base root spatial velocity (6 floats at link_velocity[0]).
     void SetRootVel(const std::array<float, 6>& v) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         cudaMemcpy(State().link_velocity, v.data(), 6u * sizeof(float),
                    cudaMemcpyHostToDevice);
     }
     std::array<float, 6> GetRootVel() {
         std::array<float, 6> v{};
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         cudaMemcpy(v.data(), State().link_velocity, 6u * sizeof(float),
                    cudaMemcpyDeviceToHost);
         return v;
@@ -335,7 +336,7 @@ public:
         s.link_velocity.resize(n_);
         s.q.resize(n_);
         s.qdot.resize(n_);
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         cudaMemcpy(s.base_pose.data(), st.base_pose,
                    st.articulation_count * sizeof(Transform),
                    cudaMemcpyDeviceToHost);
@@ -365,16 +366,16 @@ public:
         return OwnedDeviceBuffer(n_ * sizeof(float));
     }
 
-    void Sync() { ctx_.stream.Synchronize(); }
+    void Sync() { cudaStreamSynchronize(ctx_); }
 
     void Upload(float* dst, const std::vector<float>& v) {
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         cudaMemcpy(dst, v.data(), v.size() * sizeof(float),
                    cudaMemcpyHostToDevice);
     }
     std::vector<float> Download(const float* src, uint32_t count) {
         std::vector<float> v(count, 0.0f);
-        nuka::phi::ScopedDeviceGuard guard(ctx_.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev_);
         cudaMemcpy(v.data(), src, count * sizeof(float), cudaMemcpyDeviceToHost);
         return v;
     }
@@ -385,7 +386,8 @@ public:
     }
 
 private:
-    const nuka::phi::DeviceContext& ctx_;
+    cudaStream_t ctx_ = nullptr;
+    int ctx_dev_ = 0;
     const ChainModel& model_;
     articulation::ArticulationDeviceBuffers device_;
     uint32_t n_ = 0u;
@@ -440,7 +442,8 @@ float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
 //    replay to N; the authoritative state is bit-exact.
 // ===========================================================================
 TEST(MultiStepBackward, ReplayBitExact_FixedBase) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float dt = 0.005f, g = -9.81f;
     const uint32_t N = 50u;
@@ -450,7 +453,7 @@ TEST(MultiStepBackward, ReplayBitExact_FixedBase) {
     desc.max_checkpoints = 64u;
     desc.recompute_on_backward = 1u;
 
-    RolloutHarness h(ctx, model, dt, g, desc);
+    RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
     const std::vector<float> q0 = {0.0f, 0.30f, -0.45f, 0.20f};
     const std::vector<float> qd0(model.link_count, 0.0f);
     h.SetState(q0, qd0);
@@ -493,7 +496,8 @@ TEST(MultiStepBackward, ReplayBitExact_FixedBase) {
 //    grad_actions + grad_mass are BIT-IDENTICAL.
 // ===========================================================================
 TEST(MultiStepBackward, CheckpointVsFullTape_BitIdentical) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float dt = 0.005f, g = -9.81f;
     const uint32_t N = 40u;
@@ -507,7 +511,7 @@ TEST(MultiStepBackward, CheckpointVsFullTape_BitIdentical) {
         desc.max_tape_entries = 256u;
         desc.max_checkpoints = N + 4u;
         desc.recompute_on_backward = recompute;
-        RolloutHarness h(ctx, model, dt, g, desc);
+        RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
         h.SetState(q0, qd0);
         h.Record(actions);
         auto ga = h.MakeOutputActions(N);
@@ -549,7 +553,8 @@ TEST(MultiStepBackward, CheckpointVsFullTape_BitIdentical) {
 //    short rollout. The p02-A spine is exact for the fixed base.
 // ===========================================================================
 TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float dt = 0.005f, g = -9.81f;
     const uint32_t N = 6u;  // short horizon -> FD truncation stays clean
@@ -574,7 +579,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
     desc.recompute_on_backward = 1u;
 
     // -- Analytic grads via the backward runner. --
-    RolloutHarness h(ctx, model, dt, g, desc);
+    RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
     h.SetState(q0, qd0);
     h.Record(actions);
     auto ga = h.MakeOutputActions(N);
@@ -609,7 +614,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
         }
         diffsim::TapeDesc d2 = desc;
         d2.recompute_on_backward = 0u;  // irrelevant; we only forward-roll
-        RolloutHarness hh(ctx, m, dt, g, d2);
+        RolloutHarness hh(ctx, ctx_dev, m, dt, g, d2);
         hh.SetState(q0, qd0);
         // Forward roll via StepOnce on uploaded actions.
         OwnedDeviceBuffer ab(model.link_count * sizeof(float));
@@ -685,7 +690,8 @@ TEST(MultiStepBackward, MultiStepGradVsFD_FixedBase) {
 //     angular velocity exercises the gyroscopic term across every step.
 // ===========================================================================
 TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFloatingChain();
     const float dt = 0.01f, g = 0.0f;  // g=0 -> deferred a_grav channel is inert
     const uint32_t N = 5u;             // short horizon -> FD truncation stays clean
@@ -713,7 +719,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
     desc.recompute_on_backward = 1u;
 
     // -- Analytic grads via the backward runner. --
-    RolloutHarness h(ctx, model, dt, g, desc);
+    RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
     h.SetState(q0, qd0);
     h.SetRootVel(rootv0);
     h.Record(actions);
@@ -749,7 +755,7 @@ TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
         }
         diffsim::TapeDesc d2 = desc;
         d2.recompute_on_backward = 0u;
-        RolloutHarness hh(ctx, m, dt, g, d2);
+        RolloutHarness hh(ctx, ctx_dev, m, dt, g, d2);
         hh.SetState(q0, qd0);
         std::array<float, 6> rv = rootv0;
         if (rootv_comp >= 0) rv[rootv_comp] += rootv_delta;
@@ -816,7 +822,8 @@ TEST(MultiStepBackward, MultiStepGradVsFD_Floating) {
 // 4. D1 TWO-RUN: the whole backward twice -> bit-exact grad_actions + grad_mass.
 // ===========================================================================
 TEST(MultiStepBackward, D1_TwoRunBitExact) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float dt = 0.005f, g = -9.81f;
     const uint32_t N = 30u;
@@ -831,7 +838,7 @@ TEST(MultiStepBackward, D1_TwoRunBitExact) {
     desc.recompute_on_backward = 1u;
 
     auto run = [&]() {
-        RolloutHarness h(ctx, model, dt, g, desc);
+        RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
         h.SetState(q0, qd0);
         h.Record(actions);
         auto ga = h.MakeOutputActions(N);
@@ -865,7 +872,8 @@ TEST(MultiStepBackward, D1_TwoRunBitExact) {
 //    reverse/forward time ratio.
 // ===========================================================================
 TEST(MultiStepBackward, MemoryCost_1000Step_K100) {
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     ChainModel model = BuildFixedChain();
     const float dt = 0.002f, g = -9.81f;  // benign dt so the explicit-damping roll is stable
     const uint32_t N = 1000u;
@@ -884,7 +892,7 @@ TEST(MultiStepBackward, MemoryCost_1000Step_K100) {
     desc.max_checkpoints = (N / 100u) + 8u;
     desc.recompute_on_backward = 1u;
 
-    RolloutHarness h(ctx, model, dt, g, desc);
+    RolloutHarness h(ctx, ctx_dev, model, dt, g, desc);
     h.SetState(q0, qd0);
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -932,7 +940,8 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
     if (!std::filesystem::exists(scene_path)) {
         GTEST_SKIP() << "go2_float scene is not available";
     }
-    auto ctx = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
+    const int ctx_dev = 0;
     const auto scene = nuka::import::LoadUsd(scene_path.string());
     const auto blob = nuka::scene::CookScene(scene);
     const auto world = nuka::runtime::BuildWorld(blob);
@@ -969,7 +978,7 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
         }
     }
 
-    auto device = articulation::UploadArticulationState(ctx, host);
+    auto device = articulation::UploadArticulationState(ctx, ctx_dev, host);
 
     diffsim::RolloutParams rp;
     rp.dt = 0.005f;
@@ -987,10 +996,10 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
     desc.max_checkpoints = 32u;
     desc.recompute_on_backward = 1u;
 
-    diffsim::RecomputeOrchestrator orch(ctx, device.View(), rp, stiffness, damping,
+    diffsim::RecomputeOrchestrator orch(ctx, ctx_dev, device.View(), rp, stiffness, damping,
                                         force_limits, mass_params);
-    diffsim::Tape tape(ctx, desc, n);
-    diffsim::CheckpointManager cm(ctx, desc.max_checkpoints,
+    diffsim::Tape tape(ctx, ctx_dev, desc, n);
+    diffsim::CheckpointManager cm(ctx, ctx_dev, desc.max_checkpoints,
                                   device.View().articulation_count, n, 0u);
 
     const uint32_t N = 40u;
@@ -1011,12 +1020,12 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
         orch.StepOnce(static_cast<const float*>(ab.Data()));
         since += 1u;
     }
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
 
     auto snap = [&]() {
         std::vector<float> q(n), qd(n);
         std::vector<articulation::LinkSpatialVel> lv(n);
-        nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+        nuka::phi::ScopedDeviceGuard guard(ctx_dev);
         cudaMemcpy(q.data(), orch.State().q, n * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(qd.data(), orch.State().qdot, n * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(lv.data(), orch.State().link_velocity,
@@ -1032,7 +1041,7 @@ TEST(MultiStepBackward, ReplayBitExact_Go2Float) {
     cm.Restore(0u, orch.State(), nullptr);
     for (uint32_t s = 0u; s < N; ++s)
         orch.StepOnce(tape.ActionSlice(s));
-    ctx.stream.Synchronize();
+    cudaStreamSynchronize(ctx);
     const std::vector<float> replayed = snap();
 
     EXPECT_TRUE(BitEqual(orig, replayed))

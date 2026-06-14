@@ -31,7 +31,7 @@
 #include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 #include "rt/bvh_traverse_impl.cuh"
 #include "rt/camera.hpp"
 #include "rt/ray_box.cuh"
@@ -175,9 +175,9 @@ DepthRender RenderDepth(const std::vector<collision::AABB>& boxes,
         return out;
     }
 
-    auto context = phi::MakeDefaultDeviceContext();
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    const cudaStream_t stream = nullptr;  // default stream 0
+    const int device_id = 0;
+    phi::ScopedDeviceGuard guard(device_id);
 
     // Output framebuffers (device). RenderDepth is NOT a per-step hot path (it
     // renders a sensor frame, like cross_system_query's allocations) -> these
@@ -214,7 +214,7 @@ DepthRender RenderDepth(const std::vector<collision::AABB>& boxes,
         static_cast<float*>(d_depth.Data()),
         static_cast<uint32_t*>(d_prim.Data()));
     CheckCuda(cudaGetLastError(), "RenderDepthKernel launch");
-    context.stream.Synchronize();
+    cudaStreamSynchronize(stream);
 
     d_depth.CopyToHost(out.depth.data(), pixels * sizeof(float));
     d_prim.CopyToHost(out.prim.data(), pixels * sizeof(uint32_t));

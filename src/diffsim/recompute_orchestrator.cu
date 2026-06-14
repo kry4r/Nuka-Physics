@@ -27,15 +27,15 @@ void CheckCuda(cudaError_t status, const char* what) {
 // floats on ctx.stream via a raw cudaMemcpyAsync over the base pointer -- the
 // SAME stream (and byte-for-byte the same copy) the legacy UploadFloat used; the
 // gains are then read by the PD kernels on that same stream.
-phi::Buffer* UploadFloat(const phi::DeviceContext& ctx,
+phi::Buffer* UploadFloat(cudaStream_t stream, int device_id,
                          const std::vector<float>& v) {
     phi::Buffer* b = phi::BufferAlloc(
         phi::DeviceBufferType(phi::InitBestDevice()), v.size() * sizeof(float));
     if (!v.empty()) {
-        phi::ScopedDeviceGuard guard(ctx.device_id);
+        phi::ScopedDeviceGuard guard(device_id);
         CheckCuda(cudaMemcpyAsync(phi::BufferBase(b), v.data(),
                                   v.size() * sizeof(float),
-                                  cudaMemcpyHostToDevice, ctx.stream.Native()),
+                                  cudaMemcpyHostToDevice, stream),
                   "UploadFloat");
     }
     return b;
@@ -43,13 +43,13 @@ phi::Buffer* UploadFloat(const phi::DeviceContext& ctx,
 }  // namespace
 
 RecomputeOrchestrator::RecomputeOrchestrator(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     articulation::ArticulationDeviceState state, const RolloutParams& params,
     const std::vector<float>& drive_stiffness,
     const std::vector<float>& drive_damping,
     const std::vector<float>& drive_force_limits,
     const std::vector<LinkMassParams>& mass_params)
-    : context_(context), state_(state), params_(params) {
+    : stream_(stream), device_id_(device_id), state_(state), params_(params) {
     total_link_count_ = state.total_link_count;
     if (total_link_count_ == 0u) {
         throw std::invalid_argument(
@@ -63,14 +63,14 @@ RecomputeOrchestrator::RecomputeOrchestrator(
             "nuka::diffsim::RecomputeOrchestrator: gain/mass length != "
             "total_link_count");
     }
-    stiffness_ = UploadFloat(context_, drive_stiffness);
-    damping_ = UploadFloat(context_, drive_damping);
-    force_limits_ = UploadFloat(context_, drive_force_limits);
+    stiffness_ = UploadFloat(stream_, device_id_, drive_stiffness);
+    damping_ = UploadFloat(stream_, device_id_, drive_damping);
+    force_limits_ = UploadFloat(stream_, device_id_, drive_force_limits);
     // Representation-consistent dI/dmass slope (parallel-axis + COM coupling),
     // the SAME mapping the engine forward uses (see step_backward_host.cpp).
     const std::vector<float> dIdm = BuildSpatialInertiaMassJacobian(mass_params);
-    dI_dmass_ = UploadFloat(context_, dIdm);
-    context_.stream.Synchronize();
+    dI_dmass_ = UploadFloat(stream_, device_id_, dIdm);
+    cudaStreamSynchronize(stream_);
 }
 
 RecomputeOrchestrator::~RecomputeOrchestrator() {
@@ -85,15 +85,15 @@ void RecomputeOrchestrator::StepOnce(const float* device_actions) {
     // damping, defer_velocity_damping=false; NO contact pipeline). The kernel
     // sequence mirrors the FD test's ForwardFullStep + the floating integrators.
     articulation::FeatherstoneAba::ApplyPositionDrives(
-        context_, state_, device_actions, DriveStiffness(), DriveDamping(),
+        stream_, device_id_, state_, device_actions, DriveStiffness(), DriveDamping(),
         DriveForceLimits(), /*defer_velocity_damping=*/false);
-    articulation::FeatherstoneAba::ComputeAccelerations(context_, state_,
+    articulation::FeatherstoneAba::ComputeAccelerations(stream_, device_id_, state_,
                                                         params_.gravity_z);
-    articulation::FeatherstoneAba::IntegrateVelocity(context_, state_, params_.dt);
+    articulation::FeatherstoneAba::IntegrateVelocity(stream_, device_id_, state_, params_.dt);
     articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
-        context_, state_, params_.dt, params_.gravity_z);
-    articulation::FeatherstoneAba::IntegratePosition(context_, state_, params_.dt);
-    articulation::FeatherstoneAba::IntegrateFloatingBasePose(context_, state_,
+        stream_, device_id_, state_, params_.dt, params_.gravity_z);
+    articulation::FeatherstoneAba::IntegratePosition(stream_, device_id_, state_, params_.dt);
+    articulation::FeatherstoneAba::IntegrateFloatingBasePose(stream_, device_id_, state_,
                                                             params_.dt);
 }
 

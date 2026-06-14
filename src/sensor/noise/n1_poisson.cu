@@ -34,7 +34,7 @@ __global__ void PoissonNoiseKernel(float* __restrict__ data, uint32_t count,
 
 }  // namespace
 
-void LaunchPoissonNoise(const phi::DeviceContext& ctx, float* data,
+void LaunchPoissonNoise(cudaStream_t stream, int device_id, float* data,
                         uint32_t count, float lambda, uint64_t seed,
                         uint64_t seq) {
     if (data == nullptr || count == 0u) {
@@ -42,7 +42,7 @@ void LaunchPoissonNoise(const phi::DeviceContext& ctx, float* data,
     }
     constexpr uint32_t kBlock = 256u;
     const uint32_t grid = (count + kBlock - 1u) / kBlock;
-    PoissonNoiseKernel<<<grid, kBlock, 0, ctx.stream.Native()>>>(
+    PoissonNoiseKernel<<<grid, kBlock, 0, stream>>>(
         data, count, lambda, seed, seq);
 }
 

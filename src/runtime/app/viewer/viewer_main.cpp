@@ -36,7 +36,6 @@
 
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
@@ -150,8 +149,6 @@ int main(int argc, char** argv) {
     }
 
     // ---- 1. physics backend + cook -> nk::World + RenderWorld ------------------
-    nphi::DeviceContext ctx = nphi::MakeDefaultDeviceContext();
-    (void)ctx;
     nphi::Device* dev = nphi::InitBestDevice();
     if (!dev) { std::fprintf(stderr, "[nuka_viewer] no physics device\n"); return 3; }
     nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);

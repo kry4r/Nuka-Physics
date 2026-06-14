@@ -8,7 +8,8 @@
 // ---------------------------------------------------------------------------
 
 #include "import/usd_importer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
 #include "runtime/world_builder.hpp"
@@ -47,18 +48,18 @@ articulation::ArticulationHostState CookGo2HostState() {
 // are not replicated here. Gravity (plus any seeded tau) drives the dynamics,
 // which is sufficient to exercise the per-articulation grid kernels and prove
 // replication + determinism.
-void StepAba(const nuka::phi::DeviceContext& context,
+void StepAba(cudaStream_t context, int context_dev,
              articulation::ArticulationDeviceBuffers& device_state,
              uint32_t steps,
              float gravity_z,
              float dt) {
     for (uint32_t step = 0u; step < steps; ++step) {
-        articulation::FeatherstoneAba::ComputeAccelerations(context,
+        articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev,
                                                             device_state.View(),
                                                             gravity_z);
-        articulation::FeatherstoneAba::Integrate(context, device_state.View(), dt);
+        articulation::FeatherstoneAba::Integrate(context, context_dev, device_state.View(), dt);
     }
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
 }
 
 } // namespace
@@ -97,11 +98,12 @@ TEST(BatchedArticulationReplication, NReplicasStepBitIdenticalToSingleEnv) {
     }
     const std::vector<float> base_initial_q = base.q;
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
 
     // --- Single-env reference run -------------------------------------------
-    auto single_device = articulation::UploadArticulationState(context, base);
-    StepAba(context, single_device, kSteps, kGravityZ, kDt);
+    auto single_device = articulation::UploadArticulationState(context, context_dev, base);
+    StepAba(context, context_dev, single_device, kSteps, kGravityZ, kDt);
     articulation::ArticulationHostState reference;
     articulation::DownloadArticulationState(single_device, &reference);
     ASSERT_EQ(reference.q.size(), base.q.size());
@@ -132,8 +134,8 @@ TEST(BatchedArticulationReplication, NReplicasStepBitIdenticalToSingleEnv) {
         EXPECT_EQ(batched.parent_link[link], base.parent_link[0]);
     }
 
-    auto batched_device = articulation::UploadArticulationState(context, batched);
-    StepAba(context, batched_device, kSteps, kGravityZ, kDt);
+    auto batched_device = articulation::UploadArticulationState(context, context_dev, batched);
+    StepAba(context, context_dev, batched_device, kSteps, kGravityZ, kDt);
     articulation::ArticulationHostState batched_result;
     articulation::DownloadArticulationState(batched_device, &batched_result);
     ASSERT_EQ(batched_result.q.size(),

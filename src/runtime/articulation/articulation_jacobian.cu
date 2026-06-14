@@ -190,7 +190,7 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 } // namespace
 
-void ComputeLinkPointJacobians(const phi::DeviceContext& context,
+void ComputeLinkPointJacobians(cudaStream_t stream, int device_id,
                                ArticulationDeviceState state,
                                const uint32_t* contact_link_indices,
                                const math::Vec3* contact_point_world,
@@ -205,8 +205,7 @@ void ComputeLinkPointJacobians(const phi::DeviceContext& context,
         throw std::runtime_error("ComputeLinkPointJacobians requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (contact_count + kBlockSize - 1u) / kBlockSize;
     ComputeLinkPointJacobianKernel<<<block_count, kBlockSize, 0u, stream>>>(
@@ -218,7 +217,7 @@ void ComputeLinkPointJacobians(const phi::DeviceContext& context,
     CheckCuda(cudaGetLastError(), "ComputeLinkPointJacobianKernel launch");
 }
 
-void ComputeContactChainJacobians(const phi::DeviceContext& context,
+void ComputeContactChainJacobians(cudaStream_t stream, int device_id,
                                   ArticulationDeviceState state,
                                   const uint32_t* contact_link_indices,
                                   const math::Vec3* contact_point_world,
@@ -237,8 +236,7 @@ void ComputeContactChainJacobians(const phi::DeviceContext& context,
             "ComputeContactChainJacobians requires device input and output buffers");
     }
 
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     // Each contact owns its dof_stride-wide slice; the kernel only writes the
     // ancestor-chain columns, so zero the full output up front to give the
     // "untouched columns are zero" guarantee the callers rely on.

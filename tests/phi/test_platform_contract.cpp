@@ -5,15 +5,13 @@
 #include <gtest/gtest.h>
 
 #include "phi/capabilities.hpp"
-#include "phi/device_context.hpp"
 #include "phi/device.hpp"
 #include "phi/platform_contract.hpp"
 
 #include <cstring>
 
 TEST(PlatformContract, RequiresCudaForProductionPhysics) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
-    const auto& contract = context.contract;
+    const nuka::phi::PlatformContract contract{};
     EXPECT_EQ(contract.physics_backend, nuka::phi::PhysicsBackend::Cuda);
     EXPECT_EQ(contract.reference_backend, nuka::phi::PhysicsBackend::CpuReference);
     EXPECT_TRUE(contract.requires_gpu_simulation);
@@ -41,9 +39,9 @@ TEST(PlatformContract, CpuReferenceSelectionIsMarkedValidationOnly) {
 }
 
 TEST(PlatformContract, ReportsActiveCudaDeviceForPhysics) {
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const nuka::phi::PlatformContract contract{};
     EXPECT_GE(nuka::phi::GetDeviceCount(), 1);
-    const auto device = nuka::phi::GetDeviceInfo(context.contract.cuda_device_id);
+    const auto device = nuka::phi::GetDeviceInfo(contract.cuda_device_id);
     EXPECT_GT(std::strlen(device.name), 0u);
     EXPECT_GT(device.total_memory, 0u);
 }

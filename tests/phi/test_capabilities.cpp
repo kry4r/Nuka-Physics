@@ -8,7 +8,6 @@
 #include "phi/device.hpp"
 #include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType (v2)
 #include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload (v2)
-#include "phi/owned_stream.hpp"
 
 #include <cstring>
 #include <vector>
@@ -76,22 +75,4 @@ TEST(PhiBuffer, V2ZeroByteAllocIsSafe) {
     // UploadVectorV2 empty-vector path several production consumers rely on).
     Buffer* buf = BufferAlloc(bt, 0u);
     EXPECT_NO_THROW({ if (buf != nullptr) BufferFree(buf); });
-}
-
-// ---- Owned stream --------------------------------------------------------
-
-TEST(PhiOwnedStream, CreateAndSync) {
-    nuka::phi::OwnedStream stream;
-    EXPECT_NE(stream.Native(), nullptr);
-    EXPECT_NO_THROW(stream.Synchronize());
-}
-
-TEST(PhiOwnedStream, MoveSemantics) {
-    nuka::phi::OwnedStream a;
-    auto* handle = a.Native();
-    EXPECT_NE(handle, nullptr);
-
-    nuka::phi::OwnedStream b(std::move(a));
-    EXPECT_EQ(b.Native(), handle);
-    EXPECT_EQ(a.Native(), nullptr);
 }

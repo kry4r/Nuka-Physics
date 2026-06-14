@@ -34,7 +34,7 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
 
 namespace {
 
@@ -55,8 +55,6 @@ struct Ctx {
 Ctx GetCtx() {
     static Ctx c = [] {
         Ctx r;
-        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
-        (void)keep;
         r.dev = nphi::InitBestDevice();
         if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
         return r;

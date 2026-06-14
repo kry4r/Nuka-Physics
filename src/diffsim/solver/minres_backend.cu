@@ -283,9 +283,9 @@ void CheckCuda(cudaError_t result, const char* operation) {
 
 }  // namespace
 
-SelfWrittenMinresBackend::SelfWrittenMinresBackend(const phi::DeviceContext& context,
+SelfWrittenMinresBackend::SelfWrittenMinresBackend(cudaStream_t stream, int device_id,
                                                    DeterminismLevel determinism)
-    : context_(context), determinism_(determinism) {}
+    : stream_(stream), device_id_(device_id), determinism_(determinism) {}
 
 void SelfWrittenMinresBackend::Solve(const BatchedDenseSpdSystem& system,
                                      const float* b, float* x,
@@ -297,8 +297,8 @@ void SelfWrittenMinresBackend::Solve(const BatchedDenseSpdSystem& system,
             "nuka::diffsim::SelfWrittenMinresBackend::Solve: null system/vector "
             "pointer");
     }
-    phi::ScopedDeviceGuard guard(context_.device_id);
-    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id_);
+    const cudaStream_t stream = stream_;
 
     SolveMinresKernel<<<system.block_count, kWarpSize, 0u, stream>>>(
         system.values, system.block_dim, b, x, system.block_count,

@@ -3,7 +3,9 @@
 // nuka::runtime::articulation -- CUDA Featherstone ABA public API
 // ---------------------------------------------------------------------------
 
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 namespace nuka::runtime::articulation {
@@ -16,17 +18,17 @@ public:
     // batched contact stepper sets this true so the soft-gain stance is stable at
     // the native dt; the single-env oracle path leaves it false (explicit damping,
     // byte-for-byte unchanged trajectory).
-    static void ApplyPositionDrives(const phi::DeviceContext& context,
+    static void ApplyPositionDrives(cudaStream_t stream, int device_id,
                                     ArticulationDeviceState state,
                                     const float* drive_targets,
                                     const float* drive_stiffness,
                                     const float* drive_damping,
                                     const float* drive_force_limits,
                                     bool defer_velocity_damping = false);
-    static void ComputeAccelerations(const phi::DeviceContext& context,
+    static void ComputeAccelerations(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      float gravity_z);
-    static void Integrate(const phi::DeviceContext& context,
+    static void Integrate(cudaStream_t stream, int device_id,
                           ArticulationDeviceState state,
                           float dt);
     // Split halves of Integrate(): IntegrateVelocity does qdot += qddot*dt,
@@ -34,10 +36,10 @@ public:
     // bit-for-bit equal to the combined Integrate(); the batched stepper uses
     // the split so the contact solve sits between the two halves. The single-env
     // path keeps using the combined Integrate().
-    static void IntegrateVelocity(const phi::DeviceContext& context,
+    static void IntegrateVelocity(cudaStream_t stream, int device_id,
                                   ArticulationDeviceState state,
                                   float dt);
-    static void IntegratePosition(const phi::DeviceContext& context,
+    static void IntegratePosition(cudaStream_t stream, int device_id,
                                   ArticulationDeviceState state,
                                   float dt);
     // T8a: floating-base integrators. For a FloatingBase root (parent ==
@@ -49,11 +51,11 @@ public:
     // kinematic roots, so callers may invoke them unconditionally. Placed
     // analogously to the velocity/position split: velocity pre-contact, pose
     // post-contact.
-    static void IntegrateFloatingBaseVelocity(const phi::DeviceContext& context,
+    static void IntegrateFloatingBaseVelocity(cudaStream_t stream, int device_id,
                                               ArticulationDeviceState state,
                                               float dt,
                                               float gravity_z);
-    static void IntegrateFloatingBasePose(const phi::DeviceContext& context,
+    static void IntegrateFloatingBasePose(cudaStream_t stream, int device_id,
                                           ArticulationDeviceState state,
                                           float dt);
 };

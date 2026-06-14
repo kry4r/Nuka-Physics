@@ -57,7 +57,9 @@
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cstdint>
@@ -105,7 +107,7 @@ struct BackwardSeeds {
 
 class BackwardRunner {
 public:
-    BackwardRunner(const phi::DeviceContext& context,
+    BackwardRunner(cudaStream_t stream, int device_id,
                    RecomputeOrchestrator& orchestrator);
 
     // Frees the v2 scratch/seed/window Buffer* members (out-of-line).
@@ -151,7 +153,8 @@ private:
     void ReverseStep(const Tape& tape, uint32_t step,
                      const BackwardOutputs& out);
 
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     RecomputeOrchestrator& orch_;
     uint32_t total_link_count_ = 0u;
 

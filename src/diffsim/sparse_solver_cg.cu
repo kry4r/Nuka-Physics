@@ -454,9 +454,9 @@ __global__ void DetectIndefiniteKernel(const float* __restrict__ values,
 
 }  // namespace
 
-SelfWrittenCgBackend::SelfWrittenCgBackend(const phi::DeviceContext& context,
+SelfWrittenCgBackend::SelfWrittenCgBackend(cudaStream_t stream, int device_id,
                                            DeterminismLevel determinism)
-    : context_(context), determinism_(determinism) {}
+    : stream_(stream), device_id_(device_id), determinism_(determinism) {}
 
 void SelfWrittenCgBackend::Solve(const BatchedDenseSpdSystem& system,
                                  const float* b, float* x,
@@ -467,8 +467,8 @@ void SelfWrittenCgBackend::Solve(const BatchedDenseSpdSystem& system,
         throw std::invalid_argument(
             "nuka::diffsim::SelfWrittenCgBackend::Solve: null system/vector pointer");
     }
-    phi::ScopedDeviceGuard guard(context_.device_id);
-    const cudaStream_t stream = context_.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id_);
+    const cudaStream_t stream = stream_;
 
     // ONE warp per block; grid over blocks. Mirrors the engine's canonical
     // <<<count, 32>>> warp-per-articulation idiom. params.diagnostics is passed by
@@ -482,26 +482,26 @@ void SelfWrittenCgBackend::Solve(const BatchedDenseSpdSystem& system,
 }
 
 std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
-    std::string_view name, const phi::DeviceContext& context,
+    std::string_view name, cudaStream_t stream, int device_id,
     DeterminismLevel determinism) {
     // v0.7 p01: the self-written CG is the only SHIPPING backend. Accept its v0.5
     // aliases ("cg"/""/"default") AND the v0.7 canonical key "self_cg" (the C ABI
     // NUKA_SOLVER_BACKEND_SELF_CG round-trips through this name).
     if (name.empty() || name == "cg" || name == "default" || name == "self_cg") {
-        return std::make_unique<SelfWrittenCgBackend>(context, determinism);
+        return std::make_unique<SelfWrittenCgBackend>(stream, device_id, determinism);
     }
     // v0.7 p02: the self-written MINRES backend (symmetric INDEFINITE Krylov +
     // ILU(0) preconditioner) shares this same batched-dense seam. The C ABI
     // NUKA_SOLVER_BACKEND_SELF_MINRES round-trips through this "self_minres" name.
     if (name == "self_minres" || name == "minres") {
-        return std::make_unique<SelfWrittenMinresBackend>(context, determinism);
+        return std::make_unique<SelfWrittenMinresBackend>(stream, device_id, determinism);
     }
     // v0.7 p03-A: the self-written GMRES backend (GENERAL non-symmetric Krylov,
     // restarted GMRES(m) + Jacobi preconditioner; ILU0/AMG hook reserved) shares the
     // same batched-dense seam. The C ABI NUKA_SOLVER_BACKEND_SELF_GMRES round-trips
     // through this "self_gmres" name. Default restart m=30 (Saad's 30-50 band).
     if (name == "self_gmres" || name == "gmres") {
-        return std::make_unique<SelfWrittenGmresBackend>(context, 30u, determinism);
+        return std::make_unique<SelfWrittenGmresBackend>(stream, device_id, 30u, determinism);
     }
     throw std::invalid_argument(
         "nuka::diffsim::MakeSparseSolverBackend: unknown backend '" +
@@ -510,7 +510,7 @@ std::unique_ptr<SparseLinearSolver> MakeSparseSolverBackend(
         "'self_gmres'/'gmres')");
 }
 
-void DetectBatchedIndefinite(const phi::DeviceContext& context,
+void DetectBatchedIndefinite(cudaStream_t stream, int device_id,
                              const BatchedDenseSpdSystem& system,
                              uint32_t* out_indefinite_flag) {
     if (system.block_count == 0u || out_indefinite_flag == nullptr) return;
@@ -518,8 +518,7 @@ void DetectBatchedIndefinite(const phi::DeviceContext& context,
         throw std::invalid_argument(
             "nuka::diffsim::DetectBatchedIndefinite: null system pointer");
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     // One warp per block (lane 0 does the elimination). READ-ONLY over `system`;
     // writes only the caller-pre-zeroed uint flag. The caller synchronizes + reads.
     DetectIndefiniteKernel<<<system.block_count, kWarpSize, 0u, stream>>>(

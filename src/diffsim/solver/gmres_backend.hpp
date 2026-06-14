@@ -56,7 +56,9 @@
 // ---------------------------------------------------------------------------
 
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <string_view>
@@ -70,7 +72,7 @@ public:
     // converges within one cycle (GMRES is exact in <= n Arnoldi steps in fp64); a
     // SMALLER m (< n) exercises the genuine restart path and is covered by the test.
     explicit SelfWrittenGmresBackend(
-        const phi::DeviceContext& context, uint32_t restart = 30u,
+        cudaStream_t stream, int device_id, uint32_t restart = 30u,
         DeterminismLevel determinism = DeterminismLevel::Strong);
 
     void Solve(const BatchedDenseSpdSystem& system, const float* b, float* x,
@@ -79,7 +81,8 @@ public:
     std::string_view Name() const override { return "gmres"; }
 
 private:
-    const phi::DeviceContext& context_;
+    cudaStream_t stream_ = nullptr;
+    int device_id_ = 0;
     uint32_t restart_;
     DeterminismLevel determinism_;
 };
@@ -109,7 +112,7 @@ private:
 // NonSymmetricDetectorBytesafe.
 //
 // Enqueues on the context stream; the caller synchronizes + reads the flag back.
-void DetectBatchedNonSymmetric(const phi::DeviceContext& context,
+void DetectBatchedNonSymmetric(cudaStream_t stream, int device_id,
                                const BatchedDenseSpdSystem& system,
                                uint32_t* out_nonsymmetric_flag);
 

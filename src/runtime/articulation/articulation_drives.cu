@@ -531,15 +531,14 @@ __global__ void ApplyActuatorDriveKernel(ArticulationDeviceState state,
 
 }  // namespace
 
-void LaunchApplyTorqueDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyTorqueDriveKernels(cudaStream_t stream, int device_id,
                                    ArticulationDeviceState state,
                                    const float* torque_input,
                                    const float* drive_force_limits) {
     if (state.total_link_count == 0u || torque_input == nullptr) {
         return;
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t blocks =
         (state.total_link_count + kDriveBlockSize - 1u) / kDriveBlockSize;
     ApplyTorqueDriveKernel<<<blocks, kDriveBlockSize, 0u, stream>>>(
@@ -547,7 +546,7 @@ void LaunchApplyTorqueDriveKernels(const phi::DeviceContext& context,
     CheckCudaDrive(cudaGetLastError(), "ApplyTorqueDriveKernel launch");
 }
 
-void LaunchApplyVelocityDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyVelocityDriveKernels(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      const float* velocity_target,
                                      const float* drive_stiffness,
@@ -556,8 +555,7 @@ void LaunchApplyVelocityDriveKernels(const phi::DeviceContext& context,
         drive_stiffness == nullptr) {
         return;
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t blocks =
         (state.total_link_count + kDriveBlockSize - 1u) / kDriveBlockSize;
     ApplyVelocityDriveKernel<<<blocks, kDriveBlockSize, 0u, stream>>>(
@@ -565,7 +563,7 @@ void LaunchApplyVelocityDriveKernels(const phi::DeviceContext& context,
     CheckCudaDrive(cudaGetLastError(), "ApplyVelocityDriveKernel launch");
 }
 
-void LaunchApplyComputedTorqueDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyComputedTorqueDriveKernels(cudaStream_t stream, int device_id,
                                            ArticulationDeviceState state,
                                            uint32_t max_dof,
                                            const float* inertia_M_inv,
@@ -593,15 +591,14 @@ void LaunchApplyComputedTorqueDriveKernels(const phi::DeviceContext& context,
             std::to_string(kMaxContactSolverDof) +
             "), the ComputedTorque drive scratch cap");
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     ApplyComputedTorqueDriveKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state, max_dof, inertia_M_inv, qddot_free, q_target, kp, kd,
         drive_force_limits);
     CheckCudaDrive(cudaGetLastError(), "ApplyComputedTorqueDriveKernel launch");
 }
 
-void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyActuatorDriveKernels(cudaStream_t stream, int device_id,
                                      ArticulationDeviceState state,
                                      const float* torque_input,
                                      const float* drive_force_limits,
@@ -609,8 +606,7 @@ void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
     if (state.total_link_count == 0u || torque_input == nullptr) {
         return;
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     const uint32_t blocks =
         (state.total_link_count + kDriveBlockSize - 1u) / kDriveBlockSize;
     ApplyActuatorDriveKernel<<<blocks, kDriveBlockSize, 0u, stream>>>(
@@ -618,7 +614,7 @@ void LaunchApplyActuatorDriveKernels(const phi::DeviceContext& context,
     CheckCudaDrive(cudaGetLastError(), "ApplyActuatorDriveKernel launch");
 }
 
-void LaunchApplyOscDriveKernels(const phi::DeviceContext& context,
+void LaunchApplyOscDriveKernels(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
                                 uint32_t osc_task_link,
@@ -644,8 +640,7 @@ void LaunchApplyOscDriveKernels(const phi::DeviceContext& context,
             std::to_string(kMaxContactSolverDof) +
             "), the Osc drive scratch cap");
     }
-    phi::ScopedDeviceGuard guard(context.device_id);
-    const cudaStream_t stream = context.stream.Native();
+    phi::ScopedDeviceGuard guard(device_id);
     ApplyOscDriveKernel<<<state.articulation_count, 32u, 0u, stream>>>(
         state, max_dof, osc_task_link, inertia_M_inv, task_target, kp, kd,
         drive_force_limits);

@@ -51,7 +51,9 @@
 
 #include "diffsim/sparse_solver_backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 
 #include <cstddef>
@@ -109,7 +111,7 @@ struct ContactDelassusBuffers {
 // and `out_system` points at them with out_system.block_count == block_count.
 // Enqueues on the context stream; the caller synchronizes (mirrors diffsim).
 void BuildContactDelassusSystem(
-    const phi::DeviceContext& context,
+    cudaStream_t stream, int device_id,
     const articulation::ArticulatedContactRow* rows,
     const float* jac_normal,
     const float* jac_tangent1,

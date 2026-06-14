@@ -5,7 +5,8 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/featherstone_aba.hpp"
@@ -97,14 +98,15 @@ std::vector<float> ComputeCudaAbaQddot(const std::filesystem::path& model_path,
     std::copy(qvel, qvel + golden.qvel_count, host_state.qdot.begin());
     std::copy(tau, tau + golden.qvel_count, host_state.tau.begin());
 
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto device_state =
-        nuka::runtime::articulation::UploadArticulationState(context, host_state);
+        nuka::runtime::articulation::UploadArticulationState(context, context_dev, host_state);
     nuka::runtime::articulation::FeatherstoneAba::ComputeAccelerations(
-        context,
+        context, context_dev,
         device_state.View(),
         -9.81f);
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     nuka::runtime::articulation::DownloadArticulationState(device_state, &host_state);
     return host_state.qddot;
 }
@@ -260,12 +262,13 @@ FloatingBaseAbaResult ComputeCudaAbaFloatingBase(
     host_state.tau[root] = 0.0f;
 
     constexpr float kGravityZ = -9.81f;
-    const auto context = nuka::phi::MakeDefaultDeviceContext();
+    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
     auto device_state =
-        nuka::runtime::articulation::UploadArticulationState(context, host_state);
+        nuka::runtime::articulation::UploadArticulationState(context, context_dev, host_state);
     nuka::runtime::articulation::FeatherstoneAba::ComputeAccelerations(
-        context, device_state.View(), kGravityZ);
-    context.stream.Synchronize();
+        context, context_dev, device_state.View(), kGravityZ);
+    cudaStreamSynchronize(context);
     nuka::runtime::articulation::DownloadArticulationState(device_state, &host_state);
 
     FloatingBaseAbaResult result;
@@ -539,7 +542,7 @@ std::vector<float> NkAbaQddot(nk::World& world, const float* record,
     nphi::AbaForwardParams aba{};
     aba.gravity[0] = 0.0f;
     aba.gravity[1] = 0.0f;
-    aba.gravity[2] = -9.81f;  // == the legacy ComputeAccelerations(ctx, st, -9.81f)
+    aba.gravity[2] = -9.81f;  // == the legacy ComputeAccelerations(ctx, ctx_dev, st, -9.81f)
     aba.articulation_count = 1u;
     aba.total_link_count = link_count;
     EXPECT_EQ(world.DispatchOp(nphi::NkOp::AbaForward, &aba), nphi::Status::Ok);
@@ -855,8 +858,9 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
         const auto built = nuka::runtime::BuildWorld(blob);
         auto host = articulation::BuildArticulationHostState(
             built.template_view.articulations, built.template_view.body_table);
-        const auto context = nuka::phi::MakeDefaultDeviceContext();
-        auto device = articulation::UploadArticulationState(context, host);
+        const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const int context_dev = 0;
+        auto device = articulation::UploadArticulationState(context, context_dev, host);
         const uint32_t max_dof = articulation::ArticulationDofCount(host, 0u);
         ASSERT_GT(max_dof, 0u);
 
@@ -895,32 +899,32 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
         const auto state = device.View();
         for (uint32_t step = 0; step < kSteps; ++step) {
             articulation::FeatherstoneAba::ApplyPositionDrives(
-                context, state,
+                context, context_dev, state,
                 static_cast<const float*>(nuka::phi::BufferBase(d_targets)),
                 static_cast<const float*>(nuka::phi::BufferBase(d_stiffness)),
                 static_cast<const float*>(nuka::phi::BufferBase(d_damping)),
                 static_cast<const float*>(nuka::phi::BufferBase(d_limits)),
                 /*defer_velocity_damping=*/true);
-            articulation::FeatherstoneAba::ComputeAccelerations(context, state, kGravityZ);
+            articulation::FeatherstoneAba::ComputeAccelerations(context, context_dev, state, kGravityZ);
             articulation::FeatherstoneAba::IntegrateFloatingBaseVelocity(
-                context, state, kDt, kGravityZ);
-            articulation::FeatherstoneAba::IntegrateVelocity(context, state, kDt);
+                context, context_dev, state, kDt, kGravityZ);
+            articulation::FeatherstoneAba::IntegrateVelocity(context, context_dev, state, kDt);
             articulation::ComputeArticulationInertiaM(
-                context, state, max_dof,
+                context, context_dev, state, max_dof,
                 static_cast<articulation::LinkSpatialInertia*>(nuka::phi::BufferBase(composite)),
                 static_cast<float*>(nuka::phi::BufferBase(m)),
                 static_cast<const float*>(nuka::phi::BufferBase(d_damping)), kDt);
             articulation::FactorArticulationInertiaM(
-                context, state, max_dof,
+                context, context_dev, state, max_dof,
                 static_cast<const float*>(nuka::phi::BufferBase(m)),
                 static_cast<float*>(nuka::phi::BufferBase(m_inv)));
             articulation::ApplyImplicitJointDamping(
-                context, state,
+                context, context_dev, state,
                 static_cast<const float*>(nuka::phi::BufferBase(m_inv)),
                 static_cast<const float*>(nuka::phi::BufferBase(d_damping)), max_dof, kDt);
-            articulation::FeatherstoneAba::IntegratePosition(context, state, kDt);
-            articulation::FeatherstoneAba::IntegrateFloatingBasePose(context, state, kDt);
-            context.stream.Synchronize();
+            articulation::FeatherstoneAba::IntegratePosition(context, context_dev, state, kDt);
+            articulation::FeatherstoneAba::IntegrateFloatingBasePose(context, context_dev, state, kDt);
+            cudaStreamSynchronize(context);
             articulation::DownloadArticulationState(device, &host);
             legacy_traj.insert(legacy_traj.end(), host.q.begin(), host.q.end());
         }

@@ -124,16 +124,18 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         record->desc.max_checkpoints = desc->max_checkpoints;
         record->desc.recompute_on_backward = desc->recompute_on_backward;
 
-        const auto& ctx = world_record->device->context;
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const int device_id = world_record->device->device_id;
         // M9 SEAM (now LIVE): the diffsim machinery consumes ArticulationDeviceState
         // -- a pure pointer view. The pointers now come from the nk arena via
         // MakeArticulationDeviceStateFromViews(ModelView, DataView, links, artics):
         // algorithm/kernels are UNTOUCHED (proven bit-exact by
         // AbaReverse.NkArenaSeamForwardReverseBitExact). The legacy backward .cu
-        // kernels still run on the phi v1 ctx (the legacy DeviceContext stays in
-        // DeviceRecord until the backward op-ifies at T7). The diffsim path is
-        // single-env (the tape tests create env_count == 1), so the host mirror's
-        // single-env link/articulation counts == the arena's.
+        // kernels still run on stream 0 (the diffsim launchers are driven on the
+        // handle's stream, now the NULL stream) until the backward op-ifies at
+        // T7. The diffsim path is single-env (the tape tests create
+        // env_count == 1), so the host mirror's single-env link/articulation
+        // counts == the arena's.
         const uint32_t total_link_count =
             world_record->articulation_host.TotalLinkCount();
         const uint32_t articulation_count =
@@ -157,16 +159,16 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         const nuka::nk::ModelHoldDrives& drives =
             world_record->world->GetModel().hold_drives;
         record->orchestrator = std::make_unique<diffsim::RecomputeOrchestrator>(
-            ctx, state, rp, drives.stiffness, drives.damping, drives.force_limits,
+            stream, device_id, state, rp, drives.stiffness, drives.damping, drives.force_limits,
             mass_params);
-        record->tape = std::make_unique<diffsim::Tape>(ctx, record->desc,
+        record->tape = std::make_unique<diffsim::Tape>(stream, device_id, record->desc,
                                                        record->total_link_count);
         // Contact-free path: lambda_width 0 (the R2 slot is present-but-unused).
         record->checkpoints = std::make_unique<diffsim::CheckpointManager>(
-            ctx, record->desc.max_checkpoints, state.articulation_count,
+            stream, device_id, record->desc.max_checkpoints, state.articulation_count,
             record->total_link_count, /*lambda_width=*/0u);
         record->backward = std::make_unique<diffsim::BackwardRunner>(
-            ctx, *record->orchestrator);
+            stream, device_id, *record->orchestrator);
 
         *out = TapeTable().Insert(std::move(record));
         return (*out != nullptr) ? NUKA_RESULT_OK : NUKA_RESULT_INTERNAL;
@@ -192,7 +194,7 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
-        const auto& ctx = world_record->device->context;
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
         // The action this step is the world's current DRIVE_TARGET arena field
         // (the policy writes it through the buffer view before each step). The
         // cook seeds it to the hold-pose targets (SeedInitialState), so an
@@ -226,7 +228,7 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
         // Record the action + entry, then advance the differentiable forward.
         record->tape->RecordStep(action, has_checkpoint, checkpoint_slot);
         record->orchestrator->StepOnce(action);
-        ctx.stream.Synchronize();
+        cudaStreamSynchronize(stream);
         record->steps_since_checkpoint += 1u;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -250,7 +252,8 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
-        const auto& ctx = record->world->device->context;
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const int device_id = record->world->device->device_id;
         const uint32_t n = record->total_link_count;
         const uint32_t step_count = record->tape->StepCount();
         if (step_count == 0u) {
@@ -258,12 +261,12 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
         }
 
         // phi v2 device buffers (device-level DEFAULT, stream-0 alloc). ALL
-        // transfers below run on ctx.stream (the DeviceRecord's owned stream) via
+        // transfers below run on stream 0 (the handle's NULL/default stream) via
         // raw cudaMemcpyAsync over the base pointers -- the SAME stream the
         // backward kernels run on -- so the seed memset/upload is ordered before
         // the runner reads them and the readback after the runner's own
-        // ctx.stream sync is ordered after the writes (R1/R2: byte+order-identical
-        // to the legacy memset(ctx.stream)+sync-CopyFromHost flow; never split the
+        // stream-0 sync is ordered after the writes (R1/R2: byte+order-identical
+        // to the legacy memset(stream-0)+sync-host-copy flow; never split the
         // transfers onto a foreign stream from the consuming kernels).
         nuka::phi::BufferType* bt =
             nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice());
@@ -285,25 +288,25 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
         nuka::phi::Buffer* grad_mass_dev = g.bufs[4] = nuka::phi::BufferAlloc(bt, n * sizeof(float));
 
         // Upload the final-state loss-adjoint seed (host -> device), all on
-        // ctx.stream, mirroring the runner's transfer stream.
+        // stream 0, mirroring the runner's transfer stream.
         {
-            nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+            nuka::phi::ScopedDeviceGuard guard(device_id);
             cudaMemsetAsync(nuka::phi::BufferBase(seed_q), 0, n * sizeof(float),
-                            ctx.stream.Native());
+                            stream);
             cudaMemsetAsync(nuka::phi::BufferBase(seed_qdot), 0, n * sizeof(float),
-                            ctx.stream.Native());
+                            stream);
             cudaMemsetAsync(nuka::phi::BufferBase(seed_lv), 0, n * 6u * sizeof(float),
-                            ctx.stream.Native());
+                            stream);
             if (grad_observations_in != nullptr) {
                 cudaMemcpyAsync(nuka::phi::BufferBase(seed_q), grad_observations_in,
                                 n * sizeof(float), cudaMemcpyHostToDevice,
-                                ctx.stream.Native());
+                                stream);
                 cudaMemcpyAsync(nuka::phi::BufferBase(seed_qdot),
                                 grad_observations_in + n, n * sizeof(float),
-                                cudaMemcpyHostToDevice, ctx.stream.Native());
+                                cudaMemcpyHostToDevice, stream);
                 cudaMemcpyAsync(nuka::phi::BufferBase(seed_lv),
                                 grad_observations_in + 2u * n, n * 6u * sizeof(float),
-                                cudaMemcpyHostToDevice, ctx.stream.Native());
+                                cudaMemcpyHostToDevice, stream);
             }
         }
 
@@ -320,19 +323,19 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
         record->backward->Run(*record->tape, *record->checkpoints, seeds,
                               outputs);
 
-        // Readback device -> host on ctx.stream (the runner already synced it at
+        // Readback device -> host on stream 0 (the runner already synced it at
         // the end of Run; re-issue + sync to make the host reads observable).
         {
-            nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+            nuka::phi::ScopedDeviceGuard guard(device_id);
             cudaMemcpyAsync(grad_actions_out, nuka::phi::BufferBase(grad_actions_dev),
                             static_cast<size_t>(step_count) * n * sizeof(float),
-                            cudaMemcpyDeviceToHost, ctx.stream.Native());
+                            cudaMemcpyDeviceToHost, stream);
             if (grad_parameters_out != nullptr) {
                 cudaMemcpyAsync(grad_parameters_out,
                                 nuka::phi::BufferBase(grad_mass_dev), n * sizeof(float),
-                                cudaMemcpyDeviceToHost, ctx.stream.Native());
+                                cudaMemcpyDeviceToHost, stream);
             }
-            ctx.stream.Synchronize();
+            cudaStreamSynchronize(stream);
         }
         // g (BufGuard) frees all five buffers on scope exit.
         return NUKA_RESULT_OK;
@@ -507,22 +510,23 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
         // (affine), so the tape's uploaded slope needs no refresh.
         host.link_inertia[link_index] = new_inertia;
 
-        const auto& ctx = world_record->device->context;
+        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const int device_id = world_record->device->device_id;
         auto* device_inertia =
             world_record->world->FieldPtr<nuka::runtime::articulation::LinkSpatialInertia>(
                 nuka::nk::FieldId::LinkInertia);
         if (device_inertia == nullptr) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
-        nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+        nuka::phi::ScopedDeviceGuard guard(device_id);
         cudaError_t copy_status = cudaMemcpyAsync(
             device_inertia + link_index, &new_inertia,
             sizeof(nuka::runtime::articulation::LinkSpatialInertia),
-            cudaMemcpyHostToDevice, ctx.stream.Native());
+            cudaMemcpyHostToDevice, stream);
         if (copy_status != cudaSuccess) {
             return NUKA_RESULT_INTERNAL;
         }
-        ctx.stream.Synchronize();
+        cudaStreamSynchronize(stream);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

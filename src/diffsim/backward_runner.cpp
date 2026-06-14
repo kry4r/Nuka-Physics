@@ -41,42 +41,42 @@ void CheckCuda(cudaError_t status, const char* what) {
 // in the phi v2 op TU (diffsim_backward.cu) so this file stays pure-host; the
 // thin launcher (diffsim::LaunchAddInPlace) keeps the SAME 256-threads/block
 // geometry and one-thread-per-link plain load/add/store -> D1 bit-exact.
-void LaunchAdd(const phi::DeviceContext& ctx, float* acc, const float* step,
+void LaunchAdd(cudaStream_t stream, int device_id, float* acc, const float* step,
                uint32_t n) {
-    phi::ScopedDeviceGuard guard(ctx.device_id);
-    LaunchAddInPlace(acc, step, n, ctx.stream.Native());
+    phi::ScopedDeviceGuard guard(device_id);
+    LaunchAddInPlace(acc, step, n, stream);
     CheckCuda(cudaGetLastError(), "AddInPlace launch");
 }
 
 // Allocate a v2 device Buffer* (device-level DEFAULT type) and zero it on
 // ctx.stream via a raw cudaMemsetAsync over the base pointer -- the SAME stream
 // (and byte-for-byte the same memset) the legacy ZeroedFloat used.
-phi::Buffer* ZeroedFloat(const phi::DeviceContext& ctx, size_t count) {
+phi::Buffer* ZeroedFloat(cudaStream_t stream, int device_id, size_t count) {
     phi::Buffer* b = phi::BufferAlloc(
         phi::DeviceBufferType(phi::InitBestDevice()), count * sizeof(float));
-    phi::ScopedDeviceGuard guard(ctx.device_id);
+    phi::ScopedDeviceGuard guard(device_id);
     CheckCuda(cudaMemsetAsync(phi::BufferBase(b), 0, count * sizeof(float),
-                              ctx.stream.Native()),
+                              stream),
               "ZeroedFloat memset");
     return b;
 }
 }  // namespace
 
-BackwardRunner::BackwardRunner(const phi::DeviceContext& context,
+BackwardRunner::BackwardRunner(cudaStream_t stream, int device_id,
                                RecomputeOrchestrator& orchestrator)
-    : context_(context), orch_(orchestrator) {
+    : stream_(stream), device_id_(device_id), orch_(orchestrator) {
     total_link_count_ = orch_.TotalLinkCount();
     articulation_count_ = orch_.State().articulation_count;
     const size_t n = total_link_count_;
-    q_pre_ = ZeroedFloat(context_, n);
-    qdot_pre_ = ZeroedFloat(context_, n);
-    v_root_pre_ = ZeroedFloat(context_, n * 6u);
-    grad_q_ = ZeroedFloat(context_, n);
-    grad_qdot_ = ZeroedFloat(context_, n);
-    grad_link_vel_ = ZeroedFloat(context_, n * 6u);
-    grad_mass_step_ = ZeroedFloat(context_, n);
-    grad_mass_acc_ = ZeroedFloat(context_, n);
-    grad_tau_ = ZeroedFloat(context_, n);
+    q_pre_ = ZeroedFloat(stream_, device_id_, n);
+    qdot_pre_ = ZeroedFloat(stream_, device_id_, n);
+    v_root_pre_ = ZeroedFloat(stream_, device_id_, n * 6u);
+    grad_q_ = ZeroedFloat(stream_, device_id_, n);
+    grad_qdot_ = ZeroedFloat(stream_, device_id_, n);
+    grad_link_vel_ = ZeroedFloat(stream_, device_id_, n * 6u);
+    grad_mass_step_ = ZeroedFloat(stream_, device_id_, n);
+    grad_mass_acc_ = ZeroedFloat(stream_, device_id_, n);
+    grad_tau_ = ZeroedFloat(stream_, device_id_, n);
 }
 
 BackwardRunner::~BackwardRunner() {
@@ -107,7 +107,7 @@ void BackwardRunner::ApplyIftContactSeed(const IftContactInputs& inputs,
             "ContactFree (call SetGradientMode(GradientMode::ContactIft) first)");
     }
     if (!ift_) {
-        ift_ = std::make_unique<IftRunner>(context_);  // lazy: only on first IFT use
+        ift_ = std::make_unique<IftRunner>(stream_, device_id_);  // lazy: only on first IFT use
     }
     IftContactGrads grads;
     grads.grad_qdot_free = grad_qdot_free;
@@ -118,13 +118,13 @@ void BackwardRunner::ApplyIftContactSeed(const IftContactInputs& inputs,
 void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
                                  const BackwardOutputs& out) {
     const articulation::ArticulationDeviceState state = orch_.State();
-    const cudaStream_t stream = context_.stream.Native();
+    const cudaStream_t stream = stream_;
     const size_t n = total_link_count_;
 
     // 1. Snapshot pre-step q/qdot (StepBackward's drive + ABA reverses need the
     //    PRE-step values; StepOnce below overwrites the live q/qdot).
     {
-        phi::ScopedDeviceGuard guard(context_.device_id);
+        phi::ScopedDeviceGuard guard(device_id_);
         CheckCuda(cudaMemcpyAsync(phi::BufferBase(q_pre_), state.q, n * sizeof(float),
                                   cudaMemcpyDeviceToDevice, stream),
                   "snapshot q_pre");
@@ -149,7 +149,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
 
     // 3. Zero grad_tau (StepBackward STAGES dL/dtau here; caller must pre-zero).
     {
-        phi::ScopedDeviceGuard guard(context_.device_id);
+        phi::ScopedDeviceGuard guard(device_id_);
         CheckCuda(cudaMemsetAsync(phi::BufferBase(grad_tau_), 0, n * sizeof(float), stream),
                   "zero grad_tau");
     }
@@ -176,10 +176,10 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
     g.grad_tau_out = static_cast<float*>(phi::BufferBase(grad_tau_));
     g.grad_link_velocity_out = static_cast<float*>(phi::BufferBase(grad_link_vel_));
 
-    StepBackward(context_, state, in, g);
+    StepBackward(stream_, device_id_, state, in, g);
 
     // 6. grad_mass_acc_ += grad_mass_step_ (fixed-order, atomic-free, D1).
-    LaunchAdd(context_, static_cast<float*>(phi::BufferBase(grad_mass_acc_)),
+    LaunchAdd(stream_, device_id_, static_cast<float*>(phi::BufferBase(grad_mass_acc_)),
               static_cast<const float*>(phi::BufferBase(grad_mass_step_)),
               total_link_count_);
 }
@@ -187,7 +187,7 @@ void BackwardRunner::ReverseStep(const Tape& tape, uint32_t step,
 void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
                          const BackwardSeeds& seeds, const BackwardOutputs& out) {
     const uint32_t step_count = tape.StepCount();
-    const cudaStream_t stream = context_.stream.Native();
+    const cudaStream_t stream = stream_;
     const size_t n = total_link_count_;
     if (out.grad_actions == nullptr || out.grad_mass == nullptr) {
         throw std::invalid_argument(
@@ -199,7 +199,7 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
 
     // -- Seed the loss adjoint on the FINAL (post last-step) state. --
     {
-        phi::ScopedDeviceGuard guard(context_.device_id);
+        phi::ScopedDeviceGuard guard(device_id_);
         if (seeds.grad_q_final) {
             CheckCuda(cudaMemcpyAsync(phi::BufferBase(grad_q_), seeds.grad_q_final,
                                       n * sizeof(float), cudaMemcpyDeviceToDevice,
@@ -293,7 +293,7 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
         // Roll forward through the window, snapshotting the PRE-state of each
         // step (the state at the START of step base_step + w) into cache slot w.
         for (uint32_t w = 0u; w < window_len; ++w) {
-            phi::ScopedDeviceGuard guard(context_.device_id);
+            phi::ScopedDeviceGuard guard(device_id_);
             float* wq = static_cast<float*>(phi::BufferBase(win_q_)) +
                         static_cast<size_t>(w) * n;
             float* wqd = static_cast<float*>(phi::BufferBase(win_qdot_)) +
@@ -330,7 +330,7 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
         for (uint32_t wi = window_len; wi-- > 0u;) {
             const uint32_t step = base_step + wi;
             {
-                phi::ScopedDeviceGuard guard(context_.device_id);
+                phi::ScopedDeviceGuard guard(device_id_);
                 const float* wq = static_cast<const float*>(phi::BufferBase(win_q_)) +
                                   static_cast<size_t>(wi) * n;
                 const float* wqd = static_cast<const float*>(phi::BufferBase(win_qdot_)) +
@@ -365,13 +365,13 @@ void BackwardRunner::Run(const Tape& tape, const CheckpointManager& cm,
 
     // -- Publish the accumulated mass gradient. --
     {
-        phi::ScopedDeviceGuard guard(context_.device_id);
+        phi::ScopedDeviceGuard guard(device_id_);
         CheckCuda(cudaMemcpyAsync(out.grad_mass, phi::BufferBase(grad_mass_acc_),
                                   n * sizeof(float), cudaMemcpyDeviceToDevice,
                                   stream),
                   "publish grad_mass");
     }
-    context_.stream.Synchronize();
+    cudaStreamSynchronize(stream_);
 }
 
 }  // namespace nuka::diffsim

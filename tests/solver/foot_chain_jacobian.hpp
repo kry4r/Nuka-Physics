@@ -31,7 +31,8 @@
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"
 #include "phi/buffer.hpp"
-#include "phi/device_context.hpp"
+#include "phi/scoped_device_guard.hpp"
+#include <cuda_runtime.h>
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -46,7 +47,7 @@ namespace nuka::test {
 // is taken BY VALUE so we can refresh its link_pose without mutating the caller's
 // state; `fk_world_poses` are the current-q FK world poses (one per link).
 inline std::vector<float> ComputeFootChainJ18(
-    const nuka::phi::DeviceContext& context,
+    cudaStream_t context, int context_dev,
     nuka::runtime::articulation::ArticulationHostState host,  // by value (refreshed).
     const std::vector<nuka::math::Transform>& fk_world_poses,
     uint32_t contact_link,
@@ -58,7 +59,7 @@ inline std::vector<float> ComputeFootChainJ18(
     if (fk_world_poses.size() == host.link_pose.size()) {
         host.link_pose = fk_world_poses;  // refresh world poses from current q.
     }
-    auto device = articulation::UploadArticulationState(context, host);
+    auto device = articulation::UploadArticulationState(context, context_dev, host);
     // phi v2 device buffers from the device-level DEFAULT (stream-0) type. Upload/
     // download run on stream 0 like the legacy CopyFromHost/ToHost; the chain-J
     // kernel runs on context.stream over the base pointers (unchanged).
@@ -75,12 +76,12 @@ inline std::vector<float> ComputeFootChainJ18(
     std::vector<float> zero(dof_stride, 0.0f);
     nuka::phi::BufferUpload(jbuf, zero.data(), 0, zero.size() * sizeof(float));
     articulation::ComputeContactChainJacobians(
-        context, device.View(),
+        context, context_dev, device.View(),
         static_cast<const uint32_t*>(nuka::phi::BufferBase(link_buf)),
         static_cast<const Vec3*>(nuka::phi::BufferBase(point_buf)),
         static_cast<const Vec3*>(nuka::phi::BufferBase(normal_buf)),
         1u, dof_stride, static_cast<float*>(nuka::phi::BufferBase(jbuf)));
-    context.stream.Synchronize();
+    cudaStreamSynchronize(context);
     std::vector<float> j(dof_stride);
     nuka::phi::BufferDownload(jbuf, j.data(), 0, j.size() * sizeof(float));
     nuka::phi::BufferFree(link_buf);
