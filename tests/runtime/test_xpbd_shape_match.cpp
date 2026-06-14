@@ -1,34 +1,35 @@
 // ---------------------------------------------------------------------------
-// v0.7 p09-C: XPBD SHAPE-MATCH (id 9) cluster tests -- the meshless cluster
-// regularizer (Mueller et al. 2005). The 4th and hardest XPBD row class.
+// M9 T11: XPBD SHAPE-MATCH (id 9) cluster tests, RE-POINTED to the nk path.
+// The meshless cluster regularizer (Mueller et al. 2005), the 4th XPBD row class.
 //
-// The V3 FD adjoint gate (test_adjoint_fd_xpbd_shape_match) validates the
-// multilinear per-particle GOAL-PROJECTION law, BLIND to the polar-decomposition
-// rotation R that builds the goal (and its derivative dR/dA). This suite is where
-// the downstream GEOMETRY is exercised (the analog of the volume row's grad-C
-// suite):
+// The shape-match constraint is the one XPBD family that lived ONLY in the legacy
+// runtime::soft::XpbdWorld stepper; M9 T11 ports it to the nk particle ops
+// (src/phi/backend_cuda/ops/particles.cu XpbdShapeMatchKernel + the CookXpbd
+// shape-match cook). This suite asserts the SAME analytic/physical invariants the
+// legacy p09-C suite asserted, now through nk::World (cook -> World -> Step):
 //
 //   1. POLAR dR/dA: a host replication of the device Higham Newton polar
 //      decomposition, with the analytic derivative dR/dA via the skew-generator
 //      solve (tr(S)I - S) w = axial(R^T dA - (R^T dA)^T), dR = R [w]_x, matched to
-//      a host central-difference of R(A) at a well-conditioned non-degenerate
-//      cluster (det A > 0, healthy singular values) -- rel-err < 1e-3. Also
-//      asserts det(R) ~ +1 (proper rotation).
-//   2. DISCRIMINATING cluster relaxation: a cluster initialized NON-rigidly
-//      (anisotropic stretch + shear, so it does NOT already match the rest shape),
-//      gravity OFF, relaxes under the shape-match constraint ALONE toward a RIGID
-//      transform of the rest shape: final pairwise distances return to the REST
-//      pairwise distances (within tol) AND the initial sheared config did NOT
-//      already match (so the test is not vacuous) AND the recovered rotation is a
-//      proper rotation (det +1).
-//   3. D1 two-run byte-exactness of the shape-match forward.
+//      a host central-difference of R(A) -- rel-err < 1e-3. PURE host math (the
+//      polar machinery is identical between the legacy + nk kernels), unchanged.
+//   2. DISCRIMINATING cluster relaxation (on nk): a cluster initialized NON-rigidly
+//      (anisotropic stretch + shear) relaxes under the shape-match constraint
+//      ALONE toward a RIGID transform of the rest shape: final pairwise distances
+//      return to the REST pairwise distances AND the recovered rotation equals
+//      polar(A_init) (forces the nk device polar to be correct) AND the initial
+//      sheared config did NOT already match (non-vacuous).
+//   3. D1 two-run byte-exactness of the nk shape-match forward.
 //
-// A full Vellum golden is DEFERRED to p15; these are ANALYTIC/physical invariants.
+// A full Vellum golden is DEFERRED; these are ANALYTIC/physical invariants.
 // ---------------------------------------------------------------------------
 
-#include "runtime/soft/xpbd_world.hpp"
-
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
@@ -38,15 +39,29 @@
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
-using nuka::runtime::soft::StepXpbdWorld;
-using nuka::runtime::soft::UploadXpbdWorld;
-using nuka::runtime::soft::XpbdConstraintSet;
-using nuka::runtime::soft::XpbdParticleSet;
-using nuka::runtime::soft::XpbdShapeMatchCluster;
-using nuka::runtime::soft::XpbdStepOptions;
-using nuka::runtime::soft::XpbdWorld;
-using nuka::runtime::soft::XpbdWorldState;
+
+// Downloaded particle state holder (replaces the legacy XpbdWorldState).
+struct XpbdWorldState {
+    std::vector<Vec3> positions;
+    std::vector<Vec3> velocities;
+};
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
 
 // -------------------------------------------------------------------------
 // Host replica of the device 3x3 polar machinery (row-major m[3r+c]). Kept
@@ -296,43 +311,71 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
         return rotateR0(stretched);
     };
 
-    auto build = [&]() {
-        XpbdParticleSet particles;
-        for (const Vec3& q : rest) {
-            particles.positions.push_back(deform(q));
-            particles.velocities.push_back(Vec3{0.0f, 0.0f, 0.0f});
-            particles.inv_masses.push_back(1.0f);
-        }
-        XpbdShapeMatchCluster cl;
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+
+    // The initial (deformed) positions -- the soft particle rest state seeded into
+    // the nk Model. Used both for the setup-sanity check and for the per-run cook.
+    std::vector<Vec3> init_positions;
+    for (const Vec3& q : rest) init_positions.push_back(deform(q));
+
+    // Build an nk::Model carrying ONE shape-match cluster over the deformed cube
+    // (the CSR cook: c0 + q_i are computed inside CookShapeMatch via the Model
+    // staging). The cook here is inline (the nk_particle_equivalence pattern) so
+    // the test exercises the SAME ModelParticles fields the cook produces.
+    auto build_model = [&]() {
+        nk::Model model;
+        nk::Model::ModelParticles& mp = model.particles;
+        mp.mode = nk::Model::ParticleMode::Xpbd;
+        mp.initial_pos = init_positions;
+        mp.initial_vel.assign(rest.size(), Vec3::Zero());
+        mp.inv_mass.assign(rest.size(), 1.0f);
+        mp.xpbd_iters = 30u;  // within-step re-projection converges.
+        // ONE cluster over all 8 corners. Cook c0 = (sum m_i x_i^0)/sum m_i and
+        // q_i = x_i^0 - c0 (the legacy UploadXpbdWorld shape-match flatten 1:1).
+        const float n = static_cast<float>(rest.size());
+        Vec3 c0{0, 0, 0};
+        for (const Vec3& q : rest) c0 += q;
+        c0 /= n;
+        mp.sm_cluster_offset = {0u};
+        mp.sm_cluster_size   = {static_cast<uint32_t>(rest.size())};
+        mp.sm_stiffness      = {1.0f};  // s=1: goal config has rest pairwise dists.
+        mp.sm_rest_centroid  = {c0};
         for (uint32_t i = 0; i < rest.size(); ++i) {
-            cl.particle.push_back(i);
-            cl.rest_positions.push_back(rest[i]);
-            cl.cluster_mass.push_back(1.0f);
+            mp.sm_particles.push_back(i);
+            mp.sm_rest_q.push_back(rest[i] - c0);
+            mp.sm_mass.push_back(1.0f);
         }
-        cl.stiffness = 1.0f;  // s=1: goal config has exactly rest pairwise dists.
-        XpbdConstraintSet cs;
-        cs.shape_match.push_back(cl);
-        return std::make_pair(particles, cs);
+        nk::ModelCapacities& cap = model.capacities;
+        cap.env_count = 1;
+        cap.particles_per_env = static_cast<uint32_t>(rest.size());
+        cap.shape_match_slots_per_env = 1u;
+        cap.shape_match_members_per_env = static_cast<uint32_t>(rest.size());
+        return model;
     };
 
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = 1.0f / 240.0f;
+    cfg.gravity[0] = cfg.gravity[1] = cfg.gravity[2] = 0.0f;  // isolate shape-match.
+    NkCtx c = GetNkCtx();
     auto run = [&]() {
-        auto [particles, cs] = build();
-        XpbdWorld world = UploadXpbdWorld(particles, cs);
-        XpbdStepOptions so;
-        so.gravity = Vec3{0.0f, 0.0f, 0.0f};  // gravity OFF: isolate shape-match.
-        so.dt = 1.0f / 240.0f;
-        so.step_count = 1u;
-        so.solver_iterations = 30u;  // within-step re-projection converges.
-        for (uint32_t s = 0; s < 60u; ++s) {
-            StepXpbdWorld(world, so);
-        }
-        return world.DownloadState();
+        nk::World world(build_model(), 1u, c.dev, c.backend, cfg);
+        EXPECT_TRUE(world.Ready());
+        const uint32_t P = world.GetModel().capacities.particles_per_env;
+        for (uint32_t s = 0; s < 60u; ++s) world.Step();
+        std::vector<Vec3> p(P), v(P);
+        world.GetData().DownloadField(nk::FieldId::ParticlePos, p.data(),
+                                      P * sizeof(Vec3));
+        world.GetData().DownloadField(nk::FieldId::ParticleVel, v.data(),
+                                      P * sizeof(Vec3));
+        XpbdWorldState st;
+        st.positions = p;
+        st.velocities = v;
+        return st;
     };
 
     // Setup sanity: the sheared init must NOT already match rest distances (else
     // the relaxation assertion would be vacuous).
-    const auto [init_particles, init_cs] = build();
-    const std::vector<float> init_d = PairwiseDistances(init_particles.positions);
+    const std::vector<float> init_d = PairwiseDistances(init_positions);
     float init_max_drift = 0.0f;
     for (std::size_t k = 0; k < rest_d.size(); ++k)
         init_max_drift = std::max(init_max_drift, std::fabs(init_d[k] - rest_d[k]));
@@ -392,11 +435,11 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
         // (built from the SAME deform() the world was seeded with) against the rest
         // offsets. This is the rotation the device fixed point provably converges to.
         Vec3 ci{0, 0, 0};
-        for (const Vec3& p : init_particles.positions) ci += p;
-        ci /= static_cast<float>(init_particles.positions.size());
+        for (const Vec3& p : init_positions) ci += p;
+        ci /= static_cast<float>(init_positions.size());
         M3 Ai = Zero3();
         for (std::size_t i = 0; i < rest.size(); ++i) {
-            const Vec3 d = init_particles.positions[i] - ci;
+            const Vec3 d = init_positions[i] - ci;
             const Vec3 q = rest[i] - c0;
             Ai.m[0] += d.x * q.x; Ai.m[1] += d.x * q.y; Ai.m[2] += d.x * q.z;
             Ai.m[3] += d.y * q.x; Ai.m[4] += d.y * q.y; Ai.m[5] += d.y * q.z;

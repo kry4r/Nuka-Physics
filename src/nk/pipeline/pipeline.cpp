@@ -81,19 +81,27 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t dist_count = cap.dist_cons_per_env * env_count;
     const uint32_t bend_count = cap.bend_cons_per_env * env_count;
     const uint32_t vol_count  = cap.vol_cons_per_env * env_count;
+    const uint32_t sm_cluster_count = cap.shape_match_slots_per_env * env_count;
     const Model::ModelParticles& mp = model.particles;
     const uint32_t particle_mode =
         mp.mode == Model::ParticleMode::Xpbd ? phi::kParticleModeXpbd
         : mp.mode == Model::ParticleMode::Pbf ? phi::kParticleModePbf
         : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
+        : mp.mode == Model::ParticleMode::SoftFluid ? phi::kParticleModeSoftFluid
                                                   : phi::kParticleModeNone;
+    // M9 T11 SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
+    const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
+                                ? mp.n_soft_particles : 0u;
+    const uint32_t per_env_particles = cap.particles_per_env;
     const uint32_t coupled_internal =
         mp.coupled_internal == Model::CoupledInternal::Xpbd ? phi::kCoupledInternalXpbd
         : mp.coupled_internal == Model::CoupledInternal::Pbf ? phi::kCoupledInternalPbf
                                                              : phi::kCoupledInternalNone;
-    // The PBF density-projection runs when the body IS a fluid: either standalone
-    // PBF mode, or coupled mode with the Pbf internal sub-type.
+    // The PBF density-projection runs when the body IS a fluid: standalone PBF
+    // mode, coupled mode with the Pbf internal sub-type, OR the SoftFluid
+    // co-residence mode (which always carries a PBF fluid slice).
     const bool runs_pbf = (particle_mode == phi::kParticleModePbf) ||
+        (particle_mode == phi::kParticleModeSoftFluid) ||
         (particle_mode == phi::kParticleModeCoupled &&
          coupled_internal == phi::kCoupledInternalPbf);
 
@@ -105,6 +113,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_predict_.mode = particle_mode;
         p_part_predict_.particle_count = particle_count;
         p_part_predict_.coupled_internal = coupled_internal;
+        p_part_predict_.n_soft_particles = n_soft;
+        p_part_predict_.particles_per_env = per_env_particles;
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
     }
 
@@ -245,6 +255,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_xpbd_.dist_con_count = dist_count;
         p_xpbd_.bend_con_count = bend_count;
         p_xpbd_.vol_con_count  = vol_count;
+        p_xpbd_.shape_match_cluster_count = sm_cluster_count;
         add(phi::NkOp::XpbdProject, &p_xpbd_);
 
         // PbfDensityLambda / PbfApplyDelta: the PBF density-projection. Inert for
@@ -261,6 +272,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_pbf_density_.dt             = cfg.dt;
         p_pbf_density_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
         p_pbf_density_.floor_z        = mp.floor_z;
+        p_pbf_density_.n_soft_particles = n_soft;
+        p_pbf_density_.particles_per_env = per_env_particles;
         add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
 
         p_pbf_apply_.support_radius  = mp.pbf_support_radius;
@@ -268,6 +281,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_pbf_apply_.particle_count  = particle_count;
         p_pbf_apply_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
         p_pbf_apply_.floor_z         = mp.floor_z;
+        p_pbf_apply_.n_soft_particles = n_soft;
+        p_pbf_apply_.particles_per_env = per_env_particles;
         add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
     }
 
@@ -312,6 +327,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_finalize_.xsph_viscosity_c = mp.pbf_xsph_viscosity;
         p_part_finalize_.surface_tension_gamma = mp.pbf_surface_tension;
         p_part_finalize_.rest_density = mp.pbf_rest_density;
+        p_part_finalize_.n_soft_particles = n_soft;
+        p_part_finalize_.particles_per_env = per_env_particles;
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
     }
 

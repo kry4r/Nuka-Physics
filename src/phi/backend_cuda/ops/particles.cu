@@ -59,6 +59,17 @@ constexpr uint32_t kBlockSize = 128u;
 // per-particle private CSR slice stride the M5 GridFillKernel wrote.
 constexpr uint32_t kNeighborStride = 32u;
 
+// M9 T11 SoftFluid: within-env local particle index (env-major: env e owns
+// [e*per_env, e*per_env+per_env); the soft sub-slice is the first n_soft of each
+// env). per_env == 0 (defensive) makes the local index the global index. The
+// PBF fluid ops use this to skip soft particles; single-system n_soft == 0 makes
+// it always false -> the fluid kernels stay byte-identical to the legacy.
+__device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
+                                         uint32_t per_env) {
+    const uint32_t local = per_env > 0u ? (i % per_env) : i;
+    return local < n_soft;
+}
+
 // =============================================================================
 // XPBD kernels — VERBATIM from runtime/soft/xpbd_world.cu (predict / distance /
 // bend / volume / correct). Indices/expressions unchanged; only the buffer
@@ -244,6 +255,148 @@ __global__ void XpbdVolumeKernel(uint32_t volume_constraint_count,
     }
 }
 
+// --- solve: shape-match (Mueller et al. 2005) ---------------------------------
+// VERBATIM port of runtime/soft/xpbd_world.cu SolveShapeMatchConstraintsKernel +
+// its local 3x3 polar machinery. Same math, same reduction order, single-thread
+// fixed-order GS sweep -- D1, no float atomics. The buffer arguments are the nk
+// arena/model fields (positions = data.particle_pos; the CSR cluster tables come
+// from the ModelView sm_* fields). The reduction order (ascending member j) and
+// every float expression are unchanged so the legacy shape-match invariants hold.
+// A 3x3 matrix stored ROW-MAJOR as nine floats m[0..8] (m[3*r+c]).
+struct SmMat3 {
+    float m[9];
+};
+__device__ __forceinline__ SmMat3 SmMat3Zero() {
+    SmMat3 a;
+    for (int i = 0; i < 9; ++i) {
+        a.m[i] = 0.0f;
+    }
+    return a;
+}
+__device__ __forceinline__ SmMat3 SmMat3Identity() {
+    SmMat3 a = SmMat3Zero();
+    a.m[0] = 1.0f;
+    a.m[4] = 1.0f;
+    a.m[8] = 1.0f;
+    return a;
+}
+__device__ __forceinline__ float SmMat3Det(const SmMat3& a) {
+    return a.m[0] * (a.m[4] * a.m[8] - a.m[5] * a.m[7]) -
+           a.m[1] * (a.m[3] * a.m[8] - a.m[5] * a.m[6]) +
+           a.m[2] * (a.m[3] * a.m[7] - a.m[4] * a.m[6]);
+}
+// Inverse-transpose (a^-1)^T = cofactor(a)/det(a). Identity if |det| < eps.
+__device__ __forceinline__ SmMat3 SmMat3InvTranspose(const SmMat3& a, float eps) {
+    const float det = SmMat3Det(a);
+    if (fabsf(det) < eps) {
+        return SmMat3Identity();
+    }
+    const float inv_det = 1.0f / det;
+    SmMat3 c;
+    c.m[0] = (a.m[4] * a.m[8] - a.m[5] * a.m[7]) * inv_det;
+    c.m[1] = -(a.m[3] * a.m[8] - a.m[5] * a.m[6]) * inv_det;
+    c.m[2] = (a.m[3] * a.m[7] - a.m[4] * a.m[6]) * inv_det;
+    c.m[3] = -(a.m[1] * a.m[8] - a.m[2] * a.m[7]) * inv_det;
+    c.m[4] = (a.m[0] * a.m[8] - a.m[2] * a.m[6]) * inv_det;
+    c.m[5] = -(a.m[0] * a.m[7] - a.m[1] * a.m[6]) * inv_det;
+    c.m[6] = (a.m[1] * a.m[5] - a.m[2] * a.m[4]) * inv_det;
+    c.m[7] = -(a.m[0] * a.m[5] - a.m[2] * a.m[3]) * inv_det;
+    c.m[8] = (a.m[0] * a.m[4] - a.m[1] * a.m[3]) * inv_det;
+    return c;
+}
+// Higham Newton polar rotation R = polar(A), det-corrected proper rotation.
+__device__ __forceinline__ SmMat3 SmPolarRotation(const SmMat3& A) {
+    constexpr int kPolarIters = 24;
+    constexpr float kDetEps = 1.0e-12f;
+    SmMat3 R = A;
+    for (int it = 0; it < kPolarIters; ++it) {
+        const SmMat3 RinvT = SmMat3InvTranspose(R, kDetEps);
+        for (int i = 0; i < 9; ++i) {
+            R.m[i] = 0.5f * (R.m[i] + RinvT.m[i]);
+        }
+    }
+    if (SmMat3Det(R) < 0.0f) {
+        R.m[2] = -R.m[2];
+        R.m[5] = -R.m[5];
+        R.m[8] = -R.m[8];
+    }
+    return R;
+}
+__global__ void XpbdShapeMatchKernel(
+    uint32_t cluster_count,
+    uint32_t solver_iterations,
+    math::Vec3* __restrict__ positions,
+    const float* __restrict__ inv_masses,
+    const uint32_t* __restrict__ cluster_offset,
+    const uint32_t* __restrict__ cluster_size,
+    const float* __restrict__ stiffness,
+    const math::Vec3* __restrict__ rest_centroid,  // c0 (unused; q_i pre-offset)
+    const uint32_t* __restrict__ particles,        // sum(n_c)
+    const math::Vec3* __restrict__ rest_q,         // q_i = x_i^0 - c0
+    const float* __restrict__ mass) {              // m_i
+    if (blockIdx.x != 0u || threadIdx.x != 0u) {
+        return;
+    }
+    (void)rest_centroid;  // c0 folded into the cooked q_i; kept for completeness.
+    using mg::MakeVec3;
+    for (uint32_t iter = 0u; iter < solver_iterations; ++iter) {
+        for (uint32_t cc = 0u; cc < cluster_count; ++cc) {
+            const uint32_t base = cluster_offset[cc];
+            const uint32_t n = cluster_size[cc];
+            if (n == 0u) {
+                continue;
+            }
+            const float s = stiffness[cc];
+            // Current mass-weighted centroid c (fixed-order ascending sum).
+            float mass_sum = 0.0f;
+            math::Vec3 c_acc = MakeVec3(0.0f, 0.0f, 0.0f);
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                const float mi = mass[base + j];
+                mass_sum += mi;
+                c_acc = Add(c_acc, Scale(positions[idx], mi));
+            }
+            if (mass_sum <= 0.0f) {
+                continue;  // degenerate cluster weights.
+            }
+            const math::Vec3 c = Scale(c_acc, 1.0f / mass_sum);
+            // Covariance A = sum_i m_i (p_i - c) q_i^T (row-major; fixed order).
+            SmMat3 A = SmMat3Zero();
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                const float mi = mass[base + j];
+                const math::Vec3 d = Sub(positions[idx], c);  // p_i - c
+                const math::Vec3 q = rest_q[base + j];        // q_i = x_i^0 - c0
+                A.m[0] += mi * d.x * q.x;
+                A.m[1] += mi * d.x * q.y;
+                A.m[2] += mi * d.x * q.z;
+                A.m[3] += mi * d.y * q.x;
+                A.m[4] += mi * d.y * q.y;
+                A.m[5] += mi * d.y * q.z;
+                A.m[6] += mi * d.z * q.x;
+                A.m[7] += mi * d.z * q.y;
+                A.m[8] += mi * d.z * q.z;
+            }
+            const SmMat3 R = SmPolarRotation(A);
+            // Goal pull: g_i = c + R q_i ; p_i += w_active * s * (g_i - p_i).
+            for (uint32_t j = 0u; j < n; ++j) {
+                const uint32_t idx = particles[base + j];
+                if (inv_masses[idx] <= 0.0f) {
+                    continue;  // pinned particle: position held fixed.
+                }
+                const math::Vec3 q = rest_q[base + j];
+                const math::Vec3 rq = MakeVec3(
+                    R.m[0] * q.x + R.m[1] * q.y + R.m[2] * q.z,
+                    R.m[3] * q.x + R.m[4] * q.y + R.m[5] * q.z,
+                    R.m[6] * q.x + R.m[7] * q.y + R.m[8] * q.z);
+                const math::Vec3 goal = Add(c, rq);
+                const math::Vec3 p = positions[idx];
+                positions[idx] = Add(p, Scale(Sub(goal, p), s));
+            }
+        }
+    }
+}
+
 // correct: v = (p - prev)/dt (pinned keep their stored velocity). Verbatim.
 __global__ void XpbdCorrectKernel(uint32_t particle_count,
                                   const math::Vec3* __restrict__ positions,
@@ -297,8 +450,14 @@ __global__ void PbfPredictKernel(uint32_t particle_count,
         math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
 }
 
-// density (Poly6, self term first, ascending neighbor sum). Verbatim.
+// density (Poly6, self term first, ascending neighbor sum). Verbatim, plus the
+// M9 T11 SoftFluid fluid-slice scope: when n_soft > 0 the owner particle skips if
+// it is a SOFT particle, and a SOFT neighbor is skipped in the sum (a soft
+// particle must NOT contribute to fluid density). For single-system PBF n_soft ==
+// 0 so SfIsSoft is always false -> the loop is BYTE-IDENTICAL to the legacy.
 __global__ void PbfDensityKernel(uint32_t particle_count,
+                                 uint32_t n_soft,
+                                 uint32_t per_env,
                                  const math::Vec3* __restrict__ predicted,
                                  float particle_mass,
                                  fl::PbfKernelCoeffs coeffs,
@@ -309,12 +468,18 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
     if (i >= particle_count) {
         return;
     }
+    if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
+        return;  // SoftFluid: soft owner is not a fluid particle.
+    }
     const math::Vec3 pi = predicted[i];
     float rho = particle_mass * fl::Poly6FromR2(0.0f, coeffs);
     const uint32_t base = i * kNeighborStride;
     const uint32_t n = neighbor_counts[i];
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (n_soft > 0u && SfIsSoft(j, n_soft, per_env)) {
+            continue;  // SoftFluid: skip soft neighbors in the fluid density sum.
+        }
         const math::Vec3 r = Sub(pi, predicted[j]);
         const float r2 = Dot(r, r);
         rho += particle_mass * fl::Poly6FromR2(r2, coeffs);
@@ -322,8 +487,10 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
     out_density[i] = rho;
 }
 
-// lambda (M&M eq.9-11). Verbatim.
+// lambda (M&M eq.9-11). Verbatim, plus the M9 T11 SoftFluid fluid-slice scope.
 __global__ void PbfLambdaKernel(uint32_t particle_count,
+                                uint32_t n_soft,
+                                uint32_t per_env,
                                 const math::Vec3* __restrict__ predicted,
                                 fl::PbfKernelCoeffs coeffs,
                                 float inv_rho0,
@@ -338,6 +505,10 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
     if (i >= particle_count) {
         return;
     }
+    if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
+        out_lambda[i] = 0.0f;  // SoftFluid: soft owner contributes no fluid lambda.
+        return;
+    }
     float c_i = density[i] / rest_density - 1.0f;
     if (clamp_to_overdensity && c_i < 0.0f) {
         out_lambda[i] = 0.0f;
@@ -350,6 +521,9 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
     float sum_grad_sq = 0.0f;
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (n_soft > 0u && SfIsSoft(j, n_soft, per_env)) {
+            continue;  // SoftFluid: skip soft neighbors in the fluid gradient sum.
+        }
         const math::Vec3 r = Sub(pi, predicted[j]);
         const float dist = sqrtf(Dot(r, r));
         const math::Vec3 sg = fl::SpikyGradient(r, dist, coeffs);
@@ -363,9 +537,12 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
     out_lambda[i] = -c_i / (sum_grad_sq + cfm_epsilon);
 }
 
-// correction compute (Jacobi, read-only on predicted). Verbatim.
+// correction compute (Jacobi, read-only on predicted). Verbatim, plus the M9 T11
+// SoftFluid fluid-slice scope (soft owner gets no delta; soft neighbors skipped).
 __global__ void PbfComputeCorrectionKernel(
     uint32_t particle_count,
+    uint32_t n_soft,
+    uint32_t per_env,
     const math::Vec3* __restrict__ predicted,
     fl::PbfKernelCoeffs coeffs,
     float inv_rho0,
@@ -377,6 +554,10 @@ __global__ void PbfComputeCorrectionKernel(
     if (i >= particle_count) {
         return;
     }
+    if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
+        out_delta[i] = math::Vec3{0.0f, 0.0f, 0.0f};  // SoftFluid: no fluid delta.
+        return;
+    }
     const math::Vec3 pi = predicted[i];
     const float lam_i = lambda[i];
     const uint32_t base = i * kNeighborStride;
@@ -384,6 +565,9 @@ __global__ void PbfComputeCorrectionKernel(
     math::Vec3 dp{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (n_soft > 0u && SfIsSoft(j, n_soft, per_env)) {
+            continue;  // SoftFluid: skip soft neighbors in the fluid correction.
+        }
         const math::Vec3 r = Sub(pi, predicted[j]);
         const float dist = sqrtf(Dot(r, r));
         const math::Vec3 sg = fl::SpikyGradient(r, dist, coeffs);
@@ -620,6 +804,86 @@ __global__ void CoupledFinalizeKernel(uint32_t particle_count,
 }
 
 // =============================================================================
+// SOFT+FLUID co-resident kernels (M9 T11): ONE Model holds a soft (XPBD) set in
+// [0, n_soft) and a fluid (PBF) set in [n_soft, per_env) per env. The predict /
+// finalize kernels branch per-particle on the within-env local index vs n_soft;
+// the soft branch is the VERBATIM XPBD predict/correct, the fluid branch the
+// VERBATIM PBF predict/finalize. (Single-system byte-identity is preserved: the
+// single-system path still uses the dedicated XpbdPredictKernel/PbfPredictKernel;
+// these run ONLY for kParticleModeSoftFluid.)
+// =============================================================================
+
+__global__ void SoftFluidPredictKernel(uint32_t particle_count,
+                                       uint32_t n_soft,
+                                       uint32_t per_env,
+                                       math::Vec3* __restrict__ positions,
+                                       math::Vec3* __restrict__ prev_positions,
+                                       math::Vec3* __restrict__ velocities,
+                                       math::Vec3* __restrict__ predicted_positions,
+                                       const float* __restrict__ inv_masses,
+                                       math::Vec3 gravity,
+                                       float dt) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particle_count) {
+        return;
+    }
+    if (SfIsSoft(i, n_soft, per_env)) {
+        // VERBATIM XpbdPredictKernel body.
+        const math::Vec3 p = positions[i];
+        prev_positions[i] = p;
+        if (inv_masses[i] <= 0.0f) {
+            return;
+        }
+        const math::Vec3 step =
+            Add(Scale(velocities[i], dt), Scale(gravity, dt * dt));
+        positions[i] = Add(p, step);
+    } else {
+        // VERBATIM PbfPredictKernel body.
+        math::Vec3 v = velocities[i];
+        if (inv_masses[i] > 0.0f) {
+            v.x += dt * gravity.x;
+            v.y += dt * gravity.y;
+            v.z += dt * gravity.z;
+            velocities[i] = v;
+        }
+        const math::Vec3 p = positions[i];
+        predicted_positions[i] =
+            math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
+    }
+}
+
+__global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
+                                        uint32_t n_soft,
+                                        uint32_t per_env,
+                                        math::Vec3* __restrict__ positions,
+                                        const math::Vec3* __restrict__ prev_positions,
+                                        const math::Vec3* __restrict__ predicted,
+                                        math::Vec3* __restrict__ velocities,
+                                        const float* __restrict__ inv_masses,
+                                        float dt) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particle_count) {
+        return;
+    }
+    if (inv_masses[i] <= 0.0f) {
+        return;  // pinned: position + velocity held (both branches).
+    }
+    if (SfIsSoft(i, n_soft, per_env)) {
+        // VERBATIM XpbdCorrectKernel body (v = (p - prev)/dt).
+        const math::Vec3 delta = Sub(positions[i], prev_positions[i]);
+        velocities[i] = Scale(delta, 1.0f / dt);
+    } else {
+        // VERBATIM PbfFinalizeKernel body (v = (predicted - pos)/dt; pos = pred).
+        const float inv_dt = 1.0f / dt;
+        const math::Vec3 p0 = positions[i];
+        const math::Vec3 pp = predicted[i];
+        velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
+                                   (pp.z - p0.z) * inv_dt};
+        positions[i] = pp;
+    }
+}
+
+// =============================================================================
 // op entry points
 // =============================================================================
 
@@ -641,6 +905,11 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
                    p->particle_count, data.particle_pos, data.particle_prev_pos,
                    data.particle_vel, data.particle_v_pre, data.pbf_predicted_pos,
                    p->coupled_internal, data.particle_inv_mass, g, p->dt);
+    } else if (p->mode == kParticleModeSoftFluid) {
+        LaunchCuda(SoftFluidPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   p->particle_count, p->n_soft_particles, p->particles_per_env,
+                   data.particle_pos, data.particle_prev_pos, data.particle_vel,
+                   data.pbf_predicted_pos, data.particle_inv_mass, g, p->dt);
     } else {  // kParticleModePbf
         LaunchCuda(PbfPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_vel,
@@ -654,7 +923,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     const auto* p = static_cast<const XpbdProjectParams*>(params);
     if (p == nullptr) return Status::Failed;
     if (p->dist_con_count == 0u && p->bend_con_count == 0u &&
-        p->vol_con_count == 0u) {
+        p->vol_con_count == 0u && p->shape_match_cluster_count == 0u) {
         return Status::Ok;  // PBF-only (or no XPBD) scene: inert.
     }
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
@@ -681,6 +950,17 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
                    model.vol_rest_times6, model.vol_compliance, data.vol_lambda,
                    p->dt);
     }
+    // Shape-match is solved LAST (after the local constraints), the legacy
+    // StepXpbdWorld order, so it pulls the already-projected config toward the
+    // rigid goal. No lambda field: shape matching is a direct goal projection
+    // re-evaluated from the current positions each iteration.
+    if (p->shape_match_cluster_count > 0u) {
+        LaunchCuda(XpbdShapeMatchKernel, dim3(1u), dim3(1u), 0u, stream,
+                   p->shape_match_cluster_count, iters, data.particle_pos,
+                   data.particle_inv_mass, model.sm_cluster_offset,
+                   model.sm_cluster_size, model.sm_stiffness, model.sm_rest_centroid,
+                   model.sm_particles, model.sm_rest_q, model.sm_mass);
+    }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -703,19 +983,21 @@ Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     const uint32_t N = p->particle_count;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
+    const uint32_t n_soft = p->n_soft_particles;
+    const uint32_t per_env = p->particles_per_env;
     for (uint32_t it = 0u; it < iters; ++it) {
         LaunchCuda(PbfDensityKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.pbf_predicted_pos, p->particle_mass, coeffs,
-                   data.grid_neighbor_count, data.grid_neighbor_idx,
+                   N, n_soft, per_env, data.pbf_predicted_pos, p->particle_mass,
+                   coeffs, data.grid_neighbor_count, data.grid_neighbor_idx,
                    data.pbf_density);
         LaunchCuda(PbfLambdaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.pbf_predicted_pos, coeffs, inv_rho0, p->rest_density,
-                   p->relaxation, p->clamp_overdensity != 0u, data.pbf_density,
-                   data.grid_neighbor_count, data.grid_neighbor_idx,
-                   data.pbf_lambda);
+                   N, n_soft, per_env, data.pbf_predicted_pos, coeffs, inv_rho0,
+                   p->rest_density, p->relaxation, p->clamp_overdensity != 0u,
+                   data.pbf_density, data.grid_neighbor_count,
+                   data.grid_neighbor_idx, data.pbf_lambda);
         LaunchCuda(PbfComputeCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                   stream, N, data.pbf_predicted_pos, coeffs, inv_rho0,
-                   data.pbf_lambda, data.grid_neighbor_count,
+                   stream, N, n_soft, per_env, data.pbf_predicted_pos, coeffs,
+                   inv_rho0, data.pbf_lambda, data.grid_neighbor_count,
                    data.grid_neighbor_idx, data.pbf_position_delta);
         // Apply in-loop for every iteration EXCEPT the last (PbfApplyDelta runs
         // the last apply, so the two ops together == the legacy NxN loop).
@@ -764,6 +1046,19 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(CoupledFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, data.particle_pos, data.particle_prev_pos, data.particle_vel,
                    data.particle_v_pre, data.pbf_predicted_pos, p->coupled_internal,
+                   data.particle_inv_mass, p->dt);
+        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    }
+    if (p->mode == kParticleModeSoftFluid) {
+        // SoftFluid finalize: soft slice => XPBD correct (v from particle_pos);
+        // fluid slice => PBF finalize (v from pbf_predicted_pos, commit). The
+        // post-finalize polish (XSPH/cohesion) reuses THIS step's neighbor grid;
+        // it would also nudge soft velocities, so the SoftFluid polish is
+        // DEFERRED to Phase 2 (it must be fluid-slice-scoped alongside the id-10
+        // co-step). Phase 1 SoftFluid runs the un-polished fluid (gamma/visc 0).
+        LaunchCuda(SoftFluidFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
+                   data.particle_prev_pos, data.pbf_predicted_pos, data.particle_vel,
                    data.particle_inv_mass, p->dt);
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }

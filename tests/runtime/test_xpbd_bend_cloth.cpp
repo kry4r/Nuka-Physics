@@ -1,32 +1,34 @@
 // ---------------------------------------------------------------------------
-// v0.7 p09-B: XPBD BEND (id 7) cloth tests -- Bergou isometric bending.
+// M9 T11: XPBD BEND (id 7) cloth tests, the STEPPING sub-tests RE-POINTED to nk.
+// Bergou isometric bending.
 //
-// The V3 FD adjoint gate (test_adjoint_fd_xpbd_bend) validates the multilinear
-// XPBD multiplier law, which is BLIND to the geometric bend gradient grad C. This
-// suite is where grad C is actually exercised:
+// The bend kernel already lives on the nk path (particles.cu XpbdBendKernel,
+// covered structurally by nk_particle_equivalence); M9 T11 re-points the bend
+// SIM sub-tests (sensitivity + drape) from the legacy runtime::soft::XpbdWorld
+// stepper to nk::World (cook -> World -> Step). The two PURE-HOST gates (stencil
+// linear-precision + grad-C FD) are stepper-independent and unchanged.
 //
-//   1. Stencil rest properties: sum_i k_i == 0 and sum_i k_i*x_rest == 0 (the
-//      linear-precision conditions that PIN the isometric stencil up to scale).
-//   2. grad C is CONSTANT: the stored K_i equal a host central-difference of
-//      C = sum_i K_i . p_i at TWO distinct non-flat configs, and the two FD
-//      gradients are equal -- the discriminating check that catches a non-linear
-//      (e.g. ||sum k x||) regression a drape test would silently pass.
-//   3. Bend SENSITIVITY: a cantilever cloth strip pinned along one edge sags
-//      measurably LESS with stiff bend than with floppy bend (and far less than a
-//      no-bend control) -- proves grad C actually does work.
-//   4. Drape invariants: a small patch under gravity stays finite, edges near
-//      rest length.
-//   5. D1 two-run byte-exactness of the bend forward.
+//   1. Stencil rest properties (host): sum_i k_i == 0 and sum_i k_i*x_rest == 0.
+//   2. grad C is CONSTANT (host): the stored K_i equal a host FD of C at two
+//      distinct non-flat configs.
+//   3. Bend SENSITIVITY (nk): stiff bend flattens a folded flap while a no-bend
+//      control stays folded -- proves grad C does work on the nk path.
+//   4. Drape invariants + D1 (nk): a patch under gravity stays finite, edges near
+//      rest length, and the nk bend forward is two-run byte-exact.
 //
-// A full Vellum/Houdini golden bend trajectory is DEFERRED to p15 (not
-// reproducible here); these are ANALYTIC/physical invariants.
+// A full Vellum/Houdini golden is DEFERRED; these are ANALYTIC/physical invariants.
 // ---------------------------------------------------------------------------
 
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"  // TetSignedVolumeTimes6 (planarity metric)
-#include "runtime/soft/xpbd_world.hpp"
+#include "runtime/soft/xpbd_world.hpp"  // XpbdParticleSet / XpbdConstraintSet (host POD only)
 
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
@@ -36,20 +38,93 @@
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 using nuka::runtime::soft::BuildClothConstraints;
 using nuka::runtime::soft::ClothTopologyOptions;
 using nuka::runtime::soft::ClothTriangle;
 using nuka::runtime::soft::ComputeIsometricBendStencil;
-using nuka::runtime::soft::StepXpbdWorld;
 using nuka::runtime::soft::TetSignedVolumeTimes6;
-using nuka::runtime::soft::UploadXpbdWorld;
 using nuka::runtime::soft::XpbdBendConstraint;
 using nuka::runtime::soft::XpbdConstraintSet;
 using nuka::runtime::soft::XpbdParticleSet;
-using nuka::runtime::soft::XpbdStepOptions;
-using nuka::runtime::soft::XpbdWorld;
-using nuka::runtime::soft::XpbdWorldState;
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
+
+// Downloaded particle state (replaces the legacy XpbdWorldState).
+struct XpbdWorldState {
+    std::vector<Vec3> positions;
+    std::vector<Vec3> velocities;
+};
+
+// Cook an XpbdParticleSet + XpbdConstraintSet (the HOST cloth_topology product)
+// into an nk::Model with mode = Xpbd, transcribing the de-interleaved SoA exactly
+// as CookXpbdParticles does (dist a/b/rest/alpha; bend 4-particle + 4-gradient).
+nk::Model BuildNkClothModel(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
+                            uint16_t iters) {
+    nk::Model model;
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Xpbd;
+    mp.initial_pos = ps.positions;
+    mp.initial_vel = ps.velocities;
+    mp.inv_mass = ps.inv_masses;
+    mp.xpbd_iters = iters == 0u ? 1u : iters;
+    const uint32_t dn = static_cast<uint32_t>(cs.distance.size());
+    for (uint32_t c = 0; c < dn; ++c) {
+        mp.dist_a.push_back(cs.distance[c].particle_a);
+        mp.dist_b.push_back(cs.distance[c].particle_b);
+        mp.dist_rest.push_back(cs.distance[c].rest_length);
+        mp.dist_alpha.push_back(cs.distance[c].compliance_alpha);
+    }
+    const uint32_t bn = static_cast<uint32_t>(cs.bend.size());
+    for (uint32_t c = 0; c < bn; ++c) {
+        for (uint32_t j = 0; j < 4u; ++j) {
+            mp.bend_particles.push_back(cs.bend[c].particle[j]);
+            mp.bend_gradients.push_back(cs.bend[c].k[j]);
+        }
+        mp.bend_alpha.push_back(cs.bend[c].compliance_alpha);
+    }
+    nk::ModelCapacities& cap = model.capacities;
+    cap.env_count = 1;
+    cap.particles_per_env = static_cast<uint32_t>(ps.positions.size());
+    cap.dist_cons_per_env = dn;
+    cap.bend_cons_per_env = bn;
+    return model;
+}
+
+// Run an nk cloth world for kSteps with the given gravity/dt and download state.
+XpbdWorldState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
+                          uint16_t iters, Vec3 gravity, float dt, uint32_t kSteps) {
+    NkCtx c = GetNkCtx();
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = dt;
+    cfg.gravity[0] = gravity.x; cfg.gravity[1] = gravity.y; cfg.gravity[2] = gravity.z;
+    nk::World world(BuildNkClothModel(ps, cs, iters), 1u, c.dev, c.backend, cfg);
+    EXPECT_TRUE(world.Ready());
+    const uint32_t P = world.GetModel().capacities.particles_per_env;
+    for (uint32_t s = 0; s < kSteps; ++s) world.Step();
+    XpbdWorldState st;
+    st.positions.resize(P);
+    st.velocities.resize(P);
+    world.GetData().DownloadField(nk::FieldId::ParticlePos, st.positions.data(),
+                                  P * sizeof(Vec3));
+    world.GetData().DownloadField(nk::FieldId::ParticleVel, st.velocities.data(),
+                                  P * sizeof(Vec3));
+    return st;
+}
 
 // A single shared edge along x with two apex vertices straddling it in the z=0
 // plane (a flat flap): shared_a=(0,0,0), shared_b=(1,0,0), apex0=(0.3,0.8,0),
@@ -243,6 +318,8 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
     const float initial = nonplanarity(folded);
     ASSERT_GT(initial, 1.0e-3f) << "setup sanity: flap must start non-planar";
 
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+
     auto run = [&](bool emit_bend) {
         XpbdParticleSet particles;
         particles.positions = folded;
@@ -262,17 +339,11 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
         } else {
             EXPECT_EQ(cs.bend.size(), 0u);
         }
-
-        XpbdWorld world = UploadXpbdWorld(particles, cs);
-        XpbdStepOptions so;
-        so.gravity = Vec3{0.0f, 0.0f, 0.0f};  // no gravity: isolate the constraint.
-        so.dt = 1.0f / 240.0f;
-        so.step_count = 1u;
-        so.solver_iterations = 10u;
-        for (uint32_t s = 0; s < 200u; ++s) {
-            StepXpbdWorld(world, so);
-        }
-        return nonplanarity(world.DownloadState().positions);
+        // nk path: gravity OFF (isolate the constraint), 10 GS iters, 200 steps.
+        const XpbdWorldState st = RunNkCloth(particles, cs, /*iters=*/10u,
+                                             Vec3{0.0f, 0.0f, 0.0f}, 1.0f / 240.0f,
+                                             /*kSteps=*/200u);
+        return nonplanarity(st.positions);
     };
 
     const float stiff = run(/*emit_bend=*/true);
@@ -291,6 +362,8 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
 // Gate 3 (invariants) + Gate 4 (D1): a free patch drapes under gravity, stays
 // finite and near-inextensible, and is two-run byte-exact.
 TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+
     auto run = []() {
         GridCloth g = MakeGrid(4u, 4u, 0.25f, /*pin_first_row=*/false);
         // Pin the two root corners so the patch does not free-fall forever.
@@ -308,17 +381,10 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
         for (const auto& dc : cs.distance) {
             rest_edges.push_back({{dc.particle_a, dc.particle_b}, dc.rest_length});
         }
-
-        XpbdWorld world = UploadXpbdWorld(g.particles, cs);
-        XpbdStepOptions so;
-        so.gravity = Vec3{0.0f, -9.81f, 0.3f};  // gravity + small out-of-plane nudge.
-        so.dt = 1.0f / 240.0f;
-        so.step_count = 1u;
-        so.solver_iterations = 20u;
-        for (uint32_t s = 0; s < 300u; ++s) {
-            StepXpbdWorld(world, so);
-        }
-        const XpbdWorldState st = world.DownloadState();
+        // nk path: gravity + small out-of-plane nudge, 20 GS iters, 300 steps.
+        const XpbdWorldState st = RunNkCloth(g.particles, cs, /*iters=*/20u,
+                                             Vec3{0.0f, -9.81f, 0.3f}, 1.0f / 240.0f,
+                                             /*kSteps=*/300u);
         return std::make_pair(st, rest_edges);
     };
 

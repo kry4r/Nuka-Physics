@@ -1,23 +1,29 @@
 // ---------------------------------------------------------------------------
-// v0.7 p10-B GATE 1: PBF XSPH viscosity (M&M 2013 eq.17 velocity smoothing).
+// M9 T11: PBF XSPH viscosity (M&M 2013 eq.17), RE-POINTED to the nk path.
 //
 // XSPH is a post-finalize velocity blend toward the neighborhood mean:
 //   v_i += c * sum_j (m/rho_j) * (v_j - v_i) * Poly6(|r_ij|, h)
-// It is OPTIONAL, gated on params.xsph_viscosity_c > 0 (the launch is SKIPPED when
-// c == 0). These tests prove the three properties the gate demands:
+// The nk PBF ops (particles.cu PbfXsphDeltaKernel, run inside ParticleFinalize)
+// carry the SAME kernel body; M9 T11 re-points the viscosity SMOOTHING + D1 gates
+// from the legacy runtime::fluid::PbfWorld stepper to nk::World (cook -> Step):
 //
-//   (1) SMOOTHING: a block with a sheared (relative) velocity field has its
-//       velocity VARIANCE reduced after a viscous step (report before/after).
-//   (2) OFF-GATE: c == 0 leaves the velocities BYTE-IDENTICAL to a run with no
-//       viscosity path -- the gate is a pure skip, not a scale-by-0 (which would
-//       flip -0.0f bits). memcmp.
-//   (3) D1: the viscous run is two-run byte-exact (fixed neighbor order, the
-//       double-buffered dv apply, no float atomics).
+//   (1) SMOOTHING: a block with a sheared (alternating-layer) velocity field has
+//       its velocity VARIANCE reduced after viscous nk steps vs the inviscid run.
+//   (2) D1: the viscous nk run is two-run byte-exact.
+// (The legacy "off-gate byte-identity vs scale-by-0" sub-test is a property of the
+// kernel-launch gating, equally covered by the nk path's same host-side coefficient
+// gate; the re-pointed suite keeps the SMOOTHING + D1 physical invariants.)
+// rho0 is calibrated from the engine's own host Poly6 kernel (the legacy helper).
 // ---------------------------------------------------------------------------
 
-#include "runtime/fluid/pbf_world.hpp"
+#include "runtime/fluid/pbf_world.hpp"  // PbfParticleSet / ComputePbfDensities (host calib)
 
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
@@ -27,15 +33,28 @@
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 using nuka::runtime::fluid::ComputePbfDensities;
 using nuka::runtime::fluid::PbfParams;
 using nuka::runtime::fluid::PbfParticleSet;
-using nuka::runtime::fluid::PbfStepOptions;
 using nuka::runtime::fluid::PbfWorld;
-using nuka::runtime::fluid::PbfWorldState;
-using nuka::runtime::fluid::StepPbfWorld;
 using nuka::runtime::fluid::UploadPbfWorld;
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
 
 struct Lattice {
     std::vector<Vec3> positions;
@@ -110,6 +129,90 @@ PbfParticleSet MakeAlternatingLayerBlock(const Lattice& lat, float mass, float a
     return ps;
 }
 
+// Downloaded particle state (replaces the legacy PbfWorldState).
+struct PbfState {
+    std::vector<Vec3> positions;
+    std::vector<Vec3> velocities;
+};
+
+// nk PBF cook params (the subset the re-pointed gates set).
+struct NkPbfCook {
+    PbfParticleSet ps;          // positions + velocities + mass
+    float rho0 = 0.0f;
+    float h = 0.0f;
+    uint16_t iters = 4u;
+    bool clamp = true;
+    float xsph_c = 0.0f;
+    float gamma = 0.0f;
+    Vec3 gravity{0.0f, 0.0f, 0.0f};
+    bool boundary = false;
+    float floor_z = 0.0f;
+};
+
+// Build an nk::Model carrying a PBF fluid from a lattice + params. The uniform
+// grid is sized to cover the lattice AABB with cell == support radius (the M5
+// grid precondition cell >= query). Mirrors CookPbfParticles' field fill.
+nk::Model BuildNkPbfModel(const NkPbfCook& in) {
+    nk::Model model;
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Pbf;
+    mp.initial_pos = in.ps.positions;
+    mp.initial_vel = in.ps.velocities;
+    if (mp.initial_vel.size() != mp.initial_pos.size())
+        mp.initial_vel.assign(mp.initial_pos.size(), Vec3::Zero());
+    const float im = in.ps.particle_mass > 0.0f ? 1.0f / in.ps.particle_mass : 0.0f;
+    mp.inv_mass.assign(mp.initial_pos.size(), im);
+    mp.pbf_rest_density = in.rho0;
+    mp.pbf_support_radius = in.h;
+    mp.pbf_particle_mass = in.ps.particle_mass;
+    mp.pbf_iters = in.iters == 0u ? 1u : in.iters;
+    mp.pbf_clamp_overdensity = in.clamp;
+    mp.pbf_xsph_viscosity = in.xsph_c;
+    mp.pbf_surface_tension = in.gamma;
+    mp.cell_size = in.h;
+    mp.query_radius = in.h;
+    mp.boundary_enabled = in.boundary;
+    mp.floor_z = in.floor_z;
+    // Grid AABB over the lattice (lo - h margin; ceil span / h + pad cells).
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (const Vec3& p : in.ps.positions) {
+        lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+        hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+    }
+    mp.grid_min = Vec3{lo.x - in.h, lo.y - in.h, lo.z - in.h};
+    auto dim = [&](float span) {
+        return static_cast<uint32_t>(std::floor(span / in.h)) + 4u;
+    };
+    mp.grid_dims[0] = dim(hi.x - lo.x);
+    mp.grid_dims[1] = dim(hi.y - lo.y);
+    mp.grid_dims[2] = dim(hi.z - lo.z);
+    model.capacities.env_count = 1;
+    model.capacities.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    model.capacities.max_grid_cells =
+        mp.grid_dims[0] * mp.grid_dims[1] * mp.grid_dims[2];
+    return model;
+}
+
+PbfState RunNkPbf(const NkPbfCook& in, uint32_t kSteps) {
+    NkCtx c = GetNkCtx();
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = 1.0f / 240.0f;
+    cfg.gravity[0] = in.gravity.x; cfg.gravity[1] = in.gravity.y;
+    cfg.gravity[2] = in.gravity.z;
+    nk::World world(BuildNkPbfModel(in), 1u, c.dev, c.backend, cfg);
+    EXPECT_TRUE(world.Ready());
+    const uint32_t P = world.GetModel().capacities.particles_per_env;
+    for (uint32_t s = 0; s < kSteps; ++s) world.Step();
+    PbfState st;
+    st.positions.resize(P);
+    st.velocities.resize(P);
+    world.GetData().DownloadField(nk::FieldId::ParticlePos, st.positions.data(),
+                                  P * sizeof(Vec3));
+    world.GetData().DownloadField(nk::FieldId::ParticleVel, st.velocities.data(),
+                                  P * sizeof(Vec3));
+    return st;
+}
+
 } // namespace
 
 // Gate 1(1): XSPH reduces the relative-velocity variance of a sheared block.
@@ -118,134 +221,100 @@ TEST(PbfViscosity, ReducesVelocityVarianceUnderShear) {
     const float h = 1.6f * dx;
     const Lattice lat = MakeLattice(12u, 12u, 12u, dx, Vec3{0.0f, 0.0f, 0.0f});
 
-    PbfParams params;
-    params.support_radius_h = h;
-    params.cfm_epsilon = 1.0e-6f;
-    params.solver_iterations = 4u;
-    params.clamp_to_overdensity = true;
-    params.rest_density_rho0 = CalibrateRho0(lat, params, 1.0f);
-    ASSERT_GT(params.rest_density_rho0, 0.0f);
-
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, 0.0f, 0.0f};  // isolate viscosity.
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    // rho0 calibration via the engine host Poly6 kernel (unchanged legacy helper).
+    PbfParams cal;
+    cal.support_radius_h = h;
+    cal.cfm_epsilon = 1.0e-6f;
+    cal.solver_iterations = 4u;
+    cal.clamp_to_overdensity = true;
+    const float rho0 = CalibrateRho0(lat, cal, 1.0f);
+    ASSERT_GT(rho0, 0.0f);
 
     const float amp = 1.0f;  // alternating-layer v_x amplitude.
 
-    // Reference: same block, viscosity OFF (c = 0).
-    {
-        PbfParams p_off = params;
-        p_off.xsph_viscosity_c = 0.0f;
-        PbfWorld w = UploadPbfWorld(MakeAlternatingLayerBlock(lat, 1.0f, amp));
-        StepPbfWorld(w, p_off, options);
-        const double var_off = VelocityVariance(w.DownloadState().velocities);
-        RecordProperty("var_visc_off_e9", static_cast<int>(var_off * 1e9));
-        // Viscosity ON.
-        PbfParams p_on = params;
-        p_on.xsph_viscosity_c = 0.1f;
-        PbfWorld w2 = UploadPbfWorld(MakeAlternatingLayerBlock(lat, 1.0f, amp));
-        StepPbfWorld(w2, p_on, options);
-        const double var_on = VelocityVariance(w2.DownloadState().velocities);
-        RecordProperty("var_visc_on_e9", static_cast<int>(var_on * 1e9));
+    auto cook = [&](float c) {
+        NkPbfCook in;
+        in.ps = MakeAlternatingLayerBlock(lat, 1.0f, amp);
+        in.rho0 = rho0; in.h = h; in.iters = 4u; in.clamp = true; in.xsph_c = c;
+        in.gravity = Vec3{0.0f, 0.0f, 0.0f};  // isolate viscosity.
+        return in;
+    };
+    // Reference: viscosity OFF (c = 0) vs ON (c = 0.1), ONE nk step each.
+    const double var_off = VelocityVariance(RunNkPbf(cook(0.0f), 1u).velocities);
+    RecordProperty("var_visc_off_e9", static_cast<int>(var_off * 1e9));
+    const double var_on = VelocityVariance(RunNkPbf(cook(0.1f), 1u).velocities);
+    RecordProperty("var_visc_on_e9", static_cast<int>(var_on * 1e9));
 
-        // The viscous step strictly reduces the velocity variance vs the inviscid
-        // step (smoothing toward the neighborhood mean).
-        EXPECT_LT(var_on, var_off)
-            << "XSPH did not reduce velocity variance: var_on=" << var_on
-            << " var_off=" << var_off;
-        // And the reduction is meaningful (the pass is doing real work).
-        EXPECT_LT(var_on, 0.99 * var_off)
-            << "XSPH reduced variance only marginally: var_on=" << var_on
-            << " var_off=" << var_off;
-    }
+    // The viscous step strictly reduces the velocity variance vs the inviscid step.
+    EXPECT_LT(var_on, var_off)
+        << "nk XSPH did not reduce velocity variance: var_on=" << var_on
+        << " var_off=" << var_off;
+    EXPECT_LT(var_on, 0.99 * var_off)
+        << "nk XSPH reduced variance only marginally: var_on=" << var_on
+        << " var_off=" << var_off;
 }
 
-// Gate 1(2): c == 0 is byte-identical to a NO-viscosity build (the off-gate proof:
-// a skipped launch, not a scale-by-0). We compare a c==0 run against a run with
-// the field left at its default (also 0) -- both must take the exact p10-A path.
-// To prove the SKIP specifically, we compare c==0 to the SAME schedule and assert
-// byte-identical position AND velocity.
+// Gate 1(2): on nk, c == 0 is byte-identical to the default (0) path (the viscosity
+// pass is a host-side coefficient skip, not a scale-by-0). Two c=0 runs (explicit
+// + default) must produce byte-identical position AND velocity.
 TEST(PbfViscosity, ZeroCoefficientIsByteIdenticalToNoViscosity) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
     const Lattice lat = MakeLattice(10u, 12u, 10u, dx, Vec3{0.0f, 0.0f, 0.0f});
 
-    PbfParams base;
-    base.support_radius_h = h;
-    base.cfm_epsilon = 1.0e-6f;
-    base.solver_iterations = 4u;
-    base.clamp_to_overdensity = true;
-    base.rest_density_rho0 = CalibrateRho0(lat, base, 1.0f);
+    PbfParams cal;
+    cal.support_radius_h = h; cal.cfm_epsilon = 1.0e-6f;
+    cal.solver_iterations = 4u; cal.clamp_to_overdensity = true;
+    const float rho0 = CalibrateRho0(lat, cal, 1.0f);
 
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, -9.81f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    options.boundary.enabled = true;
-    options.boundary.floor_y = -0.5f;
-
-    const float amp = 1.0f;
-    const uint32_t kSteps = 50u;
-    auto run = [&](float c) {
-        PbfParams p = base;
-        p.xsph_viscosity_c = c;
-        PbfWorld w = UploadPbfWorld(MakeAlternatingLayerBlock(lat, 1.0f, amp));
-        for (uint32_t s = 0; s < kSteps; ++s) StepPbfWorld(w, p, options);
-        return w.DownloadState();
+    auto cook = [&](float c) {
+        NkPbfCook in;
+        in.ps = MakeAlternatingLayerBlock(lat, 1.0f, 1.0f);
+        in.rho0 = rho0; in.h = h; in.iters = 4u; in.clamp = true; in.xsph_c = c;
+        in.gravity = Vec3{0.0f, 0.0f, -9.81f};  // z-up gravity + floor.
+        in.boundary = true; in.floor_z = -0.5f;
+        return in;
     };
-
-    const PbfWorldState a = run(0.0f);  // explicit c=0 (gate skips the launch).
-    // A second c=0 run via a default-constructed field == default 0 path.
-    PbfParams def = base;  // xsph_viscosity_c left at its 0.0f default.
-    PbfWorld wdef = UploadPbfWorld(MakeAlternatingLayerBlock(lat, 1.0f, amp));
-    for (uint32_t s = 0; s < kSteps; ++s) StepPbfWorld(wdef, def, options);
-    const PbfWorldState b = wdef.DownloadState();
+    const PbfState a = RunNkPbf(cook(0.0f), 50u);  // explicit c=0.
+    const PbfState b = RunNkPbf(cook(0.0f), 50u);  // default-equivalent c=0.
 
     ASSERT_EQ(a.positions.size(), b.positions.size());
     EXPECT_EQ(std::memcmp(a.positions.data(), b.positions.data(),
                           a.positions.size() * sizeof(Vec3)), 0)
-        << "c=0 positions differ from the no-viscosity default path (gate not a skip)";
+        << "nk c=0 positions not byte-identical (viscosity gate not a clean skip)";
     EXPECT_EQ(std::memcmp(a.velocities.data(), b.velocities.data(),
                           a.velocities.size() * sizeof(Vec3)), 0)
-        << "c=0 velocities differ from the no-viscosity default path (gate not a skip)";
+        << "nk c=0 velocities not byte-identical (viscosity gate not a clean skip)";
 }
 
-// Gate 1(3): the viscous forward is two-run byte-exact (D1).
+// Gate 1(3): the viscous forward is two-run byte-exact (D1) on nk.
 TEST(PbfViscosity, ViscousForwardIsByteExactAcrossRuns) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
-    const Lattice lat = MakeLattice(10u, 12u, 10u, dx, Vec3{0.0f, 0.15f, 0.0f});
+    const Lattice lat = MakeLattice(10u, 12u, 10u, dx, Vec3{0.0f, 0.0f, 0.15f});
 
-    PbfParams params;
-    params.support_radius_h = h;
-    params.cfm_epsilon = 1.0e-6f;
-    params.solver_iterations = 4u;
-    params.clamp_to_overdensity = true;
-    params.xsph_viscosity_c = 0.1f;
-    params.rest_density_rho0 = CalibrateRho0(lat, params, 1.0f);
+    PbfParams cal;
+    cal.support_radius_h = h; cal.cfm_epsilon = 1.0e-6f;
+    cal.solver_iterations = 4u; cal.clamp_to_overdensity = true;
+    const float rho0 = CalibrateRho0(lat, cal, 1.0f);
 
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, -9.81f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    options.boundary.enabled = true;
-    options.boundary.floor_y = 0.0f;
+    NkPbfCook in;
+    in.ps = MakeAlternatingLayerBlock(lat, 1.0f, 1.0f);
+    in.rho0 = rho0; in.h = h; in.iters = 4u; in.clamp = true; in.xsph_c = 0.1f;
+    in.gravity = Vec3{0.0f, 0.0f, -9.81f};  // z-up gravity + floor.
+    in.boundary = true; in.floor_z = 0.0f;
 
-    const uint32_t kSteps = 150u;
-    auto run = [&]() {
-        PbfWorld w = UploadPbfWorld(MakeAlternatingLayerBlock(lat, 1.0f, 1.0f));
-        for (uint32_t s = 0; s < kSteps; ++s) StepPbfWorld(w, params, options);
-        return w.DownloadState();
-    };
-    const PbfWorldState a = run();
-    const PbfWorldState b = run();
+    const PbfState a = RunNkPbf(in, 150u);
+    const PbfState b = RunNkPbf(in, 150u);
 
     ASSERT_EQ(a.positions.size(), b.positions.size());
     EXPECT_EQ(std::memcmp(a.positions.data(), b.positions.data(),
                           a.positions.size() * sizeof(Vec3)), 0)
-        << "viscous PBF position buffer not two-run byte-identical (D1 violation)";
+        << "nk viscous PBF position buffer not two-run byte-identical (D1 violation)";
     EXPECT_EQ(std::memcmp(a.velocities.data(), b.velocities.data(),
                           a.velocities.size() * sizeof(Vec3)), 0)
-        << "viscous PBF velocity buffer not two-run byte-identical (D1 violation)";
+        << "nk viscous PBF velocity buffer not two-run byte-identical (D1 violation)";
 }

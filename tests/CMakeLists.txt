@@ -886,6 +886,30 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_nk_particle_equivalence_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+    # --- M9 T11 PHASE 1: soft+fluid co-residence smoke -------------------------
+    # The two-system [soft | fluid] schema: CookSoftFluidParticles cooks ONE Model
+    # holding both an XPBD soft set + a PBF fluid set co-resident (split index
+    # n_soft_particles), and nk::World steps it on the SoftFluid op path. Asserts
+    # the strict-superset byte-identity (soft-only/fluid-only == the single-system
+    # cooks), a stable co-resident step (soft near-rigid, fluid finite), + D1.
+    add_executable(nuka_nk_soft_fluid_coresidence_test
+        scenario/nk_soft_fluid_coresidence.cpp
+    )
+    add_dependencies(nuka_nk_soft_fluid_coresidence_test nuka_codegen)
+    target_include_directories(nuka_nk_soft_fluid_coresidence_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_nk_soft_fluid_coresidence_test
+        PRIVATE
+            nuka_scene_cook
+            nuka_nk
+            nuka_phi2
+            nuka_phi
+            nuka_core
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_nk_soft_fluid_coresidence_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     add_executable(nuka_cuda_runtime_test
         # M9 T11-core-b2: test_cuda_solver.cpp (legacy CudaRowSolver device-kernel
         # tests) deleted with row_solver.cu; the nk device solve is covered by
@@ -909,8 +933,18 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime_gpu
             nuka_runtime
             nuka_articulation_gpu
+            # M9 T11: the re-pointed XPBD shape-match / bend-cloth tests cook a
+            # scene -> nk::World -> Step on the nk particle ops (the legacy
+            # XpbdWorld stays alive this phase for the distance/volume tests).
+            nuka_nk
+            nuka_phi2
+            nuka_phi
+            nuka_core
             GTest::gtest_main
     )
+    add_dependencies(nuka_cuda_runtime_test nuka_codegen)
+    target_include_directories(nuka_cuda_runtime_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
     gtest_discover_tests(nuka_cuda_runtime_test)
 
@@ -988,9 +1022,18 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_pbf_test
         PRIVATE
             nuka_runtime_gpu
+            # M9 T11: the re-pointed PBF viscosity / surface-tension / v2-invariant
+            # tests cook a fluid -> nk::World -> Step on the nk particle ops (the
+            # legacy PbfWorld stays alive this phase for density/volume tests).
+            nuka_nk
+            nuka_phi2
             nuka_phi
+            nuka_core
             GTest::gtest_main
     )
+    add_dependencies(nuka_pbf_test nuka_codegen)
+    target_include_directories(nuka_pbf_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
     gtest_discover_tests(nuka_pbf_test)
 

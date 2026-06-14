@@ -54,6 +54,16 @@ struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
 struct CookBendCon { uint32_t p[4]; math::Vec3 k[4]; float compliance_alpha; };
 // One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
 struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
+// One XPBD shape-match cluster (M9 T11; the de-interleaved XpbdShapeMatchCluster).
+// Variable-size cluster pulled toward the rigid transform of its rest shape.
+// particle[i] indexes the soft particle set; rest_positions[i] is x_i^0; the
+// cluster weight m_i defaults to the particle's mass when omitted (see the cook).
+struct CookShapeMatchCluster {
+    std::vector<uint32_t>   particle;        // cluster particle indices (size n>=1)
+    std::vector<math::Vec3> rest_positions;  // x_i^0, size n (same order)
+    std::vector<float>      cluster_mass;    // m_i weight, size n (>0)
+    float stiffness = 1.0f;                  // goal-pull fraction in [0,1].
+};
 
 struct XpbdCookInput {
     std::vector<math::Vec3>      positions;     // per-particle rest state
@@ -62,6 +72,7 @@ struct XpbdCookInput {
     std::vector<CookDistanceCon> distance;
     std::vector<CookBendCon>     bend;
     std::vector<CookVolumeCon>   volume;
+    std::vector<CookShapeMatchCluster> shape_match;  // M9 T11 (id 9).
     uint16_t solver_iterations = 1u;
 };
 
@@ -94,5 +105,18 @@ struct PbfCookInput {
 // replicates env-major). Sets particles_per_env.
 void CookPbfParticles(nk::Model& model, uint32_t env_count,
                       const PbfCookInput& in);
+
+// M9 T11 two-system cook: stage BOTH a soft (XPBD) particle set AND a fluid (PBF)
+// particle set co-resident into ONE Model with a contiguous [soft | fluid] layout
+// (the soft particles occupy [0, n_soft), the fluid [n_soft, particles_per_env)).
+// The soft XPBD constraint indices stay in the soft slice; the fluid particles are
+// appended AFTER the soft set, so the PBF density solve (scoped to [n_soft, P) by
+// the SoftFluid ops) never sees a soft particle. Mode = ParticleMode::SoftFluid.
+// STRICT SUPERSET: a soft-only cook (fluid empty) is byte-identical to
+// CookXpbdParticles + the shape-match block; a fluid-only cook (soft empty,
+// n_soft 0) is byte-identical to CookPbfParticles. The two single-system cooks
+// remain the canonical paths; this is the co-residence composer.
+void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
+                            const XpbdCookInput& soft, const PbfCookInput& fluid);
 
 } // namespace nuka::scene::cook

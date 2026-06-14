@@ -69,6 +69,13 @@ struct ModelView {
     uint32_t* vol_particles = nullptr;  // per:vol_con arena:persistent owner:model elem:4
     float* vol_rest_times6 = nullptr;  // per:vol_con arena:persistent owner:model
     float* vol_compliance = nullptr;  // per:vol_con arena:persistent owner:model flags:[param]
+    uint32_t* sm_cluster_offset = nullptr;  // per:shape_match_slot arena:persistent owner:model
+    uint32_t* sm_cluster_size = nullptr;  // per:shape_match_slot arena:persistent owner:model
+    float* sm_stiffness = nullptr;  // per:shape_match_slot arena:persistent owner:model flags:[param]
+    ::nuka::math::Vec3* sm_rest_centroid = nullptr;  // per:shape_match_slot arena:persistent owner:model
+    uint32_t* sm_particles = nullptr;  // per:shape_match_member arena:persistent owner:model
+    ::nuka::math::Vec3* sm_rest_q = nullptr;  // per:shape_match_member arena:persistent owner:model
+    float* sm_mass = nullptr;  // per:shape_match_member arena:persistent owner:model
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena

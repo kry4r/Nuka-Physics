@@ -20,7 +20,8 @@ enum class FieldOwner : uint8_t { Model, Data };
 // concrete element count from the Model capacities x env_count.
 enum class FieldPer : uint8_t {
     Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,
-    DistCon, BendCon, VolCon, ShapeMatchSlot, EnvDof2, Scalar
+    DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,
+    Scalar
 };
 
 struct FieldLayout {
@@ -167,6 +168,13 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_rest_times6
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_compliance
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::VolCon, 1, 1, 4, 0},  // vol_lambda
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_cluster_offset
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_cluster_size
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_stiffness
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 3, 12, 0},  // sm_rest_centroid
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_particles
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 3, 12, 0},  // sm_rest_q
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_predicted_pos
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_position_delta
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_density
