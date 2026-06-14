@@ -3,7 +3,7 @@
 // The meshless cluster regularizer (Mueller et al. 2005), the 4th XPBD row class.
 //
 // The shape-match constraint is the one XPBD family that lived ONLY in the legacy
-// runtime::soft::XpbdWorld stepper; M9 T11 ports it to the nk particle ops
+// legacy XPBD soft stepper; M9 T11 ports it to the nk particle ops
 // (src/phi/backend_cuda/ops/particles.cu XpbdShapeMatchKernel + the CookXpbd
 // shape-match cook). This suite asserts the SAME analytic/physical invariants the
 // legacy p09-C suite asserted, now through nk::World (cook -> World -> Step):
@@ -43,8 +43,8 @@ namespace nk = nuka::nk;
 namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 
-// Downloaded particle state holder (replaces the legacy XpbdWorldState).
-struct XpbdWorldState {
+// Downloaded particle state holder (replaces the legacy XpbdState).
+struct XpbdState {
     std::vector<Vec3> positions;
     std::vector<Vec3> velocities;
 };
@@ -286,7 +286,7 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
     // deformation, NOT the rotation the device recovers (the shear contributes its
     // own rotational component -- see the discrimination block below). The
     // discrimination matters because the device PolarRotation (float, in
-    // xpbd_world.cu) is a SEPARATE transcription from the host PolarR (double, in
+    // nk soft ops) is a SEPARATE transcription from the host PolarR (double, in
     // this file): a relaxation that only checked rest pairwise distances would pass
     // even if the device polar returned IDENTITY (a pure rest-translation also
     // preserves pairwise distances). The block below recovers the rotation from the
@@ -331,7 +331,7 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
         mp.inv_mass.assign(rest.size(), 1.0f);
         mp.xpbd_iters = 30u;  // within-step re-projection converges.
         // ONE cluster over all 8 corners. Cook c0 = (sum m_i x_i^0)/sum m_i and
-        // q_i = x_i^0 - c0 (the legacy UploadXpbdWorld shape-match flatten 1:1).
+        // q_i = x_i^0 - c0 (the legacy soft-upload shape-match flatten 1:1).
         const float n = static_cast<float>(rest.size());
         Vec3 c0{0, 0, 0};
         for (const Vec3& q : rest) c0 += q;
@@ -367,7 +367,7 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
                                       P * sizeof(Vec3));
         world.GetData().DownloadField(nk::FieldId::ParticleVel, v.data(),
                                       P * sizeof(Vec3));
-        XpbdWorldState st;
+        XpbdState st;
         st.positions = p;
         st.velocities = v;
         return st;
@@ -382,7 +382,7 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
     ASSERT_GT(init_max_drift, 0.1f)
         << "setup sanity: sheared init must NOT already match rest distances";
 
-    const XpbdWorldState sa = run();
+    const XpbdState sa = run();
     for (const Vec3& p : sa.positions) {
         ASSERT_TRUE(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z));
     }
@@ -470,7 +470,7 @@ TEST(XpbdShapeMatch, NonRigidClusterRelaxesToRigidShapeAndIsByteExact) {
     }
 
     // D1 two-run byte-exact.
-    const XpbdWorldState sb = run();
+    const XpbdState sb = run();
     EXPECT_EQ(std::memcmp(sa.positions.data(), sb.positions.data(),
                           sa.positions.size() * sizeof(Vec3)),
               0)

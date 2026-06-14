@@ -60,7 +60,7 @@ XpbdConstraintSet CookXpbdSoftBody(const XpbdSoftBodySpec& spec) {
             // it is just rest-position + weight assembly over the whole particle
             // set, so do it inline (still THIN -- the polar-decomposition / goal
             // MATH lives in the GPU id9 row, not here). One cluster per spec.
-            // Upload (UploadXpbdWorld) cooks the rest centroid c0 and the q_i =
+            // The nk soft cook derives the rest centroid c0 and the q_i =
             // x_i^0 - c0 from rest_positions + cluster_mass; we only fill the raw
             // rest data.
             if (!spec.rest_positions.empty()) {

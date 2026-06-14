@@ -394,7 +394,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         // is replicated env-major; env e's constraints get their particle
         // indices offset by e*particles_per_env (the device particle arrays
         // are env-major, so a constraint must point at its own env's particles).
-        // This mirrors the legacy per-world UploadXpbdWorld layout tiled E times.
+        // This mirrors the legacy per-world soft-upload layout tiled E times.
         // ---------------------------------------------------------------
         case FieldId::DistParticleA:
         case FieldId::DistParticleB: {
@@ -483,7 +483,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         // member OFFSET is shifted by e*members_per_env (the device member pool
         // is env-major) and the per-member PARTICLE index by e*particles_per_env
         // (the device particle arrays are env-major). The legacy single-world
-        // CSR layout tiled E times -- byte-faithful to UploadXpbdWorld's flatten.
+        // CSR layout tiled E times -- byte-faithful to the legacy soft flatten.
         // ---------------------------------------------------------------
         case FieldId::SmClusterOffset: {
             auto* p = reinterpret_cast<uint32_t*>(dst);

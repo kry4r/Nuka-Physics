@@ -4,7 +4,7 @@
 //
 // The bend kernel already lives on the nk path (particles.cu XpbdBendKernel,
 // covered structurally by nk_particle_equivalence); M9 T11 re-points the bend
-// SIM sub-tests (sensitivity + drape) from the legacy runtime::soft::XpbdWorld
+// SIM sub-tests (sensitivity + drape) from the legacy XPBD soft
 // stepper to nk::World (cook -> World -> Step). The two PURE-HOST gates (stencil
 // linear-precision + grad-C FD) are stepper-independent and unchanged.
 //
@@ -19,9 +19,9 @@
 // A full Vellum/Houdini golden is DEFERRED; these are ANALYTIC/physical invariants.
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XpbdParticleSet / XpbdConstraintSet (host POD)
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"  // TetSignedVolumeTimes6 (planarity metric)
-#include "runtime/soft/xpbd_world.hpp"  // XpbdParticleSet / XpbdConstraintSet (host POD only)
 
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -64,8 +64,8 @@ NkCtx GetNkCtx() {
     return c;
 }
 
-// Downloaded particle state (replaces the legacy XpbdWorldState).
-struct XpbdWorldState {
+// Downloaded particle state (replaces the legacy XpbdState).
+struct XpbdState {
     std::vector<Vec3> positions;
     std::vector<Vec3> velocities;
 };
@@ -106,7 +106,7 @@ nk::Model BuildNkClothModel(const XpbdParticleSet& ps, const XpbdConstraintSet& 
 }
 
 // Run an nk cloth world for kSteps with the given gravity/dt and download state.
-XpbdWorldState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
+XpbdState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
                           uint16_t iters, Vec3 gravity, float dt, uint32_t kSteps) {
     NkCtx c = GetNkCtx();
     nk::Pipeline::SolverConfig cfg;
@@ -116,7 +116,7 @@ XpbdWorldState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs
     EXPECT_TRUE(world.Ready());
     const uint32_t P = world.GetModel().capacities.particles_per_env;
     for (uint32_t s = 0; s < kSteps; ++s) world.Step();
-    XpbdWorldState st;
+    XpbdState st;
     st.positions.resize(P);
     st.velocities.resize(P);
     world.GetData().DownloadField(nk::FieldId::ParticlePos, st.positions.data(),
@@ -340,7 +340,7 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
             EXPECT_EQ(cs.bend.size(), 0u);
         }
         // nk path: gravity OFF (isolate the constraint), 10 GS iters, 200 steps.
-        const XpbdWorldState st = RunNkCloth(particles, cs, /*iters=*/10u,
+        const XpbdState st = RunNkCloth(particles, cs, /*iters=*/10u,
                                              Vec3{0.0f, 0.0f, 0.0f}, 1.0f / 240.0f,
                                              /*kSteps=*/200u);
         return nonplanarity(st.positions);
@@ -382,7 +382,7 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
             rest_edges.push_back({{dc.particle_a, dc.particle_b}, dc.rest_length});
         }
         // nk path: gravity + small out-of-plane nudge, 20 GS iters, 300 steps.
-        const XpbdWorldState st = RunNkCloth(g.particles, cs, /*iters=*/20u,
+        const XpbdState st = RunNkCloth(g.particles, cs, /*iters=*/20u,
                                              Vec3{0.0f, -9.81f, 0.3f}, 1.0f / 240.0f,
                                              /*kSteps=*/300u);
         return std::make_pair(st, rest_edges);
@@ -390,7 +390,7 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
 
     const auto a = run();
     const auto b = run();
-    const XpbdWorldState& sa = a.first;
+    const XpbdState& sa = a.first;
 
     // Finite.
     for (const Vec3& p : sa.positions) {

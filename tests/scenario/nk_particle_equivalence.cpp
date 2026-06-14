@@ -2,7 +2,7 @@
 // M6 — nk standalone-particle EQUIVALENCE to the legacy XPBD/PBF oracle bars.
 //
 // The XPBD 4件套 + PBF 5件套 (tests/runtime/test_xpbd_*, test_pbf_*) test the
-// LEGACY runtime::soft::XpbdWorld / runtime::fluid::PbfWorld classes directly;
+// LEGACY soft/fluid stepper classes directly;
 // those classes SURVIVE until M9 and stay green. This file is the M6 nk-path
 // EQUIVALENCE: the SAME kernel bodies, now ported into the nk particle ops
 // (particles.cu, the standalone mode == Xpbd / Pbf path — no coupling), reproduce

@@ -1,11 +1,11 @@
 // ---------------------------------------------------------------------------
 // M9 T11 Phase 2: id-10 cross-system particle-particle CONTACT, re-pointed to the
-// UNIFIED nk core. The legacy runtime::coupling::StepParticleParticleCoupling is
+// UNIFIED nk core. The legacy cross-system particle co-step is
 // op-ified as NkOp::ParticleParticleContact (src/phi/backend_cuda/ops/particles.cu),
 // emitted in the ParticleMode::SoftFluid pipeline as a co-step AFTER finalize over
 // the FULL [soft | fluid] union. This test reproduces the SAME analytic invariants
-// the legacy oracle asserted, now on a SoftFluid nk::World step (NO XpbdWorld /
-// PbfWorld / StepParticleParticleCoupling).
+// the legacy oracle asserted, now on a SoftFluid nk::World step (NO legacy soft /
+// fluid steppers / co-step).
 //
 // There is no Vellum/Flex/Houdini golden here, so the physical correctness of the
 // class-blind mass-weighted symmetric non-penetration projection is validated with

@@ -188,7 +188,7 @@ struct ParticleGridBuildParams {
     float    grid_min[3];       // grid lower corner
     uint32_t grid_dims[3];      // grid resolution (PER ENV)
     // M6: which position field the grid is built over. PBF builds the neighbor
-    // list on the PREDICTED positions (legacy StepPbfWorld), so pos_source == 1
+    // list on the PREDICTED positions (legacy PBF step order), so pos_source == 1
     // routes the op to pbf_predicted_pos; 0 == particle_pos (the M5 default).
     uint32_t pos_source;        // 0 = particle_pos, 1 = pbf_predicted_pos
     // Env-private grids (review fix): cell keys are offset env*cells so envs
@@ -362,7 +362,7 @@ struct XpbdProjectParams {
     uint32_t vol_con_count;    // total env-major volume constraints
     // M9 T11: total env-major shape-match cluster count (XPBD id 9). 0 == none.
     // Solved LAST in the XPBD sweep (after dist/bend/vol), the legacy
-    // StepXpbdWorld order, so it pulls the projected config toward the rigid goal.
+    // XPBD-sweep order, so it pulls the projected config toward the rigid goal.
     uint32_t shape_match_cluster_count;
 };
 
@@ -414,7 +414,7 @@ struct ParticleFinalizeParams {
 };
 
 // M9 T11 Phase 2 — id-10 cross-system particle-particle CONTACT (the op-ified
-// legacy runtime::coupling::StepParticleParticleCoupling). A class-blind
+// legacy cross-system particle co-step). A class-blind
 // unilateral non-penetration row over the FULL [soft | fluid] union (the row math
 // does NOT branch on soft vs fluid). Mirrors ParticleParticleContactParams 1:1
 // (contact_distance_d_min / compliance_alpha / solver_iterations) + the particle

@@ -28,8 +28,8 @@
 // and bend flaps are emitted in a fixed sorted order.
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XpbdConstraintSet (CUDA-free PODs)
 #include "math/vec3.hpp"
-#include "runtime/soft/xpbd_world.hpp"
 
 #include <cstdint>
 #include <vector>

@@ -595,8 +595,8 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     if (cells64 * E > 0xFFFFFFFFull) return Status::Failed;
     const uint32_t cells = static_cast<uint32_t>(cells64);
     const uint32_t blocks = (Np + kBlockSize - 1u) / kBlockSize;
-    // M6: PBF builds the neighbor grid on the PREDICTED positions (legacy
-    // StepPbfWorld), so pos_source routes the op to pbf_predicted_pos; the M5
+    // M6: PBF builds the neighbor grid on the PREDICTED positions (legacy PBF
+    // step order), so pos_source routes the op to pbf_predicted_pos; the M5
     // default (0) keeps the particle_pos source. All downstream PBF density /
     // lambda / correction kernels read pbf_predicted_pos, so the neighbor list
     // and the queries are over the SAME positions (D1 + the legacy semantics).

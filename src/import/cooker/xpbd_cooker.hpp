@@ -49,10 +49,10 @@
 // parse files and does NOT touch usd_importer.cpp / mjcf_importer.cpp.
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XpbdConstraintSet/XpbdShapeMatchCluster (CUDA-free)
 #include "math/vec3.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"
-#include "runtime/soft/xpbd_world.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -117,8 +117,8 @@ float ShapeMatchFractionFromStiffness(float stiffness);
 // dispatches on spec.type, maps the material params, and appends the constraints
 // (via the existing topology builders for Cloth/SoftBody, or a directly-assembled
 // single cluster for ShapeMatch). The constraint MATH lives in the builders / the
-// id9 row; this only orchestrates. The result is uploaded via
-// runtime::soft::UploadXpbdWorld by the caller.
+// id9 row; this only orchestrates. The result feeds the nk soft world cook
+// (nk::Model::ModelParticles, mode == Xpbd) by the caller.
 runtime::soft::XpbdConstraintSet CookXpbdSoftBody(const XpbdSoftBodySpec& spec);
 
 } // namespace nuka::import::cooker

@@ -690,7 +690,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     mp.xpbd_iters = in.solver_iterations == 0u ? 1u : in.solver_iterations;
 
     // De-interleave the constraint AoS into the per-field SoA (the EXACT
-    // UploadXpbdWorld layout: distance a/b/rest/alpha; bend 4-particle +
+    // legacy soft-upload layout: distance a/b/rest/alpha; bend 4-particle +
     // 4-gradient; volume 4-particle + rest6/alpha).
     const uint32_t dn = static_cast<uint32_t>(in.distance.size());
     mp.dist_a.resize(dn); mp.dist_b.resize(dn);
@@ -726,7 +726,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     // M9 T11 SHAPE-MATCH (id 9): flatten the variable-size clusters into the CSR
     // (offset, size) layout over flat particle / rest-offset / weight pools. Cook
     // the rest centroid c0 = (sum_i m_i x_i^0)/sum_i m_i and the per-member rest
-    // OFFSET q_i = x_i^0 - c0 ONCE -- BYTE-FAITHFUL to the legacy UploadXpbdWorld
+    // OFFSET q_i = x_i^0 - c0 ONCE -- BYTE-FAITHFUL to the legacy soft-upload
     // shape-match flatten (same fixed-order ascending accumulation).
     const uint32_t scn = static_cast<uint32_t>(in.shape_match.size());
     mp.sm_cluster_offset.clear(); mp.sm_cluster_size.clear();

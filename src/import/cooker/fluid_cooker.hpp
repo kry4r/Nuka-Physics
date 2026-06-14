@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 //
 // A THIN, deterministic, cook-time CPU layer that turns a programmatic fluid
-// VOLUME spec into the runtime::fluid::PbfParticleSet that PbfWorld uploads. It
+// VOLUME spec into the runtime::fluid::PbfParticleSet the nk PBF world cooks. It
 // owns NO simulation math: it SAMPLES particle initial positions filling the
 // authored volume on a uniform lattice and computes the per-particle mass from
 // the rest density and the lattice cell volume. (Same posture as the p09-D
@@ -35,8 +35,8 @@
 // parse files (no USD nuka:fluid_volume reader -- that layers on at p16, #19/#26).
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet (CUDA-free)
 #include "math/vec3.hpp"
-#include "runtime/fluid/pbf_world.hpp"
 
 #include <cstdint>
 
@@ -77,8 +77,8 @@ float FluidParticleMass(const FluidBoxSpec& spec);
 
 // Cook a BOX fluid volume into a PbfParticleSet. PURE + deterministic: samples the
 // cell-centered uniform lattice (x fastest), zero initial velocities, and the
-// uniform mass = rest_density * spacing^3. The result is uploaded via
-// runtime::fluid::UploadPbfWorld by the caller. Invalid spec (spacing <= 0,
+// uniform mass = rest_density * spacing^3. The result feeds the nk PBF world cook
+// (nk::Model::ModelParticles, mode == Pbf). Invalid spec (spacing <= 0,
 // rest_density <= 0, or an empty box) cooks to an EMPTY set (no throw -- mirrors
 // the xpbd_cooker's empty-input tolerance).
 runtime::fluid::PbfParticleSet CookFluidBox(const FluidBoxSpec& spec);

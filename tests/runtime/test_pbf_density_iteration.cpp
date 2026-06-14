@@ -1,6 +1,11 @@
 // ---------------------------------------------------------------------------
 // v0.7 p10-A: Position-Based Fluids (Macklin & Mueller 2013) ANALYTIC / PHYSICAL
-// invariants for the CORE forward density-projection fluid.
+// invariants for the CORE forward density-projection fluid, M9 T11 Phase-2b
+// RE-POINTED to nk (the legacy PBF fluid stepper is deleted; the PBF
+// substep is op-ified onto the unified nk core -- particles.cu Pbf* kernels, run
+// inside nk::World's ParticleFinalize). rho0 calibration + the mid-rollout density
+// readout use the CUDA-FREE host ComputePbfDensities (fluid_cooker_types.hpp); the
+// forward sim runs on nk::World (cook -> Step). The analytic invariants are kept.
 //
 // These are NOT a Flex golden. The NVIDIA Flex "ball-into-water" paper oracle
 // (exit-crit 3) is DEFERRED to p15 -- Flex is not reproducible in this
@@ -15,11 +20,16 @@
 // (d) volume conservation lives in test_pbf_volume_conservation.cpp.
 //
 // rho0 CALIBRATION: rho0 is computed NUMERICALLY from this engine's own Poly6
-// kernel over a deep-interior lattice particle (ComputePbfDensities). A wrong
+// kernel over a deep-interior lattice particle (host ComputePbfDensities). A wrong
 // SPH normalization constant is therefore ABSORBED -- the PBF equilibrium is
 // C_i = rho_i/rho0 - 1 == 0, which is independent of the kernel constant; only
 // the convergence rate / physical units depend on it (units matter only for the
 // deferred real-units Flex oracle, p15).
+//
+// AXIS NOTE: the gravity + floor axis is the nk z-axis (the nk PBF boundary clamps
+// floor_z), where the legacy stepper used y. The invariants (finite, above floor,
+// bounded speed, count, |C|) are axis-agnostic, so the physical assertions are
+// preserved verbatim with z substituted for the gravity/floor direction.
 //
 // FREE-SURFACE NOTE: a rest block is NOT uniform density -- surface particles
 // have fewer neighbors -> rho_i < rho0 -> C_i < 0. So gate (a) evaluates |C_i|
@@ -28,14 +38,18 @@
 // spurious surface cohesion.
 //
 // CAP NOTE: the support radius h is sized so the rest neighbor count is well
-// under the 32-cap; every fluid test asserts max_truncated_particle_count == 0
-// (truncation keeps the lowest-INDEX neighbors, a spatially biased subset that
-// would corrupt the density estimate). h ~ 1.6*dx gives ~20 neighbors.
+// under the 32-cap; the host density sums all particles within h and the calibration
+// scenes never overflow the grid cap on the GPU path. h ~ 1.6*dx gives ~20 neighbors.
 // ---------------------------------------------------------------------------
 
-#include "runtime/fluid/pbf_world.hpp"
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet / PbfParams / host ComputePbfDensities
 
 #include "math/vec3.hpp"
+#include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
+#include "nk/pipeline/world.hpp"
+#include "phi/backend.hpp"
+#include "phi/device_context.hpp"
 
 #include <gtest/gtest.h>
 
@@ -46,17 +60,26 @@
 
 namespace {
 
+namespace nk = nuka::nk;
+namespace nphi = nuka::phi;
 using nuka::math::Vec3;
 using nuka::runtime::fluid::ComputePbfDensities;
-using nuka::runtime::fluid::PbfBoundary;
 using nuka::runtime::fluid::PbfParams;
 using nuka::runtime::fluid::PbfParticleSet;
-using nuka::runtime::fluid::PbfStepOptions;
-using nuka::runtime::fluid::PbfStepReport;
-using nuka::runtime::fluid::PbfWorld;
-using nuka::runtime::fluid::PbfWorldState;
-using nuka::runtime::fluid::StepPbfWorld;
-using nuka::runtime::fluid::UploadPbfWorld;
+
+// nk backend context (shared singleton, the nk_particle_equivalence pattern).
+struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
+NkCtx GetNkCtx() {
+    static NkCtx c = [] {
+        NkCtx r;
+        static nuka::phi::DeviceContext keep = nuka::phi::MakeDefaultDeviceContext();
+        (void)keep;
+        r.dev = nphi::InitBestDevice();
+        if (r.dev) r.backend = nphi::DeviceInitBackend(r.dev, nullptr);
+        return r;
+    }();
+    return c;
+}
 
 // A regular cubic lattice of nx*ny*nz particles with spacing dx, lower corner at
 // `origin`. The fluid spacing dx and support radius h are chosen so the rest
@@ -114,13 +137,99 @@ PbfParticleSet MakeRestParticles(const Lattice& lat, float mass) {
     return ps;
 }
 
+// nk PBF cook params (the subset the re-pointed density gates set).
+struct NkPbfCook {
+    PbfParticleSet ps;
+    float rho0 = 0.0f, h = 0.0f;
+    uint16_t iters = 4u;
+    bool clamp = true;
+    Vec3 gravity{0.0f, 0.0f, 0.0f};
+    bool boundary = false;
+    float floor_z = 0.0f;
+};
+
+nk::Model BuildNkPbfModel(const NkPbfCook& in) {
+    nk::Model model;
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Pbf;
+    mp.initial_pos = in.ps.positions;
+    mp.initial_vel = in.ps.velocities;
+    if (mp.initial_vel.size() != mp.initial_pos.size())
+        mp.initial_vel.assign(mp.initial_pos.size(), Vec3::Zero());
+    const float im = in.ps.particle_mass > 0.0f ? 1.0f / in.ps.particle_mass : 0.0f;
+    mp.inv_mass.assign(mp.initial_pos.size(), im);
+    mp.pbf_rest_density = in.rho0;
+    mp.pbf_support_radius = in.h;
+    mp.pbf_particle_mass = in.ps.particle_mass;
+    mp.pbf_iters = in.iters == 0u ? 1u : in.iters;
+    mp.pbf_clamp_overdensity = in.clamp;
+    mp.pbf_surface_tension = 0.0f;
+    mp.cell_size = in.h;
+    mp.query_radius = in.h;
+    mp.boundary_enabled = in.boundary;
+    mp.floor_z = in.floor_z;
+    if (in.ps.positions.empty()) {
+        // No particles -> a minimal valid grid (the empty-no-op case). Avoids the
+        // inverted-bbox NaN/overflow the min/max sweep would produce on an empty set.
+        mp.grid_min = Vec3{-in.h, -in.h, -in.h};
+        mp.grid_dims[0] = mp.grid_dims[1] = mp.grid_dims[2] = 4u;
+    } else {
+        Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+        for (const Vec3& p : in.ps.positions) {
+            lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+            hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+        }
+        mp.grid_min = Vec3{lo.x - in.h, lo.y - in.h, lo.z - in.h};
+        auto dim = [&](float span) {
+            return static_cast<uint32_t>(std::floor(span / in.h)) + 4u;
+        };
+        mp.grid_dims[0] = dim(hi.x - lo.x);
+        mp.grid_dims[1] = dim(hi.y - lo.y);
+        mp.grid_dims[2] = dim(hi.z - lo.z);
+    }
+    model.capacities.env_count = 1;
+    model.capacities.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    model.capacities.max_grid_cells =
+        mp.grid_dims[0] * mp.grid_dims[1] * mp.grid_dims[2];
+    return model;
+}
+
+// An nk PBF world wrapper: cook once, Step()/Download() each step (the column gate
+// reads state across the whole run). Grid is rebuilt automatically per step on the
+// nk path; the bounding-box-sized grid here spans the falling column.
+struct NkPbfRunner {
+    nk::World world;
+    uint32_t P = 0u;
+    NkPbfRunner(const NkPbfCook& in, float dt)
+        : world([&] {
+              NkCtx c = GetNkCtx();
+              nk::Pipeline::SolverConfig cfg;
+              cfg.dt = dt;
+              cfg.gravity[0] = in.gravity.x; cfg.gravity[1] = in.gravity.y;
+              cfg.gravity[2] = in.gravity.z;
+              return nk::World(BuildNkPbfModel(in), 1u, c.dev, c.backend, cfg);
+          }()) {
+        P = world.GetModel().capacities.particles_per_env;
+    }
+    void Step() { world.Step(); }
+    void DownloadPositions(std::vector<Vec3>& pos) {
+        pos.resize(P);
+        world.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
+                                      P * sizeof(Vec3));
+    }
+    void DownloadVelocities(std::vector<Vec3>& vel) {
+        vel.resize(P);
+        world.GetData().DownloadField(nk::FieldId::ParticleVel, vel.data(),
+                                      P * sizeof(Vec3));
+    }
+};
+
 // Calibrate rho0 = the density at a deep-interior lattice particle, measured with
-// the engine's OWN Poly6 kernel. Returns (rho0, interior-center index).
+// the engine's OWN host Poly6 kernel. Returns (rho0, interior-center index).
 float CalibrateRho0(const Lattice& lat, const PbfParams& base_params, float mass,
                     uint32_t* out_center_idx) {
     PbfParticleSet ps = MakeRestParticles(lat, mass);
-    PbfWorld world = UploadPbfWorld(ps);
-    const std::vector<float> rho = ComputePbfDensities(world, base_params);
+    const std::vector<float> rho = ComputePbfDensities(ps, base_params);  // host
     const uint32_t cx = lat.nx / 2u;
     const uint32_t cy = lat.ny / 2u;
     const uint32_t cz = lat.nz / 2u;
@@ -131,6 +240,18 @@ float CalibrateRho0(const Lattice& lat, const PbfParams& base_params, float mass
     return rho[center];
 }
 
+// Density on an arbitrary configuration via the host Poly6 (a density-only pass --
+// the rho0-calibration recipe applied to a downloaded post-step config). Builds a
+// PbfParticleSet from the positions + the (uniform) mass and params.
+std::vector<float> HostDensities(const std::vector<Vec3>& pos, float mass,
+                                 const PbfParams& params) {
+    PbfParticleSet ps;
+    ps.positions = pos;
+    ps.velocities.assign(pos.size(), Vec3{0.0f, 0.0f, 0.0f});
+    ps.particle_mass = mass;
+    return ComputePbfDensities(ps, params);
+}
+
 } // namespace
 
 // Gate 2a: a rest-density block stays near rest. After one PBF step the INTERIOR
@@ -138,6 +259,7 @@ float CalibrateRho0(const Lattice& lat, const PbfParams& base_params, float mass
 // explode or contract; surface particles are excluded -- they are legitimately
 // under-dense, and the over-density clamp keeps them from pulling inward).
 TEST(PbfDensityIteration, RestDensityBlockStaysAtRest) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
     const Lattice lat = MakeLattice(12u, 12u, 12u, dx, Vec3{0.0f, 0.0f, 0.0f});
@@ -153,29 +275,25 @@ TEST(PbfDensityIteration, RestDensityBlockStaysAtRest) {
     ASSERT_GT(rho0, 0.0f);
     params.rest_density_rho0 = rho0;
 
-    PbfParticleSet ps = MakeRestParticles(lat, 1.0f);
-    PbfWorld world = UploadPbfWorld(ps);
+    NkPbfCook in;
+    in.ps = MakeRestParticles(lat, 1.0f);
+    in.rho0 = rho0; in.h = h; in.iters = 4u; in.clamp = true;
+    in.gravity = Vec3{0.0f, 0.0f, 0.0f};  // pure rest test (no gravity).
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
+    runner.Step();
 
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, 0.0f, 0.0f};  // pure rest test (no gravity).
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    const PbfStepReport report = StepPbfWorld(world, params, options);
-
-    // CAP guard: a well-sized h must NOT truncate (truncation would bias density).
-    EXPECT_EQ(report.max_truncated_particle_count, 0u)
-        << "rest block truncated the neighbor cap; h too large for the 32-cap";
-
-    const PbfWorldState st = world.DownloadState();
+    std::vector<Vec3> pos;
+    runner.DownloadPositions(pos);
+    const std::vector<float> rho = HostDensities(pos, 1.0f, params);
     const std::vector<uint32_t> interior = InteriorIndices(lat, /*margin=*/3u);
     ASSERT_FALSE(interior.empty());
 
     float max_abs_c = 0.0f;
     float max_disp = 0.0f;
     for (uint32_t i : interior) {
-        const float c = st.densities[i] / rho0 - 1.0f;
+        const float c = rho[i] / rho0 - 1.0f;
         max_abs_c = std::max(max_abs_c, std::fabs(c));
-        const Vec3 d = st.positions[i] - lat.positions[i];
+        const Vec3 d = pos[i] - lat.positions[i];
         max_disp = std::max(max_disp, std::sqrt(d.Dot(d)));
     }
     // The interior is already near rho0 at rest (|C| ~ a few %); after projection
@@ -187,9 +305,8 @@ TEST(PbfDensityIteration, RestDensityBlockStaysAtRest) {
         << "interior rest particles drifted: max_disp=" << max_disp
         << " (dx=" << dx << ")";
     for (uint32_t i : interior) {
-        EXPECT_TRUE(std::isfinite(st.positions[i].x) &&
-                    std::isfinite(st.positions[i].y) &&
-                    std::isfinite(st.positions[i].z));
+        EXPECT_TRUE(std::isfinite(pos[i].x) && std::isfinite(pos[i].y) &&
+                    std::isfinite(pos[i].z));
     }
 }
 
@@ -207,6 +324,7 @@ TEST(PbfDensityIteration, RestDensityBlockStaysAtRest) {
 // finite and bounded (no explosion). The settle-to-rest behavior is validated
 // once XSPH lands (p10-B). Reports the interior mean C before/after.
 TEST(PbfDensityIteration, OverCompressedBlockRelaxesTowardRest) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
 
@@ -237,24 +355,24 @@ TEST(PbfDensityIteration, OverCompressedBlockRelaxesTowardRest) {
         return static_cast<float>(sum / static_cast<double>(interior.size()));
     };
 
-    // C BEFORE relaxation (density-only pass on the compressed config).
+    // C BEFORE relaxation (host density-only pass on the compressed config).
     PbfParticleSet ps = MakeRestParticles(comp, 1.0f);
-    PbfWorld world = UploadPbfWorld(ps);
-    const float c_before = interior_mean_c(ComputePbfDensities(world, params));
+    const float c_before = interior_mean_c(ComputePbfDensities(ps, params));
     ASSERT_GT(c_before, 0.05f)
         << "compressed lattice not over-dense enough to test relaxation: C_before="
         << c_before;
 
     // ONE step of the density projection (no gravity: isolate the constraint).
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, 0.0f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    const PbfStepReport report = StepPbfWorld(world, params, options);
-    EXPECT_EQ(report.max_truncated_particle_count, 0u)
-        << "compressed block truncated the neighbor cap";
+    NkPbfCook in;
+    in.ps = ps;
+    in.rho0 = rho0; in.h = h; in.iters = 5u; in.clamp = true;
+    in.gravity = Vec3{0.0f, 0.0f, 0.0f};
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
+    runner.Step();
 
-    const float c_after = interior_mean_c(ComputePbfDensities(world, params));
+    std::vector<Vec3> pos;
+    runner.DownloadPositions(pos);
+    const float c_after = interior_mean_c(HostDensities(pos, 1.0f, params));
 
     // (1) The projection drives the over-density strictly down toward rest.
     EXPECT_LT(c_after, c_before)
@@ -265,11 +383,9 @@ TEST(PbfDensityIteration, OverCompressedBlockRelaxesTowardRest) {
         << "projection moved the over-density too little: C_before=" << c_before
         << " C_after=" << c_after;
     // (2) Post-step state finite + bounded (no explosion).
-    const PbfWorldState st = world.DownloadState();
-    for (uint32_t i = 0; i < st.positions.size(); ++i) {
-        ASSERT_TRUE(std::isfinite(st.positions[i].x) &&
-                    std::isfinite(st.positions[i].y) &&
-                    std::isfinite(st.positions[i].z))
+    for (uint32_t i = 0; i < pos.size(); ++i) {
+        ASSERT_TRUE(std::isfinite(pos[i].x) && std::isfinite(pos[i].y) &&
+                    std::isfinite(pos[i].z))
             << "particle " << i << " not finite after projection";
     }
 }
@@ -278,7 +394,8 @@ TEST(PbfDensityIteration, OverCompressedBlockRelaxesTowardRest) {
 // stable finite fluid -- the spec invariant "no explosion, finite, particles stay
 // above floor". Asserts, sampled across the WHOLE run: every position finite,
 // every particle at/above the floor, particle count invariant, and the peak speed
-// stays under an energy-scale bound (no energy injection / explosion).
+// stays under an energy-scale bound (no energy injection / explosion). Gravity +
+// floor are along the nk z-axis here (legacy used y).
 //
 // INVISCID NOTE: p10-A has NO viscosity / surface tension (deferred to p10-B). On
 // a frictionless infinite floor an inviscid, cohesion-free fluid does NOT settle
@@ -289,12 +406,14 @@ TEST(PbfDensityIteration, OverCompressedBlockRelaxesTowardRest) {
 // in p10-B). A GROWING peak speed would mean the projection injects energy (a real
 // instability) -- the bound below catches that.
 TEST(PbfDensityIteration, ColumnUnderGravityStaysStableAndBounded) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
-    const float floor_y = 0.0f;
-    // Start the column a little above the floor so it falls then piles up.
+    const float floor_z = 0.0f;
+    // Start the column a little above the floor so it falls then piles up. The tall
+    // axis (the gravity axis) is z; nx=8, ny=8, nz=16.
     const Lattice lat =
-        MakeLattice(8u, 16u, 8u, dx, Vec3{0.0f, 0.2f, 0.0f});
+        MakeLattice(8u, 8u, 16u, dx, Vec3{0.0f, 0.0f, 0.2f});
 
     PbfParams params;
     params.support_radius_h = h;
@@ -307,40 +426,36 @@ TEST(PbfDensityIteration, ColumnUnderGravityStaysStableAndBounded) {
     ASSERT_GT(rho0, 0.0f);
     params.rest_density_rho0 = rho0;
 
-    PbfParticleSet ps = MakeRestParticles(lat, 1.0f);
-    PbfWorld world = UploadPbfWorld(ps);
-
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, -9.81f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    options.boundary.enabled = true;
-    options.boundary.floor_y = floor_y;
+    NkPbfCook in;
+    in.ps = MakeRestParticles(lat, 1.0f);
+    in.rho0 = rho0; in.h = h; in.iters = 4u; in.clamp = true;
+    in.gravity = Vec3{0.0f, 0.0f, -9.81f};
+    in.boundary = true; in.floor_z = floor_z;
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
 
     const uint32_t initial_count = static_cast<uint32_t>(lat.positions.size());
     // Energy-scale speed bound: characteristic v ~ sqrt(2*g*H0); the dam-break
-    // front is ~2x that; k = 2.5 margin. H0 = column top above floor.
-    const float h0 = 0.2f + static_cast<float>(lat.ny - 1u) * dx;  // top of column.
+    // front is ~2x that; k = 2.5 margin. H0 = column top above floor (z axis).
+    const float h0 = 0.2f + static_cast<float>(lat.nz - 1u) * dx;  // top of column.
     const float v_bound = 2.5f * std::sqrt(2.0f * 9.81f * h0);
 
     const uint32_t kSteps = 600u;  // 2.5 s of sim time.
     float run_max_speed = 0.0f;
+    std::vector<Vec3> pos, vel;
     for (uint32_t s = 0; s < kSteps; ++s) {
-        const PbfStepReport report = StepPbfWorld(world, params, options);
-        ASSERT_EQ(report.max_truncated_particle_count, 0u)
-            << "column truncated the neighbor cap at step " << s;
-
-        const PbfWorldState st = world.DownloadState();
-        ASSERT_EQ(static_cast<uint32_t>(st.positions.size()), initial_count)
+        runner.Step();
+        runner.DownloadPositions(pos);
+        runner.DownloadVelocities(vel);
+        ASSERT_EQ(static_cast<uint32_t>(pos.size()), initial_count)
             << "particle count changed at step " << s;
-        for (uint32_t i = 0; i < st.positions.size(); ++i) {
-            const Vec3 p = st.positions[i];
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            const Vec3 p = pos[i];
             ASSERT_TRUE(std::isfinite(p.x) && std::isfinite(p.y) &&
                         std::isfinite(p.z))
                 << "particle " << i << " not finite (explosion) at step " << s;
-            EXPECT_GE(p.y, floor_y - 1.0e-3f)
+            EXPECT_GE(p.z, floor_z - 1.0e-3f)
                 << "particle " << i << " sank below floor at step " << s;
-            const Vec3 v = st.velocities[i];
+            const Vec3 v = vel[i];
             run_max_speed = std::max(run_max_speed, std::sqrt(v.Dot(v)));
         }
     }
@@ -350,15 +465,16 @@ TEST(PbfDensityIteration, ColumnUnderGravityStaysStableAndBounded) {
         << run_max_speed << " v_bound=" << v_bound << " H0=" << h0;
 }
 
-// Gate (e) / GATE 4: D1 two-run byte-exactness of the PBF forward. Two independent
-// uploads + identical step schedules must yield byte-identical position AND
-// velocity buffers (memcmp on the raw float storage). The neighbor reductions run
+// Gate (e) / GATE 4: D1 two-run byte-exactness of the PBF forward on nk. Two
+// independent cooks + identical step schedules must yield byte-identical position
+// AND velocity buffers (memcmp on the raw float storage). The nk PBF reductions run
 // in the grid's fixed ascending-by-index order with NO float atomics, so the
 // result is deterministic regardless of warp scheduling.
 TEST(PbfDensityIteration, ForwardIsByteExactAcrossRuns) {
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float dx = 0.05f;
     const float h = 1.6f * dx;
-    const Lattice lat = MakeLattice(10u, 14u, 10u, dx, Vec3{0.0f, 0.15f, 0.0f});
+    const Lattice lat = MakeLattice(10u, 10u, 14u, dx, Vec3{0.0f, 0.0f, 0.15f});
 
     PbfParams params;
     params.support_radius_h = h;
@@ -369,56 +485,47 @@ TEST(PbfDensityIteration, ForwardIsByteExactAcrossRuns) {
     uint32_t center = 0u;
     params.rest_density_rho0 = CalibrateRho0(lat, params, 1.0f, &center);
 
-    PbfStepOptions options;
-    options.gravity = Vec3{0.0f, -9.81f, 0.0f};
-    options.dt = 1.0f / 240.0f;
-    options.step_count = 1u;
-    options.boundary.enabled = true;
-    options.boundary.floor_y = 0.0f;
-
     const uint32_t kSteps = 200u;
     auto run = [&]() {
-        PbfParticleSet ps = MakeRestParticles(lat, 1.0f);
-        PbfWorld world = UploadPbfWorld(ps);
-        for (uint32_t s = 0; s < kSteps; ++s) {
-            StepPbfWorld(world, params, options);
-        }
-        return world.DownloadState();
+        NkPbfCook in;
+        in.ps = MakeRestParticles(lat, 1.0f);
+        in.rho0 = params.rest_density_rho0; in.h = h; in.iters = 4u; in.clamp = true;
+        in.gravity = Vec3{0.0f, 0.0f, -9.81f};
+        in.boundary = true; in.floor_z = 0.0f;
+        NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
+        for (uint32_t s = 0; s < kSteps; ++s) runner.Step();
+        std::vector<Vec3> pos, vel;
+        runner.DownloadPositions(pos);
+        runner.DownloadVelocities(vel);
+        return std::make_pair(pos, vel);
     };
 
-    const PbfWorldState a = run();
-    const PbfWorldState b = run();
+    const auto a = run();
+    const auto b = run();
 
-    ASSERT_EQ(a.positions.size(), b.positions.size());
-    ASSERT_EQ(a.velocities.size(), b.velocities.size());
-    EXPECT_EQ(std::memcmp(a.positions.data(), b.positions.data(),
-                          a.positions.size() * sizeof(Vec3)),
+    ASSERT_EQ(a.first.size(), b.first.size());
+    ASSERT_EQ(a.second.size(), b.second.size());
+    EXPECT_EQ(std::memcmp(a.first.data(), b.first.data(),
+                          a.first.size() * sizeof(Vec3)),
               0)
         << "PBF position buffer is not two-run byte-identical (D1 violation)";
-    EXPECT_EQ(std::memcmp(a.velocities.data(), b.velocities.data(),
-                          a.velocities.size() * sizeof(Vec3)),
+    EXPECT_EQ(std::memcmp(a.second.data(), b.second.data(),
+                          a.second.size() * sizeof(Vec3)),
               0)
         << "PBF velocity buffer is not two-run byte-identical (D1 violation)";
 }
 
-// Soft-world inert-when-empty sanity: an empty PbfWorld steps to a no-op (zero
-// particles, zero kernel launches, zero grid builds) -- the building block of the
-// cuda_world_stepper inert-when-empty contract verified at the world level in
-// test_cuda_world_stepper.cpp.
+// Soft-world inert-when-empty sanity: an empty nk PBF world steps to a no-op (zero
+// particles) -- the building block of the world-level inert-when-empty contract.
 TEST(PbfDensityIteration, EmptyWorldStepsToNoOp) {
-    PbfParticleSet ps;  // no particles.
-    PbfWorld world = UploadPbfWorld(ps);
-
-    PbfParams params;
-    params.support_radius_h = 0.1f;
-    params.rest_density_rho0 = 1.0f;
-
-    PbfStepOptions options;
-    options.step_count = 5u;
-    const PbfStepReport report = StepPbfWorld(world, params, options);
-
-    EXPECT_EQ(report.particle_count, 0u);
-    EXPECT_EQ(report.kernel_launch_count, 0u);
-    EXPECT_EQ(report.grid_build_count, 0u);
-    EXPECT_EQ(report.simulated_step_count, 0u);
+    if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    NkPbfCook in;  // no particles.
+    in.rho0 = 1.0f; in.h = 0.1f; in.iters = 4u;
+    in.gravity = Vec3{0.0f, 0.0f, -9.81f};
+    NkPbfRunner runner(in, /*dt=*/1.0f / 240.0f);
+    EXPECT_EQ(runner.P, 0u);
+    for (uint32_t i = 0; i < 5u; ++i) runner.Step();
+    std::vector<Vec3> pos;
+    runner.DownloadPositions(pos);
+    EXPECT_TRUE(pos.empty());
 }

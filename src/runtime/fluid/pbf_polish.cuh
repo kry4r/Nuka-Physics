@@ -2,8 +2,8 @@
 // ---------------------------------------------------------------------------
 // nuka::runtime::fluid -- p10-B PBF POLISH kernels: the Akinci et al. 2013
 // surface-tension COHESION spline C(r). (XSPH viscosity reuses Poly6FromR2 from
-// pbf_kernels.cuh, so it lives directly in pbf_world.cu; only the cohesion spline
-// is novel enough to warrant its own coefficient + device helper here.)
+// pbf_kernels.cuh, so it lives directly in the nk PBF op TU; only the cohesion
+// spline is novel enough to warrant its own coefficient + device helper here.)
 //
 // Akinci, Akinci & Teschner 2013, "Versatile Surface Tension and Adhesion for
 // SPH Fluids", eq.2: the cohesion kernel is a piecewise C^1 spline supported on

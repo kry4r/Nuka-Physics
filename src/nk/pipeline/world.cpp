@@ -127,7 +127,7 @@ bool World::SeedInitialState() {
 
     // -- M6: particle (XPBD soft / PBF fluid) initial state seeding (env-major
     // replication of the single-env template). particle_prev_pos is seeded == pos
-    // (the legacy UploadXpbdWorld "prev seeded = p" / UploadPbfWorld "predicted
+    // (the legacy soft-upload "prev seeded = p" / fluid-upload "predicted
     // seeded = p"). The XPBD/PBF constraint lambdas + the PBF scratch stay at the
     // arena's zero init (matching the legacy zero-seed).
     if (cap.particles_per_env > 0 &&

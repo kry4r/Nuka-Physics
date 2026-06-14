@@ -13,13 +13,13 @@
 //
 // This is a ONE-TIME cook-time builder (master plan: cookers may be CPU; the
 // per-step SIM remains GPU-only). It returns host XpbdConstraintSet entries the
-// caller uploads via UploadXpbdWorld; the runtime solve iterates them on the GPU.
+// caller feeds them into the nk soft cook; the nk solve iterates them on the GPU.
 // Determinism: edges are emitted in a fixed, sorted, de-duplicated order so the
 // constraint list (and therefore the serial GS sweep order) is reproducible.
 // ---------------------------------------------------------------------------
 
+#include "import/cooker/xpbd_cooker_types.hpp"  // XpbdConstraintSet (CUDA-free PODs)
 #include "math/vec3.hpp"
-#include "runtime/soft/xpbd_world.hpp"
 
 #include <cstdint>
 #include <vector>

@@ -2,8 +2,8 @@
 // PHI v2 CUDA backend — M6 particle ops (XPBD soft + PBF fluid as backend ops).
 //
 // LINE-BY-LINE ports of the kernel bodies from
-//   src/runtime/soft/xpbd_world.cu  (predict / distance / bend / volume / correct)
-//   src/runtime/fluid/pbf_world.cu  (predict / density / lambda / delta / apply /
+//   the legacy XPBD soft stepper (predict / distance / bend / volume / correct)
+//   the legacy PBF fluid stepper (predict / density / lambda / delta / apply /
 //                                    finalize / xsph viscosity / cohesion)
 // onto the nk arena fields (DataView/ModelView typed device pointers). The op
 // order, the reduction order, and every float expression are preserved verbatim
@@ -15,7 +15,7 @@
 // XPBD vs PBF predict/finalize diverge): the param's `mode` selects the kernel
 // body. The PBF density-projection iteration loop lives inside PbfDensityLambda /
 // PbfApplyDelta (the pipeline is a flat OpCall list, so the N-iteration coupling
-// is owned by the op TU, exactly as the legacy StepPbfWorld owned its inner loop).
+// is owned by the op TU, exactly as the legacy PBF stepper owned its inner loop).
 //
 // NEIGHBOR LAYOUT (M5 arena CSR): the ParticleGridBuild op (broadphase.cu) writes
 // each particle's neighbor list into a PRIVATE slice grid_neighbor_idx[i*32 .. ]
@@ -71,7 +71,7 @@ __device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
 }
 
 // =============================================================================
-// XPBD kernels — VERBATIM from runtime/soft/xpbd_world.cu (predict / distance /
+// XPBD kernels — VERBATIM from the legacy XPBD soft stepper (predict / distance /
 // bend / volume / correct). Indices/expressions unchanged; only the buffer
 // arguments are the arena fields.
 // =============================================================================
@@ -256,7 +256,7 @@ __global__ void XpbdVolumeKernel(uint32_t volume_constraint_count,
 }
 
 // --- solve: shape-match (Mueller et al. 2005) ---------------------------------
-// VERBATIM port of runtime/soft/xpbd_world.cu SolveShapeMatchConstraintsKernel +
+// VERBATIM port of the legacy XPBD soft SolveShapeMatchConstraintsKernel +
 // its local 3x3 polar machinery. Same math, same reduction order, single-thread
 // fixed-order GS sweep -- D1, no float atomics. The buffer arguments are the nk
 // arena/model fields (positions = data.particle_pos; the CSR cluster tables come
@@ -416,7 +416,7 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
 }
 
 // =============================================================================
-// PBF kernels — VERBATIM from runtime/fluid/pbf_world.cu. The ONLY change is the
+// PBF kernels — VERBATIM from the legacy PBF fluid stepper. The ONLY change is the
 // neighbor read: the M5 arena grid writes a PRIVATE per-particle slice
 // (neighbor_idx[i*32 + k], count[i]), so `base = i * kNeighborStride` here in
 // place of the legacy flat `neighbor_offsets[i]`. The k-loop order is identical.
@@ -1036,7 +1036,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     }
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     // Solve order is FIXED (distance, then bend, then volume), each a
-    // single-thread serial sweep — D1 by construction (legacy StepXpbdWorld).
+    // single-thread serial sweep — D1 by construction (legacy XPBD stepper order).
     if (p->dist_con_count > 0u) {
         LaunchCuda(XpbdDistanceKernel, dim3(1u), dim3(1u), 0u, stream,
                    p->dist_con_count, iters, data.particle_pos,
@@ -1059,7 +1059,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
                    p->dt);
     }
     // Shape-match is solved LAST (after the local constraints), the legacy
-    // StepXpbdWorld order, so it pulls the already-projected config toward the
+    // legacy XPBD-sweep order, so it pulls the already-projected config toward the
     // rigid goal. No lambda field: shape matching is a direct goal projection
     // re-evaluated from the current positions each iteration.
     if (p->shape_match_cluster_count > 0u) {
@@ -1077,7 +1077,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
 // apply is in-loop here; the LAST iteration's compute leaves `pbf_position_delta`
 // staged for PbfApplyDelta. This keeps both ops non-vacuous + byte-exact to the
 // legacy [density,lambda,delta,apply]xN inner loop (the pipeline is a flat list,
-// so the iteration coupling is owned by the op TU, exactly as StepPbfWorld did).
+// so the iteration coupling is owned by the op TU, exactly as the legacy PBF stepper did).
 Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
                           const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const PbfDensityLambdaParams*>(params);
@@ -1192,7 +1192,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     }
     // PBF: finalize v from the corrected predicted positions + commit, then the
     // gated post-finalize polish (XSPH viscosity / Akinci cohesion) — exactly the
-    // legacy StepPbfWorld order. The polish reuses THIS step's neighbor grid (the
+    // legacy PBF-step order. The polish reuses THIS step's neighbor grid (the
     // M5 arena CSR, still live) and the position-delta scratch (free post-finalize).
     // n_soft == 0 here (single-system) so the fluid-slice guards are inert.
     LaunchCuda(PbfFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,

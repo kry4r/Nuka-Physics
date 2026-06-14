@@ -28,7 +28,7 @@
 // rho0 NOTE: the ABSOLUTE Poly6 constant only sets physical units. The PBF
 // equilibrium is C_i = rho_i/rho0 - 1 == 0, i.e. rho_i == rho0; a wrong constant
 // is absorbed when rho0 is calibrated numerically from this SAME kernel over a
-// rest lattice (see pbf_world.cu / the tests). The constants below are the
+// rest lattice (see the nk PBF ops / the tests). The constants below are the
 // textbook values so that a future real-units (rho0 = 1000 kg/m^3) Flex oracle
 // (deferred to p15) lines up without re-derivation.
 // ---------------------------------------------------------------------------

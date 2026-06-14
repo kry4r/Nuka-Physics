@@ -3,7 +3,7 @@
 // A post-finalize velocity nudge a_i = -gamma * sum_j m * C(|r_ij|) * r_hat that
 // pulls neighbors together. The nk PBF ops (particles.cu PbfCohesionKernel, run
 // inside ParticleFinalize) carry the SAME kernel body; M9 T11 re-points the
-// COHESION + D1 gates from the legacy runtime::fluid::PbfWorld stepper to
+// COHESION + D1 gates from the legacy PBF fluid stepper to
 // nk::World (cook -> Step):
 //
 //   (1) COHESION: a small detached blob, no gravity, has its MEAN PAIRWISE
@@ -14,7 +14,7 @@
 // COHESION + D1 physical invariants.) rho0 is calibrated from the engine host kernel.
 // ---------------------------------------------------------------------------
 
-#include "runtime/fluid/pbf_world.hpp"  // PbfParticleSet / ComputePbfDensities (host calib)
+#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet / PbfParams / host ComputePbfDensities
 
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -37,8 +37,6 @@ using nuka::math::Vec3;
 using nuka::runtime::fluid::ComputePbfDensities;
 using nuka::runtime::fluid::PbfParams;
 using nuka::runtime::fluid::PbfParticleSet;
-using nuka::runtime::fluid::PbfWorld;
-using nuka::runtime::fluid::UploadPbfWorld;
 
 // nk backend context (shared singleton, the nk_particle_equivalence pattern).
 struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
@@ -82,8 +80,7 @@ float CalibrateRho0(const Lattice& lat, const PbfParams& params, float mass) {
     ps.positions = lat.positions;
     ps.velocities.assign(lat.positions.size(), Vec3{0.0f, 0.0f, 0.0f});
     ps.particle_mass = mass;
-    PbfWorld world = UploadPbfWorld(ps);
-    const std::vector<float> rho = ComputePbfDensities(world, params);
+    const std::vector<float> rho = ComputePbfDensities(ps, params);  // host calib
     return rho[LatIdx(lat, lat.nx / 2u, lat.ny / 2u, lat.nz / 2u)];
 }
 
@@ -113,7 +110,7 @@ double MeanPairwiseDistance(const std::vector<Vec3>& p) {
     return pairs == 0 ? 0.0 : sum / static_cast<double>(pairs);
 }
 
-// Downloaded particle state (replaces the legacy PbfWorldState).
+// Downloaded particle state (replaces the legacy fluid world state).
 struct PbfState {
     std::vector<Vec3> positions;
     std::vector<Vec3> velocities;

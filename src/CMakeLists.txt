@@ -794,50 +794,36 @@ if(CMAKE_CUDA_COMPILER)
         # only remaining consumer is the LBVH-vs-SAP differential gate (the legacy
         # whole-world AABB-generation path was removed in the M0 cleanup).
         collision/gpu/broadphase.cu
-        # v0.7 p09-A: XPBD soft-body distance world (GPU predict/solve/correct).
-        # The first soft path; the soft/fluid particle worlds live in this same
-        # library so their cross-system co-step overloads can link directly.
-        # p09-B adds the bend (id 7) + volume (id 8) GPU solve sweeps in the same TU.
-        runtime/soft/xpbd_world.cu
+        # M9 T11 Phase 2b: the legacy XPBD soft, PBF fluid, and cross-system
+        # particle-particle co-step STEPPERS were DELETED -- the forward sim is
+        # op-ified onto the unified nk core (phi/backend_cuda/ops/particles.cu, run
+        # by nk::World). The shared PBF device-kernel headers (runtime/fluid/
+        # pbf_kernels.cuh + pbf_polish.cuh) survive: the nk op TU includes them. The
+        # id-10 particle-particle CONTACT row class (codegen forward/adjoint + v3 FD)
+        # is the M11-deferred IFT family, distinct from the deleted runtime co-step,
+        # and is unaffected.
         # v0.7 p09-B: cook-time HOST topology builders (cloth stretch+bend,
-        # tet edge+volume) -> XpbdConstraintSet the GPU solve iterates. Cook-time
-        # CPU is allowed (same posture as the p06/p07 cookers); the per-step sim
-        # stays GPU-only.
+        # tet edge+volume) -> XpbdConstraintSet the nk soft solve iterates. Cook-time
+        # CPU is allowed (same posture as the p06/p07 cookers). Now depend only on
+        # the CUDA-free import/cooker/xpbd_cooker_types.hpp PODs.
         runtime/soft/cloth_topology.cpp
         runtime/soft/tetmesh_topology.cpp
         # v0.7 p09-D: the XPBD soft-body COOKER (programmatic XpbdSoftBodySpec ->
         # XpbdConstraintSet). THIN cook-time CPU orchestration: maps the authored
         # material params (the USD MaterialX soft schema) + dispatches to the
-        # topology builders above (and assembles the id9 cluster). Lives in this
-        # library (not nuka_cooker) because it calls the builders here; nuka_cooker
-        # is deliberately CUDA-free, so routing the other way would pull CUDA in.
+        # topology builders above (and assembles the id9 cluster). Stays in this
+        # library because it calls the builders here (which compile as CUDA-lang TUs).
         import/cooker/xpbd_cooker.cpp
         # v0.7 p10-B: the PBF fluid COOKER (programmatic FluidBoxSpec ->
         # runtime::fluid::PbfParticleSet). THIN cook-time CPU: samples a
         # cell-centered uniform lattice filling an AABB (optional inscribed-sphere
-        # carve) + the uniform mass = rest_density*spacing^3. Lives in this library
-        # (not nuka_cooker) because it includes pbf_world.hpp (a CUDA-language
-        # header in this lib); nuka_cooker is deliberately CUDA-free.
+        # carve) + the uniform mass = rest_density*spacing^3. Now depends only on the
+        # CUDA-free import/cooker/fluid_cooker_types.hpp PODs.
         import/cooker/fluid_cooker.cpp
         # v0.7 p08-A: GPU upload of cooked sparse SDFs. Uploads scene::CookedSdfTable
         # to phi::Buffers and exposes a device array of SparseSdfDevice views + the
         # per-piece sdf-index map for the p08 Newton-summed-SDF contact kernel.
         runtime/sdf/sdf_device_world.cu
-        # v0.7 p10-A: Position-Based Fluids (Macklin & Mueller 2013) -- the CORE
-        # forward density-projection fluid. GPU predict/density-iterate/finalize;
-        # FORWARD-ONLY + INTERNAL (no row class, no codegen, no adjoint). Reuses
-        # the p05 particle uniform grid (nuka_collision_gpu) for the per-step
-        # neighbor list; the cross-system particle co-step links against it, so it
-        # lives in the same library. p10-B layers XSPH viscosity + surface tension
-        # + the fluid cooker on top.
-        runtime/fluid/pbf_world.cu
-        # v0.7 p11 (K3): the cross-system particle-particle CONTACT co-step -- the
-        # v0.7 infrastructure deliverable for cross-system coupling. Concatenates
-        # the XPBD soft + PBF fluid particles into a union, builds the p05 cross-
-        # system uniform grid (nuka_collision_gpu) over it, and applies the
-        # mass-weighted symmetric non-penetration projection as a D1 Jacobi double-
-        # buffer (NO float atomicAdd). Links both worlds, so it lives in this lib.
-        runtime/coupling/particle_particle_contact.cu
     )
     set_target_properties(nuka_runtime_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -851,7 +837,10 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_solver
             nuka_phi
-            # v0.7 p10-A: the PBF substep reuses the p05 particle uniform grid.
+            # nuka_collision_gpu: retained for the SAP broadphase oracle + the
+            # candidate-pair / particle-grid primitives surviving consumers link
+            # transitively (the deleted PBF/co-step's particle-grid use is gone, but
+            # the dependency edge stays for the rest of the GPU collision estate).
             nuka_collision_gpu
     )
 
