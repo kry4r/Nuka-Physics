@@ -20,7 +20,8 @@
 #include "diffsim/tape.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
+#include "phi/buffer.hpp"   // phi v2 Buffer*, BufferAlloc / BufferBase / BufferFree
 #include "runtime/articulation/articulation_state.hpp"
 
 #include <cuda_runtime.h>
@@ -256,55 +257,84 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
             return NUKA_RESULT_OK;
         }
 
-        // Upload the final-state loss-adjoint seed (host -> device).
-        nuka::phi::Buffer seed_q(n * sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer seed_qdot(n * sizeof(float),
-                                    nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer seed_lv(n * 6u * sizeof(float),
-                                  nuka::phi::MemoryKind::Device);
+        // phi v2 device buffers (device-level DEFAULT, stream-0 alloc). ALL
+        // transfers below run on ctx.stream (the DeviceRecord's owned stream) via
+        // raw cudaMemcpyAsync over the base pointers -- the SAME stream the
+        // backward kernels run on -- so the seed memset/upload is ordered before
+        // the runner reads them and the readback after the runner's own
+        // ctx.stream sync is ordered after the writes (R1/R2: byte+order-identical
+        // to the legacy memset(ctx.stream)+sync-CopyFromHost flow; never split the
+        // transfers onto a foreign stream from the consuming kernels).
+        nuka::phi::BufferType* bt =
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice());
+        // RAII free-guard: frees every owned Buffer* on ANY exit (the backward
+        // runner can throw), restoring the legacy RAII-Buffer auto-free semantics.
+        struct BufGuard {
+            nuka::phi::Buffer* bufs[5] = {};
+            ~BufGuard() {
+                for (nuka::phi::Buffer* b : bufs) {
+                    if (b != nullptr) { nuka::phi::BufferFree(b); }
+                }
+            }
+        } g;
+        nuka::phi::Buffer* seed_q = g.bufs[0] = nuka::phi::BufferAlloc(bt, n * sizeof(float));
+        nuka::phi::Buffer* seed_qdot = g.bufs[1] = nuka::phi::BufferAlloc(bt, n * sizeof(float));
+        nuka::phi::Buffer* seed_lv = g.bufs[2] = nuka::phi::BufferAlloc(bt, n * 6u * sizeof(float));
+        nuka::phi::Buffer* grad_actions_dev = g.bufs[3] = nuka::phi::BufferAlloc(
+            bt, static_cast<size_t>(step_count) * n * sizeof(float));
+        nuka::phi::Buffer* grad_mass_dev = g.bufs[4] = nuka::phi::BufferAlloc(bt, n * sizeof(float));
+
+        // Upload the final-state loss-adjoint seed (host -> device), all on
+        // ctx.stream, mirroring the runner's transfer stream.
         {
             nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
-            cudaMemsetAsync(seed_q.Data(), 0, n * sizeof(float),
+            cudaMemsetAsync(nuka::phi::BufferBase(seed_q), 0, n * sizeof(float),
                             ctx.stream.Native());
-            cudaMemsetAsync(seed_qdot.Data(), 0, n * sizeof(float),
+            cudaMemsetAsync(nuka::phi::BufferBase(seed_qdot), 0, n * sizeof(float),
                             ctx.stream.Native());
-            cudaMemsetAsync(seed_lv.Data(), 0, n * 6u * sizeof(float),
+            cudaMemsetAsync(nuka::phi::BufferBase(seed_lv), 0, n * 6u * sizeof(float),
                             ctx.stream.Native());
+            if (grad_observations_in != nullptr) {
+                cudaMemcpyAsync(nuka::phi::BufferBase(seed_q), grad_observations_in,
+                                n * sizeof(float), cudaMemcpyHostToDevice,
+                                ctx.stream.Native());
+                cudaMemcpyAsync(nuka::phi::BufferBase(seed_qdot),
+                                grad_observations_in + n, n * sizeof(float),
+                                cudaMemcpyHostToDevice, ctx.stream.Native());
+                cudaMemcpyAsync(nuka::phi::BufferBase(seed_lv),
+                                grad_observations_in + 2u * n, n * 6u * sizeof(float),
+                                cudaMemcpyHostToDevice, ctx.stream.Native());
+            }
         }
-        if (grad_observations_in != nullptr) {
-            seed_q.CopyFromHost(grad_observations_in, n * sizeof(float));
-            seed_qdot.CopyFromHost(grad_observations_in + n, n * sizeof(float));
-            seed_lv.CopyFromHost(grad_observations_in + 2u * n,
-                                 n * 6u * sizeof(float));
-        }
-
-        // Device output buffers for the runner.
-        nuka::phi::Buffer grad_actions_dev(
-            static_cast<size_t>(step_count) * n * sizeof(float),
-            nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer grad_mass_dev(n * sizeof(float),
-                                        nuka::phi::MemoryKind::Device);
 
         diffsim::BackwardSeeds seeds;
-        seeds.grad_q_final = static_cast<const float*>(seed_q.Data());
-        seeds.grad_qdot_final = static_cast<const float*>(seed_qdot.Data());
+        seeds.grad_q_final = static_cast<const float*>(nuka::phi::BufferBase(seed_q));
+        seeds.grad_qdot_final = static_cast<const float*>(nuka::phi::BufferBase(seed_qdot));
         seeds.grad_link_velocity_final =
-            static_cast<const float*>(seed_lv.Data());
+            static_cast<const float*>(nuka::phi::BufferBase(seed_lv));
 
         diffsim::BackwardOutputs outputs;
-        outputs.grad_actions = static_cast<float*>(grad_actions_dev.Data());
-        outputs.grad_mass = static_cast<float*>(grad_mass_dev.Data());
+        outputs.grad_actions = static_cast<float*>(nuka::phi::BufferBase(grad_actions_dev));
+        outputs.grad_mass = static_cast<float*>(nuka::phi::BufferBase(grad_mass_dev));
 
         record->backward->Run(*record->tape, *record->checkpoints, seeds,
                               outputs);
 
-        // Readback device -> host.
-        grad_actions_dev.CopyToHost(
-            grad_actions_out,
-            static_cast<size_t>(step_count) * n * sizeof(float));
-        if (grad_parameters_out != nullptr) {
-            grad_mass_dev.CopyToHost(grad_parameters_out, n * sizeof(float));
+        // Readback device -> host on ctx.stream (the runner already synced it at
+        // the end of Run; re-issue + sync to make the host reads observable).
+        {
+            nuka::phi::ScopedDeviceGuard guard(ctx.device_id);
+            cudaMemcpyAsync(grad_actions_out, nuka::phi::BufferBase(grad_actions_dev),
+                            static_cast<size_t>(step_count) * n * sizeof(float),
+                            cudaMemcpyDeviceToHost, ctx.stream.Native());
+            if (grad_parameters_out != nullptr) {
+                cudaMemcpyAsync(grad_parameters_out,
+                                nuka::phi::BufferBase(grad_mass_dev), n * sizeof(float),
+                                cudaMemcpyDeviceToHost, ctx.stream.Native());
+            }
+            ctx.stream.Synchronize();
         }
+        // g (BufGuard) frees all five buffers on scope exit.
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

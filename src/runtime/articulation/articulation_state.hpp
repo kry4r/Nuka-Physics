@@ -6,7 +6,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // phi::ModelView/DataView (M3b nk seam)
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"                 // phi v2 opaque Buffer* + free-fn wrappers
 #include "phi/device_context.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cooked_blob.hpp"
@@ -154,38 +154,55 @@ struct ArticulationHostState {
     }
 };
 
+// TEST-ORACLE HARNESS, NO PRODUCTION CONSUMER (M11 OD-17). The live engine path
+// serves articulation state DIRECTLY from the nk arena via
+// MakeArticulationDeviceStateFromViews (the M3b seam); this owned-buffer struct
+// is now consumed only by the oracle / parity / diffsim-FD test harnesses, which
+// upload a host state, run kernels, and read it back. The 29 members are phi v2
+// opaque Buffer* (allocated from the device-level DEFAULT, stream-0 BufferType in
+// UploadArticulationState -- byte+ordering identical to the legacy stream-0
+// CopyFromHost/ToHost) with RAII teardown below.
 struct ArticulationDeviceBuffers {
-    phi::Buffer link_inertia;
-    phi::Buffer link_velocity;
-    phi::Buffer link_acceleration;
-    phi::Buffer link_xup;
-    phi::Buffer link_velocity_bias;
-    phi::Buffer link_articulated_inertia;
-    phi::Buffer link_bias_force;
-    phi::Buffer link_u_spatial;
-    phi::Buffer joint_motion_subspace;
-    phi::Buffer link_pose;
-    phi::Buffer link_local_pose;
-    phi::Buffer link_inertial_frame;
-    phi::Buffer base_pose;  // T8a: live root pose, per articulation.
-    phi::Buffer q;
-    phi::Buffer qdot;
-    phi::Buffer qddot;
-    phi::Buffer tau;
-    phi::Buffer joint_damping;
-    phi::Buffer joint_armature;
-    phi::Buffer joint_diagonal;
-    phi::Buffer joint_force;
-    phi::Buffer joint_axis;
-    phi::Buffer parent_offset;
-    phi::Buffer joint_type;
-    phi::Buffer parent_link;
-    phi::Buffer link_body;
-    phi::Buffer link_to_articulation;
-    phi::Buffer articulation_link_count;
-    phi::Buffer articulation_link_offset;
+    phi::Buffer* link_inertia = nullptr;
+    phi::Buffer* link_velocity = nullptr;
+    phi::Buffer* link_acceleration = nullptr;
+    phi::Buffer* link_xup = nullptr;
+    phi::Buffer* link_velocity_bias = nullptr;
+    phi::Buffer* link_articulated_inertia = nullptr;
+    phi::Buffer* link_bias_force = nullptr;
+    phi::Buffer* link_u_spatial = nullptr;
+    phi::Buffer* joint_motion_subspace = nullptr;
+    phi::Buffer* link_pose = nullptr;
+    phi::Buffer* link_local_pose = nullptr;
+    phi::Buffer* link_inertial_frame = nullptr;
+    phi::Buffer* base_pose = nullptr;  // T8a: live root pose, per articulation.
+    phi::Buffer* q = nullptr;
+    phi::Buffer* qdot = nullptr;
+    phi::Buffer* qddot = nullptr;
+    phi::Buffer* tau = nullptr;
+    phi::Buffer* joint_damping = nullptr;
+    phi::Buffer* joint_armature = nullptr;
+    phi::Buffer* joint_diagonal = nullptr;
+    phi::Buffer* joint_force = nullptr;
+    phi::Buffer* joint_axis = nullptr;
+    phi::Buffer* parent_offset = nullptr;
+    phi::Buffer* joint_type = nullptr;
+    phi::Buffer* parent_link = nullptr;
+    phi::Buffer* link_body = nullptr;
+    phi::Buffer* link_to_articulation = nullptr;
+    phi::Buffer* articulation_link_count = nullptr;
+    phi::Buffer* articulation_link_offset = nullptr;
     uint32_t total_link_count = 0;
     uint32_t articulation_count = 0;
+
+    ArticulationDeviceBuffers() = default;
+    // Owns every non-null Buffer* (v2 BufferFree on teardown). Was move-only under
+    // the legacy RAII Buffer; preserve move-only by stealing + nulling.
+    ~ArticulationDeviceBuffers();
+    ArticulationDeviceBuffers(ArticulationDeviceBuffers&&) noexcept;
+    ArticulationDeviceBuffers& operator=(ArticulationDeviceBuffers&&) noexcept;
+    ArticulationDeviceBuffers(const ArticulationDeviceBuffers&) = delete;
+    ArticulationDeviceBuffers& operator=(const ArticulationDeviceBuffers&) = delete;
 
     ArticulationDeviceState View();
     ArticulationDeviceState View() const;

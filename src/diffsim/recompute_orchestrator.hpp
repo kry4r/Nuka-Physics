@@ -45,7 +45,7 @@
 #include "diffsim/checkpoint.hpp"
 #include "diffsim/step_backward.hpp"
 #include "diffsim/tape.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -96,19 +96,23 @@ public:
 
     // Device pointers to the uploaded drive descriptors (const), for the runner.
     const float* DriveStiffness() const {
-        return static_cast<const float*>(stiffness_.Data());
+        return static_cast<const float*>(phi::BufferBase(stiffness_));
     }
     const float* DriveDamping() const {
-        return static_cast<const float*>(damping_.Data());
+        return static_cast<const float*>(phi::BufferBase(damping_));
     }
     const float* DriveForceLimits() const {
-        return static_cast<const float*>(force_limits_.Data());
+        return static_cast<const float*>(phi::BufferBase(force_limits_));
     }
     const float* DiDMass() const {
-        return static_cast<const float*>(dI_dmass_.Data());
+        return static_cast<const float*>(phi::BufferBase(dI_dmass_));
     }
 
     articulation::ArticulationDeviceState State() const { return state_; }
+
+    ~RecomputeOrchestrator();
+    RecomputeOrchestrator(const RecomputeOrchestrator&) = delete;
+    RecomputeOrchestrator& operator=(const RecomputeOrchestrator&) = delete;
 
 private:
     const phi::DeviceContext& context_;
@@ -116,10 +120,10 @@ private:
     RolloutParams params_;
     uint32_t total_link_count_ = 0u;
 
-    phi::Buffer stiffness_;     // float[total_link_count]
-    phi::Buffer damping_;       // float[total_link_count]
-    phi::Buffer force_limits_;  // float[total_link_count]
-    phi::Buffer dI_dmass_;      // float[total_link_count * 36]
+    phi::Buffer* stiffness_ = nullptr;     // float[total_link_count]
+    phi::Buffer* damping_ = nullptr;       // float[total_link_count]
+    phi::Buffer* force_limits_ = nullptr;  // float[total_link_count]
+    phi::Buffer* dI_dmass_ = nullptr;      // float[total_link_count * 36]
 };
 
 }  // namespace nuka::diffsim

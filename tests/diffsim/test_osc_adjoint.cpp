@@ -51,7 +51,8 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_drives.hpp"
@@ -74,6 +75,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace articulation = nuka::runtime::articulation;
 namespace diffsim = nuka::diffsim;
@@ -149,21 +188,21 @@ struct SyntheticArticulation {
 
     nuka::phi::DeviceContext context = nuka::phi::MakeDefaultDeviceContext();
 
-    nuka::phi::Buffer link_pose_dev;
-    nuka::phi::Buffer joint_axis_dev;
-    nuka::phi::Buffer joint_type_dev;
-    nuka::phi::Buffer parent_link_dev;
-    nuka::phi::Buffer art_link_count_dev;
-    nuka::phi::Buffer art_link_offset_dev;
-    nuka::phi::Buffer q_dev;
-    nuka::phi::Buffer qdot_dev;
-    nuka::phi::Buffer tau_dev;
+    OwnedDeviceBuffer link_pose_dev;
+    OwnedDeviceBuffer joint_axis_dev;
+    OwnedDeviceBuffer joint_type_dev;
+    OwnedDeviceBuffer parent_link_dev;
+    OwnedDeviceBuffer art_link_count_dev;
+    OwnedDeviceBuffer art_link_offset_dev;
+    OwnedDeviceBuffer q_dev;
+    OwnedDeviceBuffer qdot_dev;
+    OwnedDeviceBuffer tau_dev;
 
-    nuka::phi::Buffer minv_dev;
-    nuka::phi::Buffer stiff_dev;   // float[kLinks]
-    nuka::phi::Buffer damp_dev;    // float[kLinks]
-    nuka::phi::Buffer target_dev;  // float[3]
-    nuka::phi::Buffer limit_dev;   // float[kLinks]
+    OwnedDeviceBuffer minv_dev;
+    OwnedDeviceBuffer stiff_dev;   // float[kLinks]
+    OwnedDeviceBuffer damp_dev;    // float[kLinks]
+    OwnedDeviceBuffer target_dev;  // float[3]
+    OwnedDeviceBuffer limit_dev;   // float[kLinks]
 
     float kp = 175.0f;
     float kd = 9.0f;
@@ -172,8 +211,8 @@ struct SyntheticArticulation {
     SyntheticArticulation() { Build(); }
 
     template <typename T>
-    static nuka::phi::Buffer Upload(const std::vector<T>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(T), nuka::phi::MemoryKind::Device);
+    static OwnedDeviceBuffer Upload(const std::vector<T>& v) {
+        OwnedDeviceBuffer b(v.size() * sizeof(T));
         b.CopyFromHost(v.data(), v.size() * sizeof(T));
         return b;
     }
@@ -218,10 +257,10 @@ struct SyntheticArticulation {
         tau_dev = Upload(tau);
 
         minv_dev = Upload(MakeSpdTile(kMaxDof, 0x05C5C0DEu));
-        stiff_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
-        damp_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
-        target_dev = nuka::phi::Buffer(3u * sizeof(float), nuka::phi::MemoryKind::Device);
-        limit_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
+        stiff_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
+        damp_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
+        target_dev = OwnedDeviceBuffer(3u * sizeof(float));
+        limit_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
 
         // Target offset from the end-effector position so e_x is nonzero in all 3
         // (now-reachable) directions.
@@ -291,10 +330,10 @@ struct SyntheticArticulation {
         const bool use_limit = !limits.empty();
         if (use_limit) limit_dev.CopyFromHost(limits.data(), limits.size() * sizeof(float));
 
-        nuka::phi::Buffer gtau_dev = Upload(g_tau);
-        nuka::phi::Buffer gkp(sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer gkd(sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer gtgt(3u * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer gtau_dev = Upload(g_tau);
+        OwnedDeviceBuffer gkp(sizeof(float));
+        OwnedDeviceBuffer gkd(sizeof(float));
+        OwnedDeviceBuffer gtgt(3u * sizeof(float));
 
         diffsim::OscAdjointParamGrads g;
         g.grad_kp = static_cast<float*>(gkp.Data());
@@ -367,21 +406,21 @@ struct RevoluteArticulation {
 
     nuka::phi::DeviceContext context = nuka::phi::MakeDefaultDeviceContext();
 
-    nuka::phi::Buffer link_pose_dev;
-    nuka::phi::Buffer joint_axis_dev;
-    nuka::phi::Buffer joint_type_dev;
-    nuka::phi::Buffer parent_link_dev;
-    nuka::phi::Buffer art_link_count_dev;
-    nuka::phi::Buffer art_link_offset_dev;
-    nuka::phi::Buffer q_dev;
-    nuka::phi::Buffer qdot_dev;
-    nuka::phi::Buffer tau_dev;
+    OwnedDeviceBuffer link_pose_dev;
+    OwnedDeviceBuffer joint_axis_dev;
+    OwnedDeviceBuffer joint_type_dev;
+    OwnedDeviceBuffer parent_link_dev;
+    OwnedDeviceBuffer art_link_count_dev;
+    OwnedDeviceBuffer art_link_offset_dev;
+    OwnedDeviceBuffer q_dev;
+    OwnedDeviceBuffer qdot_dev;
+    OwnedDeviceBuffer tau_dev;
 
-    nuka::phi::Buffer minv_dev;
-    nuka::phi::Buffer stiff_dev;
-    nuka::phi::Buffer damp_dev;
-    nuka::phi::Buffer target_dev;
-    nuka::phi::Buffer limit_dev;
+    OwnedDeviceBuffer minv_dev;
+    OwnedDeviceBuffer stiff_dev;
+    OwnedDeviceBuffer damp_dev;
+    OwnedDeviceBuffer target_dev;
+    OwnedDeviceBuffer limit_dev;
 
     float kp = 175.0f;
     float kd = 9.0f;
@@ -396,8 +435,8 @@ struct RevoluteArticulation {
     RevoluteArticulation() { Build(); }
 
     template <typename T>
-    static nuka::phi::Buffer Upload(const std::vector<T>& v) {
-        nuka::phi::Buffer b(v.size() * sizeof(T), nuka::phi::MemoryKind::Device);
+    static OwnedDeviceBuffer Upload(const std::vector<T>& v) {
+        OwnedDeviceBuffer b(v.size() * sizeof(T));
         b.CopyFromHost(v.data(), v.size() * sizeof(T));
         return b;
     }
@@ -452,10 +491,10 @@ struct RevoluteArticulation {
 
         minv_host = MakeSpdTile(kMaxDof, 0x57E9A11u);
         minv_dev = Upload(minv_host);
-        stiff_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
-        damp_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
-        target_dev = nuka::phi::Buffer(3u * sizeof(float), nuka::phi::MemoryKind::Device);
-        limit_dev = nuka::phi::Buffer(kLinks * sizeof(float), nuka::phi::MemoryKind::Device);
+        stiff_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
+        damp_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
+        target_dev = OwnedDeviceBuffer(3u * sizeof(float));
+        limit_dev = OwnedDeviceBuffer(kLinks * sizeof(float));
 
         target = Vec3{x_task.x + 0.08f, x_task.y - 0.05f, x_task.z + 0.06f};
         context.stream.Synchronize();
@@ -560,10 +599,10 @@ struct RevoluteArticulation {
 
     Grads RunAdjoint(const std::vector<float>& g_tau) {
         SetGainsTarget(kp, kd, target);
-        nuka::phi::Buffer gtau_dev = Upload(g_tau);
-        nuka::phi::Buffer gkp(sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer gkd(sizeof(float), nuka::phi::MemoryKind::Device);
-        nuka::phi::Buffer gtgt(3u * sizeof(float), nuka::phi::MemoryKind::Device);
+        OwnedDeviceBuffer gtau_dev = Upload(g_tau);
+        OwnedDeviceBuffer gkp(sizeof(float));
+        OwnedDeviceBuffer gkd(sizeof(float));
+        OwnedDeviceBuffer gtgt(3u * sizeof(float));
 
         diffsim::OscAdjointParamGrads g;
         g.grad_kp = static_cast<float*>(gkp.Data());
@@ -852,30 +891,29 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
 
     std::vector<float> stiff(base_link_count, 0.0f), damp(base_link_count, 0.0f);
     stiff[task_link] = 200.0f;
-    nuka::phi::Buffer stiff_dev(stiff.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer stiff_dev(stiff.size() * sizeof(float));
     stiff_dev.CopyFromHost(stiff.data(), stiff.size() * sizeof(float));
-    nuka::phi::Buffer damp_dev(damp.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer damp_dev(damp.size() * sizeof(float));
     damp_dev.CopyFromHost(damp.data(), damp.size() * sizeof(float));
     std::vector<float> tgt = {0.2f, 0.0f, 0.1f};
-    nuka::phi::Buffer tgt_dev(tgt.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer tgt_dev(tgt.size() * sizeof(float));
     tgt_dev.CopyFromHost(tgt.data(), tgt.size() * sizeof(float));
 
     // A synthetic SPD M^-1 tile (the cook's M^-1 is rebuilt per step; the
     // gain/target channels are M^-1-provenance-independent). The adjoint just needs
     // to run on the real link_pose/q/qdot/joint_axis buffers.
-    nuka::phi::Buffer minv_dev(static_cast<size_t>(max_dof) * max_dof * sizeof(float),
-                               nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer minv_dev(static_cast<size_t>(max_dof) * max_dof * sizeof(float));
     {
         std::vector<float> minv = MakeSpdTile(max_dof, 0x9909u);
         minv_dev.CopyFromHost(minv.data(), minv.size() * sizeof(float));
     }
     std::vector<float> g_tau = MakeGradTau(base_link_count, 0xC0FFEEu);
-    nuka::phi::Buffer gtau_dev(g_tau.size() * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer gtau_dev(g_tau.size() * sizeof(float));
     gtau_dev.CopyFromHost(g_tau.data(), g_tau.size() * sizeof(float));
 
-    nuka::phi::Buffer gkp(sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer gkd(sizeof(float), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer gtgt(3u * sizeof(float), nuka::phi::MemoryKind::Device);
+    OwnedDeviceBuffer gkp(sizeof(float));
+    OwnedDeviceBuffer gkd(sizeof(float));
+    OwnedDeviceBuffer gtgt(3u * sizeof(float));
     diffsim::OscAdjointParamGrads grads;
     grads.grad_kp = static_cast<float*>(gkp.Data());
     grads.grad_kd = static_cast<float*>(gkd.Data());

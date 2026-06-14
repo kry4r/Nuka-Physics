@@ -4,6 +4,8 @@
 
 #include "diffsim/checkpoint.hpp"
 
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -39,21 +41,28 @@ CheckpointManager::CheckpointManager(const phi::DeviceContext& context,
             "nuka::diffsim::CheckpointManager: zero world dimensions");
     }
     const size_t mc = max_checkpoints_;
-    base_pose_ = phi::Buffer(
-        mc * articulation_count_ * sizeof(nuka::math::Transform),
-        phi::MemoryKind::Device);
-    link_velocity_ = phi::Buffer(
-        mc * total_link_count_ * sizeof(articulation::LinkSpatialVel),
-        phi::MemoryKind::Device);
-    q_ = phi::Buffer(mc * total_link_count_ * sizeof(float),
-                     phi::MemoryKind::Device);
-    qdot_ = phi::Buffer(mc * total_link_count_ * sizeof(float),
-                        phi::MemoryKind::Device);
+    // Device-level DEFAULT (stream-0) BufferType -- Capture/Restore D2D copies run
+    // on context_.stream (raw cudaMemcpyAsync over the base pointers), so the
+    // allocation stream is irrelevant; only the device pointer is consumed.
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+    base_pose_ = phi::BufferAlloc(
+        bt, mc * articulation_count_ * sizeof(nuka::math::Transform));
+    link_velocity_ = phi::BufferAlloc(
+        bt, mc * total_link_count_ * sizeof(articulation::LinkSpatialVel));
+    q_ = phi::BufferAlloc(bt, mc * total_link_count_ * sizeof(float));
+    qdot_ = phi::BufferAlloc(bt, mc * total_link_count_ * sizeof(float));
     if (lambda_width_ > 0u) {
-        lambda_ = phi::Buffer(mc * lambda_width_ * sizeof(float),
-                              phi::MemoryKind::Device);
+        lambda_ = phi::BufferAlloc(bt, mc * lambda_width_ * sizeof(float));
     }
     slot_steps_.reserve(max_checkpoints_);
+}
+
+CheckpointManager::~CheckpointManager() {
+    if (base_pose_ != nullptr) { phi::BufferFree(base_pose_); }
+    if (link_velocity_ != nullptr) { phi::BufferFree(link_velocity_); }
+    if (q_ != nullptr) { phi::BufferFree(q_); }
+    if (qdot_ != nullptr) { phi::BufferFree(qdot_); }
+    if (lambda_ != nullptr) { phi::BufferFree(lambda_); }
 }
 
 void CheckpointManager::Reset() {
@@ -74,7 +83,7 @@ uint32_t CheckpointManager::Capture(
     const cudaStream_t stream = context_.stream.Native();
     phi::ScopedDeviceGuard guard(context_.device_id);
 
-    auto* base_dst = static_cast<nuka::math::Transform*>(base_pose_.Data()) +
+    auto* base_dst = static_cast<nuka::math::Transform*>(phi::BufferBase(base_pose_)) +
                      static_cast<size_t>(slot) * articulation_count_;
     CheckCuda(cudaMemcpyAsync(base_dst, state.base_pose,
                               static_cast<size_t>(articulation_count_) *
@@ -83,7 +92,7 @@ uint32_t CheckpointManager::Capture(
               "Capture base_pose");
 
     auto* vel_dst =
-        static_cast<articulation::LinkSpatialVel*>(link_velocity_.Data()) +
+        static_cast<articulation::LinkSpatialVel*>(phi::BufferBase(link_velocity_)) +
         static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(vel_dst, state.link_velocity,
                               static_cast<size_t>(total_link_count_) *
@@ -91,7 +100,7 @@ uint32_t CheckpointManager::Capture(
                               cudaMemcpyDeviceToDevice, stream),
               "Capture link_velocity");
 
-    auto* q_dst = static_cast<float*>(q_.Data()) +
+    auto* q_dst = static_cast<float*>(phi::BufferBase(q_)) +
                   static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(q_dst, state.q,
                               static_cast<size_t>(total_link_count_) *
@@ -99,7 +108,7 @@ uint32_t CheckpointManager::Capture(
                               cudaMemcpyDeviceToDevice, stream),
               "Capture q");
 
-    auto* qdot_dst = static_cast<float*>(qdot_.Data()) +
+    auto* qdot_dst = static_cast<float*>(phi::BufferBase(qdot_)) +
                      static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(qdot_dst, state.qdot,
                               static_cast<size_t>(total_link_count_) *
@@ -112,7 +121,7 @@ uint32_t CheckpointManager::Capture(
     // the slot is present but holds nothing (no divergence, since the contact-
     // free replay never reads it).
     if (lambda_width_ > 0u && lambda_device != nullptr) {
-        auto* lam_dst = static_cast<float*>(lambda_.Data()) +
+        auto* lam_dst = static_cast<float*>(phi::BufferBase(lambda_)) +
                         static_cast<size_t>(slot) * lambda_width_;
         CheckCuda(cudaMemcpyAsync(lam_dst, lambda_device,
                                   static_cast<size_t>(lambda_width_) *
@@ -137,7 +146,7 @@ void CheckpointManager::Restore(
     phi::ScopedDeviceGuard guard(context_.device_id);
 
     const auto* base_src =
-        static_cast<const nuka::math::Transform*>(base_pose_.Data()) +
+        static_cast<const nuka::math::Transform*>(phi::BufferBase(base_pose_)) +
         static_cast<size_t>(slot) * articulation_count_;
     CheckCuda(cudaMemcpyAsync(state.base_pose, base_src,
                               static_cast<size_t>(articulation_count_) *
@@ -146,7 +155,7 @@ void CheckpointManager::Restore(
               "Restore base_pose");
 
     const auto* vel_src =
-        static_cast<const articulation::LinkSpatialVel*>(link_velocity_.Data()) +
+        static_cast<const articulation::LinkSpatialVel*>(phi::BufferBase(link_velocity_)) +
         static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(state.link_velocity, vel_src,
                               static_cast<size_t>(total_link_count_) *
@@ -154,7 +163,7 @@ void CheckpointManager::Restore(
                               cudaMemcpyDeviceToDevice, stream),
               "Restore link_velocity");
 
-    const auto* q_src = static_cast<const float*>(q_.Data()) +
+    const auto* q_src = static_cast<const float*>(phi::BufferBase(q_)) +
                         static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(state.q, q_src,
                               static_cast<size_t>(total_link_count_) *
@@ -162,7 +171,7 @@ void CheckpointManager::Restore(
                               cudaMemcpyDeviceToDevice, stream),
               "Restore q");
 
-    const auto* qdot_src = static_cast<const float*>(qdot_.Data()) +
+    const auto* qdot_src = static_cast<const float*>(phi::BufferBase(qdot_)) +
                            static_cast<size_t>(slot) * total_link_count_;
     CheckCuda(cudaMemcpyAsync(state.qdot, qdot_src,
                               static_cast<size_t>(total_link_count_) *
@@ -171,7 +180,7 @@ void CheckpointManager::Restore(
               "Restore qdot");
 
     if (lambda_width_ > 0u && lambda_device != nullptr) {
-        const auto* lam_src = static_cast<const float*>(lambda_.Data()) +
+        const auto* lam_src = static_cast<const float*>(phi::BufferBase(lambda_)) +
                               static_cast<size_t>(slot) * lambda_width_;
         CheckCuda(cudaMemcpyAsync(lambda_device, lam_src,
                                   static_cast<size_t>(lambda_width_) *

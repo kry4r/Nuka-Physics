@@ -4,7 +4,8 @@
 
 #include "runtime/articulation/articulation_state.hpp"
 
-#include "phi/buffer_transfer.hpp"
+#include "phi/backend.hpp"             // DeviceBufferType, InitBestDevice
+#include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2 / DownloadVectorV2
 
 #include <algorithm>
 #include <cmath>
@@ -14,13 +15,14 @@ namespace nuka::runtime::articulation {
 
 namespace {
 
-// UploadVector and the out-param DownloadVector(buffer, vector<T>* out) now come
-// from the shared host buffer-transfer header (phi/buffer_transfer.hpp). The
-// out-param form is the DIVERGENT OVERLOAD (sizes by Buffer::Size()/sizeof(T),
-// null-safe) used only here; the shared header provides it as a distinct
-// overload. Both bodies are byte-identical to the former local copies.
-using ::nuka::phi::DownloadVector;
-using ::nuka::phi::UploadVector;
+// phi v2 transfer helpers (UploadVectorV2 / out-param DownloadVectorV2) replace
+// the legacy UploadVector / DownloadVector(buffer, vector<T>* out). The v2 forms
+// take an explicit element `count` (the opaque v2 Buffer has no Size()); the
+// caller derives every count from the device-buffer dimensions
+// (total_link_count / articulation_count), which mirror the host_state that was
+// uploaded. Byte math is unchanged (size*sizeof(T)).
+using ::nuka::phi::DownloadVectorV2;
+using ::nuka::phi::UploadVectorV2;
 
 float MassForBody(const scene::CookedBodyTable& bodies,
                   const ArticulationCookedTopology& topology,
@@ -162,42 +164,51 @@ void CrossMatrix(math::Vec3 c, float* out) {
 
 } // namespace
 
+namespace {
+// Null-safe v2 base-pointer accessor: BufferBase dereferences the handle's
+// vtable, so a null member (e.g. an empty/zero-byte upload) must short-circuit to
+// nullptr -- exactly what the legacy Buffer::Data() returned for an empty buffer.
+void* BaseOrNull(phi::Buffer* b) {
+    return b != nullptr ? phi::BufferBase(b) : nullptr;
+}
+}  // namespace
+
 ArticulationDeviceState ArticulationDeviceBuffers::View() {
     ArticulationDeviceState state;
-    state.link_inertia = static_cast<LinkSpatialInertia*>(link_inertia.Data());
-    state.link_velocity = static_cast<LinkSpatialVel*>(link_velocity.Data());
-    state.link_acceleration = static_cast<LinkSpatialAccel*>(link_acceleration.Data());
-    state.link_xup = static_cast<LinkSpatialTransform*>(link_xup.Data());
-    state.link_velocity_bias = static_cast<LinkSpatialVel*>(link_velocity_bias.Data());
+    state.link_inertia = static_cast<LinkSpatialInertia*>(BaseOrNull(link_inertia));
+    state.link_velocity = static_cast<LinkSpatialVel*>(BaseOrNull(link_velocity));
+    state.link_acceleration = static_cast<LinkSpatialAccel*>(BaseOrNull(link_acceleration));
+    state.link_xup = static_cast<LinkSpatialTransform*>(BaseOrNull(link_xup));
+    state.link_velocity_bias = static_cast<LinkSpatialVel*>(BaseOrNull(link_velocity_bias));
     state.link_articulated_I =
-        static_cast<LinkArticulatedInertia*>(link_articulated_inertia.Data());
-    state.link_bias_force = static_cast<LinkBiasForce*>(link_bias_force.Data());
-    state.link_u_spatial = static_cast<LinkBiasForce*>(link_u_spatial.Data());
+        static_cast<LinkArticulatedInertia*>(BaseOrNull(link_articulated_inertia));
+    state.link_bias_force = static_cast<LinkBiasForce*>(BaseOrNull(link_bias_force));
+    state.link_u_spatial = static_cast<LinkBiasForce*>(BaseOrNull(link_u_spatial));
     state.joint_motion_subspace =
-        static_cast<LinkMotionSubspace*>(joint_motion_subspace.Data());
-    state.link_pose = static_cast<math::Transform*>(link_pose.Data());
-    state.link_local_pose = static_cast<math::Transform*>(link_local_pose.Data());
+        static_cast<LinkMotionSubspace*>(BaseOrNull(joint_motion_subspace));
+    state.link_pose = static_cast<math::Transform*>(BaseOrNull(link_pose));
+    state.link_local_pose = static_cast<math::Transform*>(BaseOrNull(link_local_pose));
     state.link_inertial_frame =
-        static_cast<math::Transform*>(link_inertial_frame.Data());
-    state.base_pose = static_cast<math::Transform*>(base_pose.Data());
-    state.q = static_cast<float*>(q.Data());
-    state.qdot = static_cast<float*>(qdot.Data());
-    state.qddot = static_cast<float*>(qddot.Data());
-    state.tau = static_cast<float*>(tau.Data());
-    state.joint_damping = static_cast<float*>(joint_damping.Data());
-    state.joint_armature = static_cast<float*>(joint_armature.Data());
-    state.joint_diagonal = static_cast<float*>(joint_diagonal.Data());
-    state.joint_force = static_cast<float*>(joint_force.Data());
-    state.joint_axis = static_cast<math::Vec3*>(joint_axis.Data());
-    state.parent_offset = static_cast<math::Vec3*>(parent_offset.Data());
-    state.joint_type = static_cast<ArticulationJointType*>(joint_type.Data());
-    state.parent_link = static_cast<uint32_t*>(parent_link.Data());
-    state.link_body = static_cast<uint32_t*>(link_body.Data());
-    state.link_to_articulation = static_cast<uint32_t*>(link_to_articulation.Data());
+        static_cast<math::Transform*>(BaseOrNull(link_inertial_frame));
+    state.base_pose = static_cast<math::Transform*>(BaseOrNull(base_pose));
+    state.q = static_cast<float*>(BaseOrNull(q));
+    state.qdot = static_cast<float*>(BaseOrNull(qdot));
+    state.qddot = static_cast<float*>(BaseOrNull(qddot));
+    state.tau = static_cast<float*>(BaseOrNull(tau));
+    state.joint_damping = static_cast<float*>(BaseOrNull(joint_damping));
+    state.joint_armature = static_cast<float*>(BaseOrNull(joint_armature));
+    state.joint_diagonal = static_cast<float*>(BaseOrNull(joint_diagonal));
+    state.joint_force = static_cast<float*>(BaseOrNull(joint_force));
+    state.joint_axis = static_cast<math::Vec3*>(BaseOrNull(joint_axis));
+    state.parent_offset = static_cast<math::Vec3*>(BaseOrNull(parent_offset));
+    state.joint_type = static_cast<ArticulationJointType*>(BaseOrNull(joint_type));
+    state.parent_link = static_cast<uint32_t*>(BaseOrNull(parent_link));
+    state.link_body = static_cast<uint32_t*>(BaseOrNull(link_body));
+    state.link_to_articulation = static_cast<uint32_t*>(BaseOrNull(link_to_articulation));
     state.articulation_link_count =
-        static_cast<uint32_t*>(articulation_link_count.Data());
+        static_cast<uint32_t*>(BaseOrNull(articulation_link_count));
     state.articulation_link_offset =
-        static_cast<uint32_t*>(articulation_link_offset.Data());
+        static_cast<uint32_t*>(BaseOrNull(articulation_link_offset));
     state.total_link_count = total_link_count;
     state.articulation_count = articulation_count;
     return state;
@@ -209,6 +220,94 @@ ArticulationDeviceState ArticulationDeviceBuffers::View() const {
 
 bool ArticulationDeviceBuffers::Empty() const {
     return total_link_count == 0u || articulation_count == 0u;
+}
+
+namespace {
+// Steal+null every member buffer from `src` into `dst` (move semantics) and free
+// `dst`'s prior holdings first. Declared here so the move ctor/assign + dtor
+// share one member list.
+void BufferMemberPtrs(ArticulationDeviceBuffers* b, phi::Buffer** out[]) {
+    out[0] = &b->link_inertia;
+    out[1] = &b->link_velocity;
+    out[2] = &b->link_acceleration;
+    out[3] = &b->link_xup;
+    out[4] = &b->link_velocity_bias;
+    out[5] = &b->link_articulated_inertia;
+    out[6] = &b->link_bias_force;
+    out[7] = &b->link_u_spatial;
+    out[8] = &b->joint_motion_subspace;
+    out[9] = &b->link_pose;
+    out[10] = &b->link_local_pose;
+    out[11] = &b->link_inertial_frame;
+    out[12] = &b->base_pose;
+    out[13] = &b->q;
+    out[14] = &b->qdot;
+    out[15] = &b->qddot;
+    out[16] = &b->tau;
+    out[17] = &b->joint_damping;
+    out[18] = &b->joint_armature;
+    out[19] = &b->joint_diagonal;
+    out[20] = &b->joint_force;
+    out[21] = &b->joint_axis;
+    out[22] = &b->parent_offset;
+    out[23] = &b->joint_type;
+    out[24] = &b->parent_link;
+    out[25] = &b->link_body;
+    out[26] = &b->link_to_articulation;
+    out[27] = &b->articulation_link_count;
+    out[28] = &b->articulation_link_offset;
+}
+constexpr int kArticulationBufferCount = 29;
+}  // namespace
+
+ArticulationDeviceBuffers::~ArticulationDeviceBuffers() {
+    phi::Buffer** members[kArticulationBufferCount];
+    BufferMemberPtrs(this, members);
+    for (int i = 0; i < kArticulationBufferCount; ++i) {
+        if (*members[i] != nullptr) {
+            phi::BufferFree(*members[i]);
+            *members[i] = nullptr;
+        }
+    }
+}
+
+ArticulationDeviceBuffers::ArticulationDeviceBuffers(
+    ArticulationDeviceBuffers&& other) noexcept {
+    phi::Buffer** dst[kArticulationBufferCount];
+    phi::Buffer** src[kArticulationBufferCount];
+    BufferMemberPtrs(this, dst);
+    BufferMemberPtrs(&other, src);
+    for (int i = 0; i < kArticulationBufferCount; ++i) {
+        *dst[i] = *src[i];
+        *src[i] = nullptr;
+    }
+    total_link_count = other.total_link_count;
+    articulation_count = other.articulation_count;
+    other.total_link_count = 0u;
+    other.articulation_count = 0u;
+}
+
+ArticulationDeviceBuffers& ArticulationDeviceBuffers::operator=(
+    ArticulationDeviceBuffers&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    phi::Buffer** dst[kArticulationBufferCount];
+    phi::Buffer** src[kArticulationBufferCount];
+    BufferMemberPtrs(this, dst);
+    BufferMemberPtrs(&other, src);
+    for (int i = 0; i < kArticulationBufferCount; ++i) {
+        if (*dst[i] != nullptr) {
+            phi::BufferFree(*dst[i]);
+        }
+        *dst[i] = *src[i];
+        *src[i] = nullptr;
+    }
+    total_link_count = other.total_link_count;
+    articulation_count = other.articulation_count;
+    other.total_link_count = 0u;
+    other.articulation_count = 0u;
+    return *this;
 }
 
 LinkSpatialInertia MakeDiagonalSpatialInertia(float mass, math::Vec3 diagonal_inertia) {
@@ -446,38 +545,45 @@ ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState
 ArticulationDeviceBuffers UploadArticulationState(const phi::DeviceContext& context,
                                                   const ArticulationHostState& host_state) {
     phi::ScopedDeviceGuard guard(context.device_id);
+    // The device-level DEFAULT (stream-0) BufferType: v2 upload transfers run on
+    // stream 0 exactly like the legacy synchronous CopyFromHost cudaMemcpy. The
+    // returned Buffer*'s pointers feed kernels launched on the caller's
+    // context.stream (raw cudaMemcpyAsync / launches, unchanged) -- the test
+    // harness coordinates upload vs kernel via NULL-stream implicit sync, the
+    // legacy oracle path.
+    phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
     ArticulationDeviceBuffers result;
     result.total_link_count = host_state.TotalLinkCount();
     result.articulation_count = host_state.ArticulationCount();
-    result.link_inertia = UploadVector(host_state.link_inertia);
-    result.link_velocity = UploadVector(host_state.link_velocity);
-    result.link_acceleration = UploadVector(host_state.link_acceleration);
-    result.link_xup = UploadVector(host_state.link_xup);
-    result.link_velocity_bias = UploadVector(host_state.link_velocity_bias);
-    result.link_articulated_inertia = UploadVector(host_state.link_articulated_inertia);
-    result.link_bias_force = UploadVector(host_state.link_bias_force);
-    result.link_u_spatial = UploadVector(host_state.link_u_spatial);
-    result.joint_motion_subspace = UploadVector(host_state.joint_motion_subspace);
-    result.link_pose = UploadVector(host_state.link_pose);
-    result.link_local_pose = UploadVector(host_state.link_local_pose);
-    result.link_inertial_frame = UploadVector(host_state.link_inertial_frame);
-    result.base_pose = UploadVector(host_state.base_pose);
-    result.q = UploadVector(host_state.q);
-    result.qdot = UploadVector(host_state.qdot);
-    result.qddot = UploadVector(host_state.qddot);
-    result.tau = UploadVector(host_state.tau);
-    result.joint_damping = UploadVector(host_state.joint_damping);
-    result.joint_armature = UploadVector(host_state.joint_armature);
-    result.joint_diagonal = UploadVector(host_state.joint_diagonal);
-    result.joint_force = UploadVector(host_state.joint_force);
-    result.joint_axis = UploadVector(host_state.joint_axis);
-    result.parent_offset = UploadVector(host_state.parent_offset);
-    result.joint_type = UploadVector(host_state.joint_type);
-    result.parent_link = UploadVector(host_state.parent_link);
-    result.link_body = UploadVector(host_state.link_body);
-    result.link_to_articulation = UploadVector(host_state.link_to_articulation);
-    result.articulation_link_count = UploadVector(host_state.articulation_link_count);
-    result.articulation_link_offset = UploadVector(host_state.articulation_link_offset);
+    result.link_inertia = UploadVectorV2(bt, host_state.link_inertia);
+    result.link_velocity = UploadVectorV2(bt, host_state.link_velocity);
+    result.link_acceleration = UploadVectorV2(bt, host_state.link_acceleration);
+    result.link_xup = UploadVectorV2(bt, host_state.link_xup);
+    result.link_velocity_bias = UploadVectorV2(bt, host_state.link_velocity_bias);
+    result.link_articulated_inertia = UploadVectorV2(bt, host_state.link_articulated_inertia);
+    result.link_bias_force = UploadVectorV2(bt, host_state.link_bias_force);
+    result.link_u_spatial = UploadVectorV2(bt, host_state.link_u_spatial);
+    result.joint_motion_subspace = UploadVectorV2(bt, host_state.joint_motion_subspace);
+    result.link_pose = UploadVectorV2(bt, host_state.link_pose);
+    result.link_local_pose = UploadVectorV2(bt, host_state.link_local_pose);
+    result.link_inertial_frame = UploadVectorV2(bt, host_state.link_inertial_frame);
+    result.base_pose = UploadVectorV2(bt, host_state.base_pose);
+    result.q = UploadVectorV2(bt, host_state.q);
+    result.qdot = UploadVectorV2(bt, host_state.qdot);
+    result.qddot = UploadVectorV2(bt, host_state.qddot);
+    result.tau = UploadVectorV2(bt, host_state.tau);
+    result.joint_damping = UploadVectorV2(bt, host_state.joint_damping);
+    result.joint_armature = UploadVectorV2(bt, host_state.joint_armature);
+    result.joint_diagonal = UploadVectorV2(bt, host_state.joint_diagonal);
+    result.joint_force = UploadVectorV2(bt, host_state.joint_force);
+    result.joint_axis = UploadVectorV2(bt, host_state.joint_axis);
+    result.parent_offset = UploadVectorV2(bt, host_state.parent_offset);
+    result.joint_type = UploadVectorV2(bt, host_state.joint_type);
+    result.parent_link = UploadVectorV2(bt, host_state.parent_link);
+    result.link_body = UploadVectorV2(bt, host_state.link_body);
+    result.link_to_articulation = UploadVectorV2(bt, host_state.link_to_articulation);
+    result.articulation_link_count = UploadVectorV2(bt, host_state.articulation_link_count);
+    result.articulation_link_offset = UploadVectorV2(bt, host_state.articulation_link_offset);
     return result;
 }
 
@@ -533,39 +639,46 @@ void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
     if (host_state == nullptr) {
         return;
     }
-    DownloadVector(device_state.link_inertia, &host_state->link_inertia);
-    DownloadVector(device_state.link_velocity, &host_state->link_velocity);
-    DownloadVector(device_state.link_acceleration, &host_state->link_acceleration);
-    DownloadVector(device_state.link_xup, &host_state->link_xup);
-    DownloadVector(device_state.link_velocity_bias, &host_state->link_velocity_bias);
-    DownloadVector(device_state.link_articulated_inertia,
-                   &host_state->link_articulated_inertia);
-    DownloadVector(device_state.link_bias_force, &host_state->link_bias_force);
-    DownloadVector(device_state.link_u_spatial, &host_state->link_u_spatial);
-    DownloadVector(device_state.joint_motion_subspace,
-                   &host_state->joint_motion_subspace);
-    DownloadVector(device_state.link_pose, &host_state->link_pose);
-    DownloadVector(device_state.link_local_pose, &host_state->link_local_pose);
-    DownloadVector(device_state.link_inertial_frame, &host_state->link_inertial_frame);
-    DownloadVector(device_state.base_pose, &host_state->base_pose);
-    DownloadVector(device_state.q, &host_state->q);
-    DownloadVector(device_state.qdot, &host_state->qdot);
-    DownloadVector(device_state.qddot, &host_state->qddot);
-    DownloadVector(device_state.tau, &host_state->tau);
-    DownloadVector(device_state.joint_damping, &host_state->joint_damping);
-    DownloadVector(device_state.joint_armature, &host_state->joint_armature);
-    DownloadVector(device_state.joint_diagonal, &host_state->joint_diagonal);
-    DownloadVector(device_state.joint_force, &host_state->joint_force);
-    DownloadVector(device_state.joint_axis, &host_state->joint_axis);
-    DownloadVector(device_state.parent_offset, &host_state->parent_offset);
-    DownloadVector(device_state.joint_type, &host_state->joint_type);
-    DownloadVector(device_state.parent_link, &host_state->parent_link);
-    DownloadVector(device_state.link_body, &host_state->link_body);
-    DownloadVector(device_state.link_to_articulation, &host_state->link_to_articulation);
-    DownloadVector(device_state.articulation_link_count,
-                   &host_state->articulation_link_count);
-    DownloadVector(device_state.articulation_link_offset,
-                   &host_state->articulation_link_offset);
+    // The opaque v2 Buffer has no Size(), so element counts come from the device
+    // buffers' dimensions: per-link arrays are total_link_count, per-articulation
+    // arrays (base_pose / articulation_link_*) are articulation_count -- exactly
+    // the sizes UploadArticulationState wrote (mirrors the host_state layout
+    // BuildArticulationHostState emits). DownloadVectorV2 self-syncs (stream 0).
+    const std::size_t links = device_state.total_link_count;
+    const std::size_t artics = device_state.articulation_count;
+    DownloadVectorV2(device_state.link_inertia, &host_state->link_inertia, links);
+    DownloadVectorV2(device_state.link_velocity, &host_state->link_velocity, links);
+    DownloadVectorV2(device_state.link_acceleration, &host_state->link_acceleration, links);
+    DownloadVectorV2(device_state.link_xup, &host_state->link_xup, links);
+    DownloadVectorV2(device_state.link_velocity_bias, &host_state->link_velocity_bias, links);
+    DownloadVectorV2(device_state.link_articulated_inertia,
+                     &host_state->link_articulated_inertia, links);
+    DownloadVectorV2(device_state.link_bias_force, &host_state->link_bias_force, links);
+    DownloadVectorV2(device_state.link_u_spatial, &host_state->link_u_spatial, links);
+    DownloadVectorV2(device_state.joint_motion_subspace,
+                     &host_state->joint_motion_subspace, links);
+    DownloadVectorV2(device_state.link_pose, &host_state->link_pose, links);
+    DownloadVectorV2(device_state.link_local_pose, &host_state->link_local_pose, links);
+    DownloadVectorV2(device_state.link_inertial_frame, &host_state->link_inertial_frame, links);
+    DownloadVectorV2(device_state.base_pose, &host_state->base_pose, artics);
+    DownloadVectorV2(device_state.q, &host_state->q, links);
+    DownloadVectorV2(device_state.qdot, &host_state->qdot, links);
+    DownloadVectorV2(device_state.qddot, &host_state->qddot, links);
+    DownloadVectorV2(device_state.tau, &host_state->tau, links);
+    DownloadVectorV2(device_state.joint_damping, &host_state->joint_damping, links);
+    DownloadVectorV2(device_state.joint_armature, &host_state->joint_armature, links);
+    DownloadVectorV2(device_state.joint_diagonal, &host_state->joint_diagonal, links);
+    DownloadVectorV2(device_state.joint_force, &host_state->joint_force, links);
+    DownloadVectorV2(device_state.joint_axis, &host_state->joint_axis, links);
+    DownloadVectorV2(device_state.parent_offset, &host_state->parent_offset, links);
+    DownloadVectorV2(device_state.joint_type, &host_state->joint_type, links);
+    DownloadVectorV2(device_state.parent_link, &host_state->parent_link, links);
+    DownloadVectorV2(device_state.link_body, &host_state->link_body, links);
+    DownloadVectorV2(device_state.link_to_articulation, &host_state->link_to_articulation, links);
+    DownloadVectorV2(device_state.articulation_link_count,
+                     &host_state->articulation_link_count, artics);
+    DownloadVectorV2(device_state.articulation_link_offset,
+                     &host_state->articulation_link_offset, artics);
 }
 
 } // namespace nuka::runtime::articulation

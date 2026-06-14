@@ -11,6 +11,8 @@
 
 #include "diffsim/tape.hpp"
 
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -42,8 +44,19 @@ Tape::Tape(const phi::DeviceContext& context, const TapeDesc& desc,
     }
     const size_t bytes = static_cast<size_t>(desc_.max_tape_entries) *
                          static_cast<size_t>(total_link_count_) * sizeof(float);
-    actions_ = phi::Buffer(bytes, phi::MemoryKind::Device);
+    // Device-level DEFAULT (stream-0) BufferType: the action D2D copy + the
+    // kernels that read it run on context_.stream (raw cudaMemcpyAsync over the
+    // base pointer below), so the allocation stream is irrelevant -- only the
+    // device pointer is consumed.
+    actions_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
     entries_.reserve(desc_.max_tape_entries);
+}
+
+Tape::~Tape() {
+    if (actions_ != nullptr) {
+        phi::BufferFree(actions_);
+        actions_ = nullptr;
+    }
 }
 
 void Tape::Reset() {
@@ -79,12 +92,12 @@ uint32_t Tape::RecordStep(const float* device_actions, uint32_t has_checkpoint,
 }
 
 float* Tape::ActionSlice(uint32_t step) {
-    float* base = static_cast<float*>(actions_.Data());
+    float* base = static_cast<float*>(phi::BufferBase(actions_));
     return base + static_cast<size_t>(step) * total_link_count_;
 }
 
 const float* Tape::ActionSlice(uint32_t step) const {
-    const float* base = static_cast<const float*>(actions_.Data());
+    const float* base = static_cast<const float*>(phi::BufferBase(actions_));
     return base + static_cast<size_t>(step) * total_link_count_;
 }
 

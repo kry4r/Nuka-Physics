@@ -27,7 +27,8 @@
 
 #include "diffsim/kkt_builder.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 
@@ -43,6 +44,44 @@
 #include <vector>
 
 namespace {
+
+// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
+// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
+// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
+// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
+// legacy synchronous cudaMemcpy this replaces.
+class OwnedDeviceBuffer {
+public:
+    OwnedDeviceBuffer() = default;
+    explicit OwnedDeviceBuffer(size_t bytes) : bytes_(bytes) {
+        buf_ = nuka::phi::BufferAlloc(
+            nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice()), bytes);
+    }
+    ~OwnedDeviceBuffer() { if (buf_ != nullptr) nuka::phi::BufferFree(buf_); }
+    OwnedDeviceBuffer(OwnedDeviceBuffer&& o) noexcept
+        : buf_(o.buf_), bytes_(o.bytes_) { o.buf_ = nullptr; o.bytes_ = 0u; }
+    OwnedDeviceBuffer& operator=(OwnedDeviceBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) nuka::phi::BufferFree(buf_);
+            buf_ = o.buf_; bytes_ = o.bytes_; o.buf_ = nullptr; o.bytes_ = 0u;
+        }
+        return *this;
+    }
+    OwnedDeviceBuffer(const OwnedDeviceBuffer&) = delete;
+    OwnedDeviceBuffer& operator=(const OwnedDeviceBuffer&) = delete;
+    void* Data() { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    const void* Data() const { return buf_ != nullptr ? nuka::phi::BufferBase(buf_) : nullptr; }
+    size_t Size() const { return bytes_; }
+    void CopyFromHost(const void* src, size_t bytes) {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferUpload(buf_, src, 0, bytes);
+    }
+    void CopyToHost(void* dst, size_t bytes) const {
+        if (buf_ != nullptr && bytes > 0u) nuka::phi::BufferDownload(buf_, dst, 0, bytes);
+    }
+private:
+    nuka::phi::Buffer* buf_ = nullptr;
+    size_t bytes_ = 0u;
+};
 
 namespace diffsim = nuka::diffsim;
 namespace art = nuka::runtime::articulation;
@@ -158,15 +197,15 @@ BuildResult RunBuild(const nuka::phi::DeviceContext& ctx,
         }
     }
 
-    nuka::phi::Buffer d_rows(rows.size() * sizeof(art::ArticulatedContactRow));
+    OwnedDeviceBuffer d_rows(rows.size() * sizeof(art::ArticulatedContactRow));
     d_rows.CopyFromHost(rows.data(), rows.size() * sizeof(art::ArticulatedContactRow));
-    nuka::phi::Buffer d_jn(jn.size() * sizeof(float));
+    OwnedDeviceBuffer d_jn(jn.size() * sizeof(float));
     d_jn.CopyFromHost(jn.data(), jn.size() * sizeof(float));
-    nuka::phi::Buffer d_jt1(jt1.size() * sizeof(float));
+    OwnedDeviceBuffer d_jt1(jt1.size() * sizeof(float));
     d_jt1.CopyFromHost(jt1.data(), jt1.size() * sizeof(float));
-    nuka::phi::Buffer d_jt2(jt2.size() * sizeof(float));
+    OwnedDeviceBuffer d_jt2(jt2.size() * sizeof(float));
     d_jt2.CopyFromHost(jt2.data(), jt2.size() * sizeof(float));
-    nuka::phi::Buffer d_minv(minv.size() * sizeof(float));
+    OwnedDeviceBuffer d_minv(minv.size() * sizeof(float));
     d_minv.CopyFromHost(minv.data(), minv.size() * sizeof(float));
 
     diffsim::BatchedDenseSpdSystem system;
@@ -182,8 +221,12 @@ BuildResult RunBuild(const nuka::phi::DeviceContext& ctx,
     BuildResult res;
     res.values.assign(static_cast<size_t>(bc) * kStride, 0.0f);
     res.dims.assign(bc, 0u);
-    buffers.values.CopyToHost(res.values.data(), res.values.size() * sizeof(float));
-    buffers.block_dim.CopyToHost(res.dims.data(), res.dims.size() * sizeof(uint32_t));
+    // buffers.values / block_dim are the production ContactDelassusBuffers' phi v2
+    // Buffer* (settled by the Synchronize above); read them via BufferDownload.
+    nuka::phi::BufferDownload(buffers.values, res.values.data(), 0,
+                             res.values.size() * sizeof(float));
+    nuka::phi::BufferDownload(buffers.block_dim, res.dims.data(), 0,
+                             res.dims.size() * sizeof(uint32_t));
     return res;
 }
 

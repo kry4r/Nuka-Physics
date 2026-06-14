@@ -44,7 +44,7 @@
 
 #include "diffsim/kkt_builder.hpp"
 #include "diffsim/sparse_solver_backend.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_contacts.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -123,6 +123,13 @@ public:
     // batch -- the router's SPD branch is byte-identical to the default CG solve.
     void SetAdaptiveRouting(bool enable) noexcept { adaptive_routing_ = enable; }
 
+    // Frees the v2 rhs_/z_/flag Buffer* members (delassus_ frees itself; the
+    // unique_ptr solver backends free themselves). Out-of-line so the incomplete
+    // SparseLinearSolver / IftRunner members are complete at destruction.
+    ~IftRunner();
+    IftRunner(const IftRunner&) = delete;
+    IftRunner& operator=(const IftRunner&) = delete;
+
 private:
     // Auto-router body (p02 indefinite -> MINRES, p03-A non-symmetric -> GMRES, else
     // CG). Reached ONLY when adaptive_routing_ is true; see SetAdaptiveRouting().
@@ -147,12 +154,14 @@ private:
     // reaches this seam.
     std::unique_ptr<SparseLinearSolver> gmres_solver_;
 
-    // Reused intermediates (lazily (re)allocated to the current shape).
-    ContactDelassusBuffers delassus_;     // A (values + block_dim)
-    phi::Buffer rhs_;                     // J M^-1 g, block-major stride kMaxBlockDim
-    phi::Buffer z_;                       // A^-1 rhs,  block-major stride kMaxBlockDim
-    phi::Buffer indef_flag_;              // uint32[1] indefinite-detector flag
-    phi::Buffer nonsym_flag_;             // uint32[1] non-symmetric-detector flag
+    // Reused intermediates (lazily (re)allocated to the current shape). phi v2
+    // Buffer*; device-level DEFAULT (stream-0) alloc, all kernel work runs on
+    // context_.stream over the base pointers (raw launches / copies, unchanged).
+    ContactDelassusBuffers delassus_;       // A (values + block_dim)
+    phi::Buffer* rhs_ = nullptr;            // J M^-1 g, block-major stride kMaxBlockDim
+    phi::Buffer* z_ = nullptr;              // A^-1 rhs,  block-major stride kMaxBlockDim
+    phi::Buffer* indef_flag_ = nullptr;     // uint32[1] indefinite-detector flag
+    phi::Buffer* nonsym_flag_ = nullptr;    // uint32[1] non-symmetric-detector flag
     uint32_t capacity_blocks_ = 0u;
     // Gates the Run() auto-router. false (default) => skip BOTH detectors + their two
     // per-solve stream syncs and solve directly with CG (zero added cost, byte-

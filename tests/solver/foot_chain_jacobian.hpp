@@ -29,7 +29,8 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/buffer_legacy.hpp"
+#include "phi/backend.hpp"
+#include "phi/buffer.hpp"
 #include "phi/device_context.hpp"
 #include "runtime/articulation/articulation_jacobian.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -58,25 +59,34 @@ inline std::vector<float> ComputeFootChainJ18(
         host.link_pose = fk_world_poses;  // refresh world poses from current q.
     }
     auto device = articulation::UploadArticulationState(context, host);
-    nuka::phi::Buffer link_buf(sizeof(uint32_t), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer point_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer normal_buf(sizeof(Vec3), nuka::phi::MemoryKind::Device);
-    nuka::phi::Buffer jbuf(static_cast<size_t>(dof_stride) * sizeof(float),
-                           nuka::phi::MemoryKind::Device);
-    link_buf.CopyFromHost(&contact_link, sizeof(uint32_t));
-    point_buf.CopyFromHost(&contact_point, sizeof(Vec3));
-    normal_buf.CopyFromHost(&contact_normal, sizeof(Vec3));
+    // phi v2 device buffers from the device-level DEFAULT (stream-0) type. Upload/
+    // download run on stream 0 like the legacy CopyFromHost/ToHost; the chain-J
+    // kernel runs on context.stream over the base pointers (unchanged).
+    nuka::phi::BufferType* bt =
+        nuka::phi::DeviceBufferType(nuka::phi::InitBestDevice());
+    nuka::phi::Buffer* link_buf = nuka::phi::BufferAlloc(bt, sizeof(uint32_t));
+    nuka::phi::Buffer* point_buf = nuka::phi::BufferAlloc(bt, sizeof(Vec3));
+    nuka::phi::Buffer* normal_buf = nuka::phi::BufferAlloc(bt, sizeof(Vec3));
+    nuka::phi::Buffer* jbuf =
+        nuka::phi::BufferAlloc(bt, static_cast<size_t>(dof_stride) * sizeof(float));
+    nuka::phi::BufferUpload(link_buf, &contact_link, 0, sizeof(uint32_t));
+    nuka::phi::BufferUpload(point_buf, &contact_point, 0, sizeof(Vec3));
+    nuka::phi::BufferUpload(normal_buf, &contact_normal, 0, sizeof(Vec3));
     std::vector<float> zero(dof_stride, 0.0f);
-    jbuf.CopyFromHost(zero.data(), zero.size() * sizeof(float));
+    nuka::phi::BufferUpload(jbuf, zero.data(), 0, zero.size() * sizeof(float));
     articulation::ComputeContactChainJacobians(
         context, device.View(),
-        static_cast<const uint32_t*>(link_buf.Data()),
-        static_cast<const Vec3*>(point_buf.Data()),
-        static_cast<const Vec3*>(normal_buf.Data()),
-        1u, dof_stride, static_cast<float*>(jbuf.Data()));
+        static_cast<const uint32_t*>(nuka::phi::BufferBase(link_buf)),
+        static_cast<const Vec3*>(nuka::phi::BufferBase(point_buf)),
+        static_cast<const Vec3*>(nuka::phi::BufferBase(normal_buf)),
+        1u, dof_stride, static_cast<float*>(nuka::phi::BufferBase(jbuf)));
     context.stream.Synchronize();
     std::vector<float> j(dof_stride);
-    jbuf.CopyToHost(j.data(), j.size() * sizeof(float));
+    nuka::phi::BufferDownload(jbuf, j.data(), 0, j.size() * sizeof(float));
+    nuka::phi::BufferFree(link_buf);
+    nuka::phi::BufferFree(point_buf);
+    nuka::phi::BufferFree(normal_buf);
+    nuka::phi::BufferFree(jbuf);
     return j;
 }
 

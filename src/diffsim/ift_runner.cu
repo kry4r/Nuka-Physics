@@ -67,6 +67,7 @@
 #include "diffsim/ift_runner.hpp"
 #include "diffsim/solver/gmres_backend.hpp"
 #include "diffsim/sparse_solver_cg.hpp"
+#include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
 
 #include <cuda_runtime.h>
 
@@ -327,6 +328,13 @@ IftRunner::IftRunner(const phi::DeviceContext& context, DeterminismLevel determi
       determinism_(determinism),
       solver_(MakeSparseSolverBackend("cg", context, determinism)) {}
 
+IftRunner::~IftRunner() {
+    if (rhs_ != nullptr) { phi::BufferFree(rhs_); }
+    if (z_ != nullptr) { phi::BufferFree(z_); }
+    if (indef_flag_ != nullptr) { phi::BufferFree(indef_flag_); }
+    if (nonsym_flag_ != nullptr) { phi::BufferFree(nonsym_flag_); }
+}
+
 void IftRunner::Run(const IftContactInputs& inputs, const float* g,
                     const IftContactGrads& grads) {
     const uint32_t bc = inputs.block_count;
@@ -361,16 +369,18 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
                                inputs.m_inv, bc, inputs.dof_stride, system,
                                delassus_);
 
-    // (Re)allocate the block-major rhs/z scratch to the current shape.
+    // (Re)allocate the block-major rhs/z scratch to the current shape. Free the
+    // prior (smaller) allocation on growth; device-level DEFAULT (stream-0) type.
     if (capacity_blocks_ < bc) {
         capacity_blocks_ = bc;
-        rhs_ = phi::Buffer(static_cast<size_t>(bc) * kMaxBlockDim * sizeof(float),
-                           phi::MemoryKind::Device);
-        z_ = phi::Buffer(static_cast<size_t>(bc) * kMaxBlockDim * sizeof(float),
-                         phi::MemoryKind::Device);
+        phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
+        if (rhs_ != nullptr) { phi::BufferFree(rhs_); }
+        if (z_ != nullptr) { phi::BufferFree(z_); }
+        rhs_ = phi::BufferAlloc(bt, static_cast<size_t>(bc) * kMaxBlockDim * sizeof(float));
+        z_ = phi::BufferAlloc(bt, static_cast<size_t>(bc) * kMaxBlockDim * sizeof(float));
     }
-    float* rhs = static_cast<float*>(rhs_.Data());
-    float* z = static_cast<float*>(z_.Data());
+    float* rhs = static_cast<float*>(phi::BufferBase(rhs_));
+    float* z = static_cast<float*>(phi::BufferBase(z_));
 
     // (2) rhs = J M^-1 g.  One warp per articulation, atomic-free.
     FormRhsKernel<<<bc, kWarpSize, 0u, stream>>>(
@@ -434,16 +444,19 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
     // detector is a SYMMETRIC LDLT (Sylvester) -- only meaningful on a symmetric matrix;
     // gating non-symmetric out first keeps that precondition. Only a genuinely non-
     // symmetric batch routes to GMRES.
-    if (nonsym_flag_.Size() < sizeof(uint32_t)) {
-        nonsym_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
+    if (nonsym_flag_ == nullptr) {
+        nonsym_flag_ = phi::BufferAlloc(
+            phi::DeviceBufferType(phi::InitBestDevice()), sizeof(uint32_t));
     }
-    uint32_t* ns_flag = static_cast<uint32_t*>(nonsym_flag_.Data());
+    uint32_t* ns_flag = static_cast<uint32_t*>(phi::BufferBase(nonsym_flag_));
     CheckCuda(cudaMemsetAsync(ns_flag, 0, sizeof(uint32_t), stream),
               "zero non-symmetric flag");
     DetectBatchedNonSymmetric(context_, system, ns_flag);
     uint32_t nonsymmetric = 0u;
     CheckCuda(cudaStreamSynchronize(stream), "sync non-symmetric detect");
-    nonsym_flag_.CopyToHost(&nonsymmetric, sizeof(uint32_t));
+    // R9: the detector kernel already completed on `stream` (the sync above), so
+    // the device flag is settled; BufferDownload reads it (and self-syncs stream 0).
+    phi::BufferDownload(nonsym_flag_, &nonsymmetric, 0, sizeof(uint32_t));
 
     if (nonsymmetric != 0u) {
         // Genuinely non-symmetric KKT: route the whole batch to GMRES (restarted
@@ -469,16 +482,19 @@ void IftRunner::RunAutoRouter(const BatchedDenseSpdSystem& system, float* rhs, f
         // pivot is >= 0 so the flag stays 0 and the CG solve below runs -> byte-
         // identical z. ONLY a genuinely indefinite batch routes to MINRES (whole batch,
         // absolute-Jacobi -- the SPD preconditioner indefinite MINRES requires).
-        if (indef_flag_.Size() < sizeof(uint32_t)) {
-            indef_flag_ = phi::Buffer(sizeof(uint32_t), phi::MemoryKind::Device);
+        if (indef_flag_ == nullptr) {
+            indef_flag_ = phi::BufferAlloc(
+                phi::DeviceBufferType(phi::InitBestDevice()), sizeof(uint32_t));
         }
-        uint32_t* flag = static_cast<uint32_t*>(indef_flag_.Data());
+        uint32_t* flag = static_cast<uint32_t*>(phi::BufferBase(indef_flag_));
         CheckCuda(cudaMemsetAsync(flag, 0, sizeof(uint32_t), stream),
                   "zero indefinite flag");
         DetectBatchedIndefinite(context_, system, flag);
         uint32_t indefinite = 0u;
         CheckCuda(cudaStreamSynchronize(stream), "sync indefinite detect");
-        indef_flag_.CopyToHost(&indefinite, sizeof(uint32_t));
+        // R9: detector kernel done on `stream` (sync above) -> BufferDownload reads
+        // the settled device flag and self-syncs stream 0.
+        phi::BufferDownload(indef_flag_, &indefinite, 0, sizeof(uint32_t));
 
         if (indefinite != 0u) {
             // Genuinely indefinite KKT: route the whole batch to MINRES (absolute-
