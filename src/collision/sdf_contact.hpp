@@ -262,7 +262,9 @@ inline NUKA_SDF_HD SdfContactResult find_sdf_contact_newton(
 // --------------------------------------------------------------------------
 
 // One broadphase candidate piece-pair to test. `sdf_index_*` index a device
-// array of SparseSdfDevice views (e.g. SdfDeviceWorld::DeviceViews()); the
+// array of SparseSdfDevice views built from the nk::Model sdf_* tables
+// (sdf_grids/sdf_cell_{keys,values,gradients}, uploaded by Model::UploadTo --
+// the former SdfDeviceWorld upload duties moved INTO Model, COL-5/M11); the
 // frames carry each body's world<->local transform, baked on the host.
 struct SdfContactCandidate {
     uint32_t body_a = 0u;
