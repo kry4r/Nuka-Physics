@@ -38,6 +38,32 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
+// File-local RAII over a phi v2 opaque Buffer* (BUF-F1). Frees on every path incl.
+// the CheckCuda(stable_sort_by_key) throw -- the legacy stack-RAII phi::Buffer auto-
+// freed on unwind; the bare UploadVectorV2 handles did not. Adopt() takes an
+// already-allocated handle; Release() hands the result its owned d_pairs on success.
+// Mirrors the sibling collision files' OwnedBuffer exactly (byte-identical happy path).
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    static OwnedBuffer Adopt(phi::Buffer* b) { OwnedBuffer o; o.buf_ = b; return o; }
+    void* Base() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    phi::Buffer* Release() { phi::Buffer* b = buf_; buf_ = nullptr; return b; }
+private:
+    phi::Buffer* buf_ = nullptr;
+};
+
 } // namespace
 
 CandidatePairStream::CandidatePairStream(uint32_t count, phi::Buffer* pairs)
@@ -106,20 +132,21 @@ CandidatePairStream BuildCandidatePairStream(cudaStream_t stream, int device_id,
         keys[i] = staged[i].stable_key;
     }
 
-    // Upload keys + pairs, then radix stable_sort_by_key ascending on the key.
-    phi::Buffer* d_keys = phi::UploadVectorV2(bt, keys);
-    phi::Buffer* d_pairs = phi::UploadVectorV2(bt, staged);
+    // Upload keys + pairs (RAII-wrapped: both free on any throw, BUF-F1), then radix
+    // stable_sort_by_key ascending on the key.
+    OwnedBuffer d_keys  = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, keys));
+    OwnedBuffer d_pairs = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, staged));
 
     thrust::stable_sort_by_key(
         thrust::cuda::par.on(stream),
-        static_cast<uint64_t*>(phi::BufferBase(d_keys)),
-        static_cast<uint64_t*>(phi::BufferBase(d_keys)) + count,
-        static_cast<CandidatePair*>(phi::BufferBase(d_pairs)));
+        static_cast<uint64_t*>(d_keys.Base()),
+        static_cast<uint64_t*>(d_keys.Base()) + count,
+        static_cast<CandidatePair*>(d_pairs.Base()));
     CheckCuda(cudaGetLastError(), "stable_sort_by_key candidate pairs");
 
     cudaStreamSynchronize(stream);
-    phi::BufferFree(d_keys);
-    return CandidatePairStream(count, d_pairs);
+    // d_keys frees on scope exit; d_pairs ownership transfers to the result.
+    return CandidatePairStream(count, d_pairs.Release());
 }
 
 CandidatePairStream BuildCandidatePairStream(const std::vector<CandidatePair>& unsorted_pairs) {

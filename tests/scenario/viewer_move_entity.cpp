@@ -163,6 +163,65 @@ TEST(ViewerMoveEntity, DragWritesLiveBodyPoseAndZeroesVelocity) {
     // no SceneIR / nuka_scene_set_local / Save call exists in this path.
 }
 
+// VIEW-F3: an OFFSET visual node (cached_visual_local != identity) must round-trip.
+// The drag command carries a VISUAL-frame transform (the viewer builds it from
+// inst.world_xform == fk * cvl). ApplyMoveEntity must strip cvl before writing the
+// PHYSICS-frame pose into BodyPose, so the publisher re-multiplying cvl reproduces
+// the requested visual transform EXACTLY. (Pre-fix this double-applied the offset.)
+TEST(ViewerMoveEntity, OffsetVisualNodeRoundTrips) {
+    if (GetCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Ctx c = GetCtx();
+
+    const nuka::scene::EntityId e{7u, 0u};
+    nk::World world(BuildBodyModel(), 1u, c.dev, c.backend, Config());
+    ASSERT_TRUE(world.Ready());
+
+    // An instance whose visual node is OFFSET from the body frame: a 0.1m +x shift
+    // plus a 90deg rotation about Z (a non-identity cached_visual_local).
+    render::RenderWorld rw;
+    render::RenderInstance inst;
+    inst.entity = e;
+    inst.pose_source.kind = render::PoseSource::Kind::Body;
+    inst.pose_source.row = 0u;
+    Transform cvl;
+    cvl.position = Vec3{0.1f, 0.0f, 0.0f};
+    cvl.rotation = nuka::math::Quat{0.70710678f, 0.0f, 0.0f, 0.70710678f};  // 90deg about Z
+    inst.cached_visual_local = cvl;
+    inst.world_xform = Transform::Identity();
+    rw.instances.push_back(inst);
+
+    app::HostDownloadPublisher publisher;
+    app::Simulation sim(world, publisher, std::move(rw));
+
+    // The drag target in the VISUAL frame (where the user dropped the visual mesh).
+    Transform visual_target;
+    visual_target.position = Vec3{1.25f, -0.5f, 2.0f};
+    visual_target.rotation = nuka::math::Quat{0.92388f, 0.0f, 0.38268f, 0.0f};  // ~45deg about Y
+
+    sim.Commands().Push(app::Command::MakeMoveEntity(e, visual_target));
+    app::InputIntents intents;
+    sim.FramePublish(&intents, /*do_step=*/false);
+    EXPECT_EQ(intents.move_entity_count, 1u);
+
+    // The PHYSICS pose written must be visual_target * Inverse(cvl).
+    Transform expect_physics = visual_target * cvl.Inverse();
+    Transform got_physics;
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyPose, &got_physics,
+                                              sizeof(Transform), 0));
+    EXPECT_TRUE(TfNear(got_physics, expect_physics, 1e-5f))
+        << "BodyPose should hold the physics-frame pose (visual * cvl^-1), not the "
+           "visual-frame transform";
+
+    // And the publisher's re-compose (physics * cvl) must reproduce the requested
+    // VISUAL transform -> no double-applied offset (the FramePublish above already
+    // ran the publisher into the RenderWorld; read it back).
+    const Transform reconstructed_visual = got_physics * cvl;
+    EXPECT_TRUE(TfNear(reconstructed_visual, visual_target, 1e-5f))
+        << "round-trip physics->visual must equal the dragged visual target";
+    EXPECT_TRUE(TfNear(sim.GetRenderWorld().instances[0].world_xform, visual_target, 1e-5f))
+        << "the published world_xform must equal the dragged visual target";
+}
+
 // VIEW-4: an UNKNOWN / unbound entity is a clean no-op (general handler).
 TEST(ViewerMoveEntity, UnknownEntityIsNoOp) {
     if (GetCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";

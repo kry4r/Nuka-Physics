@@ -72,6 +72,11 @@ using NkVkDescriptorPool = VkDescriptorPool_T*;
 // 64-bit builds). We carry it as a void* at this seam to stay header-light; the
 // present renderer reinterpret_casts it back to VkSurfaceKHR in its .cpp.
 using NkVkSurface        = void*;
+// VkDescriptorSetLayout / VkDescriptorSet are non-dispatchable handles too (the
+// interop SSBO's set-1 layout + bound set, INT-F1). Carried as void* like
+// NkVkSurface; the present renderer reinterpret_casts them back in its .cpp.
+using NkVkDescriptorSetLayout = void*;
+using NkVkDescriptorSet       = void*;
 
 // ---------------------------------------------------------------------------
 // OffscreenOverlayFn (M8.5 T3) -- an OPTIONAL per-render ImGui (or any extra)

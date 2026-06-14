@@ -45,6 +45,13 @@
 
 namespace nuka::phi {
 
+// Opaque phi backend handle (phi/backend.hpp). Forward-declared here so the
+// CUDA-FREE seam can carry the World's backend pointer (for cross-stream
+// ordering, INT-F2) without pulling in backend.hpp transitively. It is a plain
+// opaque pointer -- NOT a CUDA token; the app layer obtains it from
+// nk::World::Backend() and passes it straight through.
+struct Backend;
+
 // ---------------------------------------------------------------------------
 // ExternalMemoryDesc -- an exported Vulkan memory handle, transport-neutral.
 //
@@ -116,6 +123,15 @@ struct ScatterFkSource {
     uint32_t    env_index       = 0;
     uint32_t    links_per_env   = 0;
     uint32_t    bodies_per_env  = 0;
+
+    // INT-F2 (cross-stream RAW ordering): the phi backend the World ran its FK ops
+    // on (nk::World::Backend()) -- an OPAQUE pointer, NOT a CUDA token. The scatter
+    // reads the live LinkPose/BodyPose/BasePose buffers the World wrote on this
+    // backend's main stream; the CUDA backend records an event on that main stream
+    // and makes the (separate) scatter stream wait on it BEFORE launching, so the
+    // scatter never reads torn/stale FK transforms. Null => no ordering (the scatter
+    // falls back to its standalone-stream behaviour; defensive only).
+    Backend*    world_backend   = nullptr;
 };
 
 // ---------------------------------------------------------------------------
