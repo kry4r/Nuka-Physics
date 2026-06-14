@@ -2,7 +2,7 @@
 """
 run_perf_baseline.py - Drive a perf sweep and write a baseline JSON.
 
-Runs the engine perf-harness over a sweep of environment counts
+Runs an engine perf-harness over a sweep of environment counts
 (N in {64, 256, 1024, 4096} by default) and assembles a single baseline
 JSON file. The harness is invoked per N with the documented contract:
 
@@ -18,13 +18,29 @@ produced by the engine's PerfRecorder.DumpJson():
 The per_tag schema is the contract between the in-engine recorder and this
 tooling; it is kept byte-compatible.
 
+NOTE (M9 T14) -- THE OLD perf_harness CLI WAS DELETED.
+    The previous `--harness build/perf_harness ... --perf-json -` binary
+    (tools/perf/perf_harness.cpp) was removed in M9 T11 with the legacy
+    batched-articulated world it constructed. There is currently NO shipping
+    CLI that emits the --perf-json contract above; the live perf gates are now
+    the gtest perf binaries (the nuka_perf_test category exe -- nk_union_n1
+    <=5ms, the grasp throughput >=11k env-steps/s gate, go2 4096-env step-time),
+    which assert thresholds in-process and do NOT emit per_tag JSON. A
+    --perf-json-capable CLI is deferred to the M11 perf-CLI rework. Until then
+    these scripts are dormant baseline-capture tooling: --dry-run still prints
+    the planned sweep, but a real capture requires the caller to pass the path
+    of a (future) harness that honours the --perf-json contract above. There is
+    intentionally NO default --harness path -- the deleted build/perf_harness is
+    not referenced anywhere.
+
 Usage:
     # Plan the sweep + print exact harness commands without running anything:
     python3 tools/perf/run_perf_baseline.py --dry-run
 
-    # Capture a real baseline (once the harness exists):
+    # Capture a real baseline (requires a harness honouring the --perf-json
+    # contract above; the M11 perf-CLI, once it exists):
     python3 tools/perf/run_perf_baseline.py \\
-        --harness build/perf_harness \\
+        --harness <path-to-perf-json-harness> \\
         --gpu-label "RTX 4000 Ada (dev)" \\
         --out out/perf/baseline_2026-05-29.json
 """

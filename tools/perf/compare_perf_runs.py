@@ -10,6 +10,13 @@ B exceeds A by more than --regress-pct percent.
 Tags or env counts present in only one of the two runs are reported but never
 counted as regressions.
 
+NOTE (M9 T14): this script only diffs baseline JSON files; it produces no
+regression baselines itself. Those baselines come from run_perf_baseline.py,
+whose perf-harness CLI was deleted in M9 T11 (see that file's docstring). Until
+the M11 perf-CLI rework reintroduces a --perf-json-capable harness, no fresh
+baselines can be captured; this comparator stays valid for any baseline JSON
+that already honours the documented per_tag schema.
+
 Usage:
     python3 tools/perf/compare_perf_runs.py baseline_a.json baseline_b.json
     python3 tools/perf/compare_perf_runs.py a.json b.json --metric p99_us \\
