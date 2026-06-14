@@ -506,7 +506,7 @@ inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g
 // side A -> sdf_a (geom_a) and side B -> sdf_b (geom_b), so SDF body a == pair
 // side A: the SDF normal is ALREADY "separation dir for side A" -- NO FLIP. (A
 // flip would be needed only if the caller swapped the binding; verified against
-// the box-on-ground analytical case in test_sdf_tier_wired: top box A on ground
+// the box-on-ground analytical case (SDF-tier forward gate -> M11): top box A on ground
 // box B -> normal.y > 0, i.e. A separates +Y, matching grad_b(+Y)-grad_a(-Y).)
 //
 // p08-C ADJOINT / DIFFERENTIABILITY SEAM (NOT dropped). The Q5 differentiable

@@ -186,8 +186,9 @@ TEST(MultiEnvWorld, CreateStepReadStableContactsActive) {
     // (Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance, 1e-4). Active foot-
     // ground contact + the bounded-penetration solve are exercised on a SEATED
     // scene by the runtime contact gates (test_floating_base_contact /
-    // test_go2_pd_standing / test_articulation_contact_rows) and the union grasp
-    // gate (h1_grasp_lift); this C-ABI gate's role is the FIELD BINARY CONTRACT.
+    // test_articulation_contact_rows; go2 free-base PD stance on ground -> M10
+    // carry-forward) and the union grasp gate (h1_grasp_lift); this C-ABI gate's
+    // role is the FIELD BINARY CONTRACT.
     const auto contacts = DownloadField(world.handle, NUKA_FIELD_CONTACT_POINTS);
     ASSERT_FALSE(contacts.empty());
     EXPECT_TRUE(AllFinite(contacts));

@@ -242,7 +242,8 @@ TEST(NarrowphaseDispatch, CallThroughTableReachesExpectedTier) {
     // the default ShapeProxyView (null SDF seam) it null-guards to an EMPTY
     // manifold (point_count 0; StampSides still stamps the real manifold_key from
     // the sides, NOT a stub marker), proving the real handler ran without crashing.
-    // The SDF-driven manifold is exercised in test_sdf_tier_wired.
+    // The SDF-driven manifold's forward-accuracy gate is deferred to M11 (the SDF
+    // tier + find_sdf_contact_newton are KEPT per ruling #4; the gate re-asserts there).
     CandidatePair sdf_pair;
     sdf_pair.a = CollidableRef{CollidableType::RigidBody,
                                ReactionProviderKind::RigidInvMass, 7u};

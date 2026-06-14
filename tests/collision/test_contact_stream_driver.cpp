@@ -23,7 +23,8 @@
 //   (7) D1: two BuildContactManifolds runs on the same pairs+resolver are
 //       byte-identical (memcmp on value-initialised manifold vectors).
 //
-// The geometry MATH is validated in test_analytical_manifold / test_sdf_tier_*;
+// The geometry MATH is validated in test_analytical_manifold (the SDF-tier forward
+// accuracy gate is deferred to M11 with the kept SDF/IFT family);
 // here we validate the DRIVER (resolve -> route -> invoke -> merge -> append),
 // and the geometry checks are anchored to a DIRECT dispatch-table call so they
 // can never silently disagree with the table.
