@@ -178,15 +178,38 @@ bool RayAabb(const viewer::Ray& ray, const nuka::math::Vec3& lo,
     return true;
 }
 
+// VIEW-F2: the u8 value of ArticulationJointType::FloatingBase (==3). The canonical
+// enum is in runtime/articulation/articulation_state.hpp, but that header pulls in
+// <cuda_runtime.h> and this file is on the zero-CUDA-token red-line, so we mirror the
+// stable cooked-Model value here (same constant as systems.cpp::kFloatingBaseJointType).
+constexpr uint8_t kFloatingBaseJointType = 3u;
+
+// True iff `src` names the FLOATING articulation root link (joint_type[root]==
+// FloatingBase). Such a link is the ONE link whose live pose IS editable (it is
+// driven via BasePose; ApplyMoveEntity reroutes a root-link Link source to Base).
+bool IsFloatingRootLink(const render::PoseSource& src, const nk::ModelArticulation& art) {
+    if (src.kind != render::PoseSource::Kind::Link) return false;
+    const uint32_t root = (art.root_link != ~uint32_t(0)) ? art.root_link : 0u;
+    if (src.row != root) return false;
+    return root < art.joint_type.size() && art.joint_type[root] == kFloatingBaseJointType;
+}
+
 // Pick the nearest MOVABLE instance the ray hits. Returns its index or ~0u.
-uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w) {
+// VIEW-F1: a movable instance is a free body (Body), an articulation floating base
+// (Base), OR the FLOATING ROOT LINK (its Link source reroutes to Base on move) --
+// so the advertised floating-base teleport is genuinely UI-reachable (the Base
+// source is never emitted by ResolvePoseSource, which has no Model; the root link is
+// the reachable handle for it).
+uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w,
+                      const nk::ModelArticulation& art) {
     uint32_t best = ~0u;
     float best_t = std::numeric_limits<float>::max();
     for (uint32_t i = 0; i < w.InstanceCount(); ++i) {
         const render::RenderInstance& inst = w.instances[i];
         const bool movable = inst.pose_source.kind == render::PoseSource::Kind::Body ||
-                             inst.pose_source.kind == render::PoseSource::Kind::Base;
-        if (!movable) continue;  // only movable bodies are draggable
+                             inst.pose_source.kind == render::PoseSource::Kind::Base ||
+                             IsFloatingRootLink(inst.pose_source, art);
+        if (!movable) continue;  // only movable bodies / the floating root are draggable
         nuka::math::Vec3 lo, hi;
         InstanceAabb(inst, w, &lo, &hi);
         if (lo.x > hi.x) continue;  // empty
@@ -287,8 +310,25 @@ int main(int argc, char** argv) {
         }
     }
     if (interop_active) {
-        sim.SetPublisher(interop_publisher);  // zero-copy device scatter
-        std::printf("[nuka_viewer] CUDA<->Vulkan interop ACTIVE (zero-copy transform SSBO)\n");
+        // INT-F1: close the producer->consumer loop. The publisher SCATTERS the
+        // composed transforms into the SSBO; wire that SAME SSBO into the present
+        // renderer's instanced pipeline (set 1) so the draw READS the scattered
+        // device transforms by gl_InstanceIndex (true zero-copy, no per-draw
+        // world_xform). If the present renderer cannot build the instanced pipeline,
+        // it is NOT genuine zero-copy -> revert to HostDownloadPublisher so the
+        // scatter output is never silently drawn over frozen bind poses.
+        present->SetInteropTransforms(
+            reinterpret_cast<render::NkVkDescriptorSetLayout>(interop_ssbo.SetLayout()),
+            reinterpret_cast<render::NkVkDescriptorSet>(interop_ssbo.DescriptorSet()));
+        if (present->InteropDrawActive()) {
+            sim.SetPublisher(interop_publisher);  // zero-copy device scatter -> SSBO -> instanced draw
+            std::printf("[nuka_viewer] CUDA<->Vulkan interop ACTIVE "
+                        "(zero-copy transform SSBO + instanced draw)\n");
+        } else {
+            interop_active = false;
+            std::printf("[nuka_viewer] interop scatter available but the instanced draw "
+                        "pipeline did not install -> HostDownloadPublisher (no frozen draw)\n");
+        }
     } else {
         std::printf("[nuka_viewer] interop unavailable -> HostDownloadPublisher "
                     "(graceful fallback; expected on lavapipe / no external-memory-fd)\n");
@@ -410,7 +450,9 @@ int main(int argc, char** argv) {
                         const viewer::Ray ray = camera.ScreenRay(
                             static_cast<float>(ev.mouse_x),
                             static_cast<float>(ev.mouse_y), vp_w, vp_h);
-                        const uint32_t hit = PickInstance(ray, sim.GetRenderWorld());
+                        const uint32_t hit = PickInstance(
+                            ray, sim.GetRenderWorld(),
+                            sim.GetWorld().GetModel().articulation);
                         drag_inst = hit;
                         if (hit != ~0u) {
                             ui_state.selected_inst = hit;

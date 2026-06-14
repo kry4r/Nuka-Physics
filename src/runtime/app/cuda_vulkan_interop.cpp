@@ -118,6 +118,10 @@ void CudaVulkanInteropPublisher::Publish(const nk::World& world, uint32_t env_in
     fk.env_index      = env;
     fk.links_per_env  = caps.links_per_env;
     fk.bodies_per_env = caps.bodies_per_env;
+    // INT-F2: the backend the World ran its FK ops on (opaque, CUDA-free). The CUDA
+    // scatter orders itself AFTER the FK write on this backend's main stream via an
+    // event, so it never reads torn/stale transforms (cross-stream RAW hazard).
+    fk.world_backend  = world.Backend();
 
     scatter_->Scatter(fk, rows_.data(), instance_count_);
 }

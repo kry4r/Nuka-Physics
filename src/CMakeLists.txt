@@ -297,6 +297,9 @@ if(NK_BUILD_VULKAN_VALIDATION)
         PRIVATE
             NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
             NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
+            # M11 INT-F1: the present path's opt-in instanced pipeline reads the
+            # per-instance model matrix from the interop SSBO by gl_InstanceIndex.
+            NUKA_RASTER_MESH_INSTANCED_VERT_SPV="${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
     )
 
     # libxcb: the self-written surface backend uses xcb directly. X11_xcb_LIB is set

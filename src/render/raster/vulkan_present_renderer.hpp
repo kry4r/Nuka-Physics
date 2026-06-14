@@ -94,6 +94,25 @@ public:
                                  const RasterOptions& options = {},
                                  const OverlayRecordFn& overlay = {});
 
+    // M11 INT-F1 (CUDA<->Vulkan zero-copy consumer): enable the OPT-IN instanced
+    // draw path. When the interop publisher has stood up an exportable transform
+    // SSBO (InteropTransformSsbo), the viewer passes its descriptor-set layout
+    // (set 1, STORAGE_BUFFER) + the bound descriptor set here. DrawFrame then binds
+    // the 2nd graphics pipeline (mesh_instanced.vert) + that SSBO at set 1 and draws
+    // each instance by gl_InstanceIndex reading the SCATTERED device transforms,
+    // INSTEAD of the per-draw push-constant world_xform. The DEFAULT per-draw
+    // pipeline (the D1 oracle path) stays in place and is used whenever interop is
+    // NOT enabled, so the default offscreen/present render is byte-unchanged.
+    // Pass VK_NULL_HANDLE handles to disable (revert to the per-draw path).
+    // Opaque NkVk* handles keep this header CUDA-free and Vulkan-light at the seam.
+    void SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout,
+                              NkVkDescriptorSet ssbo_set);
+
+    // True iff SetInteropTransforms installed a usable instanced pipeline (the
+    // viewer logs an HONEST "interop ACTIVE" only when this AND the publisher's
+    // device scatter are both live).
+    bool InteropDrawActive() const;
+
     // The narrow Vulkan handle seam (for the viewer's ImGui InitInfo): device /
     // queue / render pass / descriptor pool / image counts. Mirrors what
     // NukaImGuiInitInfo needs (the swapchain present pass is render_pass).

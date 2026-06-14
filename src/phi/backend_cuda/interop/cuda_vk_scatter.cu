@@ -35,6 +35,7 @@
 #include "phi/backend_cuda/interop/cuda_vk_scatter.hpp"
 
 #include "phi/backend.hpp"   // InitBestDevice (availability probe)
+#include "phi/backend_cuda/cuda_internal.cuh"  // CudaBackend, CudaBackendMainStream (INT-F2)
 #include "phi/backend_cuda/launch.cuh"  // LaunchCuda (the sole <<<>>> wrapper)
 
 #include "math/transform.hpp"
@@ -213,12 +214,22 @@ public:
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
             stream_ = nullptr;
         }
+        // INT-F2: an event used to order the scatter AFTER the World's FK write.
+        // Recorded on the World's main stream each Scatter, waited on the scatter
+        // stream before the launch. Timing-disabled (we never query elapsed time)
+        // for the lowest record/wait overhead. If creation fails, fk_done_ stays 0
+        // and Scatter degrades to running the scatter ON the main stream (still
+        // correctly ordered -- same-stream RAW).
+        if (cudaEventCreateWithFlags(&fk_done_, cudaEventDisableTiming) != cudaSuccess) {
+            fk_done_ = nullptr;
+        }
     }
 
     ~CudaVkScatter() override {
         ReleaseMemory();
         ReleaseSemaphores();
         if (d_rows_ != nullptr) cudaFree(d_rows_);
+        if (fk_done_ != nullptr) cudaEventDestroy(fk_done_);
         if (stream_ != nullptr) cudaStreamDestroy(stream_);
     }
 
@@ -276,6 +287,34 @@ public:
         }
         if (instance_count > instance_capacity_) return false;
 
+        // INT-F2 (cross-stream read-after-write ordering): the scatter READS the
+        // live FK buffers (link/body/base pose) the World wrote on its backend's
+        // MAIN stream. Pick the stream the scatter runs on so that read is correctly
+        // ordered after that write:
+        //   * scatter stream + the World main stream both exist -> record an event on
+        //     the World main stream NOW (captures "FK write done") and make the
+        //     scatter stream wait on it before the launch. The scatter then overlaps
+        //     other main-stream work yet never reads torn/stale transforms.
+        //   * otherwise -> run the scatter ON the World main stream itself (same-stream
+        //     RAW is implicitly ordered). If there is no main stream either (defensive:
+        //     null backend), fall back to the scatter's own stream with no ordering.
+        cudaStream_t main_stream = nullptr;
+        if (fk.world_backend != nullptr) {
+            main_stream = CudaBackendMainStream(
+                reinterpret_cast<CudaBackend*>(fk.world_backend));
+        }
+        cudaStream_t launch_stream = stream_;
+        if (stream_ != nullptr && main_stream != nullptr && fk_done_ != nullptr) {
+            // Order the scatter stream after the FK write on the main stream.
+            if (cudaEventRecord(fk_done_, main_stream) == cudaSuccess) {
+                cudaStreamWaitEvent(stream_, fk_done_, 0);
+            }
+        } else if (main_stream != nullptr) {
+            // No usable scatter stream / event -> run directly on the main stream so
+            // the read trivially follows the FK write on the same stream.
+            launch_stream = main_stream;
+        }
+
         // Upload the (build-time constant) per-instance bindings to a persistent
         // device buffer; re-alloc only when the count grows (allocation-free in
         // steady state -- the binding never changes).
@@ -291,7 +330,7 @@ public:
         }
         if (cudaMemcpyAsync(d_rows_, rows,
                             instance_count * sizeof(InstanceScatterRow),
-                            cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+                            cudaMemcpyHostToDevice, launch_stream) != cudaSuccess) {
             return false;
         }
 
@@ -299,18 +338,18 @@ public:
         // when imported (binary, value ignored).
         if (wait_sem_ != nullptr) {
             cudaExternalSemaphoreWaitParams wp{};
-            cudaWaitExternalSemaphoresAsync(&wait_sem_, &wp, 1, stream_);
+            cudaWaitExternalSemaphoresAsync(&wait_sem_, &wp, 1, launch_stream);
         }
 
         LaunchScatterTransforms(fk, d_rows_, instance_count,
-                                static_cast<float*>(mapped_ptr_), stream_);
+                                static_cast<float*>(mapped_ptr_), launch_stream);
 
         if (signal_sem_ != nullptr) {
             cudaExternalSemaphoreSignalParams sp{};
-            cudaSignalExternalSemaphoresAsync(&signal_sem_, &sp, 1, stream_);
+            cudaSignalExternalSemaphoresAsync(&signal_sem_, &sp, 1, launch_stream);
         } else {
             // No CUDA->Vulkan semaphore: make the SSBO coherent before the draw.
-            cudaStreamSynchronize(stream_);
+            cudaStreamSynchronize(launch_stream);
         }
         return cudaPeekAtLastError() == cudaSuccess;
     }
@@ -327,6 +366,7 @@ private:
     }
 
     cudaStream_t           stream_            = nullptr;
+    cudaEvent_t            fk_done_           = nullptr;   // INT-F2: orders scatter after FK write
     cudaExternalMemory_t   ext_mem_           = nullptr;
     void*                  mapped_ptr_        = nullptr;   // device ptr into the imported SSBO
     uint32_t               instance_capacity_ = 0;

@@ -52,6 +52,35 @@ void CheckCuda(cudaError_t result, const char* operation) {
     }
 }
 
+// File-local RAII over a phi v2 opaque Buffer* (BUF-F2). Frees on EVERY exit incl.
+// the CheckCuda(launch) throw AND the `std::vector survivors(total)` bad_alloc -- the
+// bare UploadVectorV2/BufferAlloc handles leaked on those paths. Adopt() takes an
+// already-allocated handle (UploadVectorV2); the bytes-ctor allocates (BufferAlloc).
+// Mirrors the sibling collision OwnedBuffer (byte-identical happy path).
+class OwnedBuffer {
+public:
+    OwnedBuffer() = default;
+    explicit OwnedBuffer(size_t bytes) {
+        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
+    }
+    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
+    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
+    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
+        if (this != &o) {
+            if (buf_ != nullptr) phi::BufferFree(buf_);
+            buf_ = o.buf_; o.buf_ = nullptr;
+        }
+        return *this;
+    }
+    OwnedBuffer(const OwnedBuffer&) = delete;
+    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
+    static OwnedBuffer Adopt(phi::Buffer* b) { OwnedBuffer o; o.buf_ = b; return o; }
+    void* Base() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
+    phi::Buffer* Handle() const { return buf_; }
+private:
+    phi::Buffer* buf_ = nullptr;
+};
+
 // --- particle<->rigid reframe kernel ----------------------------------------
 // One thread per particle. For particle p with CSR slice [off, off+count): each
 // candidate SHAPE index s = cand_indices[off + k] maps to body shape_body_ids[s];
@@ -194,30 +223,29 @@ CandidatePairStream BuildParticleRigidCandidatePairs(
     phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
 
     // Upload the shape->body map (length == rigid shape count == LBVH leaf count).
+    // RAII-wrapped: frees on the launch throw + the survivors bad_alloc (BUF-F2).
     const uint32_t shape_count = rigid_tree.LeafCount();
     std::vector<uint32_t> body_ids(rigid_shape_body_ids,
                                    rigid_shape_body_ids + shape_count);
-    phi::Buffer* d_body_ids = phi::UploadVectorV2(bt, body_ids);
+    OwnedBuffer d_body_ids = OwnedBuffer::Adopt(phi::UploadVectorV2(bt, body_ids));
 
     // --- reframe every CSR entry into its offset slot (NO scan, NO atomic) ---
-    phi::Buffer* d_out = phi::BufferAlloc(bt, total * sizeof(CandidatePair));
+    OwnedBuffer d_out(total * sizeof(CandidatePair));
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
     ReframeParticleRigidKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count,
         query.DeviceCandidateOffsets(),
         query.DeviceCandidateCounts(),
         query.DeviceCandidateIndices(),
-        static_cast<const uint32_t*>(phi::BufferBase(d_body_ids)),
+        static_cast<const uint32_t*>(d_body_ids.Base()),
         particle_react, rigid_react,
-        static_cast<CandidatePair*>(phi::BufferBase(d_out)));
+        static_cast<CandidatePair*>(d_out.Base()));
     CheckCuda(cudaGetLastError(), "ReframeParticleRigidKernel launch");
     cudaStreamSynchronize(stream);
 
     std::vector<CandidatePair> survivors(total);
-    phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
-    phi::BufferFree(d_body_ids);
-    phi::BufferFree(d_out);
-
+    phi::BufferDownload(d_out.Handle(), survivors.data(), 0, total * sizeof(CandidatePair));
+    // d_body_ids + d_out free on scope exit.
     return BuildAndDedup(stream, device_id, survivors);
 }
 
@@ -266,7 +294,8 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
     phi::BufferType* bt = phi::DeviceBufferType(phi::InitBestDevice());
 
     // --- reframe every neighbor (canonical min,max) into its offset slot -----
-    phi::Buffer* d_out = phi::BufferAlloc(bt, total * sizeof(CandidatePair));
+    // RAII-wrapped: frees on the launch throw + the survivors bad_alloc (BUF-F2).
+    OwnedBuffer d_out(total * sizeof(CandidatePair));
     const uint32_t blocks = (particle_count + kBlockSize - 1u) / kBlockSize;
     ReframeParticleParticleKernel<<<blocks, kBlockSize, 0, stream>>>(
         particle_count,
@@ -274,13 +303,13 @@ CandidatePairStream BuildParticleParticleCandidatePairs(
         grid.DeviceNeighborCounts(),
         grid.DeviceNeighborIndices(),
         particle_react,
-        static_cast<CandidatePair*>(phi::BufferBase(d_out)));
+        static_cast<CandidatePair*>(d_out.Base()));
     CheckCuda(cudaGetLastError(), "ReframeParticleParticleKernel launch");
     cudaStreamSynchronize(stream);
 
     std::vector<CandidatePair> survivors(total);
-    phi::BufferDownload(d_out, survivors.data(), 0, total * sizeof(CandidatePair));
-    phi::BufferFree(d_out);
+    phi::BufferDownload(d_out.Handle(), survivors.data(), 0, total * sizeof(CandidatePair));
+    // d_out frees on scope exit.
 
     // Canonical (i<j) emit means i->j and j->i are byte-identical pairs; the
     // adjacent dedup in BuildAndDedup collapses each double-listing to one i<j.
