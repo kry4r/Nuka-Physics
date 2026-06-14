@@ -21,11 +21,6 @@ HandleTable<nuka_world_t, WorldRecord>& WorldTable() {
     return table;
 }
 
-HandleTable<nuka_buffer_t, BufferRecord>& BufferTable() {
-    static HandleTable<nuka_buffer_t, BufferRecord> table;
-    return table;
-}
-
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept {
     const std::string message = error.what();
     if (message.find("cuda") != std::string::npos ||

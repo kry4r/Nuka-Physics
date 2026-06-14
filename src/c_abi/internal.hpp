@@ -5,7 +5,6 @@
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
 #include "phi/backend.hpp"
-#include "phi/buffer_legacy.hpp"
 #include "phi/device_context.hpp"
 #include "phi/owned_stream.hpp"
 // M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
@@ -172,10 +171,6 @@ struct WorldRecord {
     WorldRecord& operator=(WorldRecord&&) noexcept;
     WorldRecord(const WorldRecord&) = delete;
     WorldRecord& operator=(const WorldRecord&) = delete;
-};
-
-struct BufferRecord {
-    phi::Buffer buffer;
 };
 
 // --- M9 T4: the GENERIC authored-scene record (nuka_scene.h) ----------------
