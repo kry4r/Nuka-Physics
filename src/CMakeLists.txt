@@ -127,7 +127,6 @@ set(NUKA_PUBLIC_HEADERS
 )
 
 add_library(nuka_render STATIC
-    render/render_scene.cpp
     render/render_world.cpp
     # M11 RT-4 (§3.10): host, CUDA-free adapter mapping RenderWorld -> the
     # self-written path-tracer scene-desc POD (rt::TwoLevelScene). Zero CUDA
@@ -299,8 +298,9 @@ endif()
 
 # M9 T11-core-b2: nuka_scene_pipeline (scene/scene_pipeline.cpp + the co-orphaned
 # scene/pose_graph.*) deleted. Its sole consumer (test_scene_pipeline.cpp) was
-# dropped in T11 and the remaining scene units relinked to nuka_scene; render uses
-# its OWN render::BuildRenderScene, never scene::ScenePipeline. ZERO live consumers.
+# dropped in T11 and the remaining scene units relinked to nuka_scene.
+# (M11 RT-6: the legacy render::RenderScene / BuildRenderScene scene-view path
+# was deleted too; the live render path is RenderWorld -> raster / rt_adapter.)
 
 # ---------------------------------------------------------------------------
 # nuka_import – MJCF and URDF importers
