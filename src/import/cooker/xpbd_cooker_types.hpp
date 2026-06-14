@@ -3,8 +3,8 @@
 // nuka::runtime::soft -- CUDA-FREE XPBD param / constraint structs
 // ---------------------------------------------------------------------------
 //
-// M9 T11 soft/fluid Phase 2b: the XPBD stepper (runtime/soft/xpbd_world.{cu,hpp})
-// is being DELETED -- the forward sim is op-ified onto the unified nk core
+// M9 T11 soft/fluid Phase 2b: the legacy XPBD soft-body stepper has been
+// DELETED -- the forward sim is op-ified onto the unified nk core
 // (phi/backend_cuda/ops/particles.cu, run by nk::World). The plain data structs
 // the cook-time topology builders (cloth_topology / tetmesh_topology), the XPBD
 // COOKER, and the re-pointed XPBD tests still need are relocated here, into a

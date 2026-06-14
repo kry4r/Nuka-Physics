@@ -3,8 +3,8 @@
 // nuka::runtime::fluid -- CUDA-FREE PBF param structs + a pure-host density helper
 // ---------------------------------------------------------------------------
 //
-// M9 T11 soft/fluid Phase 2b: the PBF stepper (runtime/fluid/pbf_world.{cu,hpp})
-// is being DELETED -- the forward sim is op-ified onto the unified nk core
+// M9 T11 soft/fluid Phase 2b: the legacy PBF fluid stepper has been
+// DELETED -- the forward sim is op-ified onto the unified nk core
 // (phi/backend_cuda/ops/particles.cu, run by nk::World). The plain data structs
 // the FLUID COOKER and the PBF tests still need -- PbfParticleSet / PbfParams --
 // are relocated here, into a header with NO GPU/World dependency (no buffer, no
