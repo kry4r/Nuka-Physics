@@ -2535,6 +2535,42 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # Go2-on-stairs demo PHASE 3 -- go2_terrain_demo: the MULTI-DOG TERRAIN RENDER
+    # (Isaac-Lab-cover style). Renders N Go2 each on its own procedural-terrain tile
+    # (tessellated by sampling the SHARED nuka::terrain::SampleTerrainHeight() so the
+    # rendered ground matches the physics surface -- anti-drift), with a ROTATING
+    # orbit camera, atmospheric white haze (the new fog SceneUbo slot), and per-foot
+    # contact shadows placed at the LOCAL terrain height under each foot. Consumes an
+    # N-robot GO2T trajectory (the real trained-terrain rollout seam, --bin) or
+    # synthesises a PLACEHOLDER by replicating the single-robot GO2W flat walk
+    # (out/go2_walk_trajectory.bin) to N tiled robots. PURE KINEMATIC REPLAY: no
+    # device, no nk::World, no policy. NOT a gtest -- a real main() exe. Behind
+    # NK_BUILD_VULKAN_VALIDATION. Same link set as the other video exes.
+    add_executable(nuka_go2_terrain_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_terrain_demo.cpp
+    )
+    add_dependencies(nuka_go2_terrain_demo nuka_codegen)
+    target_compile_definitions(nuka_go2_terrain_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_go2_terrain_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_terrain_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M10 -- scene_still: render ONE offscreen still of any .nks (kitchen-scene
     # verification + the H1-kitchen-grasp layout/look STILL the owner approves
     # BEFORE the RL effort). Load(.nks) -> CookToModel (host-only SceneMap) ->

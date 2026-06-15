@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -205,8 +206,87 @@ struct RasterOptions {
     // dark at the centre, so it blends seamlessly with NO alpha blending). When
     // non-empty these REPLACE the single-blob fallback. Each entry = {x, y, radius,
     // strength}; an entry with radius<=0 or strength<=0 is skipped.
-    struct ContactPoint { float x = 0.0f, y = 0.0f, radius = 0.0f, strength = 0.0f; };
+    // Each entry = {x, y, radius, strength}; an optional `z` places the decal at a
+    // GIVEN world height (for non-flat terrain: drop the decal onto the LOCAL surface
+    // under the foot rather than the single flat floor plane). DEFAULT z = a NaN
+    // sentinel meaning "use the flat floor_z" -> every existing caller (e.g. the flat
+    // go2_walk_video) is byte-identical: the renderer only honours a FINITE z.
+    struct ContactPoint {
+        float x = 0.0f, y = 0.0f, radius = 0.0f, strength = 0.0f;
+        float z = std::numeric_limits<float>::quiet_NaN();  // NaN => use flat floor_z
+    };
     std::vector<ContactPoint> contact_points;
+
+    // ----- ATMOSPHERIC HAZE / FOG (Go2-terrain demo: the Isaac-Lab look) -------
+    // A simple exponential distance fog that fades far geometry toward a bright
+    // horizon colour. DEFAULT density 0 => OFF, so every existing caller is
+    // byte-identical (the gated synthetic smokes + G2 parity are unperturbed):
+    // the fog is packed into a previously-unused SceneUbo slot (ambient_ground.w),
+    // and the shader's mix is a strict no-op when density == 0. When > 0 the
+    // fragment colour is lerped toward `fog_color` by 1 - exp(-density * view_dist)
+    // (distance from the camera eye), giving distant dogs/terrain the soft white
+    // atmospheric fade. Tune density ~0.02-0.06 per metre for a gentle haze.
+    float       fog_density   = 0.0f;                  // 0 => fog OFF (G2-safe default)
+    float       fog_color[3]  = {0.93f, 0.95f, 0.98f}; // near-white horizon (linear rgb)
+
+    // ----- CINEMATIC SUN LIGHTING (Go2-terrain demo: the Isaac-Lab look) -------
+    // A single strong directional KEY light (the "sun") replacing the soft 3-point
+    // studio rig, plus a LOW ambient fill, so vertical step risers darken vs the
+    // horizontal treads (geometry reads) and a mid-grey concrete albedo stays mid-
+    // grey (not washed to white). DEFAULT use_sun_light=false => the renderer keeps
+    // the EXACT pre-existing 3-point rig + ambient, so the gated synthetic smokes
+    // (render_raster_smoke / render_physics_parity) are byte-identical (G2-safe).
+    // The demo turns it ON. When on AND world.lights is empty the renderer uses
+    // ONLY this sun (+ sun_ambient_*); authored world.lights still win when present.
+    //
+    //   sun_direction  : world-space direction TOWARD the sun (need NOT be unit;
+    //                    the renderer normalizes). A LOW elevation (small +z) casts
+    //                    the long crisp shadows that carve the stairs. Default points
+    //                    down from the upper-front at ~28 deg elevation.
+    //   sun_color      : the sun radiance (color * intensity, linear rgb). A strong
+    //                    near-white key; raise to brighten the lit treads.
+    //   sun_ambient_sky/ground : the hemispheric ambient (sky overhead, ground
+    //                    bounce). Kept LOW so the unlit riser faces stay dark and the
+    //                    N.L contrast carves the geometry. rgb linear.
+    bool        use_sun_light       = false;            // false => legacy 3-point rig (G2-safe)
+    float       sun_direction[3]    = {0.42f, -0.34f, 0.50f};  // toward the sun (low-ish)
+    float       sun_color[3]        = {3.05f, 2.95f, 2.78f};   // strong warm-white key
+    float       sun_ambient_sky[3]  = {0.30f, 0.34f, 0.42f};   // cool sky fill (low)
+    float       sun_ambient_ground[3] = {0.16f, 0.16f, 0.17f}; // ground bounce (low)
+
+    // ----- VERTICAL SKY GRADIENT BACKGROUND -----------------------------------
+    // Replace the flat `background` clear with a soft vertical gradient drawn into
+    // the clear (a full-screen sky: a brighter horizon low in the frame easing to a
+    // cooler darker zenith up top), the Isaac-Lab cool-grey sky. DEFAULT
+    // sky_gradient=false => the flat `background` clear is used unchanged, so the
+    // gated smokes clear to the SAME constant colour (G2-safe). When true the
+    // renderer paints a screen-space gradient sky BEFORE the scene (a 2-triangle
+    // full-screen draw with a dedicated sky pipeline; depth write off so the scene
+    // overwrites it). sky_top = zenith (up), sky_bottom = horizon (down); linear rgb.
+    bool        sky_gradient   = false;                       // false => flat clear (G2-safe)
+    float       sky_top[3]     = {0.62f, 0.67f, 0.74f};       // cooler zenith
+    float       sky_bottom[3]  = {0.84f, 0.87f, 0.91f};       // brighter horizon
+
+    // ----- DIRECTIONAL SHADOW MAP (the hero Isaac-Lab feature) ----------------
+    // A real depth-from-the-sun shadow map: the scene depth is rendered once from
+    // the sun's orthographic view, then sampled (with a small PCF kernel) in
+    // mesh_pbr.frag so the stairs self-shadow and the robots cast crisp ground
+    // shadows into the grooves. DEFAULT shadow_strength=0 => NO shadow pass is
+    // recorded, the sun-shadow descriptor/sampler is never bound, and the fragment
+    // shader's shadow term is a strict no-op -> the gated smokes record a BYTE-FOR-
+    // BYTE identical command stream + pixels (G2-safe). Requires use_sun_light=true
+    // (the shadow is cast from the sun direction). The demo turns it ON.
+    //
+    //   shadow_strength : 0 => OFF (default). 1 => fully dark occlusion; ~0.7-0.9
+    //                     gives crisp-but-not-pure-black Isaac-Lab grooves.
+    //   shadow_map_size : the square shadow-map resolution (px). 2048 is crisp on
+    //                     lavapipe offline; lower it if a render is too slow.
+    //   shadow_bias     : depth bias (shadow-map units) to kill self-shadow acne on
+    //                     the lit treads. Tune up if treads show moire; down if a
+    //                     thin light gap ("peter-panning") appears at contact.
+    float       shadow_strength  = 0.0f;     // 0 => shadow pass OFF (G2-safe default)
+    uint32_t    shadow_map_size  = 2048u;    // shadow map resolution (px, square)
+    float       shadow_bias      = 0.0025f;  // depth bias to suppress acne
 };
 
 // ---------------------------------------------------------------------------

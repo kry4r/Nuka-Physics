@@ -36,7 +36,10 @@ layout(set = 0, binding = 0) uniform SceneUbo {
     vec4     ambient;       // rgb = hemispheric/ambient sky color; w = ground mix
     vec4     ambient_ground;// rgb = hemispheric ground color;      w unused
     ivec4    counts;        // x = active light count
+    vec4     fog;           // rgb = haze colour; w = density (0 => fog OFF)
     GpuLight lights[kMaxLights];
+    mat4     light_view_proj;  // sun's view-proj (world -> light clip) for shadows
+    vec4     shadow_params;     // x = strength (0=off), y = bias, z = texel, w pad
 } scene;
 
 layout(push_constant) uniform PushBlock {
@@ -53,6 +56,7 @@ layout(location = 2) out vec2 vUv;          // forward-compat (textures deferred
 layout(location = 3) out vec4 vBaseColor;
 layout(location = 4) out vec4 vMr;
 layout(location = 5) out vec4 vEmissive;
+layout(location = 6) out vec4 vLightClip;   // position in the sun's clip space (shadows)
 
 void main() {
     vec4 world = pc.model * vec4(inPosition, 1.0);
@@ -64,5 +68,8 @@ void main() {
     vBaseColor = pc.base_color;
     vMr = pc.mr;
     vEmissive = pc.emissive;
+    // Shadow: the same world position projected into the sun's clip space (only
+    // used when scene.shadow_params.x > 0; otherwise the fragment ignores it).
+    vLightClip = scene.light_view_proj * world;
     gl_Position = scene.view_proj * world;
 }

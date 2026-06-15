@@ -195,11 +195,46 @@ add_custom_command(
     VERBATIM
 )
 
+# Go2-terrain demo: the DIRECTIONAL SHADOW-MAP depth-only vertex shader (the hero
+# Isaac-Lab feature). Same glslc custom_command pattern. Depth-only, no fragment.
+set(NUKA_RASTER_SHADOW_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/shadow_depth.vert")
+set(NUKA_RASTER_SHADOW_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/shadow_depth.vert.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_SHADOW_VERT_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_SHADOW_VERT}" -o "${NUKA_RASTER_SHADOW_VERT_SPV}"
+    DEPENDS "${NUKA_RASTER_SHADOW_VERT}"
+    VERBATIM
+)
+
+# Go2-terrain demo: the SKY GRADIENT fullscreen vertex + fragment shaders.
+set(NUKA_RASTER_SKY_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/sky_gradient.vert")
+set(NUKA_RASTER_SKY_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/sky_gradient.vert.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_SKY_VERT_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_SKY_VERT}" -o "${NUKA_RASTER_SKY_VERT_SPV}"
+    DEPENDS "${NUKA_RASTER_SKY_VERT}"
+    VERBATIM
+)
+set(NUKA_RASTER_SKY_FRAG "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/sky_gradient.frag")
+set(NUKA_RASTER_SKY_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/sky_gradient.frag.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_SKY_FRAG_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" "${NUKA_RASTER_SKY_FRAG}" -o "${NUKA_RASTER_SKY_FRAG_SPV}"
+    DEPENDS "${NUKA_RASTER_SKY_FRAG}"
+    VERBATIM
+)
+
 add_custom_target(nuka_render_shaders DEPENDS
     "${NUKA_DEBUG_DRAW_SPV}"
     "${NUKA_RASTER_MESH_VERT_SPV}"
     "${NUKA_RASTER_MESH_FRAG_SPV}"
     "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
+    "${NUKA_RASTER_SHADOW_VERT_SPV}"
+    "${NUKA_RASTER_SKY_VERT_SPV}"
+    "${NUKA_RASTER_SKY_FRAG_SPV}"
 )
 add_dependencies(nuka_render nuka_render_shaders)
 target_compile_definitions(nuka_render
@@ -208,6 +243,9 @@ target_compile_definitions(nuka_render
         NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_VERT_SPV}"
         NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
         NUKA_RASTER_MESH_INSTANCED_VERT_SPV="${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
+        NUKA_RASTER_SHADOW_VERT_SPV="${NUKA_RASTER_SHADOW_VERT_SPV}"
+        NUKA_RASTER_SKY_VERT_SPV="${NUKA_RASTER_SKY_VERT_SPV}"
+        NUKA_RASTER_SKY_FRAG_SPV="${NUKA_RASTER_SKY_FRAG_SPV}"
 )
 
 target_include_directories(nuka_render

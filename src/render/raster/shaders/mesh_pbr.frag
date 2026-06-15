@@ -28,8 +28,16 @@ layout(set = 0, binding = 0) uniform SceneUbo {
     vec4     ambient;        // rgb = hemispheric SKY color; w = ground mix weight
     vec4     ambient_ground; // rgb = hemispheric GROUND color
     ivec4    counts;         // x = active light count
+    vec4     fog;            // rgb = haze colour; w = density (0 => fog OFF)
     GpuLight lights[kMaxLights];
+    mat4     light_view_proj;   // sun's view-proj (world -> light clip) for shadows
+    vec4     shadow_params;     // x = strength (0=off), y = bias, z = texel, w pad
 } scene;
+
+// Directional shadow map (depth from the sun). ALWAYS bound (a 1x1 dummy when
+// shadows are OFF); sampled ONLY when scene.shadow_params.x > 0 so the gated
+// determinism path is byte-identical (the branch below is never taken).
+layout(set = 0, binding = 1) uniform sampler2D uShadowMap;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vWorldNormal;
@@ -37,6 +45,7 @@ layout(location = 2) in vec2 vUv;
 layout(location = 3) in vec4 vBaseColor;
 layout(location = 4) in vec4 vMr;        // x metallic, y roughness, z opacity
 layout(location = 5) in vec4 vEmissive;  // rgb emissive
+layout(location = 6) in vec4 vLightClip; // position in the sun's clip space
 
 // Per-draw push block (must match mesh.vert byte-for-byte). The fragment only
 // reads ground_shadow: a soft procedural CONTACT SHADOW the renderer fills for
@@ -97,6 +106,35 @@ vec3 LinearToSrgb(vec3 c) {
     return mix(hi, lo, lessThanEqual(c, vec3(0.0031308)));
 }
 
+// Directional shadow factor in [0,1] (1 = fully lit, 0 = fully in shadow), from a
+// 3x3 PCF of the sun's depth map. Returns 1.0 (no shadow) when shadows are off or
+// the fragment is outside the shadow frustum. n_dot_l drives a slope-scaled bias
+// so steep treads do not self-shadow (acne) while contact stays tight.
+float SunShadow(float n_dot_l) {
+    if (scene.shadow_params.x <= 0.0) return 1.0;          // shadows OFF -> fully lit
+    // Perspective divide (ortho w==1, but divide for generality) -> NDC.
+    vec3 ndc = vLightClip.xyz / max(vLightClip.w, 1e-6);
+    // Outside the light frustum in xy -> treat as lit (CLAMP_TO_EDGE + white border).
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    vec2 uv = ndc.xy * 0.5 + 0.5;          // [-1,1] -> [0,1] texel space
+    float frag_depth = ndc.z;              // already in [0,1] (Vulkan ortho)
+    float slope = clamp(1.0 - n_dot_l, 0.0, 1.0);
+    float bias = scene.shadow_params.y * (0.5 + 2.0 * slope);
+    float texel = scene.shadow_params.z;
+    float lit = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float sd = texture(uShadowMap, uv + vec2(float(dx), float(dy)) * texel).r;
+            lit += (frag_depth - bias <= sd) ? 1.0 : 0.0;
+        }
+    }
+    lit /= 9.0;
+    // shadow_params.x scales how DARK the shadow gets (1 => fully dark occluder).
+    return mix(1.0, lit, scene.shadow_params.x);
+}
+
 void main() {
     vec3  albedo    = vBaseColor.rgb;
     float metallic  = clamp(vMr.x, 0.0, 1.0);
@@ -143,7 +181,11 @@ void main() {
         vec3  kd    = (vec3(1.0) - fres) * (1.0 - metallic);
         vec3  diff  = kd * albedo / kPi;
 
-        lo += (diff + spec) * radiance * n_dot_l;
+        // Directional lights (the sun) are occluded by the shadow map; point
+        // lights are not shadowed (the map is the sun's ortho view). When shadows
+        // are OFF, SunShadow() returns 1.0 so this is an exact no-op (G2-safe).
+        float shadow = (L.direction.w > 0.5) ? SunShadow(n_dot_l) : 1.0;
+        lo += (diff + spec) * radiance * n_dot_l * shadow;
     }
 
     // Hemispheric ambient (cheap image-based-lighting stand-in): blend a sky and a
@@ -180,6 +222,18 @@ void main() {
         float occ = 1.0 - smoothstep(0.0, pc.ground_shadow.z, d);
         occ = occ * occ;  // tighten the core, soften the skirt
         color *= (1.0 - pc.ground_shadow.w * occ);
+    }
+
+    // Atmospheric HAZE (Go2-terrain demo: the Isaac-Lab look). Exponential
+    // distance fog fading the fragment toward a bright horizon colour by the
+    // distance from the camera eye. When scene.fog.w (density) == 0 the factor is
+    // 1 - exp(0) == 0, so color is UNCHANGED -> byte-identical to the pre-fog
+    // oracle for every non-fog render (G2-safe). Applied in linear HDR space so it
+    // tonemaps together with the lit surface (a natural, photographic fade).
+    if (scene.fog.w > 0.0) {
+        float view_dist = length(vWorldPos - scene.camera_pos.xyz);
+        float fog_amt   = 1.0 - exp(-scene.fog.w * view_dist);
+        color = mix(color, scene.fog.rgb, clamp(fog_amt, 0.0, 1.0));
     }
 
     // Tonemap (HDR -> LDR) then sRGB encode.
