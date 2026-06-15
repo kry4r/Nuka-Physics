@@ -38,6 +38,18 @@ layout(location = 3) in vec4 vBaseColor;
 layout(location = 4) in vec4 vMr;        // x metallic, y roughness, z opacity
 layout(location = 5) in vec4 vEmissive;  // rgb emissive
 
+// Per-draw push block (must match mesh.vert byte-for-byte). The fragment only
+// reads ground_shadow: a soft procedural CONTACT SHADOW the renderer fills for
+// the GROUND disc (z = radius = 0 on every other draw, so this is a no-op there
+// and their output stays byte-identical to the pre-M10 oracle).
+layout(push_constant) uniform PushBlock {
+    mat4 model;
+    vec4 base_color;
+    vec4 mr;
+    vec4 emissive;
+    vec4 ground_shadow;  // xy = world contact centre, z = radius (0=off), w = strength
+} pc;
+
 layout(location = 0) out vec4 oColor;
 
 const float kPi = 3.14159265358979323846;
@@ -158,6 +170,17 @@ void main() {
     vec3  ambient         = diffuse_ambient + spec_ambient + form_floor;
 
     vec3 color = lo + ambient + vEmissive.rgb;
+
+    // Procedural CONTACT SHADOW (M10 grounded look). Only the ground disc carries
+    // a non-zero radius; for every other draw pc.ground_shadow.z == 0 so this whole
+    // block is skipped and the fragment is byte-identical to the pre-M10 oracle.
+    // A soft radial occlusion of the floor radiance anchors the subject's feet.
+    if (pc.ground_shadow.z > 0.0) {
+        float d   = length(vWorldPos.xy - pc.ground_shadow.xy);
+        float occ = 1.0 - smoothstep(0.0, pc.ground_shadow.z, d);
+        occ = occ * occ;  // tighten the core, soften the skirt
+        color *= (1.0 - pc.ground_shadow.w * occ);
+    }
 
     // Tonemap (HDR -> LDR) then sRGB encode.
     color = AcesFilmic(color);

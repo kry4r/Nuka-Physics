@@ -44,6 +44,7 @@ layout(push_constant) uniform PushBlock {
     vec4 base_color;     // material albedo (rgb) + opacity (a)
     vec4 mr;             // x = metallic, y = roughness, z = opacity, w = pad
     vec4 emissive;       // rgb = emissive radiance; a = pad
+    vec4 ground_shadow;  // xy = world contact centre, z = radius (0=off), w = strength
 } pc;
 
 layout(location = 0) out vec3 vWorldPos;
