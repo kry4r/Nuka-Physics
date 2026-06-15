@@ -181,17 +181,24 @@ params:
         difficulty_step: 0.1     # promote/demote increment.
         ema_beta: 0.99           # reward-EMA smoothing (diagnostic only now).
         promote_thr: 8.0         # DEPRECATED reward-threshold gate (diagnostic).
-        # RANDOM-XY SPAWN + FREE-ROAM (随地走). On every reset the base is placed at
-        # a RANDOM (x,y) in [-spawn_xy_range, +spawn_xy_range]^2 around the tile
-        # origin (so dogs start on different steps/rings/boxes) and -- when
-        # randomize_yaw -- at a RANDOM heading (so the body-frame velocity command
-        # sends each dog in a random WORLD direction = free roaming). The spawn
-        # height at the random column comes from the BATCHED C-ABI sampler
+        # SPAWN POSITION randomization (起始位置随机) -- STAGED per the owner's
+        # "单一起点先稳后随机" (stabilise a single start point FIRST, randomise it
+        # LATER). FREE-ROAM commands (随地走, random body-frame vx/vy/wyaw) are ON in
+        # BOTH stages -- only the SPAWN is staged:
+        #   PHASE A (now, the values below): spawn_xy_range 0.0 + randomize_yaw false
+        #     = a SINGLE fixed start (tile origin, fixed heading). Lowest-variance
+        #     way to learn terrain-climbing reliably; pairs with the path-length gate
+        #     + the terrain-relative height-kill so descents (pits / down-stairs)
+        #     actually train. Train to a stable terrain-climber.
+        #   PHASE B (later fine-tune, warm-start from Phase A): flip to
+        #     spawn_xy_range 2.0 + randomize_yaw true = dogs start on different
+        #     steps/rings/boxes at random headings (the final free-roam demo form).
+        # The spawn height at the chosen column comes from the BATCHED C-ABI sampler
         # (nuka.terrain_sample_height_batch = the C++ heightfield itself), so the
         # base lands ON the local surface, never inside it.
-        spawn_xy_range: 2.0      # half-edge (m) of the spawn square; 2.0 keeps the
-                                 # dog inside the stepped region (~2.9 m radius).
-        randomize_yaw: true      # randomize base heading per reset (free roam).
+        spawn_xy_range: 0.0      # PHASE A: fixed single start (tile origin). PHASE B
+                                 # -> 2.0 (~2.9 m radius, inside the stepped region).
+        randomize_yaw: false     # PHASE A: fixed heading. PHASE B -> true (free roam).
         # Per-env START type weights {0:Flat,1:Stairs,2:Pit,3:Boxes}. Omit/empty
         # => deterministic round-robin over {stairs, pit, boxes} (all 3 trained).
         # type_distribution: {1: 1.0, 2: 1.0, 3: 1.0}

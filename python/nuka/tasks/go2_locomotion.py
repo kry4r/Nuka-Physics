@@ -521,6 +521,33 @@ class Go2LocomotionEnv(NukaGymEnv):
             self._curriculum.accumulate_path(self._last_base_xy)
         return r
 
+    # -- local terrain surface sampler (shared by collision proxy + height-kill) --
+    def _terrain_surface(self, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
+        """(N, M) local terrain surface z at world (xs, ys) per env, using the env's
+        LIVE curriculum terrain TYPE + DIFFICULTY (broadcast across the trailing M
+        dim), via the SINGLE-source batched C-ABI sampler
+        ``nuka.terrain_sample_height_batch`` -- the exact heightfield the foot kernel
+        rests the feet on. ``xs``/``ys`` are (N, M); the sampler takes flat CPU
+        arrays so we flatten (N*M,) and reshape back. Only called on the terrain-ON
+        paths (the collision proxy and the relative height-kill)."""
+        n, m = xs.shape
+        cur = self._curriculum
+        types = cur.terrain_type.view(n, 1).expand(n, m)         # (N, M) long
+        diff = cur.difficulty.view(n, 1).expand(n, m)            # (N, M) float
+        types_cpu = types.reshape(-1).to(torch.int64).cpu().to(torch.uint32).contiguous()
+        xs_cpu = xs.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        ys_cpu = ys.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        diff_cpu = diff.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        surf = nuka.terrain_sample_height_batch(
+            types_cpu, xs_cpu, ys_cpu, diff_cpu,
+            self._ground_height, self._terrain_step_height,
+            self._terrain_step_width, self._terrain_platform_width,
+            self._terrain_grid_width, self._terrain_grid_height_max,
+        )
+        return torch.as_tensor(
+            surf, device=self._torch_device, dtype=torch.float32
+        ).view(n, m)
+
     # -- collision proxy: penalised links clipping the local terrain surface --
     def _collision_count(self) -> torch.Tensor:
         """(N,) count of penalised links (thigh/calf/base) whose world z is BELOW
@@ -548,35 +575,43 @@ class Go2LocomotionEnv(NukaGymEnv):
             return self._reward._collision(link_z, surface)
 
         # Per-link (x,y) for the batched terrain sampler. The terrain TYPE +
-        # DIFFICULTY are PER-ENV (broadcast across that env's K links).
+        # DIFFICULTY are PER-ENV (broadcast across that env's K links inside the
+        # shared sampler helper).
         link_x = pose[:, links, 0]                               # (N, K)
         link_y = pose[:, links, 1]                               # (N, K)
-        cur = self._curriculum
-        types = cur.terrain_type.view(n, 1).expand(n, k)         # (N, K) long
-        diff = cur.difficulty.view(n, 1).expand(n, k)            # (N, K) float
-        # The C-ABI sampler takes flat CPU arrays; flatten (N*K,) and reshape back.
-        types_cpu = types.reshape(-1).to(torch.int64).cpu().to(torch.uint32).contiguous()
-        xs_cpu = link_x.reshape(-1).detach().cpu().to(torch.float32).contiguous()
-        ys_cpu = link_y.reshape(-1).detach().cpu().to(torch.float32).contiguous()
-        diff_cpu = diff.reshape(-1).detach().cpu().to(torch.float32).contiguous()
-        surf = nuka.terrain_sample_height_batch(
-            types_cpu, xs_cpu, ys_cpu, diff_cpu,
-            self._ground_height, self._terrain_step_height,
-            self._terrain_step_width, self._terrain_platform_width,
-            self._terrain_grid_width, self._terrain_grid_height_max,
-        )
-        surface = torch.as_tensor(
-            surf, device=self._torch_device, dtype=torch.float32
-        ).view(n, k)
+        surface = self._terrain_surface(link_x, link_y)          # (N, K)
         return self._reward._collision(link_z, surface)
 
     def compute_terminated(self) -> torch.Tensor:
-        """Base termination predicate, with the terminal (fell) mask captured for
-        the terrain curriculum's demote-on-fall rule. The capture is a no-op when
-        terrain is disabled (the base predicate is byte-identical either way)."""
-        term = super().compute_terminated()
-        if self._curriculum is not None:
-            self._last_terminated = term
+        """Termination predicate, with the terminal (fell) mask captured for the
+        terrain curriculum's demote-on-fall rule.
+
+        TERRAIN OFF -> the base predicate verbatim (absolute base_z <
+        termination_height OR tilt > termination_tilt_deg); byte-identical, no
+        capture overhead when there is no curriculum.
+
+        TERRAIN ON -> the height-kill is made RELATIVE to the LOCAL terrain surface
+        at the base (x,y): ``(base_z - local_surface) < termination_height``. The
+        ABSOLUTE base-z kill is WRONG on terrain -- a dog walking DOWN into the
+        inverted-pyramid pit (surface ~ -1.2 m) or down stairs has base_z far below
+        the 0.18 m absolute floor even while walking PERFECTLY, so it was being
+        terminated on contact (eval: Pit d>=0.5 ep_len~1, instant death) and the
+        curriculum could never train descents. On FLAT (terrain_type 0 -> surface 0)
+        this reduces EXACTLY to the absolute kill, so flat behaviour is preserved.
+        The tilt kill is unchanged."""
+        if self._curriculum is None or not self._terrain_on:
+            term = super().compute_terminated()
+            if self._curriculum is not None:
+                self._last_terminated = term
+            return term
+
+        base = self._obs.base_pos()                              # (N, 7) -> xyz
+        base_z = base[:, 2]
+        surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
+        fell = (base_z - surf) < self.termination_height
+        tipped = self._obs.tilt_deg() > self.termination_tilt_deg
+        term = fell | tipped
+        self._last_terminated = term
         return term
 
     def step(self, actions: torch.Tensor):
