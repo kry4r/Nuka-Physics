@@ -178,6 +178,14 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "(overrides config.env_config.terrain.enable).")
     p.add_argument("--no-terrain", dest="terrain", action="store_false",
                    help="Force-DISABLE the terrain curriculum (flat training).")
+    # Toggle the legged_gym-style terrain HEIGHT-SCAN obs (needs --terrain). It
+    # grows the obs to 48 + n_scan, so a run with it ON cannot warm-start from a
+    # blind (48-dim) checkpoint -- it is a COLD-START.
+    p.add_argument("--height-scan", dest="height_scan", action="store_true", default=None,
+                   help="Force-ENABLE the terrain height-scan obs "
+                        "(overrides config.env_config.terrain.height_scan.enable).")
+    p.add_argument("--no-height-scan", dest="height_scan", action="store_false",
+                   help="Force-DISABLE the height-scan obs (blind proprioception).")
     return p
 
 
@@ -228,6 +236,10 @@ def _apply_overrides(params: dict, args: argparse.Namespace) -> dict:
     if args.terrain is not None:
         ec = cfg.setdefault("env_config", {})
         ec.setdefault("terrain", {})["enable"] = bool(args.terrain)
+    # Height-scan obs enable/disable override (CLI wins over yaml; needs terrain).
+    if args.height_scan is not None:
+        ec = cfg.setdefault("env_config", {})
+        ec.setdefault("terrain", {}).setdefault("height_scan", {})["enable"] = bool(args.height_scan)
 
     # Guard the rl_games divisibility assertion early with a clear message.
     batch = cfg["horizon_length"] * cfg["num_actors"]

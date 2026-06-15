@@ -202,3 +202,36 @@ params:
         # Per-env START type weights {0:Flat,1:Stairs,2:Pit,3:Boxes}. Omit/empty
         # => deterministic round-robin over {stairs, pit, boxes} (all 3 trained).
         # type_distribution: {1: 1.0, 2: 1.0, 3: 1.0}
+
+        # ---------------------------------------------------------------------
+        # legged_gym-style HEIGHT SCAN (terrain perception). DEFAULT OFF: with
+        # enable=false (or the parent terrain block disabled) the obs stays the
+        # 48-dim blind vector and EVERY consumer is byte-identical to before.
+        #
+        # When enabled, the env APPENDS an n_scan-dim terrain height measurement
+        # to the 48-dim obs: a base-frame grid (rotated by the base heading/yaw)
+        # is sampled against each env's LIVE curriculum terrain (type+difficulty)
+        # via the same C-ABI heightfield sampler the foot kernel uses, giving the
+        # policy a forward-looking view of the terrain so it can climb HIGH stairs
+        # (blind walking plateaus at ~5-6 cm; with the scan it should reach
+        # 12-15 cm). The obs/network input dim becomes 48 + n_scan.
+        #
+        # GRID (legged_gym Go2 measured_points_x/y): x in [x_min,x_max], y in
+        # [y_min,y_max], step `resolution` m. nx = round((x_max-x_min)/res)+1,
+        # ny = round((y_max-y_min)/res)+1, n_scan = nx*ny. The defaults below
+        # give nx=17, ny=11 -> n_scan = 187 (the legged_gym Go2 grid).
+        #
+        # VALUE (legged_gym convention): clip(base_z - 0.5 - surface_z, -clip,
+        # +clip) * scale, per grid point.
+        height_scan:
+          enable: false          # DEFAULT OFF (blind Go2 + all other consumers
+                                 # byte-identical; flip true to give the policy a
+                                 # terrain view -- requires a retrain, the net
+                                 # input dim changes to 48 + n_scan).
+          x_min: -0.8            # base-frame grid extent (m), forward = +x.
+          x_max: 0.8
+          y_min: -0.5            # base-frame grid extent (m), left = +y.
+          y_max: 0.5
+          resolution: 0.1        # grid step (m). default 17(x)*11(y) = 187 pts.
+          scale: 5.0             # obs scale (legged_gym obs_scales.height_measurements).
+          clip: 1.0              # clip half-range (m) before scaling.
