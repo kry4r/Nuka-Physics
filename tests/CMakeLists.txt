@@ -2462,6 +2462,42 @@ if(NK_BUILD_VULKAN_VALIDATION)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # M10 Phase A -- THE HEADLINE DEMO EXE: h1_grasp_video. The unified offscreen
+    # C++ video tool that renders the proven 51-DOF H1 cup-grasp choreography
+    # (h1_grasp_lift's TableTorque drive, shared via examples/demo/h1_grasp_driver.hpp)
+    # to a PBR-beautiful PPM sequence on lavapipe (cup + H1 visual MESHES, hero
+    # camera, studio ground). Hand-builds a RenderWorld binding the union model's
+    # link/body pose rows to the import-time visual triangles (CR-2 option A; the
+    # union cook emits no SceneMap). NOT a gtest -- a real `main()` exe. Same link
+    # set as render_physics_parity (nk physics + nuka_render). Behind
+    # NK_BUILD_VULKAN_VALIDATION (real Vulkan device).
+    add_executable(nuka_h1_grasp_video
+        ${CMAKE_SOURCE_DIR}/examples/demo/h1_grasp_video.cpp
+    )
+    add_dependencies(nuka_h1_grasp_video nuka_codegen)
+    target_compile_definitions(nuka_h1_grasp_video
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_h1_grasp_video
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_h1_grasp_video
+        PRIVATE
+            nuka_test_validated_sources  # BuildNkUnionModel (union_nk_model.cpp)
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
     # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
     # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb
