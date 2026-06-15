@@ -878,6 +878,11 @@ if(CMAKE_CUDA_COMPILER)
         coupling/test_pbd_costep_unified.cpp
         scenario/h1_grasp_lift.cpp
         scenario/union_cook_golden.cpp
+        # WP1 dog-collision FOUNDATION spike: K Go2 articulations co-resident in
+        # ONE env of ONE general nk::World (cook + model + schema re-key + staging).
+        # Proves K articulations co-step finite + INDEPENDENT (no dog-dog contact
+        # yet -- that is the later contact crux). Composes go2_stand with itself.
+        scenario/multi_dog_costep.cpp
         # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.

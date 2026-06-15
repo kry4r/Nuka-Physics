@@ -32,8 +32,17 @@ namespace nuka::nk {
 // a Model property (deterministic for a given cook product + env_count).
 struct ModelCapacities {
     uint32_t env_count       = 1;   // number of replicated envs (env-major).
-    uint32_t dofs_per_env    = 0;   // articulation generalized DOF count / env.
-    uint32_t links_per_env   = 0;   // articulation link count / env.
+    // Multi-articulation co-residence (K Go2 in ONE env): the number of SEPARATE
+    // articulations resident in each env. The forward kernels are grid =
+    // articulation_count == articulations_per_env * env_count, each dog keeping
+    // its OWN max_dof^2 M-tile (dofs_per_env stays the per-DOG DOF, NEVER summed,
+    // so the per-artic 64-DOF CRBA cap is safe for K separate ~18-DOF dogs). The
+    // DEFAULT 1 is the legacy single-robot-per-env shape: every per:articulation
+    // / per:articulation_dof2 field then has articulations_per_env == 1 entries,
+    // identical to the prior per:env / per:env_dof2 layout (the K==1 D1 invariant).
+    uint32_t articulations_per_env = 1;
+    uint32_t dofs_per_env    = 0;   // PER-ARTICULATION generalized DOF (max single-dog DOF).
+    uint32_t links_per_env   = 0;   // articulation link count / env (SUM across co-resident dogs).
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
@@ -98,10 +107,28 @@ struct ModelArticulation {
     // Empty == zero-velocity start (the M3 CookToModel path, unchanged).
     std::vector<float>            initial_qdot;          // per LINK (scalar slot)
     std::vector<float>            initial_link_velocity; // 6 floats / link (flat)
-    math::Transform               base_pose = math::Transform::Identity();  // root world pose
-    uint32_t                      dof_count  = 0;        // generalized DOFs (floating root = 6)
-    uint32_t                      link_count = 0;
+    math::Transform               base_pose = math::Transform::Identity();  // root world pose (artic 0).
+    uint32_t                      dof_count  = 0;        // PER-ARTIC generalized DOFs (max single-dog; floating root = 6)
+    uint32_t                      link_count = 0;        // TOTAL links across co-resident articulations.
     uint32_t                      root_link  = ~uint32_t(0);
+    // Multi-articulation co-residence (K Go2 in one env). When the cooked scene
+    // holds >1 disjoint kinematic tree, these carry the per-articulation
+    // bookkeeping (BuildArticulationHostState builds them over ALL topologies):
+    //   base_poses              : K root world poses (one per co-resident dog).
+    //   articulation_link_count : K link counts (one per dog).
+    //   articulation_link_offset: K base offsets into the flat per-env link arrays.
+    //   articulation_count      : K == base_poses.size().
+    // For the legacy single-robot scene articulation_count == 1, base_poses ==
+    // { base_pose }, and the staging collapses to the prior per:env layout (D1).
+    std::vector<math::Transform>  base_poses;            // K root world poses.
+    std::vector<uint32_t>         articulation_link_count;   // K per-dog link counts.
+    std::vector<uint32_t>         articulation_link_offset;  // K per-dog flat link offsets.
+    // Per-template-link LOCAL articulation index (length == link_count). Built by
+    // BuildArticulationHostState over all co-resident topologies; staged into the
+    // link_to_articulation field with the +e*K per-replica offset. Empty / all-0
+    // for the single-articulation scene (link l -> artic 0).
+    std::vector<uint32_t>         link_to_articulation;
+    uint32_t                      articulation_count = 1;
 };
 
 // One cooked foot-sphere row (legacy articulation::FootShape 1:1: base-relative

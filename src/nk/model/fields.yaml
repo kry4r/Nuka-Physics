@@ -27,8 +27,16 @@
 #   per    : the count-unit the array is sized by —
 #            env | dof | link | body | contact_slot | row_slot | particle |
 #            dist_con | bend_con | vol_con | shape_match_slot | shape_match_member
-#            | scalar
+#            | scalar | articulation | articulation_dof2
 #            (plus the §3.3 examples' env_dof2). `scalar` uses an explicit count.
+#            articulation       = per-ARTICULATION arrays (sized articulations_per_env);
+#                                 the multi-dog co-residence root pose + per-artic link
+#                                 offset tables (was per:env when 1 artic == 1 env).
+#            articulation_dof2  = per-articulation M-tile (articulations_per_env *
+#                                 max_dof^2); the CRBA M / M^-1 tiles, one max_dof^2
+#                                 block per co-resident articulation (was env_dof2).
+#            At articulations_per_env == 1 BOTH collapse element-for-element onto
+#            env / env_dof2 -> every single-articulation golden stays byte-identical.
 #            shape_match_slot = per-CLUSTER arrays (offset/count/stiffness/centroid);
 #            shape_match_member = per flat-cluster-MEMBER arrays (the CSR particle /
 #            rest-offset / weight pool, sized sum_c n_c per env).
@@ -48,7 +56,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -66,7 +74,9 @@ fields:
   - {name: q,             dtype: f32,       per: link,         arena: persistent, owner: data,  flags: [diff]}
   - {name: qdot,          dtype: f32,       per: link,         arena: persistent, owner: data,  flags: [diff]}
   - {name: link_pose,     dtype: transform, per: link,         arena: persistent, owner: data}
-  - {name: base_pose,     dtype: transform, per: env,          arena: persistent, owner: data,  flags: [diff]}
+  # base_pose is per-ARTICULATION (the FK/integrate kernels read base_pose[articulation],
+  # one root pose per co-resident dog). K==1 (1 artic/env) collapses to per:env bytes.
+  - {name: base_pose,     dtype: transform, per: articulation, arena: persistent, owner: data,  flags: [diff]}
   - {name: body_pose,     dtype: transform, per: body,         arena: persistent, owner: data,  flags: [diff]}
   - {name: body_inv_mass, dtype: f32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: contact_count, dtype: u32,       per: env,          arena: scratch,    owner: data}
@@ -76,7 +86,9 @@ fields:
   # UNION-family CSR row records live in `urows` (per row_slot) below.
   - {name: rows,          dtype: f32,       per: contact_slot, arena: scratch,    owner: data,  elem: 16}
   - {name: lambda,        dtype: f32,       per: row_slot,     arena: persistent, owner: data}
-  - {name: m_inv,         dtype: f32,       per: env_dof2,     arena: scratch,    owner: data}
+  # m_inv is the per-ARTICULATION M^-1 tile (CRBA factor writes one max_dof^2 block
+  # per co-resident dog at m_inv[articulation*max_dof^2]). K==1 collapses to env_dof2.
+  - {name: m_inv,         dtype: f32,       per: articulation_dof2, arena: scratch, owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data,  flags: [diff]}
   - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*8", arena: persistent, owner: data, flags: [param]}
   - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
@@ -114,7 +126,10 @@ fields:
   - {name: snapshot_q,             dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_qdot,          dtype: f32,       per: link, arena: persistent, owner: data}
   - {name: snapshot_link_velocity, dtype: spatial6,  per: link, arena: persistent, owner: data}
-  - {name: snapshot_base_pose,     dtype: transform, per: env,  arena: persistent, owner: data}
+  # snapshot_base_pose mirrors base_pose 1:1 (the Reset restore source), so it MUST
+  # carry the same per:articulation count (else SnapshotState/RestoreState would
+  # round-trip a size mismatch). K==1 collapses to per:env bytes.
+  - {name: snapshot_base_pose,     dtype: transform, per: articulation, arena: persistent, owner: data}
   # M7 T1: movable rigid-body snapshot state (the restore source for the M7
   # settle consumer — a bodies-only world like a settled cup-on-table must
   # round-trip its body pose/velocity on Reset). Mirror the LIVE body_pose /
@@ -143,10 +158,12 @@ fields:
   - {name: link_to_articulation,  dtype: u32,       per: link, arena: persistent, owner: model}
   - {name: joint_damping,         dtype: f32,       per: link, arena: persistent, owner: model, flags: [param]}
   - {name: joint_armature,        dtype: f32,       per: link, arena: persistent, owner: model, flags: [param]}
-  # per-env articulation offset tables (one entry per articulation; here keyed by
-  # env since the cook replicates exactly one articulation template per env).
-  - {name: articulation_link_count,  dtype: u32, per: env, arena: persistent, owner: model}
-  - {name: articulation_link_offset, dtype: u32, per: env, arena: persistent, owner: model}
+  # per-ARTICULATION offset tables (one entry per co-resident articulation; the CRBA
+  # / ABA / assemble kernels index articulation_link_offset[articulation]). With K
+  # dogs co-resident in one env there are K entries/env; at K==1 (1 artic == 1 env)
+  # the count is articulations_per_env == 1 == per:env, so the bytes are identical.
+  - {name: articulation_link_count,  dtype: u32, per: articulation, arena: persistent, owner: model}
+  - {name: articulation_link_offset, dtype: u32, per: articulation, arena: persistent, owner: model}
   # Foot-shape table (legacy articulation::FootShape feet_ buffer 1:1): a GLOBAL
   # table (shared by all envs, base-relative link indices), 5 scalars per slot
   # {calf_local_link(u32 bits), offset.xyz, radius}, max_contacts_per_env slots.
@@ -251,7 +268,9 @@ fields:
   - {name: qdot_flat,       dtype: f32,  per: dof,      arena: scratch,    owner: data}
   # Unfactored CRBA M tile (legacy m_; m_inv above is its LDL^T inverse) + the
   # CRBA composite-inertia scratch (legacy composite_).
-  - {name: m,                      dtype: f32,   per: env_dof2, arena: scratch, owner: data}
+  # m is the per-ARTICULATION unfactored CRBA M tile (one max_dof^2 block per
+  # co-resident dog at m[articulation*max_dof^2]). K==1 collapses to env_dof2.
+  - {name: m,                      dtype: f32,   per: articulation_dof2, arena: scratch, owner: data}
   - {name: link_composite_inertia, dtype: mat36, per: link,     arena: scratch, owner: data}
 
   # =========================================================================

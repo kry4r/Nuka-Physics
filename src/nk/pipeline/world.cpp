@@ -77,7 +77,14 @@ bool World::SeedInitialState() {
     reset_params_.count = 0;
     reset_params_.base_link_count = L;
     reset_params_.lambda_stride = cap.max_rows_per_env;
-    reset_params_.articulation_count = E;
+    // WP1 multi-articulation: reset addresses GLOBAL articulations (K per env). The
+    // ResetEnvs id-bound guard checks `env >= articulation_count`, so this must be
+    // the TOTAL co-resident articulation count. At K==1 this is E (unchanged).
+    // (NOTE: the ResetEnvs/Snapshot/Restore base_pose handling itself is still
+    // env-keyed -- only the FIRST dog's root pose per env round-trips a reset. The
+    // per-dog reset/snapshot is part of the later contact-crux RL work, NOT this
+    // forward-dynamics foundation; the co-step spike does not reset.)
+    reset_params_.articulation_count = cap.articulations_per_env * E;
     reset_params_.body_count = cap.bodies_per_env;
 
     // -- M4: movable rigid-body template seeding (env-major replication) -----
@@ -305,7 +312,19 @@ bool World::SeedInitialState() {
         }
     }
     {
-        std::vector<math::Transform> host(E, a.base_pose);
+        // WP1 multi-articulation: K distinct root poses per env (one per co-resident
+        // dog), laid out env-major at flat index e*K + k -- matching the FK kernel's
+        // base_pose[articulation] index where articulation == e*K + k. At K==1 this
+        // is exactly { a.base_pose } per env (E entries), byte-identical to the prior
+        // vector<Transform>(E, a.base_pose) seed (the K==1 D1 invariant).
+        const uint32_t K = cap.articulations_per_env;
+        std::vector<math::Transform> host(static_cast<size_t>(K) * E);
+        for (uint32_t e = 0; e < E; ++e) {
+            for (uint32_t k = 0; k < K; ++k) {
+                host[static_cast<size_t>(e) * K + k] =
+                    k < a.base_poses.size() ? a.base_poses[k] : a.base_pose;
+            }
+        }
         if (!data_.UploadField(FieldId::BasePose, host.data(),
                                host.size() * sizeof(math::Transform))) {
             return false;

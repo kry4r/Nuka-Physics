@@ -61,6 +61,11 @@ VALID_PER = {
     "particle", "dist_con", "bend_con", "vol_con", "shape_match_slot",
     "shape_match_member",
     "env_dof2", "scalar",
+    # Multi-articulation co-residence (K Go2 in one env): per-articulation count
+    # unit (= articulations_per_env) and per-articulation M-tile unit
+    # (= articulations_per_env * max_dof^2). At articulations_per_env == 1 these
+    # collapse element-for-element onto `env` / `env_dof2` (the K==1 D1 invariant).
+    "articulation", "articulation_dof2",
 }
 VALID_ARENA = {"persistent", "scratch", "tape"}
 VALID_OWNER = {"model", "data"}
@@ -235,7 +240,12 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "enum class FieldPer : uint8_t {",
         "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,",
         "    DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,",
-        "    Scalar",
+        "    Scalar,",
+        "    // Multi-articulation co-residence: per-articulation (= "
+        "articulations_per_env)",
+        "    // and per-articulation M-tile (= articulations_per_env * max_dof^2).",
+        "    // APPENDED so the existing enumerator values never shift.",
+        "    Articulation, ArticulationDof2",
         "};",
         "",
         "struct FieldLayout {",
@@ -262,6 +272,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "dist_con": "DistCon", "bend_con": "BendCon", "vol_con": "VolCon",
         "shape_match_slot": "ShapeMatchSlot", "shape_match_member": "ShapeMatchMember",
         "env_dof2": "EnvDof2", "scalar": "Scalar",
+        "articulation": "Articulation", "articulation_dof2": "ArticulationDof2",
     }
     scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
                    "transform": 4, "spatial6": 4, "mat36": 4}
