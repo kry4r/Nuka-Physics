@@ -330,6 +330,12 @@ phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
     if (!ready_ || backend_ == nullptr) {
         return phi::Status::Failed;
     }
+    // M10 RL-completion: bump the IC-jitter episode counter so successive resets
+    // draw distinct (yet reproducible) Philox streams. The jitter MAGNITUDES stay
+    // at their zero defaults here (the training env wires them later), so this is
+    // a pure no-op for every existing caller — the kernel's per-perturbation
+    // `if (half != 0)` gates skip every draw and the reset is byte-identical.
+    ++reset_params_.ic_episode;
     if (env_ids.empty()) {
         // Bulk restore: snapshot -> live + clear qddot/tau/lambda (device-side).
         return DispatchOp(phi::NkOp::RestoreState, &restore_params_);

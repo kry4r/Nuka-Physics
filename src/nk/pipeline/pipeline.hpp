@@ -86,6 +86,8 @@ private:
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ParticleParticleContactParams p_pp_contact_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
+    // M10 RL-completion: union-only per-env contact obs readout (additive).
+    phi::ReadoutUnionContactObsParams p_union_obs_{};
 };
 
 } // namespace nuka::nk

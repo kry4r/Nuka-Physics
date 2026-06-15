@@ -359,6 +359,32 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_readout_.max_contacts_per_env = cap.max_contacts_per_env;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
+
+    // M10 RL-completion: the union-family per-env contact-observation readout
+    // (finger normal-impulse force-closure signal + foot contact state). Emitted
+    // ONLY for the UnionCsr family (strictly ADDITIVE — the fused/pair-driven
+    // graphs are untouched, so their goldens stay byte-identical). Writes into
+    // obs_buffer (allocated per-env for every model; ExportObs is NOT in this
+    // pipeline graph, so the obs row is free). n_feet/n_fingers are counted by
+    // class from the host-side model.union_slots template (no fingertips count
+    // is exposed on nk::Model; the slot order is FIXED feet->fingers->table).
+    if (is_union && (has_articulation || has_bodies)) {
+        uint32_t n_feet = 0u, n_fingers = 0u;
+        for (const UnionSlot& s : model.union_slots) {
+            if (s.cls == UnionSlot::kFootSpherePlane) ++n_feet;
+            else if (s.cls == UnionSlot::kFingerSphereHull) ++n_fingers;
+        }
+        p_union_obs_.env_count = env_count;
+        p_union_obs_.union_slot_count = cap.max_contacts_per_env;
+        p_union_obs_.rows_per_env = cap.max_rows_per_env;
+        p_union_obs_.n_feet = n_feet;
+        p_union_obs_.n_fingers = n_fingers;
+        p_union_obs_.obs_offset = 0u;
+        p_union_obs_.obs_width = cap.obs_width;
+        // Finger slots are kFingerSphereHull (1 manifold point => 1 normal row).
+        p_union_obs_.max_pts = 1u;
+        add(phi::NkOp::ReadoutUnionContactObs, &p_union_obs_);
+    }
 }
 
 } // namespace nuka::nk
