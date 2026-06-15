@@ -9,11 +9,14 @@
 // IDENTICAL to the legacy path. The legacy single-env host round-trip and the
 // batched-world device-buffer arms are deleted.
 //
-// The 4 control-input fields (TORQUE_INPUT/VELOCITY_TARGET/ACTUATOR_NOLOAD_SPEED/
-// TASK_TARGET) map to kNoFieldId -- they were the non-PD control surface served
-// by the deleted batched world's owned param buffers. Non-PD control is an M10
-// named gap (RL-adjacent, rebuilt on the nk world at M10), so they return
-// NOT_SUPPORTED here rather than aliasing a non-existent buffer.
+// T1 (unified actuator): TORQUE_INPUT now ALIASES nk::FieldId::DriveTarget in
+// dlpack_table.hpp -- the Torque preset reads its `u` from the SAME persistent
+// Data field as the PD target, so TORQUE_INPUT is served zero-copy as the very
+// same device buffer as DRIVE_TARGET (one control buffer, preset-reinterpreted).
+// The remaining three control-input fields (VELOCITY_TARGET/ACTUATOR_NOLOAD_SPEED/
+// TASK_TARGET) still map to kNoFieldId -- their presets are not yet wired onto the
+// unified nk::World, so they return NOT_SUPPORTED rather than aliasing a buffer
+// that no preset consumes yet.
 // ---------------------------------------------------------------------------
 
 #include "c_abi/dlpack_table.hpp"

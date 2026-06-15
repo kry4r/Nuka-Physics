@@ -131,19 +131,24 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
     if (desc->determinism > 1u) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    // Control mode: 0 = PDPosition (the only mode wired onto the generic nk::World
-    // in M9). M10 NAMED GAP: non-PD modes (1 Torque / 2 Velocity / 3 ComputedTorque
-    // / 4 Osc / 5 Actuator) + osc_task_link are RL-adjacent control surfaces that
-    // are rebuilt on the nk world at M10 -- reject them with NOT_SUPPORTED rather
-    // than silently mis-actuate.
+    // Control mode (T1 unified-actuator wire): 0 = PDPosition and 1 = Torque are
+    // both wired onto the ONE generic nk::World -- OpApplyDrives carries both the
+    // position-PD kernel (mode 0) and the direct-torque kernel (mode 1), selected
+    // by model.drive_mode, which we route from desc->control_mode below. These are
+    // PRESETS of the one affine actuator, not separate solver paths. The remaining
+    // modes (2 Velocity / 3 ComputedTorque / 4 Osc / 5 Actuator) have no op kernel
+    // on the unified world yet -> still rejected with NOT_SUPPORTED rather than
+    // silently mis-actuate (the affine evaluator + those presets land in a later
+    // phase). A value ABOVE the enum's range is an outright INVALID_ARG.
     if (!nuka::runtime::articulation::IsControlModeImplemented(
             desc->control_mode)) {
         return NUKA_RESULT_INVALID_ARG;
     }
     const auto control_mode = static_cast<nuka::runtime::articulation::ControlMode>(
         desc->control_mode);
-    if (control_mode != nuka::runtime::articulation::ControlMode::PDPosition) {
-        return NUKA_RESULT_NOT_SUPPORTED;  // M10 named gap (non-PD control).
+    if (control_mode != nuka::runtime::articulation::ControlMode::PDPosition &&
+        control_mode != nuka::runtime::articulation::ControlMode::Torque) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // preset not yet wired on the nk world.
     }
 
     auto* device_record = nuka::c_abi::DeviceTable().Get(device);
@@ -176,6 +181,18 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         // and is a per-scene special-case the unified-world directive forbids.
         nuka::scene::cook::CookToModelResult cooked =
             nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
+
+        // T1 (unified-actuator wire): route the declared control mode onto the
+        // cooked Model's drive_mode, which the Pipeline copies into the ApplyDrives
+        // op params (pipeline.cpp: p_apply_drives_.mode = model.drive_mode).
+        // PDPosition -> 0 (position-PD kernel), Torque -> 1 (direct-torque kernel).
+        // CookToModel defaults drive_mode to 0, so for PDPosition this assignment is
+        // a no-op (the op graph + every drive byte is unchanged => the PD goldens
+        // stay byte-identical). For Torque it flips the ApplyDrives op to the torque
+        // preset that already lives in OpApplyDrives.
+        cooked.model.drive_mode =
+            (control_mode == nuka::runtime::articulation::ControlMode::Torque) ? 1u
+                                                                               : 0u;
 
         // Go2-on-stairs Phase 2a: apply the procedural-terrain cook config from the
         // desc AFTER cook + BEFORE nk::World construction (Pipeline::Build reads
