@@ -131,10 +131,15 @@ class Go2LocomotionEnv(NukaGymEnv):
                 ema_beta=float(tcfg.get("ema_beta", 0.99)),
                 type_distribution=type_dist,
                 # SCALE-INDEPENDENT promotion gates (replace the broken reward-
-                # threshold gate): survive most of the episode AND walk far enough.
+                # threshold gate): survive most of the episode AND actually WALK A
+                # LOT. The PRIMARY "walked a lot" signal is the cumulative PATH
+                # length (promote_path_m), which -- unlike NET displacement -- is
+                # FREE-ROAM robust (a wandering dog has small net disp but large
+                # path). NET displacement (promote_dist_m) is kept as a diagnostic.
                 max_episode_length=int(self.max_episode_length),
                 survive_frac=float(tcfg.get("survive_frac", 0.8)),
-                promote_dist_m=float(tcfg.get("promote_dist_m", 3.0)),
+                promote_path_m=float(tcfg.get("promote_path_m", 5.0)),
+                promote_dist_m=float(tcfg.get("promote_dist_m", 3.0)),  # diag only.
                 promote_thr=float(tcfg.get("promote_thr", 8.0)),  # diagnostic only.
             )
             self._ground_height = float(tcfg.get("ground_height", 0.0))
@@ -506,8 +511,14 @@ class Go2LocomotionEnv(NukaGymEnv):
             # Capture the LIVE base (x,y) this step. compute_reward runs BEFORE the
             # base step's autoreset clobbers the done envs' pose, so the value held
             # here at the done step IS the episode's TERMINAL position -- the
-            # displacement gate's end point (||terminal - start||).
+            # net-displacement diagnostic's end point (||terminal - start||).
             self._last_base_xy = b.base_pos()[:, :2].detach().clone()
+            # Accumulate this step's PATH increment (||base_xy - prev_xy||) into the
+            # cumulative path length -- the PRIMARY (free-roam-robust) promotion
+            # gate. Done here (pre-autoreset) so the terminal step's true motion is
+            # counted; the subsequent set_start_xy re-seeds prev_xy to the new spawn
+            # so the terminal->spawn teleport is NOT counted as path.
+            self._curriculum.accumulate_path(self._last_base_xy)
         return r
 
     # -- collision proxy: penalised links clipping the local terrain surface --

@@ -141,12 +141,18 @@ params:
       # (legged_gym terrain-level style) then raises difficulty toward 1.0 (=0.15 m)
       # as the policy improves: on reset an env is PROMOTED (difficulty += step;
       # once it tops out at 1.0, advanced to the next terrain TYPE) iff it SURVIVED
-      # most of the episode (ep_len >= survive_frac * max_episode_length) AND walked
-      # far enough (base XY displacement over the episode > promote_dist_m), and
-      # DEMOTED (difficulty -= step, toward flat) if it FELL (terminated). The OLD
-      # reward-threshold gate (promote_thr 8.0) NEVER fired -- the real reward scale
-      # is ~0.01-0.07, so every env stayed pinned at the easiest tier; promote_thr
-      # is retained only as a diagnostic and is no longer the gate.
+      # most of the episode (ep_len >= survive_frac * max_episode_length) AND
+      # actually WALKED A LOT -- the cumulative PATH length over the episode >
+      # promote_path_m -- and DEMOTED (difficulty -= step, toward flat) if it FELL
+      # (terminated). The gate uses PATH LENGTH, not NET displacement: the Go2
+      # trains under FREE-ROAM commands + a random spawn heading (随地走), so a
+      # walking dog WANDERS and its NET displacement from spawn is typically only
+      # ~1/3 of the distance it actually travelled (measured: net~2.7 m vs path
+      # ~6.6 m on a perfect flat walker). The OLD net-displacement gate
+      # (promote_dist_m 3.0) therefore NEVER fired even for a flawless walker, so
+      # the curriculum stayed pinned at flat forever (reward plateaued ~11 by epoch
+      # ~250, ep_len ~750-900 = flat mastery). promote_dist_m and the OLD
+      # reward-threshold gate (promote_thr 8.0) are retained as DIAGNOSTICS only.
       terrain:
         enable: false
         # Procedural-terrain cook geometry (the 5 create_from_scene terrain_*).
@@ -163,7 +169,14 @@ params:
                                  # to 1.0 (= 0.15 m steps). Warm-start a learned
                                  # policy by raising this (e.g. 0.3-0.5).
         survive_frac: 0.8        # PROMOTE gate: survive >= 0.8*max_episode_length.
-        promote_dist_m: 3.0      # PROMOTE gate: base XY displacement > 3 m / episode.
+        promote_path_m: 5.0      # PROMOTE gate (PRIMARY): cumulative PATH length
+                                 # walked over the episode > 5 m. Free-roam robust
+                                 # (a wandering dog's path >> its net displacement);
+                                 # this is the gate that actually fires. ~5 m over a
+                                 # 20 s episode = a sustained ~0.25 m/s walk.
+        promote_dist_m: 3.0      # DIAGNOSTIC only (the OLD net-displacement gate;
+                                 # logged, no longer enforced -- free-roam wandering
+                                 # makes net disp << path, so it rarely fired).
         demote_on_fall: true     # a terminated (fell) episode demotes the env.
         difficulty_step: 0.1     # promote/demote increment.
         ema_beta: 0.99           # reward-EMA smoothing (diagnostic only now).
