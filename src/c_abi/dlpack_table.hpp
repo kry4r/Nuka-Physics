@@ -118,17 +118,27 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     // -- field 19: per-slot owning global link index (uint32, 4 B). THE ONLY
     //    non-float32 field — dtype == 1. -------------------------------------
     {NUKA_FIELD_CONTACT_LINK,           kStrideU32,   kWireDtypeU32, nk::FieldId::ContactLink},
+    // -- field 20: Go2-on-stairs Phase 2a per-env terrain TYPE (uint32, 4 B). A
+    //    writable per-env Data field (the curriculum-control surface). ----------
+    {NUKA_FIELD_ENV_TERRAIN_TYPE,       kStrideU32,   kWireDtypeU32, nk::FieldId::EnvTerrainType},
+    // -- field 21: Go2-on-stairs Phase 2a per-env terrain DIFFICULTY scale (f32,
+    //    4 B, default 1.0). A writable per-env Data field. -----------------------
+    {NUKA_FIELD_ENV_TERRAIN_DIFFICULTY, kStrideF32,   kWireDtypeF32, nk::FieldId::EnvTerrainDifficulty},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
-// The table must cover exactly the 20 public fields (0..19), one row each, in
-// integer order. CONTACT_LINK == 19 is the highest public field; the count is
-// one past it. (Append-only: bump this together with a new trailing row.)
-static_assert(kDlpackFieldCount == 20u,
-              "dlpack_table must hold exactly the 20 public state fields");
+// The table must cover exactly the 22 public fields (0..21), one row each, in
+// integer order. ENV_TERRAIN_DIFFICULTY == 21 is the highest public field; the
+// count is one past it. (Append-only: bump this together with a new trailing row.)
+// Fields 0..19 are byte-pinned by the RL contract; fields 20/21 are the Go2-on-
+// stairs Phase-2a additive per-env terrain controls (appended, never reordered).
+static_assert(kDlpackFieldCount == 22u,
+              "dlpack_table must hold exactly the 22 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
+              "public field enum range changed — review the RL binary contract");
+static_assert(static_cast<int>(NUKA_FIELD_ENV_TERRAIN_DIFFICULTY) == 21,
               "public field enum range changed — review the RL binary contract");
 
 // Resolve a public field's canonical descriptor. Returns nullptr if the field

@@ -70,6 +70,31 @@ NK_TERRAIN_HD inline TerrainParams DefaultTerrainParams() {
     return TerrainParams{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 }
 
+// ---------------------------------------------------------------------------
+// ScaleTerrainDifficulty: scale a TerrainParams by a per-env curriculum
+// DIFFICULTY factor (Go2-on-stairs demo, Phase 2a). The SINGLE source of truth
+// for the difficulty scaling, called by BOTH the PHYSICS foot-contact kernel
+// (contacts_foot.cu) AND the future RENDER tessellator -- so the rendered ground
+// mesh can never disagree with the surface the feet rest on (the #1 drift risk,
+// mirroring why SampleTerrainHeight itself is shared).
+//
+// SEMANTICS: difficulty scales only the VERTICAL feature magnitude --
+// step_height (PyramidStairs / InvertedPyramid rise per ring) and grid_height_max
+// (RandomBoxes max per-cell rise). The HORIZONTAL geometry (step_width,
+// platform_width, grid_width) and ground_height are LEFT UNCHANGED so a curriculum
+// raises/lowers the same step/box layout in place (the legged_gym terrain-level
+// convention: higher level == taller steps over the SAME footprint). diff == 1.0
+// returns the params unchanged; diff == 0.0 collapses the terrain to a flat plane
+// at ground_height (every step/box rise becomes zero -> SampleTerrainHeight
+// returns ground_height for every column).
+// ---------------------------------------------------------------------------
+NK_TERRAIN_HD inline TerrainParams ScaleTerrainDifficulty(TerrainParams p,
+                                                          float diff) {
+    p.step_height     *= diff;  // vertical rise per step ring.
+    p.grid_height_max *= diff;  // max per-cell random rise (RandomBoxes).
+    return p;                   // horizontal geometry + ground_height unchanged.
+}
+
 namespace detail {
 
 NK_TERRAIN_HD inline float AbsF(float v) { return v < 0.0f ? -v : v; }

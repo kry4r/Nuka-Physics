@@ -190,6 +190,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 64, 1, 256, 0},  // obs_buffer
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_type
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_difficulty
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

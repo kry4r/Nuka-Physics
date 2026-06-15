@@ -89,6 +89,24 @@ typedef struct nuka_world_desc_t {
     // a PD/Torque/etc world is unaffected). An index >= the articulation's link
     // count makes the Osc drive a no-op (tau left unchanged).
     uint32_t osc_task_link;
+    // Go2-on-stairs Phase 2a: procedural-terrain cook config (the shared
+    // nuka::terrain::TerrainParams, minus ground_height which stays the model's).
+    // These 5 floats are MODEL-LEVEL (one set for the whole world, NOT per env);
+    // the per-env terrain TYPE + DIFFICULTY are written through
+    // NUKA_FIELD_ENV_TERRAIN_TYPE / NUKA_FIELD_ENV_TERRAIN_DIFFICULTY. They are
+    // applied AFTER cook + BEFORE the nk::World is constructed (the Pipeline reads
+    // model.terrain at construct time). A zero-initialized desc leaves ALL FIVE at
+    // 0.0 => the cook's flat terrain (SampleTerrainHeight returns ground_height for
+    // every env regardless of type) => BYTE-IDENTICAL to a world created without
+    // terrain (the D1 default). A caller that wants stairs sets terrain_step_height
+    // / terrain_step_width / terrain_platform_width (PyramidStairs/InvertedPyramid)
+    // or terrain_grid_width / terrain_grid_height_max (RandomBoxes), then writes a
+    // non-zero terrain TYPE per env. See nuka::terrain::TerrainParams for the units.
+    float terrain_step_height;      // vertical rise per step ring.
+    float terrain_step_width;       // horizontal width of each step ring.
+    float terrain_platform_width;   // full edge length of the central top platform.
+    float terrain_grid_width;       // cell edge length (RandomBoxes).
+    float terrain_grid_height_max;  // max per-cell random rise (RandomBoxes).
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -351,7 +369,37 @@ typedef enum nuka_state_field_t {
     // field with a non-float32 dtype. INACTIVE slots carry ~0u (0xFFFFFFFF, the
     // invalid-link sentinel). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env
     // path.
-    NUKA_FIELD_CONTACT_LINK = 19
+    NUKA_FIELD_CONTACT_LINK = 19,
+    // WRITE (per-env). Go2-on-stairs Phase 2a: per-env procedural-terrain TYPE
+    // code (nuka::terrain::TerrainType: 0 = Flat (default seed), 1 = PyramidStairs,
+    // 2 = InvertedPyramid, 3 = RandomBoxes). Aliases the engine's persistent
+    // env_terrain_type Data field (zero-copy). The FusedFoot foot-contact kernel
+    // samples the shared procedural heightfield h(x,y) per env instead of the
+    // scalar ground plane; type 0 (the default seed) reproduces the flat plane at
+    // model.ground_height (byte-identical to the legacy path). The horizontal/
+    // vertical TerrainParams (step_height etc.) are set ONCE at world create via
+    // nuka_world_desc_t.terrain_* (model-level cook config, NOT per env).
+    //
+    // LAYOUT: 1 uint32 per env, env-major. element_count == env_count,
+    // element_stride_bytes == sizeof(uint32_t). dtype == 1 (UINT32). A write is
+    // picked up by the NEXT Step (the curriculum-control surface). Persistent =>
+    // round-trips reset.
+    NUKA_FIELD_ENV_TERRAIN_TYPE = 20,
+    // WRITE (per-env). Go2-on-stairs Phase 2a: per-env procedural-terrain
+    // DIFFICULTY scale (f32, default seed 1.0 == unscaled). Aliases the engine's
+    // persistent env_terrain_difficulty Data field (zero-copy). The foot-contact
+    // kernel multiplies the terrain's VERTICAL feature magnitude (step_height +
+    // grid_height_max) by this scale before sampling the heightfield, so a
+    // curriculum can raise/lower the SAME step/box footprint per env (legged_gym
+    // terrain-level convention). diff == 1.0 leaves the terrain unscaled; 0.0
+    // collapses it to a flat plane at ground_height. Ignored by type-0 (Flat) envs
+    // (SampleTerrainHeight returns ground_height regardless), so the default seed
+    // is byte-identical to the legacy flat path.
+    //
+    // LAYOUT: 1 float per env, env-major. element_count == env_count,
+    // element_stride_bytes == sizeof(float). dtype == 0 (FLOAT32). A write is
+    // picked up by the NEXT Step. Persistent => round-trips reset.
+    NUKA_FIELD_ENV_TERRAIN_DIFFICULTY = 21
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

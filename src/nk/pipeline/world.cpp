@@ -140,6 +140,25 @@ bool World::SeedInitialState() {
         }
     }
 
+    // -- Go2-on-stairs Phase 2a: the per-env procedural-terrain DIFFICULTY scale.
+    // Seeded 1.0 (the unscaled terrain) for EVERY env. The FusedFoot detection
+    // kernel multiplies the terrain step_height + grid_height_max by this scale
+    // (nuka::terrain::ScaleTerrainDifficulty) BEFORE sampling, so a curriculum can
+    // vary feature height per env. The DEFAULT (1.0) keeps the unscaled terrain,
+    // and for the type-0 (Flat) seed SampleTerrainHeight ignores step/grid so the
+    // multiply is computed-but-unused => byte-identical to the legacy flat path
+    // (D1). A training harness sets it post-construction via
+    // World::GetData().UploadField(FieldId::EnvTerrainDifficulty, ...). Persistent
+    // so it round-trips Reset (the construction-time snapshot).
+    {
+        std::vector<float> terrain_difficulty(E, 1.0f);  // 1.0 == unscaled
+        if (!data_.UploadField(FieldId::EnvTerrainDifficulty,
+                               terrain_difficulty.data(),
+                               terrain_difficulty.size() * sizeof(float))) {
+            return false;
+        }
+    }
+
     // -- M6: particle (XPBD soft / PBF fluid) initial state seeding (env-major
     // replication of the single-env template). particle_prev_pos is seeded == pos
     // (the legacy soft-upload "prev seeded = p" / fluid-upload "predicted
