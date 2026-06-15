@@ -99,12 +99,17 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     // -- field 11: authoritative per-env floating-base root world pose
     //    (Transform, quat W-FIRST, 28 B; ONE per env, NOT per link). ----------
     {NUKA_FIELD_BASE_POSE,              kStridePose,  kWireDtypeF32, nk::FieldId::BasePose},
-    // -- fields 12/13/14/15: control-input params buffers. These are NOT Arena
-    //    Data fields — they are params-carried raw device buffers the batched
-    //    step reads by control_mode, with NO fields.yaml ordinal (this is what
-    //    keeps the diffsim tape/checkpoint protection — see the recon note).
-    //    field_id == kNoFieldId; their data source stays params-carried in T5.
-    {NUKA_FIELD_TORQUE_INPUT,           kStrideF32,   kWireDtypeF32, kNoFieldId},
+    // -- field 12: TORQUE_INPUT. The Torque control mode (drive_mode==1) reads the
+    //    per-link torque command from the SAME persistent Data field as the PD
+    //    target (DriveTarget): OpApplyDrives's ApplyTorqueDriveKernel consumes
+    //    data.drive_target as the torque (articulation.cu ApplyTorqueDriveKernel +
+    //    OpApplyDrives mode==1). So in the unified actuator (T1) TORQUE_INPUT
+    //    ALIASES DriveTarget -- the public field is the SAME device buffer as
+    //    DRIVE_TARGET, reinterpreted by the active preset (this is "禁止特化":
+    //    ONE control buffer `u`, the preset decides its meaning). Byte-identical
+    //    storage; the alias is only the wire name. The other three control-input
+    //    fields (13/14/15) stay kNoFieldId until their presets are wired.
+    {NUKA_FIELD_TORQUE_INPUT,           kStrideF32,   kWireDtypeF32, nk::FieldId::DriveTarget},
     {NUKA_FIELD_VELOCITY_TARGET,        kStrideF32,   kWireDtypeF32, kNoFieldId},
     {NUKA_FIELD_ACTUATOR_NOLOAD_SPEED,  kStrideF32,   kWireDtypeF32, kNoFieldId},
     // TASK_TARGET is per-ENV float3 {x,y,z} (stride 12), NOT per-link f32.

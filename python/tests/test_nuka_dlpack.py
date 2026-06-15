@@ -66,16 +66,69 @@ def test_world_metadata(device):
         assert w.dt > 0.0
 
 
-# M10 NAMED GAP (M9 T5 unified-world cutover): non-PD control modes (Torque /
-# Velocity / ComputedTorque / Osc / Actuator) + their TORQUE_INPUT/VELOCITY_TARGET/
-# ACTUATOR_NOLOAD_SPEED/TASK_TARGET control buffers were served by the deleted
-# legacy batched world's owned param buffers. The generic nk::World wires only the
-# PDPosition drive in M9; non-PD control is RL-adjacent (recon ruling #3: ALL RL
-# deferred to M10) and is rebuilt on the nk world at M10. create_from_scene now
-# returns NOT_SUPPORTED for these modes (it does NOT silently mis-actuate), so the
-# binding smokes below are skipped until M10 re-lights the non-PD laws.
-@pytest.mark.skip(reason="M10 named gap: non-PD control modes deferred to M10 "
-                         "(M9 unified-world wires PDPosition only)")
+# T1 (unified actuator): the Torque control mode is wired onto the ONE generic
+# nk::World. control_mode=Torque routes to model.drive_mode==1, selecting the
+# direct-torque preset of OpApplyDrives (tau = clamp(u, +/-force_limit)). The
+# control input `u` is the TORQUE_INPUT field, which ALIASES DriveTarget (the same
+# persistent device buffer, preset-reinterpreted -- "禁止特化": one ctrl buffer).
+# This smoke proves: (a) the world constructs in Torque mode; (b) TORQUE_INPUT is a
+# writable, correctly-shaped, zero-copy view that aliases the DRIVE_TARGET buffer;
+# (c) the world steps finite; (d) a non-zero torque on one joint moves that joint's
+# own velocity sign-correct (it actually reaches the solver as a torque).
+def test_torque_mode_world_steps(device):
+    with nuka.World.create_from_scene(
+        device, SCENE, 64, control_mode=nuka.CONTROL_MODE_TORQUE
+    ) as w:
+        # The torque control buffer is writable + correctly shaped (env x links).
+        view = torch.from_dlpack(w.buffer_view(nuka.TORQUE_INPUT))
+        assert view.is_cuda
+        assert view.numel() == w.env_count * w.base_link_count
+        # The alias: TORQUE_INPUT is the SAME device buffer as DRIVE_TARGET.
+        assert w.buffer_device_ptr(nuka.TORQUE_INPUT) == \
+            w.buffer_device_ptr(nuka.DRIVE_TARGET), \
+            "TORQUE_INPUT must alias the DRIVE_TARGET device buffer"
+        view.zero_()  # writable in place.
+        w.step()  # the torque preset must step without throwing.
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        assert torch.isfinite(q).all()
+
+
+def test_torque_mode_drives_joint_sign_correct(device):
+    # A positive torque on one actuated joint must increase that joint's own
+    # velocity after a step; a negative torque must decrease it (the torque reached
+    # the solver with the right sign). N=64; we read env0, the perturbed joint only.
+    GO2_TORQUE = 5.0  # well inside the cooked force limit; enough to move qd in 1 dt.
+
+    def _own_qd(slot, tau):
+        with nuka.World.create_from_scene(
+            device, SCENE, 64, control_mode=nuka.CONTROL_MODE_TORQUE
+        ) as w:
+            tq = torch.from_dlpack(w.buffer_view(nuka.TORQUE_INPUT))
+            qd = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
+            tq.zero_()
+            if tau != 0.0:
+                tq[0, slot] = tau
+            w.step()
+            nuka.sync()
+            return float(qd[0, slot].item())
+
+    bad = []
+    for slot in range(1, GO2_BLC):  # actuated joints 1..12
+        base = _own_qd(slot, 0.0)
+        d_pos = _own_qd(slot, +GO2_TORQUE) - base
+        d_neg = _own_qd(slot, -GO2_TORQUE) - base
+        if not (d_pos > 0 and d_neg < 0):
+            bad.append((slot, d_pos, d_neg))
+    assert not bad, f"torque wrong-sign joints (slot, d+, d-): {bad}"
+
+
+# NOT YET WIRED on the unified nk::World: the ComputedTorque / Actuator / Osc
+# presets have no op kernel on nk::World yet (T1 lights PDPosition + Torque only).
+# create_from_scene returns NOT_SUPPORTED for these, so their binding smokes stay
+# skipped until those presets are wired.
+@pytest.mark.skip(reason="ComputedTorque/Actuator presets not yet wired on the "
+                         "unified nk::World (T1 wires PDPosition + Torque)")
 @pytest.mark.parametrize(
     "mode, field",
     [
