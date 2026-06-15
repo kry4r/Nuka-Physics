@@ -446,3 +446,19 @@ fields:
   # =========================================================================
   - {name: env_status,   dtype: u32, per: env, arena: scratch, owner: data, flags: [readout]}
   - {name: obs_buffer,   dtype: f32, per: env, arena: scratch, owner: data, flags: [readout], elem: 64}
+
+  # =========================================================================
+  # PROCEDURAL TERRAIN (Go2-on-stairs demo, Phase 1) — DATA. Per-env terrain
+  # TYPE code (nuka::terrain::TerrainType: 0=Flat .. 3=RandomBoxes). The
+  # FusedFoot DetectFootGroundContacts kernel samples the SHARED procedural
+  # heightfield h(x,y) (src/sensor/terrain/terrain_field.hpp) instead of the
+  # scalar ground plane; type 0 (the DEFAULT seed) makes SampleTerrainHeight
+  # return exactly ground_height, so the contact path is byte-identical to the
+  # legacy scalar plane (the D1 guarantee). The TerrainParams (step_height etc.)
+  # ride the NarrowphasePrimitives op params (model-level cook config), NOT a
+  # device field. Persistent + owner:data so it round-trips Reset (snapshot) and
+  # a caller/training harness can SET it post-cook via
+  # World::GetData().UploadField(FieldId::EnvTerrainType, ...). Default 0 (flat)
+  # is seeded by World::SeedInitialState (mirrors the table_enabled seed).
+  # =========================================================================
+  - {name: env_terrain_type, dtype: u32, per: env, arena: persistent, owner: data}

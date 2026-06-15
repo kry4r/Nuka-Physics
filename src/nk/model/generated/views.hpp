@@ -183,6 +183,7 @@ struct DataView {
     uint64_t* rng_state = nullptr;  // per:env arena:persistent owner:data flags:[param]
     uint32_t* env_status = nullptr;  // per:env arena:scratch owner:data flags:[readout]
     float* obs_buffer = nullptr;  // per:env arena:scratch owner:data elem:64 flags:[readout]
+    uint32_t* env_terrain_type = nullptr;  // per:env arena:persistent owner:data
 };
 
 } // namespace nuka::phi

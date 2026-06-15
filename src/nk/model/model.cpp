@@ -666,6 +666,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.ground_height = src.ground_height;
     dst.friction_coefficient = src.friction_coefficient;
     dst.baumgarte_max_velocity = src.baumgarte_max_velocity;
+    dst.terrain = src.terrain;  // Go2-on-stairs Phase 1 procedural-terrain params.
     dst.filter_cross_env = src.filter_cross_env;
     dst.contact_family = src.contact_family;
     dst.drive_mode = src.drive_mode;

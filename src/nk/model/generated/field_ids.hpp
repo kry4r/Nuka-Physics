@@ -159,6 +159,7 @@ enum class FieldId : uint16_t {
     RngState,  // rng_state (per:env arena:persistent owner:data flags:[param])
     EnvStatus,  // env_status (per:env arena:scratch owner:data flags:[readout])
     ObsBuffer,  // obs_buffer (per:env arena:scratch owner:data elem:64 flags:[readout])
+    EnvTerrainType,  // env_terrain_type (per:env arena:persistent owner:data)
     Count
 };
 

@@ -22,6 +22,8 @@
 #include "phi/backend_cuda/ops/prims_types.cuh"   // M5: pair-driven dispatch
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"  // M4: union-family dispatch
+#include "phi/op_schema.hpp"                      // NarrowphasePrimitivesParams
+#include "sensor/terrain/terrain_field.hpp"       // Go2-on-stairs: terrain h(x,y)
 
 namespace nuka::phi {
 
@@ -78,6 +80,8 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
                                                uint32_t env_count,
                                                uint32_t base_link_count,
                                                float ground_height,
+                                               const uint32_t* env_terrain_type,
+                                               ::nuka::terrain::TerrainParams terrain,
                                                uint32_t* out_contact_link,
                                                math::Vec3* out_contact_point,
                                                math::Vec3* out_contact_normal,
@@ -88,6 +92,15 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
         return;
     }
 
+    // Go2-on-stairs Phase 1: per-env procedural terrain TYPE. env_terrain_type
+    // is seeded 0 (Flat) for every env at construction, so the default contact
+    // path is byte-identical to the legacy scalar plane (SampleTerrainHeight
+    // returns terrain.ground_height == ground_height when type == 0). A null
+    // pointer (defensive) also falls back to the flat plane.
+    const uint32_t terrain_type =
+        (env_terrain_type != nullptr) ? env_terrain_type[env]
+                                      : ::nuka::terrain::kTerrainFlat;
+
     const uint32_t base_slot = env * kMaxFootContactsPerEnv;
     uint32_t count = 0u;
     for (uint32_t foot = 0u; foot < foot_count; ++foot) {
@@ -97,12 +110,19 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
         // Foot sphere center in world = calf_world o local_offset.
         const math::Vec3 center =
             AddVec(calf.position, RotateByQuat(calf.rotation, shape.local_offset));
-        const float depth = (ground_height + shape.radius) - center.z;
+        // Procedural-terrain support height at the foot's (x,y) column. For the
+        // default Flat type this returns EXACTLY terrain.ground_height (==
+        // ground_height), so depth == (ground_height + radius) - center.z — the
+        // byte-identical legacy expression. Normal stays {0,0,1} (heightfield
+        // vertical-support model; gradient normals are a v1 non-goal).
+        const float surface = ::nuka::terrain::SampleTerrainHeight(
+            terrain_type, center.x, center.y, terrain);
+        const float depth = (surface + shape.radius) - center.z;
         if (depth > 0.0f) {
             const uint32_t slot = base_slot + count;
             out_contact_link[slot] = link;
-            // Contact point: foot center projected onto the ground surface.
-            out_contact_point[slot] = {center.x, center.y, ground_height};
+            // Contact point: foot center projected onto the local terrain surface.
+            out_contact_point[slot] = {center.x, center.y, surface};
             out_contact_normal[slot] = {0.0f, 0.0f, 1.0f};
             out_contact_depth[slot] = depth;
             ++count;
@@ -195,6 +215,7 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(data.link_pose),
                reinterpret_cast<const FootShape*>(model.foot_shape),
                p->foot_count, p->env_count, p->base_link_count, p->ground_height,
+               static_cast<const uint32_t*>(data.env_terrain_type), p->terrain,
                data.contact_link, data.contact_point, data.contact_normal,
                data.contact_depth, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
