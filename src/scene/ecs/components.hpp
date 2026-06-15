@@ -73,6 +73,19 @@ struct RenderMaterial {
 struct VisualMeshComponent {
     AssetRef mesh;
     uint32_t render_material_id = ~uint32_t(0);
+
+    // M10: PRIMITIVE visual fallback. When `mesh` is empty but the source geom is a
+    // box/sphere/capsule/plane VISUAL primitive (e.g. the Robocasa kitchen
+    // counters / walls / floor, which are primitive geoms with no MESH asset), the
+    // SceneIR records its shape here so render_world.cpp tessellates it instead of
+    // skipping -- the skip left primitive-heavy scenes invisible except for their
+    // few mesh appliances. kind None => a mesh-backed (or non-renderable) visual,
+    // unchanged. params layout mirrors CollisionShapeComponent: sphere(r) /
+    // capsule(r,half_height) / box|plane(hx,hy,hz). PROJECTED from records (never
+    // serialized), so .nks/.nka roundtrip + cook goldens are unaffected.
+    enum class PrimKind : uint8_t { None = 0, Sphere, Capsule, Box, Plane };
+    PrimKind prim_kind = PrimKind::None;
+    float    prim_params[4]{0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct CollisionShapeComponent {
