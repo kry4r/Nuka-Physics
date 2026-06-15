@@ -2535,6 +2535,36 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # M10 -- scene_still: render ONE offscreen still of any .nks (kitchen-scene
+    # verification + the H1-kitchen-grasp layout/look STILL the owner approves
+    # BEFORE the RL effort). Load(.nks) -> CookToModel (host-only SceneMap) ->
+    # BuildRenderWorld -> rasterise one frame (grounded studio look). Same link
+    # set as the video exes so the cook symbols resolve.
+    add_executable(nuka_scene_still
+        ${CMAKE_SOURCE_DIR}/examples/demo/scene_still.cpp
+    )
+    add_dependencies(nuka_scene_still nuka_codegen)
+    target_compile_definitions(nuka_scene_still
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_scene_still
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_scene_still
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
     # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
     # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb

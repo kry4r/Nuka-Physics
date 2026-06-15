@@ -392,10 +392,38 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     registry.ForEach<scene::VisualMeshComponent>(
         [&](scene::EntityId e, const scene::VisualMeshComponent& vis) {
             if (vis.mesh.Empty() || vis.mesh.fourcc != scene::NkaTagMesh()) {
-                // No bound MESH geometry: rather than emit a placeholder box that
-                // occludes the real geometry, skip this visual node entirely. Its
-                // appearance is asset-gated; a missing ref renders nothing, not a
-                // misleading cube.
+                // No bound MESH geometry. M10: if the source geom was a renderable
+                // VISUAL PRIMITIVE (box/sphere/capsule/plane -- the kitchen counters/
+                // walls/floor), tessellate it from its recorded params so primitive-
+                // heavy scenes are visible. This is INDEPENDENT of the collision
+                // proxy gate below (we deliberately do NOT bump loaded_visual_meshes,
+                // so a pure-collision scene keeps its collision render unchanged).
+                using PK = scene::VisualMeshComponent::PrimKind;
+                if (vis.prim_kind == PK::None) {
+                    // Still asset-gated / non-renderable: skip (no misleading cube).
+                    return;
+                }
+                uint32_t prim_mesh_id;
+                const float p0 = vis.prim_params[0], p1 = vis.prim_params[1],
+                            p2 = vis.prim_params[2];
+                switch (vis.prim_kind) {
+                    case PK::Box:
+                    case PK::Plane:
+                        prim_mesh_id = world.meshes.InternPrimitive(
+                            PrimKey("vbox", p0, p1, p2), [&]() { return MakeBox(p0, p1, p2); });
+                        break;
+                    case PK::Sphere:
+                        prim_mesh_id = world.meshes.InternPrimitive(
+                            PrimKey("vsphere", p0, 0, 0), [&]() { return MakeSphere(p0); });
+                        break;
+                    case PK::Capsule:
+                        prim_mesh_id = world.meshes.InternPrimitive(
+                            PrimKey("vcapsule", p0, p1, 0), [&]() { return MakeCapsule(p0, p1); });
+                        break;
+                    default:
+                        return;
+                }
+                build_common(e, prim_mesh_id, resolve_material(vis.render_material_id));
                 return;
             }
             std::shared_ptr<scene::NkaFile> file = open_nka(vis.mesh.nka_path);

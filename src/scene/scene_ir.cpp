@@ -643,6 +643,21 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
         vis.render_material_id = render_id;
         if (!rec.visual_mesh_ref.empty()) {
             vis.mesh = ParseAssetRef(rec.visual_mesh_ref);
+        } else {
+            // No MESH asset: record the PRIMITIVE so render_world can tessellate it
+            // (the kitchen counters/walls/floor are box/cylinder VISUAL geoms with
+            // no mesh). cylinder is imported as Capsule; hull/trimesh have no inline
+            // params and stay None (their triangles come from a later .nka pass).
+            switch (rec.type) {
+                case ShapeType::Box:     vis.prim_kind = VisualMeshComponent::PrimKind::Box;     break;
+                case ShapeType::Plane:   vis.prim_kind = VisualMeshComponent::PrimKind::Plane;   break;
+                case ShapeType::Sphere:  vis.prim_kind = VisualMeshComponent::PrimKind::Sphere;  break;
+                case ShapeType::Capsule: vis.prim_kind = VisualMeshComponent::PrimKind::Capsule; break;
+                default:                 vis.prim_kind = VisualMeshComponent::PrimKind::None;    break;
+            }
+            if (vis.prim_kind != VisualMeshComponent::PrimKind::None) {
+                FillShapeParams(rec, vis.prim_params);
+            }
         }
         ecs_.Add(entity, std::move(vis));
     } else {
