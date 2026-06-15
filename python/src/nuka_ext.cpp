@@ -1235,4 +1235,68 @@ NB_MODULE(_nuka_ext, m) {
                                      std::to_string(rc) + ")");
         }
     }, "Block until all queued CUDA work completes (test/debug helper).");
+
+    // -----------------------------------------------------------------------
+    // Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y)
+    // terrain height sampler (nuka_terrain_sample_height_batch). PURE HOST free
+    // function -- the C-ABI projection of the SINGLE source of truth
+    // nuka::terrain::SampleTerrainHeight + ScaleTerrainDifficulty. The RL
+    // spawn-on-terrain reset calls this so a RANDOM (x,y) spawn reads the EXACT
+    // heightfield the foot kernel uses (no python center-only mirror drift for
+    // arbitrary columns). Accepts CPU-contiguous numpy/torch arrays for
+    // types(uint32)/xs/ys/difficulties(float32) (all length n) + the model-level
+    // scalar TerrainParams; returns a (n,) numpy float32 array of surface heights.
+    // -----------------------------------------------------------------------
+    m.def(
+        "terrain_sample_height_batch",
+        [](nb::ndarray<uint32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> types,
+           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> xs,
+           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> ys,
+           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> difficulties,
+           float ground_height, float step_height, float step_width,
+           float platform_width, float grid_width,
+           float grid_height_max) -> nb::object {
+            const size_t n = types.shape(0);
+            if (xs.shape(0) != n || ys.shape(0) != n ||
+                difficulties.shape(0) != n) {
+                throw std::runtime_error(
+                    "terrain_sample_height_batch: types/xs/ys/difficulties "
+                    "must all have the same length");
+            }
+            // Allocate the output and let an owning capsule free it after the
+            // returned numpy array is collected.
+            float* out = new float[n == 0 ? 1 : n];
+            nuka_result_t rc = nuka_terrain_sample_height_batch(
+                static_cast<uint32_t>(n), types.data(), xs.data(), ys.data(),
+                difficulties.data(), ground_height, step_height, step_width,
+                platform_width, grid_width, grid_height_max, out);
+            if (rc != NUKA_RESULT_OK) {
+                delete[] out;
+                throw std::runtime_error(
+                    std::string("terrain_sample_height_batch failed: ") +
+                    nuka_result_message(rc));
+            }
+            nb::capsule owner(out, [](void* p) noexcept {
+                delete[] static_cast<float*>(p);
+            });
+            size_t shape[1] = {n};
+            return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
+        },
+        nb::arg("types"), nb::arg("xs"), nb::arg("ys"), nb::arg("difficulties"),
+        nb::arg("ground_height"), nb::arg("step_height"), nb::arg("step_width"),
+        nb::arg("platform_width"), nb::arg("grid_width"),
+        nb::arg("grid_height_max"),
+        "Batched arbitrary-(x,y) procedural-terrain surface height. The C-ABI "
+        "projection of nuka::terrain::SampleTerrainHeight + "
+        "ScaleTerrainDifficulty (the SINGLE source of truth in "
+        "src/sensor/terrain/terrain_field.hpp). types: (n,) uint32 terrain type "
+        "code (0=Flat,1=PyramidStairs,2=InvertedPyramid,3=RandomBoxes); xs/ys: "
+        "(n,) float32 world columns (m); difficulties: (n,) float32 curriculum "
+        "difficulty (1.0=unscaled, 0.0=flat). ground_height/step_height/"
+        "step_width/platform_width/grid_width/grid_height_max: the model-level "
+        "TerrainParams scalars (the create-time terrain_* geometry). All array "
+        "args must be CPU-contiguous (numpy or a CPU torch tensor). Returns a "
+        "(n,) numpy float32 array of absolute surface z. Used by the Go2 "
+        "random-XY spawn reset so the spawn height matches the foot kernel's "
+        "heightfield exactly.");
 }

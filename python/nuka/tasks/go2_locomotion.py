@@ -130,6 +130,21 @@ class Go2LocomotionEnv(NukaGymEnv):
             self._ground_height = float(tcfg.get("ground_height", 0.0))
             self._terrain_step_height = float(tcfg.get("step_height", T.STEP_HEIGHT_MAX))
             self._terrain_grid_height_max = float(tcfg.get("grid_height_max", 0.15))
+            # FULL terrain geometry (the create-time TerrainParams) the BATCHED
+            # arbitrary-(x,y) sampler needs -- mirror the create_from_scene kwargs
+            # so the spawn height at a RANDOM column matches the foot kernel exactly.
+            self._terrain_step_width = float(tcfg.get("step_width", 0.3))
+            self._terrain_platform_width = float(tcfg.get("platform_width", 1.0))
+            self._terrain_grid_width = float(tcfg.get("grid_width", 0.45))
+            # RANDOM-XY SPAWN + FREE-ROAM (随地走) config. spawn_xy_range = the half-
+            # edge (m) of the square the per-reset (x,y) is sampled uniformly from,
+            # centered on the tile origin. Default 2.0 m keeps the dog inside the
+            # real stepped region (half_platform + kPyramidRings*step_width ~=
+            # 0.5 + 8*0.3 = 2.9 m), so it starts on different steps/rings/boxes.
+            # randomize_yaw randomizes the base HEADING so the same body-frame
+            # velocity command sends the dog in a random WORLD direction (free roam).
+            self._spawn_xy_range = float(tcfg.get("spawn_xy_range", 2.0))
+            self._randomize_yaw = bool(tcfg.get("randomize_yaw", True))
             # Zero-copy WRITABLE engine views (terrain type uint32 (N,1); difficulty
             # float32 (N,); base_pose float32 (N,7)).
             w = self._world
@@ -239,42 +254,95 @@ class Go2LocomotionEnv(NukaGymEnv):
                 self._curriculum.update_on_done(mask, self._last_terminated & mask)
             self._write_terrain_for_reset(mask)
 
-    # -- spawn-on-terrain: write per-env terrain + lift base z ----------------
+    # -- spawn-on-terrain: random (x,y) + yaw + lift base z to local surface --
     def _write_terrain_for_reset(self, mask) -> None:
         """Write ENV_TERRAIN_TYPE / ENV_TERRAIN_DIFFICULTY (the curriculum's
-        current per-env assignment) and set BASE_POSE.z = center_terrain_height +
-        NOMINAL_BASE_Z for the (masked, or all) reset envs.
+        current per-env assignment) and place the base at a RANDOM (x,y) within the
+        terrain tile, at a RANDOM heading, lifted to the LOCAL surface height +
+        NOMINAL_BASE_Z, for the (masked, or all) reset envs.
+
+        RANDOM-XY SPAWN + FREE-ROAM (随地走). Per reset env we sample (x,y)
+        uniformly in [-spawn_xy_range, +spawn_xy_range]^2 around the tile origin and
+        (when randomize_yaw) a heading yaw in [-pi, pi]. The LOCAL surface height at
+        each sampled column comes from the BATCHED C-ABI sampler
+        ``nuka.terrain_sample_height_batch`` -- the host-side projection of the
+        SINGLE source of truth ``SampleTerrainHeight`` (+ difficulty scale), so the
+        spawn z is read from the EXACT heightfield the foot-contact kernel rests the
+        feet on (no python center-only mirror drift for arbitrary columns). This
+        lifts the base ABOVE the local platform/pit/box step instead of inside it
+        (the Phase-2a "spawn inside a raised step -> Baumgarte launch to z~=18" bug),
+        AND, combined with the body-frame velocity command, sends the dog walking in
+        a random world direction from a random start = 随地走.
 
         Called from :meth:`_reset_joint_state` AFTER world.reset/reset_envs settled
         the buffers and BEFORE the obs is recomposed. The curriculum's promote/
-        demote for the done envs has already run this step (see :meth:`step` ->
-        _last_* + the curriculum update before super().step's autoreset path is
-        sufficient because difficulty/type were updated at the PRIOR done; here we
-        simply mirror the live curriculum state into the engine)."""
+        demote for the done envs has already run this step. ``terrain.center_height``
+        is kept only for reference/diagnostic now; the live reset uses the batched
+        arbitrary-(x,y) sampler."""
         cur = self._curriculum
-        # Center terrain surface height for EVERY env (cheap; vectorized).
-        center = T.center_height(
-            cur.terrain_type, cur.difficulty,
-            ground_height=self._ground_height,
-            step_height=self._terrain_step_height,
-            grid_height_max=self._terrain_grid_height_max,
+        gen = self._generator
+        dev = self._torch_device
+        n = self.num_envs
+
+        # Per-env random spawn column (x,y) in the configurable square + heading.
+        rng = self._spawn_xy_range
+        spawn_x = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
+        spawn_y = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
+        if self._randomize_yaw:
+            yaw = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * torch.pi
+        else:
+            yaw = torch.zeros(n, device=dev)
+
+        # LOCAL surface height at each sampled column via the SINGLE-source C-ABI
+        # sampler (host-side; (x,y,type,diff) -> z). The sampler takes CPU arrays;
+        # the per-reset cost is tiny (N control-plane samples) so the host round-trip
+        # is fine. Difficulty is the curriculum's live per-env scale.
+        types_cpu = cur.terrain_type.to(torch.int64).cpu().to(torch.uint32).contiguous()
+        xs_cpu = spawn_x.detach().cpu().to(torch.float32).contiguous()
+        ys_cpu = spawn_y.detach().cpu().to(torch.float32).contiguous()
+        diff_cpu = cur.difficulty.detach().cpu().to(torch.float32).contiguous()
+        surf = nuka.terrain_sample_height_batch(
+            types_cpu, xs_cpu, ys_cpu, diff_cpu,
+            self._ground_height, self._terrain_step_height,
+            self._terrain_step_width, self._terrain_platform_width,
+            self._terrain_grid_width, self._terrain_grid_height_max,
         )
-        base_z = center + NOMINAL_BASE_Z
+        base_z = torch.as_tensor(surf, device=dev, dtype=torch.float32) + NOMINAL_BASE_Z
+
+        # Yaw -> quaternion (w-first, rotation about world +Z): [cos(y/2),0,0,sin(y/2)].
+        half = yaw * 0.5
+        qw = torch.cos(half)
+        qz = torch.sin(half)
+
         if mask is None:
             self._tt_view[:, 0] = cur.terrain_type.to(self._tt_view.dtype)
             self._td_view[:] = cur.difficulty
+            self._bp_view[:, 0] = spawn_x
+            self._bp_view[:, 1] = spawn_y
             self._bp_view[:, 2] = base_z
+            # BASE_POSE quat is [qw,qx,qy,qz] at cols 3..6; a yaw rotation sets only
+            # qw (col 3) and qz (col 6), qx=qy=0 (upright heading).
+            self._bp_view[:, 3] = qw
+            self._bp_view[:, 4] = 0.0
+            self._bp_view[:, 5] = 0.0
+            self._bp_view[:, 6] = qz
         else:
             # NB torch has no masked index_put for UInt32, so write the ENV_TERRAIN
             # TYPE column via torch.where (the curriculum type is unchanged for
-            # non-done envs, so a full-column write is a no-op for them). DIFFICULTY
-            # and BASE_POSE.z are float32 -> masked assignment works and is scoped to
-            # the done envs (their LIVE mid-episode z must NOT be clobbered).
+            # non-done envs, so a full-column write is a no-op for them). The float
+            # BASE_POSE / DIFFICULTY writes are masked to the done envs so a non-done
+            # env's LIVE mid-episode pose is NOT clobbered.
             self._tt_view[:, 0] = torch.where(
                 mask, cur.terrain_type, self._tt_view[:, 0].to(torch.long)
             ).to(self._tt_view.dtype)
             self._td_view[mask] = cur.difficulty[mask]
+            self._bp_view[mask, 0] = spawn_x[mask]
+            self._bp_view[mask, 1] = spawn_y[mask]
             self._bp_view[mask, 2] = base_z[mask]
+            self._bp_view[mask, 3] = qw[mask]
+            self._bp_view[mask, 4] = 0.0
+            self._bp_view[mask, 5] = 0.0
+            self._bp_view[mask, 6] = qz[mask]
         nuka.sync()
 
     # -- command sampling (legged_gym _resample_commands, seeded) -----------

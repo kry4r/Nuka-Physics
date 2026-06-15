@@ -31,6 +31,7 @@
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
 #include "scene/scene_ir.hpp"
+#include "sensor/terrain/terrain_field.hpp"  // Go2-on-stairs batched height sampler
 
 #include <algorithm>
 #include <exception>
@@ -369,6 +370,54 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
         out[index].env_id = violation.env_id;
         out[index].value = violation.value;
         out[index].threshold = violation.threshold;
+    }
+    return NUKA_RESULT_OK;
+}
+
+// Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y) procedural
+// terrain height sampler -- the C-ABI projection of the SINGLE source of truth
+// nuka::terrain::SampleTerrainHeight (+ ScaleTerrainDifficulty) in
+// src/sensor/terrain/terrain_field.hpp. The RL spawn-on-terrain reset places the
+// Go2 base at a RANDOM (x,y) and reads its spawn height from the EXACT closed-form
+// heightfield the foot kernel rests feet on (no python full-sampler drift). PURE
+// HOST free function: includes only the host/device-portable terrain header (its
+// __host__/__device__ qualifiers gate on __CUDACC__ -> empty under g++, zero CUDA
+// tokens) -- no device, no world handle. NULL with n>0 => INVALID_ARG.
+nuka_result_t nuka_terrain_sample_height_batch(uint32_t n,
+                                               const uint32_t* types,
+                                               const float* xs,
+                                               const float* ys,
+                                               const float* difficulties,
+                                               float ground_height,
+                                               float step_height,
+                                               float step_width,
+                                               float platform_width,
+                                               float grid_width,
+                                               float grid_height_max,
+                                               float* out_heights) {
+    if (n == 0u) {
+        return NUKA_RESULT_OK;  // nothing to sample.
+    }
+    if (types == nullptr || xs == nullptr || ys == nullptr ||
+        difficulties == nullptr || out_heights == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    // MODEL-LEVEL TerrainParams (one geometry for the whole batch); difficulty is
+    // the per-element scale applied below.
+    nuka::terrain::TerrainParams base{};
+    base.ground_height   = ground_height;
+    base.step_height     = step_height;
+    base.step_width      = step_width;
+    base.platform_width  = platform_width;
+    base.grid_width      = grid_width;
+    base.grid_height_max = grid_height_max;
+    for (uint32_t i = 0u; i < n; ++i) {
+        // Per-env curriculum difficulty (scales vertical magnitude only), then
+        // sample the shared closed-form heightfield at this element's (x,y).
+        const nuka::terrain::TerrainParams scaled =
+            nuka::terrain::ScaleTerrainDifficulty(base, difficulties[i]);
+        out_heights[i] = nuka::terrain::SampleTerrainHeight(
+            types[i], xs[i], ys[i], scaled);
     }
     return NUKA_RESULT_OK;
 }

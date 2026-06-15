@@ -156,6 +156,17 @@ params:
         demote_on_fall: true     # a terminated (fell) episode demotes the env.
         difficulty_step: 0.1     # promote/demote increment.
         ema_beta: 0.99           # reward-EMA smoothing (diagnostic gate).
+        # RANDOM-XY SPAWN + FREE-ROAM (随地走). On every reset the base is placed at
+        # a RANDOM (x,y) in [-spawn_xy_range, +spawn_xy_range]^2 around the tile
+        # origin (so dogs start on different steps/rings/boxes) and -- when
+        # randomize_yaw -- at a RANDOM heading (so the body-frame velocity command
+        # sends each dog in a random WORLD direction = free roaming). The spawn
+        # height at the random column comes from the BATCHED C-ABI sampler
+        # (nuka.terrain_sample_height_batch = the C++ heightfield itself), so the
+        # base lands ON the local surface, never inside it.
+        spawn_xy_range: 2.0      # half-edge (m) of the spawn square; 2.0 keeps the
+                                 # dog inside the stepped region (~2.9 m radius).
+        randomize_yaw: true      # randomize base heading per reset (free roam).
         # Per-env START type weights {0:Flat,1:Stairs,2:Pit,3:Boxes}. Omit/empty
         # => deterministic round-robin over {stairs, pit, boxes} (all 3 trained).
         # type_distribution: {1: 1.0, 2: 1.0, 3: 1.0}

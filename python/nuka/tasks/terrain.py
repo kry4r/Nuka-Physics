@@ -40,11 +40,19 @@ MIRRORED CONSTANTS / FORMULAS (verbatim from terrain_field.hpp):
                                geometry unchanged). diff==1 -> unchanged;
                                diff==0 -> flat.
 
-NOTE (future enhancement): the Go2 always spawns at the tile CENTER (x,y~=0,0),
-which is sufficient for v1 -- a single closed-form center height per type. A
-random-XY spawn (legged_gym terrain_origins jitter) would need the FULL
-``SampleTerrainHeight`` (the ring index / per-cell hash for arbitrary x,y) ported
-here; that is explicitly deferred.
+RESOLVED (random-XY spawn + free-roam, 随地走): the Go2 now spawns at a RANDOM
+(x,y) within the terrain tile (legged_gym terrain_origins jitter), so the reset
+needs the FULL arbitrary-(x,y) surface height -- the ring index / per-cell hash
+for any column, not just the center. Rather than port that into torch here (and
+risk drift from the header), the FULL height is now served by the BATCHED C-ABI
+sampler ``nuka.terrain_sample_height_batch`` (src/c_abi/terrain.cpp), which calls
+the C++ header's ``SampleTerrainHeight`` + ``ScaleTerrainDifficulty`` DIRECTLY --
+so the header itself IS the single source for arbitrary columns and there is no
+parallel python full-sampler to drift. ``center_height`` below is kept only as a
+LEGACY / DIAGNOSTIC convenience (the center-column height per type); the live
+spawn-on-terrain reset uses the C-ABI sampler at the random column. The
+ANTI-DRIFT CONTRACT above still binds ``center_height`` to the header's center
+formula.
 """
 
 from __future__ import annotations
