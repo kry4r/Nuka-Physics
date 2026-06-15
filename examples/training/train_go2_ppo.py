@@ -159,6 +159,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--command", type=float, nargs=3, default=None,
                    metavar=("VX", "VY", "WYAW"),
                    help="Constant velocity command for all envs.")
+    p.add_argument("--gait-mode", dest="gait_mode",
+                   choices=("walk", "trot", "pronk", "bound"), default=None,
+                   help="Go2 gait reward mode (overrides env_config.gait_mode). "
+                        "walk=default flat walker; trot/pronk/bound re-weight the "
+                        "reward for flight gaits. Default None => keep the yaml.")
     p.add_argument("--experiment-name", dest="experiment_name", default=None)
     p.add_argument("--train-dir", dest="train_dir", default=None,
                    help="rl_games output root (config.train_dir). The run writes "
@@ -228,6 +233,8 @@ def _apply_overrides(params: dict, args: argparse.Namespace) -> dict:
         cfg["mini_epochs"] = args.mini_epochs
     if args.command is not None:
         cfg.setdefault("env_config", {})["command"] = list(args.command)
+    if args.gait_mode is not None:
+        cfg.setdefault("env_config", {})["gait_mode"] = args.gait_mode
     if args.experiment_name is not None:
         cfg["name"] = cfg["full_experiment_name"] = args.experiment_name
     if args.train_dir is not None:

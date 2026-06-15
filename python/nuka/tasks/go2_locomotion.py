@@ -72,6 +72,12 @@ CMD_RANGE_ANG_VEL_YAW = (-1.0, 1.0)
 RESAMPLING_TIME_S = 10.0
 CMD_ZERO_THRESHOLD = 0.2
 
+# Flight-gait LANDING GRACE (pronk/bound): terminate on the base-height floor only
+# after the floor has been breached for this many CONSECUTIVE control steps, so a
+# hard 1-step touchdown dip does not false-terminate. Active ONLY for non-walk
+# gait modes (walk is byte-identical to before -- the grace counter is never read).
+LANDING_GRACE_STEPS = 2
+
 
 class Go2LocomotionEnv(NukaGymEnv):
     """Go2 flat-ground velocity-tracking locomotion env (legged_gym reward).
@@ -84,7 +90,14 @@ class Go2LocomotionEnv(NukaGymEnv):
 
     def __init__(self, scene: str, num_envs: int, *,
                  fixed_command: bool = False, terrain: "dict | None" = None,
+                 gait_mode: str = "walk",
                  **kw) -> None:
+        # GAIT MODE (Go2 pronk/bound skill). Re-weights the reward dict only (see
+        # go2_rewards.GAIT_SCALE_OVERRIDES / GAIT_AIR_TIME_BIAS) -- no engine, obs or
+        # action change. ``walk`` (default) => byte-identical to the proven flat
+        # walker. Stored before super().__init__ (which does NOT take it) so it is
+        # available when the Go2Reward is constructed below.
+        self._gait_mode = str(gait_mode)
         # ----------------------------------------------------------------------
         # TERRAIN CURRICULUM (Go2-on-stairs Phase 2b). ``terrain`` is the yaml
         # ``config.env_config.terrain`` block (or None => terrain DISABLED, the
@@ -260,7 +273,24 @@ class Go2LocomotionEnv(NukaGymEnv):
                            n_term=0, n_trunc=0)
                       if os.environ.get("NUKA_GO2_DIAG") else None)
         # Ported legged_gym reward (owns last_dof_vel for dof_acc + feet_air_time).
-        self._reward = Go2Reward(self.num_envs, self._torch_device)
+        # gait_mode re-weights its scale dict (walk == byte-identical to before).
+        self._reward = Go2Reward(
+            self.num_envs, self._torch_device, gait_mode=self._gait_mode
+        )
+
+        # LANDING GRACE (flight gaits only). A hard pronk/bound touchdown can dip the
+        # base below termination_height for a SINGLE control step before the legs
+        # re-extend; the absolute height-kill would false-terminate at the first hop,
+        # starving the learning signal (risk #3). For gait_mode != 'walk' we require
+        # the height floor to be breached for >= LANDING_GRACE_STEPS CONSECUTIVE
+        # control steps before terminating on height (the tilt-kill is unchanged --
+        # a genuine flip still dies immediately). DEFAULT-OFF for walk: when
+        # gait_mode == 'walk' compute_terminated never consults this counter, so the
+        # flat reward/termination/curriculum/goldens are byte-identical.
+        self._landing_grace_on = (self._gait_mode != "walk")
+        self._below_floor_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self._torch_device
+        )
 
         # ----------------------------------------------------------------------
         # GAIT-CRITICAL term wiring (feet_air_time + collision). Both read engine
@@ -518,6 +548,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         self._reward.last_dof_vel.zero_()
         self._reward.feet_air_time.zero_()
         self._reward.last_contacts.zero_()
+        if self._landing_grace_on:
+            self._below_floor_steps.zero_()
         # Resample EVERY env's command on a full reset, then recompose the obs
         # command slot so the returned reset obs carries the new command.
         all_envs = torch.ones(
@@ -554,6 +586,9 @@ class Go2LocomotionEnv(NukaGymEnv):
             target_q_urdf=self._target_q_urdf,
             action=self.last_action,
             last_action=self._prev_action,
+            # base_lin_vel (body frame) drives the gait-mode vertical_oscillation
+            # term (v_z at lift-off). 0-weighted for walk/trot -> no effect there.
+            base_lin_vel=b.base_lin_vel(),
             foot_contact_fz=foot_contact_fz,
             collision_count=collision_count,
         )
@@ -689,20 +724,52 @@ class Go2LocomotionEnv(NukaGymEnv):
         terminated on contact (eval: Pit d>=0.5 ep_len~1, instant death) and the
         curriculum could never train descents. On FLAT (terrain_type 0 -> surface 0)
         this reduces EXACTLY to the absolute kill, so flat behaviour is preserved.
-        The tilt kill is unchanged."""
-        if self._curriculum is None or not self._terrain_on:
-            term = super().compute_terminated()
-            if self._curriculum is not None:
-                self._last_terminated = term
+        The tilt kill is unchanged.
+
+        LANDING GRACE (gait_mode != 'walk' only): the base-height breach (``fell``)
+        must persist for LANDING_GRACE_STEPS consecutive control steps before it
+        terminates, so a single-step hard-landing dip does not false-terminate a
+        pronk/bound (risk #3). The tilt-kill is NEVER graced. For gait_mode == 'walk'
+        this whole branch is skipped (``_landing_grace_on`` False) and the original
+        two paths below run UNCHANGED -- the flat termination is byte-identical."""
+        # WALK (and any non-flight default): the original byte-identical paths.
+        if not self._landing_grace_on:
+            if self._curriculum is None or not self._terrain_on:
+                term = super().compute_terminated()
+                if self._curriculum is not None:
+                    self._last_terminated = term
+                return term
+            base = self._obs.base_pos()                          # (N, 7) -> xyz
+            base_z = base[:, 2]
+            surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
+            fell = (base_z - surf) < self.termination_height
+            tipped = self._obs.tilt_deg() > self.termination_tilt_deg
+            term = fell | tipped
+            self._last_terminated = term
             return term
 
+        # FLIGHT GAIT (pronk/bound): same height/tilt predicates, but the height
+        # breach is debounced over LANDING_GRACE_STEPS consecutive steps.
         base = self._obs.base_pos()                              # (N, 7) -> xyz
         base_z = base[:, 2]
-        surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
-        fell = (base_z - surf) < self.termination_height
+        if self._curriculum is not None and self._terrain_on:
+            surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
+            below = (base_z - surf) < self.termination_height
+        else:
+            below = base_z < self.termination_height
         tipped = self._obs.tilt_deg() > self.termination_tilt_deg
+        # Advance the consecutive-below-floor counter (reset to 0 the moment the base
+        # recovers above the floor); terminate on height only once the counter has
+        # reached the grace window.
+        self._below_floor_steps = torch.where(
+            below,
+            self._below_floor_steps + 1,
+            torch.zeros_like(self._below_floor_steps),
+        )
+        fell = self._below_floor_steps >= LANDING_GRACE_STEPS
         term = fell | tipped
-        self._last_terminated = term
+        if self._curriculum is not None:
+            self._last_terminated = term
         return term
 
     def step(self, actions: torch.Tensor):
@@ -739,6 +806,10 @@ class Go2LocomotionEnv(NukaGymEnv):
             # terminal swing phase / contact history.
             self._reward.feet_air_time[done] = 0.0
             self._reward.last_contacts[done] = False
+            # Landing-grace counter: a fresh episode must not inherit the terminal
+            # below-floor streak (no-op for walk -- the counter is never read there).
+            if self._landing_grace_on:
+                self._below_floor_steps[done] = 0
 
         # Resample command for (periodic | done) envs; recompose the obs command
         # slot so the returned obs carries the fresh command for those envs.
