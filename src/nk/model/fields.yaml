@@ -462,3 +462,19 @@ fields:
   # is seeded by World::SeedInitialState (mirrors the table_enabled seed).
   # =========================================================================
   - {name: env_terrain_type, dtype: u32, per: env, arena: persistent, owner: data}
+  # =========================================================================
+  # PROCEDURAL TERRAIN (Go2-on-stairs demo, Phase 2a) — DATA. Per-env terrain
+  # DIFFICULTY scale (f32) for the locomotion curriculum: the FusedFoot
+  # DetectFootGroundContacts kernel multiplies the terrain step_height +
+  # grid_height_max by this env's difficulty (via the SHARED
+  # nuka::terrain::ScaleTerrainDifficulty helper, also used by the render
+  # tessellator so physics + render never drift) BEFORE sampling the heightfield.
+  # DEFAULT 1.0 (seeded by World::SeedInitialState) == the unscaled terrain. For
+  # the type-0 (Flat) default seed SampleTerrainHeight ignores step/grid entirely
+  # and returns ground_height, so the difficulty multiply is computed-but-unused
+  # and the flat contact path stays byte-identical to the legacy scalar plane
+  # (the D1 guarantee). A curriculum/training harness varies it per-env post-cook
+  # via World::GetData().UploadField(FieldId::EnvTerrainDifficulty, ...).
+  # Persistent + owner:data so it round-trips Reset (the construction snapshot).
+  # =========================================================================
+  - {name: env_terrain_difficulty, dtype: f32, per: env, arena: persistent, owner: data}

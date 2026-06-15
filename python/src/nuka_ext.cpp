@@ -127,7 +127,12 @@ public:
     static World* create_from_scene(Device* device, const std::string& scene_path,
                                     uint32_t env_count, float dt,
                                     uint32_t determinism, uint32_t control_mode,
-                                    uint32_t osc_task_link) {
+                                    uint32_t osc_task_link,
+                                    float terrain_step_height,
+                                    float terrain_step_width,
+                                    float terrain_platform_width,
+                                    float terrain_grid_width,
+                                    float terrain_grid_height_max) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -161,6 +166,16 @@ public:
         // v0.5 C-fwd slice 3: Osc task link (articulation-local). Read only in Osc
         // mode; ignored otherwise (zero-init default == root, a no-op task).
         desc.osc_task_link = osc_task_link;
+        // Go2-on-stairs Phase 2a: procedural-terrain cook config (model-level, NOT
+        // per env). All-zero default (the kwargs default to 0.0) == flat terrain ==
+        // byte-identical to a world created without terrain. The per-env terrain
+        // TYPE/DIFFICULTY are seeded (0 / 1.0) and written via
+        // buffer_view(Field.ENV_TERRAIN_TYPE / ENV_TERRAIN_DIFFICULTY).
+        desc.terrain_step_height = terrain_step_height;
+        desc.terrain_step_width = terrain_step_width;
+        desc.terrain_platform_width = terrain_platform_width;
+        desc.terrain_grid_width = terrain_grid_width;
+        desc.terrain_grid_height_max = terrain_grid_height_max;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -804,6 +819,14 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_NORMAL", NUKA_FIELD_CONTACT_NORMAL)
         .value("CONTACT_FORCE", NUKA_FIELD_CONTACT_FORCE)
         .value("CONTACT_LINK", NUKA_FIELD_CONTACT_LINK)
+        // Go2-on-stairs Phase 2a: per-env procedural-terrain controls (writable,
+        // one value per env). ENV_TERRAIN_TYPE (uint32, default seed 0=Flat):
+        // 0=Flat, 1=PyramidStairs, 2=InvertedPyramid, 3=RandomBoxes. buffer_view
+        // shape (env_count, 1), dtype uint32. ENV_TERRAIN_DIFFICULTY (float32,
+        // default seed 1.0): scales the terrain's vertical feature height per env
+        // for the locomotion curriculum; buffer_view shape (env_count,).
+        .value("ENV_TERRAIN_TYPE", NUKA_FIELD_ENV_TERRAIN_TYPE)
+        .value("ENV_TERRAIN_DIFFICULTY", NUKA_FIELD_ENV_TERRAIN_DIFFICULTY)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -829,6 +852,11 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("determinism") = uint32_t{0},
                     nb::arg("control_mode") = uint32_t{0},
                     nb::arg("osc_task_link") = uint32_t{0},
+                    nb::arg("terrain_step_height") = 0.0f,
+                    nb::arg("terrain_step_width") = 0.0f,
+                    nb::arg("terrain_platform_width") = 0.0f,
+                    nb::arg("terrain_grid_width") = 0.0f,
+                    nb::arg("terrain_grid_height_max") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
@@ -851,7 +879,16 @@ NB_MODULE(_nuka_ext, m) {
                     "Non-PD modes require env_count > 1. osc_task_link (default 0, "
                     "Osc only): the articulation-local link index of the task link; "
                     "for a fixed-base scene the root (0) is a no-op, so set a real "
-                    "end-effector (e.g. a foot/calf local link).")
+                    "end-effector (e.g. a foot/calf local link). "
+                    "terrain_* (Go2-on-stairs Phase 2a, all default 0.0 == flat): "
+                    "the procedural-terrain cook config (model-level, NOT per env). "
+                    "Set terrain_step_height/terrain_step_width/terrain_platform_width "
+                    "for PyramidStairs/InvertedPyramid or terrain_grid_width/"
+                    "terrain_grid_height_max for RandomBoxes, then write per-env "
+                    "Field.ENV_TERRAIN_TYPE (0=Flat,1=PyramidStairs,2=InvertedPyramid,"
+                    "3=RandomBoxes) and Field.ENV_TERRAIN_DIFFICULTY (default 1.0, "
+                    "scales the vertical feature height) via buffer_view. All-zero "
+                    "terrain == byte-identical to a world created without terrain.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")

@@ -81,6 +81,7 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
                                                uint32_t base_link_count,
                                                float ground_height,
                                                const uint32_t* env_terrain_type,
+                                               const float* env_terrain_difficulty,
                                                ::nuka::terrain::TerrainParams terrain,
                                                uint32_t* out_contact_link,
                                                math::Vec3* out_contact_point,
@@ -101,6 +102,19 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
         (env_terrain_type != nullptr) ? env_terrain_type[env]
                                       : ::nuka::terrain::kTerrainFlat;
 
+    // Go2-on-stairs Phase 2a: per-env terrain DIFFICULTY scale (curriculum). It
+    // scales the terrain's VERTICAL feature magnitude (step_height +
+    // grid_height_max) via the SHARED ScaleTerrainDifficulty helper (the same one
+    // the render tessellator uses, so the two never drift). DEFAULT 1.0 (seeded by
+    // World::SeedInitialState) leaves the terrain unscaled; a null pointer
+    // (defensive) also falls back to 1.0. For the type-0 (Flat) default the scale
+    // is computed but UNUSED -- SampleTerrainHeight returns ground_height
+    // regardless of step/grid -- so the flat contact path stays byte-identical (D1).
+    const float terrain_difficulty =
+        (env_terrain_difficulty != nullptr) ? env_terrain_difficulty[env] : 1.0f;
+    const ::nuka::terrain::TerrainParams env_terrain =
+        ::nuka::terrain::ScaleTerrainDifficulty(terrain, terrain_difficulty);
+
     const uint32_t base_slot = env * kMaxFootContactsPerEnv;
     uint32_t count = 0u;
     for (uint32_t foot = 0u; foot < foot_count; ++foot) {
@@ -116,7 +130,7 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
         // byte-identical legacy expression. Normal stays {0,0,1} (heightfield
         // vertical-support model; gradient normals are a v1 non-goal).
         const float surface = ::nuka::terrain::SampleTerrainHeight(
-            terrain_type, center.x, center.y, terrain);
+            terrain_type, center.x, center.y, env_terrain);
         const float depth = (surface + shape.radius) - center.z;
         if (depth > 0.0f) {
             const uint32_t slot = base_slot + count;
@@ -215,7 +229,8 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(data.link_pose),
                reinterpret_cast<const FootShape*>(model.foot_shape),
                p->foot_count, p->env_count, p->base_link_count, p->ground_height,
-               static_cast<const uint32_t*>(data.env_terrain_type), p->terrain,
+               static_cast<const uint32_t*>(data.env_terrain_type),
+               static_cast<const float*>(data.env_terrain_difficulty), p->terrain,
                data.contact_link, data.contact_point, data.contact_normal,
                data.contact_depth, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

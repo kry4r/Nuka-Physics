@@ -93,6 +93,15 @@ LINK_CONTACT_WRENCH = Field.LINK_CONTACT_WRENCH
 CONTACT_NORMAL = Field.CONTACT_NORMAL
 CONTACT_FORCE = Field.CONTACT_FORCE
 CONTACT_LINK = Field.CONTACT_LINK
+# Go2-on-stairs Phase 2a: writable per-env procedural-terrain controls.
+# ENV_TERRAIN_TYPE (uint32, default 0=Flat): 0=Flat, 1=PyramidStairs,
+# 2=InvertedPyramid, 3=RandomBoxes; buffer_view shape (env_count, 1).
+# ENV_TERRAIN_DIFFICULTY (float32, default 1.0): per-env curriculum scale of the
+# terrain's vertical feature height; buffer_view shape (env_count,). The terrain
+# geometry (step_height etc.) is set at create via
+# World.create_from_scene(terrain_step_height=..., ...).
+ENV_TERRAIN_TYPE = Field.ENV_TERRAIN_TYPE
+ENV_TERRAIN_DIFFICULTY = Field.ENV_TERRAIN_DIFFICULTY
 
 # ARTICULATION_LINK_POSE element = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
 LINK_POSE_FLOATS = 7

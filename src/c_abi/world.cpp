@@ -176,6 +176,22 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         nuka::scene::cook::CookToModelResult cooked =
             nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
 
+        // Go2-on-stairs Phase 2a: apply the procedural-terrain cook config from the
+        // desc AFTER cook + BEFORE nk::World construction (Pipeline::Build reads
+        // model.terrain at construct time, copying it into the NarrowphasePrimitives
+        // op params). ground_height stays the cooked model's; the 5 desc floats set
+        // the shared TerrainParams. A zero-initialized desc leaves all five at 0.0
+        // => the cook's flat terrain (SampleTerrainHeight returns ground_height for
+        // every env) => byte-identical to a world created without terrain (D1). The
+        // per-env terrain TYPE/DIFFICULTY are seeded by SeedInitialState (0 / 1.0)
+        // and written post-create via NUKA_FIELD_ENV_TERRAIN_TYPE/DIFFICULTY.
+        cooked.model.terrain.ground_height   = cooked.model.ground_height;
+        cooked.model.terrain.step_height     = desc->terrain_step_height;
+        cooked.model.terrain.step_width      = desc->terrain_step_width;
+        cooked.model.terrain.platform_width  = desc->terrain_platform_width;
+        cooked.model.terrain.grid_width      = desc->terrain_grid_width;
+        cooked.model.terrain.grid_height_max = desc->terrain_grid_height_max;
+
         auto record = std::make_unique<nuka::c_abi::WorldRecord>();
         record->device = device_record;
         record->env_count = desc->env_count;
