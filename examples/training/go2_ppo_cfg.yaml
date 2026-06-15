@@ -118,6 +118,19 @@ params:
       # all-negative reward -> only_positive_rewards zeroed it -> value head collapsed.
       command: [0.5, 0.0, 0.0]
       fixed_command: false
+
+      # GAIT MODE (Go2 pronk/bound skill). DEFAULT 'walk' => byte-identical to the
+      # proven flat walker (the reward dict, termination, obs are all unchanged).
+      # Re-weights the legged_gym reward only (see go2_rewards.GAIT_SCALE_OVERRIDES):
+      #   walk  -- no change (the flat walker).
+      #   trot  -- Stage-1 loosener (lin_vel_z -2.0 -> -0.5, air-time bias -> 0.35).
+      #   pronk -- all-four synchronized flight (lin_vel_z 0.0, air-time x2 + flight/
+      #            oscillation/symmetry bonuses, halved action_rate).
+      #   bound -- front/rear antiphase flight.
+      # For pronk/bound a 2-step landing GRACE on the base-height kill is auto-enabled
+      # (a single-step hard touchdown does not false-terminate); walk is unaffected.
+      # Override per run with the train_go2_ppo.py --gait-mode flag.
+      gait_mode: walk
       # Termination = base-ground contact only (legged_gym terminate_after_contacts_on
       # =["base"]). base-height z<0.18 ~ base touching ground; tilt kill relaxed to
       # 120 deg so only a genuinely flipped robot is culled (the 75 deg default

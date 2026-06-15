@@ -109,6 +109,65 @@ SCALES = {
     # docstring + Go2Reward._feet_air_time / _collision).
     "feet_air_time": 1.0,
     "collision": -1.0,
+    # FLIGHT-GAIT scaffold terms (pronk/bound). DEFAULT 0.0 here so the SCALES
+    # superset stays BYTE-IDENTICAL to the walk reward (walk's GAIT_SCALE_OVERRIDES
+    # is {} so these three remain 0 -- they contribute exactly nothing to walk/trot).
+    # A non-zero weight is injected ONLY for gait_mode in {pronk, bound} via
+    # GAIT_SCALE_OVERRIDES below. See Go2Reward._flight_phase / _vertical_oscillation
+    # / _gait_symmetry.
+    "flight_phase": 0.0,
+    "vertical_oscillation": 0.0,
+    "gait_symmetry": 0.0,
+}
+
+# ---------------------------------------------------------------------------
+# GAIT-MODE reward re-weighting (Go2 pronk/bound skill). The reward TERMS are the
+# same across gaits; only the SCALES change. ``gait_mode='walk'`` (the default)
+# applies NO override (the empty dict) so the active scale set is exactly SCALES
+# above -- walk/trot stay byte-identical to the pre-gait-mode reward (the three
+# flight terms are 0-weighted and the air-time bias is the legged_gym 0.5).
+#
+#   walk  : the proven flat walker -- no change at all.
+#   trot  : Stage-1 loosener -- relax the anti-flight lin_vel_z (-2.0 -> -0.5) and
+#           lengthen swings (air-time bias 0.5 -> 0.35); flight terms stay 0.
+#   pronk : all-four synchronized flight -- lin_vel_z OFF (0.0), air-time scale x2
+#           (bias 0.30), all-airborne flight bonus, push-off oscillation seed,
+#           all-sync symmetry, halved action_rate (sharper leg extension).
+#   bound : front/rear antiphase flight -- small lin_vel_z (-0.2) to avoid pogo,
+#           air-time scale 1.8 (bias 0.32), smaller flight/oscillation, front/rear
+#           antiphase symmetry, halved action_rate.
+# (Weights are the RAW config values; REWARD_DT is applied in compute().)
+GAIT_SCALE_OVERRIDES = {
+    "walk": {},
+    "trot": {
+        "lin_vel_z": -0.5,
+    },
+    "pronk": {
+        "lin_vel_z": 0.0,
+        "feet_air_time": 2.0,
+        "flight_phase": 1.5,
+        "vertical_oscillation": 0.3,
+        "gait_symmetry": 0.5,
+        "action_rate": -0.005,
+    },
+    "bound": {
+        "lin_vel_z": -0.2,
+        "feet_air_time": 1.8,
+        "flight_phase": 0.5,
+        "vertical_oscillation": 0.2,
+        "gait_symmetry": 0.5,
+        "action_rate": -0.005,
+    },
+}
+
+# Per-gait feet_air_time BIAS (the air_time-BIAS subtracted at touchdown -- a swing
+# longer than BIAS earns a positive air-time reward). walk = the legged_gym 0.5;
+# flight gaits LOWER it so any moderately-long synchronized swing is net-positive.
+GAIT_AIR_TIME_BIAS = {
+    "walk": 0.5,
+    "trot": 0.35,
+    "pronk": 0.30,
+    "bound": 0.32,
 }
 
 # No reward terms are dropped any more. Kept (empty) so the env's once-at-init
@@ -177,11 +236,25 @@ class Go2Reward:
     zeroed externally for autoreset/done envs -- see the env's step override).
     """
 
-    def __init__(self, num_envs: int, device, *, dtype=torch.float32):
+    def __init__(self, num_envs: int, device, *, dtype=torch.float32,
+                 gait_mode: str = "walk"):
         self.num_envs = int(num_envs)
         self.device = device
         self.dtype = dtype
-        self.scales = dict(SCALES)
+        # GAIT MODE: the active scale set = SCALES overlaid with the per-gait
+        # override. ``walk`` overrides nothing (override == {}) so self.scales is
+        # byte-identical to SCALES (the three flight terms 0-weighted, lin_vel_z
+        # -2.0, air-time bias 0.5) -- the proven flat reward is unchanged.
+        if gait_mode not in GAIT_SCALE_OVERRIDES:
+            raise ValueError(
+                f"unknown gait_mode {gait_mode!r}; "
+                f"expected one of {sorted(GAIT_SCALE_OVERRIDES)}"
+            )
+        self.gait_mode = str(gait_mode)
+        self.scales = {**SCALES, **GAIT_SCALE_OVERRIDES[gait_mode]}
+        # Per-gait feet_air_time bias (replaces the module FEET_AIR_TIME_BIAS const
+        # in _feet_air_time). walk == 0.5 (the legged_gym value) -> byte-identical.
+        self.air_time_bias = GAIT_AIR_TIME_BIAS[gait_mode]
         # Constant device tensors (URDF order).
         self.default_angles = torch.as_tensor(
             G.DEFAULT_ANGLES, dtype=dtype, device=device
@@ -267,7 +340,9 @@ class Go2Reward:
         self.last_contacts = contact
         first_contact = (self.feet_air_time > 0.0) & contact_filt
         self.feet_air_time = self.feet_air_time + REWARD_DT
-        rew = ((self.feet_air_time - FEET_AIR_TIME_BIAS) * first_contact.to(self.dtype)
+        # Per-gait air_time bias (self.air_time_bias; == module FEET_AIR_TIME_BIAS
+        # 0.5 for walk -> byte-identical, LOWER for flight gaits).
+        rew = ((self.feet_air_time - self.air_time_bias) * first_contact.to(self.dtype)
                ).sum(dim=1)
         # No air-time reward when commanded to stand (||cmd_xy|| <= 0.1).
         cmd_moving = (cmd[:, :2].norm(dim=1) > FEET_AIR_TIME_CMD_THRESHOLD).to(self.dtype)
@@ -275,6 +350,74 @@ class Go2Reward:
         # Reset the air-time accumulator for feet currently in (filtered) contact.
         self.feet_air_time = self.feet_air_time * (~contact_filt).to(self.dtype)
         return rew
+
+    # -- FLIGHT-GAIT terms (pronk/bound; 0-weighted for walk/trot) -----------
+    def _flight_phase(self, foot_contact_fz, cmd):
+        """All-four-airborne control-step bonus (pronk/bound flight signature).
+
+        ``foot_contact_fz`` : (N,4) the four feet's RAW contact-force z (world)
+        this step -- NOT the ``contact_filt`` debounce: a true single-step airborne
+        frame must NOT be masked out by the legged_gym one-frame-dropout OR, so we
+        recompute contact directly from the raw force here (risk #5). A step counts
+        as a flight phase iff ALL four feet have ``|Fz| <= 1 N`` (zero feet loaded).
+
+        Command-gated (``||cmd_xy|| > 0.1``): a commanded STAND never earns the
+        flight bonus, so the policy can't pogo-in-place to farm it (risk #1).
+        Returns (N,) float in {0,1}.
+        """
+        contact = foot_contact_fz.abs() > FEET_CONTACT_FORCE_THRESHOLD  # (N,4) bool
+        all_airborne = (contact.sum(dim=1) == 0)                        # (N,) bool
+        cmd_moving = cmd[:, :2].norm(dim=1) > FEET_AIR_TIME_CMD_THRESHOLD
+        return (all_airborne & cmd_moving).to(self.dtype)
+
+    def _vertical_oscillation(self, base_lin_vel_z, just_left_ground):
+        """Push-off seed: positive body-frame upward velocity AT the moment the feet
+        leave the ground (``just_left_ground`` transition), 0 otherwise.
+
+        ``base_lin_vel_z`` : (N,) body-frame base linear velocity z.
+        ``just_left_ground`` : (N,) bool, True the step a (filtered) full-contact ->
+        airborne transition occurs (computed in compute() from the feet_air_time
+        state machine). ``max(0, v_z)`` rewards launching UP, never penalizes a
+        descent; gated on the transition so it only fires at lift-off, not every
+        airborne step (risk #2 -- it is an ANNEAL-to-0 scaffold). Returns (N,) >= 0.
+        """
+        return base_lin_vel_z.clamp(min=0.0) * just_left_ground.to(self.dtype)
+
+    def _gait_symmetry(self, contact_bool, mode):
+        """Gait-class selector reward (DISTINGUISHES pronk from bound).
+
+        ``contact_bool`` : (N,4) per-foot in-contact bool, foot order FL,FR,RL,RR
+        (the env's foot-slot order). ``mode`` : 'pronk' or 'bound'.
+
+        pronk = ALL FOUR feet synchronized -> reward the negative mean pairwise
+            DISAGREEMENT among the 4 feet (0 when all-same = perfectly synchronized,
+            -1 when maximally split). Reward synchronized SWING, not contact, and
+            gate on nonzero air-time so an all-feet-PLANTED stand (also "synchronized")
+            is NOT rewarded (risk #7).
+        bound = FRONT pair (FL,FR) in phase + REAR pair (RL,RR) in phase + front !=
+            rear (the front/rear antiphase bound signature). Each sub-condition in
+            [0,1]; summed/normalized to [0,1].
+
+        The air-time gate (nonzero swing) is applied by the caller via the term's
+        own gating in compute(); here we return the raw shaped value in
+        [-1,0] (pronk) / [0,1] (bound). Returns (N,) float.
+        """
+        c = contact_bool.to(self.dtype)                                # (N,4)
+        if mode == "bound":
+            # Pairs: front = [0,1] (FL,FR), rear = [2,3] (RL,RR).
+            front_in_phase = 1.0 - (c[:, 0] - c[:, 1]).abs()           # 1 if FL==FR
+            rear_in_phase = 1.0 - (c[:, 2] - c[:, 3]).abs()            # 1 if RL==RR
+            front_mean = c[:, 0:2].mean(dim=1)
+            rear_mean = c[:, 2:4].mean(dim=1)
+            front_ne_rear = (front_mean - rear_mean).abs()             # 1 if antiphase
+            return (front_in_phase + rear_in_phase + front_ne_rear) / 3.0
+        # pronk (default): -mean pairwise disagreement among all 4 feet.
+        # 6 unordered pairs; |c_i - c_j| is 1 iff the two feet disagree.
+        pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        disagree = torch.zeros(self.num_envs, dtype=self.dtype, device=self.device)
+        for i, j in pairs:
+            disagree = disagree + (c[:, i] - c[:, j]).abs()
+        return -(disagree / len(pairs))
 
     @staticmethod
     def _collision(link_world_z, local_surface_z):
@@ -316,6 +459,7 @@ class Go2Reward:
         target_q_urdf,
         action,
         last_action,
+        base_lin_vel=None,
         foot_contact_fz=None,
         collision_count=None,
         return_terms: bool = False,
@@ -355,7 +499,35 @@ class Go2Reward:
         # when the env supplies the true per-foot contact (else its state must NOT
         # tick). collision is a pure per-step proxy count.
         if foot_contact_fz is not None:
+            # FLIGHT-GAIT terms (guarded identically to feet_air_time so walk/trot --
+            # where their scale is 0 -- are byte-identical, but the state-coupled
+            # bits are still computed only when the engine contact is supplied).
+            # Capture the prior-step filtered contact (the lift-off transition source)
+            # BEFORE _feet_air_time mutates self.last_contacts.
+            raw_contact = foot_contact_fz.abs() > FEET_CONTACT_FORCE_THRESHOLD  # (N,4)
+            prev_filt = self.last_contacts.clone()
+            terms["flight_phase"] = self._flight_phase(foot_contact_fz, cmd)
+            # gait_symmetry on the RAW per-foot contact; gate on nonzero air-time
+            # (at least one foot currently swinging) AND a moving command so a static
+            # all-planted (or all-airborne-but-commanded-still) pose is not rewarded.
+            sym = self._gait_symmetry(raw_contact, self.gait_mode)
+            air_active = (~raw_contact).any(dim=1)                          # (N,) bool
+            cmd_moving = cmd[:, :2].norm(dim=1) > FEET_AIR_TIME_CMD_THRESHOLD
+            terms["gait_symmetry"] = sym * (air_active & cmd_moving).to(self.dtype)
+            # feet_air_time advances the state machine (mutates last_contacts /
+            # feet_air_time) -- run AFTER capturing prev_filt.
             terms["feet_air_time"] = self._feet_air_time(foot_contact_fz, cmd)
+            # vertical_oscillation: positive body-frame v_z at the just-left-ground
+            # transition (was in filtered contact last step, fully airborne now).
+            if base_lin_vel is not None:
+                just_left_ground = prev_filt.any(dim=1) & (~raw_contact).all(dim=1)
+                terms["vertical_oscillation"] = self._vertical_oscillation(
+                    base_lin_vel[:, 2], just_left_ground
+                )
+            else:
+                terms["vertical_oscillation"] = torch.zeros(
+                    self.num_envs, dtype=self.dtype, device=self.device
+                )
         if collision_count is not None:
             terms["collision"] = collision_count.to(self.dtype)
         total = torch.zeros(self.num_envs, dtype=self.dtype, device=self.device)
