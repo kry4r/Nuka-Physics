@@ -20,6 +20,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
+#include "sensor/terrain/terrain_field.hpp"  // TerrainParams (procedural terrain)
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/arena_layout.hpp"
 #include "nk/model/generated/views.hpp"
@@ -221,6 +222,17 @@ public:
     float ground_height          = 0.0f;
     float friction_coefficient   = 0.8f;   // legacy kContactFriction
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
+
+    // Go2-on-stairs Phase 1: the SHARED procedural-terrain params (additive,
+    // model-level cook config like ground_height; a caller may override BEFORE
+    // World construction). The per-env terrain TYPE is the env_terrain_type
+    // DATA field (default 0 = Flat, seeded by World::SeedInitialState). DEFAULT
+    // == flat: terrain.ground_height mirrors ground_height and all step/grid
+    // params are 0, so SampleTerrainHeight returns exactly ground_height for the
+    // default type-0 envs => the foot kernel is byte-identical to today (D1).
+    // Pipeline::Build copies this into the NarrowphasePrimitives op params, and
+    // sets terrain.ground_height = ground_height so the two never disagree.
+    ::nuka::terrain::TerrainParams terrain{};  // {0,0,0,0,0,0} => flat-at-ground.
 
     // -- M6: particle (XPBD soft + PBF fluid) cook product --------------------
     // The XPBD constraint templates (dist/bend/vol, owner:model) are staged by

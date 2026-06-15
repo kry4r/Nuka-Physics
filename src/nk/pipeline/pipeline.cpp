@@ -186,6 +186,15 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.contact_margin = cfg.contact_margin;
         p_np_prim_.max_contacts_per_pair = 4;
         p_np_prim_.ground_height = model.ground_height;
+        // Go2-on-stairs Phase 1: the SHARED procedural-terrain params. We copy
+        // the model's terrain config but PIN terrain.ground_height to the same
+        // ground_height the scalar path uses, so the type-0 (Flat) sample
+        // (which returns terrain.ground_height) is byte-identical to the legacy
+        // scalar plane (ground_height + radius - center.z). With the default
+        // all-zero terrain + every env's type seeded 0, the kernel reproduces
+        // today's foot contacts to the bit (D1).
+        p_np_prim_.terrain = model.terrain;
+        p_np_prim_.terrain.ground_height = model.ground_height;
         p_np_prim_.foot_count = static_cast<uint32_t>(model.feet.size());
         p_np_prim_.env_count = env_count;
         p_np_prim_.base_link_count = base_link_count;

@@ -125,6 +125,21 @@ bool World::SeedInitialState() {
         }
     }
 
+    // -- Go2-on-stairs Phase 1: the per-env procedural-terrain TYPE. Seeded 0
+    // (nuka::terrain::kTerrainFlat) for EVERY env so the FusedFoot detection
+    // kernel samples a flat plane at ground_height => byte-identical to the
+    // legacy scalar-plane contact path (the D1 default). A training harness /
+    // verification sets non-flat terrain post-construction via
+    // World::GetData().UploadField(FieldId::EnvTerrainType, ...). The field is
+    // Persistent so it round-trips Reset (the construction-time snapshot).
+    {
+        std::vector<uint32_t> terrain_type(E, 0u);  // 0 == kTerrainFlat
+        if (!data_.UploadField(FieldId::EnvTerrainType, terrain_type.data(),
+                               terrain_type.size() * sizeof(uint32_t))) {
+            return false;
+        }
+    }
+
     // -- M6: particle (XPBD soft / PBF fluid) initial state seeding (env-major
     // replication of the single-env template). particle_prev_pos is seeded == pos
     // (the legacy soft-upload "prev seeded = p" / fluid-upload "predicted
