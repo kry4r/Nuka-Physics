@@ -60,6 +60,14 @@ class NukaGymEnv:
         Max episode length (s) before truncation. Default 20.0.
     seed : int | None
         Seed for the action/space RNG (determinism).
+    terrain_create : dict | None
+        Optional procedural-terrain cook config forwarded as
+        ``create_from_scene(terrain_step_height=..., terrain_step_width=...,
+        terrain_platform_width=..., terrain_grid_width=...,
+        terrain_grid_height_max=...)``. ``None``/empty => no terrain (flat;
+        byte-identical to the legacy path). The per-env terrain TYPE/DIFFICULTY are
+        written separately via the engine ``ENV_TERRAIN_TYPE``/``ENV_TERRAIN_DIFFICULTY``
+        buffer views (see :class:`~nuka.tasks.go2_locomotion.Go2LocomotionEnv`).
     """
 
     metadata = {"render_modes": []}
@@ -77,6 +85,7 @@ class NukaGymEnv:
         termination_tilt_deg: float = 75.0,
         episode_length_s: float = 20.0,
         seed: int | None = None,
+        terrain_create: "dict | None" = None,
     ) -> None:
         self.num_envs = int(num_envs)
         self.decimation = int(decimation)
@@ -90,8 +99,15 @@ class NukaGymEnv:
         self._owns_device = device is None
         self._device = device if device is not None else nuka.Device.create(0)
 
+        # Go2-on-stairs Phase 2b: optional procedural-terrain COOK config (model
+        # level). ``terrain_create`` is a dict of the create_from_scene terrain_*
+        # kwargs (step_height/step_width/platform_width/grid_width/grid_height_max).
+        # None / empty => no terrain kwargs => byte-identical to the flat path (the
+        # kwargs all default to 0.0 in the binding == flat). This is purely additive:
+        # the flat training path passes nothing and is unaffected.
+        terrain_kw = dict(terrain_create) if terrain_create else {}
         self._world = nuka.World.create_from_scene(
-            self._device, scene, self.num_envs, self.dt
+            self._device, scene, self.num_envs, self.dt, **terrain_kw
         )
         assert self._world.action_dim == G.GO2_ACTION_DIM, (
             f"NukaGymEnv expects a 12-DOF Go2 (action_dim=12), got "

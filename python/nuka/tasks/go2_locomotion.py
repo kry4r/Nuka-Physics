@@ -54,7 +54,14 @@ import nuka
 
 from ..gym.env import NukaGymEnv
 from . import go2_obs as G
+from . import terrain as T
 from .go2_rewards import Go2Reward, DROPPED, REWARD_DT
+
+
+# Nominal base spawn height (m): the go2_locomotion scene cooks the trunk at
+# z=0.445 (verified). Used as the offset added to the local terrain surface height
+# so the base spawns ABOVE the platform/pit/box, not inside it.
+NOMINAL_BASE_Z = 0.445
 
 
 # legged_gym commands.ranges (go2 inherits the LeggedRobotCfg base defaults).
@@ -76,8 +83,75 @@ class Go2LocomotionEnv(NukaGymEnv):
     """
 
     def __init__(self, scene: str, num_envs: int, *,
-                 fixed_command: bool = False, **kw) -> None:
+                 fixed_command: bool = False, terrain: "dict | None" = None,
+                 **kw) -> None:
+        # ----------------------------------------------------------------------
+        # TERRAIN CURRICULUM (Go2-on-stairs Phase 2b). ``terrain`` is the yaml
+        # ``config.env_config.terrain`` block (or None => terrain DISABLED, the
+        # flat path -- byte-identical to before). When enabled it (1) cooks the
+        # world with the procedural-terrain geometry at the MAX step height
+        # (terrain.STEP_HEIGHT_MAX) and (2) drives a per-env type+difficulty
+        # curriculum, writing ENV_TERRAIN_TYPE / ENV_TERRAIN_DIFFICULTY +
+        # BASE_POSE.z on every reset. Default OFF: with terrain None, NO terrain
+        # kwargs reach create_from_scene and NO per-env terrain field is written,
+        # so the existing flat training is reproduced exactly.
+        # ----------------------------------------------------------------------
+        tcfg = dict(terrain) if terrain else {}
+        self._terrain_on = bool(tcfg.get("enable", False))
+        self._tcfg = tcfg
+        if self._terrain_on:
+            # Cook the world with the procedural-terrain geometry (step height set
+            # to the MAX; per-env difficulty scales it down toward 0.08 m).
+            kw["terrain_create"] = {
+                "terrain_step_height": float(tcfg.get("step_height", T.STEP_HEIGHT_MAX)),
+                "terrain_step_width": float(tcfg.get("step_width", 0.3)),
+                "terrain_platform_width": float(tcfg.get("platform_width", 1.0)),
+                "terrain_grid_width": float(tcfg.get("grid_width", 0.45)),
+                "terrain_grid_height_max": float(tcfg.get("grid_height_max", 0.15)),
+            }
+
         super().__init__(scene, num_envs, **kw)
+
+        # Build the curriculum + cache the engine terrain field views (zero-copy).
+        if self._terrain_on:
+            type_dist = tcfg.get("type_distribution", None)
+            if isinstance(type_dist, dict):
+                # yaml gives str keys -> int.
+                type_dist = {int(k): float(v) for k, v in type_dist.items()}
+            self._curriculum = T.TerrainCurriculum(
+                self.num_envs, self._torch_device,
+                start_difficulty=float(tcfg.get("start_difficulty", T.DIFFICULTY_MIN)),
+                promote_thr=float(tcfg.get("promote_thr", 8.0)),
+                demote_on_fall=bool(tcfg.get("demote_on_fall", True)),
+                difficulty_step=float(tcfg.get("difficulty_step", 0.1)),
+                ema_beta=float(tcfg.get("ema_beta", 0.99)),
+                type_distribution=type_dist,
+            )
+            self._ground_height = float(tcfg.get("ground_height", 0.0))
+            self._terrain_step_height = float(tcfg.get("step_height", T.STEP_HEIGHT_MAX))
+            self._terrain_grid_height_max = float(tcfg.get("grid_height_max", 0.15))
+            # Zero-copy WRITABLE engine views (terrain type uint32 (N,1); difficulty
+            # float32 (N,); base_pose float32 (N,7)).
+            w = self._world
+            self._tt_view = torch.from_dlpack(w.buffer_view(nuka.ENV_TERRAIN_TYPE))
+            self._td_view = torch.from_dlpack(w.buffer_view(nuka.ENV_TERRAIN_DIFFICULTY))
+            self._bp_view = torch.from_dlpack(w.buffer_view(nuka.BASE_POSE))
+            # Per-step bookkeeping the curriculum-on-done hook reads (set in step()).
+            self._last_reward = torch.zeros(self.num_envs, device=self._torch_device)
+            self._last_terminated = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self._torch_device
+            )
+            # Optional terrain diagnostic (NUKA_GO2_TERRAIN_DIAG=1): base-z min/max
+            # + periodic type/difficulty histogram. Always-on float guards start at
+            # +-inf so the first step seeds them.
+            self._tdiag = (dict(n=0, z_min=float("inf"), z_max=float("-inf"))
+                           if os.environ.get("NUKA_GO2_TERRAIN_DIAG") else None)
+            print(f"[go2_locomotion] TERRAIN curriculum ON: "
+                  f"{self._curriculum.histogram()}", flush=True)
+        else:
+            self._curriculum = None
+            self._tdiag = None
+
         # CURRICULUM SWITCH (researcher's reduce-the-problem lever). When
         # ``fixed_command=True`` the per-env velocity command is PINNED to the ctor
         # ``command`` for the whole run (no resample on reset / timer / autoreset).
@@ -147,6 +221,61 @@ class Go2LocomotionEnv(NukaGymEnv):
             q[mask, 1:G.GO2_BLC] = default_nuka
             qd[mask, 1:G.GO2_BLC] = 0.0
         nuka.sync()
+        # Spawn-on-terrain placement (Phase 2b). For the DONE envs (mask is the
+        # done mask in autoreset), FIRST run the curriculum promote/demote off this
+        # step's reward + terminated (mirrored onto self by compute_reward /
+        # compute_terminated), THEN write the (possibly updated) per-env terrain
+        # TYPE/DIFFICULTY + lift the base z to the LOCAL surface + nominal stance
+        # height -- so a reset onto a raised platform/pit/box does NOT spawn the
+        # robot inside the surface (the Phase-2a Baumgarte-launch bug). On a full
+        # reset (mask is None) the curriculum is left at its current assignment and
+        # only the engine fields are (re)written. No-op when terrain is disabled.
+        if self._terrain_on:
+            if mask is not None:
+                # mask is the (num_envs,) done bool. Promote/demote off this step's
+                # terminated (fell) -- the curriculum uses the episode return it
+                # accumulated each step (see compute_reward) as the walk-quality
+                # gate. terminated[done] is the part NOT due to time-limit truncation.
+                self._curriculum.update_on_done(mask, self._last_terminated & mask)
+            self._write_terrain_for_reset(mask)
+
+    # -- spawn-on-terrain: write per-env terrain + lift base z ----------------
+    def _write_terrain_for_reset(self, mask) -> None:
+        """Write ENV_TERRAIN_TYPE / ENV_TERRAIN_DIFFICULTY (the curriculum's
+        current per-env assignment) and set BASE_POSE.z = center_terrain_height +
+        NOMINAL_BASE_Z for the (masked, or all) reset envs.
+
+        Called from :meth:`_reset_joint_state` AFTER world.reset/reset_envs settled
+        the buffers and BEFORE the obs is recomposed. The curriculum's promote/
+        demote for the done envs has already run this step (see :meth:`step` ->
+        _last_* + the curriculum update before super().step's autoreset path is
+        sufficient because difficulty/type were updated at the PRIOR done; here we
+        simply mirror the live curriculum state into the engine)."""
+        cur = self._curriculum
+        # Center terrain surface height for EVERY env (cheap; vectorized).
+        center = T.center_height(
+            cur.terrain_type, cur.difficulty,
+            ground_height=self._ground_height,
+            step_height=self._terrain_step_height,
+            grid_height_max=self._terrain_grid_height_max,
+        )
+        base_z = center + NOMINAL_BASE_Z
+        if mask is None:
+            self._tt_view[:, 0] = cur.terrain_type.to(self._tt_view.dtype)
+            self._td_view[:] = cur.difficulty
+            self._bp_view[:, 2] = base_z
+        else:
+            # NB torch has no masked index_put for UInt32, so write the ENV_TERRAIN
+            # TYPE column via torch.where (the curriculum type is unchanged for
+            # non-done envs, so a full-column write is a no-op for them). DIFFICULTY
+            # and BASE_POSE.z are float32 -> masked assignment works and is scoped to
+            # the done envs (their LIVE mid-episode z must NOT be clobbered).
+            self._tt_view[:, 0] = torch.where(
+                mask, cur.terrain_type, self._tt_view[:, 0].to(torch.long)
+            ).to(self._tt_view.dtype)
+            self._td_view[mask] = cur.difficulty[mask]
+            self._bp_view[mask, 2] = base_z[mask]
+        nuka.sync()
 
     # -- command sampling (legged_gym _resample_commands, seeded) -----------
     def _resample_commands(self, mask: torch.Tensor) -> None:
@@ -178,6 +307,13 @@ class Go2LocomotionEnv(NukaGymEnv):
         self.command[mask] = new
 
     def reset(self, *, seed=None, options=None):
+        # Reset the curriculum's per-episode accumulators on a FULL reset (the
+        # type/difficulty ASSIGNMENT is preserved across the reset -- a full reset
+        # is a fresh rollout, not a demotion). super().reset() -> _reset_joint_state
+        # (None) then writes the engine terrain fields + base z for all envs.
+        if self._curriculum is not None:
+            self._curriculum.ep_reward.zero_()
+            self._curriculum.ep_len.zero_()
         out = super().reset(seed=seed, options=options)
         # Fresh-episode bookkeeping.
         self._prev_action.zero_()
@@ -198,7 +334,7 @@ class Go2LocomotionEnv(NukaGymEnv):
         THIS step's clipped action (the base sets it before calling us);
         ``self._prev_action`` is the prior step's clipped action."""
         b = self._obs
-        return self._reward.compute(
+        r = self._reward.compute(
             cmd=self.command,
             lin_vel=b.base_lin_vel(),
             ang_vel=b.base_ang_vel(),
@@ -208,6 +344,22 @@ class Go2LocomotionEnv(NukaGymEnv):
             action=self.last_action,
             last_action=self._prev_action,
         )
+        # Feed the per-env reward into the terrain curriculum's running episode
+        # return (the promotion gate). Done at reward time so it runs BEFORE the
+        # base step's autoreset (which calls _reset_joint_state -> the curriculum
+        # update). No-op when terrain is disabled.
+        if self._curriculum is not None:
+            self._curriculum.accumulate(r)
+        return r
+
+    def compute_terminated(self) -> torch.Tensor:
+        """Base termination predicate, with the terminal (fell) mask captured for
+        the terrain curriculum's demote-on-fall rule. The capture is a no-op when
+        terrain is disabled (the base predicate is byte-identical either way)."""
+        term = super().compute_terminated()
+        if self._curriculum is not None:
+            self._last_terminated = term
+        return term
 
     def step(self, actions: torch.Tensor):
         # Record the PD target this step (default + 0.25*action, URDF order) for
@@ -250,7 +402,25 @@ class Go2LocomotionEnv(NukaGymEnv):
         if self._diag is not None:
             self._diag_step(actions, reward, terminated, truncated)
 
+        # Terrain curriculum diagnostic (guarded by NUKA_GO2_TERRAIN_DIAG): tracks
+        # the base-z min/max over the run (catches a spawn-on-terrain regression --
+        # a z~=18 launch) + prints the live type/difficulty histogram periodically.
+        if self._terrain_on and self._tdiag is not None:
+            self._terrain_diag_step()
+
         return obs, reward, terminated, truncated, info
+
+    # -- terrain curriculum diagnostic (NUKA_GO2_TERRAIN_DIAG=1) --------------
+    def _terrain_diag_step(self) -> None:
+        d = self._tdiag
+        z = self._bp_view[:, 2]
+        d["z_min"] = min(d["z_min"], float(z.min()))
+        d["z_max"] = max(d["z_max"], float(z.max()))
+        d["n"] += 1
+        if d["n"] % 25 == 0:
+            print(f"[go2_terrain] step{d['n']}: base_z[min={d['z_min']:.3f} "
+                  f"max={d['z_max']:.3f}]  {self._curriculum.histogram()}",
+                  flush=True)
 
     # -- optional in-env training instrumentation (NUKA_GO2_DIAG=1) ----------
     def _diag_step(self, actions, reward, terminated, truncated) -> None:

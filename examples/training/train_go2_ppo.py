@@ -127,6 +127,24 @@ def _build_argparser() -> argparse.ArgumentParser:
                    metavar=("VX", "VY", "WYAW"),
                    help="Constant velocity command for all envs.")
     p.add_argument("--experiment-name", dest="experiment_name", default=None)
+    p.add_argument("--train-dir", dest="train_dir", default=None,
+                   help="rl_games output root (config.train_dir). The run writes "
+                        "checkpoints to <train_dir>/<experiment_name>/nn/. Default "
+                        "'runs'; set 'out' + --experiment-name go2_terrain_policy "
+                        "for out/go2_terrain_policy/nn/.")
+    # Go2-on-stairs Phase 2b: warm-start from a flat-policy checkpoint
+    # (rl_games restores it into the agent BEFORE training -- so terrain training
+    # resumes from a walking policy, not from scratch).
+    p.add_argument("--checkpoint", default=None,
+                   help="Path to a .pth checkpoint to warm-start from "
+                        "(rl_games agent.restore). E.g. the flat baseline "
+                        "out/go2_policy/go2_walk_randomcmd_ep250.pth.")
+    # Toggle the terrain curriculum without editing the yaml (additive override).
+    p.add_argument("--terrain", dest="terrain", action="store_true", default=None,
+                   help="Force-ENABLE the procedural-terrain curriculum "
+                        "(overrides config.env_config.terrain.enable).")
+    p.add_argument("--no-terrain", dest="terrain", action="store_false",
+                   help="Force-DISABLE the terrain curriculum (flat training).")
     return p
 
 
@@ -171,6 +189,12 @@ def _apply_overrides(params: dict, args: argparse.Namespace) -> dict:
         cfg.setdefault("env_config", {})["command"] = list(args.command)
     if args.experiment_name is not None:
         cfg["name"] = cfg["full_experiment_name"] = args.experiment_name
+    if args.train_dir is not None:
+        cfg["train_dir"] = args.train_dir
+    # Terrain curriculum enable/disable override (CLI wins over yaml).
+    if args.terrain is not None:
+        ec = cfg.setdefault("env_config", {})
+        ec.setdefault("terrain", {})["enable"] = bool(args.terrain)
 
     # Guard the rl_games divisibility assertion early with a clear message.
     batch = cfg["horizon_length"] * cfg["num_actors"]
@@ -210,7 +234,15 @@ def main(argv=None) -> int:
 
     runner = Runner(algo_observer=StdoutAlgoObserver())
     runner.load_config(params)
-    runner.run({"train": True, "play": False})
+    run_args = {"train": True, "play": False}
+    if args.checkpoint:
+        if not os.path.isfile(args.checkpoint):
+            raise SystemExit(f"--checkpoint not found: {args.checkpoint}")
+        # rl_games restores this into the agent BEFORE the first epoch (warm-start).
+        run_args["checkpoint"] = args.checkpoint
+        print(f"[train_go2_ppo] WARM-START from checkpoint {args.checkpoint}",
+              flush=True)
+    runner.run(run_args)
     print("[train_go2_ppo] run() returned cleanly.", flush=True)
     return 0
 
