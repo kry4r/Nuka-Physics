@@ -187,6 +187,57 @@ class Go2LocomotionEnv(NukaGymEnv):
             self._curriculum = None
             self._tdiag = None
 
+        # ----------------------------------------------------------------------
+        # HEIGHT SCAN (legged_gym terrain perception). DEFAULT OFF. Only active on
+        # the terrain-ON path (a height scan needs the curriculum terrain field to
+        # sample). When OFF -- height_scan.enable false OR terrain off -- NOTHING
+        # below runs and the env (obs 48, observation_space, every behaviour) is
+        # byte-identical to the blind env. When ON, the env APPENDS an n_scan-dim
+        # heightfield measurement to the 48-dim obs (see _height_scan + step/reset)
+        # and OVERRIDES the gym observation_space to (48 + n_scan,) so rl_games
+        # builds the right network input.
+        # ----------------------------------------------------------------------
+        hscfg = dict(tcfg.get("height_scan", {})) if self._terrain_on else {}
+        self._height_scan_on = bool(hscfg.get("enable", False)) and self._terrain_on
+        self._scan_n = 0
+        if self._height_scan_on:
+            x_min = float(hscfg.get("x_min", -0.8))
+            x_max = float(hscfg.get("x_max", 0.8))
+            y_min = float(hscfg.get("y_min", -0.5))
+            y_max = float(hscfg.get("y_max", 0.5))
+            res = float(hscfg.get("resolution", 0.1))
+            self._scan_scale = float(hscfg.get("scale", 5.0))
+            self._scan_clip = float(hscfg.get("clip", 1.0))
+            nx = int(round((x_max - x_min) / res)) + 1
+            ny = int(round((y_max - y_min) / res)) + 1
+            self._scan_n = nx * ny
+            # Fixed (n_scan, 2) base-frame grid offsets (meshgrid of x in
+            # [x_min,x_max], y in [y_min,y_max], step res). Kept on device; rotated
+            # by each env's yaw + translated to its base xy in _height_scan.
+            gx = torch.linspace(x_min, x_max, nx, device=self._torch_device)
+            gy = torch.linspace(y_min, y_max, ny, device=self._torch_device)
+            mesh_x, mesh_y = torch.meshgrid(gx, gy, indexing="ij")   # (nx, ny)
+            self._scan_grid = torch.stack(
+                (mesh_x.reshape(-1), mesh_y.reshape(-1)), dim=1
+            ).contiguous()                                           # (n_scan, 2)
+            # OVERRIDE the gym obs spaces to (48 + n_scan,) / (N, 48 + n_scan) so
+            # rl_games sizes the network input to the scan-augmented obs. Same
+            # Box low/high (-OBS_CLIP/+OBS_CLIP) + dtype as the base 48-dim space.
+            import numpy as _np
+            from gymnasium import spaces as _spaces
+            full_dim = G.GO2_OBS_DIM + self._scan_n
+            self.single_observation_space = _spaces.Box(
+                low=-G.OBS_CLIP, high=G.OBS_CLIP, shape=(full_dim,), dtype=_np.float32
+            )
+            self.observation_space = _spaces.Box(
+                low=-G.OBS_CLIP, high=G.OBS_CLIP,
+                shape=(self.num_envs, full_dim), dtype=_np.float32,
+            )
+            print(f"[go2_locomotion] HEIGHT SCAN ON: grid {nx}x{ny} = "
+                  f"{self._scan_n} pts (x[{x_min},{x_max}] y[{y_min},{y_max}] "
+                  f"res {res}); scale {self._scan_scale} clip {self._scan_clip}; "
+                  f"obs dim {G.GO2_OBS_DIM} -> {full_dim}", flush=True)
+
         # CURRICULUM SWITCH (researcher's reduce-the-problem lever). When
         # ``fixed_command=True`` the per-env velocity command is PINNED to the ctor
         # ``command`` for the whole run (no resample on reset / timer / autoreset).
@@ -475,6 +526,10 @@ class Go2LocomotionEnv(NukaGymEnv):
         self._resample_commands(all_envs)
         obs, info = out
         obs[:, 9:12] = self.command * self._obs.cmd_scale
+        # APPEND the legged_gym height scan (the base 48 cols are unchanged; we
+        # only concatenate). No-op when height_scan is disabled (obs stays 48-dim).
+        if self._height_scan_on:
+            obs = torch.cat([obs, self._height_scan()], dim=-1)
         return obs, info
 
     def compute_reward(self) -> torch.Tensor:
@@ -547,6 +602,42 @@ class Go2LocomotionEnv(NukaGymEnv):
         return torch.as_tensor(
             surf, device=self._torch_device, dtype=torch.float32
         ).view(n, m)
+
+    # -- legged_gym height scan: forward-looking terrain measurement -----------
+    def _height_scan(self) -> torch.Tensor:
+        """(N, n_scan) terrain height measurement around the base, legged_gym
+        convention. The fixed base-frame grid (``self._scan_grid``, (n_scan, 2)) is
+        rotated by each env's heading (YAW only) and translated to the base (x,y),
+        sampled against the env's LIVE curriculum terrain (type+difficulty) via the
+        shared C-ABI heightfield sampler (:meth:`_terrain_surface` -- the exact
+        field the foot kernel rests the feet on), then reduced to the legged_gym
+        value ``clip(base_z - 0.5 - surface, -clip, +clip) * scale``.
+
+        Base pose is read from the AUTHORITATIVE BASE_POSE view (``self._bp_view``):
+        xy at cols 0,1; z at col 2; quat (w-first) at cols 3..6. Only called on the
+        height-scan-ON path. Returns float32 on device."""
+        bp = self._bp_view                                       # (N, 7)
+        base_x = bp[:, 0:1]                                      # (N, 1)
+        base_y = bp[:, 1:2]                                      # (N, 1)
+        base_z = bp[:, 2:3]                                      # (N, 1)
+        qw, qx, qy, qz = bp[:, 3], bp[:, 4], bp[:, 5], bp[:, 6]  # each (N,)
+        # Heading yaw from the (w-first) quaternion (rotation about world +Z).
+        yaw = torch.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        ).unsqueeze(1)                                           # (N, 1)
+        cos_y = torch.cos(yaw)                                   # (N, 1)
+        sin_y = torch.sin(yaw)                                   # (N, 1)
+        px = self._scan_grid[:, 0].unsqueeze(0)                  # (1, n_scan)
+        py = self._scan_grid[:, 1].unsqueeze(0)                  # (1, n_scan)
+        # Rotate the base-frame grid by yaw (heading frame), translate to base xy.
+        wx = base_x + (px * cos_y - py * sin_y)                  # (N, n_scan)
+        wy = base_y + (px * sin_y + py * cos_y)                  # (N, n_scan)
+        heights = self._terrain_surface(wx, wy)                  # (N, n_scan)
+        value = (base_z - 0.5 - heights).clamp(
+            -self._scan_clip, self._scan_clip
+        ) * self._scan_scale
+        return value.to(torch.float32)
 
     # -- collision proxy: penalised links clipping the local terrain surface --
     def _collision_count(self) -> torch.Tensor:
@@ -666,6 +757,12 @@ class Go2LocomotionEnv(NukaGymEnv):
         # a z~=18 launch) + prints the live type/difficulty histogram periodically.
         if self._terrain_on and self._tdiag is not None:
             self._terrain_diag_step()
+
+        # APPEND the legged_gym height scan (the base 48 cols are byte-unchanged;
+        # the autoreset already patched obs[done,6:9] within those 48 dims). No-op
+        # when height_scan is disabled (obs stays the 48-dim blind vector).
+        if self._height_scan_on:
+            obs = torch.cat([obs, self._height_scan()], dim=-1)
 
         return obs, reward, terminated, truncated, info
 
