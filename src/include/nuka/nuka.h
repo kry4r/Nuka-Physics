@@ -428,6 +428,50 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
                                                        void* out_array,
                                                        uint32_t array_capacity);
 
+// ---------------------------------------------------------------------------
+// Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y) terrain
+// height sampler -- the SINGLE host-side source for the surface height at any
+// column. This is the C-ABI projection of nuka::terrain::SampleTerrainHeight +
+// ScaleTerrainDifficulty (src/sensor/terrain/terrain_field.hpp), so the RL
+// spawn-on-terrain reset that places the Go2 base at a RANDOM (x,y) within the
+// terrain tile reads the EXACT same heightfield the foot-contact kernel uses --
+// eliminating the python center-only mirror's drift for arbitrary columns.
+//
+// PURE HOST, no device, no world handle: a free function over plain arrays so an
+// RL env can sample N per-env spawn columns in one call. Per element i it builds
+// a TerrainParams from the (model-level) scalar geometry params, applies
+// ScaleTerrainDifficulty(params, difficulties[i]) (the per-env curriculum
+// difficulty), and writes
+//   out_heights[i] = SampleTerrainHeight(types[i], xs[i], ys[i], scaled).
+//
+//   n              -- element count (the number of (type,x,y,diff) tuples).
+//   types          -- per-element terrain TYPE code (nuka::terrain::TerrainType:
+//                     0=Flat,1=PyramidStairs,2=InvertedPyramid,3=RandomBoxes).
+//   xs, ys         -- per-element world column (x,y) in meters.
+//   difficulties   -- per-element curriculum difficulty (scales the vertical
+//                     feature magnitude; 1.0 == unscaled, 0.0 == flat).
+//   ground_height  -- the base plane / floor height (NOT scaled by difficulty).
+//   step_height / step_width / platform_width / grid_width / grid_height_max
+//                  -- the MODEL-LEVEL TerrainParams (the create-time geometry;
+//                     same five floats as nuka_world_desc_t.terrain_*).
+//   out_heights    -- output array (n floats), the absolute surface z per column.
+//
+// Returns NUKA_RESULT_INVALID_ARG if n > 0 and any of types/xs/ys/difficulties/
+// out_heights is NULL; n == 0 is a no-op OK. Never touches the device or any
+// world; safe to call before/without creating a world.
+nuka_result_t nuka_terrain_sample_height_batch(uint32_t n,
+                                               const uint32_t* types,
+                                               const float* xs,
+                                               const float* ys,
+                                               const float* difficulties,
+                                               float ground_height,
+                                               float step_height,
+                                               float step_width,
+                                               float platform_width,
+                                               float grid_width,
+                                               float grid_height_max,
+                                               float* out_heights);
+
 #ifdef __cplusplus
 }
 #endif
