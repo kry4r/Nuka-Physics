@@ -39,6 +39,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nuka::render {
 
@@ -182,6 +183,30 @@ struct RasterOptions {
     // hero shot (robot filling ~60-70% of the frame, slight level/down gaze). The
     // beauty/viewer path enables this; the gates keep their plain auto-frame.
     bool        hero_framing = false;
+
+    // The ground disc albedo (linear rgb). DEFAULT = the original near-black cool
+    // studio floor so every existing draw_ground caller is unchanged; the M10 demo
+    // tools raise it to a mid-grey studio sweep so a DARK robot foot reads against
+    // it (a near-black foot on a near-black floor was the "floating" cue).
+    float       ground_color[3] = {0.018f, 0.020f, 0.026f};
+
+    // M10 grounded-look CONTACT SHADOW (0 => OFF, the default, so the gated
+    // synthetic smokes are byte-identical). When > 0 AND draw_ground is on AND no
+    // explicit contact_points are supplied, the renderer paints ONE soft radial
+    // occlusion into the GROUND disc under the scene footprint (centre = AABB xy
+    // centre, radius from the xy extent). This is the simple single-blob fallback.
+    // Robot/scene draws never receive it, so their output is unperturbed (G2-safe).
+    float       contact_shadow_strength = 0.0f;
+
+    // EXPLICIT per-contact shadows (the good look): a caller (e.g. the quadruped
+    // walk tool) supplies one entry PER FOOT each frame -- world xy of the contact
+    // patch, its radius, and a strength it fades with foot lift. The renderer draws
+    // each as a soft "shadow decal" disc on the floor (floor-coloured at the rim ->
+    // dark at the centre, so it blends seamlessly with NO alpha blending). When
+    // non-empty these REPLACE the single-blob fallback. Each entry = {x, y, radius,
+    // strength}; an entry with radius<=0 or strength<=0 is skipped.
+    struct ContactPoint { float x = 0.0f, y = 0.0f, radius = 0.0f, strength = 0.0f; };
+    std::vector<ContactPoint> contact_points;
 };
 
 // ---------------------------------------------------------------------------

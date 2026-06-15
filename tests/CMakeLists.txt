@@ -2498,6 +2498,43 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # M10 Phase A -- THE SECOND HEADLINE DEMO EXE: go2_walk_video. A unified
+    # offscreen C++ video tool that POSE-REPLAYS the proven, golden-validated Go2
+    # WALK (out/go2_walk_trajectory.bin, +3.91 m forward, D1) to a PBR-beautiful
+    # PPM sequence on lavapipe -- the M8.5 go2 visual MESHES (go2.nks/.nka), a
+    # premium dark-body / metallic-joint material override, a base-tracking hero
+    # follow-camera, and the studio ground at z=0. PURE KINEMATIC REPLAY: no
+    # device, no nk::World, no policy, no torch in C++ -- it Load(.nks) ->
+    # CookToModel (host-only, for the EntityId->link SceneMap) -> BuildRenderWorld
+    # and drives each visual instance's world_xform from the dumped per-frame
+    # link_pose. NOT a gtest -- a real main() exe. Behind NK_BUILD_VULKAN_VALIDATION
+    # (real Vulkan device). nuka_scene_cook (CookToModel) transitively pulls the nk
+    # core; the link set mirrors the H1 video exe so the cook symbols resolve.
+    add_executable(nuka_go2_walk_video
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_walk_video.cpp
+    )
+    add_dependencies(nuka_go2_walk_video nuka_codegen)
+    target_compile_definitions(nuka_go2_walk_video
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_go2_walk_video
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_walk_video
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
     # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
     # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb

@@ -174,8 +174,14 @@ struct PushBlock {
     float base_color[4];   // rgb albedo + a opacity
     float mr[4];           // x metallic, y roughness, z opacity, w pad
     float emissive[4];     // rgb emissive, a pad
+    // M10 grounded-look: a per-draw procedural CONTACT SHADOW the GROUND fragment
+    // reads. xy = world-space contact center, z = radius (0 => shadow OFF, which
+    // EVERY non-ground draw sets -> their fragment output is byte-identical to the
+    // pre-M10 oracle), w = strength (0..1). Soft radial occlusion painted into the
+    // ground albedo only; no blend pipeline / no SceneUbo change (G2-safe).
+    float ground_shadow[4];
 };
-static_assert(sizeof(PushBlock) == 112, "PushBlock must stay <=128 push-constant bytes");
+static_assert(sizeof(PushBlock) == 128, "PushBlock must stay <=128 push-constant bytes");
 
 // std140-laid-out per-frame scene uniform (camera + light rig). Must match the
 // SceneUbo block in mesh.vert / mesh_pbr.frag byte-for-byte.
@@ -905,6 +911,10 @@ struct InstanceDraw {
     float roughness = 0.5f;
     float opacity = 1.0f;
     float emissive[3] = {0.0f, 0.0f, 0.0f};
+    // Procedural contact-shadow params (xy center, z radius, w strength); the
+    // default {0,0,0,0} = OFF, so every robot/scene draw is unperturbed. Only the
+    // renderer-side GROUND disc fills this when contact_shadow_strength > 0.
+    float ground_shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // Resolve the camera (eye/target/up/fov) for this render. Priority:
@@ -1176,11 +1186,25 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         math::Transform gt = math::Transform::Identity();
         gt.position = {ctr.x, ctr.y, aabb_min.z - reach * 0.01f};
         g.model = TransformToMatrix(gt);
-        // A DARK, fairly matte studio floor with a faint cool tint -- kept low
-        // enough that it grounds the robot without competing with it for the eye.
-        g.base_color[0] = 0.018f; g.base_color[1] = 0.020f; g.base_color[2] = 0.026f;
+        // A fairly matte studio floor. The colour is caller-tunable (default = the
+        // original near-black cool tint); the M10 demos raise it to a mid-grey
+        // sweep so a near-black robot foot reads against it instead of dissolving.
+        g.base_color[0] = options.ground_color[0];
+        g.base_color[1] = options.ground_color[1];
+        g.base_color[2] = options.ground_color[2];
         g.base_color[3] = 1.0f;
         g.metallic = 0.0f; g.roughness = 0.70f; g.opacity = 1.0f;
+        // SINGLE-BLOB fallback contact shadow (used only when the caller gives NO
+        // explicit per-foot contact_points): one soft radial occlusion centred
+        // under the scene footprint. The fragment shader paints it into the floor
+        // albedo so the subject is anchored. Per-foot decals (below) supersede it.
+        if (options.contact_shadow_strength > 0.0f && options.contact_points.empty()) {
+            const float foot_r = 0.5f * std::max(std::max(ext.x, ext.y), 1e-3f);
+            g.ground_shadow[0] = ctr.x;
+            g.ground_shadow[1] = ctr.y;
+            g.ground_shadow[2] = foot_r * 1.05f;  // just past the footprint for a soft skirt
+            g.ground_shadow[3] = std::min(options.contact_shadow_strength, 1.0f);
+        }
 
         const VkDeviceSize gp = disc.positions.size() * sizeof(float);
         g.vertex_pos = d.CreateBuffer(
@@ -1200,6 +1224,53 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         g.index_count = static_cast<uint32_t>(disc.indices.size());
         // Draw the ground FIRST so the depth buffer lets the robot occlude it.
         draws.insert(draws.begin(), std::move(g));
+
+        // -- PER-FOOT CONTACT SHADOW DECALS ---------------------------------
+        // For each caller-supplied contact point, drop a small disc just ABOVE the
+        // floor whose fragment fades from the floor colour at the rim to dark at the
+        // centre (the same procedural occlusion). Because the rim equals the floor
+        // colour exactly, the decal blends seamlessly with NO alpha blending; only
+        // the soft dark core reads -> a believable per-foot contact shadow that the
+        // caller fades out as the foot lifts. Depth-tested + opaque, so the robot
+        // still occludes them and draw order is irrelevant.
+        const float floor_z = aabb_min.z - reach * 0.01f;
+        for (const auto& cp : options.contact_points) {
+            if (cp.radius <= 0.0f || cp.strength <= 0.0f) continue;
+            const MeshGeometry sd = MakeGroundDisc(cp.radius, 48u);
+            InstanceDraw s;
+            math::Transform st = math::Transform::Identity();
+            st.position = {cp.x, cp.y, floor_z + reach * 0.002f};  // a hair above the floor
+            s.model = TransformToMatrix(st);
+            s.base_color[0] = options.ground_color[0];
+            s.base_color[1] = options.ground_color[1];
+            s.base_color[2] = options.ground_color[2];
+            s.base_color[3] = 1.0f;
+            s.metallic = 0.0f; s.roughness = 0.70f; s.opacity = 1.0f;
+            s.ground_shadow[0] = cp.x;
+            s.ground_shadow[1] = cp.y;
+            s.ground_shadow[2] = cp.radius;
+            s.ground_shadow[3] = std::min(cp.strength, 1.0f);
+
+            const VkDeviceSize sp = sd.positions.size() * sizeof(float);
+            s.vertex_pos = d.CreateBuffer(
+                sp, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            d.UploadBuffer(s.vertex_pos, sd.positions.data(), sp);
+            const VkDeviceSize sn = sd.normals.size() * sizeof(float);
+            s.vertex_nrm = d.CreateBuffer(
+                sn, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            d.UploadBuffer(s.vertex_nrm, sd.normals.data(), sn);
+            const VkDeviceSize si = sd.indices.size() * sizeof(uint32_t);
+            s.index = d.CreateBuffer(
+                si, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            d.UploadBuffer(s.index, sd.indices.data(), si);
+            s.index_count = static_cast<uint32_t>(sd.indices.size());
+            // Insert right after the floor so it paints over the floor but under the
+            // robot (depth still arbitrates; this just keeps the floor-group together).
+            draws.insert(draws.begin() + 1, std::move(s));
+        }
     }
 
     // -- 2b. Per-frame SceneUbo (camera + light rig) + descriptor set --------
@@ -1314,6 +1385,7 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         push.emissive[1] = draw.emissive[1];
         push.emissive[2] = draw.emissive[2];
         push.emissive[3] = 0.0f;
+        std::memcpy(push.ground_shadow, draw.ground_shadow, sizeof(push.ground_shadow));
         vkCmdPushConstants(cmd, d.pipeline_layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                            sizeof(PushBlock), &push);
