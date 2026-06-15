@@ -2565,6 +2565,37 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # M10 RL feasibility gate (SG-spec G1d) -- union_throughput: measure batched
+    # H1+cup+table UNION env-steps/sec at N in {1,64,256,1024}. Cooks the union
+    # once, BuildNkUnionModel(tmpl,N) -> nk::World -> StepPlanned loop + timing +
+    # N>1 finite-q check. No Vulkan (shares the gated link set for the cook symbols).
+    add_executable(nuka_union_throughput
+        ${CMAKE_SOURCE_DIR}/examples/demo/union_throughput.cpp
+    )
+    add_dependencies(nuka_union_throughput nuka_codegen)
+    target_compile_definitions(nuka_union_throughput
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_union_throughput
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_union_throughput
+        PRIVATE
+            nuka_test_validated_sources  # BuildNkUnionModel (union_nk_model.cpp)
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
     # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
     # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb
