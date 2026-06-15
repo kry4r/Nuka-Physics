@@ -670,6 +670,7 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
                                        const float* drive_stiffness,
                                        const float* drive_damping,
                                        const float* drive_force_limits,
+                                       const float* joint_feedforward,
                                        uint32_t mode,
                                        bool defer_velocity_damping) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
@@ -721,6 +722,20 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
         const float limit = drive_force_limits[link];
         if (limit > 0.0f) {
             tau = fminf(fmaxf(tau, -limit), limit);
+        }
+    }
+
+    // T3 feed-forward: add the user-supplied direct joint force AFTER actuator
+    // saturation (MuJoCo qfrc_applied -- a user force, not an actuator output, so
+    // it is not clamped by the actuator force-range). Additive in EVERY preset
+    // (gravcomp / computed-torque / RL residual). The guard makes a default (0)
+    // joint_f a TRUE no-op: `jf != 0.0f` is false for +0.0 AND -0.0, so the store
+    // is byte-IDENTICAL to the pre-T3 drive when no feed-forward is written (the
+    // D1 guarantee). A non-null check keeps it safe on a model without the field.
+    if (joint_feedforward != nullptr) {
+        const float jf = joint_feedforward[link];
+        if (jf != 0.0f) {
+            tau += jf;
         }
     }
     state.tau[link] = tau;
@@ -922,6 +937,7 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
                static_cast<const float*>(data.drive_stiffness),
                static_cast<const float*>(data.drive_damping),
                static_cast<const float*>(data.drive_force_limit),
+               static_cast<const float*>(data.joint_f),
                p->mode,
                p->defer_velocity_damping != 0u);
     return LaunchOk(stream);

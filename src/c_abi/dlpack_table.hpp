@@ -129,21 +129,26 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     // -- field 21: Go2-on-stairs Phase 2a per-env terrain DIFFICULTY scale (f32,
     //    4 B, default 1.0). A writable per-env Data field. -----------------------
     {NUKA_FIELD_ENV_TERRAIN_DIFFICULTY, kStrideF32,   kWireDtypeF32, nk::FieldId::EnvTerrainDifficulty},
+    // -- field 22: T3 unified-actuator feed-forward joint force (f32, 4 B, default
+    //    0). A writable per-link Data field aliasing the persistent joint_f Data
+    //    field; added to tau in every preset (default 0 => no-op). ---------------
+    {NUKA_FIELD_JOINT_FEEDFORWARD,      kStrideF32,   kWireDtypeF32, nk::FieldId::JointF},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
-// The table must cover exactly the 22 public fields (0..21), one row each, in
-// integer order. ENV_TERRAIN_DIFFICULTY == 21 is the highest public field; the
-// count is one past it. (Append-only: bump this together with a new trailing row.)
+// The table must cover exactly the 23 public fields (0..22), one row each, in
+// integer order. JOINT_FEEDFORWARD == 22 is the highest public field; the count
+// is one past it. (Append-only: bump this together with a new trailing row.)
 // Fields 0..19 are byte-pinned by the RL contract; fields 20/21 are the Go2-on-
-// stairs Phase-2a additive per-env terrain controls (appended, never reordered).
-static_assert(kDlpackFieldCount == 22u,
-              "dlpack_table must hold exactly the 22 public state fields");
+// stairs Phase-2a per-env terrain controls; field 22 is the T3 unified-actuator
+// feed-forward joint force (all appended, never reordered).
+static_assert(kDlpackFieldCount == 23u,
+              "dlpack_table must hold exactly the 23 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
-static_assert(static_cast<int>(NUKA_FIELD_ENV_TERRAIN_DIFFICULTY) == 21,
+static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,
               "public field enum range changed — review the RL binary contract");
 
 // Resolve a public field's canonical descriptor. Returns nullptr if the field

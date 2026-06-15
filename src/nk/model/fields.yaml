@@ -478,3 +478,19 @@ fields:
   # Persistent + owner:data so it round-trips Reset (the construction snapshot).
   # =========================================================================
   - {name: env_terrain_difficulty, dtype: f32, per: env, arena: persistent, owner: data}
+  # =========================================================================
+  # FEED-FORWARD JOINT FORCE (T3, unified actuator) — DATA. Per-DOF direct
+  # applied force/torque ADDITIVE in EVERY actuator preset (PD/Torque/Velocity/
+  # Damper): tau += joint_f. This is MuJoCo's qfrc_applied -- the channel for
+  # gravity compensation, computed-torque feed-forward, and RL torque residuals,
+  # added AFTER actuator saturation (it is a user force, not an actuator output,
+  # so it is not clamped by the actuator force-range). APPENDED LAST so it is the
+  # highest FieldId: the arena lays fields out in FieldId order, so every existing
+  # field keeps its exact byte offset and the addition is layout-safe. DEFAULT 0
+  # (seeded by World::SeedInitialState); the drive kernel adds it ONLY when the
+  # per-DOF value is non-zero, so a default (0) joint_f leaves tau byte-IDENTICAL
+  # to the pre-T3 drive (the D1 guarantee -- proven by the go2_stand PD trajectory
+  # memcmp). Persistent + owner:data so it round-trips Reset and an RL/control
+  # harness can write it zero-copy (exposed as NUKA_FIELD_JOINT_FEEDFORWARD).
+  # =========================================================================
+  - {name: joint_f, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}

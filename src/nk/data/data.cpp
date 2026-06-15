@@ -128,6 +128,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ObsBuffer:           v.obs_buffer = static_cast<float*>(p); break;
         case FieldId::EnvTerrainType:      v.env_terrain_type = static_cast<uint32_t*>(p); break;
         case FieldId::EnvTerrainDifficulty: v.env_terrain_difficulty = static_cast<float*>(p); break;
+        case FieldId::JointF:              v.joint_f = static_cast<float*>(p); break;
         default: break;  // model-owned field id: not a DataView member.
     }
 }

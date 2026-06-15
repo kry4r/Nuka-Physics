@@ -108,6 +108,10 @@ CONTACT_LINK = Field.CONTACT_LINK
 # World.create_from_scene(terrain_step_height=..., ...).
 ENV_TERRAIN_TYPE = Field.ENV_TERRAIN_TYPE
 ENV_TERRAIN_DIFFICULTY = Field.ENV_TERRAIN_DIFFICULTY
+# T3 unified-actuator feed-forward joint force (per-link, default 0): tau += joint_f
+# in every control mode (gravcomp / computed-torque / RL residual). Writable
+# zero-copy; same layout/slot map as DRIVE_TARGET.
+JOINT_FEEDFORWARD = Field.JOINT_FEEDFORWARD
 
 # ARTICULATION_LINK_POSE element = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
 LINK_POSE_FLOATS = 7
@@ -196,6 +200,7 @@ __all__ = [
     "CONTACT_NORMAL",
     "CONTACT_FORCE",
     "CONTACT_LINK",
+    "JOINT_FEEDFORWARD",
     "CONTROL_MODE_PD_POSITION",
     "CONTROL_MODE_TORQUE",
     "CONTROL_MODE_VELOCITY",
