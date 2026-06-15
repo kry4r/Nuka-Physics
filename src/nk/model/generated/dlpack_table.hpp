@@ -177,6 +177,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ObsBuffer, DlpackDtype::kF32, 2, false, true},  // obs_buffer
     {FieldId::EnvTerrainType, DlpackDtype::kU32, 1, false, false},  // env_terrain_type
     {FieldId::EnvTerrainDifficulty, DlpackDtype::kF32, 1, false, false},  // env_terrain_difficulty
+    {FieldId::JointF, DlpackDtype::kF32, 1, false, false},  // joint_f
 };
 
 } // namespace nuka::nk

@@ -399,7 +399,20 @@ typedef enum nuka_state_field_t {
     // LAYOUT: 1 float per env, env-major. element_count == env_count,
     // element_stride_bytes == sizeof(float). dtype == 0 (FLOAT32). A write is
     // picked up by the NEXT Step. Persistent => round-trips reset.
-    NUKA_FIELD_ENV_TERRAIN_DIFFICULTY = 21
+    NUKA_FIELD_ENV_TERRAIN_DIFFICULTY = 21,
+    // WRITE (per-link). T3 unified-actuator feed-forward joint force: a direct
+    // applied torque/force ADDED to the actuator output of EVERY control mode
+    // (tau += joint_f), AFTER actuator saturation (MuJoCo qfrc_applied -- a user
+    // force, not an actuator output, so the actuator force-range does NOT clamp
+    // it). This is the channel for gravity compensation, computed-torque
+    // feed-forward, and RL torque residuals. Aliases the engine's persistent
+    // joint_f Data field (zero-copy). DEFAULT 0 => no-op (the drive is then
+    // byte-identical to a world without feed-forward). LAYOUT and slot map are
+    // IDENTICAL to NUKA_FIELD_DRIVE_TARGET: float[env_count * base_link_count],
+    // env-major, element_stride_bytes == sizeof(float), dtype == 0 (FLOAT32);
+    // slot 0 is the inert root, actuated joints are [1..base_link_count). A write
+    // is picked up by the NEXT Step. Persistent => round-trips reset.
+    NUKA_FIELD_JOINT_FEEDFORWARD = 22
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

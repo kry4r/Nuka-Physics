@@ -161,6 +161,7 @@ enum class FieldId : uint16_t {
     ObsBuffer,  // obs_buffer (per:env arena:scratch owner:data elem:64 flags:[readout])
     EnvTerrainType,  // env_terrain_type (per:env arena:persistent owner:data)
     EnvTerrainDifficulty,  // env_terrain_difficulty (per:env arena:persistent owner:data)
+    JointF,  // joint_f (per:link arena:persistent owner:data flags:[param])
     Count
 };
 

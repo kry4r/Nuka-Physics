@@ -827,6 +827,10 @@ NB_MODULE(_nuka_ext, m) {
         // for the locomotion curriculum; buffer_view shape (env_count,).
         .value("ENV_TERRAIN_TYPE", NUKA_FIELD_ENV_TERRAIN_TYPE)
         .value("ENV_TERRAIN_DIFFICULTY", NUKA_FIELD_ENV_TERRAIN_DIFFICULTY)
+        // T3 unified-actuator feed-forward joint force (per-link f32, default 0):
+        // tau += joint_f in every control mode, after actuator saturation. Same
+        // layout/slot map as DRIVE_TARGET; writable zero-copy. Default 0 => no-op.
+        .value("JOINT_FEEDFORWARD", NUKA_FIELD_JOINT_FEEDFORWARD)
         .export_values();
 
     nb::class_<Device>(m, "Device")

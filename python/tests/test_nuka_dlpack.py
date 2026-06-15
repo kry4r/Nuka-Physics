@@ -177,6 +177,59 @@ def test_out_of_range_control_mode_rejected(device):
         nuka.World.create_from_scene(device, SCENE, 64, control_mode=6)
 
 
+# ---------------------------------------------------------------------------
+# T3 unified-actuator feed-forward joint force (JOINT_FEEDFORWARD): a per-link
+# direct force added to the actuator output of EVERY control mode (tau += joint_f).
+# Default 0 => no-op (the drive is byte-identical to a world without it -- proven
+# at the C++ level by the go2_stand PD trajectory memcmp). These smokes prove the
+# field is a writable zero-copy view AND that a non-zero feed-forward actually
+# reaches the solver and moves the joint sign-correct.
+# ---------------------------------------------------------------------------
+def test_joint_feedforward_zero_copy_and_shaped(device):
+    with make_world(device, 64) as w:
+        view = w.buffer_view(nuka.JOINT_FEEDFORWARD)
+        ff = torch.from_dlpack(view)
+        assert ff.is_cuda and ff.dtype == torch.float32
+        assert tuple(ff.shape) == (64, GO2_BLC)
+        # writable + zero-copy: torch aliases the engine device buffer.
+        assert ff.data_ptr() == w.buffer_device_ptr(nuka.JOINT_FEEDFORWARD), \
+            "DLPack made a copy!"
+        ff.zero_()  # writable in place.
+        w.step()
+        nuka.sync()
+        q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+        assert torch.isfinite(q).all()
+
+
+def test_joint_feedforward_reaches_solver_sign_correct(device):
+    # In PD mode, a positive feed-forward torque on one actuated joint must push
+    # that joint's own velocity MORE positive than with zero feed-forward (and a
+    # negative feed-forward more negative) after one step -- i.e. tau += joint_f
+    # reached the solver additively, on top of the PD hold. N=64; env0, the
+    # perturbed joint only.
+    FF = 4.0  # well inside the cooked force limit.
+
+    def _own_qd(slot, ff_val):
+        with make_world(device, 64) as w:
+            ff = torch.from_dlpack(w.buffer_view(nuka.JOINT_FEEDFORWARD))
+            qd = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
+            ff.zero_()
+            if ff_val != 0.0:
+                ff[0, slot] = ff_val
+            w.step()
+            nuka.sync()
+            return float(qd[0, slot].item())
+
+    bad = []
+    for slot in range(1, GO2_BLC):  # actuated joints 1..12
+        base = _own_qd(slot, 0.0)
+        d_pos = _own_qd(slot, +FF) - base
+        d_neg = _own_qd(slot, -FF) - base
+        if not (d_pos > 0 and d_neg < 0):
+            bad.append((slot, d_pos, d_neg))
+    assert not bad, f"feed-forward wrong-sign joints (slot, d+, d-): {bad}"
+
+
 def test_4096_smoke(device):
     with make_world(device, 4096) as w:
         w.step()
