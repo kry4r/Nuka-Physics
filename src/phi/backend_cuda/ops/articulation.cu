@@ -623,44 +623,100 @@ __global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
     state.base_pose[articulation] = pose;
 }
 
-__global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
-                                         const float* drive_targets,
-                                         const float* drive_stiffness,
-                                         const float* drive_damping,
-                                         const float* drive_force_limits,
-                                         bool defer_velocity_damping) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count ||
-        state.joint_type[link] == ArticulationJointType::Fixed) {
-        return;
-    }
-    // tau = Kp*(target-q) - Kd*qdot; the -Kd*qdot term is deferred to the
-    // implicit joint-damping solve when defer_velocity_damping is set (see
-    // featherstone_aba.cu for the stability note).
-    float tau = drive_stiffness[link] * (drive_targets[link] - state.q[link]);
-    if (!defer_velocity_damping) {
-        tau -= drive_damping[link] * state.qdot[link];
-    }
-    const float limit = drive_force_limits[link];
-    if (limit > 0.0f) {
-        tau = fminf(fmaxf(tau, -limit), limit);
-    }
-    state.tau[link] = tau;
-}
+// ---------------------------------------------------------------------------
+// The ONE affine actuator (T2). All actuator "modes" are PRESETS of a single
+// affine force law -- there is NO per-actuator-type code path (owner's "禁止特化",
+// the convergent MuJoCo/Newton/Genesis design). Per actuated DOF, with control
+// input u (= the drive_target field), joint pos q, joint vel qdot:
+//
+//     p     = gain*u + b0 + b1*q + b2*qdot          (the affine law)
+//     tau   = clamp(p, -force_limit, +force_limit)  (effort saturation)
+//
+// The velocity term b2*qdot is folded IMPLICITLY into the mass-matrix diagonal
+// (crba.cu reads the drive_damping field as the per-DOF Kd and adds dt*Kd to the
+// M diagonal) -- the SAME stability mechanism PD has always used. So this kernel
+// applies ONLY {gain*u + b0 + b1*q}; the b2*qdot stabilizing term lives in the
+// implicit solve and is therefore NOT recomputed here when defer_velocity_damping
+// is set (the production schedule). The passive joint viscous damping
+// (model.joint_damping, applied in ABA Pass-2) is a SEPARATE physical property
+// from the control Kd (drive_damping): it persists in every preset incl. Torque,
+// so torque control does not silently lose joint friction.
+//
+// Preset table (which params each mode sets; Kp == drive_stiffness, Kd ==
+// drive_damping). The affine is evaluated GAIN-FACTORED -- p = gain*(u + r1*q) +
+// b0 with r1 = b1/gain -- because that is the ONLY float form that is BIT-EXACT
+// to the historical kernels (the distributed form gain*u + b1*q rounds
+// differently in ~43% of inputs and would move the byte-pinned PD trajectory;
+// the factored form Kp*(u + (-1)*q) == Kp*(u-q) exactly, since -1*q is exact so
+// the inner add carries a single rounding either way, fma or not):
+//   PDPosition (0): gain=Kp,  r1=-1, b0=0   -> Kp*(u-q)   [+ implicit -Kd*qdot]
+//   Torque     (1): gain=1,   r1=0,  b0=0   -> u          [direct torque]
+//   Velocity   (2): gain=Kd,  r1=0,  b0=0   -> Kd*u       [+ implicit -Kd*qdot
+//                                              == Kd*(u-qdot), the velocity servo]
+//   Damper     (3): gain=0,   b0=0          -> 0 explicit [pure implicit -Kd*qdot,
+//                                              ctrl-scaled damping; u unused here]
+// Modes 0/1 are the C-ABI-reachable, byte-D1-gated presets; 2/3 are wired in the
+// evaluator (presets = parameters, not new code paths) for when their control
+// surface is lit, and cannot perturb the reachable presets.
+enum NkDrivePreset : uint32_t {
+    kDrivePresetPD       = 0u,
+    kDrivePresetTorque   = 1u,
+    kDrivePresetVelocity = 2u,
+    kDrivePresetDamper   = 3u,
+};
 
-// M4: the union world's torque drive — LINE-BY-LINE port of
-// articulation_drives.cu ApplyTorqueDriveKernel (tau = clamp(torque_input,
-// +/-limit); no control Kd — physical joint damping runs downstream). The
-// torque input is the drive_target field (the union action surface).
-__global__ void ApplyTorqueDriveKernel(ArticulationDeviceState state,
-                                       const float* torque_input,
-                                       const float* drive_force_limits) {
+__global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
+                                       const float* drive_targets,
+                                       const float* drive_stiffness,
+                                       const float* drive_damping,
+                                       const float* drive_force_limits,
+                                       uint32_t mode,
+                                       bool defer_velocity_damping) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count ||
         state.joint_type[link] == ArticulationJointType::Fixed) {
         return;
     }
-    float tau = torque_input[link];
+    const float u = drive_targets[link];
+
+    // The affine, GAIN-FACTORED so each preset's float arithmetic is BIT-EXACT to
+    // the kernel it replaces. PDPosition is the historical position-PD expression
+    // Kp*(target-q); Torque is the historical direct-torque tau=u.
+    float tau;
+    if (mode == kDrivePresetTorque) {
+        // gain=1, r1=0, b0=0 -> p = u (no q/qdot read -- identical to the legacy
+        // ApplyTorqueDriveKernel, which set tau = torque_input directly).
+        tau = u;
+    } else if (mode == kDrivePresetVelocity) {
+        // gain=Kd, r1=0 -> p = Kd*u; the -Kd*qdot completes via the implicit fold
+        // (drive_damping == Kd), giving the Kd*(u-qdot) velocity servo. If the
+        // implicit fold is OFF, apply -Kd*qdot explicitly (mirrors PD's branch).
+        const float kd = drive_damping[link];
+        tau = kd * u;
+        if (!defer_velocity_damping) {
+            tau -= kd * state.qdot[link];
+        }
+    } else if (mode == kDrivePresetDamper) {
+        // gain=0, b0=0 -> no explicit term; the damping is the implicit -Kd*qdot.
+        // With the fold OFF, realize it explicitly as -Kd*qdot.
+        tau = 0.0f;
+        if (!defer_velocity_damping) {
+            tau -= drive_damping[link] * state.qdot[link];
+        }
+    } else {
+        // PDPosition (default). gain=Kp, r1=-1, b0=0 -> the affine reduces to
+        // Kp*(u - q). Written as the subtraction (the r1=-1 reduction) so the
+        // emitted float arithmetic is TEXTUALLY identical to the historical
+        // ApplyPositionDriveKernel (Kp*(target-q)); u is the same value as
+        // drive_targets[link]. This keeps the byte-pinned PD trajectory exact.
+        tau = drive_stiffness[link] * (u - state.q[link]);
+        if (!defer_velocity_damping) {
+            tau -= drive_damping[link] * state.qdot[link];
+        }
+    }
+
+    // Effort saturation (symmetric today; T3 generalizes to asymmetric). A
+    // non-positive limit means "unlimited", matching every historical kernel.
     if (drive_force_limits != nullptr) {
         const float limit = drive_force_limits[link];
         if (limit > 0.0f) {
@@ -856,20 +912,17 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
     const ArticulationDeviceState state =
         MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
     const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-    if (p->mode == 1u) {
-        // M4 union path: direct torque drive (drive_target carries the torque).
-        LaunchCuda(ApplyTorqueDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
-                   stream, state,
-                   static_cast<const float*>(data.drive_target),
-                   static_cast<const float*>(data.drive_force_limit));
-        return LaunchOk(stream);
-    }
-    LaunchCuda(ApplyPositionDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
+    // ONE affine actuator kernel for EVERY preset (p->mode selects which params the
+    // affine uses; there is no per-mode kernel/code path). PDPosition (0) and
+    // Torque (1) are the reachable, byte-D1-gated presets; Velocity (2)/Damper (3)
+    // are evaluated by the same kernel for when their control surface is lit.
+    LaunchCuda(ApplyAffineDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
                state,
                static_cast<const float*>(data.drive_target),
                static_cast<const float*>(data.drive_stiffness),
                static_cast<const float*>(data.drive_damping),
                static_cast<const float*>(data.drive_force_limit),
+               p->mode,
                p->defer_velocity_damping != 0u);
     return LaunchOk(stream);
 }
