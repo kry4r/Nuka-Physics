@@ -135,11 +135,18 @@ params:
       # scales it down): owner step-height band 0.08-0.15 m -> step_height 0.15
       # at create, per-env DIFFICULTY in [~0.53, 1.0] -> realized [0.08, 0.15].
       #
-      # CURRICULUM: all envs start at the easiest difficulty (start_difficulty
-      # ~= 0.53 -> 0.08 m steps) on a round-robin of the 3 terrain types
-      # (stairs/pit/boxes). On reset an env is PROMOTED (difficulty += step;
-      # once it tops out, advanced to the next type) if its episode mean reward
-      # cleared promote_thr, and DEMOTED (difficulty -= step) if it FELL.
+      # CURRICULUM (COLD-START): all envs start near-FLAT (start_difficulty 0.0 =>
+      # difficulty 0 => flat geometry even for Stairs/Pit/Boxes types) so a from-
+      # scratch policy can bootstrap walking. The SCALE-INDEPENDENT promotion gate
+      # (legged_gym terrain-level style) then raises difficulty toward 1.0 (=0.15 m)
+      # as the policy improves: on reset an env is PROMOTED (difficulty += step;
+      # once it tops out at 1.0, advanced to the next terrain TYPE) iff it SURVIVED
+      # most of the episode (ep_len >= survive_frac * max_episode_length) AND walked
+      # far enough (base XY displacement over the episode > promote_dist_m), and
+      # DEMOTED (difficulty -= step, toward flat) if it FELL (terminated). The OLD
+      # reward-threshold gate (promote_thr 8.0) NEVER fired -- the real reward scale
+      # is ~0.01-0.07, so every env stayed pinned at the easiest tier; promote_thr
+      # is retained only as a diagnostic and is no longer the gate.
       terrain:
         enable: false
         # Procedural-terrain cook geometry (the 5 create_from_scene terrain_*).
@@ -150,12 +157,17 @@ params:
         grid_height_max: 0.15    # RandomBoxes max per-cell rise.
         ground_height: 0.0       # absolute floor (matches the flat scene).
         # Curriculum knobs.
-        start_difficulty: 0.5333 # 0.08/0.15 -> easiest tier = 0.08 m steps.
-        promote_thr: 8.0         # episode MEAN reward to promote (per-step ~0.005
-                                 # -> ~ a sustained-walk episode return / length).
+        start_difficulty: 0.0    # COLD-START: difficulty 0 => FLAT for every type
+                                 # (range [0.0, 1.0]); the dog bootstraps walking on
+                                 # flat, then the survival/displacement gate climbs
+                                 # to 1.0 (= 0.15 m steps). Warm-start a learned
+                                 # policy by raising this (e.g. 0.3-0.5).
+        survive_frac: 0.8        # PROMOTE gate: survive >= 0.8*max_episode_length.
+        promote_dist_m: 3.0      # PROMOTE gate: base XY displacement > 3 m / episode.
         demote_on_fall: true     # a terminated (fell) episode demotes the env.
         difficulty_step: 0.1     # promote/demote increment.
-        ema_beta: 0.99           # reward-EMA smoothing (diagnostic gate).
+        ema_beta: 0.99           # reward-EMA smoothing (diagnostic only now).
+        promote_thr: 8.0         # DEPRECATED reward-threshold gate (diagnostic).
         # RANDOM-XY SPAWN + FREE-ROAM (随地走). On every reset the base is placed at
         # a RANDOM (x,y) in [-spawn_xy_range, +spawn_xy_range]^2 around the tile
         # origin (so dogs start on different steps/rings/boxes) and -- when
