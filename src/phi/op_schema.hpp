@@ -10,7 +10,9 @@
 //   * NkOp has exactly 30 named ops + a trailing `Count` sentinel. (M9 T7
 //     appended StepBackward, the diffsim contact-free single-step adjoint; M9
 //     T11 Phase 2 appended ParticleParticleContact, the id-10 cross-system
-//     particle-particle non-penetration co-step.)
+//     particle-particle non-penetration co-step. M10 RL-completion appended
+//     ReadoutUnionContactObs, the union-only per-env contact observation
+//     readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family.)
 //   * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
 //     spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
 //     carry a minimal plausible field set where obvious, or a reserved POD
@@ -67,6 +69,7 @@ enum class NkOp : uint16_t {
     ResetEnvs,             // per-env reset to initial state
     SnapshotState,         // capture full world state
     RestoreState,          // restore from a snapshot
+    ReadoutUnionContactObs,// union-only per-env contact obs (finger force + foot state)
 
     // --- domain randomization -------------------------------------------
     RandomizeMaterialBuckets, // per-env material bucket randomization
@@ -454,6 +457,26 @@ struct ExportObsParams {
     uint32_t obs_width;         // floats per env in obs_buffer
 };
 
+// M10 RL-completion: ReadoutUnionContactObs — union-only per-env contact obs.
+// After a union StepPlanned, write a per-env contact-observation slice into
+// obs_buffer for the RL grasp reward. The slice layout per env (at obs_offset,
+// inside the per-env obs_buffer row of `obs_width` floats):
+//   [ n_fingers finger normal-impulse floats | n_feet foot contact-scalar floats ]
+// Each finger entry = the sum of the slot's NORMAL-row impulses (lambda) over
+// the finger slot's max_pts normal rows (the force-closure signal). Each foot
+// entry = 1.0 if the foot slot has >0 manifold contacts this step else 0.0.
+// Strictly ADDITIVE + UnionCsr-gated: never emitted for fused/pair-driven.
+struct ReadoutUnionContactObsParams {
+    uint32_t env_count;
+    uint32_t union_slot_count;  // union slots per env (== max_contacts_per_env)
+    uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
+    uint32_t n_feet;            // foot slots [0, n_feet)
+    uint32_t n_fingers;         // finger slots [n_feet, n_feet+n_fingers)
+    uint32_t obs_offset;        // float offset of the slice in the per-env row
+    uint32_t obs_width;         // per-env obs_buffer stride in floats (== 64)
+    uint32_t max_pts;           // normal rows per finger slot (sphere-hull == 1)
+};
+
 // ResetEnvs: per-env masked snapshot restore. The env-id list is uploaded into
 // the reset_env_ids field (scratch) by World::Reset BEFORE the dispatch; count
 // is how many leading entries are valid.
@@ -467,6 +490,17 @@ struct ResetEnvsParams {
     // slice [env*body_count, env*body_count+body_count) from the snapshot_body_*
     // fields. 0 => no bodies (the articulation-only path stays byte-identical).
     uint32_t body_count;        // bodies per env (snapshot_body_* slice stride)
+    // M10 RL-completion: OPTIONAL per-env Philox initial-condition randomization,
+    // applied ON TOP of the snapshot restore. ALL fields default-zero (this POD
+    // is value-init), and EACH perturbation is gated `if (half != 0)` in the
+    // kernel, so an all-zero params (every existing go2/fused caller) yields the
+    // VERBATIM snapshot copy — byte-identical to the pre-M10 reset.
+    uint64_t ic_seed;           // Philox seed (0 default; combined with ic_episode)
+    uint32_t ic_episode;        // bumped each Reset() so successive resets differ
+    uint32_t cup_body_index;    // which body slot the cup-XY jitter targets (0)
+    float    jitter_cup_xy[2];  // +/- half-range for cup body pose x/y (0 => off)
+    float    jitter_base_pos[3];// +/- half-range for base pose x/y/z (0 => off)
+    float    jitter_q;          // +/- half-range for each generalized coord (0=off)
 };
 
 struct SnapshotStateParams {
