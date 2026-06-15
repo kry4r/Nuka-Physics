@@ -124,3 +124,38 @@ params:
       # over-killed recoverable wobbles -> short episodes -> starved reward signal).
       termination_tilt_deg: 120.0
       termination_height: 0.18
+
+      # ---------------------------------------------------------------------
+      # Go2-on-stairs Phase 2b: BLIND terrain curriculum (default DISABLED so
+      # the flat training path above is reproduced byte-for-byte). Set
+      # enable=true (or pass --terrain to train_go2_ppo.py) to cook the
+      # procedural terrain + drive a per-env type+difficulty curriculum.
+      #
+      # GEOMETRY (model-level cook config; step_height is the MAX, difficulty
+      # scales it down): owner step-height band 0.08-0.15 m -> step_height 0.15
+      # at create, per-env DIFFICULTY in [~0.53, 1.0] -> realized [0.08, 0.15].
+      #
+      # CURRICULUM: all envs start at the easiest difficulty (start_difficulty
+      # ~= 0.53 -> 0.08 m steps) on a round-robin of the 3 terrain types
+      # (stairs/pit/boxes). On reset an env is PROMOTED (difficulty += step;
+      # once it tops out, advanced to the next type) if its episode mean reward
+      # cleared promote_thr, and DEMOTED (difficulty -= step) if it FELL.
+      terrain:
+        enable: false
+        # Procedural-terrain cook geometry (the 5 create_from_scene terrain_*).
+        step_height: 0.15        # the MAX rise per ring (difficulty scales DOWN).
+        step_width: 0.3          # horizontal width of each step ring.
+        platform_width: 1.0      # central top-platform / pit edge length.
+        grid_width: 0.45         # RandomBoxes cell edge.
+        grid_height_max: 0.15    # RandomBoxes max per-cell rise.
+        ground_height: 0.0       # absolute floor (matches the flat scene).
+        # Curriculum knobs.
+        start_difficulty: 0.5333 # 0.08/0.15 -> easiest tier = 0.08 m steps.
+        promote_thr: 8.0         # episode MEAN reward to promote (per-step ~0.005
+                                 # -> ~ a sustained-walk episode return / length).
+        demote_on_fall: true     # a terminated (fell) episode demotes the env.
+        difficulty_step: 0.1     # promote/demote increment.
+        ema_beta: 0.99           # reward-EMA smoothing (diagnostic gate).
+        # Per-env START type weights {0:Flat,1:Stairs,2:Pit,3:Boxes}. Omit/empty
+        # => deterministic round-robin over {stairs, pit, boxes} (all 3 trained).
+        # type_distribution: {1: 1.0, 2: 1.0, 3: 1.0}
