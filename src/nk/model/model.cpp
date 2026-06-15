@@ -35,6 +35,13 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::ShapeMatchSlot:   return shape_match_slots_per_env;
         case FieldPer::ShapeMatchMember: return shape_match_members_per_env;
         case FieldPer::EnvDof2:        return dofs_per_env * dofs_per_env;
+        // Multi-articulation co-residence: per-artic count == articulations_per_env;
+        // the per-artic M-tile == articulations_per_env * max_dof^2. At
+        // articulations_per_env == 1 these equal PerEnvCount(Env) / PerEnvCount(EnvDof2)
+        // EXACTLY (same element count + ordering => the K==1 byte-identity invariant).
+        case FieldPer::Articulation:     return articulations_per_env;
+        case FieldPer::ArticulationDof2: return articulations_per_env * dofs_per_env *
+                                                dofs_per_env;
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
     return 0u;
@@ -189,11 +196,20 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, a.link_body, L, E, sizeof(uint32_t));
             break;
         case FieldId::LinkToArticulation: {
-            // replica e's links all belong to articulation e (1 artic / env).
+            // Multi-articulation co-residence: link l of replica e belongs to GLOBAL
+            // articulation (e * K + local_artic_of_link[l]), where K ==
+            // articulations_per_env. The template-local link->artic map is
+            // a.link_to_articulation (built by BuildArticulationHostState over ALL
+            // co-resident topologies). The +e*K term is the per-replica articulation
+            // offset (the TileConcatOffset stride). At K==1 local_artic is always 0,
+            // so this reduces EXACTLY to p[e*L+l] = e (the prior 1-artic byte layout).
             auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t K = capacities.articulations_per_env;
             for (uint32_t e = 0; e < E; ++e) {
                 for (uint32_t l = 0; l < L; ++l) {
-                    p[static_cast<size_t>(e) * L + l] = e;
+                    const uint32_t local_artic =
+                        l < a.link_to_articulation.size() ? a.link_to_articulation[l] : 0u;
+                    p[static_cast<size_t>(e) * L + l] = e * K + local_artic;
                 }
             }
             break;
@@ -205,13 +221,38 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, a.joint_armature, L, E, sizeof(float));
             break;
         case FieldId::ArticulationLinkCount: {
+            // K entries per replica (one per co-resident articulation). The per-dog
+            // link counts come from a.articulation_link_count; the per-replica term
+            // is none (a count is replica-invariant). At K==1 a.articulation_link_count
+            // == { L }, so this reduces to p[e] = L (the prior per:env byte layout).
             auto* p = reinterpret_cast<uint32_t*>(dst);
-            for (uint32_t e = 0; e < E; ++e) { p[e] = L; }
+            const uint32_t K = capacities.articulations_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t k = 0; k < K; ++k) {
+                    p[static_cast<size_t>(e) * K + k] =
+                        k < a.articulation_link_count.size() ? a.articulation_link_count[k]
+                                                             : 0u;
+                }
+            }
             break;
         }
         case FieldId::ArticulationLinkOffset: {
+            // K entries per replica. Each dog's flat link offset is its template-local
+            // offset (a.articulation_link_offset[k]) PLUS the per-replica e*L shift
+            // (the device link arrays are env-major at stride L == total links/env --
+            // the documented TileConcatOffset pattern, stride = total link count). At
+            // K==1 a.articulation_link_offset == { 0 }, so this reduces to p[e] = e*L
+            // (the prior per:env byte layout).
             auto* p = reinterpret_cast<uint32_t*>(dst);
-            for (uint32_t e = 0; e < E; ++e) { p[e] = e * L; }
+            const uint32_t K = capacities.articulations_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t k = 0; k < K; ++k) {
+                    const uint32_t local_off =
+                        k < a.articulation_link_offset.size() ? a.articulation_link_offset[k]
+                                                              : 0u;
+                    p[static_cast<size_t>(e) * K + k] = e * L + local_off;
+                }
+            }
             break;
         }
         case FieldId::FootShape: {

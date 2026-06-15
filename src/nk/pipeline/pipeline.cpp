@@ -29,7 +29,15 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t env_count        = cap.env_count;
     const uint32_t base_link_count  = cap.links_per_env;
     const uint32_t total_link_count = cap.links_per_env * cap.env_count;
-    const uint32_t articulation_cnt = has_articulation ? cap.env_count : 0u;
+    // WP1 multi-articulation co-residence: articulation_count == K * env_count
+    // (K == articulations_per_env, the number of co-resident dogs per env). Every
+    // forward kernel already launches dim3(articulation_count) and indexes
+    // articulation_link_offset[articulation] / base_pose[articulation] /
+    // m[articulation*max_dof^2], so this single scalar generalizes the launch
+    // geometry. At K==1 (the legacy single-robot scene) this equals env_count, so
+    // the launch is byte-identical. max_dof stays cap.dofs_per_env (per-DOG DOF).
+    const uint32_t articulation_cnt =
+        has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
 

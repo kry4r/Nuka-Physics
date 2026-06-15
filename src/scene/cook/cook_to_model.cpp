@@ -221,17 +221,23 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     // an EMPTY body_init, so SeedInitialState skips the body block entirely).
     std::vector<uint8_t> body_is_articulation_link(blob.body_count, 0u);
 
-    // 4. Articulation template (the FIRST articulation, the single-robot scene
-    //    shape; multi-articulation per env is a later extension). M3b: the
-    //    template arrays are the SINGLE-ENV BuildArticulationHostState product
-    //    transcribed 1:1, so the staged Model bytes (after env-major tiling in
-    //    Model::StageModelField) match the legacy UploadArticulationState bytes
-    //    EXACTLY — the byte-exact kernel-port contract.
+    // 4. Articulation template(s). M3b transcribed the SINGLE-ENV
+    //    BuildArticulationHostState product 1:1; the WP1 multi-articulation
+    //    foundation transcribes the FULL set of co-resident topologies (K Go2 in
+    //    ONE env). BuildArticulationHostState(arts, ...) ALREADY loops over every
+    //    topology, building the flat per-link arrays + link_to_articulation[] +
+    //    articulation_link_count/offset[] with a running global offset, so the
+    //    only change here is to pass the WHOLE `arts` vector (not just the front)
+    //    and carry the per-articulation bookkeeping into nk::Model. At
+    //    articulations_per_env == 1 (the legacy single-robot scene) the host state
+    //    is identical to the BuildArticulationHostState({arts.front()}) product,
+    //    so the staged Model bytes are byte-for-byte unchanged (the K==1 D1
+    //    invariant). dofs_per_env stays the MAX single-dog DOF (NEVER summed): the
+    //    CRBA M-tile is per-articulation (one max_dof^2 block per dog).
     if (!arts.empty()) {
         namespace articulation = runtime::articulation;
-        const articulation::ArticulationCookedTopology& a = arts.front();
         const articulation::ArticulationHostState host =
-            articulation::BuildArticulationHostState({a}, blob.bodies);
+            articulation::BuildArticulationHostState(arts, blob.bodies);
 
         nk::ModelArticulation& m = model.articulation;
         m.link_count = host.TotalLinkCount();
@@ -248,6 +254,13 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
                                              : host.base_pose.front();
         m.link_body = host.link_body;
+        // WP1 multi-articulation co-residence bookkeeping (host already built it).
+        m.link_to_articulation = host.link_to_articulation;
+        m.articulation_link_count = host.articulation_link_count;
+        m.articulation_link_offset = host.articulation_link_offset;
+        m.base_poses = host.base_pose;  // K root world poses (one per co-resident dog).
+        m.articulation_count =
+            static_cast<uint32_t>(host.articulation_link_count.size());
 
         // Mark every body row owned by an articulation link (so the movable
         // body_init pass skips them — they are integrated by FK, not as free
@@ -290,17 +303,37 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         // DOF count (Revolute/Prismatic = 1, Fixed = 0, FloatingBase = 6) — the
         // legacy ArticulationDofCount semantics (inlined: that symbol lives in
         // the GPU lib, which the pure cook must not link), i.e. max_dof.
-        uint32_t dofs = 0;
-        for (auto jt : host.joint_type) {
+        //
+        // WP1 multi-articulation: dofs_per_env is the MAX single-DOG DOF (the
+        // per-articulation CRBA M-tile is max_dof^2, ONE block per co-resident dog
+        // -- NEVER the SUM, which would (a) be a G0-dishonest monolithic DOF and
+        // (b) blow the per-artic 64-DOF cap at K>=4). Compute each articulation's
+        // own DOF over its link slice [offset, offset+count) and keep the max.
+        // For the single-articulation scene this is exactly the prior whole-host
+        // sum (one articulation == the whole host), so dofs_per_env is unchanged.
+        auto joint_dof = [](articulation::ArticulationJointType jt) -> uint32_t {
             switch (jt) {
-                case articulation::ArticulationJointType::Fixed: break;
-                case articulation::ArticulationJointType::FloatingBase: dofs += 6; break;
-                default: dofs += 1; break;
+                case articulation::ArticulationJointType::Fixed: return 0u;
+                case articulation::ArticulationJointType::FloatingBase: return 6u;
+                default: return 1u;
             }
+        };
+        uint32_t max_dof = 0u;
+        for (uint32_t ai = 0; ai < m.articulation_count; ++ai) {
+            const uint32_t off = ai < host.articulation_link_offset.size()
+                                     ? host.articulation_link_offset[ai] : 0u;
+            const uint32_t cnt = ai < host.articulation_link_count.size()
+                                     ? host.articulation_link_count[ai] : 0u;
+            uint32_t dofs = 0u;
+            for (uint32_t l = off; l < off + cnt && l < host.joint_type.size(); ++l) {
+                dofs += joint_dof(host.joint_type[l]);
+            }
+            if (dofs > max_dof) max_dof = dofs;
         }
-        m.dof_count = dofs;
+        m.dof_count = max_dof;          // PER-ARTICULATION (max single-dog DOF).
         cap.dofs_per_env = m.dof_count;
-        cap.links_per_env = m.link_count;
+        cap.links_per_env = m.link_count;        // SUM across co-resident dogs.
+        cap.articulations_per_env = m.articulation_count;  // K (1 for legacy scenes).
 
         // Foot shapes: the T2/T6 derivation — every Sphere shape whose owning
         // body maps to an articulation link is a foot (base-relative indices).
@@ -540,6 +573,20 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     //    row triple {normal, t1, t2} makes max_rows = 3 * max_contacts (this is
     //    exactly the legacy lambda buffer layout slot*3 + k). The general
     //    broadphase-cooked sizing arrives with M5.
+    //
+    // WP1 NOTE (multi-articulation foot contact is the LATER contact crux, NOT
+    // this foundation task): kMaxFootContactsPerEnv == 4 is a COMPILE-TIME constant
+    // and the FUSED foot-detection kernel keys slots by ENV (base_slot = env*4),
+    // NOT by articulation. With K co-resident dogs (4 feet each) one env's K*4 feet
+    // would overflow the 4 env slots / mis-slot across dogs. Growing this to K*4
+    // here WITHOUT re-keying contacts_foot.cu's slot math (env -> articulation) and
+    // the `rows` field stride would be incorrect AND would shift the K==1 `rows`
+    // byte layout (D1 break). So the cap is left at 4 (byte-identical at K==1); the
+    // multi-dog foot/leg contact pipeline (K*4 slots + env->artic slot re-key +
+    // capsule-capsule narrowphase + two-articulation reaction scatter) is WP5-8,
+    // the genuinely-new contact crux. The WP1 co-step spike free-falls the dogs so
+    // no ground contact is exercised -- it validates the multi-artic FORWARD
+    // dynamics co-residence, which is what this foundation delivers.
     if (cap.links_per_env > 0) {
         cap.max_contacts_per_env = 4u;   // == articulation::kMaxFootContactsPerEnv
         cap.max_rows_per_env     = 12u;  // 3 rows per contact slot.

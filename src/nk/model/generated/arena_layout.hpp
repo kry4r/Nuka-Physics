@@ -21,7 +21,11 @@ enum class FieldOwner : uint8_t { Model, Data };
 enum class FieldPer : uint8_t {
     Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,
     DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,
-    Scalar
+    Scalar,
+    // Multi-articulation co-residence: per-articulation (= articulations_per_env)
+    // and per-articulation M-tile (= articulations_per_env * max_dof^2).
+    // APPENDED so the existing enumerator values never shift.
+    Articulation, ArticulationDof2
 };
 
 struct FieldLayout {
@@ -43,13 +47,13 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // q
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // qdot
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 7, 28, 0},  // link_pose
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // base_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 7, 28, 0},  // base_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // body_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_inv_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // contact_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 16, 1, 64, 0},  // rows
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // lambda
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::EnvDof2, 1, 1, 4, 0},  // m_inv
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m_inv
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mat_buckets
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // mat_index
@@ -73,7 +77,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // snapshot_q
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // snapshot_qdot
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // snapshot_link_velocity
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // snapshot_base_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 7, 28, 0},  // snapshot_base_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // snapshot_body_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // snapshot_body_linear_velocity
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // snapshot_body_angular_velocity
@@ -89,8 +93,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_to_articulation
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_damping
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_armature
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Env, 1, 1, 4, 0},  // articulation_link_count
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Env, 1, 1, 4, 0},  // articulation_link_offset
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Articulation, 1, 1, 4, 0},  // articulation_link_count
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Articulation, 1, 1, 4, 0},  // articulation_link_offset
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // foot_shape
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_linear_velocity
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_angular_velocity
@@ -132,7 +136,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Dof, 1, 1, 4, 0},  // qdot_flat
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::EnvDof2, 1, 1, 4, 0},  // m
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_composite_inertia
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // union_slots
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // hull_verts
