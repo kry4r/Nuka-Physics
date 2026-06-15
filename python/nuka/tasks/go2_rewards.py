@@ -33,14 +33,32 @@ PORTED reward terms (term | legged_gym scale | status):
   dof_acc           | -2.5e-7   | yes   Σ ((qd_prev - qd)/dt)^2
   action_rate       | -0.01     | yes   Σ (last_action - action)^2
   dof_pos_limits    | -10.0     | yes   Σ out-of-(soft 0.9 URDF limit)
+  feet_air_time     |  1.0      | yes   Σ (air_time - 0.5)·first_contact, gated
+                                       by ||cmd_xy||>0.1 -- the TRUE per-foot
+                                       contact comes from LINK_CONTACT_WRENCH (the
+                                       foot sphere's contact force/torque is summed
+                                       onto its owning CALF link, field 16; a foot
+                                       is "in contact" iff |wrench.Fz| > 1 N), NOT
+                                       from CONTACT_POINTS (which is positions).
+  collision         | -1.0      | PROXY Σ 1[ thigh/calf/base link clips BELOW the
+                                       local terrain surface ]. FusedFoot has no
+                                       thigh/calf collision geometry (only the 4
+                                       foot spheres are collidable), so there is no
+                                       true per-body contact force for these links.
+                                       We use a faithful KINEMATIC terrain-clipping
+                                       proxy: ARTICULATION_LINK_POSE link world z
+                                       vs terrain_sample_height_batch at the link
+                                       (x,y) (the SINGLE-source heightfield). See
+                                       Go2Reward._collision + the env wiring + the
+                                       HONESTY caveat there.
 
-DROPPED terms (active in legged_gym, dropped here -- DATA GAP, logged):
-  feet_air_time     |  1.0      | DROP  needs PER-FOOT contact-force z>1 N; Nuka's
-                                       CONTACT_POINTS field is foot POSITIONS
-                                       (4 feet x xyz), not a net-contact-force
-                                       tensor indexed by body. No air-time signal.
-  collision         | -1.0      | DROP  needs per-BODY contact-force norm on
-                                       thigh/calf (>0.1 N); same missing tensor.
+PREVIOUSLY DROPPED (now re-enabled) -- the missing-tensor diagnosis was wrong:
+  Nuka DOES populate a per-link contact wrench (LINK_CONTACT_WRENCH, field 16;
+  ReadoutContactWrench runs for the !is_union FusedFoot Go2 world). The earlier
+  code looked at CONTACT_POINTS (foot positions) instead of LINK_CONTACT_WRENCH
+  (the per-link summed contact force) -- so feet_air_time is now sourced correctly.
+  collision still has NO true per-body force (no thigh/calf geometry in FusedFoot)
+  and is the documented kinematic terrain-clip PROXY.
 
 NOT PORTED -- ZERO scale in legged_gym (so legged_gym itself pops these in
 ``_prepare_reward_function``; they are NOT "drops", they are simply inactive):
@@ -84,16 +102,32 @@ SCALES = {
     "dof_acc": -2.5e-7,
     "action_rate": -0.01,
     "dof_pos_limits": -10.0,
+    # GAIT-CRITICAL terms (owner: "feet_air_time, collision 一定要加上, 步态很重要").
+    # Both legged_gym defaults; both now ACTIVE (no longer dropped) -- feet_air_time
+    # is sourced from the TRUE per-foot contact (LINK_CONTACT_WRENCH onto the calf
+    # link), collision is the kinematic terrain-clipping proxy (see the module
+    # docstring + Go2Reward._feet_air_time / _collision).
+    "feet_air_time": 1.0,
+    "collision": -1.0,
 }
 
-# Terms dropped due to a missing per-body/per-foot contact-FORCE tensor (Nuka's
-# CONTACT_POINTS holds foot positions, not forces). Kept here ONLY so the env can
-# log them once at construction (term + reason); they contribute 0 to the reward.
-DROPPED = {
-    "feet_air_time": "no per-foot contact-force tensor (CONTACT_POINTS = foot "
-                     "positions, not net contact force)",
-    "collision": "no per-body contact-force tensor for thigh/calf",
-}
+# No reward terms are dropped any more. Kept (empty) so the env's once-at-init
+# "DROPPED reward term" logging loop is a no-op and downstream imports stay valid.
+# (Historical: feet_air_time + collision were dropped on the WRONG premise that no
+# per-link contact tensor existed; LINK_CONTACT_WRENCH provides it for FusedFoot.)
+DROPPED: dict[str, str] = {}
+
+# legged_gym _reward_feet_air_time params:
+#   contact threshold (foot "loaded" iff |contact_force.z| > 1 N),
+#   air_time bias 0.5 s (reward = air_time - 0.5 at the touchdown step),
+#   command-gate ||cmd_xy|| > 0.1 (no air-time reward when commanded to stand).
+FEET_CONTACT_FORCE_THRESHOLD = 1.0
+FEET_AIR_TIME_BIAS = 0.5
+FEET_AIR_TIME_CMD_THRESHOLD = 0.1
+# collision proxy: a link counts as "clipping" when its world z is more than this
+# many metres BELOW the local terrain surface (a small tolerance absorbs FK lag /
+# numerical jitter so a grazing link near the surface is not falsely penalized).
+COLLISION_PENETRATION_TOL = 0.02
 
 # legged_gym rewards params (go2 overrides: tracking_sigma inherited 0.25;
 # soft_dof_pos_limit overridden to 0.9).
@@ -159,6 +193,18 @@ class Go2Reward:
         self.last_dof_vel = torch.zeros(
             self.num_envs, G.GO2_ACTION_DIM, dtype=dtype, device=device
         )
+        # feet_air_time bookkeeping (legged_gym): per-FOOT (4) cumulative time off
+        # the ground (s) + the prior step's per-foot contact bool (the
+        # contact_filt OR-with-last-step debounce). 4 = FL/FR/RL/RR feet. Both are
+        # zeroed externally for done envs in the env's autoreset (mirroring
+        # legged_gym reset_idx zeroing feet_air_time / last_contacts), exactly like
+        # last_dof_vel.
+        self.feet_air_time = torch.zeros(
+            self.num_envs, 4, dtype=dtype, device=device
+        )
+        self.last_contacts = torch.zeros(
+            self.num_envs, 4, dtype=torch.bool, device=device
+        )
 
     # -- term helpers (each mirrors a legged_gym _reward_*) ------------------
     @staticmethod
@@ -199,6 +245,65 @@ class Go2Reward:
         out = out + (q_urdf - self.soft_hi).clamp(min=0.0)   # above upper
         return out.sum(dim=1)
 
+    def _feet_air_time(self, foot_contact_fz, cmd):
+        """legged_gym _reward_feet_air_time, ported VERBATIM.
+
+        ``foot_contact_fz`` : (N,4) the four feet's CONTACT FORCE z (world) read
+        from LINK_CONTACT_WRENCH at each foot's owning CALF link (field 16). A
+        foot is "in contact" iff ``|Fz| > 1 N`` (legged_gym uses contact_forces.z
+        > 1). ``cmd`` : (N,3) velocity command (the air-time reward is gated off
+        when ||cmd_xy|| <= 0.1, i.e. when commanded to stand still).
+
+        Reward (per env): Σ_feet (air_time - 0.5) at the FIRST contact step after a
+        flight phase, so a clean long swing -> touchdown is rewarded and a foot that
+        never lifts (drag) earns nothing. Mutates ``self.feet_air_time`` /
+        ``self.last_contacts`` in place (the legged_gym per-step state machine);
+        the env zeroes both for done envs in autoreset.
+        """
+        contact = foot_contact_fz.abs() > FEET_CONTACT_FORCE_THRESHOLD  # (N,4) bool
+        # contact_filt: OR with last step (debounce a 1-frame contact dropout --
+        # legged_gym does this because PhysX can miss a contact for one substep).
+        contact_filt = contact | self.last_contacts
+        self.last_contacts = contact
+        first_contact = (self.feet_air_time > 0.0) & contact_filt
+        self.feet_air_time = self.feet_air_time + REWARD_DT
+        rew = ((self.feet_air_time - FEET_AIR_TIME_BIAS) * first_contact.to(self.dtype)
+               ).sum(dim=1)
+        # No air-time reward when commanded to stand (||cmd_xy|| <= 0.1).
+        cmd_moving = (cmd[:, :2].norm(dim=1) > FEET_AIR_TIME_CMD_THRESHOLD).to(self.dtype)
+        rew = rew * cmd_moving
+        # Reset the air-time accumulator for feet currently in (filtered) contact.
+        self.feet_air_time = self.feet_air_time * (~contact_filt).to(self.dtype)
+        return rew
+
+    @staticmethod
+    def _collision(link_world_z, local_surface_z):
+        """Kinematic terrain-CLIPPING proxy for legged_gym _reward_collision.
+
+        legged_gym penalizes ``Σ 1[ ||contact_force[penalised_body]|| > 0.1 ]`` --
+        a COUNT of penalised bodies (thigh/calf [+ base]) in hard contact. The
+        FusedFoot Go2 model has collision geometry ONLY on the 4 foot spheres, so
+        there is NO true per-body contact force for the thighs/calves/base. We
+        substitute a faithful KINEMATIC proxy that matches the term's INTENT
+        (discourage limbs hitting / clipping the terrain): a penalised link counts
+        as "in collision" when its world z is below the LOCAL terrain surface at
+        its (x,y) -- i.e. it is clipping INTO a step.
+
+        ``link_world_z`` / ``local_surface_z`` : (N, K) world z and local terrain
+        surface z for the K penalised links. Returns (N,) the count of links that
+        penetrate the surface by more than COLLISION_PENETRATION_TOL.
+
+        >>> HONESTY CAVEAT <<<  This is a TERRAIN-CLIP proxy, not a contact-force
+        readout. It cannot see a limb hitting ANOTHER limb (self-collision) or a
+        limb resting exactly on a surface; it only fires on geometric penetration
+        of the heightfield. A TRUE collision penalty would require thigh/calf
+        collision geometry + per-body contact force in the engine (a future engine
+        change -- the FusedFoot pipeline is foot-spheres-only by construction).
+        """
+        penetration = local_surface_z - link_world_z  # >0 when link is BELOW surface
+        clipping = penetration > COLLISION_PENETRATION_TOL
+        return clipping.to(torch.float32).sum(dim=1)
+
     # -- the full reward (legged_gym compute_reward semantics) --------------
     def compute(
         self,
@@ -211,6 +316,8 @@ class Go2Reward:
         target_q_urdf,
         action,
         last_action,
+        foot_contact_fz=None,
+        collision_count=None,
         return_terms: bool = False,
     ):
         """Total reward (num_envs,) = clip(Σ scale·term·REWARD_DT, min=0).
@@ -221,6 +328,14 @@ class Go2Reward:
         PD target the env wrote this step (default + 0.25*action). Updates
         ``last_dof_vel`` to the current ``qd_urdf`` at the end (legged_gym does
         ``last_dof_vel[:] = dof_vel`` at the tail of post_physics_step).
+
+        ``foot_contact_fz`` : (N,4) the four feet's contact-force z (world) read by
+        the env from LINK_CONTACT_WRENCH at each foot's owning calf link -- drives
+        feet_air_time. ``collision_count`` : (N,) the env's precomputed count of
+        penalised links clipping the terrain surface -- drives the collision proxy.
+        Both default None (e.g. the obs/oracle sanity probes that call compute()
+        without an engine world); the matching term then contributes 0 and its
+        per-step state machine is not advanced.
 
         With ``return_terms`` also returns a dict of the SIGNED, dt-scaled
         per-term contributions (for the sanity probe) -- pre-clamp.
@@ -235,6 +350,14 @@ class Go2Reward:
             "action_rate": self._action_rate(action, last_action),
             "dof_pos_limits": self._dof_pos_limits(q_urdf),
         }
+        # GAIT-CRITICAL terms (sourced by the env from the engine contact/pose
+        # fields). feet_air_time advances a per-foot state machine, so only run it
+        # when the env supplies the true per-foot contact (else its state must NOT
+        # tick). collision is a pure per-step proxy count.
+        if foot_contact_fz is not None:
+            terms["feet_air_time"] = self._feet_air_time(foot_contact_fz, cmd)
+        if collision_count is not None:
+            terms["collision"] = collision_count.to(self.dtype)
         total = torch.zeros(self.num_envs, dtype=self.dtype, device=self.device)
         contrib = {} if return_terms else None
         for name, term in terms.items():

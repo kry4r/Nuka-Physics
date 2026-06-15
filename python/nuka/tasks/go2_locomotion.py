@@ -120,12 +120,22 @@ class Go2LocomotionEnv(NukaGymEnv):
                 type_dist = {int(k): float(v) for k, v in type_dist.items()}
             self._curriculum = T.TerrainCurriculum(
                 self.num_envs, self._torch_device,
-                start_difficulty=float(tcfg.get("start_difficulty", T.DIFFICULTY_MIN)),
-                promote_thr=float(tcfg.get("promote_thr", 8.0)),
+                # COLD-START: default near-FLAT (difficulty 0 => flat geometry for
+                # every terrain type) so a from-scratch policy can bootstrap walking
+                # before any step height; the survival+displacement curriculum then
+                # raises difficulty toward 1.0 (= 0.15 m). Config knob:
+                # env_config.terrain.start_difficulty (default DIFFICULTY_COLD_START).
+                start_difficulty=float(tcfg.get("start_difficulty", T.DIFFICULTY_COLD_START)),
                 demote_on_fall=bool(tcfg.get("demote_on_fall", True)),
                 difficulty_step=float(tcfg.get("difficulty_step", 0.1)),
                 ema_beta=float(tcfg.get("ema_beta", 0.99)),
                 type_distribution=type_dist,
+                # SCALE-INDEPENDENT promotion gates (replace the broken reward-
+                # threshold gate): survive most of the episode AND walk far enough.
+                max_episode_length=int(self.max_episode_length),
+                survive_frac=float(tcfg.get("survive_frac", 0.8)),
+                promote_dist_m=float(tcfg.get("promote_dist_m", 3.0)),
+                promote_thr=float(tcfg.get("promote_thr", 8.0)),  # diagnostic only.
             )
             self._ground_height = float(tcfg.get("ground_height", 0.0))
             self._terrain_step_height = float(tcfg.get("step_height", T.STEP_HEIGHT_MAX))
@@ -155,6 +165,11 @@ class Go2LocomotionEnv(NukaGymEnv):
             self._last_reward = torch.zeros(self.num_envs, device=self._torch_device)
             self._last_terminated = torch.zeros(
                 self.num_envs, dtype=torch.bool, device=self._torch_device
+            )
+            # LIVE base (x,y) captured each step in compute_reward (the displacement
+            # gate's end point at the done step -- before autoreset clobbers it).
+            self._last_base_xy = torch.zeros(
+                self.num_envs, 2, device=self._torch_device
             )
             # Optional terrain diagnostic (NUKA_GO2_TERRAIN_DIAG=1): base-z min/max
             # + periodic type/difficulty histogram. Always-on float guards start at
@@ -188,8 +203,53 @@ class Go2LocomotionEnv(NukaGymEnv):
         self._diag = (dict(n=0, sum_a_mean=0.0, max_a=0.0, sum_r=0.0,
                            n_term=0, n_trunc=0)
                       if os.environ.get("NUKA_GO2_DIAG") else None)
-        # Ported legged_gym reward (owns last_dof_vel for dof_acc).
+        # Ported legged_gym reward (owns last_dof_vel for dof_acc + feet_air_time).
         self._reward = Go2Reward(self.num_envs, self._torch_device)
+
+        # ----------------------------------------------------------------------
+        # GAIT-CRITICAL term wiring (feet_air_time + collision). Both read engine
+        # per-link fields that the FusedFoot Go2 world DOES populate:
+        #   * LINK_CONTACT_WRENCH (field 16): net per-link contact force/torque
+        #     (world). ReadoutContactWrench runs for this !is_union world, so each
+        #     foot sphere's contact force is summed onto its owning CALF link. A
+        #     foot is "in contact" iff |wrench.Fz| > 1 N -> feets_air_time signal.
+        #   * ARTICULATION_LINK_POSE (field 1): per-link world pose -> the thigh/
+        #     calf/base link world z for the collision terrain-clip proxy.
+        # LINK index map: ARTICULATION_LINK_POSE / LINK_CONTACT_WRENCH are indexed
+        # by LOCAL link slot (0 = trunk/base, 1..12 = the leg-joint child links).
+        # Each foot sphere is cooked onto its CALF link; the calf link slot for a
+        # URDF calf joint j is (nuka_slot_for_urdf[j] + 1) (the +1 skips the root
+        # slot). We derive foot/thigh slots from the obs builder's structurally-
+        # discovered permutation so a future scrambled joint order stays correct.
+        b = self._obs
+        _u_calf = [G.URDF_JOINT_NAMES.index(n) for n in
+                   ("FL_calf", "FR_calf", "RL_calf", "RR_calf")]
+        _u_thigh = [G.URDF_JOINT_NAMES.index(n) for n in
+                    ("FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh")]
+        # foot CONTACT links == the 4 calf links (the foot sphere's owning link).
+        self._foot_link_slot = torch.as_tensor(
+            [int(b.nuka_slot_for_urdf_np[u]) + 1 for u in _u_calf],
+            dtype=torch.long, device=self._torch_device,
+        )
+        # collision penalised links: thigh + calf + base/trunk (legged_gym go2
+        # penalised_contacts = thigh + calf; we also include the base/trunk slot 0
+        # so a base belly-flop onto a step is penalised before the height-kill).
+        _calf_slots = [int(b.nuka_slot_for_urdf_np[u]) + 1 for u in _u_calf]
+        _thigh_slots = [int(b.nuka_slot_for_urdf_np[u]) + 1 for u in _u_thigh]
+        self._collision_link_slot = torch.as_tensor(
+            _thigh_slots + _calf_slots + [0],   # +base/trunk (root) slot
+            dtype=torch.long, device=self._torch_device,
+        )
+        # Zero-copy engine field views (alias the live buffers; re-read each step).
+        self._wrench_view = torch.from_dlpack(
+            self._world.buffer_view(nuka.LINK_CONTACT_WRENCH)  # (N, BLC, 6)
+        )
+        self._pose_view = torch.from_dlpack(
+            self._world.buffer_view(nuka.ARTICULATION_LINK_POSE)  # (N, BLC, 7)
+        )
+        print(f"[go2_locomotion] feet_air_time foot(calf)-link slots = "
+              f"{self._foot_link_slot.tolist()}; collision penalised-link slots = "
+              f"{self._collision_link_slot.tolist()} (thigh+calf+base)", flush=True)
         # Prior step's clipped action (the action-rate delta source). Distinct
         # from base.last_action, which is THIS step's clipped action.
         self._prev_action = torch.zeros(
@@ -202,7 +262,11 @@ class Go2LocomotionEnv(NukaGymEnv):
         ).contiguous()
         # Resample period in CONTROL steps.
         self._resample_every = max(1, int(round(RESAMPLING_TIME_S / REWARD_DT)))
-        # Log the dropped terms once (term + reason) -- honest record in stdout.
+        # Log the ACTIVE reward terms once (no DROPs now: feet_air_time + collision
+        # are re-enabled -- see go2_rewards). DROPPED is empty so this loop is a
+        # no-op; kept so a future genuine drop is still surfaced honestly.
+        print(f"[go2_locomotion] ACTIVE reward terms = "
+              f"{sorted(self._reward.scales.keys())}", flush=True)
         for name, reason in DROPPED.items():
             print(f"[go2_locomotion] DROPPED reward term '{name}': {reason}",
                   flush=True)
@@ -247,11 +311,15 @@ class Go2LocomotionEnv(NukaGymEnv):
         # only the engine fields are (re)written. No-op when terrain is disabled.
         if self._terrain_on:
             if mask is not None:
-                # mask is the (num_envs,) done bool. Promote/demote off this step's
-                # terminated (fell) -- the curriculum uses the episode return it
-                # accumulated each step (see compute_reward) as the walk-quality
-                # gate. terminated[done] is the part NOT due to time-limit truncation.
-                self._curriculum.update_on_done(mask, self._last_terminated & mask)
+                # mask is the (num_envs,) done bool. Promote/demote off the SCALE-
+                # INDEPENDENT survival+displacement gate: an env that survived most
+                # of the episode (curriculum.ep_len) AND walked far enough
+                # (||terminal base xy - start xy||, terminal captured pre-autoreset
+                # in compute_reward) is promoted; a fall (terminated, not just
+                # time-limit truncation) demotes.
+                self._curriculum.update_on_done(
+                    mask, self._last_terminated & mask, base_xy=self._last_base_xy
+                )
             self._write_terrain_for_reset(mask)
 
     # -- spawn-on-terrain: random (x,y) + yaw + lift base z to local surface --
@@ -345,6 +413,12 @@ class Go2LocomotionEnv(NukaGymEnv):
             self._bp_view[mask, 6] = qz[mask]
         nuka.sync()
 
+        # Record the spawn (x,y) as the episode START for the displacement-gate
+        # curriculum (||terminal - start||). Done here, AFTER the spawn pose is
+        # written, for the same (masked or all) reset envs.
+        spawn_xy = torch.stack((spawn_x, spawn_y), dim=1)
+        self._curriculum.set_start_xy(mask, spawn_xy)
+
     # -- command sampling (legged_gym _resample_commands, seeded) -----------
     def _resample_commands(self, mask: torch.Tensor) -> None:
         """Resample the velocity command for the envs in the boolean ``mask``.
@@ -386,6 +460,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         # Fresh-episode bookkeeping.
         self._prev_action.zero_()
         self._reward.last_dof_vel.zero_()
+        self._reward.feet_air_time.zero_()
+        self._reward.last_contacts.zero_()
         # Resample EVERY env's command on a full reset, then recompose the obs
         # command slot so the returned reset obs carries the new command.
         all_envs = torch.ones(
@@ -402,6 +478,13 @@ class Go2LocomotionEnv(NukaGymEnv):
         THIS step's clipped action (the base sets it before calling us);
         ``self._prev_action`` is the prior step's clipped action."""
         b = self._obs
+        # GAIT-CRITICAL signals (read live, zero-copy, post-step):
+        #   foot_contact_fz: (N,4) the 4 feet's world contact-force z, taken from
+        #     LINK_CONTACT_WRENCH at each foot's owning CALF link. |Fz|>1N == loaded.
+        #   collision_count: (N,) # of penalised links (thigh/calf/base) clipping
+        #     BELOW the local terrain surface (the kinematic terrain-clip proxy).
+        foot_contact_fz = self._wrench_view[:, self._foot_link_slot, 2]  # (N,4)
+        collision_count = self._collision_count()                        # (N,)
         r = self._reward.compute(
             cmd=self.command,
             lin_vel=b.base_lin_vel(),
@@ -411,6 +494,8 @@ class Go2LocomotionEnv(NukaGymEnv):
             target_q_urdf=self._target_q_urdf,
             action=self.last_action,
             last_action=self._prev_action,
+            foot_contact_fz=foot_contact_fz,
+            collision_count=collision_count,
         )
         # Feed the per-env reward into the terrain curriculum's running episode
         # return (the promotion gate). Done at reward time so it runs BEFORE the
@@ -418,7 +503,61 @@ class Go2LocomotionEnv(NukaGymEnv):
         # update). No-op when terrain is disabled.
         if self._curriculum is not None:
             self._curriculum.accumulate(r)
+            # Capture the LIVE base (x,y) this step. compute_reward runs BEFORE the
+            # base step's autoreset clobbers the done envs' pose, so the value held
+            # here at the done step IS the episode's TERMINAL position -- the
+            # displacement gate's end point (||terminal - start||).
+            self._last_base_xy = b.base_pos()[:, :2].detach().clone()
         return r
+
+    # -- collision proxy: penalised links clipping the local terrain surface --
+    def _collision_count(self) -> torch.Tensor:
+        """(N,) count of penalised links (thigh/calf/base) whose world z is BELOW
+        the local terrain surface at their (x,y) -- the kinematic terrain-clipping
+        proxy for the legged_gym collision penalty (see Go2Reward._collision; there
+        is no true per-body contact force in the foot-only FusedFoot model).
+
+        TERRAIN ON  -> the local surface z per (link x,y) comes from the SINGLE-
+            source batched C-ABI sampler ``nuka.terrain_sample_height_batch`` (the
+            exact heightfield the foot kernel rests the feet on), using each env's
+            live curriculum terrain TYPE + DIFFICULTY.
+        TERRAIN OFF -> the surface is the flat ground at z=0 (``ground_height``),
+            so the proxy is still ACTIVE (and faithfully ~0: a thigh/calf/base only
+            clips z<0 in a hard fall, which the height-kill already terminates) --
+            no DROP, byte-compatible with the flat reward semantics.
+        """
+        pose = self._pose_view                                   # (N, BLC, 7)
+        links = self._collision_link_slot                        # (K,)
+        link_z = pose[:, links, 2]                               # (N, K) world z
+        n, k = link_z.shape
+
+        if not self._terrain_on:
+            # Flat ground at ground_height 0 for every link.
+            surface = torch.zeros_like(link_z)
+            return self._reward._collision(link_z, surface)
+
+        # Per-link (x,y) for the batched terrain sampler. The terrain TYPE +
+        # DIFFICULTY are PER-ENV (broadcast across that env's K links).
+        link_x = pose[:, links, 0]                               # (N, K)
+        link_y = pose[:, links, 1]                               # (N, K)
+        cur = self._curriculum
+        types = cur.terrain_type.view(n, 1).expand(n, k)         # (N, K) long
+        diff = cur.difficulty.view(n, 1).expand(n, k)            # (N, K) float
+        # The C-ABI sampler takes flat CPU arrays; flatten (N*K,) and reshape back.
+        types_cpu = types.reshape(-1).to(torch.int64).cpu().to(torch.uint32).contiguous()
+        xs_cpu = link_x.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        ys_cpu = link_y.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        diff_cpu = diff.reshape(-1).detach().cpu().to(torch.float32).contiguous()
+        surf = nuka.terrain_sample_height_batch(
+            types_cpu, xs_cpu, ys_cpu, diff_cpu,
+            self._ground_height, self._terrain_step_height,
+            self._terrain_step_width, self._terrain_platform_width,
+            self._terrain_grid_width, self._terrain_grid_height_max,
+        )
+        surface = torch.as_tensor(
+            surf, device=self._torch_device, dtype=torch.float32
+        ).view(n, k)
+        return self._reward._collision(link_z, surface)
 
     def compute_terminated(self) -> torch.Tensor:
         """Base termination predicate, with the terminal (fell) mask captured for
@@ -457,6 +596,12 @@ class Go2LocomotionEnv(NukaGymEnv):
             # last_dof_vel). The base already zeroed last_action[done].
             self._prev_action[done] = 0.0
             self._reward.last_dof_vel[done] = 0.0
+            # feet_air_time state machine: zero the per-foot air-time accumulator +
+            # last-contact debounce for the done envs (legged_gym reset_idx zeros
+            # feet_air_time + last_contacts) so a fresh episode does not inherit the
+            # terminal swing phase / contact history.
+            self._reward.feet_air_time[done] = 0.0
+            self._reward.last_contacts[done] = False
 
         # Resample command for (periodic | done) envs; recompose the obs command
         # slot so the returned obs carries the fresh command for those envs.
@@ -487,7 +632,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         d["n"] += 1
         if d["n"] % 25 == 0:
             print(f"[go2_terrain] step{d['n']}: base_z[min={d['z_min']:.3f} "
-                  f"max={d['z_max']:.3f}]  {self._curriculum.histogram()}",
+                  f"max={d['z_max']:.3f}]  {self._curriculum.histogram()}  "
+                  f"{self._curriculum.gate_diag()}",
                   flush=True)
 
     # -- optional in-env training instrumentation (NUKA_GO2_DIAG=1) ----------
