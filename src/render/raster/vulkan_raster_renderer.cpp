@@ -34,6 +34,15 @@ namespace {
 #ifndef NUKA_RASTER_MESH_FRAG_SPV
 #define NUKA_RASTER_MESH_FRAG_SPV "mesh_pbr.frag.spv"
 #endif
+#ifndef NUKA_RASTER_SHADOW_VERT_SPV
+#define NUKA_RASTER_SHADOW_VERT_SPV "shadow_depth.vert.spv"
+#endif
+#ifndef NUKA_RASTER_SKY_VERT_SPV
+#define NUKA_RASTER_SKY_VERT_SPV "sky_gradient.vert.spv"
+#endif
+#ifndef NUKA_RASTER_SKY_FRAG_SPV
+#define NUKA_RASTER_SKY_FRAG_SPV "sky_gradient.frag.spv"
+#endif
 
 constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
@@ -165,6 +174,22 @@ Mat4 Perspective(float fov_y_radians, float aspect, float z_near, float z_far) {
     return r;
 }
 
+// Right-handed orthographic projection (depth 0..1, Vulkan clip). Used ONLY for
+// the directional shadow map (the sun's view). No y-flip: the shadow-map texels
+// and the fragment's sample UV (clip.xy*0.5+0.5) both use THIS matrix, so they
+// agree by construction. Column-major. Maps [l,r]x[b,t]x[n,f] view -> clip.
+Mat4 Orthographic(float l, float r, float b, float t, float z_near, float z_far) {
+    Mat4 m;  // zero-initialized
+    m.m[0]  = 2.0f / (r - l);
+    m.m[5]  = 2.0f / (t - b);
+    m.m[10] = 1.0f / (z_near - z_far);
+    m.m[12] = -(r + l) / (r - l);
+    m.m[13] = -(t + b) / (t - b);
+    m.m[14] = z_near / (z_near - z_far);
+    m.m[15] = 1.0f;
+    return m;
+}
+
 // Per-draw push constant (M8.5 T4): the object->world model matrix plus the
 // per-draw material scalars. The view_proj + light rig live in the per-frame
 // SceneUbo (set 0) so the push block stays under the 128-byte guaranteed limit
@@ -197,9 +222,15 @@ struct SceneUbo {
     float    ambient[4];        // rgb hemispheric sky, w ground mix (unused in shader path)
     float    ambient_ground[4]; // rgb hemispheric ground
     int32_t  counts[4];         // x active light count
+    float    fog[4];            // rgb haze colour, w = density (0 => fog OFF, G2-safe)
     GpuLight lights[kMaxUboLights];
+    // --- Directional shadow map (appended AFTER lights so the pre-shadow byte
+    //     offsets are unchanged; default-zero => the shader's shadow term is a
+    //     strict no-op and the gated path is byte-identical, G2-safe). ---
+    float    light_view_proj[16];  // the sun's view-projection (world -> light clip)
+    float    shadow_params[4];     // x = strength (0 => OFF), y = bias, z = texel size, w = pad
 };
-static_assert(sizeof(SceneUbo) == 512, "SceneUbo must match the std140 shader block");
+static_assert(sizeof(SceneUbo) == 608, "SceneUbo must match the std140 shader block");
 
 // Build the per-frame SceneUbo. Lights come from world.lights when authored;
 // otherwise a deterministic renderer-side default 3-point key/fill/rim rig +
@@ -208,7 +239,8 @@ static_assert(sizeof(SceneUbo) == 512, "SceneUbo must match the std140 shader bl
 // default lives RENDERER-SIDE (not in BuildRenderWorld) so the RenderWorld stays
 // a pure data product and the M11 path-tracer is unaffected.
 SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
-                       const math::Vec3& eye) {
+                       const math::Vec3& eye, const RasterOptions& options,
+                       const Mat4& light_view_proj, float shadow_texel) {
     SceneUbo ubo{};
     std::memcpy(ubo.view_proj, view_proj.m.data(), sizeof(ubo.view_proj));
     ubo.camera_pos[0] = eye.x;
@@ -216,15 +248,50 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     ubo.camera_pos[2] = eye.z;
     ubo.camera_pos[3] = 1.0f;
 
+    // Directional shadow map (default OFF -> shadow_params[0]==0 -> the fragment
+    // shader's shadow term is a strict no-op, so every non-shadow caller is byte-
+    // identical to the pre-shadow oracle, G2-safe). When on, light_view_proj maps
+    // world -> the sun's clip space and shadow_params carries strength/bias/texel.
+    std::memcpy(ubo.light_view_proj, light_view_proj.m.data(), sizeof(ubo.light_view_proj));
+    ubo.shadow_params[0] = options.shadow_strength;
+    ubo.shadow_params[1] = options.shadow_bias;
+    ubo.shadow_params[2] = shadow_texel;
+    ubo.shadow_params[3] = 0.0f;
+
+    // Atmospheric haze (Go2-terrain demo). DEFAULT density 0 => fog[3] == 0 ->
+    // the shader's fog mix is a strict no-op, so every non-fog caller is byte-
+    // identical to the pre-fog oracle (G2-safe). Only the demo tool sets density>0.
+    ubo.fog[0] = options.fog_color[0];
+    ubo.fog[1] = options.fog_color[1];
+    ubo.fog[2] = options.fog_color[2];
+    ubo.fog[3] = options.fog_density;
+
     // Hemispheric ambient: a soft, near-neutral studio sky (a faint cool tint) over
     // a warm-dark ground bounce. Kept MODERATE -- strong enough (with the shader's
     // small albedo-independent form floor) that black plastic reads its FORM as a
     // dark-grey shape, but not so strong it washes the whole model to a flat tone
     // and kills the white-vs-black material contrast. The KEY light (below) carries
     // the bright white shells; the ambient just lifts the shadows.
-    ubo.ambient[0] = 0.17f; ubo.ambient[1] = 0.185f; ubo.ambient[2] = 0.215f; ubo.ambient[3] = 0.0f;
-    ubo.ambient_ground[0] = 0.12f; ubo.ambient_ground[1] = 0.10f;
-    ubo.ambient_ground[2] = 0.085f; ubo.ambient_ground[3] = 0.0f;
+    //
+    // CINEMATIC SUN override (use_sun_light + no authored lights): swap the soft
+    // studio ambient for the caller's LOW sun ambient so the unlit risers stay dark
+    // and the single sun's N.L carves the geometry. DEFAULT (off) leaves the exact
+    // pre-existing studio ambient -> the gated smokes are byte-identical (G2-safe).
+    const bool sun_mode = options.use_sun_light && world.lights.empty();
+    if (sun_mode) {
+        ubo.ambient[0] = options.sun_ambient_sky[0];
+        ubo.ambient[1] = options.sun_ambient_sky[1];
+        ubo.ambient[2] = options.sun_ambient_sky[2];
+        ubo.ambient[3] = 0.0f;
+        ubo.ambient_ground[0] = options.sun_ambient_ground[0];
+        ubo.ambient_ground[1] = options.sun_ambient_ground[1];
+        ubo.ambient_ground[2] = options.sun_ambient_ground[2];
+        ubo.ambient_ground[3] = 0.0f;
+    } else {
+        ubo.ambient[0] = 0.17f; ubo.ambient[1] = 0.185f; ubo.ambient[2] = 0.215f; ubo.ambient[3] = 0.0f;
+        ubo.ambient_ground[0] = 0.12f; ubo.ambient_ground[1] = 0.10f;
+        ubo.ambient_ground[2] = 0.085f; ubo.ambient_ground[3] = 0.0f;
+    }
 
     auto set_dir_light = [](GpuLight& l, const math::Vec3& dir,
                             float r, float g, float b) {
@@ -236,7 +303,14 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     };
 
     int n = 0;
-    if (!world.lights.empty()) {
+    if (sun_mode) {
+        // Single strong directional SUN (the Isaac-Lab key). One light only so the
+        // shadows it casts are unambiguous and the riser faces it does not reach go
+        // dark (carving the stairs). All tunable via RasterOptions.
+        set_dir_light(ubo.lights[n++],
+                      {options.sun_direction[0], options.sun_direction[1], options.sun_direction[2]},
+                      options.sun_color[0], options.sun_color[1], options.sun_color[2]);
+    } else if (!world.lights.empty()) {
         for (const RenderLight& rl : world.lights) {
             if (n >= kMaxUboLights) break;
             GpuLight& l = ubo.lights[n];
@@ -362,6 +436,34 @@ struct VulkanRasterRenderer::Impl {
     VkDescriptorPool scene_pool     = VK_NULL_HANDLE;  // lazily created (per-frame SceneUbo set)
     std::string      device_name;
 
+    // ---- Directional SHADOW MAP (lazily created on first shadow render) -------
+    // A depth-only render pass + pipeline (shadow_depth.vert, no fragment) that
+    // rasterizes the scene depth from the sun's orthographic view; the main pass
+    // samples it via a combined-image-sampler at scene set binding 1. The shadow
+    // sampler binding is ALWAYS present in scene_set_layout, and a persistent 1x1
+    // DUMMY depth texture is bound when shadows are OFF, so the shader's shadow
+    // term (gated on shadow_params[0]==0) is a strict no-op and the gated smokes
+    // are byte-identical. All shadow Vulkan objects are created lazily the first
+    // time a shadow render is requested (offscreen-only callers never pay for them).
+    VkSampler        shadow_sampler   = VK_NULL_HANDLE;  // depth compare-off, clamp
+    VkRenderPass     shadow_render_pass = VK_NULL_HANDLE;
+    VkPipelineLayout shadow_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline       shadow_pipeline  = VK_NULL_HANDLE;
+    VkShaderModule   shadow_vert_module = VK_NULL_HANDLE;
+    GpuImage         dummy_shadow_map{};  // persistent 1x1 depth tex (shadows OFF)
+    bool             shadow_ready     = false;
+
+    // ---- SKY GRADIENT (lazily created on first sky render) -------------------
+    // A fullscreen-triangle pipeline (sky_gradient.vert/.frag) that paints a cool
+    // vertical gradient into the colour attachment BEFORE the scene (depth off so
+    // the scene overwrites it). Recorded ONLY when RasterOptions.sky_gradient is
+    // true; the gated smokes never use it (G2-safe). Uses the MAIN render pass.
+    VkPipelineLayout sky_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline       sky_pipeline     = VK_NULL_HANDLE;
+    VkShaderModule   sky_vert_module  = VK_NULL_HANDLE;
+    VkShaderModule   sky_frag_module  = VK_NULL_HANDLE;
+    bool             sky_ready        = false;
+
     explicit Impl(const RendererConfig& config)
         : present_capable(config.present_capable),
           probe_surface(reinterpret_cast<VkSurfaceKHR>(config.surface)) {
@@ -380,6 +482,18 @@ struct VulkanRasterRenderer::Impl {
         }
         if (imgui_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, imgui_pool, nullptr);
         if (scene_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, scene_pool, nullptr);
+        // Shadow-map resources (created lazily; harmless if never used).
+        if (shadow_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, shadow_pipeline, nullptr);
+        if (shadow_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, shadow_pipeline_layout, nullptr);
+        if (shadow_vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, shadow_vert_module, nullptr);
+        if (shadow_render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, shadow_render_pass, nullptr);
+        if (shadow_sampler != VK_NULL_HANDLE) vkDestroySampler(device, shadow_sampler, nullptr);
+        if (dummy_shadow_map.view != VK_NULL_HANDLE) DestroyImage(dummy_shadow_map);
+        // Sky-gradient resources (created lazily; harmless if never used).
+        if (sky_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, sky_pipeline, nullptr);
+        if (sky_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, sky_pipeline_layout, nullptr);
+        if (sky_vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, sky_vert_module, nullptr);
+        if (sky_frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, sky_frag_module, nullptr);
         if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
         if (pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
         if (scene_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr);
@@ -588,16 +702,268 @@ struct VulkanRasterRenderer::Impl {
     // each Render() allocates + frees one set deterministically.
     VkDescriptorPool EnsureScenePool() {
         if (scene_pool != VK_NULL_HANDLE) return scene_pool;
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8u};
+        // The per-frame set has 2 bindings: a uniform buffer (SceneUbo) + a combined
+        // image sampler (the shadow map; a dummy 1x1 when shadows are off). Both
+        // pool sizes are present so the SAME set works in the gated (shadows-off,
+        // dummy-bound) and the shadow paths.
+        const std::array<VkDescriptorPoolSize, 2> sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8u},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8u}}};
         VkDescriptorPoolCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         info.maxSets = 8u;
-        info.poolSizeCount = 1u;
-        info.pPoolSizes = &size;
+        info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+        info.pPoolSizes = sizes.data();
         CheckVk(vkCreateDescriptorPool(device, &info, nullptr, &scene_pool),
                 "vkCreateDescriptorPool(scene)");
         return scene_pool;
+    }
+
+    // ---- Directional shadow map: lazy resource creation --------------------
+    // The sampler + a 1x1 dummy depth texture are created at pipeline-build time so
+    // the scene set always has SOMETHING valid to bind at binding 1 (even when
+    // shadows are off). Compare-off (we do the depth test manually in the shader).
+    void EnsureShadowSampler() {
+        if (shadow_sampler != VK_NULL_HANDLE) return;
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_NEAREST;   // PCF done manually with texelFetch-style taps
+        si.minFilter = VK_FILTER_NEAREST;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;  // outside = fully lit
+        si.maxLod = 0.0f;
+        CheckVk(vkCreateSampler(device, &si, nullptr, &shadow_sampler), "vkCreateSampler(shadow)");
+        // 1x1 dummy depth texture (sampled when shadows off; the shader ignores it).
+        dummy_shadow_map = CreateImage(1u, 1u, kDepthFormat,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Transition the dummy to SHADER_READ_ONLY so it is legal to sample.
+        TransitionImageLayout(dummy_shadow_map.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                              VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    }
+
+    // Build the depth-only shadow render pass + pipeline (lazy; first shadow draw).
+    void EnsureShadowPipeline() {
+        if (shadow_ready) return;
+        // Depth-only render pass: a single D32 attachment, cleared, stored, ending
+        // in DEPTH_STENCIL_READ_ONLY so the main pass can sample it.
+        VkAttachmentDescription depth_att{};
+        depth_att.format = kDepthFormat;
+        depth_att.samples = VK_SAMPLE_COUNT_1_BIT;
+        depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depth_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth_att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depth_att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depth_att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depth_att.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        VkAttachmentReference depth_ref{0u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 0u;
+        subpass.pDepthStencilAttachment = &depth_ref;
+        VkRenderPassCreateInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rp.attachmentCount = 1u;
+        rp.pAttachments = &depth_att;
+        rp.subpassCount = 1u;
+        rp.pSubpasses = &subpass;
+        CheckVk(vkCreateRenderPass(device, &rp, nullptr, &shadow_render_pass),
+                "vkCreateRenderPass(shadow)");
+
+        // The shadow pipeline layout: a single push constant = light_mvp (mat4).
+        shadow_vert_module = CreateShaderModule(NUKA_RASTER_SHADOW_VERT_SPV);
+        VkPushConstantRange push_range{};
+        push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        push_range.offset = 0u;
+        push_range.size = sizeof(float) * 16u;  // mat4 light_mvp
+        VkPipelineLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.pushConstantRangeCount = 1u;
+        layout_info.pPushConstantRanges = &push_range;
+        CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &shadow_pipeline_layout),
+                "vkCreatePipelineLayout(shadow)");
+
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stage.module = shadow_vert_module;
+        stage.pName = "main";
+
+        VkVertexInputBindingDescription binding{};
+        binding.binding = 0u;
+        binding.stride = sizeof(float) * 3u;
+        binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        VkVertexInputAttributeDescription attr{};
+        attr.location = 0u;
+        attr.binding = 0u;
+        attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+        attr.offset = 0u;
+        VkPipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertex_input.vertexBindingDescriptionCount = 1u;
+        vertex_input.pVertexBindingDescriptions = &binding;
+        vertex_input.vertexAttributeDescriptionCount = 1u;
+        vertex_input.pVertexAttributeDescriptions = &attr;
+
+        VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+        input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewport_state{};
+        viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport_state.viewportCount = 1u;
+        viewport_state.scissorCount = 1u;
+
+        VkPipelineRasterizationStateCreateInfo rasterization{};
+        rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterization.cullMode = VK_CULL_MODE_NONE;
+        rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterization.lineWidth = 1.0f;
+        // A slope-scaled depth bias in the shadow PASS further kills acne (in
+        // addition to the shader-side constant bias). Deterministic.
+        rasterization.depthBiasEnable = VK_TRUE;
+        rasterization.depthBiasConstantFactor = 1.25f;
+        rasterization.depthBiasSlopeFactor = 2.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+        depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depth_stencil.depthTestEnable = VK_TRUE;
+        depth_stencil.depthWriteEnable = VK_TRUE;
+        depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendStateCreateInfo color_blend{};
+        color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        color_blend.attachmentCount = 0u;  // depth-only
+
+        std::array<VkDynamicState, 2> dynamic_states{
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic_state{};
+        dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+        dynamic_state.pDynamicStates = dynamic_states.data();
+
+        VkGraphicsPipelineCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ci.stageCount = 1u;
+        ci.pStages = &stage;
+        ci.pVertexInputState = &vertex_input;
+        ci.pInputAssemblyState = &input_assembly;
+        ci.pViewportState = &viewport_state;
+        ci.pRasterizationState = &rasterization;
+        ci.pMultisampleState = &multisample;
+        ci.pDepthStencilState = &depth_stencil;
+        ci.pColorBlendState = &color_blend;
+        ci.pDynamicState = &dynamic_state;
+        ci.layout = shadow_pipeline_layout;
+        ci.renderPass = shadow_render_pass;
+        ci.subpass = 0u;
+        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &ci, nullptr, &shadow_pipeline),
+                "vkCreateGraphicsPipelines(shadow)");
+        shadow_ready = true;
+    }
+
+    // Build the fullscreen sky-gradient pipeline (lazy; first sky render). Uses the
+    // MAIN render pass + subpass 0 (so it draws into the same colour attachment),
+    // no vertex input, depth test/write OFF, push constant = {sky_top, sky_bottom}.
+    void EnsureSkyPipeline() {
+        if (sky_ready) return;
+        sky_vert_module = CreateShaderModule(NUKA_RASTER_SKY_VERT_SPV);
+        sky_frag_module = CreateShaderModule(NUKA_RASTER_SKY_FRAG_SPV);
+
+        VkPushConstantRange push_range{};
+        push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        push_range.offset = 0u;
+        push_range.size = sizeof(float) * 8u;  // two vec4 (sky_top, sky_bottom)
+        VkPipelineLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.pushConstantRangeCount = 1u;
+        layout_info.pPushConstantRanges = &push_range;
+        CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &sky_pipeline_layout),
+                "vkCreatePipelineLayout(sky)");
+
+        std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = sky_vert_module;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = sky_frag_module;
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;  // no inputs
+
+        VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+        input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewport_state{};
+        viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport_state.viewportCount = 1u;
+        viewport_state.scissorCount = 1u;
+
+        VkPipelineRasterizationStateCreateInfo rasterization{};
+        rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterization.cullMode = VK_CULL_MODE_NONE;
+        rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterization.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+        depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depth_stencil.depthTestEnable = VK_FALSE;   // sky is the backdrop
+        depth_stencil.depthWriteEnable = VK_FALSE;  // scene overwrites it
+
+        VkPipelineColorBlendAttachmentState blend_attachment{};
+        blend_attachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        blend_attachment.blendEnable = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo color_blend{};
+        color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        color_blend.attachmentCount = 1u;
+        color_blend.pAttachments = &blend_attachment;
+
+        std::array<VkDynamicState, 2> dynamic_states{
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic_state{};
+        dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+        dynamic_state.pDynamicStates = dynamic_states.data();
+
+        VkGraphicsPipelineCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ci.stageCount = static_cast<uint32_t>(stages.size());
+        ci.pStages = stages.data();
+        ci.pVertexInputState = &vertex_input;
+        ci.pInputAssemblyState = &input_assembly;
+        ci.pViewportState = &viewport_state;
+        ci.pRasterizationState = &rasterization;
+        ci.pMultisampleState = &multisample;
+        ci.pDepthStencilState = &depth_stencil;
+        ci.pColorBlendState = &color_blend;
+        ci.pDynamicState = &dynamic_state;
+        ci.layout = sky_pipeline_layout;
+        ci.renderPass = render_pass;
+        ci.subpass = 0u;
+        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &ci, nullptr, &sky_pipeline),
+                "vkCreateGraphicsPipelines(sky)");
+        sky_ready = true;
     }
 
     void CreateCommandPool() {
@@ -668,15 +1034,25 @@ struct VulkanRasterRenderer::Impl {
 
         // Set 0, binding 0: the per-frame SceneUbo (camera + light rig), read by
         // both the vertex (view_proj) and fragment (camera + lights) stages.
-        VkDescriptorSetLayoutBinding ubo_binding{};
-        ubo_binding.binding = 0u;
-        ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        ubo_binding.descriptorCount = 1u;
-        ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        // Binding 1: the directional shadow map (combined image sampler), read by
+        // the fragment stage. It is ALWAYS in the layout; a persistent 1x1 dummy
+        // depth texture is bound when shadows are OFF and the fragment shader's
+        // shadow term is gated to a no-op (shadow_params[0]==0), so the gated path
+        // output is byte-identical (G2-safe). The shadow sampler is created here.
+        EnsureShadowSampler();
+        std::array<VkDescriptorSetLayoutBinding, 2> set_bindings{};
+        set_bindings[0].binding = 0u;
+        set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        set_bindings[0].descriptorCount = 1u;
+        set_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        set_bindings[1].binding = 1u;
+        set_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        set_bindings[1].descriptorCount = 1u;
+        set_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        set_info.bindingCount = 1u;
-        set_info.pBindings = &ubo_binding;
+        set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
+        set_info.pBindings = set_bindings.data();
         CheckVk(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &scene_set_layout),
                 "vkCreateDescriptorSetLayout(scene)");
 
@@ -838,6 +1214,47 @@ struct VulkanRasterRenderer::Impl {
             vkFreeMemory(device, resource.memory, nullptr);
             resource.memory = VK_NULL_HANDLE;
         }
+    }
+
+    // One-shot image layout transition (a submit + wait-idle; deterministic). Used
+    // to put the persistent dummy shadow map (and, if ever needed, other images)
+    // into a samplable layout outside a render pass.
+    void TransitionImageLayout(VkImage image, VkImageAspectFlags aspect,
+                               VkImageLayout old_layout, VkImageLayout new_layout) {
+        VkCommandBufferAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc.commandPool = command_pool;
+        alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc.commandBufferCount = 1u;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        CheckVk(vkAllocateCommandBuffers(device, &alloc, &cmd), "vkAllocateCommandBuffers(transition)");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(transition)");
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = old_layout;
+        b.newLayout = new_layout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange.aspectMask = aspect;
+        b.subresourceRange.levelCount = 1u;
+        b.subresourceRange.layerCount = 1u;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1u, &b);
+        CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(transition)");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &cmd;
+        CheckVk(vkQueueSubmit(queue, 1u, &submit, VK_NULL_HANDLE), "vkQueueSubmit(transition)");
+        CheckVk(vkQueueWaitIdle(queue), "vkQueueWaitIdle(transition)");
+        vkFreeCommandBuffers(device, command_pool, 1u, &cmd);
     }
 
     GpuImage CreateImage(uint32_t width, uint32_t height, VkFormat format,
@@ -1165,6 +1582,37 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
     const Mat4 view_proj = Multiply(proj, view);
 
+    // -- 2-SHADOW. Directional shadow-map light matrix (the sun's ortho view) --
+    // OFF by default (shadow_strength<=0 || !use_sun_light) -> identity matrix +
+    // 0 texel passed to the UBO and NO shadow pass recorded, so the gated path is
+    // byte-identical (G2-safe). When on, fit an orthographic frustum around the
+    // scene AABB looking ALONG the sun direction, so the whole scene is captured
+    // in the shadow map. We pad the box and the depth range so grazing-angle suns
+    // still cover the footprint.
+    const bool want_shadows =
+        options.shadow_strength > 0.0f && options.use_sun_light && has_geometry;
+    Mat4 light_view_proj = Mat4::Identity();
+    float shadow_texel = 0.0f;
+    if (want_shadows) {
+        const math::Vec3 ctr = (aabb_min + aabb_max) * 0.5f;
+        const float radius = std::max((aabb_max - aabb_min).Length() * 0.5f, 1e-3f);
+        math::Vec3 sun_dir = math::Vec3{options.sun_direction[0], options.sun_direction[1],
+                                        options.sun_direction[2]}.Normalized();
+        // Place the light eye back along the sun direction, looking at the centre.
+        const math::Vec3 light_eye = ctr + sun_dir * (radius * 2.5f);
+        // A world-up that is not parallel to the sun dir.
+        math::Vec3 up = {0.0f, 0.0f, 1.0f};
+        if (std::fabs(sun_dir.z) > 0.95f) up = {0.0f, 1.0f, 0.0f};
+        const Mat4 light_view = LookAt(light_eye, ctr, up);
+        // Ortho half-extent padded so long shadows of the tallest features fit.
+        const float half = radius * 1.35f;
+        const float zn = radius * 0.05f;
+        const float zf = radius * 5.0f;
+        const Mat4 light_proj = Orthographic(-half, half, -half, half, zn, zf);
+        light_view_proj = Multiply(light_proj, light_view);
+        shadow_texel = 1.0f / static_cast<float>(std::max(options.shadow_map_size, 1u));
+    }
+
     // -- 2a. Optional ground plane (M8.5 T4b, beauty/viewer; default OFF). ----
     // Appended AFTER the scene AABB + camera are resolved so its extent does not
     // perturb the framing. A large dark disc at the bottom of the scene, lit by
@@ -1239,7 +1687,13 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
             const MeshGeometry sd = MakeGroundDisc(cp.radius, 48u);
             InstanceDraw s;
             math::Transform st = math::Transform::Identity();
-            st.position = {cp.x, cp.y, floor_z + reach * 0.002f};  // a hair above the floor
+            // Decal height: honour a caller-supplied FINITE cp.z (non-flat terrain:
+            // sit on the LOCAL surface under the foot) -> a hair above it; otherwise
+            // (NaN sentinel) fall back to the flat floor_z (byte-identical to every
+            // pre-terrain caller). std::isfinite(NaN) == false -> the fallback path.
+            const float decal_z = std::isfinite(cp.z) ? (cp.z + reach * 0.002f)
+                                                      : (floor_z + reach * 0.002f);
+            st.position = {cp.x, cp.y, decal_z};
             s.model = TransformToMatrix(st);
             s.base_color[0] = options.ground_color[0];
             s.base_color[1] = options.ground_color[1];
@@ -1273,8 +1727,83 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         }
     }
 
+    // -- 2-SHADOW-PASS. Render the scene depth from the sun into a shadow map. --
+    // Recorded ONLY when shadows are requested; otherwise nothing here runs and the
+    // dummy 1x1 depth texture (bound below) keeps the descriptor set valid. The
+    // shadow map view that the main pass samples is `shadow_view` (real map or the
+    // persistent dummy). The shadow image is a per-frame resource freed at teardown.
+    GpuImage shadow_map{};
+    VkFramebuffer shadow_fb = VK_NULL_HANDLE;
+    VkImageView shadow_view = d.dummy_shadow_map.view;  // default: the dummy (shadows OFF)
+    if (want_shadows) {
+        d.EnsureShadowPipeline();
+        const uint32_t sz = std::max(options.shadow_map_size, 1u);
+        shadow_map = d.CreateImage(sz, sz, kDepthFormat,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
+        shadow_view = shadow_map.view;
+        VkFramebufferCreateInfo sfb{};
+        sfb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        sfb.renderPass = d.shadow_render_pass;
+        sfb.attachmentCount = 1u;
+        sfb.pAttachments = &shadow_map.view;
+        sfb.width = sz; sfb.height = sz; sfb.layers = 1u;
+        CheckVk(vkCreateFramebuffer(d.device, &sfb, nullptr, &shadow_fb),
+                "vkCreateFramebuffer(shadow)");
+
+        VkCommandBufferAllocateInfo scmd_alloc{};
+        scmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        scmd_alloc.commandPool = d.command_pool;
+        scmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        scmd_alloc.commandBufferCount = 1u;
+        VkCommandBuffer scmd = VK_NULL_HANDLE;
+        CheckVk(vkAllocateCommandBuffers(d.device, &scmd_alloc, &scmd),
+                "vkAllocateCommandBuffers(shadow)");
+        VkCommandBufferBeginInfo sbegin{};
+        sbegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        sbegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CheckVk(vkBeginCommandBuffer(scmd, &sbegin), "vkBeginCommandBuffer(shadow)");
+        VkClearValue sclear{};
+        sclear.depthStencil = {1.0f, 0u};
+        VkRenderPassBeginInfo srp{};
+        srp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        srp.renderPass = d.shadow_render_pass;
+        srp.framebuffer = shadow_fb;
+        srp.renderArea = {{0, 0}, {sz, sz}};
+        srp.clearValueCount = 1u;
+        srp.pClearValues = &sclear;
+        vkCmdBeginRenderPass(scmd, &srp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(scmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.shadow_pipeline);
+        VkViewport svp{};
+        svp.x = 0.0f; svp.y = 0.0f;
+        svp.width = static_cast<float>(sz); svp.height = static_cast<float>(sz);
+        svp.minDepth = 0.0f; svp.maxDepth = 1.0f;
+        vkCmdSetViewport(scmd, 0u, 1u, &svp);
+        VkRect2D ssc{{0, 0}, {sz, sz}};
+        vkCmdSetScissor(scmd, 0u, 1u, &ssc);
+        for (const InstanceDraw& draw : draws) {
+            const Mat4 light_mvp = Multiply(light_view_proj, draw.model);
+            vkCmdPushConstants(scmd, d.shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                               0u, sizeof(float) * 16u, light_mvp.m.data());
+            VkDeviceSize off0 = 0u;
+            vkCmdBindVertexBuffers(scmd, 0u, 1u, &draw.vertex_pos.buffer, &off0);
+            vkCmdBindIndexBuffer(scmd, draw.index.buffer, 0u, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(scmd, draw.index_count, 1u, 0u, 0, 0u);
+        }
+        vkCmdEndRenderPass(scmd);
+        CheckVk(vkEndCommandBuffer(scmd), "vkEndCommandBuffer(shadow)");
+        VkSubmitInfo ssubmit{};
+        ssubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        ssubmit.commandBufferCount = 1u;
+        ssubmit.pCommandBuffers = &scmd;
+        CheckVk(vkQueueSubmit(d.queue, 1u, &ssubmit, VK_NULL_HANDLE), "vkQueueSubmit(shadow)");
+        CheckVk(vkQueueWaitIdle(d.queue), "vkQueueWaitIdle(shadow)");
+        vkFreeCommandBuffers(d.device, d.command_pool, 1u, &scmd);
+    }
+
     // -- 2b. Per-frame SceneUbo (camera + light rig) + descriptor set --------
-    const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye);
+    const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye, options,
+                                             light_view_proj, shadow_texel);
     GpuBuffer ubo_buffer = d.CreateBuffer(
         sizeof(SceneUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -1291,15 +1820,33 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
         CheckVk(vkAllocateDescriptorSets(d.device, &alloc, &scene_set),
                 "vkAllocateDescriptorSets(scene)");
         VkDescriptorBufferInfo buffer_info{ubo_buffer.buffer, 0u, sizeof(SceneUbo)};
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = scene_set;
-        write.dstBinding = 0u;
-        write.descriptorCount = 1u;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        write.pBufferInfo = &buffer_info;
-        vkUpdateDescriptorSets(d.device, 1u, &write, 0u, nullptr);
+        // Binding 1: the shadow map (real map when shadows on, else the persistent
+        // dummy). Always written so the set is complete; the shader ignores it when
+        // shadow_params[0]==0 (gated path -> byte-identical pixels).
+        VkDescriptorImageInfo shadow_info{};
+        shadow_info.sampler = d.shadow_sampler;
+        shadow_info.imageView = shadow_view;
+        shadow_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = scene_set;
+        writes[0].dstBinding = 0u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &buffer_info;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = scene_set;
+        writes[1].dstBinding = 1u;
+        writes[1].descriptorCount = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &shadow_info;
+        vkUpdateDescriptorSets(d.device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0u, nullptr);
     }
+
+    // Lazily build the sky pipeline outside the pass when first requested (G2-safe:
+    // never created for the gated smokes since they leave sky_gradient false).
+    if (options.sky_gradient) d.EnsureSkyPipeline();
 
     // -- 3. Offscreen color + depth targets + framebuffer -------------------
     GpuImage color = d.CreateImage(
@@ -1358,10 +1905,6 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     rp_begin.pClearValues = clears.data();
     vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline_layout,
-                            0u, 1u, &scene_set, 0u, nullptr);
-
     VkViewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
@@ -1372,6 +1915,23 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkCmdSetViewport(cmd, 0u, 1u, &viewport);
     VkRect2D scissor{{0, 0}, {options.width, options.height}};
     vkCmdSetScissor(cmd, 0u, 1u, &scissor);
+
+    // -- 4a. SKY GRADIENT backdrop (opt-in; default OFF -> not recorded, so the
+    //        gated smokes' command stream + pixels are byte-identical, G2-safe).
+    //        Drawn first (depth off) so the scene overwrites it where geometry is.
+    if (options.sky_gradient) {
+        float sky_push[8] = {
+            options.sky_top[0], options.sky_top[1], options.sky_top[2], 1.0f,
+            options.sky_bottom[0], options.sky_bottom[1], options.sky_bottom[2], 1.0f};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.sky_pipeline);
+        vkCmdPushConstants(cmd, d.sky_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
+                           sizeof(sky_push), sky_push);
+        vkCmdDraw(cmd, 3u, 1u, 0u, 0u);  // fullscreen triangle (no vertex buffer)
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline_layout,
+                            0u, 1u, &scene_set, 0u, nullptr);
 
     for (const InstanceDraw& draw : draws) {
         PushBlock push{};
@@ -1438,6 +1998,8 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkDestroyFramebuffer(d.device, framebuffer, nullptr);
     d.DestroyImage(depth);
     d.DestroyImage(color);
+    if (shadow_fb != VK_NULL_HANDLE) vkDestroyFramebuffer(d.device, shadow_fb, nullptr);
+    if (shadow_map.image != VK_NULL_HANDLE) d.DestroyImage(shadow_map);
     for (InstanceDraw& draw : draws) {
         d.DestroyBuffer(draw.vertex_pos);
         d.DestroyBuffer(draw.vertex_nrm);
