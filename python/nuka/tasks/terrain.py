@@ -189,8 +189,25 @@ class TerrainCurriculum:
 
       * SURVIVAL: the env survived most of the episode
         (``ep_len >= survive_frac * max_episode_length``), AND
-      * DISPLACEMENT: the base walked far enough over the episode
-        (``||base_xy_done - base_xy_start|| > promote_dist_m``).
+      * PATH LENGTH: the base actually WALKED A LOT over the episode --
+        the CUMULATIVE path length (``sum over steps of ||delta base_xy||``)
+        exceeds ``promote_path_m``.
+
+    >>> WHY PATH LENGTH, NOT NET DISPLACEMENT (the free-roam fix) <<<
+    The Go2 trains under FREE-ROAM commands (random vx/vy/wyaw resampled every
+    10 s, "随地走") AND a randomized spawn HEADING, so a perfectly-walking dog
+    WANDERS -- it turns, sidesteps, and circles, and its NET displacement from
+    spawn over an episode is typically << the distance it actually travelled.
+    Measured on a trained flat-walker (go2_terrain_eval.py): even a 100%-survival,
+    0%-fall flat episode has NET disp ~2.7 m but PATH length ~6.6 m -- net/path
+    ~0.32-0.41 across all survivable cells. The OLD net-displacement gate
+    (``||base_xy_done - start_xy|| > 3.0 m``) therefore NEVER fired -- 0% of
+    eval cells reached net>3 m even for the perfect walker -- so the curriculum
+    stayed pinned at flat (difficulty 0) forever (the symptom: reward plateaued
+    ~11 by epoch ~250, ep_len ~750-900 = flat mastery, no difficulty-induced
+    dips). The CUMULATIVE path-length gate fires for a wandering-but-walking dog
+    (42% of eval cells reach path>5 m), so the curriculum can actually climb.
+    NET displacement is RETAINED as a logged DIAGNOSTIC only.
 
     An env meeting BOTH is PROMOTED (difficulty += step; once it tops out at 1.0
     it advances to the next terrain TYPE and resets difficulty to the floor). An
@@ -201,8 +218,10 @@ class TerrainCurriculum:
     so every env stayed pinned at the easiest tier.
 
     State (all (num_envs,) device tensors): ``terrain_type`` (long), ``difficulty``
-    (float in [DIFFICULTY_MIN, 1]), ``ep_len`` (running step count), ``start_xy``
-    ((N,2) base xy captured at each reset), plus diagnostics ``ep_reward`` /
+    (float in [DIFFICULTY_MIN, 1]), ``ep_len`` (running step count), ``path_len``
+    (running cumulative path length, the promotion gate), ``prev_xy`` ((N,2) last
+    step's base xy, the path-increment source), ``start_xy`` ((N,2) base xy at each
+    reset, the NET-disp diagnostic origin), plus diagnostics ``ep_reward`` /
     ``ep_reward_ema`` (kept for logging only -- no longer the promotion gate).
 
     The class never touches the engine -- it only updates Python tensors. The env
@@ -234,9 +253,12 @@ class TerrainCurriculum:
         # SCALE-INDEPENDENT promotion gates (legged_gym terrain-level style).
         max_episode_length: int = 1,
         survive_frac: float = 0.8,
+        # PRIMARY promotion gate (free-roam robust): cumulative PATH length.
+        promote_path_m: float = 5.0,
+        # NET-displacement (kept as a logged DIAGNOSTIC only -- the OLD gate).
         promote_dist_m: float = 3.0,
         # DEPRECATED reward-threshold gate (kept for back-compat / diagnostics;
-        # NOT used by the new survival+displacement promotion).
+        # NOT used by the new survival+path-length promotion).
         promote_thr: float = 8.0,
     ) -> None:
         self.num_envs = int(num_envs)
@@ -246,8 +268,12 @@ class TerrainCurriculum:
         self.ema_beta = float(ema_beta)
         self.max_episode_length = int(max_episode_length)
         self.survive_frac = float(survive_frac)
-        self.promote_dist_m = float(promote_dist_m)
+        self.promote_path_m = float(promote_path_m)
+        self.promote_dist_m = float(promote_dist_m)  # diagnostic only now.
         self.promote_thr = float(promote_thr)  # diagnostic only now.
+        # Promotion/demotion counters since the last diagnostic print (always-on).
+        self.n_promote = 0
+        self.n_demote = 0
         # The survival step threshold (an env must run at least this many steps).
         self.survive_steps = max(1, int(round(self.survive_frac * self.max_episode_length)))
 
@@ -279,22 +305,49 @@ class TerrainCurriculum:
         self.ep_reward_ema = torch.zeros(
             self.num_envs, dtype=torch.float32, device=device
         )
+        # CUMULATIVE PATH LENGTH over the episode (the PRIMARY promotion gate) +
+        # the previous step's base (x,y) it is differenced against. ``prev_xy`` is
+        # seeded with the spawn xy on each reset (set_start_xy) so the first step's
+        # increment is measured from the true episode origin.
+        self.path_len = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.prev_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=device)
         # Base (x,y) at the episode START (set by the env via set_start_xy on every
-        # reset). The displacement gate is ||base_xy_done - start_xy||.
+        # reset). NET displacement ||base_xy_done - start_xy|| is a DIAGNOSTIC now.
         self.start_xy = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=device)
-        # Last-computed per-env promotion-gate values (for the smoke diagnostic).
+        # Last-computed per-env promotion-gate values (for the diagnostic prints).
         self.last_disp = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.last_path = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
 
     def set_start_xy(self, mask, xy: torch.Tensor) -> None:
-        """Record the base (x,y) at episode start for the reset envs.
+        """Record the base (x,y) at episode start for the reset envs, seed the
+        path-length increment origin (``prev_xy``), and zero the cumulative
+        ``path_len`` for the fresh episode.
 
         ``mask`` is the (N,) done bool (autoreset) or None (full reset); ``xy`` is
         the (N,2) spawn position. Called by the env right after it writes the spawn
-        pose so the displacement gate measures from the true episode origin."""
+        pose so BOTH the net-disp diagnostic and the path-length gate measure from
+        the true episode origin."""
+        xy = xy.to(self.start_xy.dtype)
         if mask is None:
-            self.start_xy[:] = xy.to(self.start_xy.dtype)
+            self.start_xy[:] = xy
+            self.prev_xy[:] = xy
+            self.path_len.zero_()
         else:
-            self.start_xy[mask] = xy[mask].to(self.start_xy.dtype)
+            self.start_xy[mask] = xy[mask]
+            self.prev_xy[mask] = xy[mask]
+            self.path_len[mask] = 0.0
+
+    def accumulate_path(self, base_xy: torch.Tensor) -> None:
+        """Add this control step's per-env path increment ``||base_xy - prev_xy||``
+        into the running cumulative ``path_len`` (the PRIMARY promotion gate), then
+        roll ``prev_xy`` forward. Called every step (in compute_reward, alongside
+        ``accumulate``) BEFORE the autoreset clobbers the done envs' pose -- so the
+        increment at the terminal step uses the true terminal xy. The subsequent
+        ``set_start_xy`` (on the autoreset) re-seeds ``prev_xy`` to the new spawn,
+        so a teleport from terminal->spawn is NOT counted as path."""
+        xy = base_xy.to(self.prev_xy.dtype)
+        self.path_len += (xy - self.prev_xy).norm(dim=1)
+        self.prev_xy = xy
 
     def accumulate(self, reward: torch.Tensor) -> None:
         """Add this control step's per-env reward into the running episode return
@@ -307,17 +360,18 @@ class TerrainCurriculum:
         self, done: torch.Tensor, terminated: torch.Tensor,
         base_xy: "torch.Tensor | None" = None,
     ) -> None:
-        """Promote/demote the DONE envs (survival+displacement), then reset their
-        episode accumulators.
+        """Promote/demote the DONE envs (survival + cumulative PATH length), then
+        reset their episode accumulators.
 
         ``done`` = terminated | truncated; ``terminated`` = fell (base contact /
         flipped). PROMOTE a done env iff it SURVIVED most of the episode
-        (``ep_len >= survive_steps``) AND walked far enough
-        (``||base_xy - start_xy|| > promote_dist_m``). DEMOTE on a fall
-        (terminated). Scale-independent -- no dependence on the reward magnitude.
-        ``base_xy`` is the (N,2) live base position at the done step (the
-        displacement source); when None the displacement gate is treated as 0
-        (survival alone cannot promote, matching legged_gym's distance gate).
+        (``ep_len >= survive_steps``) AND actually WALKED A LOT -- its cumulative
+        PATH length (``path_len``, accumulated per step via ``accumulate_path``)
+        exceeds ``promote_path_m``. DEMOTE on a fall (terminated). Scale-independent
+        -- no dependence on the reward magnitude, and FREE-ROAM robust (a wandering
+        dog's path length, unlike its net displacement, reflects the distance it
+        truly walked). ``base_xy`` is the (N,2) live base position at the done step,
+        used ONLY for the NET-displacement DIAGNOSTIC now (``last_disp``).
         """
         if not bool(done.any()):
             return
@@ -330,19 +384,24 @@ class TerrainCurriculum:
             self.ep_reward_ema,
         )
 
-        # SCALE-INDEPENDENT gates.
+        # SCALE-INDEPENDENT gates: survived most of the episode AND walked a lot.
         survived = self.ep_len >= self.survive_steps
+        walked_far = self.path_len > self.promote_path_m
+        # NET-displacement DIAGNOSTIC (the OLD gate; logged, not enforced).
         if base_xy is not None:
             disp = (base_xy.to(self.start_xy.dtype) - self.start_xy).norm(dim=1)
         else:
             disp = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.last_disp = torch.where(done, disp, self.last_disp)
-        walked_far = disp > self.promote_dist_m
+        self.last_path = torch.where(done, self.path_len, self.last_path)
 
         promote = done & survived & walked_far
         demote = done & terminated if self.demote_on_fall else torch.zeros_like(done)
         # An env can't both promote and demote; a fall (terminated) wins.
         promote = promote & ~demote
+        # Always-on diagnostic counters (cheap; reset on each diagnostic print).
+        self.n_promote += int(promote.sum())
+        self.n_demote += int(demote.sum())
 
         # Raise / lower difficulty within [DIFFICULTY_MIN, 1].
         self.difficulty = torch.where(
@@ -369,9 +428,43 @@ class TerrainCurriculum:
 
         self.difficulty = self.difficulty.clamp(DIFFICULTY_MIN, DIFFICULTY_MAX)
 
-        # Reset the episode accumulators for the done envs.
+        # Reset the episode accumulators for the done envs. ``path_len`` is also
+        # re-zeroed by the subsequent ``set_start_xy`` (which re-seeds ``prev_xy``
+        # to the fresh spawn), but we zero it here too so the accumulator is in a
+        # clean state regardless of call ordering.
         self.ep_reward = torch.where(done, torch.zeros_like(self.ep_reward), self.ep_reward)
         self.ep_len = torch.where(done, torch.zeros_like(self.ep_len), self.ep_len)
+        self.path_len = torch.where(done, torch.zeros_like(self.path_len), self.path_len)
+
+    # -- always-on training diagnostic (per-type difficulty + promote/demote) --
+    def difficulty_report(self, reset_counters: bool = True) -> str:
+        """A compact PER-TYPE difficulty report (min/mean/max) + the #promotions /
+        #demotions and mean path-length SINCE the last report -- the always-on
+        training-metrics line that SHOWS the curriculum climbing flat -> 0.15 m.
+
+        Cheap: a handful of reductions over the (num_envs,) tensors. When
+        ``reset_counters`` the promote/demote counters are zeroed after reading so
+        the next report covers only the next interval."""
+        names = {0: "Flat", 1: "Stairs", 2: "Pit", 3: "Boxes"}
+        tt = self.terrain_type.detach().cpu()
+        td = self.difficulty.detach().cpu()
+        parts = []
+        for code in (0, 1, 2, 3):
+            m = tt == code
+            n = int(m.sum())
+            if n:
+                d = td[m]
+                parts.append(f"{names[code]}={n}"
+                             f"[d {float(d.min()):.2f}/{float(d.mean()):.2f}/"
+                             f"{float(d.max()):.2f}]")
+        mean_path = float(self.last_path.detach().mean())
+        line = (f"difficulty(min/mean/max): {'  '.join(parts)}  |  "
+                f"+{self.n_promote}/-{self.n_demote} (promote/demote since last)  "
+                f"|  mean_done_path={mean_path:.2f}m")
+        if reset_counters:
+            self.n_promote = 0
+            self.n_demote = 0
+        return line
 
     def histogram(self) -> str:
         """A one-line type+difficulty histogram (smoke-run diagnostic)."""
@@ -389,9 +482,12 @@ class TerrainCurriculum:
 
     def gate_diag(self) -> str:
         """One-line promotion-gate reachability diagnostic (smoke run): the
-        survival-step threshold + the live max base displacement seen at done, so a
-        smoke can show whether the SCALE-INDEPENDENT criterion is REACHABLE."""
+        survival-step threshold + the live PATH length (primary gate) and net
+        displacement (diagnostic) seen at done, so a smoke can show whether the
+        SCALE-INDEPENDENT criterion is REACHABLE."""
         disp = self.last_disp.detach().cpu()
+        path = self.last_path.detach().cpu()
         return (f"promote_gate[survive>={self.survive_steps} steps & "
-                f"disp>{self.promote_dist_m:.1f}m]  max_done_disp={float(disp.max()):.3f}m "
-                f"mean={float(disp.mean()):.3f}m")
+                f"path>{self.promote_path_m:.1f}m]  "
+                f"max_done_path={float(path.max()):.3f}m mean={float(path.mean()):.3f}m  "
+                f"(diag net_disp max={float(disp.max()):.3f}m mean={float(disp.mean()):.3f}m)")

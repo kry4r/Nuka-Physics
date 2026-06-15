@@ -83,14 +83,28 @@ class _StdoutMetricsWriter:
         return getattr(self._writer, name)
 
 
+# Always-on terrain-curriculum diagnostic cadence (epochs). Cheap per-call (a few
+# reductions over (num_envs,) tensors) so a 50-epoch period is negligible.
+_TERRAIN_DIAG_EVERY = int(os.environ.get("NUKA_GO2_TERRAIN_DIAG_EVERY", "50"))
+
+
 class StdoutAlgoObserver(DefaultAlgoObserver):
-    """DefaultAlgoObserver + per-epoch stdout dump of the metrics rl_games logs.
+    """DefaultAlgoObserver + per-epoch stdout dump of the metrics rl_games logs +
+    an ALWAYS-ON periodic terrain-curriculum difficulty report.
 
     Wraps ``algo.writer`` with :class:`_StdoutMetricsWriter` so we capture
     EXACTLY what rl_games emits (version-stable; ``a_loss``/``c_loss`` are
     local to ``train_epoch`` and only ever reach the writer). The reward/length
     scalars are guarded by ``game_rewards.current_size>0`` inside rl_games, so
     they appear once episodes complete; losses appear every epoch.
+
+    When terrain is ON it ALSO prints, every ``_TERRAIN_DIAG_EVERY`` epochs, the
+    per-type difficulty histogram (min/mean/max) + the #promotions/#demotions since
+    the last print + mean done-episode path length -- so the training log SHOWS the
+    curriculum difficulty climbing flat -> 0.15 m. This is NOT gated behind
+    NUKA_GO2_TERRAIN_DIAG (that env-var guards the much noisier per-25-step base-z
+    histogram in the env); the difficulty report is the curriculum's headline
+    health metric and is always emitted.
     """
 
     def after_init(self, algo):
@@ -98,13 +112,32 @@ class StdoutAlgoObserver(DefaultAlgoObserver):
         self._shim = _StdoutMetricsWriter(algo.writer)
         algo.writer = self._shim
         self.writer = self._shim
-        print(f"[metrics] observer attached (writer={'real' if self._shim._writer else 'none'})",
+        # Reach the live Go2 env's curriculum (algo.vec_env is the NukaVecEnv;
+        # .env is the Go2LocomotionEnv). None when terrain is OFF or unavailable.
+        self._curriculum = None
+        try:
+            env = getattr(getattr(algo, "vec_env", None), "env", None)
+            self._curriculum = getattr(env, "_curriculum", None)
+        except Exception:
+            self._curriculum = None
+        print(f"[metrics] observer attached (writer={'real' if self._shim._writer else 'none'}; "
+              f"terrain_curriculum={'on' if self._curriculum is not None else 'off'})",
               flush=True)
 
     def after_print_stats(self, frame, epoch_num, total_time):
         super().after_print_stats(frame, epoch_num, total_time)
         if isinstance(getattr(self, "_shim", None), _StdoutMetricsWriter):
             self._shim.flush_row(epoch_num, frame)
+        # Always-on terrain-curriculum difficulty report (every N epochs).
+        if (self._curriculum is not None
+                and _TERRAIN_DIAG_EVERY > 0
+                and epoch_num % _TERRAIN_DIAG_EVERY == 0):
+            try:
+                print(f"[terrain] epoch {epoch_num}: "
+                      f"{self._curriculum.difficulty_report()}", flush=True)
+            except Exception as exc:  # never let a diagnostic kill training.
+                print(f"[terrain] epoch {epoch_num}: report failed: {exc}",
+                      flush=True)
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
