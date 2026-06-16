@@ -132,6 +132,38 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
         // max |vertex| — rotation-invariant, so no RotAbs needed).
         case kKindConvexHull:
         case kKindSdfMesh:    r = s.p[0]; he = {r, r, r}; break;
+        // B3 (general contact pipeline Phase 2): the heightfield static collidable.
+        // A big FINITE local box spanning the full grid footprint + its z-range so
+        // the field is ONE big leaf in the LBVH and any overlapping body yields a
+        // (body, heightfield) candidate pair. The cook stamps the grid half-extents
+        // in p[0]/p[1] (== 0.5*(ncol-1)*cell / 0.5*(nrow-1)*cell, the local XY span
+        // from the grid CENTER, which is where the body_pose sits) and the LOCAL
+        // z-range min/max into p[2]/p[3]. The box is centred on the body origin in
+        // XY but z-asymmetric (min_z..max_z), so we build the world AABB from the
+        // local corners through RotAbs of the half-extent plus the z-centre offset.
+        // Mirror the plane clamp posture (rotate the local box by the body pose).
+        case kKindHeightfield: {
+            const float hx = s.p[0];           // half X span (grid centre -> edge)
+            const float hy = s.p[1];           // half Y span
+            const float zmin = s.p[2];         // LOCAL z range
+            const float zmax = s.p[3];
+            const float hz = 0.5f * (zmax - zmin);
+            const float zc = 0.5f * (zmax + zmin);  // local z-centre offset.
+            he = RotAbs(xf.rotation, math::Vec3{hx, hy, hz});
+            // The box is centred at the grid centre + the LOCAL z-centre (rotated
+            // into world by the body pose, like every other kind's extent). Inline
+            // the quaternion-vector rotation (HD-clean; mirrors the RotAbs lambda).
+            const math::Quat q = xf.rotation;
+            const math::Vec3 qv{q.x, q.y, q.z};
+            const math::Vec3 zloc{0.0f, 0.0f, zc};
+            const math::Vec3 tt = 2.0f * qv.Cross(zloc);
+            const math::Vec3 zoff_w = zloc + q.w * tt + qv.Cross(tt);
+            const math::Vec3 c2 = xf.position + zoff_w;
+            const float m = margin;
+            out_lo[gid] = {c2.x - he.x - m, c2.y - he.y - m, c2.z - he.z - m};
+            out_hi[gid] = {c2.x + he.x + m, c2.y + he.y + m, c2.z + he.z + m};
+            return;
+        }
         case kKindPlane: default:
             // A plane has effectively-infinite extent; clamp to a large finite
             // box so the LBVH morton quantization stays sane. The slab is thin

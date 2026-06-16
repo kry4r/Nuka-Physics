@@ -897,6 +897,11 @@ if(CMAKE_CUDA_COMPILER)
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path, dog_dog gated OFF).
         scenario/pairdriven_dog_solve.cpp
+        # General contact pipeline Phase 2A: the GENERAL HEIGHTFIELD narrowphase
+        # gate. A box on a FLAT grid rests; ★ a box on a real PyramidStairs STEP
+        # EDGE settles finite + no 穿模 (the exact gate2 explosion fix); per-cell
+        # TRIANGLE_PRISM contacts via the EXISTING cvx GJK/EPA; two-run identity.
+        scenario/pairdriven_heightfield.cpp
         # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.

@@ -103,6 +103,17 @@ enum class NkOp : uint16_t {
                            // gated to the PairDriven family (early-exit otherwise),
                            // and no current cook is PairDriven (B1 is Phase 1).
 
+    // --- general contact pipeline Phase 2 (H3) --------------------------
+    NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
+                            // (convex, heightfield) candidate pair, walk the
+                            // overlapped grid cells, emit 2 TRIANGLE_PRISM
+                            // colliders/cell, route each through the EXISTING cvx
+                            // GJK/EPA, and write the manifolds into the unified
+                            // ucontact_* buffer (side a = convex, side b = the
+                            // static heightfield). APPENDED after SyncLinkBodyPose
+                            // (stable prior NkOp values). PairDriven-family-gated
+                            // (early-exit for FusedFoot/UnionCsr).
+
     Count                  // sentinel: number of ops (NOT an op)
 };
 
@@ -328,6 +339,36 @@ struct SyncLinkBodyPoseParams {
     uint32_t env_count;
     uint32_t links_per_env;   // per-env link stride (the kernel grids env*links)
     uint32_t bodies_per_env;  // body rows per env (the per-env body stride)
+};
+
+// General contact pipeline Phase 2 (H3): the per-cell heightfield midphase. One
+// thread per (env x candidate slot); when the slot's broadphase pair is (convex,
+// heightfield) it projects the convex's world AABB into heightfield-LOCAL space,
+// maps it to the overlapped grid cell range, and for EACH cell emits its 2
+// TRIANGLE_PRISM colliders (corner heights -> the Newton (p00,p10,p11)+(p00,p11,
+// p01) layout) routed through the EXISTING cvx GJK/EPA. The resulting <=4-pt
+// manifolds are fanned across FREE trailing ucontact slots (atomically reserved
+// from the per-env candidate-slot tail), so a body straddling a STEP gets
+// contacts from BOTH the tread AND the riser prisms. Side a == the convex body
+// (its body_id resolves the reaction side); side b == the heightfield (static,
+// body_id==-1 -> no reaction). The HeightfieldData descriptor travels in the
+// params (one heightfield/model in the first scope); the height grid rides the
+// model `heights` field. EARLY-EXITS unless family == kContactFamilyPairDriven.
+struct NarrowphaseHeightfieldParams {
+    uint32_t family;            // kContactFamily* (PairDriven => run)
+    uint32_t env_count;
+    uint32_t slot_stride;       // candidate slots per env (== max_contacts_per_env)
+    uint32_t bodies_per_env;
+    uint32_t hull_vert_count;   // cooked hull pool (convex-hull convex side)
+    float    contact_margin;
+    // -- the heightfield descriptor (HeightfieldData mirror) ------------------
+    uint32_t has_heightfield;   // 0 == no cooked heightfield (op no-op)
+    float    origin_x, origin_y, origin_z;  // local (0,0) corner (descriptor.origin)
+    float    cell_size;
+    uint32_t nrow, ncol;
+    float    min_z, max_z;      // LOCAL z-range (for the prism z + extrude)
+    uint32_t data_offset;       // base index into the `heights` field
+    uint32_t hf_body_row;       // the heightfield collidable's body row (side b)
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
