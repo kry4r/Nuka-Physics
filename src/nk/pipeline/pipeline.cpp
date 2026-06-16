@@ -298,6 +298,43 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             add(phi::NkOp::DogDogContact, &p_dog_dog_);
         }
 
+        // General contact pipeline Phase 2 (H3): the per-cell heightfield
+        // midphase. Runs AFTER NarrowphasePrimitives (which left the (convex,
+        // heightfield) candidate slots empty — kKindHeightfield hits DispatchPair's
+        // default case) and BEFORE AssembleRows (which consumes the unified
+        // ucontact_* buffer). For each (convex, heightfield) candidate slot it
+        // emits the per-cell TRIANGLE_PRISM contacts (tread + riser) routed through
+        // cvx GJK/EPA, written into THAT slot's ucontact_* with side a = convex,
+        // side b = the static heightfield. PairDriven-family-gated (early-exit for
+        // FusedFoot/UnionCsr -> byte-identical). The descriptor travels in params
+        // (the first cooked heightfield; the grid rides the model `heights` field).
+        p_np_hf_.family = family;
+        p_np_hf_.env_count = env_count;
+        p_np_hf_.slot_stride =
+            is_pair_driven ? cap.max_contacts_per_env
+                           : static_cast<uint32_t>(model.union_slots.size());
+        p_np_hf_.bodies_per_env = cap.bodies_per_env;
+        p_np_hf_.hull_vert_count =
+            static_cast<uint32_t>(model.hull_verts.size() / 3u);
+        p_np_hf_.contact_margin = cfg.contact_margin;
+        if (!model.heightfields.empty()) {
+            const nk::HeightfieldData& hfd = model.heightfields.front();
+            p_np_hf_.has_heightfield = 1u;
+            p_np_hf_.origin_x = hfd.origin.x;
+            p_np_hf_.origin_y = hfd.origin.y;
+            p_np_hf_.origin_z = hfd.origin.z;
+            p_np_hf_.cell_size = hfd.cell_size;
+            p_np_hf_.nrow = hfd.nrow;
+            p_np_hf_.ncol = hfd.ncol;
+            p_np_hf_.min_z = hfd.min_z;
+            p_np_hf_.max_z = hfd.max_z;
+            p_np_hf_.data_offset = hfd.data_offset;
+            p_np_hf_.hf_body_row = 0u;  // resolved per-slot from the candidate kind.
+        } else {
+            p_np_hf_.has_heightfield = 0u;
+        }
+        add(phi::NkOp::NarrowphaseHeightfield, &p_np_hf_);
+
         p_np_sdf_.contact_margin = cfg.contact_margin;
         p_np_sdf_.max_contacts_per_pair = 4;
         p_np_sdf_.family = family;          // PairDriven => sample; else no-op.

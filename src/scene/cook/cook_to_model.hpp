@@ -52,6 +52,33 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options);
 
 // ---------------------------------------------------------------------------
+// H2 (general contact pipeline Phase 2) — the ONE cook-time heightfield grid
+// generator. Fills the Model's heightfield collidable from a procedural terrain
+// spec: it samples SampleTerrainHeight (terrain_field.hpp — the SAME pure
+// generator the feet/obs/render call) over an (nrow x ncol) grid centred at the
+// world origin, stores the normalized [0,1] heights into model.heightfield_heights,
+// pushes a HeightfieldData descriptor into model.heightfields, and registers a
+// STATIC heightfield collidable (a body_init row with inv_mass==0 + body_id==-1
+// in shape_table) so the field enters the LBVH as one big leaf (B3) and any
+// overlapping body yields a (body, heightfield) candidate pair routed to the
+// per-cell TRIANGLE_PRISM midphase (H3). SampleTerrainHeight is called ONLY here
+// (at cook); the contact kernel reads the COOKED grid, never an in-kernel sample.
+//
+// A NON-analytic source (imported DEM / mesh) would fill the SAME grid + push the
+// SAME descriptor via its own sampler — the contact path is source-agnostic.
+//
+// Returns the body row index of the heightfield collidable (so a caller can wire
+// excluded pairs / inspect it). The grid spans [-half, +half] in local XY where
+// half = 0.5*(n-1)*cell; the body pose is placed at world `center` (identity
+// rotation by default). The caller is responsible for sizing
+// model.capacities.max_heightfield_cells (this helper sets it to nrow*ncol).
+uint32_t CookHeightfieldGrid(nk::Model& model,
+                             const ::nuka::terrain::TerrainParams& terrain,
+                             uint32_t terrain_type,
+                             uint32_t nrow, uint32_t ncol, float cell_size,
+                             const math::Vec3& center);
+
+// ---------------------------------------------------------------------------
 // M6 — particle cook (plan §3.10 "粒子 XPBD/PBF"). Stage an XPBD soft body or a
 // PBF fluid into the nk::Model particle block + set the particle/constraint
 // capacities. The cook layer is PURE C++ (nk_engine lint scope: zero CUDA

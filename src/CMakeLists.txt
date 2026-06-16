@@ -656,6 +656,12 @@ if(CMAKE_CUDA_COMPILER)
         # links enter the LBVH. PairDriven-family-gated (inert for the FusedFoot /
         # UnionCsr graphs); present-but-inert in Phase 0.
         phi/backend_cuda/ops/sync_body_pose.cu
+        # General contact pipeline Phase 2 (H3): the GENERAL heightfield narrowphase
+        # — per-cell TRIANGLE_PRISM midphase routed through the EXISTING cvx GJK/EPA
+        # (no terrain-type-specific contact code; the prism corner heights come from
+        # the cooked `heights` grid, never an in-kernel SampleTerrainHeight).
+        # PairDriven-family-gated (inert for FusedFoot/UnionCsr).
+        phi/backend_cuda/ops/narrowphase_heightfield.cu
         # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
         # + generalized pair-driven narrowphase (analytic prim set + sphere x
         # hull) + the SDF main path (SAMP x cooked sparse SDF grid). Ports of
