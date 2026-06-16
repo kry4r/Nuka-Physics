@@ -272,6 +272,36 @@ __global__ void ComputeContactTangentBasisKernel(const uint32_t* contact_link,
     out_tangent2[slot] = t2;
 }
 
+// C4: PairDriven tangent basis over the UNIFIED contact buffer. One thread per
+// contact slot; for each of the <=4 manifold points (ucontact_count[slot]) build
+// (t1,t2) from ucontact_normal (elem:4). The FUSED contact_link/contact_normal
+// buffer is empty for the PairDriven family, so this op reads ucontact_* instead.
+// Inactive points (i >= count) get zero tangents. Deterministic (per-point,
+// element-independent), so two runs are byte-identical.
+__global__ void ComputeUnionContactTangentBasisKernel(
+    const uint32_t* ucontact_count,
+    const math::Vec3* ucontact_normal,   // elem:4 per slot
+    uint32_t slot_count,
+    math::Vec3* out_tangent1,            // elem:4 per slot
+    math::Vec3* out_tangent2) {
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= slot_count) return;
+    const uint32_t n = ucontact_count[slot];
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        const size_t at = static_cast<size_t>(slot) * 4u + i;
+        if (i < n) {
+            const math::Vec3 normal = NormalizeOrUpLocal(ucontact_normal[at]);
+            math::Vec3 t1, t2;
+            TangentBasis(normal, &t1, &t2);
+            out_tangent1[at] = t1;
+            out_tangent2[at] = t2;
+        } else {
+            out_tangent1[at] = {0.0f, 0.0f, 0.0f};
+            out_tangent2[at] = {0.0f, 0.0f, 0.0f};
+        }
+    }
+}
+
 // --- op entry points ---------------------------------------------------------
 
 Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
@@ -333,6 +363,16 @@ Status OpContactTangentBasis(const ModelView& /*model*/, const DataView& data,
     }
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (p->slot_count + kBlockSize - 1u) / kBlockSize;
+    if (p->family == kContactFamilyPairDriven) {
+        // C4: the unified contact buffer (ucontact_*, elem:4). The FUSED
+        // contact_normal buffer is empty for this family.
+        LaunchCuda(ComputeUnionContactTangentBasisKernel, dim3(block_count),
+                   dim3(kBlockSize), 0u, stream,
+                   static_cast<const uint32_t*>(data.ucontact_count),
+                   static_cast<const math::Vec3*>(data.ucontact_normal),
+                   p->slot_count, data.ucontact_tangent1, data.ucontact_tangent2);
+        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    }
     LaunchCuda(ComputeContactTangentBasisKernel, dim3(block_count), dim3(kBlockSize),
                0u, stream,
                static_cast<const uint32_t*>(data.contact_link),

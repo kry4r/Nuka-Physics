@@ -232,8 +232,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.env_count = env_count;
         p_np_prim_.base_link_count = base_link_count;
         p_np_prim_.family = family;
+        // The pair-driven narrowphase reuses union_slot_count as its CANDIDATE
+        // slot STRIDE (slots per env in candidate_pairs / ucontact_*). For the
+        // PairDriven family that stride MUST equal the broadphase's
+        // (EnvQueryPairsKernel uses max_contacts_per_env), so the candidate slot
+        // index lines up across broadphase -> narrowphase -> the unified buffer.
+        // The UnionCsr family keeps its real union-slot count; FusedFoot ignores
+        // this field. (G5 wiring fix; byte-safe for the non-PairDriven families.)
         p_np_prim_.union_slot_count =
-            static_cast<uint32_t>(model.union_slots.size());
+            is_pair_driven ? cap.max_contacts_per_env
+                           : static_cast<uint32_t>(model.union_slots.size());
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
@@ -293,11 +301,15 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
-        // ContactTangentBasis: fused-family only (the union family's tangent
-        // spokes are emitted inside AssembleRows, the EmitCompliantContactRows
-        // per-manifold basis).
+        // ContactTangentBasis: fused + pair-driven families (the union family's
+        // tangent spokes are emitted inside AssembleRows, the
+        // EmitCompliantContactRows per-manifold basis). C4: the family selector
+        // routes the PairDriven path to the unified contact buffer (ucontact_*),
+        // the FusedFoot path to the FUSED contact buffer; byte-identical for
+        // FusedFoot (family 0, the prior single-arg launch).
         if (!is_union) {
             p_tangent_.slot_count = slot_count;
+            p_tangent_.family = family;
             add(phi::NkOp::ContactTangentBasis, &p_tangent_);
         }
     }

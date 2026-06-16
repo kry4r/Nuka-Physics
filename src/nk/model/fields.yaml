@@ -203,7 +203,14 @@ fields:
   # These are ONLY touched by the pair-driven family; the union slot-template
   # path early-exits before LbvhBuild (gate-pinned, bit-identical to M4).
   # =========================================================================
-  - {name: lbvh_nodes,      dtype: f32,  per: body,          arena: scratch, owner: data, elem: 9}
+  # lbvh_nodes: the per-env Karras tree has 2N-1 nodes (N internal-1 + N leaves),
+  # NOT N. It was sized per:body (N nodes/env) which UNDERSIZED the array by N-1
+  # nodes/env -> the build wrote node[2N-2] past the segment (a latent bug, inert
+  # until the first PairDriven world runs). FIX: per:scalar with the explicit
+  # env_count*(2*max_bodies_total-1) node count (the kernel's nbase = env*(2N-1)
+  # stride). 9 f32 lanes/node (left/right/parent i32 + aabb 6 f32 = 36 B). The
+  # morton/index/visit companions stay per:body (one entry/body, the correct N).
+  - {name: lbvh_nodes,      dtype: f32,  per: scalar, count: "lbvh_node_count",  arena: scratch, owner: data}
   - {name: lbvh_morton,     dtype: u32,  per: body,          arena: scratch, owner: data}
   - {name: lbvh_index,      dtype: u32,  per: body,          arena: scratch, owner: data}
   - {name: lbvh_visit,      dtype: u32,  per: body,          arena: scratch, owner: data}
@@ -597,3 +604,16 @@ fields:
   # zero-bytes (the field is byte-inert). Sized max_heightfield_cells from the
   # scene at cook (H2, Phase 2).
   - {name: heights, dtype: f32, per: scalar, count: "max_heightfield_cells", arena: persistent, owner: model}
+
+  # --- C4: per-point tangent basis for the unified (PairDriven) contact buffer.
+  # DATA, per contact_slot, elem:4 (one (t1,t2) per <=4-pt manifold point), the
+  # cvx manifold's ucontact_normal -> orthonormal (t1,t2). The FUSED family uses
+  # contact_tangent1/2 (per contact_slot, no elem) built by the SAME
+  # ComputeContactTangentBasisKernel over the FUSED contact_normal; the PairDriven
+  # path needs its own elem:4 tangents over ucontact_normal (the FUSED tangents
+  # are inert for it). The union family emits tangents inside AssembleRows, so it
+  # never reads these. INERT until a PairDriven cook runs (B1, Phase 1B); the
+  # assembly (S5) consumes them. Appended AFTER every existing FieldId (D1: the
+  # pre-existing arena offsets stay byte-stable).
+  - {name: ucontact_tangent1, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_tangent2, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
