@@ -571,6 +571,30 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, particles.sm_mass,
                          capacities.shape_match_members_per_env, E, sizeof(float));
             break;
+        case FieldId::LinkGeomKind:
+            // WP5/WP6: per-link collision primitive kind. Empty for non-dog-dog
+            // cooks -> StampPerLink leaves the section zero (inactive sentinel),
+            // so K==1 stays byte-identical.
+            StampPerLink(dst, a.link_geom_kind, L, E, sizeof(uint32_t));
+            break;
+        case FieldId::LinkGeomParams: {
+            // 4 packed f32 per link, env-major tile (same pattern as StampPerLink
+            // with a 4-wide element).
+            auto* p = reinterpret_cast<float*>(dst);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t l = 0; l < L; ++l) {
+                    for (uint32_t c = 0; c < 4u; ++c) {
+                        const size_t si = static_cast<size_t>(l) * 4u + c;
+                        p[(static_cast<size_t>(e) * L + l) * 4u + c] =
+                            si < a.link_geom_params.size() ? a.link_geom_params[si] : 0.0f;
+                    }
+                }
+            }
+            break;
+        }
+        case FieldId::LinkGeomLocal:
+            StampPerLink(dst, a.link_geom_local, L, E, sizeof(math::Transform));
+            break;
         default:
             // Unpopulated model sections: deterministic 0.
             break;
@@ -593,6 +617,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParentLink:            v.parent_link = static_cast<uint32_t*>(p); break;
         case FieldId::LinkBody:              v.link_body = static_cast<uint32_t*>(p); break;
         case FieldId::LinkToArticulation:    v.link_to_articulation = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkGeomKind:          v.link_geom_kind = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkGeomParams:        v.link_geom_params = static_cast<float*>(p); break;
+        case FieldId::LinkGeomLocal:         v.link_geom_local = static_cast<math::Transform*>(p); break;
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;

@@ -73,6 +73,9 @@ __device__ void DispatchPair(uint32_t ka, const amf::PrimParams& a,
     if (ka == kKindBox && kb == kKindBox)       { amf::BoxBox(a, b, out); return; }
     if (ka == kKindCapsule && kb == kKindPlane) { amf::CapsulePlane(a, b, out); return; }
     if (ka == kKindCapsule && kb == kKindSphere){ amf::CapsuleSphere(a, b, out); return; }
+    // WP6 dog-dog leg/trunk: capsule x capsule analytic (segment-segment) — the
+    // ANALYTIC pair (no EPA, so it avoids the v0.8 shallow-penetration hull debt).
+    if (ka == kKindCapsule && kb == kKindCapsule){ amf::CapsuleCapsule(a, b, out); return; }
     // Swapped orders: run the canonical handler then flip the normal for A.
     auto flip = [&]() {
         for (uint32_t i = 0; i < out->point_count; ++i) {

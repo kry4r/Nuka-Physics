@@ -120,6 +120,66 @@ inline PrimFrame BuildPrimFrame(const math::Transform& xf) {
 }
 
 // ---------------------------------------------------------------------------
+// DEVICE-SAFE frame baking (WP5/WP6 dog-dog narrowphase). The same math as
+// BuildPrimFrame but written HD-clean (no Quat::Rotate, which is host-only):
+// rotate the 3 unit axes by the quaternion with the explicit v + 2w(qxv) +
+// 2 qx(qxv) formula (the same recipe contacts_foot.cu RotateByQuat uses), so it
+// compiles for both host and device. Used by the dog_dog_contact.cu kernel.
+// ---------------------------------------------------------------------------
+NUKA_AMF_HD inline Vec3 RotateByQuatHD(const math::Quat& q_in, Vec3 v) {
+    // Normalize defensively (matches RotateByQuat's 1e-12 guard).
+    math::Quat q = q_in;
+    const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (norm_sq > 1.0e-12f) {
+        const float inv = 1.0f / sqrtf(norm_sq);
+        q.w *= inv; q.x *= inv; q.y *= inv; q.z *= inv;
+    }
+    const Vec3 qv{q.x, q.y, q.z};
+    // t = 2 * (qv x v)
+    const Vec3 t{2.0f * (qv.y * v.z - qv.z * v.y),
+                 2.0f * (qv.z * v.x - qv.x * v.z),
+                 2.0f * (qv.x * v.y - qv.y * v.x)};
+    // result = v + w*t + qv x t
+    const Vec3 qvt{qv.y * t.z - qv.z * t.y,
+                   qv.z * t.x - qv.x * t.z,
+                   qv.x * t.y - qv.y * t.x};
+    return {v.x + q.w * t.x + qvt.x,
+            v.y + q.w * t.y + qvt.y,
+            v.z + q.w * t.z + qvt.z};
+}
+
+// Hamilton product (w-first), HD-clean (mirrors math::Quat::operator*).
+NUKA_AMF_HD inline math::Quat QuatMulHD(const math::Quat& a, const math::Quat& b) {
+    math::Quat r;
+    r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    return r;
+}
+
+// Compose two transforms HD-clean: (parent o child) = apply child first, then
+// parent. position = parent.pos + R(parent.rot) * child.pos; rotation = parent.rot
+// * child.rot. (math::Transform::operator* is host-only `inline`.)
+NUKA_AMF_HD inline math::Transform ComposeTransformHD(const math::Transform& parent,
+                                                     const math::Transform& child) {
+    math::Transform out;
+    out.position = parent.position + RotateByQuatHD(parent.rotation, child.position);
+    out.rotation = QuatMulHD(parent.rotation, child.rotation);
+    return out;
+}
+
+// Bake a Transform into a PrimFrame on host OR device (HD-clean).
+NUKA_AMF_HD inline PrimFrame BuildPrimFrameDevice(const math::Transform& xf) {
+    PrimFrame f;
+    f.cx = RotateByQuatHD(xf.rotation, Vec3{1.0f, 0.0f, 0.0f});
+    f.cy = RotateByQuatHD(xf.rotation, Vec3{0.0f, 1.0f, 0.0f});
+    f.cz = RotateByQuatHD(xf.rotation, Vec3{0.0f, 0.0f, 1.0f});
+    f.t  = xf.position;
+    return f;
+}
+
+// ---------------------------------------------------------------------------
 // HD-clean vector helpers (no Vec3::Length/Normalized -- those are not HD).
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline float Len(Vec3 v) {
@@ -729,6 +789,105 @@ NUKA_AMF_HD inline void CapsuleSphere(const PrimParams& cap, const PrimParams& s
     const Vec3 p = closest - n * cap.radius;                 // on capsule surface
     ContactPoint pt;
     pt.position = p; pt.normal = n; pt.penetration = pen; pt.stable_key = 0ull;
+    out->AddPoint(pt);
+}
+
+// ---------------------------------------------------------------------------
+// Closest points between two segments [p1,q1] and [p2,q2] (Ericson, Real-Time
+// Collision Detection 5.1.9, HD-clean). Returns the two closest points via
+// out_c1/out_c2 and the squared distance. Deterministic: a FIXED branch order,
+// no data-dependent reordering, so the FP accumulation matches host==device.
+// ---------------------------------------------------------------------------
+NUKA_AMF_HD inline float ClosestPtSegmentSegment(Vec3 p1, Vec3 q1, Vec3 p2,
+                                                 Vec3 q2, Vec3* out_c1,
+                                                 Vec3* out_c2) {
+    const Vec3 d1 = q1 - p1;          // direction of segment S1
+    const Vec3 d2 = q2 - p2;          // direction of segment S2
+    const Vec3 r  = p1 - p2;
+    const float a = d1.Dot(d1);       // squared length of S1
+    const float e = d2.Dot(d2);       // squared length of S2
+    const float f = d2.Dot(r);
+    float s = 0.0f;
+    float t = 0.0f;
+    constexpr float kEps = 1.0e-12f;
+    if (a <= kEps && e <= kEps) {
+        // Both segments degenerate to points.
+        s = 0.0f; t = 0.0f;
+    } else if (a <= kEps) {
+        // First segment degenerates to a point.
+        s = 0.0f;
+        t = f / e;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    } else {
+        const float c = d1.Dot(r);
+        if (e <= kEps) {
+            // Second segment degenerates to a point.
+            t = 0.0f;
+            s = -c / a;
+            s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+        } else {
+            // The general nondegenerate case.
+            const float b = d1.Dot(d2);
+            const float denom = a * e - b * b;   // always >= 0
+            if (denom > kEps) {
+                s = (b * f - c * e) / denom;
+                s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+            } else {
+                s = 0.0f;  // parallel segments: pick s = 0 (deterministic).
+            }
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = -c / a;
+                s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = (b - c) / a;
+                s = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+            }
+        }
+    }
+    const Vec3 c1 = p1 + d1 * s;
+    const Vec3 c2 = p2 + d2 * t;
+    if (out_c1) *out_c1 = c1;
+    if (out_c2) *out_c2 = c2;
+    const Vec3 dv = c1 - c2;
+    return dv.Dot(dv);
+}
+
+// ---------------------------------------------------------------------------
+// CAPSULE (a) x CAPSULE (b) -> 1 point. Closest segment-to-segment between the
+// two capsule axes; inflate by the two radii. normal = separation dir for A
+// (capsule a). The single deepest point is emitted at the midpoint of the two
+// closest surface points (matches the SphereSphere convention applied to the
+// closest features). This is the WP6 dog-dog leg/trunk narrowphase.
+// ---------------------------------------------------------------------------
+NUKA_AMF_HD inline void CapsuleCapsule(const PrimParams& a, const PrimParams& b,
+                                       ContactManifold* out) {
+    out->Clear();
+    const Vec3 axa = a.frame.cy;                  // capsule a local Y in world
+    const Vec3 axb = b.frame.cy;
+    const Vec3 a0 = a.frame.t + axa * a.half_height;
+    const Vec3 a1 = a.frame.t - axa * a.half_height;
+    const Vec3 b0 = b.frame.t + axb * b.half_height;
+    const Vec3 b1 = b.frame.t - axb * b.half_height;
+    Vec3 ca;
+    Vec3 cb;
+    const float dist2 = ClosestPtSegmentSegment(a0, a1, b0, b1, &ca, &cb);
+    const float dist = sqrtf(dist2);
+    const float pen = (a.radius + b.radius) - dist;
+    if (pen <= 0.0f) return;
+    const Vec3 delta = ca - cb;                   // a away from b
+    // Fallback normal: if the axes intersect (dist ~ 0), use a's axis-perp guess.
+    const Vec3 n = Norm(delta, Norm(axa.Cross(axb), Vec3::UnitY()));
+    // Contact point: the midpoint of the two surface points along the normal.
+    const Vec3 sa = ca - n * a.radius;            // a's surface point
+    const Vec3 sb = cb + n * b.radius;            // b's surface point
+    ContactPoint pt;
+    pt.position = (sa + sb) * 0.5f;
+    pt.normal = n;
+    pt.penetration = pen;
+    pt.stable_key = 0ull;
     out->AddPoint(pt);
 }
 
