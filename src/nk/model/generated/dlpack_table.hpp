@@ -181,6 +181,12 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LinkGeomKind, DlpackDtype::kU32, 1, false, false},  // link_geom_kind
     {FieldId::LinkGeomParams, DlpackDtype::kF32, 2, false, false},  // link_geom_params
     {FieldId::LinkGeomLocal, DlpackDtype::kF32, 2, false, false},  // link_geom_local
+    {FieldId::BodyToLink, DlpackDtype::kU32, 1, false, false},  // body_to_link
+    {FieldId::BodyToArticulation, DlpackDtype::kU32, 1, false, false},  // body_to_articulation
+    {FieldId::UcontactA, DlpackDtype::kU32, 2, false, false},  // ucontact_a
+    {FieldId::UcontactB, DlpackDtype::kU32, 2, false, false},  // ucontact_b
+    {FieldId::UcontactGen, DlpackDtype::kU32, 2, false, false},  // ucontact_gen
+    {FieldId::Heights, DlpackDtype::kF32, 1, false, false},  // heights
 };
 
 } // namespace nuka::nk

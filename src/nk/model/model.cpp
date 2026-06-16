@@ -71,8 +71,10 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
         }
         // M5 pair-driven / SDF GLOBAL tables (per-env template, base-relative).
+        // R1: the shape_table record GREW 8 -> 10 f32/row (appended body_id +
+        // group); the unpack of lanes 0..7 stays byte-identical.
         if (id == FieldId::ShapeTable) {
-            return static_cast<uint64_t>(max_bodies_total) * 8ull;
+            return static_cast<uint64_t>(max_bodies_total) * 10ull;
         }
         if (id == FieldId::ExcludedPairs) {
             return static_cast<uint64_t>(max_excluded_pairs);
@@ -98,6 +100,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::GridCellStart || id == FieldId::GridCellEnd) {
             return static_cast<uint64_t>(max_grid_cells) *
                    static_cast<uint64_t>(env_count);
+        }
+        // H1 (general contact pipeline Phase 0): the GLOBAL heightfield grid pool
+        // (shared by every env; the heightfield is a static collidable). 0 cells
+        // for every current scene (no cook fills it yet) -> a zero-byte segment.
+        if (id == FieldId::Heights) {
+            return static_cast<uint64_t>(max_heightfield_cells);
         }
         return static_cast<uint64_t>(env_count);
     }
@@ -306,21 +314,26 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         }
         case FieldId::ShapeTable: {
-            // GLOBAL pair-driven shape table: 8 packed f32 per body row
-            // {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
-            //  sdf_grid(u32)}. Empty for the union slot-template family.
+            // GLOBAL pair-driven shape table: R1 GREW it 8 -> 10 packed f32 per
+            // body row {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
+            //  sdf_grid(u32), body_id(int32 bits; -1==static), group(u32 bits)}.
+            // Lanes 0..7 are byte-identical to the prior layout; lanes 8/9 are the
+            // appended R1 fields (INERT in Phase 0). Empty for the union family.
             auto* p = reinterpret_cast<float*>(dst);
             auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
+            auto put_i32 = [&](size_t at, int32_t v) { std::memcpy(&p[at], &v, 4); };
             const uint32_t rows = capacities.max_bodies_total;
             for (uint32_t s = 0; s < shape_table_rows.size() && s < rows; ++s) {
                 const PairDrivenShape& sh = shape_table_rows[s];
-                const size_t b = static_cast<size_t>(s) * 8u;
+                const size_t b = static_cast<size_t>(s) * 10u;
                 put_u32(b + 0, sh.kind);
                 p[b + 1] = sh.params[0]; p[b + 2] = sh.params[1];
                 p[b + 3] = sh.params[2]; p[b + 4] = sh.params[3];
                 put_u32(b + 5, sh.contype);
                 put_u32(b + 6, sh.conaffinity);
                 put_u32(b + 7, sh.sdf_grid);
+                put_i32(b + 8, sh.body_id);
+                put_u32(b + 9, sh.group);
             }
             break;
         }
@@ -595,6 +608,38 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::LinkGeomLocal:
             StampPerLink(dst, a.link_geom_local, L, E, sizeof(math::Transform));
             break;
+        case FieldId::BodyToLink:
+        case FieldId::BodyToArticulation: {
+            // R3 (general contact pipeline Phase 0): the shape->body inverse
+            // tables. TEMPLATE-local per-body values tiled env-major (like
+            // link_body). A body row not covered by the cooked table (free rigid /
+            // static / an unpopulated cook) defaults to ~0u so the runtime resolves
+            // it as a free-rigid/static side. INERT in Phase 0 (no op reads them).
+            const std::vector<uint32_t>& tpl =
+                (id == FieldId::BodyToLink) ? body_to_link : body_to_articulation;
+            const uint32_t B = capacities.bodies_per_env;
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t b = 0; b < B; ++b) {
+                    p[static_cast<size_t>(e) * B + b] =
+                        (b < tpl.size()) ? tpl[b] : ~uint32_t(0);
+                }
+            }
+            break;
+        }
+        case FieldId::Heights: {
+            // H1 (general contact pipeline Phase 0): the GLOBAL flat heightfield
+            // grid pool. EMPTY for every current scene (the cook fill is H2, Phase
+            // 2) -> seg.bytes == 0 already short-circuits above; the copy is a
+            // forward-compatible no-op until H2 sizes max_heightfield_cells > 0.
+            if (!heightfield_heights.empty()) {
+                const size_t n = std::min(
+                    heightfield_heights.size(),
+                    static_cast<size_t>(capacities.max_heightfield_cells));
+                std::memcpy(dst, heightfield_heights.data(), n * sizeof(float));
+            }
+            break;
+        }
         default:
             // Unpopulated model sections: deterministic 0.
             break;
@@ -620,6 +665,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::LinkGeomKind:          v.link_geom_kind = static_cast<uint32_t*>(p); break;
         case FieldId::LinkGeomParams:        v.link_geom_params = static_cast<float*>(p); break;
         case FieldId::LinkGeomLocal:         v.link_geom_local = static_cast<math::Transform*>(p); break;
+        // General contact pipeline Phase 0 (R3 inverse tables + H1 height grid).
+        case FieldId::BodyToLink:            v.body_to_link = static_cast<uint32_t*>(p); break;
+        case FieldId::BodyToArticulation:    v.body_to_articulation = static_cast<uint32_t*>(p); break;
+        case FieldId::Heights:               v.heights = static_cast<float*>(p); break;
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;

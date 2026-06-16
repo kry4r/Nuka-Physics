@@ -109,7 +109,7 @@ enum class FieldId : uint16_t {
     DofToLink,  // dof_to_link (per:dof arena:persistent owner:model)
     DofToComponent,  // dof_to_component (per:dof arena:persistent owner:model)
     TableEnabled,  // table_enabled (per:env arena:persistent owner:data)
-    ShapeTable,  // shape_table (per:scalar arena:persistent owner:model count:max_bodies_total*8)
+    ShapeTable,  // shape_table (per:scalar arena:persistent owner:model count:max_bodies_total*10)
     ExcludedPairs,  // excluded_pairs (per:scalar arena:persistent owner:model count:max_excluded_pairs)
     SampPoints,  // samp_points (per:scalar arena:persistent owner:model count:max_samp_points*3)
     SampRanges,  // samp_ranges (per:scalar arena:persistent owner:model count:max_bodies_total*2)
@@ -165,6 +165,12 @@ enum class FieldId : uint16_t {
     LinkGeomKind,  // link_geom_kind (per:link arena:persistent owner:model)
     LinkGeomParams,  // link_geom_params (per:link arena:persistent owner:model elem:4)
     LinkGeomLocal,  // link_geom_local (per:link arena:persistent owner:model)
+    BodyToLink,  // body_to_link (per:body arena:persistent owner:model)
+    BodyToArticulation,  // body_to_articulation (per:body arena:persistent owner:model)
+    UcontactA,  // ucontact_a (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactB,  // ucontact_b (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactGen,  // ucontact_gen (per:contact_slot arena:scratch owner:data elem:4)
+    Heights,  // heights (per:scalar arena:persistent owner:model count:max_heightfield_cells)
     Count
 };
 

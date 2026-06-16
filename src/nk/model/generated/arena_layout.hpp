@@ -199,6 +199,12 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_geom_kind
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 4, 1, 16, 0},  // link_geom_params
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 7, 28, 0},  // link_geom_local
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_to_link
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_to_articulation
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_a
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_gen
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // heights
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

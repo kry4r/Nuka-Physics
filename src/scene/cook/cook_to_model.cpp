@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "runtime/articulation/articulation_contacts.hpp"  // contact-slot strides
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -270,6 +271,24 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
             if (lb < body_is_articulation_link.size()) {
                 body_is_articulation_link[lb] = 1u;
             }
+        }
+
+        // R3 (general contact pipeline Phase 0): the shape->body INVERSE tables.
+        // link_body is link->body; the general PairDriven row-emission (S5) needs
+        // body->owner. For each TEMPLATE link l with owning body row b, record
+        // body_to_link[b] = l and body_to_articulation[b] = the LOCAL articulation
+        // of l. A body row owned by NO link (free rigid / static) keeps ~0u (so
+        // its side resolves free-rigid; the shape_table body_id == -1 resolves
+        // static). Both stage template-local + tile env-major. INERT in Phase 0.
+        model.body_to_link.assign(cap.bodies_per_env, ~uint32_t(0));
+        model.body_to_articulation.assign(cap.bodies_per_env, ~uint32_t(0));
+        for (uint32_t l = 0; l < host.link_body.size(); ++l) {
+            const uint32_t b = host.link_body[l];
+            if (b >= cap.bodies_per_env) continue;
+            model.body_to_link[b] = l;
+            model.body_to_articulation[b] =
+                l < host.link_to_articulation.size() ? host.link_to_articulation[l]
+                                                     : 0u;
         }
 
         // M7 T5b — seed the AUTHORED settled IC (qpos -> initial_q per-link, root
@@ -727,6 +746,13 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
             row.contype = 1u;
             row.conaffinity = 1u;
             row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
+            // R1 (general contact pipeline Phase 0): the shape->body indirection.
+            // A cooked collidable row maps to its OWNING body row (never static
+            // here — static collidables are emitted separately, R5). group 0 ==
+            // the default collide-all group. INERT in Phase 0 (no routing reads
+            // these lanes; R4/S5 wire them in Phase 1).
+            row.body_id = static_cast<int32_t>(sh.body_row);
+            row.group = 0u;
         }
 
         // SDF grids: mirror the cooked CookedSdfTable into the Model SDF tables;
@@ -783,6 +809,41 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         cap.max_sdf_cells   = static_cast<uint32_t>(model.sdf_cell_keys.size());
         cap.max_excluded_pairs =
             static_cast<uint32_t>(model.excluded_pairs.size());
+
+        // R5 (general contact pipeline Phase 0): emit a STATIC ground collidable
+        // row into shape_table as a first-class collidable with body_id == -1 (no
+        // reaction side). Appended AFTER the per-body rows so the per-body rows
+        // [0, bodies_per_env) keep their exact indices + bytes; the static row
+        // lives at index bodies_per_env. contype/conaffinity == 1 (collide-all).
+        // INERT in Phase 0: the broadphase iterates only bodies_per_env body rows
+        // per env (it never indexes the static row), and shape_table is a model
+        // param pinned by no golden, so growing max_bodies_total by one row is
+        // byte-safe for the gated FusedFoot/UnionCsr families. The static row's
+        // WORLD pose / LBVH entry is wired in Phase 1 (R5 downstream + B3); here we
+        // only register the collidable. A Plane kind anchors the flat-ground case
+        // (the general heightfield collidable, kShapeHeightfield, is added by H2/H3
+        // in Phase 2). params[0] carries the ground plane height for the future
+        // static-pose stamp.
+        {
+            nk::Model::PairDrivenShape ground;
+            ground.kind = ::nuka::collision::kShapePlane;
+            ground.params[0] = model.ground_height;
+            ground.params[1] = 0.0f;
+            ground.params[2] = 0.0f;
+            ground.params[3] = 0.0f;
+            ground.contype = 1u;
+            ground.conaffinity = 1u;
+            ground.sdf_grid = ~0u;
+            ground.body_id = -1;   // STATIC: no owning body, no reaction side.
+            ground.group = 0u;
+            model.shape_table_rows.push_back(ground);
+        }
+        // Grow the shape_table capacity to cover the appended static row(s). Only
+        // shape_table (count max_bodies_total*10) + samp_ranges (count
+        // max_bodies_total*2) scale with this; both are model params pinned by no
+        // golden, and the extra samp_ranges entries default to 0 (no samples).
+        cap.max_bodies_total =
+            static_cast<uint32_t>(model.shape_table_rows.size());
     }
 
     return result;

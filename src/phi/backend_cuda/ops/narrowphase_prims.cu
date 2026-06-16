@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include "collision/analytical_manifold.hpp"   // amf:: analytic handlers (HD)
+#include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind (R2)
 #include "math/transform.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
@@ -33,12 +34,13 @@ namespace {
 namespace amf = ::nuka::collision::amf;
 using ::nuka::constraint::ContactManifold;
 
-// Shape kinds (mirror scene::CollisionShapeComponent::Kind + the broadphase
-// ShapeDev). Plane is a +Z analytic plane at the body origin (frame.cy = world Z).
-constexpr uint32_t kKindSphere = 0u;
-constexpr uint32_t kKindCapsule = 1u;
-constexpr uint32_t kKindBox = 2u;
-constexpr uint32_t kKindPlane = 3u;
+// Shape kinds — R2: the ONE shared enum (collision/shape_kind.hpp). Local
+// aliases keep the DispatchPair text identical. Plane is a +Z analytic plane at
+// the body origin (frame.cy = world Z).
+constexpr uint32_t kKindSphere  = ::nuka::collision::kShapeSphere;
+constexpr uint32_t kKindCapsule = ::nuka::collision::kShapeCapsule;
+constexpr uint32_t kKindBox     = ::nuka::collision::kShapeBox;
+constexpr uint32_t kKindPlane   = ::nuka::collision::kShapePlane;
 
 // Build the amf::PrimParams (baked world frame + extents) for one body row.
 __device__ amf::PrimParams MakePrim(const PrimShapeDev& s,

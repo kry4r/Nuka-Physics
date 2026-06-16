@@ -15,26 +15,31 @@
 
 namespace nuka::phi::nkops {
 
-// Device-side shape_table record (8 packed f32 / body row; Model::PairDrivenShape
-// staging in StageModelField(ShapeTable)). params: sphere r / capsule r,hh / box
-// he.xyz, by kind.
+// Device-side shape_table record. R1 GREW it 8 -> 10 packed f32 / body row
+// (Model::PairDrivenShape staging in StageModelField(ShapeTable)). params:
+// sphere r / capsule r,hh / box he.xyz, by kind. Lanes 8/9 = body_id (int32) +
+// group (uint32), the shape->body indirection (INERT in Phase 0).
 struct PrimShapeDev {
     uint32_t kind;
     float    params[4];
     uint32_t contype;
     uint32_t conaffinity;
     uint32_t sdf_grid;
+    int32_t  body_id;     // owning body row, or -1 == static (R1).
+    uint32_t group;       // signed collision-group filter key (R1).
 };
 
 __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
                                                       uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 8u;
+    const float* q = table + static_cast<size_t>(row) * 10u;
     PrimShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.params[0] = q[1]; s.params[1] = q[2]; s.params[2] = q[3]; s.params[3] = q[4];
     s.contype = __float_as_uint(q[5]);
     s.conaffinity = __float_as_uint(q[6]);
     s.sdf_grid = __float_as_uint(q[7]);
+    s.body_id = static_cast<int32_t>(__float_as_uint(q[8]));
+    s.group = __float_as_uint(q[9]);
     return s;
 }
 

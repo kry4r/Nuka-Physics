@@ -47,7 +47,7 @@ struct ModelView {
     float* hull_verts = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts*3
     uint32_t* dof_to_link = nullptr;  // per:dof arena:persistent owner:model
     uint32_t* dof_to_component = nullptr;  // per:dof arena:persistent owner:model
-    float* shape_table = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*8
+    float* shape_table = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*10
     uint64_t* excluded_pairs = nullptr;  // per:scalar arena:persistent owner:model count:max_excluded_pairs
     float* samp_points = nullptr;  // per:scalar arena:persistent owner:model count:max_samp_points*3
     uint32_t* samp_ranges = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*2
@@ -79,6 +79,9 @@ struct ModelView {
     uint32_t* link_geom_kind = nullptr;  // per:link arena:persistent owner:model
     float* link_geom_params = nullptr;  // per:link arena:persistent owner:model elem:4
     ::nuka::math::Transform* link_geom_local = nullptr;  // per:link arena:persistent owner:model
+    uint32_t* body_to_link = nullptr;  // per:body arena:persistent owner:model
+    uint32_t* body_to_articulation = nullptr;  // per:body arena:persistent owner:model
+    float* heights = nullptr;  // per:scalar arena:persistent owner:model count:max_heightfield_cells
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -189,6 +192,9 @@ struct DataView {
     uint32_t* env_terrain_type = nullptr;  // per:env arena:persistent owner:data
     float* env_terrain_difficulty = nullptr;  // per:env arena:persistent owner:data
     float* joint_f = nullptr;  // per:link arena:persistent owner:data flags:[param]
+    uint32_t* ucontact_a = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    uint32_t* ucontact_b = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    uint32_t* ucontact_gen = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
 };
 
 } // namespace nuka::phi

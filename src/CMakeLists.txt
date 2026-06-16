@@ -651,6 +651,11 @@ if(CMAKE_CUDA_COMPILER)
         # analytic narrowphase routed through the fused per-articulation solver
         # so each dog's reaction scatters into its OWN qdot tile. K==1 inert.
         phi/backend_cuda/ops/dog_dog_contact.cu
+        # General contact pipeline Phase 0 (B2): SyncLinkBodyPose — copies each
+        # articulation link's FK world pose into its owning body_pose row so artic
+        # links enter the LBVH. PairDriven-family-gated (inert for the FusedFoot /
+        # UnionCsr graphs); present-but-inert in Phase 0.
+        phi/backend_cuda/ops/sync_body_pose.cu
         # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
         # + generalized pair-driven narrowphase (analytic prim set + sphere x
         # hull) + the SDF main path (SAMP x cooked sparse SDF grid). Ports of

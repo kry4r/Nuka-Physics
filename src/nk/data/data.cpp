@@ -90,6 +90,11 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::UcontactPoint:       v.ucontact_point = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactNormal:      v.ucontact_normal = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactDepth:       v.ucontact_depth = static_cast<float*>(p); break;
+        // C1 (general contact pipeline Phase 0): per-slot collidable-id + gen
+        // fields on the unified contact buffer (INERT in Phase 0; stamped by C2).
+        case FieldId::UcontactA:           v.ucontact_a = static_cast<uint32_t*>(p); break;
+        case FieldId::UcontactB:           v.ucontact_b = static_cast<uint32_t*>(p); break;
+        case FieldId::UcontactGen:         v.ucontact_gen = static_cast<uint32_t*>(p); break;
         case FieldId::RowCount:            v.row_count = static_cast<uint32_t*>(p); break;
         case FieldId::Urows:               v.urows = static_cast<float*>(p); break;
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;

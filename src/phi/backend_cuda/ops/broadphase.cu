@@ -35,6 +35,7 @@
 
 #include "collision/lbvh_node.cuh"      // LbvhNode / LbvhDelta / LbvhMerge
 #include "collision/morton_codes.cuh"   // Morton3D30
+#include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
 #include "collision/particle_grid_traversal.cuh"  // ParticleGridConfigDevice / QueryParticleNeighbors
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -52,33 +53,41 @@ namespace cg = ::nuka::collision::gpu;
 constexpr uint32_t kBlockSize = 128u;
 constexpr uint32_t kParticleGridMaxNeighbors = 32u;  // mirror particle_uniform_grid.
 
-// shape_table record: 8 packed f32 / body row (Model::PairDrivenShape).
+// shape_table record: R1 GREW it 8 -> 10 packed f32 / body row
+// (Model::PairDrivenShape). Lanes 0..7 unchanged; lanes 8/9 = body_id (int32) +
+// group (uint32), the shape->body indirection (INERT in Phase 0).
 struct ShapeDev {
     uint32_t   kind;
     float      p[4];        // sphere r / capsule r,hh / box he.xyz
     uint32_t   contype;
     uint32_t   conaffinity;
     uint32_t   sdf_grid;
+    int32_t    body_id;     // owning body row, or -1 == static (R1).
+    uint32_t   group;       // signed collision-group filter key (R1).
 };
 __forceinline__ __device__ ShapeDev LoadShape(const float* table, uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 8u;
+    const float* q = table + static_cast<size_t>(row) * 10u;
     ShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.p[0] = q[1]; s.p[1] = q[2]; s.p[2] = q[3]; s.p[3] = q[4];
     s.contype = __float_as_uint(q[5]);
     s.conaffinity = __float_as_uint(q[6]);
     s.sdf_grid = __float_as_uint(q[7]);
+    s.body_id = static_cast<int32_t>(__float_as_uint(q[8]));
+    s.group = __float_as_uint(q[9]);
     return s;
 }
 
-// Shape kinds (mirror scene::CollisionShapeComponent::Kind: Sphere/Capsule/Box/
-// Plane/ConvexHull/SdfMesh). Only the extents matter for the AABB.
-constexpr uint32_t kKindSphere = 0u;
-constexpr uint32_t kKindCapsule = 1u;
-constexpr uint32_t kKindBox = 2u;
-constexpr uint32_t kKindPlane = 3u;
-constexpr uint32_t kKindConvexHull = 4u;
-constexpr uint32_t kKindSdfMesh = 5u;
+// Shape kinds — R2: the ONE shared enum (collision/shape_kind.hpp). These local
+// aliases keep the kernel switch text identical while removing the divergent
+// copy-pasted sentinel block. Only the extents matter for the AABB.
+constexpr uint32_t kKindSphere      = ::nuka::collision::kShapeSphere;
+constexpr uint32_t kKindCapsule     = ::nuka::collision::kShapeCapsule;
+constexpr uint32_t kKindBox         = ::nuka::collision::kShapeBox;
+constexpr uint32_t kKindPlane       = ::nuka::collision::kShapePlane;
+constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
+constexpr uint32_t kKindSdfMesh     = ::nuka::collision::kShapeSdfMesh;
+constexpr uint32_t kKindHeightfield = ::nuka::collision::kShapeHeightfield;
 
 __forceinline__ __device__ math::Vec3 RotAbs(math::Quat q, math::Vec3 v) {
     // |R| * v applied component-wise: the world AABB half-extent of a local box

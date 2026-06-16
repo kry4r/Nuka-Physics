@@ -70,6 +70,7 @@ private:
     phi::IntegratePositionParams      p_int_pos_{};
     phi::CrbaComputeMParams           p_crba_m_{};
     phi::CrbaFactorMParams            p_crba_factor_{};
+    phi::SyncLinkBodyPoseParams       p_sync_body_pose_{};  // general contact B2
     phi::BuildAabbsParams             p_aabbs_{};
     phi::LbvhBuildParams              p_lbvh_build_{};
     phi::LbvhQueryPairsParams         p_lbvh_query_{};

@@ -94,6 +94,15 @@ enum class NkOp : uint16_t {
                            // contact rows (two-way reaction). Emitted ONLY for
                            // articulations_per_env > 1; the K==1 graph never sees it.
 
+    // --- general contact pipeline Phase 0 (B2) --------------------------
+    SyncLinkBodyPose,      // copy each articulation link's FK world pose into its
+                           // owning body_pose row (composing link_geom_local) so
+                           // artic links enter the LBVH as collidables. APPENDED
+                           // after DogDogContact so the prior NkOp values are
+                           // stable. INERT in Phase 0: inserted into the graph but
+                           // gated to the PairDriven family (early-exit otherwise),
+                           // and no current cook is PairDriven (B1 is Phase 1).
+
     Count                  // sentinel: number of ops (NOT an op)
 };
 
@@ -302,6 +311,23 @@ struct DogDogContactParams {
     uint32_t terrain_body_contact;   // 0 == off (dog-dog only), !=0 == body-terrain on
     float    ground_height;          // base plane height (PINNED == terrain.ground_height)
     ::nuka::terrain::TerrainParams terrain;  // SHARED procedural-terrain params
+};
+
+// General contact pipeline Phase 0 (B2): SyncLinkBodyPose. One thread per
+// articulation link copies its FK world pose (link_pose[l]) into its owning
+// body_pose row (body_pose[link_body[l]]), composing the cooked link_geom_local
+// offset so an offset collidable is posed in world space. This is what makes
+// articulation links visible to the LBVH (BuildAabbsKernel reads body_pose),
+// the load-bearing prerequisite for general body<->body contact. EARLY-EXITS
+// unless family == kContactFamilyPairDriven (so the FusedFoot/UnionCsr graphs
+// are byte-untouched in Phase 0; no current cook is PairDriven). link_body is
+// the MODEL table (template-local body row per link); the kernel adds the
+// per-env body offset for the global body_pose index.
+struct SyncLinkBodyPoseParams {
+    uint32_t family;          // kContactFamily* (PairDriven => run; else early-exit)
+    uint32_t env_count;
+    uint32_t links_per_env;   // per-env link stride (the kernel grids env*links)
+    uint32_t bodies_per_env;  // body rows per env (the per-env body stride)
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
