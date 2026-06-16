@@ -101,7 +101,7 @@ enum class FieldId : uint16_t {
     RowCjLink,  // row_cj_link (per:row_slot arena:scratch owner:data)
     RowCjPoint,  // row_cj_point (per:row_slot arena:scratch owner:data)
     RowCjDir,  // row_cj_dir (per:row_slot arena:scratch owner:data)
-    QdotFlat,  // qdot_flat (per:dof arena:scratch owner:data)
+    QdotFlat,  // qdot_flat (per:articulation_dof arena:scratch owner:data)
     M,  // m (per:articulation_dof2 arena:scratch owner:data)
     LinkCompositeInertia,  // link_composite_inertia (per:link arena:scratch owner:data)
     UnionSlots,  // union_slots (per:scalar arena:persistent owner:model count:max_contacts_per_env*16)
@@ -173,6 +173,11 @@ enum class FieldId : uint16_t {
     Heights,  // heights (per:scalar arena:persistent owner:model count:max_heightfield_cells)
     UcontactTangent1,  // ucontact_tangent1 (per:contact_slot arena:scratch owner:data elem:4)
     UcontactTangent2,  // ucontact_tangent2 (per:contact_slot arena:scratch owner:data elem:4)
+    ChainJacobianB,  // chain_jacobian_b (per:row_dof arena:scratch owner:data)
+    RowMinvJtB,  // row_minv_jt_b (per:row_dof arena:scratch owner:data)
+    RowCjLinkB,  // row_cj_link_b (per:row_slot arena:scratch owner:data)
+    RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
+    RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
     Count
 };
 

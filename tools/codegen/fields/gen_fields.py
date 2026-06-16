@@ -66,6 +66,11 @@ VALID_PER = {
     # (= articulations_per_env * max_dof^2). At articulations_per_env == 1 these
     # collapse element-for-element onto `env` / `env_dof2` (the K==1 D1 invariant).
     "articulation", "articulation_dof2",
+    # Per-articulation flat-DOF tile unit (= articulations_per_env * max_dof); the
+    # general contact pipeline's per-artic qdot_flat tile (S3). At
+    # articulations_per_env == 1 it collapses element-for-element onto `dof` (the
+    # K==1 D1 invariant).
+    "articulation_dof",
 }
 VALID_ARENA = {"persistent", "scratch", "tape"}
 VALID_OWNER = {"model", "data"}
@@ -245,7 +250,10 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "articulations_per_env)",
         "    // and per-articulation M-tile (= articulations_per_env * max_dof^2).",
         "    // APPENDED so the existing enumerator values never shift.",
-        "    Articulation, ArticulationDof2",
+        "    Articulation, ArticulationDof2,",
+        "    // Per-articulation flat-DOF tile (= articulations_per_env * max_dof);",
+        "    // the general-contact per-artic qdot_flat tile (S3). APPENDED LAST.",
+        "    ArticulationDof",
         "};",
         "",
         "struct FieldLayout {",
@@ -273,6 +281,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "shape_match_slot": "ShapeMatchSlot", "shape_match_member": "ShapeMatchMember",
         "env_dof2": "EnvDof2", "scalar": "Scalar",
         "articulation": "Articulation", "articulation_dof2": "ArticulationDof2",
+        "articulation_dof": "ArticulationDof",
     }
     scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
                    "transform": 4, "spatial6": 4, "mat36": 4}

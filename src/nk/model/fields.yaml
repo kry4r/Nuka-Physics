@@ -56,7 +56,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -272,7 +272,15 @@ fields:
   - {name: row_cj_link,     dtype: u32,  per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_point,    dtype: vec3, per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_dir,      dtype: vec3, per: row_slot, arena: scratch,    owner: data}
-  - {name: qdot_flat,       dtype: f32,  per: dof,      arena: scratch,    owner: data}
+  # qdot_flat is the per-ARTICULATION flat joint-velocity tile (S3, general contact
+  # pipeline Phase 1B): one max_dof-wide tile per co-resident articulation
+  # (qdot_flat[artic_global*max_dof + k]) so two co-resident dogs' reactions land in
+  # their OWN tiles (no aliasing). K==1 (1 artic/env) -> articulation_dof count ==
+  # dof count element-for-element, so the segment is byte-identical to the prior
+  # per:dof keying (the D1 invariant; verified by the K==1 arena-offset diff). The
+  # union/fused single-dog paths index it at env*max_dof == artic_global*max_dof
+  # at K==1, unchanged.
+  - {name: qdot_flat,       dtype: f32,  per: articulation_dof, arena: scratch, owner: data}
   # Unfactored CRBA M tile (legacy m_; m_inv above is its LDL^T inverse) + the
   # CRBA composite-inertia scratch (legacy composite_).
   # m is the per-ARTICULATION unfactored CRBA M tile (one max_dof^2 block per
@@ -617,3 +625,20 @@ fields:
   # pre-existing arena offsets stay byte-stable).
   - {name: ucontact_tangent1, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: ucontact_tangent2, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+
+  # =========================================================================
+  # GENERAL CONTACT PIPELINE — Phase 1B SOLVER (S2). The SECOND per-side arm for
+  # a two-DYNAMIC-side row (artic x artic, artic x free-rigid): a contact whose
+  # side B is also an articulation needs its OWN chain-Jacobian row + its own
+  # w = M^-1 J^T row + its own chain-J gather inputs (link/point/dir). These
+  # mirror the side-A fields (chain_jacobian / row_minv_jt per:row_dof;
+  # row_cj_link/point/dir per:row_slot) 1:1. APPENDED LAST (highest FieldIds) so
+  # every pre-existing arena offset is byte-stable at K==1. INERT for the
+  # Union/Fused families (only the PairDriven assembly fills them; a row with no
+  # artic side B leaves row_cj_link_b == kInvalidLink so the second chain-J pass
+  # writes a zero row and the meff side-B artic branch contributes nothing).
+  - {name: chain_jacobian_b, dtype: f32,  per: row_dof,  arena: scratch, owner: data}
+  - {name: row_minv_jt_b,    dtype: f32,  per: row_dof,  arena: scratch, owner: data}
+  - {name: row_cj_link_b,    dtype: u32,  per: row_slot, arena: scratch, owner: data}
+  - {name: row_cj_point_b,   dtype: vec3, per: row_slot, arena: scratch, owner: data}
+  - {name: row_cj_dir_b,     dtype: vec3, per: row_slot, arena: scratch, owner: data}

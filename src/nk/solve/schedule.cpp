@@ -175,6 +175,11 @@ SolveScheduleResult SolveSchedule::Partition(const std::vector<ScheduleRow>& row
             if (first == ~0u) first = row; else uf.Union(first, row);
         }
         if (rows[row].artic != ~0u) art_rows.emplace_back(rows[row].artic, row);
+        // S4: a two-artic row (artic x artic) contributes its SECOND artic key too,
+        // so the union-find merges the two colliding dogs' islands into one
+        // component (they share mutable qdot state and must serialize). ~0u for a
+        // single-artic row -> no extra edge (the legacy behaviour, K==1 unchanged).
+        if (rows[row].artic_b != ~0u) art_rows.emplace_back(rows[row].artic_b, row);
         if (rows[row].group_first != ~0u && rows[row].group_first < row_count) {
             uf.Union(row, rows[row].group_first);
         }
@@ -255,7 +260,7 @@ SolveScheduleResult SolveSchedule::Partition(const std::vector<ScheduleRow>& row
     }
     for (uint32_t row = 0; row < row_count; ++row) {
         const uint32_t comp = component_of_row[row];
-        if (rows[row].artic != ~0u) {
+        if (rows[row].artic != ~0u || rows[row].artic_b != ~0u) {
             out.islands[static_cast<size_t>(comp) * 4u + 2u] |= 1u;
         }
         out.islands[static_cast<size_t>(comp) * 4u + 3u] =
@@ -292,6 +297,47 @@ void SolveSchedule::Build(Model* model) {
     model->schedule_islands.clear();
     model->schedule_island_count = 0;
     model->schedule_segment_count = 0;
+
+    // S4 (general contact pipeline Phase 1B): the PairDriven family has NO static
+    // union-slot template — its contacts are DYNAMIC broadphase candidate pairs, so
+    // the worst-case row->collidable mapping is unknown at cook time. The safe
+    // worst-case schedule is therefore ONE island per env holding ALL of that env's
+    // rows (flagged has-artic so the qdot tiles round-trip), with each row its OWN
+    // color segment in row-index order. This is a valid REFINEMENT bound: at runtime
+    // the active subset's true components are sub-unions of the per-env island, and
+    // a contact-free env early-exits every inactive row. (The per-color parallelism
+    // is conservative; correctness is exact. A finer dynamic island pass is a later
+    // optimization.)
+    if (model->contact_family == ContactFamily::PairDriven) {
+        const ModelCapacities& cap = model->capacities;
+        const uint32_t E = cap.env_count;
+        const uint32_t rpe = cap.max_rows_per_env;
+        if (E == 0u || rpe == 0u) return;
+        const uint32_t total_rows = rpe * E;
+        // row_order: rows grouped per env (island), ascending row index.
+        model->schedule_row_order.resize(total_rows);
+        for (uint32_t r = 0; r < total_rows; ++r) model->schedule_row_order[r] = r;
+        // One color segment per ROW (each row its own color within the island; the
+        // island serializes all its rows, the maximal-conflict worst case). segments
+        // = total_rows pairs {row_order offset, count==1}.
+        model->schedule_color_segments.assign(static_cast<size_t>(total_rows) * 2u, 0u);
+        for (uint32_t r = 0; r < total_rows; ++r) {
+            model->schedule_color_segments[static_cast<size_t>(r) * 2u + 0u] = r;
+            model->schedule_color_segments[static_cast<size_t>(r) * 2u + 1u] = 1u;
+        }
+        // islands: one quad per env {seg_off, seg_cnt, flags(has-artic), env}.
+        model->schedule_islands.assign(static_cast<size_t>(E) * 4u, 0u);
+        for (uint32_t e = 0; e < E; ++e) {
+            model->schedule_islands[static_cast<size_t>(e) * 4u + 0u] = e * rpe;  // seg off
+            model->schedule_islands[static_cast<size_t>(e) * 4u + 1u] = rpe;      // seg cnt
+            model->schedule_islands[static_cast<size_t>(e) * 4u + 2u] = 1u;       // has artic
+            model->schedule_islands[static_cast<size_t>(e) * 4u + 3u] = e;        // env
+        }
+        model->schedule_island_count = E;
+        model->schedule_segment_count = total_rows;
+        return;
+    }
+
     if (model->contact_family != ContactFamily::UnionCsr ||
         model->union_slots.empty()) {
         return;  // fused / contact-free family: no CSR schedule.

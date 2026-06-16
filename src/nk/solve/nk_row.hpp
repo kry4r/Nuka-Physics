@@ -50,6 +50,18 @@ inline constexpr uint32_t kActive   = 1u << 0;  // slot live this step (watermar
 inline constexpr uint32_t kFriction = 1u << 1;  // pyramid spoke (vs normal row)
 }  // namespace nk_row_flags
 
+// General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-
+// slot row layout the assembly (EmitPairDrivenRowsKernel) emits and the cook sizes
+// max_rows_per_env by. Each candidate slot expands to kPdPtsPerSlot manifold points
+// (cvx caps at 4), each point -> 1 normal row + kPdSpokesPerPt friction spokes
+// (+t0,-t0,+t1,-t1; condim-3 pyramid). rows_per_slot == pts*(1+spokes). Shared
+// between the cook (host) and the assembly (device) so the schedule, the assembly,
+// and the row budget all agree on the layout.
+inline constexpr uint32_t kPairDrivenPtsPerSlot = 4u;
+inline constexpr uint32_t kPairDrivenSpokesPerPt = 4u;
+inline constexpr uint32_t kPairDrivenRowsPerSlot =
+    kPairDrivenPtsPerSlot * (1u + kPairDrivenSpokesPerPt);  // 20
+
 struct NkRowSide {
     uint32_t   kind  = kNkSideStatic;  // kNkSide* dispatch code
     uint32_t   index = ~0u;            // rigid: GLOBAL body row; artic: art index

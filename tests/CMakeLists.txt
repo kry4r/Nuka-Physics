@@ -889,6 +889,14 @@ if(CMAKE_CUDA_COMPILER)
         # asserts contacts detected, <=4 pts, no NaN, retained (a,b) ids, tangent
         # basis (C4), and two-run byte-identity (the new path's own D1).
         scenario/pairdriven_narrowphase.cpp
+        # General contact pipeline Phase 1B: the PairDriven SOLVER + INTEGRATION gate.
+        # Free x free (two boxes collide + symmetric momentum exchange), free x static
+        # (box rests on a static ground plane), and two-run byte-identity for the new
+        # mixed-island solve path (S1-S6 fed into the existing coupling engine).
+        scenario/pairdriven_solve.cpp
+        # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
+        # and artic x artic (two dogs collide via the GENERAL path, dog_dog gated OFF).
+        scenario/pairdriven_dog_solve.cpp
         # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.

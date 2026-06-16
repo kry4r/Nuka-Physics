@@ -47,6 +47,7 @@
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"  // LoadPrimShape (PairDriven side resolve)
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
 
@@ -525,6 +526,36 @@ __global__ void EmitUnionRowsKernel(const float* __restrict__ union_slots,
     }
 }
 
+// K1 (PairDriven, S3): pack the per-ARTICULATION flat qdot tiles. One thread per
+// (global artic x DOF). dof_to_link/component are the per:dog TEMPLATE map; for
+// co-resident dog a the same template-local (link, component) applies to the
+// articulation's links, which live contiguously at a*links_per_dog within the env
+// (the multi-dog cook concatenates dogs' links). At K==1 (k_tiles == 1) this is
+// EXACTLY the legacy PackQdotFlat (env tile 0).
+__global__ void PackQdotFlatMultiKernel(const Spatial6* __restrict__ link_velocity,
+                                        const float* __restrict__ qdot,
+                                        const uint32_t* __restrict__ dof_to_link,
+                                        const uint32_t* __restrict__ dof_to_component,
+                                        uint32_t artic_count, uint32_t dof_stride,
+                                        uint32_t base_link_count, uint32_t k_tiles,
+                                        float* __restrict__ qdot_flat) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = artic_count * dof_stride;
+    if (gid >= total) return;
+    const uint32_t ag = gid / dof_stride;          // global articulation
+    const uint32_t k = gid - ag * dof_stride;      // DOF within tile
+    const uint32_t kt = (k_tiles == 0u) ? 1u : k_tiles;
+    const uint32_t env = ag / kt;
+    const uint32_t a = ag - env * kt;              // env-local artic
+    const uint32_t links_per_dog = base_link_count / kt;
+    const size_t tmpl = static_cast<size_t>(env) * dof_stride + k;  // per:dof template idx
+    const uint32_t tmpl_link = dof_to_link[tmpl];
+    const uint32_t comp = dof_to_component[tmpl];
+    const uint32_t link = tmpl_link + a * links_per_dog;
+    const size_t gl = static_cast<size_t>(env) * base_link_count + link;
+    qdot_flat[gid] = (comp != ~0u) ? link_velocity[gl].v[comp] : qdot[gl];
+}
+
 // K4a: w = M^-1 J^T per articulation row. One thread per (row, r): the
 // ArticulationApplyImpulse / ArticulationEffectiveInvMass inner product
 // `acc = sum_c Minv[r*stride+c] * J[c]` with the IDENTICAL ascending-c order,
@@ -613,6 +644,404 @@ __global__ void ComputeRowMeffKernel(const NkRow* __restrict__ urows,
     }
     diagonal += row.compliance_alpha;  // + R (dual regularizer)
     row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
+}
+
+// ===========================================================================
+// GENERAL CONTACT PIPELINE — Phase 1B PairDriven-family assembly (S1/S2/S5).
+//
+// The third OpAssembleRows branch (the union/fused arms are LITERALLY unchanged,
+// the H1 union golden + go2 FusedFoot golden D1 invariant). Per active unified
+// contact slot (the pair-driven narrowphase's ucontact_* manifold + the C1/C2
+// (a,b) collidable ids) it resolves each side via the registry (body_to_link /
+// body_to_articulation / shape_table body_id) into {kNkSideArtic, real artic id
+// (S1), owning link}, {kNkSideRigid, body row}, or {kNkSideStatic}, and fills a
+// COUPLED two-sided NkRow + the side-A chain-J gather (row_cj_*) AND the side-B
+// chain-J gather (row_cj_*_b, S2). The chain-J kernel + K4a/K4b then run with
+// the side-B second passes. The Jv reduction / two-sided apply / mixed-island
+// coupling are ALL the existing SolveUnionRowWarp + island solver, unchanged.
+// ===========================================================================
+
+// Per-slot layout (FIXED worst case, mirroring the union per-manifold layout) —
+// the SHARED constants from nk_row.hpp so the cook (row budget), the schedule, and
+// this assembly all agree. kPdPtsPerSlot manifold points, each expanding to 1
+// normal row + kPdSpokes friction-spoke rows (+t0,-t0,+t1,-t1).
+constexpr uint32_t kPdPtsPerSlot = nk::kPairDrivenPtsPerSlot;   // 4
+constexpr uint32_t kPdSpokes     = nk::kPairDrivenSpokesPerPt;  // 4
+constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
+
+// Resolve a collidable body row -> reaction side. body_id == -1 (from shape_table)
+// is static; an articulation-link body row resolves to (real artic id, owning
+// global link); a free-rigid body row resolves to the rigid side. Returns the
+// side kind; out_artic / out_link valid only for the artic kind; out_body for
+// the rigid kind. env-major: body_to_* are TEMPLATE-local (per:body), so the
+// global body row == env*bodies_per_env + local; the global link == env*base_link
+// + template_link; the global artic == env*artics_per_env + local_artic.
+__device__ uint32_t ResolvePairSide(const float* shape_table,
+                                    const uint32_t* body_to_link,
+                                    const uint32_t* body_to_articulation,
+                                    uint32_t env, uint32_t local_body,
+                                    uint32_t bodies_per_env, uint32_t base_link_count,
+                                    uint32_t artics_per_env,
+                                    uint32_t* out_artic, uint32_t* out_link,
+                                    uint32_t* out_body) {
+    *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u;
+    const PrimShapeDev s = LoadPrimShape(shape_table, local_body);
+    if (s.body_id < 0) {
+        return kNkSideStatic;  // static ground / heightfield collidable.
+    }
+    const uint32_t tmpl_link = (local_body < bodies_per_env)
+                                   ? body_to_link[local_body] : ~0u;
+    if (tmpl_link == ~0u) {
+        // free-rigid body row (not an articulation link).
+        *out_body = env * bodies_per_env + local_body;
+        return kNkSideRigid;
+    }
+    const uint32_t local_artic = (local_body < bodies_per_env)
+                                     ? body_to_articulation[local_body] : ~0u;
+    *out_artic = env * artics_per_env + (local_artic == ~0u ? 0u : local_artic);
+    *out_link = env * base_link_count + tmpl_link;
+    return kNkSideArtic;
+}
+
+// One thread per (env x candidate slot). Emits the slot's NkRow block from the
+// unified manifold. Reuses ComputeCompliantRow + ChooseTangentDev (the union
+// math). Side A is the candidate's a-collidable, side B its b-collidable; the
+// chain-J gathers (row_cj_*, row_cj_*_b) carry the per-side artic link/point/dir.
+__global__ void EmitPairDrivenRowsKernel(
+    const uint32_t* __restrict__ ucontact_count,
+    const math::Vec3* __restrict__ ucontact_point,
+    const math::Vec3* __restrict__ ucontact_normal,
+    const float* __restrict__ ucontact_depth,
+    const uint32_t* __restrict__ ucontact_a,
+    const uint32_t* __restrict__ ucontact_b,
+    const math::Transform* __restrict__ body_pose,
+    const float* __restrict__ shape_table,
+    const uint32_t* __restrict__ body_to_link,
+    const uint32_t* __restrict__ body_to_articulation,
+    float solref0, float solref1,
+    float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
+    float dt,
+    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
+    uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
+    NkRow* __restrict__ urows, float* __restrict__ lambda,
+    uint32_t* __restrict__ row_cj_link, math::Vec3* __restrict__ row_cj_point,
+    math::Vec3* __restrict__ row_cj_dir,
+    uint32_t* __restrict__ row_cj_link_b, math::Vec3* __restrict__ row_cj_point_b,
+    math::Vec3* __restrict__ row_cj_dir_b,
+    uint32_t* __restrict__ row_count) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = env_count * slot_count;
+    if (gid >= total) return;
+    const uint32_t env = gid / slot_count;
+    const uint32_t slot = gid - env * slot_count;
+    const uint32_t base = env * rows_per_env + slot * kPdRowsPerSlot;
+
+    const uint32_t n_active = ucontact_count[gid];
+
+    // Resolve the two sides ONCE per slot (same a/b for every manifold point).
+    uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
+    uint32_t art_a = ~0u, link_a = ~0u, body_a = ~0u;
+    uint32_t art_b = ~0u, link_b = ~0u, body_b = ~0u;
+    if (n_active > 0u) {
+        const uint32_t a = ucontact_a[static_cast<size_t>(gid) * 4u];
+        const uint32_t b = ucontact_b[static_cast<size_t>(gid) * 4u];
+        kind_a = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
+                                 env, a, bodies_per_env, base_link_count,
+                                 artics_per_env, &art_a, &link_a, &body_a);
+        kind_b = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
+                                 env, b, bodies_per_env, base_link_count,
+                                 artics_per_env, &art_b, &link_b, &body_b);
+    }
+    const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
+                          : (kind_a == kNkSideRigid) ? body_a : ~0u;
+    const uint32_t idx_b = (kind_b == kNkSideArtic) ? art_b
+                          : (kind_b == kNkSideRigid) ? body_b : ~0u;
+
+    math::Vec3 com_a{0, 0, 0}, com_b{0, 0, 0};
+    if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
+    if (kind_b == kNkSideRigid) com_b = body_pose[idx_b].position;
+
+    const float solref[2] = {solref0, solref1};
+    const float solimp[5] = {solimp0, solimp1, solimp2, solimp3, solimp4};
+    constexpr float mu = 1.0f;  // general friction coefficient (cone bound).
+    const float kFltMaxLocal = kFltMax;
+
+    uint32_t active_rows = 0u;
+    for (uint32_t p = 0u; p < kPdPtsPerSlot; ++p) {
+        const bool live = p < n_active && p < 4u;
+        const size_t mp = static_cast<size_t>(gid) * 4u + p;
+        const uint32_t normal_row = base + p;          // pts normal rows first.
+        const uint32_t spoke_base = base + kPdPtsPerSlot + p * kPdSpokes;
+
+        math::Vec3 n{0, 0, 1};
+        math::Vec3 point{0, 0, 0};
+        math::Vec3 t0{1, 0, 0}, t1v{0, 1, 0};
+        if (live) {
+            n = NormalizedHostExpr(ucontact_normal[mp]);
+            point = ucontact_point[mp];
+            t0 = ChooseTangentDev(n);
+            t1v = NormalizedHostExpr(n.Cross(t0));
+        }
+
+        // ---- normal row ------------------------------------------------------
+        {
+            const uint32_t rs = normal_row;
+            NkRow row{};
+            lambda[rs] = 0.0f;
+            row_cj_link[rs] = kInvalidLink;
+            row_cj_link_b[rs] = kInvalidLink;
+            if (live) {
+                const float pos = -ucontact_depth[mp];
+                const constraint::CompliantContactRow compliant =
+                    constraint::ComputeCompliantRow(solref, solimp, pos, pos,
+                                                    /*vel=*/0.0f, /*invweight=*/1.0f,
+                                                    dt, /*refsafe=*/true);
+                row.flags = nk::nk_row_flags::kActive;
+                row.group_first = base;
+                row.group_normal_count = kPdPtsPerSlot;
+                row.env = env;
+                row.rhs = compliant.aref_bias;
+                row.compliance_alpha = compliant.R;
+                row.lower = 0.0f;
+                row.upper = kFltMaxLocal;
+                row.mu = mu;
+                row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = n;
+                row.b.kind = kind_b; row.b.index = idx_b;
+                row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
+                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
+                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
+                if (kind_a == kNkSideArtic) {
+                    row_cj_link[rs] = link_a; row_cj_point[rs] = point;
+                    row_cj_dir[rs] = row.a.jlin;
+                }
+                if (kind_b == kNkSideArtic) {
+                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point;
+                    row_cj_dir_b[rs] = row.b.jlin;
+                }
+                ++active_rows;
+            }
+            urows[rs] = row;
+        }
+
+        // ---- friction spokes -------------------------------------------------
+        for (uint32_t k = 0u; k < kPdSpokes; ++k) {
+            const uint32_t rs = spoke_base + k;
+            NkRow row{};
+            lambda[rs] = 0.0f;
+            row_cj_link[rs] = kInvalidLink;
+            row_cj_link_b[rs] = kInvalidLink;
+            if (live) {
+                const math::Vec3 spokes[4] = {
+                    t0, math::Vec3{-t0.x, -t0.y, -t0.z},
+                    t1v, math::Vec3{-t1v.x, -t1v.y, -t1v.z}};
+                const math::Vec3 dir = spokes[k & 3u];
+                row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kFriction;
+                row.group_first = base;
+                row.group_normal_count = kPdPtsPerSlot;
+                row.env = env;
+                row.rhs = 0.0f;
+                row.compliance_alpha = 0.0f;
+                row.lower = 0.0f;
+                row.upper = 0.0f;  // overridden in-kernel (pyramid bound).
+                row.mu = mu;
+                row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = dir;
+                row.b.kind = kind_b; row.b.index = idx_b;
+                row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
+                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
+                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
+                if (kind_a == kNkSideArtic) {
+                    row_cj_link[rs] = link_a; row_cj_point[rs] = point;
+                    row_cj_dir[rs] = row.a.jlin;
+                }
+                if (kind_b == kNkSideArtic) {
+                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point;
+                    row_cj_dir_b[rs] = row.b.jlin;
+                }
+                ++active_rows;
+            }
+            urows[rs] = row;
+        }
+    }
+    if (active_rows > 0u) atomicAdd(&row_count[env], active_rows);
+}
+
+// K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row (S2). Mirrors
+// ComputeRowMinvJtKernel but gates on row.b.kind and tiles by row.b.index.
+__global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
+                                        const float* __restrict__ chain_jacobian_b,
+                                        const float* __restrict__ m_inv,
+                                        uint32_t total_rows, uint32_t dof_stride,
+                                        float* __restrict__ row_minv_jt_b) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = total_rows * dof_stride;
+    if (gid >= total) return;
+    const uint32_t rs = gid / dof_stride;
+    const uint32_t r = gid - rs * dof_stride;
+    const NkRow row = urows[rs];
+    if (!(row.flags & nk::nk_row_flags::kActive) || row.b.kind != kNkSideArtic) {
+        return;
+    }
+    const size_t tile = static_cast<size_t>(row.b.index) * dof_stride * dof_stride;
+    const float* const Minv = m_inv + tile + static_cast<size_t>(r) * dof_stride;
+    const float* const J = chain_jacobian_b + static_cast<size_t>(rs) * dof_stride;
+    float acc = 0.0f;
+    for (uint32_t c = 0u; c < dof_stride; ++c) acc += Minv[c] * J[c];
+    row_minv_jt_b[gid] = acc;
+}
+
+// K4b PairDriven: per-row effective mass over BOTH arms with the CORRECT arrays
+// (side A: chain_jacobian/row_minv_jt; side B artic: chain_jacobian_b/row_minv_jt_b).
+__global__ void ComputeRowMeffPairDrivenKernel(
+    const NkRow* __restrict__ urows,
+    const float* __restrict__ chain_jacobian,
+    const float* __restrict__ row_minv_jt,
+    const float* __restrict__ chain_jacobian_b,
+    const float* __restrict__ row_minv_jt_b,
+    const float* __restrict__ body_inv_mass,
+    const math::Vec3* __restrict__ body_inv_inertia,
+    uint32_t total_rows, uint32_t dof_stride, float* __restrict__ row_meff) {
+    const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rs >= total_rows) return;
+    const NkRow row = urows[rs];
+    if (!(row.flags & nk::nk_row_flags::kActive)) { row_meff[rs] = 0.0f; return; }
+    float diagonal = 0.0f;
+    for (int s = 0; s < 2; ++s) {
+        const NkRowSide& sd = (s == 0) ? row.a : row.b;
+        switch (sd.kind) {
+            case kNkSideRigid: {
+                const float im = body_inv_mass[sd.index];
+                const math::Vec3 ii = body_inv_inertia[sd.index];
+                diagonal += im * Dot3(sd.jlin, sd.jlin);
+                diagonal += sd.jang.x * sd.jang.x * ii.x;
+                diagonal += sd.jang.y * sd.jang.y * ii.y;
+                diagonal += sd.jang.z * sd.jang.z * ii.z;
+                break;
+            }
+            case kNkSideArtic: {
+                const float* const J = ((s == 0) ? chain_jacobian : chain_jacobian_b) +
+                                       static_cast<size_t>(rs) * dof_stride;
+                const float* const w = ((s == 0) ? row_minv_jt : row_minv_jt_b) +
+                                       static_cast<size_t>(rs) * dof_stride;
+                float denom = 0.0f;
+                for (uint32_t r = 0u; r < dof_stride; ++r) denom += J[r] * w[r];
+                diagonal += denom;
+                break;
+            }
+            default: break;
+        }
+    }
+    diagonal += row.compliance_alpha;
+    row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
+}
+
+Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
+                                const AssembleRowsParams* p, cudaStream_t stream) {
+    if (p->env_count == 0u || p->union_slot_count == 0u || p->rows_per_env == 0u) {
+        return Status::Ok;
+    }
+    constexpr uint32_t kBlockSize = 128u;
+    const uint32_t total_rows = p->env_count * p->rows_per_env;
+    const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
+    const uint32_t artics_per_env =
+        (p->articulation_count > 0u && p->env_count > 0u)
+            ? (p->articulation_count / p->env_count) : 0u;
+
+    // K1: pack the per-articulation flat qdot tiles (S3: one tile per co-resident
+    // articulation, qdot_flat[artic_global*max_dof + k]). PackQdotFlatKernel is
+    // keyed per env*max_dof -> for K>1 launch over articulation_count*max_dof so
+    // every dog's tile is packed. dof_to_link/component are per:dof (TEMPLATE),
+    // so the kernel re-uses them per artic via the env stride.
+    if (has_artic) {
+        const uint32_t total = p->articulation_count * p->max_dof;
+        const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(PackQdotFlatMultiKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   reinterpret_cast<const Spatial6*>(data.link_velocity),
+                   static_cast<const float*>(data.qdot),
+                   static_cast<const uint32_t*>(model.dof_to_link),
+                   static_cast<const uint32_t*>(model.dof_to_component),
+                   p->articulation_count, p->max_dof, p->base_link_count,
+                   artics_per_env, data.qdot_flat);
+    }
+
+    // K2: emit the pair-driven rows (S1/S2/S5).
+    {
+        const uint32_t total = p->env_count * p->union_slot_count;
+        const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   static_cast<const uint32_t*>(data.ucontact_count),
+                   static_cast<const math::Vec3*>(data.ucontact_point),
+                   static_cast<const math::Vec3*>(data.ucontact_normal),
+                   static_cast<const float*>(data.ucontact_depth),
+                   static_cast<const uint32_t*>(data.ucontact_a),
+                   static_cast<const uint32_t*>(data.ucontact_b),
+                   static_cast<const math::Transform*>(data.body_pose),
+                   static_cast<const float*>(model.shape_table),
+                   static_cast<const uint32_t*>(model.body_to_link),
+                   static_cast<const uint32_t*>(model.body_to_articulation),
+                   p->solref[0], p->solref[1],
+                   p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
+                   p->dt, p->env_count, p->union_slot_count, p->rows_per_env,
+                   p->bodies_per_env, p->base_link_count, artics_per_env,
+                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
+                   data.row_cj_link, data.row_cj_point, data.row_cj_dir,
+                   data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
+                   data.row_count);
+    }
+
+    if (has_artic) {
+        // K3: chain Jacobians for side A AND side B (the SAME multi-artic kernel,
+        // fed each side's per-row link/point/dir gather). Zero both outputs first.
+        const size_t jbytes =
+            static_cast<size_t>(total_rows) * p->max_dof * sizeof(float);
+        if (cudaMemsetAsync(data.chain_jacobian, 0, jbytes, stream) != cudaSuccess ||
+            cudaMemsetAsync(data.chain_jacobian_b, 0, jbytes, stream) != cudaSuccess) {
+            return Status::Failed;
+        }
+        const ArticulationDeviceState state = MakeArticulationDeviceState(
+            model, data, p->total_link_count, p->articulation_count);
+        const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(ComputeContactChainJacobianKernel, dim3(blocks), dim3(kBlockSize),
+                   0u, stream, state,
+                   static_cast<const uint32_t*>(data.row_cj_link),
+                   static_cast<const math::Vec3*>(data.row_cj_point),
+                   static_cast<const math::Vec3*>(data.row_cj_dir),
+                   total_rows, p->max_dof, data.chain_jacobian);
+        LaunchCuda(ComputeContactChainJacobianKernel, dim3(blocks), dim3(kBlockSize),
+                   0u, stream, state,
+                   static_cast<const uint32_t*>(data.row_cj_link_b),
+                   static_cast<const math::Vec3*>(data.row_cj_point_b),
+                   static_cast<const math::Vec3*>(data.row_cj_dir_b),
+                   total_rows, p->max_dof, data.chain_jacobian_b);
+
+        // K4a: w = M^-1 J^T for side A and side B.
+        const uint32_t wtotal = total_rows * p->max_dof;
+        const uint32_t wblocks = (wtotal + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(ComputeRowMinvJtKernel, dim3(wblocks), dim3(kBlockSize), 0u, stream,
+                   reinterpret_cast<const NkRow*>(data.urows),
+                   static_cast<const float*>(data.chain_jacobian),
+                   static_cast<const float*>(data.m_inv),
+                   total_rows, p->max_dof, data.row_minv_jt);
+        LaunchCuda(ComputeRowMinvJtBKernel, dim3(wblocks), dim3(kBlockSize), 0u, stream,
+                   reinterpret_cast<const NkRow*>(data.urows),
+                   static_cast<const float*>(data.chain_jacobian_b),
+                   static_cast<const float*>(data.m_inv),
+                   total_rows, p->max_dof, data.row_minv_jt_b);
+    }
+
+    // K4b: per-row effective mass over both arms (correct arrays per side).
+    {
+        const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(ComputeRowMeffPairDrivenKernel, dim3(blocks), dim3(kBlockSize), 0u,
+                   stream, reinterpret_cast<const NkRow*>(data.urows),
+                   static_cast<const float*>(data.chain_jacobian),
+                   static_cast<const float*>(data.row_minv_jt),
+                   static_cast<const float*>(data.chain_jacobian_b),
+                   static_cast<const float*>(data.row_minv_jt_b),
+                   static_cast<const float*>(data.body_inv_mass),
+                   static_cast<const math::Vec3*>(data.body_inv_inertia),
+                   total_rows, p->max_dof, data.row_meff);
+    }
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
 // --- op entry point ---------------------------------------------------------
@@ -787,9 +1216,13 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    return (p->family == kContactFamilyUnionCsr)
-               ? OpAssembleRowsUnion(model, data, p, stream)
-               : OpAssembleRowsFused(model, data, p, stream);
+    if (p->family == kContactFamilyUnionCsr) {
+        return OpAssembleRowsUnion(model, data, p, stream);
+    }
+    if (p->family == kContactFamilyPairDriven) {
+        return OpAssembleRowsPairDriven(model, data, p, stream);
+    }
+    return OpAssembleRowsFused(model, data, p, stream);
 }
 
 } // namespace

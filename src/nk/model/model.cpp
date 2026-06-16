@@ -42,6 +42,10 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::Articulation:     return articulations_per_env;
         case FieldPer::ArticulationDof2: return articulations_per_env * dofs_per_env *
                                                 dofs_per_env;
+        // Per-articulation flat-DOF tile (S3 qdot_flat). At articulations_per_env
+        // == 1 this equals dofs_per_env == PerEnvCount(Dof) EXACTLY (same element
+        // count + ordering => the K==1 byte-identity invariant for qdot_flat).
+        case FieldPer::ArticulationDof:  return articulations_per_env * dofs_per_env;
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
     return 0u;
@@ -821,6 +825,16 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.sdf_cell_keys = std::move(src.sdf_cell_keys);
     dst.sdf_cell_values = std::move(src.sdf_cell_values);
     dst.sdf_cell_gradients = std::move(src.sdf_cell_gradients);
+    // General contact pipeline Phase 0/1B: the shape->body inverse tables (R3) +
+    // the heightfield grid (H1). These were appended to the Model struct but were
+    // MISSING from this manual move list -> they were silently DROPPED on every
+    // move (return-by-value cook -> World), leaving body_to_link empty so the
+    // PairDriven assembly resolved every collidable as free-rigid (no artic
+    // reaction). Moved here so the PairDriven cook's registry survives into World.
+    dst.body_to_link = std::move(src.body_to_link);
+    dst.body_to_articulation = std::move(src.body_to_articulation);
+    dst.heightfields = std::move(src.heightfields);
+    dst.heightfield_heights = std::move(src.heightfield_heights);
 }
 
 }  // namespace

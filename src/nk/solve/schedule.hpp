@@ -60,7 +60,15 @@ struct ScheduleRow {
     uint32_t key_a = ~0u;
     uint32_t key_b = ~0u;
     uint32_t group_first = ~0u;  // global row index of the group anchor
-    uint32_t artic = ~0u;        // articulation index (qdot tile) or ~0u
+    uint32_t artic = ~0u;        // articulation index (qdot tile) or ~0u (side A)
+    // S4 (general contact pipeline Phase 1B): a row whose side B is ALSO an
+    // articulation (artic x artic, e.g. two co-resident dogs colliding) carries a
+    // SECOND articulation key here so the union-find merges BOTH sides' islands
+    // into one component (they share mutable qdot state and must serialize). ~0u
+    // for a single-artic row (foot / artic x rigid / artic x static) — identical
+    // to the legacy single-key behaviour, so the Union/Fused schedules are
+    // unchanged at K==1.
+    uint32_t artic_b = ~0u;      // second articulation index (side B) or ~0u
 };
 
 struct SolveScheduleResult {

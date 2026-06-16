@@ -265,7 +265,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // carries this op -- does NO work and stays byte-identical. (Emitted only
         // when has_articulation, behind the same gate, so a body/particle-only
         // scene never sees it.)
-        if (has_articulation) {
+        // B1 (general contact pipeline Phase 1B): the DogDogContact hack MUST NOT
+        // run for the PairDriven family — the GENERAL LBVH -> cvx -> mixed-island
+        // path is the ONE contact path there, so running dog_dog too would
+        // double-count contacts. Gate it OFF (the op + file stay; Phase 2 D1 deletes
+        // them). The FusedFoot/UnionCsr families keep it (single-dog + H1 golden).
+        if (has_articulation && !is_pair_driven) {
             p_dog_dog_.contact_margin = cfg.contact_margin;
             p_dog_dog_.env_count = env_count;
             p_dog_dog_.base_link_count = base_link_count;
@@ -334,8 +339,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.articulation_count = articulation_cnt;
         p_assemble_.total_link_count = total_link_count;
         p_assemble_.family = family;
+        // The PairDriven assembly reads union_slot_count as the CANDIDATE-slot
+        // stride (slots per env in the unified contact buffer), which must equal the
+        // broadphase's max_contacts_per_env (so the candidate index lines up across
+        // broadphase -> narrowphase -> assembly). UnionCsr keeps its real slot count.
         p_assemble_.union_slot_count =
-            static_cast<uint32_t>(model.union_slots.size());
+            is_pair_driven ? cap.max_contacts_per_env
+                           : static_cast<uint32_t>(model.union_slots.size());
         p_assemble_.rows_per_env = cap.max_rows_per_env;
         p_assemble_.bodies_per_env = cap.bodies_per_env;
         p_assemble_.base_link_count = base_link_count;
