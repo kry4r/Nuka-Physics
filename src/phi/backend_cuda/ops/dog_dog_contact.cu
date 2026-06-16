@@ -121,6 +121,57 @@ __device__ bool BuildLinkPrim(uint32_t kind_sentinel, const float* params4,
     return true;
 }
 
+// Task 2: the LOWEST world-space point of a posed link primitive (its support
+// point in -Z) + the world (x,y) of that lowest point. Heightfield contact uses
+// the {0,0,1} vertical-support model (same as feet), so the deepest penetration
+// is at the primitive's lowest point. kind is the narrowphase kKind
+// (Sphere=0/Capsule=1/Box=2). Returns false if the link carries no primitive.
+//   Sphere:  center - radius*ez ; the (x,y) is the center's.
+//   Capsule: the lower of the two segment-end spheres (axis = local Z half_height).
+//   Box:     the lowest of the 8 OBB corners.
+__device__ bool LinkLowestPoint(uint32_t kind, const amf::PrimParams& prim,
+                                float radius, float half_height,
+                                const math::Vec3& half_extents,
+                                math::Vec3* out_lowest) {
+    const amf::PrimFrame& f = prim.frame;
+    if (kind == kKindSphere) {
+        *out_lowest = math::Vec3{f.t.x, f.t.y, f.t.z - radius};
+        return true;
+    }
+    if (kind == kKindCapsule) {
+        // Capsule axis is local Z (matches amf::CapsuleCapsule's segment model).
+        const math::Vec3 axis = f.Axis(2);  // world capsule axis
+        const math::Vec3 e0{f.t.x + axis.x * half_height,
+                            f.t.y + axis.y * half_height,
+                            f.t.z + axis.z * half_height};
+        const math::Vec3 e1{f.t.x - axis.x * half_height,
+                            f.t.y - axis.y * half_height,
+                            f.t.z - axis.z * half_height};
+        const math::Vec3 lo = (e0.z <= e1.z) ? e0 : e1;  // lower segment end
+        *out_lowest = math::Vec3{lo.x, lo.y, lo.z - radius};
+        return true;
+    }
+    if (kind == kKindBox) {
+        // Lowest of the 8 OBB corners (he in box-local, posed to world).
+        math::Vec3 best{0.0f, 0.0f, 0.0f};
+        bool first = true;
+        for (int sx = -1; sx <= 1; sx += 2) {
+            for (int sy = -1; sy <= 1; sy += 2) {
+                for (int sz = -1; sz <= 1; sz += 2) {
+                    const math::Vec3 c = f.LocalToWorld(
+                        amf::Vec3{static_cast<float>(sx) * half_extents.x,
+                                  static_cast<float>(sy) * half_extents.y,
+                                  static_cast<float>(sz) * half_extents.z});
+                    if (first || c.z < best.z) { best = c; first = false; }
+                }
+            }
+        }
+        *out_lowest = best;
+        return true;
+    }
+    return false;
+}
+
 // One thread per environment. Walks the env's collision links pairwise; for every
 // pair of links belonging to DISTINCT articulations whose posed primitives
 // overlap, emits TWO fused contact rows (one per dog, opposite normals) into the
@@ -141,6 +192,11 @@ __global__ void DogDogContactKernel(
     uint32_t base_link_count,           // links per env (sum over K dogs)
     uint32_t articulations_per_env,     // K
     uint32_t max_foot_contacts,         // == kMaxFootContactsPerEnv (slot stride)
+    uint32_t terrain_body_contact,      // Task 2: !=0 => body-link vs terrain on
+    float ground_height,                // base plane height (== terrain.ground_height)
+    ::nuka::terrain::TerrainParams terrain,  // SHARED procedural-terrain params
+    const uint32_t* __restrict__ env_terrain_type,        // per env (may be null)
+    const float* __restrict__ env_terrain_difficulty,     // per env (may be null)
     uint32_t* __restrict__ out_contact_link,
     math::Vec3* __restrict__ out_contact_point,
     math::Vec3* __restrict__ out_contact_normal,
@@ -152,18 +208,6 @@ __global__ void DogDogContactKernel(
     const uint32_t L = base_link_count;
     const uint32_t K = articulations_per_env;
     const uint32_t stride = max_foot_contacts;
-    // The env's per-articulation slot blocks span [art0*stride, (artK-1)*stride+stride).
-    // articulation_global = env * K + local_artic. Zero-fill the whole env span first.
-    for (uint32_t a = 0u; a < K; ++a) {
-        const uint32_t art_global = env * K + a;
-        const uint32_t base = art_global * stride;
-        for (uint32_t s = 0u; s < stride; ++s) {
-            out_contact_link[base + s] = kInvalidLink;
-            out_contact_point[base + s] = math::Vec3{0.0f, 0.0f, 0.0f};
-            out_contact_normal[base + s] = math::Vec3{0.0f, 0.0f, 0.0f};
-            out_contact_depth[base + s] = 0.0f;
-        }
-    }
 
     // Per-articulation slot fill counters (K small; capped at stride). One thread
     // per env owns every slot block, so no atomics are needed.
@@ -175,9 +219,95 @@ __global__ void DogDogContactKernel(
         out_contact_count[env] = 0u;
         return;
     }
-    for (uint32_t a = 0u; a < K; ++a) fill[a] = 0u;
+
+    // Task 1 FEET + DOG-DOG COEXISTENCE: this op runs AFTER the foot narrowphase,
+    // which (at K>1) has already filled each articulation's slot block from slot 0
+    // with that dog's GROUND contacts and zero-filled the trailing slots. DO NOT
+    // clobber those feet -- instead SEED each per-articulation fill counter at the
+    // number of foot slots already present (the contiguous active prefix of the
+    // block), and APPEND dog-dog rows into the remaining trailing slots. So one
+    // env's articulation block carries BOTH its dog's ground contacts AND its
+    // dog-dog contacts, and the fused per-articulation solver resolves them all
+    // into that dog's qdot tile (ground reaction + push-apart simultaneously).
+    // The env's per-articulation slot blocks span
+    // [art0*stride, (artK-1)*stride+stride). articulation_global = env*K + local.
+    for (uint32_t a = 0u; a < K; ++a) {
+        const uint32_t art_global = env * K + a;
+        const uint32_t base = art_global * stride;
+        uint32_t n = 0u;
+        // Count the contiguous active foot slots (the foot kernel compacts from 0;
+        // the first kInvalidLink marks the end of this dog's ground contacts).
+        for (uint32_t s = 0u; s < stride; ++s) {
+            if (out_contact_link[base + s] == kInvalidLink) break;
+            ++n;
+        }
+        fill[a] = n;  // dog-dog rows start AFTER this dog's existing ground feet.
+    }
 
     uint32_t emitted = 0u;
+
+    // Task 2 BODY/CAPSULE-vs-TERRAIN (the 穿模 fix): drop every collidable body
+    // LINK (trunk box / upper-leg capsule -- the links that pass through the
+    // terrain when a dog collapses, NOT just the feet) against the SHARED terrain
+    // heightfield. Runs BEFORE the dog-dog pairwise pass so a collapsing trunk's
+    // ground support claims a slot ahead of a (rarer) dog-dog overlap. Reuses the
+    // SAME SampleTerrainHeight the feet/obs/render call -> the body rests on the
+    // exact surface the feet do (no drift). Normal {0,0,1} (vertical-support).
+    if (terrain_body_contact != 0u) {
+        const uint32_t terrain_type =
+            (env_terrain_type != nullptr) ? env_terrain_type[env]
+                                          : ::nuka::terrain::kTerrainFlat;
+        const float diff =
+            (env_terrain_difficulty != nullptr) ? env_terrain_difficulty[env] : 1.0f;
+        const ::nuka::terrain::TerrainParams env_terrain =
+            ::nuka::terrain::ScaleTerrainDifficulty(terrain, diff);
+        for (uint32_t li = 0u; li < L; ++li) {
+            const uint32_t gi = env * L + li;
+            const uint32_t kind_i = link_geom_kind[gi];
+            if (kind_i == 0u) continue;
+            amf::PrimParams prim;
+            uint32_t kk;
+            if (!BuildLinkPrim(kind_i,
+                               link_geom_params + static_cast<size_t>(gi) * 4u,
+                               link_pose[gi], link_geom_local[gi], &prim, &kk)) {
+                continue;
+            }
+            const float* gp = link_geom_params + static_cast<size_t>(gi) * 4u;
+            math::Vec3 lowest;
+            if (!LinkLowestPoint(kk, prim, gp[0], gp[1],
+                                 math::Vec3{gp[0], gp[1], gp[2]}, &lowest)) {
+                continue;
+            }
+            const float surface = ::nuka::terrain::SampleTerrainHeight(
+                terrain_type, lowest.x, lowest.y, env_terrain);
+            const float depth = (surface - lowest.z) + contact_margin;
+            if (depth <= 0.0f) continue;  // link is above the local terrain surface.
+            const uint32_t art = link_to_articulation[gi];
+            const uint32_t local = (art >= env * K && art < env * K + K)
+                                       ? (art - env * K) : 0u;
+            if (fill[local] >= stride) continue;  // block full (feet + dog-dog cap).
+            // Skip if this link ALREADY has a foot-ground contact (the foot kernel
+            // emitted one for the calf's foot sphere). The foot path is the
+            // authoritative ground contact for a foot link; the body pass only adds
+            // the NON-foot body links (trunk / upper-leg capsules) so we never
+            // double-constrain a foot or waste its slot. Scan the foot prefix only.
+            const uint32_t blk = art * stride;
+            bool already_foot = false;
+            for (uint32_t s = 0u; s < fill[local]; ++s) {
+                if (out_contact_link[blk + s] == gi) { already_foot = true; break; }
+            }
+            if (already_foot) continue;
+            const uint32_t slot = art * stride + fill[local];
+            out_contact_link[slot] = gi;
+            // Contact point: the lowest body point projected onto the terrain.
+            out_contact_point[slot] = math::Vec3{lowest.x, lowest.y, surface};
+            out_contact_normal[slot] = math::Vec3{0.0f, 0.0f, 1.0f};
+            out_contact_depth[slot] = depth;
+            ++fill[local];
+            ++emitted;
+        }
+    }
+
     // Pairwise over the env's links (i<j), fixed ascending order (deterministic).
     for (uint32_t li = 0u; li < L; ++li) {
         const uint32_t gi = env * L + li;
@@ -219,27 +349,33 @@ __global__ void DogDogContactKernel(
             const math::Vec3 pos = m.points[best].position;
             const math::Vec3 n_a = m.points[best].normal;  // A away from B.
 
+            // art_i/art_j are GLOBAL articulation indices (link_to_articulation is
+            // staged env*K + local). The fill[] counter is LOCAL (0..K-1); the slot
+            // base uses the GLOBAL index directly. (Reducing to local here also
+            // fixes the prior env>0 double-offset -- env==0 was a coincidence.)
+            const uint32_t local_i = (art_i >= env * K && art_i < env * K + K)
+                                         ? (art_i - env * K) : 0u;
+            const uint32_t local_j = (art_j >= env * K && art_j < env * K + K)
+                                         ? (art_j - env * K) : 0u;
             // Emit into dog A's slot block (reaction pushes A along +n_a).
-            const uint32_t art_i_global = env * K + art_i;
-            if (fill[art_i] < stride) {
-                const uint32_t slot = art_i_global * stride + fill[art_i];
+            if (fill[local_i] < stride) {
+                const uint32_t slot = art_i * stride + fill[local_i];
                 out_contact_link[slot] = gi;
                 out_contact_point[slot] = pos;
                 out_contact_normal[slot] = n_a;
                 out_contact_depth[slot] = pen;
-                ++fill[art_i];
+                ++fill[local_i];
                 ++emitted;
             }
             // Emit into dog B's slot block (reaction pushes B along -n_a).
-            const uint32_t art_j_global = env * K + art_j;
-            if (fill[art_j] < stride) {
-                const uint32_t slot = art_j_global * stride + fill[art_j];
+            if (fill[local_j] < stride) {
+                const uint32_t slot = art_j * stride + fill[local_j];
                 out_contact_link[slot] = gj;
                 out_contact_point[slot] = pos;
                 out_contact_normal[slot] =
                     math::Vec3{-n_a.x, -n_a.y, -n_a.z};
                 out_contact_depth[slot] = pen;
-                ++fill[art_j];
+                ++fill[local_j];
                 ++emitted;
             }
         }
@@ -268,6 +404,9 @@ Status OpDogDogContact(const ModelView& model, const DataView& data,
                static_cast<const uint32_t*>(model.link_to_articulation),
                p->contact_margin, p->env_count, p->base_link_count,
                p->articulations_per_env, p->max_foot_contacts,
+               p->terrain_body_contact, p->ground_height, p->terrain,
+               static_cast<const uint32_t*>(data.env_terrain_type),
+               static_cast<const float*>(data.env_terrain_difficulty),
                data.contact_link, data.contact_point, data.contact_normal,
                data.contact_depth, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

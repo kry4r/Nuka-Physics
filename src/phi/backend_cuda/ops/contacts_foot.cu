@@ -83,6 +83,9 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
                                                const uint32_t* env_terrain_type,
                                                const float* env_terrain_difficulty,
                                                ::nuka::terrain::TerrainParams terrain,
+                                               uint32_t articulations_per_env,
+                                               uint32_t max_foot_contacts,
+                                               const uint32_t* link_to_articulation,
                                                uint32_t* out_contact_link,
                                                math::Vec3* out_contact_point,
                                                math::Vec3* out_contact_normal,
@@ -115,42 +118,113 @@ __global__ void DetectFootGroundContactsKernel(const math::Transform* world_pose
     const ::nuka::terrain::TerrainParams env_terrain =
         ::nuka::terrain::ScaleTerrainDifficulty(terrain, terrain_difficulty);
 
-    const uint32_t base_slot = env * kMaxFootContactsPerEnv;
-    uint32_t count = 0u;
+    // Task 1: K co-resident dogs per env. The FUSED per-articulation solver reads
+    // each articulation's contacts from the slot block [artic*kMaxFootContacts,
+    // +kMaxFootContacts) (slot_base = articulation*stride). At K<=1 articulation ==
+    // env, so the LEGACY env-keyed layout (base_slot = env*kMaxFootContactsPerEnv,
+    // one per-env count) IS the per-articulation layout -> the K==1 path below is
+    // byte-identical to the prior kernel (D1). At K>1 each foot is routed into its
+    // OWNING articulation's block via link_to_articulation[global_link], with a
+    // PER-ARTICULATION fill counter, so K dogs' 4K feet never overflow one env's 4
+    // slots and the dog-dog op can APPEND into the same blocks afterwards.
+    const bool multi_artic = articulations_per_env > 1u &&
+                             link_to_articulation != nullptr;
+
+    if (!multi_artic) {
+        // -- LEGACY env-keyed path (K<=1): byte-identical to the prior kernel. ----
+        const uint32_t base_slot = env * kMaxFootContactsPerEnv;
+        uint32_t count = 0u;
+        for (uint32_t foot = 0u; foot < foot_count; ++foot) {
+            const FootShape shape = feet[foot];
+            const uint32_t link = env * base_link_count + shape.calf_local_link;
+            const math::Transform calf = world_pose[link];
+            // Foot sphere center in world = calf_world o local_offset.
+            const math::Vec3 center =
+                AddVec(calf.position, RotateByQuat(calf.rotation, shape.local_offset));
+            // Procedural-terrain support height at the foot's (x,y) column. For the
+            // default Flat type this returns EXACTLY terrain.ground_height (==
+            // ground_height), so depth == (ground_height + radius) - center.z — the
+            // byte-identical legacy expression. Normal stays {0,0,1} (heightfield
+            // vertical-support model; gradient normals are a v1 non-goal).
+            const float surface = ::nuka::terrain::SampleTerrainHeight(
+                terrain_type, center.x, center.y, env_terrain);
+            const float depth = (surface + shape.radius) - center.z;
+            if (depth > 0.0f) {
+                const uint32_t slot = base_slot + count;
+                out_contact_link[slot] = link;
+                // Contact point: foot center projected onto the local terrain surface.
+                out_contact_point[slot] = {center.x, center.y, surface};
+                out_contact_normal[slot] = {0.0f, 0.0f, 1.0f};
+                out_contact_depth[slot] = depth;
+                ++count;
+            }
+        }
+        // Zero-fill the env's unused trailing slots so stale data never leaks.
+        for (uint32_t slot = count; slot < kMaxFootContactsPerEnv; ++slot) {
+            const uint32_t index = base_slot + slot;
+            out_contact_link[index] = kInvalidLink;
+            out_contact_point[index] = {0.0f, 0.0f, 0.0f};
+            out_contact_normal[index] = {0.0f, 0.0f, 0.0f};
+            out_contact_depth[index] = 0.0f;
+        }
+        out_contact_count[env] = count;
+        return;
+    }
+
+    // -- MULTI-ARTICULATION path (K>1): per-articulation foot slot re-key. --------
+    // The env owns K articulation slot blocks [art0*stride .. (artK-1)*stride+stride).
+    // articulation_global = env*K + local; the legacy stride is kMaxFootContacts.
+    const uint32_t K = articulations_per_env;
+    const uint32_t stride = max_foot_contacts;  // == kMaxFootContactsPerEnv
+    constexpr uint32_t kMaxArtPerEnv = 64u;
+    if (K > kMaxArtPerEnv) {
+        // Honest guard (matches the dog-dog op's G0 discipline): never silently
+        // misroute past the on-thread per-artic counter capacity.
+        out_contact_count[env] = 0u;
+        return;
+    }
+    // Zero-fill every articulation block of this env first (one thread owns the
+    // whole env span, so no atomics). The dog-dog op later APPENDS into the slots
+    // these feet leave free -- it counts the active foot slots, not re-zeroes them.
+    for (uint32_t a = 0u; a < K; ++a) {
+        const uint32_t art_global = env * K + a;
+        const uint32_t base = art_global * stride;
+        for (uint32_t s = 0u; s < stride; ++s) {
+            out_contact_link[base + s] = kInvalidLink;
+            out_contact_point[base + s] = {0.0f, 0.0f, 0.0f};
+            out_contact_normal[base + s] = {0.0f, 0.0f, 0.0f};
+            out_contact_depth[base + s] = 0.0f;
+        }
+    }
+    uint32_t fill[kMaxArtPerEnv];
+    for (uint32_t a = 0u; a < K; ++a) fill[a] = 0u;
+
+    uint32_t total = 0u;
     for (uint32_t foot = 0u; foot < foot_count; ++foot) {
         const FootShape shape = feet[foot];
         const uint32_t link = env * base_link_count + shape.calf_local_link;
         const math::Transform calf = world_pose[link];
-        // Foot sphere center in world = calf_world o local_offset.
         const math::Vec3 center =
             AddVec(calf.position, RotateByQuat(calf.rotation, shape.local_offset));
-        // Procedural-terrain support height at the foot's (x,y) column. For the
-        // default Flat type this returns EXACTLY terrain.ground_height (==
-        // ground_height), so depth == (ground_height + radius) - center.z — the
-        // byte-identical legacy expression. Normal stays {0,0,1} (heightfield
-        // vertical-support model; gradient normals are a v1 non-goal).
         const float surface = ::nuka::terrain::SampleTerrainHeight(
             terrain_type, center.x, center.y, env_terrain);
         const float depth = (surface + shape.radius) - center.z;
-        if (depth > 0.0f) {
-            const uint32_t slot = base_slot + count;
-            out_contact_link[slot] = link;
-            // Contact point: foot center projected onto the local terrain surface.
-            out_contact_point[slot] = {center.x, center.y, surface};
-            out_contact_normal[slot] = {0.0f, 0.0f, 1.0f};
-            out_contact_depth[slot] = depth;
-            ++count;
-        }
+        if (depth <= 0.0f) continue;
+        // Route into the foot's OWNING articulation's block. link_to_articulation
+        // is staged GLOBAL (env*K + local), so this is the global articulation idx.
+        const uint32_t art = link_to_articulation[link];
+        const uint32_t local = (art >= env * K && art < env * K + K)
+                                   ? (art - env * K) : 0u;
+        if (fill[local] >= stride) continue;  // a dog can't exceed its own block.
+        const uint32_t slot = art * stride + fill[local];
+        out_contact_link[slot] = link;
+        out_contact_point[slot] = {center.x, center.y, surface};
+        out_contact_normal[slot] = {0.0f, 0.0f, 1.0f};
+        out_contact_depth[slot] = depth;
+        ++fill[local];
+        ++total;
     }
-    // Zero-fill the env's unused trailing slots so stale data never leaks.
-    for (uint32_t slot = count; slot < kMaxFootContactsPerEnv; ++slot) {
-        const uint32_t index = base_slot + slot;
-        out_contact_link[index] = kInvalidLink;
-        out_contact_point[index] = {0.0f, 0.0f, 0.0f};
-        out_contact_normal[index] = {0.0f, 0.0f, 0.0f};
-        out_contact_depth[index] = 0.0f;
-    }
-    out_contact_count[env] = count;
+    out_contact_count[env] = total;
 }
 
 // Branch-stable orthonormal tangent basis (t1,t2) for a unit normal n.
@@ -219,8 +293,18 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
     if (p->env_count == 0u) {
         return Status::Ok;
     }
-    if (p->foot_count > kMaxFootContactsPerEnv) {
-        return Status::Failed;  // legacy loud-throw guard.
+    // Foot-budget guard. At K<=1 the legacy per-ENV cap holds (one dog, <=4 feet).
+    // At K>1 the cap is PER-ARTICULATION (the kernel routes each foot into its
+    // owning dog's 4-slot block), so the env's total budget is K*kMaxFootContacts
+    // -- a K-dog scene legitimately carries 4K feet. The kernel itself caps each
+    // dog's block at the stride (a >4-foot dog drops the overflow), so this is the
+    // honest env-wide ceiling, not a per-dog one.
+    const uint32_t K = (p->articulations_per_env == 0u) ? 1u
+                                                        : p->articulations_per_env;
+    const uint32_t foot_budget =
+        (K > 1u) ? (K * kMaxFootContactsPerEnv) : kMaxFootContactsPerEnv;
+    if (p->foot_count > foot_budget) {
+        return Status::Failed;  // loud-throw guard (per-artic budget for K>1).
     }
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t block_count = (p->env_count + kBlockSize - 1u) / kBlockSize;
@@ -231,6 +315,8 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
                p->foot_count, p->env_count, p->base_link_count, p->ground_height,
                static_cast<const uint32_t*>(data.env_terrain_type),
                static_cast<const float*>(data.env_terrain_difficulty), p->terrain,
+               p->articulations_per_env, p->max_foot_contacts,
+               static_cast<const uint32_t*>(model.link_to_articulation),
                data.contact_link, data.contact_point, data.contact_normal,
                data.contact_depth, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

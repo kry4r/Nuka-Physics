@@ -44,6 +44,14 @@ namespace nuka::runtime::articulation {
 // Max foot contacts emitted per environment (Go2 has 4 feet).
 constexpr uint32_t kMaxFootContactsPerEnv = 4u;
 
+// Task 1/2: the per-ARTICULATION contact-slot stride for a MULTI-DOG (K>1) world.
+// Each co-resident dog needs room in its OWN fused slot block for its 4 feet PLUS
+// body-vs-terrain contacts PLUS dog-dog rows. 12 covers the worst realistic case
+// (4 feet + up to ~6 body links + a couple dog-dog) with margin and stays within
+// the FUSED solver's compile-time register ceiling (kMaxContactsPerArtic). At K<=1
+// the stride collapses to kMaxFootContactsPerEnv (4) so K==1 stays byte-identical.
+constexpr uint32_t kMultiDogContactsPerArtic = 12u;
+
 // Per-foot static description, expressed in BASE (single-replica) link indices.
 // The detection kernel turns calf_local_link into a per-replica global link via
 //   global_link = env * base_link_count + calf_local_link

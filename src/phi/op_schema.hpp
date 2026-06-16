@@ -259,6 +259,18 @@ struct NarrowphasePrimitivesParams {
     // M6: particle coupling (the kUSlotParticleSphere* union classes form the
     // particle side's world sphere from particle_pos[env*particles_per_env+link]).
     uint32_t particles_per_env;
+    // Task 1 multi-dog FEET+DOG-DOG coexistence: K (== articulations_per_env). At
+    // K<=1 the foot detection keeps the LEGACY env-keyed slot layout (base_slot =
+    // env*kMaxFootContactsPerEnv, one per-env count) -> byte-identical (D1). At
+    // K>1 it RE-KEYS each foot into its OWNING articulation's fused slot block
+    // (slot_base = link_to_articulation[link] * kMaxFootContactsPerEnv) with a
+    // per-articulation fill counter, so K dogs' 4K feet land in K disjoint 4-slot
+    // blocks the fused per-articulation solver consumes -- and so the dog-dog op
+    // (which runs after) can APPEND its rows into the same per-articulation blocks
+    // without overflowing one env's 4 slots. articulations_per_env == 0 (no
+    // articulation, e.g. body/particle-only) also falls to the legacy path.
+    uint32_t articulations_per_env;  // K (>1 => per-articulation foot slot re-key)
+    uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (per-artic stride)
 };
 
 // WP5-8 multi-articulation dog-dog link contact. One thread-block per env walks
@@ -277,6 +289,19 @@ struct DogDogContactParams {
     uint32_t articulations_per_env;  // K (the gate: > 1 => active)
     uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (slot stride/artic)
     uint32_t max_contacts_per_env;   // contact_* slot stride per env (== K*stride)
+    // Task 2 BODY/CAPSULE-vs-TERRAIN contact (the owner 穿模 fix). The same op
+    // ALSO drops every collidable body LINK (trunk box / upper-leg capsule, not
+    // just the feet) against the SHARED terrain heightfield: when a link's posed
+    // primitive's lowest world point penetrates SampleTerrainHeight(x,y) it emits
+    // a {0,0,1}-normal contact into that dog's slot block, so a collapsing trunk
+    // RESTS ON the terrain instead of clipping THROUGH it. Reuses the SAME
+    // SampleTerrainHeight the feet/obs/render call (no surface drift). enable=0
+    // (the default) keeps the op dog-dog-only -> additive; enable!=0 for the
+    // terrain/composite scenes. terrain.ground_height is PINNED to ground_height
+    // by the pipeline so the type-0 (Flat) sample matches the foot path.
+    uint32_t terrain_body_contact;   // 0 == off (dog-dog only), !=0 == body-terrain on
+    float    ground_height;          // base plane height (PINNED == terrain.ground_height)
+    ::nuka::terrain::TerrainParams terrain;  // SHARED procedural-terrain params
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
@@ -341,6 +366,11 @@ struct SolveRowsBlockIslandParams {
     // 1 => apply the implicit joint-damping seed (drive_damping as per-DOF c_j,
     // requires m_inv == (M + dt*C)^-1). 0 => contacts-only.
     uint32_t apply_implicit_damping;
+    // Task 1/2: the FUSED solver's per-articulation contact-slot STRIDE (slot_base
+    // = articulation * contact_slots_per_artic). At K<=1 == kMaxFootContactsPerEnv
+    // (4) -> byte-identical; at K>1 the grown stride (kMultiDogContactsPerArtic)
+    // gives each dog room for feet + body-terrain + dog-dog rows in one block.
+    uint32_t contact_slots_per_artic;
 };
 
 // --- particle (XPBD / PBF) substep --------------------------------------

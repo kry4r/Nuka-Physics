@@ -40,6 +40,17 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
+    // Task 1/2: the per-ARTICULATION contact-slot stride the foot detection, the
+    // dog-dog/body-terrain op, and the FUSED solver all share. The cook sizes
+    // max_contacts_per_env == stride * K, so the stride is the per-K quotient. At
+    // K<=1 this is the legacy kMaxFootContactsPerEnv (4) -> byte-identical layout;
+    // at K>1 it is the grown multi-dog stride (room for feet + body + dog-dog).
+    const uint32_t artics_per_env =
+        cap.articulations_per_env == 0u ? 1u : cap.articulations_per_env;
+    const uint32_t contact_slots_per_artic =
+        (artics_per_env > 0u && cap.max_contacts_per_env >= artics_per_env)
+            ? (cap.max_contacts_per_env / artics_per_env)
+            : 4u;
 
     auto add = [&](phi::NkOp op, const void* params) {
         // Capability query (§3.1): with a device, emit only ops the backend
@@ -213,6 +224,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
         p_np_prim_.particles_per_env = cap.particles_per_env;  // M6 coupling slots.
+        // Task 1 multi-dog feet: route each foot into its OWNING articulation's
+        // fused slot block when K>1 (byte-identical env-keyed at K<=1; the foot
+        // narrowphase reads link_to_articulation only on the K>1 branch). The
+        // per-artic slot stride is the SHARED runtime value (4 at K<=1).
+        p_np_prim_.articulations_per_env = cap.articulations_per_env;
+        p_np_prim_.max_foot_contacts = contact_slots_per_artic;
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
         // WP5/6/8 multi-articulation dog-dog link contact. Runs AFTER the foot
@@ -231,8 +248,26 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_dog_dog_.env_count = env_count;
             p_dog_dog_.base_link_count = base_link_count;
             p_dog_dog_.articulations_per_env = cap.articulations_per_env;
-            p_dog_dog_.max_foot_contacts = 4u;  // == kMaxFootContactsPerEnv stride
+            p_dog_dog_.max_foot_contacts = contact_slots_per_artic;  // shared stride
             p_dog_dog_.max_contacts_per_env = cap.max_contacts_per_env;
+            // Task 2 body/capsule-vs-terrain (the 穿模 fix). Enabled when the model
+            // carries non-trivial TERRAIN GEOMETRY (step_height / grid_height_max
+            // != 0 => a pyramid-stairs / inverted-pit / random-box field, the
+            // terrain/composite scenes the owner saw dogs clip through). A flat
+            // multi-dog scene (terrain all-zero) leaves it OFF so the op stays
+            // dog-dog-only (additive). The per-env terrain TYPE is set by the
+            // harness post-construction (env_terrain_type, seeded Flat); the body
+            // pass reads it at runtime, so it only does work where a non-Flat type
+            // is actually active. terrain.ground_height is PINNED to the same
+            // ground_height the foot path uses (the type-0 Flat sample then matches
+            // the feet exactly). The SHARED SampleTerrainHeight means the body
+            // rests on the EXACT surface the feet do (no render/physics drift).
+            const bool has_terrain_geom = model.terrain.step_height != 0.0f ||
+                                          model.terrain.grid_height_max != 0.0f;
+            p_dog_dog_.terrain_body_contact = has_terrain_geom ? 1u : 0u;
+            p_dog_dog_.ground_height = model.ground_height;
+            p_dog_dog_.terrain = model.terrain;
+            p_dog_dog_.terrain.ground_height = model.ground_height;
             add(phi::NkOp::DogDogContact, &p_dog_dog_);
         }
 
@@ -343,6 +378,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_solve_.friction_coefficient = model.friction_coefficient;
         p_solve_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         p_solve_.apply_implicit_damping = cfg.fold_drive_damping;
+        // Task 1/2: the FUSED per-articulation slot stride MUST match the foot /
+        // dog-dog detection (slot_base = articulation * stride). 4 at K<=1.
+        p_solve_.contact_slots_per_artic = contact_slots_per_artic;
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
     }
 

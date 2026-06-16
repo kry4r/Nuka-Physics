@@ -85,6 +85,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
                                                   const float* tangent2_jacobian,
                                                   const float* inertia_M_inv,
                                                   uint32_t dof_stride,
+                                                  uint32_t contact_slots_per_artic,
                                                   float dt,
                                                   float friction_coefficient,
                                                   float baumgarte_max_velocity,
@@ -160,13 +161,19 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
         }
     }
 
-    // This articulation's contact slots (env-major; env == articulation in the
-    // 1-articulation-per-env design).
-    const uint32_t slot_base = articulation * kMaxFootContactsPerEnv;
-    float lambda_n[kMaxFootContactsPerEnv];
-    float lambda_t1[kMaxFootContactsPerEnv];
-    float lambda_t2[kMaxFootContactsPerEnv];
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+    // This articulation's contact slots. The per-articulation slot STRIDE is a
+    // RUNTIME value: at K<=1 it is exactly kMaxFootContactsPerEnv (4) so slot_base
+    // == articulation*4 and the loop visits exactly 4 slots -> byte-identical to
+    // the legacy single-dog layout. At K>1 the stride grows (kMultiDogContactsPer-
+    // Artic) so each dog's block holds feet + body-terrain + dog-dog. The register
+    // arrays are sized at the compile-time ceiling kMaxContactsPerArtic; slots past
+    // the runtime stride are never visited (extra storage, no float-op change).
+    const uint32_t stride = contact_slots_per_artic;
+    const uint32_t slot_base = articulation * stride;
+    float lambda_n[kMaxContactsPerArtic];
+    float lambda_t1[kMaxContactsPerArtic];
+    float lambda_t2[kMaxContactsPerArtic];
+    for (uint32_t s = 0u; s < stride; ++s) {
         float ln = 0.0f;
         float lt1 = 0.0f;
         float lt2 = 0.0f;
@@ -186,7 +193,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
 
     // Apply any warm-started impulse so qdot_work reflects the seed lambda before
     // the first sweep (qdot_work += M^-1 J^T * actual).
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+    for (uint32_t s = 0u; s < stride; ++s) {
         const ArticulatedContactRow row = rows[slot_base + s];
         if (row.row_type != ContactRowType::kRowNormal ||
             row.articulation != articulation) {
@@ -216,7 +223,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
 
     for (uint32_t iter = 0u; iter < kContactSolverIterations; ++iter) {
         // -- Normal rows first, fixed slot order. ---------------------------
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+        for (uint32_t s = 0u; s < stride; ++s) {
             const ArticulatedContactRow row = rows[slot_base + s];
             if (row.row_type != ContactRowType::kRowNormal ||
                 row.articulation != articulation) {
@@ -252,7 +259,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
             }
         }
         // -- Friction tangent rows, fixed slot order. -----------------------
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+        for (uint32_t s = 0u; s < stride; ++s) {
             const ArticulatedContactRow row = rows[slot_base + s];
             if (row.row_type != ContactRowType::kRowNormal ||
                 row.articulation != articulation) {
@@ -295,7 +302,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
     }
 
     // Final normal-row sweep (see articulation_contacts.cu for the rationale).
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+    for (uint32_t s = 0u; s < stride; ++s) {
         const ArticulatedContactRow row = rows[slot_base + s];
         if (row.row_type != ContactRowType::kRowNormal ||
             row.articulation != articulation) {
@@ -341,7 +348,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
 
     // Persist this step's impulses for the next step's warm start.
     if (inout_lambda != nullptr) {
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
+        for (uint32_t s = 0u; s < stride; ++s) {
             const size_t base = static_cast<size_t>(slot_base + s) * 3u;
             inout_lambda[base + 0u] = lambda_n[s];
             inout_lambda[base + 1u] = lambda_t1[s];
@@ -870,7 +877,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                static_cast<const float*>(data.jac_tangent1),
                static_cast<const float*>(data.jac_tangent2),
                static_cast<const float*>(data.m_inv),
-               p->max_dof, p->dt, p->friction_coefficient,
+               p->max_dof, p->contact_slots_per_artic, p->dt,
+               p->friction_coefficient,
                p->baumgarte_max_velocity, data.lambda, joint_damping);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
