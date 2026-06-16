@@ -74,6 +74,12 @@ struct ModelCapacities {
     // ParticleGridBuild op fails LOUDLY if the live dims product exceeds it.
     uint32_t max_grid_cells       = 0;
 
+    // H1 (general contact pipeline Phase 0) — total cooked heightfield-grid cells
+    // (sum over all heightfield collidables of nrow*ncol). Sizes the GLOBAL
+    // `heights[]` Model field. 0 for every current scene (the cook fill is H2,
+    // Phase 2) -> the heights segment is zero bytes (byte-inert).
+    uint32_t max_heightfield_cells = 0;
+
     // Resolve a FieldPer count-unit to a concrete per-env element count using
     // these capacities (env-major; the env multiplier is applied by the Arena /
     // UploadTo packer, NOT folded in here -- this returns the PER-ENV count).
@@ -239,6 +245,23 @@ struct UnionSlot {
     uint32_t MaxRows() const { return MaxPoints() * RowsPerPoint(); }
 };
 inline constexpr uint32_t kUnionSlotGatedOnTable = 1u;  // UnionSlot::flags bit0.
+
+// H1 (general contact pipeline Phase 0): the general heightfield collidable's
+// grid descriptor POD, mirroring Newton's HeightfieldData (utils/heightfield.py).
+// One per cooked heightfield. The flat height grid itself rides the `heights[]`
+// Model field (row-major, h[r*ncol + c]); this POD locates + scales it. DATA POD
+// ONLY in Phase 0 — no cook fills it (H2, Phase 2) and no contact kernel reads
+// it (H3, Phase 2). Kept a trivially-copyable aggregate so a future cook can
+// stage it into a device record alongside the height grid.
+struct HeightfieldData {
+    math::Vec3 origin{};         // world-space corner (cell (0,0) base) of the grid.
+    float      cell_size = 0.0f; // uniform XY cell spacing.
+    uint32_t   nrow = 0u;        // grid rows (Y).
+    uint32_t   ncol = 0u;        // grid cols (X).
+    float      min_z = 0.0f;     // height-grid min (for the big finite AABB).
+    float      max_z = 0.0f;     // height-grid max.
+    uint32_t   data_offset = 0u; // base index into the flat `heights[]` field.
+};
 
 class Model {
 public:
@@ -420,6 +443,15 @@ public:
         uint32_t   contype = 1;
         uint32_t   conaffinity = 1;
         uint32_t   sdf_grid = ~0u;       // sdf_headers index, or ~0 (analytic).
+        // R1 (general contact pipeline Phase 0): the shape->body indirection +
+        // collision group. body_id resolves the collidable to its owning body
+        // row (-1 == static: ground plane / heightfield, no reaction side).
+        // group is the signed collision-group filter key (Newton test_group_pair).
+        // APPENDED after the original 6 members so the staged lanes 0..7 are
+        // byte-identical; body_id/group pack into the new lanes 8/9. Default
+        // body_id == -1 (static) is OVERRIDDEN by the cook for real body rows.
+        int32_t    body_id = -1;         // owning body row, or -1 == static.
+        uint32_t   group = 0;            // signed collision-group filter key.
     };
     std::vector<PairDrivenShape> shape_table_rows;
     std::vector<float>           samp_points;     // xyz packed.
@@ -437,6 +469,26 @@ public:
     std::vector<uint64_t>    sdf_cell_keys;       // flat ASCENDING per-grid.
     std::vector<float>       sdf_cell_values;     // flat signed distances.
     std::vector<math::Vec3>  sdf_cell_gradients;  // flat gradients.
+
+    // R3 (general contact pipeline Phase 0): the shape->body inverse tables (the
+    // S5 assembly-seam input). TEMPLATE-local, length == bodies_per_env when
+    // populated (a cook with an articulation fills them; empty otherwise ->
+    // StageModelField leaves the section ~0u-default-free... actually 0-filled,
+    // see model.cpp where the staging defaults unset rows to ~0u). For each body
+    // row b owned by template link l:  body_to_link[b] = l, body_to_articulation
+    // [b] = the LOCAL articulation index of l. A free-rigid / static body row =
+    // ~0u in both. Staged into the body_to_link / body_to_articulation fields
+    // (tiled env-major, template-local values). INERT in Phase 0.
+    std::vector<uint32_t>    body_to_link;          // template-local link, or ~0u.
+    std::vector<uint32_t>    body_to_articulation;  // template-local artic, or ~0u.
+
+    // H1 (general contact pipeline Phase 0): cooked heightfield collidables + the
+    // flat height grid that backs the `heights[]` field. EMPTY for every current
+    // scene (the cook fill is H2, Phase 2) -> max_heightfield_cells == 0 ->
+    // the heights field is a zero-byte segment (byte-inert). The HeightfieldData
+    // POD locates each grid into the flat `heightfield_heights` pool.
+    std::vector<HeightfieldData> heightfields;          // cooked heightfield descriptors.
+    std::vector<float>           heightfield_heights;   // flat row-major grid pool.
 
     // The field schema is the generated FieldId enum + arena_layout table; Model
     // exposes the capacities the layout multiplies by. (No per-field storage here

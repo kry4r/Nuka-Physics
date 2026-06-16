@@ -102,6 +102,17 @@ __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
 // (The union family launches this over ROW slots — same kernel, the per-slot
 // inputs are gathered per row; an inactive row carries the kInvalidLink
 // sentinel and is skipped, leaving its memset-zero J row.)
+// C3 (general contact pipeline Phase 0) — CONTACT POINT/NORMAL FRAME DECISION.
+// The unified contact buffer (the FUSED contact_*, the union ucontact_*, and the
+// general PairDriven manifold) stores the contact POINT in WORLD space and the
+// contact NORMAL (A->B) in WORLD space. Newton stores points in BODY frame +
+// normal in world (contact_data.py); Nuka keeps WORLD point + world normal for
+// minimal D1 churn, because this chain-Jacobian kernel ALREADY consumes a world
+// point + world normal directly (contact_point_world / contact_normal_world
+// below) — re-keying to body-frame storage would require a per-row world-recompose
+// with no functional gain in Phase 0. Body-frame storage is deferred to the
+// collide-once / reuse-across-substeps optimization (out of Phase-0 scope). This
+// is the ONE documented representation feeding AssembleRows for every family.
 __global__ void ComputeContactChainJacobianKernel(
     ArticulationDeviceState state,
     const uint32_t* contact_link_indices,

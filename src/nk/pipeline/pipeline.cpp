@@ -144,6 +144,20 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_collidables) {
+        // General contact pipeline Phase 0 (B2): SyncLinkBodyPose. Runs AFTER
+        // FkWorldPoses (the link_pose it reads) and BEFORE BuildAabbs (the
+        // body_pose it writes, which the AABB build consumes) so articulation
+        // links enter the LBVH. PairDriven-family-gated -> a no-op for the
+        // FusedFoot / UnionCsr families (the captured graph still ENQUEUES it, but
+        // the op early-exits and writes nothing), so Phase-0 goldens are
+        // byte-identical. No current cook is PairDriven (the B1 flip is Phase 1),
+        // so it is present-but-inert everywhere today.
+        p_sync_body_pose_.family = family;
+        p_sync_body_pose_.env_count = env_count;
+        p_sync_body_pose_.links_per_env = cap.links_per_env;  // PER-ENV stride
+        p_sync_body_pose_.bodies_per_env = cap.bodies_per_env;
+        add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
+
         // M5 broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops do real
         // work ONLY for the PairDriven family (the union slot-template and fused-
         // foot families run their own detection and never read candidate_pairs);

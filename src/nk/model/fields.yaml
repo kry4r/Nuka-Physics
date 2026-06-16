@@ -296,17 +296,26 @@ fields:
   # NarrowphaseSdf path (the generalized rigid/mesh collision the union slot-
   # template family does NOT use). All GLOBAL (per-env template, base-relative).
   #
-  # shape_table: the per-body collidable primitive record (8 packed f32 per
-  # body-row {kind(u32 bits), p0..p3 (sphere r / capsule r,hh / box he.xyz),
-  # contype(u32 bits), conaffinity(u32 bits), sdf_grid(u32 bits)}). The
-  # NarrowphasePrimitives pair-driven branch dispatches by (kind_a,kind_b) over
-  # the amf:: analytic set; sdf_grid != ~0 routes the pair through NarrowphaseSdf.
+  # shape_table: the per-body collidable primitive record. R1 (general contact
+  # pipeline Phase 0) GREW the record from 8 to 10 packed f32 per body-row,
+  # APPENDING two lanes after the original 8 so the unpack of lanes 0..7 is
+  # byte-identical:
+  #   {kind(u32 bits), p0..p3 (sphere r / capsule r,hh / box he.xyz),
+  #    contype(u32 bits), conaffinity(u32 bits), sdf_grid(u32 bits),
+  #    body_id(int32 bits; -1 == static), group(u32 bits)}.
+  # body_id resolves each collidable to its owning body row (the shape->body
+  # indirection); -1 marks a static collidable (ground plane / heightfield) that
+  # contributes no reaction side. group is the signed collision-group filter
+  # (Newton broad_phase test_group_pair). The NarrowphasePrimitives pair-driven
+  # branch dispatches by (kind_a,kind_b) over the amf:: analytic set; sdf_grid
+  # != ~0 routes the pair through NarrowphaseSdf. The two new lanes are INERT in
+  # Phase 0 (no routing reads them yet — R4/S5 are later phases).
   # excluded_pairs: the SORTED (lo<<32|hi) exclude list (cook filter policy);
   # the pair query drops a candidate found by binary search. filter_excluded_count
   # is its live length (a scalar staged into mat-bucket-style header — kept as a
   # 1-row table so the op reads the count device-side without a host param).
   # =========================================================================
-  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*8",       arena: persistent, owner: model}
+  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*10",      arena: persistent, owner: model}
   - {name: excluded_pairs,   dtype: u64, per: scalar, count: "max_excluded_pairs",       arena: persistent, owner: model}
 
   # =========================================================================
@@ -537,3 +546,54 @@ fields:
   - {name: link_geom_kind,   dtype: u32,       per: link, arena: persistent, owner: model}
   - {name: link_geom_params, dtype: f32,       per: link, arena: persistent, owner: model, elem: 4}
   - {name: link_geom_local,  dtype: transform, per: link, arena: persistent, owner: model}
+
+  # =========================================================================
+  # GENERAL CONTACT PIPELINE — Phase 0 spine (2026-06-16). Every field below is
+  # APPENDED LAST (highest FieldIds) so every pre-existing field keeps its exact
+  # arena/Model byte offset at K==1 (the D1 invariant; verified by diffing the
+  # generated headers post-regen). All are INERT in Phase 0 — present, staged,
+  # but consumed by no routing op yet (the broadphase/PairDriven family ops
+  # early-exit; the union/fused families never touch them). They are wired live
+  # in Phase 1+ (R4/B/G/S/H tasks).
+  # =========================================================================
+
+  # --- R3: shape->body inverse tables (the assembly seam input). MODEL, per-body.
+  # link_body[link] is link->body; the general PairDriven row-emission (S5) needs
+  # the inverse body->owner so a contact's collidable id resolves to (articulation,
+  # link) or (free-rigid) or (static). For each TEMPLATE link l with owning body
+  # row b == link_body[l]:  body_to_link[b] = l (template-local link index) and
+  # body_to_articulation[b] = local_artic_of(l). A body row that is NOT an
+  # articulation link (free rigid / static) carries ~0u in BOTH (so the side
+  # resolves free-rigid; the body_id == -1 in shape_table resolves static). Both
+  # tile env-major like link_body (template-local values; the runtime adds the
+  # per-env body/artic offset where it indexes globally). At K==1 the values are
+  # stable. Empty for a cook with no articulation -> StampPerBody leaves ~0u.
+  - {name: body_to_link,         dtype: u32, per: body, arena: persistent, owner: model}
+  - {name: body_to_articulation, dtype: u32, per: body, arena: persistent, owner: model}
+
+  # --- C1: per-slot collidable-id fields on the unified contact buffer. DATA,
+  # per contact_slot, elem:4 to match the <=4-pt manifold (one (a,b) pair + a
+  # generation per manifold point). ucontact_a/ucontact_b carry the two collidable
+  # (body-row) ids each emitted contact point belongs to (so the assembly can
+  # resolve both sides from the contact); ucontact_gen is a generation counter for
+  # the future collide-once / reuse-across-substeps optimization. Siblings of the
+  # ucontact_point/normal/depth scratch (fields above). INERT in Phase 0: the
+  # PairDriven narrowphase does not stamp them yet (C2, Phase 1).
+  # C3 (frame decision): ucontact_point is stored in WORLD space, ucontact_normal
+  # (A->B) in WORLD space — the ONE documented representation feeding AssembleRows
+  # (the chain-J kernel consumes a world point + world normal directly). See
+  # ComputeContactChainJacobianKernel in assemble_rows.cu for the rationale.
+  - {name: ucontact_a,   dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_b,   dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_gen, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+
+  # --- H1: general heightfield collidable height grid. MODEL, per:scalar. A flat
+  # height grid the general heightfield collidable samples (Newton HeightfieldData
+  # `heights`). The HeightfieldData POD {origin, cell_size, nrow, ncol, min_z,
+  # max_z, data_offset} lives in model.hpp; this is the backing flat grid (one
+  # f32 per cell-corner, row-major r*ncol+c). DATA POD + FIELD ONLY in Phase 0 —
+  # the cook does NOT fill it (H2) and no contact kernel reads it (H3) yet, so
+  # max_heightfield_cells == 0 for every current scene and the segment is
+  # zero-bytes (the field is byte-inert). Sized max_heightfield_cells from the
+  # scene at cook (H2, Phase 2).
+  - {name: heights, dtype: f32, per: scalar, count: "max_heightfield_cells", arena: persistent, owner: model}
