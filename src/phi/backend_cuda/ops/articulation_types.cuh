@@ -106,6 +106,21 @@ struct ArticulationDeviceState {
 // --- runtime/articulation/articulation_contacts.hpp (verbatim) -------------
 constexpr uint32_t kMaxFootContactsPerEnv = 4u;
 
+// Task 1/2: the per-ARTICULATION contact-slot stride for a MULTI-DOG world is a
+// RUNTIME value (the foot/dog-dog/solver share it) so K co-resident dogs each get
+// room for their 4 feet PLUS body-vs-terrain PLUS dog-dog rows in ONE block. At
+// K<=1 the runtime stride is EXACTLY kMaxFootContactsPerEnv (4) -> byte-identical.
+// kMaxContactsPerArtic is the COMPILE-TIME ceiling sizing the FUSED solver's
+// per-slot register arrays (lambda_n/t1/t2). Raising the array sizes does not
+// change any float op for a stride <= the old 4 (the loop is bounded by the
+// runtime stride; extra slots are never visited at K==1), so the K==1 results
+// stay byte-identical -- the same discipline as the kMaxArticulationDof bump.
+constexpr uint32_t kMaxContactsPerArtic = 12u;   // 4 feet + body-terrain + dog-dog
+// The multi-dog (K>1) per-articulation stride. A Go2 has 4 feet; up to ~6 body
+// links can touch terrain when it collapses; plus a few dog-dog rows -> 12 covers
+// the worst realistic case with margin. <= kMaxContactsPerArtic (the array cap).
+constexpr uint32_t kMultiDogContactsPerArtic = 12u;
+
 struct FootShape {
     uint32_t calf_local_link = 0u;
     math::Vec3 local_offset{};

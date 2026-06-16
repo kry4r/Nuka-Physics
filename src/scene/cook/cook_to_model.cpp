@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "runtime/articulation/articulation_contacts.hpp"  // contact-slot strides
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cooker.hpp"
@@ -654,8 +655,16 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
         // slot stream to hold every dog's per-articulation contact block.
         const uint32_t k = cap.articulations_per_env == 0u ? 1u
                                                            : cap.articulations_per_env;
-        cap.max_contacts_per_env = 4u * k;   // K * kMaxFootContactsPerEnv
-        cap.max_rows_per_env     = 12u * k;  // 3 rows per contact slot, per dog.
+        // Task 1/2: per-dog slot stride. At K==1 (the legacy single-robot scene)
+        // this is EXACTLY kMaxFootContactsPerEnv (4) -> max_contacts 4 / rows 12,
+        // byte-identical. At K>1 it grows to kMultiDogContactsPerArtic (12) so each
+        // dog's block holds feet + body-vs-terrain + dog-dog rows (the Task 1/2
+        // coexistence). 3 rows per contact slot {normal, t1, t2}.
+        const uint32_t stride = (k > 1u)
+            ? ::nuka::runtime::articulation::kMultiDogContactsPerArtic
+            : ::nuka::runtime::articulation::kMaxFootContactsPerEnv;
+        cap.max_contacts_per_env = stride * k;     // K * per-dog stride
+        cap.max_rows_per_env     = 3u * stride * k;  // 3 rows per contact slot.
     } else {
         const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
         cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
