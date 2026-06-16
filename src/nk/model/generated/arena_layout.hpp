@@ -25,7 +25,10 @@ enum class FieldPer : uint8_t {
     // Multi-articulation co-residence: per-articulation (= articulations_per_env)
     // and per-articulation M-tile (= articulations_per_env * max_dof^2).
     // APPENDED so the existing enumerator values never shift.
-    Articulation, ArticulationDof2
+    Articulation, ArticulationDof2,
+    // Per-articulation flat-DOF tile (= articulations_per_env * max_dof);
+    // the general-contact per-artic qdot_flat tile (S3). APPENDED LAST.
+    ArticulationDof
 };
 
 struct FieldLayout {
@@ -135,7 +138,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Dof, 1, 1, 4, 0},  // qdot_flat
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // qdot_flat
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_composite_inertia
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // union_slots
@@ -207,6 +210,11 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // heights
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent2
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // row_minv_jt_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir_b
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

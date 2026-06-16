@@ -34,6 +34,23 @@ struct CookToModelResult {
 // EntityId<->row SceneMap. env_count must be >= 1 (clamped to 1 if 0).
 CookToModelResult CookToModel(const SceneIR& scene, int env_count);
 
+// B1 (general contact pipeline Phase 1B): cook options. contact_family selects the
+// stepped contact path. FusedFoot (the DEFAULT, used by the 2-arg overload above)
+// keeps the legacy single-dog foot pipeline BYTE-IDENTICAL; PairDriven flips the
+// world to the GENERAL LBVH -> cvx narrowphase -> mixed-island solve path (the
+// multi-body / body-body cook). When PairDriven is set the per-env row budget is
+// resized for the general per-candidate-slot row layout and the cook sets
+// model.contact_family = PairDriven (so the pipeline gates the dog_dog hack OFF
+// and routes the general assembly/solve). H1 grasp keeps UnionCsr (union_cook);
+// single-dog go2 keeps FusedFoot (the 2-arg cook). Cross-env filtering is left ON
+// for PairDriven multi-dog-in-one-env (intra-env collidables collide).
+enum class CookContactFamily { FusedFoot, PairDriven };
+struct CookToModelOptions {
+    CookContactFamily contact_family = CookContactFamily::FusedFoot;
+};
+CookToModelResult CookToModel(const SceneIR& scene, int env_count,
+                              const CookToModelOptions& options);
+
 // ---------------------------------------------------------------------------
 // M6 — particle cook (plan §3.10 "粒子 XPBD/PBF"). Stage an XPBD soft body or a
 // PBF fluid into the nk::Model particle block + set the particle/constraint

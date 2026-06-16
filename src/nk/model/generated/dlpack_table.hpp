@@ -189,6 +189,11 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::Heights, DlpackDtype::kF32, 1, false, false},  // heights
     {FieldId::UcontactTangent1, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent1
     {FieldId::UcontactTangent2, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent2
+    {FieldId::ChainJacobianB, DlpackDtype::kF32, 1, false, false},  // chain_jacobian_b
+    {FieldId::RowMinvJtB, DlpackDtype::kF32, 1, false, false},  // row_minv_jt_b
+    {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false, false},  // row_cj_link_b
+    {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false, false},  // row_cj_point_b
+    {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false, false},  // row_cj_dir_b
 };
 
 } // namespace nuka::nk

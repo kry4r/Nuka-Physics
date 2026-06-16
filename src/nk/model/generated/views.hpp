@@ -164,7 +164,7 @@ struct DataView {
     uint32_t* row_cj_link = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_point = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_dir = nullptr;  // per:row_slot arena:scratch owner:data
-    float* qdot_flat = nullptr;  // per:dof arena:scratch owner:data
+    float* qdot_flat = nullptr;  // per:articulation_dof arena:scratch owner:data
     float* m = nullptr;  // per:articulation_dof2 arena:scratch owner:data
     ::nuka::nk::Mat36* link_composite_inertia = nullptr;  // per:link arena:scratch owner:data
     uint32_t* table_enabled = nullptr;  // per:env arena:persistent owner:data
@@ -197,6 +197,11 @@ struct DataView {
     uint32_t* ucontact_gen = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
     ::nuka::math::Vec3* ucontact_tangent1 = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
     ::nuka::math::Vec3* ucontact_tangent2 = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    float* chain_jacobian_b = nullptr;  // per:row_dof arena:scratch owner:data
+    float* row_minv_jt_b = nullptr;  // per:row_dof arena:scratch owner:data
+    uint32_t* row_cj_link_b = nullptr;  // per:row_slot arena:scratch owner:data
+    ::nuka::math::Vec3* row_cj_point_b = nullptr;  // per:row_slot arena:scratch owner:data
+    ::nuka::math::Vec3* row_cj_dir_b = nullptr;  // per:row_slot arena:scratch owner:data
 };
 
 } // namespace nuka::phi

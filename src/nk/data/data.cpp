@@ -107,6 +107,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::RowCjLink:           v.row_cj_link = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPoint:          v.row_cj_point = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDir:            v.row_cj_dir = static_cast<math::Vec3*>(p); break;
+        // S2 (general contact pipeline Phase 1B): the second per-side arm fields.
+        case FieldId::ChainJacobianB:      v.chain_jacobian_b = static_cast<float*>(p); break;
+        case FieldId::RowMinvJtB:          v.row_minv_jt_b = static_cast<float*>(p); break;
+        case FieldId::RowCjLinkB:          v.row_cj_link_b = static_cast<uint32_t*>(p); break;
+        case FieldId::RowCjPointB:         v.row_cj_point_b = static_cast<math::Vec3*>(p); break;
+        case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
         case FieldId::TableEnabled:        v.table_enabled = static_cast<uint32_t*>(p); break;
         case FieldId::M:                   v.m = static_cast<float*>(p); break;

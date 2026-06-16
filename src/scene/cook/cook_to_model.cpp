@@ -29,6 +29,7 @@
 #include <cmath>
 
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
+#include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
 #include "runtime/articulation/articulation_contacts.hpp"  // contact-slot strides
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -846,6 +847,82 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
             static_cast<uint32_t>(model.shape_table_rows.size());
     }
 
+    return result;
+}
+
+// B1 (general contact pipeline Phase 1B): the PairDriven cook overload. It runs
+// the SAME cook (so the registry / shape_table / body_to_link / static ground row
+// / multi-artic foundation are all reused verbatim) then flips the model to the
+// GENERAL family: contact_family = PairDriven (the pipeline then gates the dog_dog
+// hack OFF and routes the LBVH -> cvx -> mixed-island path), enables cross-env
+// filtering so candidate pairs stay env-local, and RE-SIZES the per-env row budget
+// to the general per-candidate-slot layout (max_contacts_per_env candidate slots x
+// kPairDrivenRowsPerSlot rows/slot). The FusedFoot overload is byte-untouched.
+CookToModelResult CookToModel(const SceneIR& scene, int env_count,
+                              const CookToModelOptions& options) {
+    CookToModelResult result = CookToModel(scene, env_count);
+    if (options.contact_family != CookContactFamily::PairDriven) {
+        return result;  // FusedFoot: byte-identical to the 2-arg cook.
+    }
+    nk::Model& model = result.model;
+    model.contact_family = nk::ContactFamily::PairDriven;
+    // Env-local candidate pairs: keep cross-env filtering ON so co-resident
+    // collidables of ONE env collide (multi-dog-in-one-env / box-on-dog), not
+    // across envs (the batch replicas stay independent).
+    model.filter_cross_env = true;
+
+    // Build the per-DOG flat-DOF -> (template-local link, base component) maps
+    // (DofIndexOf^-1) the general island solver's qdot pack/scatter needs. The
+    // 2-arg cook does NOT cook these (only union_nk_model did, for the H1 path), so
+    // for a PairDriven articulated world they were EMPTY -> the floating-base
+    // reaction never reached link_velocity. The map is PER-DOG (the first
+    // articulation's link slice [0, links_per_dog)); the multi-tile solver applies
+    // it per co-resident articulation with that artic's link offset. Mirrors
+    // union_nk_model.cpp's DofIndexOf^-1 (FloatingBase root -> 6 components, scalar
+    // joint -> component ~0u). Only the FIRST dog's links since every dog is the
+    // same template (dofs_per_env is the per-dog DOF).
+    {
+        namespace articulation = runtime::articulation;
+        const nk::ModelArticulation& m = model.articulation;
+        const uint32_t k = model.capacities.articulations_per_env == 0u
+                               ? 1u : model.capacities.articulations_per_env;
+        const uint32_t links_per_dog =
+            (k > 0u && m.link_count >= k) ? (m.link_count / k) : m.link_count;
+        model.dof_to_link.clear();
+        model.dof_to_component.clear();
+        for (uint32_t l = 0; l < links_per_dog && l < m.joint_type.size(); ++l) {
+            const articulation::ArticulationJointType jt =
+                static_cast<articulation::ArticulationJointType>(m.joint_type[l]);
+            const bool is_root_floating =
+                (l == 0u) && (l < m.parent_link.size()) &&
+                (m.parent_link[l] == ~uint32_t(0)) &&
+                (jt == articulation::ArticulationJointType::FloatingBase);
+            if (is_root_floating) {
+                for (uint32_t b = 0; b < 6u; ++b) {
+                    model.dof_to_link.push_back(l);
+                    model.dof_to_component.push_back(b);
+                }
+                continue;
+            }
+            switch (jt) {
+                case articulation::ArticulationJointType::Revolute:
+                case articulation::ArticulationJointType::Prismatic:
+                    model.dof_to_link.push_back(l);
+                    model.dof_to_component.push_back(~uint32_t(0));
+                    break;
+                default:
+                    break;  // Fixed (0 DOF) / non-root FloatingBase: no entry.
+            }
+        }
+    }
+    // The general per-candidate-slot row budget. The broadphase emits up to
+    // max_contacts_per_env candidate slots per env; the assembly expands each into
+    // kPairDrivenRowsPerSlot NkRows. The schedule + the assembly both read this.
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.max_contacts_per_env > 0u) {
+        cap.max_rows_per_env =
+            cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    }
     return result;
 }
 
