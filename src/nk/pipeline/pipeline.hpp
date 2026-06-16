@@ -75,6 +75,7 @@ private:
     phi::LbvhQueryPairsParams         p_lbvh_query_{};
     phi::ParticleGridBuildParams      p_grid_{};
     phi::NarrowphasePrimitivesParams  p_np_prim_{};
+    phi::DogDogContactParams          p_dog_dog_{};  // WP5/6/8 multi-artic contact
     phi::NarrowphaseSdfParams         p_np_sdf_{};
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};

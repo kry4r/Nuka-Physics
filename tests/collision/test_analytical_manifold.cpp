@@ -291,6 +291,51 @@ TEST(AnalyticalManifold, CapsuleSphereSinglePoint) {
 }
 
 // ---------------------------------------------------------------------------
+// WP6 dog-dog: amf::CapsuleCapsule analytic segment-segment narrowphase. The
+// host narrowphase TABLE routes Capsule x Capsule to the convex GJK/EPA tier;
+// the dog-dog DEVICE path instead calls amf::CapsuleCapsule directly (analytic,
+// no EPA -> avoids the v0.8 shallow-penetration hull debt). Test it DIRECTLY.
+// ---------------------------------------------------------------------------
+TEST(AnalyticalManifold, CapsuleCapsuleParallelOverlapPushesApart) {
+    // Two capsules both along Y, r 0.1 hh 0.3. A at origin, B at x=0.15. The axes
+    // are parallel 0.15 apart; sum radii 0.2 => penetration 0.05. A must push -x.
+    PrimParams a = MakeCapsule(0.1f, 0.3f, {0.0f, 0.0f, 0.0f});
+    PrimParams b = MakeCapsule(0.1f, 0.3f, {0.15f, 0.0f, 0.0f});
+    ContactManifold m;
+    m.Clear();
+    nuka::collision::amf::CapsuleCapsule(a, b, &m);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 0.05f, kTol);
+    // separation dir for A == -x (B is at +x, so A moves -x to separate).
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {-1.0f, 0.0f, 0.0f}));
+}
+
+TEST(AnalyticalManifold, CapsuleCapsulePerpendicularCross) {
+    // A along Y at origin (r 0.1 hh 0.5); B along X crossing above it at z=0.15
+    // (r 0.1 hh 0.5). Closest features are the two axis crossings; the vertical
+    // gap is 0.15, sum radii 0.2 => pen 0.05, A pushed -z.
+    PrimParams a = MakeCapsule(0.1f, 0.5f, {0.0f, 0.0f, 0.0f});
+    const Quat y_to_x = Quat::FromAxisAngle({0.0f, 0.0f, 1.0f},
+                                            -1.57079632679f);  // Y axis -> X
+    PrimParams b = MakeCapsule(0.1f, 0.5f, {0.0f, 0.0f, 0.15f}, y_to_x);
+    ContactManifold m;
+    m.Clear();
+    nuka::collision::amf::CapsuleCapsule(a, b, &m);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 0.05f, kTol);
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, 0.0f, -1.0f}));
+}
+
+TEST(AnalyticalManifold, CapsuleCapsuleSeparatedNoContact) {
+    PrimParams a = MakeCapsule(0.1f, 0.3f, {0.0f, 0.0f, 0.0f});
+    PrimParams b = MakeCapsule(0.1f, 0.3f, {0.5f, 0.0f, 0.0f});  // 0.5 apart > 0.2
+    ContactManifold m;
+    m.Clear();
+    nuka::collision::amf::CapsuleCapsule(a, b, &m);
+    EXPECT_EQ(m.point_count, 0u);
+}
+
+// ---------------------------------------------------------------------------
 // D1: two-run byte-identical manifold (padding zeroed).
 // ---------------------------------------------------------------------------
 namespace {

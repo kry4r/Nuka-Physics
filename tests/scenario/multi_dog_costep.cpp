@@ -44,6 +44,13 @@ std::filesystem::path Go2ScenePath() {
            "go2_stand.usda";
 }
 
+// The FLOATING-BASE Go2 variant (FloatingBase root => the trunk can TRANSLATE,
+// so two co-resident dogs whose trunk boxes overlap can PHYSICALLY push apart).
+std::filesystem::path Go2FloatScenePath() {
+    return std::filesystem::path(NUKA_SOURCE_DIR) / "examples" / "scenes" /
+           "go2_float.usda";
+}
+
 // Cook K go2 (composed at distinct XY) into ONE env. Returns the cooked Model.
 nk::Model CookKDogs(uint32_t k, float spacing) {
     nuka::scene::SceneIR scene = nuka::import::LoadUsd(Go2ScenePath().string());
@@ -51,6 +58,18 @@ nk::Model CookKDogs(uint32_t k, float spacing) {
         nuka::math::Transform place = nuka::math::Transform::Identity();
         place.position.x = spacing * static_cast<float>(i);
         scene = nuka::scene::Compose(scene, nuka::import::LoadUsd(Go2ScenePath().string()),
+                                     place, "dog" + std::to_string(i) + "_");
+    }
+    return nuka::scene::cook::CookToModel(scene, 1).model;
+}
+
+// Cook K FLOATING-BASE go2 placed `spacing` apart in X into ONE env.
+nk::Model CookKFloatDogs(uint32_t k, float spacing) {
+    nuka::scene::SceneIR scene = nuka::import::LoadUsd(Go2FloatScenePath().string());
+    for (uint32_t i = 1; i < k; ++i) {
+        nuka::math::Transform place = nuka::math::Transform::Identity();
+        place.position.x = spacing * static_cast<float>(i);
+        scene = nuka::scene::Compose(scene, nuka::import::LoadUsd(Go2FloatScenePath().string()),
                                      place, "dog" + std::to_string(i) + "_");
     }
     return nuka::scene::cook::CookToModel(scene, 1).model;
@@ -201,4 +220,164 @@ TEST(MultiDogCoStep, TwoDogsCoStepFiniteAndIndependent) {
         << "undriven dog B must move LESS than driven dog A (no tile aliasing)";
     EXPECT_GT(ab_coupling, 1.0e-2f)
         << "dog B must NOT track dog A's driven joints (independent tiles)";
+}
+
+// ===========================================================================
+// WP5/WP6/WP8 dog-dog PHYSICAL COLLISION spike (the owner bottom-line). TWO
+// FLOATING-BASE Go2 dropped into each other (trunk boxes overlapping) must
+// PHYSICALLY PUSH APART: trunk separation grows, BOTH dogs' qdot changes
+// (two-way momentum exchange), and a far-apart control run shows NO push.
+// Free-fall (feet cleared) isolates the dog-dog reaction from foot-ground.
+// ===========================================================================
+
+namespace {
+
+// Step K floating-base dogs (feet cleared) for `steps` and return their final
+// per-dog root X positions (from BasePose) + the L2 norm of the joint qdot
+// (the kinetic signature). `spacing` sets the X gap between the two dogs.
+struct DogRunResult {
+    std::vector<float> root_x;   // K root X positions (BasePose).
+    float qdot_norm = 0.0f;      // ||qdot|| over all dogs.
+    bool ok = true;
+};
+
+DogRunResult RunFloatDogs(nphi::Device* dev, nphi::Backend* backend, uint32_t k,
+                          float spacing, uint32_t steps) {
+    DogRunResult out;
+    nk::Model model = CookKFloatDogs(k, spacing);
+    const uint32_t L = model.capacities.links_per_env;
+    // Free-fall: drop foot-ground contact (the env-keyed fused foot cap is a
+    // named WP1 debt; this isolates the dog-DOG reaction, the WP5-8 deliverable).
+    model.feet.clear();
+
+    nk::Pipeline::SolverConfig cfg;
+    cfg.dt = 1.0f / 240.0f;
+    cfg.gravity[2] = 0.0f;  // no gravity: isolate the dog-dog contact impulse
+                            // (overlapping trunks must push apart on their own).
+    cfg.contact_margin = 0.0f;
+
+    nk::World world(std::move(model), 1u, dev, backend, cfg);
+    if (!world.Ready()) { out.ok = false; return out; }
+
+    for (uint32_t s = 0; s < steps; ++s) {
+        const nk::StepResult r = world.Step();
+        if (!r.AllOk()) { out.ok = false; return out; }
+    }
+
+    std::vector<float> base_pose(k * 7u, 0.0f);  // K root transforms (pos+quat).
+    std::vector<float> qd(L, 0.0f);
+    out.ok = world.GetData().DownloadField(nk::FieldId::BasePose, base_pose.data(),
+                                           base_pose.size() * sizeof(float)) &&
+             world.GetData().DownloadField(nk::FieldId::Qdot, qd.data(),
+                                           L * sizeof(float));
+    out.root_x.resize(k);
+    for (uint32_t a = 0; a < k; ++a) out.root_x[a] = base_pose[a * 7u + 0u];
+    float n2 = 0.0f;
+    for (float v : qd) n2 += v * v;
+    out.qdot_norm = std::sqrt(n2);
+    return out;
+}
+
+}  // namespace
+
+// --- The cook records per-link collision geometry (WP5/WP6 source) ------------
+TEST(MultiDogContact, CookEmitsPerLinkCollisionGeometry) {
+    if (!std::filesystem::exists(Go2FloatScenePath())) {
+        GTEST_SKIP() << "go2_float.usda not present";
+    }
+    const nk::Model two = CookKFloatDogs(2u, 0.15f);
+    ASSERT_EQ(two.capacities.articulations_per_env, 2u);
+
+    // The contact slot budget grew to K * kMaxFootContactsPerEnv so the fused
+    // per-articulation solver's slot_base = artic*4 stays in bounds for K dogs.
+    EXPECT_EQ(two.capacities.max_contacts_per_env, 8u);   // 2 * 4
+    EXPECT_EQ(two.capacities.max_rows_per_env, 24u);      // 2 * 12
+
+    // K==1 collapses to the legacy single-robot budget (the D1 invariant).
+    const nk::Model one = CookKFloatDogs(1u, 0.15f);
+    EXPECT_EQ(one.capacities.max_contacts_per_env, 4u);
+    EXPECT_EQ(one.capacities.max_rows_per_env, 12u);
+
+    // Per-link collision geometry is populated: each dog's trunk cooks a Box
+    // (link_geom_kind == ShapeType::Box + 1 == 3) so dog-dog narrowphase has a
+    // collidable to pose from link_pose. At least one link per dog is collidable.
+    ASSERT_FALSE(two.articulation.link_geom_kind.empty());
+    uint32_t collidable_links = 0u;
+    for (uint32_t kind : two.articulation.link_geom_kind) {
+        if (kind != 0u) ++collidable_links;
+    }
+    EXPECT_GE(collidable_links, 2u)
+        << "each dog must cook >=1 collidable link (trunk box / foot sphere)";
+}
+
+// --- The two-way physical reaction spike (GPU) --------------------------------
+TEST(MultiDogContact, TwoDogsPushApartAndExchangeMomentum) {
+    if (!std::filesystem::exists(Go2FloatScenePath())) {
+        GTEST_SKIP() << "go2_float.usda not present";
+    }
+    nphi::Device* dev = nphi::InitBestDevice();
+    if (dev == nullptr) {
+        GTEST_SKIP() << "no compute device";
+    }
+    nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
+    ASSERT_NE(backend, nullptr);
+
+    // (A) OVERLAPPING: two dogs 0.15 m apart in X. Trunk boxes are 0.20 m cubes
+    // (half-extent 0.10), so the centers 0.15 m apart => 0.05 m interpenetration.
+    // With contact ON the dogs MUST push apart along X.
+    const uint32_t kSteps = 30u;
+    DogRunResult overlap = RunFloatDogs(dev, backend, 2u, 0.15f, kSteps);
+    ASSERT_TRUE(overlap.ok) << "overlapping co-step must run clean";
+    ASSERT_EQ(overlap.root_x.size(), 2u);
+
+    const float sep_overlap = std::abs(overlap.root_x[1] - overlap.root_x[0]);
+    const float radii_sum = 0.10f + 0.10f;  // the two trunk box half-extents.
+
+    std::fprintf(stderr,
+                 "[dog-dog spike] OVERLAP: root_x={%.4f, %.4f} sep=%.4f "
+                 "(spawn 0.15, radii_sum %.2f)  qdot_norm=%.5f\n",
+                 overlap.root_x[0], overlap.root_x[1], sep_overlap, radii_sum,
+                 overlap.qdot_norm);
+
+    // (1) PUSH-APART: after the contact engages the trunk separation must EXCEED
+    // the initial 0.15 m gap (they were forced apart) and approach the
+    // non-interpenetrating separation (Sum of half-extents, minus a small slop).
+    EXPECT_GT(sep_overlap, 0.15f + 1.0e-3f)
+        << "overlapping dogs MUST push apart (separation grew past the 0.15 spawn)";
+    EXPECT_GE(sep_overlap, radii_sum - 0.03f)
+        << "the dogs must separate to ~non-interpenetrating distance (Sum radii - slop)";
+
+    // (2a) TWO-WAY (the WP8 crux): BOTH dogs moved from their spawn (dog A at
+    // x=0 went negative, dog B at x=0.15 went positive) -- the contact reaction
+    // scattered into BOTH per-articulation qdot tiles, not just one. This is the
+    // exact thing single-tile solvers cannot do; here each dog's fused solver
+    // block resolves its OWN slot block into its OWN tile.
+    EXPECT_LT(overlap.root_x[0], 0.0f - 1.0e-3f)
+        << "dog A (spawn x=0) must be pushed in -X by the contact";
+    EXPECT_GT(overlap.root_x[1], 0.15f + 1.0e-3f)
+        << "dog B (spawn x=0.15) must be pushed in +X by the contact";
+
+    // (2b) MOMENTUM EXCHANGE: qdot is nonzero (the contact reaction injected
+    // velocity). With gravity off and feet cleared, the ONLY force is the dog-dog
+    // contact, so a nonzero qdot_norm IS the two-way reaction itself.
+    EXPECT_GT(overlap.qdot_norm, 1.0e-3f)
+        << "the dog-dog contact must inject velocity into BOTH dogs' qdot tiles";
+
+    // (B) FAR-APART CONTROL: two dogs 1.5 m apart never overlap => NO contact.
+    // Separation stays at the spawn gap and qdot stays ~0 (no spurious push).
+    DogRunResult apart = RunFloatDogs(dev, backend, 2u, 1.5f, kSteps);
+    ASSERT_TRUE(apart.ok) << "far-apart co-step must run clean";
+    const float sep_apart = std::abs(apart.root_x[1] - apart.root_x[0]);
+    std::fprintf(stderr,
+                 "[dog-dog spike] CONTROL: root_x={%.4f, %.4f} sep=%.4f "
+                 "(spawn 1.5)  qdot_norm=%.7f\n",
+                 apart.root_x[0], apart.root_x[1], sep_apart, apart.qdot_norm);
+    EXPECT_NEAR(sep_apart, 1.5f, 1.0e-2f)
+        << "far-apart dogs must NOT move (no spurious dog-dog contact)";
+    EXPECT_LT(apart.qdot_norm, 1.0e-4f)
+        << "far-apart dogs must stay at rest (the dog-dog op is inert with no overlap)";
+
+    // The push-apart separation must DOMINATE the control's drift: the contact
+    // produced a real, large displacement the no-contact case never shows.
+    EXPECT_GT(sep_overlap, 0.15f + 0.01f);
 }

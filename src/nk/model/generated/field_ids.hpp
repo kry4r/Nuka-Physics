@@ -162,6 +162,9 @@ enum class FieldId : uint16_t {
     EnvTerrainType,  // env_terrain_type (per:env arena:persistent owner:data)
     EnvTerrainDifficulty,  // env_terrain_difficulty (per:env arena:persistent owner:data)
     JointF,  // joint_f (per:link arena:persistent owner:data flags:[param])
+    LinkGeomKind,  // link_geom_kind (per:link arena:persistent owner:model)
+    LinkGeomParams,  // link_geom_params (per:link arena:persistent owner:model elem:4)
+    LinkGeomLocal,  // link_geom_local (per:link arena:persistent owner:model)
     Count
 };
 

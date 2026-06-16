@@ -215,6 +215,27 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.particles_per_env = cap.particles_per_env;  // M6 coupling slots.
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
+        // WP5/6/8 multi-articulation dog-dog link contact. Runs AFTER the foot
+        // narrowphase (which fills/zero-fills the env's slot blocks) and BEFORE
+        // AssembleRows (which consumes the contact_* slots). Detects FK-posed
+        // capsule x capsule overlaps between links of DISTINCT co-resident
+        // articulations and emits TWO articulation-keyed fused rows per overlap
+        // (one per dog, opposite normals) into the per-ARTICULATION slot blocks
+        // [artic*kMaxFootContacts, +stride). The op EARLY-EXITS for
+        // articulations_per_env <= 1, so the single-dog (K==1) graph -- though it
+        // carries this op -- does NO work and stays byte-identical. (Emitted only
+        // when has_articulation, behind the same gate, so a body/particle-only
+        // scene never sees it.)
+        if (has_articulation) {
+            p_dog_dog_.contact_margin = cfg.contact_margin;
+            p_dog_dog_.env_count = env_count;
+            p_dog_dog_.base_link_count = base_link_count;
+            p_dog_dog_.articulations_per_env = cap.articulations_per_env;
+            p_dog_dog_.max_foot_contacts = 4u;  // == kMaxFootContactsPerEnv stride
+            p_dog_dog_.max_contacts_per_env = cap.max_contacts_per_env;
+            add(phi::NkOp::DogDogContact, &p_dog_dog_);
+        }
+
         p_np_sdf_.contact_margin = cfg.contact_margin;
         p_np_sdf_.max_contacts_per_pair = 4;
         p_np_sdf_.family = family;          // PairDriven => sample; else no-op.

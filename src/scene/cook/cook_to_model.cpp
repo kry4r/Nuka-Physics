@@ -364,6 +364,62 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
             model.feet.push_back(foot);
         }
 
+        // WP5/WP6 dog-dog link collision geometry: per template-link, record the
+        // FIRST primitive (Sphere/Box/Capsule) collision shape whose owning body
+        // maps to that link, in the link's LOCAL frame. This is the source the
+        // NkOp::DogDogContact narrowphase poses into world space from the FK
+        // link_pose. Cooked for EVERY scene (the field is inert until the op runs,
+        // which it does only at articulations_per_env > 1), so a single-dog scene
+        // populates the table but never exercises it -> K==1 byte-identical.
+        //   kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
+        //   default-zero (no-shape) link is unambiguously inactive.
+        m.link_geom_kind.assign(m.link_count, 0u);
+        m.link_geom_params.assign(static_cast<size_t>(m.link_count) * 4u, 0.0f);
+        m.link_geom_local.assign(m.link_count, math::Transform::Identity());
+        for (uint32_t shape = 0; shape < blob.shapes.types.size(); ++shape) {
+            const ShapeType st = blob.shapes.types[shape];
+            if (st != ShapeType::Sphere && st != ShapeType::Box &&
+                st != ShapeType::Capsule) {
+                continue;  // only bounded primitives are collidable here.
+            }
+            const BodyId body = shape < blob.shapes.body_ids.size()
+                                    ? blob.shapes.body_ids[shape]
+                                    : kInvalidBody;
+            uint32_t owner_link = ~uint32_t(0);
+            for (uint32_t link = 0; link < m.link_count; ++link) {
+                if (host.link_body[link] == body) { owner_link = link; break; }
+            }
+            if (owner_link == ~uint32_t(0)) {
+                continue;  // body is not an articulation link.
+            }
+            if (m.link_geom_kind[owner_link] != 0u) {
+                continue;  // keep the FIRST primitive for this link (deterministic).
+            }
+            m.link_geom_kind[owner_link] = static_cast<uint32_t>(st) + 1u;
+            const float radius = shape < blob.shapes.radii.size()
+                                     ? blob.shapes.radii[shape] : 0.0f;
+            const float half_height = shape < blob.shapes.half_heights.size()
+                                          ? blob.shapes.half_heights[shape] : 0.0f;
+            const math::Vec3 he = shape < blob.shapes.half_extents.size()
+                                      ? blob.shapes.half_extents[shape]
+                                      : math::Vec3::Zero();
+            const size_t b = static_cast<size_t>(owner_link) * 4u;
+            if (st == ShapeType::Sphere) {
+                m.link_geom_params[b + 0] = radius;
+            } else if (st == ShapeType::Capsule) {
+                m.link_geom_params[b + 0] = radius;
+                m.link_geom_params[b + 1] = half_height;
+            } else {  // Box
+                m.link_geom_params[b + 0] = he.x;
+                m.link_geom_params[b + 1] = he.y;
+                m.link_geom_params[b + 2] = he.z;
+            }
+            m.link_geom_local[owner_link] =
+                shape < blob.shapes.local_transforms.size()
+                    ? blob.shapes.local_transforms[shape]
+                    : math::Transform::Identity();
+        }
+
         // Hold drives (legacy BuildHoldDriveTargets 1:1): targets = cooked q;
         // Position actuators seed stiffness = gain, damping = 2*sqrt(gain),
         // force limits from the actuator table.
@@ -588,8 +644,18 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     // no ground contact is exercised -- it validates the multi-artic FORWARD
     // dynamics co-residence, which is what this foundation delivers.
     if (cap.links_per_env > 0) {
-        cap.max_contacts_per_env = 4u;   // == articulation::kMaxFootContactsPerEnv
-        cap.max_rows_per_env     = 12u;  // 3 rows per contact slot.
+        // WP5-8: with K co-resident articulations (dogs), the FUSED solver is
+        // block-per-articulation and reads slot block [artic*kMaxFootContactsPerEnv,
+        // +stride); articulation index runs [0, K*env_count). So the per-env
+        // contact-slot budget must cover K articulation blocks: K * 4 slots, with
+        // 3 rows/slot. At K==1 (the legacy single-robot scene) this is EXACTLY
+        // 4 / 12 -- byte-identical (the K==1 D1 invariant; a multi-dog scene is a
+        // DISTINCT validation surface). This grows the DogDogContact + fused-foot
+        // slot stream to hold every dog's per-articulation contact block.
+        const uint32_t k = cap.articulations_per_env == 0u ? 1u
+                                                           : cap.articulations_per_env;
+        cap.max_contacts_per_env = 4u * k;   // K * kMaxFootContactsPerEnv
+        cap.max_rows_per_env     = 12u * k;  // 3 rows per contact slot, per dog.
     } else {
         const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
         cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;

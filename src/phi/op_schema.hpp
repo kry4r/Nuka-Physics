@@ -88,6 +88,12 @@ enum class NkOp : uint16_t {
     // --- cross-system particle contact (M9 T11 Phase 2) -----------------
     ParticleParticleContact, // id-10 class-blind unilateral non-penetration co-step
 
+    // --- multi-articulation dog-dog link contact (WP5-8) ----------------
+    DogDogContact,         // FK link x link analytic narrowphase between DISTINCT
+                           // co-resident articulations -> articulation-keyed fused
+                           // contact rows (two-way reaction). Emitted ONLY for
+                           // articulations_per_env > 1; the K==1 graph never sees it.
+
     Count                  // sentinel: number of ops (NOT an op)
 };
 
@@ -253,6 +259,24 @@ struct NarrowphasePrimitivesParams {
     // M6: particle coupling (the kUSlotParticleSphere* union classes form the
     // particle side's world sphere from particle_pos[env*particles_per_env+link]).
     uint32_t particles_per_env;
+};
+
+// WP5-8 multi-articulation dog-dog link contact. One thread-block per env walks
+// the env's links pairwise, runs the analytic primitive narrowphase (WP6) between
+// links of DISTINCT articulations posed from the FK link_pose * link_geom_local
+// (WP5), and emits TWO articulation-keyed FUSED contact rows per overlap (one per
+// dog, opposite normals) into the contact_* slot blocks [artic*kMaxFootContacts,
+// +kMaxFootContacts). The existing fused AssembleRows + per-articulation solver
+// then scatter each side's reaction into its OWN dog's qdot tile (two-way push).
+// EARLY-EXITS unless articulations_per_env > 1, so the single-dog (K==1) graph
+// never enqueues this op -> its goldens stay byte-identical.
+struct DogDogContactParams {
+    float    contact_margin;
+    uint32_t env_count;
+    uint32_t base_link_count;        // links per env (== sum over the K dogs)
+    uint32_t articulations_per_env;  // K (the gate: > 1 => active)
+    uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (slot stride/artic)
+    uint32_t max_contacts_per_env;   // contact_* slot stride per env (== K*stride)
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.

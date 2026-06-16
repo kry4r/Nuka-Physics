@@ -196,6 +196,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_type
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_difficulty
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // joint_f
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_geom_kind
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 4, 1, 16, 0},  // link_geom_params
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 7, 28, 0},  // link_geom_local
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {
