@@ -346,6 +346,11 @@ struct NarrowphaseSdfParams {
 
 struct ContactTangentBasisParams {
     uint32_t slot_count;        // env_count * max_contacts_per_env
+    // C4: family selector. FusedFoot reads the FUSED contact_normal (per slot);
+    // PairDriven reads the unified ucontact_normal (elem:4) and writes the elem:4
+    // ucontact_tangent1/2. Default 0 (FusedFoot) keeps the existing path
+    // byte-identical (the union family never adds this op).
+    uint32_t family = 0u;
 };
 
 struct AssembleRowsParams {

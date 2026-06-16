@@ -883,6 +883,12 @@ if(CMAKE_CUDA_COMPILER)
         # Proves K articulations co-step finite + INDEPENDENT (no dog-dog contact
         # yet -- that is the later contact crux). Composes go2_stand with itself.
         scenario/multi_dog_costep.cpp
+        # General contact pipeline Phase 1A: the PairDriven NARROWPHASE DETECTION
+        # gate. A body-only PairDriven world with two overlapping collidables runs
+        # broadphase -> cvx GJK/EPA narrowphase -> the unified contact buffer;
+        # asserts contacts detected, <=4 pts, no NaN, retained (a,b) ids, tangent
+        # basis (C4), and two-run byte-identity (the new path's own D1).
+        scenario/pairdriven_narrowphase.cpp
         # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.

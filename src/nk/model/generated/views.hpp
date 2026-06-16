@@ -134,7 +134,7 @@ struct DataView {
     ::nuka::math::Vec3* body_aabb_hi = nullptr;  // per:body arena:scratch owner:data
     uint32_t* pair_count = nullptr;  // per:env arena:scratch owner:data
     uint32_t* candidate_pairs = nullptr;  // per:contact_slot arena:scratch owner:data elem:2
-    float* lbvh_nodes = nullptr;  // per:body arena:scratch owner:data elem:9
+    float* lbvh_nodes = nullptr;  // per:scalar arena:scratch owner:data count:lbvh_node_count
     uint32_t* lbvh_morton = nullptr;  // per:body arena:scratch owner:data
     uint32_t* lbvh_index = nullptr;  // per:body arena:scratch owner:data
     uint32_t* lbvh_visit = nullptr;  // per:body arena:scratch owner:data
@@ -195,6 +195,8 @@ struct DataView {
     uint32_t* ucontact_a = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
     uint32_t* ucontact_b = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
     uint32_t* ucontact_gen = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    ::nuka::math::Vec3* ucontact_tangent1 = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    ::nuka::math::Vec3* ucontact_tangent2 = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
 };
 
 } // namespace nuka::phi

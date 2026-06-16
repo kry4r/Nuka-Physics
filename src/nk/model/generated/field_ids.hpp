@@ -71,7 +71,7 @@ enum class FieldId : uint16_t {
     BodyAabbHi,  // body_aabb_hi (per:body arena:scratch owner:data)
     PairCount,  // pair_count (per:env arena:scratch owner:data)
     CandidatePairs,  // candidate_pairs (per:contact_slot arena:scratch owner:data elem:2)
-    LbvhNodes,  // lbvh_nodes (per:body arena:scratch owner:data elem:9)
+    LbvhNodes,  // lbvh_nodes (per:scalar arena:scratch owner:data count:lbvh_node_count)
     LbvhMorton,  // lbvh_morton (per:body arena:scratch owner:data)
     LbvhIndex,  // lbvh_index (per:body arena:scratch owner:data)
     LbvhVisit,  // lbvh_visit (per:body arena:scratch owner:data)
@@ -171,6 +171,8 @@ enum class FieldId : uint16_t {
     UcontactB,  // ucontact_b (per:contact_slot arena:scratch owner:data elem:4)
     UcontactGen,  // ucontact_gen (per:contact_slot arena:scratch owner:data elem:4)
     Heights,  // heights (per:scalar arena:persistent owner:model count:max_heightfield_cells)
+    UcontactTangent1,  // ucontact_tangent1 (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactTangent2,  // ucontact_tangent2 (per:contact_slot arena:scratch owner:data elem:4)
     Count
 };
 

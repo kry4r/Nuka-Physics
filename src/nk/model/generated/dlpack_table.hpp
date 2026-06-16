@@ -87,7 +87,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyAabbHi, DlpackDtype::kF32, 2, false, false},  // body_aabb_hi
     {FieldId::PairCount, DlpackDtype::kU32, 1, false, false},  // pair_count
     {FieldId::CandidatePairs, DlpackDtype::kU32, 2, false, false},  // candidate_pairs
-    {FieldId::LbvhNodes, DlpackDtype::kF32, 2, false, false},  // lbvh_nodes
+    {FieldId::LbvhNodes, DlpackDtype::kF32, 1, false, false},  // lbvh_nodes
     {FieldId::LbvhMorton, DlpackDtype::kU32, 1, false, false},  // lbvh_morton
     {FieldId::LbvhIndex, DlpackDtype::kU32, 1, false, false},  // lbvh_index
     {FieldId::LbvhVisit, DlpackDtype::kU32, 1, false, false},  // lbvh_visit
@@ -187,6 +187,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::UcontactB, DlpackDtype::kU32, 2, false, false},  // ucontact_b
     {FieldId::UcontactGen, DlpackDtype::kU32, 2, false, false},  // ucontact_gen
     {FieldId::Heights, DlpackDtype::kF32, 1, false, false},  // heights
+    {FieldId::UcontactTangent1, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent1
+    {FieldId::UcontactTangent2, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent2
 };
 
 } // namespace nuka::nk

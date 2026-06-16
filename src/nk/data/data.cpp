@@ -95,6 +95,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::UcontactA:           v.ucontact_a = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactB:           v.ucontact_b = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactGen:         v.ucontact_gen = static_cast<uint32_t*>(p); break;
+        // C4 (general contact pipeline Phase 1A): per-point tangent basis for the
+        // unified PairDriven contact buffer (ComputeUnionContactTangentBasisKernel).
+        case FieldId::UcontactTangent1:    v.ucontact_tangent1 = static_cast<math::Vec3*>(p); break;
+        case FieldId::UcontactTangent2:    v.ucontact_tangent2 = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCount:            v.row_count = static_cast<uint32_t*>(p); break;
         case FieldId::Urows:               v.urows = static_cast<float*>(p); break;
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;

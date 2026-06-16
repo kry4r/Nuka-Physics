@@ -92,6 +92,15 @@ struct ConvexHullView {
     const float* verts = nullptr;   // flat x,y,z triples (count*3 floats)
     uint32_t     vcount = 0u;       // vertex count
     amf::PrimFrame frame;           // mesh-local -> world (baked, HD-clean)
+    // G2 (general-heightfield TRIANGLE_PRISM): the solid -Z extrusion depth, in
+    // the hull's LOCAL frame (mirrors Newton support_function.py:167-174 which
+    // extrudes the triangle along local -Z to make a SOLID prism so GJK/EPA
+    // resolves shapes resting on the top face without tunnelling through the
+    // back). Used ONLY by SupportTrianglePrism (SupportKind::TrianglePrism); the
+    // first 3 `verts` are the triangle, the support adds local (0,0,-extrude)
+    // when the query direction points -Z. extrude == 0 (default) makes the prism
+    // a flat triangle, so a non-prism ConvexHullView is byte-unchanged.
+    float        extrude = 0.0f;
     // M4 DEVICE-ONLY opt-in: when true, SupportHull runs its vertex scan
     // WARP-COOPERATIVELY (lanes split the pool, exact lowest-index argmax
     // reduce — bit-identical result). REQUIREMENT: every caller up the GJK
@@ -202,13 +211,51 @@ NUKA_CVX_HD inline Vec3 SupportCapsule(const amf::PrimParams& c, Vec3 dir) {
     return seg + amf::Norm(dir, Vec3::UnitX()) * c.radius;
 }
 
+// Triangle-prism support (G2, the general-heightfield per-cell collider). The
+// first 3 `verts` of the ConvexHullView are the triangle (mesh-local); the prism
+// is the triangle extruded `extrude` along the hull's LOCAL -Z to make it SOLID.
+// Mirrors Newton support_function.py:148-174: 3-vert max-dot (LOWEST-index tie-
+// break -> D1, like SupportHull), then if the query direction points along the
+// triangle's local -Z, add the extruded offset. The 3-vert scan is in WORLD
+// space (Vertex() bakes the frame), and the extrude offset is the frame's local
+// -Z column scaled by `extrude` -- so the whole shape rotates/translates with the
+// frame exactly like every other support. Rides the SAME GJK/EPA/BuildConvex
+// Manifold (a prism HAS a flat face, so HasFace() face-clip applies).
+NUKA_CVX_HD inline Vec3 SupportTrianglePrism(const ConvexHullView& h, Vec3 dir,
+                                             uint32_t* out_idx) {
+    // 3-vert max-dot with a fixed-order, strict-`>` (lowest-index) tie-break.
+    const Vec3 v0 = h.Vertex(0u);
+    const Vec3 v1 = h.Vertex(1u);
+    const Vec3 v2 = h.Vertex(2u);
+    const float d0 = v0.Dot(dir);
+    const float d1 = v1.Dot(dir);
+    const float d2 = v2.Dot(dir);
+    uint32_t best = 0u;
+    float best_d = d0;
+    Vec3 best_v = v0;
+    if (d1 > best_d) { best_d = d1; best = 1u; best_v = v1; }
+    if (d2 > best_d) { best_d = d2; best = 2u; best_v = v2; }
+    // Solid -Z extrusion: when the support direction points along the triangle's
+    // LOCAL -Z, the deepest point is on the bottom face. h.frame.cz is the local
+    // +Z axis in world; the local -Z direction is -cz. Test dir against local -Z.
+    if (h.extrude > 0.0f && dir.Dot(h.frame.cz) < 0.0f) {
+        best_v = best_v - h.frame.cz * h.extrude;
+    }
+    if (out_idx) *out_idx = best;
+    return best_v;
+}
+
 // ---------------------------------------------------------------------------
 // SupportProxy -- a tagged union so ONE GJK/EPA path handles hull-vs-hull AND
 // hull-vs-primitive. The handler fills two of these (one per side). No virtuals
 // (device-clean) -- a kind tag + the two possible payloads (a view ptr / a prim
 // ptr). The support() dispatch is a small fixed switch.
 // ---------------------------------------------------------------------------
-enum class SupportKind : uint8_t { Hull = 0, Box = 1, Sphere = 2, Capsule = 3 };
+// TrianglePrism (G2) reuses the `hull` payload (its first 3 verts + frame +
+// extrude); it is a hull-like side (HasFace() == true) for the face-clip.
+enum class SupportKind : uint8_t {
+    Hull = 0, Box = 1, Sphere = 2, Capsule = 3, TrianglePrism = 4
+};
 
 struct SupportProxy {
     SupportKind kind = SupportKind::Hull;
@@ -221,18 +268,21 @@ struct SupportProxy {
             case SupportKind::Box:    if (out_idx) *out_idx = 0u; return SupportBox(*prim, dir);
             case SupportKind::Sphere: if (out_idx) *out_idx = 0u; return SupportSphere(*prim, dir);
             case SupportKind::Capsule:if (out_idx) *out_idx = 0u; return SupportCapsule(*prim, dir);
+            case SupportKind::TrianglePrism: return SupportTrianglePrism(*hull, dir, out_idx);
         }
         if (out_idx) *out_idx = 0u;
         return Vec3::Zero();
     }
     // Center-ish interior point (a deterministic seed for the first GJK dir).
     NUKA_CVX_HD Vec3 Center() const {
-        if (kind == SupportKind::Hull) return hull->frame.t;
+        if (kind == SupportKind::Hull || kind == SupportKind::TrianglePrism)
+            return hull->frame.t;
         return prim->frame.t;
     }
     // Does this side have a flat polygonal supporting face worth clipping?
     NUKA_CVX_HD bool HasFace() const {
-        return kind == SupportKind::Hull || kind == SupportKind::Box;
+        return kind == SupportKind::Hull || kind == SupportKind::Box ||
+               kind == SupportKind::TrianglePrism;
     }
 };
 

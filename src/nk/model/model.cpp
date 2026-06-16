@@ -107,6 +107,16 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::Heights) {
             return static_cast<uint64_t>(max_heightfield_cells);
         }
+        // LBVH per-env Karras tree: (2N-1) nodes/env (N = bodies_per_env), 9 f32
+        // lanes/node, env_count envs. The kernel strides by env*(2N-1) so the
+        // array MUST be env_count*(2N-1) nodes (the prior per:body N-node sizing
+        // undersized it by N-1 nodes/env). N<2 -> no tree -> 0 nodes (the build
+        // early-exits for N<2). 9 f32/node packs the LbvhNode {3 i32 + 6 f32}.
+        if (id == FieldId::LbvhNodes) {
+            const uint32_t n = max_bodies_total;
+            const uint64_t nodes_per_env = (n >= 2u) ? (2ull * n - 1ull) : 0ull;
+            return nodes_per_env * 9ull * static_cast<uint64_t>(env_count);
+        }
         return static_cast<uint64_t>(env_count);
     }
     const uint64_t per_env = PerEnvCount(lay.per);

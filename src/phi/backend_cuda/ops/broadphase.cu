@@ -308,6 +308,20 @@ __device__ __forceinline__ bool Overlaps(const collision::AABB& a,
     return true;
 }
 
+// R4: signed collision-GROUP filter. Port of Newton broad_phase_common.py:132-
+// 150 test_group_pair, with ONE Nuka divergence: group == 0 is the UNGROUPED
+// default (collide-all), NOT Newton's "never collide" -- the cook fills group 0
+// for every cooked + static collidable (cook_to_model.cpp:755,838 "group 0 ==
+// the default collide-all group"), so the default scene must collide artic <->
+// free-rigid <-> static. Non-zero groups then follow Newton's signed semantics:
+//   positive group: collides with the SAME positive group OR any negative group.
+//   negative group: collides with everything EXCEPT its own negative counterpart.
+__device__ __forceinline__ bool TestGroupPair(int32_t ga, int32_t gb) {
+    if (ga == 0 || gb == 0) return true;        // ungrouped default == collide-all
+    if (ga > 0) return ga == gb || gb < 0;
+    /* ga < 0 */ return ga != gb;
+}
+
 // Binary search a key in the ASCENDING excluded_pairs list.
 __device__ __forceinline__ bool IsExcluded(const uint64_t* keys, uint32_t n,
                                            uint64_t key) {
@@ -373,6 +387,13 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                     const bool mask = ((sa.contype & sb.conaffinity) != 0u) ||
                                       ((sb.contype & sa.conaffinity) != 0u);
                     if (!mask) continue;
+                    // R4: signed collision-group filter (default group 0 ==
+                    // collide-all). The group lane is stored as a u32 bit-pattern;
+                    // reinterpret as signed for the Newton signed semantics.
+                    if (!TestGroupPair(static_cast<int32_t>(sa.group),
+                                       static_cast<int32_t>(sb.group))) {
+                        continue;
+                    }
                     const uint32_t a32 = static_cast<uint32_t>(my_body);
                     const uint32_t b32 = static_cast<uint32_t>(ob);
                     const uint64_t key =
