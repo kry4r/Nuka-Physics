@@ -21,33 +21,12 @@ include(GoogleTest)
 #
 # SHARED VALIDATED-NOT-WIRED SOURCES
 # ----------------------------------
-# src/collision/contact_stream_driver.cpp + src/scene/cook/union_nk_model.cpp are
-# host C++ sources that live in the `nuka` SHARED C-ABI lib but are NOT in any of
-# the static nk libs the test exes link. They were previously compiled as an
-# extra-source into ~8 separate test exes (one redundant TU each). They are now
-# folded into ONE static support lib the category exes link, eliminating the
-# duplication. contact_stream_driver.cpp keeps the production lib's -w (it is a
-# byte-exact gate-pinned source never written under the strict test warning set).
-# Guarded by CMAKE_CUDA_COMPILER because it needs nuka_codegen's generated
-# collidable_registry.hpp + the nk/cook libs (all CUDA-region targets); the only
-# consumers (the union/foot perf+scenario gates) are themselves CUDA-region.
-if(CMAKE_CUDA_COMPILER)
-    add_library(nuka_test_validated_sources STATIC
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-        ${CMAKE_SOURCE_DIR}/src/scene/cook/union_nk_model.cpp
-    )
-    add_dependencies(nuka_test_validated_sources nuka_codegen)
-    set_source_files_properties(
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-        PROPERTIES COMPILE_OPTIONS "-w"
-    )
-    target_include_directories(nuka_test_validated_sources
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    # union_nk_model.cpp pulls the nk model + cook headers; link them PUBLIC so any
-    # exe that links this support lib transitively gets the cook/nk symbol set it
-    # needs (the union grasp gates list nuka_scene_cook first explicitly anyway).
-    target_link_libraries(nuka_test_validated_sources PUBLIC nuka_scene_cook nuka_nk)
-endif()
+# L1-c: the nuka_test_validated_sources static support lib was DELETED. It existed
+# to fold src/scene/cook/union_nk_model.cpp (the UnionCsr BuildNkUnionModel bridge)
+# + contact_stream_driver.cpp into ONE lib for the union grasp/perf gates. The
+# union path + union_nk_model.cpp are gone (cup-grasping moved to RL); the foot
+# collision/solver gates that still need contact_stream_driver.cpp compile it
+# directly as a per-exe extra source (they always did), so no shared lib remains.
 
 # --- Smoke test -----------------------------------------------------------
 add_executable(nuka_smoke_test
@@ -512,10 +491,13 @@ gtest_discover_tests(nuka_compliant_rows_test
 # nk::SolveSchedule::Partition) and is exercised end-to-end by the byte-exact nk
 # union gates + the nk_solve_harness foot_*/link_rigid device-solve tests.
 add_executable(nuka_solver_test
-    # M4 re-point: the nk-driven UnifiedSolve oracle scenarios
-    # (test_unified_solve.cpp NkWorld* cases mirror every deleted UnifiedSolve.*
-    # assertion via the nk path).
-    solver/test_unified_solve.cpp
+    # L1-c: test_unified_solve.cpp was DELETED. It was WHOLLY a UnionCsr box-on-
+    # plane oracle (MakeNkBoxModel built an nk::UnionSlot kBodyBoxPlane model with
+    # contact_family=UnionCsr + union_solref/solimp -- all deleted with the
+    # UnionCsr path). The general (PairDriven) box-rests-on-static-ground +
+    # solref/solimp + friction-pyramid + D1 coverage lives in
+    # scenario/pairdriven_solve.cpp (nuka_scenario_test). See the L1-c report:
+    # this file was on the "keep" list but had no general-path content to preserve.
     # v0.8 C5b-core: ArticulationChainJ reaction arm wired into UnifiedSolve
     # (closed-form chain oracle + same-articulation coloring + link<->rigid two-
     # way + D1). Hand-built ArticulationReactionState data (no device CRBA).
@@ -799,25 +781,15 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # --- M4: nk_union_n1 — the ≤5 ms/step hard perf gate (N=1 union full
-    # contact, 1000 StepPlanned steps). M7: the union scene is cooked from the
-    # authored .nks (scene::cook::CookSceneToUnionTemplate), NO factory.
-    # Asset-gated SKIP.
-    # M9 T11-core-b2: the legacy coresident .cpp (batched_unified_world /
-    # unified_coresident_stepper) are GONE. The union bridge is now self-contained
-    # in src/scene/cook/ (union_nk_model.cpp + the UnionSceneTemplate/CoResident*
-    # descriptors in the cook headers); this gate only needs union_nk_model.cpp +
-    # the contact_stream_driver it links.
     # =====================================================================
     # CATEGORY EXE 3/5: nuka_perf_test -- throughput / timing GATES.
-    # Consolidates: nk_union_n1 (<=5ms + grasp >=11k eps), go2_4096env step-time,
-    # cuda_perf (lbvh 50k / 1M particles), perf_timing infra, rt_two_level_bench.
-    # union_nk_model.cpp + contact_stream_driver.cpp come from the shared
-    # nuka_test_validated_sources lib (no per-exe duplication). The RT bench source
-    # keeps its per-file -ffp-contract=off (host==device bit-exact oracle).
+    # Consolidates: go2_4096env step-time, cuda_perf (lbvh 50k / 1M particles),
+    # perf_timing infra, rt_two_level_bench. L1-c DELETED nk_union_n1.cpp (the
+    # <=5ms/step + grasp throughput UnionCsr gate) with the UnionCsr path, so this
+    # exe no longer links the union bridge (nuka_test_validated_sources). The RT
+    # bench source keeps its per-file -ffp-contract=off (host==device bit-exact).
     # =====================================================================
     add_executable(nuka_perf_test
-        perf/nk_union_n1.cpp
         perf/test_go2_4096env_step_time.cpp
         perf/test_lbvh_50k_bodies.cpp
         perf/test_1m_particles_grid_perf.cpp
@@ -835,9 +807,8 @@ if(CMAKE_CUDA_COMPILER)
             ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(nuka_perf_test
         PRIVATE
-            # the union cook + validated-not-wired bridge (listed first so the
-            # union_nk_model TU's symbols resolve against the cook).
-            nuka_test_validated_sources
+            # L1-c: nuka_test_validated_sources (the union_nk_model bridge) was
+            # dropped here with nk_union_n1.cpp (the UnionCsr perf gate).
             nuka_scene_cook
             nuka_nk
             nuka_phi2
@@ -861,23 +832,18 @@ if(CMAKE_CUDA_COMPILER)
 
     # =====================================================================
     # CATEGORY EXE 2/5: nuka_scenario_test -- physics integration SCENARIOS.
-    # Consolidates the nk-physics integration cluster: the coupled grasp/soft/fluid
-    # co-step gates, nk particle/soft-fluid equivalence, cook-settle determinism,
-    # the PBD/coupling co-step framework, AND the two .nks-cooked union grasp gates
-    # (h1_grasp_lift force-balance/BITE/D1 + union_cook_golden cook-fidelity).
-    # union_nk_model.cpp + contact_stream_driver.cpp come from the shared
-    # nuka_test_validated_sources lib (no per-exe duplication). All sources are
+    # Consolidates the nk-physics integration cluster: cook-settle determinism, nk
+    # particle/soft-fluid equivalence, the multi-dog + PairDriven general-path
+    # gates, and the general-path V-PROOFs. L1-c DELETED the UnionCsr-path members
+    # (coupled_grasp_soft / test_coupling_framework / test_pbd_costep_unified --
+    # the hand-assembled UnionSlot co-step gates -- plus the .nks union grasp gates
+    # h1_grasp_lift / union_cook_golden); cup-grasping moved to RL. All sources are
     # anon-namespaced with distinct TEST suites (no ODR / name collision -- M9 T14).
     # =====================================================================
     add_executable(nuka_scenario_test
-        scenario/coupled_grasp_soft.cpp
         scenario/cook_settle_determinism.cpp
         scenario/nk_particle_equivalence.cpp
         scenario/nk_soft_fluid_coresidence.cpp
-        coupling/test_coupling_framework.cpp
-        coupling/test_pbd_costep_unified.cpp
-        scenario/h1_grasp_lift.cpp
-        scenario/union_cook_golden.cpp
         # Multi-articulation co-residence + GENERAL-PATH collision: K Go2
         # articulations co-resident in ONE env of ONE general nk::World. Proves K
         # articulations co-step finite + INDEPENDENT, AND collide via the GENERAL
@@ -903,11 +869,10 @@ if(CMAKE_CUDA_COMPILER)
         # EDGE settles finite + no 穿模 (the exact gate2 explosion fix); per-cell
         # TRIANGLE_PRISM contacts via the EXISTING cvx GJK/EPA; two-run identity.
         scenario/pairdriven_heightfield.cpp
-        # V-PROOF (one-general-solver-spec §4/§L0): equivalence harness proving the
-        # GENERAL contact path (PairDriven + CookHeightfieldGrid) reproduces the
-        # LEGACY private paths (FusedFoot feet-on-ground / terrain) to a physical
-        # tolerance BEFORE the family collapse re-baselines the goldens. A FAIL with
-        # precise per-joint/contact diagnostics is the intended, valuable outcome.
+        # V-PROOF (one-general-solver-spec §4/§L0): physical-validity harness for the
+        # GENERAL contact path (PairDriven + CookHeightfieldGrid) on go2 feet-on-
+        # ground / terrain. (L1-b deleted the FUSED reference half; these now assert
+        # the general path alone is finite + feet-load + no-sink.)
         scenario/vproof_go2_ground.cpp
         scenario/vproof_go2_terrain.cpp
         scenario/vproof_h1_grasp.cpp
@@ -923,9 +888,9 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(nuka_scenario_test
         PRIVATE
-            # the union cook + validated-not-wired bridge first (so union_nk_model's
-            # symbols resolve against the cook for h1_grasp_lift / union_cook_golden).
-            nuka_test_validated_sources
+            # L1-c: nuka_test_validated_sources (the union_nk_model bridge) was
+            # dropped here -- the UnionCsr grasp gates are deleted; the surviving
+            # general-path V-PROOF cooks via nuka_scene_cook's CookToModel.
             nuka_scene_cook
             # M11 VIEW-4/6: the frame-loop spine (Simulation / systems / publisher /
             # ApplyMoveEntity) for viewer_move_entity. nuka_app pulls nuka_render for
@@ -2495,41 +2460,11 @@ if(NK_BUILD_VULKAN_VALIDATION)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # M10 Phase A -- THE HEADLINE DEMO EXE: h1_grasp_video. The unified offscreen
-    # C++ video tool that renders the proven 51-DOF H1 cup-grasp choreography
-    # (h1_grasp_lift's TableTorque drive, shared via examples/demo/h1_grasp_driver.hpp)
-    # to a PBR-beautiful PPM sequence on lavapipe (cup + H1 visual MESHES, hero
-    # camera, studio ground). Hand-builds a RenderWorld binding the union model's
-    # link/body pose rows to the import-time visual triangles (CR-2 option A; the
-    # union cook emits no SceneMap). NOT a gtest -- a real `main()` exe. Same link
-    # set as render_physics_parity (nk physics + nuka_render). Behind
-    # NK_BUILD_VULKAN_VALIDATION (real Vulkan device).
-    add_executable(nuka_h1_grasp_video
-        ${CMAKE_SOURCE_DIR}/examples/demo/h1_grasp_video.cpp
-    )
-    add_dependencies(nuka_h1_grasp_video nuka_codegen)
-    target_compile_definitions(nuka_h1_grasp_video
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_h1_grasp_video
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_h1_grasp_video
-        PRIVATE
-            nuka_test_validated_sources  # BuildNkUnionModel (union_nk_model.cpp)
-            nuka_app
-            nuka_scene_cook
-            nuka_render
-            nuka_nk
-            nuka_phi2
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
+    # L1-c: the nuka_h1_grasp_video demo exe (examples/demo/h1_grasp_video.cpp +
+    # h1_grasp_driver.hpp) was DELETED with the UnionCsr path -- it rendered the
+    # UnionCsr cup-grasp choreography via BuildNkUnionModel (union_nk_model.cpp,
+    # gone). Cup-grasping moved to RL; the grasp video will be re-authored on the
+    # general path once the RL grip is trained.
 
     # M10 Phase A -- THE SECOND HEADLINE DEMO EXE: go2_walk_video. A unified
     # offscreen C++ video tool that POSE-REPLAYS the proven, golden-validated Go2
@@ -2634,36 +2569,10 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
-    # M10 RL feasibility gate (SG-spec G1d) -- union_throughput: measure batched
-    # H1+cup+table UNION env-steps/sec at N in {1,64,256,1024}. Cooks the union
-    # once, BuildNkUnionModel(tmpl,N) -> nk::World -> StepPlanned loop + timing +
-    # N>1 finite-q check. No Vulkan (shares the gated link set for the cook symbols).
-    add_executable(nuka_union_throughput
-        ${CMAKE_SOURCE_DIR}/examples/demo/union_throughput.cpp
-    )
-    add_dependencies(nuka_union_throughput nuka_codegen)
-    target_compile_definitions(nuka_union_throughput
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_union_throughput
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_union_throughput
-        PRIVATE
-            nuka_test_validated_sources  # BuildNkUnionModel (union_nk_model.cpp)
-            nuka_app
-            nuka_scene_cook
-            nuka_render
-            nuka_nk
-            nuka_phi2
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
+    # L1-c: the nuka_union_throughput demo exe (examples/demo/union_throughput.cpp)
+    # was DELETED with the UnionCsr path -- it measured batched UnionCsr
+    # H1+cup+table throughput via BuildNkUnionModel (union_nk_model.cpp, gone). The
+    # GENERAL-path throughput floor is now measured by vproof_go2_throughput below.
 
     # V-PROOF throughput gate (one-general-solver-spec §4) -- vproof_go2_throughput:
     # measure the GENERAL-path (PairDriven + flat heightfield) go2 env-steps/sec at
@@ -2682,7 +2591,8 @@ if(NK_BUILD_VULKAN_VALIDATION)
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(vproof_go2_throughput
         PRIVATE
-            nuka_test_validated_sources
+            # L1-c: dropped nuka_test_validated_sources (the deleted union bridge)
+            # -- this general-path throughput exe cooks via nuka_scene_cook only.
             nuka_app
             nuka_scene_cook
             nuka_render
@@ -2713,7 +2623,8 @@ if(NK_BUILD_VULKAN_VALIDATION)
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(lreconb_cook_profile
         PRIVATE
-            nuka_test_validated_sources
+            # L1-c: dropped nuka_test_validated_sources (the deleted union bridge)
+            # -- this general-path cook profiler cooks via nuka_scene_cook only.
             nuka_app
             nuka_scene_cook
             nuka_render

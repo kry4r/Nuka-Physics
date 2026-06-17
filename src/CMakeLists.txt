@@ -638,24 +638,23 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/cuda_buffer.cu
         phi/backend_cuda/ops/registry.cu
         # M3b articulation pipeline op implementations (line-by-line kernel
-        # ports; see each file's header). M4 adds the union-family contact
-        # pipeline (contacts_union / assemble_rows / solve_rows — the §3.4
-        # device-resident unified row solve, replacing the transitional
-        # solve_articulated.cu).
+        # ports; see each file's header). The contact pipeline (assemble_rows /
+        # solve_rows — the §3.4 device-resident unified row solve). L1-c DELETED
+        # contacts_union.cu (the UnionCsr narrowphase) with the rest of the
+        # UnionCsr path; PairDriven is the one general contact path.
         phi/backend_cuda/ops/articulation.cu
         phi/backend_cuda/ops/crba.cu
         phi/backend_cuda/ops/contacts_foot.cu
-        phi/backend_cuda/ops/contacts_union.cu
         # General contact pipeline Phase 0 (B2): SyncLinkBodyPose — copies each
         # articulation link's FK world pose into its owning body_pose row so artic
-        # links enter the LBVH. PairDriven-family-gated (inert for the FusedFoot /
-        # UnionCsr graphs); present-but-inert in Phase 0.
+        # links enter the LBVH. PairDriven-family-gated (inert for the UnionCsr
+        # graph; L1-b: PairDriven is now the general default).
         phi/backend_cuda/ops/sync_body_pose.cu
         # General contact pipeline Phase 2 (H3): the GENERAL heightfield narrowphase
         # — per-cell TRIANGLE_PRISM midphase routed through the EXISTING cvx GJK/EPA
         # (no terrain-type-specific contact code; the prism corner heights come from
         # the cooked `heights` grid, never an in-kernel SampleTerrainHeight).
-        # PairDriven-family-gated (inert for FusedFoot/UnionCsr).
+        # PairDriven-family-gated (inert for UnionCsr).
         phi/backend_cuda/ops/narrowphase_heightfield.cu
         # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
         # + generalized pair-driven narrowphase (analytic prim set + sphere x
@@ -745,14 +744,9 @@ if(CMAKE_CUDA_COMPILER)
         # rest seat). Pure host C++ (the World device work goes through phi v2).
         scene/cook/settle.cpp
         scene/cook/placement.cpp
-        # M7 T4 (THE CRUX): CookSceneToUnionTemplate — the .nks h1_cup_table ->
-        # union UnionSceneTemplate cook that REPLACES the 1026-line
-        # h1_union_scene_factory authoring (reads the baked settled IC + grasp
-        # config instead of running FK/placement/settle). Produces the
-        # coresident::UnionSceneTemplate BuildNkUnionModel consumes (that + the
-        # struct stay alive to M9 per R1/R2/R3). Pure host C++; the coresident dep
-        # is header-only product types (no kernels).
-        scene/cook/union_cook.cpp
+        # L1-c: union_cook.cpp (CookSceneToUnionTemplate — the .nks h1_cup_table
+        # -> UnionSceneTemplate cook) was DELETED with the UnionCsr path. The one
+        # general cook is cook_to_model.cpp (CookSceneToModel -> PairDriven).
     )
     set_target_properties(nuka_scene_cook PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

@@ -196,56 +196,21 @@ struct ModelMaterialBucket {
 
 // Which contact pipeline this Model runs through the AssembleRows /
 // SolveRowsBlockIsland ops:
-//   FusedFoot — the M3 articulation foot pipeline (sphere x ground detection,
-//               ArticulatedContactRow records, the fused block-per-articulation
-//               PGS — the legacy batched articulated foot semantics, goldens
-//               byte-exact).
+//   FusedFoot — DEAD (L1-b): the legacy M3 articulation foot pipeline runtime
+//               was DELETED. The enum value is retained (not renumbered) until
+//               the L1-d enum collapse; no runtime branch reads it anymore.
 //   UnionCsr  — the union compliant-CSR pipeline (feet x ground + finger x
 //               hull + box x plane in ONE solve — the legacy coresident union
 //               world semantics).
 //   PairDriven — the M5 generalized broadphase->narrowphase pipeline (per-env
 //               LBVH candidate_pairs -> analytic prim dispatch + SDF main path).
-//               ADDITIVE; the union slot-template path is untouched.
+//               The GENERAL default for every non-union cooked model.
 enum class ContactFamily : uint8_t { FusedFoot = 0, UnionCsr = 1, PairDriven = 2 };
 
-// One union contact-pair slot (the per-env contact template, replicated across
-// envs; the legacy UnionSceneTemplate fingertips/feet/table classes 1:1).
-// Worst-case manifold points: sphere classes -> 1, box x plane -> 4. Each point
-// expands to 1 normal row + (condim>=2 ? 2*(condim-1) : 0) friction-spoke rows
-// (the EmitCompliantContactRows layout: ALL normals first, then ALL spokes).
-struct UnionSlot {
-    enum Class : uint32_t {
-        kInactive       = 0,
-        kFootSpherePlane = 1,  // artic sphere (link+offset+radius) x +Z plane.
-        kFingerSphereHull = 2, // artic sphere x convex hull on body `body`.
-        kBodyBoxPlane   = 3,   // rigid box (body+offset+half) x +Z plane.
-        // M6 particle coupling classes: side a == a PARTICLE sphere (the slot's
-        // `link` field carries the LOCAL particle index; detection forms its
-        // world pos from particle_pos[env*particles_per_env + link]); side b is
-        // a static +Z plane (kParticleSpherePlane) or a rigid box (the slot's
-        // `body` field; kParticleSphereBox). Radius == particle contact radius.
-        kParticleSpherePlane = 4,  // particle sphere x +Z plane (static floor).
-        kParticleSphereBox   = 5,  // particle sphere x rigid box (body+offset+half).
-    };
-    uint32_t   cls = kInactive;
-    uint32_t   link = ~0u;            // template-local link (sphere classes).
-    uint32_t   body = ~0u;            // template-local body row (hull owner / box).
-    uint32_t   condim = 3;            // 1 (frictionless) or 3 (4 spokes).
-    math::Vec3 offset{};              // sphere local offset / box-center offset.
-    float      radius = 0.0f;         // sphere radius.
-    math::Vec3 box_half{};            // box half extents (kBodyBoxPlane).
-    float      plane_height = 0.0f;   // +Z plane height (ground / table z).
-    float      mu = 0.5f;             // per-class friction stamp (RowMaterial.friction).
-    uint32_t   flags = 0;             // bit0: emission gated on the table_enabled field.
-
-    // Worst-case manifold points / rows for this slot.
-    uint32_t MaxPoints() const { return cls == kBodyBoxPlane ? 4u : 1u; }
-    uint32_t RowsPerPoint() const {
-        return 1u + (condim >= 2u ? 2u * (condim - 1u) : 0u);
-    }
-    uint32_t MaxRows() const { return MaxPoints() * RowsPerPoint(); }
-};
-inline constexpr uint32_t kUnionSlotGatedOnTable = 1u;  // UnionSlot::flags bit0.
+// L1-c: the UnionSlot struct (the legacy union contact-pair template) + the
+// kUnionSlotGatedOnTable flag were DELETED here together with the entire UnionCsr
+// row-assembly pipeline. The ONE general path is PairDriven (broadphase ->
+// narrowphase manifolds -> EmitPairDrivenRows), which carries no slot template.
 
 // H1 (general contact pipeline Phase 0): the general heightfield collidable's
 // grid descriptor POD, mirroring Newton's HeightfieldData (utils/heightfield.py).
@@ -387,19 +352,19 @@ public:
     ModelParticles particles;
 
     // -- M4: contact family + union (CSR compliant) tables --------------------
-    ContactFamily contact_family = ContactFamily::FusedFoot;
+    // L1-b: the FUSED runtime path is deleted; PairDriven is the general default.
+    // (The FusedFoot enum value is retained but dead until the L1-d enum collapse.)
+    ContactFamily contact_family = ContactFamily::PairDriven;
     // Drive mode the ApplyDrives op runs (0 = position PD hold drive, the M3
     // batched articulated path; 1 = direct torque drive, the union world's
     // LaunchApplyTorqueDriveKernels path — drive_target carries the torque).
     uint32_t drive_mode = 0;
-    std::vector<UnionSlot> union_slots;   // per-env contact-pair template.
     std::vector<float>     hull_verts;    // mesh-local hull verts (xyz packed).
-    // Merged contact params for the union rows (the legacy BuildContactManifolds
-    // MergeContactParams(default,default) product — per-class mu comes from the
-    // slot's mu stamp, exactly as the legacy class stamp overwrote it).
-    float union_solref[2] = {0.02f, 1.0f};
-    float union_solimp[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
-    bool  table_enabled_default = true;   // seeds the per-env table_enabled field.
+    // The ONE general path's contact-compliance defaults (solref/solimp). The
+    // PairDriven row emitter (EmitPairDrivenRows) feeds these to ComputeCompliantRow.
+    // (L1-c renamed these from union_solref/union_solimp; the values are unchanged.)
+    float contact_solref[2] = {0.02f, 1.0f};
+    float contact_solimp[5] = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
     // Per-env movable rigid body initial state (template; replicated env-major).
     struct BodyInit {
         math::Transform pose = math::Transform::Identity();

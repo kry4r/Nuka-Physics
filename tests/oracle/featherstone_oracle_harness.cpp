@@ -813,7 +813,19 @@ TEST(FeatherstoneOracle, NkWorldGo2Stand5sMatchesGoldenAndLegacyByteExact) {
     // solve degrades to EXACTLY the legacy ApplyImplicitJointDamping float
     // sequence — documented in articulation_contacts.cu).
     auto MakeStandWorld = [&]() {
-        auto cooked = nuka::scene::cook::CookToModel(scene, 1);
+        // Contacts OFF: the legacy single-env path runs enable_contacts == false.
+        // On the general (PairDriven) path this is a CONTACTS-OFF cook -- it zeroes
+        // the contact budget so the pipeline emits NO broadphase/narrowphase/solve
+        // (the general cook would otherwise add the go2 links + a static ground as
+        // collidables, generating spurious link-vs-ground contacts AND a thrust-LBVH
+        // broadphase that cannot be CUDA-graph-captured). The world then runs pure
+        // articulation dynamics (FK -> CRBA -> implicit joint damping -> integrate),
+        // byte-identical to the legacy reference + the MJX golden, and StepPlanned
+        // captures cleanly. feet.clear() is kept (belt-and-suspenders; the foot
+        // table is now also never read).
+        nuka::scene::cook::CookToModelOptions opts;
+        opts.enable_contacts = false;
+        auto cooked = nuka::scene::cook::CookToModel(scene, 1, opts);
         cooked.model.feet.clear();
         nk::Pipeline::SolverConfig cfg;
         cfg.dt = kDt;

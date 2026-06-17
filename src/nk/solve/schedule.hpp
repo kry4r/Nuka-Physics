@@ -66,7 +66,7 @@ struct ScheduleRow {
     // SECOND articulation key here so the union-find merges BOTH sides' islands
     // into one component (they share mutable qdot state and must serialize). ~0u
     // for a single-artic row (foot / artic x rigid / artic x static) — identical
-    // to the legacy single-key behaviour, so the Union/Fused schedules are
+    // to the legacy single-key behaviour, so the Union schedule is
     // unchanged at K==1.
     uint32_t artic_b = ~0u;      // second articulation index (side B) or ~0u
 };
@@ -86,7 +86,7 @@ struct SolveScheduleResult {
 
 class SolveSchedule {
 public:
-    // Build the worst-case schedule for `model` (union family; a FusedFoot /
+    // Build the worst-case schedule for `model` (union / pair-driven family; a
     // contact-free model yields an empty schedule) and write the triple +
     // counts into the model's schedule_* host tables (staged into the Model
     // device buffer by Model::UploadTo). Deterministic: same model -> byte-same
@@ -99,13 +99,8 @@ public:
                                          const std::vector<uint32_t>& row_env);
 };
 
-// The shared slot-layout contract between SolveSchedule and the AssembleRows
-// op: per env, union slot s expands to MaxRows() consecutive row slots laid
-// out as ALL normal rows first (one per worst-case manifold point), then the
-// friction spokes (per point, 2*(condim-1) each, +t0,-t0,+t1,-t1 order) — the
-// EmitCompliantContactRows per-manifold layout on fixed slots. Returns the
-// per-env row-slot base offset of each union slot plus the per-env total
-// (== ModelCapacities::max_rows_per_env after the cook sizes it).
-std::vector<uint32_t> UnionSlotRowBases(const Model& model, uint32_t* rows_per_env);
+// L1-c: UnionSlotRowBases (the union-slot row-layout contract) was DELETED with
+// the UnionCsr path. The PairDriven schedule derives its row layout directly
+// from ModelCapacities::max_rows_per_env (see SolveSchedule::Build).
 
 }  // namespace nuka::nk

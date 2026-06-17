@@ -12,7 +12,10 @@
 //     T11 Phase 2 appended ParticleParticleContact, the id-10 cross-system
 //     particle-particle non-penetration co-step. M10 RL-completion appended
 //     ReadoutUnionContactObs, the union-only per-env contact observation
-//     readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family.)
+//     readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family. L1-b
+//     appended ApplyImplicitDamping, the standalone backward-Euler joint
+//     viscous-damping velocity correction extracted from the deleted FUSED
+//     contact solve — strictly ADDITIVE, emitted ONLY when fold_drive_damping.)
 //   * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
 //     spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
 //     carry a minimal plausible field set where obvious, or a reserved POD
@@ -49,6 +52,14 @@ enum class NkOp : uint16_t {
     IntegratePosition,     // q  += qd  * dt
     CrbaComputeM,          // composite rigid-body M (joint-space inertia)
     CrbaFactorM,           // LTDL / Cholesky factorization of M
+    ApplyImplicitDamping,  // standalone backward-Euler joint viscous-damping
+                           // velocity correction qdot -= dt*(M+dt*C)^-1*(C*qdot).
+                           // General articulation physics that USED to ride
+                           // inside the deleted FUSED contact solve kernel; now a
+                           // standalone op gated on fold_drive_damping (so the
+                           // damping survives the FUSED-path deletion). Reads the
+                           // factored (M+dt*C)^-1 = data.m_inv (must run AFTER
+                           // CrbaFactorM) and the per-DOF c_j = data.drive_damping.
 
     // --- broadphase / spatial acceleration ------------------------------
     BuildAabbs,            // per-collidable world-space AABB build
@@ -76,7 +87,9 @@ enum class NkOp : uint16_t {
     ResetEnvs,             // per-env reset to initial state
     SnapshotState,         // capture full world state
     RestoreState,          // restore from a snapshot
-    ReadoutUnionContactObs,// union-only per-env contact obs (finger force + foot state)
+    // L1-c: ReadoutUnionContactObs (union-only per-env contact obs) was DELETED.
+    // Removing the enum value is safe — NkOp ids are runtime-only dispatch, never
+    // serialized (goldens byte-exact across the L1-a/L1-b enum shifts).
 
     // --- domain randomization -------------------------------------------
     RandomizeMaterialBuckets, // per-env material bucket randomization
@@ -93,7 +106,7 @@ enum class NkOp : uint16_t {
                            // owning body_pose row (composing link_geom_local) so
                            // artic links enter the LBVH as collidables. Gated to
                            // the PairDriven family (early-exit otherwise), so the
-                           // FusedFoot/UnionCsr graphs are byte-untouched.
+                           // UnionCsr graph is byte-untouched.
 
     // --- general contact pipeline Phase 2 (H3) --------------------------
     NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
@@ -104,7 +117,7 @@ enum class NkOp : uint16_t {
                             // ucontact_* buffer (side a = convex, side b = the
                             // static heightfield). APPENDED after SyncLinkBodyPose
                             // (stable prior NkOp values). PairDriven-family-gated
-                            // (early-exit for FusedFoot/UnionCsr).
+                            // (early-exit for UnionCsr).
 
     Count                  // sentinel: number of ops (NOT an op)
 };
@@ -180,6 +193,21 @@ struct CrbaFactorMParams {
     uint32_t articulation_count;
 };
 
+// Standalone implicit joint-damping op. Applies the backward-Euler joint
+// viscous-damping velocity correction qdot -= dt*(M+dt*C)^-1*(C*qdot) using the
+// factored inverse data.m_inv (== (M+dt*C)^-1 when CrbaComputeM folded dt*C, so
+// this op MUST be scheduled AFTER CrbaFactorM and BEFORE the row solve /
+// IntegratePosition) and the per-DOF c_j == data.drive_damping. The float
+// sequence is the deleted FUSED solve kernel's implicit-damping seed +
+// write-back, so a zero-contact world's trajectory is byte-identical to the
+// legacy standalone-damping order (factor -> damping -> integrate).
+struct ApplyImplicitDampingParams {
+    float    dt;
+    uint32_t max_dof;             // dof_stride == the M tile stride
+    uint32_t articulation_count;
+    uint32_t total_link_count;
+};
+
 // --- broadphase / spatial acceleration ----------------------------------
 // M5: the broadphase ops (BuildAabbs/LbvhBuild/LbvhQueryPairs) and the SDF
 // narrowphase EARLY-EXIT unless family == kContactFamilyPairDriven (the union
@@ -235,14 +263,16 @@ inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
 // (mirrors nk::ContactFamily; a plain u32 so the POD stays header-light).
-//   0 = FusedFoot  (M3 articulation foot pipeline, goldens byte-exact)
+//   0 = FusedFoot  (DEAD: the M3 articulation foot pipeline RUNTIME was deleted in
+//       L1-b; the constant is retained, dead, until the L1-d enum collapse — no
+//       op dispatches on it anymore)
 //   1 = UnionCsr   (M4 union compliant-CSR pipeline)
 //   2 = PairDriven (M5 generalized broadphase->narrowphase: BuildAabbs/Lbvh*/
 //       candidate_pairs -> NarrowphasePrimitives (amf:: analytic set + sphere x
-//       hull) + NarrowphaseSdf (SAMP x SDF grid). ADDITIVE; the union family's
-//       slot-template path is untouched. The broadphase + SDF ops EARLY-EXIT
-//       for FusedFoot/UnionCsr so those gate-pinned paths stay bit-identical.)
-inline constexpr uint32_t kContactFamilyFusedFoot  = 0u;
+//       hull) + NarrowphaseSdf (SAMP x SDF grid). The general default for every
+//       non-union cooked model. The broadphase + SDF ops EARLY-EXIT for UnionCsr
+//       so that gate-pinned path stays bit-identical.)
+inline constexpr uint32_t kContactFamilyFusedFoot  = 0u;  // L1-b: dead constant.
 inline constexpr uint32_t kContactFamilyUnionCsr   = 1u;
 inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 
@@ -251,13 +281,12 @@ struct NarrowphasePrimitivesParams {
     uint8_t max_contacts_per_pair;
     // M3b first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;
-    // Go2-on-stairs Phase 1: the SHARED procedural-terrain params. The FusedFoot
-    // detection kernel samples nuka::terrain::SampleTerrainHeight(env_type, x, y,
-    // terrain) instead of the scalar ground plane; the per-env terrain TYPE is the
-    // env_terrain_type DataView field. DEFAULT (all-zero except ground_height ==
-    // ground_height) + every env's type seeded 0 (Flat) => SampleTerrainHeight
-    // returns exactly ground_height => byte-identical to the legacy scalar plane
-    // (the D1 guarantee).
+    // Go2-on-stairs Phase 1: the SHARED procedural-terrain params. (Historically the
+    // FUSED detection kernel sampled nuka::terrain::SampleTerrainHeight here; L1-b
+    // deletes that runtime — the general path's terrain is the cook-time baked
+    // heightfield collidable. These fields are retained for the still-live foot
+    // table / params layout; the per-env terrain TYPE is the env_terrain_type
+    // DataView field, now model-level/informational.)
     ::nuka::terrain::TerrainParams terrain;
     uint32_t foot_count;        // active rows of the Model foot_shape table
     uint32_t env_count;
@@ -271,18 +300,12 @@ struct NarrowphasePrimitivesParams {
     // M6: particle coupling (the kUSlotParticleSphere* union classes form the
     // particle side's world sphere from particle_pos[env*particles_per_env+link]).
     uint32_t particles_per_env;
-    // Multi-articulation FUSED-foot slot keying: K (== articulations_per_env). At
-    // K<=1 the foot detection keeps the LEGACY env-keyed slot layout (base_slot =
-    // env*kMaxFootContactsPerEnv, one per-env count) -> byte-identical (D1). At
-    // K>1 it RE-KEYS each foot into its OWNING articulation's fused slot block
-    // (slot_base = link_to_articulation[link] * kMaxFootContactsPerEnv) with a
-    // per-articulation fill counter, so K dogs' 4K feet land in K disjoint 4-slot
-    // blocks the fused per-articulation solver consumes (each dog's feet stay in
-    // its own block). articulations_per_env == 0 (no articulation, e.g.
-    // body/particle-only) also falls to the legacy path. (Multi-body dog<->dog
-    // collision now lives on the GENERAL PairDriven path, not the FusedFoot path.)
-    uint32_t articulations_per_env;  // K (>1 => per-articulation foot slot re-key)
-    uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (per-artic stride)
+    // L1-b: these two fields drove the (now-deleted) FUSED foot slot re-keying.
+    // They are retained in the POD for layout stability (no op reads them anymore;
+    // multi-body dog<->dog collision rides the GENERAL PairDriven path). K ==
+    // articulations_per_env; max_foot_contacts == the per-artic stride.
+    uint32_t articulations_per_env;  // K (dead: FUSED foot slot re-key removed)
+    uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (dead with FUSED)
 };
 
 // General contact pipeline Phase 0 (B2): SyncLinkBodyPose. One thread per
@@ -291,10 +314,10 @@ struct NarrowphasePrimitivesParams {
 // offset so an offset collidable is posed in world space. This is what makes
 // articulation links visible to the LBVH (BuildAabbsKernel reads body_pose),
 // the load-bearing prerequisite for general body<->body contact. EARLY-EXITS
-// unless family == kContactFamilyPairDriven (so the FusedFoot/UnionCsr graphs
-// are byte-untouched in Phase 0; no current cook is PairDriven). link_body is
-// the MODEL table (template-local body row per link); the kernel adds the
-// per-env body offset for the global body_pose index.
+// unless family == kContactFamilyPairDriven (so the UnionCsr graph is
+// byte-untouched in Phase 0). link_body is the MODEL table (template-local body
+// row per link); the kernel adds the per-env body offset for the global body_pose
+// index.
 struct SyncLinkBodyPoseParams {
     uint32_t family;          // kContactFamily* (PairDriven => run; else early-exit)
     uint32_t env_count;
@@ -348,10 +371,10 @@ struct NarrowphaseSdfParams {
 
 struct ContactTangentBasisParams {
     uint32_t slot_count;        // env_count * max_contacts_per_env
-    // C4: family selector. FusedFoot reads the FUSED contact_normal (per slot);
-    // PairDriven reads the unified ucontact_normal (elem:4) and writes the elem:4
-    // ucontact_tangent1/2. Default 0 (FusedFoot) keeps the existing path
-    // byte-identical (the union family never adds this op).
+    // L1-b: the FUSED tangent kernel was deleted. The op is now enqueued ONLY for
+    // the PairDriven family (the union family emits its tangent spokes inside
+    // AssembleRows), and it unconditionally reads the unified ucontact_normal
+    // (elem:4) -> ucontact_tangent1/2. The field is retained for layout/diagnostics.
     uint32_t family = 0u;
 };
 
@@ -396,9 +419,10 @@ struct SolveRowsBlockIslandParams {
     // Fused-family legacy knobs (Model properties; unused by the union family):
     float    friction_coefficient;
     float    baumgarte_max_velocity;
-    // 1 => apply the implicit joint-damping seed (drive_damping as per-DOF c_j,
-    // requires m_inv == (M + dt*C)^-1). 0 => contacts-only.
-    uint32_t apply_implicit_damping;
+    // (L1-b: the FUSED-family `apply_implicit_damping` knob was REMOVED — the
+    // implicit joint-damping seed moved out of the deleted FUSED solve kernel
+    // into the standalone NkOp::ApplyImplicitDamping op; nothing in the solve op
+    // reads it any more.)
     // Task 1/2: the FUSED solver's per-articulation contact-slot STRIDE (slot_base
     // = articulation * contact_slots_per_artic). At K<=1 == kMaxFootContactsPerEnv
     // (4) -> byte-identical; at K>1 the grown stride (kMultiDogContactsPerArtic)
@@ -559,25 +583,8 @@ struct ExportObsParams {
     uint32_t obs_width;         // floats per env in obs_buffer
 };
 
-// M10 RL-completion: ReadoutUnionContactObs — union-only per-env contact obs.
-// After a union StepPlanned, write a per-env contact-observation slice into
-// obs_buffer for the RL grasp reward. The slice layout per env (at obs_offset,
-// inside the per-env obs_buffer row of `obs_width` floats):
-//   [ n_fingers finger normal-impulse floats | n_feet foot contact-scalar floats ]
-// Each finger entry = the sum of the slot's NORMAL-row impulses (lambda) over
-// the finger slot's max_pts normal rows (the force-closure signal). Each foot
-// entry = 1.0 if the foot slot has >0 manifold contacts this step else 0.0.
-// Strictly ADDITIVE + UnionCsr-gated: never emitted for fused/pair-driven.
-struct ReadoutUnionContactObsParams {
-    uint32_t env_count;
-    uint32_t union_slot_count;  // union slots per env (== max_contacts_per_env)
-    uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
-    uint32_t n_feet;            // foot slots [0, n_feet)
-    uint32_t n_fingers;         // finger slots [n_feet, n_feet+n_fingers)
-    uint32_t obs_offset;        // float offset of the slice in the per-env row
-    uint32_t obs_width;         // per-env obs_buffer stride in floats (== 64)
-    uint32_t max_pts;           // normal rows per finger slot (sphere-hull == 1)
-};
+// L1-c: ReadoutUnionContactObsParams (the union-only per-env contact obs params)
+// was DELETED here along with its op + kernel. Grasp/union moved to RL.
 
 // ResetEnvs: per-env masked snapshot restore. The env-id list is uploaded into
 // the reset_env_ids field (scratch) by World::Reset BEFORE the dispatch; count

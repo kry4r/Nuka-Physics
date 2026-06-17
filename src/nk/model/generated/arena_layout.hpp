@@ -141,11 +141,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // qdot_flat
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_composite_inertia
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // union_slots
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // hull_verts
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_link
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Dof, 1, 1, 4, 0},  // dof_to_component
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // table_enabled
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // shape_table
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 8, 0},  // excluded_pairs
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // samp_points

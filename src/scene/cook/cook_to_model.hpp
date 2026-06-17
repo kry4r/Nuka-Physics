@@ -35,18 +35,25 @@ struct CookToModelResult {
 CookToModelResult CookToModel(const SceneIR& scene, int env_count);
 
 // B1 (general contact pipeline Phase 1B): cook options. contact_family selects the
-// stepped contact path. FusedFoot (the DEFAULT, used by the 2-arg overload above)
-// keeps the legacy single-dog foot pipeline BYTE-IDENTICAL; PairDriven flips the
-// world to the GENERAL LBVH -> cvx narrowphase -> mixed-island solve path (the
-// multi-body / body-body cook). When PairDriven is set the per-env row budget is
-// resized for the general per-candidate-slot row layout and the cook sets
-// model.contact_family = PairDriven (so the pipeline routes the general
-// assembly/solve). H1 grasp keeps UnionCsr (union_cook);
-// single-dog go2 keeps FusedFoot (the 2-arg cook). Cross-env filtering is left ON
-// for PairDriven multi-dog-in-one-env (intra-env collidables collide).
+// stepped contact path. L1-b: the legacy FusedFoot runtime is DELETED, so the cook
+// always routes the GENERAL LBVH -> cvx narrowphase -> mixed-island solve path —
+// PairDriven is now the DEFAULT. The cook resizes the per-env row budget for the
+// general per-candidate-slot row layout and sets model.contact_family = PairDriven
+// (so the pipeline routes the general assembly/solve). H1 grasp keeps UnionCsr
+// (union_cook). Cross-env filtering is left ON for PairDriven multi-dog-in-one-env
+// (intra-env collidables collide). The FusedFoot enum value is retained (dead)
+// until the L1-d enum collapse.
 enum class CookContactFamily { FusedFoot, PairDriven };
 struct CookToModelOptions {
-    CookContactFamily contact_family = CookContactFamily::FusedFoot;
+    CookContactFamily contact_family = CookContactFamily::PairDriven;
+    // enable_contacts == false cooks a CONTACTS-OFF world: the per-env contact /
+    // candidate-slot budget is zeroed (max_contacts_per_env == max_rows_per_env ==
+    // 0) so the pipeline emits NO broadphase/narrowphase/solve ops -- the world is
+    // pure articulation + rigid dynamics. This is the general-path equivalent of the
+    // legacy single-env `enable_contacts == false` (the dynamics oracle): a fixed-
+    // base / free-space scene with nothing to collide. The cooked shape_table /
+    // link_geom rows stay sized consistently (just never read). Default true.
+    bool enable_contacts = true;
 };
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options);

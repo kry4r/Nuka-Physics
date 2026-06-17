@@ -271,25 +271,14 @@ SolveScheduleResult SolveSchedule::Partition(const std::vector<ScheduleRow>& row
     return out;
 }
 
-std::vector<uint32_t> UnionSlotRowBases(const Model& model, uint32_t* rows_per_env) {
-    std::vector<uint32_t> bases;
-    bases.reserve(model.union_slots.size());
-    uint32_t cursor = 0;
-    for (const UnionSlot& s : model.union_slots) {
-        bases.push_back(cursor);
-        cursor += s.MaxRows();
-    }
-    if (rows_per_env != nullptr) *rows_per_env = cursor;
-    return bases;
-}
-
 void SolveSchedule::Build(Model* model) {
     if (model == nullptr) return;
-    if (model->contact_family == ContactFamily::UnionCsr &&
-        model->union_slots.empty() && model->schedule_island_count > 0) {
-        // Oracle-harness seam: a hand-built schedule (Partition output written
-        // straight into the model by a test that uploads rows directly) is
-        // kept as-is — there is no slot template to derive one from.
+    // L1-c: the UnionCsr early-exit seam + UnionSlotRowBases were DELETED with
+    // the UnionCsr path. The only live family is PairDriven (below). The
+    // oracle-harness "hand-built schedule" seam below preserves a directly
+    // uploaded schedule for any family that derives no schedule of its own.
+    if (model->contact_family != ContactFamily::PairDriven &&
+        model->schedule_island_count > 0) {
         return;
     }
     model->schedule_row_order.clear();
@@ -338,80 +327,10 @@ void SolveSchedule::Build(Model* model) {
         return;
     }
 
-    if (model->contact_family != ContactFamily::UnionCsr ||
-        model->union_slots.empty()) {
-        return;  // fused / contact-free family: no CSR schedule.
-    }
-
-    const ModelCapacities& cap = model->capacities;
-    const uint32_t E = cap.env_count;
-    uint32_t rows_per_env = 0;
-    const std::vector<uint32_t> bases = UnionSlotRowBases(*model, &rows_per_env);
-
-    // Worst-case conflict keys, EXACTLY the legacy emission's body-index keys:
-    //   articulation side -> total_body_count + env   (the bijection-invariant
-    //                        synthetic key paired with art_index == env)
-    //   rigid side        -> env * bodies_per_env + body
-    //   static side       -> no key (legacy kInvalidBodyIndex never conflicts)
-    // Emission order: env-major, slots in template order, per slot all normal
-    // rows then all spokes — the AssembleRows fixed slot layout.
-    const uint32_t total_body_count = cap.bodies_per_env * E;
-    std::vector<ScheduleRow> rows(static_cast<size_t>(rows_per_env) * E);
-    std::vector<uint32_t> row_env(rows.size(), 0u);
-    for (uint32_t e = 0; e < E; ++e) {
-        const uint32_t env_base = e * rows_per_env;
-        for (size_t s = 0; s < model->union_slots.size(); ++s) {
-            const UnionSlot& u = model->union_slots[s];
-            const uint32_t slot_base = env_base + bases[s];
-            uint32_t key_a = kNoKey;  // ~0u
-            uint32_t key_b = kNoKey;
-            uint32_t artic = ~0u;
-            switch (u.cls) {
-                case UnionSlot::kFootSpherePlane:
-                    key_a = total_body_count + e;
-                    artic = e;
-                    break;
-                case UnionSlot::kFingerSphereHull:
-                    key_a = total_body_count + e;
-                    key_b = e * cap.bodies_per_env + u.body;
-                    artic = e;
-                    break;
-                case UnionSlot::kBodyBoxPlane:
-                    key_a = e * cap.bodies_per_env + u.body;
-                    break;
-                case UnionSlot::kParticleSpherePlane:
-                    // side a == a particle (synthetic key past the artic keys so a
-                    // particle conflicts only with rows touching the SAME particle);
-                    // side b == static plane (no key).
-                    key_a = total_body_count + E +
-                            (e * cap.particles_per_env + u.link);
-                    break;
-                case UnionSlot::kParticleSphereBox:
-                    key_a = total_body_count + E +
-                            (e * cap.particles_per_env + u.link);
-                    key_b = e * cap.bodies_per_env + u.body;
-                    break;
-                default:
-                    break;
-            }
-            const uint32_t n_rows = u.MaxRows();
-            for (uint32_t r = 0; r < n_rows; ++r) {
-                ScheduleRow& sr = rows[slot_base + r];
-                sr.key_a = key_a;
-                sr.key_b = key_b;
-                sr.artic = artic;
-                sr.group_first = slot_base;  // the slot's first normal row
-                row_env[slot_base + r] = e;
-            }
-        }
-    }
-
-    SolveScheduleResult result = Partition(rows, row_env);
-    model->schedule_row_order = std::move(result.row_order);
-    model->schedule_color_segments = std::move(result.color_segments);
-    model->schedule_islands = std::move(result.islands);
-    model->schedule_island_count = result.island_count;
-    model->schedule_segment_count = result.segment_count;
+    // L1-c: the entire UnionCsr schedule-derivation branch (the union-slot
+    // worst-case conflict-key build + Partition) was DELETED with the UnionCsr
+    // path. PairDriven (above) is the only family that derives a schedule; any
+    // other (contact-free / template-less) family leaves the cleared schedule.
 }
 
 }  // namespace nuka::nk

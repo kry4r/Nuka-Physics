@@ -21,7 +21,6 @@
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
-#include "phi/backend_cuda/ops/union_types.cuh"  // M10: LoadUnionSlot / kUSlot*
 #include "sensor/noise/philox.cuh"               // M10: deterministic IC jitter
 
 namespace nuka::phi {
@@ -250,73 +249,9 @@ __global__ void ExportObsKernel(const Transform* base_pose,
     }
 }
 
-// --- ReadoutUnionContactObs (M10 RL-completion, union-only, additive) --------
-//
-// ONE BLOCK PER ENV; lanes stride over the env's union slots. No cross-env
-// atomics; each finger's normal-impulse is summed in FIXED slot/row order by a
-// SINGLE lane (deterministic). Writes a per-env contact-observation slice into
-// obs_buffer at obs_offset:
-//   obs[obs_offset + fingertip]            = sum_p lambda[base + p]  (p in [0,max_pts))
-//                                            over the finger slot's normal rows.
-//   obs[obs_offset + n_fingers + foot]     = (ucontact_count[slot] > 0) ? 1 : 0.
-// Slot order is FIXED feet->fingers->table (union cook): foot slots [0,n_feet),
-// finger slots [n_feet, n_feet+n_fingers). The normal-row impulses live at
-// [base, base+max_pts) where base = env*rows_per_env + slot.row_base (the same
-// row layout AssembleRows emits: normals first, then friction spokes).
-__global__ void ReadoutUnionContactObsKernel(const float* __restrict__ union_slots,
-                                             const float* __restrict__ lambda,
-                                             const uint32_t* __restrict__ ucontact_count,
-                                             uint32_t env_count,
-                                             uint32_t union_slot_count,
-                                             uint32_t rows_per_env,
-                                             uint32_t n_feet,
-                                             uint32_t n_fingers,
-                                             uint32_t obs_offset,
-                                             uint32_t obs_width,
-                                             uint32_t max_pts,
-                                             float* __restrict__ obs_buffer) {
-    const uint32_t env = blockIdx.x;
-    if (env >= env_count) {
-        return;
-    }
-    float* obs = obs_buffer + static_cast<size_t>(env) * obs_width;
-    const uint32_t slice = n_fingers + n_feet;
-    // Zero-fill the obs slice first (lanes cover the slice deterministically).
-    for (uint32_t i = threadIdx.x; i < slice; i += blockDim.x) {
-        if (obs_offset + i < obs_width) {
-            obs[obs_offset + i] = 0.0f;
-        }
-    }
-    __syncthreads();
-    // One lane per union slot; the slot's class selects the obs target. Each
-    // target index is unique to a slot, so distinct lanes never collide (no
-    // atomics needed). Within a slot the lambda sum runs in fixed row order.
-    for (uint32_t slot = threadIdx.x; slot < union_slot_count; slot += blockDim.x) {
-        const UnionSlotDev u = LoadUnionSlot(union_slots, slot);
-        const uint32_t base = env * rows_per_env + u.row_base;
-        if (u.cls == kUSlotFingerSphereHull) {
-            // Finger force-closure signal: sum the slot's normal-row impulses.
-            const uint32_t fingertip = slot - n_feet;  // slot in [n_feet, n_feet+n_fingers)
-            if (fingertip < n_fingers && obs_offset + fingertip < obs_width) {
-                float sum = 0.0f;
-                for (uint32_t p = 0u; p < max_pts; ++p) {
-                    sum += lambda[base + p];
-                }
-                obs[obs_offset + fingertip] = sum;
-            }
-        } else if (u.cls == kUSlotFootSpherePlane) {
-            // Foot contact state: 1.0 if the foot slot has any manifold contact.
-            const uint32_t foot = slot;  // slot in [0, n_feet)
-            if (foot < n_feet) {
-                const uint32_t idx = env * union_slot_count + slot;
-                const float in_contact = (ucontact_count[idx] > 0u) ? 1.0f : 0.0f;
-                if (obs_offset + n_fingers + foot < obs_width) {
-                    obs[obs_offset + n_fingers + foot] = in_contact;
-                }
-            }
-        }
-    }
-}
+// L1-c: ReadoutUnionContactObsKernel (the union-only per-env contact obs) was
+// DELETED here. Grasp/union moved to RL; the general path's per-env contact
+// readout is OpReadoutContactWrench over the unified contact buffer.
 
 // --- op entry points ---------------------------------------------------------
 
@@ -372,28 +307,7 @@ Status OpExportObs(const ModelView& /*model*/, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-Status OpReadoutUnionContactObs(const ModelView& model, const DataView& data,
-                                const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const ReadoutUnionContactObsParams*>(params);
-    if (p == nullptr) {
-        return Status::Failed;
-    }
-    // Nothing to write when there are no envs, no obs targets, or no obs row.
-    if (p->env_count == 0u || (p->n_feet == 0u && p->n_fingers == 0u) ||
-        p->obs_width == 0u || p->union_slot_count == 0u) {
-        return Status::Ok;
-    }
-    // ONE BLOCK PER ENV; lanes cover the union slots (cap the block at 256).
-    const uint32_t kBlock = p->union_slot_count < 256u ? p->union_slot_count : 256u;
-    LaunchCuda(ReadoutUnionContactObsKernel, dim3(p->env_count), dim3(kBlock), 0u,
-               stream, static_cast<const float*>(model.union_slots),
-               static_cast<const float*>(data.lambda),
-               static_cast<const uint32_t*>(data.ucontact_count),
-               p->env_count, p->union_slot_count, p->rows_per_env, p->n_feet,
-               p->n_fingers, p->obs_offset, p->obs_width, p->max_pts,
-               data.obs_buffer);
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-}
+// L1-c: OpReadoutUnionContactObs was DELETED here (see kernel note above).
 
 Status OpResetEnvs(const ModelView& model, const DataView& data,
                    const void* params, cudaStream_t stream) {
@@ -551,7 +465,6 @@ void RegisterNkReadoutOps() {
     SetCudaOp(NkOp::ResetEnvs, &OpResetEnvs);
     SetCudaOp(NkOp::SnapshotState, &OpSnapshotState);
     SetCudaOp(NkOp::RestoreState, &OpRestoreState);
-    SetCudaOp(NkOp::ReadoutUnionContactObs, &OpReadoutUnionContactObs);
 }
 
 } // namespace nuka::phi

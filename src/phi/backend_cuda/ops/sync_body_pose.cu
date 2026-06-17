@@ -9,11 +9,11 @@
 // the load-bearing prerequisite for the whole general path (design §2.6).
 //
 // FAMILY GATING (D1): the op EARLY-EXITS unless family == kContactFamilyPairDriven
-// — exactly like the broadphase ops it feeds. The single-dog go2 (FusedFoot) and
-// the H1 grasp (UnionCsr) graphs enqueue this op (the pipeline always inserts it
-// when there are collidables) but it does NO work for them, so their captured
-// graphs / goldens are byte-untouched. No current cook is PairDriven (the B1 flip
-// is Phase 1), so in Phase 0 this op is present-but-inert everywhere.
+// — exactly like the broadphase ops it feeds. The H1 grasp (UnionCsr) graph
+// enqueues this op (the pipeline always inserts it when there are collidables) but
+// it does NO work for the union family, so its captured graph / golden is
+// byte-untouched. (L1-b: the FUSED family is gone; PairDriven is the general
+// default, so this op now does real work for the locomotion/general cook.)
 //
 // INDEXING: link_body is the MODEL table (one TEMPLATE-LOCAL body row per link,
 // tiled env-major without offset; staged by StampPerLink). For a GLOBAL link

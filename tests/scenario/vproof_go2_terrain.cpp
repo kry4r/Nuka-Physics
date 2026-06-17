@@ -1,36 +1,25 @@
 // ---------------------------------------------------------------------------
-// V-PROOF — go2 feet on PyramidStairs TERRAIN: LEGACY (FusedFoot foot-vs-terrain
-// kernel) vs GENERAL (PairDriven + CookHeightfieldGrid(kTerrainPyramidStairs))
-// equivalence harness. The terrain companion to vproof_go2_ground.
+// V-PROOF — go2 feet on PyramidStairs TERRAIN: GENERAL (PairDriven +
+// CookHeightfieldGrid(kTerrainPyramidStairs)) physical-validity harness. The
+// terrain companion to vproof_go2_ground.
 //
-//   LEGACY  : CookToModel(scene, 1) (FusedFoot) + keep feet + model.terrain =
-//             PyramidStairs params; EnvTerrainType = kTerrainPyramidStairs
-//             (uploaded post-construction). The FUSED foot kernel samples
-//             SampleTerrainHeight analytically (sphere bottom vs the local
-//             surface, normal +Z).
+// L1-b: the legacy FUSED foot-vs-terrain RUNTIME was DELETED, so the former
+// LEGACY-vs-GENERAL equivalence half can no longer be PRODUCED. Per the L1-b spec
+// this test is converted to assert the GENERAL path ALONE is physically valid on
+// a discretized stair terrain: FINITE, feet LOAD (contacts > 0), and NO sink /
+// tunnel through the surface beyond a small slop.
+//
 //   GENERAL : CookToModel(scene, 1, {PairDriven}) + CookHeightfieldGrid(
-//             kTerrainPyramidStairs) with the SAME params + capacity grow. The
-//             feet collide against the cooked per-cell TRIANGLE_PRISM grid via the
-//             SAME cvx GJK/EPA narrowphase -> general mixed-island solve.
+//             kTerrainPyramidStairs) + capacity grow. The feet collide against the
+//             cooked per-cell TRIANGLE_PRISM grid via the cvx GJK/EPA narrowphase
+//             -> general mixed-island solve.
 //
 // We seat a WIDE elevated platform (half_plat >> the dog footprint) so all four
-// feet rest on the FLAT platform TOP at a single height (clean comparison + every
-// foot loads). The platform top is seated near the perf-gate foot level (~0.31 m)
-// so the fixed-base feet reach it.
+// feet rest on the FLAT platform TOP at a single height. The platform top is
+// seated near the foot level (~0.32 m) so the fixed-base feet reach it.
 //
-// Spec §"go2-terrain": tolerance MAY be looser on steps (documented why) but must
-// BOUND divergence; assert finite + NO sink-through + foot-terrain contact loaded
-// on both sides. HONESTY: a FAIL with the worst-joint + sink-through diagnostic is
-// the intended outcome; we do NOT loosen to force a pass.
-//
-// Why a (documented) looser joint band than the flat-ground 1e-3: even with the
-// feet on a flat platform top, the two paths sample DIFFERENT surface
-// representations of the SAME analytic terrain — the legacy kernel samples
-// SampleTerrainHeight per foot exactly, while the general path discretizes the
-// terrain into a finite-resolution prism grid (cell 0.25 m) whose triangulated
-// facets the foot sphere contacts. The discretization is a real, expected source
-// of small divergence the collapse must account for; we still BOUND it tightly and
-// report the exact worst joint so the gap is quantified, not hidden.
+// HONESTY: we do NOT loosen tolerances or fake a pass — a foot that falls through,
+// a NaN, or a deep sink FAILS with a diagnostic.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -66,12 +55,6 @@ constexpr float kDt = 1.0f / 240.0f;
 constexpr float kGravityZ = -9.81f;
 constexpr uint32_t kSteps = 200u;
 
-// Joint band: looser than the flat-ground 1e-3 (documented above — the prism
-// discretization of the analytic terrain). Still a tight bound that quantifies,
-// not hides, divergence. Base position band kept tight (the platform top is one
-// flat height under the dog).
-constexpr float kJointTol = 2.0e-2f;
-constexpr float kBaseTol = 5.0e-3f;
 constexpr float kSinkTol = 0.05f;  // a real clip-through is tens of cm.
 
 std::filesystem::path StandScenePath() {
@@ -151,22 +134,6 @@ Snap ReadRun(nk::World& w) {
     return r;
 }
 
-// LEGACY FusedFoot go2 + PyramidStairs terrain (model.terrain + EnvTerrainType).
-Snap RunLegacy(const nuka::scene::SceneIR& scene, Backend b) {
-    nk::Model m = cook::CookToModel(scene, 1).model;
-    EXPECT_EQ(m.feet.size(), 4u);
-    m.terrain = TerrainSpec();
-    m.ground_height = TerrainSpec().ground_height;
-    nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
-    EXPECT_TRUE(w.Ready());
-    // Switch every env to PyramidStairs (seeded Flat at construction).
-    std::vector<uint32_t> ttype(1u, terrain::kTerrainPyramidStairs);
-    EXPECT_TRUE(w.GetData().UploadField(nk::FieldId::EnvTerrainType, ttype.data(),
-                                        sizeof(uint32_t)));
-    for (uint32_t s = 0; s < kSteps; ++s) EXPECT_TRUE(w.Step().AllOk()) << s;
-    return ReadRun(w);
-}
-
 // GENERAL PairDriven go2 + CookHeightfieldGrid(PyramidStairs).
 Snap RunGeneral(const nuka::scene::SceneIR& scene, Backend b, uint32_t* out_hf) {
     cook::CookToModelOptions opt;
@@ -216,76 +183,42 @@ float WorstFootSink(const Snap& r, const std::vector<nk::ModelFootShape>& feet,
 }  // namespace
 
 // ===========================================================================
-// THE V-PROOF (terrain): general heightfield path reproduces the FusedFoot
-// foot-vs-terrain motion within a (documented) bounded tolerance; finite + no
-// sink-through + feet loaded on both sides.
+// THE V-PROOF (terrain): the GENERAL heightfield path is physically valid for a
+// go2 standing on a discretized stair terrain — finite, feet load, no sink-through.
+// (L1-b: the FUSED reference half was deleted; this is the surviving general-path
+// validity assertion.)
 // ===========================================================================
-TEST(VProofGo2Terrain, GeneralReproducesFusedFootOnPyramidStairs) {
+TEST(VProofGo2Terrain, GeneralPathPhysicallyValidOnPyramidStairs) {
     if (!std::filesystem::exists(StandScenePath()))
         GTEST_SKIP() << "go2_stand.usda not present";
     Backend b = GetBackend();
     if (b.backend == nullptr) GTEST_SKIP() << "no CUDA backend";
 
     const auto scene = nuka::import::LoadUsd(StandScenePath().string());
-    // feet table (link/offset/radius) for the sink-through check — same on both.
+    // feet table (link/offset/radius) for the sink-through check.
     const std::vector<nk::ModelFootShape> feet =
         cook::CookToModel(scene, 1).model.feet;
+    EXPECT_EQ(feet.size(), 4u);
     const terrain::TerrainParams tp = TerrainSpec();
 
-    const Snap leg = RunLegacy(scene, b);
     uint32_t hf_row = ~0u;
     const Snap gen = RunGeneral(scene, b, &hf_row);
 
-    ASSERT_EQ(leg.q.size(), gen.q.size());
-    const uint32_t L = static_cast<uint32_t>(leg.q.size());
-
-    float worst_dq = 0.0f;
-    uint32_t worst_j = 0u;
-    for (uint32_t j = 0; j < L; ++j) {
-        const float d = std::abs(gen.q[j] - leg.q[j]);
-        if (d > worst_dq) { worst_dq = d; worst_j = j; }
-    }
-    const Vec3 dbase = gen.base.position - leg.base.position;
-    const float worst_dbase =
-        std::max({std::abs(dbase.x), std::abs(dbase.y), std::abs(dbase.z)});
-
-    const float leg_sink = WorstFootSink(leg, feet, tp);
     const float gen_sink = WorstFootSink(gen, feet, tp);
 
     std::fprintf(stderr,
-        "[VPROOF go2-terrain] platform_top=%.3f hf_row=%u | LEGACY contacts=%u "
-        "GENERAL contacts=%u | worst |dq|=%.6e rad at link %u (gen=%.6f leg=%.6f) "
-        "| worst |dbase|=%.6e m | foot-sink legacy=%.4f general=%.4f m (<0 == 穿模)\n",
-        PlatformTop(), hf_row, leg.contacts, gen.contacts, worst_dq, worst_j,
-        gen.q[worst_j], leg.q[worst_j], worst_dbase, leg_sink, gen_sink);
-    for (uint32_t j = 0; j < L; ++j) {
-        const float d = std::abs(gen.q[j] - leg.q[j]);
-        if (d > kJointTol)
-            std::fprintf(stderr, "    [diff] link %u: gen=%.6f leg=%.6f |d|=%.6e\n",
-                         j, gen.q[j], leg.q[j], d);
-    }
+        "[VPROOF go2-terrain] platform_top=%.3f hf_row=%u | GENERAL contacts=%u | "
+        "base=(%.4f,%.4f,%.4f) | foot-sink=%.4f m (<0 == 穿模)\n",
+        PlatformTop(), hf_row, gen.contacts, gen.base.position.x,
+        gen.base.position.y, gen.base.position.z, gen_sink);
 
-    // (1) finite on both sides.
-    ASSERT_TRUE(leg.finite) << "LEGACY side produced NaN/inf";
+    // (1) finite.
     ASSERT_TRUE(gen.finite) << "GENERAL side produced NaN/inf";
 
-    // (2) feet load on both sides (general must not fall through the terrain grid).
-    EXPECT_GT(leg.contacts, 0u) << "LEGACY feet did not load on the terrain";
+    // (2) feet load (general must not fall through the terrain grid).
     EXPECT_GT(gen.contacts, 0u)
         << "GENERAL feet did not load (fell through the heightfield terrain)";
 
-    // (3) NO sink-through on either side (the body never tunnels the surface).
-    EXPECT_GT(leg_sink, -kSinkTol) << "LEGACY foot sank THROUGH the terrain (穿模)";
+    // (3) NO sink-through (the body never tunnels the surface beyond a small slop).
     EXPECT_GT(gen_sink, -kSinkTol) << "GENERAL foot sank THROUGH the terrain (穿模)";
-
-    // (4) equivalence within the documented bounded tolerance (NOT loosened to
-    // force a pass — a FAIL here is the collapse's terrain worklist).
-    EXPECT_LE(worst_dq, kJointTol)
-        << "GENERAL terrain path joint trajectory diverges from FusedFoot by "
-        << worst_dq << " rad (> " << kJointTol << ") at link " << worst_j
-        << " (legacy contacts=" << leg.contacts << ", general contacts="
-        << gen.contacts << ").";
-    EXPECT_LE(worst_dbase, kBaseTol)
-        << "GENERAL terrain path base position diverges by " << worst_dbase
-        << " m (> " << kBaseTol << ").";
 }

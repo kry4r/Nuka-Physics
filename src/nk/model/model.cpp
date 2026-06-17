@@ -65,11 +65,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             // 5 packed scalars per slot, max_contacts_per_env slots.
             return static_cast<uint64_t>(max_contacts_per_env) * 5ull;
         }
-        if (id == FieldId::UnionSlots) {
-            // GLOBAL union contact-pair template (shared by every env): 16
-            // packed scalars per contact slot.
-            return static_cast<uint64_t>(max_contacts_per_env) * 16ull;
-        }
+        // L1-c: FieldId::UnionSlots staging size was DELETED with the field.
         if (id == FieldId::HullVerts) {
             // GLOBAL convex-hull vertex pool, xyz packed.
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
@@ -293,32 +289,8 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
-        case FieldId::UnionSlots: {
-            // GLOBAL union contact-pair template: 16 packed scalars per slot
-            // {cls, link, body, condim (u32 bits), offset.xyz, radius,
-            //  box_half.xyz, plane_height, mu, flags (u32 bits), 2 reserved}.
-            auto* p = reinterpret_cast<float*>(dst);
-            const uint32_t slots = capacities.max_contacts_per_env;
-            auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
-            uint32_t row_base = 0;  // per-env row-slot prefix sum (lane 14).
-            for (uint32_t s = 0; s < union_slots.size() && s < slots; ++s) {
-                const UnionSlot& u = union_slots[s];
-                const size_t b = static_cast<size_t>(s) * 16u;
-                put_u32(b + 0, u.cls);
-                put_u32(b + 1, u.link);
-                put_u32(b + 2, u.body);
-                put_u32(b + 3, u.condim);
-                p[b + 4] = u.offset.x;  p[b + 5] = u.offset.y;  p[b + 6] = u.offset.z;
-                p[b + 7] = u.radius;
-                p[b + 8] = u.box_half.x; p[b + 9] = u.box_half.y; p[b + 10] = u.box_half.z;
-                p[b + 11] = u.plane_height;
-                p[b + 12] = u.mu;
-                put_u32(b + 13, u.flags);
-                put_u32(b + 14, row_base);
-                row_base += u.MaxRows();
-            }
-            break;
-        }
+        // L1-c: FieldId::UnionSlots staging was DELETED (the union_slots MODEL
+        // field is gone). The ONE general path carries no slot template.
         case FieldId::HullVerts: {
             if (!hull_verts.empty()) {
                 const size_t n = hull_verts.size() < static_cast<size_t>(
@@ -694,7 +666,7 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;
         case FieldId::ArticulationLinkOffset:v.articulation_link_offset = static_cast<uint32_t*>(p); break;
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
-        case FieldId::UnionSlots:            v.union_slots = static_cast<float*>(p); break;
+        // L1-c: FieldId::UnionSlots (v.union_slots) was DELETED with the field.
         case FieldId::HullVerts:             v.hull_verts = static_cast<float*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
         case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
@@ -808,11 +780,11 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.contact_family = src.contact_family;
     dst.drive_mode = src.drive_mode;
     dst.particles = std::move(src.particles);  // M6 particle cook product.
-    dst.union_slots = std::move(src.union_slots);
     dst.hull_verts = std::move(src.hull_verts);
-    for (int k = 0; k < 2; ++k) dst.union_solref[k] = src.union_solref[k];
-    for (int k = 0; k < 5; ++k) dst.union_solimp[k] = src.union_solimp[k];
-    dst.table_enabled_default = src.table_enabled_default;
+    // L1-c: union_slots / table_enabled_default copies were removed; union_solref/
+    // union_solimp renamed to the general path's contact_solref/contact_solimp.
+    for (int k = 0; k < 2; ++k) dst.contact_solref[k] = src.contact_solref[k];
+    for (int k = 0; k < 5; ++k) dst.contact_solimp[k] = src.contact_solimp[k];
     dst.body_init = std::move(src.body_init);
     dst.dof_to_link = std::move(src.dof_to_link);
     dst.dof_to_component = std::move(src.dof_to_component);

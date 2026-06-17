@@ -43,8 +43,8 @@
 // used by amf::ReduceAndEmitSpread -> two-run byte-identical contact streams.
 //
 // FAMILY GATING (D1): EARLY-EXITS unless family == kContactFamilyPairDriven, so
-// the FusedFoot/UnionCsr graphs (which enqueue it when has_collidables) do NO
-// work -> their goldens are byte-untouched.
+// the UnionCsr graph (which enqueues it when has_collidables) does NO work ->
+// its golden is byte-untouched.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>

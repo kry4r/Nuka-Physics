@@ -122,21 +122,15 @@ bool World::SeedInitialState() {
         }
     }
 
-    // -- M4: the per-env live table toggle (union family; harmless default
-    // elsewhere — the field exists for every model).
-    {
-        std::vector<uint32_t> enabled(E, model_.table_enabled_default ? 1u : 0u);
-        if (!data_.UploadField(FieldId::TableEnabled, enabled.data(),
-                               enabled.size() * sizeof(uint32_t))) {
-            return false;
-        }
-    }
+    // L1-c: the M4 union per-env live table toggle (FieldId::TableEnabled) seed
+    // was DELETED here — both the field and table_enabled_default are gone.
 
     // -- Go2-on-stairs Phase 1: the per-env procedural-terrain TYPE. Seeded 0
-    // (nuka::terrain::kTerrainFlat) for EVERY env so the FusedFoot detection
-    // kernel samples a flat plane at ground_height => byte-identical to the
-    // legacy scalar-plane contact path (the D1 default). A training harness /
-    // verification sets non-flat terrain post-construction via
+    // (nuka::terrain::kTerrainFlat) for EVERY env. (Historically the FUSED foot
+    // kernel sampled this per env; L1-b deletes that runtime — the general path's
+    // terrain is the cook-time baked heightfield collidable, so the per-env type is
+    // now a model-level / informational field.) A training harness / verification
+    // sets non-flat terrain post-construction via
     // World::GetData().UploadField(FieldId::EnvTerrainType, ...). The field is
     // Persistent so it round-trips Reset (the construction-time snapshot).
     {
@@ -148,10 +142,11 @@ bool World::SeedInitialState() {
     }
 
     // -- Go2-on-stairs Phase 2a: the per-env procedural-terrain DIFFICULTY scale.
-    // Seeded 1.0 (the unscaled terrain) for EVERY env. The FusedFoot detection
-    // kernel multiplies the terrain step_height + grid_height_max by this scale
-    // (nuka::terrain::ScaleTerrainDifficulty) BEFORE sampling, so a curriculum can
-    // vary feature height per env. The DEFAULT (1.0) keeps the unscaled terrain,
+    // Seeded 1.0 (the unscaled terrain) for EVERY env. (Historically the FUSED foot
+    // kernel multiplied the terrain step_height + grid_height_max by this scale
+    // before sampling per env; L1-b deletes that runtime, so the field is now
+    // model-level / informational alongside the cook-time baked heightfield.)
+    // The DEFAULT (1.0) keeps the unscaled terrain,
     // and for the type-0 (Flat) seed SampleTerrainHeight ignores step/grid so the
     // multiply is computed-but-unused => byte-identical to the legacy flat path
     // (D1). A training harness sets it post-construction via

@@ -194,33 +194,22 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
 
         // Cook the authored scene to an nk::Model (mirrors recorder.cpp). The
         // unified world runs EXACTLY the cooked scene physics -- it does NOT inject
-        // a synthetic ground (the legacy multi-env batched path derived one via
-        // DeriveGroundHeight; the single-env oracle path ran contacts OFF). The
-        // FusedFoot foot pipeline detects against the implicit ground plane at
-        // model.ground_height (default 0); a scene that wants seated feet authors a
-        // ground at or above the feet. go2_stand.usda authors NO ground -> its feet
-        // (z ~ 0.28) float above z = 0 -> no foot-ground reaction -> the world
-        // reproduces the owner MJX golden's free-space fixed-base PD stance to 1e-4
-        // (the golden's ground truth). Auto-seating would load the feet and diverge
-        // the golden by ~1 rad -- i.e. it would change the physics the golden pins,
-        // and is a per-scene special-case the unified-world directive forbids.
-        // ONE-GENERAL-SOLVER landing (L1): select the contact path. contact_family
-        // == 0 (default) keeps the EXACT legacy 2-arg FusedFoot cook (byte-identical
-        // -- same overload, same bytes). == 1 takes the PairDriven option so the cook
-        // routes the world through the general LBVH+cvx narrowphase + mixed-island
-        // solve; the static heightfield collidable the general feet collide against
-        // is baked below (after model.terrain is set).
-        nuka::scene::cook::CookToModelResult cooked = [&] {
-            if (desc->contact_family == 1u) {
-                nuka::scene::cook::CookToModelOptions opt;
-                opt.contact_family =
-                    nuka::scene::cook::CookContactFamily::PairDriven;
-                return nuka::scene::cook::CookToModel(
-                    scene, static_cast<int>(desc->env_count), opt);
-            }
-            return nuka::scene::cook::CookToModel(scene,
-                                                  static_cast<int>(desc->env_count));
-        }();
+        // a synthetic ground. A scene that wants seated feet authors a ground at or
+        // above the feet (or requests a baked heightfield, below). go2_stand.usda
+        // authors NO ground -> its feet (z ~ 0.28) float above z = 0 -> no
+        // foot-ground reaction -> the world reproduces the owner MJX golden's
+        // free-space fixed-base PD stance to 1e-4 (the golden's ground truth).
+        // Auto-seating would load the feet and diverge the golden by ~1 rad -- i.e.
+        // it would change the physics the golden pins, and is a per-scene
+        // special-case the unified-world directive forbids.
+        // ONE-GENERAL-SOLVER landing (L1-b): the FUSED runtime is DELETED, so every
+        // world cooks through the GENERAL LBVH+cvx narrowphase + mixed-island solve
+        // (CookToModel always returns a PairDriven model). desc->contact_family no
+        // longer selects FUSED-vs-general (it is retained in the struct, removed in a
+        // later milestone); it now only requests the baked-heightfield collidable
+        // (below), the surface the general feet collide against.
+        nuka::scene::cook::CookToModelResult cooked = nuka::scene::cook::CookToModel(
+            scene, static_cast<int>(desc->env_count));
 
         // T1 (unified-actuator wire): route the declared control mode onto the
         // cooked Model's drive_mode, which the Pipeline copies into the ApplyDrives
@@ -250,15 +239,17 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         cooked.model.terrain.grid_width      = desc->terrain_grid_width;
         cooked.model.terrain.grid_height_max = desc->terrain_grid_height_max;
 
-        // ONE-GENERAL-SOLVER landing (L1): for the general (PairDriven) path the feet
-        // have NO analytic ground/terrain to detect against -- they must collide with
-        // a real collidable. Bake a STATIC heightfield collidable from the SAME
-        // model.terrain the FusedFoot kernel would sample (mirrors
+        // ONE-GENERAL-SOLVER landing (L1-b): on the general path the feet have NO
+        // analytic ground/terrain to detect against -- they must collide with a real
+        // collidable. When the caller REQUESTS a baked heightfield (contact_family ==
+        // 1, the heightfield-request signal now the FUSED path is gone), bake a STATIC
+        // heightfield collidable from model.terrain (mirrors
         // tests/scenario/vproof_go2_terrain.cpp::RunGeneral): CookHeightfieldGrid
         // samples SampleTerrainHeight over an (nrow x ncol) grid at the origin, pushes
         // it as one static body_init row, and the general narrowphase routes any
-        // overlapping foot to the per-cell TRIANGLE_PRISM contact. FusedFoot
-        // (contact_family == 0) bakes NOTHING -> the model is untouched (D1).
+        // overlapping foot to the per-cell TRIANGLE_PRISM contact. When no heightfield
+        // is requested (contact_family == 0) the model is untouched -- a scene that
+        // wants ground authors its own collidable (or its feet float, like the golden).
         if (desc->contact_family == 1u) {
             nuka::nk::Model& m = cooked.model;
             const uint32_t orig_bodies = m.capacities.bodies_per_env;

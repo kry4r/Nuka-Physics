@@ -1,42 +1,22 @@
 // ---------------------------------------------------------------------------
 // PHI v2 CUDA backend — M4 AssembleRows (the §3.4 row-assembly op).
 //
-// TWO contact families behind the ONE op (params->family):
+// Contact families behind the ONE op (params->family):
 //
-//   FUSED (kContactFamilyFusedFoot) — the M3 articulation foot pipeline,
-//   MOVED VERBATIM from the deleted transitional ops/solve_articulated.cu:
-//   per-contact chain Jacobians (normal/t1/t2) + effective masses +
-//   ArticulatedContactRow assembly. Kernel bodies are the same line-by-line
-//   ports of articulation_jacobian.cu / articulation_contacts.cu (D1
-//   byte-exact contract unchanged — the foot goldens pin it).
+//   FUSED (kContactFamilyFusedFoot) — DEAD as of L1-b: the FUSED contact RUNTIME
+//   was deleted (solve_rows.cu / contacts_foot.cu kernels gone, and the pipeline
+//   no longer selects this family). The OpAssembleRowsFused branch below is now
+//   UNREACHABLE — no cooked model is FusedFoot anymore — and is retained, dead,
+//   only until the L1-d enum collapse removes it wholesale. (Its kernels are the
+//   line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.)
 //
-//   UNION (kContactFamilyUnionCsr) — the legacy coresident union world's row
-//   assembly, device-resident on FIXED row slots:
-//     K1 PackQdotFlat        — the per-env flat prefix-sum qdot pack (the
-//                              legacy host qdot[] pack loop 1:1 via the cooked
-//                              dof_to_link/dof_to_component maps).
-//     K2 EmitUnionRows       — EmitCompliantContactRows' math per (env x
-//                              slot): solref/solimp aref + R via the SAME
-//                              constraint/solref_solimp.hpp HD header
-//                              (vel = 0, invweight = 1 — the union world's
-//                              exact inputs), ChooseTangent spoke basis,
-//                              normals-then-spokes group layout, the C5c
-//                              r x j rigid angular augment, λ cold-start
-//                              (the legacy union rebuilt rows from zeroed
-//                              manifold impulses every step — warm-start
-//                              stays mechanism-present via the persistent
-//                              lambda field, zeroed here to match legacy).
-//     K3 chain Jacobians     — the SAME ComputeContactChainJacobianKernel,
-//                              launched over ROW slots (link/point/dir
-//                              gathered per row by K2), out chain_jacobian.
-//     K4a row_minv_jt        — w = M^-1 J^T per articulation row (the
-//                              ArticulationApplyImpulse inner product, hoisted
-//                              to assembly: same inner loop, same order,
-//                              computed once instead of per iteration).
-//     K4b row_meff           — ComputeCompliantEffectiveMass hoisted to
-//                              assembly (constant across iterations): side-a
-//                              + side-b J M^-1 J^T + R, recip with the legacy
-//                              1e-12 floor.
+//   UNION (kContactFamilyUnionCsr) — DELETED in L1-c: the legacy coresident
+//   union world's CSR row assembly (EmitUnionRowsKernel / OpAssembleRowsUnion)
+//   was removed wholesale. Grasp moved to RL; the ONE general path is PairDriven.
+//
+//   PAIRDRIVEN (kContactFamilyPairDriven) — the ONE general path: the broadphase
+//   -> narrowphase manifolds (ucontact_*) are turned into solver rows (urows) by
+//   EmitPairDrivenRowsKernel + the shared chain-J / row_minv_jt / row_meff hoists.
 //   Entirely arena-resident; ZERO host participation; every launch shape is a
 //   fixed function of the capacities -> CUDA-graph capturable.
 // ---------------------------------------------------------------------------
@@ -348,183 +328,8 @@ __global__ void PackQdotFlatKernel(const Spatial6* __restrict__ link_velocity,
     (void)k;
 }
 
-// K2: one thread per (env x union slot) — EmitCompliantContactRows onto the
-// slot's FIXED row span. Worst-case layout: max_pts normal rows first, then
-// per point 2*(condim-1) spokes (+t0,-t0,+t1,-t1) — the emitter's exact
-// per-manifold order on fixed slots; inactive points/slots write zeroed
-// records (flags = 0) + lambda = 0 + the kInvalidLink chain-J sentinel.
-__global__ void EmitUnionRowsKernel(const float* __restrict__ union_slots,
-                                    const uint32_t* __restrict__ ucontact_count,
-                                    const math::Vec3* __restrict__ ucontact_point,
-                                    const math::Vec3* __restrict__ ucontact_normal,
-                                    const float* __restrict__ ucontact_depth,
-                                    const math::Transform* __restrict__ body_pose,
-                                    float solref0, float solref1,
-                                    float solimp0, float solimp1, float solimp2,
-                                    float solimp3, float solimp4,
-                                    float dt,
-                                    uint32_t env_count,
-                                    uint32_t slot_count,
-                                    uint32_t rows_per_env,
-                                    uint32_t bodies_per_env,
-                                    uint32_t base_link_count,
-                                    uint32_t particles_per_env,
-                                    NkRow* __restrict__ urows,
-                                    float* __restrict__ lambda,
-                                    uint32_t* __restrict__ row_cj_link,
-                                    math::Vec3* __restrict__ row_cj_point,
-                                    math::Vec3* __restrict__ row_cj_dir,
-                                    uint32_t* __restrict__ row_count) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = env_count * slot_count;
-    if (gid >= total) return;
-    const uint32_t env = gid / slot_count;
-    const uint32_t slot = gid - env * slot_count;
-
-    const UnionSlotDev u = LoadUnionSlot(union_slots, slot);
-    if (u.cls == kUSlotInactive) return;
-
-    const uint32_t max_pts = USlotMaxPoints(u);
-    const uint32_t rpp = USlotRowsPerPoint(u);
-    const uint32_t n_spokes = rpp - 1u;
-    const uint32_t base = env * rows_per_env + u.row_base;
-    const uint32_t n_active = ucontact_count[gid];
-
-    // Side kinds/indices by class (the legacy wiring loop's classification).
-    uint32_t kind_a = kNkSideStatic, idx_a = ~0u;
-    uint32_t kind_b = kNkSideStatic, idx_b = ~0u;
-    switch (u.cls) {
-        case kUSlotFootSpherePlane:
-            kind_a = kNkSideArtic;  idx_a = env;
-            kind_b = kNkSideStatic; idx_b = ~0u;
-            break;
-        case kUSlotFingerSphereHull:
-            kind_a = kNkSideArtic;  idx_a = env;
-            kind_b = kNkSideRigid;  idx_b = env * bodies_per_env + u.body;
-            break;
-        case kUSlotBodyBoxPlane:
-            kind_a = kNkSideRigid;  idx_a = env * bodies_per_env + u.body;
-            kind_b = kNkSideStatic; idx_b = ~0u;
-            break;
-        case kUSlotParticleSpherePlane:
-            // side a == the GLOBAL particle row (env*particles_per_env + link);
-            // side b == the static +Z plane.
-            kind_a = kNkSideParticle; idx_a = env * particles_per_env + u.link;
-            kind_b = kNkSideStatic;   idx_b = ~0u;
-            break;
-        case kUSlotParticleSphereBox:
-            kind_a = kNkSideParticle; idx_a = env * particles_per_env + u.link;
-            kind_b = kNkSideRigid;    idx_b = env * bodies_per_env + u.body;
-            break;
-        default:
-            break;
-    }
-
-    // Spoke basis from point[0]'s normal (EmitCompliantContactRows: ONE basis
-    // per manifold).
-    math::Vec3 t0{1.0f, 0.0f, 0.0f}, t1v{0.0f, 1.0f, 0.0f};
-    if (n_active > 0u && n_spokes > 0u) {
-        const math::Vec3 base_normal =
-            NormalizedHostExpr(ucontact_normal[static_cast<size_t>(gid) * 4u]);
-        t0 = ChooseTangentDev(base_normal);
-        t1v = NormalizedHostExpr(base_normal.Cross(t0));
-    }
-
-    const float solref[2] = {solref0, solref1};
-    const float solimp[5] = {solimp0, solimp1, solimp2, solimp3, solimp4};
-
-    // The rigid-side COM for the r x j angular augment (constant this step).
-    math::Vec3 com_a{0.0f, 0.0f, 0.0f}, com_b{0.0f, 0.0f, 0.0f};
-    if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
-    if (kind_b == kNkSideRigid) com_b = body_pose[idx_b].position;
-
-    uint32_t active_rows = 0u;
-    for (uint32_t p = 0u; p < max_pts; ++p) {
-        const bool live = p < n_active;
-        const size_t mp = static_cast<size_t>(gid) * 4u + p;
-
-        // ---- normal row at base + p ------------------------------------
-        {
-            const uint32_t rs = base + p;
-            NkRow row{};  // zero-init: inactive default.
-            lambda[rs] = 0.0f;   // legacy union cold start (impulses==0).
-            row_cj_link[rs] = kInvalidLink;
-            if (live) {
-                const math::Vec3 n = NormalizedHostExpr(ucontact_normal[mp]);
-                const math::Vec3 point = ucontact_point[mp];
-                const float pos = -ucontact_depth[mp];
-                const constraint::CompliantContactRow compliant =
-                    constraint::ComputeCompliantRow(solref, solimp, pos, pos,
-                                                    /*vel=*/0.0f,
-                                                    /*invweight=*/1.0f, dt,
-                                                    /*refsafe=*/true);
-                row.flags = nk::nk_row_flags::kActive;
-                row.group_first = base;
-                row.group_normal_count = max_pts;
-                row.env = env;
-                row.rhs = compliant.aref_bias;
-                row.compliance_alpha = compliant.R;
-                row.lower = 0.0f;
-                row.upper = kFltMax;
-                row.mu = u.mu;
-                row.a.kind = kind_a; row.a.index = idx_a;
-                row.a.jlin = n;
-                row.b.kind = kind_b; row.b.index = idx_b;
-                row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
-                // C5c rigid angular augment: jang = (point - COM) x jlin.
-                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
-                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
-                if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = env * base_link_count + u.link;
-                    row_cj_point[rs] = point;
-                    row_cj_dir[rs] = row.a.jlin;  // the artic side's row direction
-                }
-                ++active_rows;
-            }
-            urows[rs] = row;
-        }
-
-        // ---- friction spokes at base + max_pts + p*n_spokes + k ----------
-        for (uint32_t k = 0u; k < n_spokes; ++k) {
-            const uint32_t rs = base + max_pts + p * n_spokes + k;
-            NkRow row{};
-            lambda[rs] = 0.0f;
-            row_cj_link[rs] = kInvalidLink;
-            if (live) {
-                const math::Vec3 spokes[4] = {
-                    t0, math::Vec3{-t0.x, -t0.y, -t0.z},
-                    t1v, math::Vec3{-t1v.x, -t1v.y, -t1v.z}};
-                const math::Vec3 dir = spokes[k & 3u];
-                const math::Vec3 point = ucontact_point[mp];
-                row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kFriction;
-                row.group_first = base;
-                row.group_normal_count = max_pts;
-                row.env = env;
-                row.rhs = 0.0f;               // no positional bias (emitter).
-                row.compliance_alpha = 0.0f;  // spokes carry R = 0.
-                row.lower = 0.0f;
-                row.upper = 0.0f;             // overridden in-kernel (pyramid).
-                row.mu = u.mu;
-                row.a.kind = kind_a; row.a.index = idx_a;
-                row.a.jlin = dir;
-                row.b.kind = kind_b; row.b.index = idx_b;
-                row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
-                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
-                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
-                if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = env * base_link_count + u.link;
-                    row_cj_point[rs] = point;
-                    row_cj_dir[rs] = row.a.jlin;
-                }
-                ++active_rows;
-            }
-            urows[rs] = row;
-        }
-    }
-    if (active_rows > 0u) {
-        atomicAdd(&row_count[env], active_rows);  // order-independent sum (D1).
-    }
-}
+// L1-c: EmitUnionRowsKernel (the UnionCsr K2 row emitter) was DELETED here. The
+// ONE general path emits its rows via EmitPairDrivenRowsKernel below.
 
 // K1 (PairDriven, S3): pack the per-ARTICULATION flat qdot tiles. One thread per
 // (global artic x DOF). dof_to_link/component are the per:dog TEMPLATE map; for
@@ -1119,96 +924,8 @@ Status OpAssembleRowsFused(const ModelView& model, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-Status OpAssembleRowsUnion(const ModelView& model, const DataView& data,
-                           const AssembleRowsParams* p, cudaStream_t stream) {
-    if (p->env_count == 0u || p->union_slot_count == 0u || p->rows_per_env == 0u) {
-        return Status::Ok;
-    }
-    constexpr uint32_t kBlockSize = 128u;
-    const uint32_t total_rows = p->env_count * p->rows_per_env;
-    const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
-
-    // K1: pack the flat qdot (articulated models only).
-    if (has_artic) {
-        const uint32_t total = p->env_count * p->max_dof;
-        const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(PackQdotFlatKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   reinterpret_cast<const Spatial6*>(data.link_velocity),
-                   static_cast<const float*>(data.qdot),
-                   static_cast<const uint32_t*>(model.dof_to_link),
-                   static_cast<const uint32_t*>(model.dof_to_component),
-                   p->env_count, p->max_dof, p->base_link_count,
-                   data.qdot_flat);
-    }
-
-    // K2: emit the union rows onto the fixed slots.
-    {
-        const uint32_t total = p->env_count * p->union_slot_count;
-        const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitUnionRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   static_cast<const float*>(model.union_slots),
-                   static_cast<const uint32_t*>(data.ucontact_count),
-                   static_cast<const math::Vec3*>(data.ucontact_point),
-                   static_cast<const math::Vec3*>(data.ucontact_normal),
-                   static_cast<const float*>(data.ucontact_depth),
-                   static_cast<const math::Transform*>(data.body_pose),
-                   p->solref[0], p->solref[1],
-                   p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3],
-                   p->solimp[4],
-                   p->dt,
-                   p->env_count, p->union_slot_count, p->rows_per_env,
-                   p->bodies_per_env, p->base_link_count, p->particles_per_env,
-                   reinterpret_cast<NkRow*>(data.urows),
-                   data.lambda,
-                   data.row_cj_link, data.row_cj_point, data.row_cj_dir,
-                   data.row_count);
-    }
-
-    if (has_artic) {
-        // K3: chain Jacobians per row slot (the SAME kernel as the fused
-        // family, fed the per-row gathered link/point/dir). Zero the output
-        // first — the kernel writes only ancestor-chain entries (a stream
-        // memset, captured fine; NOT an allocation).
-        const size_t jbytes =
-            static_cast<size_t>(total_rows) * p->max_dof * sizeof(float);
-        if (cudaMemsetAsync(data.chain_jacobian, 0, jbytes, stream) != cudaSuccess) {
-            return Status::Failed;
-        }
-        const ArticulationDeviceState state = MakeArticulationDeviceState(
-            model, data, p->total_link_count, p->articulation_count);
-        const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ComputeContactChainJacobianKernel, dim3(blocks), dim3(kBlockSize),
-                   0u, stream, state,
-                   static_cast<const uint32_t*>(data.row_cj_link),
-                   static_cast<const math::Vec3*>(data.row_cj_point),
-                   static_cast<const math::Vec3*>(data.row_cj_dir),
-                   total_rows, p->max_dof, data.chain_jacobian);
-
-        // K4a: w = M^-1 J^T per articulation row.
-        const uint32_t wtotal = total_rows * p->max_dof;
-        const uint32_t wblocks = (wtotal + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ComputeRowMinvJtKernel, dim3(wblocks), dim3(kBlockSize), 0u,
-                   stream,
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   static_cast<const float*>(data.chain_jacobian),
-                   static_cast<const float*>(data.m_inv),
-                   total_rows, p->max_dof, data.row_minv_jt);
-    }
-
-    // K4b: per-row effective mass.
-    {
-        const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ComputeRowMeffKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   static_cast<const float*>(data.chain_jacobian),
-                   static_cast<const float*>(data.row_minv_jt),
-                   static_cast<const float*>(data.body_inv_mass),
-                   static_cast<const math::Vec3*>(data.body_inv_inertia),
-                   static_cast<const float*>(data.particle_inv_mass),
-                   total_rows, p->max_dof, data.row_meff);
-    }
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-}
+// L1-c: OpAssembleRowsUnion (the UnionCsr K1-K4 assembly orchestrator) was
+// DELETED here. The ONE general path assembles via OpAssembleRowsPairDriven.
 
 Status OpAssembleRows(const ModelView& model, const DataView& data,
                       const void* params, cudaStream_t stream) {
@@ -1216,12 +933,11 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->family == kContactFamilyUnionCsr) {
-        return OpAssembleRowsUnion(model, data, p, stream);
-    }
     if (p->family == kContactFamilyPairDriven) {
         return OpAssembleRowsPairDriven(model, data, p, stream);
     }
+    // L1-b/L1-d dead fallthrough: the FUSED family is unreachable (no cooked
+    // model selects it). Retained until the L1-d enum collapse removes it.
     return OpAssembleRowsFused(model, data, p, stream);
 }
 

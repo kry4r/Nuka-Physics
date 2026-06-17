@@ -205,7 +205,8 @@ namespace {
 // the general-path options (single-hull + no SDF) so the whole-body union scene
 // cooks tractably. No entity/scene-name branch — the options are the only seam.
 CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
-                                  const CookSceneOptions& cook_options) {
+                                  const CookSceneOptions& cook_options,
+                                  bool enable_contacts = true) {
     const uint32_t envs = env_count > 0 ? static_cast<uint32_t>(env_count) : 1u;
 
     // 1. Drive the existing cook (the heavy lifting: V-HACD / SDF / filters).
@@ -399,8 +400,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // that link, in the link's LOCAL frame. This is the source the GENERAL
         // contact path poses into world space (SyncLinkBodyPose: link_pose o
         // link_geom_local -> the link's collidable body row in the LBVH). Cooked
-        // for EVERY scene; the FusedFoot/UnionCsr graphs never read it (it only
-        // feeds the PairDriven SyncLinkBodyPose op) -> K==1 FUSED byte-identical.
+        // for EVERY scene; the UnionCsr graph never reads it (it only feeds the
+        // PairDriven SyncLinkBodyPose op).
         //   kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
         //   default-zero (no-shape) link is unambiguously inactive.
         m.link_geom_kind.assign(m.link_count, 0u);
@@ -689,8 +690,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // this is EXACTLY kMaxFootContactsPerEnv (4) -> max_contacts 4 / rows 12,
         // byte-identical. At K>1 it grows to kMultiDogContactsPerArtic (12) so each
         // dog's per-articulation foot block has headroom. 3 rows per contact slot
-        // {normal, t1, t2}. (PairDriven overrides this budget with its own
-        // candidate-slot layout; this stride only governs the FusedFoot path.)
+        // {normal, t1, t2}. (The PairDriven cook OVERRIDES this budget with its own
+        // candidate-slot layout; L1-b deleted the FUSED path this stride once fed, so
+        // this is now only the initial sizing the general cook resizes.)
         const uint32_t stride = (k > 1u)
             ? ::nuka::runtime::articulation::kMultiDogContactsPerArtic
             : ::nuka::runtime::articulation::kMaxFootContactsPerEnv;
@@ -701,12 +703,24 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
         cap.max_rows_per_env     = cap.max_contacts_per_env * 4u;
     }
+    // Contacts-OFF dynamics world (the general-path equivalent of the legacy
+    // single-env enable_contacts==false): zero the per-env contact/candidate
+    // budget so the pipeline emits NO broadphase/narrowphase/solve ops (has_-
+    // collidables gates on max_contacts_per_env). The cooked shape_table / link_-
+    // geom rows below stay sized consistently but are never read -- the world runs
+    // pure articulation+rigid dynamics (FK -> CRBA -> implicit damping -> integrate),
+    // and StepPlanned captures cleanly (no thrust LBVH). Also keeps the PairDriven
+    // overload's row-budget resize a no-op (it guards on max_contacts_per_env > 0).
+    if (!enable_contacts) {
+        cap.max_contacts_per_env = 0u;
+        cap.max_rows_per_env     = 0u;
+    }
 
     // 10. M5 — pair-driven generalized-collision + SDF main-path staging (plan
     //     §3.5). The shape_table (one PairDrivenShape / collidable body row),
     //     the SDF sampling-point pool (SAMP cook), the cooked sparse-SDF grids
     //     (SdfDeviceWorld upload duties moved INTO the Model), and the filter
-    //     exclude-list. A FusedFoot scene with no SdfMesh shape leaves the SDF
+    //     exclude-list. A scene with no SdfMesh shape leaves the SDF
     //     tables empty (max_sdf_* == 0); they are populated for a cooked
     //     pair-driven SDF scene. These tables are sized AFTER the contact
     //     capacity (max_bodies_total == bodies_per_env, the shape_table stride).
@@ -845,7 +859,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // INERT in Phase 0: the broadphase iterates only bodies_per_env body rows
         // per env (it never indexes the static row), and shape_table is a model
         // param pinned by no golden, so growing max_bodies_total by one row is
-        // byte-safe for the gated FusedFoot/UnionCsr families. The static row's
+        // byte-safe for the gated UnionCsr family. The static row's
         // WORLD pose / LBVH entry is wired in Phase 1 (R5 downstream + B3); here we
         // only register the collidable. A Plane kind anchors the flat-ground case
         // (the general heightfield collidable, kShapeHeightfield, is added by H2/H3
@@ -879,35 +893,38 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 }  // namespace
 
 CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
-    // DEFAULT (legacy) cook options -> byte-identical to the pre-L-RECON-B cook.
-    return CookToModelImpl(scene, env_count, CookSceneOptions{});
+    // L1-b: the FUSED runtime is deleted, so the 2-arg cook now produces a fully
+    // general (PairDriven) model — it delegates to the general overload so the
+    // contact_family / dof maps / per-candidate-slot row budget are all consistent
+    // (a bare CookSceneOptions{} cook would leave a PairDriven-family model in a
+    // half-configured state). PairDriven is the default CookToModelOptions.
+    return CookToModel(scene, env_count, CookToModelOptions{});
 }
 
-// B1 (general contact pipeline Phase 1B): the PairDriven cook overload. It runs
-// the SAME cook (so the registry / shape_table / body_to_link / static ground row
-// / multi-artic foundation are all reused verbatim) then flips the model to the
-// GENERAL family: contact_family = PairDriven (the pipeline then routes the ONE
-// LBVH -> cvx -> mixed-island contact path), enables cross-env
-// filtering so candidate pairs stay env-local, and RE-SIZES the per-env row budget
-// to the general per-candidate-slot layout (max_contacts_per_env candidate slots x
-// kPairDrivenRowsPerSlot rows/slot). The FusedFoot overload is byte-untouched.
+// B1 (general contact pipeline Phase 1B): the PairDriven (general) cook overload.
+// It runs the SAME cook (so the registry / shape_table / body_to_link / static
+// ground row / multi-artic foundation are all reused verbatim) then flips the model
+// to the GENERAL family: contact_family = PairDriven (the pipeline then routes the
+// ONE LBVH -> cvx -> mixed-island contact path), enables cross-env filtering so
+// candidate pairs stay env-local, and RE-SIZES the per-env row budget to the
+// general per-candidate-slot layout (max_contacts_per_env candidate slots x
+// kPairDrivenRowsPerSlot rows/slot). L1-b: the FUSED runtime is deleted, so this is
+// the ONLY general cook path — the options.contact_family no longer selects FUSED.
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options) {
+    // L1-b: options.contact_family no longer selects FUSED; the cook is always
+    // general (PairDriven). options.enable_contacts is threaded to CookToModelImpl
+    // (a contacts-OFF cook zeroes the contact budget for dynamics-only worlds).
     // L-RECON-B: the GENERAL (PairDriven) cvx narrowphase consumes NEITHER the
     // sparse SDF (OpNarrowphaseSdf is a no-op for every family) NOR V-HACD's
     // N-piece decomposition (it wants ONE convex hull per mesh). Skipping both
     // makes the whole-body H1 union scene cook tractable (>178s -> seconds), and
-    // is a no-op for primitive-only scenes (go2: no mesh, no SDF). The FusedFoot
-    // overload keeps the DEFAULT cook options (byte-identical to the 2-arg cook).
+    // is a no-op for primitive-only scenes (go2: no mesh, no SDF).
     CookSceneOptions cook_options;
-    if (options.contact_family == CookContactFamily::PairDriven) {
-        cook_options.bake_sdf = false;
-        cook_options.general_single_hull = true;
-    }
-    CookToModelResult result = CookToModelImpl(scene, env_count, cook_options);
-    if (options.contact_family != CookContactFamily::PairDriven) {
-        return result;  // FusedFoot: DEFAULT cook options == byte-identical 2-arg.
-    }
+    cook_options.bake_sdf = false;
+    cook_options.general_single_hull = true;
+    CookToModelResult result =
+        CookToModelImpl(scene, env_count, cook_options, options.enable_contacts);
     nk::Model& model = result.model;
     model.contact_family = nk::ContactFamily::PairDriven;
     // Env-local candidate pairs: keep cross-env filtering ON so co-resident

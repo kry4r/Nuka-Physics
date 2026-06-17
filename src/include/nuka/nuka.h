@@ -122,23 +122,25 @@ typedef struct nuka_world_desc_t {
     // then sized env_count * (K * per-dog), the K dogs concatenated per env.
     uint32_t instance_count;        // # co-resident articulation replicas (0/1 = single).
     float instance_spacing;         // X gap between replica spawns before cook (m).
-    // ONE-GENERAL-SOLVER landing (L1): route this world through the GENERAL contact
-    // path (CookContactFamily::PairDriven -> LBVH broadphase + cvx GJK/EPA
-    // narrowphase + mixed-island solve) instead of the legacy analytic FusedFoot
-    // foot-vs-ground/terrain kernel. 0 (the zero-initialized default) == FusedFoot
-    // == BYTE-IDENTICAL to every legacy create. 1 == PairDriven general path: the
-    // cook is taken with the PairDriven option AND a STATIC heightfield collidable
-    // is baked from the SAME model.terrain (the procedural surface the FusedFoot
-    // kernel samples analytically), so the feet collide against the cooked per-cell
-    // TRIANGLE_PRISM grid via the general narrowphase. The heightfield geometry is
-    // MODEL-LEVEL (one baked terrain type for the whole batch -- general per-env
-    // terrain types are a later feature); the type baked is heightfield_terrain_type
+    // ONE-GENERAL-SOLVER landing (L1-b): the FUSED runtime is DELETED, so every
+    // world now cooks through the GENERAL contact path (LBVH broadphase + cvx GJK/EPA
+    // narrowphase + mixed-island solve) unconditionally. This field NO LONGER selects
+    // FUSED-vs-general (it is retained in the struct for ABI stability, removed in a
+    // later milestone). It now only REQUESTS the baked-heightfield collidable the
+    // general feet collide against: 1 == bake a STATIC heightfield collidable from
+    // model.terrain (CookHeightfieldGrid samples SampleTerrainHeight over the grid,
+    // pushes one static body_init row, and the general narrowphase routes any
+    // overlapping foot to the per-cell TRIANGLE_PRISM contact); 0 == bake NOTHING
+    // (the scene authors its own ground collidable, or its feet float, like the
+    // go2_stand golden). The heightfield geometry is MODEL-LEVEL (one baked terrain
+    // type for the whole batch -- general per-env terrain types are a later feature);
+    // the type baked is heightfield_terrain_type
     // (0=Flat,1=PyramidStairs,2=InvertedPyramid,3=RandomBoxes). The grid is
     // (nrow x ncol) cells of edge heightfield_cell, centred at the world origin; a 0
     // in any of the three falls back to a default (41 x 41 @ 0.25 m == a ~10 m span)
     // sized to cover a single spawn footprint. Used by the L1 acceptance rollout
-    // (trained go2 policy on the general path) before the FusedFoot path is deleted.
-    uint32_t contact_family;          // 0 = FusedFoot (default), 1 = PairDriven (general).
+    // (trained go2 policy on the general path).
+    uint32_t contact_family;          // 1 = bake a heightfield collidable, 0 = none.
     uint32_t heightfield_terrain_type;// baked heightfield type for the general path.
     uint32_t heightfield_nrow;        // general heightfield grid rows (0 => 41).
     uint32_t heightfield_ncol;        // general heightfield grid cols (0 => 41).
@@ -409,10 +411,11 @@ typedef enum nuka_state_field_t {
     // WRITE (per-env). Go2-on-stairs Phase 2a: per-env procedural-terrain TYPE
     // code (nuka::terrain::TerrainType: 0 = Flat (default seed), 1 = PyramidStairs,
     // 2 = InvertedPyramid, 3 = RandomBoxes). Aliases the engine's persistent
-    // env_terrain_type Data field (zero-copy). The FusedFoot foot-contact kernel
-    // samples the shared procedural heightfield h(x,y) per env instead of the
-    // scalar ground plane; type 0 (the default seed) reproduces the flat plane at
-    // model.ground_height (byte-identical to the legacy path). The horizontal/
+    // env_terrain_type Data field (zero-copy). (Historically the FUSED foot-contact
+    // kernel sampled the shared procedural heightfield h(x,y) per env; L1-b deletes
+    // that runtime — the general path's terrain is the cook-time baked heightfield
+    // collidable, so this per-env type is now model-level / informational.) The
+    // horizontal/
     // vertical TerrainParams (step_height etc.) are set ONCE at world create via
     // nuka_world_desc_t.terrain_* (model-level cook config, NOT per env).
     //
