@@ -55,7 +55,10 @@ constexpr uint32_t kParticleGridMaxNeighbors = 32u;  // mirror particle_uniform_
 
 // shape_table record: R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape). Lanes 0..7 unchanged; lanes 8/9 = body_id (int32) +
-// group (uint32), the shape->body indirection (INERT in Phase 0).
+// group (uint32), the shape->body indirection. L-RECON-D GREW it 10 -> 12,
+// appending the per-shape hull slice in lanes 10/11; the AABB broadphase reads
+// only lanes 0..9 (the hull bound radius is baked into params[0] at cook), so it
+// just needs the WIDENED stride to index the right row.
 struct ShapeDev {
     uint32_t   kind;
     float      p[4];        // sphere r / capsule r,hh / box he.xyz
@@ -66,7 +69,7 @@ struct ShapeDev {
     uint32_t   group;       // signed collision-group filter key (R1).
 };
 __forceinline__ __device__ ShapeDev LoadShape(const float* table, uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 10u;
+    const float* q = table + static_cast<size_t>(row) * 12u;
     ShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.p[0] = q[1]; s.p[1] = q[2]; s.p[2] = q[3]; s.p[3] = q[4];

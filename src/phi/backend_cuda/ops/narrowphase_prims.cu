@@ -68,8 +68,12 @@ __device__ amf::PrimParams MakePrim(const PrimShapeDev& s,
 // baked frame (the same body world transform). Plane never reaches the fallback
 // (every plane pair is analytic inline). Returns false if the kind is not a cvx
 // shape (so the caller leaves the manifold empty).
+// L-RECON-D: hull_verts is the GLOBAL concatenated pool; (hull_off, hull_cnt) is
+// THIS shape's slice (lanes 10/11 of its shape_table row), so a hull side uses
+// its own verts (pool + hull_off*3) rather than one global hull.
 __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
-                                 const float* hull_verts, uint32_t hull_vert_count,
+                                 const float* hull_verts, uint32_t hull_off,
+                                 uint32_t hull_cnt,
                                  cvx::ConvexHullView* hull_store,
                                  cvx::SupportProxy* out) {
     switch (kind) {
@@ -77,11 +81,11 @@ __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
         case kKindSphere:  out->kind = cvx::SupportKind::Sphere;  out->prim = &prim; return true;
         case kKindCapsule: out->kind = cvx::SupportKind::Capsule; out->prim = &prim; return true;
         case kKindConvexHull:
-            // Single-hull pool (the only PairDriven hull source today). The hull
-            // verts are MESH-LOCAL; reuse the body's baked frame so the support
-            // scan transforms them to world. warp_lockstep=false (see kernel note).
-            hull_store->verts = hull_verts;
-            hull_store->vcount = hull_vert_count;
+            // Per-shape slice of the concatenated hull pool. The hull verts are
+            // MESH-LOCAL; reuse the body's baked frame so the support scan
+            // transforms them to world. warp_lockstep=false (see kernel note).
+            hull_store->verts = hull_verts + static_cast<size_t>(hull_off) * 3u;
+            hull_store->vcount = hull_cnt;
             hull_store->frame = prim.frame;
             hull_store->warp_lockstep = false;  // thread-per-slot kernel (not full-warp)
             out->kind = cvx::SupportKind::Hull;
@@ -100,7 +104,9 @@ __device__ bool MakeSupportProxy(uint32_t kind, const amf::PrimParams& prim,
 // a side (e.g. SDF mesh) leave the manifold empty (the SDF path covers them).
 __device__ void DispatchPair(uint32_t ka, const amf::PrimParams& a,
                              uint32_t kb, const amf::PrimParams& b,
-                             const float* hull_verts, uint32_t hull_vert_count,
+                             const float* hull_verts,
+                             uint32_t hull_off_a, uint32_t hull_cnt_a,
+                             uint32_t hull_off_b, uint32_t hull_cnt_b,
                              ContactManifold* out) {
     out->Clear();
     // Canonicalize so the handler arg order matches the amf:: API (sphere first
@@ -137,8 +143,8 @@ __device__ void DispatchPair(uint32_t ka, const amf::PrimParams& a,
     // is thread-per-slot, NOT full-warp converged).
     cvx::ConvexHullView ha, hb;
     cvx::SupportProxy A, B;
-    if (MakeSupportProxy(ka, a, hull_verts, hull_vert_count, &ha, &A) &&
-        MakeSupportProxy(kb, b, hull_verts, hull_vert_count, &hb, &B)) {
+    if (MakeSupportProxy(ka, a, hull_verts, hull_off_a, hull_cnt_a, &ha, &A) &&
+        MakeSupportProxy(kb, b, hull_verts, hull_off_b, hull_cnt_b, &hb, &B)) {
         cvx::ConvexNarrowphase(A, B, out);
     }
     // else: a non-cvx side (SDF mesh / plane-vs-non-prim) -> empty; the SDF path
@@ -154,7 +160,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     const float* __restrict__ shape_table,
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ hull_verts,           // cooked hull pool (G5)
-    uint32_t hull_vert_count,
+    uint32_t /*hull_vert_count*/,                    // L-RECON-D: per-shape slice now in shape_table
     uint32_t gen,                                    // run/generation counter (C2)
     uint32_t env_count, uint32_t slot_stride, uint32_t bodies_per_env,
     uint32_t* __restrict__ ucount,
@@ -184,7 +190,11 @@ __global__ void PairDrivenNarrowphaseKernel(
         const math::Transform xb = body_pose[env * bodies_per_env + b];
         const amf::PrimParams pa = MakePrim(sa, xa);
         const amf::PrimParams pb = MakePrim(sb, xb);
-        DispatchPair(sa.kind, pa, sb.kind, pb, hull_verts, hull_vert_count, &m);
+        // L-RECON-D: each side carries its OWN hull slice (lanes 10/11) into the
+        // concatenated hull_verts pool; non-hull sides keep count 0 (no-op).
+        DispatchPair(sa.kind, pa, sb.kind, pb, hull_verts,
+                     sa.hull_vert_offset, sa.hull_vert_count,
+                     sb.hull_vert_offset, sb.hull_vert_count, &m);
     }
 
     const uint32_t n = m.point_count;

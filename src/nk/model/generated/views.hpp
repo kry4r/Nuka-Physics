@@ -47,7 +47,7 @@ struct ModelView {
     float* hull_verts = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts*3
     uint32_t* dof_to_link = nullptr;  // per:dof arena:persistent owner:model
     uint32_t* dof_to_component = nullptr;  // per:dof arena:persistent owner:model
-    float* shape_table = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*10
+    float* shape_table = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*12
     uint64_t* excluded_pairs = nullptr;  // per:scalar arena:persistent owner:model count:max_excluded_pairs
     float* samp_points = nullptr;  // per:scalar arena:persistent owner:model count:max_samp_points*3
     uint32_t* samp_ranges = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total*2

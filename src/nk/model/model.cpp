@@ -76,9 +76,11 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         // M5 pair-driven / SDF GLOBAL tables (per-env template, base-relative).
         // R1: the shape_table record GREW 8 -> 10 f32/row (appended body_id +
-        // group); the unpack of lanes 0..7 stays byte-identical.
+        // group). L-RECON-D: it GREW 10 -> 12 f32/row (appended the per-shape
+        // hull slice hull_vert_offset/hull_vert_count); the unpack of lanes
+        // 0..9 stays byte-identical (the new lanes default 0 for hull-free rows).
         if (id == FieldId::ShapeTable) {
-            return static_cast<uint64_t>(max_bodies_total) * 10ull;
+            return static_cast<uint64_t>(max_bodies_total) * 12ull;
         }
         if (id == FieldId::ExcludedPairs) {
             return static_cast<uint64_t>(max_excluded_pairs);
@@ -331,15 +333,17 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             // GLOBAL pair-driven shape table: R1 GREW it 8 -> 10 packed f32 per
             // body row {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
             //  sdf_grid(u32), body_id(int32 bits; -1==static), group(u32 bits)}.
-            // Lanes 0..7 are byte-identical to the prior layout; lanes 8/9 are the
-            // appended R1 fields (INERT in Phase 0). Empty for the union family.
+            // L-RECON-D GREW it 10 -> 12, appending the per-shape hull slice
+            // {hull_vert_offset(u32), hull_vert_count(u32)} into lanes 10/11.
+            // Lanes 0..9 are byte-identical to the prior layout; lanes 10/11 are
+            // 0 for a hull-free row (NO-OP for go2). Empty for the union family.
             auto* p = reinterpret_cast<float*>(dst);
             auto put_u32 = [&](size_t at, uint32_t v) { std::memcpy(&p[at], &v, 4); };
             auto put_i32 = [&](size_t at, int32_t v) { std::memcpy(&p[at], &v, 4); };
             const uint32_t rows = capacities.max_bodies_total;
             for (uint32_t s = 0; s < shape_table_rows.size() && s < rows; ++s) {
                 const PairDrivenShape& sh = shape_table_rows[s];
-                const size_t b = static_cast<size_t>(s) * 10u;
+                const size_t b = static_cast<size_t>(s) * 12u;
                 put_u32(b + 0, sh.kind);
                 p[b + 1] = sh.params[0]; p[b + 2] = sh.params[1];
                 p[b + 3] = sh.params[2]; p[b + 4] = sh.params[3];
@@ -348,6 +352,8 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 put_u32(b + 7, sh.sdf_grid);
                 put_i32(b + 8, sh.body_id);
                 put_u32(b + 9, sh.group);
+                put_u32(b + 10, sh.hull_vert_offset);
+                put_u32(b + 11, sh.hull_vert_count);
             }
             break;
         }
