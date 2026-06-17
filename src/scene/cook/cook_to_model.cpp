@@ -197,11 +197,19 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
 
 }  // namespace
 
-CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
+namespace {
+
+// L-RECON-B: the shared cook implementation. The cook options gate the two HEAVY
+// per-shape stages (V-HACD vs single-hull, SDF bake). The public 2-arg overload
+// passes the DEFAULT options (legacy, byte-identical); the PairDriven 3-arg passes
+// the general-path options (single-hull + no SDF) so the whole-body union scene
+// cooks tractably. No entity/scene-name branch — the options are the only seam.
+CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
+                                  const CookSceneOptions& cook_options) {
     const uint32_t envs = env_count > 0 ? static_cast<uint32_t>(env_count) : 1u;
 
     // 1. Drive the existing cook (the heavy lifting: V-HACD / SDF / filters).
-    const CookedBlob blob = CookScene(scene);
+    const CookedBlob blob = CookScene(scene, cook_options);
 
     // 2. Articulation topology (kinematic tree) from the cooked joints/bodies.
     const std::vector<runtime::articulation::ArticulationCookedTopology> arts =
@@ -851,6 +859,13 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     return result;
 }
 
+}  // namespace
+
+CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
+    // DEFAULT (legacy) cook options -> byte-identical to the pre-L-RECON-B cook.
+    return CookToModelImpl(scene, env_count, CookSceneOptions{});
+}
+
 // B1 (general contact pipeline Phase 1B): the PairDriven cook overload. It runs
 // the SAME cook (so the registry / shape_table / body_to_link / static ground row
 // / multi-artic foundation are all reused verbatim) then flips the model to the
@@ -861,9 +876,20 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
 // kPairDrivenRowsPerSlot rows/slot). The FusedFoot overload is byte-untouched.
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options) {
-    CookToModelResult result = CookToModel(scene, env_count);
+    // L-RECON-B: the GENERAL (PairDriven) cvx narrowphase consumes NEITHER the
+    // sparse SDF (OpNarrowphaseSdf is a no-op for every family) NOR V-HACD's
+    // N-piece decomposition (it wants ONE convex hull per mesh). Skipping both
+    // makes the whole-body H1 union scene cook tractable (>178s -> seconds), and
+    // is a no-op for primitive-only scenes (go2: no mesh, no SDF). The FusedFoot
+    // overload keeps the DEFAULT cook options (byte-identical to the 2-arg cook).
+    CookSceneOptions cook_options;
+    if (options.contact_family == CookContactFamily::PairDriven) {
+        cook_options.bake_sdf = false;
+        cook_options.general_single_hull = true;
+    }
+    CookToModelResult result = CookToModelImpl(scene, env_count, cook_options);
     if (options.contact_family != CookContactFamily::PairDriven) {
-        return result;  // FusedFoot: byte-identical to the 2-arg cook.
+        return result;  // FusedFoot: DEFAULT cook options == byte-identical 2-arg.
     }
     nk::Model& model = result.model;
     model.contact_family = nk::ContactFamily::PairDriven;

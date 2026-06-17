@@ -285,6 +285,10 @@ void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
 } // namespace
 
 CookedBlob CookScene(const SceneIR& scene) {
+    return CookScene(scene, CookSceneOptions{});
+}
+
+CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     CookedBlob blob;
 
     const auto& bodies = scene.Bodies();
@@ -389,7 +393,18 @@ CookedBlob CookScene(const SceneIR& scene) {
             continue;
         }
 
-        const import::cooker::DecomposeMode mode = ToCookerMode(s.decompose_mode);
+        import::cooker::DecomposeMode mode = ToCookerMode(s.decompose_mode);
+
+        // L-RECON-B: the GENERAL cvx narrowphase wants ONE convex hull per mesh,
+        // not V-HACD's N concave pieces. When single-hull is requested, collapse
+        // every mesh to its own hull (the Skip path) UNLESS the author explicitly
+        // forced decomposition (a genuinely-concave shape opting INTO V-HACD).
+        // This is a STAGE gate driven by the cook option + the per-shape mode —
+        // no entity/scene-name branch.
+        if (options.general_single_hull &&
+            mode != import::cooker::DecomposeMode::Force) {
+            mode = import::cooker::DecomposeMode::Skip;
+        }
 
         if (mode == import::cooker::DecomposeMode::Skip) {
             // Treat the source mesh as a single convex piece (store its own
@@ -448,7 +463,7 @@ CookedBlob CookScene(const SceneIR& scene) {
     // stderr (R-C ~80MB cap). The detailed stats remain reachable via
     // CookedSdfTable (Count() vs piece count; sum of per-cell bytes) for callers
     // / tests that want them.
-    {
+    if (options.bake_sdf) {
         uint32_t unique = 0, total = 0;
         uint64_t bytes = 0;
         CookSdfsForGeometry(blob.convex_geometry, blob.sdfs, &unique, &total, &bytes);

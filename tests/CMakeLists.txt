@@ -2696,6 +2696,37 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # L-RECON-B cook profile -- lreconb_cook_profile: split the general
+    # CookToModel(PairDriven) cook of the H1 union scene across the two HEAVY
+    # per-shape stages (V-HACD, sparse-SDF bake) to confirm which dominates and
+    # quantify the single-hull + no-SDF fix. Shares the gated cook link set.
+    add_executable(lreconb_cook_profile
+        ${CMAKE_SOURCE_DIR}/examples/demo/lreconb_cook_profile.cpp
+    )
+    add_dependencies(lreconb_cook_profile nuka_codegen)
+    target_compile_definitions(lreconb_cook_profile
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(lreconb_cook_profile
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(lreconb_cook_profile
+        PRIVATE
+            nuka_test_validated_sources
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # M8.5 GATE-C -- viewport_present_smoke: the RUN-VERIFIED headless present-loop
     # smoke. Creates a VK_KHR_xcb_surface under Xvfb -> swapchain -> acquire ->
     # draw -> present for N frames. Links nuka_present (the swapchain renderer + xcb
