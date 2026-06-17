@@ -254,49 +254,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.max_foot_contacts = contact_slots_per_artic;
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
-        // WP5/6/8 multi-articulation dog-dog link contact. Runs AFTER the foot
-        // narrowphase (which fills/zero-fills the env's slot blocks) and BEFORE
-        // AssembleRows (which consumes the contact_* slots). Detects FK-posed
-        // capsule x capsule overlaps between links of DISTINCT co-resident
-        // articulations and emits TWO articulation-keyed fused rows per overlap
-        // (one per dog, opposite normals) into the per-ARTICULATION slot blocks
-        // [artic*kMaxFootContacts, +stride). The op EARLY-EXITS for
-        // articulations_per_env <= 1, so the single-dog (K==1) graph -- though it
-        // carries this op -- does NO work and stays byte-identical. (Emitted only
-        // when has_articulation, behind the same gate, so a body/particle-only
-        // scene never sees it.)
-        // B1 (general contact pipeline Phase 1B): the DogDogContact hack MUST NOT
-        // run for the PairDriven family — the GENERAL LBVH -> cvx -> mixed-island
-        // path is the ONE contact path there, so running dog_dog too would
-        // double-count contacts. Gate it OFF (the op + file stay; Phase 2 D1 deletes
-        // them). The FusedFoot/UnionCsr families keep it (single-dog + H1 golden).
-        if (has_articulation && !is_pair_driven) {
-            p_dog_dog_.contact_margin = cfg.contact_margin;
-            p_dog_dog_.env_count = env_count;
-            p_dog_dog_.base_link_count = base_link_count;
-            p_dog_dog_.articulations_per_env = cap.articulations_per_env;
-            p_dog_dog_.max_foot_contacts = contact_slots_per_artic;  // shared stride
-            p_dog_dog_.max_contacts_per_env = cap.max_contacts_per_env;
-            // Task 2 body/capsule-vs-terrain (the 穿模 fix). Enabled when the model
-            // carries non-trivial TERRAIN GEOMETRY (step_height / grid_height_max
-            // != 0 => a pyramid-stairs / inverted-pit / random-box field, the
-            // terrain/composite scenes the owner saw dogs clip through). A flat
-            // multi-dog scene (terrain all-zero) leaves it OFF so the op stays
-            // dog-dog-only (additive). The per-env terrain TYPE is set by the
-            // harness post-construction (env_terrain_type, seeded Flat); the body
-            // pass reads it at runtime, so it only does work where a non-Flat type
-            // is actually active. terrain.ground_height is PINNED to the same
-            // ground_height the foot path uses (the type-0 Flat sample then matches
-            // the feet exactly). The SHARED SampleTerrainHeight means the body
-            // rests on the EXACT surface the feet do (no render/physics drift).
-            const bool has_terrain_geom = model.terrain.step_height != 0.0f ||
-                                          model.terrain.grid_height_max != 0.0f;
-            p_dog_dog_.terrain_body_contact = has_terrain_geom ? 1u : 0u;
-            p_dog_dog_.ground_height = model.ground_height;
-            p_dog_dog_.terrain = model.terrain;
-            p_dog_dog_.terrain.ground_height = model.ground_height;
-            add(phi::NkOp::DogDogContact, &p_dog_dog_);
-        }
+        // (Multi-body collision — including artic-link<->artic-link "dog-dog" and
+        // body-vs-terrain — runs ENTIRELY on the GENERAL PairDriven path: LBVH
+        // broadphase -> cvx GJK/EPA narrowphase + the general heightfield
+        // narrowphase below -> mixed-island solve. There is no special-cased
+        // dog_dog op anymore; a robot body is just a physics body on the ONE path.)
 
         // General contact pipeline Phase 2 (H3): the per-cell heightfield
         // midphase. Runs AFTER NarrowphasePrimitives (which left the (convex,

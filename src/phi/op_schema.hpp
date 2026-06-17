@@ -88,20 +88,12 @@ enum class NkOp : uint16_t {
     // --- cross-system particle contact (M9 T11 Phase 2) -----------------
     ParticleParticleContact, // id-10 class-blind unilateral non-penetration co-step
 
-    // --- multi-articulation dog-dog link contact (WP5-8) ----------------
-    DogDogContact,         // FK link x link analytic narrowphase between DISTINCT
-                           // co-resident articulations -> articulation-keyed fused
-                           // contact rows (two-way reaction). Emitted ONLY for
-                           // articulations_per_env > 1; the K==1 graph never sees it.
-
     // --- general contact pipeline Phase 0 (B2) --------------------------
     SyncLinkBodyPose,      // copy each articulation link's FK world pose into its
                            // owning body_pose row (composing link_geom_local) so
-                           // artic links enter the LBVH as collidables. APPENDED
-                           // after DogDogContact so the prior NkOp values are
-                           // stable. INERT in Phase 0: inserted into the graph but
-                           // gated to the PairDriven family (early-exit otherwise),
-                           // and no current cook is PairDriven (B1 is Phase 1).
+                           // artic links enter the LBVH as collidables. Gated to
+                           // the PairDriven family (early-exit otherwise), so the
+                           // FusedFoot/UnionCsr graphs are byte-untouched.
 
     // --- general contact pipeline Phase 2 (H3) --------------------------
     NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
@@ -279,49 +271,18 @@ struct NarrowphasePrimitivesParams {
     // M6: particle coupling (the kUSlotParticleSphere* union classes form the
     // particle side's world sphere from particle_pos[env*particles_per_env+link]).
     uint32_t particles_per_env;
-    // Task 1 multi-dog FEET+DOG-DOG coexistence: K (== articulations_per_env). At
+    // Multi-articulation FUSED-foot slot keying: K (== articulations_per_env). At
     // K<=1 the foot detection keeps the LEGACY env-keyed slot layout (base_slot =
     // env*kMaxFootContactsPerEnv, one per-env count) -> byte-identical (D1). At
     // K>1 it RE-KEYS each foot into its OWNING articulation's fused slot block
     // (slot_base = link_to_articulation[link] * kMaxFootContactsPerEnv) with a
     // per-articulation fill counter, so K dogs' 4K feet land in K disjoint 4-slot
-    // blocks the fused per-articulation solver consumes -- and so the dog-dog op
-    // (which runs after) can APPEND its rows into the same per-articulation blocks
-    // without overflowing one env's 4 slots. articulations_per_env == 0 (no
-    // articulation, e.g. body/particle-only) also falls to the legacy path.
+    // blocks the fused per-articulation solver consumes (each dog's feet stay in
+    // its own block). articulations_per_env == 0 (no articulation, e.g.
+    // body/particle-only) also falls to the legacy path. (Multi-body dog<->dog
+    // collision now lives on the GENERAL PairDriven path, not the FusedFoot path.)
     uint32_t articulations_per_env;  // K (>1 => per-articulation foot slot re-key)
     uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (per-artic stride)
-};
-
-// WP5-8 multi-articulation dog-dog link contact. One thread-block per env walks
-// the env's links pairwise, runs the analytic primitive narrowphase (WP6) between
-// links of DISTINCT articulations posed from the FK link_pose * link_geom_local
-// (WP5), and emits TWO articulation-keyed FUSED contact rows per overlap (one per
-// dog, opposite normals) into the contact_* slot blocks [artic*kMaxFootContacts,
-// +kMaxFootContacts). The existing fused AssembleRows + per-articulation solver
-// then scatter each side's reaction into its OWN dog's qdot tile (two-way push).
-// EARLY-EXITS unless articulations_per_env > 1, so the single-dog (K==1) graph
-// never enqueues this op -> its goldens stay byte-identical.
-struct DogDogContactParams {
-    float    contact_margin;
-    uint32_t env_count;
-    uint32_t base_link_count;        // links per env (== sum over the K dogs)
-    uint32_t articulations_per_env;  // K (the gate: > 1 => active)
-    uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (slot stride/artic)
-    uint32_t max_contacts_per_env;   // contact_* slot stride per env (== K*stride)
-    // Task 2 BODY/CAPSULE-vs-TERRAIN contact (the owner 穿模 fix). The same op
-    // ALSO drops every collidable body LINK (trunk box / upper-leg capsule, not
-    // just the feet) against the SHARED terrain heightfield: when a link's posed
-    // primitive's lowest world point penetrates SampleTerrainHeight(x,y) it emits
-    // a {0,0,1}-normal contact into that dog's slot block, so a collapsing trunk
-    // RESTS ON the terrain instead of clipping THROUGH it. Reuses the SAME
-    // SampleTerrainHeight the feet/obs/render call (no surface drift). enable=0
-    // (the default) keeps the op dog-dog-only -> additive; enable!=0 for the
-    // terrain/composite scenes. terrain.ground_height is PINNED to ground_height
-    // by the pipeline so the type-0 (Flat) sample matches the foot path.
-    uint32_t terrain_body_contact;   // 0 == off (dog-dog only), !=0 == body-terrain on
-    float    ground_height;          // base plane height (PINNED == terrain.ground_height)
-    ::nuka::terrain::TerrainParams terrain;  // SHARED procedural-terrain params
 };
 
 // General contact pipeline Phase 0 (B2): SyncLinkBodyPose. One thread per

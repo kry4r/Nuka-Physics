@@ -40,8 +40,8 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count);
 // world to the GENERAL LBVH -> cvx narrowphase -> mixed-island solve path (the
 // multi-body / body-body cook). When PairDriven is set the per-env row budget is
 // resized for the general per-candidate-slot row layout and the cook sets
-// model.contact_family = PairDriven (so the pipeline gates the dog_dog hack OFF
-// and routes the general assembly/solve). H1 grasp keeps UnionCsr (union_cook);
+// model.contact_family = PairDriven (so the pipeline routes the general
+// assembly/solve). H1 grasp keeps UnionCsr (union_cook);
 // single-dog go2 keeps FusedFoot (the 2-arg cook). Cross-env filtering is left ON
 // for PairDriven multi-dog-in-one-env (intra-env collidables collide).
 enum class CookContactFamily { FusedFoot, PairDriven };
