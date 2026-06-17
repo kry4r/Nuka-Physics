@@ -196,6 +196,63 @@ __device__ __forceinline__ float CornerZ(const float* heights, uint32_t data_off
     return min_z + h * range;
 }
 
+// FACE-ONLY sphere-vs-triangle contact (world space). A sphere resting on a
+// heightfield must contact the FACE it sits over, NOT the internal triangulation
+// edges that split each flat cell into two coplanar triangles: the closest point
+// on such a shared edge to a shallow-resting sphere center is nearly IN-PLANE, so
+// an edge-based query (EPA / SphereHull closest-point) emits a near-HORIZONTAL
+// normal -- a spurious sideways force that kicks the foot off the stance. We emit a
+// contact ONLY when the sphere center projects INSIDE the triangle (closest feature
+// == the face); then the normal is the true face normal (oriented toward the
+// center) and the depth is radius - |signed distance to the plane|. On flat ground
+// this is EXACTLY the analytic vertical-support contact (point = center projected to
+// the surface, normal +Z, depth = (surface+r) - center_z); on a step riser the
+// steep face yields the correct near-horizontal normal. Real CONVEX edges (a step's
+// top lip) are a rare secondary feature handled by the neighbouring face the center
+// projects into; internal coplanar edges are correctly suppressed. Deterministic
+// (pure arithmetic, no data-dependent ordering).
+__device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Vec3 c,
+                                   Vec3* out_pos, Vec3* out_nrm, float* out_pen) {
+    const Vec3 ab = b - a;
+    const Vec3 ac = c - a;
+    Vec3 n{ab.y * ac.z - ab.z * ac.y,
+           ab.z * ac.x - ab.x * ac.z,
+           ab.x * ac.y - ab.y * ac.x};
+    const float nl2 = n.Dot(n);
+    if (nl2 < 1.0e-20f) return false;             // degenerate triangle
+    n = n * (1.0f / sqrtf(nl2));
+    // Orient the face normal toward the sphere center (outward for a resting foot).
+    float s = (center - a).Dot(n);
+    if (s < 0.0f) { n = n * -1.0f; s = -s; }
+    if (s > radius) return false;                 // sphere clears the plane
+    // Closest point = center projected onto the triangle plane.
+    const Vec3 proj = center - n * s;
+    // Barycentric inside test (proj within triangle abc).
+    const Vec3 v2 = proj - a;
+    const float d00 = ab.Dot(ab);
+    const float d01 = ab.Dot(ac);
+    const float d11 = ac.Dot(ac);
+    const float d20 = v2.Dot(ab);
+    const float d21 = v2.Dot(ac);
+    const float denom = d00 * d11 - d01 * d01;
+    if (fabsf(denom) < 1.0e-20f) return false;
+    const float inv = 1.0f / denom;
+    const float vv = (d11 * d20 - d01 * d21) * inv;
+    const float ww = (d00 * d21 - d01 * d20) * inv;
+    const float uu = 1.0f - vv - ww;
+    // Epsilon-tolerant inside test: a foot whose center projects onto a cell/
+    // diagonal BOUNDARY (go2's symmetric feet can land exactly on the grid lines)
+    // would FP-fail a strict `< 0` test in BOTH adjacent coplanar triangles and
+    // drop the contact entirely. Admit boundary projections (they then register in
+    // one or both triangles; ClusterByNormal collapses the duplicate by normal).
+    constexpr float kBaryEps = 1.0e-4f;
+    if (uu < -kBaryEps || vv < -kBaryEps || ww < -kBaryEps) return false;
+    *out_pos = proj;          // contact point on the face surface
+    *out_nrm = n;             // separation dir for the sphere (side a == convex)
+    *out_pen = radius - s;    // > 0 (s <= radius checked above)
+    return true;
+}
+
 // Add the contact points of a manifold into the candidate buffer (each point
 // keeps its OWN world position/normal/depth so distinct prism normals survive).
 __device__ void AccumManifold(const ContactManifold& m, uint32_t feat_base,
@@ -269,6 +326,38 @@ __device__ int ReducePerPoint(const Cand* cand, int n, Cand* out4) {
     }
     for (int i = 0; i < 4; ++i) out4[i] = cand[kept[i]];
     return 4;
+}
+
+// Cluster a single convex's heightfield candidates by NORMAL direction and keep
+// the DEEPEST per cluster. The per-cell triangle split (2 sub-triangles per cell)
+// + a convex straddling several cells produce MANY candidates for one surface --
+// on FLAT ground a resting foot picks up its true +Z face contact PLUS shallower
+// diagonal-edge / adjacent-cell artifacts (slightly tilted normals). Those extra
+// contacts over-constrain the foot and kick the stance off the analytic rest pose.
+// Clustering by normal collapses each distinct CONTACT SURFACE to one representative
+// (the deepest), so a foot on flat ground yields ONE clean +Z contact (matching the
+// analytic vertical-support detector), WHILE a foot straddling a STEP keeps BOTH the
+// tread (+Z) and the near-horizontal riser cluster (the physically-correct two-
+// surface contact the analytic model misses). DETERMINISM: fixed feat-order scan,
+// first-match cluster assignment (lowest cluster index), strict-`>` deepest keep.
+__device__ int ClusterByNormal(const Cand* in, int n, Cand* out) {
+    // Merge candidates whose unit normals lie within ~60 deg (cos > 0.5): a flat-
+    // cell diagonal artifact (a few deg off +Z) merges into the +Z surface, while a
+    // step riser (~90 deg off +Z) stays its own cluster.
+    constexpr float kMergeCos = 0.5f;
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        int hit = -1;
+        for (int j = 0; j < m; ++j) {
+            if (in[i].nrm.Dot(out[j].nrm) > kMergeCos) { hit = j; break; }
+        }
+        if (hit < 0) {
+            if (m < kMaxCand) { out[m] = in[i]; ++m; }
+        } else if (in[i].depth > out[hit].depth) {
+            out[hit] = in[i];  // keep the deepest contact on this surface
+        }
+    }
+    return m;
 }
 
 __global__ void NarrowphaseHeightfieldKernel(
@@ -392,36 +481,82 @@ __global__ void NarrowphaseHeightfieldKernel(
                 Vec3 tv[3];
                 if (sub == 0) { tv[0] = p00; tv[1] = p10; tv[2] = p11; }
                 else          { tv[0] = p00; tv[1] = p11; tv[2] = p01; }
-                // Build the prism ConvexHullView: 3 LOCAL verts, heightfield world
-                // frame, -Z extrude. cvx transforms verts via frame.LocalToWorld.
-                float prism_verts[9];
-                prism_verts[0] = tv[0].x; prism_verts[1] = tv[0].y; prism_verts[2] = tv[0].z;
-                prism_verts[3] = tv[1].x; prism_verts[4] = tv[1].y; prism_verts[5] = tv[1].z;
-                prism_verts[6] = tv[2].x; prism_verts[7] = tv[2].y; prism_verts[8] = tv[2].z;
-                cvx::ConvexHullView prism;
-                prism.verts = prism_verts;
-                prism.vcount = 3u;
-                prism.frame = hf_frame;
-                prism.extrude = extrude;
-                prism.warp_lockstep = false;
-                cvx::SupportProxy prism_proxy;
-                prism_proxy.kind = cvx::SupportKind::TrianglePrism;
-                prism_proxy.hull = &prism;
                 ContactManifold m;
-                // Convex side first (A), prism second (B): the manifold normal is
-                // the separation dir for A (the convex). Side a == convex, side b
-                // == the static heightfield -> the assembly scatters reaction into
-                // the convex only (the heightfield is body_id == -1).
-                cvx::ConvexNarrowphase(conv_proxy, prism_proxy, &m);
                 const uint32_t feat_base = (cell_idx * 2u + static_cast<uint32_t>(sub)) * 4u;
+                if (conv_sh.kind == kKindSphere) {
+                    // ROBUST shallow sphere-vs-heightfield. A sphere is the one
+                    // analytic-support shape whose CSO curvature breaks EPA's shallow-
+                    // penetration monotonicity (the documented detect->drop->detect
+                    // dead band ~1-1.4mm; see cvx::SphereHull) -- on a FLAT field that
+                    // DROPPED a resting foot (3 contacts vs the analytic 4). But a
+                    // closest-point query (EPA or SphereHull) on a per-triangle prism
+                    // returns the INTERNAL triangulation EDGE as the closest feature
+                    // for a shallow-resting sphere, whose near-HORIZONTAL normal kicks
+                    // the foot sideways (3.45 rad). A heightfield's internal coplanar
+                    // edges are not real geometric edges, so we take the FACE-ONLY
+                    // contact: emit iff the center projects INSIDE this triangle, with
+                    // the true face normal. On flat this is EXACTLY the analytic
+                    // vertical-support contact; on a riser the steep face gives the
+                    // correct near-horizontal normal. Box/capsule/hull keep the EPA
+                    // path below (EPA is robust for flat-faced supports).
+                    const Vec3 wa = hf_frame.LocalToWorld(tv[0]);
+                    const Vec3 wb = hf_frame.LocalToWorld(tv[1]);
+                    const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
+                    Vec3 cpos, cnrm;
+                    float cpen;
+                    if (SphereTriangleFace(cprim.frame.t, cprim.radius, wa, wb, wc,
+                                           &cpos, &cnrm, &cpen)) {
+                        ::nuka::constraint::ContactPoint pt;
+                        pt.position = cpos;
+                        pt.normal = cnrm;       // sep dir for side a (the convex/foot)
+                        pt.penetration = cpen;
+                        pt.stable_key = 0ull;
+                        m.AddPoint(pt);
+                    }
+                } else {
+                    // Build the prism ConvexHullView: 3 LOCAL verts, heightfield world
+                    // frame, -Z extrude. cvx transforms verts via frame.LocalToWorld.
+                    float prism_verts[9];
+                    prism_verts[0] = tv[0].x; prism_verts[1] = tv[0].y; prism_verts[2] = tv[0].z;
+                    prism_verts[3] = tv[1].x; prism_verts[4] = tv[1].y; prism_verts[5] = tv[1].z;
+                    prism_verts[6] = tv[2].x; prism_verts[7] = tv[2].y; prism_verts[8] = tv[2].z;
+                    cvx::ConvexHullView prism;
+                    prism.verts = prism_verts;
+                    prism.vcount = 3u;
+                    prism.frame = hf_frame;
+                    prism.extrude = extrude;
+                    prism.warp_lockstep = false;
+                    cvx::SupportProxy prism_proxy;
+                    prism_proxy.kind = cvx::SupportKind::TrianglePrism;
+                    prism_proxy.hull = &prism;
+                    // Convex side first (A), prism second (B): the manifold normal is
+                    // the separation dir for A (the convex). Side a == convex, side b
+                    // == the static heightfield -> the assembly scatters reaction into
+                    // the convex only (the heightfield is body_id == -1).
+                    cvx::ConvexNarrowphase(conv_proxy, prism_proxy, &m);
+                }
                 AccumManifold(m, feat_base, cand, &ncand);
             }
         }
     }
 
     // Reduce to <=4 (per-point normals preserved) and write into THIS slot.
+    // SPHERE convex only: cluster by contact surface (normal) keeping the deepest
+    // per surface FIRST, so a foot collapses its per-cell triangle-split / multi-
+    // cell duplicates to ONE +Z contact on flat (analytic-equivalent) while keeping
+    // a step's distinct tread + riser surfaces. Box/capsule/hull are NOT clustered:
+    // a box FACE legitimately needs its multi-corner contact spread for a stable
+    // rest (merging same-normal corners to one point collapses that support), so
+    // they keep the EPA manifold + farthest-point reduce unchanged (Phase 2A).
     Cand out4[4];
-    const int kept = ReducePerPoint(cand, ncand, out4);
+    int kept;
+    if (conv_sh.kind == kKindSphere) {
+        Cand clustered[kMaxCand];
+        const int nclust = ClusterByNormal(cand, ncand, clustered);
+        kept = ReducePerPoint(clustered, nclust, out4);
+    } else {
+        kept = ReducePerPoint(cand, ncand, out4);
+    }
     ucount[gid] = static_cast<uint32_t>(kept);
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
