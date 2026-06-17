@@ -107,6 +107,42 @@ typedef struct nuka_world_desc_t {
     float terrain_platform_width;   // full edge length of the central top platform.
     float terrain_grid_width;       // cell edge length (RandomBoxes).
     float terrain_grid_height_max;  // max per-cell random rise (RandomBoxes).
+    // Multi-articulation CO-RESIDENCE (M10 dog-dog collision foundation, owner
+    // bottom line): compose the authored scene with itself `instance_count` times
+    // at distinct XY BEFORE cook, so ONE env holds K SEPARATE articulations that
+    // co-step + physically collide (the WP1/WP5-8 multi-dog path validated by
+    // tests/scenario/multi_dog_costep.cpp). Each replica i (i>=1) is placed at
+    // x = i*instance_spacing (a line; the caller overrides BASE_POSE to the real
+    // cluster after create) under a distinct name prefix so the cook keys K
+    // disjoint kinematic trees -> articulation_count == instance_count. A value of
+    // 0 OR 1 (the zero-initialized default) composes NOTHING -> the cook sees the
+    // single authored scene -> BYTE-IDENTICAL to every legacy create. instance
+    // co-residence is independent of env_count (use env_count == 1 for K dogs in
+    // one world); the field arrays (Q / DRIVE_TARGET / ARTICULATION_LINK_POSE) are
+    // then sized env_count * (K * per-dog), the K dogs concatenated per env.
+    uint32_t instance_count;        // # co-resident articulation replicas (0/1 = single).
+    float instance_spacing;         // X gap between replica spawns before cook (m).
+    // ONE-GENERAL-SOLVER landing (L1): route this world through the GENERAL contact
+    // path (CookContactFamily::PairDriven -> LBVH broadphase + cvx GJK/EPA
+    // narrowphase + mixed-island solve) instead of the legacy analytic FusedFoot
+    // foot-vs-ground/terrain kernel. 0 (the zero-initialized default) == FusedFoot
+    // == BYTE-IDENTICAL to every legacy create. 1 == PairDriven general path: the
+    // cook is taken with the PairDriven option AND a STATIC heightfield collidable
+    // is baked from the SAME model.terrain (the procedural surface the FusedFoot
+    // kernel samples analytically), so the feet collide against the cooked per-cell
+    // TRIANGLE_PRISM grid via the general narrowphase. The heightfield geometry is
+    // MODEL-LEVEL (one baked terrain type for the whole batch -- general per-env
+    // terrain types are a later feature); the type baked is heightfield_terrain_type
+    // (0=Flat,1=PyramidStairs,2=InvertedPyramid,3=RandomBoxes). The grid is
+    // (nrow x ncol) cells of edge heightfield_cell, centred at the world origin; a 0
+    // in any of the three falls back to a default (41 x 41 @ 0.25 m == a ~10 m span)
+    // sized to cover a single spawn footprint. Used by the L1 acceptance rollout
+    // (trained go2 policy on the general path) before the FusedFoot path is deleted.
+    uint32_t contact_family;          // 0 = FusedFoot (default), 1 = PairDriven (general).
+    uint32_t heightfield_terrain_type;// baked heightfield type for the general path.
+    uint32_t heightfield_nrow;        // general heightfield grid rows (0 => 41).
+    uint32_t heightfield_ncol;        // general heightfield grid cols (0 => 41).
+    float    heightfield_cell;        // general heightfield cell edge, m (0 => 0.25).
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
