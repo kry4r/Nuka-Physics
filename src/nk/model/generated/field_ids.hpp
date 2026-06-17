@@ -109,7 +109,7 @@ enum class FieldId : uint16_t {
     DofToLink,  // dof_to_link (per:dof arena:persistent owner:model)
     DofToComponent,  // dof_to_component (per:dof arena:persistent owner:model)
     TableEnabled,  // table_enabled (per:env arena:persistent owner:data)
-    ShapeTable,  // shape_table (per:scalar arena:persistent owner:model count:max_bodies_total*10)
+    ShapeTable,  // shape_table (per:scalar arena:persistent owner:model count:max_bodies_total*12)
     ExcludedPairs,  // excluded_pairs (per:scalar arena:persistent owner:model count:max_excluded_pairs)
     SampPoints,  // samp_points (per:scalar arena:persistent owner:model count:max_samp_points*3)
     SampRanges,  // samp_ranges (per:scalar arena:persistent owner:model count:max_bodies_total*2)

@@ -323,14 +323,18 @@ fields:
   # contributes no reaction side. group is the signed collision-group filter
   # (Newton broad_phase test_group_pair). The NarrowphasePrimitives pair-driven
   # branch dispatches by (kind_a,kind_b) over the amf:: analytic set; sdf_grid
-  # != ~0 routes the pair through NarrowphaseSdf. The two new lanes are INERT in
-  # Phase 0 (no routing reads them yet — R4/S5 are later phases).
+  # != ~0 routes the pair through NarrowphaseSdf.
+  # L-RECON-D (general contact pipeline) GREW the record 10 -> 12, APPENDING the
+  # per-shape hull slice {hull_vert_offset(u32 bits), hull_vert_count(u32 bits)}
+  # into lanes 10/11 so the cvx narrowphase uses THIS shape's verts (its slice of
+  # the concatenated hull_verts pool) — count 0 == not a hull row (NO-OP for a
+  # hull-free scene, e.g. go2). Lanes 0..9 stay byte-identical.
   # excluded_pairs: the SORTED (lo<<32|hi) exclude list (cook filter policy);
   # the pair query drops a candidate found by binary search. filter_excluded_count
   # is its live length (a scalar staged into mat-bucket-style header — kept as a
   # 1-row table so the op reads the count device-side without a host param).
   # =========================================================================
-  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*10",      arena: persistent, owner: model}
+  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*12",      arena: persistent, owner: model}
   - {name: excluded_pairs,   dtype: u64, per: scalar, count: "max_excluded_pairs",       arena: persistent, owner: model}
 
   # =========================================================================

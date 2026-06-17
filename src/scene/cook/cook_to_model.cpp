@@ -733,7 +733,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             // Hull / mesh rows: params[0] = the BOUND RADIUS (max |vertex| of
             // the cooked convex piece) — the broadphase AABB is a conservative
             // bound sphere (review fix: the default 0.5 sphere radius was
-            // unrelated to the actual hull extent).
+            // unrelated to the actual hull extent). L-RECON-D: ALSO pack this
+            // piece's MESH-LOCAL verts into the concatenated model.hull_verts pool
+            // and record the row's (hull_vert_offset, hull_vert_count) slice so the
+            // cvx narrowphase collides THIS shape's hull (not one global hull).
             if ((sh.kind == static_cast<uint8_t>(ShapeType::ConvexHull) ||
                  sh.kind == static_cast<uint8_t>(ShapeType::TriMesh)) &&
                 sh.convex_geometry_index != ~uint32_t(0) &&
@@ -742,6 +745,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 const uint32_t piece = sh.convex_geometry_index;
                 const uint32_t voff = g.vertex_offsets[piece];
                 const uint32_t vcnt = g.vertex_counts[piece];
+                const uint32_t hull_base =
+                    static_cast<uint32_t>(model.hull_verts.size() / 3u);
                 float max_sq = 0.0f;
                 for (uint32_t v = 0; v < vcnt; ++v) {
                     const size_t at = (static_cast<size_t>(voff) + v) * 3u;
@@ -750,8 +755,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     const float z = g.vertices[at + 2];
                     const float d = x * x + y * y + z * z;
                     if (d > max_sq) max_sq = d;
+                    model.hull_verts.push_back(x);
+                    model.hull_verts.push_back(y);
+                    model.hull_verts.push_back(z);
                 }
                 row.params[0] = std::sqrt(max_sq);
+                row.hull_vert_offset = hull_base;
+                row.hull_vert_count = vcnt;
             }
             row.contype = 1u;
             row.conaffinity = 1u;
@@ -819,6 +829,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_sdf_cells   = static_cast<uint32_t>(model.sdf_cell_keys.size());
         cap.max_excluded_pairs =
             static_cast<uint32_t>(model.excluded_pairs.size());
+        // L-RECON-D: the convex-hull vertex pool capacity = the concatenated
+        // per-shape hull verts packed above (xyz triples). 0 for a hull-free
+        // scene (go2) -> the hull_verts segment stays zero bytes (byte-inert).
+        cap.max_hull_verts =
+            static_cast<uint32_t>(model.hull_verts.size() / 3u);
 
         // R5 (general contact pipeline Phase 0): emit a STATIC ground collidable
         // row into shape_table as a first-class collidable with body_id == -1 (no

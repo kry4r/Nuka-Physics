@@ -18,7 +18,9 @@ namespace nuka::phi::nkops {
 // Device-side shape_table record. R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape staging in StageModelField(ShapeTable)). params:
 // sphere r / capsule r,hh / box he.xyz, by kind. Lanes 8/9 = body_id (int32) +
-// group (uint32), the shape->body indirection (INERT in Phase 0).
+// group (uint32), the shape->body indirection. L-RECON-D GREW it 10 -> 12,
+// appending the per-shape hull slice {hull_vert_offset, hull_vert_count} into
+// lanes 10/11 so the cvx narrowphase uses THIS shape's verts (0 == not a hull).
 struct PrimShapeDev {
     uint32_t kind;
     float    params[4];
@@ -27,11 +29,13 @@ struct PrimShapeDev {
     uint32_t sdf_grid;
     int32_t  body_id;     // owning body row, or -1 == static (R1).
     uint32_t group;       // signed collision-group filter key (R1).
+    uint32_t hull_vert_offset;  // base vertex index into hull_verts/3 (L-RECON-D).
+    uint32_t hull_vert_count;   // vertex count, 0 == not a hull row (L-RECON-D).
 };
 
 __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
                                                       uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 10u;
+    const float* q = table + static_cast<size_t>(row) * 12u;
     PrimShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.params[0] = q[1]; s.params[1] = q[2]; s.params[2] = q[3]; s.params[3] = q[4];
@@ -40,6 +44,8 @@ __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
     s.sdf_grid = __float_as_uint(q[7]);
     s.body_id = static_cast<int32_t>(__float_as_uint(q[8]));
     s.group = __float_as_uint(q[9]);
+    s.hull_vert_offset = __float_as_uint(q[10]);
+    s.hull_vert_count = __float_as_uint(q[11]);
     return s;
 }
 

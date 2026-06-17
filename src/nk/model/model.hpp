@@ -452,6 +452,15 @@ public:
         // body_id == -1 (static) is OVERRIDDEN by the cook for real body rows.
         int32_t    body_id = -1;         // owning body row, or -1 == static.
         uint32_t   group = 0;            // signed collision-group filter key.
+        // L-RECON-D (general contact pipeline): the per-shape slice into the
+        // concatenated `hull_verts` pool for a ConvexHull/TriMesh row, so the
+        // cvx narrowphase uses THIS shape's verts (not one global hull). A
+        // non-hull shape (sphere/box/capsule/plane/heightfield) leaves count 0.
+        // APPENDED after body_id/group so the staged lanes 0..9 stay byte-
+        // identical; offset/count pack into the new lanes 10/11. count == 0 is
+        // a NO-OP for a hull-free scene (go2: every row keeps the default 0).
+        uint32_t   hull_vert_offset = 0; // base vertex index into hull_verts/3.
+        uint32_t   hull_vert_count  = 0; // vertex count (0 == not a hull row).
     };
     std::vector<PairDrivenShape> shape_table_rows;
     std::vector<float>           samp_points;     // xyz packed.

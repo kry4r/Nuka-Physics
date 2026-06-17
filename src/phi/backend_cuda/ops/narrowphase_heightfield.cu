@@ -110,8 +110,11 @@ __device__ amf::PrimParams MakePrim(const PrimShapeDev& s,
 
 // Convex-side support proxy from the in-hand world PrimParams (Box/Sphere/Capsule)
 // or the cooked hull pool (ConvexHull). Returns false for a non-cvx kind.
+// L-RECON-D: (hull_off, hull_cnt) is the convex shape's OWN slice into the
+// concatenated hull_verts pool (lanes 10/11 of its shape_table row).
 __device__ bool MakeConvexProxy(uint32_t kind, const amf::PrimParams& prim,
-                                const float* hull_verts, uint32_t hull_vert_count,
+                                const float* hull_verts, uint32_t hull_off,
+                                uint32_t hull_cnt,
                                 cvx::ConvexHullView* hull_store,
                                 cvx::SupportProxy* out) {
     switch (kind) {
@@ -119,8 +122,8 @@ __device__ bool MakeConvexProxy(uint32_t kind, const amf::PrimParams& prim,
         case kKindSphere:  out->kind = cvx::SupportKind::Sphere;  out->prim = &prim; return true;
         case kKindCapsule: out->kind = cvx::SupportKind::Capsule; out->prim = &prim; return true;
         case kKindConvexHull:
-            hull_store->verts = hull_verts;
-            hull_store->vcount = hull_vert_count;
+            hull_store->verts = hull_verts + static_cast<size_t>(hull_off) * 3u;
+            hull_store->vcount = hull_cnt;
             hull_store->frame = prim.frame;
             hull_store->warp_lockstep = false;  // thread-per-slot (not full-warp)
             out->kind = cvx::SupportKind::Hull;
@@ -138,7 +141,8 @@ __device__ bool MakeConvexProxy(uint32_t kind, const amf::PrimParams& prim,
 // AABB centre/half (computed from the convex prim) transformed by the heightfield
 // frame's WorldToLocal — a conservative AABB-of-the-transformed-AABB.
 __device__ void ConvexLocalAabb(uint32_t kind, const amf::PrimParams& prim,
-                                const float* hull_verts, uint32_t hull_vert_count,
+                                const float* hull_verts, uint32_t hull_off,
+                                uint32_t hull_cnt,
                                 const amf::PrimFrame& hf_frame,
                                 Vec3* out_lo, Vec3* out_hi) {
     // World AABB half-extents of the convex (rotation-baked).
@@ -156,12 +160,13 @@ __device__ void ConvexLocalAabb(uint32_t kind, const amf::PrimParams& prim,
         case kKindCapsule: he = rotabs(Vec3{prim.radius, prim.radius + prim.half_height,
                                             prim.radius}); break;
         case kKindConvexHull: {
-            // Bound-sphere from the cooked hull pool (rotation-invariant).
+            // Bound-sphere from this shape's slice of the hull pool (rot-invariant).
+            const float* hv = hull_verts + static_cast<size_t>(hull_off) * 3u;
             float max_sq = 0.0f;
-            for (uint32_t v = 0; v < hull_vert_count; ++v) {
-                const float x = hull_verts[v * 3u + 0u];
-                const float y = hull_verts[v * 3u + 1u];
-                const float z = hull_verts[v * 3u + 2u];
+            for (uint32_t v = 0; v < hull_cnt; ++v) {
+                const float x = hv[v * 3u + 0u];
+                const float y = hv[v * 3u + 1u];
+                const float z = hv[v * 3u + 2u];
                 const float d = x * x + y * y + z * z;
                 if (d > max_sq) max_sq = d;
             }
@@ -366,7 +371,7 @@ __global__ void NarrowphaseHeightfieldKernel(
     const float* __restrict__ shape_table,
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ hull_verts,
-    uint32_t hull_vert_count,
+    uint32_t /*hull_vert_count*/,   // L-RECON-D: per-shape slice now in shape_table
     const float* __restrict__ heights,
     NarrowphaseHeightfieldParams hp,
     uint32_t* __restrict__ ucount,
@@ -405,7 +410,8 @@ __global__ void NarrowphaseHeightfieldKernel(
     const amf::PrimParams cprim = MakePrim(conv_sh, xconv);
     cvx::ConvexHullView conv_hull;
     cvx::SupportProxy conv_proxy;
-    if (!MakeConvexProxy(conv_sh.kind, cprim, hull_verts, hull_vert_count,
+    if (!MakeConvexProxy(conv_sh.kind, cprim, hull_verts,
+                         conv_sh.hull_vert_offset, conv_sh.hull_vert_count,
                          &conv_hull, &conv_proxy)) {
         return;  // non-cvx convex side -> nothing to do.
     }
@@ -421,7 +427,8 @@ __global__ void NarrowphaseHeightfieldKernel(
 
     // Project the convex's world AABB into heightfield-local space + map to cells.
     Vec3 lo, hi;
-    ConvexLocalAabb(conv_sh.kind, cprim, hull_verts, hull_vert_count, hf_frame,
+    ConvexLocalAabb(conv_sh.kind, cprim, hull_verts,
+                    conv_sh.hull_vert_offset, conv_sh.hull_vert_count, hf_frame,
                     &lo, &hi);
     const float margin = hp.contact_margin;
     lo.x -= margin; lo.y -= margin; lo.z -= margin;
