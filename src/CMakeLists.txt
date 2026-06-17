@@ -646,11 +646,6 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/crba.cu
         phi/backend_cuda/ops/contacts_foot.cu
         phi/backend_cuda/ops/contacts_union.cu
-        # WP5/6/8 multi-articulation dog-dog link contact (the owner bottom-line:
-        # K co-resident dogs PHYSICALLY collide). FK-posed capsule x capsule
-        # analytic narrowphase routed through the fused per-articulation solver
-        # so each dog's reaction scatters into its OWN qdot tile. K==1 inert.
-        phi/backend_cuda/ops/dog_dog_contact.cu
         # General contact pipeline Phase 0 (B2): SyncLinkBodyPose — copies each
         # articulation link's FK world pose into its owning body_pose row so artic
         # links enter the LBVH. PairDriven-family-gated (inert for the FusedFoot /

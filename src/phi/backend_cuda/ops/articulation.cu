@@ -1071,7 +1071,6 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkAbaOps();
     RegisterNkCrbaOps();
     RegisterNkContactsFootOps();
-    RegisterNkDogDogContactOps();    // WP5/6/8 multi-articulation dog-dog contact
     RegisterNkSyncBodyPoseOps();     // general contact B2: SyncLinkBodyPose
     RegisterNkNarrowphaseHeightfieldOps();  // general contact H3: heightfield midphase
     RegisterNkBroadphaseOps();

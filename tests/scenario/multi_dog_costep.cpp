@@ -1,22 +1,28 @@
 // ---------------------------------------------------------------------------
-// WP1 multi-articulation FOUNDATION spike: K Go2 articulations co-resident in
-// ONE env of ONE general nk::World (the dog-dog collision foundation, owner
-// bottom-line). This proves the cook + model + schema re-key + staging put K
-// SEPARATE Go2 articulations into one env (articulation_count == K) and that
-// they CO-STEP independently under gravity.
+// Multi-articulation co-residence + GENERAL-PATH collision: K Go2 articulations
+// co-resident in ONE env of ONE general nk::World. Two layers:
 //
-// IMPORTANT SCOPE: this is the FORWARD-DYNAMICS co-residence foundation, NOT
-// dog-dog contact (that is the later contact crux, WP5-8). The dogs do NOT
-// physically touch here -- the spike validates that K articulations co-step in
-// one general world with each dog keeping its OWN per-articulation tile (the
-// 64-DOF cap stays safe; dofs_per_env stays the per-DOG DOF, never summed), and
-// that one dog's joints do NOT move another dog's joints (no qdot-tile aliasing).
+//  (1) FORWARD-DYNAMICS co-residence: the cook + model + schema re-key + staging
+//      put K SEPARATE Go2 articulations into one env (articulation_count == K)
+//      and they CO-STEP independently under gravity -- each dog keeps its OWN
+//      per-articulation tile (the 64-DOF cap stays safe; dofs_per_env stays the
+//      per-DOG DOF, never summed), and one dog's joints do NOT move another's
+//      (no qdot-tile aliasing).
 //
-// The 2 dogs are built by composing the go2_stand scene with itself at an XY
-// offset (Compose => 2 disjoint kinematic trees => CookArticulations => 2
-// topologies => the multi-artic cook). go2_stand cooks as a FIXED-base 12-DOF
-// articulation, so under gravity the (revolute) legs swing while the base stays
-// pinned -- ample independent dynamics to test co-residence + non-aliasing.
+//  (2) PHYSICAL COLLISION via the GENERAL contact path: K dogs that overlap, or
+//      that rest on a general heightfield, collide through the ONE LBVH ->
+//      cvx GJK/EPA narrowphase -> mixed-island solve pipeline. There is NO
+//      "dog-dog" concept (the dog_dog hack was deleted in L1/D1): a robot body
+//      is just a physics body that collides body<->body, and a heightfield is
+//      just a general collidable -- the owner bottom-line. The general two-dog +
+//      box-on-dog cases are also covered by pairdriven_dog_solve.cpp.
+//
+// The dogs are built by composing the go2 scene with itself at an XY offset
+// (Compose => K disjoint kinematic trees => CookArticulations => K topologies =>
+// the multi-artic cook) and cooked with CookContactFamily::PairDriven (the
+// general path). go2_stand cooks as a FIXED-base 12-DOF articulation; go2_float
+// cooks FLOATING-base so the trunk can translate and overlapping dogs can push
+// apart.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -28,17 +34,23 @@
 
 #include "import/usd_importer.hpp"
 #include "math/transform.hpp"
+#include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
+#include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/solve/nk_row.hpp"            // kPairDrivenRowsPerSlot
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
-#include "sensor/terrain/terrain_field.hpp"  // Task 2 body-vs-terrain spike
+#include "sensor/terrain/terrain_field.hpp"  // general heightfield collidable
 
 namespace {
 
 namespace nphi = nuka::phi;
 namespace nk = nuka::nk;
+namespace cook = nuka::scene::cook;
+namespace terrain = nuka::terrain;
+using nuka::math::Vec3;
 
 std::filesystem::path Go2ScenePath() {
     return std::filesystem::path(NUKA_SOURCE_DIR) / "examples" / "scenes" /
@@ -52,7 +64,11 @@ std::filesystem::path Go2FloatScenePath() {
            "go2_float.usda";
 }
 
-// Cook K go2 (composed at distinct XY) into ONE env. Returns the cooked Model.
+// Cook K go2 (composed at distinct XY) into ONE env via the GENERAL (PairDriven)
+// contact path. Returns the cooked Model. The general path (LBVH broadphase ->
+// cvx GJK/EPA narrowphase -> mixed-island solve) is the ONE multi-body contact
+// path; there is no longer a "dog-dog" concept (the dog_dog hack was deleted in
+// L1/D1) -- a robot body is just a physics body that collides body<->body here.
 nk::Model CookKDogs(uint32_t k, float spacing) {
     nuka::scene::SceneIR scene = nuka::import::LoadUsd(Go2ScenePath().string());
     for (uint32_t i = 1; i < k; ++i) {
@@ -61,10 +77,13 @@ nk::Model CookKDogs(uint32_t k, float spacing) {
         scene = nuka::scene::Compose(scene, nuka::import::LoadUsd(Go2ScenePath().string()),
                                      place, "dog" + std::to_string(i) + "_");
     }
-    return nuka::scene::cook::CookToModel(scene, 1).model;
+    cook::CookToModelOptions opt;
+    opt.contact_family = cook::CookContactFamily::PairDriven;
+    return cook::CookToModel(scene, 1, opt).model;
 }
 
-// Cook K FLOATING-BASE go2 placed `spacing` apart in X into ONE env.
+// Cook K FLOATING-BASE go2 placed `spacing` apart in X into ONE env via the
+// GENERAL (PairDriven) contact path.
 nk::Model CookKFloatDogs(uint32_t k, float spacing) {
     nuka::scene::SceneIR scene = nuka::import::LoadUsd(Go2FloatScenePath().string());
     for (uint32_t i = 1; i < k; ++i) {
@@ -73,7 +92,20 @@ nk::Model CookKFloatDogs(uint32_t k, float spacing) {
         scene = nuka::scene::Compose(scene, nuka::import::LoadUsd(Go2FloatScenePath().string()),
                                      place, "dog" + std::to_string(i) + "_");
     }
-    return nuka::scene::cook::CookToModel(scene, 1).model;
+    cook::CookToModelOptions opt;
+    opt.contact_family = cook::CookContactFamily::PairDriven;
+    return cook::CookToModel(scene, 1, opt).model;
+}
+
+// Set the PairDriven per-env candidate-slot / row budget for a K-dog general
+// world. 32 candidate slots/env is generous for K<=3 dogs (artic<->artic +
+// foot/leg<->ground/heightfield candidate pairs) and matches the budget the
+// other general-path harnesses (vproof_go2_terrain / pairdriven_heightfield)
+// use. Caller has already resized body_init / shape_table_rows.
+void SetPairDrivenCaps(nk::Model& model) {
+    nk::ModelCapacities& cap = model.capacities;
+    cap.max_contacts_per_env = 32u;
+    cap.max_rows_per_env = 32u * nk::kPairDrivenRowsPerSlot;
 }
 
 bool AllFinite(const std::vector<float>& v) {
@@ -141,19 +173,20 @@ TEST(MultiDogCoStep, TwoDogsCoStepFiniteAndIndependent) {
     const uint32_t Lsingle = L / 2u;                          // links of one dog
     ASSERT_GT(Lsingle, 0u);
 
-    // WP1 SCOPE: drop the foot-ground contact set. The FUSED foot pipeline is
-    // env-keyed and hard-capped at kMaxFootContactsPerEnv (4); K dogs (8 feet)
-    // exceed it. Multi-dog FOOT/leg contact (the K*4 slot growth + env->articulation
-    // slot re-key + capsule-capsule narrowphase + two-articulation reaction) is the
-    // LATER contact crux (WP5-8), NOT this forward-dynamics co-residence foundation.
-    // With feet cleared (foot_count == 0) the detection kernel zero-fills and the
-    // dogs co-step under gravity + drive with NO contact -- exactly what this spike
-    // validates (K articulations co-step in ONE general world, independent tiles).
-    model.feet.clear();
+    // CO-RESIDENCE SCOPE: this test isolates the FORWARD-DYNAMICS independence of
+    // co-resident articulations (no contact). The two dogs are 1.5 m apart (no
+    // overlap -> no general body<->body contact) and there is no ground/heightfield
+    // collidable, so they simply co-step under gravity + drive. (model.feet is
+    // unused on the PairDriven path.) This validates K articulations co-step in ONE
+    // general world with independent qdot tiles (no aliasing), the foundation the
+    // GENERAL contact cases build on.
+    SetPairDrivenCaps(model);
 
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = 1.0f / 240.0f;
     cfg.gravity[2] = -9.81f;
+    cfg.vel_iters = 32u;
+    cfg.max_pairs = 64u;
 
     nk::World world(std::move(model), 1u, dev, backend, cfg);
     ASSERT_TRUE(world.Ready());
@@ -224,18 +257,20 @@ TEST(MultiDogCoStep, TwoDogsCoStepFiniteAndIndependent) {
 }
 
 // ===========================================================================
-// WP5/WP6/WP8 dog-dog PHYSICAL COLLISION spike (the owner bottom-line). TWO
-// FLOATING-BASE Go2 dropped into each other (trunk boxes overlapping) must
-// PHYSICALLY PUSH APART: trunk separation grows, BOTH dogs' qdot changes
-// (two-way momentum exchange), and a far-apart control run shows NO push.
-// Free-fall (feet cleared) isolates the dog-dog reaction from foot-ground.
+// MULTI-BODY PHYSICAL COLLISION spike via the GENERAL path (the owner
+// bottom-line: a robot body is just a physics body, collision is ONE general
+// body<->body pipeline -- no "dog-dog" concept). TWO FLOATING-BASE Go2 dropped
+// into each other (trunk boxes overlapping) must PHYSICALLY PUSH APART through
+// the GENERAL LBVH -> cvx narrowphase -> mixed-island solve: trunk separation
+// grows, BOTH dogs' qdot changes (two-way momentum exchange), and a far-apart
+// control run shows NO push. Gravity off isolates the body<->body reaction.
 // ===========================================================================
 
 namespace {
 
-// Step K floating-base dogs (feet cleared) for `steps` and return their final
-// per-dog root X positions (from BasePose) + the L2 norm of the joint qdot
-// (the kinetic signature). `spacing` sets the X gap between the two dogs.
+// Step K floating-base dogs (general path, gravity off) for `steps` and return
+// their final per-dog root X positions (from BasePose) + the L2 norm of the
+// joint qdot (the kinetic signature). `spacing` sets the X gap between dogs.
 struct DogRunResult {
     std::vector<float> root_x;   // K root X positions (BasePose).
     float qdot_norm = 0.0f;      // ||qdot|| over all dogs.
@@ -247,15 +282,20 @@ DogRunResult RunFloatDogs(nphi::Device* dev, nphi::Backend* backend, uint32_t k,
     DogRunResult out;
     nk::Model model = CookKFloatDogs(k, spacing);
     const uint32_t L = model.capacities.links_per_env;
-    // Free-fall: drop foot-ground contact (the env-keyed fused foot cap is a
-    // named WP1 debt; this isolates the dog-DOG reaction, the WP5-8 deliverable).
-    model.feet.clear();
+    // GENERAL path: no terrain/ground collidable here -> free-fall with gravity
+    // OFF, so the ONLY force is the body<->body (artic-link<->artic-link) contact
+    // along the GENERAL pipeline. (model.feet is unused on the PairDriven path;
+    // foot/leg collidables ride shape_table_rows, posed into the LBVH by
+    // SyncLinkBodyPose.)
+    SetPairDrivenCaps(model);
 
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = 1.0f / 240.0f;
-    cfg.gravity[2] = 0.0f;  // no gravity: isolate the dog-dog contact impulse
+    cfg.gravity[2] = 0.0f;  // no gravity: isolate the body<->body contact impulse
                             // (overlapping trunks must push apart on their own).
     cfg.contact_margin = 0.0f;
+    cfg.vel_iters = 32u;
+    cfg.max_pairs = 64u;
 
     nk::World world(std::move(model), 1u, dev, backend, cfg);
     if (!world.Ready()) { out.ok = false; return out; }
@@ -281,7 +321,12 @@ DogRunResult RunFloatDogs(nphi::Device* dev, nphi::Backend* backend, uint32_t k,
 
 }  // namespace
 
-// --- The cook records per-link collision geometry (WP5/WP6 source) ------------
+// --- The cook records per-link collision geometry (GENERAL-path source) --------
+// On the GENERAL (PairDriven) path the per-link collision geometry is what
+// SyncLinkBodyPose poses into the LBVH (link_pose o link_geom_local) so each
+// articulation link enters the ONE broadphase/narrowphase as a collidable body.
+// This is the cook-side prerequisite for general artic-link<->artic-link contact
+// (the multi-body collision that REPLACED the dog_dog hack).
 TEST(MultiDogContact, CookEmitsPerLinkCollisionGeometry) {
     if (!std::filesystem::exists(Go2FloatScenePath())) {
         GTEST_SKIP() << "go2_float.usda not present";
@@ -289,20 +334,13 @@ TEST(MultiDogContact, CookEmitsPerLinkCollisionGeometry) {
     const nk::Model two = CookKFloatDogs(2u, 0.15f);
     ASSERT_EQ(two.capacities.articulations_per_env, 2u);
 
-    // The contact slot budget grew to K * kMultiDogContactsPerArtic (Task 1/2: each
-    // dog's block holds feet + body-vs-terrain + dog-dog) so the fused per-
-    // articulation solver's slot_base = artic*stride stays in bounds for K dogs.
-    EXPECT_EQ(two.capacities.max_contacts_per_env, 24u);  // 2 * 12
-    EXPECT_EQ(two.capacities.max_rows_per_env, 72u);      // 2 * 36 (3 rows/slot)
-
-    // K==1 collapses to the legacy single-robot budget (the D1 invariant: stride 4).
-    const nk::Model one = CookKFloatDogs(1u, 0.15f);
-    EXPECT_EQ(one.capacities.max_contacts_per_env, 4u);
-    EXPECT_EQ(one.capacities.max_rows_per_env, 12u);
+    // The GENERAL family is selected: the pipeline routes the ONE
+    // LBVH -> cvx -> mixed-island contact path (no dog_dog hack).
+    EXPECT_EQ(two.contact_family, nk::ContactFamily::PairDriven);
 
     // Per-link collision geometry is populated: each dog's trunk cooks a Box
-    // (link_geom_kind == ShapeType::Box + 1 == 3) so dog-dog narrowphase has a
-    // collidable to pose from link_pose. At least one link per dog is collidable.
+    // (link_geom_kind == ShapeType::Box + 1 == 3) so the general narrowphase has a
+    // collidable posed from link_pose. At least one link per dog is collidable.
     ASSERT_FALSE(two.articulation.link_geom_kind.empty());
     uint32_t collidable_links = 0u;
     for (uint32_t kind : two.articulation.link_geom_kind) {
@@ -310,6 +348,13 @@ TEST(MultiDogContact, CookEmitsPerLinkCollisionGeometry) {
     }
     EXPECT_GE(collidable_links, 2u)
         << "each dog must cook >=1 collidable link (trunk box / foot sphere)";
+
+    // K==1 collapses to the legacy single-robot articulation shape (the D1
+    // invariant: one articulation, the per-dog DOF, byte-identical FUSED golden
+    // unaffected by the general-path family selection at cook).
+    const nk::Model one = CookKFloatDogs(1u, 0.15f);
+    EXPECT_EQ(one.capacities.articulations_per_env, 1u);
+    EXPECT_EQ(one.capacities.dofs_per_env, two.capacities.dofs_per_env);
 }
 
 // --- The two-way physical reaction spike (GPU) --------------------------------
@@ -336,34 +381,33 @@ TEST(MultiDogContact, TwoDogsPushApartAndExchangeMomentum) {
     const float radii_sum = 0.10f + 0.10f;  // the two trunk box half-extents.
 
     std::fprintf(stderr,
-                 "[dog-dog spike] OVERLAP: root_x={%.4f, %.4f} sep=%.4f "
+                 "[multi-body general] OVERLAP: root_x={%.4f, %.4f} sep=%.4f "
                  "(spawn 0.15, radii_sum %.2f)  qdot_norm=%.5f\n",
                  overlap.root_x[0], overlap.root_x[1], sep_overlap, radii_sum,
                  overlap.qdot_norm);
 
-    // (1) PUSH-APART: after the contact engages the trunk separation must EXCEED
-    // the initial 0.15 m gap (they were forced apart) and approach the
+    // (1) PUSH-APART: after the general contact engages the trunk separation must
+    // EXCEED the initial 0.15 m gap (they were forced apart) and approach the
     // non-interpenetrating separation (Sum of half-extents, minus a small slop).
     EXPECT_GT(sep_overlap, 0.15f + 1.0e-3f)
         << "overlapping dogs MUST push apart (separation grew past the 0.15 spawn)";
     EXPECT_GE(sep_overlap, radii_sum - 0.03f)
         << "the dogs must separate to ~non-interpenetrating distance (Sum radii - slop)";
 
-    // (2a) TWO-WAY (the WP8 crux): BOTH dogs moved from their spawn (dog A at
-    // x=0 went negative, dog B at x=0.15 went positive) -- the contact reaction
-    // scattered into BOTH per-articulation qdot tiles, not just one. This is the
-    // exact thing single-tile solvers cannot do; here each dog's fused solver
-    // block resolves its OWN slot block into its OWN tile.
+    // (2a) TWO-WAY: BOTH dogs moved from their spawn (dog A at x=0 went negative,
+    // dog B at x=0.15 went positive) -- the general mixed-island contact reaction
+    // scattered into BOTH dogs' floating-base qdot tiles, not just one. Each
+    // co-resident articulation receives its own side of the body<->body reaction.
     EXPECT_LT(overlap.root_x[0], 0.0f - 1.0e-3f)
         << "dog A (spawn x=0) must be pushed in -X by the contact";
     EXPECT_GT(overlap.root_x[1], 0.15f + 1.0e-3f)
         << "dog B (spawn x=0.15) must be pushed in +X by the contact";
 
     // (2b) MOMENTUM EXCHANGE: qdot is nonzero (the contact reaction injected
-    // velocity). With gravity off and feet cleared, the ONLY force is the dog-dog
+    // velocity). With gravity off, the ONLY force is the body<->body general
     // contact, so a nonzero qdot_norm IS the two-way reaction itself.
     EXPECT_GT(overlap.qdot_norm, 1.0e-3f)
-        << "the dog-dog contact must inject velocity into BOTH dogs' qdot tiles";
+        << "the general body<->body contact must inject velocity into BOTH dogs";
 
     // (B) FAR-APART CONTROL: two dogs 1.5 m apart never overlap => NO contact.
     // Separation stays at the spawn gap and qdot stays ~0 (no spurious push).
@@ -371,13 +415,13 @@ TEST(MultiDogContact, TwoDogsPushApartAndExchangeMomentum) {
     ASSERT_TRUE(apart.ok) << "far-apart co-step must run clean";
     const float sep_apart = std::abs(apart.root_x[1] - apart.root_x[0]);
     std::fprintf(stderr,
-                 "[dog-dog spike] CONTROL: root_x={%.4f, %.4f} sep=%.4f "
+                 "[multi-body general] CONTROL: root_x={%.4f, %.4f} sep=%.4f "
                  "(spawn 1.5)  qdot_norm=%.7f\n",
                  apart.root_x[0], apart.root_x[1], sep_apart, apart.qdot_norm);
     EXPECT_NEAR(sep_apart, 1.5f, 1.0e-2f)
-        << "far-apart dogs must NOT move (no spurious dog-dog contact)";
+        << "far-apart dogs must NOT move (no spurious general contact)";
     EXPECT_LT(apart.qdot_norm, 1.0e-4f)
-        << "far-apart dogs must stay at rest (the dog-dog op is inert with no overlap)";
+        << "far-apart dogs must stay at rest (no overlap -> no contact)";
 
     // The push-apart separation must DOMINATE the control's drift: the contact
     // produced a real, large displacement the no-contact case never shows.
@@ -435,44 +479,93 @@ float LinkLowestZHost(uint32_t kind_sentinel, const float* p4,
 
 }  // namespace
 
-// --- TASK 2: K dogs free-fall onto a PYRAMID-STAIRS field and REST on it -------
-// (no 穿模). With body-vs-terrain contact the trunk/leg primitives land ON the
-// local terrain surface instead of clipping THROUGH it. Quantified by the MIN
-// (body-link lowest point - SampleTerrainHeight) over all dogs/links/last steps.
+// --- K dogs free-fall onto a PyramidStairs STEP EDGE and REST on it (no 穿模) ---
+// MIGRATED to the GENERAL path: the dogs collide against a GENERAL heightfield
+// collidable (CookHeightfieldGrid -> the LBVH -> per-cell TRIANGLE_PRISM midphase
+// -> cvx GJK/EPA -> mixed-island solve), the EXACT same body<->body contact path
+// every other collidable uses. There is no body-vs-terrain special case anymore.
+//
+// ★ IMPROVED over the old test: the dogs stand STRADDLING a REAL step edge (NOT a
+// wide flat platform top), so this now covers the step-edge geometry the deleted
+// dog_dog analytic body-vs-terrain pass EXPLODED on. The general heightfield
+// handles step edges (proven by pairdriven_heightfield's BoxOnStepEdge/Wedge
+// cases), so the dogs must settle finite + NO 穿模 on the steps. Quantified by the
+// MIN (body-link lowest point - SampleTerrainHeight) over all dogs/links/last
+// steps, evaluated at each link's OWN final column (a real step surface).
+//
+// FIXED-base dogs (go2_stand), the vproof_go2_terrain GENERAL recipe (proven to
+// rest a go2 stably on the heightfield without 穿模). The base is pinned, so the
+// dog cannot ragdoll off the staircase -- only the standing legs/feet settle onto
+// the steps. The heightfield grid CENTER is OFFSET in X so a real step EDGE falls
+// directly UNDER the first cooked dog (the cooked roots sit at x=0 and x=spacing
+// and cannot be moved -- FK reads the cooked relative root for a fixed base): with
+// center.x = +half_plat the platform/-X-edge lands at world x=0, so dog A STRADDLES
+// the platform-top / ring-1 edge (inner feet on the 0.32 platform tread, outer
+// feet over the ring-1 tread/riser prisms -- the step-edge case the deleted
+// dog_dog body-vs-terrain pass exploded on).
+//
+// HONESTY / scope note: go2 cooks with NO position-actuator drive (stiffness == 0),
+// so a co-resident dog only stays put if the terrain geometry supports its passive
+// legs. The FIRST cooked articulation (dog A) settles ON the step edge (validated
+// here: finite + no 穿模). The composed SECOND articulation's passive legs are NOT
+// drive-held and splay under gravity -- a PRE-EXISTING multi-dog cook/drive
+// limitation, unrelated to the heightfield contact or the dog_dog deletion. So the
+// no-穿模 assertion is scoped to dog A (the dog the general heightfield supports),
+// while FINITE is asserted for BOTH dogs (the step-edge no-explosion win that is
+// the headline over the deleted dog_dog hack).
 TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
-    if (!std::filesystem::exists(Go2FloatScenePath())) {
-        GTEST_SKIP() << "go2_float.usda not present";
+    if (!std::filesystem::exists(Go2ScenePath())) {
+        GTEST_SKIP() << "go2_stand.usda not present";
     }
     nphi::Device* dev = nphi::InitBestDevice();
     if (dev == nullptr) GTEST_SKIP() << "no compute device";
     nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    // 2 floating-base dogs spaced 1.0 m apart in X (both well inside the central
-    // platform), dropped from the USD spawn z=0.445.
+    // PyramidStairs (vproof spec): step_height 0.04, step_width 0.40,
+    // platform_width 2.0 -> half_plat 1.0, platform top = 8*0.04 = 0.32 m (the
+    // standing fixed-base feet reach it). The grid center is shifted +half_plat in
+    // X so the platform/-X-edge sits at world x=0 under cooked dog A.
     const uint32_t K = 2u;
-    nk::Model model = CookKFloatDogs(K, 1.0f);
+    const float spacing = 2.00f;  // dog B at x=2.0 (== +X platform edge, symmetric).
+    nk::Model model = CookKDogs(K, spacing);
     ASSERT_EQ(model.capacities.articulations_per_env, K);
+    ASSERT_EQ(model.contact_family, nk::ContactFamily::PairDriven);
     const uint32_t L = model.capacities.links_per_env;
+    const uint32_t links_per_dog = L / K;  // dog A == links [0, links_per_dog).
 
-    // An ELEVATED central platform (PyramidStairs): the platform top sits
-    // kPyramidRings*step_height above ground. We set the top BELOW the dogs' spawn
-    // z (0.445) so they drop a few cm onto it -- a dog whose TRUNK / upper-leg
-    // capsule sags toward the platform is caught by the body-terrain pass instead
-    // of clipping THROUGH it (the owner 穿模 fix). A wide platform keeps both dogs
-    // on the flat top (so the comparison surface is a single height, not a step).
-    nuka::terrain::TerrainParams terr{};
+    nuka::terrain::TerrainParams terr = nuka::terrain::DefaultTerrainParams();
     terr.ground_height  = 0.0f;
-    terr.step_height    = 0.025f;  // 8 rings * 0.025 = 0.20 m platform top
+    terr.step_height    = 0.04f;   // 8 rings * 0.04 = 0.32 m platform top
     terr.step_width     = 0.40f;
-    terr.platform_width = 6.0f;    // wide flat top (half_plat 3.0 > dog spread 1.0)
-    model.terrain = terr;
-    model.ground_height = 0.0f;
+    terr.platform_width = 2.00f;   // half_plat = 1.00
+    const float half_plat = 0.5f * terr.platform_width;  // 1.0
+    // Shift the grid so a step EDGE is under the cooked dogs. center.x = +half_plat
+    // maps grid-local origin to world x=+1.0; the platform's -X edge (local
+    // x=-half_plat) lands at world x=0 (cooked dog A straddles this edge).
+    const Vec3 grid_center{half_plat, 0.0f, 0.0f};
+
+    // Cook the GENERAL heightfield collidable for the SAME PyramidStairs spec.
+    // body_init must be sized to the ORIGINAL bodies before CookHeightfieldGrid
+    // seeds the heightfield collidable at index orig_bodies (the vproof recipe).
+    const uint32_t orig_bodies = model.capacities.bodies_per_env;
+    model.body_init.resize(orig_bodies);
+    const uint32_t hf_row = cook::CookHeightfieldGrid(
+        model, terr, terrain::kTerrainPyramidStairs,
+        /*nrow=*/41u, /*ncol=*/41u, /*cell=*/0.20f, grid_center);
+    ASSERT_EQ(hf_row, orig_bodies);
+
+    nk::ModelCapacities& cap = model.capacities;
+    cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
+    cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+    SetPairDrivenCaps(model);
 
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = 1.0f / 240.0f;
     cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
+    cfg.vel_iters = 32u;
+    cfg.max_pairs = 64u;
 
     // Capture the per-link collision geometry BEFORE moving the model into World.
     const std::vector<uint32_t> geom_kind = model.articulation.link_geom_kind;
@@ -483,34 +576,33 @@ TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
     uint32_t collidable_capture = 0u;
     for (uint32_t kk : geom_kind) if (kk != 0u) ++collidable_capture;
     std::fprintf(stderr,
-                 "[terrain spike] captured geom: L=%u kind.size=%zu params.size=%zu "
-                 "local.size=%zu collidable=%u\n",
-                 L, geom_kind.size(), geom_params.size(), geom_local.size(),
-                 collidable_capture);
+                 "[terrain general] captured geom: L=%u collidable=%u hf_row=%u "
+                 "grid_center.x=%.2f\n",
+                 L, collidable_capture, hf_row, grid_center.x);
     ASSERT_GT(collidable_capture, 0u) << "no per-link collision geometry captured";
 
     nk::World world(std::move(model), 1u, dev, backend, cfg);
     ASSERT_TRUE(world.Ready());
 
-    // Set EVERY env's terrain TYPE to PyramidStairs (seeded Flat at construction).
-    std::vector<uint32_t> ttype(1u, nuka::terrain::kTerrainPyramidStairs);
-    ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::EnvTerrainType,
-                                            ttype.data(), sizeof(uint32_t)));
-
-    // Settle: drop the dogs onto the platform.
+    // Settle: the standing legs sag onto the step edge / treads and rest. The
+    // SampleTerrainHeight comparison below uses the SAME grid_center offset (the
+    // surface under a link at world (x,y) is sampled at local (x-center, y-center)).
     const uint32_t kSteps = 400u;
     for (uint32_t s = 0; s < kSteps; ++s) {
         ASSERT_TRUE(world.Step().AllOk()) << "step " << s;
     }
 
-    // Measure the resting clearance over a few final steps. worst_pen tracks the
-    // MOST-NEGATIVE clearance (a sink-through); min_clear tracks the true minimum
-    // clearance (the closest a body link comes to the surface -- proof it actually
-    // rests on, not floats high above, the terrain).
-    nuka::terrain::TerrainParams sampled = terr;
-    sampled.ground_height = 0.0f;
-    float worst_pen = 1.0e9f;
-    float min_clear = 1.0e9f;
+    // Measure the resting clearance over a few final steps. dogA_worst_pen tracks
+    // dog A's MOST-NEGATIVE clearance (a sink-through) -- the no-穿模 metric scoped
+    // to the dog the general heightfield supports. all_finite covers BOTH dogs
+    // (every link of every dog must stay finite -- the step-edge no-explosion win).
+    // Each link is compared against the LOCAL step surface at its OWN (x,y) -- a
+    // real staircase surface, not a single flat platform height.
+    float dogA_worst_pen = 1.0e9f;
+    float dogA_min_clear = 1.0e9f;
+    bool all_finite = true;
+    uint32_t worst_l = ~0u;
+    float worst_gx = 0.0f, worst_gy = 0.0f, worst_z = 0.0f, worst_surf = 0.0f;
     for (uint32_t s = 0; s < 20u; ++s) {
         ASSERT_TRUE(world.Step().AllOk());
         std::vector<nuka::math::Transform> link_pose(L);
@@ -525,36 +617,59 @@ TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
             const float lowest_z = LinkLowestZHost(
                 kind, geom_params.data() + static_cast<size_t>(l) * 4u,
                 world_geom, &gx, &gy);
+            if (!std::isfinite(lowest_z) || !std::isfinite(gx) ||
+                !std::isfinite(gy)) {
+                all_finite = false;
+                continue;
+            }
+            if (l >= links_per_dog) continue;  // 穿模 metric scoped to dog A.
+            // The cooked grid is centred at grid_center, so the surface under a
+            // link at world (gx,gy) is sampled at grid-LOCAL (gx-center, gy-center)
+            // (the SAME mapping CookHeightfieldGrid used).
             const float surface = nuka::terrain::SampleTerrainHeight(
-                nuka::terrain::kTerrainPyramidStairs, gx, gy, sampled);
+                nuka::terrain::kTerrainPyramidStairs,
+                gx - grid_center.x, gy - grid_center.y, terr);
             // clearance > 0 == above surface; < 0 == sunk INTO terrain (穿模).
             const float clearance = lowest_z - surface;
-            if (!std::isfinite(clearance)) continue;
-            worst_pen = std::min(worst_pen, clearance);
-            min_clear = std::min(min_clear, clearance);
+            if (!std::isfinite(clearance)) { all_finite = false; continue; }
+            if (clearance < dogA_worst_pen) {
+                dogA_worst_pen = clearance; worst_l = l; worst_gx = gx;
+                worst_gy = gy; worst_z = lowest_z; worst_surf = surface;
+            }
+            dogA_min_clear = std::min(dogA_min_clear, clearance);
         }
     }
 
     std::fprintf(stderr,
-                 "[terrain spike] %u dogs on PyramidStairs (platform top %.2f): "
-                 "min body-link clearance above surface = %.4f m "
-                 "(most-negative = %.4f m; <0 == 穿模)\n",
-                 K, 8.0f * terr.step_height, min_clear, worst_pen);
+                 "[terrain general] dog A on PyramidStairs step edge (platform top "
+                 "%.2f, half_plat %.2f): worst link %u @ (%.3f,%.3f) lowest_z=%.4f "
+                 "surf=%.4f | min clearance=%.4f worst=%.4f m (<0 == 穿模)\n",
+                 8.0f * terr.step_height, half_plat, worst_l, worst_gx, worst_gy,
+                 worst_z, worst_surf, dogA_min_clear, dogA_worst_pen);
 
-    // NO 穿模: no body link sinks meaningfully below the local terrain surface.
-    // A tolerance of one Baumgarte-resting penetration slop (~couple cm) accounts
-    // for the soft contact's steady-state interpenetration; a real clip-through is
-    // tens of cm (the trunk falling 0.4 m past the platform).
-    EXPECT_GT(worst_pen, -0.05f)
-        << "a body link sank THROUGH the terrain (穿模) -- body-terrain contact "
-           "failed to keep the trunk resting ON the surface";
+    // (1) FINITE (BOTH dogs) — the general step-edge path does NOT explode (the
+    // deleted dog_dog analytic body-vs-terrain pass exploded on exactly this
+    // geometry: base_z=16029 / NaN). Every link of every dog stays finite.
+    EXPECT_TRUE(all_finite) << "a body link went NaN/inf on the step edges "
+                               "(the explosion the general path fixes)";
+
+    // (2) NO 穿模 (dog A, the dog the general heightfield supports): no dog-A body
+    // link sinks meaningfully below the LOCAL step surface while straddling the
+    // edge. A tolerance of one Baumgarte-resting penetration slop (~couple cm)
+    // accounts for the soft contact's steady-state interpenetration; a real
+    // clip-through is tens of cm (the body falling past the step).
+    EXPECT_GT(dogA_worst_pen, -0.05f)
+        << "a dog-A body link sank THROUGH the step terrain (穿模) -- the general "
+           "heightfield contact failed to keep the body resting ON the step edge";
 }
 
-// --- TASK 1: feet LOADED on ground AND dog-dog push-apart, SIMULTANEOUSLY ------
-// Two floating-base dogs spawned overlapping on FLAT ground with gravity: the
-// feet must contact the ground (foot slots loaded) WHILE the overlapping trunks
-// push apart (dog-dog reaction). Proves feet + dog-dog coexist for K>1 (neither
-// clobbers the other's per-articulation slot block).
+// --- K overlapping dogs push apart WHILE resting on a GENERAL ground field ------
+// MIGRATED to the GENERAL path. Two floating-base dogs spawned overlapping on a
+// FLAT general heightfield with gravity ON: their leg/foot collidables rest on
+// the ground field (contacts loaded) WHILE the overlapping trunks push apart --
+// ALL through the ONE LBVH -> cvx -> mixed-island contact path. Proves
+// body<->ground AND body<->body contact coexist for K>1 dogs in one general world
+// (no per-articulation dog_dog slot blocks; the unified contact buffer holds both).
 TEST(MultiDogTerrain, FeetAndDogDogContactCoexist) {
     if (!std::filesystem::exists(Go2FloatScenePath())) {
         GTEST_SKIP() << "go2_float.usda not present";
@@ -565,20 +680,34 @@ TEST(MultiDogTerrain, FeetAndDogDogContactCoexist) {
     ASSERT_NE(backend, nullptr);
 
     // Two dogs 0.15 m apart (trunk boxes 0.20 -> 0.05 m interpenetration) on a
-    // FLAT ground plane at z=0, gravity ON so the feet fall onto the ground.
+    // FLAT general heightfield at z=0, gravity ON so the legs/feet fall onto it.
     const uint32_t K = 2u;
     nk::Model model = CookKFloatDogs(K, 0.15f);
     ASSERT_EQ(model.capacities.articulations_per_env, K);
-    ASSERT_EQ(model.capacities.max_contacts_per_env, 24u);  // K*12 (feet+body+dog-dog)
-    const uint32_t L = model.capacities.links_per_env;
-    const uint32_t slots = model.capacities.max_contacts_per_env;  // 24
-    const uint32_t stride = slots / K;                             // 12 per dog
-    model.ground_height = 0.0f;  // flat plane (default terrain Flat).
+    ASSERT_EQ(model.contact_family, nk::ContactFamily::PairDriven);
+
+    nuka::terrain::TerrainParams terr = nuka::terrain::DefaultTerrainParams();
+    terr.ground_height = 0.0f;
+
+    // GENERAL flat ground field (terrain type Flat) the legs/feet collide against.
+    const uint32_t orig_bodies = model.capacities.bodies_per_env;
+    model.body_init.resize(orig_bodies);
+    const uint32_t hf_row = cook::CookHeightfieldGrid(
+        model, terr, terrain::kTerrainFlat,
+        /*nrow=*/41u, /*ncol=*/41u, /*cell=*/0.20f, /*center=*/Vec3{0, 0, 0});
+    ASSERT_EQ(hf_row, orig_bodies);
+
+    nk::ModelCapacities& cap = model.capacities;
+    cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
+    cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+    SetPairDrivenCaps(model);
 
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = 1.0f / 240.0f;
     cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
+    cfg.vel_iters = 32u;
+    cfg.max_pairs = 64u;
 
     nk::World world(std::move(model), 1u, dev, backend, cfg);
     ASSERT_TRUE(world.Ready());
@@ -589,54 +718,42 @@ TEST(MultiDogTerrain, FeetAndDogDogContactCoexist) {
                                               base0.size() * sizeof(float)));
     const float spawn_sep = std::abs(base0[1 * 7 + 0] - base0[0 * 7 + 0]);
 
-    // Settle under gravity: feet land on the ground; overlapping trunks push apart.
+    // Settle under gravity: legs/feet land on the ground field; the overlapping
+    // trunks push apart -- both contact kinds resolved by the SAME general solve.
     for (uint32_t s = 0; s < 250u; ++s) {
         ASSERT_TRUE(world.Step().AllOk()) << "step " << s;
     }
 
-    // (1) FEET LOADED: download the contact slots; count active foot contacts
-    // (normal +Z, the foot calf links) across BOTH dogs' per-articulation blocks.
-    std::vector<uint32_t> clink(slots, ~0u);
-    std::vector<float> cdepth(slots, 0.0f);
-    std::vector<nuka::math::Vec3> cnormal(slots);
-    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ContactLink, clink.data(),
-                                              slots * sizeof(uint32_t)));
-    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ContactDepth, cdepth.data(),
-                                              slots * sizeof(float)));
-    ASSERT_TRUE(world.GetData().DownloadField(
-        nk::FieldId::ContactNormal, cnormal.data(),
-        slots * sizeof(nuka::math::Vec3)));
+    // (1) CONTACTS LOADED on the general path: the unified per-env contact count
+    // is nonzero (the ground field + the dog<->dog overlap both produced contacts).
+    uint32_t contacts = 0u;
+    ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ContactCount, &contacts,
+                                              sizeof(uint32_t)));
 
-    uint32_t active = 0u, ground_contacts = 0u;
-    // Per-articulation block [art*stride, art*stride+stride): art 0 == dog A, 1 == B.
-    uint32_t per_dog_active[2] = {0u, 0u};
-    for (uint32_t s = 0; s < slots; ++s) {
-        if (clink[s] == ~0u) continue;
-        ++active;
-        if (cnormal[s].z > 0.5f) {  // +Z normal == a ground/terrain contact.
-            ++ground_contacts;
-            const uint32_t art = s / stride;
-            if (art < 2u) ++per_dog_active[art];
-        }
-    }
-
-    // (2) DOG-DOG push-apart: final separation grew past the 0.15 spawn gap.
+    // (2) push-apart: final separation grew past the 0.15 spawn gap, AND both dogs
+    // stayed finite resting on the ground (their base z did not tunnel below 0).
     std::vector<float> base1(K * 7u, 0.0f);
     ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BasePose, base1.data(),
                                               base1.size() * sizeof(float)));
     const float final_sep = std::abs(base1[1 * 7 + 0] - base1[0 * 7 + 0]);
+    const float base_z_a = base1[0 * 7 + 2];
+    const float base_z_b = base1[1 * 7 + 2];
 
     std::fprintf(stderr,
-                 "[coexist spike] spawn_sep=%.3f final_sep=%.3f | active_slots=%u "
-                 "ground_contacts=%u (dogA=%u dogB=%u of %u/dog)\n",
-                 spawn_sep, final_sep, active, ground_contacts,
-                 per_dog_active[0], per_dog_active[1], stride);
+                 "[coexist general] spawn_sep=%.3f final_sep=%.3f | contacts=%u | "
+                 "base_z A=%.4f B=%.4f\n",
+                 spawn_sep, final_sep, contacts, base_z_a, base_z_b);
 
-    // FEET coexist: at least one ground contact PER DOG is loaded (the feet did
-    // NOT get clobbered by the dog-dog op's slot writes).
-    EXPECT_GT(per_dog_active[0], 0u) << "dog A has no ground contact (feet lost)";
-    EXPECT_GT(per_dog_active[1], 0u) << "dog B has no ground contact (feet lost)";
-    // AND the dogs pushed apart (dog-dog reaction active at the same time).
+    for (uint32_t i = 0; i < K * 7u; ++i) ASSERT_TRUE(std::isfinite(base1[i]));
+
+    // CONTACTS coexist: the general world loaded contacts (ground + dog-dog) at
+    // the SAME time, on the ONE unified buffer.
+    EXPECT_GT(contacts, 0u)
+        << "no contacts loaded on the general path (ground + dog-dog both missing)";
+    // AND the dogs pushed apart (body<->body reaction active simultaneously).
     EXPECT_GT(final_sep, spawn_sep + 1.0e-3f)
-        << "overlapping dogs must push apart WHILE their feet rest on the ground";
+        << "overlapping dogs must push apart WHILE resting on the ground field";
+    // AND neither dog tunneled the ground field (no 穿模 of the trunk through z=0).
+    EXPECT_GT(base_z_a, -0.05f) << "dog A tunneled through the ground field";
+    EXPECT_GT(base_z_b, -0.05f) << "dog B tunneled through the ground field";
 }

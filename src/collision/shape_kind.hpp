@@ -3,8 +3,8 @@
 // General contact pipeline (Phase 0, R2) — the ONE shape-kind enum.
 //
 // Before this header the kKind* sentinels were copy-pasted across the CUDA
-// collision ops (broadphase.cu, narrowphase_prims.cu, dog_dog_contact.cu),
-// each a private `constexpr uint32_t kKind* = N` block — three sources that
+// collision ops (broadphase.cu, narrowphase_prims.cu, ...), each a private
+// `constexpr uint32_t kKind* = N` block — several sources that
 // could silently diverge. This header is the single source of truth; the
 // surviving sentinel sites include it so a new kind (Heightfield / TrianglePrism)
 // is added in ONE place.

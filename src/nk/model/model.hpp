@@ -135,16 +135,17 @@ struct ModelArticulation {
     // for the single-articulation scene (link l -> artic 0).
     std::vector<uint32_t>         link_to_articulation;
     uint32_t                      articulation_count = 1;
-    // WP5/WP6 dog-dog link collision geometry (per template-link; length ==
+    // Per-template-link collision geometry (per template-link; length ==
     // link_count when populated, else empty). ONE primitive collision shape per
-    // link in the link's LOCAL frame, the source for the NkOp::DogDogContact
-    // narrowphase (link_pose composed with link_geom_local -> world primitive).
+    // link in the link's LOCAL frame, the source the GENERAL contact path uses:
+    // SyncLinkBodyPose poses (link_pose o link_geom_local) into the link's body
+    // row so the link enters the LBVH as a collidable body for body<->body contact.
     //   link_geom_kind   : scene::ShapeType (0 == none; only Sphere/Box/Capsule
     //                      are collidable here).
     //   link_geom_params : 4 packed f32 per link (sphere r / capsule r,hh / box he).
     //   link_geom_local  : the shape's LOCAL transform relative to its link.
-    // Empty for any cook without dog-dog collision (the op early-exits at K<=1),
-    // so the field stays zero-filled and every K==1 scene is byte-identical.
+    // Empty for any cook without per-link collision geometry, so the field stays
+    // zero-filled and every such scene is byte-identical.
     std::vector<uint32_t>         link_geom_kind;
     std::vector<float>            link_geom_params;   // 4 f32 / link (flat)
     std::vector<math::Transform>  link_geom_local;

@@ -2,7 +2,8 @@
 // General contact pipeline — Phase 1B SOLVER, the ARTICULATION cases.
 //
 // The mixed-island coupling proof on REAL dogs, all through the GENERAL path
-// (LBVH -> cvx narrowphase -> mixed island), with the dog_dog hack GATED OFF:
+// (LBVH -> cvx narrowphase -> mixed island) — the ONE multi-body contact path
+// (the dog_dog hack was DELETED in L1/D1):
 //   (a) TWO co-resident floating-base dogs whose trunk boxes overlap collide via
 //       the GENERAL path (artic x artic) and push apart with two-way reaction (the
 //       reaction scatters into BOTH dogs' per-articulation qdot tiles -- S3).
@@ -10,8 +11,8 @@
 //       the free-rigid 6-DOF side coupled to the artic chain-J side -- the box's
 //       weight loads the dog, the dog's trunk moves).
 //
-// Both cook with CookContactFamily::PairDriven; the FusedFoot dog_dog variant
-// (multi_dog_costep.cpp) is kept for now (Phase 2 D1 deletes the hack).
+// Both cook with CookContactFamily::PairDriven. The migrated multi_dog_costep.cpp
+// also runs its multi-dog cases on this SAME general path (the dog_dog hack is gone).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -98,7 +99,7 @@ TEST(PairDrivenDogSolve, TwoDogsCollideViaGeneralPath) {
     if (b.backend == nullptr) GTEST_SKIP() << "no CUDA backend";
 
     // Two dogs 0.15 m apart in X; trunk boxes 0.20 (half 0.10) -> 0.05 overlap.
-    // With the GENERAL contact path (dog_dog gated OFF for PairDriven) the trunks
+    // With the GENERAL contact path (the ONE multi-body path) the trunks
     // MUST push apart, and the two-way reaction injects velocity into BOTH dogs.
     nk::Model model = CookKFloatDogsPairDriven(2u, 0.15f);
     ASSERT_EQ(model.capacities.articulations_per_env, 2u);
@@ -219,7 +220,7 @@ TEST(PairDrivenDogSolve, FreeBoxOnDogBackPushesDog) {
     // ONE dog (K==1) + a heavy free box dropped onto its trunk. The MIXED island
     // couples the free-rigid 6-DOF box side to the dog's artic chain-J side: the
     // box's weight loads the dog so the dog's trunk is pushed down (its base z
-    // drops) -- the two-way mixed coupling. dog_dog is gated OFF (PairDriven).
+    // drops) -- the two-way mixed coupling on the ONE general contact path.
     nuka::scene::SceneIR scene = nuka::import::LoadUsd(Go2FloatScenePath().string());
     nuka::scene::cook::CookToModelOptions opt;
     opt.contact_family = nuka::scene::cook::CookContactFamily::PairDriven;

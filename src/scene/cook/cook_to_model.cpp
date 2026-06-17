@@ -394,13 +394,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             model.feet.push_back(foot);
         }
 
-        // WP5/WP6 dog-dog link collision geometry: per template-link, record the
-        // FIRST primitive (Sphere/Box/Capsule) collision shape whose owning body
-        // maps to that link, in the link's LOCAL frame. This is the source the
-        // NkOp::DogDogContact narrowphase poses into world space from the FK
-        // link_pose. Cooked for EVERY scene (the field is inert until the op runs,
-        // which it does only at articulations_per_env > 1), so a single-dog scene
-        // populates the table but never exercises it -> K==1 byte-identical.
+        // Per-link collision geometry: per template-link, record the FIRST
+        // primitive (Sphere/Box/Capsule) collision shape whose owning body maps to
+        // that link, in the link's LOCAL frame. This is the source the GENERAL
+        // contact path poses into world space (SyncLinkBodyPose: link_pose o
+        // link_geom_local -> the link's collidable body row in the LBVH). Cooked
+        // for EVERY scene; the FusedFoot/UnionCsr graphs never read it (it only
+        // feeds the PairDriven SyncLinkBodyPose op) -> K==1 FUSED byte-identical.
         //   kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
         //   default-zero (no-shape) link is unambiguously inactive.
         m.link_geom_kind.assign(m.link_count, 0u);
@@ -680,15 +680,17 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // contact-slot budget must cover K articulation blocks: K * 4 slots, with
         // 3 rows/slot. At K==1 (the legacy single-robot scene) this is EXACTLY
         // 4 / 12 -- byte-identical (the K==1 D1 invariant; a multi-dog scene is a
-        // DISTINCT validation surface). This grows the DogDogContact + fused-foot
-        // slot stream to hold every dog's per-articulation contact block.
+        // DISTINCT validation surface). This grows the fused-foot slot stream to
+        // hold every dog's per-articulation foot-contact block (general multi-body
+        // collision rides the PairDriven path's own candidate-slot budget instead).
         const uint32_t k = cap.articulations_per_env == 0u ? 1u
                                                            : cap.articulations_per_env;
-        // Task 1/2: per-dog slot stride. At K==1 (the legacy single-robot scene)
+        // Per-dog FUSED-foot slot stride. At K==1 (the legacy single-robot scene)
         // this is EXACTLY kMaxFootContactsPerEnv (4) -> max_contacts 4 / rows 12,
         // byte-identical. At K>1 it grows to kMultiDogContactsPerArtic (12) so each
-        // dog's block holds feet + body-vs-terrain + dog-dog rows (the Task 1/2
-        // coexistence). 3 rows per contact slot {normal, t1, t2}.
+        // dog's per-articulation foot block has headroom. 3 rows per contact slot
+        // {normal, t1, t2}. (PairDriven overrides this budget with its own
+        // candidate-slot layout; this stride only governs the FusedFoot path.)
         const uint32_t stride = (k > 1u)
             ? ::nuka::runtime::articulation::kMultiDogContactsPerArtic
             : ::nuka::runtime::articulation::kMaxFootContactsPerEnv;
@@ -884,8 +886,8 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
 // B1 (general contact pipeline Phase 1B): the PairDriven cook overload. It runs
 // the SAME cook (so the registry / shape_table / body_to_link / static ground row
 // / multi-artic foundation are all reused verbatim) then flips the model to the
-// GENERAL family: contact_family = PairDriven (the pipeline then gates the dog_dog
-// hack OFF and routes the LBVH -> cvx -> mixed-island path), enables cross-env
+// GENERAL family: contact_family = PairDriven (the pipeline then routes the ONE
+// LBVH -> cvx -> mixed-island contact path), enables cross-env
 // filtering so candidate pairs stay env-local, and RE-SIZES the per-env row budget
 // to the general per-candidate-slot layout (max_contacts_per_env candidate slots x
 // kPairDrivenRowsPerSlot rows/slot). The FusedFoot overload is byte-untouched.

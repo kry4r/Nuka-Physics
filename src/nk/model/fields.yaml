@@ -542,18 +542,19 @@ fields:
   # =========================================================================
   - {name: joint_f, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}
   # =========================================================================
-  # WP5/WP6 DOG-DOG LINK COLLISION GEOMETRY (multi-articulation contact) —
+  # PER-LINK COLLISION GEOMETRY (general body<->body contact source) —
   # MODEL (immutable cook product). One primitive collision shape per
-  # articulation link, in the link's LOCAL frame, so the dog-dog contact op
-  # (NkOp::DogDogContact) can pose each link's collidable in WORLD space from
-  # the FK link_pose field (WP5: link_pose -> a collidable visible to the
-  # broadphase) and run the analytic primitive narrowphase (WP6) between links
-  # of DISTINCT co-resident articulations. APPENDED LAST so every existing field
-  # keeps its byte offset (layout-safe). These are inert for any scene without
-  # dog-dog pairs: the op early-exits when articulations_per_env <= 1, and a
-  # link with no cooked collision shape carries link_geom_kind == 0 (inactive
-  # sentinel) so it never produces a contact. K==1 scenes therefore hit the
-  # identical op graph + byte layout (the D1 guarantee).
+  # articulation link, in the link's LOCAL frame, so the GENERAL contact path's
+  # SyncLinkBodyPose op (NkOp::SyncLinkBodyPose, PairDriven-family-gated) can pose
+  # each link's collidable into its body row in WORLD space from the FK link_pose
+  # field (link_pose o link_geom_local -> a collidable visible to the LBVH
+  # broadphase) so artic links collide body<->body through the ONE cvx GJK/EPA
+  # narrowphase + mixed-island solve. APPENDED LAST so every existing field keeps
+  # its byte offset (layout-safe). These are inert for the FusedFoot/UnionCsr
+  # graphs (only SyncLinkBodyPose reads them), and a link with no cooked collision
+  # shape carries link_geom_kind == 0 (inactive sentinel) so it never produces a
+  # collidable. Single-dog FUSED scenes therefore hit the identical op graph +
+  # byte layout (the D1 guarantee).
   #   link_geom_kind   : scene::ShapeType (0 == none/inactive; Sphere/Box/
   #                      Capsule are the supported primitives). u32 per link.
   #   link_geom_params : packed primitive params, 4 f32 per link:

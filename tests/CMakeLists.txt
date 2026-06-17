@@ -878,10 +878,11 @@ if(CMAKE_CUDA_COMPILER)
         coupling/test_pbd_costep_unified.cpp
         scenario/h1_grasp_lift.cpp
         scenario/union_cook_golden.cpp
-        # WP1 dog-collision FOUNDATION spike: K Go2 articulations co-resident in
-        # ONE env of ONE general nk::World (cook + model + schema re-key + staging).
-        # Proves K articulations co-step finite + INDEPENDENT (no dog-dog contact
-        # yet -- that is the later contact crux). Composes go2_stand with itself.
+        # Multi-articulation co-residence + GENERAL-PATH collision: K Go2
+        # articulations co-resident in ONE env of ONE general nk::World. Proves K
+        # articulations co-step finite + INDEPENDENT, AND collide via the GENERAL
+        # contact path (overlapping dogs push apart; dogs rest on a general
+        # heightfield incl. step edges -- no dog_dog hack). Composes go2 with itself.
         scenario/multi_dog_costep.cpp
         # General contact pipeline Phase 1A: the PairDriven NARROWPHASE DETECTION
         # gate. A body-only PairDriven world with two overlapping collidables runs
@@ -895,7 +896,7 @@ if(CMAKE_CUDA_COMPILER)
         # mixed-island solve path (S1-S6 fed into the existing coupling engine).
         scenario/pairdriven_solve.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
-        # and artic x artic (two dogs collide via the GENERAL path, dog_dog gated OFF).
+        # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
         # General contact pipeline Phase 2A: the GENERAL HEIGHTFIELD narrowphase
         # gate. A box on a FLAT grid rests; ★ a box on a real PyramidStairs STEP

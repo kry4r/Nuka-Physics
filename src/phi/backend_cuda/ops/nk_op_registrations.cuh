@@ -18,7 +18,6 @@ void RegisterNkArticulationPipelineOps();
 void RegisterNkAbaOps();              // articulation.cu
 void RegisterNkCrbaOps();             // crba.cu
 void RegisterNkContactsFootOps();     // contacts_foot.cu (+contacts_union.cu)
-void RegisterNkDogDogContactOps();    // dog_dog_contact.cu (WP5/6/8 multi-artic)
 void RegisterNkSyncBodyPoseOps();     // sync_body_pose.cu (general contact B2)
 void RegisterNkNarrowphaseHeightfieldOps();  // narrowphase_heightfield.cu (H3)
 void RegisterNkBroadphaseOps();       // broadphase.cu (M5)

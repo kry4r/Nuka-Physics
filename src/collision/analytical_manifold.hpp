@@ -120,11 +120,11 @@ inline PrimFrame BuildPrimFrame(const math::Transform& xf) {
 }
 
 // ---------------------------------------------------------------------------
-// DEVICE-SAFE frame baking (WP5/WP6 dog-dog narrowphase). The same math as
-// BuildPrimFrame but written HD-clean (no Quat::Rotate, which is host-only):
-// rotate the 3 unit axes by the quaternion with the explicit v + 2w(qxv) +
-// 2 qx(qxv) formula (the same recipe contacts_foot.cu RotateByQuat uses), so it
-// compiles for both host and device. Used by the dog_dog_contact.cu kernel.
+// DEVICE-SAFE frame baking. The same math as BuildPrimFrame but written HD-clean
+// (no Quat::Rotate, which is host-only): rotate the 3 unit axes by the quaternion
+// with the explicit v + 2w(qxv) + 2 qx(qxv) formula (the same recipe
+// contacts_foot.cu RotateByQuat uses), so it compiles for both host and device.
+// Used by the general SyncLinkBodyPose op (poses each artic link's collidable).
 // ---------------------------------------------------------------------------
 NUKA_AMF_HD inline Vec3 RotateByQuatHD(const math::Quat& q_in, Vec3 v) {
     // Normalize defensively (matches RotateByQuat's 1e-12 guard).
