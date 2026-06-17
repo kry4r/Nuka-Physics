@@ -902,6 +902,14 @@ if(CMAKE_CUDA_COMPILER)
         # EDGE settles finite + no 穿模 (the exact gate2 explosion fix); per-cell
         # TRIANGLE_PRISM contacts via the EXISTING cvx GJK/EPA; two-run identity.
         scenario/pairdriven_heightfield.cpp
+        # V-PROOF (one-general-solver-spec §4/§L0): equivalence harness proving the
+        # GENERAL contact path (PairDriven + CookHeightfieldGrid) reproduces the
+        # LEGACY private paths (FusedFoot feet-on-ground / terrain) to a physical
+        # tolerance BEFORE the family collapse re-baselines the goldens. A FAIL with
+        # precise per-joint/contact diagnostics is the intended, valuable outcome.
+        scenario/vproof_go2_ground.cpp
+        scenario/vproof_go2_terrain.cpp
+        scenario/vproof_h1_grasp.cpp
         # M11 VIEW-4 + VIEW-6 host gates (command_queue -> ApplyMoveEntity -> nk::Data
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.
@@ -2642,6 +2650,38 @@ if(NK_BUILD_VULKAN_VALIDATION)
     target_link_libraries(nuka_union_throughput
         PRIVATE
             nuka_test_validated_sources  # BuildNkUnionModel (union_nk_model.cpp)
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # V-PROOF throughput gate (one-general-solver-spec §4) -- vproof_go2_throughput:
+    # measure the GENERAL-path (PairDriven + flat heightfield) go2 env-steps/sec at
+    # N in {1,64,256,1024} vs the >= 10000 env-steps/s training-ready floor. Mirrors
+    # nuka_union_throughput's structure (cook once per N -> nk::World -> StepPlanned
+    # loop + timing + finite-q). No Vulkan (shares the gated link set for the cook).
+    add_executable(vproof_go2_throughput
+        ${CMAKE_SOURCE_DIR}/examples/demo/vproof_go2_throughput.cpp
+    )
+    add_dependencies(vproof_go2_throughput nuka_codegen)
+    target_compile_definitions(vproof_go2_throughput
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(vproof_go2_throughput
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(vproof_go2_throughput
+        PRIVATE
+            nuka_test_validated_sources
             nuka_app
             nuka_scene_cook
             nuka_render
