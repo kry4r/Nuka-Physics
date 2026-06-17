@@ -105,11 +105,8 @@ __forceinline__ __device__ math::Vec3 RotateQuatHostExpr(math::Quat q,
     return v + q.w * t + qv.Cross(t);
 }
 
-// --- cross-TU launcher seams ------------------------------------------------
-// Union narrowphase (contacts_union.cu): detection per (env x union slot) into
-// the ucontact_* manifold scratch. Returns cudaSuccess-mapped Status.
-Status LaunchUnionNarrowphase(const ModelView& model, const DataView& data,
-                              const NarrowphasePrimitivesParams& p,
-                              cudaStream_t stream);
+// L1-c: the LaunchUnionNarrowphase cross-TU launcher seam was DELETED with
+// contacts_union.cu (the UnionCsr narrowphase). The PairDriven narrowphase
+// (narrowphase_prims.cu) is the only live detection path.
 
 }  // namespace nuka::phi::nkops

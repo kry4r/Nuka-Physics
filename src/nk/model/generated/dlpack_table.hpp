@@ -120,11 +120,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::QdotFlat, DlpackDtype::kF32, 1, false, false},  // qdot_flat
     {FieldId::M, DlpackDtype::kF32, 1, false, false},  // m
     {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false, false},  // link_composite_inertia
-    {FieldId::UnionSlots, DlpackDtype::kF32, 1, false, false},  // union_slots
     {FieldId::HullVerts, DlpackDtype::kF32, 1, false, false},  // hull_verts
     {FieldId::DofToLink, DlpackDtype::kU32, 1, false, false},  // dof_to_link
     {FieldId::DofToComponent, DlpackDtype::kU32, 1, false, false},  // dof_to_component
-    {FieldId::TableEnabled, DlpackDtype::kU32, 1, false, false},  // table_enabled
     {FieldId::ShapeTable, DlpackDtype::kF32, 1, false, false},  // shape_table
     {FieldId::ExcludedPairs, DlpackDtype::kU64, 1, false, false},  // excluded_pairs
     {FieldId::SampPoints, DlpackDtype::kF32, 1, false, false},  // samp_points

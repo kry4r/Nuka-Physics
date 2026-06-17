@@ -221,97 +221,15 @@ TEST(CookSettleDeterminism, TwoRunsByteIdentical) {
 }
 
 // ===========================================================================
-// (1b) SETTLE-TO-REST — a MOVABLE rigid cup dropped onto a plane settles to
-// rest and the two runs are byte-identical. This is the headline cook use case
-// (a cup coming to rest on a surface): a bodies-only union Model (no articulation
-// needed — the generic CookToModel does not author movable body_init / box-plane
-// contact yet; that is T4, so the gate supplies the union slot directly) so the
-// settle ACTUALLY rests the body. Proves the settle + body snapshot/download on a
-// genuinely resting movable body, deterministically.
+// (1b) SETTLE-TO-REST — L1-c DELETED the MovableCupSettlesToRestDeterministic
+// test + its BuildCupOnPlaneModel / RestCupOnce helpers. They hand-assembled a
+// bodies-only UnionCsr Model (nk::UnionSlot kBodyBoxPlane + union_solref/solimp)
+// to settle a movable cup on a plane — all of which were deleted with the
+// UnionCsr path. The general (PairDriven) box-rests-on-static-ground case is
+// covered by scenario/pairdriven_solve.cpp; the cook-settle determinism the rest
+// of this file proves (TwoRunsByteIdentical / FindRestPlacementSeatsCupOnTable)
+// runs the general cook path and is unaffected.
 // ===========================================================================
-namespace {
-
-// A free rigid box (the "cup") a few mm above a static z=0 plane (kBodyBoxPlane).
-nk::Model BuildCupOnPlaneModel() {
-    nk::Model model;
-    nk::ModelCapacities& cap = model.capacities;
-    cap.env_count = 1;
-    cap.bodies_per_env = 1;
-
-    const float box_he = 0.04f;
-    const float floor_z = 0.0f;
-    nk::Model::BodyInit bi;
-    bi.pose = Transform::Identity();
-    bi.pose.position = Vec3{0.0f, 0.0f, floor_z + box_he + 0.005f};  // 5 mm drop.
-    bi.inv_mass = 1.0f / 0.2f;  // 0.2 kg cup.
-    const float ii = 1.0f / (0.2f * (2 * box_he) * (2 * box_he) / 6.0f);
-    bi.inv_inertia = Vec3{ii, ii, ii};
-    model.body_init.push_back(bi);
-
-    nk::UnionSlot s;
-    s.cls = nk::UnionSlot::kBodyBoxPlane;
-    s.body = 0u;
-    s.condim = 1;
-    s.box_half = Vec3{box_he, box_he, box_he};
-    s.plane_height = floor_z;
-    s.mu = 0.0f;
-    model.union_slots.push_back(s);
-
-    model.contact_family = nk::ContactFamily::UnionCsr;
-    cap.max_contacts_per_env = static_cast<uint32_t>(model.union_slots.size());
-    uint32_t rows = 0;
-    for (const nk::UnionSlot& u : model.union_slots) rows += u.MaxRows();
-    cap.max_rows_per_env = rows;
-    model.union_solref[0] = 0.02f; model.union_solref[1] = 1.0f;
-    model.union_solimp[0] = 0.9f;  model.union_solimp[1] = 0.95f;
-    model.union_solimp[2] = 0.001f; model.union_solimp[3] = 0.5f;
-    model.union_solimp[4] = 2.0f;
-    return model;
-}
-
-// Settle the cup-on-plane Model once (no holds — bodies-only). Returns the
-// settled cup pose.
-Transform RestCupOnce(uint32_t steps) {
-    Backend b = GetBackend();
-    nk::World world(BuildCupOnPlaneModel(), 1u, b.dev, b.backend, SettleConfig());
-    EXPECT_TRUE(world.Ready());
-    // An empty SceneIR + SceneMap (bodies-only settle resolves no holds; the
-    // body-pose download path is what we exercise here).
-    SceneIR empty_scene;
-    SceneMap empty_map;
-    cook::SettleSpec spec;
-    spec.steps = static_cast<int>(steps);
-    spec.dt = kDt;
-    const cook::SettleResult r =
-        cook::Settle(world, empty_scene, empty_map, spec);
-    EXPECT_TRUE(r.ok);
-    EXPECT_EQ(r.body_poses.size(), 1u);
-    return r.body_poses.empty() ? Transform::Identity()
-                                : r.body_poses.front().second;
-}
-
-}  // namespace
-
-TEST(CookSettleDeterminism, MovableCupSettlesToRestDeterministic) {
-    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
-
-    const Transform a = RestCupOnce(/*steps=*/200u);
-    const Transform b = RestCupOnce(/*steps=*/200u);
-
-    // Byte-identical settled pose across two runs (D1).
-    EXPECT_EQ(std::memcmp(&a, &b, sizeof(Transform)), 0)
-        << "two cup-on-plane settle runs produced different rest poses (D1)";
-
-    // The cup rests on the plane: its bottom (centre z - half 0.04) sits at ~0
-    // (the plane), NOT free-fallen through it. A 5 mm drop settles to rest.
-    const float box_he = 0.04f;
-    const float cup_bottom = a.position.z - box_he;
-    std::printf("[rest] cup centre z=%.6f  bottom z=%.6f (plane 0)\n",
-                a.position.z, cup_bottom);
-    EXPECT_NEAR(cup_bottom, 0.0f, 0.01f)
-        << "the cup did not settle to rest on the plane (bottom z=" << cup_bottom
-        << ")";
-}
 
 // ===========================================================================
 // (2) REST PLACEMENT — cup seated on a table at top + clearance.

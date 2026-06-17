@@ -6,13 +6,12 @@
 // and dispatches by (kind_a, kind_b) over the amf:: analytic handler set
 // (sphere/capsule/box/plane two-by-two) + sphere x hull, writing the SAME
 // ucontact_* 4-point manifold layout AssembleRows consumes (so AssembleRows is
-// UNCHANGED). The amf:: handlers are the HD-clean ones the union / fused-foot
-// families already use (the SAME math, byte-for-byte) — this op only changes
-// the DRIVER (pair-stream, not slot-template).
+// UNCHANGED). The amf:: handlers are the HD-clean ones the union family already
+// uses (the SAME math, byte-for-byte) — this op only changes the DRIVER
+// (pair-stream, not slot-template).
 //
 // FAMILY SELECTION (the seam): OpNarrowphasePrimitives lives in contacts_foot.cu
-// and dispatches on params.family:
-//   kContactFamilyFusedFoot  -> DetectFootGroundContactsKernel (M3b, byte-exact)
+// and dispatches on params.family (L1-b: the FUSED family was deleted):
 //   kContactFamilyUnionCsr   -> LaunchUnionNarrowphase (contacts_union.cu, M4)
 //   kContactFamilyPairDriven -> LaunchPairDrivenNarrowphase (THIS file, M5)
 // The union slot-template path is the gate-pinned grasp/NkUnionN1 production

@@ -17,12 +17,19 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_bodies       = cap.bodies_per_env > 0;
     const bool has_particles    = cap.particles_per_env > 0;
     const bool has_contacts     = cap.max_rows_per_env > 0;
-    const bool has_collidables  = has_bodies || cap.links_per_env > 0;
-    const bool is_union = model.contact_family == ContactFamily::UnionCsr;
-    const bool is_pair_driven = model.contact_family == ContactFamily::PairDriven;
-    const uint32_t family = is_union ? phi::kContactFamilyUnionCsr
-                          : is_pair_driven ? phi::kContactFamilyPairDriven
-                                           : phi::kContactFamilyFusedFoot;
+    // L1-b: gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
+    // on actual contact capacity. For every cooked-with-contacts world this equals
+    // the old structural test -- the cook sizes max_contacts_per_env ==
+    // (bodies+links)*4 > 0 whenever a body/link exists, so op selection is
+    // byte-identical. A contacts-OFF cook (CookToModelOptions::enable_contacts ==
+    // false) zeroes max_contacts_per_env, so the broadphase + narrowphase + the
+    // FK->body_pose sync are all skipped -> the world runs pure articulation+rigid
+    // dynamics and StepPlanned captures cleanly (no thrust LBVH mid-graph).
+    const bool has_collidables  =
+        (has_bodies || cap.links_per_env > 0) && cap.max_contacts_per_env > 0;
+    // L1-b deleted the FUSED runtime path; L1-c deleted the UnionCsr path. There
+    // is now ONE general contact path: PairDriven. Every cooked model uses it.
+    const uint32_t family = phi::kContactFamilyPairDriven;
 
     // M3b launch-geometry counts (the views are pure pointer aggregates, so
     // every op carries its counts in the params POD).
@@ -148,21 +155,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // FkWorldPoses (the link_pose it reads) and BEFORE BuildAabbs (the
         // body_pose it writes, which the AABB build consumes) so articulation
         // links enter the LBVH. PairDriven-family-gated -> a no-op for the
-        // FusedFoot / UnionCsr families (the captured graph still ENQUEUES it, but
-        // the op early-exits and writes nothing), so Phase-0 goldens are
-        // byte-identical. No current cook is PairDriven (the B1 flip is Phase 1),
-        // so it is present-but-inert everywhere today.
+        // UnionCsr family (the captured graph still ENQUEUES it, but the op
+        // early-exits and writes nothing), so the union goldens are byte-identical.
         p_sync_body_pose_.family = family;
         p_sync_body_pose_.env_count = env_count;
         p_sync_body_pose_.links_per_env = cap.links_per_env;  // PER-ENV stride
         p_sync_body_pose_.bodies_per_env = cap.bodies_per_env;
         add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
 
-        // M5 broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops do real
-        // work ONLY for the PairDriven family (the union slot-template and fused-
-        // foot families run their own detection and never read candidate_pairs);
-        // they EARLY-EXIT for is_union / fused so the gate-pinned union
-        // StepPlanned graph stays bit-identical to M4. The family + per-env body
+        // M5 broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops drive
+        // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
         p_aabbs_.margin = cfg.contact_margin;
@@ -232,16 +234,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.env_count = env_count;
         p_np_prim_.base_link_count = base_link_count;
         p_np_prim_.family = family;
-        // The pair-driven narrowphase reuses union_slot_count as its CANDIDATE
-        // slot STRIDE (slots per env in candidate_pairs / ucontact_*). For the
-        // PairDriven family that stride MUST equal the broadphase's
-        // (EnvQueryPairsKernel uses max_contacts_per_env), so the candidate slot
-        // index lines up across broadphase -> narrowphase -> the unified buffer.
-        // The UnionCsr family keeps its real union-slot count; FusedFoot ignores
-        // this field. (G5 wiring fix; byte-safe for the non-PairDriven families.)
-        p_np_prim_.union_slot_count =
-            is_pair_driven ? cap.max_contacts_per_env
-                           : static_cast<uint32_t>(model.union_slots.size());
+        // The PairDriven narrowphase uses union_slot_count as its CANDIDATE slot
+        // STRIDE (slots per env in candidate_pairs / ucontact_*). It MUST equal
+        // the broadphase's (EnvQueryPairsKernel uses max_contacts_per_env), so the
+        // candidate slot index lines up across broadphase -> narrowphase -> the
+        // unified buffer. (Field name retained for the shared params layout.)
+        p_np_prim_.union_slot_count = cap.max_contacts_per_env;
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
@@ -267,14 +265,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // ucontact_* buffer). For each (convex, heightfield) candidate slot it
         // emits the per-cell TRIANGLE_PRISM contacts (tread + riser) routed through
         // cvx GJK/EPA, written into THAT slot's ucontact_* with side a = convex,
-        // side b = the static heightfield. PairDriven-family-gated (early-exit for
-        // FusedFoot/UnionCsr -> byte-identical). The descriptor travels in params
-        // (the first cooked heightfield; the grid rides the model `heights` field).
+        // side b = the static heightfield. Part of the ONE general PairDriven path.
+        // The descriptor travels in params (the first cooked heightfield; the grid
+        // rides the model `heights` field).
         p_np_hf_.family = family;
         p_np_hf_.env_count = env_count;
-        p_np_hf_.slot_stride =
-            is_pair_driven ? cap.max_contacts_per_env
-                           : static_cast<uint32_t>(model.union_slots.size());
+        p_np_hf_.slot_stride = cap.max_contacts_per_env;
         p_np_hf_.bodies_per_env = cap.bodies_per_env;
         p_np_hf_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
@@ -305,17 +301,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
-        // ContactTangentBasis: fused + pair-driven families (the union family's
-        // tangent spokes are emitted inside AssembleRows, the
-        // EmitCompliantContactRows per-manifold basis). C4: the family selector
-        // routes the PairDriven path to the unified contact buffer (ucontact_*),
-        // the FusedFoot path to the FUSED contact buffer; byte-identical for
-        // FusedFoot (family 0, the prior single-arg launch).
-        if (!is_union) {
-            p_tangent_.slot_count = slot_count;
-            p_tangent_.family = family;
-            add(phi::NkOp::ContactTangentBasis, &p_tangent_);
-        }
+        // ContactTangentBasis: the ONE general PairDriven path. The op builds the
+        // tangents over the unified contact buffer (ucontact_*).
+        p_tangent_.slot_count = slot_count;
+        p_tangent_.family = family;
+        add(phi::NkOp::ContactTangentBasis, &p_tangent_);
     }
 
     if (has_articulation) {
@@ -328,6 +318,23 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_crba_factor_.max_dof = max_dof;
         p_crba_factor_.articulation_count = articulation_cnt;
         add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
+        // L1-b: standalone backward-Euler joint viscous damping. This is GENERAL
+        // articulation physics that used to ride inside the now-deleted FUSED
+        // contact solve kernel (which ran every step on the go2 stand world even
+        // with zero actual contacts). It applies qdot -= dt*(M+dt*C)^-1*(C*qdot)
+        // using the freshly factored data.m_inv == (M+dt*C)^-1, so it MUST come
+        // AFTER CrbaFactorM and BEFORE AssembleRows/SolveRowsBlockIsland +
+        // IntegratePosition (the legacy single-env oracle order: factor ->
+        // damping -> solve -> integrate). Gated on fold_drive_damping so worlds
+        // that don't fold dt*C (e.g. the union path) emit NO new op -> their
+        // captured graphs / goldens stay byte-identical.
+        if (cfg.fold_drive_damping != 0u) {
+            p_apply_damping_.dt = cfg.dt;
+            p_apply_damping_.max_dof = max_dof;
+            p_apply_damping_.articulation_count = articulation_cnt;
+            p_apply_damping_.total_link_count = total_link_count;
+            add(phi::NkOp::ApplyImplicitDamping, &p_apply_damping_);
+        }
     }
 
     if (has_contacts) {
@@ -341,15 +348,14 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // The PairDriven assembly reads union_slot_count as the CANDIDATE-slot
         // stride (slots per env in the unified contact buffer), which must equal the
         // broadphase's max_contacts_per_env (so the candidate index lines up across
-        // broadphase -> narrowphase -> assembly). UnionCsr keeps its real slot count.
-        p_assemble_.union_slot_count =
-            is_pair_driven ? cap.max_contacts_per_env
-                           : static_cast<uint32_t>(model.union_slots.size());
+        // broadphase -> narrowphase -> assembly). (Field name retained for the
+        // shared params layout.)
+        p_assemble_.union_slot_count = cap.max_contacts_per_env;
         p_assemble_.rows_per_env = cap.max_rows_per_env;
         p_assemble_.bodies_per_env = cap.bodies_per_env;
         p_assemble_.base_link_count = base_link_count;
-        for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.union_solref[k];
-        for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.union_solimp[k];
+        for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
+        for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.particles_per_env = cap.particles_per_env;  // M6 coupling.
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
@@ -412,7 +418,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_solve_.total_body_count = cap.bodies_per_env * env_count;
         p_solve_.friction_coefficient = model.friction_coefficient;
         p_solve_.baumgarte_max_velocity = model.baumgarte_max_velocity;
-        p_solve_.apply_implicit_damping = cfg.fold_drive_damping;
+        // (L1-b: the FUSED-family implicit-damping seed moved to the standalone
+        // NkOp::ApplyImplicitDamping op (added after CrbaFactorM above); the
+        // solve op no longer carries an apply_implicit_damping knob.)
         // Task 1/2: the FUSED per-articulation slot stride MUST match the foot /
         // dog-dog detection (slot_base = articulation * stride). 4 at K<=1.
         p_solve_.contact_slots_per_artic = contact_slots_per_artic;
@@ -460,10 +468,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
     }
 
-    // ReadoutContactWrench: fused-family only in M4 (its kernel reads the
-    // fused contact_* stream; the union family's readout — wrench from the
-    // urows lambdas — is the M5/M9 obs wiring, tests read the fields directly).
-    if ((has_articulation || has_bodies) && !is_union) {
+    // ReadoutContactWrench: the general per-env contact-wrench readout over the
+    // unified PairDriven contact buffer (L1-c removed the !is_union gate — the
+    // UnionCsr family that suppressed this op is gone; the path is always
+    // PairDriven now).
+    if (has_articulation || has_bodies) {
         p_readout_.dt = cfg.dt;
         p_readout_.env_count = env_count;
         p_readout_.base_link_count = base_link_count;
@@ -471,31 +480,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 
-    // M10 RL-completion: the union-family per-env contact-observation readout
-    // (finger normal-impulse force-closure signal + foot contact state). Emitted
-    // ONLY for the UnionCsr family (strictly ADDITIVE — the fused/pair-driven
-    // graphs are untouched, so their goldens stay byte-identical). Writes into
-    // obs_buffer (allocated per-env for every model; ExportObs is NOT in this
-    // pipeline graph, so the obs row is free). n_feet/n_fingers are counted by
-    // class from the host-side model.union_slots template (no fingertips count
-    // is exposed on nk::Model; the slot order is FIXED feet->fingers->table).
-    if (is_union && (has_articulation || has_bodies)) {
-        uint32_t n_feet = 0u, n_fingers = 0u;
-        for (const UnionSlot& s : model.union_slots) {
-            if (s.cls == UnionSlot::kFootSpherePlane) ++n_feet;
-            else if (s.cls == UnionSlot::kFingerSphereHull) ++n_fingers;
-        }
-        p_union_obs_.env_count = env_count;
-        p_union_obs_.union_slot_count = cap.max_contacts_per_env;
-        p_union_obs_.rows_per_env = cap.max_rows_per_env;
-        p_union_obs_.n_feet = n_feet;
-        p_union_obs_.n_fingers = n_fingers;
-        p_union_obs_.obs_offset = 0u;
-        p_union_obs_.obs_width = cap.obs_width;
-        // Finger slots are kFingerSphereHull (1 manifold point => 1 normal row).
-        p_union_obs_.max_pts = 1u;
-        add(phi::NkOp::ReadoutUnionContactObs, &p_union_obs_);
-    }
+    // L1-c: the M10 union-family per-env contact-observation readout
+    // (ReadoutUnionContactObs) was DELETED together with the entire UnionCsr path.
+    // Grasp/union moved to RL; the general per-env contact readout is
+    // ReadoutContactWrench over the unified contact buffer (above).
 }
 
 } // namespace nuka::nk

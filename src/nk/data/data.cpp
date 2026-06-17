@@ -114,7 +114,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::RowCjPointB:         v.row_cj_point_b = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
-        case FieldId::TableEnabled:        v.table_enabled = static_cast<uint32_t*>(p); break;
+        // L1-c: FieldId::TableEnabled (v.table_enabled) was DELETED with the field.
         case FieldId::M:                   v.m = static_cast<float*>(p); break;
         case FieldId::LinkCompositeInertia:v.link_composite_inertia = static_cast<Mat36*>(p); break;
         case FieldId::ParticlePrevPos:     v.particle_prev_pos = static_cast<math::Vec3*>(p); break;

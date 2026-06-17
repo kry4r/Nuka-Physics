@@ -70,6 +70,7 @@ private:
     phi::IntegratePositionParams      p_int_pos_{};
     phi::CrbaComputeMParams           p_crba_m_{};
     phi::CrbaFactorMParams            p_crba_factor_{};
+    phi::ApplyImplicitDampingParams   p_apply_damping_{};  // L1-b standalone damping
     phi::SyncLinkBodyPoseParams       p_sync_body_pose_{};  // general contact B2
     phi::BuildAabbsParams             p_aabbs_{};
     phi::LbvhBuildParams              p_lbvh_build_{};
@@ -88,8 +89,8 @@ private:
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ParticleParticleContactParams p_pp_contact_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
-    // M10 RL-completion: union-only per-env contact obs readout (additive).
-    phi::ReadoutUnionContactObsParams p_union_obs_{};
+    // L1-c: p_union_obs_ (the union-only per-env contact-obs readout params)
+    // was DELETED with the UnionCsr path / ReadoutUnionContactObs op.
 };
 
 } // namespace nuka::nk

@@ -180,8 +180,8 @@ TEST(MultiEnvWorld, CreateStepReadStableContactsActive) {
     // batched" split -- env==1 and env>1 run the SAME nk::World. The world runs
     // EXACTLY the cooked scene physics; it does NOT inject a synthetic ground
     // (the legacy batched path derived one via DeriveGroundHeight). go2_stand.usda
-    // authors NO ground plane and its feet float (z ~ 0.28) above the implicit
-    // FusedFoot ground at model.ground_height == 0, so NO foot-ground contact is
+    // authors NO ground plane and its feet float (z ~ 0.28) above z == 0 with no
+    // baked heightfield collidable requested, so NO foot-ground contact is
     // active -- the same free-space fixed-base PD stance the owner MJX golden pins
     // (Go2Stand.OwnerGoldenTrajectoryMatchesWithinTolerance, 1e-4). Active foot-
     // ground contact + the bounded-penetration solve are exercised on a SEATED
@@ -366,9 +366,10 @@ TEST(MultiEnvWorld, SingleEnvStillSupported) {
 
     // M9 unified world: the per-env contact / readout fields resolve generically
     // on env==1 too (same nk arena as env>1) -- the cooked go2_stand allocates the
-    // FusedFoot contact slots, so the fields are SERVED with the canonical stride/
+    // contact slots, so the fields are SERVED with the canonical stride/
     // dtype (the RL binary contract), not NOT_SUPPORTED. (Active foot-ground
-    // contact requires a seated ground, which go2_stand does not author.)
+    // contact requires a seated ground / requested heightfield, which go2_stand
+    // does not author.)
     for (const nuka_state_field_t f :
          {NUKA_FIELD_CONTACT_POINTS, NUKA_FIELD_LINK_CONTACT_WRENCH,
           NUKA_FIELD_CONTACT_NORMAL, NUKA_FIELD_CONTACT_FORCE,

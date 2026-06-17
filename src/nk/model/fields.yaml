@@ -289,21 +289,18 @@ fields:
   - {name: link_composite_inertia, dtype: mat36, per: link,     arena: scratch, owner: data}
 
   # =========================================================================
-  # UNION CONTACT TEMPLATE + LIVE TOGGLES (M4) — the union-family contact-pair
-  # tables. union_slots: GLOBAL per-env template table (shared by all envs),
-  # 16 packed f32 per contact slot {class, local_link/body, p0..p13} — see
-  # nk::UnionSlot (src/nk/model/model.hpp) for the packing. hull_verts: the
-  # mesh-local convex-hull vertex pool (cup), xyz-packed. dof_to_link /
-  # dof_to_component: the flat-DOF -> (template-local link, base component)
-  # maps (the DofIndexOf prefix-sum inverse; component == ~0u for scalar
-  # joints). table_enabled: the per-env LIVE cup x table emission toggle
-  # (DATA — SetTableEnabled is a field write, never a graph rebuild).
+  # SHARED GENERAL-PATH TABLES (formerly the M4 union block). L1-c DELETED the
+  # union-only fields union_slots (the per-env contact-pair template) and
+  # table_enabled (the cup x table live emission toggle). The survivors below are
+  # SHARED by the ONE general (PairDriven) path: hull_verts is the mesh-local
+  # convex-hull vertex pool (xyz-packed, read by the PairDriven narrowphase);
+  # dof_to_link / dof_to_component are the flat-DOF -> (template-local link, base
+  # component) maps (the DofIndexOf prefix-sum inverse; component == ~0u for
+  # scalar joints), read by the general row assembly.
   # =========================================================================
-  - {name: union_slots,      dtype: f32, per: scalar, count: "max_contacts_per_env*16", arena: persistent, owner: model}
   - {name: hull_verts,       dtype: f32, per: scalar, count: "max_hull_verts*3",        arena: persistent, owner: model}
   - {name: dof_to_link,      dtype: u32, per: dof,    arena: persistent, owner: model}
   - {name: dof_to_component, dtype: u32, per: dof,    arena: persistent, owner: model}
-  - {name: table_enabled,    dtype: u32, per: env,    arena: persistent, owner: data}
 
   # =========================================================================
   # M5 — PAIR-DRIVEN broadphase FILTER policy + generalized narrowphase shape

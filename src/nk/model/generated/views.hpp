@@ -43,7 +43,6 @@ struct ModelView {
     uint32_t* articulation_link_count = nullptr;  // per:articulation arena:persistent owner:model
     uint32_t* articulation_link_offset = nullptr;  // per:articulation arena:persistent owner:model
     float* foot_shape = nullptr;  // per:scalar arena:persistent owner:model count:max_contacts_per_env*5
-    float* union_slots = nullptr;  // per:scalar arena:persistent owner:model count:max_contacts_per_env*16
     float* hull_verts = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts*3
     uint32_t* dof_to_link = nullptr;  // per:dof arena:persistent owner:model
     uint32_t* dof_to_component = nullptr;  // per:dof arena:persistent owner:model
@@ -167,7 +166,6 @@ struct DataView {
     float* qdot_flat = nullptr;  // per:articulation_dof arena:scratch owner:data
     float* m = nullptr;  // per:articulation_dof2 arena:scratch owner:data
     ::nuka::nk::Mat36* link_composite_inertia = nullptr;  // per:link arena:scratch owner:data
-    uint32_t* table_enabled = nullptr;  // per:env arena:persistent owner:data
     ::nuka::math::Vec3* particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
     ::nuka::math::Vec3* particle_vel = nullptr;  // per:particle arena:persistent owner:data flags:[diff]
     float* particle_inv_mass = nullptr;  // per:particle arena:persistent owner:data flags:[param]
