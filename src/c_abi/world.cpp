@@ -22,6 +22,7 @@
 #include "c_abi/internal.hpp"
 
 #include "nk/pipeline/world.hpp"
+#include "nk/solve/nk_row.hpp"  // L1: kPairDrivenRowsPerSlot (general row budget)
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cook/cook_to_model.hpp"
@@ -30,6 +31,8 @@
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "math/transform.hpp"       // M10 co-residence: replica placement transform
+#include "scene/scene_compose.hpp"  // M10 co-residence: compose K replicas pre-cook
 #include "scene/scene_ir.hpp"
 #include "sensor/terrain/terrain_field.hpp"  // Go2-on-stairs batched height sampler
 
@@ -167,6 +170,28 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             return NUKA_RESULT_NOT_SUPPORTED;
         }
 
+        // M10 CO-RESIDENCE (dog-dog collision foundation, owner bottom line):
+        // compose the authored scene with itself instance_count times at distinct
+        // XY so the cook emits K SEPARATE articulations co-resident in one env (the
+        // WP1/WP5-8 multi-dog path). A reload per replica (not a copy) mirrors
+        // tests/scenario/multi_dog_costep.cpp::CookKFloatDogs exactly. 0/1 ==
+        // single instance -> the loop body never runs -> the scene + cook are
+        // BYTE-IDENTICAL to every legacy single-articulation create (D1 safe).
+        if (desc->instance_count > 1u) {
+            const float spacing =
+                (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
+            for (uint32_t i = 1u; i < desc->instance_count; ++i) {
+                nuka::scene::SceneIR replica;
+                if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
+                    return NUKA_RESULT_NOT_SUPPORTED;
+                }
+                nuka::math::Transform place = nuka::math::Transform::Identity();
+                place.position.x = spacing * static_cast<float>(i);
+                scene = nuka::scene::Compose(scene, replica, place,
+                                             "dog" + std::to_string(i) + "_");
+            }
+        }
+
         // Cook the authored scene to an nk::Model (mirrors recorder.cpp). The
         // unified world runs EXACTLY the cooked scene physics -- it does NOT inject
         // a synthetic ground (the legacy multi-env batched path derived one via
@@ -179,8 +204,23 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         // (the golden's ground truth). Auto-seating would load the feet and diverge
         // the golden by ~1 rad -- i.e. it would change the physics the golden pins,
         // and is a per-scene special-case the unified-world directive forbids.
-        nuka::scene::cook::CookToModelResult cooked =
-            nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
+        // ONE-GENERAL-SOLVER landing (L1): select the contact path. contact_family
+        // == 0 (default) keeps the EXACT legacy 2-arg FusedFoot cook (byte-identical
+        // -- same overload, same bytes). == 1 takes the PairDriven option so the cook
+        // routes the world through the general LBVH+cvx narrowphase + mixed-island
+        // solve; the static heightfield collidable the general feet collide against
+        // is baked below (after model.terrain is set).
+        nuka::scene::cook::CookToModelResult cooked = [&] {
+            if (desc->contact_family == 1u) {
+                nuka::scene::cook::CookToModelOptions opt;
+                opt.contact_family =
+                    nuka::scene::cook::CookContactFamily::PairDriven;
+                return nuka::scene::cook::CookToModel(
+                    scene, static_cast<int>(desc->env_count), opt);
+            }
+            return nuka::scene::cook::CookToModel(scene,
+                                                  static_cast<int>(desc->env_count));
+        }();
 
         // T1 (unified-actuator wire): route the declared control mode onto the
         // cooked Model's drive_mode, which the Pipeline copies into the ApplyDrives
@@ -209,6 +249,36 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         cooked.model.terrain.platform_width  = desc->terrain_platform_width;
         cooked.model.terrain.grid_width      = desc->terrain_grid_width;
         cooked.model.terrain.grid_height_max = desc->terrain_grid_height_max;
+
+        // ONE-GENERAL-SOLVER landing (L1): for the general (PairDriven) path the feet
+        // have NO analytic ground/terrain to detect against -- they must collide with
+        // a real collidable. Bake a STATIC heightfield collidable from the SAME
+        // model.terrain the FusedFoot kernel would sample (mirrors
+        // tests/scenario/vproof_go2_terrain.cpp::RunGeneral): CookHeightfieldGrid
+        // samples SampleTerrainHeight over an (nrow x ncol) grid at the origin, pushes
+        // it as one static body_init row, and the general narrowphase routes any
+        // overlapping foot to the per-cell TRIANGLE_PRISM contact. FusedFoot
+        // (contact_family == 0) bakes NOTHING -> the model is untouched (D1).
+        if (desc->contact_family == 1u) {
+            nuka::nk::Model& m = cooked.model;
+            const uint32_t orig_bodies = m.capacities.bodies_per_env;
+            m.body_init.resize(orig_bodies);  // heightfield seeds at orig_bodies.
+            const uint32_t hf_type = desc->heightfield_terrain_type;
+            const uint32_t nrow =
+                desc->heightfield_nrow != 0u ? desc->heightfield_nrow : 41u;
+            const uint32_t ncol =
+                desc->heightfield_ncol != 0u ? desc->heightfield_ncol : 41u;
+            const float cell =
+                desc->heightfield_cell > 0.0f ? desc->heightfield_cell : 0.25f;
+            nuka::scene::cook::CookHeightfieldGrid(
+                m, m.terrain, hf_type, nrow, ncol, cell, nuka::math::Vec3{0, 0, 0});
+            nuka::nk::ModelCapacities& cap = m.capacities;
+            cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
+            cap.max_bodies_total =
+                static_cast<uint32_t>(m.shape_table_rows.size());
+            cap.max_contacts_per_env = 32u;
+            cap.max_rows_per_env = 32u * nuka::nk::kPairDrivenRowsPerSlot;
+        }
 
         auto record = std::make_unique<nuka::c_abi::WorldRecord>();
         record->device = device_record;

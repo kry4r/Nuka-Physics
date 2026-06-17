@@ -91,6 +91,11 @@ class Go2LocomotionEnv(NukaGymEnv):
     def __init__(self, scene: str, num_envs: int, *,
                  fixed_command: bool = False, terrain: "dict | None" = None,
                  gait_mode: str = "walk",
+                 contact_family: int = 0,
+                 heightfield_terrain_type: int = 0,
+                 heightfield_nrow: int = 0,
+                 heightfield_ncol: int = 0,
+                 heightfield_cell: float = 0.0,
                  **kw) -> None:
         # GAIT MODE (Go2 pronk/bound skill). Re-weights the reward dict only (see
         # go2_rewards.GAIT_SCALE_OVERRIDES / GAIT_AIR_TIME_BIAS) -- no engine, obs or
@@ -122,6 +127,29 @@ class Go2LocomotionEnv(NukaGymEnv):
                 "terrain_grid_width": float(tcfg.get("grid_width", 0.45)),
                 "terrain_grid_height_max": float(tcfg.get("grid_height_max", 0.15)),
             }
+
+        # ONE-GENERAL-SOLVER landing (L1): route the world through the GENERAL
+        # contact path (contact_family=1 -> PairDriven + a baked static heightfield
+        # collidable) instead of the legacy analytic FusedFoot kernel. 0 (default) ==
+        # byte-identical FusedFoot. terrain_create is splatted into create_from_scene
+        # by NukaGymEnv, so we inject the general-path kwargs there (building the dict
+        # even when the procedural terrain is OFF -- a flat heightfield is baked from
+        # the all-zero model.terrain). NOTE: the baked heightfield is MODEL-LEVEL (one
+        # terrain type for the whole batch), so the general path uses a single
+        # heightfield_terrain_type rather than the per-env curriculum type; used by
+        # the L1 acceptance rollout (single homogeneous terrain) + the demo.
+        self._contact_family = int(contact_family)
+        if self._contact_family != 0:
+            tc = dict(kw.get("terrain_create", {}))
+            tc["contact_family"] = int(contact_family)
+            tc["heightfield_terrain_type"] = int(heightfield_terrain_type)
+            if heightfield_nrow:
+                tc["heightfield_nrow"] = int(heightfield_nrow)
+            if heightfield_ncol:
+                tc["heightfield_ncol"] = int(heightfield_ncol)
+            if heightfield_cell > 0.0:
+                tc["heightfield_cell"] = float(heightfield_cell)
+            kw["terrain_create"] = tc
 
         super().__init__(scene, num_envs, **kw)
 

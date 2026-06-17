@@ -132,7 +132,14 @@ public:
                                     float terrain_step_width,
                                     float terrain_platform_width,
                                     float terrain_grid_width,
-                                    float terrain_grid_height_max) {
+                                    float terrain_grid_height_max,
+                                    uint32_t instance_count,
+                                    float instance_spacing,
+                                    uint32_t contact_family,
+                                    uint32_t heightfield_terrain_type,
+                                    uint32_t heightfield_nrow,
+                                    uint32_t heightfield_ncol,
+                                    float heightfield_cell) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -176,6 +183,21 @@ public:
         desc.terrain_platform_width = terrain_platform_width;
         desc.terrain_grid_width = terrain_grid_width;
         desc.terrain_grid_height_max = terrain_grid_height_max;
+        // M10 co-residence: compose K replicas of the scene before cook -> ONE env
+        // holds K co-resident articulations that physically collide (dog-dog +
+        // body-vs-terrain). Default 1 (single instance) == byte-identical legacy.
+        desc.instance_count = instance_count;
+        desc.instance_spacing = instance_spacing;
+        // ONE-GENERAL-SOLVER landing (L1): 0 (default) = legacy FusedFoot
+        // (byte-identical); 1 = general PairDriven path + a baked static heightfield
+        // collidable (heightfield_terrain_type/nrow/ncol/cell; 0s => engine
+        // defaults). Used by the L1 acceptance rollout (trained policy on the general
+        // path) before FusedFoot is deleted.
+        desc.contact_family = contact_family;
+        desc.heightfield_terrain_type = heightfield_terrain_type;
+        desc.heightfield_nrow = heightfield_nrow;
+        desc.heightfield_ncol = heightfield_ncol;
+        desc.heightfield_cell = heightfield_cell;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -861,6 +883,13 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("terrain_platform_width") = 0.0f,
                     nb::arg("terrain_grid_width") = 0.0f,
                     nb::arg("terrain_grid_height_max") = 0.0f,
+                    nb::arg("instance_count") = uint32_t{1},
+                    nb::arg("instance_spacing") = 1.5f,
+                    nb::arg("contact_family") = uint32_t{0},
+                    nb::arg("heightfield_terrain_type") = uint32_t{0},
+                    nb::arg("heightfield_nrow") = uint32_t{0},
+                    nb::arg("heightfield_ncol") = uint32_t{0},
+                    nb::arg("heightfield_cell") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
