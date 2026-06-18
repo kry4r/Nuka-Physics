@@ -39,7 +39,9 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            double size = 0.20
+            double size = 1.0
+            double3 xformOp:scale = (0.3762, 0.0935, 0.114)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
         }
     }
 
@@ -63,6 +65,17 @@ def Xform "World"
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
         double3 xformOp:translate = (0, 0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Capsule "fl_thigh_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.025
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
     }
 
     def Xform "fl_calf" (
@@ -75,13 +88,15 @@ def Xform "World"
         double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
-        def Sphere "fl_foot_collision" (
+        def Capsule "fl_calf_collision" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             double radius = 0.0175
-            double3 xformOp:translate = (0, 0, -0.213)
-            uniform token[] xformOpOrder = ["xformOp:translate"]
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         }
     }
 
@@ -105,6 +120,17 @@ def Xform "World"
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
         double3 xformOp:translate = (0, -0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Capsule "fr_thigh_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.025
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
     }
 
     def Xform "fr_calf" (
@@ -117,13 +143,15 @@ def Xform "World"
         double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
-        def Sphere "fr_foot_collision" (
+        def Capsule "fr_calf_collision" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             double radius = 0.0175
-            double3 xformOp:translate = (0, 0, -0.213)
-            uniform token[] xformOpOrder = ["xformOp:translate"]
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         }
     }
 
@@ -147,6 +175,17 @@ def Xform "World"
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
         double3 xformOp:translate = (0, 0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Capsule "rl_thigh_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.025
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
     }
 
     def Xform "rl_calf" (
@@ -159,13 +198,15 @@ def Xform "World"
         double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
-        def Sphere "rl_foot_collision" (
+        def Capsule "rl_calf_collision" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             double radius = 0.0175
-            double3 xformOp:translate = (0, 0, -0.213)
-            uniform token[] xformOpOrder = ["xformOp:translate"]
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         }
     }
 
@@ -189,6 +230,17 @@ def Xform "World"
         float3 physics:diagonalInertia = (0.00594973, 0.00584149, 0.000878787)
         double3 xformOp:translate = (0, -0.0955, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Capsule "rr_thigh_collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.025
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
     }
 
     def Xform "rr_calf" (
@@ -201,13 +253,15 @@ def Xform "World"
         double3 xformOp:translate = (0, 0, -0.213)
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
-        def Sphere "rr_foot_collision" (
+        def Capsule "rr_calf_collision" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             double radius = 0.0175
-            double3 xformOp:translate = (0, 0, -0.213)
-            uniform token[] xformOpOrder = ["xformOp:translate"]
+            double height = 0.213
+            double3 xformOp:translate = (0, 0, -0.1065)
+            double3 xformOp:rotateXYZ = (90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
         }
     }
 

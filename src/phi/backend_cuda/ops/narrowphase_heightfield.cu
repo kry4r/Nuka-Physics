@@ -294,7 +294,36 @@ __device__ void SphereHeightfieldTri(const amf::PrimParams& cprim,
     }
 }
 
-// NAMED convex(box/capsule/hull)-vs-heightfield-cell handler: the GENERAL cvx
+// Capsule vs heightfield cell: swept-sphere samples along the segment, each via the
+// sphere face handler (depth = radius - s, no dead band), so a leg shaft never sinks.
+constexpr int kCapsuleSegSamples = 9;
+__device__ void CapsuleHeightfieldTri(const amf::PrimParams& cprim,
+                                     const amf::PrimFrame& hf_frame,
+                                     const Vec3 tv[3], ContactManifold* m) {
+    const Vec3 wa = hf_frame.LocalToWorld(tv[0]);
+    const Vec3 wb = hf_frame.LocalToWorld(tv[1]);
+    const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
+    const Vec3 e0 = cprim.frame.t + cprim.frame.cy * cprim.half_height;
+    const Vec3 e1 = cprim.frame.t - cprim.frame.cy * cprim.half_height;
+    for (int i = 0; i < kCapsuleSegSamples; ++i) {
+        const float t = static_cast<float>(i) /
+                        static_cast<float>(kCapsuleSegSamples - 1);
+        const Vec3 center = e0 * (1.0f - t) + e1 * t;
+        Vec3 cpos, cnrm;
+        float cpen;
+        if (SphereTriangleFace(center, cprim.radius, wa, wb, wc, hf_frame.cz,
+                               &cpos, &cnrm, &cpen)) {
+            ::nuka::constraint::ContactPoint pt;
+            pt.position = cpos;
+            pt.normal = cnrm;     // sep dir for side a (the convex/leg)
+            pt.penetration = cpen;
+            pt.stable_key = 0ull;
+            m->AddPoint(pt);
+        }
+    }
+}
+
+// NAMED convex(box/hull)-vs-heightfield-cell handler: the GENERAL cvx
 // GJK/EPA path (robust for flat-faced supports). Builds the cell triangle's
 // downward-solid prism and runs cvx::ConvexNarrowphase (convex A, prism B).
 __device__ void PrismCvxTri(const cvx::SupportProxy& conv_proxy,
@@ -551,12 +580,12 @@ __global__ void NarrowphaseHeightfieldKernel(
                 else          { tv[0] = p00; tv[1] = p11; tv[2] = p01; }
                 ContactManifold m;
                 const uint32_t feat_base = (cell_idx * 2u + static_cast<uint32_t>(sub)) * 4u;
-                // Symmetric named dispatch: sphere takes the face-only handler (the
-                // maintained EPA-shallow-penetration workaround, see SphereHeightfieldTri);
-                // box/capsule/hull take the general cvx prism path. Both write the
-                // separation-dir-for-A manifold AccumManifold consumes.
+                // Sphere + capsule use the deep-sink-robust face handler; box/hull
+                // use the general cvx prism path. Both write separation-dir-for-A.
                 if (conv_sh.kind == kKindSphere) {
                     SphereHeightfieldTri(cprim, hf_frame, tv, &m);
+                } else if (conv_sh.kind == kKindCapsule) {
+                    CapsuleHeightfieldTri(cprim, hf_frame, tv, &m);
                 } else {
                     PrismCvxTri(conv_proxy, hf_frame, tv, extrude, &m);
                 }
@@ -565,14 +594,8 @@ __global__ void NarrowphaseHeightfieldKernel(
         }
     }
 
-    // Reduce to <=4 (per-point normals preserved) and write into THIS slot.
-    // SPHERE convex only: cluster by contact surface (normal) keeping the deepest
-    // per surface FIRST, so a foot collapses its per-cell triangle-split / multi-
-    // cell duplicates to ONE +Z contact on flat (analytic-equivalent) while keeping
-    // a step's distinct tread + riser surfaces. Box/capsule/hull are NOT clustered:
-    // a box FACE legitimately needs its multi-corner contact spread for a stable
-    // rest (merging same-normal corners to one point collapses that support), so
-    // they keep the EPA manifold + farthest-point reduce unchanged (Phase 2A).
+    // Reduce to <=4. Sphere clusters per surface-normal to one +Z contact on flat;
+    // capsule/box/hull keep their multi-point spread (caps, corners) for stable rest.
     Cand out4[4];
     int kept;
     if (conv_sh.kind == kKindSphere) {
