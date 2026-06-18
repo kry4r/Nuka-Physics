@@ -30,7 +30,7 @@
 #include <stdexcept>
 
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
-#include "sensor/terrain/terrain_field.hpp"  // SampleTerrainHeight (H2 generator)
+#include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
 #include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -1024,79 +1024,51 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
 }
 
 // ---------------------------------------------------------------------------
-// H2 (general contact pipeline Phase 2): the ONE cook-time heightfield grid
-// generator. See cook_to_model.hpp for the contract. SampleTerrainHeight is
-// called ONLY here (cook); the contact kernel reads the cooked grid (H3).
+// The ONE cook-time heightfield bake. See cook_to_model.hpp for the contract.
+// The HeightField is the single source: obs/spawn/render sample its grid via the
+// bilinear sampler; here the same grid is staged for the per-cell prism kernel.
 // ---------------------------------------------------------------------------
 uint32_t CookHeightfieldGrid(nk::Model& model,
-                             const ::nuka::terrain::TerrainParams& terrain,
-                             uint32_t terrain_type,
-                             uint32_t nrow, uint32_t ncol, float cell_size,
-                             const math::Vec3& center) {
-    if (nrow < 2u || ncol < 2u || !(cell_size > 0.0f)) return ~0u;
+                             const ::nuka::terrain::HeightField& hf) {
+    if (!::nuka::terrain::IsValid(hf)) return ~0u;
+    if (hf.cell_x != hf.cell_y) return ~0u;  // device locator is single-celled.
 
-    const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell_size;
-    const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell_size;
+    const uint32_t nrow = hf.nrow, ncol = hf.ncol;
+    const float cell = hf.cell_x;
+    const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell;
+    const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell;
+    // The collidable body sits at the grid centre + base_z; the grid is laid out
+    // in its LOCAL frame ([-half,+half] in XY, [0,scale_z] in Z). World z of a
+    // corner = base_z + value*scale_z (the HeightField definition).
+    const math::Vec3 center{hf.origin.x + half_x, hf.origin.y + half_y, hf.base_z};
 
-    // 1. Sample the absolute surface height at every grid corner (the SAME pure
-    //    SampleTerrainHeight the feet/obs/render call). Grid corner (r,c) sits at
-    //    LOCAL (x,y) = (-half_x + c*cell, -half_y + r*cell); the WORLD column the
-    //    generator samples is the local column + center.xy (the field is centred
-    //    at `center`). Track the absolute z-range for the normalize + the AABB.
     const uint32_t cells = nrow * ncol;
     const uint32_t base = static_cast<uint32_t>(model.heightfield_heights.size());
-    std::vector<float> abs_z(cells, 0.0f);
-    float min_z = 3.402823466e+38f, max_z = -3.402823466e+38f;
-    for (uint32_t r = 0; r < nrow; ++r) {
-        const float ly = -half_y + static_cast<float>(r) * cell_size;
-        for (uint32_t c = 0; c < ncol; ++c) {
-            const float lx = -half_x + static_cast<float>(c) * cell_size;
-            const float z = ::nuka::terrain::SampleTerrainHeight(
-                terrain_type, lx + center.x, ly + center.y, terrain);
-            abs_z[r * ncol + c] = z;
-            if (z < min_z) min_z = z;
-            if (z > max_z) max_z = z;
-        }
-    }
-    if (!(max_z > min_z)) max_z = min_z + 1.0e-4f;  // flat grid: tiny finite range.
-
-    // 2. Store NORMALIZED [0,1] heights (Newton HeightfieldData convention: the
-    //    grid stores h in [0,1] and the prism extractor maps z = min_z + h*range).
-    //    The descriptor's min_z/max_z are LOCAL (relative to the body pose at
-    //    `center`), so a corner's local z = (abs_z - center.z); the absolute world
-    //    z is then recovered as body_pose.z (== center.z) + local z.
-    const float local_min = min_z - center.z;
-    const float local_max = max_z - center.z;
-    const float range = local_max - local_min;
     model.heightfield_heights.reserve(base + cells);
     for (uint32_t i = 0; i < cells; ++i) {
-        const float local_z = abs_z[i] - center.z;
-        const float h = (range > 0.0f) ? (local_z - local_min) / range : 0.0f;
-        model.heightfield_heights.push_back(h);
+        model.heightfield_heights.push_back(hf.values[i]);
     }
 
-    // 3. Push the HeightfieldData descriptor.
     nk::HeightfieldData hfd;
-    hfd.origin = math::Vec3{-half_x, -half_y, local_min};  // local (0,0) corner.
-    hfd.cell_size = cell_size;
+    hfd.origin = math::Vec3{-half_x, -half_y, 0.0f};  // local (0,0) corner.
+    hfd.cell_size = cell;
     hfd.nrow = nrow;
     hfd.ncol = ncol;
-    hfd.min_z = local_min;
-    hfd.max_z = local_max;
+    hfd.min_z = 0.0f;
+    hfd.max_z = hf.scale_z;       // local z-range == the value-1 elevation.
     hfd.data_offset = base;
     model.heightfields.push_back(hfd);
     model.capacities.max_heightfield_cells =
         static_cast<uint32_t>(model.heightfield_heights.size());
 
-    // 4. Register the STATIC heightfield collidable: a body_init row (immovable,
-    //    inv_mass==0 -> the integrator holds its pose) at `center` + a shape_table
-    //    row kind=Heightfield, body_id==-1 (static, no reaction side). The AABB
-    //    case (B3) reads p[0]=half_x, p[1]=half_y, p[2]=local_min, p[3]=local_max.
+    // Register the STATIC heightfield collidable: a body_init row (immovable) at
+    // the grid centre + a shape_table row (kind=Heightfield, body_id==-1 static,
+    // no reaction side). The AABB reads p[0..3] = half_x, half_y, min_z, max_z.
     const uint32_t body_row = static_cast<uint32_t>(model.body_init.size());
     nk::Model::BodyInit bi;
     bi.pose = math::Transform::Identity();
     bi.pose.position = center;
-    bi.inv_mass = 0.0f;            // static / immovable.
+    bi.inv_mass = 0.0f;
     bi.inv_inertia = math::Vec3{0, 0, 0};
     model.body_init.push_back(bi);
 
@@ -1104,12 +1076,12 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
     sh.kind = ::nuka::collision::kShapeHeightfield;
     sh.params[0] = half_x;
     sh.params[1] = half_y;
-    sh.params[2] = local_min;
-    sh.params[3] = local_max;
+    sh.params[2] = 0.0f;
+    sh.params[3] = hf.scale_z;
     sh.contype = 1u;
     sh.conaffinity = 1u;
     sh.sdf_grid = ~0u;
-    sh.body_id = -1;               // STATIC: no owning body, no reaction side.
+    sh.body_id = -1;
     sh.group = 0u;
     if (model.shape_table_rows.size() <= body_row) {
         model.shape_table_rows.resize(body_row + 1u);

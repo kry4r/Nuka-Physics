@@ -40,7 +40,9 @@
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "scene/cook/cook_to_model.hpp"
-#include "sensor/terrain/terrain_field.hpp"
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
+#include "scene/terrain/heightfield_sample.hpp"
 
 namespace {
 
@@ -62,20 +64,32 @@ std::filesystem::path StandScenePath() {
            "go2_stand.usda";
 }
 
-// PyramidStairs seated so the WIDE flat platform TOP sits near the foot level.
-terrain::TerrainParams TerrainSpec() {
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = 0.0f;
-    tp.step_height = 0.04f;      // 8 rings * 0.04 = 0.32 m platform top.
-    tp.step_width = 0.40f;
-    tp.platform_width = 2.0f;    // half_plat 1.0 >> the dog footprint (~0.2 m).
-    return tp;
+// A Chebyshev staircase seated so the WIDE flat plateau sits near the foot level.
+// Pure parameters: ring_rise/ring_width/ring_platform -- no terrain-type selector.
+terrain::TerrainGenConfig TerrainSpec() {
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = 41u;
+    cfg.ncol = 41u;
+    cfg.cell_x = 0.25f;
+    cfg.cell_y = 0.25f;
+    cfg.origin = Vec3{-0.5f * 40.0f * 0.25f, -0.5f * 40.0f * 0.25f, 0.0f};
+    cfg.base_z = 0.0f;
+    cfg.ring_rise = 0.04f;      // 8 rings * 0.04 = 0.32 m plateau top.
+    cfg.ring_width = 0.40f;
+    cfg.ring_platform = 2.0f;   // half_plat 1.0 >> the dog footprint.
+    cfg.ring_count = 8u;
+    return cfg;
 }
-// The flat platform-top height the dog stands on (== ground + 8*step_height).
+// The cooked terrain grid (the ONE source both the cook + the sink check read).
+terrain::HeightField TerrainHeightField() {
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(TerrainSpec(), hf);
+    return hf;
+}
+// The flat plateau-top height the dog stands on (== base + 8*ring_rise).
 float PlatformTop() {
-    const terrain::TerrainParams tp = TerrainSpec();
-    return tp.ground_height +
-           static_cast<float>(terrain::kPyramidRings) * tp.step_height;
+    const terrain::TerrainGenConfig cfg = TerrainSpec();
+    return cfg.base_z + static_cast<float>(8) * cfg.ring_rise;
 }
 
 struct Backend {
@@ -142,11 +156,8 @@ Snap RunGeneral(const nuka::scene::SceneIR& scene, Backend b, uint32_t* out_hf) 
     const uint32_t orig_bodies = m.capacities.bodies_per_env;
     m.body_init.resize(orig_bodies);  // heightfield seeds at index orig_bodies.
 
-    const terrain::TerrainParams tp = TerrainSpec();
-    // A grid wide enough to cover the dog footprint + the first rings; cell 0.25.
-    const uint32_t hf_row = cook::CookHeightfieldGrid(
-        m, tp, terrain::kTerrainPyramidStairs, /*nrow=*/41u, /*ncol=*/41u,
-        /*cell=*/0.25f, /*center=*/Vec3{0, 0, 0});
+    const terrain::HeightField hf = TerrainHeightField();
+    const uint32_t hf_row = cook::CookHeightfieldGrid(m, hf);
     EXPECT_EQ(hf_row, orig_bodies);
     if (out_hf) *out_hf = hf_row;
 
@@ -166,15 +177,14 @@ Snap RunGeneral(const nuka::scene::SceneIR& scene, Backend b, uint32_t* out_hf) 
 // terrain surface. feet are the cooked foot spheres (model.feet has the link +
 // offset + radius). Returns the worst (most-negative) clearance over all feet.
 float WorstFootSink(const Snap& r, const std::vector<nk::ModelFootShape>& feet,
-                    const terrain::TerrainParams& tp) {
+                    const terrain::HeightField& hf) {
     float worst = 1.0e9f;
     for (const auto& f : feet) {
         if (f.calf_local_link >= r.link_pose.size()) continue;
         const Transform lp = r.link_pose[f.calf_local_link];
         const Vec3 c = lp.TransformPoint(f.local_offset);  // foot sphere center.
         const float bottom = c.z - f.radius;
-        const float surf = terrain::SampleTerrainHeight(
-            terrain::kTerrainPyramidStairs, c.x, c.y, tp);
+        const float surf = terrain::SampleHeightFieldZ(hf, c.x, c.y);
         worst = std::min(worst, bottom - surf);
     }
     return worst;
@@ -199,12 +209,12 @@ TEST(VProofGo2Terrain, GeneralPathPhysicallyValidOnPyramidStairs) {
     const std::vector<nk::ModelFootShape> feet =
         cook::CookToModel(scene, 1).model.feet;
     EXPECT_EQ(feet.size(), 4u);
-    const terrain::TerrainParams tp = TerrainSpec();
+    const terrain::HeightField hf = TerrainHeightField();
 
     uint32_t hf_row = ~0u;
     const Snap gen = RunGeneral(scene, b, &hf_row);
 
-    const float gen_sink = WorstFootSink(gen, feet, tp);
+    const float gen_sink = WorstFootSink(gen, feet, hf);
 
     std::fprintf(stderr,
         "[VPROOF go2-terrain] platform_top=%.3f hf_row=%u | GENERAL contacts=%u | "

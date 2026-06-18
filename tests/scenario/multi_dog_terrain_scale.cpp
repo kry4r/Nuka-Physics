@@ -33,7 +33,9 @@
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
-#include "sensor/terrain/terrain_field.hpp"
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
+#include "scene/terrain/heightfield_sample.hpp"
 
 namespace {
 
@@ -68,13 +70,24 @@ nk::Model CookKDogs(uint32_t k, float spacing) {
     return cook::CookToModel(scene, 1, opt).model;
 }
 
-terrain::TerrainParams TerrainSpec() {
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = 0.0f;
-    tp.step_height = 0.04f;     // 8 rings * 0.04 = 0.32 m platform top.
-    tp.step_width = 0.40f;
-    tp.platform_width = 2.0f;
-    return tp;
+// A Chebyshev staircase HeightField (8 rings * 0.04 = 0.32 m plateau) spanning the
+// 20-dog line. Pure parameters -- no terrain-type selector.
+terrain::HeightField TerrainHeightField(uint32_t nrow, uint32_t ncol, float cell) {
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = nrow;
+    cfg.ncol = ncol;
+    cfg.cell_x = cell;
+    cfg.cell_y = cell;
+    cfg.origin = Vec3{-0.5f * static_cast<float>(ncol - 1u) * cell,
+                      -0.5f * static_cast<float>(nrow - 1u) * cell, 0.0f};
+    cfg.base_z = 0.0f;
+    cfg.ring_rise = 0.04f;
+    cfg.ring_width = 0.40f;
+    cfg.ring_platform = 2.0f;
+    cfg.ring_count = 8u;
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    return hf;
 }
 
 }  // namespace
@@ -101,13 +114,11 @@ TEST(MultiDogTerrainScale, TwentyDogsStepOnPyramidStairsNoSharedOverflow) {
     const std::vector<nk::ModelFootShape> feet = model.feet;  // for the sink check.
     const uint32_t L = model.capacities.links_per_env;
 
-    // Seat a general PyramidStairs heightfield collidable spanning all 20 dogs.
-    const terrain::TerrainParams tp = TerrainSpec();
+    // Seat a general staircase heightfield collidable spanning all 20 dogs.
+    const terrain::HeightField hf = TerrainHeightField(161u, 41u, 0.25f);
     const uint32_t orig_bodies = model.capacities.bodies_per_env;
     model.body_init.resize(orig_bodies);
-    const uint32_t hf_row = cook::CookHeightfieldGrid(
-        model, tp, terrain::kTerrainPyramidStairs,
-        /*nrow=*/161u, /*ncol=*/41u, /*cell=*/0.25f, /*center=*/Vec3{0, 0, 0});
+    const uint32_t hf_row = cook::CookHeightfieldGrid(model, hf);
     ASSERT_EQ(hf_row, orig_bodies);
 
     nk::ModelCapacities& cap = model.capacities;
@@ -178,8 +189,7 @@ TEST(MultiDogTerrainScale, TwentyDogsStepOnPyramidStairsNoSharedOverflow) {
         const Transform lp = link_pose[f.calf_local_link];  // dog A's link block.
         const Vec3 c = lp.TransformPoint(f.local_offset);
         const float bottom = c.z - f.radius;
-        const float surf = terrain::SampleTerrainHeight(
-            terrain::kTerrainPyramidStairs, c.x, c.y, tp);
+        const float surf = terrain::SampleHeightFieldZ(hf, c.x, c.y);
         worst_sink = std::min(worst_sink, bottom - surf);
     }
 

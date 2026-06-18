@@ -14,6 +14,7 @@
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/control_mode.hpp"
 #include "runtime/step_options.hpp"
+#include "scene/terrain/heightfield.hpp"
 
 #include <memory>
 #include <string>
@@ -131,6 +132,11 @@ struct WorldRecord {
     };
     std::vector<core::diagnostics::InvariantSample> last_invariant_violations;
     std::vector<float> empty_float_storage;
+
+    // The cooked terrain HeightField (the ONE grid physics rests feet on). Empty
+    // when no heightfield was baked. The obs/spawn height sampler reads THIS grid
+    // via the bilinear sampler, so obs and physics share one height definition.
+    nuka::terrain::HeightField cooked_terrain;
 
     // --- v0.5 p04 N1: per-sensor-field domain-randomization noise -----------
     // Fixed array indexed by nuka_state_field_t. Default is None so a field with

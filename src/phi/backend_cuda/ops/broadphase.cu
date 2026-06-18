@@ -434,6 +434,12 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                 if (my_body < ob) {
                     const ShapeDev sb =
                         LoadShape(shape_table, static_cast<uint32_t>(ob));
+                    // Two static collidables (body_id < 0 each) have no reaction
+                    // side on either body, so any contact between them is an
+                    // unsolvable no-op (MuJoCo/Newton skip static-static). Drop the
+                    // pair so static terrain never consumes the candidate/row budget
+                    // against another static.
+                    if (sa.body_id < 0 && sb.body_id < 0) continue;
                     // contype/conaffinity bitmask: collide iff
                     // (a.contype & b.conaffinity) || (b.contype & a.conaffinity).
                     const bool mask = ((sa.contype & sb.conaffinity) != 0u) ||

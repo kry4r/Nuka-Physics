@@ -103,7 +103,9 @@
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
 #include "scene/scene_map.hpp"
-#include "sensor/terrain/terrain_field.hpp"
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
+#include "scene/terrain/heightfield_sample.hpp"
 
 namespace {
 
@@ -137,15 +139,80 @@ constexpr float kPi = 3.14159265358979323846f;
 // uses MakeGrid difficulties in the same [0.08,0.15]-realized band; the dressing
 // recenters+ground-lifts it onto these tiles. The real GO2T (--bin) carries its own
 // per-dog (type, difficulty) + on-terrain z (recenter/lift OFF).
-terrain::TerrainParams TilePreset() {
-    terrain::TerrainParams p{};
-    p.ground_height   = 0.0f;
-    p.step_height     = 0.15f;   // MAX rise per ring (matches physics cook); * difficulty
-    p.step_width      = 0.30f;   // horizontal width of each step ring (crisp stairs)
-    p.platform_width  = 1.00f;   // central top platform / pit-floor edge length (physics cook)
-    p.grid_width      = 0.45f;   // RandomBoxes cell edge
-    p.grid_height_max = 0.15f;   // MAX box rise (matches physics cook); * difficulty
-    return p;
+// The render terrain feature parameters (matching the physics cook knobs). These
+// are PARAMETERS, not a type: a tile's integer code selects an amplitude sign /
+// which feature is expressed, all routed through ONE parametric generator.
+struct TilePreset {
+    float step_height = 0.15f;    // MAX ring rise (* difficulty).
+    float step_width = 0.30f;     // ring width.
+    float platform_width = 1.00f; // central platform edge.
+    float grid_width = 0.45f;     // bump footprint.
+    float grid_height_max = 0.15f;// MAX bump rise (* difficulty).
+};
+
+// Tile integer codes carried in the trajectory (0=flat,1=stairs,2=pit,3=boxes).
+// They are mapped to a parametric TerrainGenConfig -- the engine has no terrain
+// types, only this grid generator (MuJoCo hfield + Newton create_heightfield model).
+constexpr uint32_t kTileFlat = 0u, kTileStairs = 1u, kTilePit = 2u, kTileBoxes = 3u;
+constexpr uint32_t kTileComposite = 4u;
+
+// Build a parametric HeightField for a tile, centred at the world origin over
+// [-half,+half], at `res` vertices/axis. difficulty scales the vertical magnitude.
+terrain::HeightField TileHeightField(uint32_t code, const TilePreset& base,
+                                     float difficulty, float half, uint32_t res) {
+    const uint32_t n = std::max(2u, res);
+    const float cell = 2.0f * half / static_cast<float>(n - 1u);
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = n;
+    cfg.ncol = n;
+    cfg.cell_x = cell;
+    cfg.cell_y = cell;
+    cfg.origin = Vec3{-half, -half, 0.0f};
+    cfg.base_z = 0.0f;
+    if (code == kTileStairs || code == kTilePit) {
+        const float sign = (code == kTilePit) ? -1.0f : 1.0f;
+        cfg.ring_rise = sign * base.step_height * difficulty;
+        cfg.ring_width = base.step_width;
+        cfg.ring_platform = base.platform_width;
+        cfg.ring_count = 8u;
+    } else if (code == kTileBoxes) {
+        cfg.bump_height = base.grid_height_max * difficulty;
+        cfg.bump_cell = base.grid_width;
+    }  // kTileFlat: every amplitude 0.
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    return hf;
+}
+
+// Build the WORLD composite HeightField over [xmin,xmax]x[ymin,ymax] at `spacing`.
+// The tiled multi-feature field (feature_cell > 0) -- the 20-dog complex scene as
+// pure parameters, no per-type tiles.
+terrain::HeightField CompositeHeightField(const TilePreset& base, float difficulty,
+                                          float xmin, float xmax, float ymin,
+                                          float ymax, float spacing) {
+    const float sx = std::max(1e-3f, spacing);
+    const uint32_t nx =
+        std::max(2u, static_cast<uint32_t>(std::ceil((xmax - xmin) / sx)) + 1u);
+    const uint32_t ny =
+        std::max(2u, static_cast<uint32_t>(std::ceil((ymax - ymin) / sx)) + 1u);
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = ny;
+    cfg.ncol = nx;
+    cfg.cell_x = (xmax - xmin) / static_cast<float>(nx - 1u);
+    cfg.cell_y = (ymax - ymin) / static_cast<float>(ny - 1u);
+    cfg.origin = Vec3{xmin, ymin, 0.0f};
+    cfg.base_z = 0.0f;
+    cfg.ring_rise = base.step_height * difficulty;
+    cfg.ring_width = base.step_width;
+    cfg.ring_platform = base.platform_width;
+    cfg.ring_count = 8u;
+    cfg.bump_height = base.grid_height_max * difficulty;
+    cfg.bump_cell = base.grid_width;
+    cfg.feature_cell = 5.0f;
+    cfg.feature_margin = 0.6f;
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    return hf;
 }
 
 // The render extent of ONE tile (half-width in x and y, world metres). Large
@@ -349,8 +416,8 @@ std::vector<TileSpec> MakeGrid(uint32_t robots, uint32_t rows, uint32_t cols) {
     // 2x2 checkerboard of the 4 terrain types over (row parity, col parity) so any
     // 2x2 block shows all four kinds (exactly the cover's mixed field).
     const uint32_t type_grid[2][2] = {
-        {terrain::kTerrainPyramidStairs, terrain::kTerrainRandomBoxes},
-        {terrain::kTerrainInvertedPyramid, terrain::kTerrainFlat}};
+        {kTileStairs, kTileBoxes},
+        {kTilePit, kTileFlat}};
     for (uint32_t r = 0; r < robots; ++r) {
         const uint32_t c = r % cols, rw = r / cols;
         tiles[r].offset_x = x0 + static_cast<float>(c) * kTilePitch;
@@ -414,17 +481,19 @@ NTrajectory MakePlaceholder(const SingleTrajectory& src, uint32_t robots,
 // half=1.6 -> spacing 0.050 m). The same SampleTerrainHeight the feet rest on ->
 // the rendered surface can never drift from the physics surface.
 // ---------------------------------------------------------------------------
-render::MeshGeometry TessellateTile(uint32_t type, const terrain::TerrainParams& base,
+render::MeshGeometry TessellateTile(uint32_t type, const TilePreset& base,
                                     float difficulty, float half, uint32_t res) {
     render::MeshGeometry m;
-    const terrain::TerrainParams p = terrain::ScaleTerrainDifficulty(base, difficulty);
     const uint32_t n = std::max(2u, res);
     const float span = 2.0f * half;
     const float step = span / static_cast<float>(n - 1u);
+    // Sample the ONE cooked-style grid (the same parametric generator + bilinear
+    // sampler the cook/obs use), so the rendered surface cannot drift from physics.
+    const terrain::HeightField hf = TileHeightField(type, base, difficulty, half, n);
 
     // Flat shading: emit 4 independent vertices per quad (2 triangles) so each
     // riser/tread has its own normal and stair edges stay crisp (no smoothing).
-    auto h = [&](float x, float y) { return terrain::SampleTerrainHeight(type, x, y, p); };
+    auto h = [&](float x, float y) { return terrain::SampleHeightFieldZ(hf, x, y); };
     auto push_v = [&](float x, float y, float z, const Vec3& nrm) {
         m.positions.push_back(x); m.positions.push_back(y); m.positions.push_back(z);
         m.normals.push_back(nrm.x); m.normals.push_back(nrm.y); m.normals.push_back(nrm.z);
@@ -463,19 +532,18 @@ render::MeshGeometry TessellateTile(uint32_t type, const terrain::TerrainParams&
 // positions; the caller adds this instance at world origin (identity xform). Flat
 // per-triangle normals keep stair risers crisp.
 // ---------------------------------------------------------------------------
-render::MeshGeometry TessellateComposite(const terrain::TerrainParams& base,
+render::MeshGeometry TessellateComposite(const TilePreset& base,
                                          float difficulty, float xmin, float xmax,
                                          float ymin, float ymax, float spacing) {
     render::MeshGeometry m;
-    const terrain::TerrainParams p = terrain::ScaleTerrainDifficulty(base, difficulty);
+    const terrain::HeightField hf =
+        CompositeHeightField(base, difficulty, xmin, xmax, ymin, ymax, spacing);
     const float sx = std::max(1e-3f, spacing);
     const uint32_t nx = std::max(2u, static_cast<uint32_t>(std::ceil((xmax - xmin) / sx)) + 1u);
     const uint32_t ny = std::max(2u, static_cast<uint32_t>(std::ceil((ymax - ymin) / sx)) + 1u);
     const float dx = (xmax - xmin) / static_cast<float>(nx - 1u);
     const float dy = (ymax - ymin) / static_cast<float>(ny - 1u);
-    auto h = [&](float x, float y) {
-        return terrain::SampleTerrainHeight(terrain::kTerrainComposite, x, y, p);
-    };
+    auto h = [&](float x, float y) { return terrain::SampleHeightFieldZ(hf, x, y); };
     auto push_v = [&](float x, float y, float z, const Vec3& nrm) {
         m.positions.push_back(x); m.positions.push_back(y); m.positions.push_back(z);
         m.normals.push_back(nrm.x); m.normals.push_back(nrm.y); m.normals.push_back(nrm.z);
@@ -668,16 +736,16 @@ int main(int argc, char** argv) {
     }
     const uint32_t robot_inst_end = rw.InstanceCount();  // terrain meshes appended after
 
-    const terrain::TerrainParams preset = TilePreset();
+    const TilePreset preset;
 
     // ---- COMPOSITE vs per-tile detection --------------------------------------
-    // The real terrain rollout (--bin) writes terrain_type == kTerrainComposite +
-    // offset (0,0) for every robot: ONE continuous world-frame field on which every
-    // dog sits at its TRUE physics (x,y). We tessellate that as a SINGLE big mesh
-    // over the dogs' world AABB. The placeholder keeps the legacy per-robot tile.
+    // The real terrain rollout (--bin) writes a composite code + offset (0,0) for
+    // every robot: ONE continuous world-frame field on which every dog sits at its
+    // TRUE physics (x,y). We tessellate that as a SINGLE big mesh over the dogs'
+    // world AABB. The placeholder keeps the legacy per-robot tile.
     bool composite_mode = (traj.num_robots > 0u);
     for (uint32_t r = 0; r < traj.num_robots; ++r)
-        if (traj.tiles[r].terrain_type != terrain::kTerrainComposite)
+        if (traj.tiles[r].terrain_type != kTileComposite)
             composite_mode = false;
 
     // World AABB of all dog base (link-0) positions over the WHOLE trajectory -- the
@@ -787,8 +855,6 @@ int main(int argc, char** argv) {
     auto publish = [&](uint32_t step) {
         for (uint32_t r = 0; r < traj.num_robots; ++r) {
             const TileSpec& t = traj.tiles[r];
-            const terrain::TerrainParams tp =
-                terrain::ScaleTerrainDifficulty(preset, t.difficulty);
             // (a) re-centre: remove the net xy drift from step 0 (gait preserved).
             const Vec3 cur_base = traj.PhasedPose(step, r, 0u).position;
             Vec3 recenter{0.0f, 0.0f, 0.0f};
@@ -799,7 +865,11 @@ int main(int argc, char** argv) {
             if (kGroundLift) {
                 const float bx = cur_base.x + recenter.x;  // tile-local base xy
                 const float by = cur_base.y + recenter.y;
-                z_lift = terrain::SampleTerrainHeight(t.terrain_type, bx, by, tp);
+                const uint32_t tile_res =
+                    static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;
+                const terrain::HeightField hf = TileHeightField(
+                    t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
+                z_lift = terrain::SampleHeightFieldZ(hf, bx, by);
             }
             const Vec3 robot_off{t.offset_x + recenter.x,
                                  t.offset_y + recenter.y, z_lift};
@@ -828,8 +898,10 @@ int main(int argc, char** argv) {
         o.contact_points.clear();
         for (uint32_t r = 0; r < traj.num_robots; ++r) {
             const TileSpec& t = traj.tiles[r];
-            const terrain::TerrainParams tp =
-                terrain::ScaleTerrainDifficulty(preset, t.difficulty);
+            const uint32_t tile_res =
+                static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;
+            const terrain::HeightField hf = TileHeightField(
+                t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
             for (size_t fi : robot_feet[r]) {
                 const auto& geo = rw.meshes.Geometry(rw.instances[fi].mesh_id);
                 const Transform& wx = rw.instances[fi].world_xform;
@@ -842,7 +914,7 @@ int main(int argc, char** argv) {
                 // Local terrain height under the foot (subtract the tile offset to
                 // sample in the tile-local frame the heightfield is defined in).
                 const float lx = fx - t.offset_x, ly = fy - t.offset_y;
-                const float surf_z = terrain::SampleTerrainHeight(t.terrain_type, lx, ly, tp);
+                const float surf_z = terrain::SampleHeightFieldZ(hf, lx, ly);
                 const float above = min_z - surf_z;        // foot height over local surface
                 const float z_full = 0.02f, z_zero = 0.12f;
                 float frac = (z_zero - above) / (z_zero - z_full);

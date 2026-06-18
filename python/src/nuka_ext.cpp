@@ -139,7 +139,12 @@ public:
                                     uint32_t heightfield_terrain_type,
                                     uint32_t heightfield_nrow,
                                     uint32_t heightfield_ncol,
-                                    float heightfield_cell) {
+                                    float heightfield_cell,
+                                    const std::string& heightfield_image_path,
+                                    float heightfield_radius_x,
+                                    float heightfield_radius_y,
+                                    float heightfield_elevation_z,
+                                    float heightfield_base_z) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -198,6 +203,14 @@ public:
         desc.heightfield_nrow = heightfield_nrow;
         desc.heightfield_ncol = heightfield_ncol;
         desc.heightfield_cell = heightfield_cell;
+        // Terrain SOURCE: a non-empty image path loads a grayscale height map
+        // (placed by radius/elevation/base); empty => the parametric generator.
+        desc.heightfield_image_path =
+            heightfield_image_path.empty() ? nullptr : heightfield_image_path.c_str();
+        desc.heightfield_radius_x = heightfield_radius_x;
+        desc.heightfield_radius_y = heightfield_radius_y;
+        desc.heightfield_elevation_z = heightfield_elevation_z;
+        desc.heightfield_base_z = heightfield_base_z;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -308,6 +321,46 @@ public:
     void apply_domain_randomization() {
         check(nuka_world_apply_domain_randomization(h_),
               "nuka_world_apply_domain_randomization");
+    }
+
+    // Batched terrain height over the world's COOKED grid (the ONE source obs and
+    // physics share). xs/ys are CPU float32 (length n); scales is an optional
+    // per-element vertical scale (the curriculum difficulty); returns a (n,) numpy
+    // float32 array of absolute surface z.
+    nb::object sample_terrain_height(
+        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> xs,
+        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> ys,
+        nb::object scales) {
+        const size_t n = xs.shape(0);
+        if (ys.shape(0) != n) {
+            throw std::runtime_error("sample_terrain_height: xs/ys length mismatch");
+        }
+        const float* scale_ptr = nullptr;
+        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> scale_arr;
+        if (!scales.is_none()) {
+            scale_arr = nb::cast<
+                nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>>(
+                scales);
+            if (scale_arr.shape(0) != n) {
+                throw std::runtime_error(
+                    "sample_terrain_height: scales length mismatch");
+            }
+            scale_ptr = scale_arr.data();
+        }
+        float* out = new float[n == 0 ? 1 : n];
+        nuka_result_t rc = nuka_world_sample_terrain_height_batch(
+            h_, static_cast<uint32_t>(n), xs.data(), ys.data(), scale_ptr, out);
+        if (rc != NUKA_RESULT_OK) {
+            delete[] out;
+            throw std::runtime_error(
+                std::string("sample_terrain_height failed: ") +
+                nuka_result_message(rc));
+        }
+        nb::capsule owner(out, [](void* p) noexcept {
+            delete[] static_cast<float*>(p);
+        });
+        size_t shape[1] = {n};
+        return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
     }
 
     uint32_t env_count() const { return env_count_; }
@@ -890,6 +943,11 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("heightfield_nrow") = uint32_t{0},
                     nb::arg("heightfield_ncol") = uint32_t{0},
                     nb::arg("heightfield_cell") = 0.0f,
+                    nb::arg("heightfield_image_path") = std::string{},
+                    nb::arg("heightfield_radius_x") = 0.0f,
+                    nb::arg("heightfield_radius_y") = 0.0f,
+                    nb::arg("heightfield_elevation_z") = 0.0f,
+                    nb::arg("heightfield_base_z") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
@@ -1106,7 +1164,14 @@ NB_MODULE(_nuka_ext, m) {
              "is idempotent across resets. DR disabled -> byte no-op. MUST be "
              "called BEFORE Tape.create (the tape captures gravity at create "
              "time; mass must be in place before the first step_with_tape). A "
-             "non-articulated world raises NOT_SUPPORTED.");
+             "non-articulated world raises NOT_SUPPORTED.")
+        .def("sample_terrain_height", &World::sample_terrain_height,
+             nb::arg("xs"), nb::arg("ys"), nb::arg("scales") = nb::none(),
+             "Batched terrain height over the world's COOKED heightfield grid (the "
+             "ONE source obs/spawn/render and physics share, sampled bilinearly). "
+             "xs/ys: (n,) float32 CPU world columns; scales: optional (n,) float32 "
+             "per-element vertical scale (curriculum difficulty). Returns (n,) numpy "
+             "float32 absolute surface z. No cooked heightfield -> all 0.");
 
     // -----------------------------------------------------------------------
     // Tape -- the multi-step differentiable rollout (nuka_diffsim.h).
@@ -1268,68 +1333,4 @@ NB_MODULE(_nuka_ext, m) {
                                      std::to_string(rc) + ")");
         }
     }, "Block until all queued CUDA work completes (test/debug helper).");
-
-    // -----------------------------------------------------------------------
-    // Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y)
-    // terrain height sampler (nuka_terrain_sample_height_batch). PURE HOST free
-    // function -- the C-ABI projection of the SINGLE source of truth
-    // nuka::terrain::SampleTerrainHeight + ScaleTerrainDifficulty. The RL
-    // spawn-on-terrain reset calls this so a RANDOM (x,y) spawn reads the EXACT
-    // heightfield the foot kernel uses (no python center-only mirror drift for
-    // arbitrary columns). Accepts CPU-contiguous numpy/torch arrays for
-    // types(uint32)/xs/ys/difficulties(float32) (all length n) + the model-level
-    // scalar TerrainParams; returns a (n,) numpy float32 array of surface heights.
-    // -----------------------------------------------------------------------
-    m.def(
-        "terrain_sample_height_batch",
-        [](nb::ndarray<uint32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> types,
-           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> xs,
-           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> ys,
-           nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> difficulties,
-           float ground_height, float step_height, float step_width,
-           float platform_width, float grid_width,
-           float grid_height_max) -> nb::object {
-            const size_t n = types.shape(0);
-            if (xs.shape(0) != n || ys.shape(0) != n ||
-                difficulties.shape(0) != n) {
-                throw std::runtime_error(
-                    "terrain_sample_height_batch: types/xs/ys/difficulties "
-                    "must all have the same length");
-            }
-            // Allocate the output and let an owning capsule free it after the
-            // returned numpy array is collected.
-            float* out = new float[n == 0 ? 1 : n];
-            nuka_result_t rc = nuka_terrain_sample_height_batch(
-                static_cast<uint32_t>(n), types.data(), xs.data(), ys.data(),
-                difficulties.data(), ground_height, step_height, step_width,
-                platform_width, grid_width, grid_height_max, out);
-            if (rc != NUKA_RESULT_OK) {
-                delete[] out;
-                throw std::runtime_error(
-                    std::string("terrain_sample_height_batch failed: ") +
-                    nuka_result_message(rc));
-            }
-            nb::capsule owner(out, [](void* p) noexcept {
-                delete[] static_cast<float*>(p);
-            });
-            size_t shape[1] = {n};
-            return nb::cast(nb::ndarray<nb::numpy, float>(out, 1, shape, owner));
-        },
-        nb::arg("types"), nb::arg("xs"), nb::arg("ys"), nb::arg("difficulties"),
-        nb::arg("ground_height"), nb::arg("step_height"), nb::arg("step_width"),
-        nb::arg("platform_width"), nb::arg("grid_width"),
-        nb::arg("grid_height_max"),
-        "Batched arbitrary-(x,y) procedural-terrain surface height. The C-ABI "
-        "projection of nuka::terrain::SampleTerrainHeight + "
-        "ScaleTerrainDifficulty (the SINGLE source of truth in "
-        "src/sensor/terrain/terrain_field.hpp). types: (n,) uint32 terrain type "
-        "code (0=Flat,1=PyramidStairs,2=InvertedPyramid,3=RandomBoxes); xs/ys: "
-        "(n,) float32 world columns (m); difficulties: (n,) float32 curriculum "
-        "difficulty (1.0=unscaled, 0.0=flat). ground_height/step_height/"
-        "step_width/platform_width/grid_width/grid_height_max: the model-level "
-        "TerrainParams scalars (the create-time terrain_* geometry). All array "
-        "args must be CPU-contiguous (numpy or a CPU torch tensor). Returns a "
-        "(n,) numpy float32 array of absolute surface z. Used by the Go2 "
-        "random-XY spawn reset so the spawn height matches the foot kernel's "
-        "heightfield exactly.");
 }

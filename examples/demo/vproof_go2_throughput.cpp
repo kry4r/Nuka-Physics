@@ -39,7 +39,8 @@
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
 #include "scene/cook/cook_to_model.hpp"
-#include "sensor/terrain/terrain_field.hpp"
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
 
 namespace {
 namespace nk = nuka::nk;
@@ -67,11 +68,16 @@ nk::Model CookGeneral(const nuka::scene::SceneIR& scene, uint32_t N) {
     const uint32_t orig_bodies = m.capacities.bodies_per_env;
     m.body_init.resize(orig_bodies);  // heightfield seeds at index orig_bodies.
 
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = kGround;
-    const uint32_t hf_row = cook::CookHeightfieldGrid(
-        m, tp, terrain::kTerrainFlat, /*nrow=*/21u, /*ncol=*/21u, /*cell=*/0.25f,
-        /*center=*/Vec3{0, 0, kGround});
+    terrain::TerrainGenConfig cfg;  // FLAT: every feature amplitude 0.
+    cfg.nrow = 21u;
+    cfg.ncol = 21u;
+    cfg.cell_x = 0.25f;
+    cfg.cell_y = 0.25f;
+    cfg.origin = Vec3{-0.5f * 20.0f * 0.25f, -0.5f * 20.0f * 0.25f, 0.0f};
+    cfg.base_z = kGround;
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    const uint32_t hf_row = cook::CookHeightfieldGrid(m, hf);
     if (hf_row != orig_bodies) {
         std::fprintf(stderr, "[vproof_go2_throughput] WARN hf_row=%u != %u\n",
                      hf_row, orig_bodies);

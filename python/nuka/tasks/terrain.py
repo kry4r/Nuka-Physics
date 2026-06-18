@@ -1,150 +1,29 @@
-"""Python MIRROR of ``src/sensor/terrain/terrain_field.hpp`` -- the per-type
-terrain CENTER height + a Go2 terrain CURRICULUM scheduler.
+"""Go2 terrain CURRICULUM scheduler (legged_gym terrain-level style).
 
-WHY THIS FILE EXISTS
---------------------
-The engine procedural terrain (the FusedFoot foot kernel + the future render
-tessellator) computes the surface height from the SINGLE source of truth
-``src/sensor/terrain/terrain_field.hpp`` (``SampleTerrainHeight(type,x,y,p)`` +
-``ScaleTerrainDifficulty(p,diff)``). The RL spawn-on-terrain reset needs to know
-the LOCAL surface height at the Go2 spawn column so it can place the base ABOVE
-the platform/pit/box instead of inside it (the Phase-2a "spawn below a raised
-platform -> first-step penetration -> Baumgarte launch to z~=18" bug).
+The engine terrain is ONE cooked heightfield grid (MuJoCo ``hfield`` / Newton
+``create_heightfield`` model: a normalized elevation grid placed by radius/
+elevation/base, filled from a parametric generator OR an image). The grid is the
+SINGLE source of truth: the RL spawn/obs read the surface height by calling the
+C-ABI grid sampler ``World.sample_terrain_height(xs, ys, scales)`` (the same grid
+the physics narrowphase rests feet on), so there is NO python formula-mirror to
+drift -- the old ``center_height`` / ``_hash_cell_uniform01`` mirror is GONE.
 
-The Go2 spawns at the tile CENTER (world x,y ~= 0,0), so we only need the
-CENTER-column height per terrain type -- a tiny closed-form subset of the full
-``SampleTerrainHeight``. This module reproduces EXACTLY that subset (plus the
-difficulty scaling) in pure Python/torch so the reset can run on-GPU per env.
-
->>> ANTI-DRIFT CONTRACT <<<
-This module is a HAND-MAINTAINED MIRROR of the C++ header. The two MUST stay in
-sync. If you ever change the terrain math in ``terrain_field.hpp`` -- the
-``kPyramidRings`` constant, the platform-top / pit-bottom formula, the
-RandomBoxes center cell-hash, or the difficulty scaling semantics -- you MUST
-update THIS file in the same change. There is no automated cross-language check
-(the header is host/device C++; this is torch); the only guard is this notice +
-the ``KPYRAMID_RINGS`` assert below mirroring ``kPyramidRings``.
-
-MIRRORED CONSTANTS / FORMULAS (verbatim from terrain_field.hpp):
-  * ``kPyramidRings = 8``  (lines ~179).
-  * Flat (type 0):             h = ground_height.
-  * PyramidStairs (type 1):    platform_top = ground + kPyramidRings*step_height;
-                               at center (r<=half_plat) h = platform_top.
-  * InvertedPyramid (type 2):  pit_bottom = ground - kPyramidRings*step_height;
-                               at center h = pit_bottom.
-  * RandomBoxes (type 3):      cell = floor(0/grid_width)=0 -> hash(0,0);
-                               u = HashCellUniform01(0,0);
-                               h = ground + u*grid_height_max.
-  * ScaleTerrainDifficulty:    step_height *= diff; grid_height_max *= diff
-                               (vertical magnitude ONLY; ground/horizontal
-                               geometry unchanged). diff==1 -> unchanged;
-                               diff==0 -> flat.
-
-RESOLVED (random-XY spawn + free-roam, 随地走): the Go2 now spawns at a RANDOM
-(x,y) within the terrain tile (legged_gym terrain_origins jitter), so the reset
-needs the FULL arbitrary-(x,y) surface height -- the ring index / per-cell hash
-for any column, not just the center. Rather than port that into torch here (and
-risk drift from the header), the FULL height is now served by the BATCHED C-ABI
-sampler ``nuka.terrain_sample_height_batch`` (src/c_abi/terrain.cpp), which calls
-the C++ header's ``SampleTerrainHeight`` + ``ScaleTerrainDifficulty`` DIRECTLY --
-so the header itself IS the single source for arbitrary columns and there is no
-parallel python full-sampler to drift. ``center_height`` below is kept only as a
-LEGACY / DIAGNOSTIC convenience (the center-column height per type); the live
-spawn-on-terrain reset uses the C-ABI sampler at the random column. The
-ANTI-DRIFT CONTRACT above still binds ``center_height`` to the header's center
-formula.
+This module keeps only the per-env curriculum scheduler (difficulty ladder +
+promote/demote), which scales the per-env vertical magnitude (the ``scales``
+passed to the grid sampler), not any terrain formula.
 """
 
 from __future__ import annotations
 
 import torch
 
-# Mirror of terrain_field.hpp ``enum TerrainType`` (the type CODES).
+# Per-env terrain TYPE codes the curriculum cycles through. These are CURRICULUM
+# labels (which parametric feature an env trains on), not engine terrain types --
+# the engine has no terrain-type enum, only the one heightfield grid.
 TERRAIN_FLAT = 0
 TERRAIN_PYRAMID_STAIRS = 1
 TERRAIN_INVERTED_PYRAMID = 2
 TERRAIN_RANDOM_BOXES = 3
-
-# Mirror of terrain_field.hpp ``inline constexpr int kPyramidRings = 8``.
-# >>> ANTI-DRIFT: keep equal to terrain_field.hpp::kPyramidRings <<<
-KPYRAMID_RINGS = 8
-
-
-# ---------------------------------------------------------------------------
-# RandomBoxes center cell hash -- the EXACT mirror of terrain_field.hpp
-# detail::HashCell(0,0) -> HashCellUniform01(0,0). cx=cy=floor(0/grid_width)=0,
-# so HashCell(0,0) = 0 ^>>... = 0 (every term is 0*const). The MurmurHash3
-# finalizer of 0 is 0, so u(0,0) == 0.0 -> the center box height is EXACTLY
-# ground_height for ALL difficulties. We still compute it through the mirrored
-# finalizer (not just hardcode 0) so that if the header's hash seed/center cell
-# ever changes, the fix lands here too.
-# ---------------------------------------------------------------------------
-def _hash_cell_uniform01(cx: int, cy: int) -> float:
-    """Mirror of terrain_field.hpp detail::HashCellUniform01 (pure uint32)."""
-    M32 = 0xFFFFFFFF
-    h = (cx * 0x9E3779B1 + cy * 0x85EBCA77) & M32
-    h ^= h >> 16
-    h = (h * 0x7FEB352D) & M32
-    h ^= h >> 15
-    h = (h * 0x846CA68B) & M32
-    h ^= h >> 16
-    return float(h >> 8) * (1.0 / 16777216.0)
-
-
-# The center cell is always (0,0) for an x,y~=0 spawn -> a single constant.
-_CENTER_BOX_U = _hash_cell_uniform01(0, 0)  # == 0.0 (see note above)
-
-
-def center_height(
-    terrain_type: torch.Tensor,
-    difficulty: torch.Tensor,
-    *,
-    ground_height: float,
-    step_height: float,
-    grid_height_max: float,
-) -> torch.Tensor:
-    """Per-env terrain surface height at the tile CENTER (x,y ~= 0,0).
-
-    EXACT mirror of ``SampleTerrainHeight(type, 0, 0, ScaleTerrainDifficulty(p,
-    diff))`` for the center column. ``step_height`` / ``grid_height_max`` are the
-    MODEL-level (un-scaled, the create-time) values; ``difficulty`` scales the
-    vertical magnitude per env (terrain_field.hpp ScaleTerrainDifficulty).
-
-    Parameters
-    ----------
-    terrain_type : (N,) or (N,1) int/uint tensor -- per-env terrain type code.
-    difficulty   : (N,) float tensor             -- per-env difficulty in [0,1].
-    ground_height, step_height, grid_height_max  -- the create-time TerrainParams
-        (horizontal geometry is irrelevant to the center height).
-
-    Returns
-    -------
-    (N,) float32 tensor on ``difficulty.device`` -- the absolute surface z at the
-    center column for each env.
-    """
-    tt = terrain_type.reshape(-1).to(torch.long)
-    diff = difficulty.reshape(-1).to(torch.float32)
-    dev = diff.device
-
-    # ScaleTerrainDifficulty: scale the vertical magnitudes only.
-    sh = step_height * diff               # (N,) scaled step height
-    gh = grid_height_max * diff           # (N,) scaled grid max
-
-    h = torch.full_like(diff, float(ground_height))  # default = Flat.
-
-    # PyramidStairs center: platform_top = ground + kPyramidRings*step_height.
-    is_stairs = tt == TERRAIN_PYRAMID_STAIRS
-    h = torch.where(is_stairs, ground_height + KPYRAMID_RINGS * sh, h)
-
-    # InvertedPyramid center: pit_bottom = ground - kPyramidRings*step_height.
-    is_pit = tt == TERRAIN_INVERTED_PYRAMID
-    h = torch.where(is_pit, ground_height - KPYRAMID_RINGS * sh, h)
-
-    # RandomBoxes center: h = ground + u(0,0)*grid_height_max (u(0,0)==0 -> ground).
-    is_boxes = tt == TERRAIN_RANDOM_BOXES
-    h = torch.where(is_boxes, ground_height + _CENTER_BOX_U * gh, h)
-
-    return h.to(device=dev, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------

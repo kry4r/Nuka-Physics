@@ -125,17 +125,13 @@ bool World::SeedInitialState() {
     // L1-c: the M4 union per-env live table toggle (FieldId::TableEnabled) seed
     // was DELETED here — both the field and table_enabled_default are gone.
 
-    // -- Go2-on-stairs Phase 1: the per-env procedural-terrain TYPE. Seeded 0
-    // (nuka::terrain::kTerrainFlat) for EVERY env. (Historically the FUSED foot
-    // kernel sampled this per env; L1-b deletes that runtime — the general path's
-    // terrain is the cook-time baked heightfield collidable, so the per-env type is
-    // now a model-level / informational field.) A training harness / verification
-    // sets non-flat terrain post-construction via
-    // World::GetData().UploadField(FieldId::EnvTerrainType, ...). The field is
-    // Persistent so it round-trips Reset (the construction-time snapshot).
+    // -- The per-env terrain TYPE field, seeded 0 (flat) for EVERY env. The general
+    // path's terrain is the cook-time baked heightfield collidable, so this per-env
+    // type is informational; a harness may set it post-construction via
+    // World::GetData().UploadField(FieldId::EnvTerrainType, ...). Persistent so it
+    // round-trips Reset (the construction-time snapshot).
     {
-        std::vector<uint32_t> terrain_type(
-            E, static_cast<uint32_t>(nuka::terrain::kTerrainFlat));
+        std::vector<uint32_t> terrain_type(E, 0u);
         if (!data_.UploadField(FieldId::EnvTerrainType, terrain_type.data(),
                                terrain_type.size() * sizeof(uint32_t))) {
             return false;
