@@ -207,22 +207,21 @@ __device__ __forceinline__ float CornerZ(const float* heights, uint32_t data_off
     return min_z + h * range;
 }
 
-// FACE-ONLY sphere-vs-triangle contact (world space). A sphere resting on a
-// heightfield must contact the FACE it sits over, NOT the internal triangulation
-// edges that split each flat cell into two coplanar triangles: the closest point
-// on such a shared edge to a shallow-resting sphere center is nearly IN-PLANE, so
-// an edge-based query (EPA / SphereHull closest-point) emits a near-HORIZONTAL
-// normal -- a spurious sideways force that kicks the foot off the stance. We emit a
-// contact ONLY when the sphere center projects INSIDE the triangle (closest feature
-// == the face); then the normal is the true face normal (oriented toward the
-// center) and the depth is radius - |signed distance to the plane|. On flat ground
-// this is EXACTLY the analytic vertical-support contact (point = center projected to
-// the surface, normal +Z, depth = (surface+r) - center_z); on a step riser the
-// steep face yields the correct near-horizontal normal. Real CONVEX edges (a step's
-// top lip) are a rare secondary feature handled by the neighbouring face the center
-// projects into; internal coplanar edges are correctly suppressed. Deterministic
-// (pure arithmetic, no data-dependent ordering).
+// Sphere-vs-triangle contact against a DOWNWARD-SOLID prism face (world space). A
+// sphere resting on a heightfield contacts the FACE it sits over, NOT the internal
+// triangulation edges that split each flat cell into two coplanar triangles: an
+// edge-based query (EPA / SphereHull closest-point) emits a near-HORIZONTAL normal
+// -- a spurious sideways force that kicks the foot off the stance. We emit a contact
+// when the sphere center projects INSIDE the triangle (closest feature == the face),
+// with the normal = the face normal oriented OUT of the solid (positive dot with
+// solid_out, the prism's outward axis) so deep penetration pushes UP, not sideways.
+// depth = radius - s where s is the signed distance ALONG the outward normal; s may
+// be NEGATIVE (center below the face / inside the solid) for arbitrary penetration,
+// giving a large depth that recovers the foot -- no dead band. On flat ground a
+// shallow rest gives s~radius, depth~0, normal +Z (the analytic vertical support);
+// a step face yields its own outward normal. Deterministic (pure arithmetic).
 __device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Vec3 c,
+                                   Vec3 solid_out,
                                    Vec3* out_pos, Vec3* out_nrm, float* out_pen) {
     const Vec3 ab = b - a;
     const Vec3 ac = c - a;
@@ -232,10 +231,11 @@ __device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Ve
     const float nl2 = n.Dot(n);
     if (nl2 < 1.0e-20f) return false;             // degenerate triangle
     n = n * (1.0f / sqrtf(nl2));
-    // Orient the face normal toward the sphere center (outward for a resting foot).
-    float s = (center - a).Dot(n);
-    if (s < 0.0f) { n = n * -1.0f; s = -s; }
-    if (s > radius) return false;                 // sphere clears the plane
+    // Orient the face normal OUT of the downward-solid prism (toward solid_out), so
+    // a center below the face still pushes UP -- robust to deep penetration.
+    if (n.Dot(solid_out) < 0.0f) n = n * -1.0f;
+    const float s = (center - a).Dot(n);
+    if (s > radius) return false;                 // sphere clears the face
     // Closest point = center projected onto the triangle plane.
     const Vec3 proj = center - n * s;
     // Barycentric inside test (proj within triangle abc).
@@ -260,7 +260,7 @@ __device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Ve
     if (uu < -kBaryEps || vv < -kBaryEps || ww < -kBaryEps) return false;
     *out_pos = proj;          // contact point on the face surface
     *out_nrm = n;             // separation dir for the sphere (side a == convex)
-    *out_pen = radius - s;    // > 0 (s <= radius checked above)
+    *out_pen = radius - s;    // > 0 (s < radius); grows when s < 0 (deep)
     return true;
 }
 
@@ -281,7 +281,9 @@ __device__ void SphereHeightfieldTri(const amf::PrimParams& cprim,
     const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
     Vec3 cpos, cnrm;
     float cpen;
-    if (SphereTriangleFace(cprim.frame.t, cprim.radius, wa, wb, wc,
+    // The prism is solid along the field frame's local -Z, so the outward face
+    // axis is +cz; orient the contact normal toward it (robust to deep sink).
+    if (SphereTriangleFace(cprim.frame.t, cprim.radius, wa, wb, wc, hf_frame.cz,
                            &cpos, &cnrm, &cpen)) {
         ::nuka::constraint::ContactPoint pt;
         pt.position = cpos;
