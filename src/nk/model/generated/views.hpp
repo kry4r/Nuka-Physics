@@ -200,6 +200,7 @@ struct DataView {
     uint32_t* row_cj_link_b = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_point_b = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_dir_b = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* pd_solve_scratch = nullptr;  // per:row_slot arena:scratch owner:data elem:3
 };
 
 } // namespace nuka::phi

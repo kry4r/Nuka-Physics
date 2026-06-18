@@ -213,6 +213,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir_b
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 3, 1, 12, 0},  // pd_solve_scratch
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

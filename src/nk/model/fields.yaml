@@ -647,3 +647,16 @@ fields:
   - {name: row_cj_link_b,    dtype: u32,  per: row_slot, arena: scratch, owner: data}
   - {name: row_cj_point_b,   dtype: vec3, per: row_slot, arena: scratch, owner: data}
   - {name: row_cj_dir_b,     dtype: vec3, per: row_slot, arena: scratch, owner: data}
+
+  # =========================================================================
+  # PairDriven block-island solver GLOBAL scratch (pd_solve_scratch). The
+  # PairDriven family schedules ONE island per env holding ALL rows_per_env rows;
+  # the per-row STAGED arrays (the active-row order + the per-color segment table
+  # the single-thread compaction builds) cannot live in dynamic shared because
+  # that scales with rows_per_env (a 20-articulation env exceeds the device opt-in
+  # limit). They live HERE in global, one disjoint region per env: rows_per_env
+  # u32 of order followed by 2*rows_per_env u32 of segments == 3 u32 per row slot.
+  # One block per env owns its region (race-free, no atomics). INERT for the Union
+  # family (it stages order/segments in shared). APPENDED LAST so every pre-existing
+  # arena offset is byte-stable.
+  - {name: pd_solve_scratch, dtype: u32, per: row_slot, arena: scratch, owner: data, elem: 3}

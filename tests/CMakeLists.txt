@@ -850,6 +850,11 @@ if(CMAKE_CUDA_COMPILER)
         # contact path (overlapping dogs push apart; dogs rest on a general
         # heightfield incl. step edges -- no dog_dog hack). Composes go2 with itself.
         scenario/multi_dog_costep.cpp
+        # SCALE: 20 Go2 articulations co-resident in ONE env on PyramidStairs
+        # terrain (~22400 rows in ONE per-env island). Pins the PairDriven solver's
+        # storage cost so a 20-dog single-env world constructs (no dynamic-shared
+        # overflow) and steps finite with feet loaded and no foot-sink-through.
+        scenario/multi_dog_terrain_scale.cpp
         # General contact pipeline Phase 1A: the PairDriven NARROWPHASE DETECTION
         # gate. A body-only PairDriven world with two overlapping collidables runs
         # broadphase -> cvx GJK/EPA narrowphase -> the unified contact buffer;

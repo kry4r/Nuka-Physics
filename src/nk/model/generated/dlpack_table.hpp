@@ -192,6 +192,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false, false},  // row_cj_link_b
     {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false, false},  // row_cj_point_b
     {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false, false},  // row_cj_dir_b
+    {FieldId::PdSolveScratch, DlpackDtype::kU32, 2, false, false},  // pd_solve_scratch
 };
 
 } // namespace nuka::nk

@@ -113,6 +113,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::RowCjLinkB:          v.row_cj_link_b = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPointB:         v.row_cj_point_b = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;
+        // PairDriven block-island GLOBAL order/segment scratch (3 u32 per row slot:
+        // rows_per_env order + 2*rows_per_env segments per env, disjoint per env).
+        case FieldId::PdSolveScratch:      v.pd_solve_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
         // L1-c: FieldId::TableEnabled (v.table_enabled) was DELETED with the field.
         case FieldId::M:                   v.m = static_cast<float*>(p); break;
