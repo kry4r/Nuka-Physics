@@ -4,13 +4,15 @@ The engine terrain is ONE cooked heightfield grid (MuJoCo ``hfield`` / Newton
 ``create_heightfield`` model: a normalized elevation grid placed by radius/
 elevation/base, filled from a parametric generator OR an image). The grid is the
 SINGLE source of truth: the RL spawn/obs read the surface height by calling the
-C-ABI grid sampler ``World.sample_terrain_height(xs, ys, scales)`` (the same grid
-the physics narrowphase rests feet on), so there is NO python formula-mirror to
-drift -- the old ``center_height`` / ``_hash_cell_uniform01`` mirror is GONE.
+C-ABI grid sampler ``World.sample_terrain_height(xs, ys)`` -- the SAME full-relief
+grid the physics narrowphase rests feet on -- so obs == physics by construction
+and there is NO python formula-mirror to drift.
 
 This module keeps only the per-env curriculum scheduler (difficulty ladder +
-promote/demote), which scales the per-env vertical magnitude (the ``scales``
-passed to the grid sampler), not any terrain formula.
+promote/demote). The grid is MODEL-LEVEL (one terrain for the whole batch at full
+relief), so per-env difficulty/type are INFORMATIONAL labels: they no longer scale
+any sampled surface (a per-env shrink would diverge obs from the model-level
+physics grid). They drive only the curriculum's own promote/demote bookkeeping.
 """
 
 from __future__ import annotations

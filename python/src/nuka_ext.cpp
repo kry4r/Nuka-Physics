@@ -324,32 +324,18 @@ public:
     }
 
     // Batched terrain height over the world's COOKED grid (the ONE source obs and
-    // physics share). xs/ys are CPU float32 (length n); scales is an optional
-    // per-element vertical scale (the curriculum difficulty); returns a (n,) numpy
-    // float32 array of absolute surface z.
+    // physics share, at full relief). xs/ys are CPU float32 (length n); returns a
+    // (n,) numpy float32 array of absolute surface z -- the exact grid physics uses.
     nb::object sample_terrain_height(
         nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> xs,
-        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> ys,
-        nb::object scales) {
+        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> ys) {
         const size_t n = xs.shape(0);
         if (ys.shape(0) != n) {
             throw std::runtime_error("sample_terrain_height: xs/ys length mismatch");
         }
-        const float* scale_ptr = nullptr;
-        nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu> scale_arr;
-        if (!scales.is_none()) {
-            scale_arr = nb::cast<
-                nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>>(
-                scales);
-            if (scale_arr.shape(0) != n) {
-                throw std::runtime_error(
-                    "sample_terrain_height: scales length mismatch");
-            }
-            scale_ptr = scale_arr.data();
-        }
         float* out = new float[n == 0 ? 1 : n];
         nuka_result_t rc = nuka_world_sample_terrain_height_batch(
-            h_, static_cast<uint32_t>(n), xs.data(), ys.data(), scale_ptr, out);
+            h_, static_cast<uint32_t>(n), xs.data(), ys.data(), out);
         if (rc != NUKA_RESULT_OK) {
             delete[] out;
             throw std::runtime_error(
@@ -1166,11 +1152,10 @@ NB_MODULE(_nuka_ext, m) {
              "time; mass must be in place before the first step_with_tape). A "
              "non-articulated world raises NOT_SUPPORTED.")
         .def("sample_terrain_height", &World::sample_terrain_height,
-             nb::arg("xs"), nb::arg("ys"), nb::arg("scales") = nb::none(),
+             nb::arg("xs"), nb::arg("ys"),
              "Batched terrain height over the world's COOKED heightfield grid (the "
-             "ONE source obs/spawn/render and physics share, sampled bilinearly). "
-             "xs/ys: (n,) float32 CPU world columns; scales: optional (n,) float32 "
-             "per-element vertical scale (curriculum difficulty). Returns (n,) numpy "
+             "ONE full-relief source obs/spawn/render and physics share, sampled "
+             "bilinearly). xs/ys: (n,) float32 CPU world columns. Returns (n,) numpy "
              "float32 absolute surface z. No cooked heightfield -> all 0.");
 
     // -----------------------------------------------------------------------

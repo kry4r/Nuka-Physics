@@ -1,0 +1,249 @@
+# rl_games (1.6.5) PPO config for Nuka Go2 TERRAIN locomotion with the legged_gym
+# HEIGHT-SCAN obs (the seeing policy). This is go2_ppo_cfg.yaml with terrain.enable
+# + height_scan.enable flipped ON; the obs grows to 48 + 187 = 235 dim. Warm-start
+# from the 235-dim ep_1500 checkpoint (see the launch command in the controller report).
+#
+# COHERENCE: the terrain is ONE model-level full-relief heightfield grid. obs/spawn
+# read that SAME grid via World.sample_terrain_height (no per-env difficulty scale),
+# so obs == physics by construction for every env regardless of curriculum state.
+#
+# Hyperparameters ALIGNED to the official unitree_rl_gym / rsl_rl Go2 recipe
+# (legged_gym/envs/base/legged_robot_config.py LeggedRobotCfgPPO + go2_config.py):
+#   policy:    init_noise_std=1.0 (sigma const-init 0 -> std=exp(0)=1.0),
+#              actor/critic hidden=[512,256,128], activation=elu.
+#   algorithm: entropy_coef=0.01, value_loss_coef=1.0, clip_param=0.2,
+#              num_learning_epochs(mini_epochs)=5, num_mini_batches=4
+#              (-> minibatch = num_envs*horizon/4 = 4096*24/4 = 24576),
+#              learning_rate=1e-3 adaptive, desired_kl(kl_threshold)=0.01,
+#              gamma=0.99, lam(tau)=0.95, max_grad_norm=1.0.
+#   runner:    num_steps_per_env(horizon)=24, max_iterations(max_epochs)=1500.
+#   env:       terminate on base-ground CONTACT only (legged_gym
+#              terminate_after_contacts_on=["base"]); the prior tilt>75 deg kill
+#              over-culled recoverable wobbles and starved the reward signal -- now
+#              base-height only (z<0.18 ~ base touching ground), tilt kill relaxed
+#              to 120 deg (only a genuinely flipped robot, which emits pure-zero
+#              reward forever, is culled). Set via env_config below.
+#
+# RATIONALE (the 1500-epoch collapse this fixes): mean reward stayed ~0 because the
+# only_positive_rewards clamp zeros a cold-start policy whose negatives swamp the
+# tiny velocity-tracking positive; with entropy_coef=0 there was no exploration
+# pressure, so the actor saturated and the value head collapsed to predict 0. The
+# recipe-aligned entropy_coef=0.01 + base-contact-only termination (longer episodes)
+# + the larger [512,256,128] net + lr 1e-3 restore the legged_gym learning regime.
+#
+# ``env_name: nuka_go2`` resolves via the nuka.rl_games adapter (registered on
+# import). ``num_actors`` / ``max_epochs`` / ``minibatch_size`` are overridden by
+# train_go2_ppo.py (esp. for --smoke).
+params:
+  seed: 1
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: go2_terrain_hs
+    full_experiment_name: go2_terrain_hs
+    env_name: nuka_go2
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-3
+    lr_schedule: adaptive
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 1500
+    save_best_after: 100
+    save_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.01
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 24
+    num_actors: 4096
+    minibatch_size: 24576
+    mini_epochs: 5
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0001
+
+    env_config:
+      # env_name here is the nuka task selector; the adapter ignores extra keys
+      # it doesn't use. device is created+owned by the env (single GPU).
+      #
+      # RANDOM command curriculum (fixed_command=false, the legged_gym default):
+      # Go2LocomotionEnv resamples a per-env velocity command (vx/vy/wyaw in [-1,1],
+      # xy zeroed if |xy|<0.2) on every reset + on the 10 s timer. This is the
+      # recipe-faithful config and it LEARNS A COMMAND-CONDITIONED gait: after 250
+      # epochs the policy tracks vx monotonically across the range -- eval
+      # (cmd vx -> vx_body): -0.5 -> -0.462, 0.0 -> +0.002, +0.5 -> +0.467, +1.0 -> +1.032;
+      # tilt 2-4 deg, 0 terminations over a 220-step x 64-env deterministic-mu sweep.
+      #
+      # ``command`` below is only the INITIAL value (immediately overwritten by the
+      # first resample). ``fixed_command: true`` is an opt-in lever that PINS the
+      # command for the whole run (no resample) -- useful as a reduce-the-problem
+      # baseline; the fixed-[0.5,0,0] config converges to a cleaner single-speed walk
+      # (vx_body 0.46 ~ cmd 0.5, reward ~26) but cannot condition on the command.
+      #
+      # THE FIX THAT MADE EITHER LEARN (was a 1500-epoch collapse: reward==0,
+      # ep_len~22): the gym action space is declared at +-1 (go2_obs.ACTION_SPACE_LIMIT),
+      # NOT +-100 -- rl_games (clip_actions=true) RESCALES the policy's [-1,1] output
+      # onto the action-space bounds, so a +-100 space 100x-amplified the applied
+      # action (measured mean|a|=64) -> joints slammed -> robot tipped in ~21 steps ->
+      # all-negative reward -> only_positive_rewards zeroed it -> value head collapsed.
+      command: [0.5, 0.0, 0.0]
+      fixed_command: false
+
+      # GAIT MODE (Go2 pronk/bound skill). DEFAULT 'walk' => byte-identical to the
+      # proven flat walker (the reward dict, termination, obs are all unchanged).
+      # Re-weights the legged_gym reward only (see go2_rewards.GAIT_SCALE_OVERRIDES):
+      #   walk  -- no change (the flat walker).
+      #   trot  -- Stage-1 loosener (lin_vel_z -2.0 -> -0.5, air-time bias -> 0.35).
+      #   pronk -- all-four synchronized flight (lin_vel_z 0.0, air-time x2 + flight/
+      #            oscillation/symmetry bonuses, halved action_rate).
+      #   bound -- front/rear antiphase flight.
+      # For pronk/bound a 2-step landing GRACE on the base-height kill is auto-enabled
+      # (a single-step hard touchdown does not false-terminate); walk is unaffected.
+      # Override per run with the train_go2_ppo.py --gait-mode flag.
+      gait_mode: walk
+      # Termination = base-ground contact only (legged_gym terminate_after_contacts_on
+      # =["base"]). base-height z<0.18 ~ base touching ground; tilt kill relaxed to
+      # 120 deg so only a genuinely flipped robot is culled (the 75 deg default
+      # over-killed recoverable wobbles -> short episodes -> starved reward signal).
+      termination_tilt_deg: 120.0
+      termination_height: 0.18
+
+      # ---------------------------------------------------------------------
+      # Terrain curriculum (enable=true here; --terrain also forces it). Cooks ONE
+      # model-level heightfield grid at FULL relief and drives a per-env type +
+      # difficulty curriculum scheduler.
+      #
+      # GEOMETRY (model-level cook config): step_height 0.15 m max rise per ring,
+      # baked once into the composite (type 4) grid the whole batch shares.
+      #
+      # CURRICULUM IS DECORATIVE FOR PHYSICS: the grid is MODEL-LEVEL at full relief,
+      # so obs/spawn read it DIRECTLY (no per-env difficulty scale -- a per-env shrink
+      # would diverge obs from the one physics grid). The per-env difficulty/type are
+      # therefore INFORMATIONAL labels: they no longer make terrain easier/harder, and
+      # the promote/demote bookkeeping runs only for the logged difficulty report. The
+      # dog always faces the full composite terrain. (Raising start_difficulty no
+      # longer changes the surface; to stage terrain hardness, change the cooked grid
+      # geometry instead.) The gate semantics below are kept for the report only.
+      #
+      # The SCALE-INDEPENDENT gate (legged_gym terrain-level style): on reset an env
+      # is PROMOTED iff it SURVIVED most of the episode (ep_len >= survive_frac *
+      # max_episode_length) AND walked a lot (cumulative PATH length > promote_path_m),
+      # and DEMOTED if it FELL (terminated). PATH not NET displacement (free-roam:
+      # net~2.7 m vs path~6.6 m on a perfect walker). promote_dist_m / promote_thr are
+      # logged diagnostics only.
+      terrain:
+        enable: true
+        # Procedural-terrain cook geometry (the 5 create_from_scene terrain_*).
+        step_height: 0.15        # the MAX rise per ring (baked at full relief).
+        step_width: 0.3          # horizontal width of each step ring.
+        platform_width: 1.0      # central top-platform / pit edge length.
+        grid_width: 0.45         # RandomBoxes cell edge.
+        grid_height_max: 0.15    # RandomBoxes max per-cell rise.
+        ground_height: 0.0       # absolute floor (matches the flat scene).
+        # Curriculum knobs (difficulty is informational; see the note above).
+        start_difficulty: 0.0    # curriculum difficulty LABEL start (no physical
+                                 # effect: the grid is model-level full-relief).
+        survive_frac: 0.8        # PROMOTE gate: survive >= 0.8*max_episode_length.
+        promote_path_m: 5.0      # PROMOTE gate (PRIMARY): cumulative PATH length
+                                 # walked over the episode > 5 m. Free-roam robust
+                                 # (a wandering dog's path >> its net displacement);
+                                 # this is the gate that actually fires. ~5 m over a
+                                 # 20 s episode = a sustained ~0.25 m/s walk.
+        promote_dist_m: 3.0      # DIAGNOSTIC only (the OLD net-displacement gate;
+                                 # logged, no longer enforced -- free-roam wandering
+                                 # makes net disp << path, so it rarely fired).
+        demote_on_fall: true     # a terminated (fell) episode demotes the env.
+        difficulty_step: 0.1     # promote/demote increment.
+        ema_beta: 0.99           # reward-EMA smoothing (diagnostic only now).
+        promote_thr: 8.0         # DEPRECATED reward-threshold gate (diagnostic).
+        # SPAWN POSITION randomization (起始位置随机) -- STAGED per the owner's
+        # "单一起点先稳后随机" (stabilise a single start point FIRST, randomise it
+        # LATER). FREE-ROAM commands (随地走, random body-frame vx/vy/wyaw) are ON in
+        # BOTH stages -- only the SPAWN is staged:
+        #   PHASE A (now, the values below): spawn_xy_range 0.0 + randomize_yaw false
+        #     = a SINGLE fixed start (tile origin, fixed heading). Lowest-variance
+        #     way to learn terrain-climbing reliably; pairs with the path-length gate
+        #     + the terrain-relative height-kill so descents (pits / down-stairs)
+        #     actually train. Train to a stable terrain-climber.
+        #   PHASE B (later fine-tune, warm-start from Phase A): flip to
+        #     spawn_xy_range 2.0 + randomize_yaw true = dogs start on different
+        #     steps/rings/boxes at random headings (the final free-roam demo form).
+        # The spawn height at the chosen column comes from the BATCHED C-ABI sampler
+        # (nuka.terrain_sample_height_batch = the C++ heightfield itself), so the
+        # base lands ON the local surface, never inside it.
+        spawn_xy_range: 0.0      # PHASE A: fixed single start (tile origin). PHASE B
+                                 # -> 2.0 (~2.9 m radius, inside the stepped region).
+        randomize_yaw: false     # PHASE A: fixed heading. PHASE B -> true (free roam).
+        # Per-env START type weights {0:Flat,1:Stairs,2:Pit,3:Boxes}. Omit/empty
+        # => deterministic round-robin over {stairs, pit, boxes} (all 3 trained).
+        # type_distribution: {1: 1.0, 2: 1.0, 3: 1.0}
+
+        # ---------------------------------------------------------------------
+        # legged_gym-style HEIGHT SCAN (terrain perception). DEFAULT OFF: with
+        # enable=false (or the parent terrain block disabled) the obs stays the
+        # 48-dim blind vector and EVERY consumer is byte-identical to before.
+        #
+        # When enabled, the env APPENDS an n_scan-dim terrain height measurement
+        # to the 48-dim obs: a base-frame grid (rotated by the base heading/yaw)
+        # is sampled against the model-level full-relief grid via the same C-ABI
+        # heightfield sampler the foot kernel uses (so obs == physics), giving the
+        # policy a forward-looking view of the terrain so it can climb HIGH stairs
+        # (blind walking plateaus at ~5-6 cm; with the scan it should reach
+        # 12-15 cm). The obs/network input dim becomes 48 + n_scan.
+        #
+        # GRID (legged_gym Go2 measured_points_x/y): x in [x_min,x_max], y in
+        # [y_min,y_max], step `resolution` m. nx = round((x_max-x_min)/res)+1,
+        # ny = round((y_max-y_min)/res)+1, n_scan = nx*ny. The defaults below
+        # give nx=17, ny=11 -> n_scan = 187 (the legged_gym Go2 grid).
+        #
+        # VALUE (legged_gym convention): clip(base_z - 0.5 - surface_z, -clip,
+        # +clip) * scale, per grid point.
+        height_scan:
+          enable: true           # ON: the policy sees the model-level grid (48 ->
+                                 # 235-dim obs). The scan reads the SAME full-relief
+                                 # grid physics rests feet on (no difficulty scale),
+                                 # so obs == physics for every env.
+          x_min: -0.8            # base-frame grid extent (m), forward = +x.
+          x_max: 0.8
+          y_min: -0.5            # base-frame grid extent (m), left = +y.
+          y_max: 0.5
+          resolution: 0.1        # grid step (m). default 17(x)*11(y) = 187 pts.
+          scale: 5.0             # obs scale (legged_gym obs_scales.height_measurements).
+          clip: 1.0              # clip half-range (m) before scaling.

@@ -515,15 +515,14 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
 
 // ---------------------------------------------------------------------------
 // BATCHED arbitrary-(x,y) terrain height sampler over the world's COOKED grid.
-// The obs/spawn/render height query reads the SAME HeightField the physics rests
-// feet on (stored on the world at create), via the ONE bilinear sampler -- so obs
-// and physics agree by construction (no shared formula, no python mirror to drift).
+// The obs/spawn/render height query reads the SAME full-relief HeightField the
+// physics rests feet on (stored on the world at create), via the ONE bilinear
+// sampler -- so obs and physics agree by construction (no per-env scale, no python
+// mirror to drift; the grid is model-level so any per-env shrink would diverge).
 //
 //   world          -- the world whose cooked terrain grid is sampled.
-//   n              -- element count (number of (x,y[,scale]) tuples).
+//   n              -- element count (number of (x,y) tuples).
 //   xs, ys         -- per-element world column (x,y) in meters.
-//   scales         -- optional per-element vertical scale (the curriculum
-//                     difficulty; multiplies value*scale_z). NULL => scale 1.0.
 //   out_heights    -- output array (n floats), the absolute surface z per column.
 //
 // Returns NUKA_RESULT_INVALID_ARG if n > 0 and any of xs/ys/out_heights is NULL,
@@ -533,7 +532,6 @@ nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
                                                      uint32_t n,
                                                      const float* xs,
                                                      const float* ys,
-                                                     const float* scales,
                                                      float* out_heights);
 
 #ifdef __cplusplus
