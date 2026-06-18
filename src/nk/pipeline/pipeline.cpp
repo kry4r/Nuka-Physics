@@ -374,6 +374,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.base_link_count = base_link_count;
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
+        p_assemble_.num_material_buckets = cap.num_material_buckets;
         p_assemble_.particles_per_env = cap.particles_per_env;  // M6 coupling.
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
