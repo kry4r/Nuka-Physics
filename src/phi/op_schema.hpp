@@ -193,6 +193,9 @@ struct IntegratePositionParams {
     // M4: movable rigid-body symplectic-Euler position arm (the union world's
     // IntegrateBodyPosition port). 0 = no bodies.
     uint32_t total_body_count;
+    // Split-impulse: advance position by (real+pseudo)*dt while the persisted
+    // velocity stays = real. 0 (the velocity-only path) is byte-identical.
+    uint32_t pos_pass;
 };
 
 struct CrbaComputeMParams {
@@ -441,6 +444,12 @@ struct SolveRowsBlockIslandParams {
     // each co-resident articulation room for end-effector + body-terrain +
     // inter-articulation rows in one block.
     uint32_t contact_slots_per_artic;
+    // Split-impulse position pass (PairDriven only; pos_iters>0). total_particle_count
+    // sizes the pseudo-velocity memsets; beta/slop tune the geometric projection
+    // (target pseudo separating vel = beta*max(depth-slop,0)/dt).
+    uint32_t total_particle_count;
+    float    pos_beta;
+    float    pos_slop;
 };
 
 // --- particle (XPBD / PBF) substep --------------------------------------

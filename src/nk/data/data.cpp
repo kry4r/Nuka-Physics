@@ -117,6 +117,17 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         // rows_per_env order + 2*rows_per_env segments per env, disjoint per env).
         case FieldId::PdSolveScratch:      v.pd_solve_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
+        // Split-impulse position pass: SEPARATE pseudo-velocity accumulators (never
+        // the persisted velocity). Written by the gated position sweep, read by
+        // IntegratePosition as (real+pseudo)*dt. Zero on the pos_iters==0 path.
+        case FieldId::RowPenetration:      v.row_penetration = static_cast<float*>(p); break;
+        case FieldId::QdotPseudo:          v.qdot_pseudo = static_cast<float*>(p); break;
+        case FieldId::LinkVelocityPseudo:  v.link_velocity_pseudo = static_cast<Spatial6*>(p); break;
+        case FieldId::QdotPseudoFlat:      v.qdot_pseudo_flat = static_cast<float*>(p); break;
+        case FieldId::BodyPseudoLinearVelocity:  v.body_pseudo_linear_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyPseudoAngularVelocity: v.body_pseudo_angular_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticlePseudoVel:   v.particle_pseudo_vel = static_cast<math::Vec3*>(p); break;
+        case FieldId::RowPseudoLambda:     v.row_pseudo_lambda = static_cast<float*>(p); break;
         // L1-c: FieldId::TableEnabled (v.table_enabled) was DELETED with the field.
         case FieldId::M:                   v.m = static_cast<float*>(p); break;
         case FieldId::LinkCompositeInertia:v.link_composite_inertia = static_cast<Mat36*>(p); break;

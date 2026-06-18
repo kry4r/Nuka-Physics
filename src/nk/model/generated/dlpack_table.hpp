@@ -193,6 +193,14 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false, false},  // row_cj_point_b
     {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false, false},  // row_cj_dir_b
     {FieldId::PdSolveScratch, DlpackDtype::kU32, 2, false, false},  // pd_solve_scratch
+    {FieldId::RowPenetration, DlpackDtype::kF32, 1, false, false},  // row_penetration
+    {FieldId::QdotPseudo, DlpackDtype::kF32, 1, false, false},  // qdot_pseudo
+    {FieldId::LinkVelocityPseudo, DlpackDtype::kF32, 2, false, false},  // link_velocity_pseudo
+    {FieldId::QdotPseudoFlat, DlpackDtype::kF32, 1, false, false},  // qdot_pseudo_flat
+    {FieldId::BodyPseudoLinearVelocity, DlpackDtype::kF32, 2, false, false},  // body_pseudo_linear_velocity
+    {FieldId::BodyPseudoAngularVelocity, DlpackDtype::kF32, 2, false, false},  // body_pseudo_angular_velocity
+    {FieldId::ParticlePseudoVel, DlpackDtype::kF32, 2, false, false},  // particle_pseudo_vel
+    {FieldId::RowPseudoLambda, DlpackDtype::kF32, 1, false, false},  // row_pseudo_lambda
 };
 
 } // namespace nuka::nk

@@ -538,12 +538,20 @@ __global__ void IntegrateVelocityArticulationKernel(ArticulationDeviceState stat
 }
 
 __global__ void IntegratePositionArticulationKernel(ArticulationDeviceState state,
+                                                    const float* __restrict__ qdot_pseudo,
                                                     float dt) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) {
         return;
     }
-    state.q[link] += state.qdot[link] * dt;
+    // Split-impulse: advance by (real+pseudo)*dt; the persisted qdot stays = real.
+    // The null branch is the EXACT velocity-only expression (byte-identical; no
+    // +0.0f that could flip a signed-zero).
+    if (qdot_pseudo != nullptr) {
+        state.q[link] += (state.qdot[link] + qdot_pseudo[link]) * dt;
+    } else {
+        state.q[link] += state.qdot[link] * dt;
+    }
 }
 
 __device__ math::Vec3 RotateByQuatForward(math::Quat q, math::Vec3 v) {
@@ -595,6 +603,7 @@ __global__ void IntegrateFloatingBaseVelocityKernel(ArticulationDeviceState stat
 }
 
 __global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
+                                                const LinkSpatialVel* __restrict__ link_velocity_pseudo,
                                                 float dt) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -606,8 +615,19 @@ __global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
         state.joint_type[root] != ArticulationJointType::FloatingBase) {
         return;
     }
-    const float* v = state.link_velocity[root].v;
+    const float* rv = state.link_velocity[root].v;
     math::Transform pose = state.base_pose[articulation];
+
+    // Split-impulse: the root pose integrates from (real+pseudo) root velocity.
+    // The null branch is the EXACT velocity-only expression (byte-identical; no
+    // +0.0f that could flip a signed-zero).
+    float v[6];
+    if (link_velocity_pseudo != nullptr) {
+        const float* pv = link_velocity_pseudo[root].v;
+        for (uint32_t i = 0u; i < 6u; ++i) v[i] = rv[i] + pv[i];
+    } else {
+        for (uint32_t i = 0u; i < 6u; ++i) v[i] = rv[i];
+    }
 
     const math::Vec3 v_lin_body = MakeVec3(v[3], v[4], v[5]);
     const math::Vec3 v_lin_world = RotateByQuatForward(pose.rotation, v_lin_body);
@@ -767,6 +787,8 @@ __global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
 __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
                                             const math::Vec3* body_linear_velocity,
                                             const math::Vec3* body_angular_velocity,
+                                            const math::Vec3* body_pseudo_lin_vel,
+                                            const math::Vec3* body_pseudo_ang_vel,
                                             const float* body_inv_mass,
                                             uint32_t total_body_count,
                                             float dt) {
@@ -778,11 +800,19 @@ __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
         return;
     }
     math::Transform pose = body_pose[body];
-    const math::Vec3 v = body_linear_velocity[body];
+    // Split-impulse: position advances by (real+pseudo)*dt; persisted velocity
+    // stays = real. The null branch is the EXACT velocity-only expression.
+    math::Vec3 v = body_linear_velocity[body];
+    math::Vec3 w = body_angular_velocity[body];
+    if (body_pseudo_lin_vel != nullptr) {
+        const math::Vec3 vp = body_pseudo_lin_vel[body];
+        const math::Vec3 wp = body_pseudo_ang_vel[body];
+        v.x += vp.x; v.y += vp.y; v.z += vp.z;
+        w.x += wp.x; w.y += wp.y; w.z += wp.z;
+    }
     pose.position.x += v.x * dt;
     pose.position.y += v.y * dt;
     pose.position.z += v.z * dt;
-    const math::Vec3 w = body_angular_velocity[body];
     math::Quat dq;
     dq.w = 1.0f;
     dq.x = 0.5f * w.x * dt;
@@ -1028,16 +1058,24 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
     if (p->dt <= 0.0f) {
         return Status::Ok;
     }
+    // Split-impulse: read the pseudo velocity additively when the position pass is
+    // active. A null pseudo pointer makes every integrate kernel byte-identical.
+    const bool pos_pass = p->pos_pass != 0u;
     if (p->total_link_count > 0u) {
         const ArticulationDeviceState state = MakeArticulationDeviceState(
             model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks =
             (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        const float* qdot_pseudo =
+            pos_pass ? static_cast<const float*>(data.qdot_pseudo) : nullptr;
+        const LinkSpatialVel* link_vel_pseudo =
+            pos_pass ? reinterpret_cast<const LinkSpatialVel*>(data.link_velocity_pseudo)
+                     : nullptr;
         LaunchCuda(IntegratePositionArticulationKernel, dim3(blocks),
-                   dim3(kAbaBlockSize), 0u, stream, state, p->dt);
+                   dim3(kAbaBlockSize), 0u, stream, state, qdot_pseudo, p->dt);
         if (p->articulation_count > 0u) {
             LaunchCuda(IntegrateFloatingBasePoseKernel, dim3(p->articulation_count),
-                       dim3(kAbaBlockSize), 0u, stream, state, p->dt);
+                       dim3(kAbaBlockSize), 0u, stream, state, link_vel_pseudo, p->dt);
         }
     }
     // M4: the movable rigid-body symplectic-Euler position step (the union
@@ -1045,9 +1083,15 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
     if (p->total_body_count > 0u) {
         const uint32_t blocks =
             (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+        const math::Vec3* body_pseudo_lin =
+            pos_pass ? static_cast<const math::Vec3*>(data.body_pseudo_linear_velocity)
+                     : nullptr;
+        const math::Vec3* body_pseudo_ang =
+            pos_pass ? static_cast<const math::Vec3*>(data.body_pseudo_angular_velocity)
+                     : nullptr;
         LaunchCuda(BodyIntegratePositionKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
                    stream, data.body_pose, data.body_linear_velocity,
-                   data.body_angular_velocity,
+                   data.body_angular_velocity, body_pseudo_lin, body_pseudo_ang,
                    static_cast<const float*>(data.body_inv_mass),
                    p->total_body_count, p->dt);
     }

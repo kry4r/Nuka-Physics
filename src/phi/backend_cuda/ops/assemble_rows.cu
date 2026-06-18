@@ -581,7 +581,8 @@ __global__ void EmitPairDrivenRowsKernel(
     math::Vec3* __restrict__ row_cj_dir,
     uint32_t* __restrict__ row_cj_link_b, math::Vec3* __restrict__ row_cj_point_b,
     math::Vec3* __restrict__ row_cj_dir_b,
-    uint32_t* __restrict__ row_count) {
+    uint32_t* __restrict__ row_count,
+    float* __restrict__ row_penetration) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_count;
     if (gid >= total) return;
@@ -660,10 +661,14 @@ __global__ void EmitPairDrivenRowsKernel(
             const uint32_t rs = normal_row;
             NkRow row{};
             lambda[rs] = 0.0f;
+            row_penetration[rs] = 0.0f;
             row_cj_link[rs] = kInvalidLink;
             row_cj_link_b[rs] = kInvalidLink;
             if (live) {
                 const float pos = -ucontact_depth[mp];
+                // Geometric penetration (positive when overlapping) for the
+                // split-impulse position pass; the velocity solve uses aref.
+                row_penetration[rs] = fmaxf(ucontact_depth[mp], 0.0f);
                 const constraint::CompliantContactRow compliant =
                     constraint::ComputeCompliantRow(solref, solimp, pos, pos,
                                                     /*vel=*/0.0f, /*invweight=*/1.0f,
@@ -700,6 +705,7 @@ __global__ void EmitPairDrivenRowsKernel(
             const uint32_t rs = spoke_base + k;
             NkRow row{};
             lambda[rs] = 0.0f;
+            row_penetration[rs] = 0.0f;  // friction rows skip the position pass.
             row_cj_link[rs] = kInvalidLink;
             row_cj_link_b[rs] = kInvalidLink;
             if (live) {
@@ -860,7 +866,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
                    data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
-                   data.row_count);
+                   data.row_count, data.row_penetration);
     }
 
     if (has_artic) {

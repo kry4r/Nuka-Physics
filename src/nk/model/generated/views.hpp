@@ -201,6 +201,14 @@ struct DataView {
     ::nuka::math::Vec3* row_cj_point_b = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_dir_b = nullptr;  // per:row_slot arena:scratch owner:data
     uint32_t* pd_solve_scratch = nullptr;  // per:row_slot arena:scratch owner:data elem:3
+    float* row_penetration = nullptr;  // per:row_slot arena:scratch owner:data
+    float* qdot_pseudo = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::nk::Spatial6* link_velocity_pseudo = nullptr;  // per:link arena:scratch owner:data
+    float* qdot_pseudo_flat = nullptr;  // per:articulation_dof arena:scratch owner:data
+    ::nuka::math::Vec3* body_pseudo_linear_velocity = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* body_pseudo_angular_velocity = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* particle_pseudo_vel = nullptr;  // per:particle arena:scratch owner:data
+    float* row_pseudo_lambda = nullptr;  // per:row_slot arena:scratch owner:data
 };
 
 } // namespace nuka::phi

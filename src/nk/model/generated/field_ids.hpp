@@ -177,6 +177,14 @@ enum class FieldId : uint16_t {
     RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
     RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
     PdSolveScratch,  // pd_solve_scratch (per:row_slot arena:scratch owner:data elem:3)
+    RowPenetration,  // row_penetration (per:row_slot arena:scratch owner:data)
+    QdotPseudo,  // qdot_pseudo (per:link arena:scratch owner:data)
+    LinkVelocityPseudo,  // link_velocity_pseudo (per:link arena:scratch owner:data)
+    QdotPseudoFlat,  // qdot_pseudo_flat (per:articulation_dof arena:scratch owner:data)
+    BodyPseudoLinearVelocity,  // body_pseudo_linear_velocity (per:body arena:scratch owner:data)
+    BodyPseudoAngularVelocity,  // body_pseudo_angular_velocity (per:body arena:scratch owner:data)
+    ParticlePseudoVel,  // particle_pseudo_vel (per:particle arena:scratch owner:data)
+    RowPseudoLambda,  // row_pseudo_lambda (per:row_slot arena:scratch owner:data)
     Count
 };
 

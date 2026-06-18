@@ -417,7 +417,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // Model-derived solver constants (see op_schema.hpp).
         p_solve_.dt = cfg.dt;
         p_solve_.vel_iters = cfg.vel_iters;
-        p_solve_.pos_iters = cfg.pos_iters;
+        // Split-impulse position pass runs ONLY on the general PairDriven path; the
+        // Union/Fused families stay velocity-only (byte-identical).
+        p_solve_.pos_iters =
+            (family == phi::kContactFamilyPairDriven) ? cfg.pos_iters : 0u;
+        p_solve_.pos_beta = cfg.pos_beta;
+        p_solve_.pos_slop = cfg.pos_slop;
+        p_solve_.total_particle_count = particle_count;
         p_solve_.family = family;
         p_solve_.total_islands = model.schedule_island_count;
         p_solve_.max_dof = max_dof;
@@ -442,6 +448,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_int_pos_.total_link_count = total_link_count;
         p_int_pos_.articulation_count = articulation_cnt;
         p_int_pos_.total_body_count = cap.bodies_per_env * env_count;
+        // Read the split-impulse pseudo velocity additively when the position pass
+        // is active (the general PairDriven path); else velocity-only (identical).
+        p_int_pos_.pos_pass =
+            (has_contacts && family == phi::kContactFamilyPairDriven &&
+             cfg.pos_iters > 0u) ? 1u : 0u;
         add(phi::NkOp::IntegratePosition, &p_int_pos_);
     }
 
