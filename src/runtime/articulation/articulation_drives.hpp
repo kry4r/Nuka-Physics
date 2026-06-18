@@ -30,6 +30,12 @@
 
 namespace nuka::runtime::articulation {
 
+// SPD floor for the ComputedTorque / Osc dense LDL^T solves (and the diagonal
+// regularization the ABA / CRBA factorizations share). Exported so the diffsim
+// Osc adjoint (osc_adjoint.cu) references the SAME floor instead of a hand-kept
+// duplicate -- a forward-side change can no longer silently diverge the adjoint.
+inline constexpr float kMinDiagonalDrive = 1.0e-6f;
+
 // Torque mode: tau[link] = clamp(torque_input[link], +/- drive_force_limits[link]).
 // `torque_input` is a per-link device buffer (length state.total_link_count,
 // same layout as drive_targets). `drive_force_limits` may be null (no clamp);

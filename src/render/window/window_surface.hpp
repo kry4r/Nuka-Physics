@@ -50,7 +50,7 @@ struct WindowEvent {
         Resize,         // width/height carry the new client size
         MouseMove,      // mouse_x/mouse_y carry the new position
         MouseButton,    // button + pressed
-        Key,            // key (platform keysym) + pressed
+        Key,            // key (raw keycode) + keysym (resolved) + pressed
         Scroll,         // scroll_delta carries wheel ticks (+up / -down)
     };
     Type     type = Type::None;
@@ -59,7 +59,8 @@ struct WindowEvent {
     int32_t  mouse_x = 0;
     int32_t  mouse_y = 0;
     uint32_t button = 0;     // 0=left, 1=middle, 2=right (xcb button order)
-    uint32_t key = 0;        // platform keysym / keycode
+    uint32_t key = 0;        // RAW platform keycode (evdev hardware code; keymap-dependent)
+    uint32_t keysym = 0;     // resolved X11 keysym (XK_*/XKB_KEY_*); keymap-independent, 0 if unresolved
     bool     pressed = false;
     int32_t  scroll_delta = 0;
 };

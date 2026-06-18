@@ -4,9 +4,17 @@
 
 #include "nk/pipeline/pipeline.hpp"
 
+#include <cassert>
+
+#include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
 
 namespace nuka::nk {
+
+// The per-pair manifold point capacity shared by every narrowphase op. Bound to
+// the manifold struct so the param fields cannot drift from the solver layout.
+inline constexpr uint8_t kMaxContactsPerPair =
+    static_cast<uint8_t>(constraint::ContactManifold::kMaxPoints);
 
 void Pipeline::Build(const Model& model, const SolverConfig& cfg,
                      phi::Device* device) {
@@ -36,28 +44,33 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t env_count        = cap.env_count;
     const uint32_t base_link_count  = cap.links_per_env;
     const uint32_t total_link_count = cap.links_per_env * cap.env_count;
-    // WP1 multi-articulation co-residence: articulation_count == K * env_count
-    // (K == articulations_per_env, the number of co-resident dogs per env). Every
+    // Multi-articulation co-residence: articulation_count == K * env_count (K ==
+    // articulations_per_env, the number of co-resident articulations per env). Every
     // forward kernel already launches dim3(articulation_count) and indexes
     // articulation_link_offset[articulation] / base_pose[articulation] /
     // m[articulation*max_dof^2], so this single scalar generalizes the launch
-    // geometry. At K==1 (the legacy single-robot scene) this equals env_count, so
-    // the launch is byte-identical. max_dof stays cap.dofs_per_env (per-DOG DOF).
+    // geometry. At K==1 (a single-articulation scene) this equals env_count, so the
+    // launch is byte-identical. max_dof stays cap.dofs_per_env (per-articulation DOF).
     const uint32_t articulation_cnt =
         has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
-    // Task 1/2: the per-ARTICULATION contact-slot stride the foot detection, the
-    // dog-dog/body-terrain op, and the FUSED solver all share. The cook sizes
-    // max_contacts_per_env == stride * K, so the stride is the per-K quotient. At
-    // K<=1 this is the legacy kMaxFootContactsPerEnv (4) -> byte-identical layout;
-    // at K>1 it is the grown multi-dog stride (room for feet + body + dog-dog).
+    // The per-ARTICULATION contact-slot stride the contact detection/assembly/solve
+    // share, DATA-DRIVEN from the cooked geometry: the cook sizes max_contacts_per_env
+    // from the collidable count, so the stride is the per-articulation quotient
+    // max_contacts_per_env / K (bounded by kMaxContactsPerArtic). At K<=1 this is
+    // kMaxFootContactsPerEnv (4) -> byte-identical layout; at K>1 it is the grown
+    // per-articulation stride (room for end-effector + body + inter-articulation rows).
     const uint32_t artics_per_env =
         cap.articulations_per_env == 0u ? 1u : cap.articulations_per_env;
+    // Degenerate-cook fallback (max_contacts_per_env < K): the single-articulation
+    // end-effector capacity == kMaxFootContactsPerEnv (defined device-side; named
+    // host-locally here so pipeline.cpp stays a pure-C++ TU).
+    constexpr uint32_t kFallbackContactsPerArtic = 4u;  // == kMaxFootContactsPerEnv
     const uint32_t contact_slots_per_artic =
         (artics_per_env > 0u && cap.max_contacts_per_env >= artics_per_env)
             ? (cap.max_contacts_per_env / artics_per_env)
-            : 4u;
+            : kFallbackContactsPerArtic;
 
     auto add = [&](phi::NkOp op, const void* params) {
         // Capability query (§3.1): with a device, emit only ops the backend
@@ -219,7 +232,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
 
     if (has_collidables) {
         p_np_prim_.contact_margin = cfg.contact_margin;
-        p_np_prim_.max_contacts_per_pair = 4;
+        p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;
         // Go2-on-stairs Phase 1: the SHARED procedural-terrain params. We copy
         // the model's terrain config but PIN terrain.ground_height to the same
@@ -244,19 +257,19 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
         p_np_prim_.particles_per_env = cap.particles_per_env;  // M6 coupling slots.
-        // Task 1 multi-dog feet: route each foot into its OWNING articulation's
-        // fused slot block when K>1 (byte-identical env-keyed at K<=1; the foot
+        // Co-resident end-effector contacts: route each into its OWNING
+        // articulation's slot block when K>1 (byte-identical env-keyed at K<=1; the
         // narrowphase reads link_to_articulation only on the K>1 branch). The
-        // per-artic slot stride is the SHARED runtime value (4 at K<=1).
+        // per-articulation slot stride is the shared data-driven value (4 at K<=1).
         p_np_prim_.articulations_per_env = cap.articulations_per_env;
         p_np_prim_.max_foot_contacts = contact_slots_per_artic;
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
-        // (Multi-body collision — including artic-link<->artic-link "dog-dog" and
+        // (Multi-body collision — including artic-link<->artic-link and
         // body-vs-terrain — runs ENTIRELY on the GENERAL PairDriven path: LBVH
         // broadphase -> cvx GJK/EPA narrowphase + the general heightfield
         // narrowphase below -> mixed-island solve. There is no special-cased
-        // dog_dog op anymore; a robot body is just a physics body on the ONE path.)
+        // op; a robot body is just a physics body on the ONE path.)
 
         // General contact pipeline Phase 2 (H3): the per-cell heightfield
         // midphase. Runs AFTER NarrowphasePrimitives (which left the (convex,
@@ -275,6 +288,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_hf_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
         p_np_hf_.contact_margin = cfg.contact_margin;
+        // NarrowphaseHeightfieldParams carries ONE descriptor; a model with more
+        // than one cooked heightfield would silently drop all but the first.
+        assert(model.heightfields.size() <= 1 &&
+               "pipeline wires a single cooked heightfield; multi-heightfield "
+               "needs a descriptor table in NarrowphaseHeightfieldParams");
         if (!model.heightfields.empty()) {
             const nk::HeightfieldData& hfd = model.heightfields.front();
             p_np_hf_.has_heightfield = 1u;
@@ -294,7 +312,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::NarrowphaseHeightfield, &p_np_hf_);
 
         p_np_sdf_.contact_margin = cfg.contact_margin;
-        p_np_sdf_.max_contacts_per_pair = 4;
+        p_np_sdf_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_sdf_.family = family;          // PairDriven => sample; else no-op.
         p_np_sdf_.env_count = env_count;
         p_np_sdf_.bodies_per_env = cap.bodies_per_env;
@@ -421,8 +439,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // (L1-b: the FUSED-family implicit-damping seed moved to the standalone
         // NkOp::ApplyImplicitDamping op (added after CrbaFactorM above); the
         // solve op no longer carries an apply_implicit_damping knob.)
-        // Task 1/2: the FUSED per-articulation slot stride MUST match the foot /
-        // dog-dog detection (slot_base = articulation * stride). 4 at K<=1.
+        // The per-articulation slot stride MUST match the detection/assembly
+        // (slot_base = articulation * stride). Data-driven; 4 at K<=1.
         p_solve_.contact_slots_per_artic = contact_slots_per_artic;
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
     }

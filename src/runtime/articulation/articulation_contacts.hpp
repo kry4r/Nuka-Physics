@@ -3,9 +3,9 @@
 // nuka::runtime::articulation -- world-pose FK + foot-vs-ground contacts
 // ---------------------------------------------------------------------------
 //
-// p01-F T2. Two GPU passes that together produce the per-step, per-env contact
-// data (which Go2 feet touch a static ground plane, where, how deep) that a
-// later row-assembly task turns into constraint rows.
+// Two GPU passes that together produce the per-step, per-env contact data (which
+// end-effector spheres touch a static ground plane, where, how deep) that a later
+// row-assembly task turns into constraint rows.
 //
 //  (A) UpdateWorldLinkPoses -- forward kinematics. The cooked link_pose in
 //      ArticulationDeviceState is cook-time STATIC (rest pose); the Featherstone
@@ -22,8 +22,8 @@
 //      Output is written to a SEPARATE buffer (not state.link_pose, which is
 //      treated as the static rest pose elsewhere).
 //
-//  (B) DetectFootGroundContacts -- deterministic sphere-vs-plane. The Go2 feet
-//      are spheres on the 4 calf links; the scene has no ground collider, so a
+//  (B) DetectFootGroundContacts -- deterministic sphere-vs-plane. The feet are
+//      spheres on the contact-capable links; the scene has no ground collider, so a
 //      static half-space (z = ground_height, normal +Z) is supplied here. One
 //      thread per env walks its (base-relative) feet in fixed order and compacts
 //      penetrating feet into the env's own fixed-stride output slots. No atomics,
@@ -41,16 +41,23 @@
 
 namespace nuka::runtime::articulation {
 
-// Max foot contacts emitted per environment (Go2 has 4 feet).
+// Compile-time MAX end-effector-vs-ground contacts per environment for the
+// articulated foot path's fixed-stride buffers + on-thread register arrays. This
+// is a CAPACITY ceiling, NOT a robot assumption: the ACTUAL per-env contact count
+// is data-driven (the cooked contact-capable link count, surfaced as the per-world
+// max_contacts_per_env). DetectFootGroundContacts throws LOUDLY when the live
+// foot_count exceeds this ceiling (no silent truncation). The diffsim shared
+// tiles (kkt/ift) size their per-env slot scratch by this same ceiling.
 constexpr uint32_t kMaxFootContactsPerEnv = 4u;
 
-// Task 1/2: the per-ARTICULATION contact-slot stride for a MULTI-DOG (K>1) world.
-// Each co-resident dog needs room in its OWN fused slot block for its 4 feet PLUS
-// body-vs-terrain contacts PLUS dog-dog rows. 12 covers the worst realistic case
-// (4 feet + up to ~6 body links + a couple dog-dog) with margin and stays within
-// the FUSED solver's compile-time register ceiling (kMaxContactsPerArtic). At K<=1
-// the stride collapses to kMaxFootContactsPerEnv (4) so K==1 stays byte-identical.
-constexpr uint32_t kMultiDogContactsPerArtic = 12u;
+// Compile-time MAX per-articulation contact-slot stride for the co-resident (K>1)
+// layout: capacity per articulation for its end-effector + body + inter-articulation
+// contacts. The ACTUAL stride is the data-driven per-world quotient
+// max_contacts_per_env / articulations_per_env (Pipeline::Build), bounded by this
+// ceiling; the launcher's register arrays are sized by it. At K<=1 the live stride
+// collapses to kMaxFootContactsPerEnv so the single-articulation layout is
+// byte-identical. (Kept here + in articulation_types.cuh as the matching cap.)
+constexpr uint32_t kMaxContactsPerArtic = 12u;
 
 // Per-foot static description, expressed in BASE (single-replica) link indices.
 // The detection kernel turns calf_local_link into a per-replica global link via
@@ -225,8 +232,9 @@ void ComputeContactEffectiveMass(cudaStream_t stream, int device_id,
 //  SolveArticulatedContactRowsKernel -- block-per-articulation fused PGS.
 //    Seeds a working joint-velocity vector qdot_work from state.qdot (which at
 //    call time holds qdot_free = the post-velocity-integration joint velocity),
-//    runs kContactSolverIterations sweeps over the rows in fixed order (all
-//    normal rows of the articulation's contacts, then the friction rows), and
+//    runs `solver_iterations` sweeps (default kContactSolverIterations) over the
+//    rows in fixed order (all normal rows of the articulation's contacts, then the
+//    friction rows), and
 //    for each row i:
 //        jv    = dot(J_i, qdot_work)          (over the articulation's dof cols)
 //        delta = m_eff_i * (b_i - jv)         (row_solver.cu:289 convention:
@@ -253,11 +261,13 @@ void ComputeContactEffectiveMass(cudaStream_t stream, int device_id,
 //    cold so two runs are trivially comparable.
 // ---------------------------------------------------------------------------
 
-// PGS sweep count. The normal and friction rows of a bent Go2 leg are strongly
-// coupled (Jn.M^-1.Jt^T is O(1)), which slows Gauss-Seidel; a sticking contact
-// needs ~40 sweeps to drive the tangential foot velocity to ~0. 48 clears that
-// with margin (resting-contact stick residual ~3e-3 m/s) while staying cheap at
-// one block per articulation; fixed count + fixed row order keeps the solve D1.
+// DEFAULT PGS sweep count for the articulated contact solve; the actual count is a
+// per-call runtime argument (SolveArticulatedContactRows' solver_iterations), and
+// the general path carries it per-world via SolverConfig/SolveRowsBlockIslandParams.
+// Strongly-coupled normal/friction rows (Jn.M^-1.Jt^T is O(1)) slow Gauss-Seidel;
+// ~40 sweeps drive a sticking contact's tangential velocity to ~0, 48 clears it with
+// margin while staying cheap at one block per articulation. A fixed count + fixed
+// row order keeps the solve D1.
 constexpr uint32_t kContactSolverIterations = 48u;
 
 // Baumgarte positional-stabilization coefficient (fraction of penetration error
@@ -270,8 +280,12 @@ constexpr float kBaumgarteBeta = 0.2f;
 // contact does not jitter about exactly zero penetration.
 constexpr float kPenetrationSlop = 1.0e-4f;
 
-// Coulomb friction coefficient applied at every foot contact (mu). 0.8 is a
-// typical rubber-on-hard-ground value and matches the Go2 foot material intent.
+// Default-material Coulomb friction (mu) for the articulated contact solve, used
+// only when no per-contact material is supplied. The per-material contract routes
+// the contact's combined shape friction (mat_buckets[mat_index]) into the
+// friction_coefficient parameter below instead. CASCADE (owner: cook): per-foot-
+// link material requires the cook to store the foot link's material and the
+// articulation_contacts.cu caller to pass it; until then this is the fallback.
 constexpr float kContactFriction = 0.8f;
 
 // Constraint-row type tag. kRowJointLimit is scaffolded but never emitted (no
@@ -313,9 +327,9 @@ struct ArticulatedContactRow {
 // articulations within the old cap, so all <=18-DOF results stay byte-identical.
 constexpr uint32_t kMaxArticulationDof = 64u;
 
-// LEGACY 18-DOF cap (6-DOF floating base + 12 revolute = the Go2). The contact
-// solve itself now sizes by kMaxArticulationDof above; this constant remains
-// ONLY for its named consumers whose scratch is genuinely pinned at 18:
+// Diffsim-tile DOF cap (18 = 6-DOF floating base + 12 revolute, e.g. a quadruped).
+// The contact solve itself now sizes by kMaxArticulationDof above; this constant
+// remains ONLY for its named consumers whose scratch is genuinely pinned at 18:
 //   * the ComputedTorque/Osc drive kernels' dense scratch (articulation_drives.cu)
 //     -- which must stay in lockstep with their diffsim adjoint,
 //   * the diffsim KKT/IFT/Osc-adjoint __shared__ tiles (kkt_builder.cu /
@@ -370,12 +384,13 @@ void ComputeContactTangentBasis(cudaStream_t stream, int device_id,
 // persisted impulse buffer, length env_count*kMaxFootContactsPerEnv*3 (normal,
 // tangent1, tangent2 per slot); when null the solve cold-starts at zero. On
 // return it holds this step's converged impulses for the next step's warm start.
-// `friction_coefficient` (default kContactFriction) is the Coulomb mu used by the
-// friction-cone clamp; passing 0 makes the friction rows inert (a frictionless
-// baseline) and a material-specific value will drive per-contact friction in T6.
-// It is a uniform scalar, so threading it preserves D1 determinism.
-// `baumgarte_max_velocity` (default +inf == non-binding, so committed T5 calls
-// are unaffected bit-for-bit) caps the normal-row positional bias at
+// `friction_coefficient` (default kContactFriction == the default-material
+// fallback) is the Coulomb mu used by the friction-cone clamp; passing 0 makes the
+// friction rows inert (a frictionless baseline). Per the per-material contract the
+// caller passes the contact's combined shape friction here. It is a uniform
+// scalar, so threading it preserves D1 determinism.
+// `baumgarte_max_velocity` (default +inf == non-binding, so prior calls are
+// unaffected bit-for-bit) caps the normal-row positional bias at
 // min(kBaumgarteBeta/dt*max(depth-slop,0), baumgarte_max_velocity); a finite
 // tuned value prevents large-penetration one-step velocity transients. It is a
 // uniform scalar applied identically at every normal-row bias site, so it
@@ -398,6 +413,7 @@ void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
                                  uint32_t dof_stride,
                                  float dt,
                                  float* inout_lambda,
+                                 uint32_t solver_iterations = kContactSolverIterations,
                                  float friction_coefficient = kContactFriction,
                                  float baumgarte_max_velocity =
                                      std::numeric_limits<float>::infinity(),

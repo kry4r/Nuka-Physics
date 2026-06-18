@@ -16,8 +16,12 @@
 
 namespace nuka::runtime {
 
+// Standard Earth gravity along the engine's Z-up convention (camera + c_abi all
+// use +Z up). Shared default so no caller hardcodes a Y-up vector.
+inline constexpr math::Vec3 kDefaultGravity = {0.0f, 0.0f, -9.81f};
+
 struct WorldStepOptions {
-    math::Vec3 gravity = {0.0f, -9.81f, 0.0f};
+    math::Vec3 gravity = kDefaultGravity;
     float dt = 1.0f / 60.0f;
     uint32_t step_count = 1;
     bool clear_forces_after_step = true;

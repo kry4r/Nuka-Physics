@@ -272,9 +272,15 @@ struct ValueRep {
     uint64_t Payload()  const { return data & ((1ull << 48) - 1); }
 };
 
-// Crate type enums (crateDataTypes.h) we care about.
-constexpr uint32_t kTypeInt   = 3;   // int
-constexpr uint32_t kTypeVec3f = 24;  // GfVec3f (point3f / normal3f / float3)
+// Crate value-type enums, copied verbatim from the OpenUSD source of truth:
+//   pxr/usd/sdf/crateDataTypes.h  (_SDF_CRATE_DATA_TYPES X-macro list).
+// The numeric IDs are part of the on-disk crate ABI and are STABLE across crate
+// versions (the reader guards crate version >= 0.7; the cup is 0.8.0). They are
+// 1-based in file order: Bool=1, UChar=2, Int=3, ..., Vec3f=24. A future spec
+// only APPENDS new IDs, so these two stay valid; if that ever changes the version
+// guard above (version_minor) is the trip-wire.
+constexpr uint32_t kTypeInt   = 3;   // SdfValueTypeNames->Int  (TypeInt)
+constexpr uint32_t kTypeVec3f = 24;  // SdfValueTypeNames->Float3 (TypeVec3f: point3f/normal3f/float3)
 
 constexpr uint32_t kFieldSetSentinel = 0xFFFFFFFFu;  // default FieldIndex
 

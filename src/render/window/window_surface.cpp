@@ -124,10 +124,12 @@ public:
 
         xcb_map_window(connection_, window_);
         xcb_flush(connection_);
+        FetchKeyboardMapping();  // keycode->keysym table (core xcb, no xcb-keysyms dep)
         valid_ = true;
     }
 
     ~XcbWindowSurface() override {
+        std::free(keymap_reply_);
         if (surface_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
             vkDestroySurfaceKHR(instance_, surface_, nullptr);
         }
@@ -214,7 +216,8 @@ public:
                     const auto* kp = reinterpret_cast<xcb_key_press_event_t*>(event);
                     WindowEvent ev;
                     ev.type = WindowEvent::Type::Key;
-                    ev.key = kp->detail;  // keycode (T3 maps to keysym as needed)
+                    ev.key = kp->detail;  // RAW keycode (kept for any keycode-level consumer)
+                    ev.keysym = ResolveKeysym(kp->detail);  // keymap-independent (XK_*)
                     ev.pressed = (kind == XCB_KEY_PRESS);
                     out.push_back(ev);
                     break;
@@ -250,10 +253,48 @@ public:
     }
 
 private:
+    // Fetch the server's keycode->keysym table ONCE via the core X protocol
+    // (xcb_get_keyboard_mapping). No xcb-keysyms / xkbcommon dependency needed.
+    void FetchKeyboardMapping() {
+        if (connection_ == nullptr) return;
+        const xcb_setup_t* setup = xcb_get_setup(connection_);
+        if (setup == nullptr) return;
+        keycode_min_ = setup->min_keycode;
+        const uint8_t keycode_max = setup->max_keycode;
+        if (keycode_max < keycode_min_) return;
+        // count is a u8 protocol field; (max-min+1) is <=255 for a valid range.
+        const uint32_t span = static_cast<uint32_t>(keycode_max - keycode_min_) + 1u;
+        const uint8_t count = static_cast<uint8_t>(span > 255u ? 255u : span);
+        xcb_get_keyboard_mapping_cookie_t cookie =
+            xcb_get_keyboard_mapping(connection_, keycode_min_, count);
+        keymap_reply_ = xcb_get_keyboard_mapping_reply(connection_, cookie, nullptr);
+        if (keymap_reply_ != nullptr) {
+            keymap_keysyms_ = xcb_get_keyboard_mapping_keysyms(keymap_reply_);
+            keysyms_len_ =
+                static_cast<uint32_t>(xcb_get_keyboard_mapping_keysyms_length(keymap_reply_));
+        }
+    }
+
+    // Resolve a raw keycode to its first (unshifted, group 0) keysym, or 0. The
+    // keysyms are laid out keysyms_per_keycode per code from keycode_min_.
+    uint32_t ResolveKeysym(uint8_t keycode) const {
+        if (keymap_reply_ == nullptr || keymap_keysyms_ == nullptr) return 0u;
+        if (keycode < keycode_min_) return 0u;
+        const uint32_t per = keymap_reply_->keysyms_per_keycode;
+        if (per == 0u) return 0u;
+        const uint32_t index = static_cast<uint32_t>(keycode - keycode_min_) * per;
+        if (index >= keysyms_len_) return 0u;
+        return static_cast<uint32_t>(keymap_keysyms_[index]);
+    }
+
     xcb_connection_t* connection_ = nullptr;
     xcb_screen_t*     screen_     = nullptr;
     xcb_window_t      window_     = 0;
     xcb_atom_t        delete_atom_ = 0;
+    xcb_get_keyboard_mapping_reply_t* keymap_reply_ = nullptr;
+    const xcb_keysym_t* keymap_keysyms_ = nullptr;
+    uint32_t          keysyms_len_ = 0;
+    uint8_t           keycode_min_ = 0;
     VkInstance        instance_   = VK_NULL_HANDLE;
     VkSurfaceKHR      surface_    = VK_NULL_HANDLE;
     uint32_t          width_      = 0;

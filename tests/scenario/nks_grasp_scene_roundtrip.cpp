@@ -1,14 +1,18 @@
 // ---------------------------------------------------------------------------
 // M7 T3 gate: examples/scenes/h1_cup_table.nks roundtrip + content exposure.
 // ---------------------------------------------------------------------------
-// Load the committed union grasp scene (H1 via imports + cup body + table body +
-// the grasp config + initial_state + settle), then:
+// Load the committed scene (H1 via imports + cup body + table body +
+// initial_state + settle), then:
 //   (1) Save the LOADED scene twice and assert the two .nks (and the two .nka)
-//       are BYTE-IDENTICAL -- the existing roundtrip determinism invariant,
-//       extended to the new initial_state/settle/grasp sections (deterministic
-//       key order, lossless float round-trip).
+//       are BYTE-IDENTICAL -- the roundtrip determinism invariant, covering the
+//       initial_state/settle sections (deterministic key order, lossless float
+//       round-trip).
 //   (2) Assert the loaded SceneIR EXPOSES the cup body / table body / expanded
-//       H1 import / grasp config / initial_state / settle.
+//       H1 import / initial_state / settle.
+//
+// FORWARD-COMPAT: the committed .nks still carries a legacy `grasp` block
+// (GraspConfig removed); this fixture proves it still LOADS + re-saves
+// byte-identically with the grasp block silently skipped.
 //
 // This does NOT weaken scene_roundtrip's own equality gates; it is an additive,
 // scene-specific coverage of the M7 sections on a real authored file.
@@ -72,8 +76,9 @@ std::vector<uint8_t> ReadBytes(const fs::path& p) {
 
 }  // namespace
 
-// 1. The committed union grasp scene round-trips byte-identically (incl. the
-//    initial_state / settle / grasp sections + the cup-hull SAMP in the .nka).
+// 1. The committed scene round-trips byte-identically (incl. the
+//    initial_state / settle sections). A legacy `grasp` block in the source
+//    .nks is skipped on Load and never re-emitted, so both saves match.
 TEST(NksGraspSceneRoundtrip, SecondSaveByteIdentical) {
     if (!SceneAvailable()) GTEST_SKIP() << "h1_cup_table.nks / H1 asset missing";
     TempDir tmp;
@@ -90,8 +95,9 @@ TEST(NksGraspSceneRoundtrip, SecondSaveByteIdentical) {
         << ".nka not byte-identical on re-save";
 }
 
-// 2. Load -> Save -> Load yields an IDENTICAL grasp/initial_state/settle (the
+// 2. Load -> Save -> Load yields an IDENTICAL initial_state/settle (the
 //    sections survive a full round-trip, not just a deterministic re-emit).
+//    The legacy grasp block (GraspConfig removed) is skipped on both Loads.
 TEST(NksGraspSceneRoundtrip, MetadataSurvivesReload) {
     if (!SceneAvailable()) GTEST_SKIP() << "h1_cup_table.nks / H1 asset missing";
     TempDir tmp;
@@ -100,22 +106,6 @@ TEST(NksGraspSceneRoundtrip, MetadataSurvivesReload) {
     const fs::path nks1 = tmp.SubFile("run1", "h1_cup_table.nks");
     nks::Save(a, nks1.string());
     const SceneIR b = nks::Load(nks1.string());
-
-    // grasp config
-    ASSERT_TRUE(a.Grasp().present);
-    ASSERT_TRUE(b.Grasp().present);
-    EXPECT_FLOAT_EQ(a.Grasp().finger_mu, b.Grasp().finger_mu);
-    EXPECT_FLOAT_EQ(a.Grasp().table_mu, b.Grasp().table_mu);
-    EXPECT_FLOAT_EQ(a.Grasp().foot_mu, b.Grasp().foot_mu);
-    EXPECT_DOUBLE_EQ(a.Grasp().total_mass, b.Grasp().total_mass);
-    EXPECT_EQ(a.Grasp().dof_stride, b.Grasp().dof_stride);
-    EXPECT_EQ(a.Grasp().cup_hull_verts.size(), b.Grasp().cup_hull_verts.size());
-    EXPECT_EQ(a.Grasp().cup_hull_verts, b.Grasp().cup_hull_verts);
-    EXPECT_EQ(a.Grasp().wrap_spheres.size(), b.Grasp().wrap_spheres.size());
-    EXPECT_EQ(a.Grasp().foot_spheres.size(), b.Grasp().foot_spheres.size());
-    EXPECT_EQ(a.Grasp().grip_links, b.Grasp().grip_links);
-    EXPECT_EQ(a.Grasp().drive_close.size(), b.Grasp().drive_close.size());
-    EXPECT_EQ(a.Grasp().dof_torque_limit, b.Grasp().dof_torque_limit);
 
     // initial_state
     ASSERT_EQ(a.InitialState().count("h1"), 1u);
@@ -131,8 +121,8 @@ TEST(NksGraspSceneRoundtrip, MetadataSurvivesReload) {
 }
 
 // 3. The loaded SceneIR exposes the first-class objects: cup body + table body +
-//    the expanded H1 import + the grasp geometry (30 wrap + 4 foot spheres).
-TEST(NksGraspSceneRoundtrip, ExposesCupTableH1Grasp) {
+//    the expanded H1 import (the legacy grasp geometry block is skipped on Load).
+TEST(NksGraspSceneRoundtrip, ExposesCupTableH1) {
     if (!SceneAvailable()) GTEST_SKIP() << "h1_cup_table.nks / H1 asset missing";
 
     const SceneIR s = nks::Load(kScene);
@@ -158,19 +148,6 @@ TEST(NksGraspSceneRoundtrip, ExposesCupTableH1Grasp) {
     }
     EXPECT_TRUE(cup_shape);
     EXPECT_TRUE(table_shape);
-
-    // The grasp config carries the full factory geometry.
-    ASSERT_TRUE(s.Grasp().present);
-    EXPECT_EQ(s.Grasp().wrap_spheres.size(), 30u);
-    EXPECT_EQ(s.Grasp().foot_spheres.size(), 4u);
-    EXPECT_EQ(s.Grasp().grip_links.size(), 12u);
-    EXPECT_EQ(s.Grasp().dof_stride, 51u);
-    EXPECT_EQ(s.Grasp().base_dof, 6u);
-    EXPECT_GT(s.Grasp().cup_hull_verts.size(), 0u);
-    EXPECT_FLOAT_EQ(s.Grasp().finger_mu, 0.8f);
-    EXPECT_FLOAT_EQ(s.Grasp().table_mu, 0.6f);
-    EXPECT_FLOAT_EQ(s.Grasp().foot_mu, 0.8f);
-    EXPECT_FLOAT_EQ(s.Grasp().cup_scale_xy, 1.8f);
 
     // initial_state + settle present.
     EXPECT_EQ(s.InitialState().count("h1"), 1u);

@@ -26,6 +26,7 @@ namespace nuka::import {
 /// the result can be std::move-assigned straight into a shape record.
 struct MeshGeometry {
     std::vector<float>    vertices;  // x,y,z triples (file order, no dedup)
+    std::vector<float>    normals;   // x,y,z per-vertex normals, 1:1 with vertices (may be empty)
     std::vector<uint32_t> indices;   // triangle indices (3 per triangle)
 
     /// Number of vertices (vertices.size() / 3).

@@ -24,7 +24,7 @@
 #include "scene/ecs/entity.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
-#include "scene/scene_metadata.hpp"     // SceneInitialState, GraspConfig
+#include "scene/scene_metadata.hpp"     // SceneInitialState
 #include "math/transform.hpp"
 
 #include <memory>
@@ -72,6 +72,10 @@ struct CollisionShapeRecord {
     uint32_t      decompose_max_pieces     = 32;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
+    // Authored per-vertex normals (x,y,z triples, 1:1 with mesh_vertices in
+    // declaration order; empty => none). Threaded to the .nka MESH normals
+    // stream by SaveShape; empty keeps the cooked .nka byte-identical.
+    std::vector<float>    mesh_normals;
 
     // -- Visual-mesh asset reference (M8.5 T5: the visual-mesh cook) ---------
     // For a VISUAL-only geom (contype==0 && conaffinity==0) carrying triangle
@@ -283,18 +287,15 @@ public:
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
     // -- authored scene METADATA (M7: not cook-fidelity records) -------------
-    // The per-articulation settled IC (initial_state, R4-baked), the
-    // deterministic-settle directive (settle), and the union GRASP config block
-    // (the externalized factory constants). Persisted by .nks Save/Load (T3),
-    // consumed by the union-slot cook (T4). NOT part of the facade (the tree /
+    // The per-articulation settled IC (initial_state, R4-baked) and the
+    // deterministic-settle directive (settle). Persisted by .nks Save/Load,
+    // consumed by the cook (IC seed). NOT part of the facade (the tree /
     // Registry / cook are unaffected): plain authoring data copied verbatim by
     // the copy ctor / assignment. Mutable access does NOT mark the facade dirty.
     const SceneInitialState&     InitialState() const { return initial_state_; }
     SceneInitialState&           InitialStateMut() { return initial_state_; }
     const cook::SettleSpec&      Settle() const { return settle_; }
     cook::SettleSpec&            SettleMut() { return settle_; }
-    const GraspConfig&           Grasp() const { return grasp_; }
-    GraspConfig&                 GraspMut() { return grasp_; }
 
     // -- facade: structural world (M2b) -------------------------------------
     // The scene TREE and the ECS Registry built by the Add* write-through. The
@@ -345,7 +346,6 @@ private:
     // -- authored metadata (M7; not facade-derived, copied verbatim) --------
     SceneInitialState  initial_state_;
     cook::SettleSpec   settle_;
-    GraspConfig        grasp_;
 
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;

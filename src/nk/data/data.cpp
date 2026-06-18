@@ -188,8 +188,12 @@ bool Data::Snapshot() {
         }
     }
     if (span == 0) {
-        snapshot_persistent_.assign(256, 0u);  // empty-but-allocated marker.
-        phi::BufferDownload(p, snapshot_persistent_.data(), 0, 256);
+        // An empty Persistent arena is still allocated at the arena alignment
+        // (Arena::Allocate rounds 0 up to kAlign); download exactly that span.
+        constexpr uint64_t kEmptyArenaSnapshotBytes = 256;
+        snapshot_persistent_.assign(kEmptyArenaSnapshotBytes, 0u);
+        phi::BufferDownload(p, snapshot_persistent_.data(), 0,
+                            kEmptyArenaSnapshotBytes);
         return true;
     }
     snapshot_persistent_.assign(span, 0u);

@@ -343,7 +343,7 @@ struct SyntheticArticulation {
 
         articulation::ArticulationDeviceState st = State();
         diffsim::LaunchOscAdjointGainTarget(
-            context, context_dev, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, /*task_dim=*/3u, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
@@ -613,7 +613,7 @@ struct RevoluteArticulation {
 
         articulation::ArticulationDeviceState st = State();
         diffsim::LaunchOscAdjointGainTarget(
-            context, context_dev, st, kMaxDof, kTaskLink,
+            context, context_dev, st, kMaxDof, /*task_dim=*/kNdof, kTaskLink,
             static_cast<const float*>(minv_dev.Data()),
             static_cast<const float*>(target_dev.Data()),
             static_cast<const float*>(stiff_dev.Data()),
@@ -924,7 +924,7 @@ TEST(OscAdjoint, Go2EngineStateSmoke) {
 
     articulation::ArticulationDeviceState st = device.View();
     diffsim::LaunchOscAdjointGainTarget(
-        context, context_dev, st, max_dof, task_link,
+        context, context_dev, st, max_dof, /*task_dim=*/3u, task_link,
         static_cast<const float*>(minv_dev.Data()),
         static_cast<const float*>(tgt_dev.Data()),
         static_cast<const float*>(stiff_dev.Data()),

@@ -53,13 +53,33 @@ struct ContactPoint {
     float solref_dampratio   = 1.0f;     // NEW (C3a): solref[1]
 };
 
+// Named MuJoCo solimp params (dmin,dmax,width,mid,power), replacing the bare
+// solimp[5] positional convention. Standard-layout: the 5 contiguous floats
+// decay to a const float* / float* and index via operator[], so existing
+// solimp[i] readers and the ComputeCompliantRow(const float solimp[5]) call site
+// are unchanged.
+struct SolImp {
+    float dmin  = 0.9f;
+    float dmax  = 0.95f;
+    float width = 0.001f;
+    float mid   = 0.5f;
+    float power = 2.0f;
+
+    NUKA_MANIFOLD_HD float& operator[](unsigned i) { return (&dmin)[i]; }
+    NUKA_MANIFOLD_HD float operator[](unsigned i) const { return (&dmin)[i]; }
+    NUKA_MANIFOLD_HD operator float*() { return &dmin; }
+    NUKA_MANIFOLD_HD operator const float*() const { return &dmin; }
+};
+
 struct ContactManifold {
     CollidableRef a;                     // NEW (C3a): was uint32 body_a (rigid case: a.handle)
     CollidableRef b;                     // NEW (C3a): was uint32 body_b (rigid case: b.handle)
     uint32_t point_count = 0;
     float friction       = 0.5f;         // merged (elementwise-max), isotropic μ
     float restitution    = 0.0f;
-    float solimp[5]      = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f}; // NEW (C3a): dmin,dmax,width,mid,power
+    SolImp solimp;                       // NEW (C3a): named dmin,dmax,width,mid,power
+    float margin = 0.0f;                 // NEW (C5c): merged detection margin (max of sides)
+    float gap    = 0.0f;                 // NEW (C5c): merged unforced gap (max of sides)
     uint64_t manifold_key = 0u;          // NEW (C3a): (min,max handle)+type, D1 sort key
 
     static constexpr uint32_t kMaxPoints = 4;   // KEEP 4: D1-friendly + matches MuJoCo face-clip ≤4
@@ -91,11 +111,9 @@ struct ContactManifold {
         point_count = 0;
         friction = 0.5f;
         restitution = 0.0f;
-        solimp[0] = 0.9f;
-        solimp[1] = 0.95f;
-        solimp[2] = 0.001f;
-        solimp[3] = 0.5f;
-        solimp[4] = 2.0f;
+        solimp = SolImp{};
+        margin = 0.0f;
+        gap = 0.0f;
         manifold_key = 0u;
         for (uint32_t i = 0u; i < kMaxPoints; ++i) {
             points[i] = ContactPoint{};

@@ -183,11 +183,26 @@ struct ModelShape {
     uint32_t         sdf_index = ~uint32_t(0);
 };
 
-// A physics-material bucket row (8 floats: μs, μd, restitution, compliant_k,
-// compliant_d, density, sdf_cell_size, reserved). The mat_buckets device field
-// is num_buckets x 8 floats (plan §3.3 example).
+// Named lanes of a physics-material bucket row (the per-shape contact contract).
+// Positional indices into ModelMaterialBucket::values; kBucketSlotCount is the
+// row width (mat_buckets device field = num_buckets x kBucketSlotCount, plan §3.3).
+enum BucketSlot : uint32_t {
+    kBucketStaticMu    = 0u,  // static friction μs
+    kBucketDynamicMu   = 1u,  // dynamic friction μd
+    kBucketRestitution = 2u,  // restitution (cooked from the authored material)
+    kBucketTimeconst   = 3u,  // solref[0] (contact timeconst)
+    kBucketDampratio   = 4u,  // solref[1] (contact dampratio)
+    kBucketDensity     = 5u,  // material density
+    kBucketMargin      = 6u,  // contact margin
+    kBucketReserved    = 7u,  // reserved lane
+    kBucketSlotCount   = 8u,  // row width (== values[] extent)
+};
+
+// A physics-material bucket row (kBucketSlotCount floats; lanes named by
+// BucketSlot). The mat_buckets device field is num_buckets x kBucketSlotCount.
 struct ModelMaterialBucket {
-    float values[8] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
+    static constexpr uint32_t kValueCount = kBucketSlotCount;  // floats per row.
+    float values[kValueCount] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
 };
 
 // ---------------------------------------------------------------------------

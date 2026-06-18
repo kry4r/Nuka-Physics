@@ -83,6 +83,8 @@ struct ResolvedShape {
     int32_t priority  = 0;
     float   solmix    = 1.0f;
     uint32_t condim   = 3u;
+    float   margin    = 0.0f;   // detection inflation; merged = max(a,b)
+    float   gap        = 0.0f;  // unforced gap within margin; merged = max(a,b)
 };
 
 // Resolver: CollidableRef -> ResolvedShape. Returns false if the side has no

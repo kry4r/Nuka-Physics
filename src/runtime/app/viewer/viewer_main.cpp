@@ -20,8 +20,8 @@
 // the untouched D1 oracle. Host-download pose is fine for M8.5 (interop = M11).
 //
 // HEADLESS-SAFE: the whole loop runs under Xvfb (the present substrate is T2-/
-// vkcube-proven there). A frame budget + an optional presented-frame PPM dump make
-// it CI-runnable for a few frames without a human at the window.
+// vkcube-proven there). A frame budget (--frames / NUKA_VIEWER_FRAMES) makes it
+// CI-runnable for a few frames without a human at the window.
 //
 // GATING: this exe is built ONLY when NK_BUILD_VULKAN_VALIDATION is ON (D3); the
 // default build-cuda128 config never sees it (opt-in, like the recorder).
@@ -80,7 +80,8 @@ namespace render = nuka::render;
 namespace window = nuka::render::window;
 namespace cook = nuka::scene::cook;
 
-constexpr const char* kDefaultNks = "examples/scenes/h1_cup_table.nks";
+// Default physics timestep when neither --dt nor a scene override is supplied.
+constexpr float kDefaultDt = 1.0f / 240.0f;
 
 // Strip shape mesh geometry so CookToModel skips the heavy V-HACD pass (the
 // viewer validates the LIVE loop, not collision-hull fidelity -- same trick the
@@ -95,9 +96,9 @@ nuka::scene::SceneIR LoadLightScene(const std::string& path) {
     return scene;
 }
 
-nk::Pipeline::SolverConfig DefaultCfg() {
+nk::Pipeline::SolverConfig DefaultCfg(float dt) {
     nk::Pipeline::SolverConfig cfg;
-    cfg.dt = 1.0f / 240.0f;
+    cfg.dt = dt;
     cfg.gravity[0] = 0.0f;
     cfg.gravity[1] = 0.0f;
     cfg.gravity[2] = -9.81f;
@@ -222,22 +223,31 @@ uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w,
 }  // namespace
 
 int main(int argc, char** argv) {
-    // ---- args: scene path, frame budget (0 = run until close), PPM dump path ---
-    std::string scene_path = kDefaultNks;
+    // ---- args: scene path (REQUIRED), frame budget (0 = run until close), dt ----
+    std::string scene_path;          // no default scene -> require --scene.
     int max_frames = 0;  // 0 -> run until the window closes (interactive).
-    std::string ppm_path;
+    float dt = kDefaultDt;           // overridable physics timestep (--dt).
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
-        else if (a == "--ppm" && i + 1 < argc) ppm_path = argv[++i];
+        else if (a == "--dt" && i + 1 < argc) dt = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--help") {
-            std::printf("usage: nuka_viewer [--scene <.nks>] [--frames N] [--ppm <out.ppm>]\n");
+            std::printf("usage: nuka_viewer --scene <.nks> [--frames N] [--dt SECONDS]\n");
             return 0;
         }
     }
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) max_frames = std::atoi(env);
 
+    if (scene_path.empty()) {
+        std::fprintf(stderr, "[nuka_viewer] no scene: pass --scene <.nks> "
+                             "(see --help)\n");
+        return 2;
+    }
+    if (!(dt > 0.0f)) {
+        std::fprintf(stderr, "[nuka_viewer] invalid --dt %g (must be > 0)\n", dt);
+        return 2;
+    }
     if (!std::filesystem::exists(scene_path)) {
         std::fprintf(stderr, "[nuka_viewer] scene not found: %s\n", scene_path.c_str());
         return 2;
@@ -255,7 +265,7 @@ int main(int argc, char** argv) {
         render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
 
     const nk::ModelCapacities caps = cooked.model.capacities;  // copy BEFORE move.
-    nk::World world(std::move(cooked.model), 1u, dev, backend, DefaultCfg());
+    nk::World world(std::move(cooked.model), 1u, dev, backend, DefaultCfg(dt));
     if (!world.Ready()) { std::fprintf(stderr, "[nuka_viewer] world not ready\n"); return 4; }
 
     app::HostDownloadPublisher publisher;
@@ -400,11 +410,11 @@ int main(int argc, char** argv) {
     bool last_step_healthy = true;
     const auto frame_budget = std::chrono::duration<double>(1.0 / 60.0);
 
-    // VIEW-3/4: picker + drag state. Ctrl is tracked by raw evdev keycode (37/105),
-    // matching camera_controller's Shift handling -- the OD-8 keysyms caveat applies
-    // (raw keycodes are keymap-dependent; documented, blocks no gate).
-    constexpr uint32_t kKeyCtrlL = 37u;
-    constexpr uint32_t kKeyCtrlR = 105u;
+    // VIEW-3/4: picker + drag state. Ctrl is tracked by RESOLVED keysym (keymap-
+    // independent), matching camera_controller's Shift handling. The window backend
+    // resolves keycode->keysym; we compare XKB_KEY_*/XK_* protocol values.
+    constexpr uint32_t kKeyCtrlL = 0xffe3u;  // XKB_KEY_Control_L / XK_Control_L
+    constexpr uint32_t kKeyCtrlR = 0xffe4u;  // XKB_KEY_Control_R / XK_Control_R
     bool     ctrl_down = false;
     uint32_t drag_inst = ~0u;          // the instance being dragged (~0u == none)
     float    last_mouse_x = 0.0f;
@@ -435,7 +445,7 @@ int main(int argc, char** argv) {
                     io.AddMouseWheelEvent(0.0f, static_cast<float>(ev.scroll_delta));
                     break;
                 case window::WindowEvent::Type::Key:
-                    if (ev.key == kKeyCtrlL || ev.key == kKeyCtrlR) ctrl_down = ev.pressed;
+                    if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
                     break;
                 default:
                     break;
@@ -499,10 +509,10 @@ int main(int argc, char** argv) {
 
         // -- timing -------------------------------------------------------------
         const auto now = Clock::now();
-        const double dt = std::chrono::duration<double>(now - prev).count();
+        const double frame_dt = std::chrono::duration<double>(now - prev).count();
         prev = now;
-        if (dt > 0.0) {
-            const double inst_fps = 1.0 / dt;
+        if (frame_dt > 0.0) {
+            const double inst_fps = 1.0 / frame_dt;
             fps_ema = (fps_ema == 0.0) ? inst_fps : (fps_ema * 0.9 + inst_fps * 0.1);
         }
 
@@ -654,8 +664,5 @@ int main(int argc, char** argv) {
     std::printf("[nuka_viewer] done: frames=%llu presented=%d last_step_healthy=%s\n",
                 static_cast<unsigned long long>(frame_index), presented,
                 last_step_healthy ? "yes" : "no");
-    (void)ppm_path;  // presented-frame readback is a present-path extension (the
-                     // PresentRenderer is present-only); GATE-B dumps the composited
-                     // PPM from the offscreen path instead (deterministic + portable).
     return 0;
 }

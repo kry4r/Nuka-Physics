@@ -84,6 +84,12 @@ constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
 // DEEPEST candidates if the cap is hit (deterministic, never UB).
 constexpr int kMaxCand = 32;
 
+// Solid-back-face extrusion pad ADDED below the field z-span so each prism is
+// solid down to (and past) the field floor — a body never tunnels the back. A
+// metre suits human/robot-scale scenes; FLAG: promote to a per-scene
+// NarrowphaseHeightfieldParams field for micro- / macro-scale cooks.
+constexpr float kHeightfieldPrismExtrudePad = 1.0f;
+
 // One contact candidate (world position + world normal + depth), kept per point
 // so tread + riser normals both survive the reduction.
 struct Cand {
@@ -256,6 +262,58 @@ __device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Ve
     *out_nrm = n;             // separation dir for the sphere (side a == convex)
     *out_pen = radius - s;    // > 0 (s <= radius checked above)
     return true;
+}
+
+// NAMED sphere-vs-heightfield-cell handler (the symmetric counterpart of the
+// general cvx prism path). Sphere is the ONE shape whose CSO curvature trips
+// cvx::SphereHull's EPA shallow-penetration dead band on a prism's internal
+// triangulation edge (a spurious near-horizontal normal), so it takes the
+// FACE-ONLY contact instead. FLAG: this is a MAINTAINED two-path split keyed on
+// kKindSphere — the durable fix is cvx::SphereHull EPA shallow-penetration
+// robustness (convex_narrowphase.hpp, not owned here); once general, delete this
+// handler + its keyed dispatch. Extracted (not inlined) so the divergence is
+// named + symmetric with the prism path, per the L1 cleanup note.
+__device__ void SphereHeightfieldTri(const amf::PrimParams& cprim,
+                                     const amf::PrimFrame& hf_frame,
+                                     const Vec3 tv[3], ContactManifold* m) {
+    const Vec3 wa = hf_frame.LocalToWorld(tv[0]);
+    const Vec3 wb = hf_frame.LocalToWorld(tv[1]);
+    const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
+    Vec3 cpos, cnrm;
+    float cpen;
+    if (SphereTriangleFace(cprim.frame.t, cprim.radius, wa, wb, wc,
+                           &cpos, &cnrm, &cpen)) {
+        ::nuka::constraint::ContactPoint pt;
+        pt.position = cpos;
+        pt.normal = cnrm;       // sep dir for side a (the convex/foot)
+        pt.penetration = cpen;
+        pt.stable_key = 0ull;
+        m->AddPoint(pt);
+    }
+}
+
+// NAMED convex(box/capsule/hull)-vs-heightfield-cell handler: the GENERAL cvx
+// GJK/EPA path (robust for flat-faced supports). Builds the cell triangle's
+// downward-solid prism and runs cvx::ConvexNarrowphase (convex A, prism B).
+__device__ void PrismCvxTri(const cvx::SupportProxy& conv_proxy,
+                            const amf::PrimFrame& hf_frame, const Vec3 tv[3],
+                            float extrude, ContactManifold* m) {
+    float prism_verts[9];
+    prism_verts[0] = tv[0].x; prism_verts[1] = tv[0].y; prism_verts[2] = tv[0].z;
+    prism_verts[3] = tv[1].x; prism_verts[4] = tv[1].y; prism_verts[5] = tv[1].z;
+    prism_verts[6] = tv[2].x; prism_verts[7] = tv[2].y; prism_verts[8] = tv[2].z;
+    cvx::ConvexHullView prism;
+    prism.verts = prism_verts;
+    prism.vcount = 3u;
+    prism.frame = hf_frame;
+    prism.extrude = extrude;
+    prism.warp_lockstep = false;
+    cvx::SupportProxy prism_proxy;
+    prism_proxy.kind = cvx::SupportKind::TrianglePrism;
+    prism_proxy.hull = &prism;
+    // Convex first (A), prism second (B): the manifold normal is the separation
+    // dir for A (the convex). Side a == convex, side b == the static heightfield.
+    cvx::ConvexNarrowphase(conv_proxy, prism_proxy, m);
 }
 
 // Add the contact points of a manifold into the candidate buffer (each point
@@ -463,7 +521,8 @@ __global__ void NarrowphaseHeightfieldKernel(
     int ncand = 0;
     // Solid -Z extrusion depth: through the whole field z-span + a fixed pad so
     // the prism is solid down to the field floor (a body never tunnels the back).
-    const float extrude = (range > 0.0f ? range : 0.0f) + 1.0f;
+    const float extrude =
+        (range > 0.0f ? range : 0.0f) + kHeightfieldPrismExtrudePad;
 
     for (int r = r_lo; r <= r_hi; ++r) {
         for (int c = c_lo; c <= c_hi; ++c) {
@@ -490,57 +549,14 @@ __global__ void NarrowphaseHeightfieldKernel(
                 else          { tv[0] = p00; tv[1] = p11; tv[2] = p01; }
                 ContactManifold m;
                 const uint32_t feat_base = (cell_idx * 2u + static_cast<uint32_t>(sub)) * 4u;
+                // Symmetric named dispatch: sphere takes the face-only handler (the
+                // maintained EPA-shallow-penetration workaround, see SphereHeightfieldTri);
+                // box/capsule/hull take the general cvx prism path. Both write the
+                // separation-dir-for-A manifold AccumManifold consumes.
                 if (conv_sh.kind == kKindSphere) {
-                    // ROBUST shallow sphere-vs-heightfield. A sphere is the one
-                    // analytic-support shape whose CSO curvature breaks EPA's shallow-
-                    // penetration monotonicity (the documented detect->drop->detect
-                    // dead band ~1-1.4mm; see cvx::SphereHull) -- on a FLAT field that
-                    // DROPPED a resting foot (3 contacts vs the analytic 4). But a
-                    // closest-point query (EPA or SphereHull) on a per-triangle prism
-                    // returns the INTERNAL triangulation EDGE as the closest feature
-                    // for a shallow-resting sphere, whose near-HORIZONTAL normal kicks
-                    // the foot sideways (3.45 rad). A heightfield's internal coplanar
-                    // edges are not real geometric edges, so we take the FACE-ONLY
-                    // contact: emit iff the center projects INSIDE this triangle, with
-                    // the true face normal. On flat this is EXACTLY the analytic
-                    // vertical-support contact; on a riser the steep face gives the
-                    // correct near-horizontal normal. Box/capsule/hull keep the EPA
-                    // path below (EPA is robust for flat-faced supports).
-                    const Vec3 wa = hf_frame.LocalToWorld(tv[0]);
-                    const Vec3 wb = hf_frame.LocalToWorld(tv[1]);
-                    const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
-                    Vec3 cpos, cnrm;
-                    float cpen;
-                    if (SphereTriangleFace(cprim.frame.t, cprim.radius, wa, wb, wc,
-                                           &cpos, &cnrm, &cpen)) {
-                        ::nuka::constraint::ContactPoint pt;
-                        pt.position = cpos;
-                        pt.normal = cnrm;       // sep dir for side a (the convex/foot)
-                        pt.penetration = cpen;
-                        pt.stable_key = 0ull;
-                        m.AddPoint(pt);
-                    }
+                    SphereHeightfieldTri(cprim, hf_frame, tv, &m);
                 } else {
-                    // Build the prism ConvexHullView: 3 LOCAL verts, heightfield world
-                    // frame, -Z extrude. cvx transforms verts via frame.LocalToWorld.
-                    float prism_verts[9];
-                    prism_verts[0] = tv[0].x; prism_verts[1] = tv[0].y; prism_verts[2] = tv[0].z;
-                    prism_verts[3] = tv[1].x; prism_verts[4] = tv[1].y; prism_verts[5] = tv[1].z;
-                    prism_verts[6] = tv[2].x; prism_verts[7] = tv[2].y; prism_verts[8] = tv[2].z;
-                    cvx::ConvexHullView prism;
-                    prism.verts = prism_verts;
-                    prism.vcount = 3u;
-                    prism.frame = hf_frame;
-                    prism.extrude = extrude;
-                    prism.warp_lockstep = false;
-                    cvx::SupportProxy prism_proxy;
-                    prism_proxy.kind = cvx::SupportKind::TrianglePrism;
-                    prism_proxy.hull = &prism;
-                    // Convex side first (A), prism second (B): the manifold normal is
-                    // the separation dir for A (the convex). Side a == convex, side b
-                    // == the static heightfield -> the assembly scatters reaction into
-                    // the convex only (the heightfield is body_id == -1).
-                    cvx::ConvexNarrowphase(conv_proxy, prism_proxy, &m);
+                    PrismCvxTri(conv_proxy, hf_frame, tv, extrude, &m);
                 }
                 AccumManifold(m, feat_base, cand, &ncand);
             }

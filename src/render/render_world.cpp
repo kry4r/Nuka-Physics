@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace nuka::render {
@@ -355,16 +356,17 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     // and (b) is frequently the WRONG size (e.g. a go2 foot's collision box is a
     // 1m cube) -- so they read as oversized white blobs occluding the model.
     //
-    // Rule (M8.5 beauty pass): render collision-shape primitives ONLY when the
-    // scene produced NO real visual-mesh geometry (a pure-collision / synthetic
-    // scene, e.g. the h1_cup_table light scene whose VisualMeshComponents carry
-    // EMPTY .nka refs, or the gates' primitive worlds -- those still show their
-    // collision geometry). Once >=1 visual mesh resolves to real triangles, the
-    // collision proxies are suppressed so the real geometry stands alone. The
-    // counter below is filled by the visual-mesh loop (a component existing is NOT
-    // enough -- its MESH ref must actually load), so a no-mesh light scene keeps
-    // its collision render and the parity/smoke gates are unperturbed.
-    uint32_t loaded_visual_meshes = 0u;
+    // Rule (M8.5 beauty pass): render an entity's collision-shape primitive ONLY
+    // when THAT entity produced no real visual-mesh geometry. A mesh's collision
+    // proxy is redundant geometry that (a) double-draws over the real mesh with the
+    // flat default-grey material, and (b) is frequently the WRONG size (a go2 foot's
+    // collision box is a 1m cube) -- so it reads as an oversized blob occluding the
+    // model. The decision is PER-ENTITY (not scene-wide): a mixed scene's mesh-free
+    // primitive entities keep their proxies even when other entities have meshes.
+    // The set is filled by the visual-mesh loop (a component existing is NOT enough
+    // -- its MESH ref must actually load), so a no-mesh light scene keeps its
+    // collision render and the parity/smoke gates are unperturbed.
+    std::unordered_set<scene::EntityId, scene::EntityIdHash> has_visual_mesh;
 
     // -- emit one RenderInstance per renderable entity -----------------------
     auto build_common = [&](scene::EntityId e, uint32_t mesh_id, uint32_t material_id) {
@@ -403,23 +405,32 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                     // Still asset-gated / non-renderable: skip (no misleading cube).
                     return;
                 }
+                // Slot semantics are kind-specific (see VisualMeshComponent doc):
+                // sphere(r) / capsule(r,half_height) / box|plane(hx,hy,hz). Name the
+                // slots per-branch so no caller reads the wrong index silently.
                 uint32_t prim_mesh_id;
-                const float p0 = vis.prim_params[0], p1 = vis.prim_params[1],
-                            p2 = vis.prim_params[2];
                 switch (vis.prim_kind) {
                     case PK::Box:
-                    case PK::Plane:
+                    case PK::Plane: {
+                        const float hx = vis.prim_params[0], hy = vis.prim_params[1],
+                                    hz = vis.prim_params[2];
                         prim_mesh_id = world.meshes.InternPrimitive(
-                            PrimKey("vbox", p0, p1, p2), [&]() { return MakeBox(p0, p1, p2); });
+                            PrimKey("vbox", hx, hy, hz), [&]() { return MakeBox(hx, hy, hz); });
                         break;
-                    case PK::Sphere:
+                    }
+                    case PK::Sphere: {
+                        const float r = vis.prim_params[0];
                         prim_mesh_id = world.meshes.InternPrimitive(
-                            PrimKey("vsphere", p0, 0, 0), [&]() { return MakeSphere(p0); });
+                            PrimKey("vsphere", r, 0, 0), [&]() { return MakeSphere(r); });
                         break;
-                    case PK::Capsule:
+                    }
+                    case PK::Capsule: {
+                        const float r = vis.prim_params[0], half_height = vis.prim_params[1];
                         prim_mesh_id = world.meshes.InternPrimitive(
-                            PrimKey("vcapsule", p0, p1, 0), [&]() { return MakeCapsule(p0, p1); });
+                            PrimKey("vcapsule", r, half_height, 0),
+                            [&]() { return MakeCapsule(r, half_height); });
                         break;
+                    }
                     default:
                         return;
                 }
@@ -435,19 +446,19 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 return FromNkaMesh(scene::DecodeMesh(
                     file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
             });
-            ++loaded_visual_meshes;  // a real mesh resolved -> suppress collision proxies
+            has_visual_mesh.insert(e);  // this ENTITY's collision proxy is now redundant
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // CollisionShapeComponent entities -> primitive tessellation fallback. Only
-    // emitted when NO real visual mesh loaded (loaded_visual_meshes == 0; otherwise
-    // the visual meshes ARE the appearance and the collision proxies are redundant
-    // / wrong-sized occluders). box/sphere/capsule tessellate from their params;
+    // CollisionShapeComponent entities -> primitive tessellation fallback. Emitted
+    // PER-ENTITY only when THAT entity loaded no real visual mesh (otherwise its
+    // visual mesh IS the appearance and its collision proxy is a redundant /
+    // wrong-sized occluder). box/sphere/capsule tessellate from their params;
     // hull/SDF kinds carry no host geometry and are SKIPPED (no oversized box).
     using CK = scene::CollisionShapeComponent::Kind;
-    if (loaded_visual_meshes == 0u)
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
+            if (has_visual_mesh.count(e)) return;  // this entity already drew its mesh
             uint32_t mesh_id;
             switch (cs.kind) {
                 case CK::Box:

@@ -17,14 +17,16 @@ SensorPacket BuildTestImuPacket() {
     return pkt;
 }
 
-SensorPacket QueryImuSensor(const runtime::rigid::BodyState& body) {
+SensorPacket QueryImuSensor(const runtime::rigid::BodyState& body,
+                            math::Vec3 gravity) {
     SensorPacket pkt;
     pkt.has_linear_acceleration = true;
     pkt.has_angular_velocity    = true;
     pkt.has_position            = true;
 
-    // Linear acceleration = force * inv_mass  (simplified; gravity not added)
-    pkt.linear_acceleration = body.force * body.inv_mass;
+    // Accelerometer specific force: applied force minus gravity (reads +g up at
+    // rest). Gravity bypasses body.force in the integrator, so subtract it here.
+    pkt.linear_acceleration = body.force * body.inv_mass - gravity;
     pkt.angular_velocity    = body.angular_velocity;
     pkt.position            = body.position;
     return pkt;

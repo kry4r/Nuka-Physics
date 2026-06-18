@@ -134,7 +134,8 @@ bool World::SeedInitialState() {
     // World::GetData().UploadField(FieldId::EnvTerrainType, ...). The field is
     // Persistent so it round-trips Reset (the construction-time snapshot).
     {
-        std::vector<uint32_t> terrain_type(E, 0u);  // 0 == kTerrainFlat
+        std::vector<uint32_t> terrain_type(
+            E, static_cast<uint32_t>(nuka::terrain::kTerrainFlat));
         if (!data_.UploadField(FieldId::EnvTerrainType, terrain_type.data(),
                                terrain_type.size() * sizeof(uint32_t))) {
             return false;
@@ -275,13 +276,16 @@ bool World::SeedInitialState() {
         return false;
     }
     if (!a.initial_link_velocity.empty()) {
-        std::vector<float> host(static_cast<size_t>(L) * E * 6u, 0.0f);
+        // Spatial-vector element count, derived from the Spatial6 layout so the
+        // per-link stride cannot drift from the field type.
+        constexpr size_t kSpatialDim = sizeof(Spatial6) / sizeof(float);
+        std::vector<float> host(static_cast<size_t>(L) * E * kSpatialDim, 0.0f);
         for (uint32_t e = 0; e < E; ++e) {
             for (uint32_t l = 0; l < L; ++l) {
-                for (uint32_t k = 0; k < 6u; ++k) {
-                    const size_t src = static_cast<size_t>(l) * 6u + k;
+                for (size_t k = 0; k < kSpatialDim; ++k) {
+                    const size_t src = static_cast<size_t>(l) * kSpatialDim + k;
                     if (src < a.initial_link_velocity.size()) {
-                        host[(static_cast<size_t>(e) * L + l) * 6u + k] =
+                        host[(static_cast<size_t>(e) * L + l) * kSpatialDim + k] =
                             a.initial_link_velocity[src];
                     }
                 }

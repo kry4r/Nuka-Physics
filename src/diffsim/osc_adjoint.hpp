@@ -73,16 +73,22 @@ namespace nuka::diffsim {
 
 namespace articulation = nuka::runtime::articulation;
 
+// Named ceiling on the OSC task dimension (headroom for a future 6-DOF pose task).
+// The on-thread adjoint scratch (A[kMaxOscTaskDim^2], MinvJt rows) is sized by this;
+// the RUNTIME task_dim passed to the launcher must satisfy 1 <= task_dim <=
+// kMaxOscTaskDim or the launcher throws LOUDLY (never a silent clamp).
+inline constexpr uint32_t kMaxOscTaskDim = 6u;
+
 // Output param-gradient buffers for the OSC adjoint. The caller owns these; they
 // must be sized for `articulation_count` articulations (grad_kp / grad_kd:
-// 1 float each; grad_target: 3 floats each, env-major like the forward's
+// 1 float each; grad_target: `task_dim` floats each, env-major like the forward's
 // task_target). This is the clean callable the diff-sim parameter spine consumes
 // (mirrors how StepBackwardGrads / the tape's grad_parameters_out slot expose
 // param gradients); C-ABI wiring is intentionally NOT done this round.
 struct OscAdjointParamGrads {
-    float* grad_kp = nullptr;      // float[articulation_count]   dL/dKp per articulation
-    float* grad_kd = nullptr;      // float[articulation_count]   dL/dKd per articulation
-    float* grad_target = nullptr;  // float[articulation_count*3] dL/dx_target (env-major)
+    float* grad_kp = nullptr;      // float[articulation_count]          dL/dKp per articulation
+    float* grad_kd = nullptr;      // float[articulation_count]          dL/dKd per articulation
+    float* grad_target = nullptr;  // float[articulation_count*task_dim] dL/dx_target (env-major)
 };
 
 // Reverse-mode adjoint of LaunchApplyOscDriveKernels. Differentiates the gain
@@ -94,6 +100,9 @@ struct OscAdjointParamGrads {
 //                      link_pose[task_link] and xdot from qdot) -- i.e. do NOT
 //                      re-step between the forward and this adjoint.
 //   max_dof          : the M^-1 tile / Jacobian stride (== forward's max_dof).
+//   task_dim         : the task-space dimension (3 == world-POSITION task, matching
+//                      the current forward; bounded by kMaxOscTaskDim). Sizes the
+//                      J row count, the task inertia A, and the grad_target stride.
 //   osc_task_link    : articulation-LOCAL task link index (== forward's).
 //   inertia_M_inv    : the SAME per-articulation full-tile physics-M inverse the
 //                      forward used (stride max_dof*max_dof, LocalDofIndex layout).
@@ -117,6 +126,7 @@ struct OscAdjointParamGrads {
 void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
                                 articulation::ArticulationDeviceState state,
                                 uint32_t max_dof,
+                                uint32_t task_dim,
                                 uint32_t osc_task_link,
                                 const float* inertia_M_inv,
                                 const float* task_target,

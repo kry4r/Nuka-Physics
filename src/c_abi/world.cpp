@@ -37,6 +37,7 @@
 #include "sensor/terrain/terrain_field.hpp"  // Go2-on-stairs batched height sampler
 
 #include <algorithm>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -102,7 +103,18 @@ void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* rec
     }
     // CookToModel transcribes only the FIRST articulation today (generic
     // single-articulation cook debt, M7); mirror that exact choice so the host
-    // mirror's global-link ordering matches the arena's.
+    // mirror's global-link ordering matches the arena's. Passing all arts here
+    // would DIVERGE the mirror from the single-articulation arena, so we keep the
+    // first and make the truncation LOUD (no silent data drop): the diffsim / DR /
+    // set_link_mass host mirror covers only articulation 0.
+    if (arts.size() > 1u) {
+        std::fprintf(stderr,
+                     "[nuka] CaptureArticulationHostMirror: %zu articulations "
+                     "cooked; diffsim/DR/set_link_mass host mirror covers only "
+                     "articulation 0 (multi-articulation mirror not yet "
+                     "implemented).\n",
+                     arts.size());
+    }
     record->articulation_host =
         articulation::BuildArticulationHostState({arts.front()}, blob.bodies);
 }
@@ -271,22 +283,31 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             cap.max_rows_per_env = 32u * nuka::nk::kPairDrivenRowsPerSlot;
         }
 
+        // Resolve world gravity (Z-up). A zero-initialized desc (all three 0.0)
+        // substitutes the shared standard-Earth default so a legacy create is
+        // byte-identical; any non-zero component takes the caller's full vector.
+        nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
+        if (desc->gravity_x != 0.0f || desc->gravity_y != 0.0f ||
+            desc->gravity_z != 0.0f) {
+            gravity = {desc->gravity_x, desc->gravity_y, desc->gravity_z};
+        }
+
         auto record = std::make_unique<nuka::c_abi::WorldRecord>();
         record->device = device_record;
         record->env_count = desc->env_count;
         record->control_mode = control_mode;
         // dt/gravity scalars for the diffsim RolloutParams + the InvariantWorldView.
         record->step_options.dt = desc->fixed_dt;
-        record->step_options.gravity = {0.0f, 0.0f, -9.81f};
+        record->step_options.gravity = gravity;
 
         // Solver config for the nk Pipeline. dt/gravity from the desc; the
         // articulation/contact knobs default from the Model (recorder.cpp seeds
         // only dt/gravity, the same as here).
         nuka::nk::Pipeline::SolverConfig cfg;
         cfg.dt = desc->fixed_dt;
-        cfg.gravity[0] = 0.0f;
-        cfg.gravity[1] = 0.0f;
-        cfg.gravity[2] = -9.81f;
+        cfg.gravity[0] = gravity.x;
+        cfg.gravity[1] = gravity.y;
+        cfg.gravity[2] = gravity.z;
 
         record->world = std::make_unique<nuka::nk::World>(
             std::move(cooked.model), desc->env_count, device_record->phi_device,

@@ -172,7 +172,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridNeighborIdx, DlpackDtype::kU32, 2, false, false},  // grid_neighbor_idx
     {FieldId::RngState, DlpackDtype::kU64, 1, false, false},  // rng_state
     {FieldId::EnvStatus, DlpackDtype::kU32, 1, false, true},  // env_status
-    {FieldId::ObsBuffer, DlpackDtype::kF32, 2, false, true},  // obs_buffer
+    {FieldId::ObsBuffer, DlpackDtype::kF32, 1, false, true},  // obs_buffer
     {FieldId::EnvTerrainType, DlpackDtype::kU32, 1, false, false},  // env_terrain_type
     {FieldId::EnvTerrainDifficulty, DlpackDtype::kF32, 1, false, false},  // env_terrain_difficulty
     {FieldId::JointF, DlpackDtype::kF32, 1, false, false},  // joint_f

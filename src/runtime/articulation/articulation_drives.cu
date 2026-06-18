@@ -34,9 +34,8 @@ namespace {
 // Mirror featherstone_aba.cu's block size so the per-link grid is identical.
 constexpr uint32_t kDriveBlockSize = 32u;
 
-// SPD floor for the ComputedTorque joint-block LDL^T solve. Matches the
-// kMinDiagonal used in FactorArticulationInertiaMKernel / the ABA factorization.
-constexpr float kMinDiagonalDrive = 1.0e-6f;
+// kMinDiagonalDrive (the SPD floor for the ComputedTorque/Osc LDL^T solves) is now
+// exported from articulation_drives.hpp so the diffsim adjoint shares one definition.
 
 void CheckCudaDrive(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -313,8 +312,10 @@ __global__ void ApplyOscDriveKernel(ArticulationDeviceState state,
     const math::Vec3 x_task = state.link_pose[task_link].position;
 
     // Walk the ancestor chain task_link -> root, writing each ancestor DOF's 3
-    // Jacobian components. FloatingBase columns are intentionally NOT built (scope:
-    // fixed-base scenes only); a floating root contributes no task columns here.
+    // Jacobian components. A FloatingBase root expands to its 6 base columns (0..5,
+    // omega-first) so A = J M^-1 J^T carries the base reaction; the base is NOT
+    // actuated, so its tau is never scattered (ABA ignores base tau). For a fixed
+    // base no FloatingBase joint exists -> this branch never runs -> byte-identical.
     uint32_t n = 0u;  // ndof actually present (high-water mark of dof_index+1).
     {
         uint32_t link = task_link;
@@ -322,7 +323,37 @@ __global__ void ApplyOscDriveKernel(ArticulationDeviceState state,
         while (link != kInvalidLink) {
             const ArticulationJointType type = state.joint_type[link];
             const uint32_t dof_count = JointDofCountDriveDevice(type);
-            if (dof_count == 1u) {  // Revolute / Prismatic (1 DOF).
+            if (type == ArticulationJointType::FloatingBase) {
+                // 6 base columns at dof 0..5. SAME geometry as the contact-chain
+                // base block (articulation_jacobian.cu): angular col k =
+                // cross(R*e_k, x_task - base_origin), linear col k = R*e_k, both as
+                // 3-component point-Jacobian columns (here, not dotted with a normal).
+                const uint32_t base_dof = LocalDofIndexDrive(state, offset, link);
+                const math::Quat base_rot = state.base_pose[articulation].rotation;
+                const math::Vec3 base_origin = state.base_pose[articulation].position;
+                const math::Vec3 lever = mg::Sub(x_task, base_origin);
+                const math::Vec3 e[3] = {
+                    RotateByQuatDrive(base_rot, math::Vec3{1.0f, 0.0f, 0.0f}),
+                    RotateByQuatDrive(base_rot, math::Vec3{0.0f, 1.0f, 0.0f}),
+                    RotateByQuatDrive(base_rot, math::Vec3{0.0f, 0.0f, 1.0f})};
+                for (uint32_t b = 0u; b < 3u; ++b) {
+                    const uint32_t ang_dof = base_dof + b;       // omega 0..2
+                    const uint32_t lin_dof = base_dof + 3u + b;  // lin   3..5
+                    if (ang_dof < max_dof) {
+                        const math::Vec3 ac = mg::Cross(e[b], lever);
+                        J[0u * max_dof + ang_dof] = ac.x;
+                        J[1u * max_dof + ang_dof] = ac.y;
+                        J[2u * max_dof + ang_dof] = ac.z;
+                        if (ang_dof + 1u > n) { n = ang_dof + 1u; }
+                    }
+                    if (lin_dof < max_dof) {
+                        J[0u * max_dof + lin_dof] = e[b].x;
+                        J[1u * max_dof + lin_dof] = e[b].y;
+                        J[2u * max_dof + lin_dof] = e[b].z;
+                        if (lin_dof + 1u > n) { n = lin_dof + 1u; }
+                    }
+                }
+            } else if (dof_count == 1u) {  // Revolute / Prismatic (1 DOF).
                 const uint32_t dof = LocalDofIndexDrive(state, offset, link);
                 if (dof < max_dof) {
                     const math::Vec3 axis_world = RotateByQuatDrive(
@@ -367,8 +398,23 @@ __global__ void ApplyOscDriveKernel(ArticulationDeviceState state,
     float xdot[3] = {0.0f, 0.0f, 0.0f};
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
-        if (JointDofCountDriveDevice(state.joint_type[link]) != 1u) {
-            continue;  // fixed (0) / floating (skipped above) -> no column.
+        const ArticulationJointType type = state.joint_type[link];
+        if (type == ArticulationJointType::FloatingBase) {
+            // 6 base DOF velocities live in link_velocity[root].v[0..5] (omega-
+            // first), NOT in state.qdot -- mirror the contact-chain qdot seeding.
+            const uint32_t base_dof = LocalDofIndexDrive(state, offset, link);
+            for (uint32_t b = 0u; b < 6u; ++b) {
+                const uint32_t dof = base_dof + b;
+                if (dof >= n) { continue; }
+                const float qd = state.link_velocity[link].v[b];
+                xdot[0] += J[0u * max_dof + dof] * qd;
+                xdot[1] += J[1u * max_dof + dof] * qd;
+                xdot[2] += J[2u * max_dof + dof] * qd;
+            }
+            continue;
+        }
+        if (JointDofCountDriveDevice(type) != 1u) {
+            continue;  // fixed (0) -> no column.
         }
         const uint32_t dof = LocalDofIndexDrive(state, offset, link);
         if (dof >= n) {
@@ -470,12 +516,13 @@ __global__ void ApplyOscDriveKernel(ArticulationDeviceState state,
     // prefix-sum scan. A 1-DOF joint NOT on the task link's chain has all-zero J
     // columns, so its tau is exactly 0 -- the task exerts no torque on it. We
     // write EVERY actuated (1-DOF) joint (zero off the chain) rather than leaving
-    // a stale prior-step tau; fixed joints / the (unbuilt) floating base keep
-    // theirs (ABA ignores tau for them). Fixed order, no atomics => D1.
+    // a stale prior-step tau; fixed joints / the floating base keep theirs (the
+    // base is unactuated and ABA ignores its tau, but its J columns DID shape A/y
+    // above). Fixed order, no atomics => D1.
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         if (JointDofCountDriveDevice(state.joint_type[link]) != 1u) {
-            continue;  // fixed (0) / floating (unbuilt) -> not actuated here.
+            continue;  // fixed (0) / floating (unactuated) -> not actuated here.
         }
         const uint32_t dof = LocalDofIndexDrive(state, offset, link);
         float tau = 0.0f;

@@ -273,11 +273,11 @@ SolveScheduleResult SolveSchedule::Partition(const std::vector<ScheduleRow>& row
 
 void SolveSchedule::Build(Model* model) {
     if (model == nullptr) return;
-    // L1-c: the UnionCsr early-exit seam + UnionSlotRowBases were DELETED with
-    // the UnionCsr path. The only live family is PairDriven (below). The
-    // oracle-harness "hand-built schedule" seam below preserves a directly
-    // uploaded schedule for any family that derives no schedule of its own.
-    if (model->contact_family != ContactFamily::PairDriven &&
+    // PairDriven is the only production family and ALWAYS re-derives below.
+    // The sole sanctioned exception is the legacy UnionCsr solver test harness,
+    // which hand-builds a schedule and uploads it directly; preserve only that
+    // pre-populated case so a future family cannot silently skip derivation.
+    if (model->contact_family == ContactFamily::UnionCsr &&
         model->schedule_island_count > 0) {
         return;
     }

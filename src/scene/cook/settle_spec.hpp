@@ -21,20 +21,26 @@ namespace nuka::scene::cook {
 // CURRENT (seeded) q so the articulation holds that pose while the rest of the
 // scene settles. (The articulation drive arrays are per-LINK; a Hold therefore
 // resolves to LINK indices and pins drive_target[link] = q[link].)
+
+// Default settle hold gains. Empirically tuned for a legged-robot mass/inertia
+// scale (the factory's non-leg hold class); scenes with very different mass
+// (manipulation objects, heavy industrial robots) should author explicit gains.
+inline constexpr float kDefaultSettleKp = 50.0f;
+inline constexpr float kDefaultSettleKd = 4.0f;
+
 struct SettleSpec {
     int   steps = 0;
     float dt    = 0.0f;   // informational (the World's SolverConfig owns the step
-                          // dt); recorded here so T3/T4 can author both together.
+                          // dt); recorded here so callers can author both together.
 
     struct Hold {
         std::string dof_pattern;            // SceneMap name pattern (path glob)
         enum class Mode { PD } mode = Mode::PD;
 
-        // PD hold gains applied to the matched links during settle. Defaults are
-        // a firm generic hold (the factory's non-leg kKpHold/kKdHold class); a
-        // caller (T3) may override per pattern.
-        float kp = 50.0f;
-        float kd = 4.0f;
+        // PD hold gains applied to the matched links during settle; a caller may
+        // override per pattern (see kDefaultSettleKp/Kd for the scale caveat).
+        float kp = kDefaultSettleKp;
+        float kd = kDefaultSettleKd;
     };
     std::vector<Hold> holds;
 };

@@ -24,6 +24,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 
 #include <cstdio>
+#include <iterator>  // std::size for array-derived loop bounds
 
 namespace nuka::runtime::app::viewer {
 
@@ -72,11 +73,13 @@ void SectionHeader(const char* label) {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 }
 
-// A labeled stat row: dim label left, value right-aligned in `value_col`. Tidy,
-// table-like alignment without a full table.
+// A labeled stat row: dim label left, value in the second column. The label
+// column width follows the FONT (not a fixed pixel literal) so it stays aligned
+// at non-default font sizes / HiDPI. ~11 glyphs wide covers the longest label.
+constexpr float kStatLabelGlyphs = 11.0f;
 void StatRow(const char* label, const char* value, const ImVec4& value_col) {
     ImGui::TextColored(kTextDim, "%s", label);
-    ImGui::SameLine(150.0f);
+    ImGui::SameLine(ImGui::CalcTextSize("M").x * kStatLabelGlyphs);
     ImGui::TextColored(value_col, "%s", value);
 }
 
@@ -187,7 +190,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::SameLine();
             const float kSpeeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
             const char* kSpeedLbl[] = {"x.25", "x.5", "x1", "x2", "x4"};
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < static_cast<int>(std::size(kSpeeds)); ++i) {
                 const bool sel = (ui_state.speed == kSpeeds[i]);
                 if (sel) {
                     ImGui::PushStyleColor(ImGuiCol_Button, kAccent);

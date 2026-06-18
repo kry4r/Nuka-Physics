@@ -31,7 +31,6 @@
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "sensor/terrain/terrain_field.hpp"  // SampleTerrainHeight (H2 generator)
 #include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
-#include "runtime/articulation/articulation_contacts.hpp"  // contact-slot strides
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cooker.hpp"
@@ -41,6 +40,16 @@
 namespace nuka::scene::cook {
 
 namespace {
+
+// ExportObs per-env observation layout (readout.cu ExportObsKernel): the base
+// pose (pos.xyz + quat.wxyz) followed by per-link q then per-link qdot. Used to
+// DERIVE obs_width from the cooked link count instead of a baked buffer width.
+constexpr uint32_t kObsBasePoseFloats = 7u;        // pos.xyz + quat.wxyz
+constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
+// Per-collidable candidate-pair budget for the general LBVH broadphase: the
+// per-env candidate-slot capacity == collidable_count * this. Named (not a baked
+// FusedFoot foot count) so the contact buffer grows with the cooked geometry.
+constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
 // M7 T5b — resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
@@ -115,6 +124,15 @@ bool ResolveAuthoredIC(const SceneIR& scene, uint32_t root_body, uint32_t link_c
     return false;
 }
 
+// Resolve the cooked per-shape restitution (producer side of the per-material
+// contact contract). FLAG: CookedContactParamTable (another agent's file) has no
+// restitution lane yet, so this returns the spec default 0 (default-material
+// scenes stay numerically unchanged). Replace the body with
+// blob.contact_params.restitutions[shape_row] once that upstream lane lands.
+float ResolveShapeRestitution(const CookedBlob& /*blob*/, uint32_t /*shape_row*/) {
+    return 0.0f;
+}
+
 // Find or append a material bucket matching the cooked contact-param row `i`.
 // Returns the bucket index. Dedup is by exact float equality (cook is
 // deterministic, so identical authored params give bit-identical bucket rows).
@@ -122,24 +140,27 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
                    std::vector<nk::ModelMaterialBucket>& buckets) {
     nk::ModelMaterialBucket row;
     if (shape_row < blob.contact_params.frictions.size()) {
-        row.values[0] = blob.contact_params.frictions[shape_row];  // static μ
-        row.values[1] = blob.contact_params.frictions[shape_row];  // dynamic μ
+        row.values[nk::kBucketStaticMu]  = blob.contact_params.frictions[shape_row];
+        row.values[nk::kBucketDynamicMu] = blob.contact_params.frictions[shape_row];
     }
-    // restitution / compliant params: the cooked tables carry solref/solimp; map
-    // a coarse compliance into values[3]/[4] (timeconst/dampratio) for M3b's
-    // material-bucket lookup. Restitution is not separately cooked here -> 0.
+    // Per-shape restitution into the named lane (producer side of the
+    // per-material contact contract). The cooked blob carries no restitution lane
+    // yet (CookedContactParamTable, another agent's file), so this resolves to the
+    // bucket default 0 until that upstream lane lands -- see the FLAG in the cook.
+    row.values[nk::kBucketRestitution] = ResolveShapeRestitution(blob, shape_row);
+    // Compliant params: solref timeconst/dampratio into the named lanes.
     if (shape_row < blob.contact_params.solref0.size()) {
-        row.values[3] = blob.contact_params.solref0[shape_row];
+        row.values[nk::kBucketTimeconst] = blob.contact_params.solref0[shape_row];
     }
     if (shape_row < blob.contact_params.solref1.size()) {
-        row.values[4] = blob.contact_params.solref1[shape_row];
+        row.values[nk::kBucketDampratio] = blob.contact_params.solref1[shape_row];
     }
     if (shape_row < blob.contact_params.margins.size()) {
-        row.values[6] = blob.contact_params.margins[shape_row];
+        row.values[nk::kBucketMargin] = blob.contact_params.margins[shape_row];
     }
     for (uint32_t b = 0; b < buckets.size(); ++b) {
         bool same = true;
-        for (int k = 0; k < 8; ++k) {
+        for (uint32_t k = 0; k < nk::ModelMaterialBucket::kValueCount; ++k) {
             if (buckets[b].values[k] != row.values[k]) { same = false; break; }
         }
         if (same) return b;
@@ -224,7 +245,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     nk::ModelCapacities& cap = model.capacities;
     cap.env_count = envs;
     cap.bodies_per_env = blob.body_count;
-    cap.obs_width = 64;
+    // obs_width is derived from the cooked observable dimensionality below, once
+    // links_per_env is known (ExportObs layout: base pose + q + qdot per link).
 
     // M7 T5b — which body rows are owned by the articulation (driven by FK, NOT
     // free rigid bodies). The movable-body body_init pass below MUST keep these
@@ -324,10 +346,14 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
         m.joint_type.reserve(host.joint_type.size());
         for (auto jt : host.joint_type) m.joint_type.push_back(static_cast<uint8_t>(jt));
-        m.link_inertia_spatial.resize(static_cast<size_t>(m.link_count) * 36u);
+        // Spatial inertia float count derived from the source 6x6 record (no bare 36).
+        constexpr size_t kSpatialInertiaFloats =
+            sizeof(host.link_inertia[0].I) / sizeof(float);
+        m.link_inertia_spatial.resize(static_cast<size_t>(m.link_count) *
+                                      kSpatialInertiaFloats);
         for (uint32_t l = 0; l < m.link_count; ++l) {
-            for (uint32_t k = 0; k < 36u; ++k) {
-                m.link_inertia_spatial[static_cast<size_t>(l) * 36u + k] =
+            for (size_t k = 0; k < kSpatialInertiaFloats; ++k) {
+                m.link_inertia_spatial[static_cast<size_t>(l) * kSpatialInertiaFloats + k] =
                     host.link_inertia[l].I[k];
             }
         }
@@ -513,6 +539,12 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
     }
 
+    // Observation export width = the cooked observable dimensionality (base pose +
+    // q + qdot per link), so a >64-channel policy is not silently truncated. A
+    // link-free scene exports just the base pose.
+    cap.obs_width = kObsBasePoseFloats +
+                    kObsChannelsPerLink * cap.links_per_env;
+
     // 5. Shapes -> ModelShape rows + material buckets. Track the SOURCE shape ->
     //    first cooked row + piece count for the SceneMap binding.
     model.shapes.reserve(blob.shape_count);
@@ -546,16 +578,22 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         uint32_t cooked_cursor = 0;
         for (uint32_t src = 0; src < scene.ShapeCount(); ++src) {
             const EntityId ent = scene.EntityOfShape(src);
-            // Count how many cooked rows this source produced: rows whose body_row
-            // matches and that fall in the next contiguous span. For primitives
-            // this is exactly 1; for a decomposed mesh the cooker emits N pieces.
+            // Count how many cooked rows this source produced: a V-HACD source
+            // (DecomposeMode::Force) expands into a contiguous span of pieces that
+            // share its body_row, so advance while consecutive cooked rows keep the
+            // same body_row. A primitive / single-hull source -> span 1.
+            // FLAG: body_row is only an APPROXIMATION of source provenance -- a body
+            // carrying several distinct source shapes would merge their rows into
+            // one span. An exact fix needs per-cooked-row source ids from the cooker
+            // (another agent's CookedShapeTable). NO-OP for the single-hull path
+            // (every source -> 1 row), which is how every scene currently cooks.
             uint32_t span = 1;
             if (cooked_cursor < model.shapes.size()) {
-                // Greedy: pieces of a source share the same body & material bucket
-                // and follow consecutively; advance while the cooked row's source
-                // provenance (approximated by identical body_row) continues. M3a's
-                // primitives never decompose -> span stays 1.
-                span = 1;
+                const uint32_t body = model.shapes[cooked_cursor].body_row;
+                while (cooked_cursor + span < model.shapes.size() &&
+                       model.shapes[cooked_cursor + span].body_row == body) {
+                    ++span;
+                }
             }
             if (ent != kInvalidEntity && cooked_cursor < model.shapes.size()) {
                 CookedRef ref;
@@ -654,54 +692,24 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     //    collide); the cooked filter pair lists ride the blob for M5.
     model.filter_cross_env = false;
 
-    // 9. Contact / row capacities. M3b: the articulation foot pipeline's slot
-    //    stride is the legacy kMaxFootContactsPerEnv == 4 (the ported kernels
-    //    hardcode slot_base = env * 4, the byte-exact layout), and the per-slot
-    //    row triple {normal, t1, t2} makes max_rows = 3 * max_contacts (this is
-    //    exactly the legacy lambda buffer layout slot*3 + k). The general
-    //    broadphase-cooked sizing arrives with M5.
-    //
-    // WP1 NOTE (multi-articulation foot contact is the LATER contact crux, NOT
-    // this foundation task): kMaxFootContactsPerEnv == 4 is a COMPILE-TIME constant
-    // and the FUSED foot-detection kernel keys slots by ENV (base_slot = env*4),
-    // NOT by articulation. With K co-resident dogs (4 feet each) one env's K*4 feet
-    // would overflow the 4 env slots / mis-slot across dogs. Growing this to K*4
-    // here WITHOUT re-keying contacts_foot.cu's slot math (env -> articulation) and
-    // the `rows` field stride would be incorrect AND would shift the K==1 `rows`
-    // byte layout (D1 break). So the cap is left at 4 (byte-identical at K==1); the
-    // multi-dog foot/leg contact pipeline (K*4 slots + env->artic slot re-key +
-    // capsule-capsule narrowphase + two-articulation reaction scatter) is WP5-8,
-    // the genuinely-new contact crux. The WP1 co-step spike free-falls the dogs so
-    // no ground contact is exercised -- it validates the multi-artic FORWARD
-    // dynamics co-residence, which is what this foundation delivers.
-    if (cap.links_per_env > 0) {
-        // WP5-8: with K co-resident articulations (dogs), the FUSED solver is
-        // block-per-articulation and reads slot block [artic*kMaxFootContactsPerEnv,
-        // +stride); articulation index runs [0, K*env_count). So the per-env
-        // contact-slot budget must cover K articulation blocks: K * 4 slots, with
-        // 3 rows/slot. At K==1 (the legacy single-robot scene) this is EXACTLY
-        // 4 / 12 -- byte-identical (the K==1 D1 invariant; a multi-dog scene is a
-        // DISTINCT validation surface). This grows the fused-foot slot stream to
-        // hold every dog's per-articulation foot-contact block (general multi-body
-        // collision rides the PairDriven path's own candidate-slot budget instead).
-        const uint32_t k = cap.articulations_per_env == 0u ? 1u
-                                                           : cap.articulations_per_env;
-        // Per-dog FUSED-foot slot stride. At K==1 (the legacy single-robot scene)
-        // this is EXACTLY kMaxFootContactsPerEnv (4) -> max_contacts 4 / rows 12,
-        // byte-identical. At K>1 it grows to kMultiDogContactsPerArtic (12) so each
-        // dog's per-articulation foot block has headroom. 3 rows per contact slot
-        // {normal, t1, t2}. (The PairDriven cook OVERRIDES this budget with its own
-        // candidate-slot layout; L1-b deleted the FUSED path this stride once fed, so
-        // this is now only the initial sizing the general cook resizes.)
-        const uint32_t stride = (k > 1u)
-            ? ::nuka::runtime::articulation::kMultiDogContactsPerArtic
-            : ::nuka::runtime::articulation::kMaxFootContactsPerEnv;
-        cap.max_contacts_per_env = stride * k;     // K * per-dog stride
-        cap.max_rows_per_env     = 3u * stride * k;  // 3 rows per contact slot.
-    } else {
-        const uint32_t collidables = cap.bodies_per_env + cap.links_per_env;
-        cap.max_contacts_per_env = collidables > 0 ? collidables * 4u : 0u;
-        cap.max_rows_per_env     = cap.max_contacts_per_env * 4u;
+    // 9. Contact / row capacities. ONE general per-env candidate-slot budget for
+    //    the LBVH broadphase, driven by the actual cooked collidable count (the
+    //    body rows the broadphase iterates) -- NO scene-type branch and NO baked
+    //    foot-count constants. The broadphase builds over bodies_per_env collidable
+    //    body rows and emits up to max_contacts_per_env candidate pairs (it SILENTLY
+    //    drops overflow, lbvh_traversal.cuh), so the budget scales with the
+    //    collidables: collidable_count * kCandidatePairsPerCollidable. The static
+    //    ground collidable (appended in section 10) is included via +1. The
+    //    PairDriven overload re-sizes max_rows_per_env to its per-candidate-slot
+    //    row layout; max_rows here is the broadphase-agnostic initial bound.
+    {
+        const uint32_t static_collidables = 1u;  // the ground plane (section 10).
+        const uint32_t collidables = cap.bodies_per_env + static_collidables;
+        cap.max_contacts_per_env =
+            cap.bodies_per_env > 0u ? collidables * kCandidatePairsPerCollidable
+                                    : 0u;
+        cap.max_rows_per_env =
+            cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
     }
     // Contacts-OFF dynamics world (the general-path equivalent of the legacy
     // single-env enable_contacts==false): zero the per-env contact/candidate
@@ -937,21 +945,21 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
     // 2-arg cook does NOT cook these (only union_nk_model did, for the H1 path), so
     // for a PairDriven articulated world they were EMPTY -> the floating-base
     // reaction never reached link_velocity. The map is PER-DOG (the first
-    // articulation's link slice [0, links_per_dog)); the multi-tile solver applies
-    // it per co-resident articulation with that artic's link offset. Mirrors
+    // articulation's link slice [0, links_per_articulation)); the multi-tile solver
+    // applies it per co-resident articulation with that artic's link offset. Mirrors
     // union_nk_model.cpp's DofIndexOf^-1 (FloatingBase root -> 6 components, scalar
-    // joint -> component ~0u). Only the FIRST dog's links since every dog is the
-    // same template (dofs_per_env is the per-dog DOF).
+    // joint -> component ~0u). Only the FIRST articulation's links since every
+    // co-resident articulation is the same template (dofs_per_env is per-artic DOF).
     {
         namespace articulation = runtime::articulation;
         const nk::ModelArticulation& m = model.articulation;
         const uint32_t k = model.capacities.articulations_per_env == 0u
                                ? 1u : model.capacities.articulations_per_env;
-        const uint32_t links_per_dog =
+        const uint32_t links_per_articulation =
             (k > 0u && m.link_count >= k) ? (m.link_count / k) : m.link_count;
         model.dof_to_link.clear();
         model.dof_to_component.clear();
-        for (uint32_t l = 0; l < links_per_dog && l < m.joint_type.size(); ++l) {
+        for (uint32_t l = 0; l < links_per_articulation && l < m.joint_type.size(); ++l) {
             const articulation::ArticulationJointType jt =
                 static_cast<articulation::ArticulationJointType>(m.joint_type[l]);
             const bool is_root_floating =
