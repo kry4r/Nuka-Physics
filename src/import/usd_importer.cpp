@@ -594,6 +594,19 @@ Affine LocalTrs(const UsdPrim& prim) {
     return out;
 }
 
+// A prim's local rotation quaternion from its rotateXYZ Euler (degrees, R=Rz*Ry*Rx),
+// so a primitive collision shape carries its authored orientation, not only translate.
+math::Quat LocalRotation(const UsdPrim& prim) {
+    constexpr float kDegToRad = 0.017453292519943295f;  // pi / 180
+    const math::Quat qx =
+        math::Quat::FromAxisAngle({1.0f, 0.0f, 0.0f}, prim.rotate_xyz.x * kDegToRad);
+    const math::Quat qy =
+        math::Quat::FromAxisAngle({0.0f, 1.0f, 0.0f}, prim.rotate_xyz.y * kDegToRad);
+    const math::Quat qz =
+        math::Quat::FromAxisAngle({0.0f, 0.0f, 1.0f}, prim.rotate_xyz.z * kDegToRad);
+    return (qz * qy * qx).Normalized();  // R = Rz*Ry*Rx
+}
+
 // Bake a full affine into a flat x,y,z vertex array in place. The identity affine
 // is an exact no-op (preserves byte-identical geometry for untransformed refs).
 void BakeAffineIntoPoints(std::vector<float>& points, const Affine& xf) {
@@ -1028,7 +1041,9 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         shape.name = prim.name;
         shape.body_id = body_id;
         shape.type = shape_type;
-        shape.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
+        // Carry the prim's authored ORIENTATION (rotateXYZ), not only translate, so
+        // a rotated capsule axis / tilted box collides in its true pose.
+        shape.local_transform = math::Transform{prim.translate, LocalRotation(prim)};
         // render-purpose geometry is visual-only: turn collision off so the
         // SceneIR facade projects it to a VisualMeshComponent (M2b).
         if (purpose == "render") {
@@ -1036,8 +1051,11 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             shape.conaffinity = 0;
         }
         if (shape_type == scene::ShapeType::Box) {
-            const float half_size = prim.cube_size * 0.5f;
-            shape.half_extents = {half_size, half_size, half_size};
+            // A non-cube box is a Cube scaled per-axis (xformOp:scale); bake the
+            // scale into the half-extents so the box keeps its true dimensions.
+            const float half = prim.cube_size * 0.5f;
+            shape.half_extents = {half * prim.scale.x, half * prim.scale.y,
+                                  half * prim.scale.z};
         } else if (shape_type == scene::ShapeType::Sphere) {
             shape.radius = prim.radius;
         } else if (shape_type == scene::ShapeType::Capsule) {
