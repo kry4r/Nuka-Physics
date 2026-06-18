@@ -535,16 +535,18 @@ __device__ uint32_t ResolvePairSide(const float* shape_table,
 // the model defaults when the side has no body-row material (static collidable /
 // out-of-range / unwired tables) -- so default-material scenes stay unchanged.
 __device__ void ReadSideMaterial(const float* mat_buckets, const uint32_t* mat_index,
+                                 uint32_t num_buckets,
                                  uint32_t env, uint32_t local_body,
                                  uint32_t bodies_per_env, int32_t body_id,
                                  float def_mu, float def_solref0, float def_solref1,
                                  float* out_mu, float* out_solref0, float* out_solref1) {
     *out_mu = def_mu; *out_solref0 = def_solref0; *out_solref1 = def_solref1;
-    if (mat_buckets == nullptr || mat_index == nullptr || body_id < 0 ||
-        local_body >= bodies_per_env) {
-        return;  // static / unwired -> model default material.
+    if (mat_buckets == nullptr || mat_index == nullptr || num_buckets == 0u ||
+        body_id < 0 || local_body >= bodies_per_env) {
+        return;  // static / no authored materials / unwired -> model defaults.
     }
     const uint32_t bucket = mat_index[env * bodies_per_env + local_body];
+    if (bucket >= num_buckets) return;  // out-of-range bucket -> model defaults.
     const size_t b = static_cast<size_t>(bucket) * kMatBucketStride;
     *out_mu = mat_buckets[b + kMatLaneFriction];
     *out_solref0 = mat_buckets[b + kMatLaneSolref0];
@@ -568,6 +570,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ body_to_articulation,
     const float* __restrict__ mat_buckets,
     const uint32_t* __restrict__ mat_index,
+    uint32_t num_material_buckets,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt,
@@ -619,10 +622,12 @@ __global__ void EmitPairDrivenRowsKernel(
     // MuJoCo solmix=max rule (friction max; solref take the stiffer/min timeconst).
     // Static / unauthored sides fall back to the model defaults below.
     float mu_a, sr0_a, sr1_a, mu_b, sr0_b, sr1_b;
-    ReadSideMaterial(mat_buckets, mat_index, env, local_a, bodies_per_env, bid_a,
-                     kDefaultMaterialFriction, solref0, solref1, &mu_a, &sr0_a, &sr1_a);
-    ReadSideMaterial(mat_buckets, mat_index, env, local_b, bodies_per_env, bid_b,
-                     kDefaultMaterialFriction, solref0, solref1, &mu_b, &sr0_b, &sr1_b);
+    ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_a,
+                     bodies_per_env, bid_a, kDefaultMaterialFriction, solref0,
+                     solref1, &mu_a, &sr0_a, &sr1_a);
+    ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_b,
+                     bodies_per_env, bid_b, kDefaultMaterialFriction, solref0,
+                     solref1, &mu_b, &sr0_b, &sr1_b);
     PairMaterial mat;
     mat.mu = fmaxf(mu_a, mu_b);
     mat.solref0 = fminf(sr0_a, sr0_b);  // smaller timeconst == stiffer
@@ -847,6 +852,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.body_to_articulation),
                    static_cast<const float*>(data.mat_buckets),
                    static_cast<const uint32_t*>(data.mat_index),
+                   p->num_material_buckets,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->env_count, p->union_slot_count, p->rows_per_env,

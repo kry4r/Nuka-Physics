@@ -418,6 +418,7 @@ struct AssembleRowsParams {
     float    solref[2];         // merged contact solref (union family)
     float    solimp[5];         // merged contact solimp (union family)
     uint32_t particles_per_env; // M6 particle coupling (kUSlotParticleSphere*).
+    uint32_t num_material_buckets;  // 0 == no authored materials -> model defaults.
 };
 
 // Spec-fixed semantic fields (M1): {dt, vel_iters, pos_iters}. The fields BELOW
