@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -311,6 +312,19 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
                       {options.sun_direction[0], options.sun_direction[1], options.sun_direction[2]},
                       options.sun_color[0], options.sun_color[1], options.sun_color[2]);
     } else if (!world.lights.empty()) {
+        // The UBO/shader light array is fixed at kMaxUboLights (must match the GLSL
+        // `kMaxLights` in mesh*.vert / mesh_pbr.frag). Warn ONCE on truncation
+        // rather than silently dropping the excess.
+        if (world.lights.size() > static_cast<size_t>(kMaxUboLights)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[nuka_render] scene has %zu lights; only the first %d "
+                             "fit the UBO (kMaxUboLights) -- the rest are dropped\n",
+                             world.lights.size(), kMaxUboLights);
+            }
+        }
         for (const RenderLight& rl : world.lights) {
             if (n >= kMaxUboLights) break;
             GpuLight& l = ubo.lights[n];

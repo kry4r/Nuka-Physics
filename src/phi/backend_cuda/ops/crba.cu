@@ -217,7 +217,8 @@ constexpr uint32_t kMaxFactorDof = kMaxArticulationDof;
 __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
                                                  uint32_t max_dof,
                                                  const float* inertia_M,
-                                                 float* out_inertia_M_inv) {
+                                                 float* out_inertia_M_inv,
+                                                 uint32_t* err_status) {
     __shared__ float a[kMaxFactorDof * kMaxFactorDof];
     __shared__ float d[kMaxFactorDof];
     __shared__ uint32_t dof_sh;
@@ -240,7 +241,10 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
             dof += JointDofCountDevice(state.joint_type[offset + local]);
         }
         if (dof > max_dof) {
-            // Defensive MEMORY-SAFETY bound only (see articulation_contacts.cu).
+            // Memory-safety bound, but NEVER a silent clamp (G0 honesty): a
+            // truncated M^-1 is dishonest, so surface it in the err_status
+            // readout (env slot 0). The host checks it post-step.
+            if (err_status != nullptr) atomicOr(&err_status[0], kEnvStatusDofOverflow);
             dof = max_dof;
         }
         dof_sh = dof;
@@ -470,8 +474,13 @@ Status OpCrbaFactorM(const ModelView& model, const DataView& data,
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, /*total_link_count=*/0u, p->articulation_count);
+    // err_status[0] (the env_status readout, slot 0) carries the dof-overflow
+    // diagnostic: a per-articulation actual-dof > max_dof is surfaced, not silently
+    // clamped. The kernel only OR-sets on overflow, so a healthy model is untouched;
+    // the host must clear/read env_status (it is the readout field).
     LaunchCuda(FactorArticulationInertiaMKernel, dim3(p->articulation_count),
-               dim3(32u), 0u, stream, state, p->max_dof, data.m, data.m_inv);
+               dim3(32u), 0u, stream, state, p->max_dof, data.m, data.m_inv,
+               data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

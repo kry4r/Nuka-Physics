@@ -40,6 +40,30 @@
 namespace nuka::phi {
 
 // ---------------------------------------------------------------------------
+// Cooked-table row strides — host-safe single source of truth shared by the
+// host Model builder (model.cpp staging / ElementCount) and the device readers
+// (prims_types.cuh LoadPrimShape, narrowphase_sdf.cu LoadSdfGrid). Naming the
+// strides here (a pure-C++ header includable by both the host .cpp and the .cu
+// readers) replaces the bare literals so a lane addition bumps ONE constant.
+// ---------------------------------------------------------------------------
+// shape_table packed f32 / body row {kind, p0..p3, contype, conaffinity,
+// sdf_grid, body_id, group, hull_vert_offset, hull_vert_count}.
+inline constexpr uint32_t kShapeTableRowStride = 12u;
+// SDF header packed f32 / grid {origin.xyz, voxel_size, dims.xyz, cell_offset}.
+inline constexpr uint32_t kSdfHeaderStride = 8u;
+
+// ---------------------------------------------------------------------------
+// env_status diagnostic bits (the per-env readout field, flags:[readout]). Ops
+// that can silently lose work under a cooked-capacity miss OR their bit here so
+// the host surfaces it post-step (never a silent drop / clamp). Each writer
+// clears ONLY its own bit at op start (order-independent across ops in a step).
+// Per-articulation / scalar diagnostics use env slot 0 (always present).
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pairs dropped
+inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
+inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
+
+// ---------------------------------------------------------------------------
 // NkOp — the closed op set. uint16_t backing so an op id fits a single field
 // and the enum can be stored in compact tables.
 // ---------------------------------------------------------------------------
@@ -423,10 +447,12 @@ struct SolveRowsBlockIslandParams {
     // implicit joint-damping seed moved out of the deleted FUSED solve kernel
     // into the standalone NkOp::ApplyImplicitDamping op; nothing in the solve op
     // reads it any more.)
-    // Task 1/2: the FUSED solver's per-articulation contact-slot STRIDE (slot_base
-    // = articulation * contact_slots_per_artic). At K<=1 == kMaxFootContactsPerEnv
-    // (4) -> byte-identical; at K>1 the grown stride (kMultiDogContactsPerArtic)
-    // gives each dog room for feet + body-terrain + dog-dog rows in one block.
+    // The solver's per-articulation contact-slot STRIDE (slot_base = articulation *
+    // contact_slots_per_artic), the data-driven quotient max_contacts_per_env /
+    // articulations_per_env bounded by kMaxContactsPerArtic. At K<=1 ==
+    // kMaxFootContactsPerEnv (4) -> byte-identical; at K>1 the grown stride gives
+    // each co-resident articulation room for end-effector + body-terrain +
+    // inter-articulation rows in one block.
     uint32_t contact_slots_per_artic;
 };
 
@@ -606,8 +632,12 @@ struct ResetEnvsParams {
     // VERBATIM snapshot copy — byte-identical to the pre-M10 reset.
     uint64_t ic_seed;           // Philox seed (0 default; combined with ic_episode)
     uint32_t ic_episode;        // bumped each Reset() so successive resets differ
-    uint32_t cup_body_index;    // which body slot the cup-XY jitter targets (0)
-    float    jitter_cup_xy[2];  // +/- half-range for cup body pose x/y (0 => off)
+    // Name-agnostic single-body position jitter override: the reset op applies
+    // jitter_body_xyz to whichever body slot jitter_body_index names (was the
+    // cup-specific cup_body_index/jitter_cup_xy; a general reset must not bake an
+    // asset identity). All-zero halves => no jitter (verbatim snapshot copy).
+    uint32_t jitter_body_index; // which body slot the per-body jitter targets (0)
+    float    jitter_body_xyz[3];// +/- half-range for that body's pose x/y/z (0=off)
     float    jitter_base_pos[3];// +/- half-range for base pose x/y/z (0 => off)
     float    jitter_q;          // +/- half-range for each generalized coord (0=off)
 };

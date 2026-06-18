@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace nuka::constraint {
 
@@ -50,15 +52,27 @@ void AppendContactGroup(uint32_t body_a,
                         float friction,
                         float restitution,
                         const ContactPoint* points,
-                        RowBuffers* out_rows) {
+                        RowBuffers* out_rows,
+                        uint32_t condim = 3u) {
     if (out_rows == nullptr || point_count == 0u) {
         return;
     }
 
-    const uint32_t normal_row_count = std::min(point_count, 4u);
+    const uint32_t normal_row_count =
+        std::min(point_count, ContactManifold::kMaxPoints);
     const uint32_t first_row = out_rows->RowCount();
     const uint32_t first_friction_row = first_row + normal_row_count;
-    const uint32_t friction_row_count = normal_row_count > 0u ? 2u : 0u;
+    // condim=1 -> frictionless (0 rows); condim=3 -> the legacy 2-tangent box.
+    // This path's spoke layout is the fixed (t0,t1) pair; condim 2/4/6 would need
+    // a different layout (see EmitCompliantContactRows) so reject them loudly
+    // rather than silently emitting the wrong row count.
+    if (condim != 1u && condim != 3u) {
+        throw std::runtime_error(
+            "AppendContactGroup: condim=" + std::to_string(condim) +
+            " unsupported (this legacy 2-tangent path handles condim 1 or 3)");
+    }
+    const uint32_t friction_row_count =
+        (normal_row_count > 0u && condim == 3u) ? 2u : 0u;
 
     const math::Vec3 normal = points != nullptr
         ? points[0].normal.Normalized()
@@ -212,6 +226,19 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
     const uint32_t friction_rows_per_point =
         inputs.condim >= 2u ? 2u * (inputs.condim - 1u) : 0u;
 
+    // The spoke/warm scratch below is statically sized to the condim<=3 case (4
+    // pure-tangent spokes). condim 4/6 (torsional/rolling) needs distinct higher-
+    // dimension directions; rather than the old `s & 3u` mask SILENTLY replaying
+    // the first 4 spokes (geometrically wrong rows), fail loudly until supported.
+    constexpr uint32_t kMaxFrictionSpokes = 4u;
+    if (friction_rows_per_point > kMaxFrictionSpokes) {
+        throw std::runtime_error(
+            "EmitCompliantContactRows: condim=" + std::to_string(inputs.condim) +
+            " requests " + std::to_string(friction_rows_per_point) +
+            " friction spokes/point, exceeding the supported maximum of " +
+            std::to_string(kMaxFrictionSpokes) + " (condim<=3)");
+    }
+
     for (const auto& manifold : manifolds) {
         if (manifold.point_count == 0u) {
             continue;
@@ -314,19 +341,18 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
             for (uint32_t i = 0; i < point_count; ++i) {
                 const ContactPoint& point = manifold.points[i];
                 // Per-point spoke set. For condim==3 (4 spokes) the FIXED angular
-                // order is +t0, -t0, +t1, -t1. For other condims we replicate the
-                // same +-t0,+-t1 pattern (v0.8 supports condim<=3; >3 deferred).
-                const math::Vec3 spokes[4] = {
+                // order is +t0, -t0, +t1, -t1 (condim>4 is rejected loudly above).
+                const math::Vec3 spokes[kMaxFrictionSpokes] = {
                     tangent0, -tangent0, tangent1, -tangent1
                 };
-                const float warm[4] = {
+                const float warm[kMaxFrictionSpokes] = {
                     point.friction_impulse_1,
                     point.friction_impulse_1,
                     point.friction_impulse_2,
                     point.friction_impulse_2
                 };
                 for (uint32_t s = 0; s < friction_rows_per_point; ++s) {
-                    const math::Vec3 dir = spokes[s & 3u];
+                    const math::Vec3 dir = spokes[s];
                     RowMaterial material;
                     material.kind = RowKind::Contact;
                     material.group_id = group_first_row;
@@ -346,7 +372,7 @@ void EmitCompliantContactRows(std::span<const ContactManifold> manifolds,
                                           0.0f,
                                           0.0f,
                                           0.0f,
-                                          warm[s & 3u],
+                                          warm[s],
                                           row_flags::Friction |
                                               row_flags::GradActive |
                                               row_flags::Compliant);
@@ -370,9 +396,9 @@ void AppendRevoluteRows(RowBuffers* out_rows,
                         math::Vec3 axis,
                         math::Transform parent_frame,
                         math::Transform child_frame,
-                        float,
-                        float,
-                        float) {
+                        float lower_limit,
+                        float upper_limit,
+                        float current_angle) {
     if (out_rows == nullptr) {
         return;
     }
@@ -426,6 +452,53 @@ void AppendRevoluteRows(RowBuffers* out_rows,
                          {body_a, body_b},
                          MakeJacobian(math::Vec3::Zero(), rot_axis),
                          MakeJacobian(math::Vec3::Zero(), -rot_axis),
+                         material,
+                         anchor);
+    }
+
+    // Range-of-motion limit rows on the FREE revolute axis. A limit is "active"
+    // only when current_angle is at/beyond it -> an unactivated joint emits the
+    // 5 equality rows alone (range-of-motion is enforced, never silently dropped).
+    // The violation depth (in radians) is carried as position_error so the solver
+    // applies its own Baumgarte/erp, exactly as the contact-normal rows do; rhs is
+    // a velocity bias (the (limit-angle)/dt form needs dt -- FLAGGED below).
+    const bool has_lower = lower_limit > -kRowHugeLimit;
+    const bool has_upper = upper_limit < kRowHugeLimit;
+    if (has_upper && current_angle > upper_limit) {
+        // Push back toward range: Jdq = -axis . dq <= 0, lambda >= 0.
+        const float violation = current_angle - upper_limit;  // >0
+        Row row = MakeBaseRow(kMaximalJointRowClassId,
+                              -violation,
+                              0.0f,
+                              kRowHugeLimit,
+                              0.0f,
+                              row_flags::Unilateral | row_flags::GradActive);
+        RowMaterial material;
+        material.kind = RowKind::Joint;
+        material.position_error = violation;
+        out_rows->AddRow(row,
+                         {body_a, body_b},
+                         MakeJacobian(math::Vec3::Zero(), -norm_axis),
+                         MakeJacobian(math::Vec3::Zero(), norm_axis),
+                         material,
+                         anchor);
+    }
+    if (has_lower && current_angle < lower_limit) {
+        // Mirror: push the other way, same unilateral lambda >= 0 convention.
+        const float violation = lower_limit - current_angle;  // >0
+        Row row = MakeBaseRow(kMaximalJointRowClassId,
+                              -violation,
+                              0.0f,
+                              kRowHugeLimit,
+                              0.0f,
+                              row_flags::Unilateral | row_flags::GradActive);
+        RowMaterial material;
+        material.kind = RowKind::Joint;
+        material.position_error = violation;
+        out_rows->AddRow(row,
+                         {body_a, body_b},
+                         MakeJacobian(math::Vec3::Zero(), norm_axis),
+                         MakeJacobian(math::Vec3::Zero(), -norm_axis),
                          material,
                          anchor);
     }

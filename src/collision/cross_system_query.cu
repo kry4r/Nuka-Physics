@@ -41,6 +41,12 @@ namespace {
 
 constexpr uint32_t kBlockSize = 128u;
 
+// Explicit-stack traversal depth. A balanced LBVH over N leaves has depth
+// ~ceil(log2(N)), so 64 covers up to 2^64 leaves balanced; a DEGENERATE
+// (Morton-collision) chain could exceed it, so an overflow at this depth is
+// surfaced via the overflow flag (-> TruncatedParticleCount), never silent.
+constexpr int32_t kTraversalStackDepth = 64;
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -151,7 +157,7 @@ __device__ uint32_t TraverseRigidLbvh(const collision::AABB& query,
     }
 
     const uint32_t internal_count = leaf_count - 1u;
-    int32_t stack[64];
+    int32_t stack[kTraversalStackDepth];
     int32_t top = 0;
     stack[top++] = 0; // root internal node
 
@@ -169,8 +175,12 @@ __device__ uint32_t TraverseRigidLbvh(const collision::AABB& query,
             }
             if (is_leaf) {
                 insert(static_cast<uint32_t>(nodes[child].left));
-            } else if (top < 63) {
+            } else if (top < kTraversalStackDepth - 1) {
                 stack[top++] = child;
+            } else {
+                // Stack full: this internal node's subtree is dropped. Flag it so
+                // the host surfaces it via TruncatedParticleCount (never silent).
+                of = true;
             }
         }
     }

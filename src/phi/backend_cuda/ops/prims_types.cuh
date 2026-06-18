@@ -15,6 +15,13 @@
 
 namespace nuka::phi::nkops {
 
+// Canonical shape_table row stride (packed f32 / body row). GREW 8 -> 10 (R1
+// body_id/group) -> 12 (L-RECON-D hull slice). The SINGLE source of truth shared
+// by every shape_table reader (LoadPrimShape, broadphase LoadShape) AND the model
+// builder (model.cpp ShapeTable staging / fields.yaml max_bodies_total*12) — adding
+// a lane bumps THIS one constant; the static_assert below pins the struct to it.
+inline constexpr uint32_t kShapeTableRowStride = 12u;
+
 // Device-side shape_table record. R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape staging in StageModelField(ShapeTable)). params:
 // sphere r / capsule r,hh / box he.xyz, by kind. Lanes 8/9 = body_id (int32) +
@@ -32,10 +39,14 @@ struct PrimShapeDev {
     uint32_t hull_vert_offset;  // base vertex index into hull_verts/3 (L-RECON-D).
     uint32_t hull_vert_count;   // vertex count, 0 == not a hull row (L-RECON-D).
 };
+// All 12 lanes are 4-byte scalars, so the packed row is exactly the stride; this
+// guards against a lane addition that forgets to bump kShapeTableRowStride.
+static_assert(sizeof(PrimShapeDev) == kShapeTableRowStride * sizeof(float),
+              "PrimShapeDev must pack exactly kShapeTableRowStride floats");
 
 __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
                                                       uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 12u;
+    const float* q = table + static_cast<size_t>(row) * kShapeTableRowStride;
     PrimShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.params[0] = q[1]; s.params[1] = q[2]; s.params[2] = q[3]; s.params[3] = q[4];

@@ -43,11 +43,11 @@ struct DeviceRecord {
 
     // --- phi v2 owned device/backend (M9 T2) -------------------------------
     // An OWNED phi v2 Backend (and the registry-owned Device it was init'd on),
-    // acquired in nuka_device_create. These feed the future nk::World ctor +
-    // cook::Settle from the C-ABI:
-    //   TODO(M9-T4): nuka_scene.cpp's settle() calls cook::Settle on this backend.
-    //   TODO(M9-T5): world.cpp create builds nk::World(model, n, phi_device,
-    //                backend, cfg) from these (mirroring recorder.cpp).
+    // acquired in nuka_device_create. These feed the nk::World ctor + cook::Settle
+    // from the C-ABI. M9 COMPLETE: T2 (phi_device/backend acquisition here), T4
+    // (scene.cpp settle calls cook::Settle on this backend) and T5 (world.cpp
+    // build nk::World(model, n, phi_device, backend, cfg)) are all wired as of the
+    // M9 push.
     // LIFETIME (mirrors RecorderRecord, commit fcae2a6): the Backend is OWNED
     // and freed in the destructor; nk::World only BORROWS it
     // (World::~World -> BackendPlanFree(backend_), never frees the backend), so
@@ -59,9 +59,9 @@ struct DeviceRecord {
     phi::Backend* backend = nullptr;     // OWNED; BackendFree'd in dtor
 
     ~DeviceRecord() {
-        // No phi v2 World borrows this backend yet (that arrives in T5); freeing
-        // it directly here is correct for T2. When T5 adds an owned nk::World to
-        // DeviceRecord, reset() it BEFORE this BackendFree (see lifetime note).
+        // The nk::World that BORROWS this backend lives on the WorldRecord, which
+        // the API contract destroys before its DeviceRecord (nuka_world_destroy
+        // before nuka_device_destroy), so the backend has no live borrower here.
         if (backend != nullptr) {
             phi::BackendFree(backend);
             backend = nullptr;
@@ -133,14 +133,20 @@ struct WorldRecord {
     std::vector<float> empty_float_storage;
 
     // --- v0.5 p04 N1: per-sensor-field domain-randomization noise -----------
-    // Fixed array indexed by nuka_state_field_t (0..15). Default is None so a
-    // field with no registered noise is a byte no-op on apply and V1 oracle
-    // scenes stay byte-identical. `noise_seq[f]` is that field's monotonically
-    // advancing per-apply sequence index (the Philox counter seq lane), giving
-    // independent noise across steps; the SAME (seed, seq) replays bit-exact on
-    // the reverse pass (no RNG state to checkpoint -- exit #6). 16 == one past
-    // the max field enum (NUKA_FIELD_TASK_TARGET == 15).
-    static constexpr uint32_t kNoiseFieldCount = 16u;
+    // Fixed array indexed by nuka_state_field_t. Default is None so a field with
+    // no registered noise is a byte no-op on apply and V1 oracle scenes stay
+    // byte-identical. `noise_seq[f]` is that field's monotonically advancing
+    // per-apply sequence index (the Philox counter seq lane), giving independent
+    // noise across steps; the SAME (seed, seq) replays bit-exact on the reverse
+    // pass (no RNG state to checkpoint -- exit #6). Sized to cover EVERY public
+    // field: derived from the current enum maximum so adding a field never leaves
+    // it silently out of range (the old hardcoded 16 rejected terrain fields).
+    static constexpr uint32_t kNoiseFieldCount =
+        static_cast<uint32_t>(NUKA_FIELD_JOINT_FEEDFORWARD) + 1u;
+    // JOINT_FEEDFORWARD is the highest field enumerator; a new field above it must
+    // bump this anchor so kNoiseFieldCount still covers the whole enum.
+    static_assert(NUKA_FIELD_JOINT_FEEDFORWARD >= NUKA_FIELD_ENV_TERRAIN_DIFFICULTY,
+                  "kNoiseFieldCount must derive from the maximum field enum");
     nuka::sensor::noise::SensorNoiseConfig noise_config[kNoiseFieldCount];
     uint64_t noise_seq[kNoiseFieldCount] = {};
 

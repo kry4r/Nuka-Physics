@@ -5,8 +5,11 @@
 #include "nk/model/model.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <utility>
+
+#include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 
 namespace nuka::nk {
 
@@ -15,6 +18,11 @@ namespace {
 constexpr uint64_t kAlign = 256;  // CUDA buffer-type alignment (BufferTypeAlignment).
 
 uint64_t AlignUp(uint64_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); }
+
+// Spatial inertia is a 6x6 matrix; derive its float/byte extent from Mat36 so the
+// staging loop cannot drift from the device record (replaces bare 36/144).
+constexpr size_t kSpatialInertiaFloats = sizeof(Mat36) / sizeof(float);
+constexpr size_t kSpatialInertiaBytes  = sizeof(Mat36);
 
 }  // namespace
 
@@ -58,7 +66,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // a GLOBAL table (not env-replicated). Any other scalar field defaults to
         // a single env-major row. Keyed by FieldId so the resolution is explicit.
         if (id == FieldId::MatBuckets) {
-            return static_cast<uint64_t>(num_material_buckets) * 8ull;
+            return static_cast<uint64_t>(num_material_buckets) *
+                   ModelMaterialBucket::kValueCount;
         }
         if (id == FieldId::FootShape) {
             // GLOBAL foot table (shared by every env, base-relative indices):
@@ -76,7 +85,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // hull slice hull_vert_offset/hull_vert_count); the unpack of lanes
         // 0..9 stays byte-identical (the new lanes default 0 for hull-free rows).
         if (id == FieldId::ShapeTable) {
-            return static_cast<uint64_t>(max_bodies_total) * 12ull;
+            return static_cast<uint64_t>(max_bodies_total) * phi::kShapeTableRowStride;
         }
         if (id == FieldId::ExcludedPairs) {
             return static_cast<uint64_t>(max_excluded_pairs);
@@ -88,7 +97,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return static_cast<uint64_t>(max_bodies_total) * 2ull;
         }
         if (id == FieldId::SdfHeaders) {
-            return static_cast<uint64_t>(max_sdf_grids) * 8ull;
+            return static_cast<uint64_t>(max_sdf_grids) * phi::kSdfHeaderStride;
         }
         if (id == FieldId::SdfCellCount) {
             return static_cast<uint64_t>(max_sdf_grids);
@@ -101,6 +110,13 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // (the keys are env-offset, so every env owns a private cell span).
         if (id == FieldId::GridCellStart || id == FieldId::GridCellEnd) {
             return static_cast<uint64_t>(max_grid_cells) *
+                   static_cast<uint64_t>(env_count);
+        }
+        // obs_buffer: the cook-derived per-env observation width x env_count (the
+        // symbolic fields.yaml count "obs_width*env_count"). 0 obs_width is a flat
+        // per-env row so the readout has a defined (empty) destination.
+        if (id == FieldId::ObsBuffer) {
+            return static_cast<uint64_t>(obs_width) *
                    static_cast<uint64_t>(env_count);
         }
         // H1 (general contact pipeline Phase 0): the GLOBAL heightfield grid pool
@@ -183,10 +199,13 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::LinkInertia: {
             for (uint32_t e = 0; e < E; ++e) {
                 for (uint32_t l = 0; l < L; ++l) {
-                    if ((static_cast<size_t>(l) + 1) * 36 <= a.link_inertia_spatial.size()) {
-                        std::memcpy(dst + (static_cast<size_t>(e) * L + l) * 144,
-                                    a.link_inertia_spatial.data() + static_cast<size_t>(l) * 36,
-                                    144);
+                    if ((static_cast<size_t>(l) + 1) * kSpatialInertiaFloats <=
+                        a.link_inertia_spatial.size()) {
+                        std::memcpy(
+                            dst + (static_cast<size_t>(e) * L + l) * kSpatialInertiaBytes,
+                            a.link_inertia_spatial.data() +
+                                static_cast<size_t>(l) * kSpatialInertiaFloats,
+                            kSpatialInertiaBytes);
                     }
                 }
             }
@@ -315,7 +334,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             const uint32_t rows = capacities.max_bodies_total;
             for (uint32_t s = 0; s < shape_table_rows.size() && s < rows; ++s) {
                 const PairDrivenShape& sh = shape_table_rows[s];
-                const size_t b = static_cast<size_t>(s) * 12u;
+                const size_t b = static_cast<size_t>(s) * phi::kShapeTableRowStride;
                 put_u32(b + 0, sh.kind);
                 p[b + 1] = sh.params[0]; p[b + 2] = sh.params[1];
                 p[b + 3] = sh.params[2]; p[b + 4] = sh.params[3];
@@ -361,7 +380,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             const uint32_t grids = capacities.max_sdf_grids;
             for (uint32_t g = 0; g < sdf_grids.size() && g < grids; ++g) {
                 const SdfGrid& s = sdf_grids[g];
-                const size_t b = static_cast<size_t>(g) * 8u;
+                const size_t b = static_cast<size_t>(g) * phi::kSdfHeaderStride;
                 p[b + 0] = s.origin.x; p[b + 1] = s.origin.y; p[b + 2] = s.origin.z;
                 p[b + 3] = s.voxel_size;
                 put_u32(b + 4, s.dims[0]); put_u32(b + 5, s.dims[1]);
@@ -707,6 +726,22 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
 
 phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     if (bt == nullptr || out_view == nullptr) {
+        return phi::Status::Failed;
+    }
+    // Capacity contracts (loud-failure discipline): the cooked host tables MUST
+    // fit their advertised capacities, else staging would SILENTLY drop the tail
+    // (a truncated device model that simulates wrong with no diagnostic). The
+    // counts are data-driven (cooked from the scene geometry); the capacities are
+    // the compile-time MAX. Fail LOUDLY in ALL builds (not just a debug assert that
+    // NDEBUG strips) when a data-driven count overflows its capacity -- never a
+    // silent truncate.
+    const bool capacities_ok =
+        feet.size() <= capacities.max_contacts_per_env &&
+        shape_table_rows.size() <= capacities.max_bodies_total &&
+        hull_verts.size() <=
+            static_cast<size_t>(capacities.max_hull_verts) * 3u;
+    assert(capacities_ok && "cooked table exceeds its capacity -> would truncate");
+    if (!capacities_ok) {
         return phi::Status::Failed;
     }
     // Enforce the excluded-pairs contract AT THE STAGING BOUNDARY: the device

@@ -32,6 +32,16 @@ using namespace ::nuka::phi::nkops;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 
+// Contact-basis lambda layout: each contact slot carries {Fn, Ft1, Ft2}; each
+// link wrench is a Spatial6 {force.xyz, torque.xyz}. Named so a layout growth
+// (e.g. a torsional-friction spoke) is a single edit, not silent stride drift.
+// FLAG: AssembleRows / the row solver also encode the 3-component contact basis;
+// the divergence-proof home is a shared contact-constants header.
+constexpr uint32_t kContactForceComponents = 3u;
+constexpr uint32_t kLinkWrenchComponents   = 6u;
+static_assert(kLinkWrenchComponents == sizeof(::nuka::math::Vec3) * 2u / sizeof(float),
+              "link wrench == force(Vec3) + torque(Vec3)");
+
 // M10 deterministic IC-jitter helpers (Philox4x32-10, host+device pure fns).
 using nuka::sensor::noise::MakeCounter;
 using nuka::sensor::noise::Philox4x32_10;
@@ -62,7 +72,7 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
     if (slot >= slot_count) {
         return;
     }
-    const uint32_t base = slot * 3u;
+    const uint32_t base = slot * kContactForceComponents;
     out_contact_force[base + 0u] = lambda[base + 0u] * inv_dt;
     out_contact_force[base + 1u] = lambda[base + 1u] * inv_dt;
     out_contact_force[base + 2u] = lambda[base + 2u] * inv_dt;
@@ -98,7 +108,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
         if (contact_link[slot] != g) {
             continue;
         }
-        const uint32_t base = slot * 3u;
+        const uint32_t base = slot * kContactForceComponents;
         const float ln = lambda[base + 0u];
         const float lt1 = lambda[base + 1u];
         const float lt2 = lambda[base + 2u];
@@ -113,7 +123,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
         torque += r.Cross(f_slot);
     }
 
-    const uint32_t out = g * 6u;
+    const uint32_t out = g * kLinkWrenchComponents;
     out_link_wrench[out + 0u] = force.x;
     out_link_wrench[out + 1u] = force.y;
     out_link_wrench[out + 2u] = force.z;
@@ -150,9 +160,10 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  // (byte-identical to the pre-M10 reset).
                                  uint64_t ic_seed,
                                  uint32_t ic_episode,
-                                 uint32_t cup_body_index,
-                                 float jitter_cup_x,
-                                 float jitter_cup_y,
+                                 uint32_t jitter_body_index,
+                                 float jitter_body_x,
+                                 float jitter_body_y,
+                                 float jitter_body_z,
                                  float jitter_base_x,
                                  float jitter_base_y,
                                  float jitter_base_z,
@@ -203,11 +214,13 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
     for (uint32_t b = threadIdx.x; b < body_count; b += blockDim.x) {
         const uint32_t body = env * body_count + b;
         Transform pose = snapshot_body_pose[body];
-        // M10: optional cup-XY jitter, ONLY on the cup body slot (per-axis
-        // distinct seq lanes 10/11). Gated; zero halves => verbatim copy.
-        if (b == cup_body_index) {
-            if (jitter_cup_x != 0.0f) pose.position.x += JitterDraw(ic_key, env, 10u, jitter_cup_x);
-            if (jitter_cup_y != 0.0f) pose.position.y += JitterDraw(ic_key, env, 11u, jitter_cup_y);
+        // M10: optional per-body position jitter, ONLY on the targeted body slot
+        // (per-axis distinct seq lanes 10/11/12). Gated; zero halves => verbatim
+        // copy. Name-agnostic: targets whichever slot jitter_body_index names.
+        if (b == jitter_body_index) {
+            if (jitter_body_x != 0.0f) pose.position.x += JitterDraw(ic_key, env, 10u, jitter_body_x);
+            if (jitter_body_y != 0.0f) pose.position.y += JitterDraw(ic_key, env, 11u, jitter_body_y);
+            if (jitter_body_z != 0.0f) pose.position.z += JitterDraw(ic_key, env, 12u, jitter_body_z);
         }
         body_pose[body] = pose;
         body_linear_velocity[body] = snapshot_body_linear_velocity[body];
@@ -346,8 +359,8 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
                static_cast<const Vec3*>(data.snapshot_body_angular_velocity),
                // M10 RL-completion: optional per-env IC jitter (all-zero =>
                // verbatim snapshot copy, byte-identical to the pre-M10 reset).
-               p->ic_seed, p->ic_episode, p->cup_body_index,
-               p->jitter_cup_xy[0], p->jitter_cup_xy[1],
+               p->ic_seed, p->ic_episode, p->jitter_body_index,
+               p->jitter_body_xyz[0], p->jitter_body_xyz[1], p->jitter_body_xyz[2],
                p->jitter_base_pos[0], p->jitter_base_pos[1], p->jitter_base_pos[2],
                p->jitter_q);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

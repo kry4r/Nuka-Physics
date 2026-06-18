@@ -31,6 +31,10 @@ public:
     struct SolverConfig {
         float    dt = 1.0f / 240.0f;
         float    gravity[3] = {0.0f, 0.0f, -9.81f};
+        // Per-world contact PGS sweep count (the general SolveRowsBlockIsland loop).
+        // This IS the runtime promotion of the legacy articulated path's named
+        // default (runtime::articulation::kContactSolverIterations == 48); kept at
+        // 32 here so existing cooked worlds stay byte-identical.
         uint16_t vel_iters = 32;
         uint16_t pos_iters = 0;
         float    contact_margin = 0.0f;

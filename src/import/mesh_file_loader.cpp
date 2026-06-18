@@ -217,6 +217,18 @@ MeshGeometry LoadObj(const std::string& path) {
             g.vertices.push_back(x);
             g.vertices.push_back(y);
             g.vertices.push_back(z);
+        } else if (tag == "vn") {
+            // Authored per-vertex normal (x,y,z triple, declaration order). Most
+            // exported OBJs declare one vn per v with matching indices (a/t/n with
+            // n==v), so file-order vn aligns 1:1 with v; faces are still indexed by
+            // the vertex slot. A vn-less OBJ leaves g.normals empty (zero-fill).
+            float nx = 0.f, ny = 0.f, nz = 0.f;
+            if (!(ls >> nx >> ny >> nz)) {
+                throw std::runtime_error("mesh-loader: OBJ malformed normal: " + path);
+            }
+            g.normals.push_back(nx);
+            g.normals.push_back(ny);
+            g.normals.push_back(nz);
         } else if (tag == "f") {
             // Collect all face vertex tokens, then fan-triangulate.
             std::vector<std::uint32_t> face;
@@ -235,15 +247,17 @@ MeshGeometry LoadObj(const std::string& path) {
                 g.indices.push_back(face[i + 1]);
             }
         }
-        // vt / vn / mtllib / usemtl / g / o / s / # and others: ignored.
-        // NOTE (M9 cook-real-normals debt): `vn` authored normals ARE present in
-        // these files but are dropped here -> MeshGeometry.normals stays empty ->
-        // EncodeMesh zero-fills -> render synthesizes normals. Parsing `vn` and
-        // threading it through is deferred (it changes cooked .nka bytes; D1).
+        // vt / mtllib / usemtl / g / o / s / # and others: ignored (vn handled).
     }
 
     if (g.vertices.empty()) {
         throw std::runtime_error("mesh-loader: OBJ has no vertices: " + path);
+    }
+    // Authored normals carry through only when they align 1:1 with vertices (one
+    // vn per v in declaration order, the common export). Any mismatch -> drop
+    // them so EncodeMesh zero-fills and the render side synthesizes.
+    if (g.normals.size() != g.vertices.size()) {
+        g.normals.clear();
     }
     return g;
 }

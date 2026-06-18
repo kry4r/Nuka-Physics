@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // ---------------------------------------------------------------------------
 // nuka::render::raster INSTANCED forward-pass vertex shader (M11 INT-5,
 // OD-2=(A)). The interop-only variant of mesh.vert: it reads the per-instance
@@ -26,7 +27,8 @@
 layout(location = 0) in vec3 inPosition;  // object-space position
 layout(location = 1) in vec3 inNormal;    // object-space normal
 
-const int kMaxLights = 8;
+#include "light_limits.glsl"  // NUKA_MAX_LIGHTS -- single source, == C++ kMaxUboLights
+const int kMaxLights = NUKA_MAX_LIGHTS;
 struct GpuLight {
     vec4 direction;
     vec4 position;

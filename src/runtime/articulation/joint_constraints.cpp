@@ -35,6 +35,11 @@ void AppendDriveRow(
     math::Vec3 axis,
     const JointDrive& drive,
     float current_velocity) {
+    // The drive row is formulated with rhs = target_velocity; the velocity ERROR
+    // (target - J.v) is formed by the solver from the integrated J.v at solve
+    // time, so current_velocity is NOT folded into rhs here (doing so would
+    // double-count it). It is unused on purpose -- see the FLAG to drop it from
+    // the public signature once the constraint::AppendDriveRow seam is updated.
     (void)current_velocity;
     constraint::AppendDriveRow(out_rows,
                                body_a,

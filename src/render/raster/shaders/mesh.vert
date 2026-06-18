@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // ---------------------------------------------------------------------------
 // nuka::render::raster forward pass vertex shader (M8.5 T4 -- full PBR seam).
 //
@@ -24,7 +25,8 @@ layout(location = 1) in vec3 inNormal;    // object-space normal (flat-synthesiz
 
 // Per-frame scene environment (camera + light rig). Bound once per render; see
 // the matching SceneUbo in mesh_pbr.frag.
-const int kMaxLights = 8;
+#include "light_limits.glsl"  // NUKA_MAX_LIGHTS -- single source, == C++ kMaxUboLights
+const int kMaxLights = NUKA_MAX_LIGHTS;
 struct GpuLight {
     vec4 direction;  // xyz = world-space direction TOWARD the light; w = is_directional
     vec4 position;   // xyz = world-space position (point lights);    w = range (unused)

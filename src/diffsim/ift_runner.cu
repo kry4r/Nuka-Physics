@@ -83,8 +83,25 @@ using art::ArticulatedContactRow;
 using art::ContactRowType;
 
 constexpr uint32_t kWarpSize = 32u;
+// NAMED capacities for the __shared__ tiles. kSlotsPerEnv caps the per-env active
+// contact slots consumed here; kMaxDof caps the per-articulation DOF tile width.
+// kMaxDof is pinned at the engine's diffsim-shared-tile ceiling
+// (kMaxContactSolverDof=18, NOT kMaxArticulationDof=64): a 64-wide fp64 M^-1 tile
+// (64*64*8 = 32KB) plus the J / w tiles would blow the 48KB static shared-memory
+// budget (see articulation_contacts.hpp). Overflow past EITHER cap is a LOUD
+// failure -- the host Run() rejects dof_stride > kMaxDof (and dof_stride == the
+// per-articulation max_dof, so this gates EVERY articulation's full DOF count),
+// and the device guards below __trap() rather than silently truncating the map.
 constexpr uint32_t kSlotsPerEnv = art::kMaxFootContactsPerEnv;  // 4
 constexpr uint32_t kMaxDof = art::kMaxContactSolverDof;         // 18
+// The active-row scan emits 3 rows (normal + 2 tangents) per engaged slot; the
+// block-major rhs/z tiles are kMaxBlockDim wide, so the scan must fit kMaxBlockDim.
+static_assert(kSlotsPerEnv * 3u <= kMaxBlockDim,
+              "active-row scan can overflow the kMaxBlockDim block tile");
+// kMaxDof is the legacy 18-DOF tile cap; if it ever rises, re-check the 48KB
+// static shared-memory budget (kMaxDof^2 fp64 M^-1 tile + the J/w tiles).
+static_assert(kMaxDof <= art::kMaxArticulationDof,
+              "kMaxDof must not exceed the engine articulation-DOF ceiling");
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -113,18 +130,32 @@ __device__ __forceinline__ uint32_t JointDofCount(art::ArticulationJointType typ
 // Build the SCALAR-joint dof column -> global link map for an articulation, into
 // `dof_to_link` (length <= kMaxDof). Returns the DOF count. Fixed loop order
 // (base-inclusive prefix sum over [offset, offset+count)) == LocalDofIndex /
-// SolveArticulatedContactRowsKernel for fixed-base models. A FloatingBase root is
-// (out of scope) treated as 6 DOFs all on the root link's qdot slot -- the
-// validated scenes have no floating root, so this branch is never exercised by
-// the FD/dense gates; documented as a limitation.
+// SolveArticulatedContactRowsKernel for fixed-base models.
+//
+// HONESTY (no silent truncation / no silently-wrong scene branch):
+//  * Overflow past kMaxDof __trap()s LOUDLY rather than silently dropping the
+//    excess DOFs' gradient scatter (the old `dof < kMaxDof` loop guard). The host
+//    Run() already rejects dof_stride > kMaxDof, and dof_stride == per-articulation
+//    max_dof, so this is a defense-in-depth guard against a contract violation.
+//  * A FloatingBase root is NOT supported here: its 6 base-velocity DOFs live in
+//    link_velocity[root].v, NOT state.qdot[root], so the scalar-joint map would be
+//    silently WRONG for all 6. Until validated against a floating-base golden we
+//    __trap() rather than emit wrong gradients. Validated scenes are fixed-base.
 __device__ __forceinline__ uint32_t BuildDofToLink(
     const art::ArticulationDeviceState& state, uint32_t offset, uint32_t count,
     uint32_t* __restrict__ dof_to_link) {
     uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count && dof < kMaxDof; ++local) {
+    for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
-        const uint32_t jdof = JointDofCount(state.joint_type[link]);
-        for (uint32_t d = 0u; d < jdof && dof < kMaxDof; ++d) {
+        const art::ArticulationJointType type = state.joint_type[link];
+        if (type == art::ArticulationJointType::FloatingBase) {
+            __trap();  // floating root unsupported (qdot map wrong) -- loud, not silent
+        }
+        const uint32_t jdof = JointDofCount(type);
+        for (uint32_t d = 0u; d < jdof; ++d) {
+            if (dof >= kMaxDof) {
+                __trap();  // DOF count exceeds the named tile cap -- loud overflow
+            }
             dof_to_link[dof] = link;  // scalar joint: one DOF per link
             ++dof;
         }
@@ -346,10 +377,18 @@ void IftRunner::Run(const IftContactInputs& inputs, const float* g,
         grads.grad_qdot_free == nullptr || grads.grad_b_c == nullptr) {
         throw std::invalid_argument("nuka::diffsim::IftRunner::Run: null buffer");
     }
+    // dof_stride == the per-articulation max_dof (M^-1 tile / Jacobian stride), so
+    // this LOUD gate caps EVERY articulation's full DOF count at the named diffsim
+    // tile ceiling (kMaxContactSolverDof=18, < kMaxArticulationDof=64; see the tile
+    // budget note above). NO silent truncation: a larger articulation (e.g. 51-DOF
+    // H1) is rejected here rather than computing gradients over a truncated DOF map.
     if (inputs.dof_stride == 0u || inputs.dof_stride > kMaxDof) {
         throw std::invalid_argument(
-            "nuka::diffsim::IftRunner::Run: dof_stride out of range (1.." +
-            std::to_string(kMaxDof) + ")");
+            "nuka::diffsim::IftRunner::Run: dof_stride (" +
+            std::to_string(inputs.dof_stride) +
+            ") out of range (1.." + std::to_string(kMaxDof) +
+            "); the diffsim IFT shared tiles are pinned at kMaxContactSolverDof -- "
+            "a larger articulation needs the dynamic-shared-memory migration");
     }
 
     phi::ScopedDeviceGuard guard(device_id_);

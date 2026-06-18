@@ -186,7 +186,7 @@ struct DataView {
     uint32_t* grid_neighbor_idx = nullptr;  // per:particle arena:scratch owner:data elem:32
     uint64_t* rng_state = nullptr;  // per:env arena:persistent owner:data flags:[param]
     uint32_t* env_status = nullptr;  // per:env arena:scratch owner:data flags:[readout]
-    float* obs_buffer = nullptr;  // per:env arena:scratch owner:data elem:64 flags:[readout]
+    float* obs_buffer = nullptr;  // per:scalar arena:scratch owner:data count:obs_width*env_count flags:[readout]
     uint32_t* env_terrain_type = nullptr;  // per:env arena:persistent owner:data
     float* env_terrain_difficulty = nullptr;  // per:env arena:persistent owner:data
     float* joint_f = nullptr;  // per:link arena:persistent owner:data flags:[param]

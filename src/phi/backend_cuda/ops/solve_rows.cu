@@ -71,6 +71,20 @@ __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
 // UNION-family island kernel (M4 NEW — the §3.4 spec kernel).
 // ===========================================================================
 
+// Island record: the schedule's per-island quad. The flat schedule array is a
+// run of these (schedule.cpp builds it as raw {seg_off, seg_cnt, flags, env}
+// stride-4 u32). FLAG: schedule.cpp:256-323 + fields.yaml encode the same quad
+// with raw `* 4u + k` arithmetic — they should adopt THIS struct so a field
+// addition is one edit, not a silent stride drift across three sites.
+struct IslandRecord {
+    uint32_t seg_off;   // first color segment of this island
+    uint32_t seg_cnt;   // color segment count
+    uint32_t flags;     // bit0 == has-articulation
+    uint32_t env;       // owning env
+};
+static_assert(sizeof(IslandRecord) == 4u * sizeof(uint32_t),
+              "IslandRecord must pack exactly the stride-4 schedule quad");
+
 // Island block size. §3.4 sketched 256; MEASURED at N=1 (one island, ~170
 // colors x 64 iters = ~11k __syncthreads on the critical path) a small block
 // wins decisively — the per-color parallel width is 1-2 rows (each handled by
@@ -388,10 +402,14 @@ __global__ void SolveRowsBlockIslandKernel(
     if (island >= total_islands) {
         return;
     }
-    const uint32_t seg_off = islands[static_cast<size_t>(island) * 4u + 0u];
-    const uint32_t seg_cnt = islands[static_cast<size_t>(island) * 4u + 1u];
-    const uint32_t flags = islands[static_cast<size_t>(island) * 4u + 2u];
-    const uint32_t env = islands[static_cast<size_t>(island) * 4u + 3u];
+    // Read the island's quad via the named record (same memory as the raw
+    // stride-4 layout; reinterpret keeps the schedule array untouched).
+    const IslandRecord rec =
+        reinterpret_cast<const IslandRecord*>(islands)[island];
+    const uint32_t seg_off = rec.seg_off;
+    const uint32_t seg_cnt = rec.seg_cnt;
+    const uint32_t flags = rec.flags;
+    const uint32_t env = rec.env;
     const uint32_t lane = threadIdx.x;
     const uint32_t env_row_base = env * rows_per_env;
     const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;

@@ -38,9 +38,8 @@ SceneIR::SceneIR(const SceneIR& other)
       exclude_pairs_(other.exclude_pairs_),
       contact_pairs_(other.contact_pairs_),
       initial_state_(other.initial_state_),
-      settle_(other.settle_),
-      grasp_(other.grasp_) {
-    // initial_state_ / settle_ / grasp_ are authored metadata, NOT projected
+      settle_(other.settle_) {
+    // initial_state_ / settle_ are authored metadata, NOT projected
     // from records, so they must be copied explicitly (RebuildFacade only
     // rebuilds the tree/ECS from records and would otherwise drop them).
     RebuildFacade();
@@ -62,7 +61,6 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     contact_pairs_ = other.contact_pairs_;
     initial_state_ = other.initial_state_;   // authored metadata (not from records)
     settle_        = other.settle_;
-    grasp_         = other.grasp_;
     RebuildFacade();
     return *this;
 }

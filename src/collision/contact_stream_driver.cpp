@@ -27,8 +27,10 @@ scene::ContactParamsIn ToMergeInput(const ResolvedShape& s) {
     in.solref[1]   = s.solref[1];
     for (int i = 0; i < 5; ++i) in.solimp[i] = s.solimp[i];
     in.solmix      = s.solmix;
-    // margin / gap left at ContactParamsIn defaults (0): a ResolvedShape carries
-    // no margin/gap today (no ContactManifold field consumes them -- C5c gap).
+    // margin/gap now carried on ResolvedShape (C5c): forward them so the merge
+    // (max of both sides) survives onto the manifold below.
+    in.margin      = s.margin;
+    in.gap         = s.gap;
     return in;
 }
 
@@ -87,12 +89,14 @@ void BuildContactManifolds(std::span<const CandidatePair> pairs,
         //    We CALL scene::MergeContactParams -- the same merge the cook-time
         //    filter uses -- never reimplement it. Map merged.friction_mu ->
         //    m.friction, merged.solimp -> m.solimp, and the merged solref onto
-        //    EVERY point's solref_timeconst/dampratio. merged.condim/margin/gap
-        //    have no ContactManifold field (consumed downstream by the row
-        //    builder, not stored here) -> dropped; named C5c gap.
+        //    EVERY point's solref_timeconst/dampratio. merged.margin/gap are now
+        //    carried onto the manifold (C5c); merged.condim still has no field
+        //    (consumed downstream by the row builder, not stored here) -> dropped.
         const scene::MergedContactParams merged =
             scene::MergeContactParams(ToMergeInput(ra), ToMergeInput(rb));
         m.friction = merged.friction_mu;
+        m.margin   = merged.margin;
+        m.gap      = merged.gap;
         for (int i = 0; i < 5; ++i) m.solimp[i] = merged.solimp[i];
         for (uint32_t p = 0; p < m.point_count; ++p) {
             m.points[p].solref_timeconst = merged.solref[0];

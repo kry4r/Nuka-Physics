@@ -42,6 +42,7 @@
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"  // kShapeTableRowStride (shared)
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
 
@@ -51,6 +52,11 @@ namespace {
 
 namespace cg = ::nuka::collision::gpu;
 constexpr uint32_t kBlockSize = 128u;
+// env_status diagnostic bits (kEnvStatus*) are shared in op_schema.hpp so the
+// broadphase, particle-grid, and CRBA ops agree on the readout layout.
+// Canonical value lives in collision/particle_uniform_grid.hpp:43 (host header,
+// non-CUDA include chain). FLAG: the divergence-proof home is the already-shared
+// particle_grid_traversal.cuh — once it re-exports the constant, delete this mirror.
 constexpr uint32_t kParticleGridMaxNeighbors = 32u;  // mirror particle_uniform_grid.
 
 // shape_table record: R1 GREW it 8 -> 10 packed f32 / body row
@@ -69,7 +75,7 @@ struct ShapeDev {
     uint32_t   group;       // signed collision-group filter key (R1).
 };
 __forceinline__ __device__ ShapeDev LoadShape(const float* table, uint32_t row) {
-    const float* q = table + static_cast<size_t>(row) * 12u;
+    const float* q = table + static_cast<size_t>(row) * nkops::kShapeTableRowStride;
     ShapeDev s;
     s.kind = __float_as_uint(q[0]);
     s.p[0] = q[1]; s.p[1] = q[2]; s.p[2] = q[3]; s.p[3] = q[4];
@@ -80,6 +86,14 @@ __forceinline__ __device__ ShapeDev LoadShape(const float* table, uint32_t row) 
     s.group = __float_as_uint(q[9]);
     return s;
 }
+
+// Plane broadphase AABB: a plane is analytically infinite, so its LBVH leaf is a
+// large-but-finite slab. kPlaneLateralExtent (1 Mm) is the in-plane half-span — a
+// scene wider than this misses plane contacts at its rim (raise it / derive from
+// the scene bound). kPlaneThickness (1 mm) is the half-thickness along the plane
+// normal so the slab stays thin (Morton quantization stays sane).
+constexpr float kPlaneLateralExtent = 1.0e6f;
+constexpr float kPlaneThickness     = 1.0e-3f;
 
 // Shape kinds — R2: the ONE shared enum (collision/shape_kind.hpp). These local
 // aliases keep the kernel switch text identical while removing the divergent
@@ -175,7 +189,9 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
             // local slab MUST be rotated by the body pose like every other
             // kind (review fix: the unrotated slab was thin in WORLD Y, which
             // missed every contact of a z-up ground plane posed with Y->Z).
-            he = RotAbs(xf.rotation, math::Vec3{1.0e6f, 1.0e-3f, 1.0e6f});
+            he = RotAbs(xf.rotation, math::Vec3{kPlaneLateralExtent,
+                                                kPlaneThickness,
+                                                kPlaneLateralExtent});
             break;
     }
     const math::Vec3 c = xf.position;
@@ -383,7 +399,8 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t* __restrict__ out_pairs,   // elem:2 per slot
-                                    uint32_t* __restrict__ out_count) {
+                                    uint32_t* __restrict__ out_count,
+                                    uint32_t* __restrict__ env_status) {
     const uint32_t env = blockIdx.y;
     const uint32_t N = bodies_per_env;
     if (N < 2u) {
@@ -443,6 +460,10 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                             (static_cast<size_t>(env) * slot_stride + slot) * 2u;
                         out_pairs[at + 0] = a32;
                         out_pairs[at + 1] = b32;
+                    } else if (env_status != nullptr) {
+                        // Capacity miss: this pair was dropped. Surface it (never
+                        // silent); the watermark out_count[env] also stays honest.
+                        atomicOr(&env_status[env], kEnvStatusPairOverflow);
                     }
                 }
             } else if (top < 63) {
@@ -524,11 +545,13 @@ __global__ void GridFillKernel(uint32_t particle_count,
                                const uint32_t* __restrict__ offsets,
                                uint32_t slot_stride,
                                uint32_t* __restrict__ neighbor_idx,
-                               uint32_t* __restrict__ counts) {
+                               uint32_t* __restrict__ counts,
+                               uint32_t* __restrict__ env_status) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) return;
     const math::Vec3 pm = pos[i];
-    const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
+    const uint32_t env = i / particles_per_env;
+    const size_t cbase = static_cast<size_t>(env) * cells_per_env;
     // Per-particle PRIVATE CSR slice (fixed cap slot_stride per particle); the
     // neighbor query writes them sorted ascending -> D1 by region (no append).
     uint32_t* slice = neighbor_idx + static_cast<size_t>(i) * slot_stride;
@@ -537,12 +560,26 @@ __global__ void GridFillKernel(uint32_t particle_count,
         make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
         cell_end + cbase, idx_sorted, pos, slice, slot_stride, &overflow);
     counts[i] = n;
+    // Surface a dropped neighbor (cap exhausted) per-env -> env_status readout;
+    // PBF density would otherwise silently lose interactions in dense regions.
+    if (overflow && env_status != nullptr) {
+        atomicOr(&env_status[env], kEnvStatusNeighborOverflow);
+    }
     (void)offsets;  // grid_neighbor_offset kept for the M6 flat-CSR consumer.
 }
 
 __global__ void ZeroU32Kernel(uint32_t* __restrict__ a, uint32_t n) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] = 0u;
+}
+
+// Clear ONLY `bit` in each of the n words. env_status is shared across the
+// broadphase + particle-grid ops (different bits), so each clears its own bit
+// at start (order-independent) rather than zeroing the whole readout word.
+__global__ void ClearBitU32Kernel(uint32_t* __restrict__ a, uint32_t n,
+                                  uint32_t bit) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] &= ~bit;
 }
 
 // --- op entry points ---------------------------------------------------------
@@ -618,11 +655,15 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
     const uint32_t N = p->bodies_per_env;
     const uint32_t E = p->env_count;
     if (E == 0u) return Status::Ok;
-    // Zero the per-env pair watermark.
+    // Zero the per-env pair watermark + clear THIS op's env_status overflow bit.
     {
         const uint32_t b = (E + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
                    data.pair_count, E);
+        if (data.env_status != nullptr) {
+            LaunchCuda(ClearBitU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
+                       data.env_status, E, kEnvStatusPairOverflow);
+        }
     }
     if (N < 2u) return Status::Ok;
     auto* nodes = reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes);
@@ -631,7 +672,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
                nodes, static_cast<const float*>(model.shape_table),
                static_cast<const uint64_t*>(model.excluded_pairs),
                p->excluded_count, N, p->max_contacts_per_env,
-               data.candidate_pairs, data.pair_count);
+               data.candidate_pairs, data.pair_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -684,6 +725,11 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
                    data.grid_cell_end, zn);
     }
+    if (data.env_status != nullptr) {  // clear THIS op's neighbor-overflow bit.
+        const uint32_t b = (E + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(ClearBitU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
+                   data.env_status, E, kEnvStatusNeighborOverflow);
+    }
     LaunchCuda(GridCellRangesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, data.grid_cell_key, data.grid_cell_start, data.grid_cell_end);
     LaunchCuda(GridCountKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
@@ -697,7 +743,7 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_offset,
                kParticleGridMaxNeighbors, data.grid_neighbor_idx,
-               data.grid_neighbor_count);
+               data.grid_neighbor_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

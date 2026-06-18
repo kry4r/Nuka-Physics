@@ -193,7 +193,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 32, 1, 128, 0},  // grid_neighbor_idx
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // rng_state
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 64, 1, 256, 0},  // obs_buffer
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // obs_buffer
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_type
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_terrain_difficulty
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // joint_f

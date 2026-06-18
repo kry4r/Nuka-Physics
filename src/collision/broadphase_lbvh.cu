@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -33,6 +34,13 @@ namespace nuka::collision::gpu {
 namespace {
 
 constexpr uint32_t kBlockSize = 128u;
+
+// Default compact-pair output sizing. When the caller passes max_pairs_hint==0 we
+// guess kDefaultPairFanout * count (typical broadphase fan-out) clamped to
+// [kMinPairCapacity, kMaxPairCapacity] so the buffer stays small even at 50k.
+constexpr uint64_t kDefaultPairFanout = 32ull;
+constexpr uint64_t kMaxPairCapacity   = 64ull * 1024ull * 1024ull;  // 64M pairs cap
+constexpr uint32_t kMinPairCapacity   = 1024u;
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -320,20 +328,24 @@ float3 Fold(const std::vector<float3>& mins, bool is_max) {
 LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
                                            uint32_t pair_count,
                                            uint32_t pair_capacity,
-                                           phi::Buffer* pairs)
+                                           phi::Buffer* pairs,
+                                           bool truncated)
     : leaf_count_(leaf_count)
     , pair_count_(pair_count)
     , pair_capacity_(pair_capacity)
+    , truncated_(truncated)
     , pairs_(pairs) {}
 
 LbvhBroadphaseResult::LbvhBroadphaseResult(uint32_t leaf_count,
                                            uint32_t pair_count,
                                            uint32_t pair_capacity,
                                            phi::Buffer* pairs,
-                                           phi::Buffer* nodes)
+                                           phi::Buffer* nodes,
+                                           bool truncated)
     : leaf_count_(leaf_count)
     , pair_count_(pair_count)
     , pair_capacity_(pair_capacity)
+    , truncated_(truncated)
     , pairs_(pairs)
     , nodes_(nodes) {}
 
@@ -346,11 +358,13 @@ LbvhBroadphaseResult::LbvhBroadphaseResult(LbvhBroadphaseResult&& other) noexcep
     : leaf_count_(other.leaf_count_)
     , pair_count_(other.pair_count_)
     , pair_capacity_(other.pair_capacity_)
+    , truncated_(other.truncated_)
     , pairs_(other.pairs_)
     , nodes_(other.nodes_) {
     other.leaf_count_ = 0u;
     other.pair_count_ = 0u;
     other.pair_capacity_ = 0u;
+    other.truncated_ = false;
     other.pairs_ = nullptr;
     other.nodes_ = nullptr;
 }
@@ -362,11 +376,13 @@ LbvhBroadphaseResult& LbvhBroadphaseResult::operator=(LbvhBroadphaseResult&& oth
         leaf_count_ = other.leaf_count_;
         pair_count_ = other.pair_count_;
         pair_capacity_ = other.pair_capacity_;
+        truncated_ = other.truncated_;
         pairs_ = other.pairs_;
         nodes_ = other.nodes_;
         other.leaf_count_ = 0u;
         other.pair_count_ = 0u;
         other.pair_capacity_ = 0u;
+        other.truncated_ = false;
         other.pairs_ = nullptr;
         other.nodes_ = nullptr;
     }
@@ -429,16 +445,15 @@ static LbvhBroadphaseResult BuildLbvhImpl(cudaStream_t stream, int device_id,
         return LbvhBroadphaseResult(count, 0u, 0u, empty.Release());
     }
 
-    // Compact-pair output capacity. Default heuristic: 32 * count (typical
-    // broadphase fan-out), clamped to a sane ceiling so the buffer stays small
-    // even at 50k. Callers that know the true overlap bound pass it explicitly.
+    // Compact-pair output capacity. Default heuristic (named constants above):
+    // kDefaultPairFanout * count clamped to [kMinPairCapacity, kMaxPairCapacity].
+    // Callers that know the true overlap bound pass it explicitly.
     uint32_t pair_capacity = max_pairs_hint;
     if (pair_capacity == 0u) {
-        const uint64_t guess = static_cast<uint64_t>(count) * 32ull;
-        const uint64_t ceiling = 64ull * 1024ull * 1024ull; // 64M pairs cap
-        pair_capacity = static_cast<uint32_t>(std::min(guess, ceiling));
-        if (pair_capacity < 1024u) {
-            pair_capacity = 1024u;
+        const uint64_t guess = static_cast<uint64_t>(count) * kDefaultPairFanout;
+        pair_capacity = static_cast<uint32_t>(std::min(guess, kMaxPairCapacity));
+        if (pair_capacity < kMinPairCapacity) {
+            pair_capacity = kMinPairCapacity;
         }
     }
 
@@ -532,6 +547,17 @@ static LbvhBroadphaseResult BuildLbvhImpl(cudaStream_t stream, int device_id,
 
     uint32_t pair_count = 0u;
     phi::BufferDownload(d_pair_count.Handle(), &pair_count, 0, sizeof(pair_count));
+    // Truncation is silent data loss: the emit kernel atomically counts EVERY
+    // overlap but only the first pair_capacity fit the buffer. Surface it loudly
+    // AND structurally (truncated flag on the result) so callers can branch.
+    const bool truncated = pair_count > pair_capacity;
+    if (truncated) {
+        std::fprintf(stderr,
+                     "[nuka_lbvh] WARNING: broadphase pair overflow -- %u overlaps "
+                     "exceed capacity %u; %u pairs DROPPED. Pass a larger "
+                     "max_pairs_hint.\n",
+                     pair_count, pair_capacity, pair_count - pair_capacity);
+    }
     const uint32_t valid = std::min(pair_count, pair_capacity);
 
     // --- 7. Deterministic sort of the compact pair list -------------------
@@ -556,9 +582,10 @@ static LbvhBroadphaseResult BuildLbvhImpl(cudaStream_t stream, int device_id,
 
     if (retain_nodes) {
         return LbvhBroadphaseResult(count, valid, pair_capacity,
-                                    d_pairs.Release(), d_nodes.Release());
+                                    d_pairs.Release(), d_nodes.Release(), truncated);
     }
-    return LbvhBroadphaseResult(count, valid, pair_capacity, d_pairs.Release());
+    return LbvhBroadphaseResult(count, valid, pair_capacity, d_pairs.Release(),
+                                truncated);
 }
 
 LbvhBroadphaseResult BuildLbvhBroadphase(cudaStream_t stream, int device_id,

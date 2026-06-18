@@ -590,7 +590,19 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                     geo.vertices[i + 1] *= s.y;
                     geo.vertices[i + 2] *= s.z;
                 }
+                // Normals transform by the inverse-transpose of the scale, then renormalize.
+                for (std::size_t i = 0; i + 2 < geo.normals.size(); i += 3) {
+                    float nx = geo.normals[i + 0] * (s.x != 0.0f ? 1.0f / s.x : 0.0f);
+                    float ny = geo.normals[i + 1] * (s.y != 0.0f ? 1.0f / s.y : 0.0f);
+                    float nz = geo.normals[i + 2] * (s.z != 0.0f ? 1.0f / s.z : 0.0f);
+                    const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                    const float inv = len > 0.0f ? 1.0f / len : 0.0f;
+                    geo.normals[i + 0] = nx * inv;
+                    geo.normals[i + 1] = ny * inv;
+                    geo.normals[i + 2] = nz * inv;
+                }
                 shape.mesh_vertices = std::move(geo.vertices);
+                shape.mesh_normals = std::move(geo.normals);
                 shape.mesh_indices = std::move(geo.indices);
             }
         }

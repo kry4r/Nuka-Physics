@@ -108,9 +108,11 @@ bool ApplyMoveEntity(nk::World& world, const render::RenderWorld& render_world,
             const uint32_t L = caps.links_per_env;
             const uint32_t root = (art.root_link != ~uint32_t(0)) ? art.root_link : 0u;
             if (L > 0u && root < L) {
-                const float zero6[6] = {0, 0, 0, 0, 0, 0};
+                // LinkVelocity is typed Spatial6 -> size the upload by the field's
+                // own type so any future padding is encoded correctly (not by 6).
+                const nk::Spatial6 zero6 = {};
                 const uint64_t row = static_cast<uint64_t>(env) * L + root;
-                data.UploadField(nk::FieldId::LinkVelocity, zero6, sizeof(zero6),
+                data.UploadField(nk::FieldId::LinkVelocity, &zero6, sizeof(zero6),
                                  row * sizeof(zero6));
             }
             return true;
@@ -133,9 +135,10 @@ bool ApplyMoveEntity(nk::World& world, const render::RenderWorld& render_world,
                 }
                 const uint32_t L = caps.links_per_env;
                 if (L > 0u && root < L) {
-                    const float zero6[6] = {0, 0, 0, 0, 0, 0};
+                    // Size by the LinkVelocity field's own Spatial6 type (not 6).
+                    const nk::Spatial6 zero6 = {};
                     const uint64_t row = static_cast<uint64_t>(env) * L + root;
-                    data.UploadField(nk::FieldId::LinkVelocity, zero6, sizeof(zero6),
+                    data.UploadField(nk::FieldId::LinkVelocity, &zero6, sizeof(zero6),
                                      row * sizeof(zero6));
                 }
                 return true;

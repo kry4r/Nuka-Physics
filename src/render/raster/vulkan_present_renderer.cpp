@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -155,6 +156,8 @@ struct PushBlock {
 };
 static_assert(sizeof(PushBlock) == 112, "PushBlock must stay <=128 push-constant bytes");
 
+// Sizes SceneUbo.lights[]; MUST equal the GLSL NUKA_MAX_LIGHTS in
+// render/raster/shaders/light_limits.glsl (the single shader-side source).
 constexpr int kMaxUboLights = 8;
 struct GpuLight {
     float direction[4];
@@ -190,6 +193,18 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     };
     int n = 0;
     if (!world.lights.empty()) {
+        // The UBO/shader light array is fixed at kMaxUboLights (must match the GLSL
+        // NUKA_MAX_LIGHTS). Warn ONCE on truncation rather than silently dropping.
+        if (world.lights.size() > static_cast<size_t>(kMaxUboLights)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[nuka_render] scene has %zu lights; only the first %d "
+                             "fit the UBO (kMaxUboLights) -- the rest are dropped\n",
+                             world.lights.size(), kMaxUboLights);
+            }
+        }
         for (const RenderLight& rl : world.lights) {
             if (n >= kMaxUboLights) break;
             GpuLight& l = ubo.lights[n];

@@ -443,6 +443,13 @@ inline constexpr int   kEpaMaxFaces    = 128;
 inline constexpr int   kEpaMaxVerts    = 64;
 inline constexpr int   kEpaMaxEdges    = 64;
 inline constexpr float kEpaTol         = 1.0e-4f;
+// Cook-time SAFE BOUND on a hull's vertex count for the EPA path. EPA's polytope
+// grows by INSERTED SUPPORT vertices (not all hull verts), so a hull far larger
+// than kEpaMaxVerts usually still converges; but a cook-time check against this
+// bound (half the vert cap, headroom for the seed tetra + expansion) flags hulls
+// that risk EPA overflow so callers cook them as sphere-proxies or sub-hulls.
+// Device code cannot log, so EpaResult.overflowed surfaces a RUNTIME overflow.
+inline constexpr uint32_t kEpaSafeHullVerts = kEpaMaxVerts / 2u;
 // Enclosure pre-loop: a seed face whose SIGNED origin-distance is <= this is
 // treated as "origin on/outside it" -> the polytope does not strictly contain the
 // origin and must be expanded before the metric loop. Fixed retry budget so the
@@ -459,6 +466,11 @@ struct EpaFace {
 
 struct EpaResult {
     bool  ok = false;
+    // Set when the polytope hit a fixed-capacity cap (kEpaMaxVerts/Faces/Edges)
+    // before converging. SURFACES capacity overflow so a dropped contact for a
+    // real overlap is never silent (device-safe: a flag, not a log/counter). A
+    // caller can route an overflowed pair to a coarser proxy or sub-hull.
+    bool  overflowed = false;
     Vec3  normal{0.0f, 1.0f, 0.0f};  // separation normal (CSO surface -> outward)
     float depth = 0.0f;              // penetration depth (>=0)
     // witness reconstruction (barycentric of the closest face's support points):
@@ -643,6 +655,7 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
             return res;
         }
         const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        if (st == EpaInsert::Overflow) res.overflowed = true;  // surface, not silent
         if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
     }
 
@@ -689,6 +702,7 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
         }
         // --- 5) Insert + rebuild horizon (shared helper; centroid-oriented fan). ---
         const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        if (st == EpaInsert::Overflow) res.overflowed = true;  // surface, not silent
         if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
     }
 

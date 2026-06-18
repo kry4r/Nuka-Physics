@@ -49,11 +49,17 @@ namespace articulation = nuka::runtime::articulation;
 
 // Reads a global link's NOMINAL scalar mass from the host inertia mirror. In the
 // 6x6 spatial inertia row-major layout MakeSpatialInertia produces, the bottom-
-// right 3x3 block is mass*Identity, so I[3*6+3] == I[21] is the scalar mass. This
-// is the LIVE truth (set_link_mass keeps it in sync) and sidesteps the
-// topo.masses vs bodies.masses ambiguity in the cooker fallback.
+// right 3x3 block is mass*Identity, so the (3,3) element is the scalar mass. The
+// static_assert pins the 6x6 row-major layout so a block reorder fails to compile
+// instead of silently extracting the wrong scalar. This is the LIVE truth
+// (set_link_mass keeps it in sync) and sidesteps the topo.masses vs bodies.masses
+// ambiguity in the cooker fallback.
 float MassFromInertia(const articulation::LinkSpatialInertia& inertia) {
-    return inertia.I[21];
+    static_assert(sizeof(inertia.I) / sizeof(inertia.I[0]) == 36u,
+                  "LinkSpatialInertia is not a flat 6x6 (row-major) matrix");
+    constexpr uint32_t kSpatialDim = 6u;          // 6x6 spatial inertia.
+    constexpr uint32_t kMassRow = 3u;             // bottom-right 3x3 == mass*I.
+    return inertia.I[kMassRow * kSpatialDim + kMassRow];  // (3,3) == scalar mass.
 }
 
 // Resolves a GLOBAL link index to its (diagonal_inertia, inertial_frame) by

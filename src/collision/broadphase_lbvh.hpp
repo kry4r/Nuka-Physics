@@ -59,12 +59,14 @@ public:
     LbvhBroadphaseResult(uint32_t leaf_count,
                          uint32_t pair_count,
                          uint32_t pair_capacity,
-                         phi::Buffer* pairs);
+                         phi::Buffer* pairs,
+                         bool truncated = false);
     LbvhBroadphaseResult(uint32_t leaf_count,
                          uint32_t pair_count,
                          uint32_t pair_capacity,
                          phi::Buffer* pairs,
-                         phi::Buffer* nodes);
+                         phi::Buffer* nodes,
+                         bool truncated = false);
     ~LbvhBroadphaseResult();
 
     LbvhBroadphaseResult(const LbvhBroadphaseResult&) = delete;
@@ -75,6 +77,11 @@ public:
     uint32_t LeafCount() const { return leaf_count_; }
     uint32_t PairCount() const { return pair_count_; }
     uint32_t PairCapacity() const { return pair_capacity_; }
+
+    // True when the true overlap count exceeded pair_capacity and pairs were
+    // DROPPED (the loud stderr warning fired). Lets callers branch structurally
+    // instead of inferring it from PairCount()==PairCapacity().
+    bool Truncated() const { return truncated_; }
 
     // Number of internal nodes (LeafCount-1 for LeafCount>=1; 0 otherwise) and
     // total nodes (2*LeafCount-1). The flat node array layout is: indices
@@ -101,6 +108,7 @@ private:
     uint32_t leaf_count_ = 0;
     uint32_t pair_count_ = 0;
     uint32_t pair_capacity_ = 0;
+    bool     truncated_ = false;    // overlap count exceeded capacity -> pairs dropped.
     phi::Buffer* pairs_ = nullptr;  // phi v2 opaque handle; freed in the dtor.
     phi::Buffer* nodes_ = nullptr;  // retained tree (null unless retain_nodes set).
 };

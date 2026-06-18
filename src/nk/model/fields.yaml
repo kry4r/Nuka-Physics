@@ -489,7 +489,10 @@ fields:
   # ExportObs. obs_buffer: the flat per-env whole-body observation export.
   # =========================================================================
   - {name: env_status,   dtype: u32, per: env, arena: scratch, owner: data, flags: [readout]}
-  - {name: obs_buffer,   dtype: f32, per: env, arena: scratch, owner: data, flags: [readout], elem: 64}
+  # obs_buffer width is the cook-derived obs_width (base pose + q + qdot per link),
+  # NOT a baked 64, so a wide policy is not silently truncated. Model resolves the
+  # symbolic count from capacities.obs_width at layout time.
+  - {name: obs_buffer,   dtype: f32, per: scalar, count: "obs_width*env_count", arena: scratch, owner: data, flags: [readout]}
 
   # =========================================================================
   # PROCEDURAL TERRAIN (Go2-on-stairs demo, Phase 1) — DATA. Per-env terrain

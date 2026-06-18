@@ -44,6 +44,7 @@
 #include "scene/canonical_types.hpp"        // scene::ShapeType
 
 #include <cstdint>
+#include <cstdio>
 
 namespace nuka::collision {
 
@@ -188,9 +189,16 @@ constexpr NarrowphaseTier SelectTier(ShapeType a, ShapeType b, bool has_sdf) {
 // downstream consumer still sees correct a/b.
 // ---------------------------------------------------------------------------
 
-// Marker stamped into ContactManifold.manifold_key by the C3a stubs so a routing
-// test can read back which tier ran. Real handlers (C3b/c/d) compute the REAL
-// D1 manifold_key instead; these markers exist ONLY while the handlers are stubs.
+// DEFERRED-PAIR SENTINEL (NOT a real contact key). The only pairs that still
+// route to a stub are PRINCIPLED DEFERRALS with NAMED CONSUMERS: (Plane,Plane)
+// (two half-spaces -> no finite manifold, degenerate by design) and TriMesh /
+// HeightField narrowphase (deferred to v0.9 raw-trimesh / C7b-2; see the table's
+// "DEFERRED ... WITH A NAMED CONSUMER" note). A stub writes this distinguishable
+// sentinel into manifold_key so a consumer (and the routing test) can tell a
+// deferred-pair empty manifold from a real handler's no-contact (real handlers
+// stamp MakeStableKey via StampSides). The high bits make it visually unmistakable
+// vs a real (min,max handle) key, and StubFillEmpty emits a LOUD diagnostic so a
+// deferred pair reaching the stub at runtime is NEVER silent.
 inline constexpr uint64_t kStubMarkerBase      = 0xC3A5'7000'0000'0000ull;
 inline constexpr uint64_t StubMarkerForTier(NarrowphaseTier tier) {
     return kStubMarkerBase | static_cast<uint64_t>(tier);
@@ -204,20 +212,41 @@ inline void StubFillEmpty(const CandidatePair& pair, ContactManifold* out,
     out->Clear();
     out->a = pair.a;   // preserve type-tagged sides (rigid case: a.handle)
     out->b = pair.b;
-    out->manifold_key = StubMarkerForTier(tier);  // routing marker (stub-only)
+    out->manifold_key = StubMarkerForTier(tier);  // deferred-pair sentinel (see above)
 }
 
-// TODO(C3b): analytical primitive×primitive multi-point / face-face manifolds.
+// Emit a LOUD, once-per-shape-pair diagnostic so a DEFERRED shape pair reaching a
+// stub at runtime is surfaced (it produces an empty manifold == no contact, a
+// silent correctness gap for the deferred pairs). Gated by a per-(a,b) latch so a
+// dense scene does not spam. NOT an abort: the deferral is principled (named
+// consumer), so production keeps stepping while the gap is visible.
+inline void WarnDeferredPair(const char* tier, ShapeType a, ShapeType b) {
+    static bool warned[kShapeTypeCount][kShapeTypeCount] = {};
+    const uint32_t ia = static_cast<uint32_t>(a), ib = static_cast<uint32_t>(b);
+    if (ia < kShapeTypeCount && ib < kShapeTypeCount && !warned[ia][ib]) {
+        warned[ia][ib] = true;
+        std::fprintf(stderr,
+                     "[nuka_narrowphase] DEFERRED %s pair (ShapeType %u x %u) -> "
+                     "EMPTY manifold (NO contact). Unimplemented; named consumer = "
+                     "v0.9 trimesh narrowphase / C7b-2.\n", tier, ia, ib);
+    }
+}
+
+// DEFERRED Analytical stub: only (Plane,Plane) reaches here (degenerate, no finite
+// manifold). All other primitive pairs have real C3b handlers.
 inline void NarrowphaseStubAnalytical(const CandidatePair& pair,
-                                      const ShapeProxyView& /*geom*/,
+                                      const ShapeProxyView& geom,
                                       ContactManifold* out) {
+    WarnDeferredPair("Analytical", geom.type_a, geom.type_b);
     StubFillEmpty(pair, out, NarrowphaseTier::Analytical);
 }
 
-// TODO(C3c): convex GJK/EPA/SAT + face-clip multi-point manifolds.
+// DEFERRED Convex stub: only TriMesh / HeightField slots reach here (raw-trimesh
+// narrowphase deferred to v0.9; convex HULL pairs have the real NarrowphaseConvex).
 inline void NarrowphaseStubConvex(const CandidatePair& pair,
-                                  const ShapeProxyView& /*geom*/,
+                                  const ShapeProxyView& geom,
                                   ContactManifold* out) {
+    WarnDeferredPair("Convex", geom.type_a, geom.type_b);
     StubFillEmpty(pair, out, NarrowphaseTier::Convex);
 }
 

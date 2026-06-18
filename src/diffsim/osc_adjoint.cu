@@ -22,6 +22,7 @@
 
 #include "math/cuda_vec_ops.cuh"
 #include "runtime/articulation/articulation_contacts.hpp"  // kMaxContactSolverDof
+#include "runtime/articulation/articulation_drives.hpp"    // kMinDiagonalDrive
 
 #include <cuda_runtime.h>
 
@@ -37,11 +38,18 @@ namespace mg = ::nuka::math::gpu;
 using art::ArticulationDeviceState;
 using art::ArticulationJointType;
 
-// SPD floor for the 3x3 LDL^T -- IDENTICAL value to the forward's
-// kMinDiagonalDrive (articulation_drives.cu). Replicated (that one is
-// translation-unit-local) so the floored factorization is bit-identical.
-constexpr float kMinDiagonalDrive = 1.0e-6f;
+// SPD floor for the LDL^T -- the SAME exported art::kMinDiagonalDrive the forward
+// uses, so the floored factorization is bit-identical (the adjoint-of-forward
+// contract); a forward-side change to the floor now propagates here automatically.
+using art::kMinDiagonalDrive;
 constexpr uint32_t kMaxDof = art::kMaxContactSolverDof;  // 18
+
+// Compile-time ceiling on the task-space dimension; the on-thread scratch
+// (A[kMaxTaskDim^2], MinvJt rows, J row count) is sized by this. The ACTUAL
+// task_dim is a RUNTIME launcher argument (3 == the current world-POSITION task,
+// matching the forward; 6 == a future pose task), validated <= kMaxTaskDim in the
+// launcher (LOUD throw on overflow, never a silent clamp).
+constexpr uint32_t kMaxTaskDim = kMaxOscTaskDim;  // headroom for a 6-DOF pose task
 
 void CheckCudaOsc(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -97,6 +105,7 @@ __device__ math::Vec3 RotateByQuatDrive(math::Quat q, math::Vec3 v) {
 // plus the adjoint solve + param-grad scatter. Disjoint output slots => D1.
 __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
                                            uint32_t max_dof,
+                                           uint32_t task_dim,
                                            uint32_t osc_task_link,
                                            const float* __restrict__ inertia_M_inv,
                                            const float* __restrict__ task_target,
@@ -118,9 +127,9 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
     if (grad_kp != nullptr) grad_kp[articulation] = 0.0f;
     if (grad_kd != nullptr) grad_kd[articulation] = 0.0f;
     if (grad_target != nullptr) {
-        grad_target[articulation * 3u + 0u] = 0.0f;
-        grad_target[articulation * 3u + 1u] = 0.0f;
-        grad_target[articulation * 3u + 2u] = 0.0f;
+        for (uint32_t r = 0u; r < task_dim; ++r) {
+            grad_target[articulation * task_dim + r] = 0.0f;
+        }
     }
 
     const uint32_t offset = state.articulation_link_offset[articulation];
@@ -130,9 +139,12 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
     }
     const uint32_t task_link = offset + osc_task_link;
 
-    // --- Build J (3 x ndof), row-major J[row*max_dof + dof]. Forward-replicated.
-    float J[3u * kMaxDof];
-    for (uint32_t i = 0u; i < 3u * max_dof; ++i) {
+    // --- Build J (task_dim x ndof), row-major J[row*max_dof + dof]. Scratch sized
+    //     by the named kMaxTaskDim cap. The geometry fills the 3 POSITION rows the
+    //     forward emits (task_dim == 3 matches it exactly; a task_dim > 3 pose task
+    //     leaves the extra rows zero until a pose-task forward exists).
+    float J[kMaxTaskDim * kMaxDof];
+    for (uint32_t i = 0u; i < task_dim * max_dof; ++i) {
         J[i] = 0.0f;
     }
     const math::Vec3 x_task = state.link_pose[task_link].position;
@@ -180,8 +192,8 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
         inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
 
     // --- xdot = J*qdot (forward-replicated, fixed-order). Needed for the dL/dKd
-    //     channel: edot_x = -xdot.
-    float xdot[3] = {0.0f, 0.0f, 0.0f};
+    //     channel: edot_x = -xdot. (task_dim == 3 position task; rows 0..2 = x,y,z.)
+    float xdot[kMaxTaskDim] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         if (JointDofCountDriveDevice(state.joint_type[link]) != 1u) {
@@ -197,27 +209,27 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
         xdot[2] += J[2u * max_dof + dof] * qd;
     }
 
-    // --- A = J M^-1 J^T (3x3), forward-replicated (same MinvJt intermediate +
-    //     identical loop order).
-    float MinvJt[kMaxDof * 3u];
+    // --- A = J M^-1 J^T (task_dim x task_dim), forward-replicated (same MinvJt
+    //     intermediate + identical loop order). Scratch sized by kMaxTaskDim.
+    float MinvJt[kMaxDof * kMaxTaskDim];
     for (uint32_t dof = 0u; dof < n; ++dof) {
-        for (uint32_t r = 0u; r < 3u; ++r) {
+        for (uint32_t r = 0u; r < task_dim; ++r) {
             float acc = 0.0f;
             for (uint32_t c = 0u; c < n; ++c) {
                 acc += Minv[static_cast<size_t>(dof) * max_dof + c] *
                        J[r * max_dof + c];
             }
-            MinvJt[dof * 3u + r] = acc;
+            MinvJt[dof * task_dim + r] = acc;
         }
     }
-    float A[9];
-    for (uint32_t r = 0u; r < 3u; ++r) {
-        for (uint32_t s = 0u; s < 3u; ++s) {
+    float A[kMaxTaskDim * kMaxTaskDim];
+    for (uint32_t r = 0u; r < task_dim; ++r) {
+        for (uint32_t s = 0u; s < task_dim; ++s) {
             float acc = 0.0f;
             for (uint32_t dof = 0u; dof < n; ++dof) {
-                acc += J[r * max_dof + dof] * MinvJt[dof * 3u + s];
+                acc += J[r * max_dof + dof] * MinvJt[dof * task_dim + s];
             }
-            A[r * 3u + s] = acc;
+            A[r * task_dim + s] = acc;
         }
     }
 
@@ -226,26 +238,26 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
     //     forward rhs (to recover y = A^-1 rhs, only needed if dL/dq were shipped)
     //     and the adjoint w (s = A^-1 w). A symmetric => A^-1 symmetric, so the
     //     adjoint solve is the exact transpose of the forward solve.
-    float L[9];
-    for (uint32_t i = 0u; i < 9u; ++i) {
+    float L[kMaxTaskDim * kMaxTaskDim];
+    for (uint32_t i = 0u; i < task_dim * task_dim; ++i) {
         L[i] = A[i];
     }
-    float d[3];
-    for (uint32_t j = 0u; j < 3u; ++j) {
-        float djj = L[j * 3u + j];
+    float d[kMaxTaskDim];
+    for (uint32_t j = 0u; j < task_dim; ++j) {
+        float djj = L[j * task_dim + j];
         for (uint32_t k = 0u; k < j; ++k) {
-            djj -= L[j * 3u + k] * L[j * 3u + k] * d[k];
+            djj -= L[j * task_dim + k] * L[j * task_dim + k] * d[k];
         }
         if (djj < kMinDiagonalDrive) {
             djj = kMinDiagonalDrive;
         }
         d[j] = djj;
-        for (uint32_t i = j + 1u; i < 3u; ++i) {
-            float lij = L[i * 3u + j];
+        for (uint32_t i = j + 1u; i < task_dim; ++i) {
+            float lij = L[i * task_dim + j];
             for (uint32_t k = 0u; k < j; ++k) {
-                lij -= L[i * 3u + k] * L[j * 3u + k] * d[k];
+                lij -= L[i * task_dim + k] * L[j * task_dim + k] * d[k];
             }
-            L[i * 3u + j] = lij / djj;
+            L[i * task_dim + j] = lij / djj;
         }
     }
 
@@ -259,38 +271,39 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
     //   joints saturated. rhs = Kp*e_x + Kd*edot_x = Kp*e_x - Kd*xdot.
     const float kp_s = (kp != nullptr) ? kp[task_link] : 0.0f;
     const float kd_s = (kd != nullptr) ? kd[task_link] : 0.0f;
-    const math::Vec3 target{task_target[articulation * 3u + 0u],
-                            task_target[articulation * 3u + 1u],
-                            task_target[articulation * 3u + 2u]};
+    const math::Vec3 target{task_target[articulation * task_dim + 0u],
+                            task_target[articulation * task_dim + 1u],
+                            task_target[articulation * task_dim + 2u]};
     const math::Vec3 e_x = mg::Sub(target, x_task);
-    float rhs[3];
-    for (uint32_t r = 0u; r < 3u; ++r) {
+    // rhs row->component mapping is the position task's x,y,z (task_dim == 3).
+    float rhs[kMaxTaskDim];
+    for (uint32_t r = 0u; r < task_dim; ++r) {
         const float ex = (r == 0u) ? e_x.x : (r == 1u) ? e_x.y : e_x.z;
         rhs[r] = kp_s * ex - kd_s * xdot[r];
     }
     // Solve A*y = rhs (forward L, diagonal D, backward L^T) -- forward-replicated.
-    float y[3];
-    for (uint32_t i = 0u; i < 3u; ++i) {
+    float y[kMaxTaskDim];
+    for (uint32_t i = 0u; i < task_dim; ++i) {
         float value = rhs[i];
         for (uint32_t k = 0u; k < i; ++k) {
-            value -= L[i * 3u + k] * y[k];
+            value -= L[i * task_dim + k] * y[k];
         }
         y[i] = value;
     }
-    for (uint32_t i = 0u; i < 3u; ++i) {
+    for (uint32_t i = 0u; i < task_dim; ++i) {
         y[i] /= d[i];
     }
-    for (uint32_t ii = 3u; ii > 0u; --ii) {
+    for (uint32_t ii = task_dim; ii > 0u; --ii) {
         const uint32_t i = ii - 1u;
         float value = y[i];
-        for (uint32_t k = i + 1u; k < 3u; ++k) {
-            value -= L[k * 3u + i] * y[k];
+        for (uint32_t k = i + 1u; k < task_dim; ++k) {
+            value -= L[k * task_dim + i] * y[k];
         }
         y[i] = value;
     }
 
     // w = J * g_tau, masking saturated joints. tau_j (unclamped) = J_j^T y.
-    float w[3] = {0.0f, 0.0f, 0.0f};
+    float w[kMaxTaskDim] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         if (JointDofCountDriveDevice(state.joint_type[link]) != 1u) {
@@ -307,37 +320,38 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
         if (drive_force_limits != nullptr) {
             const float limit = drive_force_limits[link];
             if (limit > 0.0f) {
-                const float tau_j = J[0u * max_dof + dof] * y[0] +
-                                    J[1u * max_dof + dof] * y[1] +
-                                    J[2u * max_dof + dof] * y[2];
+                float tau_j = 0.0f;
+                for (uint32_t r = 0u; r < task_dim; ++r) {
+                    tau_j += J[r * max_dof + dof] * y[r];
+                }
                 if (tau_j > limit || tau_j < -limit) {
                     g = 0.0f;  // saturated => stop-grad.
                 }
             }
         }
-        w[0] += J[0u * max_dof + dof] * g;
-        w[1] += J[1u * max_dof + dof] * g;
-        w[2] += J[2u * max_dof + dof] * g;
+        for (uint32_t r = 0u; r < task_dim; ++r) {
+            w[r] += J[r * max_dof + dof] * g;
+        }
     }
 
     // --- s = A^-1 w, reusing the forward's L D L^T factorization (forward solve
     //     shape, applied to w). Same fixed order => deterministic.
-    float s[3];
-    for (uint32_t i = 0u; i < 3u; ++i) {
+    float s[kMaxTaskDim];
+    for (uint32_t i = 0u; i < task_dim; ++i) {
         float value = w[i];
         for (uint32_t k = 0u; k < i; ++k) {
-            value -= L[i * 3u + k] * s[k];
+            value -= L[i * task_dim + k] * s[k];
         }
         s[i] = value;
     }
-    for (uint32_t i = 0u; i < 3u; ++i) {
+    for (uint32_t i = 0u; i < task_dim; ++i) {
         s[i] /= d[i];
     }
-    for (uint32_t ii = 3u; ii > 0u; --ii) {
+    for (uint32_t ii = task_dim; ii > 0u; --ii) {
         const uint32_t i = ii - 1u;
         float value = s[i];
-        for (uint32_t k = i + 1u; k < 3u; ++k) {
-            value -= L[k * 3u + i] * s[k];
+        for (uint32_t k = i + 1u; k < task_dim; ++k) {
+            value -= L[k * task_dim + i] * s[k];
         }
         s[i] = value;
     }
@@ -350,12 +364,14 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
         grad_kp[articulation] = e_x.x * s[0] + e_x.y * s[1] + e_x.z * s[2];
     }
     if (grad_kd != nullptr) {
-        grad_kd[articulation] = -(xdot[0] * s[0] + xdot[1] * s[1] + xdot[2] * s[2]);
+        float acc = 0.0f;
+        for (uint32_t r = 0u; r < task_dim; ++r) acc += xdot[r] * s[r];
+        grad_kd[articulation] = -acc;
     }
     if (grad_target != nullptr) {
-        grad_target[articulation * 3u + 0u] = kp_s * s[0];
-        grad_target[articulation * 3u + 1u] = kp_s * s[1];
-        grad_target[articulation * 3u + 2u] = kp_s * s[2];
+        for (uint32_t r = 0u; r < task_dim; ++r) {
+            grad_target[articulation * task_dim + r] = kp_s * s[r];
+        }
     }
 }
 
@@ -364,6 +380,7 @@ __global__ void OscAdjointGainTargetKernel(ArticulationDeviceState state,
 void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
                                 ArticulationDeviceState state,
                                 uint32_t max_dof,
+                                uint32_t task_dim,
                                 uint32_t osc_task_link,
                                 const float* inertia_M_inv,
                                 const float* task_target,
@@ -373,9 +390,27 @@ void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
                                 const float* grad_tau,
                                 OscAdjointParamGrads out_grads) {
     if (state.articulation_count == 0u || max_dof == 0u ||
-        max_dof > kMaxDof || inertia_M_inv == nullptr ||
-        task_target == nullptr || grad_tau == nullptr) {
+        inertia_M_inv == nullptr || task_target == nullptr ||
+        grad_tau == nullptr) {
         return;
+    }
+    // Honesty: the adjoint scratch is pinned at kMaxDof (==kMaxContactSolverDof, in
+    // lockstep with the forward Osc drive); beyond it FAIL LOUDLY -- mirrors the
+    // forward LaunchApplyOscDriveKernels throw -- NOT the old silent no-op that
+    // would emit all-zero (silently wrong) gradients for a larger articulation.
+    if (max_dof > kMaxDof) {
+        throw std::runtime_error(
+            "LaunchOscAdjointGainTarget: max_dof (" + std::to_string(max_dof) +
+            ") exceeds kMaxDof (" + std::to_string(kMaxDof) +
+            "), the Osc adjoint scratch cap");
+    }
+    // task_dim is the runtime task-space dimension (3 == the current position task).
+    // Bounded by kMaxTaskDim (the on-thread A/J/MinvJt scratch cap); 0 or overflow
+    // is a LOUD throw, never a silent clamp.
+    if (task_dim == 0u || task_dim > kMaxTaskDim) {
+        throw std::runtime_error(
+            "LaunchOscAdjointGainTarget: task_dim (" + std::to_string(task_dim) +
+            ") out of range (1.." + std::to_string(kMaxTaskDim) + ")");
     }
     if (out_grads.grad_kp == nullptr && out_grads.grad_kd == nullptr &&
         out_grads.grad_target == nullptr) {
@@ -383,7 +418,7 @@ void LaunchOscAdjointGainTarget(cudaStream_t stream, int device_id,
     }
     phi::ScopedDeviceGuard guard(device_id);
     OscAdjointGainTargetKernel<<<state.articulation_count, 32u, 0u, stream>>>(
-        state, max_dof, osc_task_link, inertia_M_inv, task_target, kp, kd,
+        state, max_dof, task_dim, osc_task_link, inertia_M_inv, task_target, kp, kd,
         drive_force_limits, grad_tau, out_grads.grad_kp, out_grads.grad_kd,
         out_grads.grad_target);
     CheckCudaOsc(cudaGetLastError(), "OscAdjointGainTargetKernel launch");

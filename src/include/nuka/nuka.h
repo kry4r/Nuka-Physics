@@ -12,6 +12,12 @@ typedef struct nuka_device_t* nuka_device_handle;
 typedef struct nuka_world_t* nuka_world_handle;
 typedef struct nuka_buffer_t* nuka_buffer_handle;
 
+// Per-env contact-slot count for the per-contact enumeration fields
+// (NUKA_FIELD_CONTACT_POINTS / _NORMAL / _FORCE / _LINK). A caller sizes those
+// buffers as env_count * NUKA_MAX_CONTACT_SLOTS_PER_ENV. Mirrors the engine's
+// internal kMaxFootContactsPerEnv; the two MUST stay equal.
+#define NUKA_MAX_CONTACT_SLOTS_PER_ENV 4u
+
 typedef enum nuka_result_t {
     NUKA_RESULT_OK = 0,
     NUKA_RESULT_INVALID_ARG = 1,
@@ -145,6 +151,18 @@ typedef struct nuka_world_desc_t {
     uint32_t heightfield_nrow;        // general heightfield grid rows (0 => 41).
     uint32_t heightfield_ncol;        // general heightfield grid cols (0 => 41).
     float    heightfield_cell;        // general heightfield cell edge, m (0 => 0.25).
+    // World gravity vector (m/s^2) in the engine's Z-up convention. Passed through
+    // to BOTH the WorldRecord step_options (the diffsim/noise gravity scalar) and
+    // the nk Pipeline SolverConfig at construction, so non-Earth gravity is set at
+    // create time (the post-create nuka_world_set_gravity_z only patches the
+    // step_options scalar, not the live Pipeline). A zero-initialized desc leaves
+    // all three at 0.0 -> the engine substitutes standard Earth gravity
+    // {0, 0, -9.81} (a literal zero-G world must be requested via the diffsim DR
+    // gravity offset, not a zero-init desc) -> BYTE-IDENTICAL to every legacy
+    // create that hardcoded Earth gravity.
+    float gravity_x;
+    float gravity_y;
+    float gravity_z;
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -197,22 +215,24 @@ typedef enum nuka_state_field_t {
     // validated rest-pose hold values and are NOT exposed here. Read of this
     // field returns the CURRENT targets (initially the rest-pose hold targets).
     //
-    // Per-env slot map (go2_stand.usda articulation, base_link_count == 13):
-    //   slot 0          = ROOT / trunk link. NOT an actuated joint; its drive
-    //                     target is a no-op. go2_stand.usda declares no free root
-    //                     joint, so the root is a FIXED base: q[0]/qd[0] are not
-    //                     meaningful joint DOFs and the base WORLD POSE is the
-    //                     constant cooked pose at
-    //                     NUKA_FIELD_ARTICULATION_LINK_POSE[env*base_link_count].
-    //                     (For a free-floating-root scene that same pose slot
-    //                     instead carries the LIVE integrated 6-DOF base pose, and
-    //                     base velocity lives in the engine's link_velocity[root]
-    //                     -- not currently exposed through this ABI.)
-    //   slots 1..12     = the 12 actuated revolute leg joints (cooked order; the
-    //                     Python harness maps cooked order -> the Unitree
-    //                     convention). These are the only slots that respond to a
-    //                     drive-target write and the only meaningful q/qd joint
-    //                     entries.
+    // Per-env slot map (general, robot-agnostic):
+    //   slot 0                   = the ROOT link. A drive write here is a NO-OP
+    //                              unless a drive joint exists at the root. For a
+    //                              FIXED-base scene q[0]/qd[0] are not meaningful
+    //                              joint DOFs and the base world pose is the
+    //                              constant cooked pose at
+    //                              NUKA_FIELD_ARTICULATION_LINK_POSE[env*
+    //                              base_link_count]; for a FLOATING-base scene that
+    //                              same pose slot carries the LIVE integrated 6-DOF
+    //                              base pose and base velocity lives in the engine's
+    //                              link_velocity[root] (not exposed through this ABI).
+    //   slots 1..base_link_count-1 = the child links in COOKED order. Only slots
+    //                              with a non-zero NUKA_FIELD_DRIVE_STIFFNESS act on
+    //                              their target (the actuated joints); these are the
+    //                              only meaningful q/qd joint entries. A caller maps
+    //                              cooked order to its own robot convention.
+    // (See examples/ for a concrete per-robot slot mapping, e.g. the Go2 leg-joint
+    // map the Python harness applies.)
     NUKA_FIELD_DRIVE_TARGET = 6,
     // READ (batched/multi-env path only). Per-LINK spatial velocity, env-major,
     // with the SAME indexing as NUKA_FIELD_ARTICULATION_LINK_POSE:
@@ -251,10 +271,11 @@ typedef enum nuka_state_field_t {
     // (zero-copy) and the NEXT nuka_world_step picks up the new gains -- IDENTICAL
     // mechanism and layout to NUKA_FIELD_DRIVE_TARGET: float[env_count *
     // base_link_count], env-major, index (env*base_link_count + link), stride
-    // sizeof(float). Per-env slot map matches DRIVE_TARGET: slot 0 = ROOT (not an
-    // actuated joint; its gain is a no-op), slots 1..12 = the 12 actuated leg
-    // joints. To drive a trained Go2 policy at its training PD gains, write
-    // STIFFNESS (Kp) = 20 and DAMPING (Kd) = 0.5 on slots 1..12 of every env.
+    // sizeof(float). Per-env slot map matches DRIVE_TARGET: slot 0 = ROOT (its gain
+    // is a no-op unless a root drive joint exists), slots 1..base_link_count-1 = the
+    // actuated child joints in cooked order. To drive a trained policy at its
+    // training PD gains, write its per-joint Kp/Kd on the actuated slots of every
+    // env (see examples/ for a concrete per-robot gain set).
     //   STIFFNESS: per-joint proportional gain Kp (tau += Kp*(target - q)).
     //   DAMPING  : per-joint derivative gain   Kd (tau -= Kd*qdot).
     //   FORCE_LIMIT: per-joint symmetric torque clamp |tau| <= limit (Nm).
@@ -372,7 +393,7 @@ typedef enum nuka_state_field_t {
     // engine's internal per-slot contact_normal buffer (zero-copy).
     //
     // LAYOUT: identical to CONTACT_POINTS -- Vec3 (3 floats) per contact slot,
-    // slot_count == env_count * kMaxFootContactsPerEnv (4 per env), env-major.
+    // slot_count == env_count * NUKA_MAX_CONTACT_SLOTS_PER_ENV, env-major.
     // element_count == slot_count, element_stride_bytes == 3*sizeof(float).
     // INACTIVE slots are zero. (For the current rigid foot-vs-ground detector the
     // active normal is always world +Z = (0,0,1).) Returns
@@ -386,7 +407,7 @@ typedef enum nuka_state_field_t {
     // world friction tangents.
     //
     // LAYOUT: 3 floats per contact slot, slot_count == env_count *
-    // kMaxFootContactsPerEnv (4 per env), env-major. element_count == slot_count,
+    // NUKA_MAX_CONTACT_SLOTS_PER_ENV, env-major. element_count == slot_count,
     // element_stride_bytes == 3*sizeof(float). INACTIVE slots are zero. NOTE: the
     // tangent BASIS VECTORS (t1,t2) are NOT exposed, so the per-contact world
     // friction DIRECTION cannot be reconstructed from this field alone -- the net
@@ -396,13 +417,13 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_CONTACT_FORCE = 18,
     // READ (batched/multi-env path only). p14a (v0.7): per-CONTACT-SLOT owning
     // GLOBAL LINK index (uint32). The CSR-by-link grouping is implicit: slots are
-    // env-major at fixed stride kMaxFootContactsPerEnv (4 per env), and each slot
+    // env-major at fixed stride NUKA_MAX_CONTACT_SLOTS_PER_ENV, and each slot
     // carries the global link (g == env*base_link_count + local_link) the contact
     // acts on, so a consumer enumerates contacts and groups them by link via this
     // field. Aliases the engine's internal per-slot contact_link buffer (zero-copy).
     //
     // LAYOUT: 1 uint32 per contact slot, slot_count == env_count *
-    // kMaxFootContactsPerEnv, env-major. element_count == slot_count,
+    // NUKA_MAX_CONTACT_SLOTS_PER_ENV, env-major. element_count == slot_count,
     // element_stride_bytes == sizeof(uint32_t). dtype == 1 (UINT32) -- the ONLY
     // field with a non-float32 dtype. INACTIVE slots carry ~0u (0xFFFFFFFF, the
     // invalid-link sentinel). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env

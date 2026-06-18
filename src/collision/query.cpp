@@ -11,19 +11,28 @@
 namespace nuka::collision {
 
 // ---------------------------------------------------------------------------
-// Ground plane (y = 0, normal = +Y)
+// General plane: ray vs the plane through `plane_point` with unit `plane_normal`.
 // ---------------------------------------------------------------------------
 
-std::optional<RayHit> RaycastPlane(math::Vec3 origin, math::Vec3 direction) {
-    // Plane equation: y = 0, normal (0, 1, 0).
-    if (std::abs(direction.y) < 1e-12f) {
+std::optional<RayHit> RaycastPlane(math::Vec3 origin, math::Vec3 direction,
+                                   math::Vec3 plane_point,
+                                   math::Vec3 plane_normal) {
+    // t = dot(n, p0 - origin) / dot(n, dir); denom ~0 => ray parallel to plane.
+    const float denom = plane_normal.Dot(direction);
+    if (std::abs(denom) < 1e-12f) {
         return std::nullopt; // parallel to the plane
     }
-    float t = -origin.y / direction.y;
+    const float t = plane_normal.Dot(plane_point - origin) / denom;
     if (t < 0.0f) {
         return std::nullopt; // behind the ray
     }
-    return RayHit{t, {0.0f, 1.0f, 0.0f}};
+    return RayHit{t, plane_normal};
+}
+
+// World ground plane (y = 0, normal = +Y): the general case at the origin with a
+// +Y normal. Delegates so the y=0 ground is not a separate hardcoded code path.
+std::optional<RayHit> RaycastPlane(math::Vec3 origin, math::Vec3 direction) {
+    return RaycastPlane(origin, direction, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
 }
 
 // ---------------------------------------------------------------------------

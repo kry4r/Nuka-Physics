@@ -35,8 +35,10 @@
 //   nuka:soft:damping -> RESERVED. No XPBD row struct (nor any topology Options)
 //     carries a damping_beta field today, so damping is parsed/stored on the spec
 //     but maps to NOTHING wired in the engine. It is reserved for a future XPBD
-//     velocity-damping row; the cooker neither drops it silently nor invents a
-//     field for it. See the schema doc.
+//     velocity-damping row. To avoid a false contract (the API accepts the param
+//     but discards it), the cooker emits a LOUD cook-time warning when an authored
+//     damping differs from the default -- it neither drops it silently nor invents
+//     a field for it. See WarnIfDampingUnwired + the schema doc.
 //
 // DETERMINISM: this cooker is a pure function of (spec). It only reorders/maps;
 // the builders it calls emit constraints in a fixed sorted order, so two cooks of
@@ -55,9 +57,15 @@
 #include "runtime/soft/tetmesh_topology.hpp"
 
 #include <cstdint>
+#include <iostream>
 #include <vector>
 
 namespace nuka::import::cooker {
+
+// Default nuka:soft:damping (matches the schema-documented default). An authored
+// value that differs from this is currently UNWIRED to any engine field; the
+// cooker warns rather than silently discarding it (see WarnIfDampingUnwired).
+constexpr float kDefaultXpbdDamping = 0.01f;
 
 // The authored soft-body kind. Matches the `nuka:soft:type` USD token:
 //   Cloth     <- "cloth"        (triangle mesh -> distance + bend)
@@ -89,9 +97,10 @@ struct XpbdSoftBodySpec {
     float stiffness = 1.0e4f;
 
     // nuka:soft:damping. RESERVED -- stored but not wired to any engine field
-    // today (no row struct carries damping_beta). Default 0.01 to match the
-    // schema's documented default.
-    float damping = 0.01f;
+    // today (no row struct carries damping_beta). An authored value != the
+    // default triggers a loud cook-time warning (WarnIfDampingUnwired) so the
+    // caller is never silently given damping=0 behaviour.
+    float damping = kDefaultXpbdDamping;
 
     // Cloth-only: emit the bend constraints (interior-edge Bergou stencil). When
     // false, only the stretch (distance) constraints are emitted. Mirrors
@@ -103,6 +112,23 @@ struct XpbdSoftBodySpec {
     // Ignored for non-SoftBody types.
     bool emit_tet_edges = true;
 };
+
+// Emit a loud cook-time warning when an authored damping differs from the default
+// (the field is RESERVED -- no engine row carries damping_beta yet, so the value
+// is not simulated). Avoids the silent false-contract where the API accepts the
+// parameter but discards it. Inline + header-defined so it stays with the spec
+// contract; CookXpbdSoftBody MUST call this. Returns true iff a warning was
+// emitted (so callers/tests can observe the divergence without parsing stderr).
+inline bool WarnIfDampingUnwired(const XpbdSoftBodySpec& spec) {
+    if (spec.damping == kDefaultXpbdDamping) {
+        return false;
+    }
+    std::cerr << "XPBD-cook: authored nuka:soft:damping=" << spec.damping
+              << " is NOT yet wired to the engine (no XPBD damping row exists); "
+              << "simulation behaves as if damping=" << kDefaultXpbdDamping
+              << ". The authored value is ignored.\n";
+    return true;
+}
 
 // Map an authored elastic stiffness to an XPBD compliance_alpha (= 1/stiffness;
 // stiffness <= 0 => 0 == rigid/inextensible). The single source of truth for the
@@ -118,7 +144,9 @@ float ShapeMatchFractionFromStiffness(float stiffness);
 // (via the existing topology builders for Cloth/SoftBody, or a directly-assembled
 // single cluster for ShapeMatch). The constraint MATH lives in the builders / the
 // id9 row; this only orchestrates. The result feeds the nk soft world cook
-// (nk::Model::ModelParticles, mode == Xpbd) by the caller.
+// (nk::Model::ModelParticles, mode == Xpbd) by the caller. MUST call
+// WarnIfDampingUnwired(spec) so an authored-but-unwired damping is never silently
+// dropped (the field is RESERVED until an XPBD damping row exists).
 runtime::soft::XpbdConstraintSet CookXpbdSoftBody(const XpbdSoftBodySpec& spec);
 
 } // namespace nuka::import::cooker

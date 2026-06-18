@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // ---------------------------------------------------------------------------
 // nuka::render::raster forward pass fragment shader (M8.5 T4 -- FULL PBR).
 //
@@ -16,7 +17,8 @@
 // We renormalize and flip to face the camera (two-sided) since cull is off.
 // ---------------------------------------------------------------------------
 
-const int kMaxLights = 8;
+#include "light_limits.glsl"  // NUKA_MAX_LIGHTS -- single source, == C++ kMaxUboLights
+const int kMaxLights = NUKA_MAX_LIGHTS;
 struct GpuLight {
     vec4 direction;  // xyz = world-space direction TOWARD the light; w = is_directional (1.0/0.0)
     vec4 position;   // xyz = world-space position (point lights);    w = range (unused)

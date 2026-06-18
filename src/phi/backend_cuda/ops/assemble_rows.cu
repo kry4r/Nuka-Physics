@@ -40,6 +40,29 @@ using namespace ::nuka::phi::nkops;
 constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kFltMax = 3.402823466e+38f;
 
+// Per-shape material lives in mat_buckets (8 f32/bucket) keyed per body row by
+// mat_index. Lane meaning mirrors ModelMaterialBucket (cook side):
+//   [0]=static mu [1]=dynamic mu [2]=restitution [3]=solref timeconst
+//   [4]=solref dampratio [5]=density [6]=sdf cell [7]=reserved.
+constexpr uint32_t kMatBucketStride = 8u;
+constexpr uint32_t kMatLaneFriction = 0u;
+constexpr uint32_t kMatLaneSolref0 = 3u;
+constexpr uint32_t kMatLaneSolref1 = 4u;
+
+// Model-default friction for a side with no authored material (static ground /
+// unwired tables). Matches the cook's MuJoCo default so default scenes stay at
+// the prior global mu=1.0.
+constexpr float kDefaultMaterialFriction = 1.0f;
+
+// Combined per-contact material params (the two shapes' authored materials mixed
+// per the MuJoCo solmix=max convention). Defaults = the model-level defaults, so
+// a contact with no authored material is numerically unchanged.
+struct PairMaterial {
+    float mu;
+    float solref0;
+    float solref1;
+};
+
 namespace mg = ::nuka::math::gpu;
 using mg::Cross;
 using mg::Dot;
@@ -508,6 +531,26 @@ __device__ uint32_t ResolvePairSide(const float* shape_table,
     return kNkSideArtic;
 }
 
+// One side's authored material (friction + solref) from mat_buckets/mat_index, or
+// the model defaults when the side has no body-row material (static collidable /
+// out-of-range / unwired tables) -- so default-material scenes stay unchanged.
+__device__ void ReadSideMaterial(const float* mat_buckets, const uint32_t* mat_index,
+                                 uint32_t env, uint32_t local_body,
+                                 uint32_t bodies_per_env, int32_t body_id,
+                                 float def_mu, float def_solref0, float def_solref1,
+                                 float* out_mu, float* out_solref0, float* out_solref1) {
+    *out_mu = def_mu; *out_solref0 = def_solref0; *out_solref1 = def_solref1;
+    if (mat_buckets == nullptr || mat_index == nullptr || body_id < 0 ||
+        local_body >= bodies_per_env) {
+        return;  // static / unwired -> model default material.
+    }
+    const uint32_t bucket = mat_index[env * bodies_per_env + local_body];
+    const size_t b = static_cast<size_t>(bucket) * kMatBucketStride;
+    *out_mu = mat_buckets[b + kMatLaneFriction];
+    *out_solref0 = mat_buckets[b + kMatLaneSolref0];
+    *out_solref1 = mat_buckets[b + kMatLaneSolref1];
+}
+
 // One thread per (env x candidate slot). Emits the slot's NkRow block from the
 // unified manifold. Reuses ComputeCompliantRow + ChooseTangentDev (the union
 // math). Side A is the candidate's a-collidable, side B its b-collidable; the
@@ -523,6 +566,8 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ shape_table,
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
+    const float* __restrict__ mat_buckets,
+    const uint32_t* __restrict__ mat_index,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt,
@@ -547,14 +592,18 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
     uint32_t art_a = ~0u, link_a = ~0u, body_a = ~0u;
     uint32_t art_b = ~0u, link_b = ~0u, body_b = ~0u;
+    uint32_t local_a = ~0u, local_b = ~0u;
+    int32_t bid_a = -1, bid_b = -1;
     if (n_active > 0u) {
-        const uint32_t a = ucontact_a[static_cast<size_t>(gid) * 4u];
-        const uint32_t b = ucontact_b[static_cast<size_t>(gid) * 4u];
+        local_a = ucontact_a[static_cast<size_t>(gid) * 4u];
+        local_b = ucontact_b[static_cast<size_t>(gid) * 4u];
+        bid_a = LoadPrimShape(shape_table, local_a).body_id;
+        bid_b = LoadPrimShape(shape_table, local_b).body_id;
         kind_a = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
-                                 env, a, bodies_per_env, base_link_count,
+                                 env, local_a, bodies_per_env, base_link_count,
                                  artics_per_env, &art_a, &link_a, &body_a);
         kind_b = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
-                                 env, b, bodies_per_env, base_link_count,
+                                 env, local_b, bodies_per_env, base_link_count,
                                  artics_per_env, &art_b, &link_b, &body_b);
     }
     const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
@@ -566,9 +615,22 @@ __global__ void EmitPairDrivenRowsKernel(
     if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
     if (kind_b == kNkSideRigid) com_b = body_pose[idx_b].position;
 
-    const float solref[2] = {solref0, solref1};
+    // Per-contact material = the two shapes' authored materials, mixed by the
+    // MuJoCo solmix=max rule (friction max; solref take the stiffer/min timeconst).
+    // Static / unauthored sides fall back to the model defaults below.
+    float mu_a, sr0_a, sr1_a, mu_b, sr0_b, sr1_b;
+    ReadSideMaterial(mat_buckets, mat_index, env, local_a, bodies_per_env, bid_a,
+                     kDefaultMaterialFriction, solref0, solref1, &mu_a, &sr0_a, &sr1_a);
+    ReadSideMaterial(mat_buckets, mat_index, env, local_b, bodies_per_env, bid_b,
+                     kDefaultMaterialFriction, solref0, solref1, &mu_b, &sr0_b, &sr1_b);
+    PairMaterial mat;
+    mat.mu = fmaxf(mu_a, mu_b);
+    mat.solref0 = fminf(sr0_a, sr0_b);  // smaller timeconst == stiffer
+    mat.solref1 = fmaxf(sr1_a, sr1_b);
+
+    const float solref[2] = {mat.solref0, mat.solref1};
     const float solimp[5] = {solimp0, solimp1, solimp2, solimp3, solimp4};
-    constexpr float mu = 1.0f;  // general friction coefficient (cone bound).
+    const float mu = mat.mu;  // per-contact friction coefficient (cone bound).
     const float kFltMaxLocal = kFltMax;
 
     uint32_t active_rows = 0u;
@@ -783,6 +845,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(model.shape_table),
                    static_cast<const uint32_t*>(model.body_to_link),
                    static_cast<const uint32_t*>(model.body_to_articulation),
+                   static_cast<const float*>(data.mat_buckets),
+                   static_cast<const uint32_t*>(data.mat_index),
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->env_count, p->union_slot_count, p->rows_per_env,

@@ -691,6 +691,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
                                                   const float* inertia_M_inv,
                                                   uint32_t dof_stride,
                                                   float dt,
+                                                  uint32_t solver_iterations,
                                                   float friction_coefficient,
                                                   float baumgarte_max_velocity,
                                                   float* inout_lambda,
@@ -841,7 +842,7 @@ __global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
         }
     }
 
-    for (uint32_t iter = 0u; iter < kContactSolverIterations; ++iter) {
+    for (uint32_t iter = 0u; iter < solver_iterations; ++iter) {
         // -- Normal rows first, fixed slot order. ---------------------------
         for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
             const ArticulatedContactRow row = rows[slot_base + s];
@@ -1395,6 +1396,7 @@ void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
                                  uint32_t dof_stride,
                                  float dt,
                                  float* inout_lambda,
+                                 uint32_t solver_iterations,
                                  float friction_coefficient,
                                  float baumgarte_max_velocity,
                                  const float* joint_damping) {
@@ -1429,6 +1431,7 @@ void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
         inertia_M_inv,
         dof_stride,
         dt,
+        solver_iterations,
         friction_coefficient,
         baumgarte_max_velocity,
         inout_lambda,

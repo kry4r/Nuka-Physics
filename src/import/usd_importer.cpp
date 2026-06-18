@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iterator>
 #include <sstream>
@@ -38,6 +40,9 @@ struct UsdPrim {
     math::Vec3 diagonal_inertia = {1.0f, 1.0f, 1.0f};
     math::Vec3 translate = math::Vec3::Zero();
     math::Vec3 scale = {1.0f, 1.0f, 1.0f};   // xformOp:scale (baked into grafted mesh)
+    // xformOp:rotateXYZ Euler angles (degrees, applied X then Y then Z). Baked
+    // into the grafted mesh alongside translate/scale via the full TRS chain.
+    math::Vec3 rotate_xyz = math::Vec3::Zero();
     float cube_size = 1.0f;
     float radius = 0.5f;
     float height = 1.0f;
@@ -49,6 +54,9 @@ struct UsdPrim {
     float friction_mu = 1.0f;            // UsdPhysics PhysicsMaterialAPI friction
     float intensity = 1.0f;
     float focal_length = 50.0f;
+    bool has_focal_length = false;        // UsdGeomCamera focalLength authored?
+    // UsdGeomCamera verticalAperture (mm); USD default 15.2908 == 0.602362"*25.4.
+    float vertical_aperture = 15.2908f;
     float near_clip = 0.01f;
     float far_clip = 1000.0f;
     std::string body0_path;
@@ -375,6 +383,7 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseVec3Value(line, "physics:diagonalInertia", prim.diagonal_inertia);
     (void)ParseVec3Value(line, "xformOp:translate", prim.translate);
     (void)ParseVec3Value(line, "xformOp:scale", prim.scale);
+    (void)ParseVec3Value(line, "xformOp:rotateXYZ", prim.rotate_xyz);
     (void)ParseFloatValue(line, "double size", prim.cube_size);
     (void)ParseFloatValue(line, "float size", prim.cube_size);
     (void)ParseFloatValue(line, "double radius", prim.radius);
@@ -392,7 +401,10 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
         prim.has_friction = true;
     }
     (void)ParseFloatValue(line, "inputs:intensity", prim.intensity);
-    (void)ParseFloatValue(line, "focalLength", prim.focal_length);
+    if (ParseFloatValue(line, "focalLength", prim.focal_length)) {
+        prim.has_focal_length = true;
+    }
+    (void)ParseFloatValue(line, "verticalAperture", prim.vertical_aperture);
     (void)ParseFloatValue(line, "clippingRange:min", prim.near_clip);
     (void)ParseFloatValue(line, "clippingRange:max", prim.far_clip);
     (void)ParseRelationship(line, "physics:body0", prim.body0_path);
@@ -527,17 +539,77 @@ std::vector<UsdPrim> ParseUsdaText(const std::string& text) {
     return prims;
 }
 
-// Bake a per-axis scale into a flat x,y,z vertex array in place. A (1,1,1) scale
-// is an exact no-op.
-void BakeScaleIntoPoints(std::vector<float>& points, const math::Vec3& scale) {
-    if (scale.x == 1.0f && scale.y == 1.0f && scale.z == 1.0f) {
+// A general affine: 3x3 linear part L (row-major) plus translation t. Composes
+// arbitrary USD xformOp TRS stacks (translate * rotate * scale) up an ancestor
+// chain -- non-uniform scale + rotation can NOT be a math::Transform (rigid).
+struct Affine {
+    float l[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    math::Vec3 t = math::Vec3::Zero();
+
+    static Affine Identity() { return Affine{}; }
+
+    // Apply to a point: L*p + t.
+    math::Vec3 Apply(const math::Vec3& p) const {
+        return math::Vec3{l[0] * p.x + l[1] * p.y + l[2] * p.z + t.x,
+                          l[3] * p.x + l[4] * p.y + l[5] * p.z + t.y,
+                          l[6] * p.x + l[7] * p.y + l[8] * p.z + t.z};
+    }
+};
+
+// Compose a*b (apply b first, then a): a.L*b.L and a.L*b.t + a.t.
+Affine Compose(const Affine& a, const Affine& b) {
+    Affine r;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            r.l[row * 3 + col] = a.l[row * 3 + 0] * b.l[0 * 3 + col] +
+                                 a.l[row * 3 + 1] * b.l[1 * 3 + col] +
+                                 a.l[row * 3 + 2] * b.l[2 * 3 + col];
+        }
+    }
+    r.t = a.Apply(b.t);
+    return r;
+}
+
+// One prim's local TRS affine = translate * rotateXYZ * scale (USD column order:
+// scale applied first). rotateXYZ Euler degrees, intrinsic X then Y then Z.
+Affine LocalTrs(const UsdPrim& prim) {
+    constexpr float kDegToRad = 0.017453292519943295f;  // pi / 180
+    const math::Quat qx =
+        math::Quat::FromAxisAngle({1.0f, 0.0f, 0.0f}, prim.rotate_xyz.x * kDegToRad);
+    const math::Quat qy =
+        math::Quat::FromAxisAngle({0.0f, 1.0f, 0.0f}, prim.rotate_xyz.y * kDegToRad);
+    const math::Quat qz =
+        math::Quat::FromAxisAngle({0.0f, 0.0f, 1.0f}, prim.rotate_xyz.z * kDegToRad);
+    const math::Quat q = (qz * qy * qx).Normalized();  // R = Rz*Ry*Rx
+    // Rotation 3x3 from the quaternion's basis-vector images.
+    const math::Vec3 ex = q.Rotate({1.0f, 0.0f, 0.0f});
+    const math::Vec3 ey = q.Rotate({0.0f, 1.0f, 0.0f});
+    const math::Vec3 ez = q.Rotate({0.0f, 0.0f, 1.0f});
+    Affine out;
+    // L = R * diag(scale): columns of R scaled by the matching scale component.
+    out.l[0] = ex.x * prim.scale.x; out.l[1] = ey.x * prim.scale.y; out.l[2] = ez.x * prim.scale.z;
+    out.l[3] = ex.y * prim.scale.x; out.l[4] = ey.y * prim.scale.y; out.l[5] = ez.y * prim.scale.z;
+    out.l[6] = ex.z * prim.scale.x; out.l[7] = ey.z * prim.scale.y; out.l[8] = ez.z * prim.scale.z;
+    out.t = prim.translate;
+    return out;
+}
+
+// Bake a full affine into a flat x,y,z vertex array in place. The identity affine
+// is an exact no-op (preserves byte-identical geometry for untransformed refs).
+void BakeAffineIntoPoints(std::vector<float>& points, const Affine& xf) {
+    static const Affine kIdentity = Affine::Identity();
+    if (std::memcmp(xf.l, kIdentity.l, sizeof(xf.l)) == 0 &&
+        xf.t.x == 0.0f && xf.t.y == 0.0f && xf.t.z == 0.0f) {
         return;
     }
     const size_t triples = points.size() / 3u;
-    for (size_t t = 0; t < triples; ++t) {
-        points[t * 3u + 0u] *= scale.x;
-        points[t * 3u + 1u] *= scale.y;
-        points[t * 3u + 2u] *= scale.z;
+    for (size_t i = 0; i < triples; ++i) {
+        const math::Vec3 p{points[i * 3u + 0u], points[i * 3u + 1u],
+                           points[i * 3u + 2u]};
+        const math::Vec3 q = xf.Apply(p);
+        points[i * 3u + 0u] = q.x;
+        points[i * 3u + 1u] = q.y;
+        points[i * 3u + 2u] = q.z;
     }
 }
 
@@ -545,11 +617,11 @@ void BakeScaleIntoPoints(std::vector<float>& points, const math::Vec3& scale) {
 // fully-parsed (and reference-resolved) prim list of the referenced file;
 // `target_path` is the </PrimPath> selected from it. The selected prim and all
 // of its descendants are appended to `out` with their paths re-rooted under
-// `host.path`, and `effective_scale` (the host's own xformOp:scale times every
-// ancestor Xform's scale -- see ComputeEffectiveScale) is baked into every
-// grafted Mesh prim's points.
+// `host.path`, and `effective_xform` (the host's full local-to-world TRS up the
+// ancestor chain -- see ComputeEffectiveTransform) is baked into every grafted
+// Mesh prim's points.
 void GraftReference(const UsdPrim& host,
-                    const math::Vec3& effective_scale,
+                    const Affine& effective_xform,
                     const std::vector<UsdPrim>& ref_prims,
                     const std::string& target_path,
                     std::vector<UsdPrim>& out) {
@@ -588,39 +660,58 @@ void GraftReference(const UsdPrim& host,
         UsdPrim grafted = prim;
         grafted.path = remap(prim.path);
         grafted.parent_path = is_root ? host.parent_path : remap(prim.parent_path);
-        // Bake the host's effective (accumulated ancestor) scale into the
-        // grafted mesh vertices.
-        BakeScaleIntoPoints(grafted.mesh_points, effective_scale);
+        // Bake the host's full effective (accumulated ancestor) TRS transform
+        // into the grafted mesh vertices.
+        BakeAffineIntoPoints(grafted.mesh_points, effective_xform);
         out.push_back(std::move(grafted));
     }
 }
 
-// The effective xformOp:scale for `prim`: the prim's own scale times every
-// ancestor Xform's scale up the hierarchy. USD applies a mesh's whole ancestor
-// transform chain; the cup authors its scale on the parent Xform while the
-// reference sits on the child Mesh, so a self-only scale would be identity. Only
-// scale is accumulated (this asset's rotate/translate are 0); per-component
-// product, no rotate/translate baking (out of scope -- would be gold-plating).
-math::Vec3 ComputeEffectiveScale(const UsdPrim& prim,
+// The full effective local-to-world transform for `prim`: the prim's own TRS
+// (translate * rotateXYZ * scale) pre-multiplied by every ancestor Xform's TRS up
+// the hierarchy (world = A_root * ... * A_parent * A_prim). USD applies a mesh's
+// whole ancestor transform chain; the cup authors its transform on the parent
+// Xform while the reference sits on the child Mesh, so a self-only transform
+// would be identity. Composes arbitrary rotate/translate/non-uniform-scale, not
+// scale alone.
+Affine ComputeEffectiveTransform(const UsdPrim& prim,
                                  const std::vector<UsdPrim>& prims) {
     std::unordered_map<std::string, const UsdPrim*> by_path;
     by_path.reserve(prims.size());
     for (const auto& p : prims) {
         by_path[p.path] = &p;
     }
-    math::Vec3 scale = prim.scale;
+    Affine xform = LocalTrs(prim);
     std::string parent = prim.parent_path;
     while (!parent.empty() && parent != "/") {
         const auto it = by_path.find(parent);
         if (it == by_path.end()) {
             break;
         }
-        scale.x *= it->second->scale.x;
-        scale.y *= it->second->scale.y;
-        scale.z *= it->second->scale.z;
+        // Ancestor is applied AFTER the accumulated child transform: world = A_anc * acc.
+        xform = Compose(LocalTrs(*it->second), xform);
         parent = it->second->parent_path;
     }
-    return scale;
+    return xform;
+}
+
+// Synthesize a single Mesh UsdPrim from a crate-reader result so the SAME
+// graft/SceneIR-build path the ASCII importer uses applies unchanged. The prim's
+// path/name/parent are derived from the crate's resolved Mesh path.
+UsdPrim CrateMeshToUsdPrim(const CrateMesh& mesh) {
+    UsdPrim ref_mesh;
+    ref_mesh.type = "Mesh";
+    ref_mesh.path = mesh.prim_path;
+    const size_t slash = mesh.prim_path.find_last_of('/');
+    ref_mesh.name = (slash == std::string::npos) ? mesh.prim_path
+                                                 : mesh.prim_path.substr(slash + 1);
+    ref_mesh.parent_path =
+        (slash == std::string::npos || slash == 0) ? "/"
+                                                   : mesh.prim_path.substr(0, slash);
+    ref_mesh.mesh_points = mesh.points;
+    ref_mesh.face_vertex_indices = mesh.face_vertex_indices;
+    ref_mesh.face_vertex_counts = mesh.face_vertex_counts;
+    return ref_mesh;
 }
 
 std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
@@ -638,35 +729,21 @@ std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
             continue;
         }
         const std::string resolved = ResolveReferencePath(base_dir, prim.reference_asset);
-        const math::Vec3 effective_scale = ComputeEffectiveScale(prim, prims);
+        const Affine effective_xform = ComputeEffectiveTransform(prim, prims);
 
         // A USDC (crate) binary reference target (the newton-assets cup's
         // ./mesh.usd; v0.8 C7a): parse the crate's Mesh geometry with the
         // self-written reader and synthesize a single ref Mesh prim at the
-        // referenced prim path, so the SAME GraftReference + scale-bake +
+        // referenced prim path, so the SAME GraftReference + transform-bake +
         // SceneIR-build path the ASCII reference graft uses applies unchanged.
         // Detect by the crate MAGIC (not the extension): the cup's binary file
         // is named "mesh.usd", and a ".usd" file may be either ASCII or crate.
         if (DetectUsdStageFormat(resolved) == UsdStageFormat::UsdcCrate ||
             IsUsdcCrateFile(resolved)) {
             const CrateMesh mesh = ReadUsdcMesh(resolved, prim.reference_prim_path);
-            UsdPrim ref_mesh;
-            ref_mesh.type = "Mesh";
-            // The path inside the referenced file (e.g. "/Model"); GraftReference
-            // selects the prim whose path == reference_prim_path, so name them so.
-            ref_mesh.path = mesh.prim_path;
-            const size_t slash = mesh.prim_path.find_last_of('/');
-            ref_mesh.name = (slash == std::string::npos)
-                                ? mesh.prim_path
-                                : mesh.prim_path.substr(slash + 1);
-            ref_mesh.parent_path =
-                (slash == std::string::npos || slash == 0) ? "/"
-                                                           : mesh.prim_path.substr(0, slash);
-            ref_mesh.mesh_points = mesh.points;
-            ref_mesh.face_vertex_indices = mesh.face_vertex_indices;
-            ref_mesh.face_vertex_counts = mesh.face_vertex_counts;
-            const std::vector<UsdPrim> ref_prims = {ref_mesh};
-            GraftReference(prim, effective_scale, ref_prims, prim.reference_prim_path, grafted);
+            // GraftReference selects the prim whose path == reference_prim_path.
+            const std::vector<UsdPrim> ref_prims = {CrateMeshToUsdPrim(mesh)};
+            GraftReference(prim, effective_xform, ref_prims, prim.reference_prim_path, grafted);
             continue;
         }
 
@@ -674,7 +751,7 @@ std::vector<UsdPrim> ParseUsdaFileWithReferences(const std::string& base_dir,
         const std::string ref_dir = std::filesystem::path(resolved).parent_path().string();
         const std::vector<UsdPrim> ref_prims =
             ParseUsdaFileWithReferences(ref_dir, stage.text);
-        GraftReference(prim, effective_scale, ref_prims, prim.reference_prim_path, grafted);
+        GraftReference(prim, effective_xform, ref_prims, prim.reference_prim_path, grafted);
     }
     if (!grafted.empty()) {
         prims.insert(prims.end(),
@@ -851,6 +928,25 @@ scene::DecomposeMode DecomposeModeFromToken(const std::string& token) {
     return scene::DecomposeMode::Auto;
 }
 
+// Fallback vertical FOV (deg) used only when no focalLength is authored on the
+// UsdGeomCamera -- USD has no implied FOV without focal length + aperture.
+constexpr float kDefaultCameraVFovDegrees = 45.0f;
+
+// Vertical FOV (degrees) from a UsdGeomCamera, per the physCamera convention:
+//   vFOV = 2 * atan(verticalAperture / (2 * focalLength)).
+// Aperture and focal length share units (mm), so the ratio is unitless. Falls
+// back to a fixed default only when focalLength was not authored.
+float CameraVFovDegreesFromUsd(const UsdPrim& prim) {
+    if (!prim.has_focal_length || prim.focal_length <= 0.0f ||
+        prim.vertical_aperture <= 0.0f) {
+        return kDefaultCameraVFovDegrees;
+    }
+    constexpr float kRadToDeg = 57.29577951308232f;  // 180 / pi
+    const float half = std::atan(prim.vertical_aperture /
+                                 (2.0f * prim.focal_length));
+    return 2.0f * half * kRadToDeg;
+}
+
 scene::LightType LightTypeFromUsdType(const std::string& type) {
     if (type == "DistantLight") {
         return scene::LightType::Directional;
@@ -993,7 +1089,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             camera.name = prim.name;
             camera.attached_body = FindNearestBodyAncestor(prim.parent_path, body_map);
             camera.local_transform = math::Transform{prim.translate, math::Quat::Identity()};
-            camera.vertical_fov_degrees = prim.focal_length > 0.0f ? 50.0f : 45.0f;
+            camera.vertical_fov_degrees = CameraVFovDegreesFromUsd(prim);
             camera.near_clip = prim.near_clip;
             camera.far_clip = prim.far_clip;
             scene.AddCamera(std::move(camera));
@@ -1036,6 +1132,31 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
 } // namespace
 
 scene::SceneIR LoadUsd(const std::string& path) {
+    // A directly-loaded USDC crate (.usdc, or a .usd whose bytes are crate) is
+    // read by the self-written crate reader -- the SAME reader the reference path
+    // uses. Routing it here makes a crate file load identically whether it is the
+    // top-level asset or a reference target, instead of throwing on a file the
+    // engine can read. Detect by MAGIC (a ".usd" may be ASCII or crate).
+    if (DetectUsdStageFormat(path) == UsdStageFormat::UsdcCrate ||
+        IsUsdcCrateFile(path)) {
+        // Empty target -> the reader picks the first Mesh prim.
+        const CrateMesh mesh = ReadUsdcMesh(path, std::string{});
+        auto scene = BuildSceneFromUsdPrims({CrateMeshToUsdPrim(mesh)});
+        if (scene.RigidBodyCount() == 0u) {
+            bool has_mesh_geometry = false;
+            for (const auto& shape : scene.Shapes()) {
+                if (!shape.mesh_vertices.empty()) {
+                    has_mesh_geometry = true;
+                    break;
+                }
+            }
+            if (!has_mesh_geometry) {
+                throw std::runtime_error("USD: crate file yielded no mesh geometry: " + path);
+            }
+        }
+        return scene;
+    }
+
     const UsdStageData stage = LoadUsdStageData(path);
     const std::string base_dir = std::filesystem::path(path).parent_path().string();
     auto scene = BuildSceneFromUsdPrims(ParseUsdaFileWithReferences(base_dir, stage.text));

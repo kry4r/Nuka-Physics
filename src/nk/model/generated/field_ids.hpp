@@ -156,7 +156,7 @@ enum class FieldId : uint16_t {
     GridNeighborIdx,  // grid_neighbor_idx (per:particle arena:scratch owner:data elem:32)
     RngState,  // rng_state (per:env arena:persistent owner:data flags:[param])
     EnvStatus,  // env_status (per:env arena:scratch owner:data flags:[readout])
-    ObsBuffer,  // obs_buffer (per:env arena:scratch owner:data elem:64 flags:[readout])
+    ObsBuffer,  // obs_buffer (per:scalar arena:scratch owner:data count:obs_width*env_count flags:[readout])
     EnvTerrainType,  // env_terrain_type (per:env arena:persistent owner:data)
     EnvTerrainDifficulty,  // env_terrain_difficulty (per:env arena:persistent owner:data)
     JointF,  // joint_f (per:link arena:persistent owner:data flags:[param])
