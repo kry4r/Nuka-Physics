@@ -279,8 +279,14 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
             cap.max_bodies_total =
                 static_cast<uint32_t>(m.shape_table_rows.size());
-            cap.max_contacts_per_env = 32u;
-            cap.max_rows_per_env = 32u * nuka::nk::kPairDrivenRowsPerSlot;
+            // Re-budget candidate/row slots from the post-heightfield collidable
+            // count, the SAME rule as the cook (cook_to_model.cpp section 9).
+            constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+            constexpr uint32_t kStaticCollidables = 1u;
+            const uint32_t collidables = cap.bodies_per_env + kStaticCollidables;
+            cap.max_contacts_per_env = collidables * kCandidatePairsPerCollidable;
+            cap.max_rows_per_env =
+                cap.max_contacts_per_env * nuka::nk::kPairDrivenRowsPerSlot;
         }
 
         // Resolve world gravity (Z-up). A zero-initialized desc (all three 0.0)

@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace nuka::scene {
 
@@ -46,6 +47,16 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     const auto joint_off = static_cast<uint32_t>(base.JointCount());
     const auto shape_off = static_cast<uint32_t>(base.ShapeCount());
 
+    // A body takes the placement only if nothing joints onto it as a child: flat
+    // body lists (all parent_id kInvalidBody) carry their tree in joints, not parents.
+    std::vector<uint8_t> addon_is_joint_child(addon.Bodies().size(), 0u);
+    for (const JointRecord& j : addon.Joints()) {
+        if (j.child_body != kInvalidBody &&
+            j.child_body < addon_is_joint_child.size()) {
+            addon_is_joint_child[j.child_body] = 1u;
+        }
+    }
+
     // -- Materials ----------------------------------------------------------
     // (No cross-refs; id reassigned by AddMaterial. Append in order.)
     for (const MaterialRecord& src : addon.Materials()) {
@@ -55,17 +66,21 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     }
 
     // -- Rigid bodies -------------------------------------------------------
+    uint32_t addon_body_idx = 0u;
     for (const RigidBodyRecord& src : addon.Bodies()) {
         RigidBodyRecord rec = src;
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.parent_id = RemapId(rec.parent_id, body_off);
-        // Re-root the addon: each root (parent_id == kInvalidBody) is placed at
-        // `placement` in base's frame. Non-root bodies keep their local
-        // transform (their world pose follows the re-rooted parent).
-        if (src.parent_id == kInvalidBody) {
+        // Re-root only a true root: no body parent AND not a joint child (a joint
+        // child's local_transform is parent-relative, reached via the re-rooted root).
+        const bool is_joint_child =
+            addon_body_idx < addon_is_joint_child.size() &&
+            addon_is_joint_child[addon_body_idx] != 0u;
+        if (src.parent_id == kInvalidBody && !is_joint_child) {
             rec.local_transform = placement * rec.local_transform;
         }
         out.AddRigidBody(std::move(rec));
+        ++addon_body_idx;
     }
 
     // -- Collision shapes ---------------------------------------------------
