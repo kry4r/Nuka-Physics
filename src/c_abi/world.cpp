@@ -540,15 +540,15 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
 }
 
 // BATCHED arbitrary-(x,y) terrain height sampler over the world's COOKED grid.
-// Reads the world's stored HeightField via the ONE bilinear sampler, so the obs/
-// spawn height matches the grid the physics narrowphase rests feet on. The optional
-// per-element scale multiplies value*scale_z (the curriculum difficulty), preserving
-// the per-env terrain ladder without per-env grids.
+// Reads the world's stored HeightField via the ONE bilinear sampler -- the SAME
+// full-relief grid the physics narrowphase rests feet on -- so obs/spawn height
+// equals physics by construction. There is no per-env vertical scaling: the grid
+// is model-level (one terrain for the batch), so any per-env shrink would diverge
+// the obs from the physics it is meant to mirror.
 nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
                                                      uint32_t n,
                                                      const float* xs,
                                                      const float* ys,
-                                                     const float* scales,
                                                      float* out_heights) {
     if (n == 0u) {
         return NUKA_RESULT_OK;  // nothing to sample.
@@ -566,10 +566,7 @@ nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
         return NUKA_RESULT_OK;
     }
     for (uint32_t i = 0u; i < n; ++i) {
-        const float z = nuka::terrain::SampleHeightFieldZ(hf, xs[i], ys[i]);
-        const float scale = (scales != nullptr) ? scales[i] : 1.0f;
-        // Apply the per-env vertical scale as a multiply around the base floor.
-        out_heights[i] = hf.base_z + (z - hf.base_z) * scale;
+        out_heights[i] = nuka::terrain::SampleHeightFieldZ(hf, xs[i], ys[i]);
     }
     return NUKA_RESULT_OK;
 }
