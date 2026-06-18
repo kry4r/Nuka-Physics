@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "sensor/terrain/terrain_field.hpp"  // SampleTerrainHeight (H2 generator)
@@ -787,8 +788,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 row.hull_vert_offset = hull_base;
                 row.hull_vert_count = vcnt;
             }
-            row.contype = 1u;
-            row.conaffinity = 1u;
+            // contype/conaffinity from the cooked per-shape values (the MuJoCo
+            // bitmask the broadphase tests), NOT a blanket collide-all -- a
+            // visual-only geom (contype 0) must stay non-colliding.
+            row.contype = s < blob.contact_params.contypes.size()
+                              ? blob.contact_params.contypes[s] : 1u;
+            row.conaffinity = s < blob.contact_params.conaffinities.size()
+                                  ? blob.contact_params.conaffinities[s] : 1u;
             row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
             // R1 (general contact pipeline Phase 0): the shape->body indirection.
             // A cooked collidable row maps to its OWNING body row (never static
@@ -851,6 +857,28 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
         cap.max_sdf_grids   = static_cast<uint32_t>(model.sdf_grids.size());
         cap.max_sdf_cells   = static_cast<uint32_t>(model.sdf_cell_keys.size());
+        // Transcribe the cooked filter exclude-list (authored <exclude> UNION
+        // joint parent-child, the MuJoCo filterparent rule) into the model's
+        // body-pair key list the broadphase binary-searches. Keys are body rows
+        // (cooked body row == SceneIR body id, == the broadphase leaf body), so
+        // no remap. The list is already (min,max)-canonical sorted+deduped.
+        model.excluded_pairs.clear();
+        model.excluded_pairs.reserve(blob.filter_policy.excluded_body_pairs.size());
+        for (const auto& p : blob.filter_policy.excluded_body_pairs) {
+            const uint32_t lo = p.first < p.second ? p.first : p.second;
+            const uint32_t hi = p.first < p.second ? p.second : p.first;
+            if (lo >= cap.bodies_per_env || hi >= cap.bodies_per_env) {
+                throw std::runtime_error(
+                    "CookToModel: excluded body pair references a body row beyond "
+                    "bodies_per_env (cook topology bug)");
+            }
+            model.excluded_pairs.push_back(
+                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+        std::sort(model.excluded_pairs.begin(), model.excluded_pairs.end());
+        model.excluded_pairs.erase(
+            std::unique(model.excluded_pairs.begin(), model.excluded_pairs.end()),
+            model.excluded_pairs.end());
         cap.max_excluded_pairs =
             static_cast<uint32_t>(model.excluded_pairs.size());
         // L-RECON-D: the convex-hull vertex pool capacity = the concatenated
