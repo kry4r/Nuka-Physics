@@ -154,12 +154,65 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
                                 uint32_t qdot_floats, bool cache_jw) {
     const uint64_t jw = cache_jw ? 2ull * rows_per_env * dof_stride : 0ull;
+    // Slim records are staged in shared ONLY by the Union family (cache_jw); the
+    // PairDriven family builds them inline in the sweep, so its carve drops the
+    // rows_per_env * sizeof(SlimRow) term (the dominant per-row cost).
+    const uint64_t slim = cache_jw ? sizeof(SlimRow) * rows_per_env : 0ull;
     return sizeof(float) *
                (qdot_floats +                                          // qdot tile(s)
                 2ull * rows_per_env +                                   // lambda+meff
                 jw) +                                                   // J + w (union only)
-           sizeof(SlimRow) * rows_per_env +                             // slim
+           slim +                                                       // slim (union only)
            sizeof(uint32_t) * 3ull * rows_per_env;                      // order+segs
+}
+
+// Build the compact solve record from the full NkRow. The Union family stages
+// these in shared once per launch; the PairDriven family builds them inline in
+// the sweep (reading the NkRow from global), keeping the per-row shared footprint
+// out of the rows_per_env-sized carve so a many-contact env fits the block.
+__device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
+                                      uint32_t env_artic_base) {
+    SlimRow sr;
+    sr.flags = row.flags;
+    sr.group_local = row.group_first - env_row_base;
+    sr.group_cnt = row.group_normal_count;
+    sr.rhs = row.rhs;
+    sr.R = row.compliance_alpha;
+    sr.lower = row.lower;
+    sr.upper = row.upper;
+    sr.mu = row.mu;
+    uint32_t code = 0u;
+    sr.a_tile = ~0u;
+    sr.b_tile = ~0u;
+    if (row.a.kind == kNkSideArtic) {
+        code |= kSlimAArt;
+        sr.a_tile = (row.a.index >= env_artic_base) ? (row.a.index - env_artic_base) : 0u;
+    }
+    if (row.b.kind == kNkSideArtic) {
+        code |= kSlimBArt;
+        sr.b_tile = (row.b.index >= env_artic_base) ? (row.b.index - env_artic_base) : 0u;
+    }
+    const bool a_dyn = row.a.kind == kNkSideRigid || row.a.kind == kNkSideParticle;
+    const bool b_dyn = row.b.kind == kNkSideRigid || row.b.kind == kNkSideParticle;
+    sr.dyn_index = 0u;
+    sr.jl[0] = sr.jl[1] = sr.jl[2] = 0.0f;
+    sr.ja[0] = sr.ja[1] = sr.ja[2] = 0.0f;
+    if (a_dyn) {
+        code |= kSlimHasDyn;
+        if (row.a.kind == kNkSideParticle) code |= kSlimDynParticle;
+        sr.dyn_index = row.a.index;
+        sr.jl[0] = row.a.jlin.x; sr.jl[1] = row.a.jlin.y; sr.jl[2] = row.a.jlin.z;
+        sr.ja[0] = row.a.jang.x; sr.ja[1] = row.a.jang.y; sr.ja[2] = row.a.jang.z;
+        if (b_dyn) code |= kSlimFallback;
+    } else if (b_dyn) {
+        code |= kSlimHasDyn | kSlimDynIsB;
+        if (row.b.kind == kNkSideParticle) code |= kSlimDynParticle;
+        sr.dyn_index = row.b.index;
+        sr.jl[0] = row.b.jlin.x; sr.jl[1] = row.b.jlin.y; sr.jl[2] = row.b.jlin.z;
+        sr.ja[0] = row.b.jang.x; sr.ja[1] = row.b.jang.y; sr.ja[2] = row.b.jang.z;
+    }
+    sr.code = code;
+    return sr;
 }
 
 // One row's velocity update — row_solver.cu SolveCompliantVelocityRow,
@@ -173,9 +226,11 @@ inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
 //     rounding regardless of which lane executes it; w is shared-cached).
 __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   uint32_t gslot,         // global slot
+                                  uint32_t env_row_base,  // env's first global slot
+                                  uint32_t env_artic_base,// env's first global artic
                                   uint32_t j_row,         // row index into J/w arrays
                                   uint32_t wlane,
-                                  const SlimRow* slim_sh,
+                                  const SlimRow* slim_sh, // null => build inline
                                   float* lambda_sh,
                                   const float* meff_sh,
                                   const float* J_sh,      // shared (union) OR global (PD)
@@ -192,7 +247,16 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   math::Vec3* __restrict__ particle_vel,
                                   uint32_t dof_stride,
                                   float dt) {
-    const SlimRow* const sr = slim_sh + ls;
+    // Union stages slim in shared (slim_sh != null); PairDriven builds it inline
+    // from the global NkRow (slim_sh == null) so the shared carve stays small.
+    SlimRow sr_local;
+    const SlimRow* sr;
+    if (slim_sh != nullptr) {
+        sr = slim_sh + ls;
+    } else {
+        sr_local = MakeSlimRow(urows[gslot], env_row_base, env_artic_base);
+        sr = &sr_local;
+    }
     const uint32_t flags = sr->flags;
     if (!(flags & nk::nk_row_flags::kActive)) {
         return;  // watermark early-exit (inactive slot).
@@ -443,8 +507,14 @@ __global__ void SolveRowsBlockIslandKernel(
         w_sh = J_sh + static_cast<size_t>(rows_per_env) * dof_stride;
         slim_base = w_sh + static_cast<size_t>(rows_per_env) * dof_stride;
     }
+    // Union stages slim records in shared; PairDriven builds them inline in the
+    // sweep, so its carve OMITS the rows_per_env * sizeof(SlimRow) region (order_sh
+    // follows meff/J/w directly). This keeps a many-contact PairDriven env in-block.
     SlimRow* const slim_sh = reinterpret_cast<SlimRow*>(slim_base);
-    uint32_t* const order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
+    unsigned char* const after_slim =
+        cache_jw ? reinterpret_cast<unsigned char*>(slim_sh + rows_per_env)
+                 : reinterpret_cast<unsigned char*>(slim_base);
+    uint32_t* const order_sh = reinterpret_cast<uint32_t*>(after_slim);
     uint32_t* const seg_sh = order_sh + rows_per_env;            // 2R u32
 
     const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
@@ -459,52 +529,11 @@ __global__ void SolveRowsBlockIslandKernel(
         const size_t g = static_cast<size_t>(env_row_base) + i;
         lambda_sh[i] = lambda[g];
         meff_sh[i] = row_meff[g];
-        // Build the slim solve record (see SlimRow).
-        const NkRow row = urows[g];
-        SlimRow sr;
-        sr.flags = row.flags;
-        sr.group_local = row.group_first - env_row_base;
-        sr.group_cnt = row.group_normal_count;
-        sr.rhs = row.rhs;
-        sr.R = row.compliance_alpha;
-        sr.lower = row.lower;
-        sr.upper = row.upper;
-        sr.mu = row.mu;
-        uint32_t code = 0u;
-        // S3: env-local artic tile index for each artic side (global - env base).
-        sr.a_tile = ~0u;
-        sr.b_tile = ~0u;
-        if (row.a.kind == kNkSideArtic) {
-            code |= kSlimAArt;
-            sr.a_tile = (row.a.index >= env_artic_base) ? (row.a.index - env_artic_base) : 0u;
+        // Union stages the slim records in shared; PairDriven builds them inline
+        // in the sweep (its carve has no slim region).
+        if (cache_jw) {
+            slim_sh[i] = MakeSlimRow(urows[g], env_row_base, env_artic_base);
         }
-        if (row.b.kind == kNkSideArtic) {
-            code |= kSlimBArt;
-            sr.b_tile = (row.b.index >= env_artic_base) ? (row.b.index - env_artic_base) : 0u;
-        }
-        const bool a_dyn =
-            row.a.kind == kNkSideRigid || row.a.kind == kNkSideParticle;
-        const bool b_dyn =
-            row.b.kind == kNkSideRigid || row.b.kind == kNkSideParticle;
-        sr.dyn_index = 0u;
-        sr.jl[0] = sr.jl[1] = sr.jl[2] = 0.0f;
-        sr.ja[0] = sr.ja[1] = sr.ja[2] = 0.0f;
-        if (a_dyn) {
-            code |= kSlimHasDyn;
-            if (row.a.kind == kNkSideParticle) code |= kSlimDynParticle;
-            sr.dyn_index = row.a.index;
-            sr.jl[0] = row.a.jlin.x; sr.jl[1] = row.a.jlin.y; sr.jl[2] = row.a.jlin.z;
-            sr.ja[0] = row.a.jang.x; sr.ja[1] = row.a.jang.y; sr.ja[2] = row.a.jang.z;
-            if (b_dyn) code |= kSlimFallback;  // two dynamic sides: full-record path
-        } else if (b_dyn) {
-            code |= kSlimHasDyn | kSlimDynIsB;
-            if (row.b.kind == kNkSideParticle) code |= kSlimDynParticle;
-            sr.dyn_index = row.b.index;
-            sr.jl[0] = row.b.jlin.x; sr.jl[1] = row.b.jlin.y; sr.jl[2] = row.b.jlin.z;
-            sr.ja[0] = row.b.jang.x; sr.ja[1] = row.b.jang.y; sr.ja[2] = row.b.jang.z;
-        }
-        sr.code = code;
-        slim_sh[i] = sr;
     }
     // Union: cache the per-row J/w into shared (the dense-sweep latency core).
     // PairDriven reads J/w/J_b/w_b from global in the sweep (no shared cache).
@@ -571,8 +600,10 @@ __global__ void SolveRowsBlockIslandKernel(
                 const float* Jb = cache_jw ? nullptr : chain_jacobian_b;
                 const float* Wb = cache_jw ? nullptr : row_minv_jt_b;
                 const uint32_t j_row = cache_jw ? (gslot - env_row_base) : gslot;
-                SolveUnionRowWarp(gslot - env_row_base, gslot, j_row, wlane,
-                                  slim_sh, lambda_sh, meff_sh, Ja, Wa, Jb, Wb,
+                SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
+                                  env_artic_base, j_row, wlane,
+                                  cache_jw ? slim_sh : nullptr,
+                                  lambda_sh, meff_sh, Ja, Wa, Jb, Wb,
                                   qdot_sh, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
                                   body_inv_inertia, particle_inv_mass,
