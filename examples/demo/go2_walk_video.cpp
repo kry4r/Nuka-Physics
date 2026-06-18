@@ -232,20 +232,17 @@ int main(int argc, char** argv) {
     uint32_t n_rebound = 0u, n_unbound = 0u, n_oob = 0u;
     uint32_t max_link_row = 0u;
     for (size_t i = 0; i < rw.instances.size(); ++i) {
-        const render::RenderInstance& inst = rw.instances[i];
-        const nuka::scene::CookedRef* ref = cooked.scene_map.RefOf(inst.entity);
-        if (ref && ref->shape_row != nuka::scene::SceneMap::kNoRow &&
-            ref->shape_row < scene.Shapes().size()) {
-            const auto& sh = scene.GetShape(ref->shape_row);
-            const uint32_t link = static_cast<uint32_t>(sh.body_id);
-            if (link < traj.link_count) {
-                inst_link[i]   = link;
-                inst_vlocal[i] = sh.local_transform;   // geom local IN its link frame
-                inst_bound[i]  = 1u;
-                max_link_row = std::max(max_link_row, link);
-                ++n_rebound;
-            } else { ++n_oob; }
-        } else { ++n_unbound; }
+        const render::PoseSource& ps = rw.instances[i].pose_source;
+        if (ps.kind == render::PoseSource::Kind::Static || ps.row == render::kNoId) {
+            ++n_unbound; continue;
+        }
+        if (ps.row < traj.link_count) {
+            inst_link[i]   = ps.row;                              // cook link == trajectory link
+            inst_vlocal[i] = rw.instances[i].cached_visual_local; // geom-in-link offset
+            inst_bound[i]  = 1u;
+            max_link_row = std::max(max_link_row, ps.row);
+            ++n_rebound;
+        } else { ++n_oob; }
     }
     std::printf("[go2_walk_video] RenderWorld: instances=%u meshes=%u materials=%u | "
                 "rebound_to_link=%u unbound=%u oob=%u max_link_row=%u dumped_links=%u\n",
