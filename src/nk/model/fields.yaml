@@ -660,3 +660,22 @@ fields:
   # family (it stages order/segments in shared). APPENDED LAST so every pre-existing
   # arena offset is byte-stable.
   - {name: pd_solve_scratch, dtype: u32, per: row_slot, arena: scratch, owner: data, elem: 3}
+
+  # =========================================================================
+  # Split-impulse position-correction pass: SEPARATE pseudo-velocity buffers
+  # (never the persisted velocity state). The solve op runs pos_iters Gauss-
+  # Seidel sweeps that drive a pseudo velocity from the geometric penetration
+  # depth into these buffers; IntegratePosition advances position by
+  # (real+pseudo)*dt while the persisted velocity stays = real. row_penetration
+  # is the per-normal-row geometric depth the assembly already has as `pos`.
+  # All pos_iters==0 (Union/Fused) paths leave these zero -> byte-identical
+  # integration. APPENDED LAST so every pre-existing arena offset is byte-stable.
+  # =========================================================================
+  - {name: row_penetration,        dtype: f32,      per: row_slot, arena: scratch, owner: data}
+  - {name: qdot_pseudo,            dtype: f32,      per: link,     arena: scratch, owner: data}
+  - {name: link_velocity_pseudo,   dtype: spatial6, per: link,     arena: scratch, owner: data}
+  - {name: qdot_pseudo_flat,       dtype: f32,      per: articulation_dof, arena: scratch, owner: data}
+  - {name: body_pseudo_linear_velocity,  dtype: vec3, per: body,     arena: scratch, owner: data}
+  - {name: body_pseudo_angular_velocity, dtype: vec3, per: body,     arena: scratch, owner: data}
+  - {name: particle_pseudo_vel,    dtype: vec3,     per: particle, arena: scratch, owner: data}
+  - {name: row_pseudo_lambda,      dtype: f32,      per: row_slot, arena: scratch, owner: data}

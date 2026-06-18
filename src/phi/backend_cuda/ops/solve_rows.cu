@@ -156,11 +156,13 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 // scale with rows_per_env); only the qdot tile region stays in shared. The Union
 // family stages every row-scaled array in shared (its carve is unchanged).
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
-                                uint32_t qdot_floats, bool cache_jw) {
+                                uint32_t qdot_floats, bool cache_jw,
+                                bool pos_pass) {
     if (!cache_jw) {
         // PairDriven: only the qdot tile(s) live in shared; lambda/meff/order/seg
-        // are read from GLOBAL, so the carve does not scale with rows_per_env.
-        return sizeof(float) * qdot_floats;
+        // are read from GLOBAL, so the carve does not scale with rows_per_env. The
+        // split-impulse position pass adds a parallel pseudo qdot tile (same size).
+        return sizeof(float) * qdot_floats * (pos_pass ? 2u : 1u);
     }
     const uint64_t jw = 2ull * rows_per_env * dof_stride;
     const uint64_t slim = sizeof(SlimRow) * rows_per_env;
@@ -449,6 +451,145 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
     }
 }
 
+// One NORMAL row's split-impulse position update, executed by ONE WARP. A
+// GEOMETRIC projection (no -R*lambda compliance feedback): it drives a SEPARATE
+// pseudo velocity from the contact penetration depth so position can close the
+// overlap WITHOUT injecting energy into the persisted velocity. Mirrors the
+// velocity warp's machinery (same J, same w = M^-1 J^T, same meff, same side
+// dispatch, same fixed sweep order) but reads/writes ONLY the pseudo
+// accumulators. Friction rows are skipped (one-sided non-penetration only);
+// the pseudo impulse is clamped >= 0.
+__device__ void SolvePositionRowWarp(uint32_t gslot,
+                                     uint32_t env_row_base,
+                                     uint32_t env_artic_base,
+                                     uint32_t j_row,
+                                     uint32_t wlane,
+                                     const float* __restrict__ row_meff,
+                                     const float* __restrict__ row_penetration,
+                                     float* __restrict__ row_pseudo_lambda,
+                                     const float* J_sh,
+                                     const float* w_sh,
+                                     const float* J_b_sh,
+                                     const float* w_b_sh,
+                                     float* qdot_pseudo_sh,
+                                     const NkRow* __restrict__ urows,
+                                     math::Vec3* __restrict__ body_pseudo_lin,
+                                     math::Vec3* __restrict__ body_pseudo_ang,
+                                     const float* __restrict__ body_inv_mass,
+                                     const math::Vec3* __restrict__ body_inv_inertia,
+                                     const float* __restrict__ particle_inv_mass,
+                                     math::Vec3* __restrict__ particle_pseudo_vel,
+                                     uint32_t dof_stride,
+                                     float beta, float slop, float dt) {
+    const SlimRow sr = MakeSlimRow(urows[gslot], env_row_base, env_artic_base);
+    const uint32_t flags = sr.flags;
+    if (!(flags & nk::nk_row_flags::kActive) ||
+        (flags & nk::nk_row_flags::kFriction)) {
+        return;  // inactive or friction row: no position correction.
+    }
+    const uint32_t code = sr.code;
+    const uint32_t a_tile = (sr.a_tile == ~0u) ? 0u : sr.a_tile;
+    const uint32_t b_tile = (sr.b_tile == ~0u) ? 0u : sr.b_tile;
+
+    float delta = 0.0f;
+    if (wlane == 0u) {
+        // Pseudo separating velocity from the SAME J over the pseudo qdot tile
+        // (artic) and the pseudo body/particle velocities (rigid/particle).
+        float art_jv_a = 0.0f;
+        if (code & kSlimAArt) {
+            const float* const J = J_sh + static_cast<size_t>(j_row) * dof_stride;
+            const float* const qd =
+                qdot_pseudo_sh + static_cast<size_t>(a_tile) * dof_stride;
+            for (uint32_t r = 0u; r < dof_stride; ++r) art_jv_a += J[r] * qd[r];
+        }
+        float art_jv_b = 0.0f;
+        if (code & kSlimBArt) {
+            const float* const J =
+                ((J_b_sh != nullptr) ? J_b_sh : J_sh) +
+                static_cast<size_t>(j_row) * dof_stride;
+            const float* const qd =
+                qdot_pseudo_sh + static_cast<size_t>(b_tile) * dof_stride;
+            for (uint32_t r = 0u; r < dof_stride; ++r) art_jv_b += J[r] * qd[r];
+        }
+        float dyn_jv = 0.0f;
+        if (code & kSlimHasDyn) {
+            const math::Vec3 jl{sr.jl[0], sr.jl[1], sr.jl[2]};
+            if (code & kSlimDynParticle) {
+                dyn_jv = (particle_pseudo_vel != nullptr)
+                             ? Dot3(jl, particle_pseudo_vel[sr.dyn_index])
+                             : 0.0f;
+            } else {
+                const math::Vec3 ja{sr.ja[0], sr.ja[1], sr.ja[2]};
+                dyn_jv = Dot3(jl, body_pseudo_lin[sr.dyn_index]) +
+                         Dot3(ja, body_pseudo_ang[sr.dyn_index]);
+            }
+        }
+        float jv = 0.0f;
+        if (code & kSlimAArt) jv += art_jv_a;
+        else if ((code & kSlimHasDyn) && !(code & kSlimDynIsB)) jv += dyn_jv;
+        if (code & kSlimBArt) jv += art_jv_b;
+        else if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
+
+        // Target pseudo separating velocity from the geometric penetration.
+        const float depth = row_penetration[gslot];
+        const float bias = beta * fmaxf(depth - slop, 0.0f) / dt;
+        const float effective_mass = row_meff[gslot];
+        const float old_imp = row_pseudo_lambda[gslot];
+        // GEOMETRIC projection: no -R*lambda compliance term (this is position,
+        // not a compliant force). One-sided (pseudo impulse >= 0).
+        const float new_imp = fmaxf(old_imp + effective_mass * (bias - jv), 0.0f);
+        row_pseudo_lambda[gslot] = new_imp;
+        const float d = new_imp - old_imp;
+        delta = (fabsf(d) > 1.0e-12f) ? d : 0.0f;
+    }
+    delta = __shfl_sync(0xffffffffu, delta, 0);
+    if (delta != 0.0f) {
+        for (int side = 0; side < 2; ++side) {
+            const bool art = side == 0 ? (code & kSlimAArt) != 0u
+                                       : (code & kSlimBArt) != 0u;
+            const bool dyn = (code & kSlimHasDyn) &&
+                             ((side == 1) == ((code & kSlimDynIsB) != 0u));
+            if (art) {
+                const uint32_t tile = (side == 0) ? a_tile : b_tile;
+                const float* w = ((side == 0) ? w_sh
+                                              : ((w_b_sh != nullptr) ? w_b_sh : w_sh)) +
+                                 static_cast<size_t>(j_row) * dof_stride;
+                float* const qd =
+                    qdot_pseudo_sh + static_cast<size_t>(tile) * dof_stride;
+                for (uint32_t r = wlane; r < dof_stride; r += 32u) {
+                    qd[r] += w[r] * delta;
+                }
+            } else if (dyn && wlane == 0u) {
+                if (code & kSlimDynParticle) {
+                    if (particle_pseudo_vel != nullptr &&
+                        particle_inv_mass != nullptr) {
+                        const float im = particle_inv_mass[sr.dyn_index];
+                        if (im > 0.0f) {
+                            math::Vec3& v = particle_pseudo_vel[sr.dyn_index];
+                            v.x += sr.jl[0] * (im * delta);
+                            v.y += sr.jl[1] * (im * delta);
+                            v.z += sr.jl[2] * (im * delta);
+                        }
+                    }
+                } else {
+                    const float im = body_inv_mass[sr.dyn_index];
+                    if (im > 0.0f) {
+                        const math::Vec3 ii = body_inv_inertia[sr.dyn_index];
+                        math::Vec3& v = body_pseudo_lin[sr.dyn_index];
+                        math::Vec3& w = body_pseudo_ang[sr.dyn_index];
+                        v.x += sr.jl[0] * (im * delta);
+                        v.y += sr.jl[1] * (im * delta);
+                        v.z += sr.jl[2] * (im * delta);
+                        w.x += sr.ja[0] * ii.x * delta;
+                        w.y += sr.ja[1] * ii.y * delta;
+                        w.z += sr.ja[2] * ii.z * delta;
+                    }
+                }
+            }
+        }
+    }
+}
+
 __global__ void SolveRowsBlockIslandKernel(
     const NkRow* __restrict__ urows,
     float* __restrict__ lambda,
@@ -472,6 +613,14 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t* __restrict__ dof_to_link,
     const uint32_t* __restrict__ dof_to_component,
     uint32_t* __restrict__ pd_solve_scratch,  // PairDriven GLOBAL order+seg scratch
+    const float* __restrict__ row_penetration,    // split-impulse depth (or null)
+    float* __restrict__ row_pseudo_lambda,        // split-impulse accumulator (or null)
+    float* __restrict__ qdot_pseudo,              // per-link pseudo joint vel (or null)
+    Spatial6* __restrict__ link_velocity_pseudo,  // per-link pseudo spatial vel (or null)
+    float* __restrict__ qdot_pseudo_flat,         // per-artic pseudo tile (or null)
+    math::Vec3* __restrict__ body_pseudo_lin_vel, // per-body pseudo lin vel (or null)
+    math::Vec3* __restrict__ body_pseudo_ang_vel, // per-body pseudo ang vel (or null)
+    math::Vec3* __restrict__ particle_pseudo_vel, // per-particle pseudo vel (or null)
     uint32_t total_islands,
     uint32_t rows_per_env,
     uint32_t dof_stride,
@@ -479,6 +628,8 @@ __global__ void SolveRowsBlockIslandKernel(
     uint32_t artics_per_env,    // S3: co-resident artic tiles per env (1 at K==1)
     uint32_t with_b_arm,        // S2: PairDriven carves J_b/w_b shared regions
     uint32_t vel_iters,
+    uint32_t pos_iters,
+    float pos_beta, float pos_slop,
     float dt) {
     const uint32_t island = blockIdx.x;
     if (island >= total_islands) {
@@ -522,6 +673,10 @@ __global__ void SolveRowsBlockIslandKernel(
     // the global lambda / row_meff source in SolveUnionRowWarp; order_sh / seg_sh
     // point into this env's disjoint slice of the global pd_solve_scratch buffer
     // (rows_per_env order u32 followed by 2*rows_per_env segment u32 per env).
+    // Split-impulse position pass (PairDriven only; pos_iters>0). The parallel
+    // pseudo qdot tile follows the real qdot tile in shared, sized identically.
+    const bool pos_pass = (pos_iters > 0u) && !cache_jw;
+    float* const qdot_pseudo_sh = pos_pass ? (qdot_sh + qdot_floats) : nullptr;
     float* lambda_sh = nullptr;
     float* meff_sh = nullptr;
     float* J_sh = nullptr;   // shared J/w cache (Union only).
@@ -646,6 +801,50 @@ __global__ void SolveRowsBlockIslandKernel(
         }
     }
 
+    // Split-impulse position pass (PairDriven, pos_iters>0): drive a SEPARATE
+    // pseudo velocity from the geometric penetration into qdot_pseudo_sh / the
+    // pseudo body+particle velocities, never the persisted velocity. Same fixed
+    // sweep order (D1). The pseudo qdot tile starts at ZERO (pseudo velocity is
+    // built from depth, not carried from the velocity solve).
+    if (pos_pass) {
+        if (has_artic) {
+            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                qdot_pseudo_sh[i] = 0.0f;
+            }
+        }
+        // Zero this island's per-row pseudo accumulators (global, race-free per
+        // island). Walk the compacted ACTIVE rows.
+        if (live_seg_cnt > 0u) {
+            const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
+            const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
+            const uint32_t island_rows = last_off + last_cnt;
+            for (uint32_t i = lane; i < island_rows; i += blockDim.x) {
+                row_pseudo_lambda[order_sh[i]] = 0.0f;
+            }
+        }
+        __syncthreads();
+        for (uint32_t it = 0u; it < pos_iters; ++it) {
+            for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                const uint32_t off = seg_sh[2u * s + 0u];
+                const uint32_t cnt = seg_sh[2u * s + 1u];
+                for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                    const uint32_t gslot = order_sh[off + idx];
+                    SolvePositionRowWarp(
+                        gslot, env_row_base, env_artic_base, gslot, wlane,
+                        row_meff, row_penetration, row_pseudo_lambda,
+                        chain_jacobian, row_minv_jt,
+                        chain_jacobian_b, row_minv_jt_b,
+                        qdot_pseudo_sh, urows,
+                        body_pseudo_lin_vel, body_pseudo_ang_vel,
+                        body_inv_mass, body_inv_inertia,
+                        particle_inv_mass, particle_pseudo_vel,
+                        dof_stride, pos_beta, pos_slop, dt);
+                }
+                __syncthreads();
+            }
+        }
+    }
+
     // Write back THIS island's lambdas (the persistent warm-start/readout
     // field) — walk the island's own ACTIVE rows (the only lambdas the sweep
     // can change; inactive slots keep the assembled 0). Multi-island-per-env
@@ -710,6 +909,19 @@ __global__ void SolveRowsBlockIslandKernel(
                     qdot[gl] = v;
                 }
                 qdot_flat[static_cast<size_t>(env_artic_base + a) * dof_stride + k] = v;
+                // Split-impulse: scatter the pseudo qdot tile to its OWN buffers,
+                // mirroring the real scatter (so IntegratePosition reads it
+                // additively without touching the persisted velocity).
+                if (pos_pass) {
+                    const float vp = qdot_pseudo_sh[i];
+                    if (comp != ~0u) {
+                        link_velocity_pseudo[gl].v[comp] = vp;
+                    } else {
+                        qdot_pseudo[gl] = vp;
+                    }
+                    qdot_pseudo_flat[static_cast<size_t>(env_artic_base + a) *
+                                         dof_stride + k] = vp;
+                }
             }
         }
     }
@@ -740,10 +952,14 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         // H1-golden footprint), the compact K-tile reservation for PairDriven (S3).
         const uint32_t qdot_floats =
             with_b_arm ? (artics_per_env * p->max_dof) : kMaxArticulationDof;
+        // Split-impulse position pass runs ONLY on the PairDriven path (pos_iters>0).
+        const bool pos_pass = (p->pos_iters > 0u) && with_b_arm;
         // Union caches J/w in shared (cache_jw == !with_b_arm); PairDriven reads
         // them from global (bounded shared), so its carve excludes the J/w regions.
+        // The position pass adds a parallel pseudo qdot tile (PairDriven only).
         const size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
-                                                      qdot_floats, !with_b_arm);
+                                                      qdot_floats, !with_b_arm,
+                                                      pos_pass);
         // One-time opt-in past the 48 KB default dynamic-shared carve-out
         // (sm_8x+ allows ~99 KB/block). Host-side attribute set — NOT a
         // stream op, so it is graph-capture-safe; cached so the steady-state
@@ -758,6 +974,30 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                     return Status::Failed;  // LOUD: slice exceeds the device limit.
                 }
                 opted_in_bytes = shared_bytes;
+            }
+        }
+        // Zero the GLOBAL pseudo accumulators the position pass touches (the
+        // per-link pseudo tiles are zeroed in-kernel). The rigid/particle pseudo
+        // velocities accumulate across the sweep, so they start from zero each
+        // step (no cross-step energy carry). pos_iters==0 leaves them untouched.
+        if (pos_pass) {
+            if (p->total_body_count > 0u && data.body_pseudo_linear_velocity != nullptr) {
+                const size_t bbytes =
+                    static_cast<size_t>(p->total_body_count) * sizeof(math::Vec3);
+                if (cudaMemsetAsync(data.body_pseudo_linear_velocity, 0, bbytes,
+                                    stream) != cudaSuccess ||
+                    cudaMemsetAsync(data.body_pseudo_angular_velocity, 0, bbytes,
+                                    stream) != cudaSuccess) {
+                    return Status::Failed;
+                }
+            }
+            if (p->total_particle_count > 0u && data.particle_pseudo_vel != nullptr) {
+                const size_t pbytes =
+                    static_cast<size_t>(p->total_particle_count) * sizeof(math::Vec3);
+                if (cudaMemsetAsync(data.particle_pseudo_vel, 0, pbytes, stream) !=
+                    cudaSuccess) {
+                    return Status::Failed;
+                }
             }
         }
         LaunchCuda(SolveRowsBlockIslandKernel, dim3(p->total_islands),
@@ -787,10 +1027,20 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.dof_to_link),
                    static_cast<const uint32_t*>(model.dof_to_component),
                    data.pd_solve_scratch,
+                   pos_pass ? static_cast<const float*>(data.row_penetration) : nullptr,
+                   pos_pass ? static_cast<float*>(data.row_pseudo_lambda) : nullptr,
+                   pos_pass ? static_cast<float*>(data.qdot_pseudo) : nullptr,
+                   pos_pass ? reinterpret_cast<Spatial6*>(data.link_velocity_pseudo) : nullptr,
+                   pos_pass ? static_cast<float*>(data.qdot_pseudo_flat) : nullptr,
+                   pos_pass ? data.body_pseudo_linear_velocity : nullptr,
+                   pos_pass ? data.body_pseudo_angular_velocity : nullptr,
+                   pos_pass ? data.particle_pseudo_vel : nullptr,
                    p->total_islands, p->rows_per_env, p->max_dof,
                    p->base_link_count, artics_per_env,
                    with_b_arm ? 1u : 0u,
-                   static_cast<uint32_t>(p->vel_iters), p->dt);
+                   static_cast<uint32_t>(p->vel_iters),
+                   static_cast<uint32_t>(p->pos_iters),
+                   p->pos_beta, p->pos_slop, p->dt);
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
 
