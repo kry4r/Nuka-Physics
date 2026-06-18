@@ -744,6 +744,10 @@ if(CMAKE_CUDA_COMPILER)
         # rest seat). Pure host C++ (the World device work goes through phi v2).
         scene/cook/settle.cpp
         scene/cook/placement.cpp
+        # The general heightfield: the parametric grid generators + the self-written
+        # grayscale image loader, the ONE source the cook + obs/render share.
+        scene/terrain/heightfield_loaders.cpp
+        scene/terrain/image_grayscale.cpp
         # L1-c: union_cook.cpp (CookSceneToUnionTemplate — the .nks h1_cup_table
         # -> UnionSceneTemplate cook) was DELETED with the UnionCsr path. The one
         # general cook is cook_to_model.cpp (CookSceneToModel -> PairDriven).

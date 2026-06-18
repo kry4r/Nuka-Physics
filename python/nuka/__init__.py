@@ -32,12 +32,6 @@ from ._nuka_ext import (  # noqa: F401
     World,
     Tape,
     sync,
-    # Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y) terrain
-    # height sampler -- the host-side projection of the SINGLE source of truth
-    # nuka::terrain::SampleTerrainHeight (+ ScaleTerrainDifficulty). The RL
-    # spawn-on-terrain reset reads the spawn height for a RANDOM (x,y) column from
-    # here so it matches the foot kernel's heightfield exactly.
-    terrain_sample_height_batch,
     __engine_version__,
     DETERMINISM_STRONG,
     DETERMINISM_WEAK,
@@ -176,7 +170,6 @@ __all__ = [
     "Scene",
     "Field",
     "sync",
-    "terrain_sample_height_batch",
     "__engine_version__",
     "DETERMINISM_STRONG",
     "DETERMINISM_WEAK",

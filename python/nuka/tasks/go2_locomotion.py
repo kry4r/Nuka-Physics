@@ -127,6 +127,19 @@ class Go2LocomotionEnv(NukaGymEnv):
                 "terrain_grid_width": float(tcfg.get("grid_width", 0.45)),
                 "terrain_grid_height_max": float(tcfg.get("grid_height_max", 0.15)),
             }
+            # Terrain runs on the general contact path (a baked static heightfield the
+            # feet + obs/spawn share); terrain config / explicit ctor arg override these.
+            if contact_family == 0:
+                contact_family = int(tcfg.get("contact_family", 1))
+            if heightfield_terrain_type == 0:
+                heightfield_terrain_type = int(
+                    tcfg.get("heightfield_terrain_type", 4))
+            if heightfield_nrow == 0:
+                heightfield_nrow = int(tcfg.get("heightfield_nrow", 161))
+            if heightfield_ncol == 0:
+                heightfield_ncol = int(tcfg.get("heightfield_ncol", 161))
+            if heightfield_cell <= 0.0:
+                heightfield_cell = float(tcfg.get("heightfield_cell", 0.25))
 
         # ONE-GENERAL-SOLVER landing (L1): route the world through the GENERAL
         # contact path (contact_family=1 -> PairDriven + a baked static heightfield
@@ -447,10 +460,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         uniformly in [-spawn_xy_range, +spawn_xy_range]^2 around the tile origin and
         (when randomize_yaw) a heading yaw in [-pi, pi]. The LOCAL surface height at
         each sampled column comes from the BATCHED C-ABI sampler
-        ``nuka.terrain_sample_height_batch`` -- the host-side projection of the
-        SINGLE source of truth ``SampleTerrainHeight`` (+ difficulty scale), so the
-        spawn z is read from the EXACT heightfield the foot-contact kernel rests the
-        feet on (no python center-only mirror drift for arbitrary columns). This
+        ``World.sample_terrain_height`` -- the EXACT cooked heightfield grid the
+        foot-contact kernel rests the feet on (one source of truth, no python mirror). This
         lifts the base ABOVE the local platform/pit/box step instead of inside it
         (the Phase-2a "spawn inside a raised step -> Baumgarte launch to z~=18" bug),
         AND, combined with the body-frame velocity command, sends the dog walking in
@@ -458,9 +469,7 @@ class Go2LocomotionEnv(NukaGymEnv):
 
         Called from :meth:`_reset_joint_state` AFTER world.reset/reset_envs settled
         the buffers and BEFORE the obs is recomposed. The curriculum's promote/
-        demote for the done envs has already run this step. ``terrain.center_height``
-        is kept only for reference/diagnostic now; the live reset uses the batched
-        arbitrary-(x,y) sampler."""
+        demote for the done envs has already run this step."""
         cur = self._curriculum
         gen = self._generator
         dev = self._torch_device
@@ -475,20 +484,14 @@ class Go2LocomotionEnv(NukaGymEnv):
         else:
             yaw = torch.zeros(n, device=dev)
 
-        # LOCAL surface height at each sampled column via the SINGLE-source C-ABI
-        # sampler (host-side; (x,y,type,diff) -> z). The sampler takes CPU arrays;
-        # the per-reset cost is tiny (N control-plane samples) so the host round-trip
-        # is fine. Difficulty is the curriculum's live per-env scale.
-        types_cpu = cur.terrain_type.to(torch.int64).cpu().to(torch.uint32).contiguous()
+        # LOCAL surface height at each sampled column via the SINGLE-source grid
+        # sampler (the EXACT cooked heightfield the physics narrowphase rests feet
+        # on). Host CPU arrays; the per-reset cost is tiny (N control-plane samples).
+        # The per-env curriculum difficulty is the vertical scale.
         xs_cpu = spawn_x.detach().cpu().to(torch.float32).contiguous()
         ys_cpu = spawn_y.detach().cpu().to(torch.float32).contiguous()
         diff_cpu = cur.difficulty.detach().cpu().to(torch.float32).contiguous()
-        surf = nuka.terrain_sample_height_batch(
-            types_cpu, xs_cpu, ys_cpu, diff_cpu,
-            self._ground_height, self._terrain_step_height,
-            self._terrain_step_width, self._terrain_platform_width,
-            self._terrain_grid_width, self._terrain_grid_height_max,
-        )
+        surf = self._world.sample_terrain_height(xs_cpu, ys_cpu, diff_cpu)
         base_z = torch.as_tensor(surf, device=dev, dtype=torch.float32) + NOMINAL_BASE_Z
 
         # Yaw -> quaternion (w-first, rotation about world +Z): [cos(y/2),0,0,sin(y/2)].
@@ -644,24 +647,17 @@ class Go2LocomotionEnv(NukaGymEnv):
         """(N, M) local terrain surface z at world (xs, ys) per env, using the env's
         LIVE curriculum terrain TYPE + DIFFICULTY (broadcast across the trailing M
         dim), via the SINGLE-source batched C-ABI sampler
-        ``nuka.terrain_sample_height_batch`` -- the exact heightfield the foot kernel
-        rests the feet on. ``xs``/``ys`` are (N, M); the sampler takes flat CPU
+        ``World.sample_terrain_height`` -- the exact cooked heightfield grid the foot
+        kernel rests the feet on. ``xs``/``ys`` are (N, M); the sampler takes flat CPU
         arrays so we flatten (N*M,) and reshape back. Only called on the terrain-ON
         paths (the collision proxy and the relative height-kill)."""
         n, m = xs.shape
         cur = self._curriculum
-        types = cur.terrain_type.view(n, 1).expand(n, m)         # (N, M) long
         diff = cur.difficulty.view(n, 1).expand(n, m)            # (N, M) float
-        types_cpu = types.reshape(-1).to(torch.int64).cpu().to(torch.uint32).contiguous()
         xs_cpu = xs.reshape(-1).detach().cpu().to(torch.float32).contiguous()
         ys_cpu = ys.reshape(-1).detach().cpu().to(torch.float32).contiguous()
         diff_cpu = diff.reshape(-1).detach().cpu().to(torch.float32).contiguous()
-        surf = nuka.terrain_sample_height_batch(
-            types_cpu, xs_cpu, ys_cpu, diff_cpu,
-            self._ground_height, self._terrain_step_height,
-            self._terrain_step_width, self._terrain_platform_width,
-            self._terrain_grid_width, self._terrain_grid_height_max,
-        )
+        surf = self._world.sample_terrain_height(xs_cpu, ys_cpu, diff_cpu)
         return torch.as_tensor(
             surf, device=self._torch_device, dtype=torch.float32
         ).view(n, m)
@@ -710,8 +706,8 @@ class Go2LocomotionEnv(NukaGymEnv):
         is no true per-body contact force in the foot-only FusedFoot model).
 
         TERRAIN ON  -> the local surface z per (link x,y) comes from the SINGLE-
-            source batched C-ABI sampler ``nuka.terrain_sample_height_batch`` (the
-            exact heightfield the foot kernel rests the feet on), using each env's
+            source grid sampler ``World.sample_terrain_height`` (the exact cooked
+            heightfield the foot kernel rests the feet on), using each env's
             live curriculum terrain TYPE + DIFFICULTY.
         TERRAIN OFF -> the surface is the flat ground at z=0 (``ground_height``),
             so the proxy is still ACTIVE (and faithfully ~0: a thigh/calf/base only

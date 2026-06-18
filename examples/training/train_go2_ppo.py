@@ -177,6 +177,15 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Path to a .pth checkpoint to warm-start from "
                         "(rl_games agent.restore). E.g. the flat baseline "
                         "out/go2_policy/go2_walk_randomcmd_ep250.pth.")
+    # Staged-curriculum warm-start: rl_games' restore() ALSO restores the epoch
+    # and frame counters from the checkpoint, so a new stage whose max_epochs is
+    # <= the checkpoint's epoch exits immediately ("MAX EPOCHS NUM!") having
+    # trained nothing. --reset-progress zeroes epoch/frame/last_mean_rewards in a
+    # temp copy of the checkpoint before restore, so the stage trains its FULL
+    # max_epochs while still inheriting the weights+optimizer+obs-normalizer.
+    p.add_argument("--reset-progress", dest="reset_progress", action="store_true",
+                   help="Zero the restored epoch/frame counters when warm-starting "
+                        "from --checkpoint (for staged-curriculum stage transitions).")
     # Toggle the terrain curriculum without editing the yaml (additive override).
     p.add_argument("--terrain", dest="terrain", action="store_true", default=None,
                    help="Force-ENABLE the procedural-terrain curriculum "
@@ -290,8 +299,23 @@ def main(argv=None) -> int:
     if args.checkpoint:
         if not os.path.isfile(args.checkpoint):
             raise SystemExit(f"--checkpoint not found: {args.checkpoint}")
+        ckpt_path = args.checkpoint
+        if args.reset_progress:
+            # Strip the epoch/frame counters so the new stage trains its full
+            # max_epochs (weights + optimizer + obs-normalizer are kept).
+            import torch, tempfile
+            sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            for k in ("epoch", "frame", "last_mean_rewards"):
+                if k in sd:
+                    sd[k] = 0
+            ckpt_path = os.path.join(
+                tempfile.gettempdir(),
+                "warmstart_reset_" + os.path.basename(args.checkpoint))
+            torch.save(sd, ckpt_path)
+            print(f"[train_go2_ppo] --reset-progress: zeroed epoch/frame -> "
+                  f"{ckpt_path}", flush=True)
         # rl_games restores this into the agent BEFORE the first epoch (warm-start).
-        run_args["checkpoint"] = args.checkpoint
+        run_args["checkpoint"] = ckpt_path
         print(f"[train_go2_ppo] WARM-START from checkpoint {args.checkpoint}",
               flush=True)
     runner.run(run_args)

@@ -2508,6 +2508,37 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # Go2 HANDSTAND (倒立) hero clip -- the same offscreen GO2W-replay renderer as
+    # go2_walk_video (Load(go2.nks) -> CookToModel SceneMap -> BuildRenderWorld ->
+    # drive each visual instance from the dumped per-sub-step link_pose), but with a
+    # LOW slow-orbit + dolly-in hero camera framing the INVERTED dog from below.
+    # Replays out/go2_handstand_trajectory.bin (the deterministic, gate-passing
+    # handstand rollout dumped by go2_dump_handstand_trajectory.py).
+    add_executable(nuka_go2_handstand_video
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_handstand_video.cpp
+    )
+    add_dependencies(nuka_go2_handstand_video nuka_codegen)
+    target_compile_definitions(nuka_go2_handstand_video
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_go2_handstand_video
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_handstand_video
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # Go2-on-stairs demo PHASE 3 -- go2_terrain_demo: the MULTI-DOG TERRAIN RENDER
     # (Isaac-Lab-cover style). Renders N Go2 each on its own procedural-terrain tile
     # (tessellated by sampling the SHARED nuka::terrain::SampleTerrainHeight() so the

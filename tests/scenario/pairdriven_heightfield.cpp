@@ -37,7 +37,9 @@
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "scene/cook/cook_to_model.hpp"
-#include "sensor/terrain/terrain_field.hpp"
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
+#include "scene/terrain/heightfield_sample.hpp"
 
 namespace {
 
@@ -105,6 +107,29 @@ void AddBox(nk::Model& m, const Vec3& pos, const Vec3& vel, float half,
     m.shape_table_rows[body_id] = sh;
 }
 
+// Build a parametric HeightField (the ONE grid the cook + the surface check share).
+// ring_rise 0 => flat; ring_rise > 0 => a Chebyshev staircase (8 rings, the prior
+// PyramidStairs amplitude). Pure parameters -- no terrain-type selector.
+terrain::HeightField MakeHf(uint32_t nrow, uint32_t ncol, float cell,
+                            float ring_rise, float ring_width,
+                            float ring_platform) {
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = nrow;
+    cfg.ncol = ncol;
+    cfg.cell_x = cell;
+    cfg.cell_y = cell;
+    cfg.origin = Vec3{-0.5f * static_cast<float>(ncol - 1u) * cell,
+                      -0.5f * static_cast<float>(nrow - 1u) * cell, 0.0f};
+    cfg.base_z = 0.0f;
+    cfg.ring_rise = ring_rise;
+    cfg.ring_width = ring_width;
+    cfg.ring_platform = ring_platform;
+    cfg.ring_count = ring_rise != 0.0f ? 8u : 0u;
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    return hf;
+}
+
 void FinishBodyModel(nk::Model& m) {
     nk::ModelCapacities& cap = m.capacities;
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -155,12 +180,8 @@ TEST(PairDrivenHeightfield, BoxRestsOnFlatGrid) {
     // TRIANGLE_PRISM contacts — not fall through, not explode.
     nk::Model m;
     AddBox(m, Vec3{0, 0, 0.30f}, Vec3{0, 0, 0}, 0.10f, 1.0f, 0);  // body 0 = box
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = 0.0f;
-    const uint32_t hf_row =
-        cook::CookHeightfieldGrid(m, tp, terrain::kTerrainFlat,
-                                  /*nrow=*/9u, /*ncol=*/9u, /*cell=*/0.25f,
-                                  /*center=*/Vec3{0, 0, 0});
+    const terrain::HeightField hf = MakeHf(9u, 9u, 0.25f, 0.0f, 0.0f, 0.0f);
+    const uint32_t hf_row = cook::CookHeightfieldGrid(m, hf);
     ASSERT_NE(hf_row, ~0u);
     FinishBodyModel(m);
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -193,31 +214,22 @@ TEST(PairDrivenHeightfield, BoxOnStepEdgeSettlesNoExplodeNoClip) {
     // straddling the first riser outside the platform, so the box's footprint
     // overlaps BOTH the upper tread AND the riser prisms. It must SETTLE finite,
     // near the LOCAL step surface, with no base_z=16029 / NaN and no clip-through.
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = 0.0f;
-    tp.step_height = 0.15f;
-    tp.step_width = 0.5f;
-    tp.platform_width = 1.0f;  // half_plat = 0.5
+    const float step_height = 0.15f;
+    const terrain::HeightField hf = MakeHf(21u, 21u, 0.25f, step_height, 0.5f, 1.0f);
 
     // Place the box over the edge between the platform (r <= 0.5) and ring 1.
     // Box centre at x = 0.5 (the platform/ring-1 boundary), y = 0 -> the box
     // [0.4, 0.6] straddles the riser at x=0.5. The platform top sits at
-    // ground + kPyramidRings*step_height = 8*0.15 = 1.20; ring-1 tread at
-    // 1.20 - 0.15 = 1.05. Drop the box from above the platform top.
+    // ground + 8*step_height = 8*0.15 = 1.20; ring-1 tread at 1.20 - 0.15 = 1.05.
     const float box_half = 0.10f;
     const float edge_x = 0.5f;
-    const float platform_top =
-        tp.ground_height +
-        static_cast<float>(terrain::kPyramidRings) * tp.step_height;  // 1.20
-    const float ring1_top = platform_top - tp.step_height;            // 1.05
+    const float platform_top = static_cast<float>(8) * step_height;  // 1.20
+    const float ring1_top = platform_top - step_height;              // 1.05
     const float drop_z = platform_top + 0.20f;  // start above the platform top.
 
     nk::Model m;
     AddBox(m, Vec3{edge_x, 0, drop_z}, Vec3{0, 0, 0}, box_half, 1.0f, 0);
-    const uint32_t hf_row =
-        cook::CookHeightfieldGrid(m, tp, terrain::kTerrainPyramidStairs,
-                                  /*nrow=*/21u, /*ncol=*/21u, /*cell=*/0.25f,
-                                  /*center=*/Vec3{0, 0, 0});
+    const uint32_t hf_row = cook::CookHeightfieldGrid(m, hf);
     ASSERT_NE(hf_row, ~0u);
     FinishBodyModel(m);
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -249,8 +261,7 @@ TEST(PairDrivenHeightfield, BoxOnStepEdgeSettlesNoExplodeNoClip) {
     // a small penetration tolerance. This is the real 穿模 check: the box never
     // sinks below the surface it sits on, anywhere on the staircase.
     const float box_base = p.z - box_half;
-    const float surf_here =
-        terrain::SampleTerrainHeight(terrain::kTerrainPyramidStairs, p.x, p.y, tp);
+    const float surf_here = terrain::SampleHeightFieldZ(hf, p.x, p.y);
     std::fprintf(stderr, "[hf step-edge] surf@(%.3f,%.3f)=%.4f box_base=%.4f\n",
                  p.x, p.y, surf_here, box_base);
     EXPECT_GT(box_base, surf_here - 0.04f)
@@ -278,16 +289,11 @@ TEST(PairDrivenHeightfield, BoxWedgedAgainstRiserPushedOut) {
     // normal) while the tread prisms hold it UP — the tread+riser dual contact the
     // step-edge case needs. We assert: finite, no penetration into the platform
     // (its x stays outside the platform footprint), and it rests on the tread.
-    terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-    tp.ground_height = 0.0f;
-    tp.step_height = 0.15f;
-    tp.step_width = 0.5f;
-    tp.platform_width = 1.0f;  // half_plat = 0.5
+    const float step_height = 0.15f;
+    const terrain::HeightField hf = MakeHf(21u, 21u, 0.25f, step_height, 0.5f, 1.0f);
     const float box_half = 0.10f;
-    const float platform_top =
-        tp.ground_height +
-        static_cast<float>(terrain::kPyramidRings) * tp.step_height;  // 1.20
-    const float ring1_top = platform_top - tp.step_height;            // 1.05
+    const float platform_top = static_cast<float>(8) * step_height;  // 1.20
+    const float ring1_top = platform_top - step_height;             // 1.05
     const float half_plat = 0.5f;
 
     // Box centre overlapping the riser: x = half_plat + box_half*0.5 = 0.55 so the
@@ -298,9 +304,7 @@ TEST(PairDrivenHeightfield, BoxWedgedAgainstRiserPushedOut) {
     nk::Model m;
     AddBox(m, Vec3{start_x, 0.0f, ring1_top + box_half + 0.02f},
            Vec3{-0.2f, 0, 0}, box_half, 1.0f, 0);  // nudge toward the platform.
-    const uint32_t hf_row =
-        cook::CookHeightfieldGrid(m, tp, terrain::kTerrainPyramidStairs,
-                                  21u, 21u, 0.25f, Vec3{0, 0, 0});
+    const uint32_t hf_row = cook::CookHeightfieldGrid(m, hf);
     ASSERT_NE(hf_row, ~0u);
     FinishBodyModel(m);
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -312,11 +316,19 @@ TEST(PairDrivenHeightfield, BoxWedgedAgainstRiserPushedOut) {
     const Snapshot snap = Download(w, bodies);
     ASSERT_TRUE(snap.ok);
     const Vec3 p = snap.pose[0].position;
-    const float surf_here =
-        terrain::SampleTerrainHeight(terrain::kTerrainPyramidStairs, p.x, p.y, tp);
+    // The box rests on a discrete STEP TREAD; at a riser the bilinear sample ramps
+    // between the tread and the higher platform, so the no-tunnel support is the
+    // LOWEST grid corner under the box footprint (the tread it sits on), not the
+    // mid-riser bilinear value (which is the sloped prism the box may shallowly
+    // penetrate -- the known box x prism EPA shallow-penetration dead-band).
+    float tread = 1.0e9f;
+    for (float dy = -box_half; dy <= box_half + 1e-6f; dy += box_half)
+        for (float dx = -box_half; dx <= box_half + 1e-6f; dx += box_half)
+            tread = std::min(tread, terrain::SampleHeightFieldZ(hf, p.x + dx, p.y + dy));
+    const float surf_here = terrain::SampleHeightFieldZ(hf, p.x, p.y);
     std::fprintf(stderr,
-                 "[hf wedge] box=(%.4f,%.4f,%.4f) vz=%.4f surf=%.4f contacts=%u\n",
-                 p.x, p.y, p.z, snap.lin[0].z, surf_here, snap.contact_count[0]);
+                 "[hf wedge] box=(%.4f,%.4f,%.4f) vz=%.4f surf=%.4f tread=%.4f contacts=%u\n",
+                 p.x, p.y, p.z, snap.lin[0].z, surf_here, tread, snap.contact_count[0]);
 
     ASSERT_TRUE(Finite(p)) << "wedged box NaN/inf (explosion)";
     // RISER reaction pushed it OUT: the box's inner face must NOT penetrate deep
@@ -324,8 +336,8 @@ TEST(PairDrivenHeightfield, BoxWedgedAgainstRiserPushedOut) {
     // tolerance (the riser prevents it from sliding under the higher platform top).
     EXPECT_GT(p.x, half_plat - box_half - 0.04f)
         << "box tunneled under the platform riser (穿模 on the riser)";
-    // TREAD reaction held it UP: its base rests at/above the local surface.
-    EXPECT_GT(p.z - box_half, surf_here - 0.04f)
+    // TREAD reaction held it UP: its base rests at/above the tread it sits on.
+    EXPECT_GT(p.z - box_half, tread - 0.04f)
         << "box sank through the tread";
     EXPECT_GT(snap.contact_count[0], 0u) << "no tread/riser contacts";
 }
@@ -336,15 +348,10 @@ TEST(PairDrivenHeightfield, TwoRunsByteIdentical) {
     Backend b = GetBackend();
 
     auto run = [&]() -> Snapshot {
-        terrain::TerrainParams tp = terrain::DefaultTerrainParams();
-        tp.ground_height = 0.0f;
-        tp.step_height = 0.15f;
-        tp.step_width = 0.5f;
-        tp.platform_width = 1.0f;
+        const terrain::HeightField hf = MakeHf(21u, 21u, 0.25f, 0.15f, 0.5f, 1.0f);
         nk::Model m;
         AddBox(m, Vec3{0.5f, 0.05f, 1.45f}, Vec3{0.1f, 0, 0}, 0.10f, 1.0f, 0);
-        cook::CookHeightfieldGrid(m, tp, terrain::kTerrainPyramidStairs,
-                                  21u, 21u, 0.25f, Vec3{0, 0, 0});
+        cook::CookHeightfieldGrid(m, hf);
         FinishBodyModel(m);
         const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg(-9.81f));

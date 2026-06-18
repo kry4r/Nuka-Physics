@@ -387,13 +387,16 @@ nuka_result_t nuka_recorder_to_video(nuka_recorder_handle recorder,
         if (std::system("command -v ffmpeg >/dev/null 2>&1") != 0) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
-        const uint32_t use_fps = (fps != 0u) ? fps : 30u;  // D6 default 30.
+        const uint32_t use_fps = (fps != 0u) ? fps : 30u;  // default 30.
+        const std::string fps_str = std::to_string(use_fps);
         const std::string pattern =
             (std::filesystem::path(out_dir) / "frame_%06d.ppm").string();
-        // -y overwrite; -framerate before -i sets the input rate; libx264 +
-        // yuv420p is the D6 default codec/pixel format. Quote paths defensively.
-        std::string cmd = "ffmpeg -y -framerate " + std::to_string(use_fps) +
-                          " -i \"" + pattern + "\" -pix_fmt yuv420p -c:v libx264 \"" +
+        // -y overwrite; -framerate before -i sets the INPUT rate; -r after -i pins
+        // the OUTPUT rate to fps so the muxed video plays at exactly fps. libx264 +
+        // yuv420p is the default codec/pixel format. Quote paths defensively.
+        std::string cmd = "ffmpeg -y -framerate " + fps_str +
+                          " -i \"" + pattern + "\" -r " + fps_str +
+                          " -pix_fmt yuv420p -c:v libx264 \"" +
                           std::string(out_mp4) + "\" >/dev/null 2>&1";
         const int rc = std::system(cmd.c_str());
         if (rc != 0) return NUKA_RESULT_INTERNAL;  // ffmpeg failed (no crash).

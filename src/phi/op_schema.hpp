@@ -30,13 +30,6 @@
 
 #include <cstdint>
 
-// The SHARED procedural-terrain heightfield params (Go2-on-stairs Phase 1).
-// terrain_field.hpp is __host__ __device__-portable (CUDA qualifiers gated on
-// __CUDACC__, the philox.cuh precedent), so it stays ZERO-CUDA-type when this
-// header is compiled by the host toolchain. nuka::terrain::TerrainParams is a
-// trivially-copyable POD of 6 floats (the "no STL / trivially copyable" rule).
-#include "sensor/terrain/terrain_field.hpp"
-
 namespace nuka::phi {
 
 // ---------------------------------------------------------------------------
@@ -305,13 +298,6 @@ struct NarrowphasePrimitivesParams {
     uint8_t max_contacts_per_pair;
     // M3b first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;
-    // Go2-on-stairs Phase 1: the SHARED procedural-terrain params. (Historically the
-    // FUSED detection kernel sampled nuka::terrain::SampleTerrainHeight here; L1-b
-    // deletes that runtime — the general path's terrain is the cook-time baked
-    // heightfield collidable. These fields are retained for the still-live foot
-    // table / params layout; the per-env terrain TYPE is the env_terrain_type
-    // DataView field, now model-level/informational.)
-    ::nuka::terrain::TerrainParams terrain;
     uint32_t foot_count;        // active rows of the Model foot_shape table
     uint32_t env_count;
     uint32_t base_link_count;   // links per env (replica stride)

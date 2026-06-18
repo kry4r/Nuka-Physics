@@ -42,7 +42,9 @@
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
-#include "sensor/terrain/terrain_field.hpp"  // general heightfield collidable
+#include "scene/terrain/heightfield.hpp"
+#include "scene/terrain/heightfield_loaders.hpp"
+#include "scene/terrain/heightfield_sample.hpp"
 
 namespace {
 
@@ -477,6 +479,29 @@ float LinkLowestZHost(uint32_t kind_sentinel, const float* p4,
     return best;
 }
 
+// Build a parametric HeightField at the given grid centre. ring_rise 0 => flat;
+// > 0 => a Chebyshev staircase (8 rings). Pure parameters -- no type selector.
+// The cook re-derives the body centre as origin + half, so origin = centre - half.
+terrain::HeightField MakeHf(uint32_t nrow, uint32_t ncol, float cell,
+                            const Vec3& centre, float ring_rise, float ring_width,
+                            float ring_platform) {
+    terrain::TerrainGenConfig cfg;
+    cfg.nrow = nrow;
+    cfg.ncol = ncol;
+    cfg.cell_x = cell;
+    cfg.cell_y = cell;
+    cfg.origin = Vec3{centre.x - 0.5f * static_cast<float>(ncol - 1u) * cell,
+                      centre.y - 0.5f * static_cast<float>(nrow - 1u) * cell, 0.0f};
+    cfg.base_z = 0.0f;
+    cfg.ring_rise = ring_rise;
+    cfg.ring_width = ring_width;
+    cfg.ring_platform = ring_platform;
+    cfg.ring_count = ring_rise != 0.0f ? 8u : 0u;
+    terrain::HeightField hf;
+    terrain::GenerateHeightField(cfg, hf);
+    return hf;
+}
+
 }  // namespace
 
 // --- K dogs free-fall onto a PyramidStairs STEP EDGE and REST on it (no 穿模) ---
@@ -534,25 +559,18 @@ TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
     const uint32_t L = model.capacities.links_per_env;
     const uint32_t links_per_dog = L / K;  // dog A == links [0, links_per_dog).
 
-    nuka::terrain::TerrainParams terr = nuka::terrain::DefaultTerrainParams();
-    terr.ground_height  = 0.0f;
-    terr.step_height    = 0.04f;   // 8 rings * 0.04 = 0.32 m platform top
-    terr.step_width     = 0.40f;
-    terr.platform_width = 2.00f;   // half_plat = 1.00
-    const float half_plat = 0.5f * terr.platform_width;  // 1.0
-    // Shift the grid so a step EDGE is under the cooked dogs. center.x = +half_plat
-    // maps grid-local origin to world x=+1.0; the platform's -X edge (local
-    // x=-half_plat) lands at world x=0 (cooked dog A straddles this edge).
+    const float half_plat = 1.0f;  // platform 2.0 -> half_plat 1.0.
+    // Shift the grid so a step EDGE is under the cooked dogs. centre.x = +half_plat
+    // maps the platform's -X edge to world x=0 (cooked dog A straddles this edge).
     const Vec3 grid_center{half_plat, 0.0f, 0.0f};
+    const terrain::HeightField hf =
+        MakeHf(41u, 41u, 0.20f, grid_center, 0.04f, 0.40f, 2.0f);
 
-    // Cook the GENERAL heightfield collidable for the SAME PyramidStairs spec.
-    // body_init must be sized to the ORIGINAL bodies before CookHeightfieldGrid
-    // seeds the heightfield collidable at index orig_bodies (the vproof recipe).
+    // Cook the GENERAL heightfield collidable. body_init must be sized to the
+    // ORIGINAL bodies before CookHeightfieldGrid seeds the collidable at orig_bodies.
     const uint32_t orig_bodies = model.capacities.bodies_per_env;
     model.body_init.resize(orig_bodies);
-    const uint32_t hf_row = cook::CookHeightfieldGrid(
-        model, terr, terrain::kTerrainPyramidStairs,
-        /*nrow=*/41u, /*ncol=*/41u, /*cell=*/0.20f, grid_center);
+    const uint32_t hf_row = cook::CookHeightfieldGrid(model, hf);
     ASSERT_EQ(hf_row, orig_bodies);
 
     nk::ModelCapacities& cap = model.capacities;
@@ -623,12 +641,9 @@ TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
                 continue;
             }
             if (l >= links_per_dog) continue;  // 穿模 metric scoped to dog A.
-            // The cooked grid is centred at grid_center, so the surface under a
-            // link at world (gx,gy) is sampled at grid-LOCAL (gx-center, gy-center)
-            // (the SAME mapping CookHeightfieldGrid used).
-            const float surface = nuka::terrain::SampleTerrainHeight(
-                nuka::terrain::kTerrainPyramidStairs,
-                gx - grid_center.x, gy - grid_center.y, terr);
+            // The surface under a link at world (gx,gy) is the bilinear sample of the
+            // EXACT cooked grid the physics narrowphase reads (one source of truth).
+            const float surface = terrain::SampleHeightFieldZ(hf, gx, gy);
             // clearance > 0 == above surface; < 0 == sunk INTO terrain (穿模).
             const float clearance = lowest_z - surface;
             if (!std::isfinite(clearance)) { all_finite = false; continue; }
@@ -644,7 +659,7 @@ TEST(MultiDogTerrain, BodyLinksRestOnTerrainNoSinkThrough) {
                  "[terrain general] dog A on PyramidStairs step edge (platform top "
                  "%.2f, half_plat %.2f): worst link %u @ (%.3f,%.3f) lowest_z=%.4f "
                  "surf=%.4f | min clearance=%.4f worst=%.4f m (<0 == 穿模)\n",
-                 8.0f * terr.step_height, half_plat, worst_l, worst_gx, worst_gy,
+                 8.0f * 0.04f, half_plat, worst_l, worst_gx, worst_gy,
                  worst_z, worst_surf, dogA_min_clear, dogA_worst_pen);
 
     // (1) FINITE (BOTH dogs) — the general step-edge path does NOT explode (the
@@ -686,15 +701,12 @@ TEST(MultiDogTerrain, FeetAndDogDogContactCoexist) {
     ASSERT_EQ(model.capacities.articulations_per_env, K);
     ASSERT_EQ(model.contact_family, nk::ContactFamily::PairDriven);
 
-    nuka::terrain::TerrainParams terr = nuka::terrain::DefaultTerrainParams();
-    terr.ground_height = 0.0f;
-
-    // GENERAL flat ground field (terrain type Flat) the legs/feet collide against.
+    // GENERAL flat ground field the legs/feet collide against.
+    const terrain::HeightField hf =
+        MakeHf(41u, 41u, 0.20f, Vec3{0, 0, 0}, 0.0f, 0.0f, 0.0f);
     const uint32_t orig_bodies = model.capacities.bodies_per_env;
     model.body_init.resize(orig_bodies);
-    const uint32_t hf_row = cook::CookHeightfieldGrid(
-        model, terr, terrain::kTerrainFlat,
-        /*nrow=*/41u, /*ncol=*/41u, /*cell=*/0.20f, /*center=*/Vec3{0, 0, 0});
+    const uint32_t hf_row = cook::CookHeightfieldGrid(model, hf);
     ASSERT_EQ(hf_row, orig_bodies);
 
     nk::ModelCapacities& cap = model.capacities;

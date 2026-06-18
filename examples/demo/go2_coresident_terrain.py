@@ -106,9 +106,9 @@ def build_scan_grid(dev):
     return grid, scale, clip, geom
 
 
-def height_scan(base_pose_K7, scan_grid, scan_scale, scan_clip, geom, dev):
-    """Standalone (K,n_scan) legged_gym height scan on PyramidStairs, byte-mirroring
-    Go2LocomotionEnv._height_scan + _terrain_surface (terrain_sample_height_batch)."""
+def height_scan(world, base_pose_K7, scan_grid, scan_scale, scan_clip, dev):
+    """Standalone (K,n_scan) legged_gym height scan, sampling the world's cooked
+    heightfield grid (the ONE source obs/physics share)."""
     bp = base_pose_K7
     K = bp.shape[0]
     base_x = bp[:, 0:1]; base_y = bp[:, 1:2]; base_z = bp[:, 2:3]
@@ -120,13 +120,9 @@ def height_scan(base_pose_K7, scan_grid, scan_scale, scan_clip, geom, dev):
     wx = base_x + (px * cos_y - py * sin_y)          # (K, n_scan)
     wy = base_y + (px * sin_y + py * cos_y)
     n, m = wx.shape
-    types = torch.full((n * m,), T_PYRAMID, dtype=torch.int64).to(torch.uint32).contiguous()
-    diff = torch.ones(n * m, dtype=torch.float32).contiguous()
-    surf = nuka.terrain_sample_height_batch(
-        types, wx.reshape(-1).detach().cpu().contiguous(),
-        wy.reshape(-1).detach().cpu().contiguous(), diff,
-        geom["ground"], geom["step_h"], geom["step_w"], geom["plat_w"],
-        geom["grid_w"], geom["grid_hmax"])
+    surf = world.sample_terrain_height(
+        wx.reshape(-1).detach().cpu().contiguous(),
+        wy.reshape(-1).detach().cpu().contiguous())
     heights = torch.as_tensor(surf, device=dev, dtype=torch.float32).view(n, m)
     value = (base_z - 0.5 - heights).clamp(-scan_clip, scan_clip) * scan_scale
     return value.to(torch.float32)
@@ -269,7 +265,7 @@ def main():
     falls = 0
     for k in range(n_steps):
         obs = ob.compute_obs(command, last_action)            # (K,48)
-        hs = height_scan(ob._base_pose, grid, scan_scale, scan_clip, geom, dev_t)
+        hs = height_scan(world, ob._base_pose, grid, scan_scale, scan_clip, dev_t)
         full = torch.cat([obs, hs], dim=-1)                    # (K,235)
         full = torch.nan_to_num(full, nan=0.0, posinf=G.OBS_CLIP, neginf=-G.OBS_CLIP)
         with torch.no_grad():

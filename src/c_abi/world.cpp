@@ -6,7 +6,7 @@
 // create+ownership pattern). The two legacy steppers (single-env Featherstone
 // StepWorldGpu + the multi-env batched articulated world) are GONE: there is no
 // special world type and no per-case physics path (owner's highest directive --
-// a GENERAL solver, no "case 特惠"). create cooks the authored scene, builds an
+// a GENERAL solver). create cooks the authored scene, builds an
 // nk::World on the DeviceRecord's already-owned phi v2 device/backend (M9 T2),
 // and seeds the cooked IC + PD hold targets (the cook+SeedInitialState bake them,
 // so the legacy BuildHoldDriveTargets/Upload/Sync host plumbing is deleted).
@@ -34,7 +34,9 @@
 #include "math/transform.hpp"       // M10 co-residence: replica placement transform
 #include "scene/scene_compose.hpp"  // M10 co-residence: compose K replicas pre-cook
 #include "scene/scene_ir.hpp"
-#include "sensor/terrain/terrain_field.hpp"  // Go2-on-stairs batched height sampler
+#include "scene/terrain/heightfield.hpp"          // the ONE cooked terrain grid
+#include "scene/terrain/heightfield_loaders.hpp"  // image + parametric loaders
+#include "scene/terrain/heightfield_sample.hpp"   // the ONE bilinear obs sampler
 
 #include <algorithm>
 #include <cstdio>
@@ -235,56 +237,113 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             (control_mode == nuka::runtime::articulation::ControlMode::Torque) ? 1u
                                                                                : 0u;
 
-        // Go2-on-stairs Phase 2a: apply the procedural-terrain cook config from the
-        // desc AFTER cook + BEFORE nk::World construction (Pipeline::Build reads
-        // model.terrain at construct time, copying it into the NarrowphasePrimitives
-        // op params). ground_height stays the cooked model's; the 5 desc floats set
-        // the shared TerrainParams. A zero-initialized desc leaves all five at 0.0
-        // => the cook's flat terrain (SampleTerrainHeight returns ground_height for
-        // every env) => byte-identical to a world created without terrain (D1). The
-        // per-env terrain TYPE/DIFFICULTY are seeded by SeedInitialState (0 / 1.0)
-        // and written post-create via NUKA_FIELD_ENV_TERRAIN_TYPE/DIFFICULTY.
-        cooked.model.terrain.ground_height   = cooked.model.ground_height;
-        cooked.model.terrain.step_height     = desc->terrain_step_height;
-        cooked.model.terrain.step_width      = desc->terrain_step_width;
-        cooked.model.terrain.platform_width  = desc->terrain_platform_width;
-        cooked.model.terrain.grid_width      = desc->terrain_grid_width;
-        cooked.model.terrain.grid_height_max = desc->terrain_grid_height_max;
-
-        // ONE-GENERAL-SOLVER landing (L1-b): on the general path the feet have NO
-        // analytic ground/terrain to detect against -- they must collide with a real
-        // collidable. When the caller REQUESTS a baked heightfield (contact_family ==
-        // 1, the heightfield-request signal now the FUSED path is gone), bake a STATIC
-        // heightfield collidable from model.terrain (mirrors
-        // tests/scenario/vproof_go2_terrain.cpp::RunGeneral): CookHeightfieldGrid
-        // samples SampleTerrainHeight over an (nrow x ncol) grid at the origin, pushes
-        // it as one static body_init row, and the general narrowphase routes any
-        // overlapping foot to the per-cell TRIANGLE_PRISM contact. When no heightfield
-        // is requested (contact_family == 0) the model is untouched -- a scene that
-        // wants ground authors its own collidable (or its feet float, like the golden).
+        // On the general path the feet have NO analytic terrain to detect against;
+        // they collide with a real STATIC heightfield collidable. When the caller
+        // requests a baked heightfield (contact_family == 1), build the ONE source-
+        // of-truth HeightField -- from a grayscale IMAGE if heightfield_image_path is
+        // set, else from the parametric generator selected by heightfield_terrain_type
+        // and the terrain_* knobs -- then cook it. The obs/spawn sampler reads the
+        // SAME grid (stored on the record), so obs and physics agree by construction.
+        // A zero-init desc => a flat parametric grid => byte-identical to no terrain.
+        nuka::terrain::HeightField cooked_terrain;
         if (desc->contact_family == 1u) {
             nuka::nk::Model& m = cooked.model;
             const uint32_t orig_bodies = m.capacities.bodies_per_env;
             m.body_init.resize(orig_bodies);  // heightfield seeds at orig_bodies.
-            const uint32_t hf_type = desc->heightfield_terrain_type;
             const uint32_t nrow =
                 desc->heightfield_nrow != 0u ? desc->heightfield_nrow : 41u;
             const uint32_t ncol =
                 desc->heightfield_ncol != 0u ? desc->heightfield_ncol : 41u;
             const float cell =
                 desc->heightfield_cell > 0.0f ? desc->heightfield_cell : 0.25f;
-            nuka::scene::cook::CookHeightfieldGrid(
-                m, m.terrain, hf_type, nrow, ncol, cell, nuka::math::Vec3{0, 0, 0});
+
+            const bool image_path = desc->heightfield_image_path != nullptr &&
+                                    desc->heightfield_image_path[0] != '\0';
+            if (image_path) {
+                // Load the grayscale height map. A malformed/unsupported image is a
+                // LOUD INVALID_ARG, never a silent flat fallback. The grid is centred
+                // at the world origin (corner = -radius), matching the parametric path.
+                const float rx = desc->heightfield_radius_x > 0.0f
+                                     ? desc->heightfield_radius_x
+                                     : 0.5f * static_cast<float>(ncol - 1u) * cell;
+                const float ry = desc->heightfield_radius_y > 0.0f
+                                     ? desc->heightfield_radius_y
+                                     : 0.5f * static_cast<float>(nrow - 1u) * cell;
+                std::string err;
+                if (!nuka::terrain::LoadHeightFieldFromImage(
+                        desc->heightfield_image_path, rx, ry,
+                        desc->heightfield_elevation_z, desc->heightfield_base_z,
+                        nuka::math::Vec3{-rx, -ry, 0.0f}, cooked_terrain, err)) {
+                    return NUKA_RESULT_INVALID_ARG;
+                }
+            } else {
+                // Parametric: the generator fills the grid ONCE from the desc knobs.
+                nuka::terrain::TerrainGenConfig cfg;
+                cfg.nrow = nrow;
+                cfg.ncol = ncol;
+                cfg.cell_x = cell;
+                cfg.cell_y = cell;
+                const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell;
+                const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell;
+                cfg.origin = nuka::math::Vec3{-half_x, -half_y, 0.0f};
+                cfg.base_z = cooked.model.ground_height;
+                // The desc's heightfield_terrain_type is a LEGACY selector the C-ABI
+                // maps to parametric feature amplitudes -- the engine has no terrain
+                // types (MuJoCo hfield model). 0 flat, 1 stairs, 2 pit, 3 boxes, 4
+                // composite (the tiled multi-feature field). The terrain_* knobs are
+                // the shared feature parameters.
+                switch (desc->heightfield_terrain_type) {
+                    case 1u:  // stairs (climbing rings).
+                        cfg.ring_rise = desc->terrain_step_height;
+                        cfg.ring_width = desc->terrain_step_width;
+                        cfg.ring_platform = desc->terrain_platform_width;
+                        cfg.ring_count = 8u;
+                        break;
+                    case 2u:  // pit (descending rings).
+                        cfg.ring_rise = -desc->terrain_step_height;
+                        cfg.ring_width = desc->terrain_step_width;
+                        cfg.ring_platform = desc->terrain_platform_width;
+                        cfg.ring_count = 8u;
+                        break;
+                    case 3u:  // hashed bumps.
+                        cfg.bump_height = desc->terrain_grid_height_max;
+                        cfg.bump_cell = desc->terrain_grid_width;
+                        break;
+                    case 4u:  // tiled multi-feature field (the complex scene).
+                        cfg.ring_rise = desc->terrain_step_height;
+                        cfg.ring_width = desc->terrain_step_width;
+                        cfg.ring_platform = desc->terrain_platform_width;
+                        cfg.ring_count = 8u;
+                        cfg.bump_height = desc->terrain_grid_height_max;
+                        cfg.bump_cell = desc->terrain_grid_width;
+                        cfg.feature_cell = 5.0f;
+                        cfg.feature_margin = 0.6f;
+                        break;
+                    default:  // 0 flat: every amplitude 0.
+                        break;
+                }
+                if (!nuka::terrain::GenerateHeightField(cfg, cooked_terrain)) {
+                    return NUKA_RESULT_INVALID_ARG;
+                }
+            }
+            nuka::scene::cook::CookHeightfieldGrid(m, cooked_terrain);
+
             nuka::nk::ModelCapacities& cap = m.capacities;
+            // bodies_per_env (the LBVH leaf count) MUST include every static terrain
+            // collidable -- they are real broadphase leaves a foot pairs against. The
+            // CONTACT budget, however, is driven by the DYNAMIC collidables only: a
+            // static-static pair is filtered (no reaction side), so every solvable
+            // contact has >=1 dynamic side. Budgeting (dynamic + 1) * 4 candidate
+            // slots per env stays bounded as static terrain geometry grows. This is
+            // the SAME per-dynamic-body rule the cook uses; the static ground is +1.
             cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
             cap.max_bodies_total =
                 static_cast<uint32_t>(m.shape_table_rows.size());
-            // Re-budget candidate/row slots from the post-heightfield collidable
-            // count, the SAME rule as the cook (cook_to_model.cpp section 9).
             constexpr uint32_t kCandidatePairsPerCollidable = 4u;
             constexpr uint32_t kStaticCollidables = 1u;
-            const uint32_t collidables = cap.bodies_per_env + kStaticCollidables;
-            cap.max_contacts_per_env = collidables * kCandidatePairsPerCollidable;
+            const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
+            cap.max_contacts_per_env =
+                dynamic_collidables * kCandidatePairsPerCollidable;
             cap.max_rows_per_env =
                 cap.max_contacts_per_env * nuka::nk::kPairDrivenRowsPerSlot;
         }
@@ -302,6 +361,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         record->device = device_record;
         record->env_count = desc->env_count;
         record->control_mode = control_mode;
+        record->cooked_terrain = std::move(cooked_terrain);  // obs/spawn read this.
         // dt/gravity scalars for the diffsim RolloutParams + the InvariantWorldView.
         record->step_options.dt = desc->fixed_dt;
         record->step_options.gravity = gravity;
@@ -479,50 +539,37 @@ nuka_result_t nuka_world_get_last_invariant_violations(nuka_world_handle world,
     return NUKA_RESULT_OK;
 }
 
-// Go2-on-stairs (random-XY spawn + free-roam): BATCHED arbitrary-(x,y) procedural
-// terrain height sampler -- the C-ABI projection of the SINGLE source of truth
-// nuka::terrain::SampleTerrainHeight (+ ScaleTerrainDifficulty) in
-// src/sensor/terrain/terrain_field.hpp. The RL spawn-on-terrain reset places the
-// Go2 base at a RANDOM (x,y) and reads its spawn height from the EXACT closed-form
-// heightfield the foot kernel rests feet on (no python full-sampler drift). PURE
-// HOST free function: includes only the host/device-portable terrain header (its
-// __host__/__device__ qualifiers gate on __CUDACC__ -> empty under g++, zero CUDA
-// tokens) -- no device, no world handle. NULL with n>0 => INVALID_ARG.
-nuka_result_t nuka_terrain_sample_height_batch(uint32_t n,
-                                               const uint32_t* types,
-                                               const float* xs,
-                                               const float* ys,
-                                               const float* difficulties,
-                                               float ground_height,
-                                               float step_height,
-                                               float step_width,
-                                               float platform_width,
-                                               float grid_width,
-                                               float grid_height_max,
-                                               float* out_heights) {
+// BATCHED arbitrary-(x,y) terrain height sampler over the world's COOKED grid.
+// Reads the world's stored HeightField via the ONE bilinear sampler, so the obs/
+// spawn height matches the grid the physics narrowphase rests feet on. The optional
+// per-element scale multiplies value*scale_z (the curriculum difficulty), preserving
+// the per-env terrain ladder without per-env grids.
+nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
+                                                     uint32_t n,
+                                                     const float* xs,
+                                                     const float* ys,
+                                                     const float* scales,
+                                                     float* out_heights) {
     if (n == 0u) {
         return NUKA_RESULT_OK;  // nothing to sample.
     }
-    if (types == nullptr || xs == nullptr || ys == nullptr ||
-        difficulties == nullptr || out_heights == nullptr) {
+    if (world == nullptr || xs == nullptr || ys == nullptr ||
+        out_heights == nullptr) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    // MODEL-LEVEL TerrainParams (one geometry for the whole batch); difficulty is
-    // the per-element scale applied below.
-    nuka::terrain::TerrainParams base{};
-    base.ground_height   = ground_height;
-    base.step_height     = step_height;
-    base.step_width      = step_width;
-    base.platform_width  = platform_width;
-    base.grid_width      = grid_width;
-    base.grid_height_max = grid_height_max;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    const nuka::terrain::HeightField& hf = record->cooked_terrain;
+    if (!nuka::terrain::IsValid(hf)) {
+        // No cooked heightfield: report the flat ground floor for every column.
+        for (uint32_t i = 0u; i < n; ++i) out_heights[i] = 0.0f;
+        return NUKA_RESULT_OK;
+    }
     for (uint32_t i = 0u; i < n; ++i) {
-        // Per-env curriculum difficulty (scales vertical magnitude only), then
-        // sample the shared closed-form heightfield at this element's (x,y).
-        const nuka::terrain::TerrainParams scaled =
-            nuka::terrain::ScaleTerrainDifficulty(base, difficulties[i]);
-        out_heights[i] = nuka::terrain::SampleTerrainHeight(
-            types[i], xs[i], ys[i], scaled);
+        const float z = nuka::terrain::SampleHeightFieldZ(hf, xs[i], ys[i]);
+        const float scale = (scales != nullptr) ? scales[i] : 1.0f;
+        // Apply the per-env vertical scale as a multiply around the base floor.
+        out_heights[i] = hf.base_z + (z - hf.base_z) * scale;
     }
     return NUKA_RESULT_OK;
 }
