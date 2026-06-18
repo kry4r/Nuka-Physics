@@ -129,8 +129,9 @@ constexpr uint32_t kSlimDynParticle = 1u << 4;
 constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 
 // The island kernel's DYNAMIC shared working-set size for a given env slice
-// (see the kernel's layout carve): qdot tile + lambda + meff + slim records +
-// J + w (R x D each) + order + segments. The 51-DOF / 190-row union scene
+// (see the kernel's layout carve). Union: qdot tile + lambda + meff + slim records
+// + J + w (R x D each) + order + segments. PairDriven: ONLY the qdot tile (every
+// row-scaled array lives in global). The 51-DOF / 190-row union scene
 // needs ~92 KB — within sm_8x+'s opt-in dynamic shared (set once via
 // cudaFuncAttributeMaxDynamicSharedMemorySize). A model whose slice exceeds
 // the device limit fails LOUDLY at the op entry (Model capacity property;
@@ -151,13 +152,18 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 // HUNDREDS of rows x ~18 DOF x 4 arrays (J,w,J_b,w_b) which would blow the ~99 KB
 // dynamic-shared limit, so it reads J/w/J_b/w_b straight from GLOBAL each iteration
 // (bounded shared; correctness-first). The shared carve excludes those regions.
+// The PairDriven family ALSO keeps lambda / meff / order / segments in GLOBAL (all
+// scale with rows_per_env); only the qdot tile region stays in shared. The Union
+// family stages every row-scaled array in shared (its carve is unchanged).
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
                                 uint32_t qdot_floats, bool cache_jw) {
-    const uint64_t jw = cache_jw ? 2ull * rows_per_env * dof_stride : 0ull;
-    // Slim records are staged in shared ONLY by the Union family (cache_jw); the
-    // PairDriven family builds them inline in the sweep, so its carve drops the
-    // rows_per_env * sizeof(SlimRow) term (the dominant per-row cost).
-    const uint64_t slim = cache_jw ? sizeof(SlimRow) * rows_per_env : 0ull;
+    if (!cache_jw) {
+        // PairDriven: only the qdot tile(s) live in shared; lambda/meff/order/seg
+        // are read from GLOBAL, so the carve does not scale with rows_per_env.
+        return sizeof(float) * qdot_floats;
+    }
+    const uint64_t jw = 2ull * rows_per_env * dof_stride;
+    const uint64_t slim = sizeof(SlimRow) * rows_per_env;
     return sizeof(float) *
                (qdot_floats +                                          // qdot tile(s)
                 2ull * rows_per_env +                                   // lambda+meff
@@ -231,8 +237,10 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   uint32_t j_row,         // row index into J/w arrays
                                   uint32_t wlane,
                                   const SlimRow* slim_sh, // null => build inline
-                                  float* lambda_sh,
-                                  const float* meff_sh,
+                                  float* lambda_sh,       // null => use global lambda
+                                  const float* meff_sh,   // null => use global row_meff
+                                  float* __restrict__ lambda,    // global lambda
+                                  const float* __restrict__ row_meff,  // global meff
                                   const float* J_sh,      // shared (union) OR global (PD)
                                   const float* w_sh,
                                   const float* J_b_sh,    // S2 side-B chain-J (or null)
@@ -321,8 +329,13 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             }
         }
 
-        const float effective_mass = meff_sh[ls];
-        const float old_impulse = lambda_sh[ls];
+        // lambda / meff source: SHARED slice (Union) or GLOBAL (PairDriven, where
+        // the row-scaled staging stays out of shared). The global env-local slot of
+        // a group member g is env_row_base + group_local + g == its global slot.
+        const float effective_mass = meff_sh != nullptr ? meff_sh[ls]
+                                                        : row_meff[gslot];
+        const float old_impulse = lambda_sh != nullptr ? lambda_sh[ls]
+                                                       : lambda[gslot];
         // rhs holds aref (a reference ACCELERATION); the velocity-impulse PGS
         // scales by dt. The -R*old_impulse regularizer feedback matches the
         // (A+R) denominator (the C5c-2 fix) — both legacy-preserved.
@@ -337,7 +350,10 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             // equals the legacy compacted-group sum.
             float total = 0.0f;
             for (uint32_t g = 0u; g < sr->group_cnt; ++g) {
-                total += fmaxf(lambda_sh[sr->group_local + g], 0.0f);
+                const float lg = lambda_sh != nullptr
+                                     ? lambda_sh[sr->group_local + g]
+                                     : lambda[env_row_base + sr->group_local + g];
+                total += fmaxf(lg, 0.0f);
             }
             lower = 0.0f;
             upper = fmaxf(sr->mu, 0.0f) * total;
@@ -345,7 +361,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
 
         const float new_impulse =
             fminf(fmaxf(old_impulse + lambda_inc, lower), upper);
-        lambda_sh[ls] = new_impulse;
+        if (lambda_sh != nullptr) lambda_sh[ls] = new_impulse;
+        else lambda[gslot] = new_impulse;
         const float d = new_impulse - old_impulse;
         // The legacy |delta| > 1e-12 apply gate, folded into the broadcast.
         delta = (fabsf(d) > 1.0e-12f) ? d : 0.0f;
@@ -454,6 +471,7 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t* __restrict__ row_order,
     const uint32_t* __restrict__ dof_to_link,
     const uint32_t* __restrict__ dof_to_component,
+    uint32_t* __restrict__ pd_solve_scratch,  // PairDriven GLOBAL order+seg scratch
     uint32_t total_islands,
     uint32_t rows_per_env,
     uint32_t dof_stride,
@@ -480,12 +498,13 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t env_artic_base = env * k_tiles;  // first global artic of this env
 
     // DYNAMIC SHARED working set for the 64-iteration sweep (sized by the op
-    // entry: qdot tile + the ENV SLICE\'s lambdas / effective masses / slim
+    // entry). Union caches the ENV SLICE\'s lambdas / effective masses / slim
     // records / chain-J rows / M^-1 J^T rows + the island\'s segment + order
-    // tables — all re-read EVERY iteration, the measured latency core of the
-    // sweep). Loading the WHOLE env slice is read-safe under multiple islands
-    // per env; only THIS island\'s rows are written back (its lambdas), so
-    // concurrent blocks of one env never write each other\'s slots.
+    // tables here — all re-read EVERY iteration, the measured latency core of the
+    // sweep. PairDriven keeps every row-scaled array in global (its per-env island
+    // is too large for shared); only the qdot tile lives here. Loading the WHOLE
+    // env slice is read-safe under multiple islands per env; only THIS island\'s
+    // rows are written back (its lambdas), so concurrent blocks never collide.
     extern __shared__ unsigned char dyn_sh[];
     // The Union/Fused families CACHE the per-row J/w in shared (with_b_arm == 0 ->
     // cache_jw == true). PairDriven does NOT (its per-env worst-case island can be
@@ -497,25 +516,37 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t qdot_floats =
         (with_b_arm != 0u) ? (k_tiles * dof_stride) : kMaxArticulationDof;
     float* const qdot_sh = reinterpret_cast<float*>(dyn_sh);
-    float* const lambda_sh = qdot_sh + qdot_floats;
-    float* const meff_sh = lambda_sh + rows_per_env;
+    // Union stages lambda/meff/slim/J/w/order/seg in shared; PairDriven keeps every
+    // row-scaled array in GLOBAL (its per-env island can be thousands of rows),
+    // leaving ONLY the qdot tile(s) in shared. lambda_sh / meff_sh == null select
+    // the global lambda / row_meff source in SolveUnionRowWarp; order_sh / seg_sh
+    // point into this env's disjoint slice of the global pd_solve_scratch buffer
+    // (rows_per_env order u32 followed by 2*rows_per_env segment u32 per env).
+    float* lambda_sh = nullptr;
+    float* meff_sh = nullptr;
     float* J_sh = nullptr;   // shared J/w cache (Union only).
     float* w_sh = nullptr;
-    float* slim_base = meff_sh + rows_per_env;
+    SlimRow* slim_sh = nullptr;
+    uint32_t* order_sh = nullptr;
+    uint32_t* seg_sh = nullptr;
     if (cache_jw) {
-        J_sh = slim_base;
+        lambda_sh = qdot_sh + qdot_floats;
+        meff_sh = lambda_sh + rows_per_env;
+        J_sh = meff_sh + rows_per_env;
         w_sh = J_sh + static_cast<size_t>(rows_per_env) * dof_stride;
-        slim_base = w_sh + static_cast<size_t>(rows_per_env) * dof_stride;
+        slim_sh = reinterpret_cast<SlimRow*>(
+            w_sh + static_cast<size_t>(rows_per_env) * dof_stride);
+        order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
+        seg_sh = order_sh + rows_per_env;                        // 2R u32
+    } else {
+        // PairDriven GLOBAL order/segment scratch: this env's DISJOINT region of
+        // 3*rows_per_env u32 (one block per env => race-free). order is the first
+        // rows_per_env u32; segments are the following 2*rows_per_env u32.
+        const size_t env_scratch_base =
+            static_cast<size_t>(3u) * env_row_base;
+        order_sh = pd_solve_scratch + env_scratch_base;
+        seg_sh = order_sh + rows_per_env;                        // 2R u32
     }
-    // Union stages slim records in shared; PairDriven builds them inline in the
-    // sweep, so its carve OMITS the rows_per_env * sizeof(SlimRow) region (order_sh
-    // follows meff/J/w directly). This keeps a many-contact PairDriven env in-block.
-    SlimRow* const slim_sh = reinterpret_cast<SlimRow*>(slim_base);
-    unsigned char* const after_slim =
-        cache_jw ? reinterpret_cast<unsigned char*>(slim_sh + rows_per_env)
-                 : reinterpret_cast<unsigned char*>(slim_base);
-    uint32_t* const order_sh = reinterpret_cast<uint32_t*>(after_slim);
-    uint32_t* const seg_sh = order_sh + rows_per_env;            // 2R u32
 
     const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
     if (has_artic) {
@@ -525,13 +556,14 @@ __global__ void SolveRowsBlockIslandKernel(
             qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
         }
     }
-    for (uint32_t i = lane; i < rows_per_env; i += blockDim.x) {
-        const size_t g = static_cast<size_t>(env_row_base) + i;
-        lambda_sh[i] = lambda[g];
-        meff_sh[i] = row_meff[g];
-        // Union stages the slim records in shared; PairDriven builds them inline
-        // in the sweep (its carve has no slim region).
-        if (cache_jw) {
+    // Union stages lambda / meff / slim records in shared; PairDriven reads lambda /
+    // row_meff straight from global and builds slim inline in the sweep (its carve
+    // has none of these regions).
+    if (cache_jw) {
+        for (uint32_t i = lane; i < rows_per_env; i += blockDim.x) {
+            const size_t g = static_cast<size_t>(env_row_base) + i;
+            lambda_sh[i] = lambda[g];
+            meff_sh[i] = row_meff[g];
             slim_sh[i] = MakeSlimRow(urows[g], env_row_base, env_artic_base);
         }
     }
@@ -603,7 +635,8 @@ __global__ void SolveRowsBlockIslandKernel(
                 SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
                                   env_artic_base, j_row, wlane,
                                   cache_jw ? slim_sh : nullptr,
-                                  lambda_sh, meff_sh, Ja, Wa, Jb, Wb,
+                                  lambda_sh, meff_sh, lambda, row_meff,
+                                  Ja, Wa, Jb, Wb,
                                   qdot_sh, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
                                   body_inv_inertia, particle_inv_mass,
@@ -616,8 +649,10 @@ __global__ void SolveRowsBlockIslandKernel(
     // Write back THIS island's lambdas (the persistent warm-start/readout
     // field) — walk the island's own ACTIVE rows (the only lambdas the sweep
     // can change; inactive slots keep the assembled 0). Multi-island-per-env
-    // safe: islands never share rows.
-    if (live_seg_cnt > 0u) {
+    // safe: islands never share rows. Union stages lambda in shared, so it copies
+    // the slice back here; PairDriven writes lambda[gslot] in-place during the
+    // sweep (no shared slice), so its writeback is already done.
+    if (cache_jw && live_seg_cnt > 0u) {
         const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
         const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
         const uint32_t island_rows = last_off + last_cnt;
@@ -751,6 +786,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.row_order),
                    static_cast<const uint32_t*>(model.dof_to_link),
                    static_cast<const uint32_t*>(model.dof_to_component),
+                   data.pd_solve_scratch,
                    p->total_islands, p->rows_per_env, p->max_dof,
                    p->base_link_count, artics_per_env,
                    with_b_arm ? 1u : 0u,

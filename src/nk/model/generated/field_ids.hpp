@@ -176,6 +176,7 @@ enum class FieldId : uint16_t {
     RowCjLinkB,  // row_cj_link_b (per:row_slot arena:scratch owner:data)
     RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
     RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
+    PdSolveScratch,  // pd_solve_scratch (per:row_slot arena:scratch owner:data elem:3)
     Count
 };
 
