@@ -121,21 +121,30 @@ constexpr uint32_t kGo2TMagic = 0x47324F54u;  // 'G2OT' (N-robot terrain format)
 constexpr float kPi = 3.14159265358979323846f;
 
 // ---- THE FIXED STUDIO-TERRAIN PRESET --------------------------------------
-// Shared by the render tessellator and (in the real rollout) the physics cook --
-// the SINGLE place the horizontal geometry is defined. difficulty scales only the
+// Shared by the render tessellator and the PHYSICS cook -- the SINGLE place the
+// horizontal geometry is defined. THESE VALUES MUST MATCH the training-time terrain
+// cook geometry (examples/training/go2_ppo_cfg.yaml config.env_config.terrain:
+// step_height 0.15, step_width 0.3, platform_width 1.0, grid_width 0.45,
+// grid_height_max 0.15, ground 0) so the rendered surface is byte-identical to the
+// one the dog's feet actually rested on during the trained rollout. difficulty (the
+// RAW curriculum value in [0,1], carried in the GO2T tile record) scales only the
 // vertical magnitude (step_height / grid_height_max) via ScaleTerrainDifficulty,
-// EXACTLY as the foot-contact kernel does, so the render mesh tracks the physics
-// surface. ground_height = 0 puts every tile's reference floor at the studio z=0.
-// Horizontal step 0.30 m reads as crisp stairs; the tessellator spacing (<=0.05 m,
-// below) is fine enough that the step edges stay sharp.
+// EXACTLY as the foot-contact kernel does -> realized step rise = 0.15 m *
+// difficulty (0.5 -> 0.075 m, 0.9 -> 0.135 m, owner's 0.08-0.15 band). ground_height
+// = 0 puts every tile's reference floor at the studio z=0. The tessellator spacing
+// (<=0.05 m, below) keeps the 0.30 m step edges sharp.
+//   NB the placeholder (--placeholder, no real rollout) replicates a FLAT walk and
+// uses MakeGrid difficulties in the same [0.08,0.15]-realized band; the dressing
+// recenters+ground-lifts it onto these tiles. The real GO2T (--bin) carries its own
+// per-dog (type, difficulty) + on-terrain z (recenter/lift OFF).
 terrain::TerrainParams TilePreset() {
     terrain::TerrainParams p{};
     p.ground_height   = 0.0f;
-    p.step_height     = 1.0f;    // base rise per ring -> scaled by difficulty (-> ~0.08-0.15 m)
+    p.step_height     = 0.15f;   // MAX rise per ring (matches physics cook); * difficulty
     p.step_width      = 0.30f;   // horizontal width of each step ring (crisp stairs)
-    p.platform_width  = 0.50f;   // central top platform / pit-floor edge length
+    p.platform_width  = 1.00f;   // central top platform / pit-floor edge length (physics cook)
     p.grid_width      = 0.45f;   // RandomBoxes cell edge
-    p.grid_height_max = 1.0f;    // base max box rise -> scaled by difficulty
+    p.grid_height_max = 0.15f;   // MAX box rise (matches physics cook); * difficulty
     return p;
 }
 
@@ -164,6 +173,10 @@ struct Args {
     float       fog = 0.004f;         // haze density per metre (0 => off); subtle far-field
     bool        probe = false;
     bool        no_shadows = false;   // disable the directional shadow map (fallback)
+    uint32_t    shadow_map = 2560u;   // directional shadow-map resolution. The single
+                                      // biggest per-frame cost on lavapipe-CPU; drop to
+                                      // 1280/1536 to roughly halve render time for a
+                                      // first-cut clip (edges soften but the look holds).
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -187,6 +200,7 @@ Args ParseArgs(int argc, char** argv) {
         else if (s == "--height") a.height = next_u(a.height);
         else if (s == "--orbit-turns") a.orbit_turns = next_f(a.orbit_turns);
         else if (s == "--fog") a.fog = next_f(a.fog);
+        else if (s == "--shadow-map") a.shadow_map = std::max(256u, next_u(a.shadow_map));
         else if (s == "--probe") a.probe = true;
         else if (s == "--no-shadows") a.no_shadows = true;
         else if (s == "--out-dir" && i + 1 < argc) a.out_dir = argv[++i];
@@ -342,10 +356,13 @@ std::vector<TileSpec> MakeGrid(uint32_t robots, uint32_t rows, uint32_t cols) {
         tiles[r].offset_x = x0 + static_cast<float>(c) * kTilePitch;
         tiles[r].offset_y = y0 + static_cast<float>(rw) * kTilePitch;
         tiles[r].terrain_type = type_grid[rw % 2u][c % 2u];
-        // Difficulty rises with the row index (front easy -> back hard), 0.08-0.15.
+        // Difficulty is the RAW curriculum value in [0,1] (same convention as the
+        // physics cook + the real GO2T tile record): realized rise = step_height
+        // (0.15) * difficulty. Front row easy -> back row hard over [0.5, 0.9] so
+        // the placeholder field reads as 0.075-0.135 m steps (owner's 0.08-0.15 band).
         const float t = (rows > 1u) ? static_cast<float>(rw) / static_cast<float>(rows - 1u)
                                     : 0.0f;
-        tiles[r].difficulty = 0.08f + 0.07f * t;
+        tiles[r].difficulty = 0.50f + 0.40f * t;
     }
     return tiles;
 }
@@ -436,6 +453,56 @@ render::MeshGeometry TessellateTile(uint32_t type, const terrain::TerrainParams&
     return m;
 }
 
+// ---------------------------------------------------------------------------
+// TessellateComposite -- tessellate the kComposite field as ONE BIG WORLD-SPACE
+// mesh spanning [xmin,xmax] x [ymin,ymax]. Unlike TessellateTile (a tile-local
+// patch translated to a per-robot offset), this samples SampleTerrainHeight(
+// kComposite, WORLD_x, WORLD_y, p) so the whole field is ONE continuous, seamless
+// surface in world coordinates -- every dog sits on its TRUE physics (x,y) on this
+// single mesh (no per-dog tile, no float, no clip). Vertices are absolute world
+// positions; the caller adds this instance at world origin (identity xform). Flat
+// per-triangle normals keep stair risers crisp.
+// ---------------------------------------------------------------------------
+render::MeshGeometry TessellateComposite(const terrain::TerrainParams& base,
+                                         float difficulty, float xmin, float xmax,
+                                         float ymin, float ymax, float spacing) {
+    render::MeshGeometry m;
+    const terrain::TerrainParams p = terrain::ScaleTerrainDifficulty(base, difficulty);
+    const float sx = std::max(1e-3f, spacing);
+    const uint32_t nx = std::max(2u, static_cast<uint32_t>(std::ceil((xmax - xmin) / sx)) + 1u);
+    const uint32_t ny = std::max(2u, static_cast<uint32_t>(std::ceil((ymax - ymin) / sx)) + 1u);
+    const float dx = (xmax - xmin) / static_cast<float>(nx - 1u);
+    const float dy = (ymax - ymin) / static_cast<float>(ny - 1u);
+    auto h = [&](float x, float y) {
+        return terrain::SampleTerrainHeight(terrain::kTerrainComposite, x, y, p);
+    };
+    auto push_v = [&](float x, float y, float z, const Vec3& nrm) {
+        m.positions.push_back(x); m.positions.push_back(y); m.positions.push_back(z);
+        m.normals.push_back(nrm.x); m.normals.push_back(nrm.y); m.normals.push_back(nrm.z);
+    };
+    for (uint32_t j = 0; j + 1 < ny; ++j) {
+        for (uint32_t i = 0; i + 1 < nx; ++i) {
+            const float x0 = xmin + static_cast<float>(i) * dx;
+            const float x1 = xmin + static_cast<float>(i + 1u) * dx;
+            const float y0 = ymin + static_cast<float>(j) * dy;
+            const float y1 = ymin + static_cast<float>(j + 1u) * dy;
+            const Vec3 a{x0, y0, h(x0, y0)};
+            const Vec3 b{x1, y0, h(x1, y0)};
+            const Vec3 c{x1, y1, h(x1, y1)};
+            const Vec3 dd{x0, y1, h(x0, y1)};
+            const uint32_t base_idx = static_cast<uint32_t>(m.positions.size() / 3u);
+            Vec3 n1 = (b - a).Cross(c - a); if (n1.Length() > 1e-12f) n1 = n1.Normalized(); else n1 = {0,0,1};
+            Vec3 n2 = (c - a).Cross(dd - a); if (n2.Length() > 1e-12f) n2 = n2.Normalized(); else n2 = {0,0,1};
+            if (n1.z < 0.0f) n1 = -n1;
+            if (n2.z < 0.0f) n2 = -n2;
+            push_v(a.x, a.y, a.z, n1); push_v(b.x, b.y, b.z, n1); push_v(c.x, c.y, c.z, n1);
+            push_v(a.x, a.y, a.z, n2); push_v(c.x, c.y, c.z, n2); push_v(dd.x, dd.y, dd.z, n2);
+            for (uint32_t k = 0; k < 6u; ++k) m.indices.push_back(base_idx + k);
+        }
+    }
+    return m;
+}
+
 bool WritePpm(const render::VulkanOffscreenReport& rep, const std::string& path) {
     if (rep.pixels.empty() || rep.width == 0u || rep.height == 0u) return false;
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -501,10 +568,11 @@ int main(int argc, char** argv) {
                 traj.link_count, traj.pose_floats, traj.dt, traj.num_steps * traj.dt);
     for (uint32_t r = 0; r < traj.num_robots; ++r) {
         const TileSpec& t = traj.tiles[r];
-        const char* names[4] = {"Flat", "PyramidStairs", "InvertedPyramid", "RandomBoxes"};
+        const char* names[5] = {"Flat", "PyramidStairs", "InvertedPyramid",
+                                 "RandomBoxes", "Composite"};
         std::printf("[go2_terrain]   tile[%u] @(%.2f,%.2f) type=%s diff=%.3f\n", r,
                     t.offset_x, t.offset_y,
-                    names[t.terrain_type < 4u ? t.terrain_type : 0u], t.difficulty);
+                    names[t.terrain_type < 5u ? t.terrain_type : 0u], t.difficulty);
     }
 
     // ---- 2. FROZEN go2 beauty scene -> ONE RenderWorld TEMPLATE -------------
@@ -521,27 +589,33 @@ int main(int argc, char** argv) {
     }
     const uint32_t per_robot_inst = tmpl.InstanceCount();
 
-    // Recover each template instance's trajectory link + geom-local (the go2 cook
-    // collapses visual geoms onto body 0; the real owning link is the SceneIR
-    // shape's body_id, identity-mapped to the trajectory link). Mirrors go2_walk_video.
+    // Drive each visual instance from the link BuildRenderWorld already resolved:
+    // pose_source.row is the cook link/body row (identity-mapped to the trajectory
+    // link), cached_visual_local is the geom offset in that link frame. Every visual
+    // sub-mesh -- including the leg geoms whose entity carries no direct CookedRef --
+    // binds, so all 13 links of every dog render their real mesh.
     std::vector<uint32_t>  tmpl_link(tmpl.instances.size(), 0u);
     std::vector<Transform> tmpl_vlocal(tmpl.instances.size(), Transform::Identity());
-    uint32_t n_rebound = 0u, n_oob = 0u;
+    uint32_t n_rebound = 0u, n_oob = 0u, n_static = 0u;
     for (size_t i = 0; i < tmpl.instances.size(); ++i) {
-        const nuka::scene::CookedRef* ref = cooked.scene_map.RefOf(tmpl.instances[i].entity);
-        if (ref && ref->shape_row != nuka::scene::SceneMap::kNoRow &&
-            ref->shape_row < scene.Shapes().size()) {
-            const auto& sh = scene.GetShape(ref->shape_row);
-            const uint32_t link = static_cast<uint32_t>(sh.body_id);
-            if (link < traj.link_count) {
-                tmpl_link[i] = link; tmpl_vlocal[i] = sh.local_transform; ++n_rebound;
-            } else { ++n_oob; }
+        const render::PoseSource& ps = tmpl.instances[i].pose_source;
+        if (ps.kind == render::PoseSource::Kind::Static || ps.row == render::kNoId) {
+            ++n_static; continue;
         }
+        if (ps.row < traj.link_count) {
+            tmpl_link[i]   = ps.row;
+            tmpl_vlocal[i] = tmpl.instances[i].cached_visual_local;
+            ++n_rebound;
+        } else { ++n_oob; }
     }
     if (n_oob > 0u) {
         std::fprintf(stderr, "[go2_terrain] FATAL: %u instances reference link >= %u\n",
                      n_oob, traj.link_count);
         return 5;
+    }
+    if (n_static > 0u) {
+        std::fprintf(stderr, "[go2_terrain] WARN: %u instances have no link pose "
+                     "(left at link 0)\n", n_static);
     }
     std::printf("[go2_terrain] template: %u instances (rebound_to_link=%u), "
                 "%u meshes\n", per_robot_inst, n_rebound, tmpl.meshes.Count());
@@ -594,35 +668,95 @@ int main(int argc, char** argv) {
     }
     const uint32_t robot_inst_end = rw.InstanceCount();  // terrain meshes appended after
 
-    // ---- terrain tile meshes: tessellate ONE per robot (shared header h(x,y)) ---
-    // Resolution: spacing <= 0.05 m -> res = ceil(2*half / 0.05) + 1.
     const terrain::TerrainParams preset = TilePreset();
-    const uint32_t tile_res =
-        static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;  // ~65
-    std::printf("[go2_terrain] terrain tessellation: %ux%u verts/tile "
-                "(spacing %.3f m, half=%.2f m)\n", tile_res, tile_res,
-                2.0f * kTileHalf / static_cast<float>(tile_res - 1u), kTileHalf);
+
+    // ---- COMPOSITE vs per-tile detection --------------------------------------
+    // The real terrain rollout (--bin) writes terrain_type == kTerrainComposite +
+    // offset (0,0) for every robot: ONE continuous world-frame field on which every
+    // dog sits at its TRUE physics (x,y). We tessellate that as a SINGLE big mesh
+    // over the dogs' world AABB. The placeholder keeps the legacy per-robot tile.
+    bool composite_mode = (traj.num_robots > 0u);
+    for (uint32_t r = 0; r < traj.num_robots; ++r)
+        if (traj.tiles[r].terrain_type != terrain::kTerrainComposite)
+            composite_mode = false;
+
+    // World AABB of all dog base (link-0) positions over the WHOLE trajectory -- the
+    // extent the composite MESH must cover (every dog, every step, sits on it).
+    float dog_x_min = 1e9f, dog_x_max = -1e9f, dog_y_min = 1e9f, dog_y_max = -1e9f;
+    // SEPARATE, TIGHTER AABB of the SPAWN positions (step 0) -- the climb happens at
+    // spawn, so the orbit frames the spawn cluster so the climbing dogs read LARGE
+    // (owner: the first cut's dogs were too small). A dog that later wanders off is
+    // fine -- the money shot is the ascent.
+    float spawn_x_min = 1e9f, spawn_x_max = -1e9f, spawn_y_min = 1e9f, spawn_y_max = -1e9f;
+    for (uint32_t s = 0; s < traj.num_steps; ++s) {
+        for (uint32_t r = 0; r < traj.num_robots; ++r) {
+            const Vec3 bp = traj.LinkPose(s, r, 0u).position;  // world (real GO2T)
+            dog_x_min = std::min(dog_x_min, bp.x); dog_x_max = std::max(dog_x_max, bp.x);
+            dog_y_min = std::min(dog_y_min, bp.y); dog_y_max = std::max(dog_y_max, bp.y);
+            if (s == 0u) {
+                spawn_x_min = std::min(spawn_x_min, bp.x); spawn_x_max = std::max(spawn_x_max, bp.x);
+                spawn_y_min = std::min(spawn_y_min, bp.y); spawn_y_max = std::max(spawn_y_max, bp.y);
+            }
+        }
+    }
+    if (!(dog_x_max >= dog_x_min)) { dog_x_min = -2.0f; dog_x_max = 2.0f;
+                                     dog_y_min = -2.0f; dog_y_max = 2.0f; }
+    if (!(spawn_x_max >= spawn_x_min)) { spawn_x_min = dog_x_min; spawn_x_max = dog_x_max;
+                                         spawn_y_min = dog_y_min; spawn_y_max = dog_y_max; }
+
     std::vector<uint32_t> tile_inst_index(traj.num_robots, render::kNoId);
-    for (uint32_t r = 0; r < traj.num_robots; ++r) {
-        const TileSpec& t = traj.tiles[r];
+    if (composite_mode) {
+        // ONE big composite mesh spanning the dog AABB + a generous flat margin so
+        // the field reads as an environment, not a cut-out under the pack.
+        const float margin = 4.0f;
+        const float xmin = dog_x_min - margin, xmax = dog_x_max + margin;
+        const float ymin = dog_y_min - margin, ymax = dog_y_max + margin;
+        const float spacing = 0.05f;  // crisp 0.30 m stair edges
+        const float diff = traj.tiles[0].difficulty;  // all equal (env difficulty)
+        std::printf("[go2_terrain] COMPOSITE field: ONE mesh over world "
+                    "[%.1f,%.1f]x[%.1f,%.1f] (spacing %.3f m, diff %.2f)\n",
+                    xmin, xmax, ymin, ymax, spacing, diff);
         char key[96];
-        std::snprintf(key, sizeof(key), "terrain:%u:%.4f:%.2f:%u",
-                      t.terrain_type, t.difficulty, kTileHalf, tile_res);
+        std::snprintf(key, sizeof(key), "composite:%.4f:%.1f:%.1f:%.1f:%.1f",
+                      diff, xmin, xmax, ymin, ymax);
         const uint32_t mesh_id = rw.meshes.InternPrimitive(key, [&]() {
-            return TessellateTile(t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
+            return TessellateComposite(preset, diff, xmin, xmax, ymin, ymax, spacing);
         });
         render::RenderInstance ti;
         ti.mesh_id = mesh_id;
         ti.render_material_id = kMatTerrain;
-        Transform xf = Transform::Identity();
-        xf.position = {t.offset_x, t.offset_y, 0.0f};  // tile centre at studio z=0
-        ti.world_xform = xf;
+        ti.world_xform = Transform::Identity();  // vertices are absolute world coords
         ti.pose_source = render::PoseSource{};
-        tile_inst_index[r] = rw.InstanceCount();
         rw.instances.push_back(ti);
+    } else {
+        // ---- per-robot tile meshes (placeholder): tessellate ONE per robot -------
+        const uint32_t tile_res =
+            static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;  // ~65
+        std::printf("[go2_terrain] terrain tessellation: %ux%u verts/tile "
+                    "(spacing %.3f m, half=%.2f m)\n", tile_res, tile_res,
+                    2.0f * kTileHalf / static_cast<float>(tile_res - 1u), kTileHalf);
+        for (uint32_t r = 0; r < traj.num_robots; ++r) {
+            const TileSpec& t = traj.tiles[r];
+            char key[96];
+            std::snprintf(key, sizeof(key), "terrain:%u:%.4f:%.2f:%u",
+                          t.terrain_type, t.difficulty, kTileHalf, tile_res);
+            const uint32_t mesh_id = rw.meshes.InternPrimitive(key, [&]() {
+                return TessellateTile(t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
+            });
+            render::RenderInstance ti;
+            ti.mesh_id = mesh_id;
+            ti.render_material_id = kMatTerrain;
+            Transform xf = Transform::Identity();
+            xf.position = {t.offset_x, t.offset_y, 0.0f};  // tile centre at studio z=0
+            ti.world_xform = xf;
+            ti.pose_source = render::PoseSource{};
+            tile_inst_index[r] = rw.InstanceCount();
+            rw.instances.push_back(ti);
+        }
     }
-    std::printf("[go2_terrain] RenderWorld: %u robot instances + %u terrain tiles = %u total\n",
-                robot_inst_end, traj.num_robots, rw.InstanceCount());
+    std::printf("[go2_terrain] RenderWorld: %u robot instances + terrain = %u total "
+                "(%s)\n", robot_inst_end, rw.InstanceCount(),
+                composite_mode ? "COMPOSITE one-field" : "per-tile");
 
     // ---- 5. PER-FRAME PUBLISH: offset each robot's poses to its tile ----------
     // robot r's link pose (per-env frame) -> world = tile_off + grounding o link_pose
@@ -758,7 +892,7 @@ int main(int argc, char** argv) {
     opts.sun_ambient_sky[0] = 0.105f; opts.sun_ambient_sky[1] = 0.122f; opts.sun_ambient_sky[2] = 0.158f;
     opts.sun_ambient_ground[0] = 0.066f; opts.sun_ambient_ground[1] = 0.066f; opts.sun_ambient_ground[2] = 0.072f;
     opts.shadow_strength = args.no_shadows ? 0.0f : 0.96f;  // crisp near-black grooves
-    opts.shadow_map_size = 2560u;
+    opts.shadow_map_size = args.shadow_map;  // default 2560; --shadow-map lowers for speed
     opts.shadow_bias = 0.0018f;
 
     // ---- COOL VERTICAL SKY GRADIENT ------------------------------------------
@@ -773,17 +907,71 @@ int main(int argc, char** argv) {
     if (const char* fv = std::getenv("NK_CAM_FOV"))
         opts.camera_fov_degrees = static_cast<float>(std::atof(fv));
 
-    // ---- grid AABB (xy) for the orbit framing -------------------------------
+    // ---- framing for the orbit ----------------------------------------------
+    // COMPOSITE (the real rollout): the dogs SPREAD as they walk, so a single static
+    // AABB over the whole clip frames too wide -> dogs read tiny (owner round-1+2
+    // complaint). Instead we TRACK the pack: per render-step the camera targets the
+    // dog CENTROID and fits a ROBUST radius (the median dog-distance-from-centroid,
+    // scaled) so the BULK of the pack fills the frame and a single dog that wanders
+    // off does NOT pull the camera back. The centroid path is lightly smoothed (a
+    // moving average) so the pan glides. PLACEHOLDER: the legacy static tile grid.
+    std::vector<Vec3> step_ctr(traj.num_steps, Vec3{0, 0, 0});
+    std::vector<float> step_rad(traj.num_steps, 2.5f);
     float gx_min = 1e9f, gx_max = -1e9f, gy_min = 1e9f, gy_max = -1e9f;
-    for (const TileSpec& t : traj.tiles) {
-        gx_min = std::min(gx_min, t.offset_x - kTileHalf);
-        gx_max = std::max(gx_max, t.offset_x + kTileHalf);
-        gy_min = std::min(gy_min, t.offset_y - kTileHalf);
-        gy_max = std::max(gy_max, t.offset_y + kTileHalf);
+    if (composite_mode) {
+        // Raw per-step centroid + robust radius (median distance from centroid).
+        std::vector<Vec3> raw_ctr(traj.num_steps, Vec3{0, 0, 0});
+        std::vector<float> raw_rad(traj.num_steps, 2.5f);
+        for (uint32_t s = 0; s < traj.num_steps; ++s) {
+            Vec3 c{0, 0, 0};
+            for (uint32_t r = 0; r < traj.num_robots; ++r)
+                c = c + traj.LinkPose(s, r, 0u).position;
+            c = c * (1.0f / static_cast<float>(std::max(1u, traj.num_robots)));
+            c.z = 0.0f;
+            raw_ctr[s] = c;
+            std::vector<float> dist(traj.num_robots, 0.0f);
+            for (uint32_t r = 0; r < traj.num_robots; ++r) {
+                const Vec3 bp = traj.LinkPose(s, r, 0u).position;
+                const float dx = bp.x - c.x, dy = bp.y - c.y;
+                dist[r] = std::sqrt(dx * dx + dy * dy);
+            }
+            std::sort(dist.begin(), dist.end());
+            // 75th-percentile distance: contains 3/4 of the pack; a couple of
+            // wanderers fall outside but are not allowed to dominate the framing.
+            const float pct = dist.empty() ? 2.5f
+                : dist[std::min(dist.size() - 1, (dist.size() * 3u) / 4u)];
+            raw_rad[s] = std::max(2.5f, pct);
+        }
+        // Smooth the centroid + radius with a centred moving average (window ~ 0.5 s
+        // of render-steps) so the camera glide is buttery, not jittery.
+        const int win = std::max(1, static_cast<int>(0.5f / std::max(1e-3f, traj.ctrl_dt)) / 2);
+        for (uint32_t s = 0; s < traj.num_steps; ++s) {
+            Vec3 acc{0, 0, 0};
+            float racc = 0.0f;
+            int cnt = 0;
+            for (int k = -win; k <= win; ++k) {
+                const int j = static_cast<int>(s) + k;
+                if (j < 0 || j >= static_cast<int>(traj.num_steps)) continue;
+                acc = acc + raw_ctr[static_cast<uint32_t>(j)];
+                racc += raw_rad[static_cast<uint32_t>(j)];
+                ++cnt;
+            }
+            if (cnt > 0) { step_ctr[s] = acc * (1.0f / cnt); step_rad[s] = racc / cnt; }
+            else { step_ctr[s] = raw_ctr[s]; step_rad[s] = raw_rad[s]; }
+        }
+    } else {
+        for (const TileSpec& t : traj.tiles) {
+            gx_min = std::min(gx_min, t.offset_x - kTileHalf);
+            gx_max = std::max(gx_max, t.offset_x + kTileHalf);
+            gy_min = std::min(gy_min, t.offset_y - kTileHalf);
+            gy_max = std::max(gy_max, t.offset_y + kTileHalf);
+        }
     }
     const Vec3 grid_ctr{0.5f * (gx_min + gx_max), 0.5f * (gy_min + gy_max), 0.0f};
-    const float grid_radius = 0.5f * std::sqrt((gx_max - gx_min) * (gx_max - gx_min) +
-                                               (gy_max - gy_min) * (gy_max - gy_min));
+    // A floor on the radius so a near-collinear cluster still frames sensibly.
+    const float grid_radius = std::max(2.5f,
+        0.5f * std::sqrt((gx_max - gx_min) * (gx_max - gx_min) +
+                         (gy_max - gy_min) * (gy_max - gy_min)));
 
     auto smoothstep = [](float e0, float e1, float x) {
         float t = (x - e0) / (e1 - e0);
@@ -792,36 +980,45 @@ int main(int argc, char** argv) {
     };
     auto lerp = [](float a, float b, float u) { return a + (b - a) * u; };
 
-    // ---- ROTATING ORBIT CAMERA (required: circle the grid to showcase gait) ---
-    // The target is the grid centre (a touch above the floor). The eye orbits in
-    // azimuth phi over the clip (orbit_turns full turns), at a gentle elevation
-    // that eases up then settles, on a radius that keeps the WHOLE grid AABB in
-    // frame (radius from grid_radius + the fov half-angle). Smooth eased azimuth so
-    // the sweep never snaps -- the dogs are shown from many angles, gait readable.
+    // ---- ROTATING ORBIT CAMERA (required: circle the pack to showcase the gait) --
+    // COMPOSITE: the eye orbits the LIVE pack centroid (step_ctr) at a radius that
+    // fits the robust pack radius (step_rad) into the vertical fov, so the dogs stay
+    // CENTERED and LARGE as they walk (not tiny in a wide static frame -- owner round
+    // 1+2). The azimuth eases through orbit_turns turns so the gait is shown from many
+    // angles. PLACEHOLDER: the legacy static-grid frame. A smaller fit_factor pulls
+    // the eye IN (bigger dogs); tune live with NK_FIT_FACTOR without a rebuild.
+    // 0.80 composite default = the value that produced the approved round-2 clip
+    // (dogs read large yet the spreading pack stays in-frame); override with
+    // NK_FIT_FACTOR (smaller = eye pulled IN = bigger dogs, risks edge cutoff).
+    float fit_factor = composite_mode ? 0.80f : 0.72f;
+    if (const char* ff = std::getenv("NK_FIT_FACTOR"))
+        fit_factor = static_cast<float>(std::atof(ff));
     auto aim_camera = [&](uint32_t step) {
         const float t = (traj.num_steps > 1u)
             ? static_cast<float>(step) / static_cast<float>(traj.num_steps - 1u) : 0.0f;
         const float e = smoothstep(0.0f, 1.0f, t);
         // Azimuth sweep: start on the front-left 3/4, circle by orbit_turns turns.
         const float phi = -0.55f * kPi + 2.0f * kPi * args.orbit_turns * e;
-        // Elevation: a low-ish hero crane (15-22 deg) -- enough to read the stepped
-        // terrain in 3/4 but never a top-down plan view of the grid.
-        const float elev_deg = lerp(15.0f, 22.0f, e) - 3.0f * std::sin(e * kPi);
+        // Elevation: a low-ish hero crane (16-24 deg) -- reads the stepped terrain in
+        // 3/4 but never a top-down plan view.
+        const float elev_deg = lerp(16.0f, 24.0f, e) - 3.0f * std::sin(e * kPi);
         const float elev = elev_deg * kPi / 180.0f;
-        // Radius: fill the frame. Fit the grid's half-diagonal into the vertical fov
-        // with a modest margin (the eye tilts down, so a tighter fit still frames
-        // the whole grid). std::cos(elev) un-projects the slant range to ground reach.
+        // Centre + pack radius: live-tracked in composite mode, static otherwise.
+        const Vec3 ctr = composite_mode ? step_ctr[step] : grid_ctr;
+        const float rad = composite_mode ? step_rad[step] : grid_radius;
+        // Fit the pack radius into the vertical fov. std::cos(elev) un-projects the
+        // slant range to ground reach. A radius floor keeps a tight pack sensible.
         const float fov_y = opts.camera_fov_degrees * kPi / 180.0f;
-        const float fit_r = (grid_radius * 0.72f) / std::tan(fov_y * 0.5f);
-        const float radius = std::max(fit_r, grid_radius * 0.95f);
+        const float fit_r = (rad * fit_factor) / std::tan(fov_y * 0.5f);
+        const float radius = std::max(fit_r, rad * 1.05f);
         const float ch = std::cos(elev), sh = std::sin(elev);
         const float dx = std::sin(phi), dy = -std::cos(phi);
-        opts.camera_eye = {grid_ctr.x + radius * ch * dx,
-                           grid_ctr.y + radius * ch * dy,
-                           grid_ctr.z + radius * sh + 0.30f};
-        opts.camera_target = {grid_ctr.x, grid_ctr.y, grid_ctr.z + 0.30f};
+        opts.camera_eye = {ctr.x + radius * ch * dx,
+                           ctr.y + radius * ch * dy,
+                           ctr.z + radius * sh + 0.30f};
+        opts.camera_target = {ctr.x, ctr.y, ctr.z + 0.30f};
         // Far clip generous enough that the haze (not the clip) fades the horizon.
-        opts.camera_far = radius * 6.0f + grid_radius * 8.0f + 50.0f;
+        opts.camera_far = radius * 6.0f + rad * 8.0f + 50.0f;
     };
 
     // ---- 8. PROBE: render 1 mid-clip frame, exit ----------------------------

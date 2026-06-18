@@ -349,23 +349,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         return component_material_id;
     };
 
-    // A CollisionShapeComponent is a PHYSICS proxy, not an authored visual. When
-    // the scene cooked REAL .nka visual meshes (go2 / h1), those meshes ARE the
-    // robot's appearance, and the collision proxies are redundant geometry that
-    // (a) double-draws over the real meshes with the flat default-grey material,
-    // and (b) is frequently the WRONG size (e.g. a go2 foot's collision box is a
-    // 1m cube) -- so they read as oversized white blobs occluding the model.
-    //
-    // Rule (M8.5 beauty pass): render an entity's collision-shape primitive ONLY
-    // when THAT entity produced no real visual-mesh geometry. A mesh's collision
-    // proxy is redundant geometry that (a) double-draws over the real mesh with the
-    // flat default-grey material, and (b) is frequently the WRONG size (a go2 foot's
-    // collision box is a 1m cube) -- so it reads as an oversized blob occluding the
-    // model. The decision is PER-ENTITY (not scene-wide): a mixed scene's mesh-free
-    // primitive entities keep their proxies even when other entities have meshes.
-    // The set is filled by the visual-mesh loop (a component existing is NOT enough
-    // -- its MESH ref must actually load), so a no-mesh light scene keeps its
-    // collision render and the parity/smoke gates are unperturbed.
+    // Collision primitives render only as a fallback when NO real visual mesh loaded
+    // (a non-empty set suppresses them: a mesh's proxy is a redundant wrong-sized occluder).
     std::unordered_set<scene::EntityId, scene::EntityIdHash> has_visual_mesh;
 
     // -- emit one RenderInstance per renderable entity -----------------------
@@ -394,12 +379,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     registry.ForEach<scene::VisualMeshComponent>(
         [&](scene::EntityId e, const scene::VisualMeshComponent& vis) {
             if (vis.mesh.Empty() || vis.mesh.fourcc != scene::NkaTagMesh()) {
-                // No bound MESH geometry. M10: if the source geom was a renderable
-                // VISUAL PRIMITIVE (box/sphere/capsule/plane -- the kitchen counters/
-                // walls/floor), tessellate it from its recorded params so primitive-
-                // heavy scenes are visible. This is INDEPENDENT of the collision
-                // proxy gate below (we deliberately do NOT bump loaded_visual_meshes,
-                // so a pure-collision scene keeps its collision render unchanged).
+                // No bound MESH: tessellate a renderable visual primitive from its
+                // params (does NOT mark has_visual_mesh, so pure-collision render holds).
                 using PK = scene::VisualMeshComponent::PrimKind;
                 if (vis.prim_kind == PK::None) {
                     // Still asset-gated / non-renderable: skip (no misleading cube).
@@ -446,19 +427,16 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 return FromNkaMesh(scene::DecodeMesh(
                     file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
             });
-            has_visual_mesh.insert(e);  // this ENTITY's collision proxy is now redundant
+            has_visual_mesh.insert(e);  // a real mesh loaded -> proxies now redundant
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // CollisionShapeComponent entities -> primitive tessellation fallback. Emitted
-    // PER-ENTITY only when THAT entity loaded no real visual mesh (otherwise its
-    // visual mesh IS the appearance and its collision proxy is a redundant /
-    // wrong-sized occluder). box/sphere/capsule tessellate from their params;
-    // hull/SDF kinds carry no host geometry and are SKIPPED (no oversized box).
+    // Collision-proxy fallback (only when no visual mesh loaded): box/sphere/capsule
+    // tessellate from params; hull/SDF carry no host geometry and are skipped.
     using CK = scene::CollisionShapeComponent::Kind;
+    if (has_visual_mesh.empty())
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
-            if (has_visual_mesh.count(e)) return;  // this entity already drew its mesh
             uint32_t mesh_id;
             switch (cs.kind) {
                 case CK::Box:
