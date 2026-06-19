@@ -1,186 +1,141 @@
 # Nuka Physics
 
-**A GPU-resident, strongly deterministic, differentiable CUDA physics engine for
-robotics and large-scale reinforcement learning.**
+<p align="center"><b>GPU-resident · bit-deterministic · differentiable CUDA physics for robotics &amp; large-scale RL.</b><br>
+<sub>Self-written end to end — no external physics or rendering SDK.</sub></p>
 
-Nuka runs thousands of articulated environments on a single GPU, reproduces
-runs bit-for-bit, and exposes a full **analytical reverse-mode adjoint** through
-its rigid + articulated dynamics — so you can backpropagate a loss through the
-simulator itself, not just sample-estimate it.
+<p align="center">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license">
+  <img src="https://img.shields.io/badge/CUDA-12.8-76b900" alt="cuda">
+  <img src="https://img.shields.io/badge/platform-Linux-555" alt="platform">
+  <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-success" alt="determinism">
+</p>
 
-## Showcase — 4096-env Go2 locomotion, trained in-engine (v0.3)
+<p align="center">
+  <video src="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4" poster="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_poster.jpg" controls muted loop playsinline width="85%"></video>
+</p>
+<p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer (1080p). <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ play</a> · <a href="docs/examples/go2_locomotion.md">4096-env batched RL →</a></sub></p>
 
-![Go2 walking — batched environments driven by an in-engine PPO policy](docs/media/go2_walk_4096env.gif)
+## Why Nuka
 
-*16 of 4096 batched Go2 environments (debug-skeleton render of the headless
-batched path), driven by a PPO policy trained end-to-end on Nuka.* The same
-cooked world template runs all 4096 environments on one GPU; the policy was
-trained from scratch with [rl_games](examples/training/) PPO and converges to a
-command-conditioned walking gait (forward-velocity tracking across
-`-0.5 … +1.0 m/s`). **This is a forward-simulation + RL training result** (v0.3),
-not the differentiable path — see
-[docs/examples/go2_locomotion.md](docs/examples/go2_locomotion.md).
+- **One GPU, thousands of articulated envs.** The same cooked world template steps 4096+ environments GPU-resident; an in-engine PPO policy trains end-to-end.
+- **Strong (D1) determinism.** No FP atomics, fixed reduction order everywhere — re-running from the same inputs reproduces results *byte-for-byte* (enforced by a physics-smell lint on every PR).
+- **Differentiable.** A real analytical reverse-mode adjoint through rigid + articulated (Featherstone) dynamics — not a stop-gradient contact approximation. `jax.grad` and `loss.backward()` agree to engine round-off.
+- **One general contact path.** Robot↔ground and robot↔object are the same contact problem and run the same solver — no per-scene fast-paths.
+- **Self-written, no SDK.** CUDA solver, hand-written MJCF/URDF/USD importers, and a self-written CUDA two-level path tracer for offline beauty.
 
-## Highlights — what makes Nuka different
+## Architecture
 
-1. **Strong (D1) determinism, bit-exact across two runs.** No floating-point
-   atomics, fixed reduction order in every physics path. Re-running a simulation
-   from the same inputs reproduces the result *byte-for-byte*. This is enforced
-   by a physics-smell lint that must pass on every PR.
+```
+ scene (.usda/.xml/.urdf/.nks)
+   → SceneIR  (compose · edit · settle)
+   → CookToModel  → nk::Model   (cooked constant tables, one general contact family)
+   → nk::World    (GPU-resident: Model uploaded once, Data arena, solve schedule)
+   → Pipeline     (fixed-order op list: AABB → LBVH → narrowphase → rows → solve → integrate)
+   → Step  (CUDA backend, PHI dispatch)        → Render  (Vulkan raster · CUDA path tracer)
+```
 
-2. **Full analytical reverse-mode adjoint** through rigid + articulated dynamics
-   (Featherstone ABA, reverse-mode), with a recorded tape + gradient
-   checkpointing and an implicit-function-theorem (IFT) contact gradient at
-   convergence. This is a *real* analytical adjoint — not a stop-gradient
-   approximation through contact (Brax) — so gradients are exact and
-   engine-consistent. (Scope honestly stated: floating-base **orientation**-channel
-   and the d/dM, d/dJ contact-derivative channels are deferred to v0.7.)
+| Module | Role |
+|---|---|
+| `nk` | Engine core — `Model` (cooked tables), `Data` (device arena), `Pipeline`, `World` (steppable), solve schedule (islands/coloring) |
+| `phi` | Backend abstraction + `backend_cuda` (all CUDA op kernels + the RT path) |
+| `collision` / `constraint` | LBVH broadphase, GJK/EPA + heightfield narrowphase, contact-row data model |
+| `scene` | Scene IR, ECS, `.nks`/`.nka` formats, `CookToModel`, terrain/heightfield |
+| `import` | MJCF / URDF / text-USD importers + cookers (XPBD, fluid, SDF) |
+| `diffsim` | Reverse-mode adjoint: tape, checkpointing, ABA-reverse, IFT contact gradient, self-written sparse solvers |
+| `render` / `rt` | Vulkan rasterizer (realtime) + CUDA two-level path tracer (offline beauty) |
+| `codegen` | Generated forward/adjoint kernels (XPBD distance/bend/volume/shape-match, Cosserat, SDF) |
+| `sensor` | Contact-wrench/ray/state sensors + Philox sim-to-real noise |
 
-3. **Zero-copy PyTorch + JAX interop via DLPack.** Engine buffers alias torch /
-   jax tensors with no copy. Both frontends drive the *same* deterministic engine
-   adjoint, so `jax.grad` and `loss.backward()` produce gradients that **agree to
-   engine round-off** (a tight rel-err < 1e-4 gate; ~1e-6 in practice).
+**Pillars in code:** D1 determinism · self-written (no external SDK) · multi-backend PHI (CUDA today) · differentiable · ONE general contact path.
 
-4. **Sim-to-real noise, deterministic and replayable.** N1 per-field sensor noise
-   (Gaussian / Poisson) + N2 per-episode domain randomization, both driven by a
-   counter-based Philox4x32-10 RNG — so noise is a pure function of
-   `(seed, index, sequence)`, two-run bit-exact, and re-derived identically on the
-   diff-sim backward. Off by default, so oracle scenes stay byte-identical.
+## What works today
+
+| System | Status | Notes |
+|---|---|---|
+| Articulated multibody (Featherstone / ABA) | **Production** | drives the 4096-env Go2; CRBA/ABA, multi-articulation co-residence |
+| Rigid + general contact | **Production** | LBVH → narrowphase → block-island PGS + split-impulse; MJX-parity tested |
+| Terrain / heightfield + RL locomotion | **Production** | the climbing demo above; height-scan obs, PPO-trained |
+| Soft body — XPBD (distance/bend/volume/shape-match) | Functional | tested; Cosserat rods forward-only (no adjoint yet); no demo |
+| Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; tested; no demo |
+| Differentiable sim (rigid + articulated) | Functional | analytical adjoint — **contact-free** path |
+| Rendering | Functional | Vulkan raster + self-written CUDA path tracer (sun/shadow/AO/GI/sky) |
+| RL / training | Functional | rl_games PPO, gym + Isaac-Lab-compat, zero-copy DLPack (torch/JAX) |
+| Scene import | Functional | MJCF, URDF, text-USD (hand-written, no OpenUSD) |
+| Sim-to-real noise | Functional | Philox4x32 sensor noise + domain randomization (off by default) |
+
+## Toward rigid–soft–fluid coupling + multibody
+
+The north star is **one general solver that couples rigid, soft, fluid, and articulated multibody two-way**. Honest distance today:
+
+- ✅ **Rigid + multibody, unified.** One general PGS path resolves rigid + articulation + static sides in a single kernel (MJX-parity). This pillar is *done*.
+- 🟡 **Soft (XPBD) + fluid (PBF) exist and step**, and **co-reside in one `nk::World`** — but in a parallel position-based particle lane, not yet inside the unified row solver.
+- 🟡 **Soft↔fluid co-residence works** (shared step, density-scope isolation); the cross-slice contact op is coded and runs, lightly tested.
+- ❌ **Rigid/articulation ↔ soft/fluid coupling: not yet.** The general row assembly does not emit rigid↔particle rows, so a foot can't yet push cloth or splash fluid *through the solver*. The generic coupling-row framework is written but unwired.
+- ❌ **Differentiability does not extend through contact / coupling** yet.
+
+**Remaining gap:** wire the coupling-row framework into the step loop, teach the general assembly to emit rigid↔particle coupling rows, add rigid↔soft / rigid↔fluid tests + demos, then extend the adjoint through contact. The multibody+rigid half is production; soft and fluid are present but not yet coupled to it through the one solver.
+
+## Roadmap
+
+- [x] Articulated multibody + general rigid contact (one solver)
+- [x] Terrain / heightfield locomotion + in-engine RL
+- [x] Soft (XPBD) and fluid (PBF) standalone + co-residence
+- [x] Self-written CUDA path-tracer beauty render
+- [ ] **Rigid ↔ soft / fluid two-way coupling in the general solver** (wire the coupling-row framework)
+- [ ] Soft / fluid demos + rigid-coupling tests
+- [ ] Differentiable contact (d/dM, d/dJ) + floating-base orientation channel
+- [ ] RT renderer speedup — denoiser + FP32 beauty TU (OptiX under evaluation)
+- [ ] Second PHI backend (multi-backend beyond CUDA)
+- [ ] PyPI wheel (`pip install nuka-physics`)
 
 ## Quick start
 
-Nuka is built and run on **Linux** with **CUDA 12.8** and **g++-10**. A
-CUDA-capable GPU is required for the production physics path. (A `pip install
-nuka-physics` from PyPI is *planned*, not yet published — build from source for
-now.)
-
-### 1. Build the C++ engine (GPU)
+Built on **Linux** with **CUDA 12.8** and **g++-10**; a CUDA GPU is required for the production physics path.
 
 ```bash
 export CC=gcc-10 CXX=g++-10
-cmake -S . -B build-cuda128 \
-  -DNK_BUILD_TESTS=ON \
-  -DNK_REQUIRE_CUDA=ON \
-  -DNK_PHYSICS_BACKEND=CUDA
+cmake -S . -B build-cuda128 -DNK_BUILD_TESTS=ON -DNK_REQUIRE_CUDA=ON -DNK_PHYSICS_BACKEND=CUDA
 cmake --build build-cuda128 -j
-```
-
-Always use the `build-cuda128` directory (never the legacy `build/`). See
-[CONTRIBUTING.md](CONTRIBUTING.md) and [`python/README.md`](python/README.md) for
-the toolchain environment variables.
-
-### 2. Install the Python bindings
-
-```bash
 pip install -e python
 ```
 
-### 3. Backpropagate through the simulator — a link-mass gradient
-
-The differentiable rollout lives in `nuka.autograd` (it is *not* re-exported at
-the top level, so `import nuka` never hard-requires torch). Pass the parameter
-you want a gradient for as a **torch tensor** via `params=` — calling `.item()`
-on it would sever the autograd graph.
-
-```python
-import torch
-import nuka
-from nuka.autograd import differentiable_rollout
-
-scene = "examples/scenes/go2_system_id.usda"   # fixed-base Go2, single env
-
-with nuka.Device.create(0) as dev:
-    # SINGLE-ENV, contact-free differentiable path: one fresh world + tape.
-    world = nuka.World.create_from_scene(dev, scene, 1)
-    world.set_gravity_z(-9.81)
-    tape = nuka.Tape.create(
-        world, checkpoint_interval=3, max_tape_entries=4096,
-        max_checkpoints=512, recompute_on_backward=1,
-    )
-
-    # The mass of one thigh link (GLOBAL link index 2) as a differentiable leaf.
-    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))
-
-    # A fixed K=30-step rest-hold PD target sequence: (K, action_dim).
-    action_dim = world.base_link_count - 1            # 12 for Go2
-    actions = torch.zeros(30, action_dim, device="cuda")
-
-    # Drive the rollout; observe post-rollout joint velocities (qdot).
-    obs = differentiable_rollout(
-        world, tape, actions,
-        params=mass, param_link_indices=[2], obs="qdot",
-    )
-    loss = obs.pow(2).mean()
-    loss.backward()
-
-    print("dLoss/dmass =", mass.grad.item())        # read the gradient...
-    tape.destroy()                                   # ...BEFORE destroying the tape
-    world.destroy()
-```
-
-`world.reset()` is **not supported** on this single-env path; build a fresh
-world + tape per evaluation (this is cheap — a few ms). The full worked example
-is the system-ID demo: [docs/examples/system_identification.md](docs/examples/system_identification.md).
-
-### Run the RL locomotion training (forward sim)
-
+**Train Go2 locomotion (forward sim):**
 ```bash
 CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --num_actors 4096
-# fast launch proof:
-CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --smoke
 ```
 
-## Status
+**Backprop through the simulator** (link-mass gradient; the full example is [system identification](docs/examples/system_identification.md)):
+```python
+import torch, nuka
+from nuka.autograd import differentiable_rollout
 
-**v0.5 — initial public release.** What ships:
-
-- 4096+ parallel articulated environments on a single GPU (v0.3 forward sim).
-- Differentiable simulation through **rigid + articulated (Featherstone)**
-  dynamics: analytical adjoint, tape + gradient checkpointing, IFT-at-convergence
-  contact gradient, parameter (link-mass) and control-mode gradients.
-- Zero-copy PyTorch + JAX (DLPack) interop.
-- Sim-to-real noise N1 (sensor) + N2 (domain randomization).
-- Self-written deterministic sparse solver (CG + Jacobi / Block-Jacobi,
-  fixed-order reductions, D1 bit-exact) for the IFT path — no closed-source SDK.
-
-**Not yet shipped (roadmap):** soft body, fluid, and rigid↔soft↔fluid
-cross-system coupling are **v0.7**; floating-base **orientation**-channel and
-d/dM, d/dJ contact gradients are **v0.7**. See the
-[master plan](docs/plans/2026-05-28-nuka-physics-master-plan.md) §7.
+with nuka.Device.create(0) as dev:
+    world = nuka.World.create_from_scene(dev, "examples/scenes/go2_system_id.usda", 1)
+    world.set_gravity_z(-9.81)
+    tape = nuka.Tape.create(world, checkpoint_interval=3, max_tape_entries=4096,
+                            max_checkpoints=512, recompute_on_backward=1)
+    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))   # one thigh link
+    actions = torch.zeros(30, world.base_link_count - 1, device="cuda")
+    obs = differentiable_rollout(world, tape, actions, params=mass,
+                                 param_link_indices=[2], obs="qdot")
+    obs.pow(2).mean().backward()
+    print("dLoss/dmass =", mass.grad.item())
+    tape.destroy(); world.destroy()
+```
+The differentiable path is single-env and contact-free; build a fresh world+tape per evaluation (cheap).
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — prerequisites, build, hello-world,
-  RL quickstart.
-- Concepts: [architecture](docs/concepts/architecture.md) ·
-  [differentiable simulation](docs/concepts/diff-sim.md) ·
-  [migrating from Isaac Lab](docs/concepts/isaaclab-compat.md)
-- Examples: [Go2 locomotion (v0.3)](docs/examples/go2_locomotion.md) ·
-  [system identification (v0.5)](docs/examples/system_identification.md)
-- Architecture deep-dives: [Runtime overview](docs/architecture/runtime-overview.md) ·
-  [diff-sim tape + checkpointing](docs/architecture/diffsim-tape.md) ·
-  [sim-to-real noise](docs/architecture/sim2real-noise.md) ·
-  [scene compiler](docs/architecture/scene-compiler.md)
-- Launch blog: [Nuka Physics v0.5](docs/blog/2026-06-01-v05-launch.md)
-- [Master plan](docs/plans/2026-05-28-nuka-physics-master-plan.md) — architecture +
-  long-term roadmap (the source of truth for the version plan).
+- [Getting started](docs/getting-started.md) · [Architecture](docs/concepts/architecture.md) · [Differentiable simulation](docs/concepts/diff-sim.md) · [Migrating from Isaac Lab](docs/concepts/isaaclab-compat.md)
+- Examples: [Go2 locomotion](docs/examples/go2_locomotion.md) · [System identification](docs/examples/system_identification.md)
+- Deep dives: [runtime](docs/architecture/runtime-overview.md) · [diff-sim tape](docs/architecture/diffsim-tape.md) · [scene compiler](docs/architecture/scene-compiler.md)
 
 ## Scene import
 
-Scenes import from **MJCF** (`.xml`), **URDF**, and **text USD** (`.usda`). The
-`.usda` parser is hand-written using only the C++ standard library — there is no
-OpenUSD SDK dependency and no binary `.usdc` / `.usdz` support. XML is parsed via
-tinyxml2. See [NOTICE](NOTICE).
+Imports **MJCF** (`.xml`), **URDF**, and **text USD** (`.usda`). The `.usda` parser is hand-written using only the C++ standard library — no OpenUSD dependency, no binary `.usdc`/`.usdz`. See [NOTICE](NOTICE).
 
-## Contributing
+## Contributing &amp; License
 
-Contributions are welcome under a signed [Contributor License Agreement](CLA.md)
-(the CLA-assistant bot checks this on every PR). Read
-[CONTRIBUTING.md](CONTRIBUTING.md) for the build, lint, and test gates, and the
-[Code of Conduct](CODE_OF_CONDUCT.md). For security issues, follow
-[SECURITY.md](SECURITY.md).
+Contributions welcome under a signed [CLA](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Security: [SECURITY.md](SECURITY.md).
 
-## License
-
-**Apache License 2.0** with a Contributor License Agreement. See
-[LICENSE](LICENSE) and [NOTICE](NOTICE) for third-party attributions.
+**Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE).
