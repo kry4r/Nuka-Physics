@@ -33,6 +33,7 @@
 #include "phi/backend_cuda/rt/two_level_render_kernels.cuh"
 #include "phi/scoped_device_guard.hpp"
 #include "rt/render_dr.hpp"
+#include "rt/sensor_fidelity.hpp"   // SensorFidelityConfig (opt-in beauty shade)
 #include "sensor/noise/philox.cuh"  // Philox4x32 host/device pure RNG
 
 #include <cuda_runtime.h>
@@ -92,6 +93,36 @@ __device__ inline float DrSym(uint64_t seed, uint32_t env, uint32_t material_slo
 
 __device__ inline float DrClamp(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Trivially-copyable device mirror of the fidelity flags the trace branches on
+// (the sky/sample params travel in BeautyParams). spp / shadow_samples are capped
+// by the host before launch, so the kernel takes them as-is.
+struct FidelityParams {
+    uint32_t spp;
+    uint32_t enabled;  // 0 -> the exact cheap-shade arithmetic (byte no-op)
+    uint32_t tonemap;
+    uint64_t seed;
+};
+
+// Stateless deterministic per-sample RNG: a PCG stream seeded from one Philox draw
+// keyed by (seed, ray, sample). Distinct (ray, sample) -> distinct Philox counter
+// (injective lanes) -> independent streams, so fidelity-on is byte-exact two-run.
+struct PhiloxSeededRng {
+    uint32_t s;
+    __device__ inline float NextF() {
+        s = s * 747796405u + 2891336453u;
+        const uint32_t word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+        const uint32_t r = (word >> 22u) ^ word;
+        return static_cast<float>(r >> 8) * (1.0f / 16777216.0f);  // [0,1)
+    }
+};
+
+__device__ inline PhiloxSeededRng MakeFidelityRng(uint64_t seed, uint32_t ray,
+                                                  uint32_t sample) {
+    const sensor::noise::Philox4x32Counter out = sensor::noise::Philox4x32_10(
+        sensor::noise::MakeCounter(ray, sample), sensor::noise::SplitSeed(seed));
+    return PhiloxSeededRng{out.v[0]};
 }
 
 // Fill the per-env material table [E*M] from the base materials as a pure function
@@ -158,6 +189,12 @@ __global__ void FillEnvLightsKernel(Light base_light, AmbientTerm base_ambient,
 // the TLAS node + instance + material slices index by env (the scene is env-shared
 // -- only cameras fan out). One writer per pixel, no atomics -> FP32-deterministic
 // byte-exact per tile. S==1 collapses cam==env, byte-identical to one cam per env.
+//
+// fid.enabled==0 takes the EXACT cheap-shade arithmetic (1 spp, 1 hard shadow,
+// ShadeDirect) -> the AOV bytes are unchanged. fid.enabled!=0 accumulates spp
+// jittered samples through the shared beauty shade (soft shadow / AO / GI per the
+// sky params) and averages into color; depth/normal/albedo/prim ALWAYS come from
+// the center ray, so only color changes under fidelity.
 __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ cameras,
                                          const LbvhNode* __restrict__ tlas_nodes,
                                          uint32_t leaves_per_env,
@@ -170,6 +207,8 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          uint32_t sensors_per_env,
                                          uint32_t width,
                                          uint32_t height,
+                                         FidelityParams fid,
+                                         BeautyParams sky,
                                          float* __restrict__ out_color,
                                          float* __restrict__ out_depth,
                                          float* __restrict__ out_normal,
@@ -268,6 +307,53 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
         color = ShadeDirect(n, V, L, light_col, mat, lit, ambient.color);
     }
 
+    // Opt-in beauty shade: accumulate spp jittered samples through the SHARED
+    // beauty shade (the single-camera look) and average. The center sample's AOVs
+    // above are kept; only color is replaced. Seeded per (ray, sample) -> two-run
+    // byte-exact. Misses sample the sky dome instead of staying black.
+    if (fid.enabled != 0u) {
+        const uint32_t S = fid.spp < 1u ? 1u : fid.spp;
+        Vec3 accum{0.0f, 0.0f, 0.0f};
+        for (uint32_t s = 0; s < S; ++s) {
+            PhiloxSeededRng rng = MakeFidelityRng(fid.seed, gid, s);
+            const float jx = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
+            const float jy = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
+            const Ray r = camera.GenerateRayJitter(px, py, jx, jy);
+            float bt; uint32_t bp;
+            ClosestHit<float>(env_nodes, leaves_per_env, env_inst, r.origin, r.dir, 0.0f,
+                              &bt, &bp);
+            if (bp == kNoPrim) {
+                const Vec3 miss = SkyColor(r.dir, sky);
+                accum.x += miss.x; accum.y += miss.y; accum.z += miss.z;
+                continue;
+            }
+            Vec3 sn; float su, sv;
+            ReconstructHit<float>(env_inst, bp, r.origin, r.dir, &sn, &su, &sv);
+            const float snv = sn.x * (-r.dir.x) + sn.y * (-r.dir.y) + sn.z * (-r.dir.z);
+            const Vec3 snf = (snv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
+            uint32_t si, slp; UnpackPrimId(bp, &si, &slp);
+            const Material smat = env_mats[env_inst[si].material_id];
+            const Vec3 shit{r.origin.x + bt * r.dir.x, r.origin.y + bt * r.dir.y,
+                            r.origin.z + bt * r.dir.z};
+            const Vec3 sV = RtNormalize<float>(Vec3{-r.dir.x, -r.dir.y, -r.dir.z});
+            Vec3 col = ShadeBeauty<PhiloxSeededRng>(env_nodes, leaves_per_env, env_inst,
+                                                    env_mats, light, sky, shit, snf, sV,
+                                                    smat, &rng);
+            if (sky.fog_density > 0.0f) {
+                const float f = 1.0f - expf(-sky.fog_density * bt);
+                col.x += (sky.fog_color.x - col.x) * f;
+                col.y += (sky.fog_color.y - col.y) * f;
+                col.z += (sky.fog_color.z - col.z) * f;
+            }
+            accum.x += col.x; accum.y += col.y; accum.z += col.z;
+        }
+        const float inv_s = 1.0f / static_cast<float>(S);
+        color = Vec3{accum.x * inv_s, accum.y * inv_s, accum.z * inv_s};
+        if (fid.tonemap != 0u) {
+            color = Vec3{TonemapAces(color.x), TonemapAces(color.y), TonemapAces(color.z)};
+        }
+    }
+
     out_color[gid * 3u + 0u] = color.x;
     out_color[gid * 3u + 1u] = color.y;
     out_color[gid * 3u + 2u] = color.z;
@@ -303,6 +389,10 @@ struct BatchedSensorSceneDevice::Impl {
     std::size_t matenv_b = 0u, lightenv_b = 0u, ambenv_b = 0u;
     uint32_t dr_env_count = 0u;  // env count the per-env tables are filled for
     rt::RenderDrConfig dr_cfg;   // disabled by default -> replicas
+
+    // Opt-in shading fidelity. Default (Enabled()==false) -> the trace takes the
+    // exact cheap-shade arithmetic (byte-identical to today).
+    rt::SensorFidelityConfig fid_cfg;
 
     // Scatter outputs + batched TLAS (sized to E*M / E*(2M-1)); *_b track each
     // allocation's byte size so growth-only realloc is honest across steps.
@@ -399,6 +489,47 @@ void EnsureBytes(OwnedBuffer& buf, std::size_t& cur_bytes, phi::BufferType* bt,
 // stays trivial (a 4-material set at 65536 envs is ~8 MB), but cap it LOUDLY so a
 // nonsense env_count fails fast instead of overflowing the allocation.
 constexpr uint32_t kMaxRenderDrEnvs = 1u << 20;  // 1,048,576 envs
+
+// Fidelity sample caps: each pixel runs spp * (shadow_samples + ao_samples) trace
+// rays, so a runaway profile would stall the launch. Cap LOUDLY so a nonsense
+// profile fails fast instead of hanging the device.
+constexpr uint32_t kMaxFidelitySpp = 256u;
+constexpr uint32_t kMaxFidelitySamples = 256u;  // per soft-shadow / AO dimension
+
+// Lower the stored fidelity config to the kernel's device params, asserting the
+// sample caps. enabled==false -> the kernel takes the exact cheap-shade branch.
+void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp,
+                         BeautyParams* sky) {
+    if (cfg.spp > kMaxFidelitySpp) {
+        throw std::runtime_error(
+            "SetSensorFidelity: spp exceeds the per-pixel sample cap "
+            "(kMaxFidelitySpp=256)");
+    }
+    if (cfg.shadow_samples > kMaxFidelitySamples ||
+        cfg.ao_samples > kMaxFidelitySamples) {
+        throw std::runtime_error(
+            "SetSensorFidelity: shadow_samples/ao_samples exceed the sample cap "
+            "(kMaxFidelitySamples=256)");
+    }
+    fp->spp = cfg.spp < 1u ? 1u : cfg.spp;
+    fp->enabled = cfg.Enabled() ? 1u : 0u;
+    fp->tonemap = cfg.tonemap_enabled ? 1u : 0u;
+    fp->seed = cfg.seed;
+    sky->shadow_rays = cfg.shadow_samples < 1u ? 1u : cfg.shadow_samples;
+    sky->sun_angular_radius = cfg.sun_angular_radius;
+    // AO off -> the shared shade's indirect term must vanish: zero sky ambient +
+    // no GI bounce, with a single (zero-contribution) AO ray (the primary-ray miss
+    // still shows the sky background, which is gated separately).
+    sky->ao_samples = cfg.ao_enabled ? (cfg.ao_samples < 1u ? 1u : cfg.ao_samples) : 1u;
+    sky->ao_radius = cfg.ao_radius;
+    sky->gi_bounces = (cfg.ao_enabled && cfg.gi_enabled) ? 1u : 0u;
+    sky->sky_intensity = cfg.ao_enabled ? cfg.sky_intensity : 0.0f;
+    sky->sky_top = cfg.sky_top;
+    sky->sky_bottom = cfg.sky_bottom;
+    sky->sky_ground = cfg.sky_ground;
+    sky->fog_color = cfg.fog_color;
+    sky->fog_density = cfg.fog_density;
+}
 
 // (Re)fill the per-env material/light/ambient tables from the base set + the
 // stored DR config, for `env_count` envs. DR off -> exact base replicas, so the
@@ -528,7 +659,11 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     }
 
     // 3) ONE flat trace over [E*S*H*W] into the persistent (E,S,H,W,ch) AOV tensor.
-    //    Materials/light/ambient resolved BY ENV from the per-env tables.
+    //    Materials/light/ambient resolved BY ENV from the per-env tables. The
+    //    fidelity params gate the shade: disabled -> the exact cheap arithmetic.
+    FidelityParams fid;
+    BeautyParams sky;
+    BuildFidelityParams(impl->fid_cfg, &fid, &sky);
     const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
     phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
                     ctx.stream, cameras_device, d_nodes, m, d_instances,
@@ -537,7 +672,7 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
                     static_cast<const Light*>(impl->d_light_env.Data()),
                     static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
                     static_cast<uint32_t>(num_cameras), s,
-                    width, height,
+                    width, height, fid, sky,
                     static_cast<float*>(impl->d_color.Data()),
                     static_cast<float*>(impl->d_depth.Data()),
                     static_cast<float*>(impl->d_normal.Data()),
@@ -573,6 +708,17 @@ void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
     impl->dr_cfg = cfg;
     EnsureEnvAppearanceTables(impl, ctx, env_count, true);
     cudaStreamSynchronize(ctx.stream);
+}
+
+void SetSensorFidelity(BatchedSensorSceneDevice& device,
+                       const SensorFidelityConfig& cfg) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    // Validate the caps here too so a bad config is rejected at set time, not only
+    // at the next render. The stored config drives the trace's shade branch.
+    FidelityParams fp;
+    BeautyParams sky;
+    BuildFidelityParams(cfg, &fp, &sky);
+    impl->fid_cfg = cfg;
 }
 
 void RenderSensorsMounted(BatchedSensorSceneDevice& device,

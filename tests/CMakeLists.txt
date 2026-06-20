@@ -1667,6 +1667,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_render_dr_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Opt-in shading-fidelity gate: SetSensorFidelity lifts the batched RGB to
+    # the beauty look (MSAA + soft shadow + AO + GI + tonemap) in the SAME kernel,
+    # gated on the config. DEFAULT == byte no-op; fidelity-on is deterministic
+    # (Philox-seeded), visibly different + finite, AOVs unchanged. A .cu;
+    # --fmad=false matches the render TU.
+    add_executable(nuka_rt_sensor_fidelity_test
+        rt/test_sensor_fidelity.cu
+    )
+    target_compile_options(nuka_rt_sensor_fidelity_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_sensor_fidelity_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_sensor_fidelity_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_sensor_fidelity_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Per-env camera-mount gate: ScatterEnvCameras builds each env's pinhole
     # camera on device from cam_world = fk(pose) * local_offset (USD/Isaac axes).
     # Asserts the device cameras are byte-identical to the host fk*local_offset

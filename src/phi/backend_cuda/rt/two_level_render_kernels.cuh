@@ -372,6 +372,181 @@ __device__ __forceinline__ void ReconstructHit(const DevInstance* __restrict__ i
     *out_v = v;
 }
 
+// ---------------------------------------------------------------------------
+// SHARED beauty shade: the single-camera beauty TU and the batched sensor TU both
+// call these (the ONE-path move -- one shading model, two callers). RtMath2Pi /
+// RtMathPi keep the literals in one place. The RNG is a template: any struct with
+// a `NextF()` returning a float in [0,1) drives the stochastic sampling, so each
+// caller supplies its own deterministic, stateless-seeded generator.
+// ---------------------------------------------------------------------------
+
+NUKA_RT_HD inline float RtMath2Pi() { return 6.2831853071795864769f; }
+NUKA_RT_HD inline float RtMathPi() { return 3.14159265358979323846f; }
+
+// Orthonormal basis around a unit normal (Duff et al. 2017, branchless).
+NUKA_RT_HD inline void OrthoBasis(const Vec3& n, Vec3* t, Vec3* b) {
+    const float sign = copysignf(1.0f, n.z);
+    const float a = -1.0f / (sign + n.z);
+    const float c = n.x * n.y * a;
+    *t = Vec3{1.0f + sign * n.x * n.x * a, sign * c, -sign * n.x};
+    *b = Vec3{c, sign + n.y * n.y * a, -n.y};
+}
+
+// Cosine-weighted hemisphere sample about `n` (Malley's method). FP32 normalize.
+NUKA_RT_HD inline Vec3 CosineHemisphere(const Vec3& n, float u1, float u2) {
+    const float r = sqrtf(u1);
+    const float phi = RtMath2Pi() * u2;
+    const float x = r * cosf(phi);
+    const float y = r * sinf(phi);
+    const float z = sqrtf(fmaxf(0.0f, 1.0f - u1));
+    Vec3 t, b;
+    OrthoBasis(n, &t, &b);
+    return RtNormalize<float>(Vec3{t.x * x + b.x * y + n.x * z,
+                                   t.y * x + b.y * y + n.y * z,
+                                   t.z * x + b.z * y + n.z * z});
+}
+
+// Sample a cone of half-angle `ang` about the unit axis `L` (soft sun disc).
+NUKA_RT_HD inline Vec3 SampleCone(const Vec3& L, float ang, float u1, float u2) {
+    const float cos_max = cosf(ang);
+    const float cos_t = 1.0f - u1 * (1.0f - cos_max);
+    const float sin_t = sqrtf(fmaxf(0.0f, 1.0f - cos_t * cos_t));
+    const float phi = RtMath2Pi() * u2;
+    Vec3 t, b;
+    OrthoBasis(L, &t, &b);
+    const float x = sin_t * cosf(phi);
+    const float y = sin_t * sinf(phi);
+    return RtNormalize<float>(Vec3{t.x * x + b.x * y + L.x * cos_t,
+                                   t.y * x + b.y * y + L.y * cos_t,
+                                   t.z * x + b.z * y + L.z * cos_t});
+}
+
+// Procedural sky + ground dome along a ray direction (the miss shader). Smooth
+// horizon blend; below-horizon fades to a neutral ground fill so bounce rays that
+// escape downward still pick up plausible fill instead of pure black.
+NUKA_RT_HD inline Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
+    if (dir.z >= 0.0f) {
+        const float up = dir.z;   // 0 horizon .. 1 zenith
+        const float w = up * up;  // bias color toward horizon
+        return Vec3{sky.sky_bottom.x + (sky.sky_top.x - sky.sky_bottom.x) * w,
+                    sky.sky_bottom.y + (sky.sky_top.y - sky.sky_bottom.y) * w,
+                    sky.sky_bottom.z + (sky.sky_top.z - sky.sky_bottom.z) * w};
+    }
+    const float w = fminf(1.0f, -dir.z * 1.5f);
+    return Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
+                sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
+                sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
+}
+
+// Per-pixel hit at world point `hit` with viewer-faced normal `Nf`: K-ray soft sun
+// shadow + cosine AO/GI bounces. Returns the lit RGB. Visibility rays use the
+// any-hit traversal; the AO/GI bounce uses a closest-hit pruned to ao_radius.
+// __device__-only: it rides the device-only TLAS/BLAS traversal nest.
+template <typename Rng>
+__device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_nodes,
+                                  uint32_t tlas_leaf_count,
+                                  const DevInstance* __restrict__ instances,
+                                  const Material* __restrict__ materials,
+                                  Light light, BeautyParams sky, const Vec3& hit,
+                                  const Vec3& Nf, const Vec3& V, const Material& mat,
+                                  Rng* rng) {
+    // Sun direction (toward the light) + a finite angular size -> penumbra.
+    Vec3 Ls;
+    if (light.directional) {
+        Ls = RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+    } else {
+        Ls = RtNormalize<float>(Vec3{light.position.x - hit.x, light.position.y - hit.y,
+                                     light.position.z - hit.z});
+    }
+    const Vec3 light_col{light.color.x * light.intensity,
+                         light.color.y * light.intensity,
+                         light.color.z * light.intensity};
+    const float eps = 1.0e-3f;
+    const Vec3 sorigin{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+
+    // Soft shadow: average visibility over K cone-sampled sun directions (any-hit
+    // visibility -- boolean occlusion, first hit wins).
+    float vis = 0.0f;
+    const uint32_t K = sky.shadow_rays < 1u ? 1u : sky.shadow_rays;
+    for (uint32_t k = 0; k < K; ++k) {
+        const Vec3 Lk = SampleCone(Ls, sky.sun_angular_radius, rng->NextF(), rng->NextF());
+        if (Lk.x * Nf.x + Lk.y * Nf.y + Lk.z * Nf.z <= 0.0f) continue;
+        if (!AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, sorigin, Lk, eps,
+                                RtMissDepth())) {
+            vis += 1.0f;
+        }
+    }
+    vis /= static_cast<float>(K);
+
+    const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
+    // Half vector for a GGX-ish specular highlight so the shell catches the sun.
+    Vec3 H = RtNormalize<float>(Vec3{V.x + Ls.x, V.y + Ls.y, V.z + Ls.z});
+    const float NoH = fmaxf(0.0f, Nf.x * H.x + Nf.y * H.y + Nf.z * H.z);
+    const float alpha = fmaxf(1.0e-3f, mat.roughness * mat.roughness);
+    const float a2 = alpha * alpha;
+    const float dterm = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    const float spec = (a2 / (RtMathPi() * dterm * dterm)) * (0.04f + mat.metallic);
+
+    const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
+    Vec3 direct{light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
+                light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
+                light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
+
+    // AO + one-bounce GI: cosine-weighted hemisphere rays. A ray that escapes the
+    // AO radius (or misses) samples the sky dome; a near hit darkens the crease
+    // and (for GI) picks up the bounce albedo*shade of the hit surface.
+    Vec3 indirect{0.0f, 0.0f, 0.0f};
+    const uint32_t M = sky.ao_samples < 1u ? 1u : sky.ao_samples;
+    for (uint32_t m = 0; m < M; ++m) {
+        const Vec3 d = CosineHemisphere(Nf, rng->NextF(), rng->NextF());
+        const Vec3 ro{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+        float bt; uint32_t bp;
+        ClosestHit<float>(tlas_nodes, tlas_leaf_count, instances, ro, d, eps, &bt, &bp,
+                          sky.ao_radius);
+        if (bp == kNoPrim || bt >= sky.ao_radius) {
+            const Vec3 s = SkyColor(d, sky);
+            indirect.x += s.x * sky.sky_intensity;
+            indirect.y += s.y * sky.sky_intensity;
+            indirect.z += s.z * sky.sky_intensity;
+            continue;
+        }
+        if (sky.gi_bounces == 0u) continue;  // AO only: occluded -> no light
+        Vec3 bn; float bu, bv;
+        ReconstructHit<float>(instances, bp, ro, d, &bn, &bu, &bv);
+        const float bnv = bn.x * (-d.x) + bn.y * (-d.y) + bn.z * (-d.z);
+        Vec3 bnf = (bnv < 0.0f) ? Vec3{-bn.x, -bn.y, -bn.z} : bn;
+        uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
+        const Material bmat = materials[instances[bi].material_id];
+        const Vec3 bhit{ro.x + bt * d.x, ro.y + bt * d.y, ro.z + bt * d.z};
+        const Vec3 bso{bhit.x + bnf.x * eps, bhit.y + bnf.y * eps, bhit.z + bnf.z * eps};
+        const bool bshadow =
+            AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, bso, Ls, eps,
+                               RtMissDepth());
+        const float bNoL = fmaxf(0.0f, bnf.x * Ls.x + bnf.y * Ls.y + bnf.z * Ls.z);
+        const float bvis = bshadow ? 0.0f : 1.0f;
+        const float bfac = bNoL * bvis * (1.0f / RtMathPi());
+        indirect.x += bmat.albedo.x * light_col.x * bfac;
+        indirect.y += bmat.albedo.y * light_col.y * bfac;
+        indirect.z += bmat.albedo.z * light_col.z * bfac;
+    }
+    const float inv_m = 1.0f / static_cast<float>(M);
+    indirect.x *= inv_m; indirect.y *= inv_m; indirect.z *= inv_m;
+
+    // Indirect modulates the surface albedo (Lambert response to ambient/bounce).
+    return Vec3{direct.x + mat.albedo.x * indirect.x,
+                direct.y + mat.albedo.y * indirect.y,
+                direct.z + mat.albedo.z * indirect.z};
+}
+
+// Filmic ACES-ish tonemap of one linear channel (Narkowicz 2015 fit), clamped to
+// [0,1]. Applied per-channel to the averaged fidelity color when tonemap is on.
+NUKA_RT_HD inline float TonemapAces(float x) {
+    x = x < 0.0f ? 0.0f : x;
+    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+    const float y = (x * (a * x + b)) / (x * (c * x + d) + e);
+    return y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+}
+
 // Launch the FP32 beauty kernel (defined in two_level_render_beauty.cu, built
 // --fmad=true). The host build path (BuildFrameTlas + buffers) stays in
 // two_level_render.cu and hands this the resolved device pointers + stream.
