@@ -233,7 +233,7 @@ int main() {
         phi::ScatterFkSource fk;
         fk.base_pose = d_base;
 
-        rt::RenderSensorsBatched(scene, fk, d_cams, n, kRes, kRes);  // warm-up (build)
+        rt::RenderSensorsBatched(scene, fk, d_cams, n, 1u, kRes, kRes);  // warm-up (build)
         cudaDeviceSynchronize();
 
         double batched_ms = 0.0;
@@ -243,7 +243,7 @@ int main() {
                 base[e] = EnvBasePose(e, n, 0.01f * static_cast<float>(it + 1u));
             cudaMemcpy(d_base, base.data(), n * sizeof(math::Transform), cudaMemcpyHostToDevice);
             const double t0 = NowSeconds();
-            rt::RenderSensorsBatched(scene, fk, d_cams, n, kRes, kRes);
+            rt::RenderSensorsBatched(scene, fk, d_cams, n, 1u, kRes, kRes);
             cudaDeviceSynchronize();
             batched_ms += (NowSeconds() - t0) * 1.0e3;
         }

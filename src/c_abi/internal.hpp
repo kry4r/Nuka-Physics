@@ -21,7 +21,8 @@
 #include <vector>
 
 namespace nuka::scene {
-class SceneIR;  // scene/scene_ir.hpp -- fwd-declared (held by unique_ptr below).
+class SceneIR;     // scene/scene_ir.hpp -- fwd-declared (held by unique_ptr below).
+struct SensorDesc; // scene/scene_ir.hpp -- accumulated mount list (vector member).
 }  // namespace nuka::scene
 
 namespace nuka::nk {
@@ -78,15 +79,17 @@ struct DeviceRecord {
 };
 
 // The world's batched camera sensor: the backend + the backend-owned scene handle
-// + the image size. The out-of-line dtor frees the handle through the backend.
+// + the image size + the accumulated mount list (each attach appends one camera, so
+// S cameras per env). The out-of-line dtor frees the handle through the backend.
 struct SensorAttachment {
     std::unique_ptr<nuka::render::SensorBackendI> backend;
     nuka::render::SensorSceneHandle* handle = nullptr;
+    std::vector<nuka::scene::SensorDesc> sensors;  // appended per attach (E*S cameras).
     uint32_t width = 0u;
     uint32_t height = 0u;
     bool rendered = false;  // a device AOV tensor exists only after the first render.
+    SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
     ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
-    SensorAttachment() = default;
     SensorAttachment(SensorAttachment&&) = delete;
     SensorAttachment& operator=(SensorAttachment&&) = delete;
     SensorAttachment(const SensorAttachment&) = delete;

@@ -1,14 +1,15 @@
 // ---------------------------------------------------------------------------
 // nuka::rt -- the BATCHED device-resident sensor render. ONE batched LBVH build
 // over N per-env instance world-AABBs (collision/lbvh_batched.cuh) + ONE flat
-// trace launch over [E*H*W] rays into a single (N,H,W,ch) device AOV tensor.
+// trace launch over [E*S*H*W] rays into a single (E,S,H,W,ch) device AOV tensor
+// (S cameras per env, each on its own mount; S==1 collapses to (E,H,W,ch)).
 //
 // THE KERNEL is RenderFrameKernel (two_level_render.cu) generalized to a flat
-// global ray index: env = gid/(H*W), pixel = gid%(H*W); it rebases the TLAS node
-// slice (env*(2M-1)) + the DevInstance slice (env*M) per env and reuses the SAME
-// ClosestHit / ReconstructHit / ShadeDirect nest, instantiated Real=float (the
-// FP32 sensor cost). The single-camera FP64 golden path is untouched -- this is
-// an additive cheap-shade profile, NOT a branch in it.
+// global ray index over cameras: cam = gid/(H*W), env = cam/S; it rebases the
+// TLAS node slice (env*(2M-1)) + the DevInstance slice (env*M) per env (the scene
+// is env-shared) and reuses the SAME ClosestHit / ReconstructHit / ShadeDirect
+// nest, instantiated Real=float (the FP32 sensor cost). The single-camera FP64
+// golden path is untouched -- this is an additive cheap-shade profile, NOT a branch.
 //
 // The TLAS leaf `.left` is the env-LOCAL instance index (the batched build's leaf
 // payload), so `instances + env*M` resolves it directly; the prim_id pack uses an
@@ -72,10 +73,11 @@ __global__ void RebaseInstanceIdsKernel(DevInstance* __restrict__ instances,
     instances[i].instance_id = i % instances_per_env;
 }
 
-// One thread per GLOBAL ray over [E*H*W]: flat gid -> (env, px, py); trace the
-// env's TLAS slice with the FP32 nest and write the (env,H,W,ch) AOV slice. The
-// body is RenderFrameKernel with Real=float + per-env pointer rebasing; one writer
-// per pixel, no atomics -> FP32-deterministic byte-exact per env tile.
+// One thread per GLOBAL ray over [num_cameras*H*W]: flat gid -> (camera, px, py).
+// Cameras are env-major (cameras[env*S+s]); the env owning a camera is cam/S, and
+// the TLAS node + instance + material slices index by env (the scene is env-shared
+// -- only cameras fan out). One writer per pixel, no atomics -> FP32-deterministic
+// byte-exact per tile. S==1 collapses cam==env, byte-identical to one cam per env.
 __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ cameras,
                                          const LbvhNode* __restrict__ tlas_nodes,
                                          uint32_t leaves_per_env,
@@ -83,7 +85,8 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          const Material* __restrict__ materials,
                                          Light light,
                                          AmbientTerm ambient,
-                                         uint32_t env_count,
+                                         uint32_t num_cameras,
+                                         uint32_t sensors_per_env,
                                          uint32_t width,
                                          uint32_t height,
                                          float* __restrict__ out_color,
@@ -92,16 +95,17 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          float* __restrict__ out_albedo,
                                          uint32_t* __restrict__ out_prim) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t pix_per_env = width * height;
-    const uint64_t total = static_cast<uint64_t>(env_count) * pix_per_env;
+    const uint32_t pix_per_cam = width * height;
+    const uint64_t total = static_cast<uint64_t>(num_cameras) * pix_per_cam;
     if (static_cast<uint64_t>(gid) >= total) return;
 
-    const uint32_t env = gid / pix_per_env;
-    const uint32_t p = gid % pix_per_env;
+    const uint32_t cam = gid / pix_per_cam;
+    const uint32_t env = cam / sensors_per_env;
+    const uint32_t p = gid % pix_per_cam;
     const uint32_t px = p % width;
     const uint32_t py = p / width;
 
-    const PinholeCamera camera = cameras[env];
+    const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
 
     // Env-offset TLAS node slice + env-offset instance slice (TLAS leaf .left is
@@ -214,13 +218,13 @@ struct BatchedSensorSceneDevice::Impl {
     bool topology_built = false;
     uint32_t frames_since_rebuild = 0u;
 
-    // (N,H,W,ch) AOV tensor (color3 + depth1 + normal3 + albedo3 + prim1).
+    // (E,S,H,W,ch) AOV tensor (color3 + depth1 + normal3 + albedo3 + prim1).
     OwnedBuffer d_color, d_depth, d_normal, d_albedo, d_prim;
     std::size_t col_b = 0u, dep_b = 0u, nrm_b = 0u, alb_b = 0u, prim_b = 0u;
     uint64_t aov_rays = 0u;
 
-    // Env-invariant mount table (uploaded once) + the per-env camera buffer the
-    // scatter writes (sized lazily). RenderSensorsMounted scatters then renders.
+    // Env-invariant mount table (uploaded once) + the E*S env-major camera buffer
+    // the scatter writes (sized lazily). RenderSensorsMounted scatters then renders.
     OwnedBuffer d_mounts, d_cameras;
     uint32_t sensors_per_env = 0u;
     std::size_t cam_b = 0u;
@@ -301,11 +305,13 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
                           const phi::ScatterFkSource& fk,
                           const PinholeCamera* cameras_device,
                           uint32_t env_count,
+                          uint32_t sensors_per_env,
                           uint32_t width,
                           uint32_t height,
                           phi::Backend* backend) {
     BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
     const uint32_t m = impl->instances_per_env;
+    const uint32_t s = sensors_per_env == 0u ? 1u : sensors_per_env;
     if (env_count == 0u || width == 0u || height == 0u || m == 0u) {
         return;
     }
@@ -319,9 +325,11 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
     phi::BufferType* bt = ctx.device_bt;
 
+    // Scene is env-shared (E trees of M instances); cameras fan out E*S env-major.
     const uint64_t total_inst = static_cast<uint64_t>(env_count) * m;
     const uint64_t node_count = static_cast<uint64_t>(env_count) * (2u * m - 1u);
-    const uint64_t rays = static_cast<uint64_t>(env_count) * width * height;
+    const uint64_t num_cameras = static_cast<uint64_t>(env_count) * s;
+    const uint64_t rays = num_cameras * width * height;
 
     EnsureBytes(impl->d_instances, impl->inst_b, bt, total_inst * sizeof(DevInstance));
     EnsureBytes(impl->d_world_aabbs, impl->aabb_b, bt, total_inst * sizeof(AABB));
@@ -377,12 +385,13 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
         ++impl->frames_since_rebuild;
     }
 
-    // 3) ONE flat trace over [E*H*W] into the persistent (N,H,W,ch) AOV tensor.
+    // 3) ONE flat trace over [E*S*H*W] into the persistent (E,S,H,W,ch) AOV tensor.
     const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
     phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
                     ctx.stream, cameras_device, d_nodes, m, d_instances,
                     static_cast<const Material*>(impl->d_materials.Data()),
-                    impl->light, impl->ambient, env_count, width, height,
+                    impl->light, impl->ambient, static_cast<uint32_t>(num_cameras), s,
+                    width, height,
                     static_cast<float*>(impl->d_color.Data()),
                     static_cast<float*>(impl->d_depth.Data()),
                     static_cast<float*>(impl->d_normal.Data()),
@@ -421,27 +430,24 @@ void RenderSensorsMounted(BatchedSensorSceneDevice& device,
     if (env_count == 0u || width == 0u || height == 0u) {
         return;
     }
-    // The batched flat trace maps one camera to one env TLAS (camera == env), so
-    // the single-launch path renders exactly one sensor per env. Loud, not silent.
-    if (impl->sensors_per_env != 1u) {
-        throw std::runtime_error(
-            "RenderSensorsMounted: the batched single-launch path renders one "
-            "sensor per env (camera index == env TLAS index)");
-    }
 
     const RtContext ctx = ResolveRtContext(backend);
     phi::ScopedDeviceGuard guard(ctx.device_id);
     (void)cudaSetDevice(ctx.device_id);
 
-    // Scatter cam_world = fk * local_offset per env into the persistent camera
-    // buffer, then drive the SAME batched build/refit + flat trace.
+    // Scatter cam_world = fk * local_offset per (env x sensor) into the persistent
+    // E*S env-major camera buffer, then drive the SAME batched build/refit + flat
+    // trace. With sensors_per_env==1 the camera index collapses to the env index.
+    const uint64_t num_cameras =
+        static_cast<uint64_t>(env_count) * impl->sensors_per_env;
     EnsureBytes(impl->d_cameras, impl->cam_b, ctx.device_bt,
-                static_cast<std::size_t>(env_count) * sizeof(PinholeCamera));
+                static_cast<std::size_t>(num_cameras) * sizeof(PinholeCamera));
     auto* d_cams = static_cast<PinholeCamera*>(impl->d_cameras.Data());
     ScatterEnvCameras(ctx.stream, fk,
                       static_cast<const SensorMountRow*>(impl->d_mounts.Data()),
                       env_count, impl->sensors_per_env, d_cams);
-    RenderSensorsBatched(device, fk, d_cams, env_count, width, height, backend);
+    RenderSensorsBatched(device, fk, d_cams, env_count, impl->sensors_per_env, width,
+                         height, backend);
 }
 
 const float* SensorColorDevice(const BatchedSensorSceneDevice& device) {
@@ -463,6 +469,10 @@ const float* SensorAlbedoDevice(const BatchedSensorSceneDevice& device) {
 const uint32_t* SensorPrimDevice(const BatchedSensorSceneDevice& device) {
     return static_cast<const uint32_t*>(
         const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_prim.Data());
+}
+
+uint32_t SensorsPerEnv(const BatchedSensorSceneDevice& device) {
+    return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->sensors_per_env;
 }
 
 }  // namespace nuka::rt

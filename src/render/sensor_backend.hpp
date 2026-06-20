@@ -64,13 +64,16 @@ struct SensorSceneDesc {
     std::vector<scene::SensorDesc>        sensors;  // mount/intrinsics per sensor
 };
 
-// The device AOV tensor's logical shape after a render: a (sensors, height, width,
-// channels) view. `channels` is 3 for the color/normal/albedo planes and 1 for the
-// depth/prim planes (the accessors below return the matching base pointer).
+// The device AOV tensor's logical shape after a render: an (env_count,
+// sensors_per_env, height, width, channels) view (S cameras per env, env-major).
+// `channels` is 3 for color/normal/albedo and 1 for depth/prim (the accessors
+// below return the matching base pointer). The pixel/tile count is
+// env_count*sensors_per_env*height*width.
 struct SensorAovShape {
-    uint32_t sensors  = 0u;
-    uint32_t height   = 0u;
-    uint32_t width    = 0u;
+    uint32_t env_count        = 0u;
+    uint32_t sensors_per_env  = 0u;
+    uint32_t height           = 0u;
+    uint32_t width            = 0u;
 };
 
 // The backend-agnostic batched sensor interface. One instance per render context;
@@ -96,15 +99,15 @@ public:
                                uint32_t height) = 0;
 
     // Device pointers into the persistent AOV tensor after RenderSensors:
-    // color/normal/albedo [N*H*W*3], depth/prim [N*H*W]. Null until the first render.
+    // color/normal/albedo [E*S*H*W*3], depth/prim [E*S*H*W]. Null until first render.
     virtual const float*    SensorColorDevice(const SensorSceneHandle* handle) const = 0;
     virtual const float*    SensorDepthDevice(const SensorSceneHandle* handle) const = 0;
     virtual const float*    SensorNormalDevice(const SensorSceneHandle* handle) const = 0;
     virtual const float*    SensorAlbedoDevice(const SensorSceneHandle* handle) const = 0;
     virtual const uint32_t* SensorPrimDevice(const SensorSceneHandle* handle) const = 0;
 
-    // The (sensors, height, width) shape of the tensor the accessors point into,
-    // as of the last RenderSensors (all-zero before the first render).
+    // The (env_count, sensors_per_env, height, width) shape of the tensor the
+    // accessors point into, as of the last RenderSensors (all-zero before the first).
     virtual SensorAovShape AovShape(const SensorSceneHandle* handle) const = 0;
 
     // Release a sensor scene handle built by this backend.

@@ -53,12 +53,13 @@ from typing import Sequence, Tuple
 
 @_dataclasses.dataclass
 class CameraCfg:
-    """One env's camera, authoring a World.attach_camera_sensor call.
+    """One camera authoring a World.attach_camera_sensor call.
 
-    ONE camera per env (the batched single-launch contract). mount/mount_index
-    name the FK pose the camera follows; pos + quat (w,x,y,z) is its offset in
-    that frame (camera-local axes: -Z forward, +Y up). width/height size every
-    env image; vfov_deg is the vertical field of view.
+    mount/mount_index name the FK pose the camera follows; pos + quat (w,x,y,z) is
+    its offset in that frame (camera-local axes: -Z forward, +Y up). width/height
+    size every env image; vfov_deg is the vertical field of view. Calling .attach
+    for several CameraCfgs at the SAME width/height gives S cameras per env (each on
+    its own mount) -- the sensor view is then (E,S,H,W,ch).
     """
 
     width: int
@@ -70,7 +71,7 @@ class CameraCfg:
     quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
     def attach(self, world: "World") -> None:
-        """Attach this camera to `world` (one camera per env)."""
+        """Attach this camera to `world` (appends a per-env camera)."""
         local_offset: Sequence[float] = (
             self.pos[0], self.pos[1], self.pos[2],
             self.quat[0], self.quat[1], self.quat[2], self.quat[3],
