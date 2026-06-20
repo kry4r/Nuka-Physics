@@ -65,7 +65,7 @@ struct SensorMountRow {
     float cy = 0.0f;
     float k1 = 0.0f;
     float k2 = 0.0f;
-    uint8_t distortion = 0u;
+    uint32_t distortion = 0u;  // 4-byte so the row is padding-free (byte-exact memcmp)
     float near_clip = 0.01f;
     float far_clip = 1000.0f;
 };
