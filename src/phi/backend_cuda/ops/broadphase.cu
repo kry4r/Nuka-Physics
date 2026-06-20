@@ -35,8 +35,8 @@
 #include <thrust/sort.h>
 #include <thrust/tuple.h>
 
-#include "collision/lbvh_node.cuh"      // LbvhNode / LbvhDelta / LbvhMerge
-#include "collision/morton_codes.cuh"   // Morton3D30
+#include "collision/lbvh_batched.cuh"   // BuildLbvhBatchedNodes (shared env-build)
+#include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
 #include "collision/particle_grid_traversal.cuh"  // ParticleGridConfigDevice / QueryParticleNeighbors
 #include "math/transform.hpp"
@@ -202,161 +202,8 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
     out_hi[gid] = {c.x + he.x + m, c.y + he.y + m, c.z + he.z + m};
 }
 
-// --- LBVH per-env build (Karras) --------------------------------------------
-// Each env owns a contiguous [env*N, env*N+N) body slice + a 2N-1 node slice in
-// the lbvh_nodes arena field + an N-entry morton/index/visit slice. The build
-// is the standalone BuildLbvhImpl pipeline run per env (the scene-bound, morton,
-// stable_sort, init/build/propagate kernels), but the bound + sort happen per
-// env so envs never share a tree (env-major). The stable_sort runs ONCE on the
-// WHOLE array with the (env<<32)|morton30 compound key so a single thrust call
-// orders all envs without cross-env mixing — the env id is the high 32 bits and
-// the 30-bit morton the low, so within an env the sort is purely by morton.
-
-// AABB center morton (per env, into the env-local [0,1] normalized box). We do a
-// simple per-env reduction in a single block per env (bodies_per_env is small —
-// the union/grasp scene has O(few) movable bodies; a generalized rigid scene is
-// 10s-100s, still one block).
-__global__ void EnvMortonKernel(const math::Vec3* __restrict__ lo,
-                                const math::Vec3* __restrict__ hi,
-                                uint32_t bodies_per_env,
-                                uint32_t* __restrict__ out_morton,
-                                uint32_t* __restrict__ out_index,
-                                uint64_t* __restrict__ out_sortkey) {
-    const uint32_t env = blockIdx.x;
-    const uint32_t base = env * bodies_per_env;
-    // Single thread per env folds the env's center bound serially (D1 fixed
-    // order — bodies_per_env is small) then writes each leaf's Morton code +
-    // env-LOCAL index. The bound is private to the env, so envs never mix.
-    if (threadIdx.x != 0u) return;
-    float mn[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
-    float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-    for (uint32_t i = 0; i < bodies_per_env; ++i) {
-        const math::Vec3 a = lo[base + i];
-        const math::Vec3 b = hi[base + i];
-        const float c[3] = {0.5f * (a.x + b.x), 0.5f * (a.y + b.y),
-                            0.5f * (a.z + b.z)};
-        for (int k = 0; k < 3; ++k) {
-            mn[k] = fminf(mn[k], c[k]);
-            mx[k] = fmaxf(mx[k], c[k]);
-        }
-    }
-    const float inv[3] = {
-        (mx[0] > mn[0]) ? 1.0f / (mx[0] - mn[0]) : 0.0f,
-        (mx[1] > mn[1]) ? 1.0f / (mx[1] - mn[1]) : 0.0f,
-        (mx[2] > mn[2]) ? 1.0f / (mx[2] - mn[2]) : 0.0f};
-    for (uint32_t i = 0; i < bodies_per_env; ++i) {
-        const math::Vec3 a = lo[base + i];
-        const math::Vec3 b = hi[base + i];
-        const float nx = (0.5f * (a.x + b.x) - mn[0]) * inv[0];
-        const float ny = (0.5f * (a.y + b.y) - mn[1]) * inv[1];
-        const float nz = (0.5f * (a.z + b.z) - mn[2]) * inv[2];
-        const uint32_t code = cg::Morton3D30(nx, ny, nz);
-        out_morton[base + i] = code;
-        out_index[base + i] = i;  // env-LOCAL leaf index (0..N-1)
-        // Compound key: env in the high 32 bits, 30-bit morton in the low. One
-        // stable sort on this orders every env in a single call (D1 anchor).
-        out_sortkey[base + i] =
-            (static_cast<uint64_t>(env) << 32) | static_cast<uint64_t>(code);
-    }
-}
-
-// Init nodes for one env's tree (node slice base = env*(2N-1)).
-__global__ void EnvInitNodesKernel(const math::Vec3* __restrict__ lo,
-                                   const math::Vec3* __restrict__ hi,
-                                   const uint32_t* __restrict__ sorted_index,
-                                   uint32_t bodies_per_env,
-                                   cg::LbvhNode* __restrict__ nodes) {
-    const uint32_t env = blockIdx.y;
-    const uint32_t N = bodies_per_env;
-    const uint32_t node_count = 2u * N - 1u;
-    const uint32_t internal = N - 1u;
-    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= node_count) return;
-    const uint32_t nbase = env * node_count;
-    const uint32_t bbase = env * N;
-    if (idx < internal) {
-        nodes[nbase + idx].parent = -1;
-        return;
-    }
-    const uint32_t lane = idx - internal;
-    const uint32_t local_body = sorted_index[bbase + lane];  // env-local id
-    cg::LbvhNode leaf;
-    leaf.left = static_cast<int32_t>(local_body);
-    leaf.right = -1;
-    leaf.parent = -1;
-    const math::Vec3 a = lo[bbase + local_body];
-    const math::Vec3 b = hi[bbase + local_body];
-    leaf.aabb.min = {a.x, a.y, a.z};
-    leaf.aabb.max = {b.x, b.y, b.z};
-    nodes[nbase + idx] = leaf;
-}
-
-__global__ void EnvBuildInternalKernel(const uint32_t* __restrict__ morton_sorted,
-                                       uint32_t bodies_per_env,
-                                       cg::LbvhNode* __restrict__ nodes) {
-    const uint32_t env = blockIdx.y;
-    const uint32_t N = bodies_per_env;
-    const uint32_t internal = N - 1u;
-    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= internal) return;
-    const uint32_t nbase = env * (2u * N - 1u);
-    const uint32_t mbase = env * N;
-    const uint32_t* morton = morton_sorted + mbase;
-    const int i = static_cast<int>(idx);
-
-    const int d_l = cg::LbvhDelta(i, i - 1, N, morton);
-    const int d_r = cg::LbvhDelta(i, i + 1, N, morton);
-    const int d = (d_r >= d_l) ? 1 : -1;
-    const int delta_min = cg::LbvhDelta(i, i - d, N, morton);
-    int l_max = 2;
-    while (cg::LbvhDelta(i, i + l_max * d, N, morton) > delta_min) l_max *= 2;
-    int l = 0;
-    for (int t = l_max >> 1; t >= 1; t >>= 1) {
-        if (cg::LbvhDelta(i, i + (l + t) * d, N, morton) > delta_min) l += t;
-    }
-    const int j = i + l * d;
-    const int delta_node = cg::LbvhDelta(i, j, N, morton);
-    int s = 0;
-    int t_div = l;
-    do {
-        t_div = (t_div + 1) >> 1;
-        if (cg::LbvhDelta(i, i + (s + t_div) * d, N, morton) > delta_node) s += t_div;
-    } while (t_div > 1);
-    const int gamma = i + s * d + min(d, 0);
-    const int first = min(i, j);
-    const int last = max(i, j);
-    const int32_t left_child = (first == gamma)
-        ? static_cast<int32_t>(internal + gamma) : static_cast<int32_t>(gamma);
-    const int32_t right_child = (last == gamma + 1)
-        ? static_cast<int32_t>(internal + gamma + 1) : static_cast<int32_t>(gamma + 1);
-    nodes[nbase + i].left = left_child;
-    nodes[nbase + i].right = right_child;
-    nodes[nbase + left_child].parent = i;
-    nodes[nbase + right_child].parent = i;
-}
-
-__global__ void EnvPropagateKernel(uint32_t bodies_per_env,
-                                   cg::LbvhNode* __restrict__ nodes,
-                                   uint32_t* __restrict__ visit) {
-    const uint32_t env = blockIdx.y;
-    const uint32_t N = bodies_per_env;
-    const uint32_t internal = N - 1u;
-    const uint32_t lane = blockIdx.x * blockDim.x + threadIdx.x;
-    if (lane >= N) return;
-    const uint32_t nbase = env * (2u * N - 1u);
-    const uint32_t vbase = env * N;  // visit sized per:body (>= internal).
-    int32_t node = nodes[nbase + internal + lane].parent;
-    while (node >= 0) {
-        __threadfence();
-        const uint32_t prev = atomicAdd(&visit[vbase + node], 1u);
-        if (prev == 0u) return;
-        const cg::LbvhNode self = nodes[nbase + node];
-        nodes[nbase + node].aabb =
-            cg::LbvhMerge(nodes[nbase + self.left].aabb,
-                          nodes[nbase + self.right].aabb);
-        node = nodes[nbase + node].parent;
-    }
-}
+// The per-env Karras build lives in collision/lbvh_batched.cuh
+// (BuildLbvhBatchedNodes), shared by OpLbvhBuild below + the render TLAS.
 
 // --- LbvhQueryPairs (tagged) ------------------------------------------------
 __device__ __forceinline__ bool Overlaps(const collision::AABB& a,
@@ -624,43 +471,11 @@ Status OpLbvhBuild(const ModelView& /*model*/, const DataView& data,
     if (E == 0u || N < 2u) return Status::Ok;  // a <2-body env has no pairs.
 
     auto* nodes = reinterpret_cast<cg::LbvhNode*>(data.lbvh_nodes);
-    auto* morton = data.lbvh_morton;
-    auto* index = data.lbvh_index;
-    auto* visit = data.lbvh_visit;
-
-    // Zero the visit counters (per:body slice).
-    {
-        const uint32_t n = E * N;
-        const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream, visit, n);
-    }
-    // Per-env Morton code + env-local leaf index + the (env<<32)|morton compound
-    // key (one thread per env folds the env's own center bound — envs never mix).
-    auto* sortkey = data.lbvh_sortkey;
-    LaunchCuda(EnvMortonKernel, dim3(E), dim3(kBlockSize), 0u, stream,
-               data.body_aabb_lo, data.body_aabb_hi, N, morton, index, sortkey);
-    // ONE stable_sort_by_key over the WHOLE [E*N] compound-key array (morton +
-    // index follow). The high env bits keep envs disjoint and contiguous, the low
-    // morton bits order within an env, and stability breaks morton ties by the
-    // ascending env-local index — bit-identical to E independent stable sorts.
-    {
-        const size_t total = static_cast<size_t>(E) * N;
-        auto vals = thrust::make_zip_iterator(thrust::make_tuple(index, morton));
-        thrust::stable_sort_by_key(thrust::cuda::par.on(stream),
-                                   sortkey, sortkey + total, vals);
-    }
-    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-
-    const uint32_t node_count = 2u * N - 1u;
-    const uint32_t node_blocks = (node_count + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(EnvInitNodesKernel, dim3(node_blocks, E), dim3(kBlockSize), 0u, stream,
-               data.body_aabb_lo, data.body_aabb_hi, index, N, nodes);
-    const uint32_t internal_blocks = ((N - 1u) + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(EnvBuildInternalKernel, dim3(internal_blocks, E), dim3(kBlockSize),
-               0u, stream, morton, N, nodes);
-    const uint32_t leaf_blocks = (N + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(EnvPropagateKernel, dim3(leaf_blocks, E), dim3(kBlockSize), 0u, stream,
-               N, nodes, visit);
+    // Shared batched env-build over the arena's split lo/hi AABBs. Leaf `.left`
+    // is the env-LOCAL body index (the query maps it via the env's node slice).
+    cg::BuildLbvhBatchedNodes(stream, /*device_id=*/0, data.body_aabb_lo,
+                              data.body_aabb_hi, E, N, nodes, data.lbvh_morton,
+                              data.lbvh_index, data.lbvh_sortkey, data.lbvh_visit);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

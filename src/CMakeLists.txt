@@ -964,6 +964,11 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka_collision_gpu STATIC
         collision/broadphase_lbvh.cu
         collision/lbvh_refit.cu
+        # The shared BATCHED, single-launch per-env LBVH build/refit primitive
+        # (collision/lbvh_batched.cuh). ONE copy of the env-build kernels called
+        # by both the pair-driven broadphase op (phi backend) and the render
+        # TLAS. Same library + default --fmad as the single-tree build above.
+        collision/lbvh_batched.cu
         # v0.7 p05: particle uniform grid (spatial hash) + cross-system query
         # (particle AABB -> rigid LBVH). D1-deterministic broadphase primitives
         # feeding the soft/fluid/coupling phases. Same lib as the LBVH (which

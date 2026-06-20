@@ -1143,6 +1143,28 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_lbvh_vs_sap_test
         PROPERTIES LABELS "fast_full")
 
+    # --- shared batched LBVH build primitive: env-batching == independent builds.
+    # One BuildLbvhBatchedNodes over E envs == E single-env builds, byte-exact per
+    # env (the u64 cross-env stable_sort isolates envs bit-exactly); same for the
+    # batched refit + the split lo/hi overload. Drives lbvh_batched.cuh directly,
+    # so it is a .cu; links nuka_collision_gpu (the primitive's compiled home).
+    add_executable(nuka_lbvh_batched_test
+        collision/test_lbvh_batched.cu
+    )
+    target_include_directories(nuka_lbvh_batched_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_lbvh_batched_test
+        PRIVATE
+            nuka_collision_gpu
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_lbvh_batched_test
+        PROPERTIES LABELS "fast_full")
+
     # --- v0.7 p05: particle uniform grid + cross-system broadphase ---------
     # Correctness vs CPU brute-force + D1 two-run byte-exact for both the
     # particle neighbor grid and the particle->rigid cross-system query (which
