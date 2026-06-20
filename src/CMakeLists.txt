@@ -1063,6 +1063,9 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/rt/bvh_ray_traversal.cu
         phi/backend_cuda/rt/scene_render.cu
         phi/backend_cuda/rt/two_level_render.cu
+        # Device instance-transform + world-AABB scatter for the batched sensor
+        # path; shares this lib's --fmad=false so the fk*cvl compose is byte-exact.
+        phi/backend_cuda/rt/sensor_scatter.cu
         # M11 RT-1/RT-3 (§3.10): the CONCRETE CUDA impl of render::RtBackendI.
         # Host C++ (no kernel launch) that WRAPS BuildTwoLevelScene/RenderFrame;
         # homed in the CUDA backend layer. Linking nuka_phi2_rt provides the

@@ -253,37 +253,9 @@ struct BlasDevice {
     DevBlas view;
 };
 
-// World-space AABB of one placed instance -- the ONE box arithmetic both the TLAS
-// build and refit feed leaf bounds from (so refit leaf AABBs are bit-identical).
-collision::AABB InstanceWorldAabb(const BlasDevice& mesh, const Transform& xf) {
-    if (mesh.leaf_count == 0u) {
-        collision::AABB b;
-        b.min = xf.position;
-        b.max = xf.position;
-        return b;
-    }
-    const Vec3 half{0.5f * (mesh.local_bound.max.x - mesh.local_bound.min.x),
-                    0.5f * (mesh.local_bound.max.y - mesh.local_bound.min.y),
-                    0.5f * (mesh.local_bound.max.z - mesh.local_bound.min.z)};
-    const Vec3 center{0.5f * (mesh.local_bound.min.x + mesh.local_bound.max.x),
-                      0.5f * (mesh.local_bound.min.y + mesh.local_bound.max.y),
-                      0.5f * (mesh.local_bound.min.z + mesh.local_bound.max.z)};
-    Transform centered = xf;
-    centered.position = xf.TransformPoint(center);
-    return collision::AABB::FromBox(centered, half);
-}
-
-// Device-side instance record from a host Instance (transform + BLAS view + ids).
-DevInstance MakeDevInstance(const BlasDevice& mesh, const Instance& I, uint32_t i) {
-    DevInstance di;
-    di.transform = I.transform;
-    di.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
-    di.blas_leaf_count = mesh.leaf_count;
-    di.blas = mesh.view;
-    di.instance_id = i;
-    di.material_id = I.material_id;
-    return di;
-}
+// InstanceWorldAabb / MakeDevInstance are SHARED (two_level_render_kernels.cuh,
+// __host__ __device__) so the single-camera path here and the batched sensor
+// scatter build leaf boxes + DevInstances through ONE copy of the arithmetic.
 
 // Full TLAS rebuild cadence (refit handles the frames between). Bounds traversal-
 // quality drift only; correctness is identical to a rebuild either way.
@@ -494,8 +466,10 @@ FrameTlasView EnsureFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelSce
             throw std::runtime_error("RenderFrame: instance.blas_id out of range");
         }
         const BlasDevice& mesh = impl->meshes[I.blas_id];
-        dev_instances[i] = MakeDevInstance(mesh, I, i);
-        tlas_aabbs[i] = InstanceWorldAabb(mesh, I.transform);
+        const LbvhNode* nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
+        dev_instances[i] = MakeDevInstance(I.transform, nodes, mesh.leaf_count,
+                                           mesh.view, i, I.material_id);
+        tlas_aabbs[i] = InstanceWorldAabb(mesh.leaf_count, mesh.local_bound, I.transform);
     }
 
     EnsureUpload(rt.d_instances, rt.inst_bytes, bt, dev_instances);

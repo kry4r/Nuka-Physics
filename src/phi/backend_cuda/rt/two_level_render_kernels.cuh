@@ -31,6 +31,12 @@
 
 #include <cstdint>
 
+#if defined(__CUDACC__)
+#define NUKA_RT_HD __host__ __device__
+#else
+#define NUKA_RT_HD
+#endif
+
 namespace nuka::rt {
 
 using ::nuka::collision::gpu::LbvhNode;
@@ -72,6 +78,58 @@ struct DevInstance {
     uint32_t instance_id = 0u;
     uint32_t material_id = 0u;
 };
+
+// World-space AABB of one placed instance, the ONE box arithmetic the TLAS build/
+// refit + the batched scatter share. HD, bit-for-bit vs host TransformPoint+FromBox.
+NUKA_RT_HD inline collision::AABB InstanceWorldAabb(uint32_t leaf_count,
+                                                   const collision::AABB& local_bound,
+                                                   const Transform& xf) {
+    if (leaf_count == 0u) {
+        collision::AABB b;
+        b.min = xf.position;
+        b.max = xf.position;
+        return b;
+    }
+    const Vec3 half{0.5f * (local_bound.max.x - local_bound.min.x),
+                    0.5f * (local_bound.max.y - local_bound.min.y),
+                    0.5f * (local_bound.max.z - local_bound.min.z)};
+    const Vec3 center{0.5f * (local_bound.min.x + local_bound.max.x),
+                      0.5f * (local_bound.min.y + local_bound.max.y),
+                      0.5f * (local_bound.min.z + local_bound.max.z)};
+    const Vec3 center_world = QuatRotate(xf.rotation, center) + xf.position;
+    collision::AABB out;
+    for (int i = 0; i < 8; ++i) {
+        const Vec3 corner{(i & 1) ? half.x : -half.x, (i & 2) ? half.y : -half.y,
+                          (i & 4) ? half.z : -half.z};
+        const Vec3 p = QuatRotate(xf.rotation, corner) + center_world;
+        // std::min/std::max semantics (Expand): min=(b<a)?b:a, max=(a<b)?b:a.
+        out.min.x = (p.x < out.min.x) ? p.x : out.min.x;
+        out.min.y = (p.y < out.min.y) ? p.y : out.min.y;
+        out.min.z = (p.z < out.min.z) ? p.z : out.min.z;
+        out.max.x = (out.max.x < p.x) ? p.x : out.max.x;
+        out.max.y = (out.max.y < p.y) ? p.y : out.max.y;
+        out.max.z = (out.max.z < p.z) ? p.z : out.max.z;
+    }
+    return out;
+}
+
+// DevInstance from a resolved transform + (shared) BLAS view + ids. The single-
+// camera path and the batched scatter both build through this ONE writer.
+NUKA_RT_HD inline DevInstance MakeDevInstance(const Transform& xf,
+                                             const LbvhNode* blas_nodes,
+                                             uint32_t blas_leaf_count,
+                                             const DevBlas& blas,
+                                             uint32_t instance_id,
+                                             uint32_t material_id) {
+    DevInstance di{};  // value-init zeroes padding -> deterministic byte layout
+    di.transform = xf;
+    di.blas_nodes = (blas_leaf_count > 0u) ? blas_nodes : nullptr;
+    di.blas_leaf_count = blas_leaf_count;
+    di.blas = blas;
+    di.instance_id = instance_id;
+    di.material_id = material_id;
+    return di;
+}
 
 // Device-side mirror of rt::BeautyOptions (trivially-copyable, passed by value
 // into the beauty kernel). Pure render parameters; no host-only types.
@@ -330,3 +388,5 @@ void LaunchBeautyKernel(const PinholeCamera& camera,
                         cudaStream_t stream);
 
 }  // namespace nuka::rt
+
+#undef NUKA_RT_HD
