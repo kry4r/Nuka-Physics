@@ -45,6 +45,7 @@
 #include "phi/backend_cuda/rt/prim_id.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
 #include "phi/backend_cuda/rt/render_timing.hpp"
+#include "phi/backend_cuda/rt/sensor_scatter.hpp"  // SensorBlasRef (batched-path accessor)
 #include "phi/backend_cuda/rt/shading.cuh"
 #include "phi/backend_cuda/rt/two_level_render_kernels.cuh"  // shared device structs + fns
 #include "rt/camera.hpp"
@@ -535,6 +536,24 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
     }
     cudaStreamSynchronize(ctx.stream);
     return device;
+}
+
+void CollectSensorBlasRefs(const TwoLevelSceneDevice& device,
+                           std::vector<SensorBlasRef>* out_refs) {
+    if (out_refs == nullptr) {
+        return;
+    }
+    const auto& meshes = device.GetImpl()->meshes;
+    out_refs->clear();
+    out_refs->reserve(meshes.size());
+    for (const BlasDevice& mesh : meshes) {
+        SensorBlasRef ref;
+        ref.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
+        ref.blas_leaf_count = mesh.leaf_count;
+        ref.blas = mesh.view;
+        ref.local_bound = mesh.local_bound;
+        out_refs->push_back(ref);
+    }
 }
 
 namespace {
