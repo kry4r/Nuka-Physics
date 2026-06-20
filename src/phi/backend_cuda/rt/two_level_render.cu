@@ -75,20 +75,6 @@ namespace {
 
 constexpr uint32_t kBlockDim = 16u;
 
-// Which AOV channels to D2H-copy back to the host Framebuffer. The kernel always
-// WRITES all 6 to device buffers (they stay device-resident for a future
-// denoiser); this only gates the download. Default = the channels host code reads
-// (color/prim for the mp4 + depth for the hit test); normal/albedo/uv stay on the
-// device. A mask, not a delete.
-struct BeautyDownloadMask {
-    bool color = true;
-    bool depth = true;
-    bool normal = false;
-    bool albedo = false;
-    bool uv = false;
-    bool prim = true;
-};
-
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -582,6 +568,17 @@ namespace {
 // AovTarget (raw per-channel device pointers; null skips a channel) is shared
 // with the beauty TU via two_level_render_kernels.cuh.
 
+// Scoped CUDA events for the opt-in timing probe; destroyed even if a launch
+// throws between create and the elapsed-time read.
+struct ScopedTimingEvents {
+    cudaEvent_t e0{}, e1{}, e2{};
+    ~ScopedTimingEvents() {
+        if (e0) cudaEventDestroy(e0);
+        if (e1) cudaEventDestroy(e1);
+        if (e2) cudaEventDestroy(e2);
+    }
+};
+
 // Refresh/refit the persistent TLAS and launch the closest-hit kernel into `dst`.
 // Only `dst` varies between the host-download and device-resident entries.
 void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
@@ -591,14 +588,14 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
                        const AovTarget& dst) {
     // Default path (probe off): no events, byte-identical to the golden tracer.
     const bool probe = g_render_timing_enabled;
-    cudaEvent_t e0 = nullptr, e1 = nullptr, e2 = nullptr;
+    ScopedTimingEvents ev;
     if (probe) {
-        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
-        cudaEventRecord(e0, ctx.stream);
+        cudaEventCreate(&ev.e0); cudaEventCreate(&ev.e1); cudaEventCreate(&ev.e2);
+        cudaEventRecord(ev.e0, ctx.stream);
     }
 
     const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
-    if (probe) cudaEventRecord(e1, ctx.stream);
+    if (probe) cudaEventRecord(ev.e1, ctx.stream);
 
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
@@ -611,15 +608,14 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
     CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
 
     if (probe) {
-        cudaEventRecord(e2, ctx.stream);
-        cudaEventSynchronize(e2);
+        cudaEventRecord(ev.e2, ctx.stream);
+        cudaEventSynchronize(ev.e2);
         float tlas_ms = 0.0f, kernel_ms = 0.0f;
-        cudaEventElapsedTime(&tlas_ms, e0, e1);
-        cudaEventElapsedTime(&kernel_ms, e1, e2);
+        cudaEventElapsedTime(&tlas_ms, ev.e0, ev.e1);
+        cudaEventElapsedTime(&kernel_ms, ev.e1, ev.e2);
         g_render_timing.tlas_ms += static_cast<double>(tlas_ms);
         g_render_timing.kernel_ms += static_cast<double>(kernel_ms);
         ++g_render_timing.calls;
-        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
     }
 }
 
@@ -755,7 +751,7 @@ Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
 
     // Persistent scratch AOVs reused across frames (sized lazily); the kernel
-    // writes all 6, the mask gates the D2H download (the rest stay device-resident).
+    // writes all 6, downloaded into the host Framebuffer (one D2H).
     RtRenderContext& rt = device.GetImpl()->rt;
     rt.EnsureAovs(ctx.device_bt, pixels);
     const AovTarget dst = rt.AovScratchTarget();
@@ -763,13 +759,12 @@ Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
     LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 
-    const BeautyDownloadMask mask;
-    if (mask.color) rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
-    if (mask.depth) rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
-    if (mask.normal) rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
-    if (mask.albedo) rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
-    if (mask.uv) rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
-    if (mask.prim) rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
 }
 

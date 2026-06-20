@@ -8,7 +8,7 @@
 // this bench uses a PER-ENV TLAS: each env is one TwoLevelSceneDevice (own
 // persistent render context + own ~36-instance sub-tree, well under the cap).
 //
-// IT REUSES the edb6878 path verbatim: BuildTwoLevelScene (BLAS once) +
+// IT REUSES the persistent-context render path verbatim: BuildTwoLevelScene (BLAS once) +
 // RenderFrameToAovs (the cheap flat trace = 1 primary + 1 shadow, no AO/GI/MSAA)
 // which build-or-refits the TLAS in the persistent buffers. Each env writes its
 // own device AOV buffers (the slices of one (N,H,W,ch) obs tensor) -- NO host
@@ -406,7 +406,7 @@ int main() {
                     100.0 * host_ovh / hi->wall_ms);
     }
     std::printf("Bottleneck = the TRACE (closest-hit ray work), NOT the N host launches: the\n"
-                "persistent context (edb6878) already drove per-call host overhead into the noise.\n"
+                "persistent context already drove per-call host overhead into the noise.\n"
                 "Each env is a separate small launch (64^2 -> 16 thread-blocks) that underfills the\n"
                 "GPU and runs serially on one stream, compounding the FP64 per-ray cost.\n");
     std::printf("Levers (ranked): (1) a BATCHED single-launch trace over all envs' rays (pair it\n"
