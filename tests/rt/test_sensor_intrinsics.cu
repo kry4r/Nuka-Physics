@@ -105,30 +105,32 @@ TEST(SensorIntrinsics, DefaultIsByteIdenticalToPinhole) {
 TEST(SensorIntrinsics, DistortionBendsOffAxisOnly) {
     const uint32_t W = 64u, H = 64u;
     PinholeCamera pin = DefaultCamera(W, H, 1.0f);
-    // Explicit intrinsics matching the default focal/principal point, then distort.
+    // Explicit intrinsics with the principal point at the CENTER of pixel (cpx,cpy)
+    // (cx=cpx+0.5) so that pixel's normalized coord is exactly (0,0) => r2==0.
+    const uint32_t cpx = W / 2u, cpy = H / 2u;
     PinholeCamera dis = pin;
-    dis.cx = 0.5f * static_cast<float>(W);
-    dis.cy = 0.5f * static_cast<float>(H);
+    dis.cx = static_cast<float>(cpx) + 0.5f;
+    dis.cy = static_cast<float>(cpy) + 0.5f;
     dis.fx = (0.5f * static_cast<float>(H)) / std::tan(0.5f * 1.0f);
     dis.fy = dis.fx;
     dis.distortion = 1u;
     dis.k1 = 0.25f;
     dis.k2 = 0.05f;
 
-    // Center pixel: on a square image with these intrinsics r2 is ~0, so d~1; the
-    // distorted center must equal the (matching-intrinsics) undistorted center.
+    // The pixel under the principal point has r2==0 => d==1; the distorted ray there
+    // must equal the (matching-intrinsics) undistorted ray bit-for-bit.
     PinholeCamera nod = dis;
     nod.distortion = 0u;
-    const uint32_t cpx = W / 2u, cpy = H / 2u;
     EXPECT_TRUE(DirBitEqual(dis.GenerateRay(cpx, cpy).dir, nod.GenerateRay(cpx, cpy).dir))
-        << "distortion changed the center ray (should be identity at r2~0)";
+        << "distortion changed the on-axis ray (should be identity at r2==0)";
 
-    // A corner pixel bends: the distorted corner ray differs from the pinhole one.
-    const rt::Ray corner_pin = pin.GenerateRay(0u, 0u);
+    // A corner pixel bends: with the SAME intrinsics, distortion-on differs from
+    // distortion-off (isolating the radial term, not the principal-point shift).
+    const rt::Ray corner_off = nod.GenerateRay(0u, 0u);
     const rt::Ray corner_dis = dis.GenerateRay(0u, 0u);
-    const float dx = corner_dis.dir.x - corner_pin.dir.x;
-    const float dy = corner_dis.dir.y - corner_pin.dir.y;
-    const float dz = corner_dis.dir.z - corner_pin.dir.z;
+    const float dx = corner_dis.dir.x - corner_off.dir.x;
+    const float dy = corner_dis.dir.y - corner_off.dir.y;
+    const float dz = corner_dis.dir.z - corner_off.dir.z;
     EXPECT_GT(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-4f)
         << "distortion did not bend the off-axis corner ray";
 }
@@ -192,17 +194,19 @@ rt::BlasMesh BuildBoxMesh(float half) {
     return m;
 }
 
-phi::InstanceScatterRow BaseRow() {
+phi::InstanceScatterRow BaseRow(float x, float y) {
     phi::InstanceScatterRow r;
     r.kind = 3u;  // Base
     r.row = 0u;
-    r.cached_visual_local[0] = 0.0f;
-    r.cached_visual_local[1] = 0.0f;
+    r.cached_visual_local[0] = x;
+    r.cached_visual_local[1] = y;
     r.cached_visual_local[2] = 0.0f;
     r.cached_visual_local[3] = 1.0f;
     return r;
 }
 
+// Two coplanar boxes at the origin region (the batched LBVH build needs >=2
+// instances/env); both sit at z=0 so the overhead camera sees them at one depth.
 rt::BatchedSensorSceneDesc MakeSceneDesc() {
     rt::BatchedSensorSceneDesc d;
     d.scene.meshes.push_back(BuildBoxMesh(kBoxHalf));
@@ -212,9 +216,12 @@ rt::BatchedSensorSceneDesc MakeSceneDesc() {
     d.scene.light.directional = true;
     d.scene.light.direction = {0.3f, 0.4f, -0.85f};
     d.scene.ambient.color = {0.05f, 0.05f, 0.05f};
-    d.rows.push_back(BaseRow());
-    d.blas_id.push_back(0u);
-    d.material_id.push_back(0u);
+    const float xy[2][2] = {{-0.5f, 0.0f}, {0.5f, 0.0f}};
+    for (auto& p : xy) {
+        d.rows.push_back(BaseRow(p[0], p[1]));
+        d.blas_id.push_back(0u);
+        d.material_id.push_back(0u);
+    }
     return d;
 }
 
@@ -246,36 +253,47 @@ TEST(SensorIntrinsics, FarClipTurnsFarHitsToMisses) {
     mount.width = kRes;
     mount.height = kRes;
 
-    auto render_depth = [&](const SensorMountRow& m) {
+    // Local check that yields an empty vector on a CUDA error (the lambda returns a
+    // vector, so the void-returning ASSERT macro cannot be used inside it).
+#define NK_CUDA_VEC(call)                                                    \
+    do {                                                                     \
+        const cudaError_t e_ = (call);                                       \
+        EXPECT_EQ(e_, cudaSuccess) << cudaGetErrorString(e_);                \
+        if (e_ != cudaSuccess) return std::vector<float>{};                  \
+    } while (0)
+    auto render_depth = [&](const SensorMountRow& m) -> std::vector<float> {
         SensorMountRow* d_m = nullptr;
-        NK_CUDA_OK(cudaMalloc(&d_m, sizeof(SensorMountRow)));
-        NK_CUDA_OK(cudaMemcpy(d_m, &m, sizeof(SensorMountRow), cudaMemcpyHostToDevice));
+        NK_CUDA_VEC(cudaMalloc(&d_m, sizeof(SensorMountRow)));
+        NK_CUDA_VEC(cudaMemcpy(d_m, &m, sizeof(SensorMountRow), cudaMemcpyHostToDevice));
         PinholeCamera* d_cam = nullptr;
-        NK_CUDA_OK(cudaMalloc(&d_cam, sizeof(PinholeCamera)));
+        NK_CUDA_VEC(cudaMalloc(&d_cam, sizeof(PinholeCamera)));
         rt::ScatterEnvCameras(nullptr, fk, d_m, 1u, 1u, d_cam);
-        NK_CUDA_OK(cudaDeviceSynchronize());
+        NK_CUDA_VEC(cudaDeviceSynchronize());
 
         rt::BatchedSensorSceneDevice scene = rt::BuildBatchedSensorScene(MakeSceneDesc());
         rt::RenderSensorsBatched(scene, fk, d_cam, 1u, 1u, kRes, kRes);
-        NK_CUDA_OK(cudaDeviceSynchronize());
+        NK_CUDA_VEC(cudaDeviceSynchronize());
 
         const size_t pix = static_cast<size_t>(kRes) * kRes;
         std::vector<float> depth(pix);
-        NK_CUDA_OK(cudaMemcpy(depth.data(), rt::SensorDepthDevice(scene),
-                              depth.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        NK_CUDA_VEC(cudaMemcpy(depth.data(), rt::SensorDepthDevice(scene),
+                               depth.size() * sizeof(float), cudaMemcpyDeviceToHost));
         cudaFree(d_m);
         cudaFree(d_cam);
         return depth;
     };
+#undef NK_CUDA_VEC
 
     // Wide-open clip (default): the box is visible -> some finite depths near ~2.6 m.
     const std::vector<float> wide = render_depth(mount);
     size_t hits_wide = 0u;
     float min_d = 1e30f;
+    float max_d = 0.0f;
     for (float d : wide) {
         if (std::isfinite(d)) {
             ++hits_wide;
             if (d < min_d) min_d = d;
+            if (d > max_d) max_d = d;
         }
     }
     ASSERT_GT(hits_wide, 0u) << "overhead camera saw no box (test scaffold broken)";
@@ -294,9 +312,9 @@ TEST(SensorIntrinsics, FarClipTurnsFarHitsToMisses) {
     EXPECT_NE(std::memcmp(wide.data(), near_only.data(), wide.size() * sizeof(float)), 0)
         << "depth AOV unchanged after far_clip (expected hits -> misses)";
 
-    // near_clip ABOVE the box depth: also clips everything to misses.
+    // near_clip ABOVE the farthest box depth: also clips everything to misses.
     SensorMountRow nearclip = mount;
-    nearclip.near_clip = min_d + 0.1f;
+    nearclip.near_clip = max_d + 0.1f;
     const std::vector<float> far_only = render_depth(nearclip);
     size_t hits_near = 0u;
     for (float d : far_only) {
