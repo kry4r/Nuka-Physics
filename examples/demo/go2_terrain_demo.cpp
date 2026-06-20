@@ -83,6 +83,7 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -99,6 +100,9 @@
 #include "math/vec3.hpp"
 #include "render/raster/vulkan_raster_renderer.hpp"
 #include "render/render_world.hpp"
+#include "render/rt_adapter.hpp"
+#include "render/rt_backend.hpp"
+#include "render/rt_framebuffer_to_report.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
@@ -110,6 +114,7 @@
 namespace {
 
 namespace render = nuka::render;
+namespace rt = nuka::rt;
 namespace cook = nuka::scene::cook;
 namespace terrain = nuka::terrain;
 using nuka::math::Quat;
@@ -239,6 +244,9 @@ struct Args {
     float       orbit_turns = 0.6f;   // azimuth sweep in full turns over the clip
     float       fog = 0.004f;         // haze density per metre (0 => off); subtle far-field
     bool        probe = false;
+    bool        gpu = false;          // CUDA ray-traced backend instead of lavapipe
+    bool        beauty = true;        // GPU beauty path (MSAA+soft-shadow+AO+GI); --flat-gpu off
+    uint32_t    samples = 16u;        // beauty MSAA samples per pixel
     bool        no_shadows = false;   // disable the directional shadow map (fallback)
     uint32_t    shadow_map = 2560u;   // directional shadow-map resolution. The single
                                       // biggest per-frame cost on lavapipe-CPU; drop to
@@ -269,12 +277,17 @@ Args ParseArgs(int argc, char** argv) {
         else if (s == "--fog") a.fog = next_f(a.fog);
         else if (s == "--shadow-map") a.shadow_map = std::max(256u, next_u(a.shadow_map));
         else if (s == "--probe") a.probe = true;
+        else if (s == "--gpu") a.gpu = true;
+        else if (s == "--flat-gpu") { a.gpu = true; a.beauty = false; }
+        else if (s == "--samples") a.samples = std::max(1u, next_u(a.samples));
         else if (s == "--no-shadows") a.no_shadows = true;
         else if (s == "--out-dir" && i + 1 < argc) a.out_dir = argv[++i];
     }
     // Default robot count = a full rows*cols grid (the Isaac-Lab field) unless the
     // caller explicitly set --robots.
     if (a.robots == 0u) a.robots = a.rows * a.cols;
+    if (const char* g = std::getenv("NK_GPU_RENDER"))
+        a.gpu = a.gpu || (g[0] == '1');
     return a;
 }
 
@@ -591,6 +604,98 @@ bool WritePpm(const render::VulkanOffscreenReport& rep, const std::string& path)
     return ok;
 }
 
+// ---- CUDA ray-traced backend (the GPU render path) ------------------------
+// A backend swap on the SAME RenderWorld + RasterOptions: re-express the world
+// as the path-tracer scene-desc and shade it on the GPU (one analytic light).
+class GpuRenderer {
+public:
+    explicit GpuRenderer(const render::RenderWorld& rw) {
+        backend_ = render::CreateCudaRtBackend();
+        if (!backend_) return;
+        scene_ = render::RenderWorldToTwoLevelScene(rw);
+        handle_ = backend_->BuildScene(scene_);
+    }
+    ~GpuRenderer() {
+        if (backend_ && handle_) backend_->FreeScene(handle_);
+    }
+    bool ok() const { return backend_ != nullptr && handle_ != nullptr; }
+
+    // Enable the stochastic beauty path (MSAA + soft shadows + AO + 1-bounce GI +
+    // procedural sky/fog) with the given sub-pixel sample count; off => the flat
+    // deterministic sensor trace.
+    void SetBeauty(bool on, uint32_t samples) { beauty_ = on; samples_ = samples; }
+
+    // Refresh transforms/materials/light from the live world (BLAS reused), trace
+    // on the GPU, tonemap the linear framebuffer into the RGBA8 report.
+    render::VulkanOffscreenReport Render(const render::RenderWorld& rw,
+                                         const render::RasterOptions& opts) {
+        scene_ = render::RenderWorldToTwoLevelScene(rw);
+        ApplyLighting(opts);
+        const rt::PinholeCamera cam = CameraFromOptions(opts);
+        rt::Framebuffer fb;
+        if (beauty_) {
+            fb = backend_->TraceBeautyToHost(handle_, scene_, cam, BeautyFromOptions(opts));
+        } else {
+            fb = backend_->TraceToHost(handle_, scene_, cam);
+        }
+        return render::FramebufferToReport(fb, opts.background);
+    }
+
+private:
+    void ApplyLighting(const render::RasterOptions& opts) {
+        // The sun direction in RasterOptions points TOWARD the sun; the rt::Light
+        // direction is the travel direction (away from the sun) -> negate.
+        rt::Light& l = scene_.light;
+        l.directional = true;
+        Vec3 to_sun{opts.sun_direction[0], opts.sun_direction[1], opts.sun_direction[2]};
+        if (to_sun.Length() > 1e-6f) to_sun = to_sun.Normalized();
+        l.direction = -to_sun;
+        l.color = {opts.sun_color[0], opts.sun_color[1], opts.sun_color[2]};
+        l.intensity = 1.0f;
+        // Flat ambient = the average of the sky + ground hemispheric fill so unlit
+        // faces lift off pure black, matching the raster ambient floor.
+        scene_.ambient.color = {
+            0.5f * (opts.sun_ambient_sky[0] + opts.sun_ambient_ground[0]),
+            0.5f * (opts.sun_ambient_sky[1] + opts.sun_ambient_ground[1]),
+            0.5f * (opts.sun_ambient_sky[2] + opts.sun_ambient_ground[2])};
+    }
+
+    rt::PinholeCamera CameraFromOptions(const render::RasterOptions& opts) {
+        const float vfov = opts.camera_fov_degrees * (kPi / 180.0f);
+        return rt::BuildPinhole(opts.camera_eye, opts.camera_target, opts.camera_up,
+                                vfov, opts.width, opts.height);
+    }
+
+    // Map the SAME RasterOptions atmosphere (sky gradient + fog + sun) the lavapipe
+    // path consumes onto the beauty path's stochastic controls -> consistent look.
+    rt::BeautyOptions BeautyFromOptions(const render::RasterOptions& opts) {
+        rt::BeautyOptions b;
+        b.samples = samples_;
+        b.shadow_rays = (opts.shadow_strength > 0.0f) ? 6u : 1u;
+        b.sun_angular_radius = 0.045f;
+        b.gi_bounces = 1u;
+        b.ao_samples = 4u;
+        b.ao_radius = 0.7f;
+        b.seed = 0x9e3779b9u;
+        b.sky_top = {opts.sky_top[0], opts.sky_top[1], opts.sky_top[2]};
+        b.sky_bottom = {opts.sky_bottom[0], opts.sky_bottom[1], opts.sky_bottom[2]};
+        b.sky_ground = {opts.ground_color[0], opts.ground_color[1], opts.ground_color[2]};
+        b.fog_color = {opts.fog_color[0], opts.fog_color[1], opts.fog_color[2]};
+        b.fog_density = opts.fog_density;
+        // Sky-dome ambient kept a modest FILL so the cool sky lifts the unlit body
+        // off pure black WITHOUT washing the scene to white -- the sun key (~2.0)
+        // stays dominant, ACES keeps the lit treads mid-grey.
+        b.sky_intensity = 0.30f;
+        return b;
+    }
+
+    std::unique_ptr<render::RtBackendI> backend_;
+    render::RtSceneHandle* handle_ = nullptr;
+    rt::TwoLevelScene scene_;
+    bool beauty_ = false;
+    uint32_t samples_ = 16u;
+};
+
 // ---- a PBR material maker (mirrors go2_walk_video) -------------------------
 nuka::scene::RenderMaterial Mk(float r, float g, float b, float metallic, float rough) {
     nuka::scene::RenderMaterial m;
@@ -692,16 +797,19 @@ int main(int argc, char** argv) {
     render::RenderWorld rw;
     rw.meshes = std::move(tmpl.meshes);   // shared interned go2 meshes
     const uint32_t kMatShell = 0u, kMatMetal = 1u, kMatFoot = 2u, kMatAccent = 3u;
-    rw.materials.push_back(Mk(0.016f, 0.017f, 0.020f, 0.02f, 0.62f));  // 0 shell charcoal
-    rw.materials.push_back(Mk(0.040f, 0.043f, 0.052f, 0.90f, 0.32f));  // 1 dark gunmetal
-    rw.materials.push_back(Mk(0.010f, 0.010f, 0.012f, 0.02f, 0.85f));  // 2 matte black rubber
-    rw.materials.push_back(Mk(0.10f,  0.115f, 0.15f,  0.70f, 0.28f));  // 3 cool steel accent
-    // 4 terrain material: light-grey CONCRETE matching the floor disc so the field
-    // reads as one continuous concrete surface (the Isaac-Lab cover). Matte; the sun
-    // + shadow map (not albedo) carve the geometry, so a single mid-light grey is
-    // right -- the N.L on risers + cast shadows do the shaping.
+    // Body materials lifted off near-black so the trunk reads as a SOLID lit
+    // volume: the sky-ambient + AO + GI of the beauty path (and the sun + shadow
+    // of the raster path) need a non-zero albedo to carve form -- a 0.016 shell
+    // stays a flat black smear no matter the lighting. A plausible dark-charcoal
+    // PBR with moderate roughness catches a sun highlight without going cartoonish.
+    rw.materials.push_back(Mk(0.072f, 0.076f, 0.085f, 0.05f, 0.55f));  // 0 shell charcoal
+    rw.materials.push_back(Mk(0.090f, 0.096f, 0.110f, 0.85f, 0.34f));  // 1 dark gunmetal
+    rw.materials.push_back(Mk(0.045f, 0.045f, 0.050f, 0.04f, 0.72f));  // 2 dark rubber
+    rw.materials.push_back(Mk(0.16f,  0.180f, 0.225f, 0.65f, 0.30f));  // 3 cool steel accent
+    // Warm sandy concrete matching the floor disc: one continuous matte surface the
+    // sun + shadow map carve, and dark dogs pop against it.
     const uint32_t kMatTerrain = static_cast<uint32_t>(rw.materials.size());
-    rw.materials.push_back(Mk(0.380f, 0.392f, 0.410f, 0.02f, 0.86f));
+    rw.materials.push_back(Mk(0.460f, 0.400f, 0.300f, 0.02f, 0.86f));
     rw.default_material_id = kMatShell;
 
     auto link_role_material = [&](uint32_t link, const Transform& vlocal) -> uint32_t {
@@ -774,9 +882,9 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> tile_inst_index(traj.num_robots, render::kNoId);
     if (composite_mode) {
-        // ONE big composite mesh spanning the dog AABB + a generous flat margin so
-        // the field reads as an environment, not a cut-out under the pack.
-        const float margin = 4.0f;
+        // ONE big composite mesh spanning the dog AABB + a modest flat margin so the
+        // field reads as an environment without a wide dead-flat border around the pack.
+        const float margin = 1.8f;
         const float xmin = dog_x_min - margin, xmax = dog_x_max + margin;
         const float ymin = dog_y_min - margin, ymax = dog_y_max + margin;
         const float spacing = 0.05f;  // crisp 0.30 m stair edges
@@ -929,14 +1037,32 @@ int main(int argc, char** argv) {
     };
 
     // ---- 7. RENDERER + studio PBR options + haze -----------------------------
+    // ONE general path, two backends on the SAME RenderWorld: the default lavapipe
+    // raster renderer, or (--gpu / NK_GPU_RENDER=1) the CUDA ray-traced backend.
     std::unique_ptr<render::VulkanRasterRenderer> renderer;
-    try {
-        renderer = std::make_unique<render::VulkanRasterRenderer>();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "[go2_terrain] no Vulkan device: %s\n", e.what());
-        return 6;
+    std::unique_ptr<GpuRenderer> gpu;
+    if (args.gpu) {
+        gpu = std::make_unique<GpuRenderer>(rw);
+        if (!gpu->ok()) {
+            std::fprintf(stderr, "[go2_terrain] --gpu: no CUDA RT backend\n");
+            return 6;
+        }
+        gpu->SetBeauty(args.beauty, args.samples);
+        std::printf("[go2_terrain] renderer: CUDA two-level ray tracer (GPU, %s%s)\n",
+                    args.beauty ? "BEAUTY MSAA/AO/GI" : "flat",
+                    args.beauty ? "" : " sensor");
+    } else {
+        try {
+            renderer = std::make_unique<render::VulkanRasterRenderer>();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[go2_terrain] no Vulkan device: %s\n", e.what());
+            return 6;
+        }
+        std::printf("[go2_terrain] renderer ICD: %s\n", renderer->DeviceName().c_str());
     }
-    std::printf("[go2_terrain] renderer ICD: %s\n", renderer->DeviceName().c_str());
+    auto render_frame = [&](const render::RasterOptions& o) {
+        return gpu ? gpu->Render(rw, o) : renderer->Render(rw, o);
+    };
 
     render::RasterOptions opts;
     opts.width = args.width; opts.height = args.height;
@@ -947,8 +1073,8 @@ int main(int argc, char** argv) {
     opts.camera_fov_degrees = 42.0f;
     // Concrete floor matching the terrain tiles (one continuous grey field, like the
     // Isaac-Lab cover). The flat clear is replaced by a cool vertical SKY gradient.
-    opts.background = {178, 188, 202, 255};  // fallback flat clear (sky_gradient on)
-    opts.ground_color[0] = 0.37f; opts.ground_color[1] = 0.382f; opts.ground_color[2] = 0.400f;
+    opts.background = {150, 178, 212, 255};  // fallback flat clear (sky_gradient on)
+    opts.ground_color[0] = 0.460f; opts.ground_color[1] = 0.400f; opts.ground_color[2] = 0.300f;
     opts.contact_shadow_strength = 0.0f;  // explicit per-foot points below
 
     // ---- CINEMATIC SUN + DIRECTIONAL SHADOW MAP (the Isaac-Lab look) ----------
@@ -959,23 +1085,23 @@ int main(int argc, char** argv) {
     // Intensity tuned against the ACES tonemap so a 0.5 concrete albedo stays a
     // readable MID-grey (not blown to white): a modest key + LOW ambient gives the
     // wide tread-vs-riser contrast that carves the stairs.
-    opts.sun_direction[0] = 0.56f; opts.sun_direction[1] = -0.46f; opts.sun_direction[2] = 0.33f;
-    opts.sun_color[0] = 2.05f; opts.sun_color[1] = 1.97f; opts.sun_color[2] = 1.78f;
-    opts.sun_ambient_sky[0] = 0.105f; opts.sun_ambient_sky[1] = 0.122f; opts.sun_ambient_sky[2] = 0.158f;
-    opts.sun_ambient_ground[0] = 0.066f; opts.sun_ambient_ground[1] = 0.066f; opts.sun_ambient_ground[2] = 0.072f;
-    opts.shadow_strength = args.no_shadows ? 0.0f : 0.96f;  // crisp near-black grooves
+    opts.sun_direction[0] = 0.52f; opts.sun_direction[1] = -0.44f; opts.sun_direction[2] = 0.30f;
+    opts.sun_color[0] = 2.30f; opts.sun_color[1] = 2.08f; opts.sun_color[2] = 1.70f;
+    opts.sun_ambient_sky[0] = 0.082f; opts.sun_ambient_sky[1] = 0.094f; opts.sun_ambient_sky[2] = 0.120f;
+    opts.sun_ambient_ground[0] = 0.052f; opts.sun_ambient_ground[1] = 0.049f; opts.sun_ambient_ground[2] = 0.043f;
+    opts.shadow_strength = args.no_shadows ? 0.0f : 0.97f;  // crisp near-black grooves
     opts.shadow_map_size = args.shadow_map;  // default 2560; --shadow-map lowers for speed
     opts.shadow_bias = 0.0018f;
 
     // ---- COOL VERTICAL SKY GRADIENT ------------------------------------------
     opts.sky_gradient = true;
-    opts.sky_top[0] = 0.55f; opts.sky_top[1] = 0.62f; opts.sky_top[2] = 0.72f;     // cooler zenith
-    opts.sky_bottom[0] = 0.86f; opts.sky_bottom[1] = 0.89f; opts.sky_bottom[2] = 0.93f; // bright horizon
+    opts.sky_top[0] = 0.26f; opts.sky_top[1] = 0.45f; opts.sky_top[2] = 0.74f;     // deep clear-blue zenith
+    opts.sky_bottom[0] = 0.62f; opts.sky_bottom[1] = 0.74f; opts.sky_bottom[2] = 0.88f; // soft blue horizon
 
     // Subtle FAR-FIELD haze only (foreground dogs stay crisp): low density + the
     // sky-horizon colour so distant tiles melt into the sky, not a white wall.
     opts.fog_density = args.fog;
-    opts.fog_color[0] = 0.84f; opts.fog_color[1] = 0.88f; opts.fog_color[2] = 0.93f;
+    opts.fog_color[0] = 0.66f; opts.fog_color[1] = 0.76f; opts.fog_color[2] = 0.88f;
     if (const char* fv = std::getenv("NK_CAM_FOV"))
         opts.camera_fov_degrees = static_cast<float>(std::atof(fv));
 
@@ -1008,11 +1134,13 @@ int main(int argc, char** argv) {
                 dist[r] = std::sqrt(dx * dx + dy * dy);
             }
             std::sort(dist.begin(), dist.end());
-            // 75th-percentile distance: contains 3/4 of the pack; a couple of
-            // wanderers fall outside but are not allowed to dominate the framing.
+            // 60th-percentile distance: frames the dense core of the pack large; the
+            // outermost wanderers drift to the frame edge rather than shrink everyone.
             const float pct = dist.empty() ? 2.5f
-                : dist[std::min(dist.size() - 1, (dist.size() * 3u) / 4u)];
-            raw_rad[s] = std::max(2.5f, pct);
+                : dist[std::min(dist.size() - 1, (dist.size() * 3u) / 5u)];
+            float cap = 8.0f;
+            if (const char* rc = std::getenv("NK_RAD_CAP")) cap = static_cast<float>(std::atof(rc));
+            raw_rad[s] = std::min(cap, std::max(2.5f, pct));
         }
         // Smooth the centroid + radius with a centred moving average (window ~ 0.5 s
         // of render-steps) so the camera glide is buttery, not jittery.
@@ -1052,44 +1180,63 @@ int main(int argc, char** argv) {
     };
     auto lerp = [](float a, float b, float u) { return a + (b - a) * u; };
 
-    // ---- ROTATING ORBIT CAMERA (required: circle the pack to showcase the gait) --
-    // COMPOSITE: the eye orbits the LIVE pack centroid (step_ctr) at a radius that
-    // fits the robust pack radius (step_rad) into the vertical fov, so the dogs stay
-    // CENTERED and LARGE as they walk (not tiny in a wide static frame -- owner round
-    // 1+2). The azimuth eases through orbit_turns turns so the gait is shown from many
-    // angles. PLACEHOLDER: the legacy static-grid frame. A smaller fit_factor pulls
-    // the eye IN (bigger dogs); tune live with NK_FIT_FACTOR without a rebuild.
-    // 0.80 composite default = the value that produced the approved round-2 clip
-    // (dogs read large yet the spreading pack stays in-frame); override with
-    // NK_FIT_FACTOR (smaller = eye pulled IN = bigger dogs, risks edge cutoff).
-    float fit_factor = composite_mode ? 0.80f : 0.72f;
+    // One keyframed curve drives elevation, azimuth (turns past a front-left 3/4
+    // start), fov-fit and look-at height; the eye is derived around the live pack
+    // centroid each step so framing tracks the pack through a shot sequence.
+    struct CamKey { float t, elev_deg, azim_turns, fit, target_z; };
+    static const CamKey kCamPath[] = {
+        {0.00f, 52.0f, 0.00f, 1.55f, 0.35f},  // establishing crane (high wide)
+        {0.16f, 30.0f, 0.05f, 1.05f, 0.32f},  // crane descends
+        {0.21f, 13.0f, 0.08f, 0.52f, 0.30f},  // drop to low tracking dolly
+        {0.42f, 11.0f, 0.11f, 0.48f, 0.34f},  // dolly travels with the pack
+        {0.47f,  8.0f, 0.17f, 0.43f, 0.46f},  // hero low-angle crest (look up)
+        {0.62f,  9.0f, 0.31f, 0.45f, 0.46f},  // hero arc across the climb
+        {0.67f, 17.0f, 0.42f, 0.62f, 0.33f},  // rise into the orbit
+        {0.85f, 21.0f, 0.92f, 0.66f, 0.32f},  // orbit reveal (~half turn)
+        {0.90f, 26.0f, 1.00f, 0.86f, 0.32f},  // begin pull-back
+        {1.00f, 40.0f, 1.14f, 1.30f, 0.30f},  // crane-up finale (wide)
+    };
+    const int num_cam_keys = static_cast<int>(sizeof(kCamPath) / sizeof(kCamPath[0]));
+    // --orbit-turns scales total azimuth travel (0.6 = the authored path).
+    const float azim_scale = (args.orbit_turns > 0.0f) ? args.orbit_turns / 0.6f : 1.0f;
+    // NK_FIT_FACTOR globally scales the fov-fit (smaller = eye IN = bigger dogs).
+    float fit_mul = 1.0f;
     if (const char* ff = std::getenv("NK_FIT_FACTOR"))
-        fit_factor = static_cast<float>(std::atof(ff));
+        fit_mul = static_cast<float>(std::atof(ff));
+    auto eval_cam = [&](float t, float& elev_deg, float& azim_turns, float& fit, float& tz) {
+        int i = 0;
+        while (i + 1 < num_cam_keys && t > kCamPath[i + 1].t) ++i;
+        const CamKey& a = kCamPath[i];
+        const CamKey& b = kCamPath[std::min(i + 1, num_cam_keys - 1)];
+        const float u = (b.t > a.t) ? smoothstep(a.t, b.t, t) : 0.0f;
+        elev_deg   = lerp(a.elev_deg, b.elev_deg, u);
+        azim_turns = lerp(a.azim_turns, b.azim_turns, u);
+        fit        = lerp(a.fit, b.fit, u);
+        tz         = lerp(a.target_z, b.target_z, u);
+    };
     auto aim_camera = [&](uint32_t step) {
         const float t = (traj.num_steps > 1u)
             ? static_cast<float>(step) / static_cast<float>(traj.num_steps - 1u) : 0.0f;
-        const float e = smoothstep(0.0f, 1.0f, t);
-        // Azimuth sweep: start on the front-left 3/4, circle by orbit_turns turns.
-        const float phi = -0.55f * kPi + 2.0f * kPi * args.orbit_turns * e;
-        // Elevation: a low-ish hero crane (16-24 deg) -- reads the stepped terrain in
-        // 3/4 but never a top-down plan view.
-        const float elev_deg = lerp(16.0f, 24.0f, e) - 3.0f * std::sin(e * kPi);
+        float elev_deg, azim_turns, fit_k, tz;
+        eval_cam(t, elev_deg, azim_turns, fit_k, tz);
+        const float phi = -0.55f * kPi + 2.0f * kPi * azim_turns * azim_scale;
         const float elev = elev_deg * kPi / 180.0f;
         // Centre + pack radius: live-tracked in composite mode, static otherwise.
         const Vec3 ctr = composite_mode ? step_ctr[step] : grid_ctr;
         const float rad = composite_mode ? step_rad[step] : grid_radius;
-        // Fit the pack radius into the vertical fov. std::cos(elev) un-projects the
-        // slant range to ground reach. A radius floor keeps a tight pack sensible.
+        // Fit the pack radius into the vertical fov; a hero floor keeps a tight
+        // pack from collapsing the eye onto the centroid.
         const float fov_y = opts.camera_fov_degrees * kPi / 180.0f;
-        const float fit_r = (rad * fit_factor) / std::tan(fov_y * 0.5f);
-        const float radius = std::max(fit_r, rad * 1.05f);
+        const float fit_r = (rad * fit_k * fit_mul) / std::tan(fov_y * 0.5f);
+        float radius = std::max(fit_r, 4.5f);
+        if (const char* hc = std::getenv("NK_HERO_CAP"))
+            radius = std::min(radius, static_cast<float>(std::atof(hc)));
         const float ch = std::cos(elev), sh = std::sin(elev);
         const float dx = std::sin(phi), dy = -std::cos(phi);
         opts.camera_eye = {ctr.x + radius * ch * dx,
                            ctr.y + radius * ch * dy,
                            ctr.z + radius * sh + 0.30f};
-        opts.camera_target = {ctr.x, ctr.y, ctr.z + 0.30f};
-        // Far clip generous enough that the haze (not the clip) fades the horizon.
+        opts.camera_target = {ctr.x, ctr.y, ctr.z + tz};
         opts.camera_far = radius * 6.0f + rad * 8.0f + 50.0f;
     };
 
@@ -1099,14 +1246,18 @@ int main(int argc, char** argv) {
         publish(mid);
         set_contact_shadows(opts);
         aim_camera(mid);
-        render::VulkanOffscreenReport rep = renderer->Render(rw, opts);
+        const auto t0 = std::chrono::steady_clock::now();
+        render::VulkanOffscreenReport rep = render_frame(opts);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::filesystem::create_directories(args.out_dir);
         const std::string p = args.out_dir + "/probe_frame.ppm";
         const bool ok = WritePpm(rep, p);
-        std::printf("[go2_terrain] PROBE: instances=%u meshes=%u non_bg=%zu (%ux%u) "
-                    "eye=(%.2f,%.2f,%.2f) -> %s (%s)\n", rw.InstanceCount(),
+        std::printf("[go2_terrain] PROBE[%s]: instances=%u meshes=%u non_bg=%zu (%ux%u) "
+                    "render=%.1f ms eye=(%.2f,%.2f,%.2f) -> %s (%s)\n",
+                    gpu ? "GPU" : "CPU", rw.InstanceCount(),
                     rw.meshes.Count(), rep.non_background_pixel_count, rep.width, rep.height,
-                    opts.camera_eye.x, opts.camera_eye.y, opts.camera_eye.z,
+                    ms, opts.camera_eye.x, opts.camera_eye.y, opts.camera_eye.z,
                     p.c_str(), ok ? "OK" : "WRITE-FAIL");
         return ok ? 0 : 7;
     }
@@ -1115,12 +1266,13 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(args.out_dir);
     uint32_t written = 0u;
     size_t first_nonbg = 0u, last_nonbg = 0u;
+    const auto clip_t0 = std::chrono::steady_clock::now();
     for (uint32_t s = 0; s < traj.num_steps; s += args.stride) {
         if (args.frames != 0u && written >= args.frames) break;
         publish(s);
         set_contact_shadows(opts);
         aim_camera(s);
-        render::VulkanOffscreenReport rep = renderer->Render(rw, opts);
+        render::VulkanOffscreenReport rep = render_frame(opts);
         char name[40];
         std::snprintf(name, sizeof(name), "frame_%06u.ppm", written);
         const std::string path = args.out_dir + "/" + name;
@@ -1136,7 +1288,11 @@ int main(int argc, char** argv) {
                         written - 1u, s, traj.num_steps, rep.non_background_pixel_count,
                         opts.camera_eye.x, opts.camera_eye.y, opts.camera_eye.z);
     }
-    std::printf("[go2_terrain] DONE: wrote %u frames to %s (first non_bg=%zu, last=%zu)\n",
-                written, args.out_dir.c_str(), first_nonbg, last_nonbg);
+    const auto clip_t1 = std::chrono::steady_clock::now();
+    const double clip_s = std::chrono::duration<double>(clip_t1 - clip_t0).count();
+    std::printf("[go2_terrain] DONE[%s]: wrote %u frames to %s in %.2f s (%.1f ms/frame, "
+                "first non_bg=%zu, last=%zu)\n", gpu ? "GPU" : "CPU", written,
+                args.out_dir.c_str(), clip_s,
+                written ? 1000.0 * clip_s / written : 0.0, first_nonbg, last_nonbg);
     return 0;
 }
