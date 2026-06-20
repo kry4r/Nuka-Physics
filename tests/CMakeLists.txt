@@ -1497,6 +1497,30 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_two_level_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Batched device-resident RGB-sensor FEASIBILITY bench. Measures the
+    # per-env-TLAS render path (BuildTwoLevelScene + RenderFrameToAovs, the cheap
+    # flat trace) across N envs x resolution and decomposes TLAS build/refit vs
+    # trace vs N-launch host overhead. Standalone main (a bench, not a gate);
+    # -ffp-contract=off to match the rt suite. NOT a discovered test. -------------
+    add_executable(nuka_rt_batched_sensor_bench
+        rt/test_batched_sensor_bench.cpp
+    )
+    set_source_files_properties(rt/test_batched_sensor_bench.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rt_batched_sensor_bench
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_batched_sensor_bench
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+    )
+
     # --- H1 cup demo: PBR-style hero scene smoke over the two-level RT path ----
     add_executable(nuka_h1_cup_pbr_render_test
         rt/test_h1_cup_pbr_render.cpp
