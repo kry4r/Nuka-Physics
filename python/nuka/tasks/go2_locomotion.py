@@ -117,6 +117,14 @@ class Go2LocomotionEnv(NukaGymEnv):
         tcfg = dict(terrain) if terrain else {}
         self._terrain_on = bool(tcfg.get("enable", False))
         self._tcfg = tcfg
+        # Optional per-axis command-range override (terrain.command_ranges). Defaults
+        # to the legged_gym symmetric +-1 ranges. A forward-biased range (e.g.
+        # lin_vel_x [0.0, 1.0]) makes the tracking reward drive the dog UP the stairs
+        # it spawns facing on the curriculum tile grid.
+        cr = tcfg.get("command_ranges") or {}
+        self._cmd_range_x = tuple(cr.get("lin_vel_x", CMD_RANGE_LIN_VEL_X))
+        self._cmd_range_y = tuple(cr.get("lin_vel_y", CMD_RANGE_LIN_VEL_Y))
+        self._cmd_range_yaw = tuple(cr.get("ang_vel_yaw", CMD_RANGE_ANG_VEL_YAW))
         if self._terrain_on:
             # Cook the world with the procedural-terrain geometry (step height set
             # to the MAX; per-env difficulty scales it down toward 0.08 m).
@@ -140,6 +148,22 @@ class Go2LocomotionEnv(NukaGymEnv):
                 heightfield_ncol = int(tcfg.get("heightfield_ncol", 161))
             if heightfield_cell <= 0.0:
                 heightfield_cell = float(tcfg.get("heightfield_cell", 0.25))
+            # Per-env curriculum TILE GRID (legged_gym style): the baked field is a
+            # curric_levels (rows) x curric_types (cols) grid of tile_size tiles; each
+            # env spawns on its (type,level) tile so obs + physics present that env its
+            # own difficulty (row 0 flat -> top row full). Sizes the grid to fit every
+            # tile exactly. Enabled by terrain.curriculum_grid.
+            self._curric_grid = bool(tcfg.get("curriculum_grid", False))
+            if self._curric_grid:
+                self._curric_levels = int(tcfg.get("curric_levels", 10))
+                self._curric_types = len(T.TerrainCurriculum.TYPE_LADDER)
+                self._tile_size = float(tcfg.get("tile_size", 6.0))
+                heightfield_cell = float(tcfg.get("heightfield_cell", 0.10))
+                heightfield_terrain_type = 5
+                heightfield_ncol = int(round(
+                    self._curric_types * self._tile_size / heightfield_cell)) + 1
+                heightfield_nrow = int(round(
+                    self._curric_levels * self._tile_size / heightfield_cell)) + 1
 
         # ONE-GENERAL-SOLVER landing (L1): route the world through the GENERAL
         # contact path (contact_family=1 -> PairDriven + a baked static heightfield
@@ -162,6 +186,10 @@ class Go2LocomotionEnv(NukaGymEnv):
                 tc["heightfield_ncol"] = int(heightfield_ncol)
             if heightfield_cell > 0.0:
                 tc["heightfield_cell"] = float(heightfield_cell)
+            if getattr(self, "_curric_grid", False):
+                tc["curric_levels"] = int(self._curric_levels)
+                tc["curric_types"] = int(self._curric_types)
+                tc["terrain_feature_cell"] = float(self._tile_size)
             kw["terrain_create"] = tc
 
         super().__init__(scene, num_envs, **kw)
@@ -193,6 +221,7 @@ class Go2LocomotionEnv(NukaGymEnv):
                 max_episode_length=int(self.max_episode_length),
                 survive_frac=float(tcfg.get("survive_frac", 0.8)),
                 promote_path_m=float(tcfg.get("promote_path_m", 5.0)),
+                promote_progress_m=float(tcfg.get("promote_progress_m", 0.8)),
                 promote_dist_m=float(tcfg.get("promote_dist_m", 3.0)),  # diag only.
                 promote_thr=float(tcfg.get("promote_thr", 8.0)),  # diagnostic only.
             )
@@ -214,6 +243,18 @@ class Go2LocomotionEnv(NukaGymEnv):
             # velocity command sends the dog in a random WORLD direction (free roam).
             self._spawn_xy_range = float(tcfg.get("spawn_xy_range", 2.0))
             self._randomize_yaw = bool(tcfg.get("randomize_yaw", True))
+            # Curriculum tile-grid geometry the per-env tile spawn needs: the field
+            # corner (tile (0,0) lower edge = -half, the field is centred on the world
+            # origin), the per-tile feature radius (mirrors the generator seam), and
+            # the curriculum-code -> field-column map (ladder index).
+            if getattr(self, "_curric_grid", False):
+                self._field_origin_x = -0.5 * (heightfield_ncol - 1) * heightfield_cell
+                self._field_origin_y = -0.5 * (heightfield_nrow - 1) * heightfield_cell
+                self._feature_half = self._tile_size * 0.5 - 0.6
+                self._type_to_col = {
+                    int(code): i
+                    for i, code in enumerate(T.TerrainCurriculum.TYPE_LADDER)
+                }
             # Zero-copy WRITABLE engine views (terrain type uint32 (N,1); difficulty
             # float32 (N,); base_pose float32 (N,7)).
             w = self._world
@@ -377,6 +418,14 @@ class Go2LocomotionEnv(NukaGymEnv):
         print(f"[go2_locomotion] feet_air_time foot(calf)-link slots = "
               f"{self._foot_link_slot.tolist()}; collision penalised-link slots = "
               f"{self._collision_link_slot.tolist()} (thigh+calf+base)", flush=True)
+        # Foot sphere local offset down the calf (Go2 URDF foot fixed-joint origin):
+        # places the foot from the calf link pose for the swing-clearance reward.
+        self._foot_local_offset = torch.tensor(
+            [0.0, 0.0, -0.213], dtype=torch.float32, device=self._torch_device
+        )
+        self._quat_conj = torch.tensor(
+            [1.0, -1.0, -1.0, -1.0], dtype=torch.float32, device=self._torch_device
+        )
         # Prior step's clipped action (the action-rate delta source). Distinct
         # from base.last_action, which is THIS step's clipped action.
         self._prev_action = torch.zeros(
@@ -475,14 +524,45 @@ class Go2LocomotionEnv(NukaGymEnv):
         dev = self._torch_device
         n = self.num_envs
 
-        # Per-env random spawn column (x,y) in the configurable square + heading.
-        rng = self._spawn_xy_range
-        spawn_x = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
-        spawn_y = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
-        if self._randomize_yaw:
-            yaw = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * torch.pi
+        if getattr(self, "_curric_grid", False):
+            # Per-env curriculum TILE: (terrain_type, difficulty) -> tile (col, row) ->
+            # tile centre. Spawn on the tile's outer ring FACING the centre so a
+            # forward command traverses the feature (climb stairs / descend pit / cross
+            # boxes); obs + physics sample this world (x,y), so the env sees its level.
+            tt = cur.terrain_type
+            col = torch.zeros(n, dtype=torch.long, device=dev)
+            for code, c in self._type_to_col.items():
+                col = torch.where(tt == code, torch.full_like(col, c), col)
+            row = (cur.difficulty * (self._curric_levels - 1)).round().long().clamp(
+                0, self._curric_levels - 1)
+            tcx = self._field_origin_x + (col.float() + 0.5) * self._tile_size
+            tcy = self._field_origin_y + (row.float() + 0.5) * self._tile_size
+            self._last_tile_center = torch.stack((tcx, tcy), dim=1)
+            ang = torch.rand(n, generator=gen, device=dev) * (2.0 * torch.pi)
+            # Stairs tiles ascend in +Y: spawn those envs on the LOW (-Y) edge facing
+            # up-slope so a forward command climbs (no go-around). Pit/box keep the
+            # radial ring spawn (gravity / flat make those traversable from any side).
+            is_stairs = (tt == T.TERRAIN_PYRAMID_STAIRS)
+            ang_stairs = (-0.5 * torch.pi
+                          + (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * 0.30)
+            ang = torch.where(is_stairs, ang_stairs, ang)
+            # Lower slope band (near the feature base) so a forward command climbs the
+            # bulk of the feature; radial jitter spreads the starting step.
+            r_spawn = self._feature_half * (
+                0.78 + 0.16 * torch.rand(n, generator=gen, device=dev))
+            spawn_x = tcx + r_spawn * torch.cos(ang)
+            spawn_y = tcy + r_spawn * torch.sin(ang)
+            jit = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * 0.25
+            yaw = torch.atan2(tcy - spawn_y, tcx - spawn_x) + jit
         else:
-            yaw = torch.zeros(n, device=dev)
+            # Per-env random spawn column (x,y) in the configurable square + heading.
+            rng = self._spawn_xy_range
+            spawn_x = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
+            spawn_y = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * rng
+            if self._randomize_yaw:
+                yaw = (torch.rand(n, generator=gen, device=dev) * 2.0 - 1.0) * torch.pi
+            else:
+                yaw = torch.zeros(n, device=dev)
 
         # LOCAL surface height at each sampled column via the SINGLE-source grid
         # sampler (the EXACT full-relief cooked heightfield the physics narrowphase
@@ -533,6 +613,10 @@ class Go2LocomotionEnv(NukaGymEnv):
         # written, for the same (masked or all) reset envs.
         spawn_xy = torch.stack((spawn_x, spawn_y), dim=1)
         self._curriculum.set_start_xy(mask, spawn_xy)
+        # Curriculum-tile radial-progress gate: the dog must traverse TOWARD this tile
+        # centre (climb/descend/cross) to promote -- not merely wander on the flat.
+        if getattr(self, "_curric_grid", False):
+            self._curriculum.set_tile_center(mask, self._last_tile_center)
 
     # -- command sampling (legged_gym _resample_commands, seeded) -----------
     def _resample_commands(self, mask: torch.Tensor) -> None:
@@ -555,9 +639,9 @@ class Go2LocomotionEnv(NukaGymEnv):
             return torch.rand(n, generator=gen, device=self._torch_device) * (hi - lo) + lo
 
         new = torch.empty(n, 3, device=self._torch_device)
-        new[:, 0] = _u(*CMD_RANGE_LIN_VEL_X)
-        new[:, 1] = _u(*CMD_RANGE_LIN_VEL_Y)
-        new[:, 2] = _u(*CMD_RANGE_ANG_VEL_YAW)
+        new[:, 0] = _u(*self._cmd_range_x)
+        new[:, 1] = _u(*self._cmd_range_y)
+        new[:, 2] = _u(*self._cmd_range_yaw)
         # Zero the xy command if its magnitude is below the threshold.
         keep = (new[:, :2].norm(dim=1) > CMD_ZERO_THRESHOLD).unsqueeze(1)
         new[:, :2] = new[:, :2] * keep
@@ -606,6 +690,17 @@ class Go2LocomotionEnv(NukaGymEnv):
         #     BELOW the local terrain surface (the kinematic terrain-clip proxy).
         foot_contact_fz = self._wrench_view[:, self._foot_link_slot, 2]  # (N,4)
         collision_count = self._collision_count()                        # (N,)
+        # Swing-foot clearance height (computed only when the active reward weights
+        # it -- climb gait -- so walk/trot pay no cost and stay byte-identical).
+        foot_height_above = (
+            self._foot_clearance_height()
+            if self._reward.scales.get("feet_clearance", 0.0) != 0.0 else None
+        )
+        # Base height above local terrain (climb gait stands tall on steps).
+        base_above_terrain = (
+            self._base_above_terrain()
+            if self._reward.scales.get("base_height", 0.0) != 0.0 else None
+        )
         r = self._reward.compute(
             cmd=self.command,
             lin_vel=b.base_lin_vel(),
@@ -619,6 +714,8 @@ class Go2LocomotionEnv(NukaGymEnv):
             # term (v_z at lift-off). 0-weighted for walk/trot -> no effect there.
             base_lin_vel=b.base_lin_vel(),
             foot_contact_fz=foot_contact_fz,
+            foot_height_above=foot_height_above,
+            base_above_terrain=base_above_terrain,
             collision_count=collision_count,
         )
         # Feed the per-env reward into the terrain curriculum's running episode
@@ -639,6 +736,48 @@ class Go2LocomotionEnv(NukaGymEnv):
             # so the terminal->spawn teleport is NOT counted as path.
             self._curriculum.accumulate_path(self._last_base_xy)
         return r
+
+    # -- base height above local terrain (drives the climb-gait stand-tall reward) --
+    def _base_above_terrain(self) -> torch.Tensor:
+        """(N,) trunk world z minus the local terrain surface under the base (flat 0
+        when terrain is off). The authoritative BASE_POSE view gives the upright
+        trunk z; the SINGLE-source heightfield gives the surface under (x,y)."""
+        bp = self._bp_view                                       # (N,7) base pose
+        base_z = bp[:, 2]
+        if not self._terrain_on:
+            return base_z
+        surf = self._terrain_surface(bp[:, 0:1], bp[:, 1:2])[:, 0]  # (N,)
+        return base_z - surf
+
+    # -- swing-foot clearance height (drives the climb-gait clearance reward) --
+    def _foot_clearance_height(self) -> torch.Tensor:
+        """(N,4) each foot sphere's height above the local terrain surface. The foot
+        sits at the calf link pose composed with the foot-local offset; terrain z
+        under the foot (x,y) is the SINGLE-source heightfield (flat 0 when terrain is
+        off). Forward-rotates the offset via the conjugate of the (w-first) calf quat
+        through the obs builder's proven inverse-rotate helper."""
+        pose = self._pose_view                                   # (N, BLC, 7)
+        calf = self._foot_link_slot                              # (4,)
+        calf_pos = pose[:, calf, 0:3]                            # (N,4,3)
+        calf_quat = pose[:, calf, 3:7]                           # (N,4,4) [w,x,y,z]
+        off = self._foot_local_offset.expand(self.num_envs, 4, 3)
+        foot = calf_pos + G.quat_rotate_inverse_wxyz(calf_quat * self._quat_conj, off)
+        foot_z = foot[:, :, 2]                                   # (N,4) world z
+        if not self._terrain_on:
+            return foot_z
+        surf = self._terrain_surface(foot[:, :, 0], foot[:, :, 1])  # (N,4)
+        return foot_z - surf
+
+    # -- height-kill reference: min surface under the base footprint -----------
+    def _base_support_surf(self, base: torch.Tensor) -> torch.Tensor:
+        """Min terrain surface under the base footprint (xy +/- a body half-span). A
+        step under one edge of the body must not raise the height-kill reference above
+        a still-climbing body and false-terminate it (the single-point sample did)."""
+        bx, by = base[:, 0:1], base[:, 1:2]
+        d = 0.25
+        xs = torch.cat([bx, bx + d, bx - d, bx, bx], dim=1)
+        ys = torch.cat([by, by, by, by + d, by - d], dim=1)
+        return self._terrain_surface(xs, ys).min(dim=1).values
 
     # -- local terrain surface sampler (shared by collision proxy + height-kill) --
     def _terrain_surface(self, xs: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
@@ -758,7 +897,7 @@ class Go2LocomotionEnv(NukaGymEnv):
                 return term
             base = self._obs.base_pos()                          # (N, 7) -> xyz
             base_z = base[:, 2]
-            surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
+            surf = self._base_support_surf(base)                 # (N,) footprint min
             fell = (base_z - surf) < self.termination_height
             tipped = self._obs.tilt_deg() > self.termination_tilt_deg
             term = fell | tipped
@@ -770,7 +909,7 @@ class Go2LocomotionEnv(NukaGymEnv):
         base = self._obs.base_pos()                              # (N, 7) -> xyz
         base_z = base[:, 2]
         if self._curriculum is not None and self._terrain_on:
-            surf = self._terrain_surface(base[:, 0:1], base[:, 1:2])[:, 0]  # (N,)
+            surf = self._base_support_surf(base)                 # (N,) footprint min
             below = (base_z - surf) < self.termination_height
         else:
             below = base_z < self.termination_height
