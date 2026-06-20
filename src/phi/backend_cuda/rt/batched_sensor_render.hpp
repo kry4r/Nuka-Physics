@@ -35,6 +35,11 @@
 
 namespace nuka::rt {
 
+// The resolved per-env lidar pose + fan (defined in sensor_scatter.hpp, which the
+// device TUs include). Forward-declared here so the host-facing API can name a
+// `const LidarSensor*` (pointer-only) without pulling the device traversal headers.
+struct LidarSensor;
+
 // Float AOV channels written per pixel (the prim1 uint32 plane is separate):
 // color3 + depth1 + normal3 + albedo3. The obs reads color+depth+prim.
 inline constexpr uint32_t kSensorFloatChannels = 10u;
@@ -117,6 +122,38 @@ void RenderSensorsMounted(BatchedSensorSceneDevice& device,
                           uint32_t height,
                           phi::Backend* backend = nullptr);
 
+// Upload the env-invariant lidar mount table into the persistent scene (lowered
+// from scene::SensorDesc via BuildSensorMountRows). RenderLidarsMounted scatters
+// the per-env LidarSensors from it each step; call once after BuildBatchedSensorScene.
+// Separate from SetSensorMounts so a scene can carry cameras AND lidars at once.
+void SetLidarMounts(BatchedSensorSceneDevice& device,
+                    const std::vector<scene::SensorDesc>& sensors);
+
+// ONE build + ONE range trace per step into the persistent (E,S,az,el) device range
+// tensor: scatter lidar poses -> batched LBVH build/refit -> flat trace over
+// [E*S*az*el] generating each (az,el) ray and writing clamp(ClosestHit t) on the
+// SAME per-env TLAS the camera trace uses. `lidars_device` is a device array of
+// env_count*sensors_per_env env-major LidarSensors (lidar env*S+s). az/el come from
+// each sensor's pattern; outputs via SensorRangeDevice (no D2H). sensors_per_env==0
+// means 1.
+void RenderLidarsBatched(BatchedSensorSceneDevice& device,
+                         const phi::ScatterFkSource& fk,
+                         const LidarSensor* lidars_device,
+                         uint32_t env_count,
+                         uint32_t sensors_per_env,
+                         uint32_t az_count,
+                         uint32_t el_count,
+                         phi::Backend* backend = nullptr);
+
+// ONE step driven by the stored lidar mount table: scatter the per-env LidarSensors
+// (fk * local_offset for every env x lidar) into the persistent lidar buffer, then
+// RenderLidarsBatched into the (E,S,az,el) range tensor. az/el come from the stored
+// pattern (uniform across the lidar set). SetLidarMounts must have been called.
+void RenderLidarsMounted(BatchedSensorSceneDevice& device,
+                         const phi::ScatterFkSource& fk,
+                         uint32_t env_count,
+                         phi::Backend* backend = nullptr);
+
 // Device pointers into the persistent AOV tensor after RenderSensorsBatched:
 // color/normal/albedo [E*S*H*W*3], depth/prim [E*S*H*W]. Null until first render.
 const float* SensorColorDevice(const BatchedSensorSceneDevice& device);
@@ -128,5 +165,15 @@ const uint32_t* SensorPrimDevice(const BatchedSensorSceneDevice& device);
 // Cameras per env from the stored mount table (0 before SetSensorMounts). The AOV
 // tensor's sensor extent; env_count*this == the camera/tile count.
 uint32_t SensorsPerEnv(const BatchedSensorSceneDevice& device);
+
+// Device pointer into the persistent range tensor after RenderLidarsBatched:
+// [E*S*az*el] floats. Null until the first lidar render.
+const float* SensorRangeDevice(const BatchedSensorSceneDevice& device);
+
+// Lidars per env from the stored lidar mount table (0 before SetLidarMounts), and
+// the fan dims of the last lidar render. The range tensor is (E, S, az, el).
+uint32_t LidarsPerEnv(const BatchedSensorSceneDevice& device);
+uint32_t LidarAzCount(const BatchedSensorSceneDevice& device);
+uint32_t LidarElCount(const BatchedSensorSceneDevice& device);
 
 }  // namespace nuka::rt
