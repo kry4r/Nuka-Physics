@@ -50,6 +50,8 @@ void ScatterEnvInstances(cudaStream_t stream,
 // One sensor's mount binding + pinhole intrinsics, the camera kernel's per-row
 // input (env-invariant). kind: 1=Link, 2=Body, 3=Base, 0=Static (no fk). row =
 // index into the env's pose field; local_offset = pos3+quat(wxyz) mount->camera.
+// fx<=0 => default intrinsics (focal from fov_y+aspect, centered, distortion off,
+// clip wide-open) => the produced camera is byte-identical to the plain pinhole.
 struct SensorMountRow {
     uint32_t kind = 0u;
     uint32_t row = 0u;
@@ -57,6 +59,15 @@ struct SensorMountRow {
     float fov_y = 0.0f;  // full vertical FOV, radians
     uint32_t width = 0u;
     uint32_t height = 0u;
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float k1 = 0.0f;
+    float k2 = 0.0f;
+    uint8_t distortion = 0u;
+    float near_clip = 0.01f;
+    float far_clip = 1000.0f;
 };
 
 // Build a per-env PinholeCamera [E*sensors_per_env] from the mount poses: per

@@ -397,6 +397,73 @@ nuka_result_t nuka_world_set_render_randomization(
     }
 }
 
+nuka_result_t nuka_world_set_camera_intrinsics(
+    nuka_world_handle world, const nuka_camera_intrinsics_desc_t* desc) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->scene || !record->sensor ||
+        record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no camera attached -> nothing to set.
+    }
+
+    // A NULL desc restores the default pinhole + wide-open clip; a non-positive
+    // near/far reads as the schema default (the all-zero desc is a byte no-op).
+    nuka::scene::CameraIntrinsics lens;  // schema defaults: no distortion, 0.01/1000
+    if (desc != nullptr) {
+        lens.distortion = desc->distortion != 0 ? 1u : 0u;
+        lens.k1 = desc->k1;
+        lens.k2 = desc->k2;
+        if (desc->near_clip > 0.0f) lens.near_clip = desc->near_clip;
+        if (desc->far_clip > 0.0f) lens.far_clip = desc->far_clip;
+    }
+
+    try {
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+
+        // Apply the lens knobs onto every stored camera (width/height/vfov/mount
+        // unchanged) and rebuild the sensor scene from the SAME cooked binding.
+        nuka::render::SensorSceneDesc rebuilt;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene,
+                                               record->world->EnvCount(), &rebuilt)) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        rebuilt.sensors = s.sensors;
+        for (nuka::scene::SensorDesc& sd : rebuilt.sensors) {
+            sd.cam.distortion = lens.distortion;
+            sd.cam.k1 = lens.k1;
+            sd.cam.k2 = lens.k2;
+            sd.cam.near_clip = lens.near_clip;
+            sd.cam.far_clip = lens.far_clip;
+        }
+
+        nuka::render::SensorSceneHandle* handle =
+            s.backend->BuildSensorScene(rebuilt);
+        if (handle == nullptr) {
+            return NUKA_RESULT_INTERNAL;
+        }
+        s.backend->FreeSensorScene(s.handle);
+        s.handle = handle;
+        s.sensors = std::move(rebuilt.sensors);
+        s.rendered = false;
+        // Re-apply the retained per-env DR + shading fidelity onto the fresh scene.
+        if (s.render_dr.enabled) {
+            s.backend->SetRenderDr(s.handle, s.render_dr, record->world->EnvCount());
+        }
+        if (s.fidelity.Enabled()) {
+            s.backend->SetSensorFidelity(s.handle, s.fidelity);
+        }
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_set_sensor_fidelity(
     nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc) {
     auto* record = nuka::c_abi::WorldTable().Get(world);

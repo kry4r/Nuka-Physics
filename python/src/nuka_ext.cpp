@@ -478,6 +478,21 @@ public:
               "nuka_world_set_sensor_fidelity");
     }
 
+    // Camera lens model: radial (Brown-Conrady) distortion + a clipped depth range
+    // on every attached camera. Default (distortion off, wide-open clip) is a byte
+    // no-op. fx/fy/cx/cy are renderer-side, not in the scene schema -> not exposed.
+    void set_camera_intrinsics(bool distortion, float k1, float k2, float near_clip,
+                               float far_clip) {
+        nuka_camera_intrinsics_desc_t desc{};
+        desc.distortion = distortion ? 1 : 0;
+        desc.k1 = k1;
+        desc.k2 = k2;
+        desc.near_clip = near_clip;
+        desc.far_clip = far_clip;
+        check(nuka_world_set_camera_intrinsics(h_, &desc),
+              "nuka_world_set_camera_intrinsics");
+    }
+
 private:
     World(nuka_world_handle h, uint32_t ec, uint32_t blc, float dt)
         : h_(h), env_count_(ec), base_link_count_(blc), dt_(dt) {}
@@ -1379,6 +1394,25 @@ NB_MODULE(_nuka_ext, m) {
             "same bytes. spp/shadow_samples/ao_samples are capped at 256. Requires a "
             "camera attached; safe to re-call per reset. Textures are not yet "
             "applied (a follow-on); this is lighting/shading + anti-aliasing.")
+        // Camera lens model: radial distortion + a clipped depth range on every
+        // attached camera. Default (distortion off, wide-open clip) is a byte no-op.
+        .def(
+            "set_camera_intrinsics",
+            [](World& w, bool distortion, float k1, float k2, float near_clip,
+               float far_clip) {
+                w.set_camera_intrinsics(distortion, k1, k2, near_clip, far_clip);
+            },
+            nb::arg("distortion") = false, nb::arg("k1") = 0.0f, nb::arg("k2") = 0.0f,
+            nb::arg("near_clip") = 0.0f, nb::arg("far_clip") = 0.0f,
+            "Apply the camera lens model to every attached camera: radial "
+            "(Brown-Conrady) distortion (distortion=True enables d=1+k1*r2+k2*r2*r2 "
+            "on each ray's normalized sensor coord) and a depth clip (a hit outside "
+            "[near_clip, far_clip] reads as a miss in the depth AOV). A non-positive "
+            "near/far reads as the wide-open default (0.01 / 1000), so the default "
+            "call (distortion off, clip 0/0) is a byte no-op. The principal point and "
+            "per-axis focal are renderer-side knobs not carried by the scene schema, "
+            "so they are not exposed here. Requires a camera attached; rebuilds the "
+            "sensor scene (per-env DR + shading fidelity are preserved).")
         // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
         // the autograd layer uses to push a mass param tensor INTO the sim).
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),
