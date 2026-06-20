@@ -27,6 +27,7 @@
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/cooker.hpp"
+#include "scene/format/nks.hpp"  // native .nks loader (parity with scene.cpp)
 
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
@@ -72,6 +73,10 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
     }
     const std::filesystem::path path(scene_path);
     const std::string extension = path.extension().string();
+    if (extension == ".nks") {
+        *out_scene = scene::nks::Load(scene_path);
+        return true;
+    }
     if (extension == ".xml" || extension == ".mjcf") {
         *out_scene = import::LoadMjcf(scene_path);
         return true;
