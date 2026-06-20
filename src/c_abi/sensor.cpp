@@ -178,6 +178,13 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
             return NUKA_RESULT_INTERNAL;
         }
 
+        // Carry a previously-set render-DR config across the rebuild so a re-attach
+        // keeps the per-env appearance (the fresh tables get the same randomization).
+        nuka::rt::RenderDrConfig carry_dr;
+        if (record->sensor) {
+            carry_dr = record->sensor->render_dr;
+        }
+
         // Install the rebuilt attachment (the old handle frees through its backend
         // in the SensorAttachment dtor when `record->sensor` is overwritten).
         auto attach = std::make_unique<nuka::c_abi::SensorAttachment>();
@@ -187,6 +194,11 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         attach->width = width;
         attach->height = height;
         attach->rendered = false;
+        attach->render_dr = carry_dr;
+        if (carry_dr.enabled) {
+            attach->backend->SetRenderDr(attach->handle, carry_dr,
+                                         record->world->EnvCount());
+        }
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -339,6 +351,44 @@ nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
     if (width != nullptr) *width = s.width;
     if (channels != nullptr) *channels = 3u;
     return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_set_render_randomization(
+    nuka_world_handle world, const nuka_render_dr_desc_t* desc) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no camera attached -> no tables to fill.
+    }
+
+    // A NULL desc disables DR (restores base replicas -> cross-env byte-identical).
+    nuka::rt::RenderDrConfig cfg;
+    if (desc != nullptr) {
+        cfg.color_jitter = desc->color_jitter;
+        cfg.roughness_jitter = desc->roughness_jitter;
+        cfg.metallic_jitter = desc->metallic_jitter;
+        cfg.light_dir_jitter = desc->light_dir_jitter;
+        cfg.light_intensity_jitter = desc->light_intensity_jitter;
+        cfg.light_color_jitter = desc->light_color_jitter;
+        cfg.ambient_intensity_jitter = desc->ambient_intensity_jitter;
+        cfg.seed = desc->seed;
+        cfg.enabled = desc->enabled != 0;
+    }
+
+    try {
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+        s.render_dr = cfg;
+        s.backend->SetRenderDr(s.handle, cfg, record->world->EnvCount());
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 }  // extern "C"

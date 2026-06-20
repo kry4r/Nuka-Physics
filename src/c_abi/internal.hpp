@@ -4,6 +4,7 @@
 
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
+#include "rt/render_dr.hpp"
 #include "phi/backend.hpp"
 // M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
 // nk::World). The diffsim + noise + set_link_mass paths still consume the legacy
@@ -88,6 +89,9 @@ struct SensorAttachment {
     uint32_t width = 0u;
     uint32_t height = 0u;
     bool rendered = false;  // a device AOV tensor exists only after the first render.
+    // Per-env appearance DR (disabled -> base replicas). Retained so a re-attach
+    // (which rebuilds the sensor scene) re-applies it onto the fresh tables.
+    nuka::rt::RenderDrConfig render_dr;
     SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
     ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
     SensorAttachment(SensorAttachment&&) = delete;

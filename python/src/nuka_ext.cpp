@@ -432,6 +432,28 @@ public:
     uint32_t sensor_height() const { return sensor_height_; }
     uint32_t sensor_count() const { return sensor_count_; }
 
+    // Per-env render domain randomization: give each env its OWN appearance
+    // (material color/roughness/metallic, light dir/intensity/color, ambient). The
+    // trace always reads BY ENV; enabled=0 -> base replicas (cross-env identical).
+    // Same seed -> same bytes. Requires a camera attached.
+    void set_render_dr(float color_jitter, float roughness_jitter,
+                       float metallic_jitter, float light_dir_jitter,
+                       float light_intensity_jitter, float light_color_jitter,
+                       float ambient_intensity_jitter, uint64_t seed, int enabled) {
+        nuka_render_dr_desc_t desc{};
+        desc.color_jitter = color_jitter;
+        desc.roughness_jitter = roughness_jitter;
+        desc.metallic_jitter = metallic_jitter;
+        desc.light_dir_jitter = light_dir_jitter;
+        desc.light_intensity_jitter = light_intensity_jitter;
+        desc.light_color_jitter = light_color_jitter;
+        desc.ambient_intensity_jitter = ambient_intensity_jitter;
+        desc.seed = seed;
+        desc.enabled = enabled;
+        check(nuka_world_set_render_randomization(h_, &desc),
+              "nuka_world_set_render_randomization");
+    }
+
 private:
     World(nuka_world_handle h, uint32_t ec, uint32_t blc, float dt)
         : h_(h), env_count_(ec), base_link_count_(blc), dt_(dt) {}
@@ -1274,6 +1296,34 @@ NB_MODULE(_nuka_ext, m) {
                      "Height of the last attached camera image (0 if none).")
         .def_prop_ro("sensor_count", &World::sensor_count,
                      "Cameras per env (S) in the attached sensor block (1 default).")
+        // Per-env render domain randomization (the vision-policy / sim2real lever):
+        // each env gets its OWN appearance set, deterministic + seeded.
+        .def(
+            "set_render_dr",
+            [](World& w, float color_jitter, float roughness_jitter,
+               float metallic_jitter, float light_dir_jitter,
+               float light_intensity_jitter, float light_color_jitter,
+               float ambient_intensity_jitter, uint64_t seed, bool enabled) {
+                w.set_render_dr(color_jitter, roughness_jitter, metallic_jitter,
+                                light_dir_jitter, light_intensity_jitter,
+                                light_color_jitter, ambient_intensity_jitter, seed,
+                                enabled ? 1 : 0);
+            },
+            nb::arg("color_jitter") = 0.0f, nb::arg("roughness_jitter") = 0.0f,
+            nb::arg("metallic_jitter") = 0.0f, nb::arg("light_dir_jitter") = 0.0f,
+            nb::arg("light_intensity_jitter") = 0.0f,
+            nb::arg("light_color_jitter") = 0.0f,
+            nb::arg("ambient_intensity_jitter") = 0.0f, nb::arg("seed") = 0u,
+            nb::arg("enabled") = true,
+            "Enable per-env render domain randomization: each env gets its OWN "
+            "material color/roughness/metallic, light direction/intensity/color, and "
+            "ambient intensity, so the (E,S,H,W,ch) sensor tensor shows appearance "
+            "variety. Each *_jitter is a symmetric band about the base (additive for "
+            "color/roughness/metallic/light_dir, fractional for the intensities); a "
+            "zero jitter leaves that axis at base. enabled=False restores base "
+            "replicas (cross-env byte-identical). A pure function of (seed, env, "
+            "axis) -- the same seed yields the same bytes (RL-reproducible). Requires "
+            "a camera attached; safe to re-call per reset.")
         // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
         // the autograd layer uses to push a mass param tensor INTO the sim).
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),

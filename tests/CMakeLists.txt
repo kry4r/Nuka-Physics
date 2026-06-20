@@ -1638,6 +1638,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_batched_sensor_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Per-env render domain-randomization gate: the trace always reads
+    # material/light/ambient BY ENV. DR off -> base replicas -> cross-env tiles
+    # byte-identical; DR on -> env tiles differ (appearance variety) AND are
+    # deterministic (same seed -> byte-identical). A .cu; --fmad=false matches the
+    # render TU so the per-env tables shade bit-exactly.
+    add_executable(nuka_rt_render_dr_test
+        rt/test_render_dr.cu
+    )
+    target_compile_options(nuka_rt_render_dr_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_render_dr_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_render_dr_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_render_dr_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Per-env camera-mount gate: ScatterEnvCameras builds each env's pinhole
     # camera on device from cam_world = fk(pose) * local_offset (USD/Isaac axes).
     # Asserts the device cameras are byte-identical to the host fk*local_offset

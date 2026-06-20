@@ -24,6 +24,7 @@
 #include "phi/interop_scatter.hpp"  // ScatterFkSource / InstanceScatterRow
 #include "rt/camera.hpp"
 #include "rt/material.hpp"
+#include "rt/render_dr.hpp"         // RenderDrConfig (per-env appearance DR)
 #include "rt/two_level_render.hpp"  // TwoLevelScene / TwoLevelSceneDevice
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (mount table)
 
@@ -87,6 +88,14 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
 // scatters the per-env cameras from it each step; call once after BuildBatchedSensorScene.
 void SetSensorMounts(BatchedSensorSceneDevice& device,
                      const std::vector<scene::SensorDesc>& sensors);
+
+// Record the per-env appearance DR config and (re)fill the per-env material /
+// light / ambient tables from the base set as a pure function of (seed, env,
+// axis). DR disabled (or never set) leaves the tables as exact base replicas, so
+// the cross-env tiles stay byte-identical. Idempotent for a fixed seed; call at
+// build and/or per reset. Cheap (one device fill over env_count tables).
+void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
+                 uint32_t env_count, phi::Backend* backend = nullptr);
 
 // ONE step driven by the stored mount table: scatter cameras (fk * local_offset
 // for every env x sensor) into the persistent camera buffer, then RenderSensorsBatched
