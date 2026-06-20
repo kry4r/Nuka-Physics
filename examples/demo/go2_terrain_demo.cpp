@@ -960,6 +960,15 @@ int main(int argc, char** argv) {
     for (uint32_t r = 0; r < traj.num_robots; ++r)
         base0[r] = traj.PhasedPose(0u, r, 0u).position;
 
+    // The per-robot tile heightfield is static across the clip, so tessellate it once
+    // and reuse for grounding + foot shadows; sampling it is identical to a rebuild.
+    const uint32_t tile_res =
+        static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;
+    std::vector<terrain::HeightField> tile_hf(traj.num_robots);
+    for (uint32_t r = 0; r < traj.num_robots; ++r)
+        tile_hf[r] = TileHeightField(traj.tiles[r].terrain_type, preset,
+                                     traj.tiles[r].difficulty, kTileHalf, tile_res);
+
     auto publish = [&](uint32_t step) {
         for (uint32_t r = 0; r < traj.num_robots; ++r) {
             const TileSpec& t = traj.tiles[r];
@@ -973,11 +982,7 @@ int main(int argc, char** argv) {
             if (kGroundLift) {
                 const float bx = cur_base.x + recenter.x;  // tile-local base xy
                 const float by = cur_base.y + recenter.y;
-                const uint32_t tile_res =
-                    static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;
-                const terrain::HeightField hf = TileHeightField(
-                    t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
-                z_lift = terrain::SampleHeightFieldZ(hf, bx, by);
+                z_lift = terrain::SampleHeightFieldZ(tile_hf[r], bx, by);
             }
             const Vec3 robot_off{t.offset_x + recenter.x,
                                  t.offset_y + recenter.y, z_lift};
@@ -1002,21 +1007,35 @@ int main(int argc, char** argv) {
         if (rw.instances[gi].render_material_id == kMatFoot)
             robot_feet[inst_meta[gi].robot].push_back(gi);
     }
+    // Dedup each distinct foot mesh's repeated positions once so the per-frame min-z
+    // scan transforms each unique point once; the lowest world vertex is unchanged.
+    std::vector<std::vector<Vec3>> foot_verts(rw.meshes.Count());
+    auto foot_local = [&](uint32_t mesh_id) -> const std::vector<Vec3>& {
+        std::vector<Vec3>& u = foot_verts[mesh_id];
+        if (!u.empty()) return u;
+        const auto& g = rw.meshes.Geometry(mesh_id);
+        for (size_t v = 0; v + 2 < g.positions.size(); v += 3) {
+            const Vec3 p{g.positions[v], g.positions[v + 1], g.positions[v + 2]};
+            bool seen = false;
+            for (const Vec3& q : u)
+                if (q.x == p.x && q.y == p.y && q.z == p.z) { seen = true; break; }
+            if (!seen) u.push_back(p);
+        }
+        return u;
+    };
+    for (uint32_t r = 0; r < traj.num_robots; ++r)
+        for (size_t fi : robot_feet[r]) foot_local(rw.instances[fi].mesh_id);
     auto set_contact_shadows = [&](render::RasterOptions& o) {
         o.contact_points.clear();
         for (uint32_t r = 0; r < traj.num_robots; ++r) {
             const TileSpec& t = traj.tiles[r];
-            const uint32_t tile_res =
-                static_cast<uint32_t>(std::ceil(2.0f * kTileHalf / 0.05f)) + 1u;
-            const terrain::HeightField hf = TileHeightField(
-                t.terrain_type, preset, t.difficulty, kTileHalf, tile_res);
+            const terrain::HeightField& hf = tile_hf[r];  // tessellated once, reused
             for (size_t fi : robot_feet[r]) {
-                const auto& geo = rw.meshes.Geometry(rw.instances[fi].mesh_id);
+                const std::vector<Vec3>& verts = foot_verts[rw.instances[fi].mesh_id];
                 const Transform& wx = rw.instances[fi].world_xform;
                 float min_z = 1e9f, fx = 0.0f, fy = 0.0f;
-                for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
-                    const Vec3 wp = wx.TransformPoint(
-                        Vec3{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]});
+                for (const Vec3& lp : verts) {
+                    const Vec3 wp = wx.TransformPoint(lp);
                     if (wp.z < min_z) { min_z = wp.z; fx = wp.x; fy = wp.y; }
                 }
                 // Local terrain height under the foot (subtract the tile offset to
@@ -1266,15 +1285,21 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(args.out_dir);
     uint32_t written = 0u;
     size_t first_nonbg = 0u, last_nonbg = 0u;
-    // Render-only wall-time accumulator: isolates the tracer cost from the CPU
-    // scene re-assembly + PPM I/O the loop ms/frame also includes.
-    double render_ms_total = 0.0;
+    // Per-stage wall-time accumulators: isolate the tracer cost from the CPU scene
+    // re-assembly (pose publish + contact shadows + camera) and the frame I/O.
+    double render_ms_total = 0.0, publish_ms_total = 0.0, shadow_ms_total = 0.0,
+           write_ms_total = 0.0;
     const auto clip_t0 = std::chrono::steady_clock::now();
     for (uint32_t s = 0; s < traj.num_steps; s += args.stride) {
         if (args.frames != 0u && written >= args.frames) break;
+        const auto p_t0 = std::chrono::steady_clock::now();
         publish(s);
+        const auto p_t1 = std::chrono::steady_clock::now();
         set_contact_shadows(opts);
+        const auto p_t2 = std::chrono::steady_clock::now();
         aim_camera(s);
+        publish_ms_total += std::chrono::duration<double, std::milli>(p_t1 - p_t0).count();
+        shadow_ms_total += std::chrono::duration<double, std::milli>(p_t2 - p_t1).count();
         const auto r_t0 = std::chrono::steady_clock::now();
         render::VulkanOffscreenReport rep = render_frame(opts);
         const auto r_t1 = std::chrono::steady_clock::now();
@@ -1286,6 +1311,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[go2_terrain] write fail @ sub-step %u\n", s);
             return 7;
         }
+        write_ms_total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - r_t1).count();
         if (written == 0u) first_nonbg = rep.non_background_pixel_count;
         last_nonbg = rep.non_background_pixel_count;
         ++written;
@@ -1296,10 +1323,13 @@ int main(int argc, char** argv) {
     }
     const auto clip_t1 = std::chrono::steady_clock::now();
     const double clip_s = std::chrono::duration<double>(clip_t1 - clip_t0).count();
+    const double inv = written ? 1.0 / written : 0.0;
     std::printf("[go2_terrain] DONE[%s]: wrote %u frames to %s in %.2f s (%.1f ms/frame, "
                 "render-only %.1f ms/frame, first non_bg=%zu, last=%zu)\n",
                 gpu ? "GPU" : "CPU", written, args.out_dir.c_str(), clip_s,
-                written ? 1000.0 * clip_s / written : 0.0,
-                written ? render_ms_total / written : 0.0, first_nonbg, last_nonbg);
+                1000.0 * clip_s * inv, render_ms_total * inv, first_nonbg, last_nonbg);
+    std::printf("[go2_terrain] PER-FRAME ms: render=%.1f publish=%.1f shadows=%.1f "
+                "write=%.1f\n", render_ms_total * inv, publish_ms_total * inv,
+                shadow_ms_total * inv, write_ms_total * inv);
     return 0;
 }
