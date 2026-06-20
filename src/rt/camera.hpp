@@ -70,9 +70,10 @@ struct PinholeCamera {
     float cx = 0.0f;
     float cy = 0.0f;
     // Radial distortion gated by `distortion`!=0: r2=x*x+y*y, d=1+k1*r2+k2*r2*r2.
+    // Held as a 4-byte flag so the struct is padding-free (byte-exact memcmp).
     float k1 = 0.0f;
     float k2 = 0.0f;
-    uint8_t distortion = 0u;
+    uint32_t distortion = 0u;
     // Depth AOV clip; a hit outside [near_clip, far_clip] reads as a miss.
     float near_clip = 0.01f;
     float far_clip = 1000.0f;
