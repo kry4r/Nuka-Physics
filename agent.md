@@ -16,6 +16,8 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 
 - Use design -> implementation -> integrated validation as the normal workflow for substantial physics work.
 - Do not default to strict TDD or spend most of the session writing narrow unit tests.
+- Do not add new narrow unit tests for Nuka-Physics work. Add or extend pipeline,
+  scenario, e2e, benchmark, or runtime validation that exercises real engine paths.
 - For the v0.1 phase sequence, do not add new narrow unit tests just to satisfy
   individual phase work. Fold validation into a larger e2e/integration test that
   can cover multiple phases and meaningful CUDA/runtime physics behavior.
@@ -25,6 +27,17 @@ This repository is being built as a CUDA-first, full-GPU physics simulation plat
 - Do not spend iterations polishing small test details at the expense of the platform mainline.
 - Each iteration should name one primary functional objective first, implement that objective coherently, then use existing integrated tests/benchmarks/docs to validate it.
 - When a test assertion becomes a distraction, prefer checking that it protects the main functional objective and either simplify it or move on after the core behavior is covered.
+
+## Physics Architecture Principle
+
+- The highest Nuka-Physics requirement is one general physics solving path. No
+  case-by-case paths, per-scene hacks, magic-numbered layouts, silent
+  truncation, or faked results are allowed.
+- When the general solver lacks a capability, implement that capability
+  generally in the shared pipeline. Do not add special-case solvers, fused
+  shortcuts, scene-specific cooks, or golden-only behavior.
+- Robot-ground, robot-robot, robot-object, terrain, and grasp contacts are all
+  the same contact problem and must run through the same general solver path.
 
 ## Robot Simulation Focus
 
