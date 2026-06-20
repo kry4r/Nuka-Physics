@@ -30,8 +30,10 @@
 
 #include <cfloat>
 #include <thrust/execution_policy.h>
+#include <thrust/iterator/zip_iterator.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <thrust/tuple.h>
 
 #include "collision/lbvh_node.cuh"      // LbvhNode / LbvhDelta / LbvhMerge
 #include "collision/morton_codes.cuh"   // Morton3D30
@@ -205,10 +207,10 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
 // the lbvh_nodes arena field + an N-entry morton/index/visit slice. The build
 // is the standalone BuildLbvhImpl pipeline run per env (the scene-bound, morton,
 // stable_sort, init/build/propagate kernels), but the bound + sort happen per
-// env so envs never share a tree (env-major). NOTE: the per-env stable_sort is
-// run on the WHOLE morton array with the (env, code) compound key so a single
-// thrust call orders all envs without cross-env mixing — the env id is the high
-// 16 bits of the sort key (bodies_per_env < 2^16 for every cooked scene).
+// env so envs never share a tree (env-major). The stable_sort runs ONCE on the
+// WHOLE array with the (env<<32)|morton30 compound key so a single thrust call
+// orders all envs without cross-env mixing — the env id is the high 32 bits and
+// the 30-bit morton the low, so within an env the sort is purely by morton.
 
 // AABB center morton (per env, into the env-local [0,1] normalized box). We do a
 // simple per-env reduction in a single block per env (bodies_per_env is small —
@@ -218,7 +220,8 @@ __global__ void EnvMortonKernel(const math::Vec3* __restrict__ lo,
                                 const math::Vec3* __restrict__ hi,
                                 uint32_t bodies_per_env,
                                 uint32_t* __restrict__ out_morton,
-                                uint32_t* __restrict__ out_index) {
+                                uint32_t* __restrict__ out_index,
+                                uint64_t* __restrict__ out_sortkey) {
     const uint32_t env = blockIdx.x;
     const uint32_t base = env * bodies_per_env;
     // Single thread per env folds the env's center bound serially (D1 fixed
@@ -247,8 +250,13 @@ __global__ void EnvMortonKernel(const math::Vec3* __restrict__ lo,
         const float nx = (0.5f * (a.x + b.x) - mn[0]) * inv[0];
         const float ny = (0.5f * (a.y + b.y) - mn[1]) * inv[1];
         const float nz = (0.5f * (a.z + b.z) - mn[2]) * inv[2];
-        out_morton[base + i] = cg::Morton3D30(nx, ny, nz);
+        const uint32_t code = cg::Morton3D30(nx, ny, nz);
+        out_morton[base + i] = code;
         out_index[base + i] = i;  // env-LOCAL leaf index (0..N-1)
+        // Compound key: env in the high 32 bits, 30-bit morton in the low. One
+        // stable sort on this orders every env in a single call (D1 anchor).
+        out_sortkey[base + i] =
+            (static_cast<uint64_t>(env) << 32) | static_cast<uint64_t>(code);
     }
 }
 
@@ -626,17 +634,20 @@ Status OpLbvhBuild(const ModelView& /*model*/, const DataView& data,
         const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream, visit, n);
     }
-    // Per-env Morton code + env-local leaf index (one thread per env folds the
-    // env's own center bound — envs never mix; the per-segment stable_sort below
-    // is the D1 radix anchor).
+    // Per-env Morton code + env-local leaf index + the (env<<32)|morton compound
+    // key (one thread per env folds the env's own center bound — envs never mix).
+    auto* sortkey = data.lbvh_sortkey;
     LaunchCuda(EnvMortonKernel, dim3(E), dim3(kBlockSize), 0u, stream,
-               data.body_aabb_lo, data.body_aabb_hi, N, morton, index);
-    // Per-env stable_sort_by_key (morton ascending; index follows). Segment sort
-    // keeps envs disjoint and preserves the D1 radix anchor.
-    for (uint32_t e = 0u; e < E; ++e) {
-        const size_t base = static_cast<size_t>(e) * N;
+               data.body_aabb_lo, data.body_aabb_hi, N, morton, index, sortkey);
+    // ONE stable_sort_by_key over the WHOLE [E*N] compound-key array (morton +
+    // index follow). The high env bits keep envs disjoint and contiguous, the low
+    // morton bits order within an env, and stability breaks morton ties by the
+    // ascending env-local index — bit-identical to E independent stable sorts.
+    {
+        const size_t total = static_cast<size_t>(E) * N;
+        auto vals = thrust::make_zip_iterator(thrust::make_tuple(index, morton));
         thrust::stable_sort_by_key(thrust::cuda::par.on(stream),
-                                   morton + base, morton + base + N, index + base);
+                                   sortkey, sortkey + total, vals);
     }
     if (cudaGetLastError() != cudaSuccess) return Status::Failed;
 

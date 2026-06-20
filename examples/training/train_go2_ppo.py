@@ -160,7 +160,7 @@ def _build_argparser() -> argparse.ArgumentParser:
                    metavar=("VX", "VY", "WYAW"),
                    help="Constant velocity command for all envs.")
     p.add_argument("--gait-mode", dest="gait_mode",
-                   choices=("walk", "trot", "pronk", "bound"), default=None,
+                   choices=("walk", "trot", "pronk", "bound", "climb"), default=None,
                    help="Go2 gait reward mode (overrides env_config.gait_mode). "
                         "walk=default flat walker; trot/pronk/bound re-weight the "
                         "reward for flight gaits. Default None => keep the yaml.")

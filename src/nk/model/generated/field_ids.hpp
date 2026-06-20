@@ -75,6 +75,7 @@ enum class FieldId : uint16_t {
     LbvhMorton,  // lbvh_morton (per:body arena:scratch owner:data)
     LbvhIndex,  // lbvh_index (per:body arena:scratch owner:data)
     LbvhVisit,  // lbvh_visit (per:body arena:scratch owner:data)
+    LbvhSortkey,  // lbvh_sortkey (per:body arena:scratch owner:data)
     ContactLink,  // contact_link (per:contact_slot arena:scratch owner:data)
     ContactPoint,  // contact_point (per:contact_slot arena:scratch owner:data)
     ContactNormal,  // contact_normal (per:contact_slot arena:scratch owner:data)

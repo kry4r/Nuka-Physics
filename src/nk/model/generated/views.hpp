@@ -137,6 +137,7 @@ struct DataView {
     uint32_t* lbvh_morton = nullptr;  // per:body arena:scratch owner:data
     uint32_t* lbvh_index = nullptr;  // per:body arena:scratch owner:data
     uint32_t* lbvh_visit = nullptr;  // per:body arena:scratch owner:data
+    uint64_t* lbvh_sortkey = nullptr;  // per:body arena:scratch owner:data
     uint32_t* contact_link = nullptr;  // per:contact_slot arena:scratch owner:data
     ::nuka::math::Vec3* contact_point = nullptr;  // per:contact_slot arena:scratch owner:data
     ::nuka::math::Vec3* contact_normal = nullptr;  // per:contact_slot arena:scratch owner:data

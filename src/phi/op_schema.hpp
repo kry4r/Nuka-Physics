@@ -597,6 +597,7 @@ struct ReadoutContactWrenchParams {
     uint32_t env_count;
     uint32_t base_link_count;
     uint32_t max_contacts_per_env;
+    uint32_t rows_per_env;      // per-env solver row-slot span (max_rows_per_env)
 };
 
 struct ExportObsParams {

@@ -498,6 +498,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_readout_.env_count = env_count;
         p_readout_.base_link_count = base_link_count;
         p_readout_.max_contacts_per_env = cap.max_contacts_per_env;
+        p_readout_.rows_per_env = cap.max_rows_per_env;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 

@@ -175,6 +175,16 @@ typedef struct nuka_world_desc_t {
     float gravity_x;
     float gravity_y;
     float gravity_z;
+    // Per-env curriculum tile grid (heightfield_terrain_type == 5). The baked field
+    // is laid out as curric_levels rows (+Y, difficulty) x curric_types cols (+X, a
+    // fixed feature ladder stairs/pit/boxes/flat) of terrain_feature_cell tiles: the
+    // col picks the feature, the row scales its amplitude by (row+1)/curric_levels.
+    // The spawn/curriculum side maps an env's (type,level) to its tile centre, so obs
+    // and physics (both sampled at the robot's world x,y) present that env its own
+    // difficulty tile. 0 (the zero-init default) => off (other types unchanged).
+    uint32_t curric_levels;          // # difficulty rows (0 => no curriculum grid).
+    uint32_t curric_types;           // # feature columns.
+    float    terrain_feature_cell;   // curriculum tile edge, m (0 => 6.0).
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,

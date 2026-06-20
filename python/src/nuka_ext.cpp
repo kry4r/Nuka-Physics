@@ -144,7 +144,10 @@ public:
                                     float heightfield_radius_x,
                                     float heightfield_radius_y,
                                     float heightfield_elevation_z,
-                                    float heightfield_base_z) {
+                                    float heightfield_base_z,
+                                    uint32_t curric_levels,
+                                    uint32_t curric_types,
+                                    float terrain_feature_cell) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -211,6 +214,11 @@ public:
         desc.heightfield_radius_y = heightfield_radius_y;
         desc.heightfield_elevation_z = heightfield_elevation_z;
         desc.heightfield_base_z = heightfield_base_z;
+        // Per-env curriculum tile grid (heightfield_terrain_type == 5). Zero-init
+        // default (curric_levels == 0) leaves every other terrain type unchanged.
+        desc.curric_levels = curric_levels;
+        desc.curric_types = curric_types;
+        desc.terrain_feature_cell = terrain_feature_cell;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -934,6 +942,9 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("heightfield_radius_y") = 0.0f,
                     nb::arg("heightfield_elevation_z") = 0.0f,
                     nb::arg("heightfield_base_z") = 0.0f,
+                    nb::arg("curric_levels") = uint32_t{0},
+                    nb::arg("curric_types") = uint32_t{0},
+                    nb::arg("terrain_feature_cell") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "

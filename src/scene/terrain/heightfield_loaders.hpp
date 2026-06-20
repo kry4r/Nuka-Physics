@@ -64,6 +64,13 @@ struct TerrainGenConfig {
     float feature_cell = 0.0f;    // tile edge length.
     float feature_margin = 0.0f;  // flat seam rim per tile side.
     uint32_t feature_seed = 0u;   // hash salt for the per-tile mix/scale.
+
+    // Curriculum tile grid: when curric_levels > 0 the field is a curric_levels (rows,
+    // +Y) x curric_types (cols, +X) grid of feature_cell tiles; the col picks a fixed
+    // feature ladder (stairs/pit/boxes/flat), the row scales amplitude by
+    // (row+1)/curric_levels. Tiles are indexed from the field origin (corner).
+    uint32_t curric_levels = 0u;  // # difficulty rows.
+    uint32_t curric_types = 0u;   // # feature columns.
 };
 
 // Fill `out` from a parametric config. The feature composition runs ONCE per cell

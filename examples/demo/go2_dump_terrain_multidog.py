@@ -77,6 +77,77 @@ DECIMATION = 4
 SIM_DT = 0.005
 
 
+def _compact_spread_spawn(R: int, seed: int):
+    """Place R dogs ONE-per-cell on a COMPACT cluster of mixed stairs/pit/box cells
+    so the pack frames prominently while every dog traverses a real feature: stairs
+    dogs climb, pit dogs descend into the recess, box dogs cross the bumps.
+
+    Cells come from a tight window picked to contain pit + stairs + box; dogs are
+    placed nearest-origin-first so the cluster is the smallest that holds R distinct
+    feature cells, then seeded headings carry each dog into its feature. No two dogs
+    share a cell -> spawn separation is the 5 m cell pitch (no clip), upright gait.
+    Returns parallel lists (xs, ys, yaws, kinds, labels) length R."""
+    rng = np.random.RandomState(seed)
+    # Centre on the densest mixed-feature patch (this cell holds stairs/box with a
+    # pit one cell away) and rank feature cells by distance to it, so the chosen R
+    # form the SMALLEST bounding cluster -> a tight pack that frames prominently.
+    cx0, cy0 = 0.0, -1.0
+    cells = []
+    for cx in range(-3, 3):
+        for cy in range(-3, 2):
+            st = ST._composite_subtype(cx, cy)
+            if st in (T_STAIRS, T_PIT, T_BOXES):
+                wx = (cx + 0.5) * ST.COMPOSITE_CELL
+                wy = (cy + 0.5) * ST.COMPOSITE_CELL
+                d2 = (cx - cx0) ** 2 + (cy - cy0) ** 2
+                cells.append((cx, cy, wx, wy, st, d2))
+    cells.sort(key=lambda c: c[5])
+    # Take the R nearest cells, then guarantee >=2 pit + >=1 stairs by swapping the
+    # farthest over-represented cell for the NEAREST missing-type cell, so the clip
+    # always shows descent and climb without inflating the cluster.
+    chosen = cells[:R]
+
+    def count(t):
+        return sum(1 for c in chosen if c[4] == t)
+
+    for need, want_n in ((T_PIT, 2), (T_STAIRS, 1)):
+        while count(need) < want_n:
+            cand = next((c for c in cells if c[4] == need and c not in chosen), None)
+            if cand is None:
+                break
+            drop = None
+            for c in sorted(chosen, key=lambda c: -c[5]):
+                if count(c[4]) > 1 and c[4] != need:
+                    drop = c
+                    break
+            if drop is None:
+                break
+            chosen[chosen.index(drop)] = cand
+
+    xs, ys, yaws, kinds, labels = [], [], [], [], []
+    kind_name = {T_STAIRS: "stairs", T_PIT: "pit", T_BOXES: "boxes"}
+    for (cx, cy, wx, wy, st, _r2) in chosen:
+        ang = 2.0 * math.pi * rng.uniform(0.0, 1.0)
+        # Spawn every dog on the seamless FLAT border just OUTSIDE its feature ring,
+        # heading inward, so it settles a confident gait before climbing/descending
+        # (a feature-slope spawn tips a cold-started dog).
+        if st == T_STAIRS:
+            ar = 2.3
+            jit = 0.22
+        elif st == T_PIT:
+            ar = ST.FEATURE_HALF + 0.30
+            jit = 0.18
+        else:
+            ar = ST.FEATURE_HALF + 0.40
+            jit = 0.18
+        sx = wx + ar * math.cos(ang)
+        sy = wy + ar * math.sin(ang)
+        yaw = math.atan2(wy - sy, wx - sx) + rng.uniform(-jit, jit)
+        xs.append(sx); ys.append(sy); yaws.append(yaw); kinds.append(st)
+        labels.append(f"{kind_name[st]} cell({cx:+d},{cy:+d})")
+    return xs[:R], ys[:R], yaws[:R], kinds[:R], labels[:R]
+
+
 def _spread_spawn(R: int, seed: int):
     """Per-dog spawn on the ONE composite field: dogs are PAIRED in clusters that
     converge so several pairs come within dog-dog collision range DURING the walk
@@ -128,7 +199,7 @@ def _spread_spawn(R: int, seed: int):
     return xs[:R], ys[:R], yaws[:R], kinds[:R], labels[:R]
 
 
-def _make_world(dev, R, nrow, ncol, cell):
+def _make_world(dev, R, nrow, ncol, cell, difficulty=1.0):
     """Create ONE env holding R floating-base go2 articulations on a baked composite
     heightfield (general contact path)."""
     import nuka
@@ -139,11 +210,12 @@ def _make_world(dev, R, nrow, ncol, cell):
         contact_family=1, heightfield_terrain_type=T_COMPOSITE,
         heightfield_nrow=int(nrow), heightfield_ncol=int(ncol),
         heightfield_cell=float(cell),
-        # Composite is a pure function of (x,y); the step_* params below match the
-        # single-dog dump's make_env so the host height sampler == the foot kernel.
-        terrain_step_height=0.04, terrain_step_width=0.40,
-        terrain_platform_width=2.0, terrain_grid_width=0.45,
-        terrain_grid_height_max=0.15,
+        # Cook the SAME composite amplitudes the renderer draws (go2_terrain_demo
+        # TilePreset * difficulty) so feet rest exactly on the drawn features; the
+        # difficulty is mirrored into the GO2T meta the renderer reads.
+        terrain_step_height=0.15 * difficulty, terrain_step_width=0.30,
+        terrain_platform_width=1.0, terrain_grid_width=0.45,
+        terrain_grid_height_max=0.15 * difficulty,
     )
     return w
 
@@ -332,14 +404,16 @@ class MultiDogObs:
         nuka.sync()
 
 
-def _rollout(checkpoint, R, seed, seconds, cmd_x, nrow, ncol, cell):
+def _rollout(checkpoint, R, seed, seconds, cmd_x, nrow, ncol, cell, layout="pairs",
+             difficulty=1.0):
     """Roll the height-scan policy on ONE env of R co-resident articulations and
     return the recorded trajectory + spawn meta + diagnostics."""
     import nuka
     from nuka.tasks import go2_obs as G
     torch.manual_seed(seed); np.random.seed(seed)
 
-    xs, ys, yaws, kinds, labels = _spread_spawn(R, seed)
+    spawn_fn = _compact_spread_spawn if layout == "spread" else _spread_spawn
+    xs, ys, yaws, kinds, labels = spawn_fn(R, seed)
     print("-" * 78)
     print(f"[multidog] seed {seed}: {R} dogs as {R} ARTICULATIONS in ONE env on "
           f"ONE composite field; placement:")
@@ -349,7 +423,7 @@ def _rollout(checkpoint, R, seed, seconds, cmd_x, nrow, ncol, cell):
     print("-" * 78, flush=True)
 
     dev = nuka.Device.create(0)
-    world = _make_world(dev, R, nrow, ncol, cell)
+    world = _make_world(dev, R, nrow, ncol, cell, difficulty)
     assert world.env_count == 1, f"expected ONE env, got {world.env_count}"
     blc = world.base_link_count
     assert blc == R * GO2_BLC, f"base_link_count {blc} != {R}*{GO2_BLC}"
@@ -428,6 +502,7 @@ def _rollout(checkpoint, R, seed, seconds, cmd_x, nrow, ncol, cell):
         "BLC": GO2_BLC, "POSE_F": 7, "decimation": DECIMATION, "ctrl_dt": ctrl_dt,
         "kinds": kinds, "labels": labels, "xs": xs, "ys": ys, "yaws": yaws,
         "falls": falls, "seed": seed, "min_pair_global": min_pair_global,
+        "difficulty": difficulty,
     }
 
 
@@ -524,6 +599,12 @@ def main(argv=None):
     ap.add_argument("--robots", type=int, default=20)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--command", type=float, default=0.45)
+    # "spread" = one dog per compact mixed-feature cell (upright traversal, prominent
+    # framing); "pairs" = converging pairs (visible dog-dog collision).
+    ap.add_argument("--layout", choices=["spread", "pairs"], default="pairs")
+    # Composite amplitude scale, cooked into physics AND written to the GO2T meta the
+    # renderer reads, so the drawn features == the feet's surface at any difficulty.
+    ap.add_argument("--difficulty", type=float, default=1.0)
     # The baked heightfield must Nyquist-sample the composite terrain it cooks:
     # the box sub-grid (0.45 m) and stair tread (0.40 m) feature widths alias
     # badly at 0.25 m, leaving the cooked physics surface up to ~0.1 m off the
@@ -543,7 +624,7 @@ def main(argv=None):
     print("=" * 78, flush=True)
 
     roll = _rollout(args.checkpoint, R, args.seed, args.seconds, args.command,
-                    args.nrow, args.ncol, args.cell)
+                    args.nrow, args.ncol, args.cell, args.layout, args.difficulty)
     st = _analyze_pushapart(roll["pose_arr"])
     print("\n" + "=" * 78)
     print(f"[multidog] DIAGNOSTICS  N={roll['N']} ({roll['N']*roll['ctrl_dt']:.2f}s) R={R}")
