@@ -135,6 +135,34 @@ TEST(SensorIntrinsics, DistortionBendsOffAxisOnly) {
         << "distortion did not bend the off-axis corner ray";
 }
 
+// (b2) Distortion ON with the DEFAULT focal (fx<=0 -- the shipped c_abi/scene path
+// never sets fx): the field center barely moves and an off-axis corner BENDS. Guards
+// that distortion is NOT silently dead when the focal is vfov-derived.
+TEST(SensorIntrinsics, DistortionWorksWithDefaultFocal) {
+    const uint32_t W = 64u, H = 64u;
+    PinholeCamera nod = DefaultCamera(W, H, 1.0f);
+    ASSERT_LE(nod.fx, rt::kIntrinsicsDeriveFromFov) << "this case must use the default focal";
+    PinholeCamera dis = nod;
+    dis.distortion = 1u;
+    dis.k1 = -0.3f;
+    dis.k2 = 0.1f;
+
+    const rt::Ray center_off = nod.GenerateRay(W / 2u, H / 2u);
+    const rt::Ray center_dis = dis.GenerateRay(W / 2u, H / 2u);
+    const float cdx = center_dis.dir.x - center_off.dir.x;
+    const float cdy = center_dis.dir.y - center_off.dir.y;
+    EXPECT_LT(std::sqrt(cdx * cdx + cdy * cdy), 1e-2f)
+        << "distortion moved the field-center ray too much (should be ~identity there)";
+
+    const rt::Ray corner_off = nod.GenerateRay(0u, 0u);
+    const rt::Ray corner_dis = dis.GenerateRay(0u, 0u);
+    const float dx = corner_dis.dir.x - corner_off.dir.x;
+    const float dy = corner_dis.dir.y - corner_off.dir.y;
+    const float dz = corner_dis.dir.z - corner_off.dir.z;
+    EXPECT_GT(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-4f)
+        << "default-focal distortion did not bend the corner ray (the dead public path)";
+}
+
 // (c) Principal-point shift + fx!=fy => the ray shifts as expected. Known-value
 // check: a half-pixel principal-point shift in +x maps the pixel whose center is
 // at the new cx to the optical axis (x==0 => dir == forward exactly).

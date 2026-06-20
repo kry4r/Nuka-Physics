@@ -99,31 +99,37 @@ struct PinholeCamera {
         return ray;
     }
 
-    // Ray through pixel (px,py) offset by sub-pixel (jx,jy) in pixel units. The
-    // default branch (fx<=0) is the original NDC arithmetic, bit-for-bit; the
-    // intrinsics branch uses principal point + per-axis focal + radial distortion.
+    // Radial (Brown-Conrady) distortion of normalized image coords, gated by
+    // `distortion`. distortion==0 -> no-op (the default ray-gen stays byte-exact).
+    NUKA_RT_HD void ApplyDistortion(double& x, double& y) const {
+        if (distortion == 0u) return;
+        const double r2 = x * x + y * y;
+        const double d = 1.0 + static_cast<double>(k1) * r2 +
+                         static_cast<double>(k2) * r2 * r2;
+        x *= d;
+        y *= d;
+    }
+
+    // Ray through pixel (px,py) + sub-pixel (jx,jy). fx<=0 = original NDC pinhole
+    // (bit-exact when distortion off); fx>0 adds principal point + per-axis focal.
     NUKA_RT_HD Ray GenerateRayJitter(uint32_t px, uint32_t py, float jx, float jy) const {
         if (fx <= kIntrinsicsDeriveFromFov) {
             const double sx = (2.0 * (static_cast<double>(px) + 0.5 + jx) /
                                static_cast<double>(width)) - 1.0;
             const double sy = 1.0 - (2.0 * (static_cast<double>(py) + 0.5 + jy) /
                                      static_cast<double>(height));
-            return AssembleRay(sx * static_cast<double>(half_w),
-                               sy * static_cast<double>(half_h));
+            double dx = sx, dy = sy;
+            ApplyDistortion(dx, dy);
+            return AssembleRay(dx * static_cast<double>(half_w),
+                               dy * static_cast<double>(half_h));
         }
-        // Continuous pixel coord -> normalized sensor coord (y up). Image-plane
-        // offset = normalized * half-extent (half_w/half_h already encode focal).
+        // Continuous pixel coord -> normalized sensor coord (y up), then radial
+        // distortion. half_w/half_h carry the vfov image-plane half-extents.
         const double u = static_cast<double>(px) + 0.5 + static_cast<double>(jx);
         const double v = static_cast<double>(py) + 0.5 + static_cast<double>(jy);
         double x = (u - static_cast<double>(cx)) / static_cast<double>(fx);
         double y = (static_cast<double>(cy) - v) / static_cast<double>(fy);
-        if (distortion != 0u) {
-            const double r2 = x * x + y * y;
-            const double d = 1.0 + static_cast<double>(k1) * r2 +
-                             static_cast<double>(k2) * r2 * r2;
-            x *= d;
-            y *= d;
-        }
+        ApplyDistortion(x, y);
         return AssembleRay(x * static_cast<double>(half_w),
                            y * static_cast<double>(half_h));
     }
