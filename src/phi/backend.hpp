@@ -145,6 +145,13 @@ RegistryEntry* GetBackend(size_t i);
 // Returns nullptr if no backend/device is available.
 Device*        InitBestDevice();
 
+// --- Active architecture (the backend PHI compute + RHI render share) -------
+// Selected when a device is created, else lazily the best device: physics and
+// render run on one device + stream so their buffers interop zero-copy.
+Backend*       ActiveBackend();
+void           SetActiveBackend(Backend*);    // register the selected backend.
+void           ResetActiveBackend(Backend*);  // clear if it is the active one.
+
 // --- Backend-bound buffer types (impl in the backend; CUDA-free here) -----
 // The buffer types whose transfers run on the backend's MAIN stream. Use these
 // when a consumer's kernels/ops run on backend->main (e.g. the diffsim op path),

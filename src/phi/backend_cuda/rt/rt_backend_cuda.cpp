@@ -19,7 +19,7 @@
 
 #include "render/rt_backend.hpp"
 
-#include "phi/backend.hpp"   // InitBestDevice / DeviceInitBackend / BackendDeviceBufferType
+#include "phi/backend.hpp"   // ActiveBackend / InitBestDevice / BackendDeviceBufferType
 #include "phi/buffer.hpp"    // BufferAlloc / BufferFree
 #include "rt/two_level_render.hpp"
 
@@ -93,23 +93,12 @@ private:
     phi::Backend* backend_ = nullptr;
 };
 
-// Initialize the selected backend (its device + main stream) from the registry's
-// first device. Null when no device is available.
-phi::Backend* InitRtBackend() {
-    phi::Device* device = phi::InitBestDevice();
-    if (device == nullptr) {
-        return nullptr;
-    }
-    return phi::DeviceInitBackend(device, nullptr);
-}
-
 }  // namespace
 
-// STRONG definitions (win over the render-lib weak fallback when nuka_phi2_rt is
-// linked). Returns nullptr when no device initializes (the phi "unavailable ->
-// null" contract).
+// Bind to the global active architecture so render shares the device + stream
+// physics uses. Null when no device is available (phi "unavailable -> null").
 std::unique_ptr<RtBackendI> CreateCudaRtBackend() {
-    phi::Backend* backend = InitRtBackend();
+    phi::Backend* backend = phi::ActiveBackend();
     if (backend == nullptr) {
         return nullptr;
     }

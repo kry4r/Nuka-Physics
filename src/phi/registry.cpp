@@ -87,4 +87,31 @@ Device* InitBestDevice() {
     return nullptr;
 }
 
+namespace {
+// The device-set active backend (null => use the lazy best-device default below).
+Backend*& ActiveOverride() { static Backend* slot = nullptr; return slot; }
+// The process-lifetime best-device backend, realized once when no device is set.
+Backend* LazyDefaultBackend() {
+    static Backend* def = []() -> Backend* {
+        Device* dev = InitBestDevice();
+        return dev != nullptr ? DeviceInitBackend(dev, nullptr) : nullptr;
+    }();
+    return def;
+}
+} // namespace
+
+Backend* ActiveBackend() {
+    Backend* over = ActiveOverride();
+    return over != nullptr ? over : LazyDefaultBackend();
+}
+
+void SetActiveBackend(Backend* backend) { ActiveOverride() = backend; }
+
+void ResetActiveBackend(Backend* backend) {
+    Backend*& slot = ActiveOverride();
+    if (slot == backend) {
+        slot = nullptr;
+    }
+}
+
 } // namespace nuka::phi

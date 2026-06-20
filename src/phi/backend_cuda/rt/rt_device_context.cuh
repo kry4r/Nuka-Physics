@@ -8,7 +8,7 @@
 // default-stream hardcode anywhere on the RT path).
 // ---------------------------------------------------------------------------
 
-#include "phi/backend.hpp"                     // Backend / Device / InitBestDevice
+#include "phi/backend.hpp"                     // Backend / Device / ActiveBackend
 #include "phi/buffer.hpp"                       // BufferType / BufferAlloc / ...
 #include "phi/buffer_transfer_v2.hpp"           // UploadVectorV2
 #include "phi/backend_cuda/cuda_internal.cuh"   // CudaBackend / CudaBackendMainStream
@@ -26,18 +26,11 @@ struct RtContext {
     phi::BufferType* device_bt = nullptr;
 };
 
-// Resolve from a phi backend. A non-null backend uses its device id + main stream
-// + device buffer type. A null backend falls back to the registry's first device,
-// initialized once to a process-lifetime backend so that path also runs on a real
-// device id + main stream. Returns a zeroed context (device_bt null) when no
-// device is available.
+// Resolve from a phi backend: its device id + main stream + device buffer type. A
+// null backend falls back to the global active backend (one device + stream).
 inline RtContext ResolveRtContext(phi::Backend* backend) {
     if (backend == nullptr) {
-        static phi::Backend* s_fallback = []() -> phi::Backend* {
-            phi::Device* dev = phi::InitBestDevice();
-            return dev != nullptr ? phi::DeviceInitBackend(dev, nullptr) : nullptr;
-        }();
-        backend = s_fallback;
+        backend = phi::ActiveBackend();
     }
     RtContext ctx;
     if (backend == nullptr) {

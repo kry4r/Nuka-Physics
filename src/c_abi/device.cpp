@@ -92,6 +92,7 @@ nuka_result_t nuka_device_create(const nuka_device_desc_t* desc,
         }
         record->phi_device = dev;     // registry-owned; not freed.
         record->backend = backend;    // OWNED; freed by ~DeviceRecord.
+        nphi::SetActiveBackend(backend);  // PHI + RHI share this architecture.
 
         *out = nuka::c_abi::DeviceTable().Insert(std::move(record));
         return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
