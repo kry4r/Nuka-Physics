@@ -2591,6 +2591,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
         PRIVATE
             nuka_scene_cook
             nuka_render
+            nuka_phi2_rt
             nuka_nk
             nuka_phi2
             nuka_runtime

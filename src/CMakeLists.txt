@@ -133,6 +133,9 @@ add_library(nuka_render STATIC
     # token (src/render red-line); the CUDA backend is reached only via the
     # render::RtBackendI interface (render/rt_backend.hpp).
     render/rt_adapter.cpp
+    # Host, CUDA-free glue mapping the path-tracer's linear-float rt::Framebuffer
+    # to the RGBA8 VulkanOffscreenReport (ACES + sRGB, matching mesh_pbr.frag).
+    render/rt_framebuffer_to_report.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
     # M11 INT-4 (OD-2): the OPT-IN, default-OFF exportable per-instance transform
