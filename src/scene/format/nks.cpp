@@ -125,22 +125,43 @@ JointType JointTypeFromName(const std::string& s) {
 const char* SensorTypeName(SensorType t) {
     switch (t) {
         case SensorType::Imu:         return "imu";
-        case SensorType::Lidar:       return "lidar";
-        case SensorType::Camera:      return "camera";
-        case SensorType::ForceTorque: return "force_torque";
         case SensorType::Contact:     return "contact";
+        case SensorType::ForceTorque: return "force_torque";
         case SensorType::FramePose:   return "frame_pose";
+        case SensorType::JointState:  return "joint_state";
+        case SensorType::Camera:      return "camera";
+        case SensorType::Depth:       return "depth";
+        case SensorType::Lidar:       return "lidar";
+        case SensorType::RangeScan:   return "range_scan";
     }
     return "imu";
 }
 SensorType SensorTypeFromName(const std::string& s) {
     if (s == "imu") return SensorType::Imu;
-    if (s == "lidar") return SensorType::Lidar;
-    if (s == "camera") return SensorType::Camera;
-    if (s == "force_torque") return SensorType::ForceTorque;
     if (s == "contact") return SensorType::Contact;
+    if (s == "force_torque") return SensorType::ForceTorque;
     if (s == "frame_pose") return SensorType::FramePose;
+    if (s == "joint_state") return SensorType::JointState;
+    if (s == "camera") return SensorType::Camera;
+    if (s == "depth") return SensorType::Depth;
+    if (s == "lidar") return SensorType::Lidar;
+    if (s == "range_scan") return SensorType::RangeScan;
     return SensorType::Imu;
+}
+
+const char* MountFrameName(MountFrame m) {
+    switch (m) {
+        case MountFrame::Link: return "link";
+        case MountFrame::Body: return "body";
+        case MountFrame::Base: return "base";
+    }
+    return "body";
+}
+MountFrame MountFrameFromName(const std::string& s) {
+    if (s == "link") return MountFrame::Link;
+    if (s == "body") return MountFrame::Body;
+    if (s == "base") return MountFrame::Base;
+    return MountFrame::Body;
 }
 
 LightType LightTypeFromName(const std::string& s) {
@@ -405,13 +426,48 @@ Value SaveActuator(const ActuatorRecord& a) {
     return o;
 }
 
-Value SaveSensor(const SensorRecord& s) {
+// Legacy keys (attached_body=mount_index, local) plus additive mount/camera/lidar
+// payloads emitted only when non-default, so an Imu sensor's bytes are unchanged.
+Value SaveSensor(const SensorDesc& s) {
     Value o = Value::Object();
     o.Set("name", Value::Str(s.name));
     o.Set("type", Value::Str(SensorTypeName(s.type)));
-    o.Set("attached_body", Value::Int(static_cast<int64_t>(s.attached_body)));
-    o.Set("local", TransformJson(s.local_transform));
+    o.Set("attached_body", Value::Int(static_cast<int64_t>(s.mount_index)));
+    o.Set("local", TransformJson(s.local_offset));
     o.Set("sample_rate_hz", Value::Float(s.sample_rate_hz));
+    if (s.mount != MountFrame::Body) {
+        o.Set("mount", Value::Str(MountFrameName(s.mount)));
+    }
+    if (s.update_period != 1u) {
+        o.Set("update_period", Value::Int(static_cast<int64_t>(s.update_period)));
+    }
+    if (s.aov_mask != 0u) {
+        o.Set("aov_mask", Value::Int(static_cast<int64_t>(s.aov_mask)));
+    }
+    if (s.type == SensorType::Camera || s.type == SensorType::Depth) {
+        Value c = Value::Object();
+        c.Set("width", Value::Int(s.cam.width));
+        c.Set("height", Value::Int(s.cam.height));
+        c.Set("vfov_degrees", Value::Float(s.cam.vfov_degrees));
+        c.Set("near_clip", Value::Float(s.cam.near_clip));
+        c.Set("far_clip", Value::Float(s.cam.far_clip));
+        c.Set("distortion", Value::Int(s.cam.distortion));
+        c.Set("k1", Value::Float(s.cam.k1));
+        c.Set("k2", Value::Float(s.cam.k2));
+        o.Set("camera", std::move(c));
+    }
+    if (s.type == SensorType::Lidar || s.type == SensorType::RangeScan) {
+        Value l = Value::Object();
+        l.Set("az_count", Value::Int(s.lidar.az_count));
+        l.Set("el_count", Value::Int(s.lidar.el_count));
+        l.Set("az_min", Value::Float(s.lidar.az_min));
+        l.Set("az_max", Value::Float(s.lidar.az_max));
+        l.Set("el_min", Value::Float(s.lidar.el_min));
+        l.Set("el_max", Value::Float(s.lidar.el_max));
+        l.Set("min_range", Value::Float(s.lidar.min_range));
+        l.Set("max_range", Value::Float(s.lidar.max_range));
+        o.Set("lidar", std::move(l));
+    }
     return o;
 }
 
@@ -692,7 +748,7 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // -- sensors (record-fidelity section: no tree home) --------------------
     {
         Value sensors = Value::Array();
-        for (const SensorRecord& s : scene.Sensors()) sensors.PushBack(SaveSensor(s));
+        for (const SensorDesc& s : scene.Sensors()) sensors.PushBack(SaveSensor(s));
         root.Set("sensors", std::move(sensors));
     }
 
@@ -1062,14 +1118,44 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
     }
 
     // -- sensors ------------------------------------------------------------
+    // The legacy 5-key form loads as a Body mount; the unified extras (mount /
+    // camera / lidar / aov_mask / update_period) are read additively when present.
     if (const Value* sensors = root.Find("sensors")) {
         for (const Value& s : sensors->Elements()) {
-            SensorRecord rec;
+            SensorDesc rec;
             rec.name = s.At("name").AsString();
             rec.type = SensorTypeFromName(s.At("type").AsString());
-            rec.attached_body = static_cast<BodyId>(s.At("attached_body").AsInt());
-            rec.local_transform = TransformFromJson(s.At("local"));
+            rec.mount_index = static_cast<uint32_t>(s.At("attached_body").AsInt());
+            rec.local_offset = TransformFromJson(s.At("local"));
             rec.sample_rate_hz = s.At("sample_rate_hz").AsFloat();
+            rec.mount = MountFrame::Body;
+            if (const Value* m = s.Find("mount")) rec.mount = MountFrameFromName(m->AsString());
+            if (const Value* up = s.Find("update_period")) {
+                rec.update_period = static_cast<uint32_t>(up->AsInt());
+            }
+            if (const Value* am = s.Find("aov_mask")) {
+                rec.aov_mask = static_cast<uint32_t>(am->AsInt());
+            }
+            if (const Value* c = s.Find("camera")) {
+                rec.cam.width = static_cast<uint16_t>(c->At("width").AsInt());
+                rec.cam.height = static_cast<uint16_t>(c->At("height").AsInt());
+                rec.cam.vfov_degrees = c->At("vfov_degrees").AsFloat();
+                rec.cam.near_clip = c->At("near_clip").AsFloat();
+                rec.cam.far_clip = c->At("far_clip").AsFloat();
+                rec.cam.distortion = static_cast<uint8_t>(c->At("distortion").AsInt());
+                rec.cam.k1 = c->At("k1").AsFloat();
+                rec.cam.k2 = c->At("k2").AsFloat();
+            }
+            if (const Value* l = s.Find("lidar")) {
+                rec.lidar.az_count = static_cast<uint16_t>(l->At("az_count").AsInt());
+                rec.lidar.el_count = static_cast<uint16_t>(l->At("el_count").AsInt());
+                rec.lidar.az_min = l->At("az_min").AsFloat();
+                rec.lidar.az_max = l->At("az_max").AsFloat();
+                rec.lidar.el_min = l->At("el_min").AsFloat();
+                rec.lidar.el_max = l->At("el_max").AsFloat();
+                rec.lidar.min_range = l->At("min_range").AsFloat();
+                rec.lidar.max_range = l->At("max_range").AsFloat();
+            }
             scene.AddSensor(std::move(rec));
         }
     }

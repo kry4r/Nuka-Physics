@@ -39,13 +39,26 @@ enum class ShapeType : uint8_t {
     HeightField
 };
 
+// Unified sensor kind covering the Isaac Lab suite: analytic (Imu/Contact/
+// ForceTorque/FramePose/JointState) and render (Camera/Depth/Lidar/RangeScan).
 enum class SensorType : uint8_t {
     Imu,
-    Lidar,
-    Camera,
-    ForceTorque,
     Contact,
-    FramePose
+    ForceTorque,
+    FramePose,
+    JointState,
+    Camera,
+    Depth,
+    Lidar,
+    RangeScan
+};
+
+// Which device FK pose a sensor mounts on; maps to FieldId::{LinkPose,BodyPose,
+// BasePose} at runtime. mount_index selects the row within that field.
+enum class MountFrame : uint8_t {
+    Link,
+    Body,
+    Base
 };
 
 enum class LightType : uint8_t {

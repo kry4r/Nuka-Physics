@@ -1,0 +1,56 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 1.0
+        double3 physics:diagonalInertia = (0.1, 0.1, 0.1)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "base_geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 0.2
+        }
+
+        def Camera "onboard"
+        {
+            double3 xformOp:translate = (0.05, 0, 0.1)
+            float focalLength = 24
+            float clippingRange:min = 0.01
+            float clippingRange:max = 100
+        }
+    }
+
+    def NukaSensor "head_lidar"
+    {
+        rel nuka:body = </World/base>
+        token nuka:type = "lidar"
+        float nuka:horizontalFov = 3.14159
+        float nuka:verticalFov = 0.52
+        int nuka:horizontalResolution = 180
+        int nuka:verticalResolution = 16
+        float nuka:minRange = 0.1
+        float nuka:maxRange = 20.0
+    }
+
+    def NukaSensor "front_depth"
+    {
+        rel nuka:body = </World/base>
+        token nuka:type = "depth"
+        int nuka:width = 160
+        int nuka:height = 120
+        float nuka:verticalFov = 1.0472
+    }
+}

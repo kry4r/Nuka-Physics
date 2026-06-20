@@ -97,6 +97,35 @@ TEST(UsdImporter, ParsesRenderControlAndSensorRecords) {
     EXPECT_EQ(scene.GetSensor(0).type, nuka::scene::SensorType::Imu);
 }
 
+TEST(UsdImporter, ParsesLidarAndDepthSensorDescs) {
+    using nuka::scene::SensorType;
+    using nuka::scene::MountFrame;
+    const auto scene = nuka::import::LoadUsd("tests/data/sensors_suite.usda");
+
+    ASSERT_EQ(scene.SensorCount(), 2u);
+    EXPECT_EQ(scene.CameraCount(), 1u);
+    EXPECT_EQ(scene.GetCamera(0).name, "onboard");
+
+    // lidar NukaSensor -> Lidar fan + range, mounted on the base body.
+    const auto& lidar = scene.GetSensor(0);
+    EXPECT_EQ(lidar.type, SensorType::Lidar);
+    EXPECT_EQ(lidar.mount, MountFrame::Body);
+    EXPECT_EQ(lidar.mount_index, 0u);
+    EXPECT_EQ(lidar.lidar.az_count, 180u);
+    EXPECT_EQ(lidar.lidar.el_count, 16u);
+    EXPECT_NEAR(lidar.lidar.az_max, 1.570795f, 1e-4f);
+    EXPECT_NEAR(lidar.lidar.az_min, -1.570795f, 1e-4f);
+    EXPECT_FLOAT_EQ(lidar.lidar.min_range, 0.1f);
+    EXPECT_FLOAT_EQ(lidar.lidar.max_range, 20.0f);
+
+    // depth NukaSensor -> Depth image with width/height + vFOV.
+    const auto& depth = scene.GetSensor(1);
+    EXPECT_EQ(depth.type, SensorType::Depth);
+    EXPECT_EQ(depth.cam.width, 160u);
+    EXPECT_EQ(depth.cam.height, 120u);
+    EXPECT_NEAR(depth.cam.vfov_degrees, 60.0f, 0.1f);
+}
+
 TEST(UsdImporter, DetectsUsdStageFormatsCaseInsensitively) {
     using nuka::import::DetectUsdStageFormat;
     using nuka::import::UsdStageFormat;

@@ -71,9 +71,10 @@ SceneIR MakeAddon() {
     act.joint_id = j0;
     s.AddActuator(std::move(act));
 
-    SensorRecord sensor;
+    SensorDesc sensor;
     sensor.name = "addon_sensor";
-    sensor.attached_body = b1;
+    sensor.mount = MountFrame::Body;
+    sensor.mount_index = b1;
     s.AddSensor(std::move(sensor));
 
     CameraRecord cam;
@@ -112,9 +113,10 @@ SceneIR MakeBase() {
     act.joint_id = 0;
     s.AddActuator(std::move(act));
 
-    SensorRecord sensor;
+    SensorDesc sensor;
     sensor.name = "base_sensor";
-    sensor.attached_body = bb0;
+    sensor.mount = MountFrame::Body;
+    sensor.mount_index = bb0;
     s.AddSensor(std::move(sensor));
 
     CameraRecord cam;
@@ -275,7 +277,7 @@ TEST(SceneCompose, SensorCameraLightBodyRemap) {
     const size_t camoff = base.CameraCount();
     const size_t ligoff = base.LightCount();
 
-    EXPECT_EQ(out.GetSensor(static_cast<SensorId>(senoff + 0)).attached_body,
+    EXPECT_EQ(out.GetSensor(static_cast<SensorId>(senoff + 0)).mount_index,
               static_cast<BodyId>(boff + 1));
     EXPECT_EQ(out.GetCamera(static_cast<CameraId>(camoff + 0)).attached_body,
               static_cast<BodyId>(boff + 0));

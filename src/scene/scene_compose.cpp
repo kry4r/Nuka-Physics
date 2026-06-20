@@ -110,10 +110,14 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     }
 
     // -- Sensors ------------------------------------------------------------
-    for (const SensorRecord& src : addon.Sensors()) {
-        SensorRecord rec = src;
+    // mount_index is a body row only for a Body mount; Link/Base mounts index
+    // articulation-internal rows that compose does not renumber, so remap then.
+    for (const SensorDesc& src : addon.Sensors()) {
+        SensorDesc rec = src;
         rec.name = PrefixName(addon_name_prefix, rec.name);
-        rec.attached_body = RemapId(rec.attached_body, body_off);
+        if (rec.mount == MountFrame::Body) {
+            rec.mount_index = RemapId(rec.mount_index, body_off);
+        }
         out.AddSensor(std::move(rec));
     }
 

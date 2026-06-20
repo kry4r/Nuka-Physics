@@ -486,8 +486,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
 
     for (const auto& s : sensors) {
         blob.sensors.types.push_back(s.type);
-        blob.sensors.attached_bodies.push_back(s.attached_body);
-        blob.sensors.local_transforms.push_back(s.local_transform);
+        blob.sensors.attached_bodies.push_back(s.mount_index);
+        blob.sensors.local_transforms.push_back(s.local_offset);
         blob.sensors.sample_rates_hz.push_back(s.sample_rate_hz);
     }
 

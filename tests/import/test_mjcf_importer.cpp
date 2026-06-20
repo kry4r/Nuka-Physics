@@ -68,9 +68,45 @@ TEST(MjcfImporter, ParsesSceneAuthoringRecords) {
     EXPECT_EQ(scene.GetCamera(0).name, "track");
     EXPECT_EQ(scene.GetLight(0).type, nuka::scene::LightType::Directional);
     EXPECT_EQ(scene.GetActuator(0).joint_id, 0u);
-    EXPECT_EQ(scene.GetSensor(0).type, nuka::scene::SensorType::Imu);
+    // <framepos> maps to the FramePose kind; mount resolves to link1's body row.
+    EXPECT_EQ(scene.GetSensor(0).type, nuka::scene::SensorType::FramePose);
+    EXPECT_EQ(scene.GetSensor(0).mount, nuka::scene::MountFrame::Body);
+    EXPECT_EQ(scene.GetSensor(0).mount_index, 1u);
 }
 
 TEST(MjcfImporter, ThrowsOnMissingFile) {
     EXPECT_THROW(nuka::import::LoadMjcf("nonexistent.xml"), std::runtime_error);
+}
+
+TEST(MjcfImporter, ParsesSensorSuiteIntoUnifiedDescs) {
+    using nuka::scene::SensorType;
+    using nuka::scene::MountFrame;
+    const auto scene = nuka::import::LoadMjcf("tests/data/sensors_suite.xml");
+
+    ASSERT_EQ(scene.SensorCount(), 4u);
+    EXPECT_EQ(scene.CameraCount(), 1u);
+    EXPECT_EQ(scene.GetCamera(0).name, "onboard");
+    EXPECT_FLOAT_EQ(scene.GetCamera(0).vertical_fov_degrees, 60.0f);
+
+    // rangefinder -> RangeScan, a single forward ray, mounted on the site's body
+    // with the site's local offset.
+    const auto& ray = scene.GetSensor(0);
+    EXPECT_EQ(ray.type, SensorType::RangeScan);
+    EXPECT_EQ(ray.mount, MountFrame::Body);
+    EXPECT_EQ(ray.mount_index, 0u);
+    EXPECT_EQ(ray.lidar.az_count, 1u);
+    EXPECT_EQ(ray.lidar.el_count, 1u);
+    EXPECT_FLOAT_EQ(ray.local_offset.position.z, 0.2f);
+
+    EXPECT_EQ(scene.GetSensor(1).type, SensorType::Imu);          // accelerometer
+    EXPECT_FLOAT_EQ(scene.GetSensor(1).local_offset.position.z, 0.2f);
+    EXPECT_EQ(scene.GetSensor(2).type, SensorType::Contact);      // touch
+    EXPECT_FLOAT_EQ(scene.GetSensor(2).local_offset.position.z, -0.1f);
+    EXPECT_EQ(scene.GetSensor(3).type, SensorType::FramePose);    // framepos
+}
+
+TEST(MjcfImporter, ThrowsOnUnsupportedSensor) {
+    // An unmapped <sensor> element errors loudly rather than silently dropping.
+    EXPECT_THROW(nuka::import::LoadMjcf("tests/data/sensor_unsupported.xml"),
+                 std::runtime_error);
 }

@@ -157,14 +157,16 @@ JointId SceneIR::AddJoint(JointRecord record) {
 }
 
 SensorId SceneIR::AddSensor(std::string name, BodyId body) {
-    SensorRecord rec;
+    SensorDesc rec;
     rec.name = std::move(name);
-    rec.attached_body = body;
+    rec.mount = MountFrame::Body;
+    rec.mount_index = body;
     return AddSensor(std::move(rec));
 }
 
-SensorId SceneIR::AddSensor(SensorRecord record) {
-    // Sensors stay record-only (no component projection) until a later milestone.
+SensorId SceneIR::AddSensor(SensorDesc record) {
+    // Sensors stay record-only (no component projection); the mount is resolved
+    // by the runtime FK world-pose pass, not the scene-tree facade.
     const auto id = static_cast<SensorId>(sensors_.size());
     record.id = id;
     sensors_.push_back(std::move(record));
@@ -251,7 +253,7 @@ const CollisionShapeRecord& SceneIR::GetShape(ShapeId id) const {
     return shapes_[id];
 }
 
-const SensorRecord& SceneIR::GetSensor(SensorId id) const {
+const SensorDesc& SceneIR::GetSensor(SensorId id) const {
     if (id >= sensors_.size()) {
         throw std::out_of_range("SceneIR::GetSensor - invalid SensorId");
     }
@@ -310,7 +312,7 @@ CollisionShapeRecord& SceneIR::GetShapeMut(ShapeId id) {
     return shapes_[id];
 }
 
-SensorRecord& SceneIR::GetSensorMut(SensorId id) {
+SensorDesc& SceneIR::GetSensorMut(SensorId id) {
     if (id >= sensors_.size()) {
         throw std::out_of_range("SceneIR::GetSensorMut - invalid SensorId");
     }
@@ -353,7 +355,7 @@ ActuatorRecord& SceneIR::GetActuatorMut(ActuatorId id) {
 const std::vector<RigidBodyRecord>& SceneIR::Bodies() const { return bodies_; }
 const std::vector<JointRecord>& SceneIR::Joints() const { return joints_; }
 const std::vector<CollisionShapeRecord>& SceneIR::Shapes() const { return shapes_; }
-const std::vector<SensorRecord>& SceneIR::Sensors() const { return sensors_; }
+const std::vector<SensorDesc>& SceneIR::Sensors() const { return sensors_; }
 const std::vector<MaterialRecord>& SceneIR::Materials() const { return materials_; }
 const std::vector<CameraRecord>& SceneIR::Cameras() const { return cameras_; }
 const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }

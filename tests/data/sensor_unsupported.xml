@@ -1,0 +1,12 @@
+<mujoco model="sensor_unsupported">
+  <worldbody>
+    <body name="base" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.1 0.1 0.1"/>
+      <geom type="box" size="0.1 0.1 0.1"/>
+      <site name="s"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <magnetometer name="m" site="s"/>
+  </sensor>
+</mujoco>

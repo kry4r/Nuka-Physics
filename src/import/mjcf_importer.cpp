@@ -135,6 +135,13 @@ struct MjcfMeshAsset {
     math::Vec3  scale = {1.0f, 1.0f, 1.0f};
 };
 
+// A named MJCF <site>: the body it rides on plus its body-local frame. A sensor
+// that references the site mounts on that body with this frame as its offset.
+struct MjcfSite {
+    scene::BodyId body = scene::kInvalidBody;
+    math::Transform local = math::Transform::Identity();
+};
+
 struct MjcfParseContext {
     std::unordered_map<std::string, scene::BodyId> body_ids;
     std::unordered_map<std::string, scene::JointId> joint_ids;
@@ -143,6 +150,7 @@ struct MjcfParseContext {
     // Named geoms only: resolves a <contact><pair geom1=/geom2=> name to the
     // ShapeId returned by AddCollisionShape (v0.8 C1b).
     std::unordered_map<std::string, scene::ShapeId> geom_ids;
+    std::unordered_map<std::string, MjcfSite> site_ids;
     MjcfDefaults defaults;
 };
 
@@ -344,23 +352,23 @@ void ParseDefaults(tinyxml2::XMLElement* mujoco, MjcfParseContext& context) {
     }
 }
 
-scene::SensorType MjcfSensorType(const std::string& tag) {
-    if (tag == "rangefinder") {
-        return scene::SensorType::Lidar;
+// Map an MJCF <sensor> tag to the unified sensor kind. An unrecognized tag is
+// rejected by the caller, not silently coerced.
+bool MjcfSensorType(const std::string& tag, scene::SensorType& out) {
+    if (tag == "rangefinder") { out = scene::SensorType::RangeScan; return true; }
+    if (tag == "accelerometer" || tag == "gyro" || tag == "velocimeter") {
+        out = scene::SensorType::Imu; return true;
     }
-    if (tag == "camera") {
-        return scene::SensorType::Camera;
+    if (tag == "force" || tag == "torque") { out = scene::SensorType::ForceTorque; return true; }
+    if (tag == "touch") { out = scene::SensorType::Contact; return true; }
+    if (tag == "framepos" || tag == "framequat" ||
+        tag == "framelinvel" || tag == "frameangvel") {
+        out = scene::SensorType::FramePose; return true;
     }
-    if (tag == "force" || tag == "torque") {
-        return scene::SensorType::ForceTorque;
+    if (tag == "jointpos" || tag == "jointvel") {
+        out = scene::SensorType::JointState; return true;
     }
-    if (tag == "touch") {
-        return scene::SensorType::Contact;
-    }
-    if (tag == "framepos" || tag == "framequat") {
-        return scene::SensorType::Imu;
-    }
-    return scene::SensorType::Imu;
+    return false;
 }
 
 void ParseMaterials(tinyxml2::XMLElement* mujoco,
@@ -714,6 +722,26 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         scene.AddCamera(std::move(record));
     }
 
+    // Named <site>: a body-local frame a <sensor> can mount on. Stored so the
+    // sensor pass resolves site -> (body, pos/quat offset).
+    for (auto* site = body_elem->FirstChildElement("site");
+         site != nullptr;
+         site = site->NextSiblingElement("site")) {
+        const char* site_name = site->Attribute("name");
+        if (!site_name) {
+            continue;
+        }
+        MjcfSite s;
+        s.body = body_id;
+        if (const char* pos = site->Attribute("pos")) {
+            s.local.position = ParseVec3(pos);
+        }
+        if (const char* quat = site->Attribute("quat")) {
+            s.local.rotation = ParseQuat(quat);
+        }
+        context.site_ids[site_name] = s;
+    }
+
     for (auto* child = body_elem->FirstChildElement("body");
          child != nullptr;
          child = child->NextSiblingElement("body")) {
@@ -793,15 +821,37 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
          sensor = sensor->NextSiblingElement()) {
 
         const std::string tag = sensor->Name() ? sensor->Name() : "";
-        scene::SensorRecord record;
+        scene::SensorDesc record;
         record.name = sensor->Attribute("name") ? sensor->Attribute("name") : "sensor";
-        record.type = MjcfSensorType(tag);
-
-        const char* body_name = sensor->Attribute("objname");
-        if (!body_name) {
-            body_name = sensor->Attribute("body");
+        if (!MjcfSensorType(tag, record.type)) {
+            throw std::runtime_error("MJCF: unsupported <sensor> element '" + tag + "'");
         }
-        record.attached_body = ResolveBody(body_name, context);
+
+        // A <site> carries (body, local frame); else objname/body name a body.
+        // An unresolved name stays kInvalidBody for the runtime to flag.
+        record.mount = scene::MountFrame::Body;
+        const char* site_name = sensor->Attribute("site");
+        if (site_name) {
+            const auto it = context.site_ids.find(site_name);
+            if (it != context.site_ids.end()) {
+                record.mount_index = it->second.body;
+                record.local_offset = it->second.local;
+            }
+        } else {
+            const char* body_name = sensor->Attribute("objname");
+            if (!body_name) {
+                body_name = sensor->Attribute("body");
+            }
+            record.mount_index = ResolveBody(body_name, context);
+        }
+
+        // A rangefinder is a single forward ray; the runtime ray-gen reads this
+        // 1-ray pattern through the same lidar path the multi-ray scanners use.
+        if (record.type == scene::SensorType::RangeScan) {
+            record.lidar.az_count = 1;
+            record.lidar.el_count = 1;
+        }
+
         scene.AddSensor(std::move(record));
     }
 }
