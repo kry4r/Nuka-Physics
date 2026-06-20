@@ -413,6 +413,34 @@ public:
         return {e, s, hh, ww, ch};
     }
 
+    // Device-resident batched lidar: S lidars per env, each an (az,el) ray fan, into
+    // a single (E,S,az,el) device RANGE tensor on the SAME RT TLAS the cameras use.
+    // mount_frame 0=Link 1=Body 2=Base; offset=pos3+quat4; angles in radians.
+    void attach_lidar_sensor(uint32_t mount_frame, uint32_t mount_index,
+                             const std::array<float, 7>& local_offset,
+                             uint32_t az_count, uint32_t el_count, float az_min,
+                             float az_max, float el_min, float el_max,
+                             float min_range, float max_range) {
+        check(nuka_world_attach_lidar_sensor(
+                  h_, static_cast<nuka_sensor_mount_t>(mount_frame), mount_index,
+                  local_offset.data(), az_count, el_count, az_min, az_max, el_min,
+                  el_max, min_range, max_range),
+              "nuka_world_attach_lidar_sensor");
+        uint32_t e = 0u, s = 0u, az = 0u, el = 0u;
+        nuka_world_get_lidar_dims(h_, &e, &s, &az, &el);
+        lidar_count_ = s;
+        lidar_az_ = az;
+        lidar_el_ = el;
+    }
+
+    // (env_count, sensors_per_env, az_count, el_count) of the attached lidar fan.
+    std::array<uint32_t, 4> lidar_dims() const {
+        uint32_t e = 0u, s = 0u, az = 0u, el = 0u;
+        check(nuka_world_get_lidar_dims(h_, &e, &s, &az, &el),
+              "nuka_world_get_lidar_dims");
+        return {e, s, az, el};
+    }
+
     void render_sensors() {
         check(nuka_world_render_sensors(h_), "nuka_world_render_sensors");
     }
@@ -431,6 +459,9 @@ public:
     uint32_t sensor_width() const { return sensor_width_; }
     uint32_t sensor_height() const { return sensor_height_; }
     uint32_t sensor_count() const { return sensor_count_; }
+    uint32_t lidar_count() const { return lidar_count_; }
+    uint32_t lidar_az() const { return lidar_az_; }
+    uint32_t lidar_el() const { return lidar_el_; }
 
     // Per-env render domain randomization: give each env its OWN appearance
     // (material color/roughness/metallic, light dir/intensity/color, ambient). The
@@ -504,6 +535,10 @@ private:
     uint32_t sensor_width_ = 0u;
     uint32_t sensor_height_ = 0u;
     uint32_t sensor_count_ = 1u;
+    // Last attached lidar fan (the (E,S,az,el) range shaping).
+    uint32_t lidar_count_ = 0u;
+    uint32_t lidar_az_ = 0u;
+    uint32_t lidar_el_ = 0u;
 };
 
 // ---------------------------------------------------------------------------
@@ -760,6 +795,29 @@ FloatArray make_sensor_float_view(const nuka_buffer_view_t& view, uint32_t n,
         }
         size_t shape[4] = {n, h, w, ch};
         return FloatArray(view.device_ptr, 4, shape, owner, nullptr,
+                          nb::dtype<float>(), nb::device::cuda::value, dev_id);
+    }
+    size_t shape[1] = {view.element_count};
+    return FloatArray(view.device_ptr, 1, shape, owner, nullptr, nb::dtype<float>(),
+                      nb::device::cuda::value, dev_id);
+}
+
+// Shape the lidar RANGE tensor zero-copy: S>1 -> (E,S,az,el); S==1 -> (E,az,el) for
+// the one-lidar-per-env contract. owner keeps the engine buffer alive.
+FloatArray make_lidar_range_view(const nuka_buffer_view_t& view, uint32_t n,
+                                 uint32_t s, uint32_t az, uint32_t el,
+                                 nb::handle owner) {
+    const int dev_id = 0;
+    const size_t cells = static_cast<size_t>(n) * s * az * el;
+    if (n > 0u && s > 0u && az > 0u && el > 0u && cells > 0u &&
+        view.element_count == cells) {
+        if (s > 1u) {
+            size_t shape[4] = {n, s, az, el};
+            return FloatArray(view.device_ptr, 4, shape, owner, nullptr,
+                              nb::dtype<float>(), nb::device::cuda::value, dev_id);
+        }
+        size_t shape[3] = {n, az, el};
+        return FloatArray(view.device_ptr, 3, shape, owner, nullptr,
                           nb::dtype<float>(), nb::device::cuda::value, dev_id);
     }
     size_t shape[1] = {view.element_count};
@@ -1062,13 +1120,15 @@ NB_MODULE(_nuka_ext, m) {
         .export_values();
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
-    // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32.
+    // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32. RANGE
+    // is the lidar plane = (N,az,el) float32 (reshape with World.lidar_dims).
     nb::enum_<nuka_sensor_channel_t>(m, "SensorChannel")
         .value("COLOR", NUKA_SENSOR_CHANNEL_COLOR)
         .value("DEPTH", NUKA_SENSOR_CHANNEL_DEPTH)
         .value("NORMAL", NUKA_SENSOR_CHANNEL_NORMAL)
         .value("ALBEDO", NUKA_SENSOR_CHANNEL_ALBEDO)
         .value("PRIM", NUKA_SENSOR_CHANNEL_PRIM)
+        .value("RANGE", NUKA_SENSOR_CHANNEL_RANGE)
         .export_values();
 
     // Which FK frame a camera mounts on for World.attach_camera_sensor.
@@ -1304,6 +1364,12 @@ NB_MODULE(_nuka_ext, m) {
             [](nb::handle self, nuka_sensor_channel_t channel) -> nb::object {
                 World* w = nb::cast<World*>(self);
                 nuka_buffer_view_t view = w->get_sensor_view(channel);
+                // RANGE is the lidar plane: float32, shaped by the (E,S,az,el) fan.
+                if (channel == NUKA_SENSOR_CHANNEL_RANGE) {
+                    return nb::cast(make_lidar_range_view(
+                        view, w->env_count(), w->lidar_count(), w->lidar_az(),
+                        w->lidar_el(), self));
+                }
                 // PRIM is the ONE uint32 plane (dtype==1); the rest are float32.
                 // (E,S,H,W,ch) for S>1, (E,H,W,ch) for S==1; zero-copy DLPack.
                 if (view.dtype == 1u) {
@@ -1317,13 +1383,14 @@ NB_MODULE(_nuka_ext, m) {
             },
             nb::arg("channel"), nb::rv_policy::reference,
             "Return a zero-copy DLPack-capable CUDA ndarray aliasing the batched "
-            "sensor AOV tensor for `channel` (SensorChannel.COLOR/DEPTH/NORMAL/"
-            "ALBEDO float32, PRIM uint32), shaped (env_count, sensors_per_env, "
-            "height, width, channels) when more than one camera is attached, else "
-            "(env_count, height, width, channels): COLOR/NORMAL/ALBEDO ch=3, "
-            "DEPTH/PRIM ch=1. torch.from_dlpack(...) yields a CUDA tensor aliasing "
-            "the engine buffer (no copy). Raises NOT_SUPPORTED before the first "
-            "render_sensors().")
+            "sensor tensor for `channel`. Cameras (COLOR/DEPTH/NORMAL/ALBEDO float32, "
+            "PRIM uint32) are shaped (env_count, sensors_per_env, height, width, "
+            "channels) for >1 camera else (env_count, height, width, channels): "
+            "COLOR/NORMAL/ALBEDO ch=3, DEPTH/PRIM ch=1. RANGE (lidar, float32) is "
+            "shaped (env_count, sensors_per_env, az_count, el_count) for >1 lidar "
+            "else (env_count, az_count, el_count). torch.from_dlpack(...) yields a "
+            "CUDA tensor aliasing the engine buffer (no copy). Raises NOT_SUPPORTED "
+            "before the first render_sensors().")
         .def("sensor_dims", &World::sensor_dims,
              "The attached sensor block shape as a 5-tuple (env_count, "
              "sensors_per_env, height, width, channels). channels is 3 (the "
@@ -1335,6 +1402,35 @@ NB_MODULE(_nuka_ext, m) {
                      "Height of the last attached camera image (0 if none).")
         .def_prop_ro("sensor_count", &World::sensor_count,
                      "Cameras per env (S) in the attached sensor block (1 default).")
+        // Device-resident batched lidar: an (az,el) ray fan per env into a single
+        // (E,S,az,el) device RANGE tensor on the SAME RT TLAS the cameras use.
+        .def(
+            "attach_lidar_sensor",
+            [](World& w, uint32_t mount_frame, uint32_t mount_index,
+               const std::array<float, 7>& local_offset, uint32_t az_count,
+               uint32_t el_count, float az_min, float az_max, float el_min,
+               float el_max, float min_range, float max_range) {
+                w.attach_lidar_sensor(mount_frame, mount_index, local_offset, az_count,
+                                      el_count, az_min, az_max, el_min, el_max,
+                                      min_range, max_range);
+            },
+            nb::arg("mount_frame"), nb::arg("mount_index"), nb::arg("local_offset"),
+            nb::arg("az_count"), nb::arg("el_count"), nb::arg("az_min"),
+            nb::arg("az_max"), nb::arg("el_min"), nb::arg("el_max"),
+            nb::arg("min_range") = 0.0f, nb::arg("max_range") = 100.0f,
+            "Attach a lidar mounted on mount_frame (0=Link, 1=Body, 2=Base) "
+            "link/body/base index mount_index, offset by local_offset (pos3 + quat4: "
+            "px,py,pz, qw,qx,qy,qz). The fan sweeps az_count*el_count rays: az in "
+            "[az_min,az_max] (radians) about the local +Z axis, el in [el_min,el_max] "
+            "toward local +Z; az=el=0 is local +X. Ranges clamp to "
+            "[min_range,max_range] (a miss reads max_range). Read RANGE via "
+            "get_sensor_view(SensorChannel.RANGE) shaped by lidar_dims. Re-callable: "
+            "a lidar attach REPLACES the lidar set. Raises NOT_SUPPORTED with no RT "
+            "backend / no geometry; ValueError on a zero fan or bad range.")
+        .def("lidar_dims", &World::lidar_dims,
+             "The attached lidar fan shape as a 4-tuple (env_count, sensors_per_env, "
+             "az_count, el_count). Valid after attach_lidar_sensor; raises "
+             "NOT_SUPPORTED if no lidar is attached.")
         // Per-env render domain randomization (the vision-policy / sim2real lever):
         // each env gets its OWN appearance set, deterministic + seeded.
         .def(
