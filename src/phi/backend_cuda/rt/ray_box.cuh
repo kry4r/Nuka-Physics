@@ -63,57 +63,65 @@ inline constexpr uint32_t kNoPrim = 0xFFFFFFFFu;
 // box test here AND NodeEntryT in the traversal .cu, so the guard covers the
 // node-pruning math too (a NaN there would mis-prune a subtree => wrong result).
 // ---------------------------------------------------------------------------
-NUKA_RT_HD inline double RtSafeInvDir(float d) {
-    const double dd = static_cast<double>(d);
+// Real defaults to double: every existing caller (golden kernel + host oracle)
+// is byte-unchanged. The beauty path instantiates Real=float for FP32 speed.
+template <typename Real = double>
+NUKA_RT_HD inline Real RtSafeInvDir(float d) {
+    const Real dd = static_cast<Real>(d);
     // |d| below this -> treat as axis-parallel; clamp inv to a large finite of
-    // the same sign. 1e-300 is far below any meaningful unit-direction component.
-    constexpr double kTinyDir = 1.0e-300;
-    constexpr double kHugeInv = 1.0e300;
+    // the same sign. The threshold scales with the precision so float never
+    // underflows it. fp64: 1e-300; fp32: a denormal-safe small value.
+    const Real kTinyDir = sizeof(Real) >= 8u ? static_cast<Real>(1.0e-300)
+                                             : static_cast<Real>(1.0e-30);
+    const Real kHugeInv = sizeof(Real) >= 8u ? static_cast<Real>(1.0e300)
+                                             : static_cast<Real>(1.0e30);
+    const Real one = static_cast<Real>(1);
     if (dd > kTinyDir) {
-        return 1.0 / dd;
+        return one / dd;
     }
     if (dd < -kTinyDir) {
-        return 1.0 / dd;
+        return one / dd;
     }
     // dd == 0 (or denormally tiny): return a large finite with the sign of dd.
     // copysign(x, +0)=+x, copysign(x, -0)=-x; for a literal 0.0f the sign is +.
-    return dd < 0.0 ? -kHugeInv : kHugeInv;
+    return dd < static_cast<Real>(0) ? -kHugeInv : kHugeInv;
 }
 
 // Shared slab reduction: computes the [tmin, tmax] interval of the ray vs the
 // box. Uses RtSafeInvDir (NaN-guarded). Subtract-then-multiply only (no FMA).
 // Returns false on a miss (interval empty or box entirely behind the ray).
+template <typename Real = double>
 NUKA_RT_HD inline bool RtSlabInterval(const math::Vec3& origin,
                                       const math::Vec3& dir,
                                       const collision::AABB& box,
-                                      double* out_tmin,
-                                      double* out_tmax) {
-    const double inv_x = RtSafeInvDir(dir.x);
-    const double inv_y = RtSafeInvDir(dir.y);
-    const double inv_z = RtSafeInvDir(dir.z);
+                                      Real* out_tmin,
+                                      Real* out_tmax) {
+    const Real inv_x = RtSafeInvDir<Real>(dir.x);
+    const Real inv_y = RtSafeInvDir<Real>(dir.y);
+    const Real inv_z = RtSafeInvDir<Real>(dir.z);
 
     // Per-axis plane distances: (plane - origin) * inv_dir. Subtract then
     // multiply -> no a*b+c -> no FMA contraction.
-    const double tx0 = (static_cast<double>(box.min.x) - static_cast<double>(origin.x)) * inv_x;
-    const double tx1 = (static_cast<double>(box.max.x) - static_cast<double>(origin.x)) * inv_x;
-    const double ty0 = (static_cast<double>(box.min.y) - static_cast<double>(origin.y)) * inv_y;
-    const double ty1 = (static_cast<double>(box.max.y) - static_cast<double>(origin.y)) * inv_y;
-    const double tz0 = (static_cast<double>(box.min.z) - static_cast<double>(origin.z)) * inv_z;
-    const double tz1 = (static_cast<double>(box.max.z) - static_cast<double>(origin.z)) * inv_z;
+    const Real tx0 = (static_cast<Real>(box.min.x) - static_cast<Real>(origin.x)) * inv_x;
+    const Real tx1 = (static_cast<Real>(box.max.x) - static_cast<Real>(origin.x)) * inv_x;
+    const Real ty0 = (static_cast<Real>(box.min.y) - static_cast<Real>(origin.y)) * inv_y;
+    const Real ty1 = (static_cast<Real>(box.max.y) - static_cast<Real>(origin.y)) * inv_y;
+    const Real tz0 = (static_cast<Real>(box.min.z) - static_cast<Real>(origin.z)) * inv_z;
+    const Real tz1 = (static_cast<Real>(box.max.z) - static_cast<Real>(origin.z)) * inv_z;
 
-    const double txmin = tx0 < tx1 ? tx0 : tx1;
-    const double txmax = tx0 < tx1 ? tx1 : tx0;
-    const double tymin = ty0 < ty1 ? ty0 : ty1;
-    const double tymax = ty0 < ty1 ? ty1 : ty0;
-    const double tzmin = tz0 < tz1 ? tz0 : tz1;
-    const double tzmax = tz0 < tz1 ? tz1 : tz0;
+    const Real txmin = tx0 < tx1 ? tx0 : tx1;
+    const Real txmax = tx0 < tx1 ? tx1 : tx0;
+    const Real tymin = ty0 < ty1 ? ty0 : ty1;
+    const Real tymax = ty0 < ty1 ? ty1 : ty0;
+    const Real tzmin = tz0 < tz1 ? tz0 : tz1;
+    const Real tzmax = tz0 < tz1 ? tz1 : tz0;
 
-    double tmin = txmin > tymin ? txmin : tymin;
+    Real tmin = txmin > tymin ? txmin : tymin;
     tmin = tmin > tzmin ? tmin : tzmin;
-    double tmax = txmax < tymax ? txmax : tymax;
+    Real tmax = txmax < tymax ? txmax : tymax;
     tmax = tmax < tzmax ? tmax : tzmax;
 
-    if (tmax < tmin || tmax < 0.0) {
+    if (tmax < tmin || tmax < static_cast<Real>(0)) {
         return false;
     }
     *out_tmin = tmin;
@@ -126,17 +134,18 @@ NUKA_RT_HD inline bool RtSlabInterval(const math::Vec3& origin,
 // camera outside the box). fp64 internally, fp32 stored. NaN-guarded via the
 // shared RtSlabInterval. The ONLY operations are subtract, multiply (by inv_dir),
 // and min/max -- no fused multiply-add anywhere.
+template <typename Real = double>
 NUKA_RT_HD inline bool RayBoxIntersect(const math::Vec3& origin,
                                        const math::Vec3& dir,
                                        const collision::AABB& box,
                                        float* t_near) {
-    double tmin, tmax;
-    if (!RtSlabInterval(origin, dir, box, &tmin, &tmax)) {
+    Real tmin, tmax;
+    if (!RtSlabInterval<Real>(origin, dir, box, &tmin, &tmax)) {
         return false;
     }
     // Entry distance: if the origin is inside the box tmin < 0; clamp to the
     // first surface crossing in front of the ray (tmin if >= 0 else tmax).
-    const double t = tmin >= 0.0 ? tmin : tmax;
+    const Real t = tmin >= static_cast<Real>(0) ? tmin : tmax;
     *t_near = static_cast<float>(t);
     return true;
 }
@@ -145,15 +154,16 @@ NUKA_RT_HD inline bool RayBoxIntersect(const math::Vec3& origin,
 // ray starts inside the box, plus a hit flag. Same NaN-guarded slab math as
 // RayBoxIntersect (shares RtSlabInterval). Used by the traversal's NodeEntryT so
 // the NaN guard covers the node-pruning test too.
+template <typename Real = double>
 NUKA_RT_HD inline bool RtNodeEntryT(const math::Vec3& origin,
                                     const math::Vec3& dir,
                                     const collision::AABB& box,
                                     float* entry_t) {
-    double tmin, tmax;
-    if (!RtSlabInterval(origin, dir, box, &tmin, &tmax)) {
+    Real tmin, tmax;
+    if (!RtSlabInterval<Real>(origin, dir, box, &tmin, &tmax)) {
         return false;
     }
-    *entry_t = static_cast<float>(tmin >= 0.0 ? tmin : 0.0);
+    *entry_t = static_cast<float>(tmin >= static_cast<Real>(0) ? tmin : static_cast<Real>(0));
     return true;
 }
 

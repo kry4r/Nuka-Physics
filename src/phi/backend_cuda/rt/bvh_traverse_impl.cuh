@@ -29,11 +29,13 @@ namespace nuka::rt {
 using ::nuka::collision::gpu::LbvhNode;
 
 // Ray-AABB entry t for node pruning (NaN-guarded; shared with the leaf box math).
+// Real defaults to double (golden traversal byte-unchanged); beauty uses float.
+template <typename Real = double>
 __device__ __forceinline__ bool TraverseNodeEntryT(const math::Vec3& origin,
                                                    const math::Vec3& dir,
                                                    const collision::AABB& box,
                                                    float* entry_t) {
-    return RtNodeEntryT(origin, dir, box, entry_t);
+    return RtNodeEntryT<Real>(origin, dir, box, entry_t);
 }
 
 // Stackless traversal of one ray. `internal_count` = N-1 (a flat index >=
@@ -41,22 +43,26 @@ __device__ __forceinline__ bool TraverseNodeEntryT(const math::Vec3& origin,
 // tests + possibly-updates the closest hit against the leaf at flat node index
 // `leaf_node` (it reads nodes[leaf_node].left == the ORIGINAL prim id). Returns
 // closest (best_t, best_prim) via out-params. For N==1 the caller intersects
-// node 0 directly (single node IS the leaf).
-template <typename LeafFn>
+// node 0 directly (single node IS the leaf). `max_dist` prunes children whose
+// entry t >= it (default +inf keeps every existing caller byte-identical); the
+// AO/GI bounce passes its finite radius so far children are skipped.
+template <typename Real = double, typename LeafFn>
 __device__ void TraverseRay(const LbvhNode* __restrict__ nodes,
                             uint32_t internal_count,
                             const math::Vec3& origin,
                             const math::Vec3& dir,
                             float* best_t,
                             uint32_t* best_prim,
-                            LeafFn leaf) {
-    // Should we descend into `child` (prune if missed or entry t >= best_t)?
+                            LeafFn leaf,
+                            float max_dist = RtMissDepth()) {
+    // Should we descend into `child` (prune if missed or entry t >= the closer
+    // of best_t / max_dist)? max_dist == +inf collapses to the original test.
     auto want = [&](int32_t child) -> bool {
         float et;
-        if (!TraverseNodeEntryT(origin, dir, nodes[child].aabb, &et)) {
+        if (!TraverseNodeEntryT<Real>(origin, dir, nodes[child].aabb, &et)) {
             return false;
         }
-        return et < *best_t;
+        return et < *best_t && et < max_dist;
     };
 
     constexpr int kFromParent = 0;
@@ -69,7 +75,7 @@ __device__ void TraverseRay(const LbvhNode* __restrict__ nodes,
     // Root pruning: if the root bound is entirely missed, nothing to do.
     {
         float et;
-        if (!TraverseNodeEntryT(origin, dir, nodes[0].aabb, &et)) {
+        if (!TraverseNodeEntryT<Real>(origin, dir, nodes[0].aabb, &et)) {
             return;
         }
     }
@@ -114,6 +120,92 @@ __device__ void TraverseRay(const LbvhNode* __restrict__ nodes,
         } else { // kFromRight: both children done -> go up.
             if (parent < 0) {
                 return; // returned to root from its right subtree: done.
+            }
+            const int32_t pleft = nodes[parent].left;
+            next = parent;
+            next_from = (pleft == current) ? kFromLeft : kFromRight;
+        }
+
+        if (next >= 0) {
+            current = next;
+            from = next_from;
+        }
+    }
+}
+
+// Stackless ANY-HIT traversal for pure-visibility rays (soft-shadow / GI-shadow):
+// returns true at the FIRST leaf occluder in [t_min, dist), pruning children whose
+// entry t >= dist. `leaf(leaf_node, origin, dir)` returns true iff that leaf is a
+// real occluder in range. Boolean visibility is order-invariant, so early-out is
+// exact. Same parent-pointer state machine as TraverseRay (one node-AABB test per
+// child). For N==1 the caller tests node 0 directly.
+template <typename Real = double, typename AnyHitFn>
+__device__ bool TraverseRayAnyHit(const LbvhNode* __restrict__ nodes,
+                                  uint32_t internal_count,
+                                  const math::Vec3& origin,
+                                  const math::Vec3& dir,
+                                  AnyHitFn leaf,
+                                  float dist) {
+    auto want = [&](int32_t child) -> bool {
+        float et;
+        if (!TraverseNodeEntryT<Real>(origin, dir, nodes[child].aabb, &et)) {
+            return false;
+        }
+        return et < dist;
+    };
+
+    constexpr int kFromParent = 0;
+    constexpr int kFromLeft = 1;
+    constexpr int kFromRight = 2;
+
+    int32_t current = 0;
+    int from = kFromParent;
+
+    {
+        float et;
+        if (!TraverseNodeEntryT<Real>(origin, dir, nodes[0].aabb, &et)) {
+            return false;
+        }
+    }
+
+    while (true) {
+        const LbvhNode node = nodes[current];
+        const int32_t left = node.left;
+        const int32_t right = node.right;
+        const int32_t parent = node.parent;
+
+        int32_t next = -1;
+        int next_from = kFromParent;
+
+        if (from == kFromParent) {
+            const bool left_leaf = (static_cast<uint32_t>(left) >= internal_count);
+            if (left_leaf) {
+                if (leaf(left, origin, dir)) return true;
+                from = kFromLeft;
+                continue;
+            } else if (want(left)) {
+                next = left;
+                next_from = kFromParent;
+            } else {
+                from = kFromLeft;
+                continue;
+            }
+        } else if (from == kFromLeft) {
+            const bool right_leaf = (static_cast<uint32_t>(right) >= internal_count);
+            if (right_leaf) {
+                if (leaf(right, origin, dir)) return true;
+                from = kFromRight;
+                continue;
+            } else if (want(right)) {
+                next = right;
+                next_from = kFromParent;
+            } else {
+                from = kFromRight;
+                continue;
+            }
+        } else { // kFromRight: both children done -> go up.
+            if (parent < 0) {
+                return false;
             }
             const int32_t pleft = nodes[parent].left;
             next = parent;
