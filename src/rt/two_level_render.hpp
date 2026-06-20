@@ -44,6 +44,11 @@
 #include <memory>
 #include <vector>
 
+namespace nuka::phi {
+struct Backend;  // opaque (phi/backend.hpp); selects the render device + stream
+struct Buffer;   // opaque (phi/buffer.hpp); the caller-resident AOV target
+}  // namespace nuka::phi
+
 namespace nuka::rt {
 
 // One UNIQUE mesh's primitives in its OWN LOCAL space (p13 declaration-order
@@ -75,6 +80,27 @@ struct TwoLevelScene {
     AmbientTerm ambient;
 };
 
+// Stochastic render controls for the beauty path (RenderBeauty): jittered MSAA,
+// soft sun shadows, AO + one-bounce GI, procedural sky/fog. Same scene feeds both.
+struct BeautyOptions {
+    uint32_t samples = 16u;          // jittered sub-pixel samples per pixel (MSAA)
+    uint32_t shadow_rays = 4u;       // penumbra samples across the sun disc
+    float sun_angular_radius = 0.04f;// sun half-angle (rad) -> soft-shadow penumbra
+    uint32_t gi_bounces = 1u;        // diffuse indirect bounces (0 = AO-only ambient)
+    uint32_t ao_samples = 3u;        // hemisphere rays for ambient occlusion
+    float ao_radius = 0.6f;          // AO ray max distance (world units)
+    uint32_t seed = 0x9e3779b9u;     // base RNG seed (fixed -> reproducible frames)
+
+    // Procedural sky + height fog (matches the lavapipe atmosphere); the miss
+    // shader returns sky(dir), reused as sky-dome ambient for secondary misses.
+    math::Vec3 sky_top{0.55f, 0.62f, 0.72f};     // zenith (up)
+    math::Vec3 sky_bottom{0.86f, 0.89f, 0.93f};  // horizon
+    math::Vec3 sky_ground{0.34f, 0.35f, 0.37f};  // below-horizon (down) fill
+    math::Vec3 fog_color{0.84f, 0.88f, 0.93f};   // height/distance fog tint
+    float fog_density = 0.0f;                     // per-metre extinction (0 = off)
+    float sky_intensity = 1.0f;                   // scales the sky-dome ambient
+};
+
 // Opaque, move-only device handle that owns the per-mesh BLAS trees + uploaded
 // LOCAL prim buffers. Survives across frames (rigid BLAS is never refit); the
 // per-frame TLAS is built inside RenderFrame. Built once by BuildTwoLevelScene.
@@ -95,18 +121,65 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Caller-resident device AOV outputs (phi v2 device buffers). The kernel writes
+// each non-null channel in place on the selected backend's stream -- no host
+// round-trip. Sizes mirror the Framebuffer channels (color/normal/albedo 3*float,
+// uv 2*float, depth 1*float, prim 1*uint32 per pixel). null skips that channel.
+struct RtDeviceAovs {
+    phi::Buffer* color  = nullptr;
+    phi::Buffer* depth  = nullptr;
+    phi::Buffer* normal = nullptr;
+    phi::Buffer* albedo = nullptr;
+    phi::Buffer* uv     = nullptr;
+    phi::Buffer* prim   = nullptr;
+};
+
 // Build each unique mesh's BLAS ONCE (per-mesh LBVH over LOCAL prims + uploaded
 // local prim buffers + per-mesh local AABB for the TLAS world-box build). Host-
-// asserts the prim_id caps (instances <= 4096, per-BLAS prims <= 2^20).
-TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene);
+// asserts the prim_id caps (instances <= 4096, per-BLAS prims <= 2^20). `backend`
+// selects the device + stream the BLAS uploads run on; null falls back to the
+// registry's first device on its own backend.
+TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
+                                       phi::Backend* backend = nullptr);
 
 // Render one frame: rebuild the TLAS over the CURRENT instance world-AABBs
 // (read from `scene.instances` each call so moving an instance tracks), launch
 // the nested-traversal kernel, download all 6 AOVs. `device` must have been
 // built from a scene with the SAME meshes (the BLAS is reused); transforms /
-// materials / light are read fresh from `scene`.
+// materials / light are read fresh from `scene`. `backend` selects the device +
+// stream; null falls back to the registry's first device.
 Framebuffer RenderFrame(TwoLevelSceneDevice& device,
                         const TwoLevelScene& scene,
-                        const PinholeCamera& camera);
+                        const PinholeCamera& camera,
+                        phi::Backend* backend = nullptr);
+
+// Same nested-traversal trace, writing the requested AOVs into CALLER-RESIDENT
+// device buffers in place (no host download). The pixel writes are identical to
+// RenderFrame -- only the destination differs (the caller's buffers vs internal
+// ones). `backend` selects the device + stream + AOV buffer type.
+void RenderFrameToAovs(TwoLevelSceneDevice& device,
+                       const TwoLevelScene& scene,
+                       const PinholeCamera& camera,
+                       const RtDeviceAovs& aov,
+                       phi::Backend* backend = nullptr);
+
+// Beauty render: a SEPARATE stochastic path tracer over the SAME device scene
+// (MSAA + soft shadows + AO + one-bounce GI + sky/fog) so near-black bodies read
+// as solid lit volumes. Reproducible given a fixed opt.seed; `color` is the beauty
+// image, the other AOVs carry the center-sample primary hit. RenderFrame untouched.
+Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
+                         const TwoLevelScene& scene,
+                         const PinholeCamera& camera,
+                         const BeautyOptions& opt,
+                         phi::Backend* backend = nullptr);
+
+// Beauty trace into CALLER-RESIDENT device AOV buffers in place (no host
+// download). Same pixel writes as RenderBeauty; only the destination differs.
+void RenderBeautyToAovs(TwoLevelSceneDevice& device,
+                        const TwoLevelScene& scene,
+                        const PinholeCamera& camera,
+                        const BeautyOptions& opt,
+                        const RtDeviceAovs& aov,
+                        phi::Backend* backend = nullptr);
 
 } // namespace nuka::rt

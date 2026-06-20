@@ -4,11 +4,10 @@
 //
 // This is the ONLY place outside the rt device TUs that reaches the self-written
 // two-level tracer's host entry points (rt::BuildTwoLevelScene / rt::RenderFrame).
-// It WRAPS them -- it does NOT reimplement the tracer (R5: kernel bodies are
-// byte-identical through the M11 home; this TU adds NO arithmetic). The device
-// trace (RenderFrame) remains the single source of truth, so every RT D1 golden
-// is preserved unchanged; the BufferI-output path is a post-trace upload of the
-// already-D1 host AOVs into the caller's device buffers.
+// It WRAPS them -- it does NOT reimplement the tracer (kernel bodies are
+// byte-identical; this TU adds NO arithmetic). The device trace is the single
+// source of truth; the BufferI-output path is the same kernel writing the caller's
+// device buffers in place (no host round-trip), byte-identical to the D1 goldens.
 //
 // Lives in src/phi/backend_cuda/rt/ (the CUDA backend layer). It is HOST C++ (no
 // kernel launch here) but is homed in backend_cuda because it is the CUDA-backed
@@ -20,12 +19,10 @@
 
 #include "render/rt_backend.hpp"
 
-#include "phi/backend.hpp"   // InitBestDevice / DeviceBufferType
-#include "phi/buffer.hpp"    // BufferAlloc / BufferUpload / BufferFree
+#include "phi/backend.hpp"   // InitBestDevice / DeviceInitBackend / BackendDeviceBufferType
+#include "phi/buffer.hpp"    // BufferAlloc / BufferFree
 #include "rt/two_level_render.hpp"
 
-#include <cstddef>
-#include <cstdint>
 #include <memory>
 
 namespace nuka::render {
@@ -39,29 +36,32 @@ struct RtSceneHandle {
 
 namespace {
 
-// Upload one host AOV channel into a caller-provided device Buffer* (skip if the
-// caller passed nullptr for that channel or the host channel is empty).
-template <class T>
-void UploadAov(phi::Buffer* dst, const std::vector<T>& host) {
-    if (dst == nullptr || host.empty()) {
-        return;
-    }
-    phi::BufferUpload(dst, host.data(), 0, host.size() * sizeof(T));
+// Map the caller's RtAovBuffers (one phi::Buffer* per AOV) to the device-resident
+// target the tracer writes in place (null channels are skipped by the kernel).
+rt::RtDeviceAovs ToDeviceAovs(const RtAovBuffers& aov) {
+    rt::RtDeviceAovs out;
+    out.color = aov.color;
+    out.depth = aov.depth;
+    out.normal = aov.normal;
+    out.albedo = aov.albedo;
+    out.uv = aov.uv;
+    out.prim = aov.prim;
+    return out;
 }
 
-// The CUDA RT backend: holds the phi device (for the AOV BufferType) and wraps
-// the host two-level tracer entry points.
+// The CUDA RT backend: holds the selected phi backend (its device + main stream +
+// AOV buffer type) and wraps the two-level tracer, which runs on that device/stream.
 class CudaRtBackend final : public RtBackendI {
 public:
-    explicit CudaRtBackend(phi::Device* device) : device_(device) {}
+    explicit CudaRtBackend(phi::Backend* backend) : backend_(backend) {}
 
     phi::BufferType* AovBufferType() override {
-        return phi::DeviceBufferType(device_);
+        return phi::BackendDeviceBufferType(backend_);
     }
 
     RtSceneHandle* BuildScene(const rt::TwoLevelScene& scene) override {
         auto handle = std::make_unique<RtSceneHandle>();
-        handle->device = rt::BuildTwoLevelScene(scene);
+        handle->device = rt::BuildTwoLevelScene(scene, backend_);
         return handle.release();
     }
 
@@ -69,31 +69,39 @@ public:
                const rt::TwoLevelScene& scene,
                const rt::PinholeCamera& camera,
                const RtAovBuffers& aov) override {
-        // The device trace (RenderFrame) is the single source of truth and is
-        // byte-identical to the rt D1 goldens. Run it, then upload the resulting
-        // (already-D1) host AOVs into the caller's device buffers. This keeps the
-        // BufferI output contract (OD-12) without perturbing the tracer.
-        const rt::Framebuffer frame =
-            rt::RenderFrame(handle->device, scene, camera);
-        UploadAov(aov.color, frame.color);
-        UploadAov(aov.depth, frame.depth);
-        UploadAov(aov.normal, frame.normal);
-        UploadAov(aov.albedo, frame.albedo);
-        UploadAov(aov.uv, frame.uv);
-        UploadAov(aov.prim, frame.prim);
+        // The kernel writes the caller's device AOV buffers in place on the selected
+        // stream (no host round-trip); identical pixels to TraceToHost.
+        rt::RenderFrameToAovs(handle->device, scene, camera, ToDeviceAovs(aov), backend_);
     }
 
     rt::Framebuffer TraceToHost(RtSceneHandle* handle,
                                 const rt::TwoLevelScene& scene,
                                 const rt::PinholeCamera& camera) override {
-        return rt::RenderFrame(handle->device, scene, camera);
+        return rt::RenderFrame(handle->device, scene, camera, backend_);
+    }
+
+    rt::Framebuffer TraceBeautyToHost(RtSceneHandle* handle,
+                                      const rt::TwoLevelScene& scene,
+                                      const rt::PinholeCamera& camera,
+                                      const rt::BeautyOptions& opt) override {
+        return rt::RenderBeauty(handle->device, scene, camera, opt, backend_);
     }
 
     void FreeScene(RtSceneHandle* handle) override { delete handle; }
 
 private:
-    phi::Device* device_ = nullptr;
+    phi::Backend* backend_ = nullptr;
 };
+
+// Initialize the selected backend (its device + main stream) from the registry's
+// first device. Null when no device is available.
+phi::Backend* InitRtBackend() {
+    phi::Device* device = phi::InitBestDevice();
+    if (device == nullptr) {
+        return nullptr;
+    }
+    return phi::DeviceInitBackend(device, nullptr);
+}
 
 }  // namespace
 
@@ -101,11 +109,11 @@ private:
 // linked). Returns nullptr when no device initializes (the phi "unavailable ->
 // null" contract).
 std::unique_ptr<RtBackendI> CreateCudaRtBackend() {
-    phi::Device* device = phi::InitBestDevice();
-    if (device == nullptr) {
+    phi::Backend* backend = InitRtBackend();
+    if (backend == nullptr) {
         return nullptr;
     }
-    return std::make_unique<CudaRtBackend>(device);
+    return std::make_unique<CudaRtBackend>(backend);
 }
 
 bool RtBackendAvailable() { return phi::InitBestDevice() != nullptr; }

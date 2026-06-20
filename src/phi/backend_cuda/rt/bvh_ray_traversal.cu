@@ -28,12 +28,12 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/lbvh_node.cuh"
 #include "math/vec3.hpp"
-#include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
+#include "phi/backend.hpp"             // Backend / InitBestDevice
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
-#include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/scoped_device_guard.hpp"
 #include "phi/backend_cuda/rt/bvh_traverse_impl.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/rt_device_context.cuh"  // RtContext / OwnedBuffer
 #include "rt/camera.hpp"
 
 #include <cuda_runtime.h>
@@ -55,48 +55,6 @@ void CheckCuda(cudaError_t result, const char* operation) {
         throw std::runtime_error(std::string(operation) + " failed: " +
                                  cudaGetErrorString(result));
     }
-}
-
-// RT-7 (M11): file-local RAII over the phi-v2 opaque Buffer*, mirroring the
-// legacy phi::Buffer surface (default-ctor + sized-ctor + Data/CopyFromHost/
-// CopyToHost, move-only) so the render bodies below stay byte-identical after the
-// BUF sweep. Bound to the stream-0 DeviceBufferType (NULL/default
-// stream) -> transfers are byte+ordering identical to the legacy synchronous
-// memcpy. The RT kernels keep running on their existing stream UNCHANGED; this is
-// the buffer-handle swap ONLY (the full RT->RtBackendI homing is a later M11 phase).
-class OwnedBuffer {
-public:
-    OwnedBuffer() = default;
-    explicit OwnedBuffer(size_t bytes) {
-        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
-    }
-    explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
-    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
-    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
-    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
-        if (this != &o) {
-            if (buf_ != nullptr) phi::BufferFree(buf_);
-            buf_ = o.buf_; o.buf_ = nullptr;
-        }
-        return *this;
-    }
-    OwnedBuffer(const OwnedBuffer&) = delete;
-    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
-    void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
-    void CopyFromHost(const void* src, size_t bytes) {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferUpload(buf_, src, 0, bytes);
-    }
-    void CopyToHost(void* dst, size_t bytes) const {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
-    }
-private:
-    phi::Buffer* buf_ = nullptr;
-};
-
-template <typename T>
-OwnedBuffer UploadOwned(const std::vector<T>& values) {
-    return OwnedBuffer(phi::UploadVectorV2(
-        phi::DeviceBufferType(phi::InitBestDevice()), values));
 }
 
 using ::nuka::collision::gpu::LbvhNode;
@@ -175,15 +133,16 @@ DepthRender RenderDepth(const std::vector<collision::AABB>& boxes,
         return out;
     }
 
-    const cudaStream_t stream = nullptr;  // default stream 0
-    const int device_id = 0;
-    phi::ScopedDeviceGuard guard(device_id);
+    const RtContext ctx = ResolveRtContext(nullptr);
+    const cudaStream_t stream = ctx.stream;
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
 
     // Output framebuffers (device). RenderDepth is NOT a per-step hot path (it
     // renders a sensor frame, like cross_system_query's allocations) -> these
     // allocations are out of the hot_path lint scope by design.
-    OwnedBuffer d_depth(pixels * sizeof(float));
-    OwnedBuffer d_prim(pixels * sizeof(uint32_t));
+    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
+    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
 
     const uint32_t leaf_count = static_cast<uint32_t>(boxes.size());
 
@@ -198,9 +157,10 @@ DepthRender RenderDepth(const std::vector<collision::AABB>& boxes,
     }
 
     // Build the box-primitive LBVH, RETAINING the node tree (BuildLbvhForQuery).
-    OwnedBuffer d_boxes = UploadOwned(boxes);
+    OwnedBuffer d_boxes = UploadOwned(ctx.device_bt, boxes);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
-    auto tree = collision::gpu::BuildLbvhForQuery(dev_boxes, leaf_count);
+    auto tree = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                  dev_boxes, leaf_count);
     if (!tree.HasNodes()) {
         throw std::runtime_error("RenderDepth: LBVH build did not retain nodes");
     }
@@ -227,9 +187,13 @@ uint32_t DebugMaxTreeDepth(const std::vector<collision::AABB>& boxes) {
         return 0u;
     }
 
-    OwnedBuffer d_boxes = UploadOwned(boxes);
+    const RtContext ctx = ResolveRtContext(nullptr);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+    OwnedBuffer d_boxes = UploadOwned(ctx.device_bt, boxes);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
-    auto tree = collision::gpu::BuildLbvhForQuery(dev_boxes, leaf_count);
+    auto tree = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                  dev_boxes, leaf_count);
     if (!tree.HasNodes()) {
         throw std::runtime_error("DebugMaxTreeDepth: LBVH build did not retain nodes");
     }

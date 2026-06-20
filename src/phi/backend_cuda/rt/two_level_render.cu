@@ -33,11 +33,12 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
+#include "phi/backend.hpp"             // InitBestDevice / BackendDeviceBufferType
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
 #include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/scoped_device_guard.hpp"
 #include "phi/backend_cuda/rt/bvh_traverse_impl.cuh"
+#include "phi/backend_cuda/rt/rt_device_context.cuh"  // RtContext / OwnedBuffer
 #include "phi/backend_cuda/rt/instance_transform.cuh"
 #include "phi/backend_cuda/rt/intersect_primitives.cuh"
 #include "phi/backend_cuda/rt/prim_id.cuh"
@@ -57,47 +58,6 @@ namespace nuka::rt {
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
-
-// RT-7 (M11): file-local RAII over the phi-v2 opaque Buffer*, mirroring the legacy
-// phi::Buffer surface (default-ctor + sized-ctor + Data/CopyFromHost/CopyToHost,
-// move-only) so the render bodies + the GpuScene buffer-holding struct below stay
-// byte-identical after the BUF sweep. Bound to the stream-0
-// DeviceBufferType (NULL/default stream) -> transfers are byte+ordering identical to
-// the legacy synchronous memcpy. The RT kernels keep running on their existing
-// stream UNCHANGED; this is the buffer-handle swap ONLY.
-class OwnedBuffer {
-public:
-    OwnedBuffer() = default;
-    explicit OwnedBuffer(size_t bytes) {
-        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
-    }
-    explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
-    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
-    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
-    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
-        if (this != &o) {
-            if (buf_ != nullptr) phi::BufferFree(buf_);
-            buf_ = o.buf_; o.buf_ = nullptr;
-        }
-        return *this;
-    }
-    OwnedBuffer(const OwnedBuffer&) = delete;
-    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
-    void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
-    // (No CopyFromHost: this TU's uploads all go through UploadOwned; only the
-    // AOV download path uses CopyToHost.)
-    void CopyToHost(void* dst, size_t bytes) const {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
-    }
-private:
-    phi::Buffer* buf_ = nullptr;
-};
-
-template <typename T>
-OwnedBuffer UploadOwned(const std::vector<T>& values) {
-    return OwnedBuffer(phi::UploadVectorV2(
-        phi::DeviceBufferType(phi::InitBestDevice()), values));
-}
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -146,6 +106,19 @@ struct DevInstance {
     DevBlas blas;
     uint32_t instance_id = 0u;
     uint32_t material_id = 0u;
+};
+
+// Device-side mirror of rt::BeautyOptions (trivially-copyable, passed by value
+// into the beauty kernel). Pure render parameters; no host-only types.
+struct BeautyParams {
+    uint32_t shadow_rays;
+    float sun_angular_radius;
+    uint32_t gi_bounces;
+    uint32_t ao_samples;
+    float ao_radius;
+    Vec3 sky_top, sky_bottom, sky_ground, fog_color;
+    float fog_density;
+    float sky_intensity;
 };
 
 // Intersect one LOCAL primitive of a BLAS (closest-hit pass): returns t only.
@@ -415,6 +388,272 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
     out_prim[pixel] = prim_id;
 }
 
+// ---------------------------------------------------------------------------
+// BEAUTY PATH (stochastic): a SEPARATE kernel that reuses the SAME ClosestHit /
+// ReconstructHit nest as RenderFrame but adds jittered MSAA, soft area-sun
+// shadows, cosine AO + one-bounce GI, and a procedural sky/fog miss shader. It
+// writes only a tonemap-free linear `color` (+ the center-sample primary AOVs);
+// RenderFrame above is byte-untouched so the D1 sensor goldens stay green.
+// ---------------------------------------------------------------------------
+
+// PCG32-ish hash RNG: cheap, well-distributed, deterministic from (seed, counter)
+// so a fixed BeautyOptions::seed makes the whole frame reproducible run-to-run.
+__device__ __forceinline__ uint32_t PcgHash(uint32_t v) {
+    uint32_t state = v * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+struct BeautyRng {
+    uint32_t s;
+    __device__ __forceinline__ float NextF() {
+        s = PcgHash(s);
+        // 24-bit mantissa float in [0,1).
+        return static_cast<float>(s >> 8) * (1.0f / 16777216.0f);
+    }
+};
+
+// Orthonormal basis around a unit normal (Duff et al. 2017, branchless).
+__device__ __forceinline__ void OrthoBasis(const Vec3& n, Vec3* t, Vec3* b) {
+    const float sign = copysignf(1.0f, n.z);
+    const float a = -1.0f / (sign + n.z);
+    const float c = n.x * n.y * a;
+    *t = Vec3{1.0f + sign * n.x * n.x * a, sign * c, -sign * n.x};
+    *b = Vec3{c, sign + n.y * n.y * a, -n.y};
+}
+
+// Cosine-weighted hemisphere sample about `n` (Malley's method).
+__device__ __forceinline__ Vec3 CosineHemisphere(const Vec3& n, float u1, float u2) {
+    const float r = sqrtf(u1);
+    const float phi = 6.2831853071795864769f * u2;
+    const float x = r * cosf(phi);
+    const float y = r * sinf(phi);
+    const float z = sqrtf(fmaxf(0.0f, 1.0f - u1));
+    Vec3 t, b;
+    OrthoBasis(n, &t, &b);
+    return RtNormalize(Vec3{t.x * x + b.x * y + n.x * z,
+                            t.y * x + b.y * y + n.y * z,
+                            t.z * x + b.z * y + n.z * z});
+}
+
+// Sample a cone of half-angle `ang` about the unit axis `L` (soft sun disc).
+__device__ __forceinline__ Vec3 SampleCone(const Vec3& L, float ang, float u1, float u2) {
+    const float cos_max = cosf(ang);
+    const float cos_t = 1.0f - u1 * (1.0f - cos_max);
+    const float sin_t = sqrtf(fmaxf(0.0f, 1.0f - cos_t * cos_t));
+    const float phi = 6.2831853071795864769f * u2;
+    Vec3 t, b;
+    OrthoBasis(L, &t, &b);
+    const float x = sin_t * cosf(phi);
+    const float y = sin_t * sinf(phi);
+    return RtNormalize(Vec3{t.x * x + b.x * y + L.x * cos_t,
+                            t.y * x + b.y * y + L.y * cos_t,
+                            t.z * x + b.z * y + L.z * cos_t});
+}
+
+// Procedural sky + ground dome along a ray direction (the miss shader). Smooth
+// horizon blend; below-horizon fades to a neutral ground fill so bounce rays that
+// escape downward still pick up plausible fill instead of pure black.
+__device__ __forceinline__ Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
+    const float t = 0.5f * (dir.z + 1.0f);             // -1..1 -> 0..1
+    if (dir.z >= 0.0f) {
+        const float up = dir.z;                        // 0 horizon .. 1 zenith
+        const float w = up * up;                       // bias color toward horizon
+        return Vec3{sky.sky_bottom.x + (sky.sky_top.x - sky.sky_bottom.x) * w,
+                    sky.sky_bottom.y + (sky.sky_top.y - sky.sky_bottom.y) * w,
+                    sky.sky_bottom.z + (sky.sky_top.z - sky.sky_bottom.z) * w};
+    }
+    const float w = fminf(1.0f, -dir.z * 1.5f);
+    (void)t;
+    return Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
+                sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
+                sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
+}
+
+// Per-pixel hit at world point `hit` with viewer-faced normal `Nf`: K-ray soft
+// sun shadow + cosine AO/GI bounces. Returns the lit RGB (diffuse + specular +
+// indirect). Reuses the SAME ClosestHit nest for every secondary ray.
+__device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_nodes,
+                                            uint32_t tlas_leaf_count,
+                                            const DevInstance* __restrict__ instances,
+                                            const Material* __restrict__ materials,
+                                            Light light, BeautyParams sky,
+                                            const Vec3& hit, const Vec3& Nf, const Vec3& V,
+                                            const Material& mat, BeautyRng* rng) {
+    // Sun direction (toward the light) + a finite angular size -> penumbra.
+    Vec3 Ls;
+    if (light.directional) {
+        Ls = RtNormalize(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+    } else {
+        Ls = RtNormalize(Vec3{light.position.x - hit.x, light.position.y - hit.y,
+                              light.position.z - hit.z});
+    }
+    const Vec3 light_col{light.color.x * light.intensity,
+                         light.color.y * light.intensity,
+                         light.color.z * light.intensity};
+    const float eps = 1.0e-3f;
+    const Vec3 sorigin{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+
+    // Soft shadow: average visibility over K cone-sampled sun directions.
+    float vis = 0.0f;
+    const uint32_t K = sky.shadow_rays < 1u ? 1u : sky.shadow_rays;
+    for (uint32_t k = 0; k < K; ++k) {
+        const Vec3 Lk = SampleCone(Ls, sky.sun_angular_radius, rng->NextF(), rng->NextF());
+        if (Lk.x * Nf.x + Lk.y * Nf.y + Lk.z * Nf.z <= 0.0f) continue;
+        float st; uint32_t sp;
+        ClosestHit(tlas_nodes, tlas_leaf_count, instances, sorigin, Lk, eps, &st, &sp);
+        if (sp == kNoPrim) vis += 1.0f;
+    }
+    vis /= static_cast<float>(K);
+
+    const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
+    // Half vector for a GGX-ish specular highlight so the shell catches the sun.
+    Vec3 H = RtNormalize(Vec3{V.x + Ls.x, V.y + Ls.y, V.z + Ls.z});
+    const float NoH = fmaxf(0.0f, Nf.x * H.x + Nf.y * H.y + Nf.z * H.z);
+    const float alpha = fmaxf(1.0e-3f, mat.roughness * mat.roughness);
+    const float a2 = alpha * alpha;
+    const float dterm = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    const float spec = (a2 / (3.14159265f * dterm * dterm)) * (0.04f + mat.metallic);
+
+    const float kd = (1.0f - mat.metallic) * (1.0f / 3.14159265f);
+    Vec3 direct{
+        light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
+        light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
+        light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
+
+    // AO + one-bounce GI: cosine-weighted hemisphere rays. A ray that escapes the
+    // AO radius (or misses) samples the sky dome; a near hit darkens the crease
+    // and (for GI) picks up the bounce albedo*shade of the hit surface.
+    Vec3 indirect{0.0f, 0.0f, 0.0f};
+    const uint32_t M = sky.ao_samples < 1u ? 1u : sky.ao_samples;
+    for (uint32_t m = 0; m < M; ++m) {
+        const Vec3 d = CosineHemisphere(Nf, rng->NextF(), rng->NextF());
+        const Vec3 ro{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+        float bt; uint32_t bp;
+        ClosestHit(tlas_nodes, tlas_leaf_count, instances, ro, d, eps, &bt, &bp);
+        if (bp == kNoPrim || bt >= sky.ao_radius) {
+            // Open sky above -> sky-dome ambient (cosine already in the sample pdf).
+            const Vec3 s = SkyColor(d, sky);
+            indirect.x += s.x * sky.sky_intensity;
+            indirect.y += s.y * sky.sky_intensity;
+            indirect.z += s.z * sky.sky_intensity;
+            continue;
+        }
+        if (sky.gi_bounces == 0u) continue;  // AO only: occluded -> no light
+        // One bounce: re-shade the hit surface with a direct sun term (no further
+        // recursion) and add its albedo-weighted contribution.
+        Vec3 bn; float bu, bv;
+        ReconstructHit(instances, bp, ro, d, &bn, &bu, &bv);
+        const float bnv = bn.x * (-d.x) + bn.y * (-d.y) + bn.z * (-d.z);
+        Vec3 bnf = (bnv < 0.0f) ? Vec3{-bn.x, -bn.y, -bn.z} : bn;
+        uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
+        const Material bmat = materials[instances[bi].material_id];
+        const Vec3 bhit{ro.x + bt * d.x, ro.y + bt * d.y, ro.z + bt * d.z};
+        const Vec3 bso{bhit.x + bnf.x * eps, bhit.y + bnf.y * eps, bhit.z + bnf.z * eps};
+        float st2; uint32_t sp2;
+        ClosestHit(tlas_nodes, tlas_leaf_count, instances, bso, Ls, eps, &st2, &sp2);
+        const float bNoL = fmaxf(0.0f, bnf.x * Ls.x + bnf.y * Ls.y + bnf.z * Ls.z);
+        const float bvis = (sp2 == kNoPrim) ? 1.0f : 0.0f;
+        const float bfac = bNoL * bvis * (1.0f / 3.14159265f);
+        indirect.x += bmat.albedo.x * light_col.x * bfac;
+        indirect.y += bmat.albedo.y * light_col.y * bfac;
+        indirect.z += bmat.albedo.z * light_col.z * bfac;
+    }
+    const float inv_m = 1.0f / static_cast<float>(M);
+    indirect.x *= inv_m; indirect.y *= inv_m; indirect.z *= inv_m;
+
+    // Indirect modulates the surface albedo (Lambert response to ambient/bounce).
+    return Vec3{direct.x + mat.albedo.x * indirect.x,
+                direct.y + mat.albedo.y * indirect.y,
+                direct.z + mat.albedo.z * indirect.z};
+}
+
+// One thread per pixel: accumulate S jittered sub-pixel samples through the
+// stochastic shade. The CENTER sample also fills depth/normal/albedo/uv/prim so
+// the host RGBA8 conversion's prim-based hit test still classifies background.
+__global__ void RenderBeautyKernel(PinholeCamera camera,
+                                   const LbvhNode* __restrict__ tlas_nodes,
+                                   uint32_t tlas_leaf_count,
+                                   const DevInstance* __restrict__ instances,
+                                   const Material* __restrict__ materials,
+                                   Light light, BeautyParams sky, uint32_t samples,
+                                   uint32_t base_seed,
+                                   float* __restrict__ out_color,
+                                   float* __restrict__ out_depth,
+                                   float* __restrict__ out_normal,
+                                   float* __restrict__ out_albedo,
+                                   float* __restrict__ out_uv,
+                                   uint32_t* __restrict__ out_prim) {
+    const uint32_t px = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= camera.width || py >= camera.height) return;
+    const uint32_t pixel = py * camera.width + px;
+
+    BeautyRng rng{PcgHash(base_seed ^ (pixel * 2654435761u))};
+    const uint32_t S = samples < 1u ? 1u : samples;
+
+    Vec3 accum{0.0f, 0.0f, 0.0f};
+    float c_depth = RtMissDepth();
+    Vec3 c_normal{0.0f, 0.0f, 0.0f}, c_albedo{0.0f, 0.0f, 0.0f};
+    float c_u = 0.0f, c_v = 0.0f;
+    uint32_t c_prim = kNoPrim;
+
+    for (uint32_t s = 0; s < S; ++s) {
+        // Sub-pixel jitter in [-0.5,0.5]; sample 0 uses center for the AOV fill.
+        const float jx = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
+        const float jy = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
+        const Ray ray = camera.GenerateRayJitter(px, py, jx, jy);
+
+        float bt; uint32_t bp;
+        ClosestHit(tlas_nodes, tlas_leaf_count, instances, ray.origin, ray.dir, 0.0f,
+                   &bt, &bp);
+        if (bp == kNoPrim) {
+            const Vec3 miss = SkyColor(ray.dir, sky);
+            accum.x += miss.x; accum.y += miss.y; accum.z += miss.z;
+            continue;
+        }
+        Vec3 n; float u, v;
+        ReconstructHit(instances, bp, ray.origin, ray.dir, &n, &u, &v);
+        const float nv = n.x * (-ray.dir.x) + n.y * (-ray.dir.y) + n.z * (-ray.dir.z);
+        const Vec3 Nf = (nv < 0.0f) ? Vec3{-n.x, -n.y, -n.z} : n;
+        uint32_t inst, lp; UnpackPrimId(bp, &inst, &lp);
+        const Material mat = materials[instances[inst].material_id];
+        const Vec3 hit{ray.origin.x + bt * ray.dir.x, ray.origin.y + bt * ray.dir.y,
+                       ray.origin.z + bt * ray.dir.z};
+        const Vec3 Vv = RtNormalize(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
+        Vec3 col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
+                               light, sky, hit, Nf, Vv, mat, &rng);
+        // Height/distance fog toward the sky-horizon: blend by 1-exp(-density*t).
+        if (sky.fog_density > 0.0f) {
+            const float f = 1.0f - expf(-sky.fog_density * bt);
+            col.x += (sky.fog_color.x - col.x) * f;
+            col.y += (sky.fog_color.y - col.y) * f;
+            col.z += (sky.fog_color.z - col.z) * f;
+        }
+        accum.x += col.x; accum.y += col.y; accum.z += col.z;
+
+        if (s == 0u) {
+            c_depth = bt; c_normal = n; c_albedo = mat.albedo;
+            c_u = u; c_v = v; c_prim = bp;
+        }
+    }
+
+    const float inv_s = 1.0f / static_cast<float>(S);
+    out_color[pixel * 3u + 0u] = accum.x * inv_s;
+    out_color[pixel * 3u + 1u] = accum.y * inv_s;
+    out_color[pixel * 3u + 2u] = accum.z * inv_s;
+    out_depth[pixel] = c_depth;
+    out_normal[pixel * 3u + 0u] = c_normal.x;
+    out_normal[pixel * 3u + 1u] = c_normal.y;
+    out_normal[pixel * 3u + 2u] = c_normal.z;
+    out_albedo[pixel * 3u + 0u] = c_albedo.x;
+    out_albedo[pixel * 3u + 1u] = c_albedo.y;
+    out_albedo[pixel * 3u + 2u] = c_albedo.z;
+    out_uv[pixel * 2u + 0u] = c_u;
+    out_uv[pixel * 2u + 1u] = c_v;
+    out_prim[pixel] = c_prim;
+}
+
 // Per-prim AABB for a LOCAL mesh primitive (BLAS build). Same as scene_render.cu.
 collision::AABB TriAabb(const TrianglePrim& t) {
     collision::AABB b;
@@ -475,8 +714,9 @@ namespace {
 // Build ONE mesh's BLAS: flat prim table + per-prim AABBs (decl order: triangles,
 // spheres, SDFs) -> upload local prim buffers -> BuildLbvhForQuery (retain). The
 // local-space mesh bound (for the TLAS world box) is the union of prim AABBs.
-BlasDevice BuildBlas(const BlasMesh& mesh) {
+BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
     BlasDevice out;
+    phi::BufferType* bt = ctx.device_bt;
 
     std::vector<collision::AABB> aabbs;
     std::vector<DevPrim> prims;
@@ -510,9 +750,9 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
         prims.push_back({static_cast<uint32_t>(PrimKind::Sdf),
                          static_cast<uint32_t>(sdf_hdrs.size())});
 
-        out.sdf_keys_bufs.push_back(UploadOwned(sd.keys));
-        out.sdf_vals_bufs.push_back(UploadOwned(sd.values));
-        out.sdf_grad_bufs.push_back(UploadOwned(sd.gradients));
+        out.sdf_keys_bufs.push_back(UploadOwned(bt, sd.keys));
+        out.sdf_vals_bufs.push_back(UploadOwned(bt, sd.values));
+        out.sdf_grad_bufs.push_back(UploadOwned(bt, sd.gradients));
 
         runtime::sdf::SparseSdfDevice hdr = sd.header;
         hdr.cell_keys = static_cast<const uint64_t*>(out.sdf_keys_bufs.back().Data());
@@ -547,16 +787,16 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
     out.local_bound = bound;
 
     // Upload local prim buffers (empty kinds get a 1-element dummy, as p13 does).
-    out.d_prims = UploadOwned(prims);
-    out.d_tri_v0 = UploadOwned(tri_v0.empty() ? std::vector<Vec3>{Vec3{}} : tri_v0);
-    out.d_tri_v1 = UploadOwned(tri_v1.empty() ? std::vector<Vec3>{Vec3{}} : tri_v1);
-    out.d_tri_v2 = UploadOwned(tri_v2.empty() ? std::vector<Vec3>{Vec3{}} : tri_v2);
-    out.d_sph_c = UploadOwned(sph_center.empty() ? std::vector<Vec3>{Vec3{}} : sph_center);
-    out.d_sph_r = UploadOwned(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
-    out.d_sdf_hdr = UploadOwned(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
-    out.d_sdf_aabb = UploadOwned(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
-    out.d_sdf_eps = UploadOwned(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
-    out.d_sdf_iters = UploadOwned(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
+    out.d_prims = UploadOwned(bt, prims);
+    out.d_tri_v0 = UploadOwned(bt, tri_v0.empty() ? std::vector<Vec3>{Vec3{}} : tri_v0);
+    out.d_tri_v1 = UploadOwned(bt, tri_v1.empty() ? std::vector<Vec3>{Vec3{}} : tri_v1);
+    out.d_tri_v2 = UploadOwned(bt, tri_v2.empty() ? std::vector<Vec3>{Vec3{}} : tri_v2);
+    out.d_sph_c = UploadOwned(bt, sph_center.empty() ? std::vector<Vec3>{Vec3{}} : sph_center);
+    out.d_sph_r = UploadOwned(bt, sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
+    out.d_sdf_hdr = UploadOwned(bt, sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
+    out.d_sdf_aabb = UploadOwned(bt, sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
+    out.d_sdf_eps = UploadOwned(bt, sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
+    out.d_sdf_iters = UploadOwned(bt, sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
 
     out.view.prims = static_cast<const DevPrim*>(out.d_prims.Data());
     out.view.prim_count = out.leaf_count;
@@ -571,41 +811,162 @@ BlasDevice BuildBlas(const BlasMesh& mesh) {
     out.view.sdf_iters = static_cast<const int*>(out.d_sdf_iters.Data());
 
     // Build the BLAS over the LOCAL per-prim AABBs (retain the tree).
-    OwnedBuffer d_boxes = UploadOwned(aabbs);
+    OwnedBuffer d_boxes = UploadOwned(bt, aabbs);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
-    out.tree = collision::gpu::BuildLbvhForQuery(dev_boxes, out.leaf_count);
+    out.tree = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                 dev_boxes, out.leaf_count);
     if (!out.tree.HasNodes()) {
         throw std::runtime_error("BuildTwoLevelScene: BLAS LBVH build retained no nodes");
     }
     return out;
 }
 
+// Per-frame scene prep shared by RenderFrame + RenderBeauty: build the device
+// instance table + the TLAS over the CURRENT instance world-AABBs, upload the
+// materials. The retained buffers must outlive the kernel, so they are held in
+// `out` (the caller keeps it alive until the stream sync).
+struct FrameTlas {
+    OwnedBuffer d_instances;
+    OwnedBuffer d_mats;
+    OwnedBuffer d_tlas_boxes;
+    collision::gpu::LbvhBroadphaseResult tlas;
+    const DevInstance* instances = nullptr;
+    const Material* materials = nullptr;
+    const LbvhNode* tlas_nodes = nullptr;
+    uint32_t inst_count = 0u;
+};
+
+FrameTlas BuildFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelScene& scene,
+                         const RtContext& ctx) {
+    FrameTlas out;
+    phi::BufferType* bt = ctx.device_bt;
+    out.inst_count = static_cast<uint32_t>(scene.instances.size());
+    std::vector<collision::AABB> tlas_aabbs(out.inst_count);
+    std::vector<DevInstance> dev_instances(out.inst_count);
+    for (uint32_t i = 0; i < out.inst_count; ++i) {
+        const Instance& I = scene.instances[i];
+        if (I.blas_id >= impl->meshes.size()) {
+            throw std::runtime_error("RenderFrame: instance.blas_id out of range");
+        }
+        const BlasDevice& mesh = impl->meshes[I.blas_id];
+        DevInstance di;
+        di.transform = I.transform;
+        di.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
+        di.blas_leaf_count = mesh.leaf_count;
+        di.blas = mesh.view;
+        di.instance_id = i;
+        di.material_id = I.material_id;
+        dev_instances[i] = di;
+        if (mesh.leaf_count == 0u) {
+            tlas_aabbs[i].min = I.transform.position;
+            tlas_aabbs[i].max = I.transform.position;
+            continue;
+        }
+        const Vec3 half{0.5f * (mesh.local_bound.max.x - mesh.local_bound.min.x),
+                        0.5f * (mesh.local_bound.max.y - mesh.local_bound.min.y),
+                        0.5f * (mesh.local_bound.max.z - mesh.local_bound.min.z)};
+        const Vec3 center{0.5f * (mesh.local_bound.min.x + mesh.local_bound.max.x),
+                          0.5f * (mesh.local_bound.min.y + mesh.local_bound.max.y),
+                          0.5f * (mesh.local_bound.min.z + mesh.local_bound.max.z)};
+        Transform centered = I.transform;
+        centered.position = I.transform.TransformPoint(center);
+        tlas_aabbs[i] = collision::AABB::FromBox(centered, half);
+    }
+    out.d_instances = UploadOwned(bt, dev_instances);
+    out.d_mats = UploadOwned(bt,
+        scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
+    out.d_tlas_boxes = UploadOwned(bt, tlas_aabbs);
+    const auto* dev_tlas_boxes = static_cast<const collision::AABB*>(out.d_tlas_boxes.Data());
+    out.tlas = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                 dev_tlas_boxes, out.inst_count);
+    if (!out.tlas.HasNodes()) {
+        throw std::runtime_error("RenderFrame: TLAS LBVH build retained no nodes");
+    }
+    out.instances = static_cast<const DevInstance*>(out.d_instances.Data());
+    out.materials = static_cast<const Material*>(out.d_mats.Data());
+    out.tlas_nodes = out.tlas.DeviceNodes();
+    return out;
+}
+
 }  // namespace
 
-TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene) {
+TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
+                                       phi::Backend* backend) {
     if (scene.instances.size() > kMaxInstances) {
         throw std::runtime_error(
             "BuildTwoLevelScene: instance_count exceeds kMaxInstances (1<<12); "
             "rebalance prim_id.cuh kInstanceBits/kPrimBits (named consumer: p16)");
     }
 
-    // Ensure the device context is live (the BLAS uploads need a device + stream).
-    const cudaStream_t stream = nullptr;  // default stream 0
-    const int device_id = 0;
-    phi::ScopedDeviceGuard guard(device_id);
+    // The BLAS uploads run on the selected device + stream (re-assert the active
+    // device, mirroring the backend dispatch path).
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
 
     TwoLevelSceneDevice device;
     device.GetImpl()->meshes.reserve(scene.meshes.size());
     for (const auto& mesh : scene.meshes) {
-        device.GetImpl()->meshes.push_back(BuildBlas(mesh));
+        device.GetImpl()->meshes.push_back(BuildBlas(mesh, ctx));
     }
-    cudaStreamSynchronize(stream);
+    cudaStreamSynchronize(ctx.stream);
     return device;
 }
 
+namespace {
+
+// AOV destination pointers for ONE frame (raw device pointers). The kernel writes
+// these in place; the caller supplies either internal scratch (host-download path)
+// or its own resident buffers (RenderFrameToAovs). null skips that channel.
+struct AovTarget {
+    float* color = nullptr;
+    float* depth = nullptr;
+    float* normal = nullptr;
+    float* albedo = nullptr;
+    float* uv = nullptr;
+    uint32_t* prim = nullptr;
+};
+
+// Build the per-frame TLAS and launch the closest-hit kernel into `dst`, on the
+// resolved device + stream. The ONLY thing that varies between the host-download
+// and device-resident entries is `dst`; the pixel writes are identical. The
+// returned FrameTlas must outlive the caller's stream sync.
+FrameTlas LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
+                            const TwoLevelScene& scene,
+                            const PinholeCamera& camera,
+                            const RtContext& ctx,
+                            const AovTarget& dst) {
+    FrameTlas frame = BuildFrameTlas(impl, scene, ctx);
+    const dim3 block(kBlockDim, kBlockDim);
+    const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
+                    (camera.height + kBlockDim - 1u) / kBlockDim);
+    RenderFrameKernel<<<grid, block, 0, ctx.stream>>>(
+        camera, frame.tlas_nodes, frame.inst_count,
+        frame.instances, frame.materials,
+        scene.light, scene.ambient,
+        dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
+    CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
+    return frame;
+}
+
+// Map a caller RtDeviceAovs (opaque phi::Buffer*) to raw device pointers.
+AovTarget DeviceAovsToTarget(const RtDeviceAovs& aov) {
+    AovTarget dst;
+    dst.color = aov.color != nullptr ? static_cast<float*>(phi::BufferBase(aov.color)) : nullptr;
+    dst.depth = aov.depth != nullptr ? static_cast<float*>(phi::BufferBase(aov.depth)) : nullptr;
+    dst.normal = aov.normal != nullptr ? static_cast<float*>(phi::BufferBase(aov.normal)) : nullptr;
+    dst.albedo = aov.albedo != nullptr ? static_cast<float*>(phi::BufferBase(aov.albedo)) : nullptr;
+    dst.uv = aov.uv != nullptr ? static_cast<float*>(phi::BufferBase(aov.uv)) : nullptr;
+    dst.prim = aov.prim != nullptr ? static_cast<uint32_t*>(phi::BufferBase(aov.prim)) : nullptr;
+    return dst;
+}
+
+}  // namespace
+
 Framebuffer RenderFrame(TwoLevelSceneDevice& device,
                         const TwoLevelScene& scene,
-                        const PinholeCamera& camera) {
+                        const PinholeCamera& camera,
+                        phi::Backend* backend) {
     Framebuffer fb;
     fb.width = camera.width;
     fb.height = camera.height;
@@ -620,92 +981,29 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
         return fb;
     }
 
-    const cudaStream_t stream = nullptr;  // default stream 0
-    const int device_id = 0;
-    phi::ScopedDeviceGuard guard(device_id);
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
 
-    TwoLevelSceneDevice::Impl* impl = device.GetImpl();
-    const uint32_t inst_count = static_cast<uint32_t>(scene.instances.size());
+    // Internal scratch AOVs, downloaded to the host Framebuffer (one D2H).
+    OwnedBuffer d_color(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
+    OwnedBuffer d_normal(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_albedo(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_uv(ctx.device_bt, pixels * 2u * sizeof(float));
+    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
 
-    // Build the per-frame TLAS world-AABBs: transform each mesh's oriented LOCAL
-    // box by the instance pose, then enclose it (p14b pattern). EVERY instance
-    // gets a box so the TLAS leaf's original index IS the instance index.
-    std::vector<collision::AABB> tlas_aabbs(inst_count);
-    std::vector<DevInstance> dev_instances(inst_count);
-    for (uint32_t i = 0; i < inst_count; ++i) {
-        const Instance& I = scene.instances[i];
-        if (I.blas_id >= impl->meshes.size()) {
-            throw std::runtime_error("RenderFrame: instance.blas_id out of range");
-        }
-        const BlasDevice& mesh = impl->meshes[I.blas_id];
+    AovTarget dst;
+    dst.color = static_cast<float*>(d_color.Data());
+    dst.depth = static_cast<float*>(d_depth.Data());
+    dst.normal = static_cast<float*>(d_normal.Data());
+    dst.albedo = static_cast<float*>(d_albedo.Data());
+    dst.uv = static_cast<float*>(d_uv.Data());
+    dst.prim = static_cast<uint32_t*>(d_prim.Data());
 
-        DevInstance di;
-        di.transform = I.transform;
-        di.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
-        di.blas_leaf_count = mesh.leaf_count;
-        di.blas = mesh.view;
-        di.instance_id = i;
-        di.material_id = I.material_id;
-        dev_instances[i] = di;
-
-        if (mesh.leaf_count == 0u) {
-            // Degenerate point box at the instance origin (its BLAS is empty;
-            // the TlasLeaf early-outs on blas_leaf_count==0 so it is never hit).
-            tlas_aabbs[i].min = I.transform.position;
-            tlas_aabbs[i].max = I.transform.position;
-            continue;
-        }
-        const Vec3 half{0.5f * (mesh.local_bound.max.x - mesh.local_bound.min.x),
-                        0.5f * (mesh.local_bound.max.y - mesh.local_bound.min.y),
-                        0.5f * (mesh.local_bound.max.z - mesh.local_bound.min.z)};
-        const Vec3 center{0.5f * (mesh.local_bound.min.x + mesh.local_bound.max.x),
-                          0.5f * (mesh.local_bound.min.y + mesh.local_bound.max.y),
-                          0.5f * (mesh.local_bound.min.z + mesh.local_bound.max.z)};
-        // Transform the box CENTER by the pose, then enclose the oriented half-
-        // extent box about it (collision::AABB::FromBox uses TransformPoint).
-        Transform centered = I.transform;
-        centered.position = I.transform.TransformPoint(center);
-        tlas_aabbs[i] = collision::AABB::FromBox(centered, half);
-    }
-
-    // Upload the instance table + the materials.
-    OwnedBuffer d_instances = UploadOwned(dev_instances);
-    OwnedBuffer d_mats = UploadOwned(
-        scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
-
-    // Build the TLAS over the instance world-AABBs (retained; lives until sync).
-    OwnedBuffer d_tlas_boxes = UploadOwned(tlas_aabbs);
-    const auto* dev_tlas_boxes = static_cast<const collision::AABB*>(d_tlas_boxes.Data());
-    auto tlas = collision::gpu::BuildLbvhForQuery(dev_tlas_boxes, inst_count);
-    if (!tlas.HasNodes()) {
-        throw std::runtime_error("RenderFrame: TLAS LBVH build retained no nodes");
-    }
-    const LbvhNode* tlas_nodes = tlas.DeviceNodes();
-
-    // Output AOV buffers (device).
-    OwnedBuffer d_color(pixels * 3u * sizeof(float));
-    OwnedBuffer d_depth(pixels * sizeof(float));
-    OwnedBuffer d_normal(pixels * 3u * sizeof(float));
-    OwnedBuffer d_albedo(pixels * 3u * sizeof(float));
-    OwnedBuffer d_uv(pixels * 2u * sizeof(float));
-    OwnedBuffer d_prim(pixels * sizeof(uint32_t));
-
-    const dim3 block(kBlockDim, kBlockDim);
-    const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
-                    (camera.height + kBlockDim - 1u) / kBlockDim);
-    RenderFrameKernel<<<grid, block, 0, stream>>>(
-        camera, tlas_nodes, inst_count,
-        static_cast<const DevInstance*>(d_instances.Data()),
-        static_cast<const Material*>(d_mats.Data()),
-        scene.light, scene.ambient,
-        static_cast<float*>(d_color.Data()),
-        static_cast<float*>(d_depth.Data()),
-        static_cast<float*>(d_normal.Data()),
-        static_cast<float*>(d_albedo.Data()),
-        static_cast<float*>(d_uv.Data()),
-        static_cast<uint32_t*>(d_prim.Data()));
-    CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
-    cudaStreamSynchronize(stream);
+    FrameTlas frame = LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
+    (void)frame;
+    cudaStreamSynchronize(ctx.stream);
 
     d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
     d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
@@ -714,6 +1012,139 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
     d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
     d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
+}
+
+void RenderFrameToAovs(TwoLevelSceneDevice& device,
+                       const TwoLevelScene& scene,
+                       const PinholeCamera& camera,
+                       const RtDeviceAovs& aov,
+                       phi::Backend* backend) {
+    const size_t pixels =
+        static_cast<size_t>(camera.width) * static_cast<size_t>(camera.height);
+    if (pixels == 0u || scene.instances.empty()) {
+        return;
+    }
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+
+    // Write directly into the caller's resident device buffers -- no host round-trip.
+    const AovTarget dst = DeviceAovsToTarget(aov);
+    FrameTlas frame = LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
+    (void)frame;
+    cudaStreamSynchronize(ctx.stream);
+}
+
+namespace {
+
+// Build the per-frame TLAS and launch the stochastic beauty kernel into `dst`, on
+// the resolved device + stream. Only `dst` varies between the host-download and
+// device-resident entries; the pixel writes are identical. The returned FrameTlas
+// must outlive the caller's stream sync.
+FrameTlas LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
+                             const TwoLevelScene& scene,
+                             const PinholeCamera& camera,
+                             const BeautyOptions& opt,
+                             const RtContext& ctx,
+                             const AovTarget& dst) {
+    FrameTlas frame = BuildFrameTlas(impl, scene, ctx);
+
+    BeautyParams sky;
+    sky.shadow_rays = opt.shadow_rays;
+    sky.sun_angular_radius = opt.sun_angular_radius;
+    sky.gi_bounces = opt.gi_bounces;
+    sky.ao_samples = opt.ao_samples;
+    sky.ao_radius = opt.ao_radius;
+    sky.sky_top = opt.sky_top;
+    sky.sky_bottom = opt.sky_bottom;
+    sky.sky_ground = opt.sky_ground;
+    sky.fog_color = opt.fog_color;
+    sky.fog_density = opt.fog_density;
+    sky.sky_intensity = opt.sky_intensity;
+
+    const dim3 block(kBlockDim, kBlockDim);
+    const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
+                    (camera.height + kBlockDim - 1u) / kBlockDim);
+    RenderBeautyKernel<<<grid, block, 0, ctx.stream>>>(
+        camera, frame.tlas_nodes, frame.inst_count, frame.instances, frame.materials,
+        scene.light, sky, opt.samples, opt.seed,
+        dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
+    CheckCuda(cudaGetLastError(), "RenderBeautyKernel launch");
+    return frame;
+}
+
+}  // namespace
+
+Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
+                         const TwoLevelScene& scene,
+                         const PinholeCamera& camera,
+                         const BeautyOptions& opt,
+                         phi::Backend* backend) {
+    Framebuffer fb;
+    fb.width = camera.width;
+    fb.height = camera.height;
+    const size_t pixels = fb.Pixels();
+    fb.color.assign(pixels * 3u, 0.0f);
+    fb.depth.assign(pixels, RtMissDepth());
+    fb.normal.assign(pixels * 3u, 0.0f);
+    fb.albedo.assign(pixels * 3u, 0.0f);
+    fb.uv.assign(pixels * 2u, 0.0f);
+    fb.prim.assign(pixels, kNoPrim);
+    if (pixels == 0u || scene.instances.empty()) {
+        return fb;
+    }
+
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+
+    OwnedBuffer d_color(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
+    OwnedBuffer d_normal(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_albedo(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_uv(ctx.device_bt, pixels * 2u * sizeof(float));
+    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
+
+    AovTarget dst;
+    dst.color = static_cast<float*>(d_color.Data());
+    dst.depth = static_cast<float*>(d_depth.Data());
+    dst.normal = static_cast<float*>(d_normal.Data());
+    dst.albedo = static_cast<float*>(d_albedo.Data());
+    dst.uv = static_cast<float*>(d_uv.Data());
+    dst.prim = static_cast<uint32_t*>(d_prim.Data());
+
+    FrameTlas frame = LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
+    (void)frame;
+    cudaStreamSynchronize(ctx.stream);
+
+    d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    return fb;
+}
+
+void RenderBeautyToAovs(TwoLevelSceneDevice& device,
+                        const TwoLevelScene& scene,
+                        const PinholeCamera& camera,
+                        const BeautyOptions& opt,
+                        const RtDeviceAovs& aov,
+                        phi::Backend* backend) {
+    const size_t pixels =
+        static_cast<size_t>(camera.width) * static_cast<size_t>(camera.height);
+    if (pixels == 0u || scene.instances.empty()) {
+        return;
+    }
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+
+    const AovTarget dst = DeviceAovsToTarget(aov);
+    FrameTlas frame = LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
+    (void)frame;
+    cudaStreamSynchronize(ctx.stream);
 }
 
 }  // namespace nuka::rt
