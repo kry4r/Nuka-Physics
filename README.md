@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_poster.jpg" width="90%" alt="Go2 robots climbing procedural terrain — click to play the 14s video"></a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="90%" alt="Go2 robots climbing procedural terrain"></a>
 </p>
-<p align="center"><sub>▶ 10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer (1080p). <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">Click the image to play the full 14s video.</a></sub></p>
+<p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ full 1080p video</a></sub></p>
 
 ## Why Nuka
 
