@@ -752,12 +752,16 @@ Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
     LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 
-    rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
-    rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
-    rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
-    rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
-    rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
-    rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    // Copy back only the requested channels; the rest keep their assign() default
+    // (background-safe). The kernel wrote all channels, so this is byte-unchanged
+    // for any channel left enabled.
+    const AovDownloadMask& m = opt.download;
+    if (m.color) rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    if (m.depth) rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    if (m.normal) rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    if (m.albedo) rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    if (m.uv) rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    if (m.prim) rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
 }
 
