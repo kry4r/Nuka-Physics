@@ -47,11 +47,13 @@ from rl_games.common import env_configurations as _env_configurations
 
 from ..tasks.go2_locomotion import make_env as make_go2_env
 from ..tasks.h1_stand import make_env as make_h1_stand_env
+from ..tasks.go2_handstand import make_env as make_handstand_env
 
 
 _ENV_FACTORIES = {
     "nuka_go2": make_go2_env,
     "nuka_h1_stand": make_h1_stand_env,
+    "nuka_go2_handstand": make_handstand_env,
 }
 
 
