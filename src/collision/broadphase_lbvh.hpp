@@ -100,6 +100,10 @@ public:
     const LbvhNode* DeviceNodes() const;
     bool HasNodes() const;
 
+    // Mutable view of the retained node array (same buffer as DeviceNodes), for
+    // RefitLbvh to re-propagate fresh leaf AABBs on the reused topology in place.
+    LbvhNode* DeviceNodesMutable();
+
     // Download exactly the PairCount() valid pairs (already sorted, canonical
     // a<b). The reduced SET equals the SAP overlap set.
     std::vector<collision::CollisionPair> DownloadPairs() const;
