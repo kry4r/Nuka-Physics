@@ -159,6 +159,35 @@ if(TARGET nuka)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             PROPERTIES LABELS "full")
 
+        # --- Device-resident batched LIDAR sensor C ABI (attach/render/RANGE) ---
+        # The lidar in-the-loop obs: attach a lidar to an N-env world, render every
+        # env's (az,el) fan into ONE device RANGE tensor on the SAME RT TLAS the
+        # cameras use, read it back zero-copy via nuka_world_get_sensor_view(RANGE).
+        add_executable(nuka_lidar_sensor_cabi_test
+            c_abi/test_lidar_sensor_cabi.cpp
+        )
+
+        target_compile_definitions(nuka_lidar_sensor_cabi_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_lidar_sensor_cabi_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_lidar_sensor_cabi_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_lidar_sensor_cabi_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            PROPERTIES LABELS "full")
+
         # --- Multiple cameras per env C ABI (S cameras, one per mount row) ------
         # Attach two cameras with different mount rows, render into ONE (E,S,H,W)
         # tensor, and assert each (env,sensor) tile equals the single-camera render
@@ -1636,6 +1665,35 @@ if(CMAKE_CUDA_COMPILER)
             GTest::gtest_main
     )
     gtest_discover_tests(nuka_rt_batched_sensor_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
+    # --- GPU lidar range trace gate: lidar rides the SAME batched TLAS/LBVH/
+    # ClosestHit the camera path builds. Known-distance geometry along a known
+    # (az,el) ray -> range == distance; miss -> max_range; clamp to [min,max];
+    # per-env tiles byte-identical; the mounted path matches the device path. A .cu;
+    # --fmad=false matches the render TU.
+    add_executable(nuka_rt_batched_lidar_render_test
+        rt/test_batched_lidar_render.cu
+    )
+    target_compile_options(nuka_rt_batched_lidar_render_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_batched_lidar_render_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_batched_lidar_render_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_batched_lidar_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
     # --- Per-env render domain-randomization gate: the trace always reads

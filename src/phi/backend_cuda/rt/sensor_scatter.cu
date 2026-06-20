@@ -191,6 +191,46 @@ __global__ void ScatterEnvCamerasKernel(ScatterFkSource fk,
     out_cameras[i] = cam;
 }
 
+// One thread per (env x sensor). Composes sensor_world = fk(pose) * local_offset
+// and stores its origin + world rotation + the row's az/el pattern. The lidar
+// trace rotates each fan ray by this rotation -- the SAME mount compose the camera
+// scatter runs, so a lidar shares the camera's FK-pose path exactly.
+__global__ void ScatterEnvLidarsKernel(ScatterFkSource fk,
+                                       const SensorMountRow* __restrict__ mounts,
+                                       uint32_t env_count,
+                                       uint32_t sensors_per_env,
+                                       LidarSensor* __restrict__ out_lidars) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = env_count * sensors_per_env;
+    if (i >= total) return;
+    const uint32_t env = i / sensors_per_env;
+    const uint32_t local = i % sensors_per_env;
+
+    const SensorMountRow row = mounts[local];
+    const Vec3 off_pos{row.local_offset[0], row.local_offset[1], row.local_offset[2]};
+    const Transform* fk_pose = ResolveFkPose(fk, row.kind, row.row, env);
+    const Transform world = ComposeWorld(fk_pose, off_pos, row.local_offset[3],
+                                         row.local_offset[4], row.local_offset[5],
+                                         row.local_offset[6]);
+    LidarSensor s;
+    s.origin[0] = world.position.x;
+    s.origin[1] = world.position.y;
+    s.origin[2] = world.position.z;
+    s.rotation[0] = world.rotation.w;
+    s.rotation[1] = world.rotation.x;
+    s.rotation[2] = world.rotation.y;
+    s.rotation[3] = world.rotation.z;
+    s.az_count = row.az_count;
+    s.el_count = row.el_count;
+    s.az_min = row.az_min;
+    s.az_max = row.az_max;
+    s.el_min = row.el_min;
+    s.el_max = row.el_max;
+    s.min_range = row.min_range;
+    s.max_range = row.max_range;
+    out_lidars[i] = s;
+}
+
 }  // namespace
 
 void ScatterEnvInstances(cudaStream_t stream,
@@ -227,6 +267,20 @@ void ScatterEnvCameras(cudaStream_t stream,
                     device_mounts, env_count, sensors_per_env, out_cameras);
 }
 
+void ScatterEnvLidars(cudaStream_t stream,
+                      const phi::ScatterFkSource& fk,
+                      const SensorMountRow* device_mounts,
+                      uint32_t env_count,
+                      uint32_t sensors_per_env,
+                      LidarSensor* out_lidars) {
+    const uint32_t total = env_count * sensors_per_env;
+    if (total == 0u) return;
+    const uint32_t kBlock = 128u;
+    const uint32_t grid = (total + kBlock - 1u) / kBlock;
+    phi::LaunchCuda(ScatterEnvLidarsKernel, dim3(grid), dim3(kBlock), 0u, stream, fk,
+                    device_mounts, env_count, sensors_per_env, out_lidars);
+}
+
 std::vector<SensorMountRow> BuildSensorMountRows(
     const std::vector<scene::SensorDesc>& sensors) {
     constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
@@ -243,16 +297,31 @@ std::vector<SensorMountRow> BuildSensorMountRows(
         r.local_offset[4] = s.local_offset.rotation.x;
         r.local_offset[5] = s.local_offset.rotation.y;
         r.local_offset[6] = s.local_offset.rotation.z;
-        r.fov_y = s.cam.vfov_degrees * kDegToRad;
-        r.width = s.cam.width;
-        r.height = s.cam.height;
-        // The schema carries focal/principal-point via vfov+centered today; k1/k2/
-        // distortion + clip ride straight through (defaults => byte-identical).
-        r.k1 = s.cam.k1;
-        r.k2 = s.cam.k2;
-        r.distortion = s.cam.distortion;
-        r.near_clip = s.cam.near_clip;
-        r.far_clip = s.cam.far_clip;
+        if (s.type == scene::SensorType::Lidar ||
+            s.type == scene::SensorType::RangeScan) {
+            // The (az,el) fan rides the row; the camera intrinsics stay zero so the
+            // camera scatter, if it ever sees this row, ignores it. Angles are stored
+            // radians (the schema authors them radians; importers convert at parse).
+            r.az_count = s.lidar.az_count;
+            r.el_count = s.lidar.el_count;
+            r.az_min = s.lidar.az_min;
+            r.az_max = s.lidar.az_max;
+            r.el_min = s.lidar.el_min;
+            r.el_max = s.lidar.el_max;
+            r.min_range = s.lidar.min_range;
+            r.max_range = s.lidar.max_range;
+        } else {
+            r.fov_y = s.cam.vfov_degrees * kDegToRad;
+            r.width = s.cam.width;
+            r.height = s.cam.height;
+            // The schema carries focal/principal-point via vfov+centered today; k1/k2/
+            // distortion + clip ride straight through (defaults => byte-identical).
+            r.k1 = s.cam.k1;
+            r.k2 = s.cam.k2;
+            r.distortion = s.cam.distortion;
+            r.near_clip = s.cam.near_clip;
+            r.far_clip = s.cam.far_clip;
+        }
         rows.push_back(r);
     }
     return rows;

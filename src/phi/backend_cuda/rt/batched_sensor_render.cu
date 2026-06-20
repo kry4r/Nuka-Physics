@@ -372,6 +372,63 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     out_prim[gid] = prim_id;
 }
 
+// One thread per GLOBAL lidar ray over [num_lidars*az*el]: flat gid -> (lidar,
+// az_index, el_index). Lidars are env-major (lidars[env*S+s]); the env owning a
+// lidar is lidar/S, and the TLAS node + instance slices index by env (the SAME
+// env-shared trees the camera trace reads). The (az,el) ray is generated in the
+// sensor-local frame then rotated to world by the resolved mount rotation, and the
+// SAME ClosestHit returns the world distance -- the range. miss => max_range;
+// otherwise clamp(t, min_range, max_range). One writer per cell, no atomics ->
+// FP32-deterministic. Strictly cheaper than the camera kernel (no shade/AOVs).
+__global__ void BatchedLidarTraceKernel(const LidarSensor* __restrict__ lidars,
+                                        const LbvhNode* __restrict__ tlas_nodes,
+                                        uint32_t leaves_per_env,
+                                        const DevInstance* __restrict__ instances,
+                                        uint32_t num_lidars,
+                                        uint32_t sensors_per_env,
+                                        uint32_t az_count,
+                                        uint32_t el_count,
+                                        float* __restrict__ out_range) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t rays_per_lidar = az_count * el_count;
+    const uint64_t total = static_cast<uint64_t>(num_lidars) * rays_per_lidar;
+    if (static_cast<uint64_t>(gid) >= total) return;
+
+    const uint32_t lidar = gid / rays_per_lidar;
+    const uint32_t env = lidar / sensors_per_env;
+    const uint32_t r = gid % rays_per_lidar;
+    const uint32_t el_index = r % el_count;
+    const uint32_t az_index = r / el_count;
+
+    const LidarSensor s = lidars[lidar];
+    const Vec3 d_local = LidarRayDirLocal(az_index, el_index, az_count, el_count,
+                                          s.az_min, s.az_max, s.el_min, s.el_max);
+    // Default-construct + assign (the Quat 4-arg ctor is host-only); QuatRotate is
+    // the SAME HD rotate the instance + camera scatter use.
+    math::Quat rot;
+    rot.w = s.rotation[0];
+    rot.x = s.rotation[1];
+    rot.y = s.rotation[2];
+    rot.z = s.rotation[3];
+    const Vec3 dir = QuatRotate(rot, d_local);
+    const Vec3 origin{s.origin[0], s.origin[1], s.origin[2]};
+
+    const LbvhNode* env_nodes = tlas_nodes + static_cast<uint64_t>(env) * (2u * leaves_per_env - 1u);
+    const DevInstance* env_inst = instances + static_cast<uint64_t>(env) * leaves_per_env;
+
+    float best_t;
+    uint32_t best_prim;
+    ClosestHit<float>(env_nodes, leaves_per_env, env_inst, origin, dir, 0.0f, &best_t,
+                      &best_prim);
+
+    float range = s.max_range;
+    if (best_prim != kNoPrim) {
+        range = best_t < s.min_range ? s.min_range
+                                     : (best_t > s.max_range ? s.max_range : best_t);
+    }
+    out_range[gid] = range;
+}
+
 }  // namespace
 
 // Persistent device state: BLAS-once handle + the env-shared instance binding
@@ -419,6 +476,14 @@ struct BatchedSensorSceneDevice::Impl {
     OwnedBuffer d_mounts, d_cameras;
     uint32_t sensors_per_env = 0u;
     std::size_t cam_b = 0u;
+
+    // Env-invariant lidar mount table + the E*S env-major LidarSensor buffer the
+    // lidar scatter writes + the (E,S,az,el) range tensor (all sized lazily). The
+    // fan dims are uniform across the lidar set (every row's pattern, capped LOUD).
+    OwnedBuffer d_lidar_mounts, d_lidars, d_range;
+    uint32_t lidars_per_env = 0u;
+    uint32_t lidar_az = 0u, lidar_el = 0u;
+    std::size_t lidar_mount_b = 0u, lidars_b = 0u, range_b = 0u;
 };
 
 BatchedSensorSceneDevice::BatchedSensorSceneDevice()
@@ -573,6 +638,67 @@ void EnsureEnvAppearanceTables(BatchedSensorSceneDevice::Impl* impl,
     impl->dr_env_count = env_count;
 }
 
+// Lidar fan + range-tensor cap. az_count*el_count*E*S rays must fit a launch + the
+// range allocation; cap each dimension LOUDLY so a nonsense pattern fails fast
+// instead of overflowing the buffer or stalling the device. 16384 per axis is far
+// above any real lidar (a 128-beam x 2048-az sweep is 2048<<16384) yet finite.
+constexpr uint32_t kMaxLidarAxis = 1u << 14;  // 16,384 az or el samples
+
+// Scatter fk*cvl -> the per-env DevInstance table + world-AABBs, rebase the
+// instance ids to env-local, then build/refit the N per-env TLASes. The ONE
+// topology path the camera AND lidar traces both consume (same trees, same poses).
+// Sizes the scatter/LBVH buffers (growth-only) and honors the rebuild cadence.
+void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ctx,
+                       const phi::ScatterFkSource& fk, uint32_t env_count) {
+    phi::BufferType* bt = ctx.device_bt;
+    const uint32_t m = impl->instances_per_env;
+    const uint64_t total_inst = static_cast<uint64_t>(env_count) * m;
+    const uint64_t node_count = static_cast<uint64_t>(env_count) * (2u * m - 1u);
+
+    EnsureBytes(impl->d_instances, impl->inst_b, bt, total_inst * sizeof(DevInstance));
+    EnsureBytes(impl->d_world_aabbs, impl->aabb_b, bt, total_inst * sizeof(AABB));
+    EnsureBytes(impl->d_tlas_nodes, impl->node_b, bt, node_count * sizeof(LbvhNode));
+    EnsureBytes(impl->d_morton, impl->mort_b, bt, total_inst * sizeof(uint32_t));
+    EnsureBytes(impl->d_index, impl->idx_b, bt, total_inst * sizeof(uint32_t));
+    EnsureBytes(impl->d_sortkey, impl->key_b, bt, total_inst * sizeof(uint64_t));
+    EnsureBytes(impl->d_visit, impl->vis_b, bt, total_inst * sizeof(uint32_t));
+
+    const bool need_rebuild = !impl->topology_built || env_count != impl->env_count ||
+                              impl->frames_since_rebuild >= kTlasRebuildPeriod;
+
+    auto* d_instances = static_cast<DevInstance*>(impl->d_instances.Data());
+    auto* d_world_aabbs = static_cast<AABB*>(impl->d_world_aabbs.Data());
+    auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
+
+    ScatterEnvInstances(ctx.stream, fk,
+                        static_cast<const phi::InstanceScatterRow*>(impl->d_rows.Data()),
+                        static_cast<const uint32_t*>(impl->d_blas_id.Data()),
+                        static_cast<const uint32_t*>(impl->d_material_id.Data()),
+                        static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data()),
+                        env_count, m, d_instances, d_world_aabbs);
+    {
+        const uint32_t grid = (static_cast<uint32_t>(total_inst) + kBlockSize - 1u) / kBlockSize;
+        phi::LaunchCuda(RebaseInstanceIdsKernel, dim3(grid), dim3(kBlockSize), 0u,
+                        ctx.stream, d_instances, env_count, m);
+    }
+    if (need_rebuild) {
+        collision::gpu::BuildLbvhBatchedNodes(
+            ctx.stream, ctx.device_id, d_world_aabbs, env_count, m, d_nodes,
+            static_cast<uint32_t*>(impl->d_morton.Data()),
+            static_cast<uint32_t*>(impl->d_index.Data()),
+            static_cast<uint64_t*>(impl->d_sortkey.Data()),
+            static_cast<uint32_t*>(impl->d_visit.Data()));
+        impl->env_count = env_count;
+        impl->topology_built = true;
+        impl->frames_since_rebuild = 0u;
+    } else {
+        collision::gpu::RefitLbvhBatched(
+            ctx.stream, ctx.device_id, d_nodes, d_world_aabbs, env_count, m,
+            static_cast<uint32_t*>(impl->d_visit.Data()));
+        ++impl->frames_since_rebuild;
+    }
+}
+
 }  // namespace
 
 void RenderSensorsBatched(BatchedSensorSceneDevice& device,
@@ -600,18 +726,9 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     phi::BufferType* bt = ctx.device_bt;
 
     // Scene is env-shared (E trees of M instances); cameras fan out E*S env-major.
-    const uint64_t total_inst = static_cast<uint64_t>(env_count) * m;
-    const uint64_t node_count = static_cast<uint64_t>(env_count) * (2u * m - 1u);
     const uint64_t num_cameras = static_cast<uint64_t>(env_count) * s;
     const uint64_t rays = num_cameras * width * height;
 
-    EnsureBytes(impl->d_instances, impl->inst_b, bt, total_inst * sizeof(DevInstance));
-    EnsureBytes(impl->d_world_aabbs, impl->aabb_b, bt, total_inst * sizeof(AABB));
-    EnsureBytes(impl->d_tlas_nodes, impl->node_b, bt, node_count * sizeof(LbvhNode));
-    EnsureBytes(impl->d_morton, impl->mort_b, bt, total_inst * sizeof(uint32_t));
-    EnsureBytes(impl->d_index, impl->idx_b, bt, total_inst * sizeof(uint32_t));
-    EnsureBytes(impl->d_sortkey, impl->key_b, bt, total_inst * sizeof(uint64_t));
-    EnsureBytes(impl->d_visit, impl->vis_b, bt, total_inst * sizeof(uint32_t));
     EnsureBytes(impl->d_color, impl->col_b, bt, rays * 3u * sizeof(float));
     EnsureBytes(impl->d_depth, impl->dep_b, bt, rays * sizeof(float));
     EnsureBytes(impl->d_normal, impl->nrm_b, bt, rays * 3u * sizeof(float));
@@ -622,46 +739,10 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     // off -> base replicas). The trace reads these BY ENV -- the ONE path.
     EnsureEnvAppearanceTables(impl, ctx, env_count, false);
 
-    // A changed env count forces a topology rebuild (node array reshaped).
-    const bool need_rebuild = !impl->topology_built || env_count != impl->env_count ||
-                              impl->frames_since_rebuild >= kTlasRebuildPeriod;
-
+    // 1+2) Scatter + batched LBVH build/refit (the ONE topology path lidar reuses).
+    EnsureEnvTopology(impl, ctx, fk, env_count);
     auto* d_instances = static_cast<DevInstance*>(impl->d_instances.Data());
-    auto* d_world_aabbs = static_cast<AABB*>(impl->d_world_aabbs.Data());
     auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
-
-    // 1) Scatter fk*cvl -> DevInstance[E*M] + world-AABB[E*M] (the shared kernel),
-    //    then rebase the instance ids to env-local for the 12-bit prim pack.
-    ScatterEnvInstances(ctx.stream, fk,
-                        static_cast<const phi::InstanceScatterRow*>(impl->d_rows.Data()),
-                        static_cast<const uint32_t*>(impl->d_blas_id.Data()),
-                        static_cast<const uint32_t*>(impl->d_material_id.Data()),
-                        static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data()),
-                        env_count, m, d_instances, d_world_aabbs);
-    {
-        const uint32_t grid = (static_cast<uint32_t>(total_inst) + kBlockSize - 1u) / kBlockSize;
-        phi::LaunchCuda(RebaseInstanceIdsKernel, dim3(grid), dim3(kBlockSize), 0u,
-                        ctx.stream, d_instances, env_count, m);
-    }
-
-    // 2) Batched LBVH: build the N per-env trees in one launch (rebuild cadence)
-    //    or refit the reused topology in place (byte-exact between rebuilds).
-    if (need_rebuild) {
-        collision::gpu::BuildLbvhBatchedNodes(
-            ctx.stream, ctx.device_id, d_world_aabbs, env_count, m, d_nodes,
-            static_cast<uint32_t*>(impl->d_morton.Data()),
-            static_cast<uint32_t*>(impl->d_index.Data()),
-            static_cast<uint64_t*>(impl->d_sortkey.Data()),
-            static_cast<uint32_t*>(impl->d_visit.Data()));
-        impl->env_count = env_count;
-        impl->topology_built = true;
-        impl->frames_since_rebuild = 0u;
-    } else {
-        collision::gpu::RefitLbvhBatched(
-            ctx.stream, ctx.device_id, d_nodes, d_world_aabbs, env_count, m,
-            static_cast<uint32_t*>(impl->d_visit.Data()));
-        ++impl->frames_since_rebuild;
-    }
 
     // 3) ONE flat trace over [E*S*H*W] into the persistent (E,S,H,W,ch) AOV tensor.
     //    Materials/light/ambient resolved BY ENV from the per-env tables. The
@@ -760,6 +841,122 @@ void RenderSensorsMounted(BatchedSensorSceneDevice& device,
                          height, backend);
 }
 
+void RenderLidarsBatched(BatchedSensorSceneDevice& device,
+                         const phi::ScatterFkSource& fk,
+                         const LidarSensor* lidars_device,
+                         uint32_t env_count,
+                         uint32_t sensors_per_env,
+                         uint32_t az_count,
+                         uint32_t el_count,
+                         phi::Backend* backend) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    const uint32_t m = impl->instances_per_env;
+    const uint32_t s = sensors_per_env == 0u ? 1u : sensors_per_env;
+    if (env_count == 0u || az_count == 0u || el_count == 0u || m == 0u) {
+        return;
+    }
+    if (m < 2u) {
+        throw std::runtime_error(
+            "RenderLidarsBatched: the batched LBVH build needs >=2 instances/env");
+    }
+    if (az_count > kMaxLidarAxis || el_count > kMaxLidarAxis) {
+        throw std::runtime_error(
+            "RenderLidarsBatched: az_count/el_count exceeds the lidar fan cap "
+            "(kMaxLidarAxis=16384)");
+    }
+
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+    phi::BufferType* bt = ctx.device_bt;
+
+    const uint64_t num_lidars = static_cast<uint64_t>(env_count) * s;
+    const uint64_t rays = num_lidars * az_count * el_count;
+    EnsureBytes(impl->d_range, impl->range_b, bt, rays * sizeof(float));
+
+    // Scatter + batched LBVH build/refit (the SAME topology the camera trace uses),
+    // then the range-only trace over [E*S*az*el] on those per-env TLASes.
+    EnsureEnvTopology(impl, ctx, fk, env_count);
+    auto* d_instances = static_cast<DevInstance*>(impl->d_instances.Data());
+    auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
+
+    const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
+    phi::LaunchCuda(BatchedLidarTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
+                    ctx.stream, lidars_device, d_nodes, m, d_instances,
+                    static_cast<uint32_t>(num_lidars), s, az_count, el_count,
+                    static_cast<float*>(impl->d_range.Data()));
+    CheckCuda(cudaGetLastError(), "BatchedLidarTraceKernel launch");
+    impl->lidar_az = az_count;
+    impl->lidar_el = el_count;
+}
+
+void SetLidarMounts(BatchedSensorSceneDevice& device,
+                    const std::vector<scene::SensorDesc>& sensors) {
+    if (sensors.empty()) {
+        throw std::runtime_error("SetLidarMounts: empty mount table");
+    }
+    const std::vector<SensorMountRow> mounts = BuildSensorMountRows(sensors);
+    // The range tensor is rectangular, so every lidar in the set shares one (az,el)
+    // fan. Reject a ragged set + a nonsense pattern LOUDLY (no silent truncation).
+    const uint32_t az = mounts.front().az_count;
+    const uint32_t el = mounts.front().el_count;
+    if (az == 0u || el == 0u) {
+        throw std::runtime_error(
+            "SetLidarMounts: lidar pattern has az_count/el_count == 0");
+    }
+    if (az > kMaxLidarAxis || el > kMaxLidarAxis) {
+        throw std::runtime_error(
+            "SetLidarMounts: az_count/el_count exceeds the lidar fan cap "
+            "(kMaxLidarAxis=16384)");
+    }
+    for (const SensorMountRow& r : mounts) {
+        if (r.az_count != az || r.el_count != el) {
+            throw std::runtime_error(
+                "SetLidarMounts: all lidars in a set must share one (az,el) fan");
+        }
+    }
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    const RtContext ctx = ResolveRtContext(nullptr);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+    impl->d_lidar_mounts = UploadOwned(ctx.device_bt, mounts);
+    impl->lidars_per_env = static_cast<uint32_t>(mounts.size());
+    impl->lidar_az = az;
+    impl->lidar_el = el;
+    cudaStreamSynchronize(ctx.stream);
+}
+
+void RenderLidarsMounted(BatchedSensorSceneDevice& device,
+                         const phi::ScatterFkSource& fk,
+                         uint32_t env_count,
+                         phi::Backend* backend) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    if (impl->lidars_per_env == 0u || impl->d_lidar_mounts.Data() == nullptr) {
+        throw std::runtime_error(
+            "RenderLidarsMounted: SetLidarMounts must be called first");
+    }
+    if (env_count == 0u) {
+        return;
+    }
+
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+
+    // Scatter origin/rotation = fk * local_offset per (env x lidar) into the
+    // persistent E*S env-major LidarSensor buffer, then drive the range trace.
+    const uint64_t num_lidars =
+        static_cast<uint64_t>(env_count) * impl->lidars_per_env;
+    EnsureBytes(impl->d_lidars, impl->lidars_b, ctx.device_bt,
+                static_cast<std::size_t>(num_lidars) * sizeof(LidarSensor));
+    auto* d_lidars = static_cast<LidarSensor*>(impl->d_lidars.Data());
+    ScatterEnvLidars(ctx.stream, fk,
+                     static_cast<const SensorMountRow*>(impl->d_lidar_mounts.Data()),
+                     env_count, impl->lidars_per_env, d_lidars);
+    RenderLidarsBatched(device, fk, d_lidars, env_count, impl->lidars_per_env,
+                        impl->lidar_az, impl->lidar_el, backend);
+}
+
 const float* SensorColorDevice(const BatchedSensorSceneDevice& device) {
     return static_cast<const float*>(
         const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_color.Data());
@@ -783,6 +980,21 @@ const uint32_t* SensorPrimDevice(const BatchedSensorSceneDevice& device) {
 
 uint32_t SensorsPerEnv(const BatchedSensorSceneDevice& device) {
     return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->sensors_per_env;
+}
+
+const float* SensorRangeDevice(const BatchedSensorSceneDevice& device) {
+    return static_cast<const float*>(
+        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_range.Data());
+}
+
+uint32_t LidarsPerEnv(const BatchedSensorSceneDevice& device) {
+    return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->lidars_per_env;
+}
+uint32_t LidarAzCount(const BatchedSensorSceneDevice& device) {
+    return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->lidar_az;
+}
+uint32_t LidarElCount(const BatchedSensorSceneDevice& device) {
+    return const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->lidar_el;
 }
 
 }  // namespace nuka::rt
