@@ -1549,6 +1549,36 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_sensor_scatter_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Batched sensor render gate: a per-env tile of the ONE batched (N,H,W,ch)
+    # AOV tensor is byte-identical to a standalone single-env (E=1) render of that
+    # env's scene + camera (same FP32 trace + same per-env TLAS + same camera ->
+    # same bytes). Drives BuildBatchedSensorScene + RenderSensorsBatched directly
+    # over envs 0/mid/last, comparing color/depth/normal/albedo/prim. A .cu (drives
+    # the device structs + launchers); --fmad=false matches the render TU.
+    add_executable(nuka_rt_batched_sensor_render_test
+        rt/test_batched_sensor_render.cu
+    )
+    target_compile_options(nuka_rt_batched_sensor_render_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_batched_sensor_render_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_batched_sensor_render_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_batched_sensor_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Batched device-resident RGB-sensor FEASIBILITY bench. Measures the
     # per-env-TLAS render path (BuildTwoLevelScene + RenderFrameToAovs, the cheap
     # flat trace) across N envs x resolution and decomposes TLAS build/refit vs
@@ -1565,6 +1595,32 @@ if(CMAKE_CUDA_COMPILER)
             ${CMAKE_SOURCE_DIR}/src
     )
     target_link_libraries(nuka_rt_batched_sensor_bench
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+    )
+
+    # --- Batched sensor PERF deliverable: times the device-resident BATCHED path
+    # (ONE batched LBVH build + ONE flat [E*H*W] trace into a (N,H,W,ch) tensor)
+    # vs the naive per-env loop at N=256/1024/4096 x 64^2 x 1spp and prints the
+    # speedup + fps -- the near-real-time verdict. A .cu (drives the batched render
+    # entry); --fmad=false matches the render TU. Standalone main, NOT discovered.
+    add_executable(nuka_rt_batched_sensor_perf
+        rt/test_batched_sensor_perf.cu
+    )
+    target_compile_options(nuka_rt_batched_sensor_perf PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_batched_sensor_perf
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_batched_sensor_perf
         PRIVATE
             nuka_phi2_rt
             nuka_collision_gpu

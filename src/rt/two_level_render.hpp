@@ -142,6 +142,12 @@ struct RtDeviceAovs {
 TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
                                        phi::Backend* backend = nullptr);
 
+// Surface ONE SensorBlasRef per built mesh (indexed by blas_id) so the batched
+// sensor path reuses the SAME once-built BLAS. Additive; the trace path unchanged.
+struct SensorBlasRef;  // defined in the CUDA-side sensor_scatter.hpp
+void CollectSensorBlasRefs(const TwoLevelSceneDevice& device,
+                           std::vector<SensorBlasRef>* out_refs);
+
 // Render one frame: rebuild the TLAS over the CURRENT instance world-AABBs
 // (read from `scene.instances` each call so moving an instance tracks), launch
 // the nested-traversal kernel, download all 6 AOVs. `device` must have been
