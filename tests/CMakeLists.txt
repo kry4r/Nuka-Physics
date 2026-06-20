@@ -1549,6 +1549,33 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_render_world_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Offline RHI replay gate: the host render layer (nuka_rhi) over the
+    # PHI-unified tracer must add ZERO numeric change vs driving RtBackendI
+    # directly. Renders one RenderWorld both ways with a Beauty profile and
+    # asserts the framebuffers are byte-identical across all AOVs (D1). Built
+    # -ffp-contract=off to stay consistent with the rt kernel's --fmad=false.
+    add_executable(nuka_rhi_offline_replay_test
+        rhi/test_offline_replay.cpp
+    )
+    set_source_files_properties(rhi/test_offline_replay.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_include_directories(nuka_rhi_offline_replay_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rhi_offline_replay_test
+        PRIVATE
+            nuka_rhi
+            nuka_phi2_rt
+            nuka_render
+            nuka_collision_gpu
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rhi_offline_replay_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
     # MEASURES flat p13 RenderScene (rebuild-all every frame over N*~300 baked
     # world triangles) vs the G1-A two-level RenderFrame (per-mesh BLAS built
