@@ -32,6 +32,8 @@
 #include "phi/backend_cuda/rt/shading.cuh"
 #include "phi/backend_cuda/rt/two_level_render_kernels.cuh"
 #include "phi/scoped_device_guard.hpp"
+#include "rt/render_dr.hpp"
+#include "sensor/noise/philox.cuh"  // Philox4x32 host/device pure RNG
 
 #include <cuda_runtime.h>
 
@@ -73,6 +75,84 @@ __global__ void RebaseInstanceIdsKernel(DevInstance* __restrict__ instances,
     instances[i].instance_id = i % instances_per_env;
 }
 
+// A symmetric draw in [-1, 1], a PURE function of (seed, env, axis): one uniform
+// from a distinct Philox lane mapped from (0,1] to [-1,1]. The light/ambient axes
+// pass material_slot==0 (one term per env); the material axes pass the slot, and
+// the seq packs (slot, axis) injectively so distinct (env, slot, axis) never alias.
+__device__ inline float DrSym(uint64_t seed, uint32_t env, uint32_t material_slot,
+                              rt::RenderDrAxis axis) {
+    const uint32_t kAxisStride = 16u;  // > the axis enum count (lanes per slot)
+    const uint64_t seq =
+        static_cast<uint64_t>(material_slot) * kAxisStride +
+        static_cast<uint32_t>(axis);
+    const sensor::noise::Philox4x32Counter out = sensor::noise::Philox4x32_10(
+        sensor::noise::MakeCounter(env, seq), sensor::noise::SplitSeed(seed));
+    return 2.0f * sensor::noise::Uint32ToUniform01(out.v[0]) - 1.0f;  // (-1, 1]
+}
+
+__device__ inline float DrClamp(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Fill the per-env material table [E*M] from the base materials as a pure function
+// of (seed, env, axis). DR off -> an exact base replica (byte-identical tiles).
+__global__ void FillEnvMaterialsKernel(const Material* __restrict__ base,
+                                       uint32_t material_count,
+                                       rt::RenderDrConfig cfg, uint32_t env_count,
+                                       Material* __restrict__ out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = env_count * material_count;
+    if (i >= total) return;
+    const uint32_t env = i / material_count;
+    const uint32_t slot = i % material_count;
+    Material m = base[slot];
+    if (cfg.enabled) {
+        m.albedo.x = DrClamp(m.albedo.x + cfg.color_jitter *
+                             DrSym(cfg.seed, env, slot, rt::RenderDrAxis::MaterialColorR), 0.0f, 1.0f);
+        m.albedo.y = DrClamp(m.albedo.y + cfg.color_jitter *
+                             DrSym(cfg.seed, env, slot, rt::RenderDrAxis::MaterialColorG), 0.0f, 1.0f);
+        m.albedo.z = DrClamp(m.albedo.z + cfg.color_jitter *
+                             DrSym(cfg.seed, env, slot, rt::RenderDrAxis::MaterialColorB), 0.0f, 1.0f);
+        m.roughness = DrClamp(m.roughness + cfg.roughness_jitter *
+                             DrSym(cfg.seed, env, slot, rt::RenderDrAxis::MaterialRoughness), 1.0e-3f, 1.0f);
+        m.metallic = DrClamp(m.metallic + cfg.metallic_jitter *
+                             DrSym(cfg.seed, env, slot, rt::RenderDrAxis::MaterialMetallic), 0.0f, 1.0f);
+    }
+    out[i] = m;
+}
+
+// Fill the per-env light [E] + ambient [E] from the base as a pure function of
+// (seed, env, axis). DR off -> an exact base replica.
+__global__ void FillEnvLightsKernel(Light base_light, AmbientTerm base_ambient,
+                                    rt::RenderDrConfig cfg, uint32_t env_count,
+                                    Light* __restrict__ out_light,
+                                    AmbientTerm* __restrict__ out_ambient) {
+    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+    if (env >= env_count) return;
+    Light l = base_light;
+    AmbientTerm a = base_ambient;
+    if (cfg.enabled) {
+        l.direction.x += cfg.light_dir_jitter * DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightDirX);
+        l.direction.y += cfg.light_dir_jitter * DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightDirY);
+        l.direction.z += cfg.light_dir_jitter * DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightDirZ);
+        l.intensity = fmaxf(0.0f, l.intensity * (1.0f + cfg.light_intensity_jitter *
+                            DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightIntensity)));
+        l.color.x = fmaxf(0.0f, l.color.x * (1.0f + cfg.light_color_jitter *
+                          DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightColorR)));
+        l.color.y = fmaxf(0.0f, l.color.y * (1.0f + cfg.light_color_jitter *
+                          DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightColorG)));
+        l.color.z = fmaxf(0.0f, l.color.z * (1.0f + cfg.light_color_jitter *
+                          DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::LightColorB)));
+        const float am = fmaxf(0.0f, 1.0f + cfg.ambient_intensity_jitter *
+                              DrSym(cfg.seed, env, 0u, rt::RenderDrAxis::AmbientIntensity));
+        a.color.x *= am;
+        a.color.y *= am;
+        a.color.z *= am;
+    }
+    out_light[env] = l;
+    out_ambient[env] = a;
+}
+
 // One thread per GLOBAL ray over [num_cameras*H*W]: flat gid -> (camera, px, py).
 // Cameras are env-major (cameras[env*S+s]); the env owning a camera is cam/S, and
 // the TLAS node + instance + material slices index by env (the scene is env-shared
@@ -83,8 +163,9 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          uint32_t leaves_per_env,
                                          const DevInstance* __restrict__ instances,
                                          const Material* __restrict__ materials,
-                                         Light light,
-                                         AmbientTerm ambient,
+                                         uint32_t material_count,
+                                         const Light* __restrict__ lights,
+                                         const AmbientTerm* __restrict__ ambients,
                                          uint32_t num_cameras,
                                          uint32_t sensors_per_env,
                                          uint32_t width,
@@ -107,6 +188,13 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
 
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
+
+    // Per-env appearance: light/ambient by env, materials env-offset by env*M.
+    // DR off -> these tables are base replicas, so the bytes match the env-shared
+    // look exactly (ONE path: always read BY ENV).
+    const Light light = lights[env];
+    const AmbientTerm ambient = ambients[env];
+    const Material* env_mats = materials + static_cast<uint64_t>(env) * material_count;
 
     // Env-offset TLAS node slice + env-offset instance slice (TLAS leaf .left is
     // env-local, so the env instance slice resolves it directly).
@@ -136,7 +224,7 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
         float uv_u, uv_v;
         ReconstructHit<float>(env_inst, best_prim, ray.origin, ray.dir, &n, &uv_u, &uv_v);
         normal = n;
-        const Material mat = materials[material_id];
+        const Material mat = env_mats[material_id];
         albedo = mat.albedo;
 
         const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
@@ -200,13 +288,21 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
 // the (N,H,W,ch) AOV tensor. Sized lazily, reused across steps.
 struct BatchedSensorSceneDevice::Impl {
     TwoLevelSceneDevice blas;  // BLAS built once (reused from the shared path)
-    Light light;
-    AmbientTerm ambient;
+    Light light;               // base (env 0) light; per-env table derived from it
+    AmbientTerm ambient;       // base ambient; per-env table derived from it
 
-    // Env-shared per-instance binding (uploaded once).
+    // Env-shared per-instance binding (uploaded once). d_materials holds the BASE
+    // material set [M]; the per-env table d_materials_env [E*M] is derived from it.
     OwnedBuffer d_rows, d_blas_id, d_material_id, d_blas_refs, d_materials;
     uint32_t instances_per_env = 0u;
     uint32_t material_count = 0u;
+
+    // Per-env appearance tables (the ONE thing the trace reads): materials [E*M],
+    // light/ambient [E]. DR off -> exact base replicas (byte-identical tiles).
+    OwnedBuffer d_materials_env, d_light_env, d_ambient_env;
+    std::size_t matenv_b = 0u, lightenv_b = 0u, ambenv_b = 0u;
+    uint32_t dr_env_count = 0u;  // env count the per-env tables are filled for
+    rt::RenderDrConfig dr_cfg;   // disabled by default -> replicas
 
     // Scatter outputs + batched TLAS (sized to E*M / E*(2M-1)); *_b track each
     // allocation's byte size so growth-only realloc is honest across steps.
@@ -299,6 +395,48 @@ void EnsureBytes(OwnedBuffer& buf, std::size_t& cur_bytes, phi::BufferType* bt,
     }
 }
 
+// Per-env appearance table cap. A vision DR run is thousands of envs; the table
+// stays trivial (a 4-material set at 65536 envs is ~8 MB), but cap it LOUDLY so a
+// nonsense env_count fails fast instead of overflowing the allocation.
+constexpr uint32_t kMaxRenderDrEnvs = 1u << 20;  // 1,048,576 envs
+
+// (Re)fill the per-env material/light/ambient tables from the base set + the
+// stored DR config, for `env_count` envs. DR off -> exact base replicas, so the
+// trace's cross-env tiles stay byte-identical. Refills only on an env-count or
+// config change; the fill is a pure function of (seed, env, axis).
+void EnsureEnvAppearanceTables(BatchedSensorSceneDevice::Impl* impl,
+                               const RtContext& ctx, uint32_t env_count, bool force) {
+    if (env_count == 0u) return;
+    if (env_count > kMaxRenderDrEnvs) {
+        throw std::runtime_error(
+            "RenderDr: env_count exceeds the per-env appearance-table cap "
+            "(kMaxRenderDrEnvs=1048576)");
+    }
+    const uint32_t mc = impl->material_count;
+    const bool resized = env_count != impl->dr_env_count;
+    EnsureBytes(impl->d_materials_env, impl->matenv_b, ctx.device_bt,
+                static_cast<std::size_t>(env_count) * mc * sizeof(Material));
+    EnsureBytes(impl->d_light_env, impl->lightenv_b, ctx.device_bt,
+                static_cast<std::size_t>(env_count) * sizeof(Light));
+    EnsureBytes(impl->d_ambient_env, impl->ambenv_b, ctx.device_bt,
+                static_cast<std::size_t>(env_count) * sizeof(AmbientTerm));
+    if (!resized && !force) return;
+
+    const uint32_t kBlock = 128u;
+    const uint32_t mat_total = env_count * mc;
+    const uint32_t mat_grid = (mat_total + kBlock - 1u) / kBlock;
+    phi::LaunchCuda(FillEnvMaterialsKernel, dim3(mat_grid), dim3(kBlock), 0u,
+                    ctx.stream, static_cast<const Material*>(impl->d_materials.Data()),
+                    mc, impl->dr_cfg, env_count,
+                    static_cast<Material*>(impl->d_materials_env.Data()));
+    const uint32_t light_grid = (env_count + kBlock - 1u) / kBlock;
+    phi::LaunchCuda(FillEnvLightsKernel, dim3(light_grid), dim3(kBlock), 0u,
+                    ctx.stream, impl->light, impl->ambient, impl->dr_cfg, env_count,
+                    static_cast<Light*>(impl->d_light_env.Data()),
+                    static_cast<AmbientTerm*>(impl->d_ambient_env.Data()));
+    impl->dr_env_count = env_count;
+}
+
 }  // namespace
 
 void RenderSensorsBatched(BatchedSensorSceneDevice& device,
@@ -344,6 +482,10 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     EnsureBytes(impl->d_albedo, impl->alb_b, bt, rays * 3u * sizeof(float));
     EnsureBytes(impl->d_prim, impl->prim_b, bt, rays * sizeof(uint32_t));
 
+    // Per-env material/light/ambient tables (refilled on an env-count change; DR
+    // off -> base replicas). The trace reads these BY ENV -- the ONE path.
+    EnsureEnvAppearanceTables(impl, ctx, env_count, false);
+
     // A changed env count forces a topology rebuild (node array reshaped).
     const bool need_rebuild = !impl->topology_built || env_count != impl->env_count ||
                               impl->frames_since_rebuild >= kTlasRebuildPeriod;
@@ -386,11 +528,15 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     }
 
     // 3) ONE flat trace over [E*S*H*W] into the persistent (E,S,H,W,ch) AOV tensor.
+    //    Materials/light/ambient resolved BY ENV from the per-env tables.
     const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
     phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
                     ctx.stream, cameras_device, d_nodes, m, d_instances,
-                    static_cast<const Material*>(impl->d_materials.Data()),
-                    impl->light, impl->ambient, static_cast<uint32_t>(num_cameras), s,
+                    static_cast<const Material*>(impl->d_materials_env.Data()),
+                    impl->material_count,
+                    static_cast<const Light*>(impl->d_light_env.Data()),
+                    static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
+                    static_cast<uint32_t>(num_cameras), s,
                     width, height,
                     static_cast<float*>(impl->d_color.Data()),
                     static_cast<float*>(impl->d_depth.Data()),
@@ -413,6 +559,19 @@ void SetSensorMounts(BatchedSensorSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
     impl->d_mounts = UploadOwned(ctx.device_bt, mounts);
     impl->sensors_per_env = static_cast<uint32_t>(mounts.size());
+    cudaStreamSynchronize(ctx.stream);
+}
+
+void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
+                 uint32_t env_count, phi::Backend* backend) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+    // Store the config and force a refill of the per-env tables (a fixed seed makes
+    // this idempotent; disabling restores exact base replicas -> byte-identical).
+    impl->dr_cfg = cfg;
+    EnsureEnvAppearanceTables(impl, ctx, env_count, true);
     cudaStreamSynchronize(ctx.stream);
 }
 

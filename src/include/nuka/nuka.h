@@ -582,6 +582,41 @@ nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
                                          uint32_t* width,
                                          uint32_t* channels);
 
+// ---------------------------------------------------------------------------
+// Per-env render domain randomization: give each env its OWN appearance (material
+// base_color/roughness/metallic, light direction/intensity/color, ambient
+// intensity) so the (E,S,H,W,ch) sensor tensor shows appearance variety -- the
+// vision-policy / sim2real lever. The trace ALWAYS reads material/light BY ENV;
+// DR off (enabled==0, the default) makes every env's table an exact base replica,
+// so the cross-env byte-identical invariant is unchanged. Each enabled axis is a
+// PURE function of (seed, env, axis) (Philox, no mutable RNG state), so the same
+// seed yields the same bytes (RL-reproducible).
+// ---------------------------------------------------------------------------
+
+// Each *_jitter is a symmetric band: a randomized scalar is base + u*jitter (u in
+// [-1,1]) for the additive axes (color/roughness/metallic/light_dir) or
+// base*(1 + u*jitter) for the fractional axes (intensity/color/ambient). A zero
+// jitter leaves that axis at its base value (an unset axis is a byte no-op).
+typedef struct nuka_render_dr_desc_t {
+    float color_jitter;             /* +/- per RGB channel of material base_color */
+    float roughness_jitter;         /* +/- added to roughness (clamped) */
+    float metallic_jitter;          /* +/- added to metallic (clamped) */
+    float light_dir_jitter;         /* +/- per light direction component */
+    float light_intensity_jitter;   /* fractional, base*(1 +/- this) */
+    float light_color_jitter;       /* fractional per RGB of light color */
+    float ambient_intensity_jitter; /* fractional, base*(1 +/- this) */
+    uint64_t seed;                  /* Philox key; the recorded deterministic state */
+    int enabled;                    /* 0 (default) -> tables are base replicas */
+} nuka_render_dr_desc_t;
+
+// Record the per-env render-DR config and (re)fill the per-env appearance tables
+// from the base set as a pure function of (seed, env, axis). A NULL desc (or
+// enabled==0) restores exact base replicas (cross-env byte-identical). Requires a
+// camera attached (the sensor scene owns the tables). Idempotent for a fixed seed;
+// safe to re-call per reset. NOT_SUPPORTED if no camera is attached.
+nuka_result_t nuka_world_set_render_randomization(
+    nuka_world_handle world, const nuka_render_dr_desc_t* desc);
+
 typedef struct nuka_invariant_violation_t {
     uint32_t invariant;
     uint32_t step;

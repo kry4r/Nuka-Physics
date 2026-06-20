@@ -87,6 +87,11 @@ public:
         return handle->shape;
     }
 
+    void SetRenderDr(SensorSceneHandle* handle, const rt::RenderDrConfig& cfg,
+                     uint32_t env_count) override {
+        rt::SetRenderDr(handle->scene, cfg, env_count, backend_);
+    }
+
     void FreeSensorScene(SensorSceneHandle* handle) override { delete handle; }
 
 private:
