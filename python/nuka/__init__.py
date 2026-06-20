@@ -42,7 +42,45 @@ from ._nuka_ext import (  # noqa: F401
     CONTROL_MODE_COMPUTED_TORQUE,
     CONTROL_MODE_OSC,
     CONTROL_MODE_ACTUATOR,
+    # Device-resident batched camera sensor: the AOV plane + the mount frame.
+    SensorChannel,
+    SensorMount,
 )
+
+import dataclasses as _dataclasses
+from typing import Sequence, Tuple
+
+
+@_dataclasses.dataclass
+class CameraCfg:
+    """One env's camera, authoring a World.attach_camera_sensor call.
+
+    ONE camera per env (the batched single-launch contract). mount/mount_index
+    name the FK pose the camera follows; pos + quat (w,x,y,z) is its offset in
+    that frame (camera-local axes: -Z forward, +Y up). width/height size every
+    env image; vfov_deg is the vertical field of view.
+    """
+
+    width: int
+    height: int
+    vfov_deg: float = 60.0
+    mount: int = SensorMount.BASE
+    mount_index: int = 0
+    pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+    def attach(self, world: "World") -> None:
+        """Attach this camera to `world` (one camera per env)."""
+        local_offset: Sequence[float] = (
+            self.pos[0], self.pos[1], self.pos[2],
+            self.quat[0], self.quat[1], self.quat[2], self.quat[3],
+        )
+        # mount may be a SensorMount enum or a plain int (.value pulls the ordinal).
+        mount = self.mount.value if hasattr(self.mount, "value") else int(self.mount)
+        world.attach_camera_sensor(
+            int(mount), int(self.mount_index), list(local_offset),
+            float(self.vfov_deg), int(self.width), int(self.height),
+        )
 
 # v0.5 p04 Task 5.4.9 sim-to-real noise config (PURE python -- no torch/jax dep,
 # so eager import is safe; see noise.py). GaussianNoise / PoissonNoise wrap the

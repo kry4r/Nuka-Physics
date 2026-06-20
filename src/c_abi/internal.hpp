@@ -29,6 +29,11 @@ class World;  // nk/pipeline/world.hpp -- fwd-declared (held by unique_ptr below
               // complete in world.cpp where the World ctor runs).
 }  // namespace nuka::nk
 
+namespace nuka::render {
+class SensorBackendI;     // render/sensor_backend.hpp -- the batched sensor facet.
+struct SensorSceneHandle; // backend-owned built scene; freed via FreeSensorScene.
+}  // namespace nuka::render
+
 namespace nuka::c_abi {
 
 struct DeviceRecord {
@@ -72,6 +77,22 @@ struct DeviceRecord {
     }
 };
 
+// The world's batched camera sensor: the backend + the backend-owned scene handle
+// + the image size. The out-of-line dtor frees the handle through the backend.
+struct SensorAttachment {
+    std::unique_ptr<nuka::render::SensorBackendI> backend;
+    nuka::render::SensorSceneHandle* handle = nullptr;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    bool rendered = false;  // a device AOV tensor exists only after the first render.
+    ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
+    SensorAttachment() = default;
+    SensorAttachment(SensorAttachment&&) = delete;
+    SensorAttachment& operator=(SensorAttachment&&) = delete;
+    SensorAttachment(const SensorAttachment&) = delete;
+    SensorAttachment& operator=(const SensorAttachment&) = delete;
+};
+
 struct WorldRecord {
     // M9 T5/T6: the ONE generic live sim — Scene->CookToModel->nk::World. Owns
     // the device-resident Model+Data+Pipeline. BORROWS the DeviceRecord's phi v2
@@ -82,6 +103,14 @@ struct WorldRecord {
     // declaration; the ctor/dtor are out-of-line in world.cpp (where nk::World is
     // complete) so the other C-ABI TUs that touch WorldTable need not see it.
     std::unique_ptr<nuka::nk::World> world;
+
+    // The FINAL composed scene this world cooked (co-residence replicas included),
+    // RETAINED so the sensor attach builds the per-env visual binding from one cook.
+    std::unique_ptr<nuka::scene::SceneIR> scene;
+
+    // The batched camera sensor (lazily built by attach). Declared AFTER `world` so
+    // it is destroyed BEFORE the World/backend drop. Null until a sensor is attached.
+    std::unique_ptr<SensorAttachment> sensor;
 
     DeviceRecord* device = nullptr;
 

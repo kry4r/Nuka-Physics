@@ -510,6 +510,63 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                                          nuka_state_field_t field,
                                          nuka_buffer_view_t* out);
 
+// ---------------------------------------------------------------------------
+// Device-resident batched camera sensor: ONE camera per env rendered into a
+// single (env_count, height, width, channels) device tensor (no host download).
+// The same RT tracer at a cheap sensor profile; the obs is read zero-copy via
+// nuka_world_get_sensor_view + torch.from_dlpack. One camera per env (the batched
+// single-launch path renders exactly one sensor per env).
+// ---------------------------------------------------------------------------
+
+// Which FK pose the camera mounts on; selects FieldId::{LinkPose,BodyPose,
+// BasePose}. mount_index selects the row within that field.
+typedef enum nuka_sensor_mount_t {
+    NUKA_SENSOR_MOUNT_LINK = 0,
+    NUKA_SENSOR_MOUNT_BODY = 1,
+    NUKA_SENSOR_MOUNT_BASE = 2
+} nuka_sensor_mount_t;
+
+// AOV channel the sensor view returns: 0 color(3) 1 depth(1) 2 normal(3) 3
+// albedo(3) 4 prim(1, uint32). Mirrors the batched AOV tensor planes.
+typedef enum nuka_sensor_channel_t {
+    NUKA_SENSOR_CHANNEL_COLOR = 0,
+    NUKA_SENSOR_CHANNEL_DEPTH = 1,
+    NUKA_SENSOR_CHANNEL_NORMAL = 2,
+    NUKA_SENSOR_CHANNEL_ALBEDO = 3,
+    NUKA_SENSOR_CHANNEL_PRIM = 4
+} nuka_sensor_channel_t;
+
+// Build the world's batched sensor scene from its cooked visual instances (the
+// per-env visual template, replicated across envs) and attach ONE camera mounted
+// on `mount_frame`[mount_index] offset by `local_offset` (px,py,pz, qw,qx,qy,qz).
+// `vfov_deg` is the vertical field of view; width/height size every env image.
+// Re-callable (rebuilds the scene/mount). Requires the world to have visual
+// meshes (cooked from a scene with VisualMeshComponents); NOT_SUPPORTED if the
+// engine has no RT sensor backend or the scene has no renderable geometry.
+nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
+                                              nuka_sensor_mount_t mount_frame,
+                                              uint32_t mount_index,
+                                              const float local_offset[7],
+                                              float vfov_deg,
+                                              uint32_t width,
+                                              uint32_t height);
+
+// Render every env's camera into the persistent device AOV tensor IN PLACE on the
+// world's backend stream (no host round-trip), driven by the world's LIVE link
+// poses. Call after step() and after nuka_world_attach_camera_sensor.
+nuka_result_t nuka_world_render_sensors(nuka_world_handle world);
+
+// Zero-copy device view into the AOV tensor after nuka_world_render_sensors:
+// `channel` selects the plane (see nuka_sensor_channel_t). out->device_ptr is the
+// (env_count*height*width*ch) device base; element_count is that float/uint32
+// count; element_stride_bytes is sizeof(float) (sizeof(uint32) for PRIM); dtype is
+// 0 float32 (1 uint32 for PRIM, same code nuka_buffer_view_t uses). MIRRORS
+// nuka_world_get_buffer_view so a caller reshapes to (N,H,W,ch). NOT_SUPPORTED
+// before the first render.
+nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
+                                         nuka_sensor_channel_t channel,
+                                         nuka_buffer_view_t* out);
+
 typedef struct nuka_invariant_violation_t {
     uint32_t invariant;
     uint32_t step;

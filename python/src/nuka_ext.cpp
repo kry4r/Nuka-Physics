@@ -16,9 +16,11 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -386,6 +388,37 @@ public:
         return view;
     }
 
+    // Device-resident batched camera sensor: ONE camera per env into a single
+    // (N,H,W,ch) device tensor. mount_frame 0=Link 1=Body 2=Base; offset=pos3+quat4.
+    void attach_camera_sensor(uint32_t mount_frame, uint32_t mount_index,
+                              const std::array<float, 7>& local_offset,
+                              float vfov_deg, uint32_t width, uint32_t height) {
+        check(nuka_world_attach_camera_sensor(
+                  h_, static_cast<nuka_sensor_mount_t>(mount_frame), mount_index,
+                  local_offset.data(), vfov_deg, width, height),
+              "nuka_world_attach_camera_sensor");
+        sensor_width_ = width;
+        sensor_height_ = height;
+    }
+
+    void render_sensors() {
+        check(nuka_world_render_sensors(h_), "nuka_world_render_sensors");
+    }
+
+    nuka_buffer_view_t get_sensor_view(nuka_sensor_channel_t channel) const {
+        nuka_buffer_view_t view{};
+        check(nuka_world_get_sensor_view(h_, channel, &view),
+              "nuka_world_get_sensor_view");
+        if (view.device_ptr == nullptr) {
+            throw std::runtime_error(
+                "get_sensor_view: engine returned null device_ptr");
+        }
+        return view;
+    }
+
+    uint32_t sensor_width() const { return sensor_width_; }
+    uint32_t sensor_height() const { return sensor_height_; }
+
 private:
     World(nuka_world_handle h, uint32_t ec, uint32_t blc, float dt)
         : h_(h), env_count_(ec), base_link_count_(blc), dt_(dt) {}
@@ -393,6 +426,9 @@ private:
     uint32_t env_count_ = 0u;
     uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
+    // Last attached camera image size (for the (N,H,W,ch) sensor view shaping).
+    uint32_t sensor_width_ = 0u;
+    uint32_t sensor_height_ = 0u;
 };
 
 // ---------------------------------------------------------------------------
@@ -624,6 +660,41 @@ Uint32Array make_uint32_view(const nuka_buffer_view_t& view, uint32_t ec,
     if (ec > 0u && view.element_count % ec == 0u) {
         size_t shape[2] = {ec, view.element_count / ec};
         return Uint32Array(view.device_ptr, 2, shape, owner, nullptr,
+                           nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
+    }
+    size_t shape[1] = {view.element_count};
+    return Uint32Array(view.device_ptr, 1, shape, owner, nullptr,
+                       nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
+}
+
+// Shape a batched-sensor AOV plane (N,H,W,ch) zero-copy: ch = element_count /
+// (N*H*W) (3 color/normal/albedo, 1 depth). owner keeps the engine buffer alive.
+FloatArray make_sensor_float_view(const nuka_buffer_view_t& view, uint32_t n,
+                                  uint32_t h, uint32_t w, nb::handle owner) {
+    const int dev_id = 0;
+    const size_t pixels = static_cast<size_t>(n) * h * w;
+    if (n > 0u && h > 0u && w > 0u && pixels > 0u &&
+        view.element_count % pixels == 0u) {
+        const size_t ch = view.element_count / pixels;
+        size_t shape[4] = {n, h, w, ch};
+        return FloatArray(view.device_ptr, 4, shape, owner, nullptr,
+                          nb::dtype<float>(), nb::device::cuda::value, dev_id);
+    }
+    size_t shape[1] = {view.element_count};
+    return FloatArray(view.device_ptr, 1, shape, owner, nullptr, nb::dtype<float>(),
+                      nb::device::cuda::value, dev_id);
+}
+
+// The uint32 (prim) plane as the same (N,H,W,1) 4D view (one channel).
+Uint32Array make_sensor_uint32_view(const nuka_buffer_view_t& view, uint32_t n,
+                                    uint32_t h, uint32_t w, nb::handle owner) {
+    const int dev_id = 0;
+    const size_t pixels = static_cast<size_t>(n) * h * w;
+    if (n > 0u && h > 0u && w > 0u && pixels > 0u &&
+        view.element_count % pixels == 0u) {
+        const size_t ch = view.element_count / pixels;
+        size_t shape[4] = {n, h, w, ch};
+        return Uint32Array(view.device_ptr, 4, shape, owner, nullptr,
                            nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
     }
     size_t shape[1] = {view.element_count};
@@ -902,6 +973,23 @@ NB_MODULE(_nuka_ext, m) {
         .value("JOINT_FEEDFORWARD", NUKA_FIELD_JOINT_FEEDFORWARD)
         .export_values();
 
+    // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
+    // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32.
+    nb::enum_<nuka_sensor_channel_t>(m, "SensorChannel")
+        .value("COLOR", NUKA_SENSOR_CHANNEL_COLOR)
+        .value("DEPTH", NUKA_SENSOR_CHANNEL_DEPTH)
+        .value("NORMAL", NUKA_SENSOR_CHANNEL_NORMAL)
+        .value("ALBEDO", NUKA_SENSOR_CHANNEL_ALBEDO)
+        .value("PRIM", NUKA_SENSOR_CHANNEL_PRIM)
+        .export_values();
+
+    // Which FK frame a camera mounts on for World.attach_camera_sensor.
+    nb::enum_<nuka_sensor_mount_t>(m, "SensorMount")
+        .value("LINK", NUKA_SENSOR_MOUNT_LINK)
+        .value("BODY", NUKA_SENSOR_MOUNT_BODY)
+        .value("BASE", NUKA_SENSOR_MOUNT_BASE)
+        .export_values();
+
     nb::class_<Device>(m, "Device")
         .def_static("create", &Device::create, nb::arg("ordinal") = 0,
                     nb::arg("stream_ptr") = uintptr_t{0},
@@ -1097,6 +1185,60 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("array"),
             "Copy a 1D contiguous float array (host or CUDA) into the live "
             "DRIVE_TARGET device buffer; picked up by the next step().")
+        // Device-resident batched camera sensor (the in-the-loop obs surface):
+        // attach the camera, render the (N,H,W,ch) tensor, alias a plane zero-copy.
+        .def(
+            "attach_camera_sensor",
+            [](World& w, uint32_t mount_frame, uint32_t mount_index,
+               std::array<float, 7> local_offset, float vfov_deg, uint32_t width,
+               uint32_t height) {
+                w.attach_camera_sensor(mount_frame, mount_index, local_offset,
+                                       vfov_deg, width, height);
+            },
+            nb::arg("mount_frame"), nb::arg("mount_index"), nb::arg("local_offset"),
+            nb::arg("vfov_deg"), nb::arg("width"), nb::arg("height"),
+            "Attach ONE camera per env, mounted on mount_frame (0=Link, 1=Body, "
+            "2=Base) link/body/base index mount_index, offset by local_offset "
+            "(pos3 + quat4: px,py,pz, qw,qx,qy,qz) in that frame; camera-local axes "
+            "are -Z forward, +Y up. vfov_deg is the vertical field of view; "
+            "width/height size every env image. Builds the sensor scene from the "
+            "world's cooked visual meshes (one camera per env -- the batched "
+            "single-launch contract). Re-callable. Raises NOT_SUPPORTED if the "
+            "engine has no RT sensor backend or the scene has no renderable "
+            "geometry.")
+        .def("render_sensors", &World::render_sensors,
+             "Render every env's camera into the persistent (N,H,W,ch) device AOV "
+             "tensor IN PLACE on the world's backend stream (no host download), "
+             "driven by the live link poses. Call after step() and after "
+             "attach_camera_sensor.")
+        .def(
+            "get_sensor_view",
+            [](nb::handle self, nuka_sensor_channel_t channel) -> nb::object {
+                World* w = nb::cast<World*>(self);
+                nuka_buffer_view_t view = w->get_sensor_view(channel);
+                // PRIM is the ONE uint32 plane (dtype==1); the rest are float32.
+                // Both shape (N,H,W,ch) zero-copy for torch.from_dlpack.
+                if (view.dtype == 1u) {
+                    return nb::cast(make_sensor_uint32_view(
+                        view, w->env_count(), w->sensor_height(),
+                        w->sensor_width(), self));
+                }
+                return nb::cast(make_sensor_float_view(
+                    view, w->env_count(), w->sensor_height(), w->sensor_width(),
+                    self));
+            },
+            nb::arg("channel"), nb::rv_policy::reference,
+            "Return a zero-copy DLPack-capable CUDA ndarray aliasing the batched "
+            "sensor AOV tensor for `channel` (SensorChannel.COLOR/DEPTH/NORMAL/"
+            "ALBEDO float32, PRIM uint32), shaped (env_count, height, width, "
+            "channels): COLOR/NORMAL/ALBEDO ch=3, DEPTH/PRIM ch=1. "
+            "torch.from_dlpack(...) yields a CUDA tensor aliasing the engine "
+            "buffer (no copy). Raises NOT_SUPPORTED before the first "
+            "render_sensors().")
+        .def_prop_ro("sensor_width", &World::sensor_width,
+                     "Width of the last attached camera image (0 if none).")
+        .def_prop_ro("sensor_height", &World::sensor_height,
+                     "Height of the last attached camera image (0 if none).")
         // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
         // the autograd layer uses to push a mass param tensor INTO the sim).
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),

@@ -400,6 +400,10 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         // path (same cook). HOST-ONLY -- device writes target the nk arena.
         nuka::c_abi::CaptureArticulationHostMirror(scene, record.get());
 
+        // Retain the FINAL composed scene so a camera-sensor attach builds the
+        // per-env visual binding from the SAME ECS the cook saw (host data only).
+        record->scene = std::make_unique<nuka::scene::SceneIR>(std::move(scene));
+
         *out = nuka::c_abi::WorldTable().Insert(std::move(record));
         return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
