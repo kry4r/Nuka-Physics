@@ -64,6 +64,7 @@ struct DeviceRecord {
         // the API contract destroys before its DeviceRecord (nuka_world_destroy
         // before nuka_device_destroy), so the backend has no live borrower here.
         if (backend != nullptr) {
+            phi::ResetActiveBackend(backend);  // drop the global selection first.
             phi::BackendFree(backend);
             backend = nullptr;
         }
