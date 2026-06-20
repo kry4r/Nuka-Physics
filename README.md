@@ -13,11 +13,11 @@
 <p align="center">
   <video src="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4" poster="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_poster.jpg" controls muted loop playsinline width="85%"></video>
 </p>
-<p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer (1080p). <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ play</a> · <a href="docs/examples/go2_locomotion.md">4096-env batched RL →</a></sub></p>
+<p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer (1080p). <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ play full video</a></sub></p>
 
 ## Why Nuka
 
-- **One GPU, thousands of articulated envs.** The same cooked world template steps 4096+ environments GPU-resident; an in-engine PPO policy trains end-to-end.
+- **One GPU, thousands of articulated envs.** The same cooked world template steps thousands of environments GPU-resident — the substrate for large-scale RL.
 - **Strong (D1) determinism.** No FP atomics, fixed reduction order everywhere — re-running from the same inputs reproduces results *byte-for-byte* (enforced by a physics-smell lint on every PR).
 - **Differentiable.** A real analytical reverse-mode adjoint through rigid + articulated (Featherstone) dynamics — not a stop-gradient contact approximation. `jax.grad` and `loss.backward()` agree to engine round-off.
 - **One general contact path.** Robot↔ground and robot↔object are the same contact problem and run the same solver — no per-scene fast-paths.
