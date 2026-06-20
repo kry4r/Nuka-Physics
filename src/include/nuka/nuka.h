@@ -655,6 +655,35 @@ typedef struct nuka_sensor_fidelity_desc_t {
 nuka_result_t nuka_world_set_sensor_fidelity(
     nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc);
 
+// ---------------------------------------------------------------------------
+// Camera lens model: by default a camera is a centered pinhole (focal from the
+// attach vfov+aspect). This applies the schema-carried lens knobs -- radial
+// (Brown-Conrady) distortion + a clipped depth range -- to every attached camera.
+// The DEFAULT desc (distortion==0, near<=0/far<=0 read as wide-open 0.01/1000) is
+// a byte no-op. The principal point + per-axis focal (fx/fy/cx/cy) are renderer-
+// side knobs that the scene schema does not carry, so they are not exposed here.
+// ---------------------------------------------------------------------------
+
+// The lens-model knobs (the scene CameraIntrinsics set). distortion!=0 enables the
+// radial term r2=x*x+y*y, d=1+k1*r2+k2*r2*r2 on each ray's normalized sensor coord
+// (k1==k2==0 with distortion on is just identity). near_clip/far_clip clip the
+// depth AOV: a hit outside [near,far] reads as a miss. A non-positive near/far
+// reads as the wide-open default (0.01 / 1000), so an all-zero desc changes nothing.
+typedef struct nuka_camera_intrinsics_desc_t {
+    int distortion;   /* 0 (default) -> radial term off (byte no-op) */
+    float k1;         /* first radial coefficient */
+    float k2;         /* second radial coefficient */
+    float near_clip;  /* depth-AOV near clip (<=0 -> default 0.01) */
+    float far_clip;   /* depth-AOV far clip (<=0 -> default 1000) */
+} nuka_camera_intrinsics_desc_t;
+
+// Record the lens-model knobs on every attached camera and rebuild the sensor
+// scene so the next render uses them (the per-env DR + shading fidelity are
+// preserved across the rebuild). A NULL desc restores the default pinhole + the
+// wide-open clip (a byte no-op for today's scenes). Requires a camera attached.
+nuka_result_t nuka_world_set_camera_intrinsics(
+    nuka_world_handle world, const nuka_camera_intrinsics_desc_t* desc);
+
 typedef struct nuka_invariant_violation_t {
     uint32_t invariant;
     uint32_t step;

@@ -243,6 +243,13 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     ClosestHit<float>(env_nodes, leaves_per_env, env_inst, ray.origin, ray.dir, 0.0f,
                       &best_t, &best_prim);
 
+    // Depth clip on the center ray (drives every AOV): a hit outside the camera's
+    // [near,far] reads as a miss. Default clip is wide-open => no pixel changes.
+    if (best_prim != kNoPrim &&
+        (best_t < camera.near_clip || best_t > camera.far_clip)) {
+        best_prim = kNoPrim;
+    }
+
     Vec3 color{0.0f, 0.0f, 0.0f};
     float depth = RtMissDepth();
     Vec3 normal{0.0f, 0.0f, 0.0f};

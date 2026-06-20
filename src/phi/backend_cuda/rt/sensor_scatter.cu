@@ -175,8 +175,20 @@ __global__ void ScatterEnvCamerasKernel(ScatterFkSource fk,
     const Quat r = cam_world.rotation;
     const Vec3 forward = QuatRotate(r, Vec3{0.0f, 0.0f, -1.0f});
     const Vec3 up = QuatRotate(r, Vec3{0.0f, 1.0f, 0.0f});
-    out_cameras[i] = BuildPinholeBasis(cam_world.position, forward, up, row.fov_y,
-                                       row.width, row.height);
+    PinholeCamera cam = BuildPinholeBasis(cam_world.position, forward, up, row.fov_y,
+                                          row.width, row.height);
+    // Carry the sensor's intrinsics; default rows (fx<=0, distortion off, clip
+    // wide-open) leave the camera byte-identical to the plain pinhole.
+    cam.fx = row.fx;
+    cam.fy = row.fy;
+    cam.cx = row.cx;
+    cam.cy = row.cy;
+    cam.k1 = row.k1;
+    cam.k2 = row.k2;
+    cam.distortion = row.distortion;
+    cam.near_clip = row.near_clip;
+    cam.far_clip = row.far_clip;
+    out_cameras[i] = cam;
 }
 
 }  // namespace
@@ -234,6 +246,13 @@ std::vector<SensorMountRow> BuildSensorMountRows(
         r.fov_y = s.cam.vfov_degrees * kDegToRad;
         r.width = s.cam.width;
         r.height = s.cam.height;
+        // The schema carries focal/principal-point via vfov+centered today; k1/k2/
+        // distortion + clip ride straight through (defaults => byte-identical).
+        r.k1 = s.cam.k1;
+        r.k2 = s.cam.k2;
+        r.distortion = s.cam.distortion;
+        r.near_clip = s.cam.near_clip;
+        r.far_clip = s.cam.far_clip;
         rows.push_back(r);
     }
     return rows;

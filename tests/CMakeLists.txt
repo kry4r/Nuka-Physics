@@ -1726,6 +1726,35 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_sensor_camera_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Camera intrinsics + lens distortion gate. Default intrinsics (fx<=0) =>
+    # ray-gen byte-identical to the plain pinhole; distortion bends off-axis rays
+    # (center unchanged); off-center principal point + per-axis focal shift rays
+    # (known-value check); far/near clip turns out-of-range hits into depth misses.
+    # A .cu; --fmad=false + host -ffp-contract=off so host==device.
+    add_executable(nuka_rt_sensor_intrinsics_test
+        rt/test_sensor_intrinsics.cu
+    )
+    target_compile_options(nuka_rt_sensor_intrinsics_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_sensor_intrinsics_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_sensor_intrinsics_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_sensor_intrinsics_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Batched device-resident RGB-sensor FEASIBILITY bench. Measures the
     # per-env-TLAS render path (BuildTwoLevelScene + RenderFrameToAovs, the cheap
     # flat trace) across N envs x resolution and decomposes TLAS build/refit vs
