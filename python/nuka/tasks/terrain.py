@@ -136,6 +136,14 @@ class TerrainCurriculum:
         survive_frac: float = 0.8,
         # PRIMARY promotion gate (free-roam robust): cumulative PATH length.
         promote_path_m: float = 5.0,
+        # CURRICULUM-TILE promotion gate: net progress TOWARD the tile centre (the dog
+        # must traverse the feature -- climb the pyramid / descend the pit / cross the
+        # boxes -- not merely wander; path length lets a dog promote by circling on the
+        # flat without ever climbing). Active only when set_tile_center is called.
+        promote_progress_m: float = 0.8,
+        # Demote on INSUFFICIENT traversal (legged_gym distance gate), NOT on falls.
+        demote_progress_m: float = 0.15,
+        demote_path_m: float = 1.0,
         # NET-displacement (kept as a logged DIAGNOSTIC only -- the OLD gate).
         promote_dist_m: float = 3.0,
         # DEPRECATED reward-threshold gate (kept for back-compat / diagnostics;
@@ -150,6 +158,9 @@ class TerrainCurriculum:
         self.max_episode_length = int(max_episode_length)
         self.survive_frac = float(survive_frac)
         self.promote_path_m = float(promote_path_m)
+        self.promote_progress_m = float(promote_progress_m)
+        self.demote_progress_m = float(demote_progress_m)
+        self.demote_path_m = float(demote_path_m)
         self.promote_dist_m = float(promote_dist_m)  # diagnostic only now.
         self.promote_thr = float(promote_thr)  # diagnostic only now.
         # Promotion/demotion counters since the last diagnostic print (always-on).
@@ -198,6 +209,15 @@ class TerrainCurriculum:
         # Last-computed per-env promotion-gate values (for the diagnostic prints).
         self.last_disp = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self.last_path = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        # CURRICULUM-TILE radial-progress gate (set_tile_center turns it on): the tile
+        # centre each env climbs toward, the spawn distance to it, and the CLOSEST
+        # approach reached this episode. progress = spawn_dist - min_dist (how far the
+        # dog traversed toward the feature centre = climbed/descended/crossed).
+        self.use_radial = False
+        self.tile_center = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=device)
+        self.spawn_dist_center = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.min_dist_center = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.last_progress = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
 
     def set_start_xy(self, mask, xy: torch.Tensor) -> None:
         """Record the base (x,y) at episode start for the reset envs, seed the
@@ -218,6 +238,23 @@ class TerrainCurriculum:
             self.prev_xy[mask] = xy[mask]
             self.path_len[mask] = 0.0
 
+    def set_tile_center(self, mask, centers: torch.Tensor) -> None:
+        """Record each reset env's curriculum-tile centre + seed the radial-progress
+        gate (spawn distance to the centre, and the running closest-approach). Turns
+        the radial-progress promotion gate ON. ``set_start_xy`` MUST be called first
+        (the spawn distance is measured from ``start_xy``)."""
+        self.use_radial = True
+        c = centers.to(self.tile_center.dtype)
+        d0 = (self.start_xy - c).norm(dim=1)
+        if mask is None:
+            self.tile_center[:] = c
+            self.spawn_dist_center[:] = d0
+            self.min_dist_center[:] = d0
+        else:
+            self.tile_center[mask] = c[mask]
+            self.spawn_dist_center[mask] = d0[mask]
+            self.min_dist_center[mask] = d0[mask]
+
     def accumulate_path(self, base_xy: torch.Tensor) -> None:
         """Add this control step's per-env path increment ``||base_xy - prev_xy||``
         into the running cumulative ``path_len`` (the PRIMARY promotion gate), then
@@ -229,6 +266,10 @@ class TerrainCurriculum:
         xy = base_xy.to(self.prev_xy.dtype)
         self.path_len += (xy - self.prev_xy).norm(dim=1)
         self.prev_xy = xy
+        # Radial-progress gate: track the CLOSEST approach to the tile centre.
+        if self.use_radial:
+            d = (xy - self.tile_center).norm(dim=1)
+            self.min_dist_center = torch.minimum(self.min_dist_center, d)
 
     def accumulate(self, reward: torch.Tensor) -> None:
         """Add this control step's per-env reward into the running episode return
@@ -265,9 +306,18 @@ class TerrainCurriculum:
             self.ep_reward_ema,
         )
 
-        # SCALE-INDEPENDENT gates: survived most of the episode AND walked a lot.
+        # SCALE-INDEPENDENT gates: survived most of the episode AND traversed.
         survived = self.ep_len >= self.survive_steps
-        walked_far = self.path_len > self.promote_path_m
+        if self.use_radial:
+            # CURRICULUM-TILE: promote only if the dog got significantly CLOSER to the
+            # tile centre (climbed/descended/crossed the feature) -- circling on the
+            # flat without traversing does NOT count (the path-length gate's blind spot
+            # that pinned stair-climbing at a near-flat level).
+            progress = self.spawn_dist_center - self.min_dist_center
+            traversed = progress > self.promote_progress_m
+            self.last_progress = torch.where(done, progress, self.last_progress)
+        else:
+            traversed = self.path_len > self.promote_path_m
         # NET-displacement DIAGNOSTIC (the OLD gate; logged, not enforced).
         if base_xy is not None:
             disp = (base_xy.to(self.start_xy.dtype) - self.start_xy).norm(dim=1)
@@ -276,9 +326,11 @@ class TerrainCurriculum:
         self.last_disp = torch.where(done, disp, self.last_disp)
         self.last_path = torch.where(done, self.path_len, self.last_path)
 
-        promote = done & survived & walked_far
-        demote = done & terminated if self.demote_on_fall else torch.zeros_like(done)
-        # An env can't both promote and demote; a fall (terminated) wins.
+        promote = done & survived & traversed
+        # Demote a DONE env that fell (terminated) without traversing the feature; a
+        # dog that progressed past the gate is exempt so a stumble at the top keeps it.
+        demote = done & terminated & ~traversed if self.demote_on_fall \
+            else torch.zeros_like(done)
         promote = promote & ~demote
         # Always-on diagnostic counters (cheap; reset on each diagnostic print).
         self.n_promote += int(promote.sum())
@@ -339,9 +391,11 @@ class TerrainCurriculum:
                              f"[d {float(d.min()):.2f}/{float(d.mean()):.2f}/"
                              f"{float(d.max()):.2f}]")
         mean_path = float(self.last_path.detach().mean())
+        prog = (f"  mean_done_progress={float(self.last_progress.detach().mean()):.2f}m"
+                if self.use_radial else "")
         line = (f"difficulty(min/mean/max): {'  '.join(parts)}  |  "
                 f"+{self.n_promote}/-{self.n_demote} (promote/demote since last)  "
-                f"|  mean_done_path={mean_path:.2f}m")
+                f"|  mean_done_path={mean_path:.2f}m{prog}")
         if reset_counters:
             self.n_promote = 0
             self.n_demote = 0

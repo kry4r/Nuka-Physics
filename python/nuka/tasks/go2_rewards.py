@@ -109,6 +109,12 @@ SCALES = {
     # docstring + Go2Reward._feet_air_time / _collision).
     "feet_air_time": 1.0,
     "collision": -1.0,
+    # Swing-foot clearance over local terrain. DEFAULT 0.0 so the SCALES superset
+    # stays byte-identical to walk; a penalty is injected only for gait_mode climb.
+    "feet_clearance": 0.0,
+    # Base-height-above-terrain maintenance. DEFAULT 0.0 (walk byte-identical);
+    # climb weights it so the dog stands tall on steps instead of crouch-dragging.
+    "base_height": 0.0,
     # FLIGHT-GAIT scaffold terms (pronk/bound). DEFAULT 0.0 here so the SCALES
     # superset stays BYTE-IDENTICAL to the walk reward (walk's GAIT_SCALE_OVERRIDES
     # is {} so these three remain 0 -- they contribute exactly nothing to walk/trot).
@@ -142,6 +148,12 @@ GAIT_SCALE_OVERRIDES = {
     "trot": {
         "lin_vel_z": -0.5,
     },
+    # Terrain CLIMBING: drop the anti-vertical-velocity penalty (0.0) so the base can
+    # lift onto risers, plus a mid-swing clearance to lift feet over the steps.
+    "climb": {
+        "lin_vel_z": 0.0,
+        "feet_clearance": -1.0,
+    },
     "pronk": {
         "lin_vel_z": 0.0,
         "feet_air_time": 2.0,
@@ -168,6 +180,7 @@ GAIT_AIR_TIME_BIAS = {
     "trot": 0.35,
     "pronk": 0.30,
     "bound": 0.32,
+    "climb": 0.5,   # same swing bias as walk; climb only relaxes lin_vel_z.
 }
 
 # No reward terms are dropped any more. Kept (empty) so the env's once-at-init
@@ -187,6 +200,12 @@ FEET_AIR_TIME_CMD_THRESHOLD = 0.1
 # many metres BELOW the local terrain surface (a small tolerance absorbs FK lag /
 # numerical jitter so a grazing link near the surface is not falsely penalized).
 COLLISION_PENETRATION_TOL = 0.02
+# Swing-foot clearance target (m) above the local terrain surface; a swing foot
+# below this earns a linear deficit penalty (drives leg lift over stair risers).
+FEET_CLEARANCE_TARGET = 0.10
+# Target base height (m) above the LOCAL terrain surface; a base sinking below this
+# earns a linear deficit penalty (drives the dog to stand tall on steps, not crawl).
+BASE_HEIGHT_TARGET = 0.34
 
 # legged_gym rewards params (go2 overrides: tracking_sigma inherited 0.25;
 # soft_dof_pos_limit overridden to 0.9).
@@ -420,6 +439,33 @@ class Go2Reward:
         return -(disagree / len(pairs))
 
     @staticmethod
+    def _base_height(base_above_terrain):
+        """Base-height-above-terrain maintenance (stair climbing).
+
+        ``base_above_terrain`` : (N,) the trunk world z minus the local terrain
+        surface under the base. A base sinking below BASE_HEIGHT_TARGET earns a
+        linear deficit, so the climb gait (negative weight) drives the dog to stand
+        tall on each step instead of crouch-dragging its body up the staircase.
+        Returns (N,) >= 0.
+        """
+        return (BASE_HEIGHT_TARGET - base_above_terrain).clamp(min=0.0)
+
+    def _feet_clearance(self, foot_height_above):
+        """Mid-swing foot clearance (legged_gym/Isaac stair term).
+
+        ``foot_height_above`` : (N,4) each foot sphere's height above the local
+        terrain surface. A foot airborne > 0.1 s (past lift-off, at the swing apex)
+        yet below FEET_CLEARANCE_TARGET earns a linear deficit; summed over those
+        feet. Gating on MID-SWING (``self.feet_air_time``, updated by _feet_air_time
+        just before) -- not the raw swing bool -- spares the legitimately-low
+        lift-off/touchdown frames that stiffened the gait under a raw-swing gate.
+        Returns (N,) >= 0 (the climb gait weights it negative).
+        """
+        midswing = (self.feet_air_time > 0.1).to(self.dtype)
+        deficit = (FEET_CLEARANCE_TARGET - foot_height_above).clamp(min=0.0)
+        return (deficit * midswing).sum(dim=1)
+
+    @staticmethod
     def _collision(link_world_z, local_surface_z):
         """Kinematic terrain-CLIPPING proxy for legged_gym _reward_collision.
 
@@ -461,6 +507,8 @@ class Go2Reward:
         last_action,
         base_lin_vel=None,
         foot_contact_fz=None,
+        foot_height_above=None,
+        base_above_terrain=None,
         collision_count=None,
         return_terms: bool = False,
     ):
@@ -517,6 +565,10 @@ class Go2Reward:
             # feet_air_time advances the state machine (mutates last_contacts /
             # feet_air_time) -- run AFTER capturing prev_filt.
             terms["feet_air_time"] = self._feet_air_time(foot_contact_fz, cmd)
+            # Swing-foot clearance (only when the env supplies foot heights; the
+            # climb gait weights it, walk/trot leave the scale 0 -> byte-identical).
+            if foot_height_above is not None:
+                terms["feet_clearance"] = self._feet_clearance(foot_height_above)
             # vertical_oscillation: positive body-frame v_z at the just-left-ground
             # transition (was in filtered contact last step, fully airborne now).
             if base_lin_vel is not None:
@@ -528,6 +580,8 @@ class Go2Reward:
                 terms["vertical_oscillation"] = torch.zeros(
                     self.num_envs, dtype=self.dtype, device=self.device
                 )
+        if base_above_terrain is not None:
+            terms["base_height"] = self._base_height(base_above_terrain)
         if collision_count is not None:
             terms["collision"] = collision_count.to(self.dtype)
         total = torch.zeros(self.num_envs, dtype=self.dtype, device=self.device)
