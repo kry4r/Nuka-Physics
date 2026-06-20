@@ -44,6 +44,7 @@
 #include "phi/backend_cuda/rt/intersect_primitives.cuh"
 #include "phi/backend_cuda/rt/prim_id.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/render_timing.hpp"
 #include "phi/backend_cuda/rt/shading.cuh"
 #include "phi/backend_cuda/rt/two_level_render_kernels.cuh"  // shared device structs + fns
 #include "rt/camera.hpp"
@@ -56,6 +57,19 @@
 #include <vector>
 
 namespace nuka::rt {
+
+// OPT-IN timing probe state (default off -> byte-exact untouched path). The probe
+// brackets the TLAS update and the kernel with CUDA events on the render stream.
+bool g_render_timing_enabled = false;
+RenderTiming g_render_timing;
+
+void SetRenderTimingEnabled(bool enabled) { g_render_timing_enabled = enabled; }
+bool RenderTimingEnabled() { return g_render_timing_enabled; }
+RenderTiming TakeRenderTiming() {
+    RenderTiming out = g_render_timing;
+    g_render_timing = RenderTiming{};
+    return out;
+}
 
 namespace {
 
@@ -575,7 +589,17 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
                        const PinholeCamera& camera,
                        const RtContext& ctx,
                        const AovTarget& dst) {
+    // Default path (probe off): no events, byte-identical to the golden tracer.
+    const bool probe = g_render_timing_enabled;
+    cudaEvent_t e0 = nullptr, e1 = nullptr, e2 = nullptr;
+    if (probe) {
+        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+        cudaEventRecord(e0, ctx.stream);
+    }
+
     const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
+    if (probe) cudaEventRecord(e1, ctx.stream);
+
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
                     (camera.height + kBlockDim - 1u) / kBlockDim);
@@ -585,6 +609,18 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
         scene.light, scene.ambient,
         dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
     CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
+
+    if (probe) {
+        cudaEventRecord(e2, ctx.stream);
+        cudaEventSynchronize(e2);
+        float tlas_ms = 0.0f, kernel_ms = 0.0f;
+        cudaEventElapsedTime(&tlas_ms, e0, e1);
+        cudaEventElapsedTime(&kernel_ms, e1, e2);
+        g_render_timing.tlas_ms += static_cast<double>(tlas_ms);
+        g_render_timing.kernel_ms += static_cast<double>(kernel_ms);
+        ++g_render_timing.calls;
+        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
+    }
 }
 
 // Map a caller RtDeviceAovs (opaque phi::Buffer*) to raw device pointers.
