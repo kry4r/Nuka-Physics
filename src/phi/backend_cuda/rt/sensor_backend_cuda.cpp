@@ -61,7 +61,8 @@ public:
                        uint32_t width,
                        uint32_t height) override {
         rt::RenderSensorsMounted(handle->scene, fk, env_count, width, height, backend_);
-        handle->shape.sensors = env_count;
+        handle->shape.env_count = env_count;
+        handle->shape.sensors_per_env = rt::SensorsPerEnv(handle->scene);
         handle->shape.height = height;
         handle->shape.width = width;
     }

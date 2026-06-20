@@ -338,7 +338,7 @@ TEST(SensorCamera, BatchedRenderWithMountedCameras) {
 
     // Batched render driven by the scatter-built cameras.
     rt::BatchedSensorSceneDevice scene = rt::BuildBatchedSensorScene(MakeSceneDesc());
-    rt::RenderSensorsBatched(scene, fk, d_cams, kEnv, kRes, kRes);
+    rt::RenderSensorsBatched(scene, fk, d_cams, kEnv, 1u, kRes, kRes);
     NK_CUDA_OK(cudaDeviceSynchronize());
 
     const uint64_t rays = static_cast<uint64_t>(kEnv) * pix;
@@ -378,7 +378,7 @@ TEST(SensorCamera, BatchedRenderWithMountedCameras) {
         NK_CUDA_OK(cudaMalloc(&d_one, sizeof(PinholeCamera)));
         NK_CUDA_OK(cudaMemcpy(d_one, &one, sizeof(PinholeCamera), cudaMemcpyHostToDevice));
 
-        rt::RenderSensorsBatched(solo, sfk, d_one, 1u, kRes, kRes);
+        rt::RenderSensorsBatched(solo, sfk, d_one, 1u, 1u, kRes, kRes);
         NK_CUDA_OK(cudaDeviceSynchronize());
 
         std::vector<float> rc(pix * 3u);

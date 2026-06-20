@@ -188,7 +188,7 @@ TEST(BatchedSensorRender, PerEnvTileMatchesSingleEnv) {
     NK_CUDA_OK(cudaMemcpy(d_cams, cams.data(), kEnv * sizeof(rt::PinholeCamera),
                           cudaMemcpyHostToDevice));
 
-    rt::RenderSensorsBatched(scene, dev.fk, d_cams, kEnv, kRes, kRes);
+    rt::RenderSensorsBatched(scene, dev.fk, d_cams, kEnv, 1u, kRes, kRes);
     NK_CUDA_OK(cudaDeviceSynchronize());
 
     // Download the whole tensor (color/depth/normal/albedo/prim).
@@ -217,7 +217,7 @@ TEST(BatchedSensorRender, PerEnvTileMatchesSingleEnv) {
         NK_CUDA_OK(cudaMalloc(&d_one, sizeof(rt::PinholeCamera)));
         NK_CUDA_OK(cudaMemcpy(d_one, &one, sizeof(rt::PinholeCamera), cudaMemcpyHostToDevice));
 
-        rt::RenderSensorsBatched(solo, sdev.fk, d_one, 1u, kRes, kRes);
+        rt::RenderSensorsBatched(solo, sdev.fk, d_one, 1u, 1u, kRes, kRes);
         NK_CUDA_OK(cudaDeviceSynchronize());
 
         std::vector<float> rc(pix * 3u), rn(pix * 3u), ra(pix * 3u), rd(pix);

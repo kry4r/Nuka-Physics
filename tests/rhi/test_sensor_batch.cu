@@ -233,7 +233,8 @@ TEST(SensorBatch, SensorRendererMatchesDirectBatchedByteExact) {
         NK_CUDA_OK(cudaDeviceSynchronize());
 
         const render::SensorAovShape shape = renderer.AovShape();
-        EXPECT_EQ(shape.sensors, kEnv);
+        EXPECT_EQ(shape.env_count, kEnv);
+        EXPECT_EQ(shape.sensors_per_env, 1u);
         EXPECT_EQ(shape.height, kRes);
         EXPECT_EQ(shape.width, kRes);
 

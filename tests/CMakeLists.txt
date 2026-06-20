@@ -159,6 +159,35 @@ if(TARGET nuka)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             PROPERTIES LABELS "full")
 
+        # --- Multiple cameras per env C ABI (S cameras, one per mount row) ------
+        # Attach two cameras with different mount rows, render into ONE (E,S,H,W)
+        # tensor, and assert each (env,sensor) tile equals the single-camera render
+        # of that mount (the S>1 fan-out is the S==1 path per camera).
+        add_executable(nuka_multi_camera_sensor_cabi_test
+            c_abi/test_multi_camera_sensor.cpp
+        )
+
+        target_compile_definitions(nuka_multi_camera_sensor_cabi_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_multi_camera_sensor_cabi_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_multi_camera_sensor_cabi_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_multi_camera_sensor_cabi_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            PROPERTIES LABELS "full")
+
         # --- Per-env drive-target write + q/qd/base read C ABI (sim-val #33) --
         add_executable(nuka_drive_target_io_test
             c_abi/test_drive_target_io.cpp

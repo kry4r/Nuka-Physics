@@ -511,11 +511,11 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                                          nuka_buffer_view_t* out);
 
 // ---------------------------------------------------------------------------
-// Device-resident batched camera sensor: ONE camera per env rendered into a
-// single (env_count, height, width, channels) device tensor (no host download).
-// The same RT tracer at a cheap sensor profile; the obs is read zero-copy via
-// nuka_world_get_sensor_view + torch.from_dlpack. One camera per env (the batched
-// single-launch path renders exactly one sensor per env).
+// Device-resident batched camera sensor: S cameras per env (each on its own mount)
+// rendered into a single (env_count, sensors_per_env, height, width, channels)
+// device tensor (no host download). The same RT tracer at a cheap sensor profile;
+// the obs is read zero-copy via nuka_world_get_sensor_view + torch.from_dlpack.
+// With one camera per env the tensor collapses to (env_count, height, width, ch).
 // ---------------------------------------------------------------------------
 
 // Which FK pose the camera mounts on; selects FieldId::{LinkPose,BodyPose,
@@ -537,12 +537,15 @@ typedef enum nuka_sensor_channel_t {
 } nuka_sensor_channel_t;
 
 // Build the world's batched sensor scene from its cooked visual instances (the
-// per-env visual template, replicated across envs) and attach ONE camera mounted
-// on `mount_frame`[mount_index] offset by `local_offset` (px,py,pz, qw,qx,qy,qz).
+// per-env visual template, replicated across envs) and attach a camera mounted on
+// `mount_frame`[mount_index] offset by `local_offset` (px,py,pz, qw,qx,qy,qz).
 // `vfov_deg` is the vertical field of view; width/height size every env image.
-// Re-callable (rebuilds the scene/mount). Requires the world to have visual
-// meshes (cooked from a scene with VisualMeshComponents); NOT_SUPPORTED if the
-// engine has no RT sensor backend or the scene has no renderable geometry.
+// Re-callable: a call at the SAME width/height APPENDS another camera (S cameras
+// per env, each its own mount); a call at a DIFFERENT width/height resets to a
+// fresh single-camera set (one (E,S,H,W) tensor block needs one image size).
+// Requires the world to have visual meshes (cooked from a scene with
+// VisualMeshComponents); NOT_SUPPORTED if the engine has no RT sensor backend or
+// the scene has no renderable geometry.
 nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
                                               nuka_sensor_mount_t mount_frame,
                                               uint32_t mount_index,
@@ -558,14 +561,26 @@ nuka_result_t nuka_world_render_sensors(nuka_world_handle world);
 
 // Zero-copy device view into the AOV tensor after nuka_world_render_sensors:
 // `channel` selects the plane (see nuka_sensor_channel_t). out->device_ptr is the
-// (env_count*height*width*ch) device base; element_count is that float/uint32
-// count; element_stride_bytes is sizeof(float) (sizeof(uint32) for PRIM); dtype is
-// 0 float32 (1 uint32 for PRIM, same code nuka_buffer_view_t uses). MIRRORS
-// nuka_world_get_buffer_view so a caller reshapes to (N,H,W,ch). NOT_SUPPORTED
-// before the first render.
+// (env_count*sensors_per_env*height*width*ch) device base; element_count is that
+// float/uint32 count; element_stride_bytes is sizeof(float) (sizeof(uint32) for
+// PRIM); dtype is 0 float32 (1 uint32 for PRIM, same code nuka_buffer_view_t uses).
+// MIRRORS nuka_world_get_buffer_view so a caller reshapes to (E,S,H,W,ch) (or
+// (E,H,W,ch) when S==1). NOT_SUPPORTED before the first render.
 nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
                                          nuka_sensor_channel_t channel,
                                          nuka_buffer_view_t* out);
+
+// The attached sensor block's logical shape: env_count, sensors_per_env (S cameras
+// per env), per-camera height/width, and `channels` (3 for the color/normal/albedo
+// planes; depth/prim are 1, derived from a view's element_count). Any out-pointer
+// may be NULL. Valid after attach (no render needed). NOT_SUPPORTED if no camera is
+// attached. Lets a caller reshape the sensor view to (E,S,H,W,ch) without guessing.
+nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
+                                         uint32_t* env_count,
+                                         uint32_t* sensors_per_env,
+                                         uint32_t* height,
+                                         uint32_t* width,
+                                         uint32_t* channels);
 
 typedef struct nuka_invariant_violation_t {
     uint32_t invariant;

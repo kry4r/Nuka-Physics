@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
 // nuka::c_abi -- the device-resident batched camera-sensor surface.
 //
-// ONE camera per env rendered into a single (env_count, height, width, channels)
-// device AOV tensor via the SAME RT tracer at a cheap sensor profile -- the
-// in-the-loop obs the RL stack reads zero-copy (nuka_world_get_sensor_view +
-// torch.from_dlpack). No host download.
+// S cameras per env (each attach appends one mount) rendered into a single
+// (env_count, sensors_per_env, height, width, channels) device AOV tensor via the
+// SAME RT tracer at a cheap sensor profile -- the in-the-loop obs the RL stack
+// reads zero-copy (nuka_world_get_sensor_view + torch.from_dlpack). No host download.
 //
 // THE COOK BRIDGE: the per-env visual binding (which mesh/material each visual
 // instance is + the link/body it follows + its physics->visual offset) is built
@@ -32,8 +32,10 @@
 
 namespace nuka::c_abi {
 
-// The out-of-line SensorAttachment dtor (internal.hpp declares it): free the
-// backend-owned scene handle THROUGH the backend before the backend drops.
+// The SensorAttachment ctor/dtor are out-of-line here (internal.hpp holds a vector
+// of the incomplete scene::SensorDesc). The dtor frees the backend-owned scene
+// handle THROUGH the backend before the backend drops.
+SensorAttachment::SensorAttachment() = default;
 SensorAttachment::~SensorAttachment() {
     if (backend && handle != nullptr) {
         backend->FreeSensorScene(handle);
@@ -91,8 +93,8 @@ bool BuildSensorSceneDesc(const nuka::scene::SceneIR& scene, uint32_t env_count,
     return true;
 }
 
-// Lower the c_abi mount enum + offset to a single-camera SensorDesc (the mount
-// table). ONE sensor per env (the batched single-launch contract).
+// Lower the c_abi mount enum + offset to one camera's SensorDesc (one row of the
+// mount table); attach appends these into the per-env S-camera list.
 nuka::scene::SensorDesc MakeCameraSensorDesc(nuka_sensor_mount_t mount_frame,
                                              uint32_t mount_index,
                                              const float local_offset[7],
@@ -158,6 +160,16 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
                                                &desc)) {
             return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
         }
+
+        // Append this camera to the world's mount list (S cameras per env, one
+        // (E,S,H,W) block). A re-attach at the SAME w/h adds another sensor; a
+        // different w/h would make the tensor ragged, so it RESETS to a fresh
+        // single-camera set (the documented re-callable contract).
+        const bool same_size = record->sensor && record->sensor->width == width &&
+                               record->sensor->height == height;
+        if (same_size) {
+            desc.sensors = record->sensor->sensors;
+        }
         desc.sensors.push_back(nuka::c_abi::MakeCameraSensorDesc(
             mount_frame, mount_index, local_offset, vfov_deg, width, height));
 
@@ -166,11 +178,12 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
             return NUKA_RESULT_INTERNAL;
         }
 
-        // Replace any prior attachment (the old handle frees through its backend in
-        // the SensorAttachment dtor) -- attach is re-callable.
+        // Install the rebuilt attachment (the old handle frees through its backend
+        // in the SensorAttachment dtor when `record->sensor` is overwritten).
         auto attach = std::make_unique<nuka::c_abi::SensorAttachment>();
         attach->backend = std::move(backend);
         attach->handle = handle;
+        attach->sensors = std::move(desc.sensors);
         attach->width = width;
         attach->height = height;
         attach->rendered = false;
@@ -250,8 +263,8 @@ nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
     try {
         nuka::c_abi::SensorAttachment& s = *record->sensor;
         const nuka::render::SensorAovShape shape = s.backend->AovShape(s.handle);
-        const uint64_t pixels = static_cast<uint64_t>(shape.sensors) *
-                                shape.height * shape.width;
+        const uint64_t pixels = static_cast<uint64_t>(shape.env_count) *
+                                shape.sensors_per_env * shape.height * shape.width;
 
         // The view mirrors nuka_world_get_buffer_view (flat device base +
         // element_count + stride/dtype); the caller reshapes to (N,H,W,ch).
@@ -299,6 +312,33 @@ nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
+                                         uint32_t* env_count,
+                                         uint32_t* sensors_per_env,
+                                         uint32_t* height,
+                                         uint32_t* width,
+                                         uint32_t* channels) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no camera attached.
+    }
+    // The AOV tensor is (env_count, sensors_per_env, H, W). `channels` is the
+    // per-pixel count of the color/normal/albedo planes (depth/prim are 1); the
+    // caller derives a plane's exact ch from its view element_count if it differs.
+    const nuka::c_abi::SensorAttachment& s = *record->sensor;
+    if (env_count != nullptr) *env_count = record->world->EnvCount();
+    if (sensors_per_env != nullptr) {
+        *sensors_per_env = static_cast<uint32_t>(s.sensors.size());
+    }
+    if (height != nullptr) *height = s.height;
+    if (width != nullptr) *width = s.width;
+    if (channels != nullptr) *channels = 3u;
+    return NUKA_RESULT_OK;
 }
 
 }  // extern "C"
