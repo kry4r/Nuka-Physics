@@ -405,6 +405,13 @@ bool LbvhBroadphaseResult::HasNodes() const {
     return nodes_ != nullptr && NodeCount() != 0u;
 }
 
+LbvhNode* LbvhBroadphaseResult::DeviceNodesMutable() {
+    if (nodes_ == nullptr || NodeCount() == 0u) {
+        return nullptr;
+    }
+    return static_cast<LbvhNode*>(phi::BufferBase(nodes_));
+}
+
 std::vector<collision::CollisionPair> LbvhBroadphaseResult::DownloadPairs() const {
     const uint32_t n = std::min(pair_count_, pair_capacity_);
     return phi::DownloadVectorV2<collision::CollisionPair>(pairs_, n);

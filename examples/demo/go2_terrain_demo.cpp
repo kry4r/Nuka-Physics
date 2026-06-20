@@ -1266,13 +1266,19 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(args.out_dir);
     uint32_t written = 0u;
     size_t first_nonbg = 0u, last_nonbg = 0u;
+    // Render-only wall-time accumulator: isolates the tracer cost from the CPU
+    // scene re-assembly + PPM I/O the loop ms/frame also includes.
+    double render_ms_total = 0.0;
     const auto clip_t0 = std::chrono::steady_clock::now();
     for (uint32_t s = 0; s < traj.num_steps; s += args.stride) {
         if (args.frames != 0u && written >= args.frames) break;
         publish(s);
         set_contact_shadows(opts);
         aim_camera(s);
+        const auto r_t0 = std::chrono::steady_clock::now();
         render::VulkanOffscreenReport rep = render_frame(opts);
+        const auto r_t1 = std::chrono::steady_clock::now();
+        render_ms_total += std::chrono::duration<double, std::milli>(r_t1 - r_t0).count();
         char name[40];
         std::snprintf(name, sizeof(name), "frame_%06u.ppm", written);
         const std::string path = args.out_dir + "/" + name;
@@ -1291,8 +1297,9 @@ int main(int argc, char** argv) {
     const auto clip_t1 = std::chrono::steady_clock::now();
     const double clip_s = std::chrono::duration<double>(clip_t1 - clip_t0).count();
     std::printf("[go2_terrain] DONE[%s]: wrote %u frames to %s in %.2f s (%.1f ms/frame, "
-                "first non_bg=%zu, last=%zu)\n", gpu ? "GPU" : "CPU", written,
-                args.out_dir.c_str(), clip_s,
-                written ? 1000.0 * clip_s / written : 0.0, first_nonbg, last_nonbg);
+                "render-only %.1f ms/frame, first non_bg=%zu, last=%zu)\n",
+                gpu ? "GPU" : "CPU", written, args.out_dir.c_str(), clip_s,
+                written ? 1000.0 * clip_s / written : 0.0,
+                written ? render_ms_total / written : 0.0, first_nonbg, last_nonbg);
     return 0;
 }

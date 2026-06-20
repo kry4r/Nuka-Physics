@@ -657,6 +657,78 @@ TEST(RtTwoLevelRender, D1TwoRunByteExactAllAovs) {
 }
 
 // =====================================================================
+// 4b. REFIT == REBUILD byte-exact: render once via refit-from-the-original-
+//     topology (moved poses) and once via a fresh rebuild, memcmp ALL 6 AOVs == 0
+//     (the closest-hit winner is a total order, so node-AABB tightness is moot).
+// =====================================================================
+TEST(RtTwoLevelRender, RefitFromMovedTopologyByteExactVsRebuild) {
+    auto build_scene = []() {
+        rt::TwoLevelScene scene;
+        rt::BlasMesh quad; AddQuadLocal(quad, 9.0f, 5.0f); scene.meshes.push_back(quad);
+        rt::BlasMesh ball; ball.spheres.push_back({{0,0,0}, 0.5f, 0u}); scene.meshes.push_back(ball);
+        rt::Material m0; m0.albedo = {0.7f, 0.5f, 0.3f}; m0.metallic = 0.3f; m0.roughness = 0.4f;
+        rt::Material m1; m1.albedo = {0.2f, 0.6f, 0.8f}; m1.metallic = 0.0f; m1.roughness = 0.7f;
+        scene.materials = {m0, m1};
+        scene.light.directional = false;
+        scene.light.position = {2.0f, 3.0f, 1.0f};
+        scene.light.intensity = 8.0f;
+        scene.ambient.color = {0.04f, 0.04f, 0.04f};
+        // Quad backdrop + a 5x5 grid of sphere instances (reused BLAS) -> a many-
+        // leaf TLAS so refit (leaf_count>=2) actually runs.
+        scene.instances.push_back({0u, math::Transform::Identity(), 0u});
+        for (int gx = -2; gx <= 2; ++gx)
+            for (int gy = -2; gy <= 2; ++gy) {
+                math::Transform t; t.position = {gx*1.4f, gy*1.4f, 6.0f};
+                scene.instances.push_back({1u, t, 1u});
+            }
+        return scene;
+    };
+
+    // Shift every sphere instance to a new pose (the quad backdrop stays put). The
+    // Morton order of the leaves changes, so a rebuild would form a DIFFERENT
+    // topology than the refit reuses -- exactly the case refit must match.
+    auto move_scene = [](rt::TwoLevelScene& scene) {
+        for (size_t i = 1; i < scene.instances.size(); ++i) {
+            auto& p = scene.instances[i].transform.position;
+            p.x += 0.37f * static_cast<float>(i) - 1.1f;
+            p.y += -0.29f * static_cast<float>(i) + 0.6f;
+            p.z += 0.13f * static_cast<float>((i % 3));
+        }
+    };
+
+    auto cam = rt::BuildPinhole({0.1f, -0.2f, 0.0f}, {0.0f, 0.0f, 6.0f},
+                                {0.0f, 1.0f, 0.0f}, 0.8f * kPi, 128u, 96u);
+
+    // Path A: persistent device. Frame 0 builds the topology at the ORIGINAL poses;
+    // moving then rendering frame 1 takes the REFIT path on that topology.
+    rt::TwoLevelScene scene_a = build_scene();
+    auto dev_a = rt::BuildTwoLevelScene(scene_a);
+    (void)rt::RenderFrame(dev_a, scene_a, cam);  // frame 0: full build
+    move_scene(scene_a);
+    auto refit = rt::RenderFrame(dev_a, scene_a, cam);  // frame 1: refit
+
+    // Path B: a FRESH device rendering the MOVED scene -> full rebuild at the moved
+    // poses (frame 0). This is the byte-exact reference.
+    rt::TwoLevelScene scene_b = build_scene();
+    move_scene(scene_b);
+    auto dev_b = rt::BuildTwoLevelScene(scene_b);
+    auto rebuild = rt::RenderFrame(dev_b, scene_b, cam);
+
+    ASSERT_EQ(refit.color.size(), rebuild.color.size());
+    EXPECT_EQ(0, std::memcmp(refit.color.data(), rebuild.color.data(), refit.color.size()*sizeof(float))) << "refit color != rebuild";
+    EXPECT_EQ(0, std::memcmp(refit.depth.data(), rebuild.depth.data(), refit.depth.size()*sizeof(float))) << "refit depth != rebuild";
+    EXPECT_EQ(0, std::memcmp(refit.normal.data(), rebuild.normal.data(), refit.normal.size()*sizeof(float))) << "refit normal != rebuild";
+    EXPECT_EQ(0, std::memcmp(refit.albedo.data(), rebuild.albedo.data(), refit.albedo.size()*sizeof(float))) << "refit albedo != rebuild";
+    EXPECT_EQ(0, std::memcmp(refit.uv.data(), rebuild.uv.data(), refit.uv.size()*sizeof(float))) << "refit uv != rebuild";
+    EXPECT_EQ(0, std::memcmp(refit.prim.data(), rebuild.prim.data(), refit.prim.size()*sizeof(uint32_t))) << "refit prim != rebuild";
+
+    size_t hits = 0; for (auto p : refit.prim) if (p != rt::kNoPrim) ++hits;
+    EXPECT_GT(hits, 100u) << "scene must actually render geometry";
+    std::printf("[refit] all 6 AOVs byte-exact vs rebuild (%ux%u, %zu instances, %zu hits)\n",
+                cam.width, cam.height, scene_a.instances.size(), hits);
+}
+
+// =====================================================================
 // 5. SPARSE-SDF leaf through the two-level nest (the p16-relevant path). Two
 //    sphere-SDF instances: ONE at IDENTITY, ONE ROTATED. Gates:
 //      * Oracle 1 byte-exact host==device across ALL 6 AOVs (the rotated SDF

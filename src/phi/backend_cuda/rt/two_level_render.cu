@@ -30,6 +30,7 @@
 #include "collision/aabb.hpp"
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/lbvh_node.cuh"
+#include "collision/lbvh_refit.cuh"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -252,11 +253,99 @@ struct BlasDevice {
     DevBlas view;
 };
 
+// World-space AABB of one placed instance -- the ONE box arithmetic both the TLAS
+// build and refit feed leaf bounds from (so refit leaf AABBs are bit-identical).
+collision::AABB InstanceWorldAabb(const BlasDevice& mesh, const Transform& xf) {
+    if (mesh.leaf_count == 0u) {
+        collision::AABB b;
+        b.min = xf.position;
+        b.max = xf.position;
+        return b;
+    }
+    const Vec3 half{0.5f * (mesh.local_bound.max.x - mesh.local_bound.min.x),
+                    0.5f * (mesh.local_bound.max.y - mesh.local_bound.min.y),
+                    0.5f * (mesh.local_bound.max.z - mesh.local_bound.min.z)};
+    const Vec3 center{0.5f * (mesh.local_bound.min.x + mesh.local_bound.max.x),
+                      0.5f * (mesh.local_bound.min.y + mesh.local_bound.max.y),
+                      0.5f * (mesh.local_bound.min.z + mesh.local_bound.max.z)};
+    Transform centered = xf;
+    centered.position = xf.TransformPoint(center);
+    return collision::AABB::FromBox(centered, half);
+}
+
+// Device-side instance record from a host Instance (transform + BLAS view + ids).
+DevInstance MakeDevInstance(const BlasDevice& mesh, const Instance& I, uint32_t i) {
+    DevInstance di;
+    di.transform = I.transform;
+    di.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
+    di.blas_leaf_count = mesh.leaf_count;
+    di.blas = mesh.view;
+    di.instance_id = i;
+    di.material_id = I.material_id;
+    return di;
+}
+
+// Full TLAS rebuild cadence (refit handles the frames between). Bounds traversal-
+// quality drift only; correctness is identical to a rebuild either way.
+constexpr uint32_t kTlasRebuildPeriod = 32u;
+
+// PERSISTENT render device buffers reused across frames (AOV scratch + TLAS
+// tables + retained tree + refit scratch); sized lazily, no per-frame malloc/free.
+struct RtRenderContext {
+    // AOV scratch (host-download path), sized to `aov_pixels`.
+    OwnedBuffer d_color, d_depth, d_normal, d_albedo, d_uv, d_prim;
+    std::size_t aov_pixels = 0u;
+
+    // TLAS state: persistent device tables + the retained tree (built once, then
+    // refit). *_bytes track each table's allocation so EnsureUpload grows on demand.
+    OwnedBuffer d_instances, d_mats, d_tlas_boxes, d_refit_visit;
+    std::size_t inst_bytes = 0u, mats_bytes = 0u, boxes_bytes = 0u;
+    collision::gpu::LbvhBroadphaseResult tlas;
+    uint32_t tlas_inst_count = 0u;
+    bool topology_built = false;
+    uint32_t frames_since_rebuild = 0u;
+
+    // Ensure the AOV scratch is sized for `pixels`; (re)allocate only on growth.
+    void EnsureAovs(phi::BufferType* bt, std::size_t pixels) {
+        if (pixels == aov_pixels && d_color.Data() != nullptr) {
+            return;
+        }
+        d_color = OwnedBuffer(bt, pixels * 3u * sizeof(float));
+        d_depth = OwnedBuffer(bt, pixels * sizeof(float));
+        d_normal = OwnedBuffer(bt, pixels * 3u * sizeof(float));
+        d_albedo = OwnedBuffer(bt, pixels * 3u * sizeof(float));
+        d_uv = OwnedBuffer(bt, pixels * 2u * sizeof(float));
+        d_prim = OwnedBuffer(bt, pixels * sizeof(uint32_t));
+        aov_pixels = pixels;
+    }
+
+    AovTarget AovScratchTarget() {
+        AovTarget dst;
+        dst.color = static_cast<float*>(d_color.Data());
+        dst.depth = static_cast<float*>(d_depth.Data());
+        dst.normal = static_cast<float*>(d_normal.Data());
+        dst.albedo = static_cast<float*>(d_albedo.Data());
+        dst.uv = static_cast<float*>(d_uv.Data());
+        dst.prim = static_cast<uint32_t*>(d_prim.Data());
+        return dst;
+    }
+};
+
+// What a launch needs from the (possibly refit) TLAS: device tables + node root.
+struct FrameTlasView {
+    const DevInstance* instances = nullptr;
+    const Material* materials = nullptr;
+    const LbvhNode* tlas_nodes = nullptr;
+    uint32_t inst_count = 0u;
+};
+
 }  // namespace
 
-// Opaque impl: the per-mesh BLAS devices (built once). The TLAS is per-frame.
+// Opaque impl: the per-mesh BLAS devices (built once) + the persistent render
+// context (AOV scratch + TLAS buffers reused/refit across frames).
 struct TwoLevelSceneDevice::Impl {
     std::vector<BlasDevice> meshes;
+    RtRenderContext rt;
 };
 
 TwoLevelSceneDevice::TwoLevelSceneDevice() : impl_(std::make_unique<Impl>()) {}
@@ -376,70 +465,76 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
     return out;
 }
 
-// Per-frame scene prep shared by RenderFrame + RenderBeauty: build the device
-// instance table + the TLAS over the CURRENT instance world-AABBs, upload the
-// materials. The retained buffers must outlive the kernel, so they are held in
-// `out` (the caller keeps it alive until the stream sync).
-struct FrameTlas {
-    OwnedBuffer d_instances;
-    OwnedBuffer d_mats;
-    OwnedBuffer d_tlas_boxes;
-    collision::gpu::LbvhBroadphaseResult tlas;
-    const DevInstance* instances = nullptr;
-    const Material* materials = nullptr;
-    const LbvhNode* tlas_nodes = nullptr;
-    uint32_t inst_count = 0u;
-};
+// Upload a host vector into a persistent OwnedBuffer, reallocating only when its
+// byte size changes; otherwise reuse the existing allocation (one device copy).
+template <typename T>
+void EnsureUpload(OwnedBuffer& dst, std::size_t& dst_bytes, phi::BufferType* bt,
+                  const std::vector<T>& values) {
+    const std::size_t bytes = values.size() * sizeof(T);
+    if (bytes != dst_bytes || dst.Data() == nullptr) {
+        dst = OwnedBuffer(bt, bytes);
+        dst_bytes = bytes;
+    }
+    dst.CopyFromHost(values.data(), bytes);
+}
 
-FrameTlas BuildFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelScene& scene,
-                         const RtContext& ctx) {
-    FrameTlas out;
+// Refresh the instance/material/box tables into the PERSISTENT buffers, then
+// REBUILD (first frame / count change / cadence) or REFIT the TLAS (byte-exact).
+FrameTlasView EnsureFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelScene& scene,
+                              const RtContext& ctx) {
+    RtRenderContext& rt = impl->rt;
     phi::BufferType* bt = ctx.device_bt;
-    out.inst_count = static_cast<uint32_t>(scene.instances.size());
-    std::vector<collision::AABB> tlas_aabbs(out.inst_count);
-    std::vector<DevInstance> dev_instances(out.inst_count);
-    for (uint32_t i = 0; i < out.inst_count; ++i) {
+    const uint32_t inst_count = static_cast<uint32_t>(scene.instances.size());
+
+    std::vector<collision::AABB> tlas_aabbs(inst_count);
+    std::vector<DevInstance> dev_instances(inst_count);
+    for (uint32_t i = 0; i < inst_count; ++i) {
         const Instance& I = scene.instances[i];
         if (I.blas_id >= impl->meshes.size()) {
             throw std::runtime_error("RenderFrame: instance.blas_id out of range");
         }
         const BlasDevice& mesh = impl->meshes[I.blas_id];
-        DevInstance di;
-        di.transform = I.transform;
-        di.blas_nodes = (mesh.leaf_count > 0u) ? mesh.tree.DeviceNodes() : nullptr;
-        di.blas_leaf_count = mesh.leaf_count;
-        di.blas = mesh.view;
-        di.instance_id = i;
-        di.material_id = I.material_id;
-        dev_instances[i] = di;
-        if (mesh.leaf_count == 0u) {
-            tlas_aabbs[i].min = I.transform.position;
-            tlas_aabbs[i].max = I.transform.position;
-            continue;
+        dev_instances[i] = MakeDevInstance(mesh, I, i);
+        tlas_aabbs[i] = InstanceWorldAabb(mesh, I.transform);
+    }
+
+    EnsureUpload(rt.d_instances, rt.inst_bytes, bt, dev_instances);
+    const std::vector<Material> mats =
+        scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials;
+    EnsureUpload(rt.d_mats, rt.mats_bytes, bt, mats);
+    EnsureUpload(rt.d_tlas_boxes, rt.boxes_bytes, bt, tlas_aabbs);
+
+    const auto* dev_tlas_boxes = static_cast<const collision::AABB*>(rt.d_tlas_boxes.Data());
+
+    // Rebuild the topology on the first frame, when the instance count changes, or
+    // periodically; otherwise refit the existing tree's bounds in place.
+    const bool need_rebuild = !rt.topology_built || inst_count != rt.tlas_inst_count ||
+                              rt.frames_since_rebuild >= kTlasRebuildPeriod;
+    if (need_rebuild) {
+        rt.tlas = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                    dev_tlas_boxes, inst_count);
+        if (!rt.tlas.HasNodes()) {
+            throw std::runtime_error("RenderFrame: TLAS LBVH build retained no nodes");
         }
-        const Vec3 half{0.5f * (mesh.local_bound.max.x - mesh.local_bound.min.x),
-                        0.5f * (mesh.local_bound.max.y - mesh.local_bound.min.y),
-                        0.5f * (mesh.local_bound.max.z - mesh.local_bound.min.z)};
-        const Vec3 center{0.5f * (mesh.local_bound.min.x + mesh.local_bound.max.x),
-                          0.5f * (mesh.local_bound.min.y + mesh.local_bound.max.y),
-                          0.5f * (mesh.local_bound.min.z + mesh.local_bound.max.z)};
-        Transform centered = I.transform;
-        centered.position = I.transform.TransformPoint(center);
-        tlas_aabbs[i] = collision::AABB::FromBox(centered, half);
+        rt.tlas_inst_count = inst_count;
+        rt.topology_built = true;
+        rt.frames_since_rebuild = 0u;
+        // Refit visit scratch: one uint32 per internal node (leaf_count-1).
+        const std::size_t visit_bytes =
+            (inst_count > 1u) ? (inst_count - 1u) * sizeof(uint32_t) : sizeof(uint32_t);
+        rt.d_refit_visit = OwnedBuffer(bt, visit_bytes);
+    } else {
+        collision::gpu::RefitLbvh(ctx.stream, ctx.device_id, rt.tlas.DeviceNodesMutable(),
+                                  dev_tlas_boxes, inst_count,
+                                  static_cast<uint32_t*>(rt.d_refit_visit.Data()));
+        ++rt.frames_since_rebuild;
     }
-    out.d_instances = UploadOwned(bt, dev_instances);
-    out.d_mats = UploadOwned(bt,
-        scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
-    out.d_tlas_boxes = UploadOwned(bt, tlas_aabbs);
-    const auto* dev_tlas_boxes = static_cast<const collision::AABB*>(out.d_tlas_boxes.Data());
-    out.tlas = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
-                                                 dev_tlas_boxes, out.inst_count);
-    if (!out.tlas.HasNodes()) {
-        throw std::runtime_error("RenderFrame: TLAS LBVH build retained no nodes");
-    }
-    out.instances = static_cast<const DevInstance*>(out.d_instances.Data());
-    out.materials = static_cast<const Material*>(out.d_mats.Data());
-    out.tlas_nodes = out.tlas.DeviceNodes();
+
+    FrameTlasView out;
+    out.inst_count = inst_count;
+    out.instances = static_cast<const DevInstance*>(rt.d_instances.Data());
+    out.materials = static_cast<const Material*>(rt.d_mats.Data());
+    out.tlas_nodes = rt.tlas.DeviceNodes();
     return out;
 }
 
@@ -473,16 +568,14 @@ namespace {
 // AovTarget (raw per-channel device pointers; null skips a channel) is shared
 // with the beauty TU via two_level_render_kernels.cuh.
 
-// Build the per-frame TLAS and launch the closest-hit kernel into `dst`, on the
-// resolved device + stream. The ONLY thing that varies between the host-download
-// and device-resident entries is `dst`; the pixel writes are identical. The
-// returned FrameTlas must outlive the caller's stream sync.
-FrameTlas LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
-                            const TwoLevelScene& scene,
-                            const PinholeCamera& camera,
-                            const RtContext& ctx,
-                            const AovTarget& dst) {
-    FrameTlas frame = BuildFrameTlas(impl, scene, ctx);
+// Refresh/refit the persistent TLAS and launch the closest-hit kernel into `dst`.
+// Only `dst` varies between the host-download and device-resident entries.
+void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
+                       const TwoLevelScene& scene,
+                       const PinholeCamera& camera,
+                       const RtContext& ctx,
+                       const AovTarget& dst) {
+    const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
                     (camera.height + kBlockDim - 1u) / kBlockDim);
@@ -492,7 +585,6 @@ FrameTlas LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
         scene.light, scene.ambient,
         dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
     CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
-    return frame;
 }
 
 // Map a caller RtDeviceAovs (opaque phi::Buffer*) to raw device pointers.
@@ -531,32 +623,21 @@ Framebuffer RenderFrame(TwoLevelSceneDevice& device,
     phi::ScopedDeviceGuard guard(ctx.device_id);
     (void)cudaSetDevice(ctx.device_id);
 
-    // Internal scratch AOVs, downloaded to the host Framebuffer (one D2H).
-    OwnedBuffer d_color(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
-    OwnedBuffer d_normal(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_albedo(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_uv(ctx.device_bt, pixels * 2u * sizeof(float));
-    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
+    // Persistent scratch AOVs (reused across frames), downloaded to the host
+    // Framebuffer (one D2H). Sized lazily; no per-frame malloc/free.
+    RtRenderContext& rt = device.GetImpl()->rt;
+    rt.EnsureAovs(ctx.device_bt, pixels);
+    const AovTarget dst = rt.AovScratchTarget();
 
-    AovTarget dst;
-    dst.color = static_cast<float*>(d_color.Data());
-    dst.depth = static_cast<float*>(d_depth.Data());
-    dst.normal = static_cast<float*>(d_normal.Data());
-    dst.albedo = static_cast<float*>(d_albedo.Data());
-    dst.uv = static_cast<float*>(d_uv.Data());
-    dst.prim = static_cast<uint32_t*>(d_prim.Data());
-
-    FrameTlas frame = LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
-    (void)frame;
+    LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 
-    d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
-    d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
-    d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
-    d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
-    d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
-    d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
 }
 
@@ -576,24 +657,21 @@ void RenderFrameToAovs(TwoLevelSceneDevice& device,
 
     // Write directly into the caller's resident device buffers -- no host round-trip.
     const AovTarget dst = DeviceAovsToTarget(aov);
-    FrameTlas frame = LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
-    (void)frame;
+    LaunchRenderFrame(device.GetImpl(), scene, camera, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 }
 
 namespace {
 
-// Build the per-frame TLAS and launch the stochastic beauty kernel into `dst`, on
-// the resolved device + stream. Only `dst` varies between the host-download and
-// device-resident entries; the pixel writes are identical. The returned FrameTlas
-// must outlive the caller's stream sync.
-FrameTlas LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
-                             const TwoLevelScene& scene,
-                             const PinholeCamera& camera,
-                             const BeautyOptions& opt,
-                             const RtContext& ctx,
-                             const AovTarget& dst) {
-    FrameTlas frame = BuildFrameTlas(impl, scene, ctx);
+// Refresh/refit the persistent TLAS and launch the stochastic beauty kernel into
+// `dst`. Only `dst` varies between the host-download and device-resident entries.
+void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
+                        const TwoLevelScene& scene,
+                        const PinholeCamera& camera,
+                        const BeautyOptions& opt,
+                        const RtContext& ctx,
+                        const AovTarget& dst) {
+    const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
 
     BeautyParams sky;
     sky.shadow_rays = opt.shadow_rays;
@@ -613,7 +691,6 @@ FrameTlas LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
                        frame.materials, scene.light, sky, opt.samples, opt.seed, dst,
                        ctx.stream);
     CheckCuda(cudaGetLastError(), "RenderBeautyKernel launch");
-    return frame;
 }
 
 }  // namespace
@@ -641,33 +718,22 @@ Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
     phi::ScopedDeviceGuard guard(ctx.device_id);
     (void)cudaSetDevice(ctx.device_id);
 
-    OwnedBuffer d_color(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
-    OwnedBuffer d_normal(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_albedo(ctx.device_bt, pixels * 3u * sizeof(float));
-    OwnedBuffer d_uv(ctx.device_bt, pixels * 2u * sizeof(float));
-    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
+    // Persistent scratch AOVs reused across frames (sized lazily); the kernel
+    // writes all 6, the mask gates the D2H download (the rest stay device-resident).
+    RtRenderContext& rt = device.GetImpl()->rt;
+    rt.EnsureAovs(ctx.device_bt, pixels);
+    const AovTarget dst = rt.AovScratchTarget();
 
-    AovTarget dst;
-    dst.color = static_cast<float*>(d_color.Data());
-    dst.depth = static_cast<float*>(d_depth.Data());
-    dst.normal = static_cast<float*>(d_normal.Data());
-    dst.albedo = static_cast<float*>(d_albedo.Data());
-    dst.uv = static_cast<float*>(d_uv.Data());
-    dst.prim = static_cast<uint32_t*>(d_prim.Data());
-
-    FrameTlas frame = LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
-    (void)frame;
+    LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 
-    // Download only the masked channels; the rest stay device-resident.
     const BeautyDownloadMask mask;
-    if (mask.color) d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
-    if (mask.depth) d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
-    if (mask.normal) d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
-    if (mask.albedo) d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
-    if (mask.uv) d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
-    if (mask.prim) d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    if (mask.color) rt.d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    if (mask.depth) rt.d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    if (mask.normal) rt.d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    if (mask.albedo) rt.d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    if (mask.uv) rt.d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    if (mask.prim) rt.d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
 }
 
@@ -687,8 +753,7 @@ void RenderBeautyToAovs(TwoLevelSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
 
     const AovTarget dst = DeviceAovsToTarget(aov);
-    FrameTlas frame = LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
-    (void)frame;
+    LaunchRenderBeauty(device.GetImpl(), scene, camera, opt, ctx, dst);
     cudaStreamSynchronize(ctx.stream);
 }
 
