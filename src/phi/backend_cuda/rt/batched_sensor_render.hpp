@@ -24,7 +24,8 @@
 #include "phi/interop_scatter.hpp"  // ScatterFkSource / InstanceScatterRow
 #include "rt/camera.hpp"
 #include "rt/material.hpp"
-#include "rt/render_dr.hpp"         // RenderDrConfig (per-env appearance DR)
+#include "rt/render_dr.hpp"          // RenderDrConfig (per-env appearance DR)
+#include "rt/sensor_fidelity.hpp"    // SensorFidelityConfig (opt-in beauty shade)
 #include "rt/two_level_render.hpp"  // TwoLevelScene / TwoLevelSceneDevice
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (mount table)
 
@@ -96,6 +97,14 @@ void SetSensorMounts(BatchedSensorSceneDevice& device,
 // build and/or per reset. Cheap (one device fill over env_count tables).
 void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
                  uint32_t env_count, phi::Backend* backend = nullptr);
+
+// Record the opt-in shading-fidelity profile (spp / soft shadow / AO / GI / sky /
+// tonemap). The DEFAULT config (Enabled()==false) makes the trace take the exact
+// cheap-shade arithmetic -> the AOV bytes are unchanged. Non-default lifts RGB to
+// the single-camera beauty look; deterministic + seeded (same seed -> same bytes).
+// Caps spp/samples LOUDLY. Stored on the device; applies to the next render.
+void SetSensorFidelity(BatchedSensorSceneDevice& device,
+                       const SensorFidelityConfig& cfg);
 
 // ONE step driven by the stored mount table: scatter cameras (fk * local_offset
 // for every env x sensor) into the persistent camera buffer, then RenderSensorsBatched
