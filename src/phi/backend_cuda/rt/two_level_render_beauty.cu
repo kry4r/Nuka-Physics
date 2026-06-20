@@ -21,6 +21,13 @@ namespace nuka::rt {
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
+constexpr uint32_t kBeautyBlockThreads = kBlockDim * kBlockDim;
+
+// Target resident blocks per SM for the beauty kernel. At the un-bounded 220
+// registers only one 256-thread block fits an sm_86 SM (~17% occupancy); bounding
+// to two blocks caps the kernel at 128 registers (a small, measured spill) and the
+// doubled occupancy hides the incoherent secondary-ray latency -> ~1.4x measured.
+constexpr uint32_t kBeautyMinBlocksPerSm = 2u;
 
 // The beauty path runs every secondary ray + the slab/intersection math in FP32.
 using Real = float;
@@ -48,7 +55,8 @@ struct BeautyRng {
 // One thread per pixel: accumulate S jittered sub-pixel samples through the
 // stochastic shade. The CENTER sample also fills depth/normal/albedo/uv/prim so
 // the host RGBA8 conversion's prim-based hit test still classifies background.
-__global__ void RenderBeautyKernel(PinholeCamera camera,
+__global__ void __launch_bounds__(kBeautyBlockThreads, kBeautyMinBlocksPerSm)
+RenderBeautyKernel(PinholeCamera camera,
                                    const LbvhNode* __restrict__ tlas_nodes,
                                    uint32_t tlas_leaf_count,
                                    const DevInstance* __restrict__ instances,
