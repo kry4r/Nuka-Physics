@@ -109,6 +109,11 @@ struct ResolvedPose {
 ResolvedPose ResolvePoseSource(const scene::SceneMap& map,
                                const std::shared_ptr<scene::SceneNode>& visual_node) {
     ResolvedPose out;
+    // A link ancestor anywhere up the chain drives the pose; a body_row is only
+    // the fallback for a free rigid body with no link ancestor.
+    bool have_body = false;
+    PoseSource body;
+    std::shared_ptr<scene::SceneNode> body_node;
     for (auto n = visual_node; n; n = n->parent.lock()) {
         if (n->entity == scene::kInvalidEntity) {
             continue;
@@ -123,12 +128,17 @@ ResolvedPose ResolvePoseSource(const scene::SceneMap& map,
             out.physics_node = n;
             return out;
         }
-        if (ref->body_row != scene::SceneMap::kNoRow) {
-            out.source.kind = PoseSource::Kind::Body;
-            out.source.row  = ref->body_row;
-            out.physics_node = n;
-            return out;
+        if (!have_body && ref->body_row != scene::SceneMap::kNoRow) {
+            body.kind = PoseSource::Kind::Body;
+            body.row  = ref->body_row;
+            body_node = n;
+            have_body = true;
         }
+    }
+    if (have_body) {
+        out.source = body;
+        out.physics_node = body_node;
+        return out;
     }
     // No physics-bound ancestor: static instance pinned at its bind pose.
     out.source.kind = PoseSource::Kind::Static;
