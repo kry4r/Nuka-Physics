@@ -686,6 +686,13 @@ private:
         // off pure black WITHOUT washing the scene to white -- the sun key (~2.0)
         // stays dominant, ACES keeps the lit treads mid-grey.
         b.sky_intensity = 0.30f;
+        // The mp4 path (FramebufferToReport) consumes only color + prim; skip the
+        // D2H copy of the four AOVs it never reads.
+        b.download = rt::AovDownloadMask{};
+        b.download.depth = false;
+        b.download.normal = false;
+        b.download.albedo = false;
+        b.download.uv = false;
         return b;
     }
 

@@ -80,6 +80,19 @@ struct TwoLevelScene {
     AmbientTerm ambient;
 };
 
+// Which host AOV channels RenderBeauty copies back from the device. The kernel
+// always WRITES every channel (determinism unchanged); this only gates the D2H
+// copies. Default = all true => the returned Framebuffer is byte-unchanged. The
+// mp4 path consumes only color + prim, so it clears the four it never reads.
+struct AovDownloadMask {
+    bool color = true;
+    bool depth = true;
+    bool normal = true;
+    bool albedo = true;
+    bool uv = true;
+    bool prim = true;
+};
+
 // Stochastic render controls for the beauty path (RenderBeauty): jittered MSAA,
 // soft sun shadows, AO + one-bounce GI, procedural sky/fog. Same scene feeds both.
 struct BeautyOptions {
@@ -99,6 +112,10 @@ struct BeautyOptions {
     math::Vec3 fog_color{0.84f, 0.88f, 0.93f};   // height/distance fog tint
     float fog_density = 0.0f;                     // per-metre extinction (0 = off)
     float sky_intensity = 1.0f;                   // scales the sky-dome ambient
+
+    // Host-download gate (default all => byte-unchanged). RenderBeautyToAovs and
+    // the device-resident path ignore it; only the host RenderBeauty copy uses it.
+    AovDownloadMask download;
 };
 
 // Opaque, move-only device handle that owns the per-mesh BLAS trees + uploaded
