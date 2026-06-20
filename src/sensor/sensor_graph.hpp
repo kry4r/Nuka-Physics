@@ -4,31 +4,18 @@
 // ---------------------------------------------------------------------------
 
 #include "sensor/sensor_packet.hpp"
-#include "math/transform.hpp"
+#include "scene/scene_ir.hpp"
 #include "runtime/rigid/body_state.hpp"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace nuka::sensor {
 
-enum class SensorType : uint8_t {
-    IMU,
-    JointState,
-    ContactSummary,
-    Lidar,
-    Depth
-};
-
-struct SensorDescriptor {
-    std::string name;
-    SensorType  type;
-    uint32_t    attached_body   = 0;
-    math::Transform local_transform = math::Transform::Identity();
-    uint32_t    ray_count       = 0;        // for lidar
-    float       ray_range       = 100.0f;
-};
+// The sensor kind + descriptor are the ONE unified scene IR; the runtime sensor
+// graph names them by alias so there is no parallel sensor type.
+using SensorType       = scene::SensorType;
+using SensorDescriptor = scene::SensorDesc;
 
 class SensorGraph {
 public:

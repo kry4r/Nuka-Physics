@@ -59,7 +59,8 @@ TEST(SceneIr, AddSensor) {
     const auto body   = scene.AddRigidBody("sensor_body");
     const auto sensor = scene.AddSensor("imu0", body);
     EXPECT_EQ(scene.SensorCount(), 1u);
-    EXPECT_EQ(scene.GetSensor(sensor).attached_body, body);
+    EXPECT_EQ(scene.GetSensor(sensor).mount, MountFrame::Body);
+    EXPECT_EQ(scene.GetSensor(sensor).mount_index, body);
     EXPECT_EQ(scene.GetSensor(sensor).name, "imu0");
     EXPECT_EQ(scene.GetSensor(sensor).type, SensorType::Imu);
 }

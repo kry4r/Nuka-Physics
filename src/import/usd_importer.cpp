@@ -76,6 +76,18 @@ struct UsdPrim {
     float force_limit = 0.0f;
     float sample_rate_hz = 0.0f;
 
+    // -- NukaSensor lidar / depth payload -----------------------------------
+    // Lidar/range fan + range, or depth image size; defaults match SensorDesc so
+    // an absent attribute keeps the descriptor default.
+    float sensor_h_fov = 0.0f;           // horizontal fan extent (rad)
+    float sensor_v_fov = 0.0f;           // vertical fan extent (rad)
+    int sensor_h_res = 0;                // horizontal ray count
+    int sensor_v_res = 0;                // vertical ray count
+    float sensor_min_range = 0.0f;
+    float sensor_max_range = 100.0f;
+    int sensor_width = 0;                // depth image width
+    int sensor_height = 0;               // depth image height
+
     // -- Mesh geometry (def Mesh; #32) --------------------------------------
     // Parsed straight from the USD attributes; triangulation to mesh_indices is
     // done at SceneIR-build time. mesh_points is flat x,y,z triples in file
@@ -434,6 +446,15 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseFloatValue(line, "nuka:gain", prim.gain);
     (void)ParseFloatValue(line, "nuka:forceLimit", prim.force_limit);
     (void)ParseFloatValue(line, "nuka:sampleRate", prim.sample_rate_hz);
+    // NukaSensor lidar/depth attributes (additive; absent -> descriptor default).
+    (void)ParseFloatValue(line, "nuka:horizontalFov", prim.sensor_h_fov);
+    (void)ParseFloatValue(line, "nuka:verticalFov", prim.sensor_v_fov);
+    (void)ParseIntValue(line, "nuka:horizontalResolution", prim.sensor_h_res);
+    (void)ParseIntValue(line, "nuka:verticalResolution", prim.sensor_v_res);
+    (void)ParseFloatValue(line, "nuka:minRange", prim.sensor_min_range);
+    (void)ParseFloatValue(line, "nuka:maxRange", prim.sensor_max_range);
+    (void)ParseIntValue(line, "nuka:width", prim.sensor_width);
+    (void)ParseIntValue(line, "nuka:height", prim.sensor_height);
     // Mesh geometry arrays + references (#32) -- additive, see helper note.
     ApplyMeshAndReferenceLine(line, prim);
 }
@@ -915,6 +936,12 @@ scene::SensorType SensorTypeFromToken(const std::string& token) {
     if (lower == "lidar") {
         return scene::SensorType::Lidar;
     }
+    if (lower == "rangescan" || lower == "range_scan") {
+        return scene::SensorType::RangeScan;
+    }
+    if (lower == "depth") {
+        return scene::SensorType::Depth;
+    }
     if (lower == "camera") {
         return scene::SensorType::Camera;
     }
@@ -926,6 +953,9 @@ scene::SensorType SensorTypeFromToken(const std::string& token) {
     }
     if (lower == "framepose") {
         return scene::SensorType::FramePose;
+    }
+    if (lower == "jointstate" || lower == "joint_state") {
+        return scene::SensorType::JointState;
     }
     return scene::SensorType::Imu;
 }
@@ -1136,11 +1166,35 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             if (body_it == body_map.end()) {
                 throw std::runtime_error("USD: sensor '" + prim.name + "' references an unknown body");
             }
-            scene::SensorRecord sensor;
+            scene::SensorDesc sensor;
             sensor.name = prim.name;
-            sensor.attached_body = body_it->second;
             sensor.type = SensorTypeFromToken(prim.nuka_type);
+            sensor.mount = scene::MountFrame::Body;
+            sensor.mount_index = body_it->second;
             sensor.sample_rate_hz = prim.sample_rate_hz;
+            // Render-sensor payloads: a lidar/range fan + range, or a depth image
+            // size. Absent attributes leave the descriptor's defaults in place.
+            if (sensor.type == scene::SensorType::Lidar ||
+                sensor.type == scene::SensorType::RangeScan) {
+                sensor.lidar.az_count = static_cast<uint16_t>(prim.sensor_h_res);
+                sensor.lidar.el_count = static_cast<uint16_t>(prim.sensor_v_res);
+                sensor.lidar.az_min = -0.5f * prim.sensor_h_fov;
+                sensor.lidar.az_max = 0.5f * prim.sensor_h_fov;
+                sensor.lidar.el_min = -0.5f * prim.sensor_v_fov;
+                sensor.lidar.el_max = 0.5f * prim.sensor_v_fov;
+                sensor.lidar.min_range = prim.sensor_min_range;
+                if (prim.sensor_max_range > 0.0f) {
+                    sensor.lidar.max_range = prim.sensor_max_range;
+                }
+            } else if (sensor.type == scene::SensorType::Depth ||
+                       sensor.type == scene::SensorType::Camera) {
+                sensor.cam.width = static_cast<uint16_t>(prim.sensor_width);
+                sensor.cam.height = static_cast<uint16_t>(prim.sensor_height);
+                if (prim.sensor_v_fov > 0.0f) {
+                    constexpr float kRadToDeg = 57.29577951308232f;
+                    sensor.cam.vfov_degrees = prim.sensor_v_fov * kRadToDeg;
+                }
+            }
             scene.AddSensor(std::move(sensor));
         }
     }

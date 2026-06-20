@@ -125,12 +125,46 @@ struct JointRecord {
     float initial_position                 = 0.0f;
 };
 
-struct SensorRecord {
+// Render-camera intrinsics carried inside a Camera/Depth SensorDesc. Width/height
+// are 0 until authored; vFOV is the physCamera-derived vertical field of view.
+struct CameraIntrinsics {
+    uint16_t width                         = 0;
+    uint16_t height                        = 0;
+    float vfov_degrees                     = 45.0f;
+    float near_clip                        = 0.01f;
+    float far_clip                         = 1000.0f;
+    uint8_t distortion                     = 0;
+    float k1                               = 0.0f;
+    float k2                               = 0.0f;
+};
+
+// Ray-fan pattern for a Lidar/RangeScan SensorDesc (1-ray rangefinder uses
+// az_count=el_count=1); dir_table_off points at an external direction table.
+struct LidarPattern {
+    uint16_t az_count                      = 0;
+    uint16_t el_count                      = 0;
+    float az_min                           = 0.0f;
+    float az_max                           = 0.0f;
+    float el_min                           = 0.0f;
+    float el_max                           = 0.0f;
+    float min_range                        = 0.0f;
+    float max_range                        = 100.0f;
+    uint32_t dir_table_off                 = ~0u;
+};
+
+// Unified sensor descriptor: ONE IR for analytic + render sensors. mount/
+// mount_index name the FK pose for local_offset; cam/lidar are render payloads.
+struct SensorDesc {
     std::string name;
     SensorId id                            = 0;
-    BodyId attached_body                   = kInvalidBody;
     SensorType type                        = SensorType::Imu;
-    math::Transform local_transform        = math::Transform::Identity();
+    MountFrame mount                       = MountFrame::Link;
+    uint32_t mount_index                   = kInvalidBody;
+    math::Transform local_offset           = math::Transform::Identity();
+    CameraIntrinsics cam;
+    LidarPattern lidar;
+    uint32_t aov_mask                      = 0;
+    uint32_t update_period                 = 1;
     float sample_rate_hz                   = 0.0f;
 };
 
@@ -223,7 +257,7 @@ public:
     JointId  AddJoint(JointRecord record);
 
     SensorId AddSensor(std::string name, BodyId body);
-    SensorId AddSensor(SensorRecord record);
+    SensorId AddSensor(SensorDesc record);
     MaterialId AddMaterial(MaterialRecord record);
     CameraId AddCamera(CameraRecord record);
     LightId AddLight(LightRecord record);
@@ -254,7 +288,7 @@ public:
     const RigidBodyRecord&      GetBody(BodyId id)    const;
     const JointRecord&          GetJoint(JointId id)  const;
     const CollisionShapeRecord& GetShape(ShapeId id)  const;
-    const SensorRecord&         GetSensor(SensorId id) const;
+    const SensorDesc&           GetSensor(SensorId id) const;
     const MaterialRecord&       GetMaterial(MaterialId id) const;
     const CameraRecord&         GetCamera(CameraId id) const;
     const LightRecord&          GetLight(LightId id) const;
@@ -268,7 +302,7 @@ public:
     RigidBodyRecord&      GetBodyMut(BodyId id);
     JointRecord&          GetJointMut(JointId id);
     CollisionShapeRecord& GetShapeMut(ShapeId id);
-    SensorRecord&         GetSensorMut(SensorId id);
+    SensorDesc&           GetSensorMut(SensorId id);
     MaterialRecord&       GetMaterialMut(MaterialId id);
     CameraRecord&         GetCameraMut(CameraId id);
     LightRecord&          GetLightMut(LightId id);
@@ -278,7 +312,7 @@ public:
     const std::vector<RigidBodyRecord>&      Bodies()  const;
     const std::vector<JointRecord>&          Joints()  const;
     const std::vector<CollisionShapeRecord>& Shapes()  const;
-    const std::vector<SensorRecord>&         Sensors() const;
+    const std::vector<SensorDesc>&           Sensors() const;
     const std::vector<MaterialRecord>&       Materials() const;
     const std::vector<CameraRecord>&         Cameras() const;
     const std::vector<LightRecord>&          Lights() const;
@@ -335,7 +369,7 @@ private:
     std::vector<RigidBodyRecord>      bodies_;
     std::vector<JointRecord>          joints_;
     std::vector<CollisionShapeRecord> shapes_;
-    std::vector<SensorRecord>         sensors_;
+    std::vector<SensorDesc>           sensors_;
     std::vector<MaterialRecord>       materials_;
     std::vector<CameraRecord>         cameras_;
     std::vector<LightRecord>          lights_;
