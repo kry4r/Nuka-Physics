@@ -15,6 +15,9 @@
 # ---------------------------------------------------------------------------
 add_library(nuka_rhi STATIC
     offline/offline_renderer.cpp
+    # The batched device-resident sensor render facade (sibling of OfflineRenderer):
+    # drives render::SensorBackendI for the in-loop per-env AOV tensor path.
+    offline/sensor_renderer.cpp
 )
 set_target_properties(nuka_rhi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

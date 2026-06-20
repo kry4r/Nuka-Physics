@@ -218,6 +218,12 @@ struct BatchedSensorSceneDevice::Impl {
     OwnedBuffer d_color, d_depth, d_normal, d_albedo, d_prim;
     std::size_t col_b = 0u, dep_b = 0u, nrm_b = 0u, alb_b = 0u, prim_b = 0u;
     uint64_t aov_rays = 0u;
+
+    // Env-invariant mount table (uploaded once) + the per-env camera buffer the
+    // scatter writes (sized lazily). RenderSensorsMounted scatters then renders.
+    OwnedBuffer d_mounts, d_cameras;
+    uint32_t sensors_per_env = 0u;
+    std::size_t cam_b = 0u;
 };
 
 BatchedSensorSceneDevice::BatchedSensorSceneDevice()
@@ -384,6 +390,58 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
                     static_cast<uint32_t*>(impl->d_prim.Data()));
     CheckCuda(cudaGetLastError(), "BatchedSensorTraceKernel launch");
     impl->aov_rays = rays;
+}
+
+void SetSensorMounts(BatchedSensorSceneDevice& device,
+                     const std::vector<scene::SensorDesc>& sensors) {
+    if (sensors.empty()) {
+        throw std::runtime_error("SetSensorMounts: empty mount table");
+    }
+    const std::vector<SensorMountRow> mounts = BuildSensorMountRows(sensors);
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    const RtContext ctx = ResolveRtContext(nullptr);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+    impl->d_mounts = UploadOwned(ctx.device_bt, mounts);
+    impl->sensors_per_env = static_cast<uint32_t>(mounts.size());
+    cudaStreamSynchronize(ctx.stream);
+}
+
+void RenderSensorsMounted(BatchedSensorSceneDevice& device,
+                          const phi::ScatterFkSource& fk,
+                          uint32_t env_count,
+                          uint32_t width,
+                          uint32_t height,
+                          phi::Backend* backend) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    if (impl->sensors_per_env == 0u || impl->d_mounts.Data() == nullptr) {
+        throw std::runtime_error(
+            "RenderSensorsMounted: SetSensorMounts must be called first");
+    }
+    if (env_count == 0u || width == 0u || height == 0u) {
+        return;
+    }
+    // The batched flat trace maps one camera to one env TLAS (camera == env), so
+    // the single-launch path renders exactly one sensor per env. Loud, not silent.
+    if (impl->sensors_per_env != 1u) {
+        throw std::runtime_error(
+            "RenderSensorsMounted: the batched single-launch path renders one "
+            "sensor per env (camera index == env TLAS index)");
+    }
+
+    const RtContext ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
+
+    // Scatter cam_world = fk * local_offset per env into the persistent camera
+    // buffer, then drive the SAME batched build/refit + flat trace.
+    EnsureBytes(impl->d_cameras, impl->cam_b, ctx.device_bt,
+                static_cast<std::size_t>(env_count) * sizeof(PinholeCamera));
+    auto* d_cams = static_cast<PinholeCamera*>(impl->d_cameras.Data());
+    ScatterEnvCameras(ctx.stream, fk,
+                      static_cast<const SensorMountRow*>(impl->d_mounts.Data()),
+                      env_count, impl->sensors_per_env, d_cams);
+    RenderSensorsBatched(device, fk, d_cams, env_count, width, height, backend);
 }
 
 const float* SensorColorDevice(const BatchedSensorSceneDevice& device) {

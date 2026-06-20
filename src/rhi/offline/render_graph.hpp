@@ -35,10 +35,11 @@ public:
         }
     }
 
-    // Build the pass list a profile selects. Beauty -> the beauty shade pass.
-    // The Sensor output is a declared seam (the batched AOV path fills it); it
-    // is not produced here, so this returns an empty graph the renderer rejects
-    // rather than silently emitting nothing.
+    // Build the pass list a profile selects. Beauty -> the beauty shade pass. The
+    // Sensor output is the batched device-resident AOV path owned by SensorRenderer
+    // (a single fused op + a persistent device tensor, not a host-framebuffer pass),
+    // so it is intentionally NOT produced here; this returns an empty graph the
+    // OfflineRenderer rejects rather than silently emitting nothing.
     static RenderGraph FromProfile(const RenderProfile& profile) {
         RenderGraph graph;
         if (profile.output == RenderOutput::Beauty) {
