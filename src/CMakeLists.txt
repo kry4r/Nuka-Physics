@@ -1076,6 +1076,11 @@ if(CMAKE_CUDA_COMPILER)
         # strong CreateCudaRtBackend definition. Built here so it shares the
         # lib's include dirs; --fmad=false only affects the CUDA .cu above.
         phi/backend_cuda/rt/rt_backend_cuda.cpp
+        # The CONCRETE CUDA impl of render::SensorBackendI (sibling of RtBackendI).
+        # Host C++ (no kernel launch) that WRAPS BuildBatchedSensorScene/
+        # RenderSensorsMounted; linking nuka_phi2_rt provides the strong
+        # CreateCudaSensorBackend definition.
+        phi/backend_cuda/rt/sensor_backend_cuda.cpp
     )
     set_target_properties(nuka_phi2_rt PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_options(nuka_phi2_rt PRIVATE

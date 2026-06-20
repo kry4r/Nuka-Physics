@@ -8,21 +8,23 @@
 //
 // It REUSES the committed pieces verbatim: BuildTwoLevelScene (BLAS once), the
 // batched LBVH build/refit (collision/lbvh_batched.cuh), the device scatter
-// (sensor_scatter.hpp), and the templated traversal nest ClosestHit/
-// ReconstructHit (two_level_render_kernels.cuh) instantiated Real=float. The
-// scene + materials + per-instance binding are env-shared (replicated scene);
-// only the per-env poses + cameras vary. The single-camera FP64 golden path is
-// untouched -- this is an additive FP32 cheap-shade profile.
+// (sensor_scatter.cu), and the templated traversal nest ClosestHit/ReconstructHit
+// (two_level_render_kernels.cuh) instantiated Real=float. The scene + materials +
+// per-instance binding are env-shared (replicated scene); only the per-env poses +
+// cameras vary. The single-camera FP64 golden path is untouched -- this is an
+// additive FP32 cheap-shade profile.
+//
+// This is the CUDA-FREE host-facing API (the device tokens live in the .cu via the
+// BatchedSensorSceneDevice pimpl, mirroring rt/two_level_render.hpp); it names only
+// CUDA-free rt:: / phi:: / scene:: PODs so a host backend TU can drive it.
 // ---------------------------------------------------------------------------
 
-#include "collision/aabb.hpp"
 #include "phi/backend.hpp"
-#include "phi/backend_cuda/rt/sensor_scatter.hpp"  // SensorBlasRef
-#include "phi/backend_cuda/rt/two_level_render_kernels.cuh"  // DevInstance
 #include "phi/interop_scatter.hpp"  // ScatterFkSource / InstanceScatterRow
 #include "rt/camera.hpp"
 #include "rt/material.hpp"
 #include "rt/two_level_render.hpp"  // TwoLevelScene / TwoLevelSceneDevice
+#include "scene/scene_ir.hpp"       // scene::SensorDesc (mount table)
 
 #include <cstdint>
 #include <memory>
@@ -72,6 +74,23 @@ BatchedSensorSceneDevice BuildBatchedSensorScene(const BatchedSensorSceneDesc& d
 void RenderSensorsBatched(BatchedSensorSceneDevice& device,
                           const phi::ScatterFkSource& fk,
                           const PinholeCamera* cameras_device,
+                          uint32_t env_count,
+                          uint32_t width,
+                          uint32_t height,
+                          phi::Backend* backend = nullptr);
+
+// Upload the env-invariant sensor mount table into the persistent scene (lowered
+// from scene::SensorDesc via BuildSensorMountRows inside the .cu). RenderSensorsMounted
+// scatters the per-env cameras from it each step; call once after BuildBatchedSensorScene.
+void SetSensorMounts(BatchedSensorSceneDevice& device,
+                     const std::vector<scene::SensorDesc>& sensors);
+
+// ONE step driven by the stored mount table: scatter cameras (fk * local_offset
+// for every env x sensor) into the persistent camera buffer, then RenderSensorsBatched
+// into the (N,H,W,ch) tensor. `width`/`height` size each sensor image; the camera
+// count is env_count * sensors_per_env. SetSensorMounts must have been called.
+void RenderSensorsMounted(BatchedSensorSceneDevice& device,
+                          const phi::ScatterFkSource& fk,
                           uint32_t env_count,
                           uint32_t width,
                           uint32_t height,

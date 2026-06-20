@@ -57,6 +57,23 @@ struct RenderProfile {
         p.image_height = height;
         return p;
     }
+
+    // A Sensor profile producing the batched per-env AOV tensor at the given
+    // per-sensor resolution. The cheap sensor shade (1spp, one hard shadow ray, no
+    // AO, no GI) is the FP32 path the batched trace runs; the controls are set here
+    // as the single source of truth for what that profile means.
+    static RenderProfile Sensor(uint32_t width, uint32_t height) {
+        RenderProfile p;
+        p.output = RenderOutput::Sensor;
+        p.determinism = Determinism::Golden;
+        p.image_width = width;
+        p.image_height = height;
+        p.beauty.samples = 1u;       // 1spp
+        p.beauty.shadow_rays = 1u;   // one hard shadow ray
+        p.beauty.ao_samples = 0u;    // no ambient occlusion
+        p.beauty.gi_bounces = 0u;    // no indirect bounce
+        return p;
+    }
 };
 
 }  // namespace nuka::rhi::offline

@@ -1738,6 +1738,39 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rhi_offline_replay_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Offline RHI sensor-batch gate: the SensorRenderer (the host render layer
+    # over the PHI-unified batched sensor render) must add ZERO numeric change vs
+    # driving the rt-layer batched entry (rt::RenderSensorsMounted) directly. Builds
+    # one N-env replicated sensor scene both ways with a Sensor profile and asserts
+    # the device AOV tensors are byte-identical across all channels (downloaded for
+    # the memcmp only). A .cu (the reference drives the CUDA-token rt entry); the
+    # render TU's --fmad=false + host -ffp-contract=off keep host==device.
+    add_executable(nuka_rhi_sensor_batch_test
+        rhi/test_sensor_batch.cu
+    )
+    target_compile_options(nuka_rhi_sensor_batch_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rhi_sensor_batch_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rhi_sensor_batch_test
+        PRIVATE
+            nuka_rhi
+            nuka_phi2_rt
+            nuka_render
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rhi_sensor_batch_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
     # MEASURES flat p13 RenderScene (rebuild-all every frame over N*~300 baked
     # world triangles) vs the G1-A two-level RenderFrame (per-mesh BLAS built
