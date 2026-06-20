@@ -124,7 +124,55 @@ float TiledRise(const TerrainGenConfig& cfg, float x, float y) {
     return h;
 }
 
+// Curriculum tile grid: a curric_levels (rows, +Y) x curric_types (cols, +X) grid of
+// feature_cell tiles indexed from the field origin (corner). The col picks a fixed
+// feature ladder (0 stairs-up / 1 pit-down / 2 boxes / else flat); the row scales the
+// amplitude by (row+1)/curric_levels so row 0 is near-flat and the top row is full.
+// obs + spawn + physics all sample world (x,y), so an env on its tile sees one level.
+float CurriculumRise(const TerrainGenConfig& cfg, float x, float y) {
+    const float cell = cfg.feature_cell;
+    if (!(cell > 0.0f) || cfg.curric_levels == 0u || cfg.curric_types == 0u) return 0.0f;
+    const int col = FloorToInt((x - cfg.origin.x) / cell);
+    const int row = FloorToInt((y - cfg.origin.y) / cell);
+    if (col < 0 || col >= static_cast<int>(cfg.curric_types) ||
+        row < 0 || row >= static_cast<int>(cfg.curric_levels)) {
+        return 0.0f;  // outside the grid: flat border.
+    }
+    const float lx = (x - cfg.origin.x) - (static_cast<float>(col) + 0.5f) * cell;
+    const float ly = (y - cfg.origin.y) - (static_cast<float>(row) + 0.5f) * cell;
+    const float feature_half = cell * 0.5f - cfg.feature_margin;
+    if (!(feature_half > 0.0f)) return 0.0f;
+    const float rl = MaxF(AbsF(lx), AbsF(ly));
+    if (rl >= feature_half) return 0.0f;  // flat seam rim between tiles.
+    // row 0 is a flat walkway (the cold-start easiest tier), the top row full relief.
+    const float diff =
+        cfg.curric_levels > 1u
+            ? static_cast<float>(row) / static_cast<float>(cfg.curric_levels - 1u)
+            : 1.0f;
+    const int rc = FloorToInt((feature_half - cfg.ring_platform * 0.5f) /
+                              MaxF(cfg.ring_width, 1.0e-6f));
+    const int type = col & 3;  // ladder repeats every 4 cols.
+    if (type == 0) {  // directional ascending staircase: forward (+Y) climbs, full
+        // width in X so a dog cannot side-step around it -- forward IS the climb.
+        const float along = ly + feature_half;  // 0 at the low (-Y) edge, up with +Y
+        const int sidx = FloorToInt(along / MaxF(cfg.ring_width, 1.0e-6f));
+        return MaxF(0.0f, static_cast<float>(sidx)) * cfg.ring_rise * diff;
+    } else if (type == 1) {  // descending pit.
+        return RingStepRise(rl, -cfg.ring_rise * diff, cfg.ring_width,
+                            cfg.ring_platform, rc);
+    } else if (type == 2) {  // hashed boxes.
+        const int bx = FloorToInt(lx / MaxF(cfg.bump_cell, 1.0e-6f));
+        const int by = FloorToInt(ly / MaxF(cfg.bump_cell, 1.0e-6f));
+        return HashCellUniform01(bx + col * 131, by + row * 137) *
+               (cfg.bump_height * diff);
+    }
+    return 0.0f;  // flat walkway column.
+}
+
 float FieldRise(const TerrainGenConfig& cfg, float lx, float ly) {
+    if (cfg.curric_levels > 0u && cfg.curric_types > 0u) {
+        return CurriculumRise(cfg, lx, ly);
+    }
     if (cfg.feature_cell > 0.0f) return TiledRise(cfg, lx, ly);
     return GlobalRise(cfg, lx, ly);
 }

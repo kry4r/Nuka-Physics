@@ -399,11 +399,13 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
     if (gid >= total) return;
     const uint32_t rs = gid / dof_stride;
     const uint32_t r = gid - rs * dof_stride;
-    const NkRow row = urows[rs];
-    if (!(row.flags & nk::nk_row_flags::kActive) || row.a.kind != kNkSideArtic) {
+    // Read flags first; the ~99% inactive rows bail on 4 bytes, not the 128-byte
+    // struct. Active rows then read only the side fields they use (same values).
+    const NkRow* const rowp = urows + rs;
+    if (!(rowp->flags & nk::nk_row_flags::kActive) || rowp->a.kind != kNkSideArtic) {
         return;  // only articulation rows carry a chain-J / w pair.
     }
-    const size_t tile = static_cast<size_t>(row.a.index) * dof_stride * dof_stride;
+    const size_t tile = static_cast<size_t>(rowp->a.index) * dof_stride * dof_stride;
     const float* const Minv = m_inv + tile + static_cast<size_t>(r) * dof_stride;
     const float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
     float acc = 0.0f;
@@ -755,11 +757,12 @@ __global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
     if (gid >= total) return;
     const uint32_t rs = gid / dof_stride;
     const uint32_t r = gid - rs * dof_stride;
-    const NkRow row = urows[rs];
-    if (!(row.flags & nk::nk_row_flags::kActive) || row.b.kind != kNkSideArtic) {
+    // Read flags first; inactive rows bail on 4 bytes, not the 128-byte struct.
+    const NkRow* const rowp = urows + rs;
+    if (!(rowp->flags & nk::nk_row_flags::kActive) || rowp->b.kind != kNkSideArtic) {
         return;
     }
-    const size_t tile = static_cast<size_t>(row.b.index) * dof_stride * dof_stride;
+    const size_t tile = static_cast<size_t>(rowp->b.index) * dof_stride * dof_stride;
     const float* const Minv = m_inv + tile + static_cast<size_t>(r) * dof_stride;
     const float* const J = chain_jacobian_b + static_cast<size_t>(rs) * dof_stride;
     float acc = 0.0f;
@@ -780,8 +783,10 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     uint32_t total_rows, uint32_t dof_stride, float* __restrict__ row_meff) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
+    // Inactive rows (the ~99%) bail on a 4-byte flags load instead of the full
+    // 128-byte struct; same row_meff=0 result.
+    if (!(urows[rs].flags & nk::nk_row_flags::kActive)) { row_meff[rs] = 0.0f; return; }
     const NkRow row = urows[rs];
-    if (!(row.flags & nk::nk_row_flags::kActive)) { row_meff[rs] = 0.0f; return; }
     float diagonal = 0.0f;
     for (int s = 0; s < 2; ++s) {
         const NkRowSide& sd = (s == 0) ? row.a : row.b;

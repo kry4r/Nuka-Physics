@@ -91,6 +91,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LbvhMorton, DlpackDtype::kU32, 1, false, false},  // lbvh_morton
     {FieldId::LbvhIndex, DlpackDtype::kU32, 1, false, false},  // lbvh_index
     {FieldId::LbvhVisit, DlpackDtype::kU32, 1, false, false},  // lbvh_visit
+    {FieldId::LbvhSortkey, DlpackDtype::kU64, 1, false, false},  // lbvh_sortkey
     {FieldId::ContactLink, DlpackDtype::kU32, 1, false, false},  // contact_link
     {FieldId::ContactPoint, DlpackDtype::kF32, 2, false, false},  // contact_point
     {FieldId::ContactNormal, DlpackDtype::kF32, 2, false, false},  // contact_normal

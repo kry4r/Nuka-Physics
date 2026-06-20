@@ -72,6 +72,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::LbvhMorton:          v.lbvh_morton = static_cast<uint32_t*>(p); break;
         case FieldId::LbvhIndex:           v.lbvh_index = static_cast<uint32_t*>(p); break;
         case FieldId::LbvhVisit:           v.lbvh_visit = static_cast<uint32_t*>(p); break;
+        case FieldId::LbvhSortkey:         v.lbvh_sortkey = static_cast<uint64_t*>(p); break;
         case FieldId::ContactLink:         v.contact_link = static_cast<uint32_t*>(p); break;
         case FieldId::ContactPoint:        v.contact_point = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactNormal:       v.contact_normal = static_cast<math::Vec3*>(p); break;

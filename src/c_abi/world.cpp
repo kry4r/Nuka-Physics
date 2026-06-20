@@ -319,6 +319,19 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                         cfg.feature_cell = 5.0f;
                         cfg.feature_margin = 0.6f;
                         break;
+                    case 5u:  // curriculum tile grid (level rows x type cols).
+                        cfg.ring_rise = desc->terrain_step_height;
+                        cfg.ring_width = desc->terrain_step_width;
+                        cfg.ring_platform = desc->terrain_platform_width;
+                        cfg.bump_height = desc->terrain_grid_height_max;
+                        cfg.bump_cell = desc->terrain_grid_width;
+                        cfg.feature_cell = desc->terrain_feature_cell > 0.0f
+                                               ? desc->terrain_feature_cell
+                                               : 6.0f;
+                        cfg.feature_margin = 0.6f;
+                        cfg.curric_levels = desc->curric_levels;
+                        cfg.curric_types = desc->curric_types;
+                        break;
                     default:  // 0 flat: every amplitude 0.
                         break;
                 }

@@ -214,6 +214,9 @@ fields:
   - {name: lbvh_morton,     dtype: u32,  per: body,          arena: scratch, owner: data}
   - {name: lbvh_index,      dtype: u32,  per: body,          arena: scratch, owner: data}
   - {name: lbvh_visit,      dtype: u32,  per: body,          arena: scratch, owner: data}
+  # Compound (env<<32)|morton30 key so ONE stable_sort_by_key orders every env in
+  # a single call (env in the high bits keeps envs disjoint, morton in the low).
+  - {name: lbvh_sortkey,    dtype: u64,  per: body,          arena: scratch, owner: data}
   - {name: contact_link,    dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_point,   dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_normal,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data}

@@ -2,9 +2,9 @@
 // PHI v2 CUDA backend — M3b readout / reset / snapshot ops:
 //   ReadoutContactWrench / ExportObs / ResetEnvs / SnapshotState / RestoreState
 //
-// ReadoutContactWrench is a LINE-BY-LINE PORT of src/sensor/contact_wrench.cu
-// (ContactForceKernel + LinkContactWrenchKernel). ResetEnvs is a LINE-BY-LINE
-// PORT of the p03 ResetEnvsKernel (the per-env RL-autoreset primitive).
+// ReadoutContactWrench sums the per-link net contact wrench over the ONE general
+// (PairDriven) solved row buffer (urows + per-row lambda + the row_cj_* gather).
+// ResetEnvs is a LINE-BY-LINE PORT of the p03 ResetEnvsKernel (RL autoreset).
 // SnapshotState / RestoreState are the device-side forms of the legacy snapshot
 // D2D copies / Reset() restore (replacing the M3a host-mediated
 // Data::Snapshot/Restore): flat stream-ordered cudaMemcpyAsync/MemsetAsync in
@@ -21,6 +21,7 @@
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/union_types.cuh"  // NkRow / kNkSideArtic (row solve)
 #include "sensor/noise/philox.cuh"               // M10: deterministic IC jitter
 
 namespace nuka::phi {
@@ -78,17 +79,31 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
     out_contact_force[base + 2u] = lambda[base + 2u] * inv_dt;
 }
 
-// Net per-link contact wrench (world frame). ONE THREAD PER OUTPUT LINK g.
+// Net per-link contact wrench (world frame) over the ONE general (PairDriven)
+// solved row buffer. ONE THREAD PER OUTPUT LINK g. The solver writes one impulse
+// lambda[rs] per ROW slot; each active row's articulation side carries its owning
+// global link / world contact point / world row direction in the chain-J gather
+// (row_cj_link/point/dir for side A, row_cj_link_b/point_b/dir_b for side B). The
+// world force a link receives from a row is dir*lambda/dt (dir == the row's world
+// jlin: +n / -n for the two normal sides, +-spoke for the friction spokes), so the
+// per-link force is the sum over every row touching it (normal + friction spokes
+// of every manifold point) -- the physically-correct net contact reaction. A row
+// whose side is rigid/static carries kInvalidLink in that side's row_cj_link, so
+// it never matches g (matching the legacy inactive-slot skip). Both sides are
+// summed so a link<->link contact contributes to BOTH links. Fixed row order,
+// fp32, no atomics -> D1.
 __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
-                                        const Vec3* __restrict__ contact_point,
-                                        const Vec3* __restrict__ contact_normal,
-                                        const Vec3* __restrict__ tangent1,
-                                        const Vec3* __restrict__ tangent2,
-                                        const uint32_t* __restrict__ contact_link,
+                                        const NkRow* __restrict__ urows,
+                                        const uint32_t* __restrict__ row_cj_link,
+                                        const Vec3* __restrict__ row_cj_point,
+                                        const Vec3* __restrict__ row_cj_dir,
+                                        const uint32_t* __restrict__ row_cj_link_b,
+                                        const Vec3* __restrict__ row_cj_point_b,
+                                        const Vec3* __restrict__ row_cj_dir_b,
                                         const Transform* __restrict__ link_world_pose,
                                         uint32_t total_link_count,
                                         uint32_t base_link_count,
-                                        uint32_t max_foot_contacts_per_env,
+                                        uint32_t rows_per_env,
                                         float inv_dt,
                                         float* __restrict__ out_link_wrench) {
     const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -96,31 +111,30 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
         return;
     }
     const uint32_t env = g / base_link_count;
-    const uint32_t slot_begin = env * max_foot_contacts_per_env;
-    const uint32_t slot_end = slot_begin + max_foot_contacts_per_env;
+    const uint32_t row_begin = env * rows_per_env;
+    const uint32_t row_end = row_begin + rows_per_env;
     const Vec3 origin = link_world_pose[g].position;
 
     Vec3 force = Vec3::Zero();
     Vec3 torque = Vec3::Zero();
-    // FIXED slot order; gate on the slot's tagged link == g. Inactive slots have
-    // contact_link == ~0u (kInvalidLink) which never equals g, so they are skipped.
-    for (uint32_t slot = slot_begin; slot < slot_end; ++slot) {
-        if (contact_link[slot] != g) {
+    // FIXED row order; gate each side on its tagged link == g. An inactive row
+    // (flags bit0 clear) carries lambda == 0 AND kInvalidLink gathers, so it never
+    // contributes; explicit flag skip keeps it cheap.
+    for (uint32_t rs = row_begin; rs < row_end; ++rs) {
+        if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
             continue;
         }
-        const uint32_t base = slot * kContactForceComponents;
-        const float ln = lambda[base + 0u];
-        const float lt1 = lambda[base + 1u];
-        const float lt2 = lambda[base + 2u];
-        // World force for this slot: n*lambda_n + t1*lambda_t1 + t2*lambda_t2, /dt.
-        const Vec3 n = contact_normal[slot];
-        const Vec3 t1 = tangent1[slot];
-        const Vec3 t2 = tangent2[slot];
-        const Vec3 f_slot = (n * ln + t1 * lt1 + t2 * lt2) * inv_dt;
-        // Torque about the link frame origin: r x F, r = contact_point - origin.
-        const Vec3 r = contact_point[slot] - origin;
-        force += f_slot;
-        torque += r.Cross(f_slot);
+        const float l = lambda[rs];
+        if (row_cj_link[rs] == g) {
+            const Vec3 f_slot = row_cj_dir[rs] * (l * inv_dt);
+            force += f_slot;
+            torque += (row_cj_point[rs] - origin).Cross(f_slot);
+        }
+        if (row_cj_link_b[rs] == g) {
+            const Vec3 f_slot = row_cj_dir_b[rs] * (l * inv_dt);
+            force += f_slot;
+            torque += (row_cj_point_b[rs] - origin).Cross(f_slot);
+        }
     }
 
     const uint32_t out = g * kLinkWrenchComponents;
@@ -290,13 +304,15 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
     const uint32_t wrench_grid = (total_link_count + kBlock - 1u) / kBlock;
     LaunchCuda(LinkContactWrenchKernel, dim3(wrench_grid), dim3(kBlock), 0u, stream,
                static_cast<const float*>(data.lambda),
-               static_cast<const Vec3*>(data.contact_point),
-               static_cast<const Vec3*>(data.contact_normal),
-               static_cast<const Vec3*>(data.contact_tangent1),
-               static_cast<const Vec3*>(data.contact_tangent2),
-               static_cast<const uint32_t*>(data.contact_link),
+               reinterpret_cast<const NkRow*>(data.urows),
+               static_cast<const uint32_t*>(data.row_cj_link),
+               static_cast<const Vec3*>(data.row_cj_point),
+               static_cast<const Vec3*>(data.row_cj_dir),
+               static_cast<const uint32_t*>(data.row_cj_link_b),
+               static_cast<const Vec3*>(data.row_cj_point_b),
+               static_cast<const Vec3*>(data.row_cj_dir_b),
                static_cast<const Transform*>(data.link_pose),
-               total_link_count, p->base_link_count, p->max_contacts_per_env,
+               total_link_count, p->base_link_count, p->rows_per_env,
                inv_dt, reinterpret_cast<float*>(data.link_contact_wrench));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
