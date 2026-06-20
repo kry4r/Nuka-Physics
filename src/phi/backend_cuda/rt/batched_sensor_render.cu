@@ -95,9 +95,8 @@ __device__ inline float DrClamp(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Trivially-copyable device mirror of the fidelity flags the trace branches on
-// (the sky/sample params travel in BeautyParams). spp / shadow_samples are capped
-// by the host before launch, so the kernel takes them as-is.
+// Device mirror of the fidelity flags the trace branches on (sky/sample params
+// travel in BeautyParams; spp/samples are host-capped before launch).
 struct FidelityParams {
     uint32_t spp;
     uint32_t enabled;  // 0 -> the exact cheap-shade arithmetic (byte no-op)
@@ -105,9 +104,8 @@ struct FidelityParams {
     uint64_t seed;
 };
 
-// Stateless deterministic per-sample RNG: a PCG stream seeded from one Philox draw
-// keyed by (seed, ray, sample). Distinct (ray, sample) -> distinct Philox counter
-// (injective lanes) -> independent streams, so fidelity-on is byte-exact two-run.
+// Per-sample RNG: a PCG stream seeded from one Philox draw keyed by (seed, ray,
+// sample) -> distinct streams, no mutable state, so fidelity-on is two-run exact.
 struct PhiloxSeededRng {
     uint32_t s;
     __device__ inline float NextF() {
