@@ -44,6 +44,7 @@
 #include "phi/backend_cuda/rt/prim_id.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
 #include "phi/backend_cuda/rt/shading.cuh"
+#include "phi/backend_cuda/rt/two_level_render_kernels.cuh"  // shared device structs + fns
 #include "rt/camera.hpp"
 
 #include <cuda_runtime.h>
@@ -59,6 +60,20 @@ namespace {
 
 constexpr uint32_t kBlockDim = 16u;
 
+// Which AOV channels to D2H-copy back to the host Framebuffer. The kernel always
+// WRITES all 6 to device buffers (they stay device-resident for a future
+// denoiser); this only gates the download. Default = the channels host code reads
+// (color/prim for the mp4 + depth for the hit test); normal/albedo/uv stay on the
+// device. A mask, not a delete.
+struct BeautyDownloadMask {
+    bool color = true;
+    bool depth = true;
+    bool normal = false;
+    bool albedo = false;
+    bool uv = false;
+    bool prim = true;
+};
+
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " +
@@ -67,211 +82,13 @@ void CheckCuda(cudaError_t result, const char* operation) {
 }
 
 using ::nuka::collision::gpu::LbvhNode;
-using ::nuka::math::Transform;
 using ::nuka::math::Vec3;
 
-// Flat per-primitive record for ONE mesh's BLAS, indexed by the BLAS leaf's
-// original (LOCAL) prim id. Mirrors scene_render.cu's DevPrim but the material
-// is dropped (material is per-instance in the two-level model).
-struct DevPrim {
-    uint32_t kind;  // PrimKind
-    uint32_t sub;   // index into the per-kind array
-};
-
-// Device view of ONE mesh's BLAS geometry (raw pointers into uploaded buffers).
-// Same layout discipline as scene_render.cu's DevScene, minus the materials.
-struct DevBlas {
-    const DevPrim* prims = nullptr;
-    uint32_t prim_count = 0u;
-
-    const Vec3* tri_v0 = nullptr;
-    const Vec3* tri_v1 = nullptr;
-    const Vec3* tri_v2 = nullptr;
-
-    const Vec3* sph_center = nullptr;
-    const float* sph_radius = nullptr;
-
-    const runtime::sdf::SparseSdfDevice* sdf_hdr = nullptr;
-    const collision::AABB* sdf_aabb = nullptr;
-    const float* sdf_eps = nullptr;
-    const int* sdf_iters = nullptr;
-};
-
-// One placed instance, device-side: its rigid transform, a view of its (shared)
-// BLAS geometry + retained tree, and the global ids the leaf packs / shades.
-struct DevInstance {
-    Transform transform;
-    const LbvhNode* blas_nodes = nullptr;
-    uint32_t blas_leaf_count = 0u;
-    DevBlas blas;
-    uint32_t instance_id = 0u;
-    uint32_t material_id = 0u;
-};
-
-// Device-side mirror of rt::BeautyOptions (trivially-copyable, passed by value
-// into the beauty kernel). Pure render parameters; no host-only types.
-struct BeautyParams {
-    uint32_t shadow_rays;
-    float sun_angular_radius;
-    uint32_t gi_bounces;
-    uint32_t ao_samples;
-    float ao_radius;
-    Vec3 sky_top, sky_bottom, sky_ground, fog_color;
-    float fog_density;
-    float sky_intensity;
-};
-
-// Intersect one LOCAL primitive of a BLAS (closest-hit pass): returns t only.
-// LOCAL-frame ray in; rigid -> local t == world t (see instance_transform.cuh).
-// Mirrors scene_render.cu::IntersectPrimT exactly (shared intersection fns).
-__device__ __forceinline__ bool IntersectBlasPrimT(const DevBlas& b,
-                                                   uint32_t prim,
-                                                   const Vec3& origin,
-                                                   const Vec3& dir,
-                                                   float t_min,
-                                                   float* out_t) {
-    const DevPrim p = b.prims[prim];
-    if (p.kind == static_cast<uint32_t>(PrimKind::Triangle)) {
-        float u, v;
-        Vec3 n;
-        return RayTriangleIntersect(origin, dir, b.tri_v0[p.sub], b.tri_v1[p.sub],
-                                    b.tri_v2[p.sub], t_min, out_t, &u, &v, &n);
-    } else if (p.kind == static_cast<uint32_t>(PrimKind::Sphere)) {
-        Vec3 n;
-        float u, v;
-        return RaySphereIntersect(origin, dir, b.sph_center[p.sub],
-                                  b.sph_radius[p.sub], t_min, out_t, &n, &u, &v);
-    } else {  // Sdf
-        Vec3 n;
-        return RaySdfSphereTrace(origin, dir, b.sdf_hdr[p.sub], b.sdf_aabb[p.sub],
-                                 t_min, b.sdf_eps[p.sub], b.sdf_iters[p.sub],
-                                 out_t, &n);
-    }
-}
-
-// BLAS leaf functor (the INNER traversal). origin/dir are the INSTANCE-LOCAL
-// ray; t_min is the (frame-invariant) world/local t_min. On a closest-hit win it
-// writes PackPrimId(instance_id, local_prim) into best_prim so the global tie-
-// break is a TOTAL ORDER (instance HIGH). best_t carries the comparable world t.
-struct BlasLeaf {
-    const LbvhNode* __restrict__ nodes;
-    DevBlas blas;
-    uint32_t instance_id;
-    float t_min;
-    __device__ void operator()(int32_t leaf_node,
-                               const Vec3& origin,
-                               const Vec3& dir,
-                               float* best_t,
-                               uint32_t* best_prim) const {
-        const uint32_t local_prim = static_cast<uint32_t>(nodes[leaf_node].left);
-        float t;
-        if (IntersectBlasPrimT(blas, local_prim, origin, dir, t_min, &t)) {
-            if (t >= t_min) {
-                RtClosestHitUpdate(t, PackPrimId(instance_id, local_prim), best_t,
-                                   best_prim);
-            }
-        }
-    }
-};
-
-// TLAS leaf functor (the heart of the nest). For the instance at TLAS leaf index
-// nodes[leaf_node].left, transform the WORLD ray into the instance-local frame,
-// then run the INNER rt::TraverseRay over that instance's BLAS, updating the SAME
-// best_t / best_prim by reference. The single-leaf BLAS is handled directly (the
-// inner TraverseRay assumes node 0 is an internal node).
-struct TlasLeaf {
-    const LbvhNode* __restrict__ tlas_nodes;
-    const DevInstance* __restrict__ instances;
-    float t_min;
-    __device__ void operator()(int32_t leaf_node,
-                               const Vec3& origin,
-                               const Vec3& dir,
-                               float* best_t,
-                               uint32_t* best_prim) const {
-        const uint32_t inst = static_cast<uint32_t>(tlas_nodes[leaf_node].left);
-        const DevInstance& I = instances[inst];
-        if (I.blas_leaf_count == 0u) {
-            return;
-        }
-        // World ray -> instance-local frame (shared with the host oracle).
-        Vec3 o_l, d_l;
-        TransformRayToLocal(I.transform, origin, dir, &o_l, &d_l);
-
-        BlasLeaf leaf{I.blas_nodes, I.blas, I.instance_id, t_min};
-        if (I.blas_leaf_count == 1u) {
-            // Single-primitive BLAS: node 0 IS the leaf (inner TraverseRay would
-            // mis-treat it as an internal node).
-            leaf(0, o_l, d_l, best_t, best_prim);
-        } else {
-            TraverseRay(I.blas_nodes, I.blas_leaf_count - 1u, o_l, d_l, best_t,
-                        best_prim, leaf);
-        }
-    }
-};
-
-// Run the full TWO-LEVEL closest hit (primary or shadow). best_t carries the
-// comparable world t; best_prim carries the packed (instance, local) id.
-__device__ __forceinline__ void ClosestHit(const LbvhNode* __restrict__ tlas_nodes,
-                                           uint32_t tlas_leaf_count,
-                                           const DevInstance* __restrict__ instances,
-                                           const Vec3& origin,
-                                           const Vec3& dir,
-                                           float t_min,
-                                           float* best_t,
-                                           uint32_t* best_prim) {
-    *best_t = RtMissDepth();
-    *best_prim = kNoPrim;
-    TlasLeaf leaf{tlas_nodes, instances, t_min};
-    if (tlas_leaf_count == 1u) {
-        leaf(0, origin, dir, best_t, best_prim);
-    } else if (tlas_leaf_count >= 2u) {
-        TraverseRay(tlas_nodes, tlas_leaf_count - 1u, origin, dir, best_t,
-                    best_prim, leaf);
-    }
-}
-
-// Reconstruct surface attributes (world normal, uv) for the WINNING (instance,
-// local) prim. Re-transform the ray to that instance's local frame, re-intersect
-// for the LOCAL normal/uv (p13 ReconstructHit pattern), then rotate the normal
-// back to world via QuatRotate (rigid: rotation only).
-__device__ __forceinline__ void ReconstructHit(const DevInstance* __restrict__ instances,
-                                               uint32_t packed_prim,
-                                               const Vec3& origin,
-                                               const Vec3& dir,
-                                               Vec3* out_world_normal,
-                                               float* out_u,
-                                               float* out_v) {
-    uint32_t inst, local_prim;
-    UnpackPrimId(packed_prim, &inst, &local_prim);
-    const DevInstance& I = instances[inst];
-    const DevBlas& b = I.blas;
-
-    Vec3 o_l, d_l;
-    TransformRayToLocal(I.transform, origin, dir, &o_l, &d_l);
-
-    const DevPrim p = b.prims[local_prim];
-    Vec3 n_local{0.0f, 0.0f, 0.0f};
-    float u = 0.0f, v = 0.0f;
-    if (p.kind == static_cast<uint32_t>(PrimKind::Triangle)) {
-        float tt;
-        RayTriangleIntersect(o_l, d_l, b.tri_v0[p.sub], b.tri_v1[p.sub],
-                             b.tri_v2[p.sub], 0.0f, &tt, &u, &v, &n_local);
-    } else if (p.kind == static_cast<uint32_t>(PrimKind::Sphere)) {
-        float tt;
-        RaySphereIntersect(o_l, d_l, b.sph_center[p.sub], b.sph_radius[p.sub],
-                           0.0f, &tt, &n_local, &u, &v);
-    } else {  // Sdf
-        float tt;
-        RaySdfSphereTrace(o_l, d_l, b.sdf_hdr[p.sub], b.sdf_aabb[p.sub], 0.0f,
-                          b.sdf_eps[p.sub], b.sdf_iters[p.sub], &tt, &n_local);
-        u = 0.0f;
-        v = 0.0f;
-    }
-    // Local geometric normal -> world (rotation only).
-    *out_world_normal = QuatRotate(I.transform.rotation, n_local);
-    *out_u = u;
-    *out_v = v;
-}
+// The device structs (DevPrim/DevBlas/DevInstance/BeautyParams/AovTarget) + the
+// nested-traversal fns (IntersectBlasPrimT/BlasLeaf/TlasLeaf/ClosestHit/
+// ReconstructHit) are SHARED with the FP32 beauty TU via two_level_render_kernels
+// .cuh. The golden kernel below instantiates them Real=double (the default), so
+// it stays byte-exact vs the host oracle.
 
 // One thread per pixel: primary two-level closest hit -> reconstruct -> shadow
 // ray -> shade -> write ALL 6 AOVs. Exactly one writer per pixel; no atomics ->
@@ -300,8 +117,8 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
 
     float best_t;
     uint32_t best_prim;
-    ClosestHit(tlas_nodes, tlas_leaf_count, instances, ray.origin, ray.dir, 0.0f,
-               &best_t, &best_prim);
+    ClosestHit<double>(tlas_nodes, tlas_leaf_count, instances, ray.origin, ray.dir, 0.0f,
+                       &best_t, &best_prim);
 
     Vec3 color{0.0f, 0.0f, 0.0f};
     float depth = RtMissDepth();
@@ -319,7 +136,7 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
         const uint32_t material_id = instances[inst].material_id;
 
         Vec3 n;
-        ReconstructHit(instances, best_prim, ray.origin, ray.dir, &n, &uv_u, &uv_v);
+        ReconstructHit<double>(instances, best_prim, ray.origin, ray.dir, &n, &uv_u, &uv_v);
         normal = n;
         const Material mat = materials[material_id];
         albedo = mat.albedo;
@@ -330,16 +147,16 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
             static_cast<float>(static_cast<double>(ray.origin.y) + static_cast<double>(best_t) * static_cast<double>(ray.dir.y)),
             static_cast<float>(static_cast<double>(ray.origin.z) + static_cast<double>(best_t) * static_cast<double>(ray.dir.z))};
 
-        const Vec3 V = RtNormalize(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
+        const Vec3 V = RtNormalize<double>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
         Vec3 L;
         float light_dist;
         if (light.directional) {
-            L = RtNormalize(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+            L = RtNormalize<double>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
             light_dist = RtMissDepth();
         } else {
             const Vec3 to{light.position.x - hit.x, light.position.y - hit.y,
                           light.position.z - hit.z};
-            L = RtNormalize(to);
+            L = RtNormalize<double>(to);
             light_dist = static_cast<float>(sqrt(
                 static_cast<double>(to.x) * to.x +
                 static_cast<double>(to.y) * to.y +
@@ -361,8 +178,8 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
         int lit = 1;
         float st;
         uint32_t sp;
-        ClosestHit(tlas_nodes, tlas_leaf_count, instances, sorigin, L, shadow_eps,
-                   &st, &sp);
+        ClosestHit<double>(tlas_nodes, tlas_leaf_count, instances, sorigin, L, shadow_eps,
+                           &st, &sp);
         if (sp != kNoPrim && st < light_dist - shadow_eps) {
             lit = 0;
         }
@@ -388,271 +205,9 @@ __global__ void RenderFrameKernel(PinholeCamera camera,
     out_prim[pixel] = prim_id;
 }
 
-// ---------------------------------------------------------------------------
-// BEAUTY PATH (stochastic): a SEPARATE kernel that reuses the SAME ClosestHit /
-// ReconstructHit nest as RenderFrame but adds jittered MSAA, soft area-sun
-// shadows, cosine AO + one-bounce GI, and a procedural sky/fog miss shader. It
-// writes only a tonemap-free linear `color` (+ the center-sample primary AOVs);
-// RenderFrame above is byte-untouched so the D1 sensor goldens stay green.
-// ---------------------------------------------------------------------------
-
-// PCG32-ish hash RNG: cheap, well-distributed, deterministic from (seed, counter)
-// so a fixed BeautyOptions::seed makes the whole frame reproducible run-to-run.
-__device__ __forceinline__ uint32_t PcgHash(uint32_t v) {
-    uint32_t state = v * 747796405u + 2891336453u;
-    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-struct BeautyRng {
-    uint32_t s;
-    __device__ __forceinline__ float NextF() {
-        s = PcgHash(s);
-        // 24-bit mantissa float in [0,1).
-        return static_cast<float>(s >> 8) * (1.0f / 16777216.0f);
-    }
-};
-
-// Orthonormal basis around a unit normal (Duff et al. 2017, branchless).
-__device__ __forceinline__ void OrthoBasis(const Vec3& n, Vec3* t, Vec3* b) {
-    const float sign = copysignf(1.0f, n.z);
-    const float a = -1.0f / (sign + n.z);
-    const float c = n.x * n.y * a;
-    *t = Vec3{1.0f + sign * n.x * n.x * a, sign * c, -sign * n.x};
-    *b = Vec3{c, sign + n.y * n.y * a, -n.y};
-}
-
-// Cosine-weighted hemisphere sample about `n` (Malley's method).
-__device__ __forceinline__ Vec3 CosineHemisphere(const Vec3& n, float u1, float u2) {
-    const float r = sqrtf(u1);
-    const float phi = 6.2831853071795864769f * u2;
-    const float x = r * cosf(phi);
-    const float y = r * sinf(phi);
-    const float z = sqrtf(fmaxf(0.0f, 1.0f - u1));
-    Vec3 t, b;
-    OrthoBasis(n, &t, &b);
-    return RtNormalize(Vec3{t.x * x + b.x * y + n.x * z,
-                            t.y * x + b.y * y + n.y * z,
-                            t.z * x + b.z * y + n.z * z});
-}
-
-// Sample a cone of half-angle `ang` about the unit axis `L` (soft sun disc).
-__device__ __forceinline__ Vec3 SampleCone(const Vec3& L, float ang, float u1, float u2) {
-    const float cos_max = cosf(ang);
-    const float cos_t = 1.0f - u1 * (1.0f - cos_max);
-    const float sin_t = sqrtf(fmaxf(0.0f, 1.0f - cos_t * cos_t));
-    const float phi = 6.2831853071795864769f * u2;
-    Vec3 t, b;
-    OrthoBasis(L, &t, &b);
-    const float x = sin_t * cosf(phi);
-    const float y = sin_t * sinf(phi);
-    return RtNormalize(Vec3{t.x * x + b.x * y + L.x * cos_t,
-                            t.y * x + b.y * y + L.y * cos_t,
-                            t.z * x + b.z * y + L.z * cos_t});
-}
-
-// Procedural sky + ground dome along a ray direction (the miss shader). Smooth
-// horizon blend; below-horizon fades to a neutral ground fill so bounce rays that
-// escape downward still pick up plausible fill instead of pure black.
-__device__ __forceinline__ Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
-    const float t = 0.5f * (dir.z + 1.0f);             // -1..1 -> 0..1
-    if (dir.z >= 0.0f) {
-        const float up = dir.z;                        // 0 horizon .. 1 zenith
-        const float w = up * up;                       // bias color toward horizon
-        return Vec3{sky.sky_bottom.x + (sky.sky_top.x - sky.sky_bottom.x) * w,
-                    sky.sky_bottom.y + (sky.sky_top.y - sky.sky_bottom.y) * w,
-                    sky.sky_bottom.z + (sky.sky_top.z - sky.sky_bottom.z) * w};
-    }
-    const float w = fminf(1.0f, -dir.z * 1.5f);
-    (void)t;
-    return Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
-                sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
-                sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
-}
-
-// Per-pixel hit at world point `hit` with viewer-faced normal `Nf`: K-ray soft
-// sun shadow + cosine AO/GI bounces. Returns the lit RGB (diffuse + specular +
-// indirect). Reuses the SAME ClosestHit nest for every secondary ray.
-__device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_nodes,
-                                            uint32_t tlas_leaf_count,
-                                            const DevInstance* __restrict__ instances,
-                                            const Material* __restrict__ materials,
-                                            Light light, BeautyParams sky,
-                                            const Vec3& hit, const Vec3& Nf, const Vec3& V,
-                                            const Material& mat, BeautyRng* rng) {
-    // Sun direction (toward the light) + a finite angular size -> penumbra.
-    Vec3 Ls;
-    if (light.directional) {
-        Ls = RtNormalize(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
-    } else {
-        Ls = RtNormalize(Vec3{light.position.x - hit.x, light.position.y - hit.y,
-                              light.position.z - hit.z});
-    }
-    const Vec3 light_col{light.color.x * light.intensity,
-                         light.color.y * light.intensity,
-                         light.color.z * light.intensity};
-    const float eps = 1.0e-3f;
-    const Vec3 sorigin{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
-
-    // Soft shadow: average visibility over K cone-sampled sun directions.
-    float vis = 0.0f;
-    const uint32_t K = sky.shadow_rays < 1u ? 1u : sky.shadow_rays;
-    for (uint32_t k = 0; k < K; ++k) {
-        const Vec3 Lk = SampleCone(Ls, sky.sun_angular_radius, rng->NextF(), rng->NextF());
-        if (Lk.x * Nf.x + Lk.y * Nf.y + Lk.z * Nf.z <= 0.0f) continue;
-        float st; uint32_t sp;
-        ClosestHit(tlas_nodes, tlas_leaf_count, instances, sorigin, Lk, eps, &st, &sp);
-        if (sp == kNoPrim) vis += 1.0f;
-    }
-    vis /= static_cast<float>(K);
-
-    const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
-    // Half vector for a GGX-ish specular highlight so the shell catches the sun.
-    Vec3 H = RtNormalize(Vec3{V.x + Ls.x, V.y + Ls.y, V.z + Ls.z});
-    const float NoH = fmaxf(0.0f, Nf.x * H.x + Nf.y * H.y + Nf.z * H.z);
-    const float alpha = fmaxf(1.0e-3f, mat.roughness * mat.roughness);
-    const float a2 = alpha * alpha;
-    const float dterm = NoH * NoH * (a2 - 1.0f) + 1.0f;
-    const float spec = (a2 / (3.14159265f * dterm * dterm)) * (0.04f + mat.metallic);
-
-    const float kd = (1.0f - mat.metallic) * (1.0f / 3.14159265f);
-    Vec3 direct{
-        light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
-        light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
-        light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
-
-    // AO + one-bounce GI: cosine-weighted hemisphere rays. A ray that escapes the
-    // AO radius (or misses) samples the sky dome; a near hit darkens the crease
-    // and (for GI) picks up the bounce albedo*shade of the hit surface.
-    Vec3 indirect{0.0f, 0.0f, 0.0f};
-    const uint32_t M = sky.ao_samples < 1u ? 1u : sky.ao_samples;
-    for (uint32_t m = 0; m < M; ++m) {
-        const Vec3 d = CosineHemisphere(Nf, rng->NextF(), rng->NextF());
-        const Vec3 ro{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
-        float bt; uint32_t bp;
-        ClosestHit(tlas_nodes, tlas_leaf_count, instances, ro, d, eps, &bt, &bp);
-        if (bp == kNoPrim || bt >= sky.ao_radius) {
-            // Open sky above -> sky-dome ambient (cosine already in the sample pdf).
-            const Vec3 s = SkyColor(d, sky);
-            indirect.x += s.x * sky.sky_intensity;
-            indirect.y += s.y * sky.sky_intensity;
-            indirect.z += s.z * sky.sky_intensity;
-            continue;
-        }
-        if (sky.gi_bounces == 0u) continue;  // AO only: occluded -> no light
-        // One bounce: re-shade the hit surface with a direct sun term (no further
-        // recursion) and add its albedo-weighted contribution.
-        Vec3 bn; float bu, bv;
-        ReconstructHit(instances, bp, ro, d, &bn, &bu, &bv);
-        const float bnv = bn.x * (-d.x) + bn.y * (-d.y) + bn.z * (-d.z);
-        Vec3 bnf = (bnv < 0.0f) ? Vec3{-bn.x, -bn.y, -bn.z} : bn;
-        uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
-        const Material bmat = materials[instances[bi].material_id];
-        const Vec3 bhit{ro.x + bt * d.x, ro.y + bt * d.y, ro.z + bt * d.z};
-        const Vec3 bso{bhit.x + bnf.x * eps, bhit.y + bnf.y * eps, bhit.z + bnf.z * eps};
-        float st2; uint32_t sp2;
-        ClosestHit(tlas_nodes, tlas_leaf_count, instances, bso, Ls, eps, &st2, &sp2);
-        const float bNoL = fmaxf(0.0f, bnf.x * Ls.x + bnf.y * Ls.y + bnf.z * Ls.z);
-        const float bvis = (sp2 == kNoPrim) ? 1.0f : 0.0f;
-        const float bfac = bNoL * bvis * (1.0f / 3.14159265f);
-        indirect.x += bmat.albedo.x * light_col.x * bfac;
-        indirect.y += bmat.albedo.y * light_col.y * bfac;
-        indirect.z += bmat.albedo.z * light_col.z * bfac;
-    }
-    const float inv_m = 1.0f / static_cast<float>(M);
-    indirect.x *= inv_m; indirect.y *= inv_m; indirect.z *= inv_m;
-
-    // Indirect modulates the surface albedo (Lambert response to ambient/bounce).
-    return Vec3{direct.x + mat.albedo.x * indirect.x,
-                direct.y + mat.albedo.y * indirect.y,
-                direct.z + mat.albedo.z * indirect.z};
-}
-
-// One thread per pixel: accumulate S jittered sub-pixel samples through the
-// stochastic shade. The CENTER sample also fills depth/normal/albedo/uv/prim so
-// the host RGBA8 conversion's prim-based hit test still classifies background.
-__global__ void RenderBeautyKernel(PinholeCamera camera,
-                                   const LbvhNode* __restrict__ tlas_nodes,
-                                   uint32_t tlas_leaf_count,
-                                   const DevInstance* __restrict__ instances,
-                                   const Material* __restrict__ materials,
-                                   Light light, BeautyParams sky, uint32_t samples,
-                                   uint32_t base_seed,
-                                   float* __restrict__ out_color,
-                                   float* __restrict__ out_depth,
-                                   float* __restrict__ out_normal,
-                                   float* __restrict__ out_albedo,
-                                   float* __restrict__ out_uv,
-                                   uint32_t* __restrict__ out_prim) {
-    const uint32_t px = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t py = blockIdx.y * blockDim.y + threadIdx.y;
-    if (px >= camera.width || py >= camera.height) return;
-    const uint32_t pixel = py * camera.width + px;
-
-    BeautyRng rng{PcgHash(base_seed ^ (pixel * 2654435761u))};
-    const uint32_t S = samples < 1u ? 1u : samples;
-
-    Vec3 accum{0.0f, 0.0f, 0.0f};
-    float c_depth = RtMissDepth();
-    Vec3 c_normal{0.0f, 0.0f, 0.0f}, c_albedo{0.0f, 0.0f, 0.0f};
-    float c_u = 0.0f, c_v = 0.0f;
-    uint32_t c_prim = kNoPrim;
-
-    for (uint32_t s = 0; s < S; ++s) {
-        // Sub-pixel jitter in [-0.5,0.5]; sample 0 uses center for the AOV fill.
-        const float jx = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
-        const float jy = (s == 0u) ? 0.0f : (rng.NextF() - 0.5f);
-        const Ray ray = camera.GenerateRayJitter(px, py, jx, jy);
-
-        float bt; uint32_t bp;
-        ClosestHit(tlas_nodes, tlas_leaf_count, instances, ray.origin, ray.dir, 0.0f,
-                   &bt, &bp);
-        if (bp == kNoPrim) {
-            const Vec3 miss = SkyColor(ray.dir, sky);
-            accum.x += miss.x; accum.y += miss.y; accum.z += miss.z;
-            continue;
-        }
-        Vec3 n; float u, v;
-        ReconstructHit(instances, bp, ray.origin, ray.dir, &n, &u, &v);
-        const float nv = n.x * (-ray.dir.x) + n.y * (-ray.dir.y) + n.z * (-ray.dir.z);
-        const Vec3 Nf = (nv < 0.0f) ? Vec3{-n.x, -n.y, -n.z} : n;
-        uint32_t inst, lp; UnpackPrimId(bp, &inst, &lp);
-        const Material mat = materials[instances[inst].material_id];
-        const Vec3 hit{ray.origin.x + bt * ray.dir.x, ray.origin.y + bt * ray.dir.y,
-                       ray.origin.z + bt * ray.dir.z};
-        const Vec3 Vv = RtNormalize(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
-        Vec3 col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
-                               light, sky, hit, Nf, Vv, mat, &rng);
-        // Height/distance fog toward the sky-horizon: blend by 1-exp(-density*t).
-        if (sky.fog_density > 0.0f) {
-            const float f = 1.0f - expf(-sky.fog_density * bt);
-            col.x += (sky.fog_color.x - col.x) * f;
-            col.y += (sky.fog_color.y - col.y) * f;
-            col.z += (sky.fog_color.z - col.z) * f;
-        }
-        accum.x += col.x; accum.y += col.y; accum.z += col.z;
-
-        if (s == 0u) {
-            c_depth = bt; c_normal = n; c_albedo = mat.albedo;
-            c_u = u; c_v = v; c_prim = bp;
-        }
-    }
-
-    const float inv_s = 1.0f / static_cast<float>(S);
-    out_color[pixel * 3u + 0u] = accum.x * inv_s;
-    out_color[pixel * 3u + 1u] = accum.y * inv_s;
-    out_color[pixel * 3u + 2u] = accum.z * inv_s;
-    out_depth[pixel] = c_depth;
-    out_normal[pixel * 3u + 0u] = c_normal.x;
-    out_normal[pixel * 3u + 1u] = c_normal.y;
-    out_normal[pixel * 3u + 2u] = c_normal.z;
-    out_albedo[pixel * 3u + 0u] = c_albedo.x;
-    out_albedo[pixel * 3u + 1u] = c_albedo.y;
-    out_albedo[pixel * 3u + 2u] = c_albedo.z;
-    out_uv[pixel * 2u + 0u] = c_u;
-    out_uv[pixel * 2u + 1u] = c_v;
-    out_prim[pixel] = c_prim;
-}
+// The stochastic FP32 beauty kernel (RenderBeautyKernel + ShadeBeauty + helpers)
+// lives in two_level_render_beauty.cu (--fmad=true, Real=float). It shares the
+// nested-traversal fns above; this TU keeps only the host build + launch path.
 
 // Per-prim AABB for a LOCAL mesh primitive (BLAS build). Same as scene_render.cu.
 collision::AABB TriAabb(const TrianglePrim& t) {
@@ -915,17 +470,8 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
 
 namespace {
 
-// AOV destination pointers for ONE frame (raw device pointers). The kernel writes
-// these in place; the caller supplies either internal scratch (host-download path)
-// or its own resident buffers (RenderFrameToAovs). null skips that channel.
-struct AovTarget {
-    float* color = nullptr;
-    float* depth = nullptr;
-    float* normal = nullptr;
-    float* albedo = nullptr;
-    float* uv = nullptr;
-    uint32_t* prim = nullptr;
-};
+// AovTarget (raw per-channel device pointers; null skips a channel) is shared
+// with the beauty TU via two_level_render_kernels.cuh.
 
 // Build the per-frame TLAS and launch the closest-hit kernel into `dst`, on the
 // resolved device + stream. The ONLY thing that varies between the host-download
@@ -1062,13 +608,10 @@ FrameTlas LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.fog_density = opt.fog_density;
     sky.sky_intensity = opt.sky_intensity;
 
-    const dim3 block(kBlockDim, kBlockDim);
-    const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
-                    (camera.height + kBlockDim - 1u) / kBlockDim);
-    RenderBeautyKernel<<<grid, block, 0, ctx.stream>>>(
-        camera, frame.tlas_nodes, frame.inst_count, frame.instances, frame.materials,
-        scene.light, sky, opt.samples, opt.seed,
-        dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
+    // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
+    LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,
+                       frame.materials, scene.light, sky, opt.samples, opt.seed, dst,
+                       ctx.stream);
     CheckCuda(cudaGetLastError(), "RenderBeautyKernel launch");
     return frame;
 }
@@ -1117,12 +660,14 @@ Framebuffer RenderBeauty(TwoLevelSceneDevice& device,
     (void)frame;
     cudaStreamSynchronize(ctx.stream);
 
-    d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
-    d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
-    d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
-    d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
-    d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
-    d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
+    // Download only the masked channels; the rest stay device-resident.
+    const BeautyDownloadMask mask;
+    if (mask.color) d_color.CopyToHost(fb.color.data(), pixels * 3u * sizeof(float));
+    if (mask.depth) d_depth.CopyToHost(fb.depth.data(), pixels * sizeof(float));
+    if (mask.normal) d_normal.CopyToHost(fb.normal.data(), pixels * 3u * sizeof(float));
+    if (mask.albedo) d_albedo.CopyToHost(fb.albedo.data(), pixels * 3u * sizeof(float));
+    if (mask.uv) d_uv.CopyToHost(fb.uv.data(), pixels * 2u * sizeof(float));
+    if (mask.prim) d_prim.CopyToHost(fb.prim.data(), pixels * sizeof(uint32_t));
     return fb;
 }
 

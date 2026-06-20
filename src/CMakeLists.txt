@@ -1073,6 +1073,33 @@ if(CMAKE_CUDA_COMPILER)
         PUBLIC
             ${CMAKE_SOURCE_DIR}/src
     )
+
+    # The FP32 BEAUTY translation unit of the two-level tracer is a DEDICATED lib
+    # so --fmad=true (FMA on) applies ONLY here, NEVER folded into the byte-exact
+    # golden lib above (which keeps --fmad=false). The beauty kernel instantiates
+    # the shared nested-traversal fns with Real=float for full FP32+FMA trace rate;
+    # the golden kernel + host oracle stay FP64. Linked into nuka_phi2_rt so callers
+    # resolve LaunchBeautyKernel transparently.
+    add_library(nuka_phi2_rt_beauty STATIC
+        phi/backend_cuda/rt/two_level_render_beauty.cu
+    )
+    set_target_properties(nuka_phi2_rt_beauty PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(nuka_phi2_rt_beauty PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=true>
+    )
+    target_include_directories(nuka_phi2_rt_beauty
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_phi2_rt_beauty
+        PUBLIC
+            nuka_collision
+            nuka_collision_gpu
+            nuka_phi
+            nuka_phi2
+            CUDA::cudart
+    )
+
     target_link_libraries(nuka_phi2_rt
         PUBLIC
             nuka_collision
@@ -1082,6 +1109,7 @@ if(CMAKE_CUDA_COMPILER)
             # nuka_phi stays for the scoped device guard (BUF-14).
             nuka_phi
             nuka_phi2
+            nuka_phi2_rt_beauty
             CUDA::cudart
     )
 
