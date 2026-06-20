@@ -22,6 +22,7 @@
 
 #include "math/vec3.hpp"
 
+#include <cmath>
 #include <cstdint>
 
 #if defined(__CUDACC__)
@@ -112,32 +113,53 @@ struct PinholeCamera {
     }
 };
 
+// Unit-length normalize matching math::Vec3::Normalized bit-for-bit (sqrtf is the
+// correctly-rounded IEEE op on host and device; len<1e-12 -> zero), HD so the same
+// basis math runs on the host AND in the device camera-mount kernel.
+NUKA_RT_HD inline math::Vec3 NormalizeVec(const math::Vec3& v) {
+    const float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len < 1e-12f) return math::Vec3{};
+    return math::Vec3{v.x / len, v.y / len, v.z / len};
+}
+
+// Build the pinhole basis from an eye + a forward + an up reference: forward and
+// right span the image plane, up is re-orthogonalized. ONE shared math the host
+// BuildPinhole and the device camera-mount kernel both call (no duplicated basis).
+NUKA_RT_HD inline PinholeCamera BuildPinholeBasis(math::Vec3 eye,
+                                                  math::Vec3 forward_dir,
+                                                  math::Vec3 up_ref,
+                                                  float vfov_radians,
+                                                  uint32_t width,
+                                                  uint32_t height) {
+    PinholeCamera cam;
+    cam.origin = eye;
+    cam.width = width;
+    cam.height = height;
+
+    const math::Vec3 fwd = NormalizeVec(forward_dir);
+    const math::Vec3 rgt = NormalizeVec(fwd.Cross(up_ref));
+    const math::Vec3 up = NormalizeVec(rgt.Cross(fwd));
+    cam.forward = fwd;
+    cam.right = rgt;
+    cam.up = up;
+
+    cam.half_h = tanf(0.5f * vfov_radians);
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    cam.half_w = cam.half_h * aspect;
+    return cam;
+}
+
 // Build a pinhole camera looking from `eye` toward `target`, with `world_up`
 // defining roll. `vfov_radians` is the FULL vertical field of view. The image is
-// `width` x `height`; aspect = width/height. HOST-only (uses sqrt via Vec3); the
-// resulting struct is then device-callable. Deterministic (no RNG).
+// `width` x `height`; aspect = width/height. Delegates to BuildPinholeBasis with
+// forward = target - eye. Deterministic (no RNG).
 inline PinholeCamera BuildPinhole(math::Vec3 eye,
                                   math::Vec3 target,
                                   math::Vec3 world_up,
                                   float vfov_radians,
                                   uint32_t width,
                                   uint32_t height) {
-    PinholeCamera cam;
-    cam.origin = eye;
-    cam.width = width;
-    cam.height = height;
-
-    const math::Vec3 fwd = (target - eye).Normalized();
-    const math::Vec3 rgt = fwd.Cross(world_up).Normalized();
-    const math::Vec3 up = rgt.Cross(fwd).Normalized();
-    cam.forward = fwd;
-    cam.right = rgt;
-    cam.up = up;
-
-    cam.half_h = std::tan(0.5f * vfov_radians);
-    const float aspect = static_cast<float>(width) / static_cast<float>(height);
-    cam.half_w = cam.half_h * aspect;
-    return cam;
+    return BuildPinholeBasis(eye, target - eye, world_up, vfov_radians, width, height);
 }
 
 } // namespace nuka::rt

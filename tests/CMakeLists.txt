@@ -1579,6 +1579,36 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_batched_sensor_render_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Per-env camera-mount gate: ScatterEnvCameras builds each env's pinhole
+    # camera on device from cam_world = fk(pose) * local_offset (USD/Isaac axes).
+    # Asserts the device cameras are byte-identical to the host fk*local_offset
+    # composition + shared BuildPinholeBasis over Link/Body/Base/Static + >=3 envs,
+    # then drives the batched trace with the scatter-built cameras (non-empty render
+    # + per-env tile == E=1 render). A .cu; --fmad=false + host -ffp-contract=off.
+    add_executable(nuka_rt_sensor_camera_test
+        rt/test_sensor_camera.cu
+    )
+    target_compile_options(nuka_rt_sensor_camera_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_sensor_camera_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_sensor_camera_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_cooker
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_sensor_camera_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Batched device-resident RGB-sensor FEASIBILITY bench. Measures the
     # per-env-TLAS render path (BuildTwoLevelScene + RenderFrameToAovs, the cheap
     # flat trace) across N envs x resolution and decomposes TLAS build/refit vs
