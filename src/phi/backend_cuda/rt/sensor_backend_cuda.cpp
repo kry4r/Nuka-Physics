@@ -92,6 +92,11 @@ public:
         rt::SetRenderDr(handle->scene, cfg, env_count, backend_);
     }
 
+    void SetSensorFidelity(SensorSceneHandle* handle,
+                           const rt::SensorFidelityConfig& cfg) override {
+        rt::SetSensorFidelity(handle->scene, cfg);
+    }
+
     void FreeSensorScene(SensorSceneHandle* handle) override { delete handle; }
 
 private:

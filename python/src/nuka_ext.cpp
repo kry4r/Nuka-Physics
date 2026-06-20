@@ -454,6 +454,30 @@ public:
               "nuka_world_set_render_randomization");
     }
 
+    // Opt-in sensor RGB shading fidelity: lift the batched RGB to the beauty look
+    // (MSAA spp + soft shadow + AO + GI + tonemap) for a vision policy. Default ==
+    // cheap shade (a byte no-op). Deterministic + seeded. Requires a camera attached.
+    void set_sensor_fidelity(uint32_t spp, uint32_t shadow_samples,
+                             float sun_angular_radius, bool ao_enabled,
+                             uint32_t ao_samples, float ao_radius, bool gi_enabled,
+                             bool tonemap_enabled, float sky_intensity,
+                             float fog_density, uint64_t seed) {
+        nuka_sensor_fidelity_desc_t desc{};
+        desc.spp = spp;
+        desc.shadow_samples = shadow_samples;
+        desc.sun_angular_radius = sun_angular_radius;
+        desc.ao_enabled = ao_enabled ? 1 : 0;
+        desc.ao_samples = ao_samples;
+        desc.ao_radius = ao_radius;
+        desc.gi_enabled = gi_enabled ? 1 : 0;
+        desc.tonemap_enabled = tonemap_enabled ? 1 : 0;
+        desc.sky_intensity = sky_intensity;
+        desc.fog_density = fog_density;
+        desc.seed = seed;
+        check(nuka_world_set_sensor_fidelity(h_, &desc),
+              "nuka_world_set_sensor_fidelity");
+    }
+
 private:
     World(nuka_world_handle h, uint32_t ec, uint32_t blc, float dt)
         : h_(h), env_count_(ec), base_link_count_(blc), dt_(dt) {}
@@ -1324,6 +1348,37 @@ NB_MODULE(_nuka_ext, m) {
             "replicas (cross-env byte-identical). A pure function of (seed, env, "
             "axis) -- the same seed yields the same bytes (RL-reproducible). Requires "
             "a camera attached; safe to re-call per reset.")
+        // Opt-in sensor RGB shading fidelity (the sim2real lever for a vision
+        // policy): lift the batched RGB to the single-camera beauty look.
+        .def(
+            "set_sensor_fidelity",
+            [](World& w, uint32_t spp, uint32_t shadow_samples,
+               float sun_angular_radius, bool ao_enabled, uint32_t ao_samples,
+               float ao_radius, bool gi_enabled, bool tonemap_enabled,
+               float sky_intensity, float fog_density, uint64_t seed) {
+                w.set_sensor_fidelity(spp, shadow_samples, sun_angular_radius,
+                                      ao_enabled, ao_samples, ao_radius, gi_enabled,
+                                      tonemap_enabled, sky_intensity, fog_density,
+                                      seed);
+            },
+            nb::arg("spp") = 4u, nb::arg("shadow_samples") = 4u,
+            nb::arg("sun_angular_radius") = 0.04f, nb::arg("ao_enabled") = true,
+            nb::arg("ao_samples") = 3u, nb::arg("ao_radius") = 0.6f,
+            nb::arg("gi_enabled") = true, nb::arg("tonemap_enabled") = true,
+            nb::arg("sky_intensity") = 0.0f, nb::arg("fog_density") = 0.0f,
+            nb::arg("seed") = 0x9e3779b9u,
+            "Enable opt-in sensor RGB shading fidelity: the batched RGB shades flat "
+            "(1 spp, 1 hard shadow) by default; this lifts it to the single-camera "
+            "beauty look -- MSAA (spp jittered samples), soft sun shadow "
+            "(shadow_samples across sun_angular_radius), ambient occlusion + "
+            "one-bounce GI (ao_*/gi_enabled), and an ACES-ish tonemap. The default "
+            "World shade (no call, or spp<=1 with everything off) is the cheap shade "
+            "(the AOV bytes are unchanged). depth/normal/albedo/prim always come from "
+            "the center ray. Deterministic + seeded: the samples derive from "
+            "Philox(seed, env, sensor, pixel, sample), so the same seed yields the "
+            "same bytes. spp/shadow_samples/ao_samples are capped at 256. Requires a "
+            "camera attached; safe to re-call per reset. Textures are not yet "
+            "applied (a follow-on); this is lighting/shading + anti-aliasing.")
         // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
         // the autograd layer uses to push a mass param tensor INTO the sim).
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),
