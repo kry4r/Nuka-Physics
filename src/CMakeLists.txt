@@ -261,6 +261,8 @@ target_link_libraries(nuka_render
 
 nuka_set_warnings(nuka_render)
 
+add_subdirectory(rhi)
+
 # ---------------------------------------------------------------------------
 # nuka_imgui (M8.5 T1) -- the nuka-side Dear ImGui glue + custom theme.
 #
