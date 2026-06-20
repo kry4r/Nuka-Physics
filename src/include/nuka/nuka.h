@@ -527,13 +527,15 @@ typedef enum nuka_sensor_mount_t {
 } nuka_sensor_mount_t;
 
 // AOV channel the sensor view returns: 0 color(3) 1 depth(1) 2 normal(3) 3
-// albedo(3) 4 prim(1, uint32). Mirrors the batched AOV tensor planes.
+// albedo(3) 4 prim(1, uint32). RANGE(5) is the lidar plane (1 float per (az,el)
+// cell of the (E,S,az,el) range tensor); reshape it with nuka_world_get_lidar_dims.
 typedef enum nuka_sensor_channel_t {
     NUKA_SENSOR_CHANNEL_COLOR = 0,
     NUKA_SENSOR_CHANNEL_DEPTH = 1,
     NUKA_SENSOR_CHANNEL_NORMAL = 2,
     NUKA_SENSOR_CHANNEL_ALBEDO = 3,
-    NUKA_SENSOR_CHANNEL_PRIM = 4
+    NUKA_SENSOR_CHANNEL_PRIM = 4,
+    NUKA_SENSOR_CHANNEL_RANGE = 5
 } nuka_sensor_channel_t;
 
 // Build the world's batched sensor scene from its cooked visual instances (the
@@ -581,6 +583,43 @@ nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
                                          uint32_t* height,
                                          uint32_t* width,
                                          uint32_t* channels);
+
+// Device-resident batched lidar/range sensor: S lidars per env, each an (az,el)
+// ray fan, rendered into a single (env_count, sensors_per_env, az_count, el_count)
+// device RANGE tensor on the SAME RT TLAS the cameras use. A lidar ray and a camera
+// ray are both (origin, unit dir) -> ClosestHit -> distance; the lidar writes that
+// distance (miss -> max_range, clamped to [min_range, max_range]) instead of an
+// image. The range is read zero-copy via nuka_world_get_sensor_view(RANGE).
+
+// Attach a lidar mounted on `mount_frame`[mount_index] offset by `local_offset`
+// (px,py,pz, qw,qx,qy,qz). The fan sweeps az_count*el_count rays: az in
+// [az_min,az_max] about the local +Z axis, el in [el_min,el_max] toward local +Z
+// (az=el=0 => local +X). Ranges clamp to [min_range,max_range]. Re-callable: a lidar
+// attach REPLACES the world's lidar set (one (E,S,az,el) tensor needs one fan).
+// NOT_SUPPORTED if the engine has no RT sensor backend or the scene has no geometry;
+// INVALID_ARG on a zero fan / non-positive max_range / max_range<=min_range.
+nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
+                                             nuka_sensor_mount_t mount_frame,
+                                             uint32_t mount_index,
+                                             const float local_offset[7],
+                                             uint32_t az_count,
+                                             uint32_t el_count,
+                                             float az_min,
+                                             float az_max,
+                                             float el_min,
+                                             float el_max,
+                                             float min_range,
+                                             float max_range);
+
+// The attached lidar set's logical shape: env_count, sensors_per_env (S lidars per
+// env), and the per-lidar az_count/el_count fan. Any out-pointer may be NULL. Valid
+// after a lidar attach (no render needed). NOT_SUPPORTED if no lidar is attached.
+// The RANGE view reshapes to (env_count, sensors_per_env, az_count, el_count).
+nuka_result_t nuka_world_get_lidar_dims(nuka_world_handle world,
+                                        uint32_t* env_count,
+                                        uint32_t* sensors_per_env,
+                                        uint32_t* az_count,
+                                        uint32_t* el_count);
 
 // ---------------------------------------------------------------------------
 // Per-env render domain randomization: give each env its OWN appearance (material

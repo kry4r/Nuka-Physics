@@ -119,6 +119,55 @@ nuka::scene::SensorDesc MakeCameraSensorDesc(nuka_sensor_mount_t mount_frame,
     return s;
 }
 
+// Lower the c_abi mount enum + offset + fan to one lidar's SensorDesc. The (az,el)
+// angles ride the LidarPattern (radians, the engine's convention). attach replaces
+// the lidar set with these (one rectangular (E,S,az,el) fan per world).
+nuka::scene::SensorDesc MakeLidarSensorDesc(nuka_sensor_mount_t mount_frame,
+                                            uint32_t mount_index,
+                                            const float local_offset[7],
+                                            uint32_t az_count, uint32_t el_count,
+                                            float az_min, float az_max, float el_min,
+                                            float el_max, float min_range,
+                                            float max_range) {
+    nuka::scene::SensorDesc s;
+    s.type = nuka::scene::SensorType::Lidar;
+    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);  // 0=Link,1=Body,2=Base.
+    s.mount_index = mount_index;
+    if (local_offset != nullptr) {
+        s.local_offset.position.x = local_offset[0];
+        s.local_offset.position.y = local_offset[1];
+        s.local_offset.position.z = local_offset[2];
+        s.local_offset.rotation.w = local_offset[3];
+        s.local_offset.rotation.x = local_offset[4];
+        s.local_offset.rotation.y = local_offset[5];
+        s.local_offset.rotation.z = local_offset[6];
+    }
+    s.lidar.az_count = static_cast<uint16_t>(az_count);
+    s.lidar.el_count = static_cast<uint16_t>(el_count);
+    s.lidar.az_min = az_min;
+    s.lidar.az_max = az_max;
+    s.lidar.el_min = el_min;
+    s.lidar.el_max = el_max;
+    s.lidar.min_range = min_range;
+    s.lidar.max_range = max_range;
+    return s;
+}
+
+// Partition a sensor list by type: the camera subset and the lidar subset (the two
+// independent mount tables on one scene). Order within each subset is preserved.
+void SplitSensors(const std::vector<nuka::scene::SensorDesc>& all,
+                  std::vector<nuka::scene::SensorDesc>* cams,
+                  std::vector<nuka::scene::SensorDesc>* lidars) {
+    for (const nuka::scene::SensorDesc& s : all) {
+        if (s.type == nuka::scene::SensorType::Lidar ||
+            s.type == nuka::scene::SensorType::RangeScan) {
+            lidars->push_back(s);
+        } else {
+            cams->push_back(s);
+        }
+    }
+}
+
 }  // namespace
 
 }  // namespace nuka::c_abi
@@ -162,13 +211,22 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         }
 
         // Append this camera to the world's mount list (S cameras per env, one
-        // (E,S,H,W) block). A re-attach at the SAME w/h adds another sensor; a
-        // different w/h would make the tensor ragged, so it RESETS to a fresh
-        // single-camera set (the documented re-callable contract).
+        // (E,S,H,W) block). A re-attach at the SAME w/h adds another camera; a
+        // different w/h would make the AOV tensor ragged, so it RESETS to a fresh
+        // single-camera set (the documented re-callable contract). Any attached
+        // LIDARS ride the same scene and are always carried over (they are a
+        // separate tensor unaffected by the camera image size).
         const bool same_size = record->sensor && record->sensor->width == width &&
                                record->sensor->height == height;
-        if (same_size) {
-            desc.sensors = record->sensor->sensors;
+        if (record->sensor) {
+            std::vector<nuka::scene::SensorDesc> prev_cams, prev_lidars;
+            nuka::c_abi::SplitSensors(record->sensor->sensors, &prev_cams, &prev_lidars);
+            if (same_size) {
+                desc.sensors = prev_cams;
+            }
+            for (const nuka::scene::SensorDesc& l : prev_lidars) {
+                desc.sensors.push_back(l);
+            }
         }
         desc.sensors.push_back(nuka::c_abi::MakeCameraSensorDesc(
             mount_frame, mount_index, local_offset, vfov_deg, width, height));
@@ -198,6 +256,110 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         attach->rendered = false;
         attach->render_dr = carry_dr;
         attach->fidelity = carry_fid;
+        // Carry the lidar fan dims forward (the lidar set is unchanged by a camera
+        // attach); the backend's RangeShape is filled only after a lidar render, so
+        // read the fan from the carried lidar descs directly.
+        for (const nuka::scene::SensorDesc& s : attach->sensors) {
+            if (s.type == nuka::scene::SensorType::Lidar ||
+                s.type == nuka::scene::SensorType::RangeScan) {
+                attach->lidar_az = s.lidar.az_count;
+                attach->lidar_el = s.lidar.el_count;
+                ++attach->lidars_per_env;
+            }
+        }
+        if (carry_dr.enabled) {
+            attach->backend->SetRenderDr(attach->handle, carry_dr,
+                                         record->world->EnvCount());
+        }
+        if (carry_fid.Enabled()) {
+            attach->backend->SetSensorFidelity(attach->handle, carry_fid);
+        }
+        record->sensor = std::move(attach);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
+                                             nuka_sensor_mount_t mount_frame,
+                                             uint32_t mount_index,
+                                             const float local_offset[7],
+                                             uint32_t az_count,
+                                             uint32_t el_count,
+                                             float az_min,
+                                             float az_max,
+                                             float el_min,
+                                             float el_max,
+                                             float min_range,
+                                             float max_range) {
+    if (mount_frame > NUKA_SENSOR_MOUNT_BASE) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (az_count == 0u || el_count == 0u || max_range <= 0.0f ||
+        max_range <= min_range || min_range < 0.0f) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->scene) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    try {
+        std::unique_ptr<nuka::render::SensorBackendI> backend =
+            nuka::render::CreateCudaSensorBackend();
+        if (!backend) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+
+        nuka::render::SensorSceneDesc desc;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene, record->world->EnvCount(),
+                                               &desc)) {
+            return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
+        }
+
+        // A lidar attach REPLACES the world's lidar set (one rectangular fan), while
+        // any attached CAMERAS ride the same scene and are carried over unchanged.
+        uint32_t carry_w = 0u, carry_h = 0u;
+        nuka::rt::RenderDrConfig carry_dr;
+        nuka::rt::SensorFidelityConfig carry_fid;
+        if (record->sensor) {
+            std::vector<nuka::scene::SensorDesc> prev_cams, prev_lidars;
+            nuka::c_abi::SplitSensors(record->sensor->sensors, &prev_cams, &prev_lidars);
+            desc.sensors = prev_cams;
+            carry_w = record->sensor->width;
+            carry_h = record->sensor->height;
+            carry_dr = record->sensor->render_dr;
+            carry_fid = record->sensor->fidelity;
+        }
+        desc.sensors.push_back(nuka::c_abi::MakeLidarSensorDesc(
+            mount_frame, mount_index, local_offset, az_count, el_count, az_min, az_max,
+            el_min, el_max, min_range, max_range));
+
+        nuka::render::SensorSceneHandle* handle = backend->BuildSensorScene(desc);
+        if (handle == nullptr) {
+            return NUKA_RESULT_INTERNAL;
+        }
+
+        auto attach = std::make_unique<nuka::c_abi::SensorAttachment>();
+        attach->backend = std::move(backend);
+        attach->handle = handle;
+        attach->sensors = std::move(desc.sensors);
+        attach->width = carry_w;
+        attach->height = carry_h;
+        attach->rendered = false;
+        attach->render_dr = carry_dr;
+        attach->fidelity = carry_fid;
+        attach->lidar_az = az_count;
+        attach->lidar_el = el_count;
+        attach->lidars_per_env = 1u;
         if (carry_dr.enabled) {
             attach->backend->SetRenderDr(attach->handle, carry_dr,
                                          record->world->EnvCount());
@@ -242,8 +404,12 @@ nuka_result_t nuka_world_render_sensors(nuka_world_handle world) {
         // ops so it never reads torn/stale poses.
         fk.world_backend = w.Backend();
 
+        // Render whichever sensors the handle carries: cameras into the AOV tensor,
+        // lidars into the range tensor. Each call is a no-op if that kind is absent,
+        // so a camera-only / lidar-only / mixed world all step the same path.
         nuka::c_abi::SensorAttachment& s = *record->sensor;
         s.backend->RenderSensors(s.handle, fk, w.EnvCount(), s.width, s.height);
+        s.backend->RenderLidars(s.handle, fk, w.EnvCount());
         s.rendered = true;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -265,7 +431,7 @@ nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
     out->element_count = 0u;
     out->element_stride_bytes = 0u;
     out->dtype = 0u;
-    if (channel > NUKA_SENSOR_CHANNEL_PRIM) {
+    if (channel > NUKA_SENSOR_CHANNEL_RANGE) {
         return NUKA_RESULT_INVALID_ARG;
     }
 
@@ -313,6 +479,14 @@ nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
                 stride = sizeof(uint32_t);
                 dtype = 1u;  // uint32 plane (the per-pixel instance/prim id).
                 break;
+            case NUKA_SENSOR_CHANNEL_RANGE: {
+                // The lidar range tensor (E,S,az,el): one float per fan cell.
+                const nuka::render::SensorRangeShape rs = s.backend->RangeShape(s.handle);
+                ptr = s.backend->SensorRangeDevice(s.handle);
+                element_count = static_cast<uint64_t>(rs.env_count) *
+                                rs.sensors_per_env * rs.az_count * rs.el_count;
+                break;
+            }
         }
         if (ptr == nullptr) {
             return NUKA_RESULT_NOT_SUPPORTED;
@@ -348,14 +522,45 @@ nuka_result_t nuka_world_get_sensor_dims(nuka_world_handle world,
     // The AOV tensor is (env_count, sensors_per_env, H, W). `channels` is the
     // per-pixel count of the color/normal/albedo planes (depth/prim are 1); the
     // caller derives a plane's exact ch from its view element_count if it differs.
+    // sensors_per_env is the CAMERA count (the AOV tensor's S); a lidar in the same
+    // list rides a separate range tensor (nuka_world_get_lidar_dims), so it is not
+    // counted here.
     const nuka::c_abi::SensorAttachment& s = *record->sensor;
-    if (env_count != nullptr) *env_count = record->world->EnvCount();
-    if (sensors_per_env != nullptr) {
-        *sensors_per_env = static_cast<uint32_t>(s.sensors.size());
+    uint32_t cam_count = 0u;
+    for (const nuka::scene::SensorDesc& sd : s.sensors) {
+        if (sd.type != nuka::scene::SensorType::Lidar &&
+            sd.type != nuka::scene::SensorType::RangeScan) {
+            ++cam_count;
+        }
     }
+    if (env_count != nullptr) *env_count = record->world->EnvCount();
+    if (sensors_per_env != nullptr) *sensors_per_env = cam_count;
     if (height != nullptr) *height = s.height;
     if (width != nullptr) *width = s.width;
     if (channels != nullptr) *channels = 3u;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_lidar_dims(nuka_world_handle world,
+                                        uint32_t* env_count,
+                                        uint32_t* sensors_per_env,
+                                        uint32_t* az_count,
+                                        uint32_t* el_count) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr ||
+        record->sensor->lidars_per_env == 0u) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no lidar attached.
+    }
+    // The range tensor is (env_count, sensors_per_env, az_count, el_count). Valid
+    // after a lidar attach (the fan is fixed by the pattern, no render needed).
+    const nuka::c_abi::SensorAttachment& s = *record->sensor;
+    if (env_count != nullptr) *env_count = record->world->EnvCount();
+    if (sensors_per_env != nullptr) *sensors_per_env = s.lidars_per_env;
+    if (az_count != nullptr) *az_count = s.lidar_az;
+    if (el_count != nullptr) *el_count = s.lidar_el;
     return NUKA_RESULT_OK;
 }
 

@@ -21,17 +21,23 @@
 
 #include "phi/backend.hpp"  // ActiveBackend / InitBestDevice
 #include "phi/backend_cuda/rt/batched_sensor_render.hpp"
+#include "scene/scene_ir.hpp"  // scene::SensorDesc / SensorType (split cam vs lidar)
 
 #include <memory>
+#include <vector>
 
 namespace nuka::render {
 
 // The opaque sensor scene handle owns the persistent batched scene device state
-// (BLAS once + the env-shared binding + per-env TLAS scratch + the device AOV
-// tensor + the mount table + the device camera buffer) plus the last shape.
+// (BLAS once + the env-shared binding + per-env TLAS scratch + the device AOV +
+// range tensors + the camera/lidar mount tables) plus the last shapes. ONE scene/
+// TLAS serves both cameras and lidars; the two mount tables are independent.
 struct SensorSceneHandle {
     rt::BatchedSensorSceneDevice scene;
     SensorAovShape shape;
+    SensorRangeShape range_shape;
+    bool has_cameras = false;
+    bool has_lidars = false;
 };
 
 namespace {
@@ -49,9 +55,28 @@ public:
         cuda_desc.blas_id = desc.blas_id;
         cuda_desc.material_id = desc.material_id;
 
+        // Split the type-tagged mount list: cameras and lidars ride the SAME scene/
+        // TLAS but their own mount tables (one range trace, one AOV trace).
+        std::vector<scene::SensorDesc> cams, lidars;
+        for (const scene::SensorDesc& s : desc.sensors) {
+            if (s.type == scene::SensorType::Lidar ||
+                s.type == scene::SensorType::RangeScan) {
+                lidars.push_back(s);
+            } else {
+                cams.push_back(s);
+            }
+        }
+
         auto handle = std::make_unique<SensorSceneHandle>();
         handle->scene = rt::BuildBatchedSensorScene(cuda_desc, backend_);
-        rt::SetSensorMounts(handle->scene, desc.sensors);
+        if (!cams.empty()) {
+            rt::SetSensorMounts(handle->scene, cams);
+            handle->has_cameras = true;
+        }
+        if (!lidars.empty()) {
+            rt::SetLidarMounts(handle->scene, lidars);
+            handle->has_lidars = true;
+        }
         return handle.release();
     }
 
@@ -60,11 +85,34 @@ public:
                        uint32_t env_count,
                        uint32_t width,
                        uint32_t height) override {
+        if (!handle->has_cameras) {
+            return;  // a lidar-only handle has no AOV tensor to fill.
+        }
         rt::RenderSensorsMounted(handle->scene, fk, env_count, width, height, backend_);
         handle->shape.env_count = env_count;
         handle->shape.sensors_per_env = rt::SensorsPerEnv(handle->scene);
         handle->shape.height = height;
         handle->shape.width = width;
+    }
+
+    void RenderLidars(SensorSceneHandle* handle, const phi::ScatterFkSource& fk,
+                      uint32_t env_count) override {
+        if (!handle->has_lidars) {
+            return;  // a camera-only handle has no range tensor to fill.
+        }
+        rt::RenderLidarsMounted(handle->scene, fk, env_count, backend_);
+        handle->range_shape.env_count = env_count;
+        handle->range_shape.sensors_per_env = rt::LidarsPerEnv(handle->scene);
+        handle->range_shape.az_count = rt::LidarAzCount(handle->scene);
+        handle->range_shape.el_count = rt::LidarElCount(handle->scene);
+    }
+
+    const float* SensorRangeDevice(const SensorSceneHandle* handle) const override {
+        return rt::SensorRangeDevice(handle->scene);
+    }
+
+    SensorRangeShape RangeShape(const SensorSceneHandle* handle) const override {
+        return handle->range_shape;
     }
 
     const float* SensorColorDevice(const SensorSceneHandle* handle) const override {

@@ -78,6 +78,16 @@ struct SensorAovShape {
     uint32_t width            = 0u;
 };
 
+// The device range tensor's logical shape after a lidar render: an (env_count,
+// sensors_per_env, az_count, el_count) view (S lidars per env, env-major). The
+// cell count is env_count*sensors_per_env*az_count*el_count.
+struct SensorRangeShape {
+    uint32_t env_count        = 0u;
+    uint32_t sensors_per_env  = 0u;
+    uint32_t az_count         = 0u;
+    uint32_t el_count         = 0u;
+};
+
 // The backend-agnostic batched sensor interface. One instance per render context;
 // holds the device/backend. Build a scene once, render it per step, free it.
 class SensorBackendI {
@@ -111,6 +121,22 @@ public:
     // The (env_count, sensors_per_env, height, width) shape of the tensor the
     // accessors point into, as of the last RenderSensors (all-zero before the first).
     virtual SensorAovShape AovShape(const SensorSceneHandle* handle) const = 0;
+
+    // Scatter the per-env lidars from the handle's lidar mount table + `fk`, then
+    // ONE batched build/refit + ONE range trace over [E*S*az*el] rays into the
+    // persistent device range tensor IN PLACE (no host round-trip). A no-op if the
+    // handle carries no lidar mounts. The az/el fan comes from the lidar pattern.
+    virtual void RenderLidars(SensorSceneHandle* handle,
+                              const phi::ScatterFkSource& fk,
+                              uint32_t env_count) = 0;
+
+    // Device pointer into the persistent range tensor after RenderLidars:
+    // [E*S*az*el] floats. Null until the first lidar render.
+    virtual const float* SensorRangeDevice(const SensorSceneHandle* handle) const = 0;
+
+    // The (env_count, sensors_per_env, az_count, el_count) shape of the range tensor
+    // the accessor points into, as of the last RenderLidars (all-zero before it).
+    virtual SensorRangeShape RangeShape(const SensorSceneHandle* handle) const = 0;
 
     // Record the per-env render-DR config and (re)fill the per-env appearance
     // tables for `env_count` envs (cfg.enabled==false -> exact base replicas, so

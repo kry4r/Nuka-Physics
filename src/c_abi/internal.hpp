@@ -80,16 +80,23 @@ struct DeviceRecord {
     }
 };
 
-// The world's batched camera sensor: the backend + the backend-owned scene handle
-// + the image size + the accumulated mount list (each attach appends one camera, so
-// S cameras per env). The out-of-line dtor frees the handle through the backend.
+// The world's batched sensors: the backend + the backend-owned scene handle + the
+// image size + the accumulated mount list. Cameras AND lidars ride ONE handle/TLAS;
+// `sensors` holds both (the backend splits by type). Each camera attach appends one
+// camera (S cameras per env); a lidar attach replaces the lidar set (one (E,S,az,el)
+// fan). The out-of-line dtor frees the handle through the backend.
 struct SensorAttachment {
     std::unique_ptr<nuka::render::SensorBackendI> backend;
     nuka::render::SensorSceneHandle* handle = nullptr;
-    std::vector<nuka::scene::SensorDesc> sensors;  // appended per attach (E*S cameras).
+    std::vector<nuka::scene::SensorDesc> sensors;  // appended per attach (cameras + lidars).
     uint32_t width = 0u;
     uint32_t height = 0u;
-    bool rendered = false;  // a device AOV tensor exists only after the first render.
+    bool rendered = false;  // a device AOV/range tensor exists only after the first render.
+    // Lidar fan dims (0 until a lidar is attached). The (E,S,az,el) RANGE tensor's
+    // az/el extent; lidars_per_env*env_count*az*el == the range cell count.
+    uint32_t lidar_az = 0u;
+    uint32_t lidar_el = 0u;
+    uint32_t lidars_per_env = 0u;
     // Per-env appearance DR (disabled -> base replicas). Retained so a re-attach
     // (which rebuilds the sensor scene) re-applies it onto the fresh tables.
     nuka::rt::RenderDrConfig render_dr;
