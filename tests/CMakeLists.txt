@@ -129,6 +129,36 @@ if(TARGET nuka)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             PROPERTIES LABELS "full")
 
+        # --- Device-resident batched camera sensor C ABI (attach/render/view) --
+        # The in-the-loop obs surface: attach a camera to an N-env world, render
+        # every env into ONE device AOV tensor, read it back zero-copy via
+        # nuka_world_get_sensor_view (the bridge cooks the world's retained scene to
+        # the per-env visual binding + drives the batched sensor backend).
+        add_executable(nuka_camera_sensor_cabi_test
+            c_abi/test_camera_sensor.cpp
+        )
+
+        target_compile_definitions(nuka_camera_sensor_cabi_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_camera_sensor_cabi_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_camera_sensor_cabi_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_camera_sensor_cabi_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            PROPERTIES LABELS "full")
+
         # --- Per-env drive-target write + q/qd/base read C ABI (sim-val #33) --
         add_executable(nuka_drive_target_io_test
             c_abi/test_drive_target_io.cpp

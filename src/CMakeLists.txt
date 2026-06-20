@@ -1328,6 +1328,11 @@ if(CMAKE_CUDA_COMPILER)
         # on the device's OWNED phi v2 backend (mirrors recorder.cpp) and runs
         # cook::Settle. NOT a special grasp/union type -- one entry, any format.
         c_abi/scene.cpp
+        # The device-resident batched camera-sensor surface (attach/render/view):
+        # cooks the world's retained scene to the per-env visual binding via
+        # BuildRenderWorld + RenderWorldToTwoLevelScene (nuka_render) and drives the
+        # batched sensor backend (strong CreateCudaSensorBackend from nuka_phi2_rt).
+        c_abi/sensor.cpp
         collision/contact_stream_driver.cpp
     )
 
@@ -1359,6 +1364,12 @@ if(CMAKE_CUDA_COMPILER)
             # nuka_scene_cook transitively pulls nuka_nk + nuka_scene +
             # nuka_articulation; nks::Load lives in nuka_import (already linked).
             nuka_scene_cook
+            # The device-resident batched camera-sensor surface (c_abi/sensor.cpp):
+            # nuka_render = the cook->visual bridge (BuildRenderWorld /
+            # RenderWorldToTwoLevelScene + the SensorBackendI interface);
+            # nuka_phi2_rt = the strong CreateCudaSensorBackend + the batched render.
+            nuka_render
+            nuka_phi2_rt
         PUBLIC
             CUDA::cudart
     )

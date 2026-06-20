@@ -1,0 +1,304 @@
+// ---------------------------------------------------------------------------
+// nuka::c_abi -- the device-resident batched camera-sensor surface.
+//
+// ONE camera per env rendered into a single (env_count, height, width, channels)
+// device AOV tensor via the SAME RT tracer at a cheap sensor profile -- the
+// in-the-loop obs the RL stack reads zero-copy (nuka_world_get_sensor_view +
+// torch.from_dlpack). No host download.
+//
+// THE COOK BRIDGE: the per-env visual binding (which mesh/material each visual
+// instance is + the link/body it follows + its physics->visual offset) is built
+// from the SAME cooked scene the physics ran -- the WorldRecord's retained
+// SceneIR -> BuildRenderWorld over its ECS + the cook's SceneMap ->
+// RenderWorldToTwoLevelScene. That is exactly the path go2_terrain_demo uses to
+// recover the shape->link binding; here it feeds the batched sensor backend. The
+// scene is the per-env template (co-residence replicas included), replicated
+// across envs by the batched render. ONE scene/cook definition for physics +
+// render -- no second authoring path.
+// ---------------------------------------------------------------------------
+
+#include "c_abi/handle_table.hpp"
+#include "c_abi/internal.hpp"
+
+#include "nk/pipeline/world.hpp"
+#include "render/render_world.hpp"
+#include "render/rt_adapter.hpp"
+#include "render/sensor_backend.hpp"
+#include "scene/cook/cook_to_model.hpp"
+#include "scene/scene_ir.hpp"
+
+#include <exception>
+#include <vector>
+
+namespace nuka::c_abi {
+
+// The out-of-line SensorAttachment dtor (internal.hpp declares it): free the
+// backend-owned scene handle THROUGH the backend before the backend drops.
+SensorAttachment::~SensorAttachment() {
+    if (backend && handle != nullptr) {
+        backend->FreeSensorScene(handle);
+        handle = nullptr;
+    }
+}
+
+namespace {
+
+namespace cook = nuka::scene::cook;
+
+// Lower the world's cooked scene to the env-shared sensor binding: RenderWorld ->
+// TwoLevelScene + per-instance rows/blas_id/material_id. False if no geometry.
+bool BuildSensorSceneDesc(const nuka::scene::SceneIR& scene, uint32_t env_count,
+                          nuka::render::SensorSceneDesc* out) {
+    // Cook to recover the EntityId<->row SceneMap (the binding render needs), at
+    // the world's env_count so pose-source rows index the live arena.
+    const cook::CookToModelResult cooked =
+        cook::CookToModel(scene, static_cast<int>(env_count));
+    const nuka::render::RenderWorld rw =
+        nuka::render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
+    if (rw.instances.empty()) {
+        return false;
+    }
+
+    out->scene = nuka::render::RenderWorldToTwoLevelScene(rw);
+    // TwoLevelScene appends a neutral default after rw.materials; an out-of-range
+    // render_material_id resolves to that last slot (same as the adapter's).
+    const uint32_t mat_count = static_cast<uint32_t>(rw.materials.size());
+    const uint32_t default_mat_id =
+        static_cast<uint32_t>(out->scene.materials.size()) - 1u;
+
+    out->rows.reserve(rw.instances.size());
+    out->blas_id.reserve(rw.instances.size());
+    out->material_id.reserve(rw.instances.size());
+    for (const nuka::render::RenderInstance& inst : rw.instances) {
+        nuka::phi::InstanceScatterRow r;
+        // PoseSource::Kind {Static,Link,Body,Base} == InstanceScatterRow::kind
+        // {0,1,2,3} by construction; row is the cooked link/body/base index.
+        r.kind = static_cast<uint32_t>(inst.pose_source.kind);
+        r.row = inst.pose_source.row;
+        r.cached_visual_local[0] = inst.cached_visual_local.position.x;
+        r.cached_visual_local[1] = inst.cached_visual_local.position.y;
+        r.cached_visual_local[2] = inst.cached_visual_local.position.z;
+        r.cached_visual_local[3] = inst.cached_visual_local.rotation.w;
+        r.cached_visual_local[4] = inst.cached_visual_local.rotation.x;
+        r.cached_visual_local[5] = inst.cached_visual_local.rotation.y;
+        r.cached_visual_local[6] = inst.cached_visual_local.rotation.z;
+        out->rows.push_back(r);
+        out->blas_id.push_back(inst.mesh_id);  // blas_id == mesh_id (1:1 mesh map).
+        out->material_id.push_back((inst.render_material_id < mat_count)
+                                       ? inst.render_material_id
+                                       : default_mat_id);
+    }
+    return true;
+}
+
+// Lower the c_abi mount enum + offset to a single-camera SensorDesc (the mount
+// table). ONE sensor per env (the batched single-launch contract).
+nuka::scene::SensorDesc MakeCameraSensorDesc(nuka_sensor_mount_t mount_frame,
+                                             uint32_t mount_index,
+                                             const float local_offset[7],
+                                             float vfov_deg, uint32_t width,
+                                             uint32_t height) {
+    nuka::scene::SensorDesc s;
+    s.type = nuka::scene::SensorType::Camera;
+    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);  // 0=Link,1=Body,2=Base.
+    s.mount_index = mount_index;
+    if (local_offset != nullptr) {
+        s.local_offset.position.x = local_offset[0];
+        s.local_offset.position.y = local_offset[1];
+        s.local_offset.position.z = local_offset[2];
+        s.local_offset.rotation.w = local_offset[3];
+        s.local_offset.rotation.x = local_offset[4];
+        s.local_offset.rotation.y = local_offset[5];
+        s.local_offset.rotation.z = local_offset[6];
+    }
+    s.cam.width = static_cast<uint16_t>(width);
+    s.cam.height = static_cast<uint16_t>(height);
+    s.cam.vfov_degrees = vfov_deg;
+    return s;
+}
+
+}  // namespace
+
+}  // namespace nuka::c_abi
+
+extern "C" {
+
+nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
+                                              nuka_sensor_mount_t mount_frame,
+                                              uint32_t mount_index,
+                                              const float local_offset[7],
+                                              float vfov_deg,
+                                              uint32_t width,
+                                              uint32_t height) {
+    if (mount_frame > NUKA_SENSOR_MOUNT_BASE) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (width == 0u || height == 0u || vfov_deg <= 0.0f) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->scene) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    try {
+        // The sensor backend binds the device's ACTIVE phi backend (the same
+        // device/stream physics runs on); null when no RT backend/device.
+        std::unique_ptr<nuka::render::SensorBackendI> backend =
+            nuka::render::CreateCudaSensorBackend();
+        if (!backend) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+
+        nuka::render::SensorSceneDesc desc;
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene, record->world->EnvCount(),
+                                               &desc)) {
+            return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
+        }
+        desc.sensors.push_back(nuka::c_abi::MakeCameraSensorDesc(
+            mount_frame, mount_index, local_offset, vfov_deg, width, height));
+
+        nuka::render::SensorSceneHandle* handle = backend->BuildSensorScene(desc);
+        if (handle == nullptr) {
+            return NUKA_RESULT_INTERNAL;
+        }
+
+        // Replace any prior attachment (the old handle frees through its backend in
+        // the SensorAttachment dtor) -- attach is re-callable.
+        auto attach = std::make_unique<nuka::c_abi::SensorAttachment>();
+        attach->backend = std::move(backend);
+        attach->handle = handle;
+        attach->width = width;
+        attach->height = height;
+        attach->rendered = false;
+        record->sensor = std::move(attach);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_render_sensors(nuka_world_handle world) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    try {
+        nuka::nk::World& w = *record->world;
+        const nuka::nk::ModelCapacities& cap = w.GetModel().capacities;
+
+        // The LIVE env-major LinkPose/BodyPose/BasePose arena buffers (the SAME
+        // ptrs DownloadField reads); the kernel derives env, so env_index is 0.
+        nuka::phi::ScatterFkSource fk;
+        fk.link_pose = w.FieldPtr(nuka::nk::FieldId::LinkPose);
+        fk.body_pose = w.FieldPtr(nuka::nk::FieldId::BodyPose);
+        fk.base_pose = w.FieldPtr(nuka::nk::FieldId::BasePose);
+        fk.env_index = 0u;
+        fk.links_per_env = cap.links_per_env;
+        fk.bodies_per_env = cap.bodies_per_env;
+        // Cross-stream RAW ordering: make the sensor render wait on the World's FK
+        // ops so it never reads torn/stale poses.
+        fk.world_backend = w.Backend();
+
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+        s.backend->RenderSensors(s.handle, fk, w.EnvCount(), s.width, s.height);
+        s.rendered = true;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_sensor_view(nuka_world_handle world,
+                                         nuka_sensor_channel_t channel,
+                                         nuka_buffer_view_t* out) {
+    if (out == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    out->device_ptr = nullptr;
+    out->element_count = 0u;
+    out->element_stride_bytes = 0u;
+    out->dtype = 0u;
+    if (channel > NUKA_SENSOR_CHANNEL_PRIM) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->sensor || record->sensor->handle == nullptr ||
+        !record->sensor->rendered) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no render yet -> no device tensor.
+    }
+
+    try {
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+        const nuka::render::SensorAovShape shape = s.backend->AovShape(s.handle);
+        const uint64_t pixels = static_cast<uint64_t>(shape.sensors) *
+                                shape.height * shape.width;
+
+        // The view mirrors nuka_world_get_buffer_view (flat device base +
+        // element_count + stride/dtype); the caller reshapes to (N,H,W,ch).
+        const void* ptr = nullptr;
+        uint64_t element_count = 0u;
+        uint32_t stride = sizeof(float);
+        uint8_t dtype = 0u;
+        switch (channel) {
+            case NUKA_SENSOR_CHANNEL_COLOR:
+                ptr = s.backend->SensorColorDevice(s.handle);
+                element_count = pixels * 3u;
+                break;
+            case NUKA_SENSOR_CHANNEL_DEPTH:
+                ptr = s.backend->SensorDepthDevice(s.handle);
+                element_count = pixels;
+                break;
+            case NUKA_SENSOR_CHANNEL_NORMAL:
+                ptr = s.backend->SensorNormalDevice(s.handle);
+                element_count = pixels * 3u;
+                break;
+            case NUKA_SENSOR_CHANNEL_ALBEDO:
+                ptr = s.backend->SensorAlbedoDevice(s.handle);
+                element_count = pixels * 3u;
+                break;
+            case NUKA_SENSOR_CHANNEL_PRIM:
+                ptr = s.backend->SensorPrimDevice(s.handle);
+                element_count = pixels;
+                stride = sizeof(uint32_t);
+                dtype = 1u;  // uint32 plane (the per-pixel instance/prim id).
+                break;
+        }
+        if (ptr == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+
+        out->device_ptr = const_cast<void*>(ptr);
+        out->element_count = element_count;
+        out->element_stride_bytes = stride;
+        out->dtype = dtype;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+}  // extern "C"
