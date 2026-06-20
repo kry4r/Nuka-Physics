@@ -86,6 +86,30 @@ struct PinholeCamera {
                              static_cast<float>(rz * inv_len)};
         return ray;
     }
+
+    // Ray through pixel (px,py) offset by sub-pixel (jx,jy) in pixel units (the
+    // beauty MSAA jitter; jx==jy==0 reproduces GenerateRay). The D1 path never calls it.
+    NUKA_RT_HD Ray GenerateRayJitter(uint32_t px, uint32_t py, float jx, float jy) const {
+        const double sx = (2.0 * (static_cast<double>(px) + 0.5 + jx) /
+                           static_cast<double>(width)) - 1.0;
+        const double sy = 1.0 - (2.0 * (static_cast<double>(py) + 0.5 + jy) /
+                                 static_cast<double>(height));
+        const double dx = sx * static_cast<double>(half_w);
+        const double dy = sy * static_cast<double>(half_h);
+        const double rx = static_cast<double>(forward.x) +
+                          dx * static_cast<double>(right.x) + dy * static_cast<double>(up.x);
+        const double ry = static_cast<double>(forward.y) +
+                          dx * static_cast<double>(right.y) + dy * static_cast<double>(up.y);
+        const double rz = static_cast<double>(forward.z) +
+                          dx * static_cast<double>(right.z) + dy * static_cast<double>(up.z);
+        const double inv_len = 1.0 / sqrt(rx * rx + ry * ry + rz * rz);
+        Ray ray;
+        ray.origin = origin;
+        ray.dir = math::Vec3{static_cast<float>(rx * inv_len),
+                             static_cast<float>(ry * inv_len),
+                             static_cast<float>(rz * inv_len)};
+        return ray;
+    }
 };
 
 // Build a pinhole camera looking from `eye` toward `target`, with `world_up`

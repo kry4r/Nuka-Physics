@@ -20,13 +20,13 @@
 #include "collision/broadphase_lbvh.hpp"
 #include "collision/lbvh_node.cuh"
 #include "math/vec3.hpp"
-#include "phi/backend.hpp"             // InitBestDevice / DeviceBufferType
+#include "phi/backend.hpp"             // Backend / InitBestDevice
 #include "phi/buffer.hpp"              // Buffer* / BufferAlloc / BufferUpload / ...
-#include "phi/buffer_transfer_v2.hpp"  // UploadVectorV2
 #include "phi/scoped_device_guard.hpp"
 #include "phi/backend_cuda/rt/bvh_traverse_impl.cuh"
 #include "phi/backend_cuda/rt/intersect_primitives.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
+#include "phi/backend_cuda/rt/rt_device_context.cuh"  // RtContext / OwnedBuffer
 #include "phi/backend_cuda/rt/shading.cuh"
 #include "rt/camera.hpp"
 
@@ -42,46 +42,6 @@ namespace nuka::rt {
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
-
-// RT-7 (M11): file-local RAII over the phi-v2 opaque Buffer*, mirroring the legacy
-// phi::Buffer surface (default-ctor + sized-ctor + Data/CopyFromHost/CopyToHost,
-// move-only) so the render bodies below stay byte-identical after the BUF
-// sweep. Bound to the stream-0 DeviceBufferType (NULL/default stream) -> transfers
-// are byte+ordering identical to the legacy synchronous memcpy. The RT kernels keep
-// running on their existing stream UNCHANGED; this is the buffer-handle swap ONLY.
-class OwnedBuffer {
-public:
-    OwnedBuffer() = default;
-    explicit OwnedBuffer(size_t bytes) {
-        buf_ = phi::BufferAlloc(phi::DeviceBufferType(phi::InitBestDevice()), bytes);
-    }
-    explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
-    ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
-    OwnedBuffer(OwnedBuffer&& o) noexcept : buf_(o.buf_) { o.buf_ = nullptr; }
-    OwnedBuffer& operator=(OwnedBuffer&& o) noexcept {
-        if (this != &o) {
-            if (buf_ != nullptr) phi::BufferFree(buf_);
-            buf_ = o.buf_; o.buf_ = nullptr;
-        }
-        return *this;
-    }
-    OwnedBuffer(const OwnedBuffer&) = delete;
-    OwnedBuffer& operator=(const OwnedBuffer&) = delete;
-    void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
-    // (No CopyFromHost: this TU's uploads all go through UploadOwned; only the
-    // AOV download path uses CopyToHost.)
-    void CopyToHost(void* dst, size_t bytes) const {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
-    }
-private:
-    phi::Buffer* buf_ = nullptr;
-};
-
-template <typename T>
-OwnedBuffer UploadOwned(const std::vector<T>& values) {
-    return OwnedBuffer(phi::UploadVectorV2(
-        phi::DeviceBufferType(phi::InitBestDevice()), values));
-}
 
 void CheckCuda(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -382,9 +342,10 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
         return fb;
     }
 
-    const cudaStream_t stream = nullptr;  // default stream 0
-    const int device_id = 0;
-    phi::ScopedDeviceGuard guard(device_id);
+    const RtContext ctx = ResolveRtContext(nullptr);
+    const cudaStream_t stream = ctx.stream;
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    (void)cudaSetDevice(ctx.device_id);
 
     // Build the flat prim table + per-prim AABBs in declaration order:
     // triangles, then spheres, then SDFs.
@@ -427,9 +388,9 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
         prims.push_back({static_cast<uint32_t>(PrimKind::Sdf),
                          static_cast<uint32_t>(sdf_hdrs.size()), sd.material_id});
 
-        sdf_keys_bufs.push_back(UploadOwned(sd.keys));
-        sdf_vals_bufs.push_back(UploadOwned(sd.values));
-        sdf_grad_bufs.push_back(UploadOwned(sd.gradients));
+        sdf_keys_bufs.push_back(UploadOwned(ctx.device_bt, sd.keys));
+        sdf_vals_bufs.push_back(UploadOwned(ctx.device_bt, sd.values));
+        sdf_grad_bufs.push_back(UploadOwned(ctx.device_bt, sd.gradients));
 
         runtime::sdf::SparseSdfDevice hdr = sd.header;
         hdr.cell_keys = static_cast<const uint64_t*>(sdf_keys_bufs.back().Data());
@@ -449,17 +410,17 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     }
 
     // Upload geometry buffers.
-    OwnedBuffer d_prims = UploadOwned(prims);
-    OwnedBuffer d_tri_v0 = UploadOwned(tri_v0.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v0);
-    OwnedBuffer d_tri_v1 = UploadOwned(tri_v1.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v1);
-    OwnedBuffer d_tri_v2 = UploadOwned(tri_v2.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v2);
-    OwnedBuffer d_sph_c = UploadOwned(sph_center.empty() ? std::vector<math::Vec3>{math::Vec3{}} : sph_center);
-    OwnedBuffer d_sph_r = UploadOwned(sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
-    OwnedBuffer d_sdf_hdr = UploadOwned(sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
-    OwnedBuffer d_sdf_aabb = UploadOwned(sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
-    OwnedBuffer d_sdf_eps = UploadOwned(sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
-    OwnedBuffer d_sdf_iters = UploadOwned(sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
-    OwnedBuffer d_mats = UploadOwned(scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
+    OwnedBuffer d_prims = UploadOwned(ctx.device_bt, prims);
+    OwnedBuffer d_tri_v0 = UploadOwned(ctx.device_bt, tri_v0.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v0);
+    OwnedBuffer d_tri_v1 = UploadOwned(ctx.device_bt, tri_v1.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v1);
+    OwnedBuffer d_tri_v2 = UploadOwned(ctx.device_bt, tri_v2.empty() ? std::vector<math::Vec3>{math::Vec3{}} : tri_v2);
+    OwnedBuffer d_sph_c = UploadOwned(ctx.device_bt, sph_center.empty() ? std::vector<math::Vec3>{math::Vec3{}} : sph_center);
+    OwnedBuffer d_sph_r = UploadOwned(ctx.device_bt, sph_radius.empty() ? std::vector<float>{0.0f} : sph_radius);
+    OwnedBuffer d_sdf_hdr = UploadOwned(ctx.device_bt, sdf_hdrs.empty() ? std::vector<runtime::sdf::SparseSdfDevice>{runtime::sdf::SparseSdfDevice{}} : sdf_hdrs);
+    OwnedBuffer d_sdf_aabb = UploadOwned(ctx.device_bt, sdf_aabbs.empty() ? std::vector<collision::AABB>{collision::AABB{}} : sdf_aabbs);
+    OwnedBuffer d_sdf_eps = UploadOwned(ctx.device_bt, sdf_eps.empty() ? std::vector<float>{0.0f} : sdf_eps);
+    OwnedBuffer d_sdf_iters = UploadOwned(ctx.device_bt, sdf_iters.empty() ? std::vector<int>{0} : sdf_iters);
+    OwnedBuffer d_mats = UploadOwned(ctx.device_bt, scene.materials.empty() ? std::vector<Material>{Material{}} : scene.materials);
 
     DevScene dev;
     dev.prims = static_cast<const DevPrim*>(d_prims.Data());
@@ -476,21 +437,22 @@ Framebuffer RenderScene(const Scene& scene, const PinholeCamera& camera) {
     dev.materials = static_cast<const Material*>(d_mats.Data());
 
     // Build the LBVH over the per-prim AABBs (retain nodes).
-    OwnedBuffer d_boxes = UploadOwned(aabbs);
+    OwnedBuffer d_boxes = UploadOwned(ctx.device_bt, aabbs);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
-    auto tree = collision::gpu::BuildLbvhForQuery(dev_boxes, leaf_count);
+    auto tree = collision::gpu::BuildLbvhForQuery(ctx.stream, ctx.device_id,
+                                                  dev_boxes, leaf_count);
     if (!tree.HasNodes()) {
         throw std::runtime_error("RenderScene: LBVH build did not retain nodes");
     }
     const LbvhNode* nodes = tree.DeviceNodes();
 
     // Output AOV buffers (device).
-    OwnedBuffer d_color(pixels * 3u * sizeof(float));
-    OwnedBuffer d_depth(pixels * sizeof(float));
-    OwnedBuffer d_normal(pixels * 3u * sizeof(float));
-    OwnedBuffer d_albedo(pixels * 3u * sizeof(float));
-    OwnedBuffer d_uv(pixels * 2u * sizeof(float));
-    OwnedBuffer d_prim(pixels * sizeof(uint32_t));
+    OwnedBuffer d_color(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_depth(ctx.device_bt, pixels * sizeof(float));
+    OwnedBuffer d_normal(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_albedo(ctx.device_bt, pixels * 3u * sizeof(float));
+    OwnedBuffer d_uv(ctx.device_bt, pixels * 2u * sizeof(float));
+    OwnedBuffer d_prim(ctx.device_bt, pixels * sizeof(uint32_t));
 
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,

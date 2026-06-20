@@ -14,19 +14,10 @@
 //                           ONCE (rigid -> never refit); returns an opaque,
 //                           backend-owned scene handle (RtSceneHandle).
 //   * Trace(handle, scene, camera, AovBuffers) -- rebuild the per-frame TLAS over
-//                           the CURRENT instance transforms, dispatch the nested-
-//                           traversal kernel, and DELIVER the 6 AOVs into the
-//                           CALLER-PROVIDED phi v2 Buffer* outputs.
-//                           ★ NAMED DEBT (RT-F2): the CUDA backend today produces
-//                           the AOVs via the HOST rt::RenderFrame path (a device->
-//                           host download) and then uploads them back into the
-//                           caller's device buffers (a host round-trip), NOT a
-//                           device-resident kernel that writes the caller buffers
-//                           directly. The bytes are identical to the D1 goldens
-//                           (the same RenderFrame output is uploaded), so the
-//                           BufferI output contract holds; true zero-copy
-//                           device-resident Trace (kernel writes the caller buffers
-//                           in place, no D2H/H2D) is deferred.
+//                           the CURRENT transforms and write the 6 AOVs into the
+//                           CALLER-PROVIDED phi v2 Buffer* outputs IN PLACE on the
+//                           selected backend's stream (no host round-trip); pixels
+//                           are byte-identical to TraceToHost.
 //   * TraceToHost(...)   -- thin convenience that allocates+downloads into a host
 //                           rt::Framebuffer (for tests / host-download recorders).
 //   * FreeScene(handle)  -- release the backend scene handle.
@@ -100,16 +91,10 @@ public:
     // handle owned by this backend (free with FreeScene). nullptr on failure.
     virtual RtSceneHandle* BuildScene(const rt::TwoLevelScene& scene) = 0;
 
-    // Rebuild the per-frame TLAS over scene.instances' CURRENT transforms,
-    // dispatch the nested-traversal kernel, and deliver the requested AOVs into the
-    // caller-provided device buffers. `handle` must have been built (BuildScene)
-    // from a scene with the SAME meshes; transforms / materials / light are read
-    // fresh from `scene` each call (moving an instance tracks).
-    // ★ NAMED DEBT (RT-F2): the CUDA backend currently produces the AOVs via the
-    // HOST rt::RenderFrame path then UPLOADS them into these device buffers (a
-    // device->host->device round-trip), not a kernel that writes them in place.
-    // Pixels are byte-identical to the D1 goldens; device-resident zero-copy Trace
-    // is deferred.
+    // Rebuild the per-frame TLAS over scene.instances' CURRENT transforms and write
+    // the requested AOVs into the caller's device buffers IN PLACE on the selected
+    // backend's stream (no host round-trip); `handle` must have the SAME meshes.
+    // Pixels are byte-identical to the D1 goldens (same kernel as TraceToHost).
     virtual void Trace(RtSceneHandle* handle,
                        const rt::TwoLevelScene& scene,
                        const rt::PinholeCamera& camera,
@@ -122,6 +107,15 @@ public:
     virtual rt::Framebuffer TraceToHost(RtSceneHandle* handle,
                                         const rt::TwoLevelScene& scene,
                                         const rt::PinholeCamera& camera) = 0;
+
+    // Beauty trace: the SEPARATE stochastic path (rt::RenderBeauty) -- jittered
+    // MSAA + soft sun shadows + AO + one-bounce GI + procedural sky/fog over the
+    // SAME scene. Distinct from the deterministic TraceToHost (sensor goldens
+    // unperturbed). Host-download convenience like TraceToHost.
+    virtual rt::Framebuffer TraceBeautyToHost(RtSceneHandle* handle,
+                                              const rt::TwoLevelScene& scene,
+                                              const rt::PinholeCamera& camera,
+                                              const rt::BeautyOptions& opt) = 0;
 
     // Release a scene handle built by this backend.
     virtual void FreeScene(RtSceneHandle* handle) = 0;
