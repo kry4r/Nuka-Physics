@@ -1519,6 +1519,36 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_two_level_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- Batched-sensor device scatter gate: ScatterEnvInstances composes, per
+    # (env x instance), world = fk*cvl from env-major device pose buffers and writes
+    # a DevInstance[E*M] table + env-major world-AABBs (the batched LBVH leaf
+    # bounds). Asserts both outputs are byte-identical to a host fk*cvl reference
+    # over Link/Body/Base/Static rows + >=3 envs. A .cu (drives the device launcher +
+    # device structs directly); --fmad=false + host -ffp-contract=off pair the
+    # device compose with the host reference bit-for-bit.
+    add_executable(nuka_rt_sensor_scatter_test
+        rt/test_sensor_scatter.cu
+    )
+    target_compile_options(nuka_rt_sensor_scatter_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>
+    )
+    target_include_directories(nuka_rt_sensor_scatter_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_rt_sensor_scatter_test
+        PRIVATE
+            nuka_phi2_rt
+            nuka_collision_gpu
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_rt_sensor_scatter_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+
     # --- Batched device-resident RGB-sensor FEASIBILITY bench. Measures the
     # per-env-TLAS render path (BuildTwoLevelScene + RenderFrameToAovs, the cheap
     # flat trace) across N envs x resolution and decomposes TLAS build/refit vs
