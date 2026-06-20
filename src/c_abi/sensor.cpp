@@ -181,8 +181,10 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         // Carry a previously-set render-DR config across the rebuild so a re-attach
         // keeps the per-env appearance (the fresh tables get the same randomization).
         nuka::rt::RenderDrConfig carry_dr;
+        nuka::rt::SensorFidelityConfig carry_fid;
         if (record->sensor) {
             carry_dr = record->sensor->render_dr;
+            carry_fid = record->sensor->fidelity;
         }
 
         // Install the rebuilt attachment (the old handle frees through its backend
@@ -195,9 +197,13 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         attach->height = height;
         attach->rendered = false;
         attach->render_dr = carry_dr;
+        attach->fidelity = carry_fid;
         if (carry_dr.enabled) {
             attach->backend->SetRenderDr(attach->handle, carry_dr,
                                          record->world->EnvCount());
+        }
+        if (carry_fid.Enabled()) {
+            attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         }
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
@@ -381,6 +387,51 @@ nuka_result_t nuka_world_set_render_randomization(
         nuka::c_abi::SensorAttachment& s = *record->sensor;
         s.render_dr = cfg;
         s.backend->SetRenderDr(s.handle, cfg, record->world->EnvCount());
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_set_sensor_fidelity(
+    nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no camera attached -> no scene to set.
+    }
+
+    // A NULL desc restores the cheap shade (a byte no-op). Sample counts are capped
+    // here so an over-cap profile is rejected INVALID_ARG (not a hung launch).
+    nuka::rt::SensorFidelityConfig cfg;  // default == cheap shade
+    if (desc != nullptr) {
+        if (desc->spp > 256u || desc->shadow_samples > 256u ||
+            desc->ao_samples > 256u) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
+        cfg.spp = desc->spp < 1u ? 1u : desc->spp;
+        cfg.shadow_samples = desc->shadow_samples;
+        if (desc->sun_angular_radius > 0.0f) cfg.sun_angular_radius = desc->sun_angular_radius;
+        cfg.ao_enabled = desc->ao_enabled != 0;
+        if (desc->ao_samples > 0u) cfg.ao_samples = desc->ao_samples;
+        if (desc->ao_radius > 0.0f) cfg.ao_radius = desc->ao_radius;
+        cfg.gi_enabled = desc->gi_enabled != 0;
+        cfg.tonemap_enabled = desc->tonemap_enabled != 0;
+        if (desc->sky_intensity > 0.0f) cfg.sky_intensity = desc->sky_intensity;
+        cfg.fog_density = desc->fog_density;
+        cfg.seed = desc->seed;
+    }
+
+    try {
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+        s.fidelity = cfg;
+        s.backend->SetSensorFidelity(s.handle, cfg);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

@@ -617,6 +617,44 @@ typedef struct nuka_render_dr_desc_t {
 nuka_result_t nuka_world_set_render_randomization(
     nuka_world_handle world, const nuka_render_dr_desc_t* desc);
 
+// ---------------------------------------------------------------------------
+// Sensor RGB shading fidelity: the batched sensor RGB shades flat (1 spp, 1 hard
+// shadow) -- low sim2real value for a vision policy. This opt-in profile lifts it
+// to the single-camera beauty look (MSAA spp + soft sun shadow + ambient occlusion
+// + one-bounce GI + procedural sky + tonemap) in the SAME trace, gated on the
+// profile. The DEFAULT profile (the all-zero desc / a NULL desc) is the cheap shade
+// -> the AOV bytes are unchanged. Deterministic + seeded: the stochastic samples
+// derive from Philox(seed, env, sensor, pixel, sample), so the same seed yields the
+// same bytes. depth/normal/albedo/prim always come from the center ray. TEXTURES
+// are out of scope (a UV-plumbing follow-on); this is lighting/shading + AA only.
+// ---------------------------------------------------------------------------
+
+// The opt-in shading-fidelity profile. The all-zero value (spp==0 reads as 1) is
+// the cheap shade (a byte no-op). spp / shadow_samples / ao_samples are capped
+// LOUDLY (INVALID_ARG over the cap). ao_radius/sun_angular_radius default to the
+// single-camera beauty values when zero is passed with the corresponding axis on.
+typedef struct nuka_sensor_fidelity_desc_t {
+    uint32_t spp;                /* jittered sub-pixel samples per pixel (MSAA); 0->1 */
+    uint32_t shadow_samples;     /* soft-shadow rays across the sun disc; 0/1 -> hard */
+    float sun_angular_radius;    /* sun half-angle (rad) -> penumbra width */
+    int ao_enabled;              /* ambient occlusion / sky-dome ambient bounces */
+    uint32_t ao_samples;         /* hemisphere rays when ao_enabled */
+    float ao_radius;             /* AO ray max distance (world units) */
+    int gi_enabled;              /* add the one-bounce diffuse GI term on AO rays */
+    int tonemap_enabled;         /* ACES-ish filmic tonemap of the averaged color */
+    float sky_intensity;         /* scales the sky-dome ambient (0 -> uses default) */
+    float fog_density;           /* per-metre height/distance fog extinction (0=off) */
+    uint64_t seed;               /* Philox key; the recorded deterministic state */
+} nuka_sensor_fidelity_desc_t;
+
+// Record the opt-in shading-fidelity profile on the attached sensor. A NULL desc
+// (or an all-zero / spp<=1 + everything-off desc) restores the cheap shade -> the
+// AOV bytes are unchanged. Requires a camera attached (the sensor scene owns the
+// state). Idempotent for a fixed seed; safe to re-call per reset. INVALID_ARG if a
+// sample count is over its cap. NOT_SUPPORTED if no camera is attached.
+nuka_result_t nuka_world_set_sensor_fidelity(
+    nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc);
+
 typedef struct nuka_invariant_violation_t {
     uint32_t invariant;
     uint32_t step;

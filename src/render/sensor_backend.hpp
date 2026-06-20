@@ -38,6 +38,7 @@
 
 #include "phi/interop_scatter.hpp"  // phi::ScatterFkSource / InstanceScatterRow (CUDA-free)
 #include "rt/render_dr.hpp"         // rt::RenderDrConfig (CUDA-free per-env DR POD)
+#include "rt/sensor_fidelity.hpp"   // rt::SensorFidelityConfig (CUDA-free shade POD)
 #include "rt/two_level_render.hpp"  // rt::TwoLevelScene (CUDA-free scene-desc POD)
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (CUDA-free)
 
@@ -116,6 +117,12 @@ public:
     // the cross-env tiles stay byte-identical). Idempotent for a fixed seed.
     virtual void SetRenderDr(SensorSceneHandle* handle, const rt::RenderDrConfig& cfg,
                              uint32_t env_count) = 0;
+
+    // Record the opt-in shading-fidelity profile (spp / soft shadow / AO / GI /
+    // tonemap). The DEFAULT config (Enabled()==false) keeps the cheap-shade
+    // arithmetic -> the AOV bytes are unchanged. Caps spp/samples LOUDLY.
+    virtual void SetSensorFidelity(SensorSceneHandle* handle,
+                                   const rt::SensorFidelityConfig& cfg) = 0;
 
     // Release a sensor scene handle built by this backend.
     virtual void FreeSensorScene(SensorSceneHandle* handle) = 0;
