@@ -4,6 +4,7 @@
 
 #include "nk/pipeline/pipeline.hpp"
 
+#include <algorithm>
 #include <cassert>
 
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
@@ -366,6 +367,17 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
                  particle_mode == phi::kParticleModeSoftFluid)
                     ? 1u : 0u;
             p_np_body_particle_.n_soft_particles = n_soft;
+            // Warp-per-particle only pays off when a collider has a WIDE hull whose
+            // SupportHull scan dominates; an analytic-only collider world (box/sphere/
+            // plane walls) keeps thread-per-particle so 31 lanes don't idle. The
+            // threshold is the cook-time max hull vcount -> a model property, not a
+            // per-scene branch; both launch paths are byte-identical.
+            uint32_t max_hull_vcount = 0u;
+            for (const auto& sh : model.shape_table_rows)
+                max_hull_vcount = std::max(max_hull_vcount, sh.hull_vert_count);
+            constexpr uint32_t kWarpHullVcountThreshold = 256u;
+            p_np_body_particle_.warp_per_particle =
+                (max_hull_vcount > kWarpHullVcountThreshold) ? 1u : 0u;
             // The heightfield descriptor (the SAME single cooked field the rigid
             // heightfield narrowphase wires) so a sphere particle walks the grid.
             if (!model.heightfields.empty()) {

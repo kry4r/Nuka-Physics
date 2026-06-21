@@ -327,6 +327,18 @@ __device__ void ParticleHeightfield(Vec3 center, float radius, float margin,
     }
 }
 
+// ONE body<->particle narrowphase, two byte-identical launch shapes selected by the
+// cook-time max hull vcount (kWarp):
+//   kWarp == true : ONE WARP per particle. The convex-hull branch (SphereHull) scans
+//     a giant cooked link hull, so its SupportHull runs WARP-COOPERATIVELY (32 lanes
+//     split the vertex pool, exact lowest-index argmax reduce -- bit-identical to the
+//     serial scan). All 32 lanes stay converged with identical inputs through every
+//     hull call; non-hull work + every store/atomic runs on LANE 0.
+//   kWarp == false: ONE THREAD per particle (lane is constexpr 0, no shuffles, serial
+//     hull scan) -- for analytic-only collider worlds where no wide hull pays for the
+//     31 idle lanes. Identical output: the warp reduce == the serial argmax and every
+//     lane-0 gate collapses to "always" when lane == 0.
+template <bool kWarp>
 __global__ void NarrowphaseBodyParticleKernel(
     const float* __restrict__ shape_table,
     const math::Transform* __restrict__ body_pose,
@@ -349,9 +361,11 @@ __global__ void NarrowphaseBodyParticleKernel(
     uint32_t* __restrict__ ucontact_gen,
     uint32_t* __restrict__ contact_count,
     uint32_t* __restrict__ env_status) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t lane = kWarp ? (threadIdx.x & 31u) : 0u;
+    const uint32_t gid = kWarp ? (tid >> 5u) : tid;
     const uint32_t total = pp.env_count * pp.particles_per_env;
-    if (gid >= total) return;
+    if (gid >= total) return;  // uniform per-warp: the whole warp exits together.
     const uint32_t env = gid / pp.particles_per_env;
     const uint32_t pi = gid - env * pp.particles_per_env;  // env-local particle
     const uint32_t N = pp.bodies_per_env;
@@ -359,23 +373,26 @@ __global__ void NarrowphaseBodyParticleKernel(
     // Reserved contact-slot sub-range for THIS particle: a fixed (non-atomic)
     // function of the particle index, so the body<->particle slot stream is bit-D1
     // by construction and lands in a deterministic sub-range relative to the rigid
-    // slots [0, pair_count). Initialize all reserved slots to inactive first.
+    // slots [0, pair_count). Initialize all reserved slots to inactive first. The
+    // sub-range is fixed per particle -> lane 0 writing it is byte-identical.
     const uint32_t slot0 = pp.particle_slot_base + pi * pp.cands_per_particle;
-    for (uint32_t k = 0u; k < pp.cands_per_particle; ++k) {
-        const uint32_t slot = slot0 + k;
-        if (slot >= pp.slot_stride) break;
-        const size_t cell = (static_cast<size_t>(env) * pp.slot_stride + slot) * 4u;
-        ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = 0u;
-        for (uint32_t i = 0u; i < 4u; ++i) {
-            upoint[cell + i] = {0, 0, 0}; unormal[cell + i] = {0, 0, 0};
-            udepth[cell + i] = 0.0f;
-            ucontact_a[cell + i] = 0u; ucontact_b[cell + i] = 0u;
-            ucontact_a_kind[cell + i] = ::nuka::nk::kUContactSideBody;
-            ucontact_b_kind[cell + i] = ::nuka::nk::kUContactSideBody;
-            ucontact_gen[cell + i] = 0u;
+    if (lane == 0u) {
+        for (uint32_t k = 0u; k < pp.cands_per_particle; ++k) {
+            const uint32_t slot = slot0 + k;
+            if (slot >= pp.slot_stride) break;
+            const size_t cell = (static_cast<size_t>(env) * pp.slot_stride + slot) * 4u;
+            ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = 0u;
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                upoint[cell + i] = {0, 0, 0}; unormal[cell + i] = {0, 0, 0};
+                udepth[cell + i] = 0.0f;
+                ucontact_a[cell + i] = 0u; ucontact_b[cell + i] = 0u;
+                ucontact_a_kind[cell + i] = ::nuka::nk::kUContactSideBody;
+                ucontact_b_kind[cell + i] = ::nuka::nk::kUContactSideBody;
+                ucontact_gen[cell + i] = 0u;
+            }
         }
     }
-    if (N == 0u) return;
+    if (N == 0u) return;  // uniform per-warp.
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
     // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position
@@ -391,13 +408,21 @@ __global__ void NarrowphaseBodyParticleKernel(
     const float radius = pp.particle_radius;
     const collision::AABB query = ParticleAabb(center, radius + pp.contact_margin);
 
+    // LANE 0 gathers the candidate list (the cand[] + traversal stack are local
+    // memory -- holding them on every lane would spill); under kWarp ncand + each
+    // cand[ci] are broadcast so all lanes walk the SAME candidates in the SAME order,
+    // byte-identical to the serial gather. The overflow flag is raised by lane 0 only.
     uint32_t cand[kMaxCandidates];
-    bool overflow = false;
-    const uint32_t ncand = GatherOverlaps(query, lbvh_nodes, body_aabb_lo,
-                                          body_aabb_hi, env, N, cand, &overflow);
-    if (overflow && env_status != nullptr) {
-        atomicOr(&env_status[env], kEnvStatusPairOverflow);
+    uint32_t ncand = 0u;
+    if (lane == 0u) {
+        bool overflow = false;
+        ncand = GatherOverlaps(query, lbvh_nodes, body_aabb_lo, body_aabb_hi, env, N,
+                               cand, &overflow);
+        if (overflow && env_status != nullptr) {
+            atomicOr(&env_status[env], kEnvStatusPairOverflow);
+        }
     }
+    if (kWarp) ncand = __shfl_sync(0xffffffffu, ncand, 0);
 
     const amf::PrimParams ps = MakeParticleSphere(center, radius);
     uint32_t written = 0u;
@@ -405,83 +430,100 @@ __global__ void NarrowphaseBodyParticleKernel(
     // Walk all gathered candidates: write the first cands_per_particle (deterministic
     // ascending-body order), flag any excess loud via kEnvStatusPairOverflow.
     for (uint32_t ci = 0u; ci < ncand; ++ci) {
-        const uint32_t body = cand[ci];
+        // Under kWarp broadcast the candidate body so every lane agrees on the
+        // shape/pose (the hull branch needs all 32 lanes converged on identical
+        // inputs); serial just reads its own cand[ci].
+        uint32_t body = (lane == 0u) ? cand[ci] : 0u;
+        if (kWarp) body = __shfl_sync(0xffffffffu, body, 0);
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
         const math::Transform xb = body_pose[env * N + body];
         const amf::PrimParams pb = MakePrim(sb, xb);
 
         // Sphere(=particle, A) vs the body shape; the manifold normal is the
-        // separation dir for the particle (push it off the body).
+        // separation dir for the particle (push it off the body). sb.kind is uniform
+        // across the warp (same body), so the warp does NOT diverge at the switch.
         ContactManifold m;
         m.Clear();
         switch (sb.kind) {
-            case kKindSphere:  amf::SphereSphere(ps, pb, &m); break;
-            case kKindBox:     amf::SphereBox(ps, pb, &m); break;
-            case kKindPlane:   amf::SpherePlane(ps, pb, &m); break;
-            case kKindCapsule: amf::CapsuleSphere(pb, ps, &m);
-                               // CapsuleSphere gives sep dir for the capsule(=A here);
-                               // flip to the particle's separation dir.
-                               for (uint32_t i = 0u; i < m.point_count; ++i)
-                                   m.points[i].normal = Vec3{-m.points[i].normal.x,
-                                                             -m.points[i].normal.y,
-                                                             -m.points[i].normal.z};
+            // The cheap analytic branches do not scan a hull -> LANE 0 only (the
+            // manifold m is meaningful on lane 0, which performs the store below).
+            case kKindSphere:  if (lane == 0u) amf::SphereSphere(ps, pb, &m); break;
+            case kKindBox:     if (lane == 0u) amf::SphereBox(ps, pb, &m); break;
+            case kKindPlane:   if (lane == 0u) amf::SpherePlane(ps, pb, &m); break;
+            case kKindCapsule: if (lane == 0u) {
+                                   amf::CapsuleSphere(pb, ps, &m);
+                                   // CapsuleSphere gives sep dir for the capsule(=A
+                                   // here); flip to the particle's separation dir.
+                                   for (uint32_t i = 0u; i < m.point_count; ++i)
+                                       m.points[i].normal = Vec3{-m.points[i].normal.x,
+                                                                 -m.points[i].normal.y,
+                                                                 -m.points[i].normal.z};
+                               }
                                break;
             case kKindConvexHull: {
+                // Under kWarp ALL 32 lanes call SphereHull in full-warp lockstep: the
+                // giant-hull SupportHull scan splits across lanes (warp_lockstep) for
+                // the win; lane 0 keeps its own (bit-identical) result for the store.
                 cvx::ConvexHullView hull;
                 hull.verts = hull_verts + static_cast<size_t>(sb.hull_vert_offset) * 3u;
                 hull.vcount = sb.hull_vert_count;
                 hull.frame = pb.frame;
-                hull.warp_lockstep = false;
+                hull.warp_lockstep = kWarp;
                 cvx::SphereHull(ps, hull, /*sphere_is_a=*/true, &m);
                 break;
             }
             case kKindHeightfield:
                 // A heightfield body without a wired descriptor cannot be walked;
                 // surface the coverage miss loud (never a silent tunnel-through).
-                if (pp.has_heightfield != 0u && heights != nullptr) {
-                    ParticleHeightfield(center, radius, pp.contact_margin, xb, pp,
-                                        heights, &m);
-                } else if (env_status != nullptr) {
-                    atomicOr(&env_status[env], kEnvStatusPairOverflow);
+                if (lane == 0u) {
+                    if (pp.has_heightfield != 0u && heights != nullptr) {
+                        ParticleHeightfield(center, radius, pp.contact_margin, xb, pp,
+                                            heights, &m);
+                    } else if (env_status != nullptr) {
+                        atomicOr(&env_status[env], kEnvStatusPairOverflow);
+                    }
                 }
                 break;
             default: break;  // SdfMesh / unknown: no analytic particle handler.
         }
-        if (m.point_count == 0u) continue;
-
-        // More real body contacts than reserved slots: keep the first
-        // cands_per_particle (deterministic order) and flag the drop loud.
-        if (written >= pp.cands_per_particle) {
-            if (env_status != nullptr) atomicOr(&env_status[env], kEnvStatusPairOverflow);
-            continue;
-        }
-        const uint32_t slot = slot0 + written;
-        if (slot >= pp.slot_stride) {
-            if (env_status != nullptr) atomicOr(&env_status[env], kEnvStatusPairOverflow);
-            break;
-        }
-        const size_t scell =
-            (static_cast<size_t>(env) * pp.slot_stride + slot) * 4u;
-        const uint32_t n = m.point_count;
-        ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = n;
-        for (uint32_t i = 0u; i < 4u; ++i) {
-            if (i < n) {
-                upoint[scell + i] = m.points[i].position;
-                unormal[scell + i] = m.points[i].normal;
-                udepth[scell + i] = m.points[i].penetration;
-                // Side A == the particle (GLOBAL id + the particle index-kind tag);
-                // side B == the body collidable (env-local row + body tag).
-                ucontact_a[scell + i] = global_particle;
-                ucontact_b[scell + i] = body;
-                ucontact_a_kind[scell + i] = ::nuka::nk::kUContactSideParticle;
-                ucontact_b_kind[scell + i] = ::nuka::nk::kUContactSideBody;
-                ucontact_gen[scell + i] = 1u;
+        // Manifold store + bookkeeping: LANE 0 ONLY (m on the other lanes is unused).
+        // The whole warp keeps iterating every candidate to `ncand` so the hull
+        // lockstep never desyncs -- so the store side-effects are gated WITHOUT any
+        // warp-divergent break/continue (the slot byte-stream is unchanged from the
+        // serial path; a stop only suppresses further writes + ORs the loud flag).
+        if (lane == 0u && m.point_count != 0u) {
+            const uint32_t slot = slot0 + written;
+            // More real body contacts than reserved slots, OR the slot ran past the
+            // env stride: keep the first cands_per_particle (deterministic order),
+            // flag the drop loud (idempotent OR), and stop emitting.
+            if (written >= pp.cands_per_particle || slot >= pp.slot_stride) {
+                if (env_status != nullptr)
+                    atomicOr(&env_status[env], kEnvStatusPairOverflow);
+            } else {
+                const size_t scell =
+                    (static_cast<size_t>(env) * pp.slot_stride + slot) * 4u;
+                const uint32_t n = m.point_count;
+                ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = n;
+                for (uint32_t i = 0u; i < 4u; ++i) {
+                    if (i < n) {
+                        upoint[scell + i] = m.points[i].position;
+                        unormal[scell + i] = m.points[i].normal;
+                        udepth[scell + i] = m.points[i].penetration;
+                        // Side A == the particle (GLOBAL id + the particle index-kind
+                        // tag); side B == the body collidable (env-local row + tag).
+                        ucontact_a[scell + i] = global_particle;
+                        ucontact_b[scell + i] = body;
+                        ucontact_a_kind[scell + i] = ::nuka::nk::kUContactSideParticle;
+                        ucontact_b_kind[scell + i] = ::nuka::nk::kUContactSideBody;
+                        ucontact_gen[scell + i] = 1u;
+                    }
+                }
+                emitted_points += n;
+                ++written;
             }
         }
-        emitted_points += n;
-        ++written;
     }
-    if (emitted_points > 0u && contact_count != nullptr) {
+    if (lane == 0u && emitted_points > 0u && contact_count != nullptr) {
         atomicAdd(&contact_count[env], emitted_points);
     }
 }
@@ -501,21 +543,29 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
         return Status::Ok;
     }
     const uint32_t total = p->env_count * p->particles_per_env;
-    const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(NarrowphaseBodyParticleKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               static_cast<const float*>(model.shape_table),
-               static_cast<const math::Transform*>(data.body_pose),
-               static_cast<const float*>(model.hull_verts),
-               static_cast<const Vec3*>(data.particle_pos),
-               static_cast<const Vec3*>(data.pbf_predicted_pos),
-               reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
-               static_cast<const Vec3*>(data.body_aabb_lo),
-               static_cast<const Vec3*>(data.body_aabb_hi),
-               static_cast<const float*>(model.heights), *p,
-               data.ucontact_count, data.ucontact_point, data.ucontact_normal,
-               data.ucontact_depth, data.ucontact_a, data.ucontact_b,
-               data.ucontact_a_kind, data.ucontact_b_kind, data.ucontact_gen,
-               data.contact_count, data.env_status);
+    // Warp-per-particle (a wide hull collider) launches 32 threads/particle (== the
+    // serial block count *32); thread-per-particle launches one thread/particle.
+    const bool warp = p->warp_per_particle != 0u;
+    const uint32_t threads = warp ? (total * 32u) : total;
+    const uint32_t blocks = (threads + kBlockSize - 1u) / kBlockSize;
+    auto launch = [&](auto kernel) {
+        LaunchCuda(kernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   static_cast<const float*>(model.shape_table),
+                   static_cast<const math::Transform*>(data.body_pose),
+                   static_cast<const float*>(model.hull_verts),
+                   static_cast<const Vec3*>(data.particle_pos),
+                   static_cast<const Vec3*>(data.pbf_predicted_pos),
+                   reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
+                   static_cast<const Vec3*>(data.body_aabb_lo),
+                   static_cast<const Vec3*>(data.body_aabb_hi),
+                   static_cast<const float*>(model.heights), *p,
+                   data.ucontact_count, data.ucontact_point, data.ucontact_normal,
+                   data.ucontact_depth, data.ucontact_a, data.ucontact_b,
+                   data.ucontact_a_kind, data.ucontact_b_kind, data.ucontact_gen,
+                   data.contact_count, data.env_status);
+    };
+    if (warp) launch(&NarrowphaseBodyParticleKernel<true>);
+    else      launch(&NarrowphaseBodyParticleKernel<false>);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
