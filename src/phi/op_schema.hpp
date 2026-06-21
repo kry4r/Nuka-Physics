@@ -125,6 +125,16 @@ enum class NkOp : uint16_t {
                            // the PairDriven family (early-exit otherwise), so the
                            // UnionCsr graph is byte-untouched.
 
+    // --- body/artic <-> particle contact --------------------------------
+    NarrowphaseBodyParticle, // body/artic <-> soft/fluid particle narrowphase: one
+                            // thread per (env x particle) traverses the env LBVH for
+                            // overlapping collidables, treats the particle as a sphere
+                            // of its radius, and writes the sphere-vs-shape manifold
+                            // into the particle's RESERVED contact-slot sub-range with
+                            // the particle-side index-kind tag + global particle id.
+                            // Runs AFTER the rigid narrowphase + BEFORE AssembleRows;
+                            // PairDriven-family-gated (early-exit otherwise).
+
     // --- general contact pipeline Phase 2 (H3) --------------------------
     NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
                             // (convex, heightfield) candidate pair, walk the
@@ -366,6 +376,32 @@ struct NarrowphaseHeightfieldParams {
     float    min_z, max_z;      // LOCAL z-range (for the prism z + extrude)
     uint32_t data_offset;       // base index into the `heights` field
     uint32_t hf_body_row;       // the heightfield collidable's body row (side b)
+};
+
+// Body/artic <-> particle narrowphase. One thread per (env x env-local particle):
+// it builds the particle's query AABB (sphere of particle_radius), traverses the
+// env's arena LBVH for overlapping collidable bodies (the cross_system_query CSR
+// pattern: insertion-sorted, capped at max_candidates, N<2 direct-scan fallback),
+// and for each candidate body runs the sphere-vs-shape manifold (the particle is a
+// SPHERE of its radius on the ONE path). The manifold is written into the
+// particle's RESERVED contact-slot sub-range [slot_base + pi*cands_per_particle,
+// ...+cands_per_particle) so the body<->particle slots occupy a DETERMINISTIC
+// sub-range relative to the racy rigid-rigid slots within each env block; the
+// per-particle base is a fixed (non-atomic) function of the particle index, so the
+// stream is bit-D1 by construction (no sort). Side A == the particle (global id +
+// kUContactSideParticle tag), side B == the body collidable. EARLY-EXITS unless
+// family == kContactFamilyPairDriven. A particle exceeding its candidate budget
+// ORs kEnvStatusPairOverflow (never a silent drop).
+struct NarrowphaseBodyParticleParams {
+    uint32_t family;              // kContactFamily* (PairDriven => run)
+    uint32_t env_count;
+    uint32_t bodies_per_env;      // collidable rows / env (LBVH leaf count)
+    uint32_t particles_per_env;   // per-env particle stride
+    uint32_t slot_stride;         // candidate slots / env (== max_contacts_per_env)
+    uint32_t particle_slot_base;  // first contact slot reserved for particles / env
+    uint32_t cands_per_particle;  // reserved contact slots per particle
+    float    particle_radius;     // the particle collision radius (sphere on the path)
+    float    contact_margin;
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.

@@ -502,10 +502,12 @@ constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
 // Resolve a contact side -> reaction side. The side-kind TAG (nk::kUContactSide*)
 // is consulted FIRST: it declares whether `index` is a body-local collidable row
 // or a global particle id, so a non-body index never reaches the shape_table
-// body-row lookup. For a body-local index: body_id == -1 (from shape_table) is
-// static; an articulation-link body row resolves to (real artic id, owning global
-// link); a free-rigid body row resolves to the rigid side. Returns the side kind;
-// out_artic / out_link valid only for the artic kind; out_body for the rigid kind.
+// body-row lookup. A particle channel resolves to the particle side with the
+// GLOBAL particle id carried in `index` (the narrowphase wrote it global). For a
+// body-local index: body_id == -1 (from shape_table) is static; an articulation-
+// link body row resolves to (real artic id, owning global link); a free-rigid body
+// row resolves to the rigid side. Returns the side kind; out_artic / out_link valid
+// only for the artic kind; out_body for the rigid kind; out_particle for particle.
 // env-major: body_to_* are TEMPLATE-local (per:body), so the global body row ==
 // env*bodies_per_env + local; the global link == env*base_link + template_link;
 // the global artic == env*artics_per_env + local_artic.
@@ -517,10 +519,16 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
                                     uint32_t bodies_per_env, uint32_t base_link_count,
                                     uint32_t artics_per_env,
                                     uint32_t* out_artic, uint32_t* out_link,
-                                    uint32_t* out_body) {
-    *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u;
+                                    uint32_t* out_body, uint32_t* out_particle) {
+    *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u; *out_particle = ~0u;
+    if (side_kind == nk::kUContactSideParticle) {
+        // The narrowphase carries the GLOBAL particle id in `index`; the particle
+        // side is a point mass (jang stays zero) keyed by that id.
+        *out_particle = index;
+        return kNkSideParticle;
+    }
     if (side_kind != nk::kUContactSideBody) {
-        return kNkSideStatic;  // non-body channel: no body-row reaction here.
+        return kNkSideStatic;  // unknown channel: no reaction here.
     }
     const uint32_t local_body = index;
     const PrimShapeDev s = LoadPrimShape(shape_table, local_body);
@@ -606,8 +614,8 @@ __global__ void EmitPairDrivenRowsKernel(
 
     // Resolve the two sides ONCE per slot (same a/b for every manifold point).
     uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
-    uint32_t art_a = ~0u, link_a = ~0u, body_a = ~0u;
-    uint32_t art_b = ~0u, link_b = ~0u, body_b = ~0u;
+    uint32_t art_a = ~0u, link_a = ~0u, body_a = ~0u, part_a = ~0u;
+    uint32_t art_b = ~0u, link_b = ~0u, body_b = ~0u, part_b = ~0u;
     uint32_t local_a = ~0u, local_b = ~0u;
     uint32_t side_kind_a = nk::kUContactSideBody, side_kind_b = nk::kUContactSideBody;
     int32_t bid_a = -1, bid_b = -1;
@@ -624,16 +632,18 @@ __global__ void EmitPairDrivenRowsKernel(
         kind_a = ResolvePairSide(side_kind_a, shape_table, body_to_link,
                                  body_to_articulation, env, local_a, bodies_per_env,
                                  base_link_count, artics_per_env, &art_a, &link_a,
-                                 &body_a);
+                                 &body_a, &part_a);
         kind_b = ResolvePairSide(side_kind_b, shape_table, body_to_link,
                                  body_to_articulation, env, local_b, bodies_per_env,
                                  base_link_count, artics_per_env, &art_b, &link_b,
-                                 &body_b);
+                                 &body_b, &part_b);
     }
     const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
-                          : (kind_a == kNkSideRigid) ? body_a : ~0u;
+                          : (kind_a == kNkSideRigid) ? body_a
+                          : (kind_a == kNkSideParticle) ? part_a : ~0u;
     const uint32_t idx_b = (kind_b == kNkSideArtic) ? art_b
-                          : (kind_b == kNkSideRigid) ? body_b : ~0u;
+                          : (kind_b == kNkSideRigid) ? body_b
+                          : (kind_b == kNkSideParticle) ? part_b : ~0u;
 
     math::Vec3 com_a{0, 0, 0}, com_b{0, 0, 0};
     if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
@@ -798,6 +808,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const float* __restrict__ row_minv_jt_b,
     const float* __restrict__ body_inv_mass,
     const math::Vec3* __restrict__ body_inv_inertia,
+    const float* __restrict__ particle_inv_mass,
     uint32_t total_rows, uint32_t dof_stride, float* __restrict__ row_meff) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
@@ -828,6 +839,12 @@ __global__ void ComputeRowMeffPairDrivenKernel(
                 diagonal += denom;
                 break;
             }
+            case kNkSideParticle:
+                // Point-mass arm: inv_mass*|jlin|^2 (no angular term).
+                diagonal += particle_inv_mass != nullptr
+                                ? particle_inv_mass[sd.index] * Dot3(sd.jlin, sd.jlin)
+                                : 0.0f;
+                break;
             default: break;
         }
     }
@@ -945,6 +962,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.row_minv_jt_b),
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::Vec3*>(data.body_inv_inertia),
+                   static_cast<const float*>(data.particle_inv_mass),
                    total_rows, p->max_dof, data.row_meff);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

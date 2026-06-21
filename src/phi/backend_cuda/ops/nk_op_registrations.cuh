@@ -20,6 +20,7 @@ void RegisterNkCrbaOps();             // crba.cu
 void RegisterNkContactsFootOps();     // contacts_foot.cu (+contacts_union.cu)
 void RegisterNkSyncBodyPoseOps();     // sync_body_pose.cu (general contact B2)
 void RegisterNkNarrowphaseHeightfieldOps();  // narrowphase_heightfield.cu (H3)
+void RegisterNkNarrowphaseBodyParticleOps(); // narrowphase_body_particle.cu
 void RegisterNkBroadphaseOps();       // broadphase.cu (M5)
 void RegisterNkNarrowphaseSdfOps();   // narrowphase_sdf.cu (M5)
 void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)

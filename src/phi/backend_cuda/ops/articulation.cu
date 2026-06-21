@@ -1117,6 +1117,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkContactsFootOps();
     RegisterNkSyncBodyPoseOps();     // general contact B2: SyncLinkBodyPose
     RegisterNkNarrowphaseHeightfieldOps();  // general contact H3: heightfield midphase
+    RegisterNkNarrowphaseBodyParticleOps(); // body/artic <-> particle narrowphase
     RegisterNkBroadphaseOps();
     RegisterNkNarrowphaseSdfOps();
     RegisterNkAssembleRowsOps();

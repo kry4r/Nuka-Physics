@@ -88,6 +88,7 @@ private:
     phi::ParticleGridBuildParams      p_grid_{};
     phi::NarrowphasePrimitivesParams  p_np_prim_{};
     phi::NarrowphaseHeightfieldParams p_np_hf_{};    // general contact H3 heightfield
+    phi::NarrowphaseBodyParticleParams p_np_body_particle_{};  // body<->particle
     phi::NarrowphaseSdfParams         p_np_sdf_{};
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};

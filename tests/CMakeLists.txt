@@ -954,6 +954,12 @@ if(CMAKE_CUDA_COMPILER)
         # (box rests on a static ground plane), and two-run byte-identity for the new
         # mixed-island solve path (S1-S6 fed into the existing coupling engine).
         scenario/pairdriven_solve.cpp
+        # Body/artic <-> soft/fluid particle coupling: a static box overlapping ONE
+        # particle emits a kNkSideParticle row through the SAME EmitPairDrivenRows ->
+        # ComputeRowMeff -> SolveRowsBlockIsland the body rows use (particle = sphere
+        # on the ONE path); asserts the particle-side row solves (lambda>0 + braked
+        # approach velocity) + two-run byte-identity of the coupling stream.
+        scenario/body_particle_coupling.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
