@@ -81,6 +81,7 @@ __global__ void XpbdPredictKernel(uint32_t particle_count,
                                   math::Vec3* __restrict__ positions,
                                   math::Vec3* __restrict__ prev_positions,
                                   const math::Vec3* __restrict__ velocities,
+                                  math::Vec3* __restrict__ v_pre,
                                   const float* __restrict__ inv_masses,
                                   math::Vec3 gravity,
                                   float dt) {
@@ -90,6 +91,9 @@ __global__ void XpbdPredictKernel(uint32_t particle_count,
     }
     const math::Vec3 p = positions[i];
     prev_positions[i] = p;
+    // Save the pre-contact velocity (XPBD predict leaves velocity untouched, so
+    // this is the step-start velocity the finalize subtracts off the contact delta).
+    v_pre[i] = velocities[i];
     if (inv_masses[i] <= 0.0f) {
         return;
     }
@@ -397,11 +401,13 @@ __global__ void XpbdShapeMatchKernel(
     }
 }
 
-// correct: v = (p - prev)/dt (pinned keep their stored velocity). Verbatim.
+// Compose projection velocity (p-prev)/dt with the contact correction (v_now-v_pre)
+// and carry its displacement; untouched (v_now==v_pre) -> byte-identical to (p-prev)/dt.
 __global__ void XpbdCorrectKernel(uint32_t particle_count,
-                                  const math::Vec3* __restrict__ positions,
+                                  math::Vec3* __restrict__ positions,
                                   const math::Vec3* __restrict__ prev_positions,
                                   math::Vec3* __restrict__ velocities,
+                                  const math::Vec3* __restrict__ v_pre,
                                   const float* __restrict__ inv_masses,
                                   float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -411,8 +417,17 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
     if (inv_masses[i] <= 0.0f) {
         return;
     }
-    const math::Vec3 delta = Sub(positions[i], prev_positions[i]);
-    velocities[i] = Scale(delta, 1.0f / dt);
+    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
+    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
+    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
+    const math::Vec3 p_proj = positions[i];
+    const math::Vec3 prev = prev_positions[i];
+    const float inv_dt = 1.0f / dt;
+    const math::Vec3 pbd_v{(p_proj.x - prev.x) * inv_dt, (p_proj.y - prev.y) * inv_dt,
+                           (p_proj.z - prev.z) * inv_dt};
+    velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
+    positions[i] = math::Vec3{p_proj.x + dv.x * dt, p_proj.y + dv.y * dt,
+                              p_proj.z + dv.z * dt};
 }
 
 // =============================================================================
@@ -1041,7 +1056,8 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
     if (p->mode == kParticleModeXpbd) {
         LaunchCuda(XpbdPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_prev_pos,
-                   data.particle_vel, data.particle_inv_mass, g, p->dt);
+                   data.particle_vel, data.particle_v_pre, data.particle_inv_mass,
+                   g, p->dt);
     } else if (p->mode == kParticleModeCoupled) {
         LaunchCuda(CoupledPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_prev_pos,
@@ -1182,7 +1198,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     if (p->mode == kParticleModeXpbd) {
         LaunchCuda(XpbdCorrectKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.particle_inv_mass, p->dt);
+                   data.particle_v_pre, data.particle_inv_mass, p->dt);
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
     if (p->mode == kParticleModeCoupled) {

@@ -980,6 +980,11 @@ if(CMAKE_CUDA_COMPILER)
         # correction (v_now - v_pre) so the impulse the solve wrote into particle_vel
         # survives instead of being overwritten by a plain v = (pos_proj - prev)/dt.
         scenario/soft_fluid_coupling_finalize.cpp
+        # Cloth <-> presser two-way coupling: a 576-particle XPBD cloth drapes over a
+        # low static ridge, a rigid presser dips it (cloth Δz down + spring-back on
+        # lift) and a dynamic presser is arrested by the cloth (body-side reaction
+        # lambda>0 vs a no-cloth control) -- all via the body<->particle row solver.
+        scenario/cloth_presser_two_way.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
@@ -1020,6 +1025,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_phi2
             nuka_solver
             nuka_constraint
+            # nuka_runtime_gpu carries the cook-time cloth topology builder
+            # (BuildClothConstraints) the cloth_presser_two_way scene uses.
+            nuka_runtime_gpu
             nuka_runtime
             nuka_import
             nuka_cooker
@@ -2951,6 +2959,37 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_render
             nuka_nk
             nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # The body<->particle coupling headline clip: a real XPBD cloth draped over two
+    # ridges, pressed + released by a rigid sphere on the ONE general row solver.
+    # Unlike the pose-replay video tools this one STEPS nk::World on CUDA (settle +
+    # the scripted press) and renders the live deforming cloth offscreen. Links the
+    # cloth topology builder (nuka_runtime_gpu) + the full physics + render stack.
+    add_executable(nuka_cloth_presser_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/cloth_presser_demo.cpp
+    )
+    add_dependencies(nuka_cloth_presser_demo nuka_codegen)
+    target_compile_definitions(nuka_cloth_presser_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_cloth_presser_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_cloth_presser_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
             nuka_runtime
             nuka_import
             nuka_cooker
