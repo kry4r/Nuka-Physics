@@ -150,6 +150,7 @@ struct BeautyParams {
     float fog_density;
     float sky_intensity;
     uint32_t transmit_bounces;  // dielectric reflect/refract recursion depth cap
+    uint32_t smooth_normals;    // 1 => opaque arm uses per-vertex smooth normals (trailing: keeps offsets)
 };
 
 // AOV destination pointers for ONE frame (raw device pointers). null skips that
@@ -588,7 +589,8 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
     (void)rng;  // dielectric interfaces are evaluated deterministically (no jitter).
     const float eps = 1.0e-3f;
     const Vec3 i{-V.x, -V.y, -V.z};  // incident travel direction (into the surface)
-    // Orient the normal against the incident ray; entering when V is on the +Ng side.
+    // Orient the normal against the incident ray; entering when V is on the +Ng side
+    // (assumes the camera/primary ray starts outside any medium -- a bounded limit).
     const float vn = V.x * Ng.x + V.y * Ng.y + V.z * Ng.z;
     const bool entering = vn > 0.0f;
     const Vec3 Nf = entering ? Ng : Vec3{-Ng.x, -Ng.y, -Ng.z};
@@ -769,6 +771,21 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     return Vec3{direct.x + mat.albedo.x * indirect.x,
                 direct.y + mat.albedo.y * indirect.y,
                 direct.z + mat.albedo.z * indirect.z};
+}
+
+// Opaque smooth shading: face-forward the per-vertex smooth normal, then ShadeBeauty.
+// __noinline__ isolates this off the flat opaque arm so that path stays byte-exact.
+template <typename Rng>
+__device__ __noinline__ Vec3 ShadeBeautySmooth(
+    const LbvhNode* __restrict__ tlas_nodes, uint32_t tlas_leaf_count,
+    const DevInstance* __restrict__ instances, const Material* __restrict__ materials,
+    Light light, BeautyParams sky, const Vec3& hit, const Vec3& rd, uint32_t bp,
+    float u, float v, const Vec3& n, const Vec3& V, const Material& mat, Rng* rng) {
+    const Vec3 sn = SmoothWorldNormal(instances, bp, u, v, n);
+    const float snv = sn.x * (-rd.x) + sn.y * (-rd.y) + sn.z * (-rd.z);
+    const Vec3 Nf = (snv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
+    return ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials, light, sky,
+                       hit, Nf, V, mat, rng);
 }
 
 // Filmic ACES-ish tonemap of one linear channel (Narkowicz 2015 fit), clamped to

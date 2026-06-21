@@ -118,6 +118,7 @@ struct BeautyOptions {
     float ao_radius = 0.6f;          // AO ray max distance (world units)
     uint32_t seed = 0x9e3779b9u;     // base RNG seed (fixed -> reproducible frames)
     uint32_t transmit_bounces = 2u;  // dielectric reflect/refract recursion depth cap
+    bool smooth_normals = false;     // opaque arm uses per-vertex smooth normals (off => flat, byte-exact)
 
     // Procedural sky + height fog (matches the lavapipe atmosphere); the miss
     // shader returns sky(dir), reused as sky-dome ambient for secondary misses.
