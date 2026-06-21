@@ -62,6 +62,12 @@ struct RenderMaterial {
     float emissive[3]{0.0f, 0.0f, 0.0f};
     float opacity = 1.0f;
 
+    // Refractive dielectric (water/glass) consumed only by the offline beauty
+    // path; transmission==0 (default) is a strict no-op opaque surface.
+    float transmission = 0.0f;       // 0 = opaque; 1 = fully transmissive
+    float ior          = 1.0f;       // refractive index (water ~1.33)
+    float absorption[3]{0.0f, 0.0f, 0.0f};  // per-metre Beer-Lambert extinction
+
     // .nka TEXB texture references (chunk path strings).
     std::string tex_albedo;
     std::string tex_normal;

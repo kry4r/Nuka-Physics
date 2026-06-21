@@ -59,6 +59,13 @@ struct DevBlas {
     const Vec3* tri_v1 = nullptr;
     const Vec3* tri_v2 = nullptr;
 
+    // Smooth per-vertex shading normals, parallel to the triangle prims (nullptr =>
+    // flat geometric normal, byte-identical to a mesh that ships no normals). Read
+    // ONLY by the beauty smooth-shade; the golden/sensor kernel never touches these.
+    const Vec3* tri_n0 = nullptr;
+    const Vec3* tri_n1 = nullptr;
+    const Vec3* tri_n2 = nullptr;
+
     const Vec3* sph_center = nullptr;
     const float* sph_radius = nullptr;
 
@@ -142,6 +149,7 @@ struct BeautyParams {
     Vec3 sky_top, sky_bottom, sky_ground, fog_color;
     float fog_density;
     float sky_intensity;
+    uint32_t transmit_bounces;  // dielectric reflect/refract recursion depth cap
 };
 
 // AOV destination pointers for ONE frame (raw device pointers). null skips that
@@ -372,6 +380,41 @@ __device__ __forceinline__ void ReconstructHit(const DevInstance* __restrict__ i
     *out_v = v;
 }
 
+// Smooth (interpolated) world normal for the WINNING triangle prim from its per-
+// vertex normals + barycentric (u,v). BEAUTY-ONLY: the golden never calls this.
+// Falls back to flat_n when the prim is not a triangle, the mesh ships no normals,
+// or the interpolation degenerates -- so a normal-free mesh shades exactly as today.
+__device__ __forceinline__ Vec3 SmoothWorldNormal(const DevInstance* __restrict__ instances,
+                                                  uint32_t packed_prim,
+                                                  float u, float v,
+                                                  const Vec3& flat_n) {
+    uint32_t inst, local_prim;
+    UnpackPrimId(packed_prim, &inst, &local_prim);
+    const DevInstance& I = instances[inst];
+    const DevBlas& b = I.blas;
+    if (b.tri_n0 == nullptr) {
+        return flat_n;
+    }
+    const DevPrim p = b.prims[local_prim];
+    if (p.kind != static_cast<uint32_t>(PrimKind::Triangle)) {
+        return flat_n;
+    }
+    const Vec3 n0 = b.tri_n0[p.sub];
+    const Vec3 n1 = b.tri_n1[p.sub];
+    const Vec3 n2 = b.tri_n2[p.sub];
+    const float w = 1.0f - u - v;
+    const Vec3 nl{w * n0.x + u * n1.x + v * n2.x,
+                  w * n0.y + u * n1.y + v * n2.y,
+                  w * n0.z + u * n1.z + v * n2.z};
+    const Vec3 nw = QuatRotate(I.transform.rotation, nl);
+    const float len2 = nw.x * nw.x + nw.y * nw.y + nw.z * nw.z;
+    if (len2 <= 1.0e-12f) {
+        return flat_n;  // degenerate (cancelling) interpolation -> keep flat.
+    }
+    const float inv = 1.0f / sqrtf(len2);
+    return Vec3{nw.x * inv, nw.y * inv, nw.z * inv};
+}
+
 // ---------------------------------------------------------------------------
 // SHARED beauty shade: the single-camera beauty TU and the batched sensor TU both
 // call these (the ONE-path move -- one shading model, two callers). RtMath2Pi /
@@ -436,6 +479,196 @@ NUKA_RT_HD inline Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
     return Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
                 sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
                 sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
+}
+
+// Unit direction toward the (analytic) sun/point light from a world point.
+__device__ __forceinline__ Vec3 SunDir(const Light& light, const Vec3& hit) {
+    if (light.directional) {
+        return RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+    }
+    return RtNormalize<float>(Vec3{light.position.x - hit.x, light.position.y - hit.y,
+                                   light.position.z - hit.z});
+}
+
+// Direct Lambert+GGX shade with ONE hard shadow ray for an OPAQUE surface a
+// dielectric reflection/refraction ray lands on. Self-contained (used only by the
+// transmissive branch) so the opaque ShadeBeauty path stays byte-identical.
+static __device__ __noinline__ Vec3 ShadeEnvOpaque(const LbvhNode* __restrict__ tlas_nodes,
+                                              uint32_t tlas_leaf_count,
+                                              const DevInstance* __restrict__ instances,
+                                              const Light& light, const BeautyParams& sky,
+                                              const Vec3& hit, const Vec3& Nf,
+                                              const Material& mat) {
+    const Vec3 Ls = SunDir(light, hit);
+    const Vec3 lc{light.color.x * light.intensity, light.color.y * light.intensity,
+                  light.color.z * light.intensity};
+    const float eps = 1.0e-3f;
+    const Vec3 so{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+    const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
+    const float vis =
+        AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, so, Ls, eps, RtMissDepth())
+            ? 0.0f : 1.0f;
+    const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
+    const Vec3 amb = SkyColor(Nf, sky);  // cheap sky-dome ambient so creases aren't black
+    return Vec3{lc.x * mat.albedo.x * kd * NoL * vis + 0.15f * mat.albedo.x * amb.x,
+                lc.y * mat.albedo.y * kd * NoL * vis + 0.15f * mat.albedo.y * amb.y,
+                lc.z * mat.albedo.z * kd * NoL * vis + 0.15f * mat.albedo.z * amb.z};
+}
+
+// Trace ONE environment ray and return its radiance: an opaque hit is direct-shaded
+// (ShadeEnvOpaque, smooth-normal aware), a hit on another dielectric returns its
+// tinted sky approximation (bounded -- no deeper recursion), a miss returns the sky.
+static __device__ __noinline__ Vec3 TraceEnv(const LbvhNode* __restrict__ tlas_nodes,
+                                       uint32_t tlas_leaf_count,
+                                       const DevInstance* __restrict__ instances,
+                                       const Material* __restrict__ materials,
+                                       const Light& light, const BeautyParams& sky,
+                                       const Vec3& ro, const Vec3& rd) {
+    const float eps = 1.0e-3f;
+    float bt; uint32_t bp;
+    ClosestHit<float>(tlas_nodes, tlas_leaf_count, instances, ro, rd, eps, &bt, &bp);
+    if (bp == kNoPrim) {
+        return SkyColor(rd, sky);
+    }
+    uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
+    const Material bmat = materials[instances[bi].material_id];
+    Vec3 bn; float bu, bv;
+    ReconstructHit<float>(instances, bp, ro, rd, &bn, &bu, &bv);
+    bn = SmoothWorldNormal(instances, bp, bu, bv, bn);
+    const float bnv = bn.x * (-rd.x) + bn.y * (-rd.y) + bn.z * (-rd.z);
+    const Vec3 bnf = (bnv < 0.0f) ? Vec3{-bn.x, -bn.y, -bn.z} : bn;
+    if (bmat.transmission > 0.0f) {
+        // Bounded: behind a second dielectric, tint the sky by its albedo.
+        const Vec3 s = SkyColor(rd, sky);
+        return Vec3{s.x * bmat.albedo.x, s.y * bmat.albedo.y, s.z * bmat.albedo.z};
+    }
+    const Vec3 bhit{ro.x + bt * rd.x, ro.y + bt * rd.y, ro.z + bt * rd.z};
+    return ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, light, sky, bhit, bnf, bmat);
+}
+
+// Refract `i` (unit, incident) about unit normal `n` with relative index `eta`
+// (n1/n2). Returns false on total internal reflection. Snell's law (vector form).
+__device__ __forceinline__ bool Refract(const Vec3& i, const Vec3& n, float eta, Vec3* out) {
+    const float ci = -(i.x * n.x + i.y * n.y + i.z * n.z);  // cos(theta_i) >= 0 (n faces -i)
+    const float k = 1.0f - eta * eta * (1.0f - ci * ci);
+    if (k < 0.0f) {
+        return false;  // total internal reflection
+    }
+    const float c = eta * ci - sqrtf(k);
+    *out = RtNormalize<float>(Vec3{eta * i.x + c * n.x, eta * i.y + c * n.y, eta * i.z + c * n.z});
+    return true;
+}
+
+// Schlick Fresnel reflectance for unpolarized light at normal-incidence cos `c`.
+__device__ __forceinline__ float FresnelSchlick(float c, float r0) {
+    const float m = 1.0f - c;
+    const float m2 = m * m;
+    return r0 + (1.0f - r0) * (m2 * m2 * m);
+}
+
+// Reflect `i` (unit, incident) about unit normal `n`.
+__device__ __forceinline__ Vec3 Reflect(const Vec3& i, const Vec3& n) {
+    const float d = i.x * n.x + i.y * n.y + i.z * n.z;
+    return Vec3{i.x - 2.0f * d * n.x, i.y - 2.0f * d * n.y, i.z - 2.0f * d * n.z};
+}
+
+// Refractive/absorptive dielectric shade (BEAUTY-ONLY). At the first interface
+// (point `hit`, geometric normal `Ng`, view `V`) split energy by Fresnel into a
+// reflected environment sample and a transmitted ray that is marched through up to
+// `transmit_bounces` interfaces, attenuated per segment by Beer-Lambert
+// exp(-absorption*t), then exits to the environment. TIR keeps the reflect term.
+template <typename Rng>
+__device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas_nodes,
+                                  uint32_t tlas_leaf_count,
+                                  const DevInstance* __restrict__ instances,
+                                  const Material* __restrict__ materials,
+                                  Light light, BeautyParams sky, const Vec3& hit,
+                                  const Vec3& Ng, const Vec3& V, const Material& mat,
+                                  Rng* rng) {
+    (void)rng;  // dielectric interfaces are evaluated deterministically (no jitter).
+    const float eps = 1.0e-3f;
+    const Vec3 i{-V.x, -V.y, -V.z};  // incident travel direction (into the surface)
+    // Orient the normal against the incident ray; entering when V is on the +Ng side.
+    const float vn = V.x * Ng.x + V.y * Ng.y + V.z * Ng.z;
+    const bool entering = vn > 0.0f;
+    const Vec3 Nf = entering ? Ng : Vec3{-Ng.x, -Ng.y, -Ng.z};
+    const float n_air = 1.0f;
+    const float n_med = mat.ior > 1.0e-3f ? mat.ior : 1.0f;
+    const float eta = entering ? (n_air / n_med) : (n_med / n_air);
+    const float r0_s = (n_med - n_air) / (n_med + n_air);
+    const float r0 = r0_s * r0_s;
+    const float cosi = fmaxf(0.0f, -(i.x * Nf.x + i.y * Nf.y + i.z * Nf.z));
+
+    // Reflected environment sample (always present; carries TIR when refraction fails).
+    const Vec3 rdir = RtNormalize<float>(Reflect(i, Nf));
+    const Vec3 ro_r{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
+    const Vec3 refl = TraceEnv(tlas_nodes, tlas_leaf_count, instances, materials, light, sky,
+                               ro_r, rdir);
+
+    Vec3 tdir;
+    if (!Refract(i, Nf, eta, &tdir)) {
+        return refl;  // total internal reflection -> all reflected
+    }
+    const float fr = FresnelSchlick(cosi, r0);
+
+    // March the transmitted ray through bounded interfaces, attenuating each in-medium
+    // segment by Beer-Lambert. `inside` flips at every dielectric crossing.
+    Vec3 thr{1.0f, 1.0f, 1.0f};  // running transmittance weight
+    Vec3 ro = Vec3{hit.x - Nf.x * eps, hit.y - Nf.y * eps, hit.z - Nf.z * eps};
+    Vec3 rd = tdir;
+    bool inside = entering;  // we just refracted into the medium iff we were entering
+    Vec3 transmitted{0.0f, 0.0f, 0.0f};
+    const uint32_t cap = sky.transmit_bounces < 1u ? 1u : sky.transmit_bounces;
+    for (uint32_t b = 0; b < cap; ++b) {
+        float bt; uint32_t bp;
+        ClosestHit<float>(tlas_nodes, tlas_leaf_count, instances, ro, rd, eps, &bt, &bp);
+        if (bp == kNoPrim) {
+            const Vec3 s = SkyColor(rd, sky);
+            transmitted = Vec3{thr.x * s.x, thr.y * s.y, thr.z * s.z};
+            break;
+        }
+        if (inside) {
+            // Beer-Lambert over the segment just traversed inside the medium.
+            thr.x *= expf(-mat.absorption.x * bt);
+            thr.y *= expf(-mat.absorption.y * bt);
+            thr.z *= expf(-mat.absorption.z * bt);
+        }
+        uint32_t hi, hlp; UnpackPrimId(bp, &hi, &hlp);
+        const Material hmat = materials[instances[hi].material_id];
+        Vec3 hn; float hu, hv;
+        ReconstructHit<float>(instances, bp, ro, rd, &hn, &hu, &hv);
+        hn = SmoothWorldNormal(instances, bp, hu, hv, hn);
+        const Vec3 hpt{ro.x + bt * rd.x, ro.y + bt * rd.y, ro.z + bt * rd.z};
+        if (hmat.transmission <= 0.0f) {
+            // Hit an opaque body inside/behind the medium -> shade and stop.
+            const float hnv = hn.x * (-rd.x) + hn.y * (-rd.y) + hn.z * (-rd.z);
+            const Vec3 hnf = (hnv < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
+            const Vec3 sh = ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, light, sky,
+                                           hpt, hnf, hmat);
+            transmitted = Vec3{thr.x * sh.x, thr.y * sh.y, thr.z * sh.z};
+            break;
+        }
+        // Another dielectric interface: refract through it, flip inside, continue.
+        const float hvn = -(rd.x * hn.x + rd.y * hn.y + rd.z * hn.z);
+        const Vec3 hnf = (hvn < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
+        const float e2 = inside ? (n_med / n_air) : (n_air / n_med);
+        Vec3 nt;
+        if (!Refract(rd, hnf, e2, &nt)) {
+            nt = RtNormalize<float>(Reflect(rd, hnf));  // TIR at the exit -> internal reflect
+        } else {
+            inside = !inside;
+        }
+        rd = nt;
+        ro = Vec3{hpt.x - hnf.x * eps, hpt.y - hnf.y * eps, hpt.z - hnf.z * eps};
+        if (b + 1u == cap) {
+            const Vec3 s = SkyColor(rd, sky);
+            transmitted = Vec3{thr.x * s.x, thr.y * s.y, thr.z * s.z};
+        }
+    }
+
+    return Vec3{fr * refl.x + (1.0f - fr) * transmitted.x,
+                fr * refl.y + (1.0f - fr) * transmitted.y,
+                fr * refl.z + (1.0f - fr) * transmitted.z};
 }
 
 // Per-pixel hit at world point `hit` with viewer-faced normal `Nf`: K-ray soft sun

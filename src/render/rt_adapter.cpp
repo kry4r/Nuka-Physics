@@ -26,6 +26,13 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
     rt::BlasMesh blas;
     const uint32_t tri_count = geo.TriangleCount();
     blas.triangles.reserve(tri_count);
+    // Emit per-vertex normals into the BLAS only when the geometry ships them; an
+    // empty tri_normals leaves the beauty path on the flat-normal byte-exact fallback.
+    const bool has_normals = geo.normals.size() == geo.positions.size() &&
+                             !geo.normals.empty();
+    if (has_normals) {
+        blas.tri_normals.reserve(tri_count);
+    }
     for (uint32_t t = 0; t < tri_count; ++t) {
         const uint32_t i0 = geo.indices[t * 3u + 0u];
         const uint32_t i1 = geo.indices[t * 3u + 1u];
@@ -38,6 +45,14 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
         // material_id on the prim is UNUSED in G1-A (material is per-instance);
         // 0 matches the in-tree BlasMesh builders.
         blas.triangles.push_back({vert(i0), vert(i1), vert(i2), 0u});
+        if (has_normals) {
+            const auto nrm = [&geo](uint32_t i) -> math::Vec3 {
+                return {geo.normals[i * 3u + 0u],
+                        geo.normals[i * 3u + 1u],
+                        geo.normals[i * 3u + 2u]};
+            };
+            blas.tri_normals.push_back({nrm(i0), nrm(i1), nrm(i2)});
+        }
     }
     return blas;
 }
@@ -50,6 +65,9 @@ rt::Material RenderMaterialToRt(const scene::RenderMaterial& m) {
     out.metallic = m.metallic;
     out.roughness = m.roughness;
     out.emission = {m.emissive[0], m.emissive[1], m.emissive[2]};
+    out.transmission = m.transmission;
+    out.ior = m.ior;
+    out.absorption = {m.absorption[0], m.absorption[1], m.absorption[2]};
     return out;
 }
 

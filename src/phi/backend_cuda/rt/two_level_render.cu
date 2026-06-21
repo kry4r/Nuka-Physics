@@ -236,6 +236,7 @@ struct BlasDevice {
     // Uploaded LOCAL prim arrays (kept alive for the kernel's lifetime).
     OwnedBuffer d_prims;
     OwnedBuffer d_tri_v0, d_tri_v1, d_tri_v2;
+    OwnedBuffer d_tri_n0, d_tri_n1, d_tri_n2;  // smooth per-vertex normals (beauty)
     OwnedBuffer d_sph_c, d_sph_r;
     OwnedBuffer d_sdf_hdr, d_sdf_aabb, d_sdf_eps, d_sdf_iters;
     // SDF cell arrays (one buffer per SDF; their device pointers are baked into
@@ -348,6 +349,22 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
         tri_v2.push_back(t.v2);
     }
 
+    // Smooth per-vertex normals, 1:1 with the triangles (only when the mesh ships
+    // them); empty => the view tri_n* pointers stay null and the beauty path flat-falls.
+    std::vector<Vec3> tri_n0, tri_n1, tri_n2;
+    const bool has_tri_normals = mesh.tri_normals.size() == mesh.triangles.size() &&
+                                 !mesh.tri_normals.empty();
+    if (has_tri_normals) {
+        tri_n0.reserve(mesh.tri_normals.size());
+        tri_n1.reserve(mesh.tri_normals.size());
+        tri_n2.reserve(mesh.tri_normals.size());
+        for (const auto& tn : mesh.tri_normals) {
+            tri_n0.push_back(tn.n0);
+            tri_n1.push_back(tn.n1);
+            tri_n2.push_back(tn.n2);
+        }
+    }
+
     std::vector<Vec3> sph_center;
     std::vector<float> sph_radius;
     for (const auto& s : mesh.spheres) {
@@ -426,6 +443,17 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
     out.view.sdf_aabb = static_cast<const collision::AABB*>(out.d_sdf_aabb.Data());
     out.view.sdf_eps = static_cast<const float*>(out.d_sdf_eps.Data());
     out.view.sdf_iters = static_cast<const int*>(out.d_sdf_iters.Data());
+
+    // Upload smooth normals + point the view at them ONLY when present; absent =>
+    // the tri_n* view pointers stay null (the flat-normal byte-exact fallback).
+    if (has_tri_normals) {
+        out.d_tri_n0 = UploadOwned(bt, tri_n0);
+        out.d_tri_n1 = UploadOwned(bt, tri_n1);
+        out.d_tri_n2 = UploadOwned(bt, tri_n2);
+        out.view.tri_n0 = static_cast<const Vec3*>(out.d_tri_n0.Data());
+        out.view.tri_n1 = static_cast<const Vec3*>(out.d_tri_n1.Data());
+        out.view.tri_n2 = static_cast<const Vec3*>(out.d_tri_n2.Data());
+    }
 
     // Build the BLAS over the LOCAL per-prim AABBs (retain the tree).
     OwnedBuffer d_boxes = UploadOwned(bt, aabbs);
@@ -710,6 +738,7 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.fog_color = opt.fog_color;
     sky.fog_density = opt.fog_density;
     sky.sky_intensity = opt.sky_intensity;
+    sky.transmit_bounces = opt.transmit_bounces;
 
     // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
     LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,

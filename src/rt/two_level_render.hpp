@@ -51,14 +51,28 @@ struct Buffer;   // opaque (phi/buffer.hpp); the caller-resident AOV target
 
 namespace nuka::rt {
 
+// Per-vertex shading normals for ONE triangle (LOCAL space, unit length). Parallel
+// to BlasMesh::triangles. Consumed ONLY by the beauty path for smooth shading; the
+// FP64 golden/sensor kernel ignores them (it uses the flat geometric normal).
+struct TriangleNormals {
+    math::Vec3 n0;
+    math::Vec3 n1;
+    math::Vec3 n2;
+};
+
 // One UNIQUE mesh's primitives in its OWN LOCAL space (p13 declaration-order
 // layout: all triangles first, then spheres, then SDFs). A BLAS is built over
 // these ONCE. The per-prim material_id fields are UNUSED in G1-A (material is
 // per-instance; see Instance::material_id).
+//
+// tri_normals, when non-empty, is 1:1 with triangles and carries smooth per-vertex
+// normals for the beauty smooth-shading path; empty => flat geometric normals
+// (byte-identical to a mesh that ships no normals).
 struct BlasMesh {
     std::vector<TrianglePrim> triangles;
     std::vector<SpherePrim> spheres;
     std::vector<SdfPrim> sdfs;
+    std::vector<TriangleNormals> tri_normals;
 };
 
 // One placed instance: which unique mesh (blas_id indexes TwoLevelScene::meshes),
@@ -103,6 +117,7 @@ struct BeautyOptions {
     uint32_t ao_samples = 3u;        // hemisphere rays for ambient occlusion
     float ao_radius = 0.6f;          // AO ray max distance (world units)
     uint32_t seed = 0x9e3779b9u;     // base RNG seed (fixed -> reproducible frames)
+    uint32_t transmit_bounces = 2u;  // dielectric reflect/refract recursion depth cap
 
     // Procedural sky + height fog (matches the lavapipe atmosphere); the miss
     // shader returns sky(dir), reused as sky-dome ambient for secondary misses.

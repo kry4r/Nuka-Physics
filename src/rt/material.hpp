@@ -18,11 +18,19 @@ namespace nuka::rt {
 
 // Lambert + GGX material. albedo is base color; metallic in [0,1] tints the
 // specular and removes diffuse; roughness in (0,1] is the GGX alpha source.
+//
+// transmission/ior/absorption are the dielectric extension consumed ONLY by the
+// stochastic beauty path (Fresnel reflect+refract + Beer-Lambert tint). They
+// DEFAULT to a strict no-op (transmission==0 => opaque): the FP64 golden/sensor
+// shade (ShadeDirect) never reads them, so an opaque material is byte-unchanged.
 struct Material {
     math::Vec3 albedo{0.8f, 0.8f, 0.8f};
     float metallic = 0.0f;
     float roughness = 0.5f;
     math::Vec3 emission{0.0f, 0.0f, 0.0f};
+    float transmission = 0.0f;            // 0 = opaque; 1 = fully transmissive
+    float ior = 1.0f;                     // refractive index (water ~1.33)
+    math::Vec3 absorption{0.0f, 0.0f, 0.0f};  // per-metre Beer-Lambert extinction
 };
 
 // One analytic light. directional == true: `direction` is the (unit) direction
