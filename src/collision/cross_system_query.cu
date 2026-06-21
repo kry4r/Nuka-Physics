@@ -1,9 +1,8 @@
 // ---------------------------------------------------------------------------
-// nuka::collision::gpu::QueryParticlesAgainstRigidLbvh implementation
-// (v0.7 p05, Task 7.5.3).
+// nuka::collision::gpu::QueryParticlesAgainstRigidLbvh implementation.
 //
 // Two passes over the particles, each traversing the rigid LBVH with an explicit
-// stack (mirrors LbvhPairQueryKernel from p04):
+// stack (mirrors LbvhPairQueryKernel):
 //   pass 1: count in-AABB rigid candidates per particle (capped) -> counts
 //   exclusive scan: counts -> CSR offsets
 //   pass 2: write each particle's candidates into its PRIVATE CSR slice,

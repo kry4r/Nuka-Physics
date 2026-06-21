@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M6 particle ops (XPBD soft + PBF fluid as backend ops).
+// PHI v2 CUDA backend — particle ops (XPBD soft + PBF fluid as backend ops).
 //
 // LINE-BY-LINE ports of the kernel bodies from
-//   the legacy XPBD soft stepper (predict / distance / bend / volume / correct)
-//   the legacy PBF fluid stepper (predict / density / lambda / delta / apply /
-//                                    finalize / xsph viscosity / cohesion)
+// the legacy XPBD soft stepper (predict / distance / bend / volume / correct)
+// the legacy PBF fluid stepper (predict / density / lambda / delta / apply /
+// finalize / xsph viscosity / cohesion)
 // onto the nk arena fields (DataView/ModelView typed device pointers). The op
 // order, the reduction order, and every float expression are preserved verbatim
 // so the existing XPBD/PBF oracle tolerances hold UNCHANGED and the D1 byte-exact
@@ -17,7 +17,7 @@
 // PbfApplyDelta (the pipeline is a flat OpCall list, so the N-iteration coupling
 // is owned by the op TU, exactly as the legacy PBF stepper owned its inner loop).
 //
-// NEIGHBOR LAYOUT (M5 arena CSR): the ParticleGridBuild op (broadphase.cu) writes
+// NEIGHBOR LAYOUT (arena CSR): the ParticleGridBuild op (broadphase.cu) writes
 // each particle's neighbor list into a PRIVATE slice grid_neighbor_idx[i*32 .. ]
 // (stride kParticleGridMaxNeighbors == 32, ascending in-cell order) with the live
 // count in grid_neighbor_count[i]. The legacy PBF kernels read a FLAT CSR
@@ -28,7 +28,7 @@
 //
 // NO host allocation, no per-call device allocation (lint hot_path scope). All
 // scratch is arena-resident (pbf_predicted_pos / pbf_position_delta / pbf_density
-// / pbf_lambda + grid_neighbor_* from M5).
+// / pbf_lambda + grid_neighbor_*).
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -60,7 +60,7 @@ constexpr uint32_t kBlockSize = 128u;
 // Per-particle private CSR slice stride the GridFillKernel wrote == the shared
 // cap cg::kParticleGridMaxNeighbors; base = i * cg::kParticleGridMaxNeighbors.
 
-// M9 T11 SoftFluid: within-env local particle index (env-major: env e owns
+// SoftFluid: within-env local particle index (env-major: env e owns
 // [e*per_env, e*per_env+per_env); the soft sub-slice is the first n_soft of each
 // env). per_env == 0 (defensive) makes the local index the global index. The
 // PBF fluid ops use this to skip soft particles; single-system n_soft == 0 makes
@@ -433,7 +433,7 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
 
 // =============================================================================
 // PBF kernels — VERBATIM from the legacy PBF fluid stepper. The ONLY change is the
-// neighbor read: the M5 arena grid writes a PRIVATE per-particle slice
+// neighbor read: the arena grid writes a PRIVATE per-particle slice
 // (neighbor_idx[i*32 + k], count[i]), so `base = i * kParticleGridMaxNeighbors` in
 // place of the legacy flat `neighbor_offsets[i]`. The k-loop order is identical.
 // =============================================================================
@@ -470,7 +470,7 @@ __global__ void PbfPredictKernel(uint32_t particle_count,
 }
 
 // density (Poly6, self term first, ascending neighbor sum). Verbatim, plus the
-// M9 T11 SoftFluid fluid-slice scope: when n_soft > 0 the owner particle skips if
+// SoftFluid fluid-slice scope: when n_soft > 0 the owner particle skips if
 // it is a SOFT particle, and a SOFT neighbor is skipped in the sum (a soft
 // particle must NOT contribute to fluid density). For single-system PBF n_soft ==
 // 0 so SfIsSoft is always false -> the loop is BYTE-IDENTICAL to the legacy.
@@ -506,7 +506,7 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
     out_density[i] = rho;
 }
 
-// lambda (M&M eq.9-11). Verbatim, plus the M9 T11 SoftFluid fluid-slice scope.
+// lambda (M&M eq.9-11). Verbatim, plus the SoftFluid fluid-slice scope.
 __global__ void PbfLambdaKernel(uint32_t particle_count,
                                 uint32_t n_soft,
                                 uint32_t per_env,
@@ -556,7 +556,7 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
     out_lambda[i] = -c_i / (sum_grad_sq + cfm_epsilon);
 }
 
-// correction compute (Jacobi, read-only on predicted). Verbatim, plus the M9 T11
+// correction compute (Jacobi, read-only on predicted). Verbatim, plus the 
 // SoftFluid fluid-slice scope (soft owner gets no delta; soft neighbors skipped).
 __global__ void PbfComputeCorrectionKernel(
     uint32_t particle_count,
@@ -598,7 +598,7 @@ __global__ void PbfComputeCorrectionKernel(
     out_delta[i] = dp;
 }
 
-// correction apply (own-index write + optional floor clamp). The M5 grid is
+// correction apply (own-index write + optional floor clamp). The grid is
 // z-up; the boundary clamps the predicted z (the legacy clamped y — same shape).
 __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
                                          math::Vec3* __restrict__ predicted,
@@ -647,7 +647,7 @@ __global__ void PbfFinalizeKernel(uint32_t particle_count,
 }
 
 // XSPH viscosity compute (read-only into the delta scratch). Verbatim, plus the
-// M9 T11 SoftFluid fluid-slice scope (a soft owner gets no XSPH delta; a soft
+// SoftFluid fluid-slice scope (a soft owner gets no XSPH delta; a soft
 // neighbor is skipped in the sum). Single-system PBF passes n_soft == 0 so
 // SfIsSoft is always false -> BYTE-IDENTICAL to the legacy XSPH.
 __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
@@ -710,7 +710,7 @@ __global__ void PbfApplyVelocityDeltaKernel(uint32_t particle_count,
     velocities[i] = math::Vec3{v.x + d.x, v.y + d.y, v.z + d.z};
 }
 
-// cohesion velocity nudge (Akinci cohesion only). Verbatim, plus the M9 T11
+// cohesion velocity nudge (Akinci cohesion only). Verbatim, plus the 
 // SoftFluid fluid-slice scope (a soft owner gets no cohesion nudge; a soft
 // neighbor is skipped). Single-system PBF (n_soft == 0) is BYTE-IDENTICAL.
 __global__ void PbfCohesionKernel(uint32_t particle_count,
@@ -759,7 +759,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
 }
 
 // =============================================================================
-// COUPLED kernels (M6): particles co-step against rigid/artic bodies through the
+// COUPLED kernels : particles co-step against rigid/artic bodies through the
 // unified row solve. The contact solve corrects the particle velocity BETWEEN
 // these two kernels (the legacy unified_costep pre/couple/post ordering inside
 // the fixed pipeline). pbf_predicted_pos stores v_pre so finalize composes the
@@ -810,10 +810,10 @@ __global__ void CoupledPredictKernel(uint32_t particle_count,
 
 // finalize: compose the PBD (soft-constraint / density) velocity with the contact
 // delta.
-//   contact_delta = v_now - v_pre              (the row solve's velocity correction)
-//   pbd_vel       = (pos_projected - prev)/dt   (the internal-projection velocity)
-//   v_final       = pbd_vel + contact_delta
-//   pos_final     = prev + v_final*dt
+// contact_delta = v_now - v_pre (the row solve's velocity correction)
+// pbd_vel = (pos_projected - prev)/dt (the internal-projection velocity)
+// v_final = pbd_vel + contact_delta
+// pos_final = prev + v_final*dt
 // pos_projected is pbf_predicted_pos for a PBF-internal body (the density-projected
 // position) and particle_pos for XPBD / free-point bodies. A pinned particle
 // (inv_mass 0) holds position + velocity (boundary anchor).
@@ -851,7 +851,7 @@ __global__ void CoupledFinalizeKernel(uint32_t particle_count,
 }
 
 // =============================================================================
-// SOFT+FLUID co-resident kernels (M9 T11): ONE Model holds a soft (XPBD) set in
+// SOFT+FLUID co-resident kernels : ONE Model holds a soft (XPBD) set in
 // [0, n_soft) and a fluid (PBF) set in [n_soft, per_env) per env. The predict /
 // finalize kernels branch per-particle on the within-env local index vs n_soft;
 // the soft branch is the VERBATIM XPBD predict/correct, the fluid branch the
@@ -966,12 +966,12 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
 }
 
 // =============================================================================
-// id-10 CROSS-SYSTEM particle-particle CONTACT (M9 T11 Phase 2). VERBATIM port of
+// CROSS-SYSTEM particle-particle CONTACT (Cross-system). VERBATIM port of
 // runtime/coupling/particle_particle_contact.cu ComputeHalfCorrectionKernel +
 // ApplyCorrectionKernel onto the nk arena. The CLASS-BLIND unilateral
 // non-penetration row does NOT branch on soft/fluid (SfIsSoft is unused here): the
 // math is identical for soft<->soft, fluid<->fluid, soft<->fluid. The ONLY change
-// from the legacy is the neighbor read: the M5 arena grid writes a PRIVATE
+// from the legacy is the neighbor read: the arena grid writes a PRIVATE
 // per-particle slice (neighbor_idx[i*32 + k], count[i]) instead of the legacy flat
 // CSR (neighbor_offsets[i] + k); the k-loop order (ascending neighbor index) is
 // identical so the fixed-order __fadd_rn reduction is D1-unchanged. The grid is
@@ -1278,7 +1278,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-// OpParticleParticleContact (M9 T11 Phase 2): the id-10 cross-system contact
+// OpParticleParticleContact (Cross-system): the cross-system contact
 // co-step. Runs AFTER ParticleFinalize (incl. the fluid-slice polish), operating
 // on the committed union positions (particle_pos). Only SoftFluid carries this op;
 // the single-system Xpbd/Pbf paths never emit it (byte-identity preserved). The

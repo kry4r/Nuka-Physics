@@ -1,50 +1,50 @@
 // ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M4 SolveRowsBlockIsland (the §3.4 device-resident
+// PHI v2 CUDA backend — SolveRowsBlockIsland (the spec device-resident
 // unified row solve). TWO contact families behind the ONE op (params->family):
 //
-//   (L1-b: the legacy FUSED block-per-articulation PGS path was DELETED here —
-//   `SolveArticulatedContactRowsKernel` + its dispatch branch are gone. The ONE
-//   general island solver below now serves both remaining families.)
+// (: the legacy FUSED block-per-articulation PGS path was DELETED here —
+// `SolveArticulatedContactRowsKernel` + its dispatch branch are gone. The ONE
+// general island solver below now serves both remaining families.)
 //
-//   UNION (kContactFamilyUnionCsr) — THE §3.4 KERNEL: grid = total_islands
-//   (= N_env x islands/env from the build-time SolveSchedule), block = 256;
-//   per block:
-//     for it in vel_iters:
-//       for c in colors(island):           // device-resident segment table
-//         rows of color c in parallel (thread/row) -> __syncthreads()
-//   Per-row math = row_solver.cu's COMPLIANT branch, preserved numerically:
-//     * jv          = per-side dispatch (CompliantSideConstraintVelocity):
-//                     rigid: dot(jlin,v)+dot(jang,w); artic: serial
-//                     sum_r J[r]*qdot[r] (ascending r, the legacy order);
-//                     particle: dot(jlin,v); static: 0. Side a then b.
-//     * update      = lambda_new = clamp(lambda + meff*(rhs*dt - jv
-//                     - R*lambda), bounds) — incl. the C5c-2 regularizer
-//                     feedback (-R*lambda) the legacy kernel carries.
-//     * friction    = the unilateral coupled-pyramid bound
-//                     [0, mu * TotalNormalLambda(group)] (IsCompliantFriction-
-//                     Row semantics; the group sum over the FIXED normal slots
-//                     equals the legacy compacted sum — inactive slots carry
-//                     lambda == 0).
-//     * apply       = per-side dispatch: rigid v += jlin*(im*dl), w += jang*
-//                     invI*dl (skip im<=0); artic qdot[r] += w[r]*dl with the
-//                     PRECOMPUTED w = M^-1 J^T (the ArticulationApplyImpulse
-//                     inner product hoisted to AssembleRows — same products,
-//                     same order); particle v += jlin*(im*dl). |dl| > 1e-12
-//                     gate, side a then b. meff is the assembly-hoisted
-//                     ComputeCompliantEffectiveMass (constant across iters).
-//   The articulation qdot tile lives in SHARED memory for the island's env
-//   (loaded from qdot_flat before the sweep, scattered back to link_velocity /
-//   qdot through the cooked dof maps after — the legacy pack/scatter 1:1; a
-//   contact-free env scatters its own unchanged values, a no-op). 51-DOF
-//   M^-1 J^T is the per-thread register loop over the row's coalesced
-//   chain_jacobian / row_minv_jt segments (fields.yaml layout note).
-//   Watermark early-exit: an inactive row slot (flags bit0 clear) returns
-//   immediately — max grid + early exit keeps the kernel graph-capturable
-//   (plan §3.3 capacity policy).
-//   pos_iters is accepted but unused: every union row is COMPLIANT, and the
-//   legacy compliant path skips Baumgarte position projection entirely
-//   (SolvePositionRow returns 0 for Compliant rows; the legacy union runs
-//   position_iterations = 0) — preserved semantics, not an omission.
+// UNION (kContactFamilyUnionCsr) — THE the spec KERNEL: grid = total_islands
+// (= N_env x islands/env from the build-time SolveSchedule), block = 256;
+// per block:
+// for it in vel_iters:
+// for c in colors(island): // device-resident segment table
+// rows of color c in parallel (thread/row) -> __syncthreads
+// Per-row math = row_solver.cu's COMPLIANT branch, preserved numerically:
+// * jv = per-side dispatch (CompliantSideConstraintVelocity):
+// rigid: dot(jlin,v)+dot(jang,w); artic: serial
+// sum_r J[r]*qdot[r] (ascending r, the legacy order);
+// particle: dot(jlin,v); static: 0. Side a then b.
+// * update = lambda_new = clamp(lambda + meff*(rhs*dt - jv
+// - R*lambda), bounds) — incl. the C5c-2 regularizer
+// feedback (-R*lambda) the legacy kernel carries.
+// * friction = the unilateral coupled-pyramid bound
+// [0, mu * TotalNormalLambda(group)] (IsCompliantFriction-
+// Row semantics; the group sum over the FIXED normal slots
+// equals the legacy compacted sum — inactive slots carry
+// lambda == 0).
+// * apply = per-side dispatch: rigid v += jlin*(im*dl), w += jang*
+// invI*dl (skip im<=0); artic qdot[r] += w[r]*dl with the
+// PRECOMPUTED w = M^-1 J^T (the ArticulationApplyImpulse
+// inner product hoisted to AssembleRows — same products,
+// same order); particle v += jlin*(im*dl). |dl| > 1e-12
+// gate, side a then b. meff is the assembly-hoisted
+// ComputeCompliantEffectiveMass (constant across iters).
+// The articulation qdot tile lives in SHARED memory for the island's env
+// (loaded from qdot_flat before the sweep, scattered back to link_velocity /
+// qdot through the cooked dof maps after — the legacy pack/scatter 1:1; a
+// contact-free env scatters its own unchanged values, a no-op). 51-DOF
+// M^-1 J^T is the per-thread register loop over the row's coalesced
+// chain_jacobian / row_minv_jt segments (fields.yaml layout note).
+// Watermark early-exit: an inactive row slot (flags bit0 clear) returns
+// immediately — max grid + early exit keeps the kernel graph-capturable
+// (the design capacity policy).
+// pos_iters is accepted but unused: every union row is COMPLIANT, and the
+// legacy compliant path skips Baumgarte position projection entirely
+// (SolvePositionRow returns 0 for Compliant rows; the legacy union runs
+// position_iterations = 0) — preserved semantics, not an omission.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -68,7 +68,7 @@ __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
 }
 
 // ===========================================================================
-// UNION-family island kernel (M4 NEW — the §3.4 spec kernel).
+// UNION-family island kernel (NEW — the spec kernel).
 // ===========================================================================
 
 // Island record: the schedule's per-island quad. The flat schedule array is a
@@ -85,12 +85,12 @@ struct IslandRecord {
 static_assert(sizeof(IslandRecord) == 4u * sizeof(uint32_t),
               "IslandRecord must pack exactly the stride-4 schedule quad");
 
-// Island block size. §3.4 sketched 256; MEASURED at N=1 (one island, ~170
+// Island block size. the spec sketched 256; MEASURED at N=1 (one island, ~170
 // colors x 64 iters = ~11k __syncthreads on the critical path) a small block
 // wins decisively — the per-color parallel width is 1-2 rows (each handled by
 // a WARP), so wide blocks only pay barrier latency. 64 = 2 row-warps, the
 // measured sweet spot; the grid (= islands = N_env x components) is what
-// fills the GPU at batch (plan §3.4's own scaling argument).
+// fills the GPU at batch (the design's own scaling argument).
 constexpr uint32_t kIslandBlockSize = 64u;
 
 // Slim per-row SOLVE record (16 f32 = 64 B), built IN-KERNEL at launch from
@@ -99,8 +99,8 @@ constexpr uint32_t kIslandBlockSize = 64u;
 // local memory and dominated the bookkeeping cost. The slim record carries
 // exactly what the velocity update needs: flags / group (re-based env-LOCAL) /
 // compliance terms / the side dispatch folded to {artic bits + at most ONE
-// dynamic (rigid|particle) side}. A row with TWO dynamic sides (the M6
-// particle x particle class — never emitted by the M4 assembly) sets the
+// dynamic (rigid|particle) side}. A row with TWO dynamic sides (the
+// particle x particle class — never emitted by the assembly) sets the
 // FALLBACK bit and the row solve reads the full NkRow from global (slow but
 // correct path; no silent drop).
 struct SlimRow {
@@ -112,7 +112,7 @@ struct SlimRow {
     float rhs, R, lower, upper, mu;
     float jl[3];            // the dynamic side's linear jacobian
     float ja[3];            // ... angular (rigid r x j augment)
-    // S3 (general contact pipeline Phase 1B): the ENV-LOCAL articulation tile
+    // the ENV-LOCAL articulation tile
     // index for each artic side (global_artic - env*artics_per_env) so the row
     // reads/writes the CORRECT per-articulation qdot tile in shared memory. At
     // K==1 both collapse to 0 (one tile/env) -> byte-identical to the single-tile
@@ -135,8 +135,8 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 // needs ~92 KB — within sm_8x+'s opt-in dynamic shared (set once via
 // cudaFuncAttributeMaxDynamicSharedMemorySize). A model whose slice exceeds
 // the device limit fails LOUDLY at the op entry (Model capacity property;
-// the M5 broadphase-cooked sizing revisits it).
-// S3: the qdot region holds ALL of the env's articulation tiles
+// the broadphase-cooked sizing revisits it).
+// the qdot region holds ALL of the env's articulation tiles
 // (qdot_tiles * dof_stride floats) so a PairDriven mixed island can service every
 // co-resident articulation it touches. For the Union/Fused single-artic families
 // qdot_tiles == kMaxArticulationDof / dof_stride is unused; they pass
@@ -144,7 +144,7 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 // to keep the union footprint UNCHANGED (the H1 golden's measured ~92 KB) the op
 // passes the legacy reservation for the non-PairDriven families (with_b_arm == 0)
 // and the compact K-tile reservation for PairDriven. The B-arm J_b/w_b region
-// (S2) is present ONLY when with_b_arm (the PairDriven family) — the union path
+// is present ONLY when with_b_arm (the PairDriven family) — the union path
 // never allocates it, so its shared footprint is byte-for-byte the legacy carve.
 // cache_jw: the Union family caches the per-row chain-J (J) + M^-1 J^T (w) rows in
 // SHARED (the measured latency core of its dense 190-row sweep). The PairDriven
@@ -225,13 +225,13 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
 
 // One row's velocity update — row_solver.cu SolveCompliantVelocityRow,
 // preserved numerically (see the file header), executed by ONE WARP:
-//   * the Jv reduction stays the LEGACY SERIAL ascending-r loop on lane 0
-//     over the SHARED J slice (a tree/warp reduction would change the
-//     summation order),
-//   * the lambda update (bounds, clamp, regularizer feedback) is lane 0,
-//   * the M^-1 J^T apply is warp-PARALLEL over the dof elements (each
-//     qdot[r] += w[r]*delta is one independent multiply-add — identical
-//     rounding regardless of which lane executes it; w is shared-cached).
+// * the Jv reduction stays the LEGACY SERIAL ascending-r loop on lane 0
+// over the SHARED J slice (a tree/warp reduction would change the
+// summation order),
+// * the lambda update (bounds, clamp, regularizer feedback) is lane 0,
+// * the M^-1 J^T apply is warp-PARALLEL over the dof elements (each
+// qdot[r] += w[r]*delta is one independent multiply-add — identical
+// rounding regardless of which lane executes it; w is shared-cached).
 __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   uint32_t gslot,         // global slot
                                   uint32_t env_row_base,  // env's first global slot
@@ -245,9 +245,9 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   const float* __restrict__ row_meff,  // global meff
                                   const float* J_sh,      // shared (union) OR global (PD)
                                   const float* w_sh,
-                                  const float* J_b_sh,    // S2 side-B chain-J (or null)
-                                  const float* w_b_sh,    // S2 side-B M^-1 J^T (or null)
-                                  float* qdot_sh,         // S3: K tiles, [tile*dof+r]
+                                  const float* J_b_sh,    // side-B chain-J (or null)
+                                  const float* w_b_sh,    // side-B M^-1 J^T (or null)
+                                  float* qdot_sh,         // K tiles, [tile*dof+r]
                                   const NkRow* __restrict__ urows,
                                   math::Vec3* __restrict__ body_lin_vel,
                                   math::Vec3* __restrict__ body_ang_vel,
@@ -272,7 +272,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         return;  // watermark early-exit (inactive slot).
     }
     const uint32_t code = sr->code;
-    // S3: each artic side reads/writes its OWN per-articulation tile in qdot_sh.
+    // each artic side reads/writes its OWN per-articulation tile in qdot_sh.
     // At K==1 a_tile == b_tile == 0 (one tile/env) -> the legacy single-tile path.
     const uint32_t a_tile = (sr->a_tile == ~0u) ? 0u : sr->a_tile;
     const uint32_t b_tile = (sr->b_tile == ~0u) ? 0u : sr->b_tile;
@@ -281,7 +281,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
     if (wlane == 0u) {
         // jv contributions, then summed in the LEGACY a-then-b side order.
         // Side A reduced-coordinate Jv = sum_r J[r]*qdot_A[r] (ascending r, the
-        // legacy serial order). Side B (S2) uses J_b over qdot_B (its OWN tile).
+        // legacy serial order). Side B uses J_b over qdot_B (its OWN tile).
         float art_jv_a = 0.0f;
         if (code & kSlimAArt) {
             const float* const J = J_sh + static_cast<size_t>(j_row) * dof_stride;
@@ -320,7 +320,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         if (code & kSlimBArt) jv += art_jv_b;
         else if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
         if (code & kSlimFallback) {
-            // Two-dynamic-side row (M6 class): the slim record carries only
+            // Two-dynamic-side row (two-dynamic-side class): the slim record carries only
             // side a; read the full record and add side b's jv (rare path).
             const NkRow row = urows[gslot];
             if (row.b.kind == kNkSideParticle && particle_vel != nullptr) {
@@ -381,7 +381,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                              ((side == 1) == ((code & kSlimDynIsB) != 0u));
             if (art) {
                 // qdot_side += w_side * delta with the PRECOMPUTED w = M^-1 J^T,
-                // into the side's OWN per-articulation tile (S3) — element-
+                // into the side's OWN per-articulation tile — element-
                 // independent multiply-add (bit-equal whatever lane executes it).
                 const uint32_t tile = (side == 0) ? a_tile : b_tile;
                 const float* w;
@@ -597,8 +597,8 @@ __global__ void SolveRowsBlockIslandKernel(
     float* __restrict__ lambda,
     const float* __restrict__ chain_jacobian,
     const float* __restrict__ row_minv_jt,
-    const float* __restrict__ chain_jacobian_b,  // S2 side-B (or null)
-    const float* __restrict__ row_minv_jt_b,     // S2 side-B (or null)
+    const float* __restrict__ chain_jacobian_b,  // side-B (or null)
+    const float* __restrict__ row_minv_jt_b,     // side-B (or null)
     const float* __restrict__ row_meff,
     float* __restrict__ qdot_flat,
     Spatial6* __restrict__ link_velocity,
@@ -627,8 +627,8 @@ __global__ void SolveRowsBlockIslandKernel(
     uint32_t rows_per_env,
     uint32_t dof_stride,
     uint32_t base_link_count,
-    uint32_t artics_per_env,    // S3: co-resident artic tiles per env (1 at K==1)
-    uint32_t with_b_arm,        // S2: PairDriven carves J_b/w_b shared regions
+    uint32_t artics_per_env,    // co-resident artic tiles per env (1 at K==1)
+    uint32_t with_b_arm,        // PairDriven carves J_b/w_b shared regions
     uint32_t vel_iters,
     uint32_t pos_iters,
     float pos_beta, float pos_slop,
@@ -664,7 +664,7 @@ __global__ void SolveRowsBlockIslandKernel(
     // hundreds of rows; caching J,w,J_b,w_b would blow the ~99 KB shared limit) --
     // it reads J/w/J_b/w_b from GLOBAL each iteration (bounded shared).
     const bool cache_jw = (with_b_arm == 0u);
-    // S3: the qdot region. Union: the legacy kMaxArticulationDof reservation (shared
+    // the qdot region. Union: the legacy kMaxArticulationDof reservation (shared
     // footprint byte-for-byte the H1-golden carve). PairDriven: compact K-tile.
     const uint32_t qdot_floats =
         (with_b_arm != 0u) ? (k_tiles * dof_stride) : kMaxArticulationDof;
@@ -707,7 +707,7 @@ __global__ void SolveRowsBlockIslandKernel(
 
     const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
     if (has_artic) {
-        // S3: load EVERY co-resident articulation tile of this env (K tiles). At
+        // load EVERY co-resident articulation tile of this env (K tiles). At
         // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
         for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
             qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
@@ -951,7 +951,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             (p->articulation_count > 0u && p->env_count > 0u)
                 ? (p->articulation_count / p->env_count) : 1u;
         // qdot region: legacy kMaxArticulationDof reservation for UnionCsr (the
-        // H1-golden footprint), the compact K-tile reservation for PairDriven (S3).
+        // H1-golden footprint), the compact K-tile reservation for PairDriven .
         const uint32_t qdot_floats =
             with_b_arm ? (artics_per_env * p->max_dof) : kMaxArticulationDof;
         // Split-impulse position pass runs ONLY on the PairDriven path (pos_iters>0).
@@ -1046,7 +1046,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
 
-    // L1-b: the legacy FUSED family was deleted. The only remaining families are
+    // the legacy FUSED family was deleted. The only remaining families are
     // UnionCsr / PairDriven (handled above); anything else is an unconfigured
     // contact family with nothing to solve.
     return Status::Ok;

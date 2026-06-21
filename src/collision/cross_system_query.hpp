@@ -1,7 +1,7 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::collision::gpu::CrossSystemQuery -- particle -> rigid candidate query
-// (v0.7 p05, Task 7.5.3). The keystone of K2 SDF coupling.
+// nuka::collision::gpu::CrossSystemQuery -- particle -> rigid candidate query.
+// The keystone of the cross-system particle<->rigid coupling row emission.
 //
 // For each particle: build a world AABB (sphere of query_radius around the
 // particle position), traverse the RIGID LBVH (built by BuildLbvhForQuery in
@@ -11,7 +11,7 @@
 //
 // 16-candidate cap (memory R-C, spec 7.5.5): at most kCrossSystemMaxCandidates
 // candidates per particle (the LOWEST rigid-body indices; deterministic subset).
-// A particle exceeding the cap increments TruncatedParticleCount().
+// A particle exceeding the cap increments TruncatedParticleCount.
 //
 // D1 (HARD): no global append atomic -- a two-pass count + exclusive-scan +
 // private-slice fill produces per-particle slices that are sorted ascending by
@@ -42,8 +42,8 @@ inline constexpr uint32_t kCrossSystemMaxCandidates = 16u;
 inline constexpr uint32_t kBodyParticleContactSlotsPerParticle = 4u;
 
 // Result of a cross-system particle->rigid query. CSR-like: particle i's
-// candidate rigid bodies occupy [CandidateOffsets()[i],
-// CandidateOffsets()[i] + CandidateCounts()[i]) in the flat CandidateIndices()
+// candidate rigid bodies occupy [CandidateOffsets[i],
+// CandidateOffsets[i] + CandidateCounts[i]) in the flat CandidateIndices
 // buffer, sorted ascending by rigid body index.
 class CrossSystemQueryResult {
 public:
@@ -87,7 +87,7 @@ private:
 
 // Query each of `particle_count` device-resident particle positions against the
 // rigid LBVH in `rigid_tree` (which MUST have been built with retain_nodes, i.e.
-// via BuildLbvhForQuery; rigid_tree.HasNodes() must be true). Each particle's
+// via BuildLbvhForQuery; rigid_tree.HasNodes must be true). Each particle's
 // query AABB is its position expanded by `query_radius`. Emits candidate rigid
 // body indices (original body ids), capped + sorted per particle.
 CrossSystemQueryResult QueryParticlesAgainstRigidLbvh(
