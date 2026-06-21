@@ -960,6 +960,12 @@ if(CMAKE_CUDA_COMPILER)
         # on the ONE path); asserts the particle-side row solves (lambda>0 + braked
         # approach velocity) + two-run byte-identity of the coupling stream.
         scenario/body_particle_coupling.cpp
+        # SoftFluid finalize composition: a soft particle braked by a static-floor
+        # coupling row must STAY braked through a FULL World::Step. The SoftFluid
+        # finalize reproduces the projection velocity AND composes the contact
+        # correction (v_now - v_pre) so the impulse the solve wrote into particle_vel
+        # survives instead of being overwritten by a plain v = (pos_proj - prev)/dt.
+        scenario/soft_fluid_coupling_finalize.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp

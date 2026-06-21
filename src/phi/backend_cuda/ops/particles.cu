@@ -836,12 +836,20 @@ __global__ void CoupledFinalizeKernel(uint32_t particle_count,
 // these run ONLY for kParticleModeSoftFluid.)
 // =============================================================================
 
+// The body<->particle contact row solve corrects particle_vel AFTER predict and
+// BEFORE finalize, so finalize must separate the gravity+free-flight+projection
+// velocity (reproduced from prev/predicted) from the contact correction. v_pre is
+// the pre-contact velocity each slice's finalize subtracts so the contact delta
+// enters exactly once. The soft branch never mutates velocity, so its v_pre is the
+// step-start velocity; the fluid branch saves v_pre AFTER gravity (the velocity the
+// solve reads). When no row touches a particle, v_now == v_pre bit-exactly.
 __global__ void SoftFluidPredictKernel(uint32_t particle_count,
                                        uint32_t n_soft,
                                        uint32_t per_env,
                                        math::Vec3* __restrict__ positions,
                                        math::Vec3* __restrict__ prev_positions,
                                        math::Vec3* __restrict__ velocities,
+                                       math::Vec3* __restrict__ v_pre,
                                        math::Vec3* __restrict__ predicted_positions,
                                        const float* __restrict__ inv_masses,
                                        math::Vec3 gravity,
@@ -851,9 +859,10 @@ __global__ void SoftFluidPredictKernel(uint32_t particle_count,
         return;
     }
     if (SfIsSoft(i, n_soft, per_env)) {
-        // VERBATIM XpbdPredictKernel body.
+        // VERBATIM XpbdPredictKernel body (velocity untouched -> v_pre == step-start v).
         const math::Vec3 p = positions[i];
         prev_positions[i] = p;
+        v_pre[i] = velocities[i];
         if (inv_masses[i] <= 0.0f) {
             return;
         }
@@ -861,7 +870,7 @@ __global__ void SoftFluidPredictKernel(uint32_t particle_count,
             Add(Scale(velocities[i], dt), Scale(gravity, dt * dt));
         positions[i] = Add(p, step);
     } else {
-        // VERBATIM PbfPredictKernel body.
+        // VERBATIM PbfPredictKernel body (v_pre saved after gravity = solve's input v).
         math::Vec3 v = velocities[i];
         if (inv_masses[i] > 0.0f) {
             v.x += dt * gravity.x;
@@ -869,12 +878,23 @@ __global__ void SoftFluidPredictKernel(uint32_t particle_count,
             v.z += dt * gravity.z;
             velocities[i] = v;
         }
+        v_pre[i] = v;
         const math::Vec3 p = positions[i];
         predicted_positions[i] =
             math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
     }
 }
 
+// Compose the gravity+free-flight+projection velocity (pbd_v, reproduced from the
+// position the projection left) with the body<->particle contact correction
+// (v_now - v_pre, what the row solve wrote into particle_vel). The contact delta
+// enters exactly once and the projection velocity exactly once. When no row touched
+// the particle, v_now == v_pre bit-exactly so (v_now - v_pre) is +0.0 per component
+// and v_final == pbd_v -> byte-identical to the plain v = (pos_proj - prev)/dt. The
+// soft branch then carries the contact displacement (v_final - pbd_v)*dt onto the
+// projected position; adding the +0.0 displacement leaves it bit-identical. The
+// fluid branch commits pos = predicted, the contact correction propagating through
+// velocity into the next predict.
 __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
                                         uint32_t n_soft,
                                         uint32_t per_env,
@@ -882,6 +902,7 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
                                         const math::Vec3* __restrict__ prev_positions,
                                         const math::Vec3* __restrict__ predicted,
                                         math::Vec3* __restrict__ velocities,
+                                        const math::Vec3* __restrict__ v_pre,
                                         const float* __restrict__ inv_masses,
                                         float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -891,17 +912,30 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
     if (inv_masses[i] <= 0.0f) {
         return;  // pinned: position + velocity held (both branches).
     }
+    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
+    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
+    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
+    const float inv_dt = 1.0f / dt;
     if (SfIsSoft(i, n_soft, per_env)) {
-        // VERBATIM XpbdCorrectKernel body (v = (p - prev)/dt).
-        const math::Vec3 delta = Sub(positions[i], prev_positions[i]);
-        velocities[i] = Scale(delta, 1.0f / dt);
+        // pbd_v = (projected pos - prev)/dt; add the contact delta; carry the
+        // contact displacement dv*dt onto the projected position (dv == 0 -> pos
+        // unchanged, bit-identical to the verbatim XpbdCorrectKernel).
+        const math::Vec3 p_proj = positions[i];
+        const math::Vec3 prev = prev_positions[i];
+        const math::Vec3 pbd_v{(p_proj.x - prev.x) * inv_dt,
+                               (p_proj.y - prev.y) * inv_dt,
+                               (p_proj.z - prev.z) * inv_dt};
+        velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
+        positions[i] = math::Vec3{p_proj.x + dv.x * dt, p_proj.y + dv.y * dt,
+                                  p_proj.z + dv.z * dt};
     } else {
-        // VERBATIM PbfFinalizeKernel body (v = (predicted - pos)/dt; pos = pred).
-        const float inv_dt = 1.0f / dt;
+        // pbd_v = (predicted - pos)/dt; add the contact delta; commit pos = pred
+        // (dv == 0 -> velocity bit-identical to the verbatim PbfFinalizeKernel).
         const math::Vec3 p0 = positions[i];
         const math::Vec3 pp = predicted[i];
-        velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
-                                   (pp.z - p0.z) * inv_dt};
+        const math::Vec3 pbd_v{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
+                               (pp.z - p0.z) * inv_dt};
+        velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
         positions[i] = pp;
     }
 }
@@ -1017,7 +1051,8 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(SoftFluidPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, p->n_soft_particles, p->particles_per_env,
                    data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.pbf_predicted_pos, data.particle_inv_mass, g, p->dt);
+                   data.particle_v_pre, data.pbf_predicted_pos,
+                   data.particle_inv_mass, g, p->dt);
     } else {  // kParticleModePbf
         LaunchCuda(PbfPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_vel,
@@ -1167,7 +1202,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(SoftFluidFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
                    data.particle_prev_pos, data.pbf_predicted_pos, data.particle_vel,
-                   data.particle_inv_mass, p->dt);
+                   data.particle_v_pre, data.particle_inv_mass, p->dt);
         if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
             const fl::PbfKernelCoeffs coeffs =
                 fl::MakePbfKernelCoeffs(p->support_radius);
