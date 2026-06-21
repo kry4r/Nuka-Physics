@@ -8,9 +8,12 @@
 #include "runtime/soft/tetmesh_topology.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <utility>
+#include <vector>
 
 namespace nuka::runtime::soft {
 
@@ -70,6 +73,60 @@ void BuildTetMeshConstraints(const std::vector<math::Vec3>& rest_positions,
         vc.compliance_alpha = options.volume_compliance_alpha;
         out.volume.push_back(vc);
     }
+}
+
+std::vector<uint32_t> ExtractBoundaryTriangles(
+    const std::vector<math::Vec3>& rest_positions,
+    const std::vector<TetMeshTet>& tets) {
+    // The four faces of a tet, each as (3 face verts, opposite vert) in local
+    // 0..3 indices. The opposite vertex lets us orient the face outward.
+    static constexpr int kFaces[4][4] = {{1, 2, 3, 0}, {0, 3, 2, 1},
+                                         {0, 1, 3, 2}, {0, 2, 1, 3}};
+
+    // Count incidence per UNDIRECTED face (sorted triple) and remember one
+    // oriented instance + its opposite vertex; a face seen once is on the boundary.
+    struct FaceRec { uint32_t a, b, c, opp; uint32_t count; uint32_t order; };
+    std::map<std::array<uint32_t, 3>, FaceRec> faces;
+    uint32_t order = 0u;
+    for (const TetMeshTet& tet : tets) {
+        for (const auto& f : kFaces) {
+            const uint32_t a = tet.v[f[0]], b = tet.v[f[1]], c = tet.v[f[2]];
+            std::array<uint32_t, 3> key{a, b, c};
+            std::sort(key.begin(), key.end());
+            auto it = faces.find(key);
+            if (it == faces.end()) {
+                faces.emplace(key, FaceRec{a, b, c, tet.v[f[3]], 1u, order++});
+            } else {
+                ++it->second.count;
+            }
+        }
+    }
+
+    // Emit boundary faces (count == 1) in first-seen order, wound so the face
+    // normal points AWAY from the opposite vertex (outward).
+    std::vector<std::pair<uint32_t, const FaceRec*>> boundary;
+    for (const auto& kv : faces) {
+        if (kv.second.count == 1u) boundary.emplace_back(kv.second.order, &kv.second);
+    }
+    std::sort(boundary.begin(), boundary.end(),
+              [](const auto& x, const auto& y) { return x.first < y.first; });
+
+    std::vector<uint32_t> tris;
+    tris.reserve(boundary.size() * 3u);
+    for (const auto& entry : boundary) {
+        const FaceRec& fr = *entry.second;
+        const math::Vec3& pa = rest_positions[fr.a];
+        const math::Vec3& pb = rest_positions[fr.b];
+        const math::Vec3& pc = rest_positions[fr.c];
+        const math::Vec3 n = (pb - pa).Cross(pc - pa);
+        const math::Vec3 to_opp = rest_positions[fr.opp] - pa;
+        if (n.Dot(to_opp) > 0.0f) {
+            tris.insert(tris.end(), {fr.a, fr.c, fr.b});  // flip to face outward
+        } else {
+            tris.insert(tris.end(), {fr.a, fr.b, fr.c});
+        }
+    }
+    return tris;
 }
 
 } // namespace nuka::runtime::soft

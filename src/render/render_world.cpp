@@ -1,12 +1,12 @@
 // ---------------------------------------------------------------------------
-// nuka::render::RenderWorld implementation (M8 manifest #1).
+// nuka::render::RenderWorld implementation.
 //
 // BuildRenderWorld walks the ECS Registry for every renderable entity. The
 // authored appearance is the VisualMeshComponent's real .nka MESH triangles;
 // CollisionShapeComponents are rendered as primitive tessellations ONLY in a
 // scene that has no visual meshes at all (a pure-collision / synthetic scene),
-// so a mesh-bearing robot is not occluded by its physics proxies (M8.5 beauty
-// pass). It resolves each instance's PBR material, its cached visual_local offset
+// so a mesh-bearing robot is not occluded by its physics proxies. It resolves
+// each instance's PBR material, its cached visual_local offset
 // (the composed node chain from the physics-bound ancestor down to the visual
 // node, Decision D1), and its pose source (LinkPose/BodyPose/Static, resolved
 // ONCE so the per-frame publisher never re-walks SceneMap).
@@ -21,6 +21,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "render/mesh_normals.hpp"
 #include "scene/asset/nka.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
@@ -244,44 +245,6 @@ MeshGeometry MakeCapsule(float r, float hh, uint32_t slices = 16, uint32_t cap_s
     return m;
 }
 
-// Area-weighted SMOOTH vertex normals from positions + indices. Used when a
-// cooked .nka MESH carries no (or all-zero, T5-flagged) normals -- without this
-// the shader's normalize() of a zero normal yields NaN and the surface renders
-// black. Smooth (vertex-averaged) normals read better than flat on the curved
-// robot shells. Deterministic accumulation order (D1-safe).
-std::vector<float> SmoothNormals(const std::vector<float>& positions,
-                                 const std::vector<uint32_t>& indices) {
-    std::vector<float> normals(positions.size(), 0.0f);
-    auto at = [&](uint32_t v, int c) { return positions[static_cast<size_t>(v) * 3 + c]; };
-    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-        const uint32_t a = indices[i], b = indices[i + 1], c = indices[i + 2];
-        const math::Vec3 pa{at(a, 0), at(a, 1), at(a, 2)};
-        const math::Vec3 pb{at(b, 0), at(b, 1), at(b, 2)};
-        const math::Vec3 pc{at(c, 0), at(c, 1), at(c, 2)};
-        // Un-normalized cross => area-weighted contribution (larger faces weigh more).
-        const math::Vec3 fn{
-            (pb.y - pa.y) * (pc.z - pa.z) - (pb.z - pa.z) * (pc.y - pa.y),
-            (pb.z - pa.z) * (pc.x - pa.x) - (pb.x - pa.x) * (pc.z - pa.z),
-            (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x)};
-        for (uint32_t v : {a, b, c}) {
-            normals[static_cast<size_t>(v) * 3 + 0] += fn.x;
-            normals[static_cast<size_t>(v) * 3 + 1] += fn.y;
-            normals[static_cast<size_t>(v) * 3 + 2] += fn.z;
-        }
-    }
-    for (size_t v = 0; v + 2 < normals.size(); v += 3) {
-        const float len = std::sqrt(normals[v] * normals[v] +
-                                    normals[v + 1] * normals[v + 1] +
-                                    normals[v + 2] * normals[v + 2]);
-        if (len > 1e-12f) {
-            normals[v] /= len; normals[v + 1] /= len; normals[v + 2] /= len;
-        } else {
-            normals[v] = 0.0f; normals[v + 1] = 0.0f; normals[v + 2] = 1.0f;
-        }
-    }
-    return normals;
-}
-
 // True when the normal stream is missing, length-mismatched, or DEGENERATE
 // (every component ~0 -- the T5 zero-filled-normals cook gap).
 bool NormalsUnusable(const std::vector<float>& positions, const std::vector<float>& normals) {
@@ -294,7 +257,7 @@ bool NormalsUnusable(const std::vector<float>& positions, const std::vector<floa
 
 // Convert a decoded .nka MESH into our backend-agnostic MeshGeometry. Synthesizes
 // smooth normals when the cooked stream is absent or all-zero so downstream
-// shading (raster + M11 RT) never normalizes a zero vector.
+// shading (raster + path-tracer) never normalizes a zero vector.
 MeshGeometry FromNkaMesh(const scene::NkaMesh& src) {
     MeshGeometry m;
     m.positions = src.positions;

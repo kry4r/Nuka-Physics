@@ -1,23 +1,26 @@
 // ---------------------------------------------------------------------------
 // cloth_presser_demo.cpp -- THE FIRST body<->particle coupling headline clip.
 //
-// A real XPBD cloth (24x24 = 576 particles) drapes across two low ridges (a
-// hammock) above a studio floor, then a rigid sphere "foot" descends into the
-// sagging center, presses, and lifts -- the cloth dips under it and springs back.
-// The cloth particles are SPHERE collidables flowing through the SAME body<->
-// particle row solver a foot uses on the ground (detection -> body<->particle
-// narrowphase -> SolveRowsBlockIsland -> finalize compose): there is NO bespoke
-// coupler, the medium difference is data (the soft mu), never code.
+// A real XPBD cloth (24x24 = 576 particles) is pinned along its two far edges to
+// two posts held closer than its natural width, so the slack hangs as a deep
+// catenary hammock above a studio floor. A rigid sphere is released above the
+// belly and falls under GRAVITY into the sag: the cloth CATCHES it and cradles it
+// in a fabric pocket (friction + the two-way non-penetration rows), no scripted
+// descent and no clip-through. The cloth particles are SPHERE collidables flowing
+// through the SAME body<->particle row solver a foot uses on the ground
+// (detection -> body<->particle narrowphase -> SolveRowsBlockIsland -> finalize
+// compose): there is NO bespoke coupler, the medium difference is data, never code.
 //
 // PIPELINE (physics on CUDA GPU 0, render offscreen on lavapipe):
-//   build ONE nk::World (ground plane + two ridges + a presser sphere + the cloth
-//   cooked via CookXpbdParticles, which grows the disjoint body<->particle contact
-//   budget) -> settle the drape -> SCRIPT the kinematic presser down/hold/up.
-//   PER FRAME: download the live particle positions + presser pose, rebuild the
-//   cloth as a DEFORMING triangle mesh (the MakeGrid triangulation over the live
-//   positions), render the cloth + presser + ridges with a studio floor + an
+//   build ONE nk::World (ground plane + two posts + a DYNAMIC presser sphere +
+//   the cloth cooked via CookXpbdParticles) -> settle the hammock with the presser
+//   parked away -> teleport the presser above center at rest -> let gravity drop
+//   it into the pocket. PER FRAME: download the live particle positions + presser
+//   pose, build the cloth as a DEFORMING surface mesh via the general
+//   runtime::soft::BuildSurfaceMesh over the cooked lattice topology (smooth
+//   recomputed normals), render cloth + presser + posts with a studio floor + an
 //   orbiting hero camera + per-contact shadow decals, write a PPM. At three key
-//   frames (settled / deepest dip / recovered) also write a hero PNG.
+//   frames (settled / cradled / rest) also write a hero PNG.
 //
 // Built behind NK_BUILD_VULKAN_VALIDATION (build-viewer / lavapipe). Usage:
 //   cloth_presser_demo [--width W] [--height H] [--out-dir DIR] [--png-dir DIR]
@@ -48,6 +51,7 @@
 #include "render/raster/vulkan_raster_renderer.hpp"
 #include "render/render_world.hpp"
 #include "runtime/soft/cloth_topology.hpp"
+#include "runtime/soft/particle_surface.hpp"
 #include "scene/cook/cook_to_model.hpp"
 
 namespace {
@@ -65,19 +69,25 @@ constexpr uint32_t kKindBox = nuka::collision::kShapeBox;
 constexpr uint32_t kKindSphere = nuka::collision::kShapeSphere;
 constexpr uint32_t kKindPlane = nuka::collision::kShapePlane;
 
-// Cloth + scene geometry (mirrors the cloth_presser_two_way scenario gate). An
-// unpinned 24x24 sheet drapes across two low ridges; its center sags into the gap.
+// Cloth + scene geometry. A 24x24 sheet is pinned along its two far x-edges to
+// the tops of two posts held CLOSER than the cloth's natural width, so the slack
+// in between hangs as a deep catenary hammock. A sphere dropped into the belly is
+// cradled by the fabric pocket (the cloth is continuous below it -> no fall-
+// through), the two-way reaction holding it against gravity.
 constexpr uint32_t kGridN = 24u;
-constexpr float kSpacing = 0.025f;
-constexpr float kClothZ = 0.16f;
-constexpr float kParticleMass = 0.01f;
-constexpr float kContactDMin = 0.030f;
-constexpr float kRidgeHalfX = 0.12f;
-constexpr float kRidgeHalfY = 0.30f;
-constexpr float kRidgeHalfZ = 0.05f;
-constexpr float kRidgeCenterX = 0.16f;
-constexpr float kRidgeTopZ = kRidgeHalfZ * 2.0f;
+constexpr float kSpacing = 0.025f;     // patch ~0.575 m square (flat rest size).
+constexpr float kClothZ = 0.30f;       // initial flat lay height of the free interior.
+constexpr float kParticleMass = 0.02f; // 20 g per particle (holds the presser).
+constexpr float kContactDMin = 0.020f; // particle sphere radius = d_min/2 = 0.010 (< spacing -> no self puff).
+constexpr float kAnchorX = 0.18f;      // pinned edges held at x = +/-0.18 (cloth half-width 0.2875 -> slack).
+constexpr float kAnchorZ = 0.30f;      // edges pinned at this height -> the belly hangs below.
+constexpr float kPostHalfX = 0.03f;
+constexpr float kPostHalfY = 0.32f;
+constexpr float kPostHalfZ = 0.15f;    // post tops at z = 0.30 (the anchor height).
+constexpr float kPostTopZ = kPostHalfZ * 2.0f;
 constexpr float kPresserRadius = 0.06f;
+constexpr float kPresserMass = 0.15f;             // dynamic presser the cloth catches.
+constexpr float kSurfaceOffset = 0.5f * kContactDMin;  // render inflation = particle radius.
 constexpr uint16_t kXpbdIters = 20u;
 constexpr uint32_t kPresserBody = 3u;
 constexpr uint64_t kPoseOff = static_cast<uint64_t>(kPresserBody) * sizeof(Transform);
@@ -110,44 +120,68 @@ Args ParseArgs(int argc, char** argv) {
     return a;
 }
 
-// ---- scene construction (mirrors the scenario gate) -----------------------
-struct ClothMesh {
-    std::vector<Vec3> rest;
-    std::vector<uint32_t> tri;  // 3 indices per triangle.
-};
-
-ClothMesh MakeClothMesh() {
-    ClothMesh c;
-    const float c0 = -0.5f * static_cast<float>(kGridN - 1u) * kSpacing;
-    for (uint32_t j = 0; j < kGridN; ++j)
-        for (uint32_t i = 0; i < kGridN; ++i)
-            c.rest.push_back(Vec3{c0 + static_cast<float>(i) * kSpacing,
-                                  c0 + static_cast<float>(j) * kSpacing, kClothZ});
+// ---- cloth cook topology (built once, reused by physics + the render mesh) --
+// The cloth lattice triangle list: two triangles per quad cell. This SAME index
+// list cooks the XPBD constraints and drives runtime::soft::BuildSurfaceMesh.
+soft::SurfaceTopology MakeClothTopology() {
+    soft::SurfaceTopology topo;
+    topo.normal_offset = kSurfaceOffset;
     auto idx = [](uint32_t i, uint32_t j) { return j * kGridN + i; };
-    for (uint32_t j = 0; j + 1 < kGridN; ++j) {
+    for (uint32_t j = 0; j + 1 < kGridN; ++j)
         for (uint32_t i = 0; i + 1 < kGridN; ++i) {
             const uint32_t v00 = idx(i, j), v10 = idx(i + 1, j);
             const uint32_t v01 = idx(i, j + 1), v11 = idx(i + 1, j + 1);
-            c.tri.insert(c.tri.end(), {v00, v10, v11, v00, v11, v01});
+            topo.triangles.insert(topo.triangles.end(),
+                                  {v00, v10, v11, v00, v11, v01});
         }
-    }
-    return c;
+    return topo;
 }
 
-cook::XpbdCookInput BuildClothInput(const ClothMesh& cm) {
+// The FLAT rest grid: the cloth's natural size. Distance-constraint rest lengths
+// come from this so the cloth is inextensible at its true dimensions; the belly
+// slack is created by pinning the edges CLOSER than this width, not by stretching.
+std::vector<Vec3> MakeClothRest() {
+    std::vector<Vec3> rest;
+    rest.reserve(kGridN * kGridN);
+    const float c0 = -0.5f * static_cast<float>(kGridN - 1u) * kSpacing;
+    for (uint32_t j = 0; j < kGridN; ++j)
+        for (uint32_t i = 0; i < kGridN; ++i)
+            rest.push_back(Vec3{c0 + static_cast<float>(i) * kSpacing,
+                                c0 + static_cast<float>(j) * kSpacing, kClothZ});
+    return rest;
+}
+
+cook::XpbdCookInput BuildClothInput(const std::vector<Vec3>& rest,
+                                    const soft::SurfaceTopology& topo) {
     std::vector<soft::ClothTriangle> tris;
-    for (size_t t = 0; t + 2 < cm.tri.size(); t += 3)
-        tris.push_back(soft::ClothTriangle{{cm.tri[t], cm.tri[t + 1], cm.tri[t + 2]}});
+    for (size_t t = 0; t + 2 < topo.triangles.size(); t += 3)
+        tris.push_back(soft::ClothTriangle{
+            {topo.triangles[t], topo.triangles[t + 1], topo.triangles[t + 2]}});
     soft::ClothTopologyOptions opts;
     opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = 1.0e-4f;
+    opts.bend_compliance_alpha = 5.0e-4f;  // soft bend so it drapes into a pocket.
     soft::XpbdConstraintSet cs;
-    soft::BuildClothConstraints(cm.rest, tris, opts, cs);
+    soft::BuildClothConstraints(rest, tris, opts, cs);
+
+    // Initial positions: pin the two far x-columns to the post tops, pulled inward
+    // to +/-kAnchorX (closer than the flat width) and up to kAnchorZ, so the slack
+    // interior bellies into a deep hammock as it settles under gravity.
+    std::vector<Vec3> init = rest;
+    auto idx = [](uint32_t i, uint32_t j) { return j * kGridN + i; };
+    const uint32_t last = kGridN - 1u;
+    for (uint32_t j = 0; j < kGridN; ++j) {
+        init[idx(0, j)] = Vec3{-kAnchorX, rest[idx(0, j)].y, kAnchorZ};
+        init[idx(last, j)] = Vec3{+kAnchorX, rest[idx(last, j)].y, kAnchorZ};
+    }
 
     cook::XpbdCookInput in;
-    in.positions = cm.rest;
-    in.velocities.assign(cm.rest.size(), Vec3{0.0f, 0.0f, -0.05f});
-    in.inv_mass.assign(cm.rest.size(), 1.0f / kParticleMass);
+    in.positions = init;
+    in.velocities.assign(rest.size(), Vec3{0.0f, 0.0f, -0.05f});
+    in.inv_mass.assign(rest.size(), 1.0f / kParticleMass);
+    for (uint32_t j = 0; j < kGridN; ++j) {  // pin the two anchored edge columns.
+        in.inv_mass[idx(0, j)] = 0.0f;
+        in.inv_mass[idx(last, j)] = 0.0f;
+    }
     for (const auto& dc : cs.distance) {
         cook::CookDistanceCon c;
         c.a = dc.particle_a; c.b = dc.particle_b;
@@ -193,11 +227,17 @@ void AddGroundPlane(nk::Model& m, int32_t body_id) {
     m.shape_table_rows.push_back(sh);
 }
 
-void AddSphere(nk::Model& m, const Vec3& pos, float radius, int32_t body_id) {
+// A DYNAMIC sphere (inv_mass > 0) the contact reaction can move: gravity pulls
+// it into the sag and the cloth catches it. inv_inertia = the solid-sphere diag.
+void AddDynamicSphere(nk::Model& m, const Vec3& pos, float radius, float mass,
+                      int32_t body_id) {
+    const float inv_mass = 1.0f / mass;
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();
     bi.pose.position = pos;
-    bi.inv_mass = 0.0f; bi.inv_inertia = Vec3{0, 0, 0};  // kinematic (scripted).
+    bi.inv_mass = inv_mass;
+    const float ii = inv_mass / (0.4f * radius * radius);
+    bi.inv_inertia = Vec3{ii, ii, ii};
     m.body_init.push_back(bi);
     nk::Model::PairDrivenShape sh;
     sh.kind = kKindSphere;
@@ -207,13 +247,14 @@ void AddSphere(nk::Model& m, const Vec3& pos, float radius, int32_t body_id) {
     m.shape_table_rows.push_back(sh);
 }
 
-nk::Model BuildScene(const ClothMesh& cm, const Vec3& presser_pos) {
+nk::Model BuildScene(const std::vector<Vec3>& rest,
+                     const soft::SurfaceTopology& topo, const Vec3& presser_pos) {
     nk::Model m;
-    const Vec3 ridge_half{kRidgeHalfX, kRidgeHalfY, kRidgeHalfZ};
+    const Vec3 post_half{kPostHalfX, kPostHalfY, kPostHalfZ};
     AddGroundPlane(m, 0);
-    AddStaticBox(m, Vec3{-kRidgeCenterX, 0.0f, kRidgeHalfZ}, ridge_half, 1);
-    AddStaticBox(m, Vec3{+kRidgeCenterX, 0.0f, kRidgeHalfZ}, ridge_half, 2);
-    AddSphere(m, presser_pos, kPresserRadius, 3);
+    AddStaticBox(m, Vec3{-kAnchorX, 0.0f, kPostHalfZ}, post_half, 1);
+    AddStaticBox(m, Vec3{+kAnchorX, 0.0f, kPostHalfZ}, post_half, 2);
+    AddDynamicSphere(m, presser_pos, kPresserRadius, kPresserMass, 3);
 
     nk::ModelCapacities& cap = m.capacities;
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -224,7 +265,7 @@ nk::Model BuildScene(const ClothMesh& cm, const Vec3& presser_pos) {
     cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
-    cook::CookXpbdParticles(m, 1u, BuildClothInput(cm));
+    cook::CookXpbdParticles(m, 1u, BuildClothInput(rest, topo));
     m.particles.pp_contact_d_min = kContactDMin;
     return m;
 }
@@ -234,18 +275,48 @@ nk::Pipeline::SolverConfig Cfg() {
     cfg.dt = 1.0f / 240.0f;
     cfg.gravity[0] = 0.0f; cfg.gravity[1] = 0.0f; cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
-    cfg.vel_iters = 32u; cfg.pos_iters = 0u;
+    cfg.vel_iters = 48u; cfg.pos_iters = 0u;  // stiff enough for the mass ratio.
     cfg.max_pairs = 64u;
     return cfg;
 }
 
-void DrivePresser(nk::World& w, const Vec3& target) {
+// Teleport the dynamic presser to `pos` at rest (zero velocity) -- used once to
+// drop it above the settled drape center, after which gravity drives it.
+void PlacePresser(nk::World& w, const Vec3& pos) {
     Transform tf = Transform::Identity();
-    tf.position = target;
+    tf.position = pos;
     const Vec3 zero = Vec3::Zero();
     w.GetData().UploadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), kPoseOff);
     w.GetData().UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), kVec3Off);
     w.GetData().UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), kVec3Off);
+}
+
+Vec3 ReadPresser(nk::World& w) {
+    Transform tf = Transform::Identity();
+    w.GetData().DownloadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), kPoseOff);
+    return tf.position;
+}
+
+// Min particle z within reach of (px,py) -- the pressed pocket depth metric.
+float MinZUnder(const std::vector<Vec3>& pos, float px, float py) {
+    float min_z = 1.0e9f;
+    const float reach = kPresserRadius + 4.0f * kSpacing;
+    for (const Vec3& p : pos) {
+        const float dx = p.x - px, dy = p.y - py;
+        if (dx * dx + dy * dy <= reach * reach) min_z = std::min(min_z, p.z);
+    }
+    return min_z;
+}
+
+// Cloth surface z directly beneath the presser axis (nearest particle in xy),
+// for the clip check: the presser bottom must stay above this.
+float ClothZUnder(const std::vector<Vec3>& pos, float px, float py) {
+    float best_d2 = 1.0e9f, best_z = kClothZ;
+    for (const Vec3& p : pos) {
+        const float dx = p.x - px, dy = p.y - py, d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) { best_d2 = d2; best_z = p.z; }
+    }
+    return best_z;
 }
 
 // ---- render helpers -------------------------------------------------------
@@ -258,8 +329,6 @@ nuka::scene::RenderMaterial MakeMat(float r, float g, float b, float metallic,
     return m;
 }
 
-// A box mesh with the given half-extents centered at the origin (the renderer
-// applies only a rigid Transform, so the extents are baked into the geometry).
 render::MeshGeometry MakeBoxGeo(const Vec3& half) {
     render::MeshGeometry g;
     const float xs[2] = {-half.x, half.x};
@@ -287,7 +356,6 @@ render::MeshGeometry MakeBoxGeo(const Vec3& half) {
     return g;
 }
 
-// A UV sphere of `radius` centered at the origin.
 render::MeshGeometry MakeSphereGeo(float radius, uint32_t rings = 18u,
                                    uint32_t sectors = 28u) {
     render::MeshGeometry g;
@@ -309,21 +377,6 @@ render::MeshGeometry MakeSphereGeo(float radius, uint32_t rings = 18u,
             const uint32_t a = r * stride + s, b = a + stride;
             g.indices.insert(g.indices.end(), {a, a + 1u, b, b, a + 1u, b + 1u});
         }
-    return g;
-}
-
-// The cloth as a double-sided deforming triangle mesh from the live positions.
-render::MeshGeometry MakeClothGeo(const std::vector<Vec3>& pos,
-                                  const std::vector<uint32_t>& tri) {
-    render::MeshGeometry g;
-    g.positions.reserve(pos.size() * 3u);
-    for (const Vec3& p : pos)
-        g.positions.insert(g.positions.end(), {p.x, p.y, p.z});
-    g.indices.reserve(tri.size() * 2u);
-    for (size_t t = 0; t + 2 < tri.size(); t += 3) {
-        g.indices.insert(g.indices.end(), {tri[t], tri[t + 1], tri[t + 2]});
-        g.indices.insert(g.indices.end(), {tri[t], tri[t + 2], tri[t + 1]});  // back face
-    }
     return g;
 }
 
@@ -360,29 +413,32 @@ bool WritePng(const render::VulkanOffscreenReport& rep, const std::string& path)
     return rc == 0;
 }
 
-// One renderable frame: cloth (deformed) + presser sphere + two ridges, on a
+// One renderable frame: cloth (deformed) + presser sphere + two posts, on a
 // studio floor, with a soft contact-shadow decal under the presser footprint.
 struct FrameScene {
     render::RenderWorld rw;
-    uint32_t cloth_inst = 0u;
 };
 
-FrameScene BuildFrame(const ClothMesh& cm, const std::vector<Vec3>& cloth_pos,
-                      const Transform& presser) {
+FrameScene BuildFrame(const soft::SurfaceTopology& topo,
+                      const std::vector<Vec3>& cloth_pos, const Transform& presser) {
     FrameScene fs;
     render::RenderWorld& rw = fs.rw;
     rw.materials.push_back(MakeMat(0.55f, 0.13f, 0.16f, 0.0f, 0.72f));  // 0 cloth crimson
     rw.materials.push_back(MakeMat(0.62f, 0.64f, 0.70f, 0.85f, 0.30f));  // 1 presser steel
-    rw.materials.push_back(MakeMat(0.12f, 0.13f, 0.16f, 0.10f, 0.65f));  // 2 ridge charcoal
+    rw.materials.push_back(MakeMat(0.12f, 0.13f, 0.16f, 0.10f, 0.65f));  // 2 post charcoal
     rw.default_material_id = 0u;
 
-    const uint32_t cloth_mesh = rw.meshes.InternPrimitive(
-        "cloth:live", [&] { return MakeClothGeo(cloth_pos, cm.tri); });
+    // The cloth: a single-sided deformed surface mesh from the live particles via
+    // the ONE general builder (smooth recomputed normals, no inline triangulation).
+    render::MeshGeometry cloth_geo;
+    soft::BuildSurfaceMesh(cloth_pos, topo, cloth_geo);
+    const uint32_t cloth_mesh =
+        rw.meshes.InternPrimitive("cloth:live", [&] { return cloth_geo; });
     const uint32_t sphere_mesh = rw.meshes.InternPrimitive(
         "presser:sphere", [&] { return MakeSphereGeo(kPresserRadius); });
-    const Vec3 rh{kRidgeHalfX, kRidgeHalfY, kRidgeHalfZ};
+    const Vec3 ph{kPostHalfX, kPostHalfY, kPostHalfZ};
     const uint32_t box_mesh =
-        rw.meshes.InternPrimitive("ridge:box", [&] { return MakeBoxGeo(rh); });
+        rw.meshes.InternPrimitive("post:box", [&] { return MakeBoxGeo(ph); });
 
     auto add = [&](uint32_t mesh, uint32_t mat, const Transform& xf) {
         render::RenderInstance inst;
@@ -391,12 +447,11 @@ FrameScene BuildFrame(const ClothMesh& cm, const std::vector<Vec3>& cloth_pos,
         rw.instances.push_back(inst);
     };
     add(cloth_mesh, 0u, Transform::Identity());  // cloth verts are world-space.
-    fs.cloth_inst = 0u;
     add(sphere_mesh, 1u, presser);
-    Transform ra = Transform::Identity(); ra.position = Vec3{-kRidgeCenterX, 0, kRidgeHalfZ};
-    Transform rb = Transform::Identity(); rb.position = Vec3{+kRidgeCenterX, 0, kRidgeHalfZ};
-    add(box_mesh, 2u, ra);
-    add(box_mesh, 2u, rb);
+    Transform pa = Transform::Identity(); pa.position = Vec3{-kAnchorX, 0, kPostHalfZ};
+    Transform pb = Transform::Identity(); pb.position = Vec3{+kAnchorX, 0, kPostHalfZ};
+    add(box_mesh, 2u, pa);
+    add(box_mesh, 2u, pb);
     return fs;
 }
 
@@ -412,28 +467,17 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const ClothMesh cm = MakeClothMesh();
-    const float top = 0.40f;       // presser parked / lift height.
-    const float bottom = kRidgeTopZ - 0.02f + kPresserRadius;  // deepest press.
-    nk::Model model = BuildScene(cm, Vec3{0.0f, 0.0f, top});
+    const soft::SurfaceTopology topo = MakeClothTopology();
+    const std::vector<Vec3> rest = MakeClothRest();
+    // Park the dynamic presser far in xy during settle so it falls to the ground
+    // away from the cloth; it is teleported above the center after the drape sets.
+    nk::Model model = BuildScene(rest, topo, Vec3{2.0f, 2.0f, kPresserRadius});
     const uint32_t P = model.capacities.particles_per_env;
     nk::World world(std::move(model), 1u, dev, backend, Cfg());
     if (!world.Ready()) {
         std::fprintf(stderr, "[cloth_presser_demo] world not ready\n");
         return 3;
     }
-
-    // The choreography: a list of (presser z, render?) per physics step. Settle
-    // (no render) -> a short hold (render begins) -> down -> hold -> up -> relax.
-    struct Segment { uint32_t steps; float z0, z1; bool render; };
-    const std::vector<Segment> segments = {
-        {600u, top, top, false},  // settle the drape (off camera).
-        { 90u, top, top, true},   // a beat on the settled drape.
-        {220u, top, bottom, true},   // descend into the sag.
-        {150u, bottom, bottom, true},  // press + hold.
-        {220u, bottom, top, true},   // lift away.
-        {240u, top, top, true},   // the cloth springs back.
-    };
 
     std::unique_ptr<render::VulkanRasterRenderer> renderer;
     try {
@@ -465,42 +509,46 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(args.out_dir);
     std::filesystem::create_directories(args.png_dir);
 
-    // Per-frame: orbit the hero camera around the rig + place a contact-shadow decal
-    // under the presser footprint (faded by its height above the cloth).
-    uint32_t total_render_steps = 0u;
-    for (const Segment& ph : segments) if (ph.render) total_render_steps += ph.steps;
-
-    uint32_t written = 0u, render_step = 0u;
-    size_t first_nonbg = 0u, last_nonbg = 0u;
     std::vector<Vec3> pos(P, Vec3::Zero());
-
     auto download_pos = [&]() {
         world.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
                                       P * sizeof(Vec3));
     };
-    auto render_frame = [&](const Vec3& presser_pos, const std::string* png) {
+
+    // The choreography: SETTLE the drape (presser parked away) -> a beat on the
+    // settled sag -> RELEASE the dynamic presser above center and let gravity drop
+    // it into the pocket (CATCH) -> a long hold while it cradles + cloth springs.
+    constexpr uint32_t kSettle = 700u, kBeat = 90u, kCatch = 360u, kRest = 320u;
+    uint32_t total_render_steps = kBeat + kCatch + kRest;
+
+    uint32_t written = 0u, render_step = 0u;
+    size_t first_nonbg = 0u, last_nonbg = 0u;
+    Vec3 presser_pos = ReadPresser(world);
+
+    auto render_frame = [&](const std::string* png) {
         download_pos();
         Transform pt = Transform::Identity(); pt.position = presser_pos;
-        FrameScene fs = BuildFrame(cm, pos, pt);
+        FrameScene fs = BuildFrame(topo, pos, pt);
 
         // Hero camera: a slow orbit framing the rig, dipping low as the press lands.
         const float t = total_render_steps > 1u
             ? static_cast<float>(render_step) / static_cast<float>(total_render_steps - 1u)
             : 0.0f;
         const float e = smoothstep(t);
-        const float phi = -0.55f + 0.9f * e;            // arc around the rig.
-        const float elev = (15.0f + 6.0f * std::sin(e * kPi)) * kPi / 180.0f;
-        const float radius = 0.95f - 0.08f * e;
-        const Vec3 look{0.0f, 0.0f, 0.11f};             // the drape center.
-        opts.camera_eye = {look.x + radius * std::cos(elev) * std::sin(phi),
-                           look.y - radius * std::cos(elev) * std::cos(phi),
+        const float az = -0.55f + 0.9f * e;            // arc around the rig.
+        const float elev = (16.0f + 7.0f * std::sin(e * kPi)) * kPi / 180.0f;
+        const float radius = 1.05f - 0.10f * e;
+        const Vec3 look{0.0f, 0.0f, 0.19f};            // the hammock belly + posts.
+        opts.camera_eye = {look.x + radius * std::cos(elev) * std::sin(az),
+                           look.y - radius * std::cos(elev) * std::cos(az),
                            look.z + radius * std::sin(elev)};
         opts.camera_target = look;
 
-        // Contact-shadow decal under the presser, faded as it lifts off the cloth.
+        // Contact-shadow decal under the presser, faded by its height above the cloth.
         opts.contact_points.clear();
-        const float lift = presser_pos.z - bottom;      // 0 at deepest press.
-        const float frac = std::max(0.0f, std::min(1.0f, 1.0f - lift / (top - bottom)));
+        const float cloth_z = ClothZUnder(pos, presser_pos.x, presser_pos.y);
+        const float gap = std::max(0.0f, presser_pos.z - kPresserRadius - cloth_z);
+        const float frac = std::max(0.0f, std::min(1.0f, 1.0f - gap / 0.20f));
         render::RasterOptions::ContactPoint cp;
         cp.x = presser_pos.x; cp.y = presser_pos.y;
         cp.radius = 0.10f + 0.05f * frac;
@@ -523,34 +571,94 @@ int main(int argc, char** argv) {
         ++written;
     };
 
-    // Drive the segments; the three hero PNGs are captured inline at the moments they
-    // depict (settled / deepest press-hold / recovered).
-    const size_t kBeatSegment = 1u, kHoldSegment = 3u, kRelaxSegment = segments.size() - 1u;
-    for (size_t pi = 0; pi < segments.size(); ++pi) {
-        const Segment& ph = segments[pi];
-        for (uint32_t s = 0; s < ph.steps; ++s) {
-            const float frac = ph.steps > 1u
-                ? static_cast<float>(s) / static_cast<float>(ph.steps - 1u) : 1.0f;
-            const float z = ph.z0 + (ph.z1 - ph.z0) * frac;
-            DrivePresser(world, Vec3{0.0f, 0.0f, z});
+    // SETTLE: cloth drapes into the gap while the presser falls to rest far away.
+    for (uint32_t s = 0; s < kSettle; ++s) world.Step();
+    download_pos();
+    const float rest_min_z = MinZUnder(pos, 0.0f, 0.0f);
+    const float sag = kAnchorZ - rest_min_z;  // how far the belly hangs below the pinned edges.
+    std::printf("[cloth_presser_demo] settled: anchor_z=%.4f post_top=%.4f "
+                "belly_min_z=%.4f sag_depth=%.4f\n",
+                kAnchorZ, kPostTopZ, rest_min_z, sag);
+
+    // RELEASE: drop the dynamic presser from just above the sagging center.
+    const float release_z = rest_min_z + kPresserRadius + 0.04f;
+    PlacePresser(world, Vec3{0.0f, 0.0f, release_z});
+
+    // A beat on the settled drape (presser hovering at release height, pre-fall).
+    presser_pos = ReadPresser(world);
+    if (!args.probe) {
+        for (uint32_t s = 0; s < kBeat; ++s) {
             world.Step();
-            if (!ph.render) continue;
-            const bool last = (s + 1u == ph.steps);
-            std::string png_path;
+            presser_pos = ReadPresser(world);
             const std::string* png = nullptr;
-            if (pi == kBeatSegment && s == 0u) png_path = args.png_dir + "/01_settled.png";
-            else if (pi == kHoldSegment && last) png_path = args.png_dir + "/02_pressed.png";
-            else if (pi == kRelaxSegment && last) png_path = args.png_dir + "/03_recovered.png";
-            if (!png_path.empty()) png = &png_path;
-            const bool do_frame = (render_step % args.stride) == 0u;
-            if (do_frame || png) render_frame(Vec3{0, 0, z}, png);
-            if (args.probe && png) {  // probe: one hero still, then exit.
-                std::printf("[cloth_presser_demo] PROBE %s first_nonbg=%zu\n",
-                            png_path.c_str(), first_nonbg);
-                return first_nonbg > 0u ? 0 : 5;
-            }
+            std::string png_path;
+            if (s == 0u) { png_path = args.png_dir + "/01_settled.png"; png = &png_path; }
+            if ((render_step % args.stride) == 0u || png) render_frame(png);
             ++render_step;
         }
+    }
+
+    // CATCH: gravity drops the presser into the sag; the cloth cradles it. The
+    // deepest-cradle PNG is captured at the end of this phase.
+    float deepest_min_z = rest_min_z, cradle_clearance = 1e9f, cradle_presser_z = release_z;
+    const uint32_t catch_steps = args.probe ? (kCatch + kRest) : kCatch;
+    for (uint32_t s = 0; s < catch_steps; ++s) {
+        world.Step();
+        presser_pos = ReadPresser(world);
+        download_pos();
+        const float mz = MinZUnder(pos, presser_pos.x, presser_pos.y);
+        if (mz < deepest_min_z) {
+            deepest_min_z = mz;
+            cradle_presser_z = presser_pos.z;
+            cradle_clearance = (presser_pos.z - kPresserRadius) - mz;
+        }
+        if (args.probe) continue;
+        const bool last = (s + 1u == catch_steps);
+        const std::string* png = nullptr;
+        std::string png_path;
+        if (last) { png_path = args.png_dir + "/02_pressed.png"; png = &png_path; }
+        if ((render_step % args.stride) == 0u || png) render_frame(png);
+        ++render_step;
+    }
+
+    // REST: the presser cradled in the pocket; render the settled hero, then exit.
+    if (!args.probe) {
+        for (uint32_t s = 0; s < kRest; ++s) {
+            world.Step();
+            presser_pos = ReadPresser(world);
+            const bool last = (s + 1u == kRest);
+            const std::string* png = nullptr;
+            std::string png_path;
+            if (last) { png_path = args.png_dir + "/03_recovered.png"; png = &png_path; }
+            if ((render_step % args.stride) == 0u || png) render_frame(png);
+            ++render_step;
+        }
+    }
+
+    // Final clip/cradle measurement: the presser bottom vs the cloth surface
+    // beneath it (positive => cradled in a pocket, no clip-through).
+    download_pos();
+    presser_pos = ReadPresser(world);
+    const float final_cloth_z = ClothZUnder(pos, presser_pos.x, presser_pos.y);
+    const float final_clearance = (presser_pos.z - kPresserRadius) - final_cloth_z;
+    std::printf("[cloth_presser_demo] caught: deepest_min_z=%.4f "
+                "presser_z=%.4f cradle_clearance=%.4f final_clearance=%.4f "
+                "(sag_depth=%.4f)\n",
+                deepest_min_z, presser_pos.z, cradle_clearance, final_clearance, sag);
+
+    if (args.probe) {
+        // PASS = visible droop below the flat lay, the presser actually descended,
+        // it did NOT punch through to the ground, and its bottom is cradled at the
+        // cloth surface (clearance within the render inflation band, no clip).
+        const bool caught_above_ground = presser_pos.z > kPresserRadius + 0.02f;
+        const bool descended = presser_pos.z < release_z - 0.01f;
+        const bool no_clip = final_clearance > -kSurfaceOffset;
+        const bool ok = sag > 0.03f && descended && caught_above_ground && no_clip;
+        std::printf("[cloth_presser_demo] PROBE %s sag=%.4f drop=%.4f "
+                    "presser_z=%.4f clear=%.4f\n",
+                    ok ? "PASS" : "FAIL", sag, release_z - presser_pos.z,
+                    presser_pos.z, final_clearance);
+        return ok ? 0 : 5;
     }
 
     std::printf("[cloth_presser_demo] DONE: %u frames -> %s (first_nonbg=%zu "
