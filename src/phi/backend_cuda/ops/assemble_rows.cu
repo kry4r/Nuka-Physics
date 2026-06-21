@@ -571,6 +571,21 @@ __device__ void ReadSideMaterial(const float* mat_buckets, const uint32_t* mat_i
     *out_solref1 = mat_buckets[b + kMatLaneSolref1];
 }
 
+// Per-particle-SYSTEM friction: the [soft|fluid] split is the first n_soft of each
+// per_env block, so (global id % per_env) < n_soft picks soft mu else fluid mu.
+__device__ void ReadParticleSideMaterial(uint32_t global_particle_id,
+                                         uint32_t n_soft, uint32_t per_env,
+                                         float soft_mu, float fluid_mu,
+                                         float def_solref0, float def_solref1,
+                                         float* out_mu, float* out_solref0,
+                                         float* out_solref1) {
+    const uint32_t local = per_env > 0u ? (global_particle_id % per_env)
+                                        : global_particle_id;
+    *out_mu = (local < n_soft) ? soft_mu : fluid_mu;
+    *out_solref0 = def_solref0;
+    *out_solref1 = def_solref1;
+}
+
 // One thread per (env x candidate slot). Emits the slot's NkRow block from the
 // unified manifold. Reuses ComputeCompliantRow + ChooseTangentDev (the union
 // math). Side A is the candidate's a-collidable, side B its b-collidable; the
@@ -591,6 +606,8 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ mat_buckets,
     const uint32_t* __restrict__ mat_index,
     uint32_t num_material_buckets,
+    uint32_t n_soft_particles, uint32_t particles_per_env,
+    float particle_soft_friction, float particle_fluid_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt,
@@ -649,16 +666,27 @@ __global__ void EmitPairDrivenRowsKernel(
     if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
     if (kind_b == kNkSideRigid) com_b = body_pose[idx_b].position;
 
-    // Per-contact material = the two shapes' authored materials, mixed by the
-    // MuJoCo solmix=max rule (friction max; solref take the stiffer/min timeconst).
-    // Static / unauthored sides fall back to the model defaults below.
+    // Per-contact material mixed by MuJoCo solmix=max (friction max, solref min).
+    // A particle side reads per-system mu; the body branch is byte-unchanged.
     float mu_a, sr0_a, sr1_a, mu_b, sr0_b, sr1_b;
-    ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_a,
-                     bodies_per_env, bid_a, kDefaultMaterialFriction, solref0,
-                     solref1, &mu_a, &sr0_a, &sr1_a);
-    ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_b,
-                     bodies_per_env, bid_b, kDefaultMaterialFriction, solref0,
-                     solref1, &mu_b, &sr0_b, &sr1_b);
+    if (kind_a == kNkSideParticle) {
+        ReadParticleSideMaterial(part_a, n_soft_particles, particles_per_env,
+                                 particle_soft_friction, particle_fluid_friction,
+                                 solref0, solref1, &mu_a, &sr0_a, &sr1_a);
+    } else {
+        ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_a,
+                         bodies_per_env, bid_a, kDefaultMaterialFriction, solref0,
+                         solref1, &mu_a, &sr0_a, &sr1_a);
+    }
+    if (kind_b == kNkSideParticle) {
+        ReadParticleSideMaterial(part_b, n_soft_particles, particles_per_env,
+                                 particle_soft_friction, particle_fluid_friction,
+                                 solref0, solref1, &mu_b, &sr0_b, &sr1_b);
+    } else {
+        ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_b,
+                         bodies_per_env, bid_b, kDefaultMaterialFriction, solref0,
+                         solref1, &mu_b, &sr0_b, &sr1_b);
+    }
     PairMaterial mat;
     mat.mu = fmaxf(mu_a, mu_b);
     mat.solref0 = fminf(sr0_a, sr0_b);  // smaller timeconst == stiffer
@@ -901,6 +929,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.mat_buckets),
                    static_cast<const uint32_t*>(data.mat_index),
                    p->num_material_buckets,
+                   p->n_soft_particles, p->particles_per_env,
+                   p->particle_soft_friction, p->particle_fluid_friction,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->env_count, p->union_slot_count, p->rows_per_env,

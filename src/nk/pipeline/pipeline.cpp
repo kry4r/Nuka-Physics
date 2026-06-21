@@ -132,6 +132,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
                                 ? mp.n_soft_particles : 0u;
     const uint32_t per_env_particles = cap.particles_per_env;
+    // Per-env soft-particle count selecting which per-system mu a particle side
+    // reads: SoftFluid the explicit split, Xpbd all-soft, Pbf all-fluid, Coupled by type.
+    const uint32_t friction_n_soft =
+        mp.mode == Model::ParticleMode::SoftFluid ? mp.n_soft_particles
+        : mp.mode == Model::ParticleMode::Xpbd ? per_env_particles
+        : mp.mode == Model::ParticleMode::Pbf ? 0u
+        : mp.mode == Model::ParticleMode::Coupled
+              ? (mp.coupled_internal == Model::CoupledInternal::Pbf ? 0u
+                                                                    : per_env_particles)
+        : 0u;
     const uint32_t coupled_internal =
         mp.coupled_internal == Model::CoupledInternal::Xpbd ? phi::kCoupledInternalXpbd
         : mp.coupled_internal == Model::CoupledInternal::Pbf ? phi::kCoupledInternalPbf
@@ -397,6 +407,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
         p_assemble_.particles_per_env = cap.particles_per_env;  // M6 coupling.
+        // Per-particle-system friction for a body<->particle contact side: the
+        // [soft | fluid] split + each slice's mu (a particle has no body material).
+        p_assemble_.n_soft_particles = friction_n_soft;
+        p_assemble_.particle_soft_friction = mp.soft_friction;
+        p_assemble_.particle_fluid_friction = mp.fluid_friction;
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
 

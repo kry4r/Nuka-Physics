@@ -960,6 +960,12 @@ if(CMAKE_CUDA_COMPILER)
         # on the ONE path); asserts the particle-side row solves (lambda>0 + braked
         # approach velocity) + two-run byte-identity of the coupling stream.
         scenario/body_particle_coupling.cpp
+        # Body<->particle FRICTION asymmetry: one SoftFluid Model presses a SOFT and a
+        # FLUID particle onto static boxes with the same (-z,+x) approach. Same pyramid,
+        # same row, same kernel -- only the per-system mu differs: the soft slice (finite
+        # mu) grips (friction lambda>0 + tangential bounded), the fluid slice (mu~0)
+        # slides (friction lambda~0 + tangential free) while its normal row still brakes.
+        scenario/body_particle_friction.cpp
         # SoftFluid finalize composition: a soft particle braked by a static-floor
         # coupling row must STAY braked through a FULL World::Step. The SoftFluid
         # finalize reproduces the projection velocity AND composes the contact

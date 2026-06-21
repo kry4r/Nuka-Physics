@@ -113,6 +113,8 @@ struct XpbdCookInput {
     std::vector<CookVolumeCon>   volume;
     std::vector<CookShapeMatchCluster> shape_match;  // M9 T11 (id 9).
     uint16_t solver_iterations = 1u;
+    // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
+    float    friction = 0.6f;
 };
 
 // Stage an XPBD soft body into the Model (single-env template; SeedInitialState
@@ -138,6 +140,8 @@ struct PbfCookInput {
     uint32_t   grid_dims[3] = {0u, 0u, 0u};
     bool       boundary_enabled = false;
     float      floor_z = 0.0f;             // z-up boundary floor.
+    // body<->fluid contact mu, ~0 so a foot slides (splash stays normal/PBF-driven).
+    float      friction = 0.0f;
 };
 
 // Stage a PBF fluid into the Model (single-env template; SeedInitialState
