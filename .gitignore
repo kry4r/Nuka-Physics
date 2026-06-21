@@ -5,6 +5,12 @@ out/*
 !out/.gitkeep
 cmake-build-*/
 
+# Working/process notes, logs, and crash dumps (not shipped)
+subagent-plans/
+docs/plans/
+core.*
+*.log
+
 # Visual Studio
 .vs/
 *.suo
