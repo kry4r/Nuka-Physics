@@ -1,0 +1,67 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+# A minimal one-revolute arm: a pinned base and a single link whose COLLIDABLE tip
+# sphere hangs out on an X lever and rotates about Y in the X-Z plane. A position
+# drive rotates the arm DOWN; the tip presses a particle set placed below it through
+# the general body<->particle contact path, and the contact reaction flows back into
+# the single revolute joint (it cannot reach the commanded target).
+def Xform "World"
+{
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        bool physics:kinematicEnabled = true
+        float physics:mass = 0
+        double3 xformOp:translate = (0, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "arm" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.5
+        double3 xformOp:translate = (0, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "tip_geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.04
+            double3 xformOp:translate = (0.30, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def PhysicsRevoluteJoint "joint0"
+    {
+        rel physics:body0 = </World/base>
+        rel physics:body1 = </World/arm>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -3.0
+        float physics:upperLimit = 3.0
+    }
+
+    def NukaActuator "motor0"
+    {
+        rel nuka:joint = </World/joint0>
+        token nuka:type = "position"
+        float nuka:gain = 40
+        float nuka:forceLimit = 200
+    }
+
+    def DistantLight "sun"
+    {
+        color3f inputs:color = (1, 0.95, 0.9)
+        float inputs:intensity = 500
+    }
+}
