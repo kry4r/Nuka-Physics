@@ -4,7 +4,7 @@
 <sub>Self-written end to end — no external physics or rendering SDK.</sub></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-blue" alt="license">
   <img src="https://img.shields.io/badge/CUDA-12.8-76b900" alt="cuda">
   <img src="https://img.shields.io/badge/platform-Linux-555" alt="platform">
   <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-success" alt="determinism">
@@ -136,6 +136,6 @@ Imports **MJCF** (`.xml`), **URDF**, and **text USD** (`.usda`). The `.usda` par
 
 ## Contributing &amp; License
 
-Contributions welcome under a signed [CLA](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Security: [SECURITY.md](SECURITY.md).
+Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Security: [SECURITY.md](SECURITY.md).
 
-**Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**Dual-licensed: [AGPL-3.0](LICENSE) (open source) or a commercial license** for closed-source / proprietary use. See [LICENSING.md](LICENSING.md) and [NOTICE](NOTICE).

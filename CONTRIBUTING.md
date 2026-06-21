@@ -5,31 +5,20 @@ strongly deterministic, differentiable physics engine for robotics simulation
 and reinforcement learning.
 
 This document describes how to build, test, and submit changes. By contributing
-you agree to the [Code of Conduct](CODE_OF_CONDUCT.md) and to the
-[Contributor License Agreement](CLA.md).
-
-## Contributor License Agreement (required)
-
-All contributions require a signed [CLA](CLA.md). Signing is automated: the
-**CLA-assistant bot** comments on each pull request and checks whether the
-author has signed. If you have not signed, follow the bot's instructions and
-post the confirmation comment it requests. **A pull request cannot be merged
-until the CLA check passes.**
+you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Project license
 
-Nuka Physics is released under the [Apache License 2.0](LICENSE). See
-[NOTICE](NOTICE) for third-party attributions. New source files should carry an
-Apache-2.0-compatible header; do not introduce code under incompatible licenses.
+Nuka Physics is **dual-licensed**: the [GNU AGPL v3.0](LICENSE) (open source) or a
+commercial license (see [LICENSING.md](LICENSING.md)). See [NOTICE](NOTICE) for
+third-party attributions. Do not introduce code under licenses incompatible with
+the AGPL. By submitting a contribution you license it to the project under the
+AGPL (inbound = outbound); there is no separate CLA at this time.
 
-## Architecture and roadmap
+## Architecture
 
-Before proposing larger changes, read the master plan, which is the source of
-truth for the architecture and the version roadmap (v0.5 open source +
-differentiable simulation; soft body / fluid / coupling are planned for v0.7 and
-are not yet implemented):
+Before proposing larger changes, read the architecture docs:
 
-- Master plan: [`docs/plans/2026-05-28-nuka-physics-master-plan.md`](docs/plans/2026-05-28-nuka-physics-master-plan.md)
 - Architecture docs: [`docs/architecture/`](docs/architecture/)
 
 ## Building
@@ -133,8 +122,7 @@ proposal.
    - `pytest python/tests/`
 4. Confirm you have **not** edited `src/codegen/generated/**` or protected
    goldens, and that you introduced **no new float atomics** in physics paths.
-5. Open the PR, fill in the pull request template, and sign the CLA when the bot
-   asks.
+5. Open the PR and fill in the pull request template.
 
 ## Reporting bugs and requesting features
 
