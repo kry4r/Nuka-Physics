@@ -4,9 +4,9 @@ Copyright 2026 The Nuka Physics Authors
 This product includes software developed by The Nuka Physics Authors and the
 Nuka Physics open-source community.
 
-This software is licensed under the Apache License, Version 2.0 (see the LICENSE
-file). The notices below are provided for informational purposes only and do not
-modify the License.
+This software is dual-licensed under the GNU Affero General Public License v3.0
+(see the LICENSE file) or a commercial license (see LICENSING.md). The notices
+below are provided for informational purposes only and do not modify the License.
 
 ================================================================================
 Third-party components SHIPPED with the engine and Python bindings
