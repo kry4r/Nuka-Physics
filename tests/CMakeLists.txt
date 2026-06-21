@@ -993,6 +993,11 @@ if(CMAKE_CUDA_COMPILER)
         # fluid (body-side reaction lambda>0 + decel vs a no-fluid control); the
         # resistance emerges from the contact rows + PBF incompressibility, no buoyancy.
         scenario/foot_splash_two_way.cpp
+        # Articulated LINK <-> particle two-way coupling on the same body<->particle
+        # row a foot uses on the ground: a minimal one-revolute pendulum arm presses a
+        # cloth patch (coupling row whose BODY side maps to an articulation link, and
+        # the reaction reaches the single revolute qdot + tip pose vs a no-patch control).
+        scenario/articulated_link_particle_coupling.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
