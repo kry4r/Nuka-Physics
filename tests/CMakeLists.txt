@@ -988,6 +988,11 @@ if(CMAKE_CUDA_COMPILER)
         # 3D soft tet body <-> rigid two-way coupling on the same body<->particle row
         # a cloth particle uses (deform + rest-on-floor reaction + volume recovery).
         scenario/soft_tet_presser_two_way.cpp
+        # PBF fluid <-> rigid foot two-way coupling on the same body<->particle row: a
+        # foot plunges a shallow pool (splash + displacement) and is resisted by the
+        # fluid (body-side reaction lambda>0 + decel vs a no-fluid control); the
+        # resistance emerges from the contact rows + PBF incompressibility, no buoyancy.
+        scenario/foot_splash_two_way.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
