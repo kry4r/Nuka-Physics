@@ -225,28 +225,106 @@ __device__ bool SphereTriangleFace(Vec3 center, float radius, Vec3 a, Vec3 b, Ve
     return true;
 }
 
-// Particle (sphere) vs the heightfield collidable: walk the overlapped cell range
-// (the body AABB query already gated the broad overlap), test each cell triangle
-// via the deep-sink-robust face handler, keep the DEEPEST face contact. Mirrors the
-// heightfield narrowphase cell walk + corner-height extraction.
-__device__ void ParticleHeightfield(Vec3 center, float radius,
-                                    const PrimShapeDev& hf_sh, const math::Transform& xhf,
-                                    const float* heights, const float* shape_table,
-                                    ContactManifold* m) {
-    (void)hf_sh; (void)shape_table;
+// Read a grid corner's LOCAL z from the cooked normalized height grid (mirrors the
+// rigid heightfield narrowphase CornerZ). heights stores h in [0,1]; row-major.
+__device__ __forceinline__ float CornerZ(const float* heights, uint32_t data_offset,
+                                         uint32_t ncol, float min_z, float range,
+                                         uint32_t r, uint32_t c) {
+    const float h = heights[data_offset + r * ncol + c];
+    return min_z + h * range;
+}
+
+// Particle (sphere) vs the heightfield collidable: project the particle's world AABB
+// into the heightfield-LOCAL frame, clamp to the cell range, and test each overlapped
+// cell triangle via the deep-sink-robust face handler oriented out of the downward-
+// solid prism (+cz). Keeps the DEEPEST face contact, exactly like the rigid path's
+// SphereHeightfieldTri. The descriptor (cell/origin/data_offset) rides the params.
+__device__ void ParticleHeightfield(Vec3 center, float radius, float margin,
+                                    const math::Transform& xhf,
+                                    const NarrowphaseBodyParticleParams& pp,
+                                    const float* heights, ContactManifold* m) {
     // Heightfield world frame (its body pose); the grid is in this LOCAL frame.
     amf::PrimFrame hf;
     hf.cx = PrimRotate(xhf.rotation, Vec3{1, 0, 0});
     hf.cy = PrimRotate(xhf.rotation, Vec3{0, 1, 0});
     hf.cz = PrimRotate(xhf.rotation, Vec3{0, 0, 1});
     hf.t = xhf.position;
-    // The cooked AABB lanes carry the grid half-extents + LOCAL z-range; the device
-    // heightfield descriptor (cell/origin/data_offset) is NOT in shape_table, so a
-    // heightfield body is only reachable here through the model's single descriptor.
-    // The face handler needs the LOCAL grid; without the descriptor we cannot walk
-    // cells, so a heightfield particle contact is left to the future descriptor wire
-    // (the demo couples against robot links + boxes). Leave empty.
-    (void)heights; (void)center; (void)radius; (void)m;
+
+    // World AABB (center +- radius + margin) -> heightfield-local AABB (transform all
+    // 8 corners, take the local min/max), then map to the overlapped cell range.
+    const float he = radius + margin;
+    Vec3 lo{3.4e38f, 3.4e38f, 3.4e38f};
+    Vec3 hi{-3.4e38f, -3.4e38f, -3.4e38f};
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) {
+                const Vec3 wc{center.x + sx * he, center.y + sy * he, center.z + sz * he};
+                const Vec3 lc = hf.WorldToLocal(wc);
+                lo.x = fminf(lo.x, lc.x); lo.y = fminf(lo.y, lc.y); lo.z = fminf(lo.z, lc.z);
+                hi.x = fmaxf(hi.x, lc.x); hi.y = fmaxf(hi.y, lc.y); hi.z = fmaxf(hi.z, lc.z);
+            }
+
+    const float origin_x = pp.origin_x, origin_y = pp.origin_y;
+    const float cell = pp.cell_size;
+    const float min_z = pp.min_z, range = pp.max_z - pp.min_z;
+    const uint32_t ncol = pp.ncol, nrow = pp.nrow;
+
+    // cell index = floor((local - origin) / cell); a cell spans corners c..c+1 so the
+    // last valid index is n-2. Clamp to [0, n-2] (the rigid path's clamp).
+    auto clampi = [](int v, int lo_, int hi_) -> int {
+        return v < lo_ ? lo_ : (v > hi_ ? hi_ : v);
+    };
+    int c_lo = static_cast<int>(floorf((lo.x - origin_x) / cell));
+    int c_hi = static_cast<int>(floorf((hi.x - origin_x) / cell));
+    int r_lo = static_cast<int>(floorf((lo.y - origin_y) / cell));
+    int r_hi = static_cast<int>(floorf((hi.y - origin_y) / cell));
+    c_lo = clampi(c_lo, 0, static_cast<int>(ncol) - 2);
+    c_hi = clampi(c_hi, 0, static_cast<int>(ncol) - 2);
+    r_lo = clampi(r_lo, 0, static_cast<int>(nrow) - 2);
+    r_hi = clampi(r_hi, 0, static_cast<int>(nrow) - 2);
+
+    // Walk the overlapped cells; keep the single DEEPEST face contact (the particle
+    // gets one contact slot per body — the rest cluster to one surface anyway).
+    Vec3 best_pos{0, 0, 0}, best_nrm{0, 0, 0};
+    float best_pen = 0.0f;
+    bool have = false;
+    for (int r = r_lo; r <= r_hi; ++r) {
+        for (int c = c_lo; c <= c_hi; ++c) {
+            const uint32_t rc = static_cast<uint32_t>(r), cc = static_cast<uint32_t>(c);
+            const float x0 = origin_x + static_cast<float>(c) * cell;
+            const float x1 = x0 + cell;
+            const float y0 = origin_y + static_cast<float>(r) * cell;
+            const float y1 = y0 + cell;
+            const float z00 = CornerZ(heights, pp.data_offset, ncol, min_z, range, rc, cc);
+            const float z10 = CornerZ(heights, pp.data_offset, ncol, min_z, range, rc, cc + 1u);
+            const float z01 = CornerZ(heights, pp.data_offset, ncol, min_z, range, rc + 1u, cc);
+            const float z11 = CornerZ(heights, pp.data_offset, ncol, min_z, range, rc + 1u, cc + 1u);
+            const Vec3 p00 = hf.LocalToWorld(Vec3{x0, y0, z00});
+            const Vec3 p10 = hf.LocalToWorld(Vec3{x1, y0, z10});
+            const Vec3 p01 = hf.LocalToWorld(Vec3{x0, y1, z01});
+            const Vec3 p11 = hf.LocalToWorld(Vec3{x1, y1, z11});
+            // The cell's 2 triangles (Newton: tri0=(p00,p10,p11), tri1=(p00,p11,p01)).
+            for (int sub = 0; sub < 2; ++sub) {
+                Vec3 a, bb, cv;
+                if (sub == 0) { a = p00; bb = p10; cv = p11; }
+                else          { a = p00; bb = p11; cv = p01; }
+                Vec3 cpos, cnrm; float cpen;
+                if (SphereTriangleFace(center, radius, a, bb, cv, hf.cz,
+                                       &cpos, &cnrm, &cpen) &&
+                    (!have || cpen > best_pen)) {
+                    best_pos = cpos; best_nrm = cnrm; best_pen = cpen; have = true;
+                }
+            }
+        }
+    }
+    if (have) {
+        ::nuka::constraint::ContactPoint pt;
+        pt.position = best_pos;
+        pt.normal = best_nrm;      // sep dir for the particle (side A), oriented up.
+        pt.penetration = best_pen;
+        pt.stable_key = 0ull;
+        m->AddPoint(pt);
+    }
 }
 
 __global__ void NarrowphaseBodyParticleKernel(
@@ -348,7 +426,14 @@ __global__ void NarrowphaseBodyParticleKernel(
                 break;
             }
             case kKindHeightfield:
-                ParticleHeightfield(center, radius, sb, xb, heights, shape_table, &m);
+                // A heightfield body without a wired descriptor cannot be walked;
+                // surface the coverage miss loud (never a silent tunnel-through).
+                if (pp.has_heightfield != 0u && heights != nullptr) {
+                    ParticleHeightfield(center, radius, pp.contact_margin, xb, pp,
+                                        heights, &m);
+                } else if (env_status != nullptr) {
+                    atomicOr(&env_status[env], kEnvStatusPairOverflow);
+                }
                 break;
             default: break;  // SdfMesh / unknown: no analytic particle handler.
         }

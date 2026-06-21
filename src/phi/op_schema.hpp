@@ -408,6 +408,14 @@ struct NarrowphaseBodyParticleParams {
     uint32_t cands_per_particle;  // reserved contact slots per particle
     float    particle_radius;     // the particle collision radius (sphere on the path)
     float    contact_margin;
+    // -- the heightfield descriptor (HeightfieldData mirror, same names/types as
+    // NarrowphaseHeightfieldParams) so a sphere particle walks the cooked grid. ---
+    uint32_t has_heightfield;   // 0 == no cooked heightfield (the field arm is inert)
+    float    origin_x, origin_y, origin_z;  // local (0,0) corner (descriptor.origin)
+    float    cell_size;
+    uint32_t nrow, ncol;
+    float    min_z, max_z;      // LOCAL z-range (for the cell corner heights)
+    uint32_t data_offset;       // base index into the `heights` field
 };
 
 // Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
