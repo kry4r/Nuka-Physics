@@ -128,7 +128,11 @@ set(NUKA_PUBLIC_HEADERS
 
 add_library(nuka_render STATIC
     render/render_world.cpp
-    # M11 RT-4 (§3.10): host, CUDA-free adapter mapping RenderWorld -> the
+    # The ONE general particle-set -> deformed render surface mesh (cloth now,
+    # tet/fluid later). Pure host, ZERO CUDA: it lives in nuka_render so a demo
+    # gets a deforming surface from live particles with no CUDA dependency.
+    runtime/soft/particle_surface.cpp
+    # Host, CUDA-free adapter mapping RenderWorld -> the
     # self-written path-tracer scene-desc POD (rt::TwoLevelScene). Zero CUDA
     # token (src/render red-line); the CUDA backend is reached only via the
     # render::RtBackendI interface (render/rt_backend.hpp).

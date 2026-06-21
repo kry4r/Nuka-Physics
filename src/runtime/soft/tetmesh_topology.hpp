@@ -55,4 +55,14 @@ void BuildTetMeshConstraints(const std::vector<math::Vec3>& rest_positions,
 float TetSignedVolumeTimes6(const math::Vec3& p0, const math::Vec3& p1,
                             const math::Vec3& p2, const math::Vec3& p3);
 
+// Extract the boundary surface of `tets` as a flat triangle index list (3
+// particle indices per triangle): a face on exactly ONE incident tet is a
+// boundary face, a face shared by two tets is interior and dropped. Each emitted
+// triangle is wound to face OUTWARD (the fourth tet vertex sits behind it).
+// Deterministic emission order. The output feeds runtime::soft::BuildSurfaceMesh
+// so a deforming tet body renders as a smooth surface on the same path as cloth.
+std::vector<uint32_t> ExtractBoundaryTriangles(
+    const std::vector<math::Vec3>& rest_positions,
+    const std::vector<TetMeshTet>& tets);
+
 } // namespace nuka::runtime::soft
