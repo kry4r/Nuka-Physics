@@ -253,6 +253,7 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                                     uint32_t excluded_count,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
+                                    uint32_t rigid_slot_cap,
                                     uint32_t* __restrict__ out_pairs,   // elem:2 per slot
                                     uint32_t* __restrict__ out_count,
                                     uint32_t* __restrict__ env_status) {
@@ -316,7 +317,9 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                         continue;
                     }
                     const uint32_t slot = atomicAdd(&out_count[env], 1u);
-                    if (slot < slot_stride) {
+                    // Full slot stride for addressing, but cap emission at rigid_slot_cap
+                    // so body<->body never spills into the body<->particle sub-range.
+                    if (slot < rigid_slot_cap) {
                         const size_t at =
                             (static_cast<size_t>(env) * slot_stride + slot) * 2u;
                         out_pairs[at + 0] = a32;
@@ -503,7 +506,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
     LaunchCuda(EnvQueryPairsKernel, dim3(leaf_blocks, E), dim3(kBlockSize), 0u, stream,
                nodes, static_cast<const float*>(model.shape_table),
                static_cast<const uint64_t*>(model.excluded_pairs),
-               p->excluded_count, N, p->max_contacts_per_env,
+               p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
                data.candidate_pairs, data.pair_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

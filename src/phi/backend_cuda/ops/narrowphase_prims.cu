@@ -162,7 +162,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     const float* __restrict__ hull_verts,           // cooked hull pool (G5)
     uint32_t /*hull_vert_count*/,                    // L-RECON-D: per-shape slice now in shape_table
     uint32_t gen,                                    // run/generation counter (C2)
-    uint32_t env_count, uint32_t slot_stride, uint32_t bodies_per_env,
+    uint32_t env_count, uint32_t slot_stride, uint32_t rigid_slot_cap,
+    uint32_t bodies_per_env,
     uint32_t* __restrict__ ucount,
     math::Vec3* __restrict__ upoint,
     math::Vec3* __restrict__ unormal,
@@ -183,7 +184,9 @@ __global__ void PairDrivenNarrowphaseKernel(
     ContactManifold m;
     m.Clear();
     uint32_t a = 0u, b = 0u;
-    if (slot < live && slot < slot_stride) {
+    // The body<->body sub-range is [0, rigid_slot_cap); slots above belong to the
+    // body<->particle narrowphase (== slot_stride when no particles -> identical).
+    if (slot < live && slot < rigid_slot_cap) {
         a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
         b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
         const PrimShapeDev sa = LoadPrimShape(shape_table, a);
@@ -260,7 +263,7 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                static_cast<const float*>(model.shape_table),
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
-               p.env_count, p.union_slot_count, p.bodies_per_env,
+               p.env_count, p.union_slot_count, p.rigid_slot_cap, p.bodies_per_env,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,

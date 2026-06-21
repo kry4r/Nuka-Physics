@@ -265,6 +265,10 @@ struct LbvhQueryPairsParams {
     uint32_t max_contacts_per_env;  // candidate_pairs slot stride / env
     uint32_t filter_cross_env;  // 1 => drop pairs spanning envs (env-major)
     uint32_t excluded_count;    // sorted exclude-list length (excluded_pairs)
+    // Rigid emission cap (<= the slot stride): body<->body pairs fill only
+    // [0, rigid_slot_cap); the body<->particle narrowphase owns [rigid_slot_cap,
+    // stride). Equals the stride when no particles -> byte-identical.
+    uint32_t rigid_slot_cap;
 };
 
 struct ParticleGridBuildParams {
@@ -318,6 +322,7 @@ struct NarrowphasePrimitivesParams {
     // detection (foot sphere x plane / finger sphere x hull / body box x plane).
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env (Model union_slots size)
+    uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
     uint32_t bodies_per_env;
     uint32_t hull_vert_count;   // live verts of the hull_verts pool
     // M6: particle coupling (the kUSlotParticleSphere* union classes form the
@@ -365,6 +370,7 @@ struct NarrowphaseHeightfieldParams {
     uint32_t family;            // kContactFamily* (PairDriven => run)
     uint32_t env_count;
     uint32_t slot_stride;       // candidate slots per env (== max_contacts_per_env)
+    uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
     uint32_t bodies_per_env;
     uint32_t hull_vert_count;   // cooked hull pool (convex-hull convex side)
     float    contact_margin;
@@ -416,6 +422,7 @@ struct NarrowphaseSdfParams {
     uint32_t env_count;
     uint32_t bodies_per_env;
     uint32_t max_contacts_per_env;  // ucontact slot stride / env
+    uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
 };
 
 struct ContactTangentBasisParams {

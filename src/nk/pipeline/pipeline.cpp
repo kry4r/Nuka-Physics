@@ -6,6 +6,7 @@
 
 #include <cassert>
 
+#include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
 
@@ -55,6 +56,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
+    // rigid_cap recovers the pre-particle budget the cook grew from, so rigid keeps
+    // [0, rigid_cap) and particles the top range; particle-free -> rigid_cap == total.
+    const uint32_t particle_reserve =
+        has_particles ? cap.particles_per_env *
+                            collision::gpu::kBodyParticleContactSlotsPerParticle
+                      : 0u;
+    const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
     // The per-ARTICULATION contact-slot stride the contact detection/assembly/solve
     // share, DATA-DRIVEN from the cooked geometry: the cook sizes max_contacts_per_env
     // from the collidable count, so the stride is the per-articulation quotient
@@ -206,6 +214,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_lbvh_query_.env_count = env_count;
         p_lbvh_query_.bodies_per_env = bodies_per_env;
         p_lbvh_query_.max_contacts_per_env = cap.max_contacts_per_env;
+        p_lbvh_query_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_lbvh_query_.filter_cross_env = model.filter_cross_env ? 1u : 0u;
         p_lbvh_query_.excluded_count =
             static_cast<uint32_t>(model.excluded_pairs.size());
@@ -254,6 +263,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // candidate slot index lines up across broadphase -> narrowphase -> the
         // unified buffer. (Field name retained for the shared params layout.)
         p_np_prim_.union_slot_count = cap.max_contacts_per_env;
+        p_np_prim_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
@@ -285,6 +295,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_hf_.family = family;
         p_np_hf_.env_count = env_count;
         p_np_hf_.slot_stride = cap.max_contacts_per_env;
+        p_np_hf_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_np_hf_.bodies_per_env = cap.bodies_per_env;
         p_np_hf_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
@@ -318,6 +329,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.env_count = env_count;
         p_np_sdf_.bodies_per_env = cap.bodies_per_env;
         p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
+        p_np_sdf_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
         // Body/artic <-> particle narrowphase. Runs AFTER the rigid narrowphase
@@ -329,19 +341,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // same uniform radius the particle-particle co-step uses). Gated on actual
         // particles; a particle-free world emits no op -> byte-identical.
         if (has_particles) {
-            const uint32_t cands_per_particle = 4u;  // reserved body slots / particle.
-            const uint32_t reserve =
-                cap.particles_per_env * cands_per_particle;
-            // Reserve the TOP `reserve` slots for particles; rigid slots grow from 0.
-            const uint32_t particle_base =
-                cap.max_contacts_per_env > reserve
-                    ? (cap.max_contacts_per_env - reserve) : 0u;
+            const uint32_t cands_per_particle =
+                collision::gpu::kBodyParticleContactSlotsPerParticle;
+            // particle_base == rigid_cap by construction: particles take the top
+            // [rigid_cap, total) range above the rigid [0, rigid_cap) sub-range.
             p_np_body_particle_.family = family;
             p_np_body_particle_.env_count = env_count;
             p_np_body_particle_.bodies_per_env = cap.bodies_per_env;
             p_np_body_particle_.particles_per_env = cap.particles_per_env;
             p_np_body_particle_.slot_stride = cap.max_contacts_per_env;
-            p_np_body_particle_.particle_slot_base = particle_base;
+            p_np_body_particle_.particle_slot_base = rigid_cap;
             p_np_body_particle_.cands_per_particle = cands_per_particle;
             // A particle is a sphere of d_min/2 on the ONE path (the cooked uniform
             // contact radius); 0 leaves the op inert (no collision radius cooked).
