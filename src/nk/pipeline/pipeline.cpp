@@ -356,6 +356,23 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             // contact radius); 0 leaves the op inert (no collision radius cooked).
             p_np_body_particle_.particle_radius = 0.5f * mp.pp_contact_d_min;
             p_np_body_particle_.contact_margin = cfg.contact_margin;
+            // The heightfield descriptor (the SAME single cooked field the rigid
+            // heightfield narrowphase wires) so a sphere particle walks the grid.
+            if (!model.heightfields.empty()) {
+                const nk::HeightfieldData& hfd = model.heightfields.front();
+                p_np_body_particle_.has_heightfield = 1u;
+                p_np_body_particle_.origin_x = hfd.origin.x;
+                p_np_body_particle_.origin_y = hfd.origin.y;
+                p_np_body_particle_.origin_z = hfd.origin.z;
+                p_np_body_particle_.cell_size = hfd.cell_size;
+                p_np_body_particle_.nrow = hfd.nrow;
+                p_np_body_particle_.ncol = hfd.ncol;
+                p_np_body_particle_.min_z = hfd.min_z;
+                p_np_body_particle_.max_z = hfd.max_z;
+                p_np_body_particle_.data_offset = hfd.data_offset;
+            } else {
+                p_np_body_particle_.has_heightfield = 0u;
+            }
             add(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle_);
         }
 

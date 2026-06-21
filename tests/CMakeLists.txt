@@ -960,6 +960,12 @@ if(CMAKE_CUDA_COMPILER)
         # on the ONE path); asserts the particle-side row solves (lambda>0 + braked
         # approach velocity) + two-run byte-identity of the coupling stream.
         scenario/body_particle_coupling.cpp
+        # Body<->particle coupling against a HEIGHTFIELD: a particle dropped onto a
+        # cooked terrain grid emits a kNkSideParticle face contact (the SAME deep-sink
+        # SphereTriangleFace the rigid sphere-vs-heightfield handler uses) and rests at
+        # the surface instead of tunnelling through -- closes the heightfield arm that
+        # was a silent no-op stub (0 rows, 0 diagnostic); + two-run byte-identity.
+        scenario/body_particle_heightfield.cpp
         # Body<->particle FRICTION asymmetry: one SoftFluid Model presses a SOFT and a
         # FLUID particle onto static boxes with the same (-z,+x) approach. Same pyramid,
         # same row, same kernel -- only the per-system mu differs: the soft slice (finite
