@@ -34,6 +34,59 @@
 
 namespace nuka::runtime::fluid {
 
+// Poly6 SCALAR kernel value at squared distance r2, the CUDA-free mirror of the
+// device Poly6FromR2 (runtime/fluid/pbf_kernels.cuh): const 315/(64*pi*h^9) and
+// the same (h^2 - r^2)^3 clamp. ONE host Poly6 reused by ComputePbfDensities and
+// the fluid surface mesher so neither carries a divergent copy.
+inline float Poly6FromR2Host(float r2, float h) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const float h2 = h * h;
+    if (r2 >= h2) {
+        return 0.0f;
+    }
+    const float h3 = h * h * h;
+    const float h6 = h3 * h3;
+    const float h9 = h6 * h3;
+    const float poly6 = 315.0f / (64.0f * kPi * h9);
+    const float diff = h2 - r2;  // (h^2 - r^2) >= 0 here.
+    return poly6 * diff * diff * diff;
+}
+
+// Spiky kernel GRADIENT, the CUDA-free mirror of the device SpikyGradient
+// (runtime/fluid/pbf_kernels.cuh:89): const -45/(pi*h^6)*(h-r)^2*(r_vec/r). Zero
+// for r >= h or r ~ 0 so the direction stays finite at coincidence.
+inline math::Vec3 SpikyGradientHost(math::Vec3 r_vec, float r, float h) {
+    constexpr float kPi = 3.14159265358979323846f;
+    if (r >= h || r <= 0.0f) {
+        return math::Vec3{0.0f, 0.0f, 0.0f};
+    }
+    const float h3 = h * h * h;
+    const float h6 = h3 * h3;
+    const float spiky_grad = -45.0f / (kPi * h6);
+    const float hr = h - r;                          // (h - r) > 0 here.
+    const float coeff = spiky_grad * hr * hr / r;    // includes 1/r for r_vec/r.
+    return math::Vec3{r_vec.x * coeff, r_vec.y * coeff, r_vec.z * coeff};
+}
+
+// GRADIENT of the Poly6 kernel wrt the sample position, the analytic gradient of
+// the SAME field ComputePbfDensities/Poly6FromR2Host sum: d/dx [(h^2-r^2)^3] gives
+// -6*(h^2-r^2)^2 * r_vec, scaled by the Poly6 constant. Used for density-isosurface
+// normals (the Spiky form is the pressure-correction gradient, not this field's).
+inline math::Vec3 Poly6GradientHost(math::Vec3 r_vec, float r2, float h) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const float h2 = h * h;
+    if (r2 >= h2) {
+        return math::Vec3{0.0f, 0.0f, 0.0f};
+    }
+    const float h3 = h * h * h;
+    const float h6 = h3 * h3;
+    const float h9 = h6 * h3;
+    const float poly6 = 315.0f / (64.0f * kPi * h9);
+    const float diff = h2 - r2;                      // (h^2 - r^2) >= 0 here.
+    const float coeff = poly6 * -6.0f * diff * diff;  // d/dr2 chain on (h^2-r^2)^3.
+    return math::Vec3{r_vec.x * coeff, r_vec.y * coeff, r_vec.z * coeff};
+}
+
 // Host-side description of a PBF particle set. Mass is UNIFORM across the fluid
 // (p10-A); per-particle mass is a future extension.
 struct PbfParticleSet {
@@ -86,37 +139,21 @@ inline std::vector<float> ComputePbfDensities(const PbfParticleSet& particles,
     // is wrong -- match the GPU which throws; but keep this header exception-light:
     // an h <= 0 yields a non-finite coeff that the caller's assert will catch. The
     // calibration sites always pass h > 0.
-    constexpr float kPi = 3.14159265358979323846f;
-    const float h2 = h * h;
-    const float h3 = h * h * h;
-    const float h6 = h3 * h3;
-    const float h9 = h6 * h3;
-    const float poly6 = 315.0f / (64.0f * kPi * h9);
     const float m = particles.particle_mass;
-
-    // Poly6 scalar value at squared distance r2 -- the EXACT GPU Poly6FromR2
-    // expression (poly6 * diff * diff * diff, clamped to 0 outside the support).
-    auto Poly6FromR2 = [&](float r2) -> float {
-        if (r2 >= h2) {
-            return 0.0f;
-        }
-        const float diff = h2 - r2;  // (h^2 - r^2) >= 0 here.
-        return poly6 * diff * diff * diff;
-    };
 
     std::vector<float> rho(n, 0.0f);
     for (std::size_t i = 0; i < n; ++i) {
         const math::Vec3 pi = particles.positions[i];
         // Self term first (r2 = 0): a fixed leading addend, identical for all i --
         // grouped m * Poly6FromR2(0) exactly as the GPU ComputeDensityKernel.
-        float r = m * Poly6FromR2(0.0f);
+        float r = m * Poly6FromR2Host(0.0f, h);
         for (std::size_t j = 0; j < n; ++j) {
             if (j == i) {
                 continue;
             }
             const math::Vec3 d = pi - particles.positions[j];
             const float r2 = d.Dot(d);
-            r += m * Poly6FromR2(r2);  // adds 0 outside h (matches the grid skip).
+            r += m * Poly6FromR2Host(r2, h);  // adds 0 outside h (grid skip).
         }
         rho[i] = r;
     }

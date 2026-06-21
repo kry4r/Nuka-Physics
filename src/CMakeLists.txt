@@ -132,6 +132,10 @@ add_library(nuka_render STATIC
     # tet/fluid later). Pure host, ZERO CUDA: it lives in nuka_render so a demo
     # gets a deforming surface from live particles with no CUDA dependency.
     runtime/soft/particle_surface.cpp
+    # The fluid counterpart: a PBF particle set -> marching-cubes isosurface
+    # MeshGeometry (same MeshToBlas path). Pure host, ZERO CUDA (reuses the
+    # CUDA-free host Poly6/Spiky in import/cooker/fluid_cooker_types.hpp).
+    runtime/fluid/surface_mesher.cpp
     # Host, CUDA-free adapter mapping RenderWorld -> the
     # self-written path-tracer scene-desc POD (rt::TwoLevelScene). Zero CUDA
     # token (src/render red-line); the CUDA backend is reached only via the
