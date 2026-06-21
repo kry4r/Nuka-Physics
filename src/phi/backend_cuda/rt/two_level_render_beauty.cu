@@ -115,6 +115,10 @@ RenderBeautyKernel(PinholeCamera camera,
             const Vec3 Nt = (tv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
             col = ShadeTransmissive(tlas_nodes, tlas_leaf_count, instances, materials,
                                     light, sky, hit, Nt, Vv, mat, &rng);
+        } else if (sky.smooth_normals != 0u) {
+            // Opaque smooth arm: gated, isolated wrapper -> the flat else below is byte-exact.
+            col = ShadeBeautySmooth(tlas_nodes, tlas_leaf_count, instances, materials,
+                                    light, sky, hit, ray.dir, bp, u, v, n, Vv, mat, &rng);
         } else {
             col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
                               light, sky, hit, Nf, Vv, mat, &rng);

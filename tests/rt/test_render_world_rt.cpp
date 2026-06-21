@@ -475,6 +475,10 @@ TEST(RenderWorldRtBeauty, OpaqueBeautyNoOpChecksum) {
                 static_cast<unsigned long long>(Fnv1a(a.color)));
     WritePpm(a, "out/rt_opaque_beauty.ppm");
     EXPECT_GT(MeanLuma(a), 0.0f);
+    // Regression anchor: opaque beauty bytes must not drift. Any change that moves
+    // this is a non-no-op edit to the flat shading path and must be justified.
+    EXPECT_EQ(Fnv1a(a.color), 15275657819673905153ull)
+        << "opaque beauty bytes drifted from the clean-tree anchor";
 }
 
 // REFRACTION: a transmissive slab in front of a bright bar must (a) shift/alter the
@@ -608,4 +612,52 @@ TEST(RenderWorldRtBeauty, SmoothNormalsAlterRefraction) {
     std::printf("SMOOTH_VS_FLAT_DIFF_PIXELS=%zu of %zu\n", diff, n);
     EXPECT_GT(diff, n / 100u)
         << "per-vertex smooth normals must alter the refraction vs the flat fallback";
+}
+
+// OPAQUE SMOOTH NORMALS: a coarse opaque sphere shaded with smooth_normals on must
+// differ from the flat-normal default -- exercises the gated ShadeBeautySmooth arm.
+TEST(RenderWorldRtBeauty, OpaqueSmoothNormalsAlterShading) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+
+    render::RenderWorld w;
+    const uint32_t ball = w.meshes.InternPrimitive("osn_ball", [] {
+        render::MeshGeometry g = SphereGeometry(0.8f, 12u, 16u);
+        g.normals = render::SmoothNormals(g.positions, g.indices);
+        return g;
+    });
+    w.materials.push_back(MakeMat(0.80f, 0.30f, 0.20f, 0.0f, 0.5f));  // matte opaque
+    render::RenderInstance si; si.mesh_id = ball; si.render_material_id = 0u;
+    si.world_xform = {{0.0f, 1.5f, 0.6f}, math::Quat::Identity()};
+    w.instances.push_back(si);
+    render::RenderLight light;
+    light.color = {1.0f, 0.98f, 0.95f}; light.intensity = 4.0f;
+    light.world_xform = {{-1.5f, -2.0f, 2.5f}, math::Quat::Identity()};
+    w.lights.push_back(light);
+
+    const rt::TwoLevelScene scene = render::RenderWorldToTwoLevelScene(w);
+    const rt::PinholeCamera camera = RefractCamera();
+    rt::BeautyOptions flat_opt = FixedBeauty();   flat_opt.smooth_normals = false;
+    rt::BeautyOptions smooth_opt = FixedBeauty(); smooth_opt.smooth_normals = true;
+
+    render::RtSceneHandle* h = backend->BuildScene(scene);
+    ASSERT_NE(h, nullptr);
+    const rt::Framebuffer flat   = backend->TraceBeautyToHost(h, scene, camera, flat_opt);
+    const rt::Framebuffer smooth = backend->TraceBeautyToHost(h, scene, camera, smooth_opt);
+    backend->FreeScene(h);
+    WritePpm(flat,   "out/rt_opaque_flat.ppm");
+    WritePpm(smooth, "out/rt_opaque_smooth.ppm");
+
+    ASSERT_EQ(flat.color.size(), smooth.color.size());
+    const size_t n = smooth.color.size() / 3u;
+    size_t diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float dr = std::fabs(smooth.color[i * 3] - flat.color[i * 3]);
+        const float dg = std::fabs(smooth.color[i * 3 + 1] - flat.color[i * 3 + 1]);
+        const float db = std::fabs(smooth.color[i * 3 + 2] - flat.color[i * 3 + 2]);
+        if (dr + dg + db > 0.02f) ++diff;
+    }
+    std::printf("OPAQUE_SMOOTH_VS_FLAT_DIFF_PIXELS=%zu of %zu\n", diff, n);
+    EXPECT_GT(diff, n / 100u)
+        << "smooth_normals must alter opaque shading (faceting removed) vs the flat arm";
 }

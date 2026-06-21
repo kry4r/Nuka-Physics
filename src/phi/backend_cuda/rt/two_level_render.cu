@@ -739,6 +739,7 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.fog_density = opt.fog_density;
     sky.sky_intensity = opt.sky_intensity;
     sky.transmit_bounces = opt.transmit_bounces;
+    sky.smooth_normals = opt.smooth_normals ? 1u : 0u;
 
     // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
     LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,
