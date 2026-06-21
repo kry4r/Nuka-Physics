@@ -414,6 +414,11 @@ struct NarrowphaseBodyParticleParams {
     // pos_source) so a fast fluid particle brakes within one step instead of lagging.
     uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
     uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
+    // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
+    // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
+    // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max
+    // hull vcount so it is a model property, not a per-scene branch.
+    uint32_t warp_per_particle;
     // -- the heightfield descriptor (HeightfieldData mirror, same names/types as
     // NarrowphaseHeightfieldParams) so a sphere particle walks the cooked grid. ---
     uint32_t has_heightfield;   // 0 == no cooked heightfield (the field arm is inert)
