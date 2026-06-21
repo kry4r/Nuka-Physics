@@ -188,6 +188,9 @@ enum class FieldId : uint16_t {
     RowPseudoLambda,  // row_pseudo_lambda (per:row_slot arena:scratch owner:data)
     UcontactAKind,  // ucontact_a_kind (per:contact_slot arena:scratch owner:data elem:4)
     UcontactBKind,  // ucontact_b_kind (per:contact_slot arena:scratch owner:data elem:4)
+    SnapshotParticlePos,  // snapshot_particle_pos (per:particle arena:persistent owner:data)
+    SnapshotParticlePrevPos,  // snapshot_particle_prev_pos (per:particle arena:persistent owner:data)
+    SnapshotParticleVel,  // snapshot_particle_vel (per:particle arena:persistent owner:data)
     Count
 };
 

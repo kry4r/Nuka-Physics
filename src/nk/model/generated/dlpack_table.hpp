@@ -204,6 +204,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::RowPseudoLambda, DlpackDtype::kF32, 1, false, false},  // row_pseudo_lambda
     {FieldId::UcontactAKind, DlpackDtype::kU32, 2, false, false},  // ucontact_a_kind
     {FieldId::UcontactBKind, DlpackDtype::kU32, 2, false, false},  // ucontact_b_kind
+    {FieldId::SnapshotParticlePos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_pos
+    {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_prev_pos
+    {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_vel
 };
 
 } // namespace nuka::nk

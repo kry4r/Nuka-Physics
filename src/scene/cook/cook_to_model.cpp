@@ -1,26 +1,26 @@
 // ---------------------------------------------------------------------------
-// nk CookToModel implementation (plan §3.3 / M3).
+// nk CookToModel implementation (the design /).
 //
-// MAPPING CHOICES (documented for M3b/SceneMap consumers):
-//   * Bodies: cooked body rows ARE record order (the cooker preserves SceneIR
-//     body order), so SceneMap binds entity-of-body -> body_row = its cooked row
-//     for every body. The nk::Model carries the per-env movable rigid-body COUNT
-//     (bodies_per_env); the actual body state lives in the Data arena (env-major
-//     replica e at [e*bodies_per_env, ...)).
-//   * Articulation: CookArticulations(blob) yields the per-env kinematic-tree
-//     template(s). M3a supports the single-articulation-per-env scene (the H1 /
-//     grasp shape); the first articulation becomes the Model template. dof_count
-//     / link_count drive the dof/link capacities. Links bind to SceneMap via
-//     link_index = the template-local link slot.
-//   * Shapes: each cooked shape ROW becomes one ModelShape. A mesh that V-HACD
-//     decomposed into N pieces produces N consecutive shape rows; the SOURCE
-//     shape entity binds to the FIRST of those rows (shape_row) and records the
-//     piece count via bp_group = N (so a consumer can walk the piece span). For
-//     a primitive (1 row) bp_group == 1.
-//   * Material buckets: one bucket per cooked shape's resolved (μ, restitution,
-//     ...) — deduplicated by exact value so a homogeneous scene collapses to a
-//     few buckets (Isaac bucketing). body_material_bucket[body_row] = the bucket
-//     of that body's FIRST shape (0 if the body has no shape).
+// MAPPING CHOICES (documented for /SceneMap consumers):
+// * Bodies: cooked body rows ARE record order (the cooker preserves SceneIR
+// body order), so SceneMap binds entity-of-body -> body_row = its cooked row
+// for every body. The nk::Model carries the per-env movable rigid-body COUNT
+// (bodies_per_env); the actual body state lives in the Data arena (env-major
+// replica e at [e*bodies_per_env, ...)).
+// * Articulation: CookArticulations(blob) yields the per-env kinematic-tree
+// template(s). the cook supports the single-articulation-per-env scene (the H1 /
+// grasp shape); the first articulation becomes the Model template. dof_count
+// / link_count drive the dof/link capacities. Links bind to SceneMap via
+// link_index = the template-local link slot.
+// * Shapes: each cooked shape ROW becomes one ModelShape. A mesh that V-HACD
+// decomposed into N pieces produces N consecutive shape rows; the SOURCE
+// shape entity binds to the FIRST of those rows (shape_row) and records the
+// piece count via bp_group = N (so a consumer can walk the piece span). For
+// a primitive (1 row) bp_group == 1.
+// * Material buckets: one bucket per cooked shape's resolved (μ, restitution,
+// ...) — deduplicated by exact value so a homogeneous scene collapses to a
+// few buckets (Isaac bucketing). body_material_bucket[body_row] = the bucket
+// of that body's FIRST shape (0 if the body has no shape).
 // ---------------------------------------------------------------------------
 
 #include "scene/cook/cook_to_model.hpp"
@@ -53,15 +53,15 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
 constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
-// M7 T5b — resolve the AUTHORED initial-condition for the cooked articulation
+// resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
-//   (1) the InitialStateComponent set on the articulation root entity by
-//       ApplySettleToRegistry (the ECS/settle writeback path), and
-//   (2) the SceneIR's `initial_state` map keyed by a tree node PATH (the .nks
-//       persisted IC): match the articulation root's node path, then any ancestor
-//       PREFIX of it (the import attach prefix, e.g. "h1"), and finally — when the
-//       map carries exactly one entry whose qpos length equals the cooked link
-//       count — that sole entry (a single-articulation scene).
+// (1) the InitialStateComponent set on the articulation root entity by
+// ApplySettleToRegistry (the ECS/settle writeback path), and
+// (2) the SceneIR's `initial_state` map keyed by a tree node PATH (the .nks
+// persisted IC): match the articulation root's node path, then any ancestor
+// PREFIX of it (the import attach prefix, e.g. "h1"), and finally — when the
+// map carries exactly one entry whose qpos length equals the cooked link
+// count — that sole entry (a single-articulation scene).
 // `qpos` is per-LINK (length == link_count) and `root` is the settled base pose,
 // matching model.articulation.initial_q / base_pose. Returns false (a strict
 // no-op: the cook-rest pose is kept) when no IC of the right length is authored —
@@ -171,7 +171,7 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     return static_cast<uint32_t>(buckets.size() - 1);
 }
 
-// M5 SAMP cook (plan §3.5): build the SDF sampling-point set for one convex-hull
+// SAMP cook : build the SDF sampling-point set for one convex-hull
 // piece — the hull vertices PLUS each triangle edge's midpoint (so a coarse hull
 // still samples the SDF densely along its silhouette). Edge midpoints are
 // de-duplicated by the canonical (min,max) vertex pair so a shared edge is
@@ -241,7 +241,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
 
 namespace {
 
-// L-RECON-B: the shared cook implementation. The cook options gate the two HEAVY
+// the shared cook implementation. The cook options gate the two HEAVY
 // per-shape stages (V-HACD vs single-hull, SDF bake). The public 2-arg overload
 // passes the DEFAULT options (legacy, byte-identical); the PairDriven 3-arg passes
 // the general-path options (single-hull + no SDF) so the whole-body union scene
@@ -269,7 +269,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // obs_width is derived from the cooked observable dimensionality below, once
     // links_per_env is known (ExportObs layout: base pose + q + qdot per link).
 
-    // M7 T5b — which body rows are owned by the articulation (driven by FK, NOT
+    // which body rows are owned by the articulation (driven by FK, NOT
     // free rigid bodies). The movable-body body_init pass below MUST keep these
     // rows at inv_mass 0 so the rigid-body gravity-kick / IntegrateBodyPosition
     // arms (which run over bodies_per_env, gated on body_inv_mass > 0) stay
@@ -277,19 +277,19 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // an EMPTY body_init, so SeedInitialState skips the body block entirely).
     std::vector<uint8_t> body_is_articulation_link(blob.body_count, 0u);
 
-    // 4. Articulation template(s). M3b transcribed the SINGLE-ENV
-    //    BuildArticulationHostState product 1:1; the WP1 multi-articulation
-    //    foundation transcribes the FULL set of co-resident topologies (K Go2 in
-    //    ONE env). BuildArticulationHostState(arts, ...) ALREADY loops over every
-    //    topology, building the flat per-link arrays + link_to_articulation[] +
-    //    articulation_link_count/offset[] with a running global offset, so the
-    //    only change here is to pass the WHOLE `arts` vector (not just the front)
-    //    and carry the per-articulation bookkeeping into nk::Model. At
-    //    articulations_per_env == 1 (the legacy single-robot scene) the host state
-    //    is identical to the BuildArticulationHostState({arts.front()}) product,
-    //    so the staged Model bytes are byte-for-byte unchanged (the K==1 D1
-    //    invariant). dofs_per_env stays the MAX single-dog DOF (NEVER summed): the
-    //    CRBA M-tile is per-articulation (one max_dof^2 block per dog).
+    // 4. Articulation template(s). transcribed the SINGLE-ENV
+    // BuildArticulationHostState product 1:1; the multi-articulation
+    // foundation transcribes the FULL set of co-resident topologies (K Go2 in
+    // ONE env). BuildArticulationHostState(arts, ...) ALREADY loops over every
+    // topology, building the flat per-link arrays + link_to_articulation +
+    // articulation_link_count/offset with a running global offset, so the
+    // only change here is to pass the WHOLE `arts` vector (not just the front)
+    // and carry the per-articulation bookkeeping into nk::Model. At
+    // articulations_per_env == 1 (the legacy single-robot scene) the host state
+    // is identical to the BuildArticulationHostState({arts.front}) product,
+    // so the staged Model bytes are byte-for-byte unchanged (the K==1 D1
+    // invariant). dofs_per_env stays the MAX single-dog DOF (NEVER summed): the
+    // CRBA M-tile is per-articulation (one max_dof^2 block per dog).
     if (!arts.empty()) {
         namespace articulation = runtime::articulation;
         const articulation::ArticulationHostState host =
@@ -310,7 +310,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
                                              : host.base_pose.front();
         m.link_body = host.link_body;
-        // WP1 multi-articulation co-residence bookkeeping (host already built it).
+        // multi-articulation co-residence bookkeeping (host already built it).
         m.link_to_articulation = host.link_to_articulation;
         m.articulation_link_count = host.articulation_link_count;
         m.articulation_link_offset = host.articulation_link_offset;
@@ -327,13 +327,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
         }
 
-        // R3 (general contact pipeline Phase 0): the shape->body INVERSE tables.
-        // link_body is link->body; the general PairDriven row-emission (S5) needs
+        // R3 (general contact pipeline): the shape->body INVERSE tables.
+        // link_body is link->body; the general PairDriven row-emission needs
         // body->owner. For each TEMPLATE link l with owning body row b, record
         // body_to_link[b] = l and body_to_articulation[b] = the LOCAL articulation
         // of l. A body row owned by NO link (free rigid / static) keeps ~0u (so
         // its side resolves free-rigid; the shape_table body_id == -1 resolves
-        // static). Both stage template-local + tile env-major. INERT in Phase 0.
+        // static). Both stage template-local + tile env-major. INERT before the general path is wired.
         model.body_to_link.assign(cap.bodies_per_env, ~uint32_t(0));
         model.body_to_articulation.assign(cap.bodies_per_env, ~uint32_t(0));
         for (uint32_t l = 0; l < host.link_body.size(); ++l) {
@@ -345,7 +345,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                                                      : 0u;
         }
 
-        // M7 T5b — seed the AUTHORED settled IC (qpos -> initial_q per-link, root
+        // seed the AUTHORED settled IC (qpos -> initial_q per-link, root
         // -> base pose), OVERRIDING the cook-rest pose just set above. A strict
         // no-op when no IC is authored (ResolveAuthoredIC returns false): every
         // existing golden/scene keeps the cook-rest pose byte-for-byte. The root
@@ -382,7 +382,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // legacy ArticulationDofCount semantics (inlined: that symbol lives in
         // the GPU lib, which the pure cook must not link), i.e. max_dof.
         //
-        // WP1 multi-articulation: dofs_per_env is the MAX single-DOG DOF (the
+        // multi-articulation: dofs_per_env is the MAX single-DOG DOF (the
         // per-articulation CRBA M-tile is max_dof^2, ONE block per co-resident dog
         // -- NEVER the SUM, which would (a) be a G0-dishonest monolithic DOF and
         // (b) blow the per-artic 64-DOF cap at K>=4). Compute each articulation's
@@ -413,8 +413,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.links_per_env = m.link_count;        // SUM across co-resident dogs.
         cap.articulations_per_env = m.articulation_count;  // K (1 for legacy scenes).
 
-        // Foot shapes: the T2/T6 derivation — every Sphere shape whose owning
-        // body maps to an articulation link is a foot (base-relative indices).
+        // Foot shapes: every Sphere shape whose owning body maps to an
+        // articulation link is a foot (base-relative indices).
         for (uint32_t shape = 0; shape < blob.shapes.types.size(); ++shape) {
             if (blob.shapes.types[shape] != ShapeType::Sphere) {
                 continue;
@@ -449,8 +449,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // link_geom_local -> the link's collidable body row in the LBVH). Cooked
         // for EVERY scene; the UnionCsr graph never reads it (it only feeds the
         // PairDriven SyncLinkBodyPose op).
-        //   kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
-        //   default-zero (no-shape) link is unambiguously inactive.
+        // kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
+        // default-zero (no-shape) link is unambiguously inactive.
         m.link_geom_kind.assign(m.link_count, 0u);
         m.link_geom_params.assign(static_cast<size_t>(m.link_count) * 4u, 0.0f);
         m.link_geom_local.assign(m.link_count, math::Transform::Identity());
@@ -567,7 +567,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     kObsChannelsPerLink * cap.links_per_env;
 
     // 5. Shapes -> ModelShape rows + material buckets. Track the SOURCE shape ->
-    //    first cooked row + piece count for the SceneMap binding.
+    // first cooked row + piece count for the SceneMap binding.
     model.shapes.reserve(blob.shape_count);
     std::vector<uint32_t> body_first_bucket(blob.body_count, 0u);
     std::vector<uint8_t>  body_has_shape(blob.body_count, 0u);
@@ -593,7 +593,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // SceneMap: SOURCE shape entity -> first cooked row + piece count via
     // bp_group. The cooker preserves source-shape order; a V-HACD source expands
     // into a contiguous span. Here we bind each source shape (SceneIR shape
-    // record order) to its first cooked row. For the primitive scenes M3a cooks,
+    // record order) to its first cooked row. For the primitive scenes the cook produces,
     // source row == cooked row, span == 1.
     {
         uint32_t cooked_cursor = 0;
@@ -648,25 +648,25 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         smap.Bind(ent, ref);
     }
 
-    // 7b. M7 T5b — movable rigid-body body_init (pose + inv_mass + inv_inertia),
-    //     so a generic .nks-cooked MOVABLE cup falls/rests under gravity instead
-    //     of being frozen at the arena's zero-init Identity (inv_mass 0). Matches
-    //     BuildNkUnionModel's cup body_init fill (pose/inv_mass/inv_inertia from
-    //     the body record) so the generic path agrees with the union path.
+    // 7b. — movable rigid-body body_init (pose + inv_mass + inv_inertia),
+    // so a generic .nks-cooked MOVABLE cup falls/rests under gravity instead
+    // of being frozen at the arena's zero-init Identity (inv_mass 0). Matches
+    // BuildNkUnionModel's cup body_init fill (pose/inv_mass/inv_inertia from
+    // the body record) so the generic path agrees with the union path.
     //
-    //     GUARD (the no-regression contract): body_init stays EMPTY unless the
-    //     scene has >=1 genuinely-MOVABLE FREE rigid body (a body row that is not
-    //     an articulation link, not static, with mass > 0 / inv_mass > 0). For
-    //     every existing golden/scene (articulation-only feet, particle, the
-    //     coupled_grasp_soft static box wall) no such body exists -> body_init
-    //     stays empty -> SeedInitialState skips the body block -> BYTE-IDENTICAL.
+    // GUARD (the no-regression contract): body_init stays EMPTY unless the
+    // scene has >=1 genuinely-MOVABLE FREE rigid body (a body row that is not
+    // an articulation link, not static, with mass > 0 / inv_mass > 0). For
+    // every existing golden/scene (articulation-only feet, particle, the
+    // coupled_grasp_soft static box wall) no such body exists -> body_init
+    // stays empty -> SeedInitialState skips the body block -> BYTE-IDENTICAL.
     //
-    //     When a movable free body IS present, body_init is sized to ALL body
-    //     rows (env-major layout: SeedInitialState indexes body_init[b]); every
-    //     row gets its cooked world pose, but STATIC and ARTICULATION-LINK rows
-    //     keep inv_mass / inv_inertia 0 (the body integrate arms remain no-ops
-    //     for them, so the articulation is untouched). Only the free movable
-    //     bodies carry a non-zero inv_mass and so respond to gravity + contacts.
+    // When a movable free body IS present, body_init is sized to ALL body
+    // rows (env-major layout: SeedInitialState indexes body_init[b]); every
+    // row gets its cooked world pose, but STATIC and ARTICULATION-LINK rows
+    // keep inv_mass / inv_inertia 0 (the body integrate arms remain no-ops
+    // for them, so the articulation is untouched). Only the free movable
+    // bodies carry a non-zero inv_mass and so respond to gravity + contacts.
     {
         bool any_movable_free = false;
         for (uint32_t b = 0; b < blob.body_count; ++b) {
@@ -709,20 +709,20 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
     }
 
-    // 8. Filter policy (cross-env collision flag). M3a defaults OFF (envs do not
-    //    collide); the cooked filter pair lists ride the blob for M5.
+    // 8. Filter policy (cross-env collision flag). the cook defaults OFF (envs do not
+    // collide); the cooked filter pair lists ride the blob for .
     model.filter_cross_env = false;
 
     // 9. Contact / row capacities. ONE general per-env candidate-slot budget for
-    //    the LBVH broadphase, driven by the actual cooked collidable count (the
-    //    body rows the broadphase iterates) -- NO scene-type branch and NO baked
-    //    foot-count constants. The broadphase builds over bodies_per_env collidable
-    //    body rows and emits up to max_contacts_per_env candidate pairs (it SILENTLY
-    //    drops overflow, lbvh_traversal.cuh), so the budget scales with the
-    //    collidables: collidable_count * kCandidatePairsPerCollidable. The static
-    //    ground collidable (appended in section 10) is included via +1. The
-    //    PairDriven overload re-sizes max_rows_per_env to its per-candidate-slot
-    //    row layout; max_rows here is the broadphase-agnostic initial bound.
+    // the LBVH broadphase, driven by the actual cooked collidable count (the
+    // body rows the broadphase iterates) -- NO scene-type branch and NO baked
+    // foot-count constants. The broadphase builds over bodies_per_env collidable
+    // body rows and emits up to max_contacts_per_env candidate pairs (it SILENTLY
+    // drops overflow, lbvh_traversal.cuh), so the budget scales with the
+    // collidables: collidable_count * kCandidatePairsPerCollidable. The static
+    // ground collidable (appended in section 10) is included via +1. The
+    // PairDriven overload re-sizes max_rows_per_env to its per-candidate-slot
+    // row layout; max_rows here is the broadphase-agnostic initial bound.
     {
         const uint32_t static_collidables = 1u;  // the ground plane (section 10).
         const uint32_t collidables = cap.bodies_per_env + static_collidables;
@@ -745,14 +745,14 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_rows_per_env     = 0u;
     }
 
-    // 10. M5 — pair-driven generalized-collision + SDF main-path staging (plan
-    //     §3.5). The shape_table (one PairDrivenShape / collidable body row),
-    //     the SDF sampling-point pool (SAMP cook), the cooked sparse-SDF grids
-    //     (SdfDeviceWorld upload duties moved INTO the Model), and the filter
-    //     exclude-list. A scene with no SdfMesh shape leaves the SDF
-    //     tables empty (max_sdf_* == 0); they are populated for a cooked
-    //     pair-driven SDF scene. These tables are sized AFTER the contact
-    //     capacity (max_bodies_total == bodies_per_env, the shape_table stride).
+    // 10. — pair-driven generalized-collision + SDF main-path staging (plan
+    // the spec). The shape_table (one PairDrivenShape / collidable body row),
+    // the SDF sampling-point pool (SAMP cook), the cooked sparse-SDF grids
+    // (SdfDeviceWorld upload duties moved INTO the Model), and the filter
+    // exclude-list. A scene with no SdfMesh shape leaves the SDF
+    // tables empty (max_sdf_* == 0); they are populated for a cooked
+    // pair-driven SDF scene. These tables are sized AFTER the contact
+    // capacity (max_bodies_total == bodies_per_env, the shape_table stride).
     cap.max_bodies_total = cap.bodies_per_env;
     {
         // shape_table: one row per body, from its FIRST shape's primitive + the
@@ -778,7 +778,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             // Hull / mesh rows: params[0] = the BOUND RADIUS (max |vertex| of
             // the cooked convex piece) — the broadphase AABB is a conservative
             // bound sphere (review fix: the default 0.5 sphere radius was
-            // unrelated to the actual hull extent). L-RECON-D: ALSO pack this
+            // unrelated to the actual hull extent). : ALSO pack this
             // piece's MESH-LOCAL verts into the concatenated model.hull_verts pool
             // and record the row's (hull_vert_offset, hull_vert_count) slice so the
             // cvx narrowphase collides THIS shape's hull (not one global hull).
@@ -816,11 +816,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             row.conaffinity = s < blob.contact_params.conaffinities.size()
                                   ? blob.contact_params.conaffinities[s] : 1u;
             row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
-            // R1 (general contact pipeline Phase 0): the shape->body indirection.
+            // R1 (general contact pipeline): the shape->body indirection.
             // A cooked collidable row maps to its OWNING body row (never static
             // here — static collidables are emitted separately, R5). group 0 ==
-            // the default collide-all group. INERT in Phase 0 (no routing reads
-            // these lanes; R4/S5 wire them in Phase 1).
+            // the default collide-all group. INERT before the general path is wired (no routing reads
+            // these lanes; a later pass wire them in the general path).
             row.body_id = static_cast<int32_t>(sh.body_row);
             row.group = 0u;
         }
@@ -901,25 +901,25 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             model.excluded_pairs.end());
         cap.max_excluded_pairs =
             static_cast<uint32_t>(model.excluded_pairs.size());
-        // L-RECON-D: the convex-hull vertex pool capacity = the concatenated
+        // the convex-hull vertex pool capacity = the concatenated
         // per-shape hull verts packed above (xyz triples). 0 for a hull-free
         // scene (go2) -> the hull_verts segment stays zero bytes (byte-inert).
         cap.max_hull_verts =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
 
-        // R5 (general contact pipeline Phase 0): emit a STATIC ground collidable
+        // R5 (general contact pipeline): emit a STATIC ground collidable
         // row into shape_table as a first-class collidable with body_id == -1 (no
         // reaction side). Appended AFTER the per-body rows so the per-body rows
         // [0, bodies_per_env) keep their exact indices + bytes; the static row
         // lives at index bodies_per_env. contype/conaffinity == 1 (collide-all).
-        // INERT in Phase 0: the broadphase iterates only bodies_per_env body rows
+        // INERT before the general path is wired: the broadphase iterates only bodies_per_env body rows
         // per env (it never indexes the static row), and shape_table is a model
         // param pinned by no golden, so growing max_bodies_total by one row is
         // byte-safe for the gated UnionCsr family. The static row's
-        // WORLD pose / LBVH entry is wired in Phase 1 (R5 downstream + B3); here we
+        // WORLD pose / LBVH entry is wired in the general path (R5 downstream + B3); here we
         // only register the collidable. A Plane kind anchors the flat-ground case
         // (the general heightfield collidable, kShapeHeightfield, is added by H2/H3
-        // in Phase 2). params[0] carries the ground plane height for the future
+        // in the general path). params[0] carries the ground plane height for the future
         // static-pose stamp.
         {
             nk::Model::PairDrivenShape ground;
@@ -949,7 +949,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 }  // namespace
 
 CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
-    // L1-b: the FUSED runtime is deleted, so the 2-arg cook now produces a fully
+    // the FUSED runtime is deleted, so the 2-arg cook now produces a fully
     // general (PairDriven) model — it delegates to the general overload so the
     // contact_family / dof maps / per-candidate-slot row budget are all consistent
     // (a bare CookSceneOptions{} cook would leave a PairDriven-family model in a
@@ -957,21 +957,21 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     return CookToModel(scene, env_count, CookToModelOptions{});
 }
 
-// B1 (general contact pipeline Phase 1B): the PairDriven (general) cook overload.
+// B1 (general contact pipeline (PairDriven)): the PairDriven (general) cook overload.
 // It runs the SAME cook (so the registry / shape_table / body_to_link / static
 // ground row / multi-artic foundation are all reused verbatim) then flips the model
 // to the GENERAL family: contact_family = PairDriven (the pipeline then routes the
 // ONE LBVH -> cvx -> mixed-island contact path), enables cross-env filtering so
 // candidate pairs stay env-local, and RE-SIZES the per-env row budget to the
 // general per-candidate-slot layout (max_contacts_per_env candidate slots x
-// kPairDrivenRowsPerSlot rows/slot). L1-b: the FUSED runtime is deleted, so this is
+// kPairDrivenRowsPerSlot rows/slot). : the FUSED runtime is deleted, so this is
 // the ONLY general cook path — the options.contact_family no longer selects FUSED.
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options) {
-    // L1-b: options.contact_family no longer selects FUSED; the cook is always
+    // options.contact_family no longer selects FUSED; the cook is always
     // general (PairDriven). options.enable_contacts is threaded to CookToModelImpl
     // (a contacts-OFF cook zeroes the contact budget for dynamics-only worlds).
-    // L-RECON-B: the GENERAL (PairDriven) cvx narrowphase consumes NEITHER the
+    // the GENERAL (PairDriven) cvx narrowphase consumes NEITHER the
     // sparse SDF (OpNarrowphaseSdf is a no-op for every family) NOR V-HACD's
     // N-piece decomposition (it wants ONE convex hull per mesh). Skipping both
     // makes the whole-body H1 union scene cook tractable (>178s -> seconds), and
@@ -1111,7 +1111,7 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
 }
 
 // ---------------------------------------------------------------------------
-// M6 particle cook.
+// particle cook.
 // ---------------------------------------------------------------------------
 
 void CookXpbdParticles(nk::Model& model, uint32_t env_count,
@@ -1168,7 +1168,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
         mp.vol_alpha[c] = in.volume[c].compliance_alpha;
     }
 
-    // M9 T11 SHAPE-MATCH (id 9): flatten the variable-size clusters into the CSR
+    // SHAPE-MATCH (id 9): flatten the variable-size clusters into the CSR
     // (offset, size) layout over flat particle / rest-offset / weight pools. Cook
     // the rest centroid c0 = (sum_i m_i x_i^0)/sum_i m_i and the per-member rest
     // OFFSET q_i = x_i^0 - c0 ONCE -- BYTE-FAITHFUL to the legacy soft-upload
@@ -1268,8 +1268,27 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     GrowContactBudgetForParticles(cap, rigid_base);
 }
 
+// Wire the body<->particle contact radius + cross-system non-penetration co-step
+// onto a cooked particle set. The body<->particle narrowphase derives its sphere
+// radius from pp_contact_d_min, so this must run for a single-medium coupled world
+// too or the robot tunnels through the medium. The neighbor grid is built over
+// query_radius, so widen cell/query to >= d_min so it covers every penetrating pair
+// (a no-op when d_min <= the cooked grid radius). The cross-system co-step is mode-
+// gated to SoftFluid downstream, so a single-medium cook carries it inert.
+static void ApplyParticleBodyContact(nk::Model::ModelParticles& mp,
+                                     const SoftFluidContactInput& contact) {
+    mp.pp_contact_d_min      = contact.contact_d_min;
+    mp.pp_contact_compliance = contact.compliance_alpha;
+    mp.pp_contact_iters = contact.solver_iterations == 0u ? 1u
+                                                          : contact.solver_iterations;
+    if (mp.pp_contact_d_min > 0.0f && mp.pp_contact_d_min > mp.query_radius) {
+        mp.cell_size    = mp.pp_contact_d_min;
+        mp.query_radius = mp.pp_contact_d_min;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// M9 T11 two-system cook: soft (XPBD) + fluid (PBF) co-resident in ONE Model.
+// Two-system cook: soft (XPBD) + fluid (PBF) co-resident in ONE Model.
 // ---------------------------------------------------------------------------
 
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
@@ -1283,35 +1302,39 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     const uint32_t rigid_base = cap.max_contacts_per_env;
 
     // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
-    // byte-identical to the single-system cook (so the existing single-system
-    // gates and goldens are unaffected). Only when BOTH sides are present do we
-    // build the [soft | fluid] composite + set the SoftFluid mode. The cross-system
-    // contact is a SoftFluid-only feature (it needs both slices), so a single-
-    // system fast path never carries it.
+    // byte-identical to the single-system cook PLUS the same body<->particle contact
+    // setup the composite path applies (so a single-medium coupled world couples).
+    // Only when BOTH sides are present do we build the [soft | fluid] composite + set
+    // the SoftFluid mode; the cross-system particle-particle co-step is mode-gated to
+    // SoftFluid downstream, so a single-system fast path carries it inert.
     const uint32_t n_soft = static_cast<uint32_t>(soft.positions.size());
     const uint32_t n_fluid = static_cast<uint32_t>(fluid.positions.size());
     if (n_fluid == 0u) {
-        // Soft-only: identical to the canonical XPBD cook (incl. shape-match).
+        // Soft-only: the canonical XPBD cook + the body<->particle contact setup so a
+        // robot+cloth-only world couples (incl. shape-match).
         CookXpbdParticles(model, env_count, soft);
+        ApplyParticleBodyContact(model.particles, contact);
         return;
     }
     if (n_soft == 0u) {
-        // Fluid-only: identical to the canonical PBF cook.
+        // Fluid-only: the canonical PBF cook + the body<->particle contact setup so a
+        // robot+fluid-only world couples.
         CookPbfParticles(model, env_count, fluid);
+        ApplyParticleBodyContact(model.particles, contact);
         return;
     }
 
     // 1) Cook the SOFT set first (fills the XPBD + shape-match templates, sets
-    //    particles_per_env = n_soft, mode = Xpbd). The soft constraint indices
-    //    already point into [0, n_soft) -- exactly where the soft particles land.
+    // particles_per_env = n_soft, mode = Xpbd). The soft constraint indices
+    // already point into [0, n_soft) -- exactly where the soft particles land.
     CookXpbdParticles(model, env_count, soft);
 
     nk::Model::ModelParticles& mp = model.particles;
 
     // 2) APPEND the fluid particles AFTER the soft set ([soft | fluid] layout).
-    //    The fluid particles are NOT referenced by any soft constraint, so no
-    //    index remap is needed; the SoftFluid PBF ops scope the density solve to
-    //    the fluid slice [n_soft, n_soft+n_fluid) by the n_soft split.
+    // The fluid particles are NOT referenced by any soft constraint, so no
+    // index remap is needed; the SoftFluid PBF ops scope the density solve to
+    // the fluid slice [n_soft, n_soft+n_fluid) by the n_soft split.
     const float fluid_im =
         fluid.particle_mass > 0.0f ? 1.0f / fluid.particle_mass : 0.0f;
     for (uint32_t i = 0; i < n_fluid; ++i) {
@@ -1323,8 +1346,8 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     }
 
     // 3) Carry the PBF fluid params + uniform-grid domain (the fluid slice solve).
-    //    The soft slice mu was set by the CookXpbdParticles call above; the fluid
-    //    slice carries its own (body<->particle contact, solmix=max with the body).
+    // The soft slice mu was set by the CookXpbdParticles call above; the fluid
+    // slice carries its own (body<->particle contact, solmix=max with the body).
     mp.fluid_friction     = fluid.friction;
     mp.pbf_rest_density   = fluid.rest_density;
     mp.pbf_support_radius = fluid.support_radius;
@@ -1343,23 +1366,14 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     mp.boundary_enabled = fluid.boundary_enabled;
     mp.floor_z = fluid.floor_z;
 
-    // 4) id-10 cross-system contact (M9 T11 Phase 2): the class-blind unilateral
-    //    non-penetration co-step over the FULL union. The neighbor grid is built
-    //    over query_radius, so it must cover d_min for the contact pass to see
-    //    every penetrating pair; widen the grid cell/query radius to >= d_min when
-    //    contact is enabled (a no-op when d_min <= the fluid support radius).
-    mp.pp_contact_d_min      = contact.contact_d_min;
-    mp.pp_contact_compliance = contact.compliance_alpha;
-    mp.pp_contact_iters = contact.solver_iterations == 0u ? 1u
-                                                          : contact.solver_iterations;
-    if (mp.pp_contact_d_min > 0.0f && mp.pp_contact_d_min > mp.query_radius) {
-        mp.cell_size    = mp.pp_contact_d_min;
-        mp.query_radius = mp.pp_contact_d_min;
-    }
+    // 4) The body<->particle contact radius + the cross-system non-penetration
+    // co-step over the FULL union (the same setup the single-medium fast paths
+    // apply, so the body<->particle radius and grid coverage are uniform).
+    ApplyParticleBodyContact(mp, contact);
 
     // 5) The co-residence schema: mode + split index + the new total particle
-    //    count. The grid is sized over the FULL union per-env (the soft particles
-    //    occupy grid cells too, but the fluid density solve skips them via n_soft).
+    // count. The grid is sized over the FULL union per-env (the soft particles
+    // occupy grid cells too, but the fluid density solve skips them via n_soft).
     mp.mode = nk::Model::ParticleMode::SoftFluid;
     mp.n_soft_particles = n_soft;
     cap.particles_per_env = n_soft + n_fluid;

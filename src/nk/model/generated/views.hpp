@@ -212,6 +212,9 @@ struct DataView {
     float* row_pseudo_lambda = nullptr;  // per:row_slot arena:scratch owner:data
     uint32_t* ucontact_a_kind = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
     uint32_t* ucontact_b_kind = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    ::nuka::math::Vec3* snapshot_particle_pos = nullptr;  // per:particle arena:persistent owner:data
+    ::nuka::math::Vec3* snapshot_particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
+    ::nuka::math::Vec3* snapshot_particle_vel = nullptr;  // per:particle arena:persistent owner:data
 };
 
 } // namespace nuka::phi

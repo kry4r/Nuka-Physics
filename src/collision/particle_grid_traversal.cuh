@@ -1,7 +1,7 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::collision::gpu -- particle uniform-grid device helpers (v0.7 p05,
-// Task 7.5.2). Cell hashing + per-particle 27-cell neighbor query.
+// nuka::collision::gpu -- particle uniform-grid device helpers. Cell hashing
+// + per-particle 27-cell neighbor query.
 //
 // Device-only; included only from .cu TUs. The cell hash is a pure function of
 // (position, config) -> identical floats give identical cell, so it is D1-safe.

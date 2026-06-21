@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// nk::Pipeline implementation (plan §3.2 fixed order).
+// nk::Pipeline implementation (the design fixed order).
 // ---------------------------------------------------------------------------
 
 #include "nk/pipeline/pipeline.hpp"
@@ -26,7 +26,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_bodies       = cap.bodies_per_env > 0;
     const bool has_particles    = cap.particles_per_env > 0;
     const bool has_contacts     = cap.max_rows_per_env > 0;
-    // L1-b: gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
+    // gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
     // on actual contact capacity. For every cooked-with-contacts world this equals
     // the old structural test -- the cook sizes max_contacts_per_env ==
     // (bodies+links)*4 > 0 whenever a body/link exists, so op selection is
@@ -36,11 +36,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // dynamics and StepPlanned captures cleanly (no thrust LBVH mid-graph).
     const bool has_collidables  =
         (has_bodies || cap.links_per_env > 0) && cap.max_contacts_per_env > 0;
-    // L1-b deleted the FUSED runtime path; L1-c deleted the UnionCsr path. There
+    // deleted the FUSED runtime path; deleted the UnionCsr path. There
     // is now ONE general contact path: PairDriven. Every cooked model uses it.
     const uint32_t family = phi::kContactFamilyPairDriven;
 
-    // M3b launch-geometry counts (the views are pure pointer aggregates, so
+    // launch-geometry counts (the views are pure pointer aggregates, so
     // every op carries its counts in the params POD).
     const uint32_t env_count        = cap.env_count;
     const uint32_t base_link_count  = cap.links_per_env;
@@ -81,15 +81,15 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             : kFallbackContactsPerArtic;
 
     auto add = [&](phi::NkOp op, const void* params) {
-        // Capability query (§3.1): with a device, emit only ops the backend
-        // implements (unimplemented = a later milestone's system).
+        // Capability query (the spec): with a device, emit only ops the backend
+        // implements (unimplemented = a later system).
         if (device != nullptr && !phi::DeviceSupportsOp(device, op)) {
             return;
         }
         calls_.push_back(phi::OpCall{op, params});
     };
 
-    // §3.2 FIXED order:
+    // the spec FIXED order:
     // ApplyDrives -> AbaForward -> IntegrateVelocity (+ParticlePredict) ->
     // FkWorldPoses -> BuildAabbs -> LbvhBuild -> LbvhQueryPairs (+ParticleGridBuild)
     // -> NarrowphasePrimitives -> NarrowphaseSdf -> ContactTangentBasis ->
@@ -117,13 +117,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_int_vel_.gravity_z = cfg.gravity[2];
         p_int_vel_.total_link_count = total_link_count;
         p_int_vel_.articulation_count = articulation_cnt;
-        // M4: the rigid-body gravity kick rides IntegrateVelocity (the union
+        // The rigid-body arm: the rigid-body gravity kick rides IntegrateVelocity (the union
         // world kicks the cup exactly once per step, before the contact solve).
         p_int_vel_.total_body_count = cap.bodies_per_env * env_count;
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }
 
-    // M6 particle launch geometry + mode (resolved once from the Model).
+    // particle launch geometry + mode (resolved once from the Model).
     const uint32_t particle_count = cap.particles_per_env * env_count;
     const uint32_t dist_count = cap.dist_cons_per_env * env_count;
     const uint32_t bend_count = cap.bend_cons_per_env * env_count;
@@ -136,7 +136,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
         : mp.mode == Model::ParticleMode::SoftFluid ? phi::kParticleModeSoftFluid
                                                   : phi::kParticleModeNone;
-    // M9 T11 SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
+    // SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
     const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
                                 ? mp.n_soft_particles : 0u;
     const uint32_t per_env_particles = cap.particles_per_env;
@@ -182,7 +182,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_collidables) {
-        // General contact pipeline Phase 0 (B2): SyncLinkBodyPose. Runs AFTER
+        // General contact pipeline (B2): SyncLinkBodyPose. Runs AFTER
         // FkWorldPoses (the link_pose it reads) and BEFORE BuildAabbs (the
         // body_pose it writes, which the AABB build consumes) so articulation
         // links enter the LBVH. PairDriven-family-gated -> a no-op for the
@@ -194,7 +194,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_sync_body_pose_.bodies_per_env = cap.bodies_per_env;
         add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
 
-        // M5 broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops drive
+        // broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops drive
         // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
@@ -222,13 +222,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_particles) {
-        // M6: resolve the PBF uniform-grid params from the cooked Model. For a
-        // PBF fluid the cell_size/query_radius == the support radius (the M5
+        // resolve the PBF uniform-grid params from the cooked Model. For a
+        // PBF fluid the cell_size/query_radius == the support radius (the
         // grid precondition cell >= query); the grid_min/dims come from the
         // cooked domain. An XPBD-only scene leaves cell_size 0 -> the build op
         // early-exits (no PBF neighbors needed). The grid is rebuilt every step
         // over the PREDICTED positions (pbf_predicted_pos) — but ParticleGridBuild
-        // reads particle_pos; M6 routes it at the PBF predicted positions via the
+        // reads particle_pos; the pipeline routes it at the PBF predicted positions via the
         // op reading particle_pos AFTER ParticlePredict... see the note below.
         p_grid_.cell_size = runs_pbf ? mp.cell_size : 0.0f;
         p_grid_.query_radius = mp.query_radius;
@@ -267,7 +267,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
-        p_np_prim_.particles_per_env = cap.particles_per_env;  // M6 coupling slots.
+        p_np_prim_.particles_per_env = cap.particles_per_env;  // coupling slots.
         // Co-resident end-effector contacts: route each into its OWNING
         // articulation's slot block when K>1 (byte-identical env-keyed at K<=1; the
         // narrowphase reads link_to_articulation only on the K>1 branch). The
@@ -282,7 +282,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // narrowphase below -> mixed-island solve. There is no special-cased
         // op; a robot body is just a physics body on the ONE path.)
 
-        // General contact pipeline Phase 2 (H3): the per-cell heightfield
+        // General contact pipeline (H3): the per-cell heightfield
         // midphase. Runs AFTER NarrowphasePrimitives (which left the (convex,
         // heightfield) candidate slots empty — kKindHeightfield hits DispatchPair's
         // default case) and BEFORE AssembleRows (which consumes the unified
@@ -356,6 +356,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             // contact radius); 0 leaves the op inert (no collision radius cooked).
             p_np_body_particle_.particle_radius = 0.5f * mp.pp_contact_d_min;
             p_np_body_particle_.contact_margin = cfg.contact_margin;
+            // Detect the fluid slice at its predicted position (the gravity-integrated
+            // pos the density solve uses) for PBF/SoftFluid, consistent with the
+            // particle grid's pos_source -- kills the one-step fluid<->body contact
+            // lag. The soft slice + pure-Xpbd/Coupled keep particle_pos (n_soft=0 for
+            // pure Pbf routes every particle; the SoftFluid split routes [n_soft, P)).
+            p_np_body_particle_.fluid_pos_source =
+                (particle_mode == phi::kParticleModePbf ||
+                 particle_mode == phi::kParticleModeSoftFluid)
+                    ? 1u : 0u;
+            p_np_body_particle_.n_soft_particles = n_soft;
             // The heightfield descriptor (the SAME single cooked field the rigid
             // heightfield narrowphase wires) so a sphere particle walks the grid.
             if (!model.heightfields.empty()) {
@@ -393,7 +403,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_crba_factor_.max_dof = max_dof;
         p_crba_factor_.articulation_count = articulation_cnt;
         add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
-        // L1-b: standalone backward-Euler joint viscous damping. This is GENERAL
+        // standalone backward-Euler joint viscous damping. This is GENERAL
         // articulation physics that used to ride inside the now-deleted FUSED
         // contact solve kernel (which ran every step on the go2 stand world even
         // with zero actual contacts). It applies qdot -= dt*(M+dt*C)^-1*(C*qdot)
@@ -432,7 +442,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
-        p_assemble_.particles_per_env = cap.particles_per_env;  // M6 coupling.
+        p_assemble_.particles_per_env = cap.particles_per_env;  // coupling.
         // Per-particle-system friction for a body<->particle contact side: the
         // [soft | fluid] split + each slice's mu (a particle has no body material).
         p_assemble_.n_soft_particles = friction_n_soft;
@@ -482,8 +492,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_contacts) {
-        // M4: the spec-fixed SolveRowsBlockIslandParams takes over the slot
-        // (the M3b transitional SolveArticulatedParams routing is deleted).
+        // The rigid-body arm: the spec-fixed SolveRowsBlockIslandParams takes over the slot
+        // (the transitional SolveArticulatedParams routing is deleted).
         // Semantic triplet first; appended launch geometry + the per-family
         // Model-derived solver constants (see op_schema.hpp).
         p_solve_.dt = cfg.dt;
@@ -505,7 +515,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_solve_.total_body_count = cap.bodies_per_env * env_count;
         p_solve_.friction_coefficient = model.friction_coefficient;
         p_solve_.baumgarte_max_velocity = model.baumgarte_max_velocity;
-        // (L1-b: the FUSED-family implicit-damping seed moved to the standalone
+        // (: the FUSED-family implicit-damping seed moved to the standalone
         // NkOp::ApplyImplicitDamping op (added after CrbaFactorM above); the
         // solve op no longer carries an apply_implicit_damping knob.)
         // The per-articulation slot stride MUST match the detection/assembly
@@ -542,7 +552,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_finalize_.particles_per_env = per_env_particles;
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
 
-        // M9 T11 Phase 2: the id-10 cross-system particle-particle contact co-step
+        // Cross-system: the cross-system particle-particle contact co-step
         // (the op-ified cross-system particle co-step). Runs AFTER ParticleFinalize
         // (incl. the fluid-slice polish), correcting the committed union positions
         // (particle_pos) over the union grid CSR built this step. ONLY the SoftFluid
@@ -561,7 +571,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     // ReadoutContactWrench: the general per-env contact-wrench readout over the
-    // unified PairDriven contact buffer (L1-c removed the !is_union gate — the
+    // unified PairDriven contact buffer (removed the !is_union gate — the
     // UnionCsr family that suppressed this op is gone; the path is always
     // PairDriven now).
     if (has_articulation || has_bodies) {
@@ -573,7 +583,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 
-    // L1-c: the M10 union-family per-env contact-observation readout
+    // the union-family per-env contact-observation readout
     // (ReadoutUnionContactObs) was DELETED together with the entire UnionCsr path.
     // Grasp/union moved to RL; the general per-env contact readout is
     // ReadoutContactWrench over the unified contact buffer (above).

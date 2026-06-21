@@ -181,7 +181,17 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  float jitter_base_x,
                                  float jitter_base_y,
                                  float jitter_base_z,
-                                 float jitter_q) {
+                                 float jitter_q,
+                                 // Per-env particle restore arm (env-major slice
+                                 // [env*particle_count, +particle_count)). 0 =>
+                                 // no particles (the loop no-ops, byte-identical).
+                                 uint32_t particle_count,
+                                 Vec3* particle_pos,
+                                 Vec3* particle_prev_pos,
+                                 Vec3* particle_vel,
+                                 const Vec3* snapshot_particle_pos,
+                                 const Vec3* snapshot_particle_prev_pos,
+                                 const Vec3* snapshot_particle_vel) {
     const uint32_t slot = blockIdx.x;
     if (slot >= id_count) {
         return;
@@ -239,6 +249,15 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
         body_pose[body] = pose;
         body_linear_velocity[body] = snapshot_body_linear_velocity[body];
         body_angular_velocity[body] = snapshot_body_angular_velocity[body];
+    }
+    // Restore this env's particle slice (pos + prev_pos + velocity) from the
+    // snapshot. particle_count == 0 (no particles) skips the loop, keeping the
+    // particle-free per-env reset byte-identical.
+    for (uint32_t i = threadIdx.x; i < particle_count; i += blockDim.x) {
+        const uint32_t pidx = env * particle_count + i;
+        particle_pos[pidx] = snapshot_particle_pos[pidx];
+        particle_prev_pos[pidx] = snapshot_particle_prev_pos[pidx];
+        particle_vel[pidx] = snapshot_particle_vel[pidx];
     }
 }
 
@@ -345,11 +364,12 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
         return Status::Failed;
     }
     // Proceed if there is ANYTHING per-env to restore: articulation links OR
-    // movable bodies. A bodies-only world (base_link_count == 0, body_count > 0)
-    // still resets its body slice; the kernel's per-link loop just no-ops then.
+    // movable bodies OR particles. A bodies-only world (base_link_count == 0,
+    // body_count > 0) still resets its body slice; the kernel's per-link loop just
+    // no-ops then. A coupled world adds the particle slice on the same dispatch.
     if (p->count == 0u ||
         ((p->articulation_count == 0u || p->base_link_count == 0u) &&
-         p->body_count == 0u)) {
+         p->body_count == 0u && p->particle_count == 0u)) {
         return Status::Ok;
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
@@ -378,7 +398,15 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
                p->ic_seed, p->ic_episode, p->jitter_body_index,
                p->jitter_body_xyz[0], p->jitter_body_xyz[1], p->jitter_body_xyz[2],
                p->jitter_base_pos[0], p->jitter_base_pos[1], p->jitter_base_pos[2],
-               p->jitter_q);
+               p->jitter_q,
+               // Per-env particle restore arm (0 particles => the loop no-ops).
+               p->particle_count,
+               static_cast<Vec3*>(data.particle_pos),
+               static_cast<Vec3*>(data.particle_prev_pos),
+               static_cast<Vec3*>(data.particle_vel),
+               static_cast<const Vec3*>(data.snapshot_particle_pos),
+               static_cast<const Vec3*>(data.snapshot_particle_prev_pos),
+               static_cast<const Vec3*>(data.snapshot_particle_vel));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -388,9 +416,10 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    // Nothing to snapshot only when there are NEITHER links NOR bodies (a
-    // bodies-only world like a settled cup-on-table still round-trips bodies).
-    if (p->total_link_count == 0u && p->total_body_count == 0u) {
+    // Nothing to snapshot only when there are NEITHER links NOR bodies NOR
+    // particles (a bodies-only or particles-only world still round-trips its slice).
+    if (p->total_link_count == 0u && p->total_body_count == 0u &&
+        p->total_particle_count == 0u) {
         return Status::Ok;
     }
     const size_t nl = p->total_link_count;
@@ -427,6 +456,22 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
+    // APPEND the particle snapshot (env-major total particle count) so a coupled
+    // world round-trips its cloth/fluid slice on Reset. Additive — the articulation
+    // and body copies above are untouched; 0 particles skips it (byte-identical).
+    const size_t np = p->total_particle_count;
+    if (np > 0u &&
+        (cudaMemcpyAsync(data.snapshot_particle_pos, data.particle_pos,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_prev_pos, data.particle_prev_pos,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_vel, data.particle_vel,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess)) {
+        return Status::Failed;
+    }
     return Status::Ok;
 }
 
@@ -436,8 +481,9 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    // Nothing to restore only when there are NEITHER links NOR bodies.
-    if (p->total_link_count == 0u && p->total_body_count == 0u) {
+    // Nothing to restore only when there are NEITHER links NOR bodies NOR particles.
+    if (p->total_link_count == 0u && p->total_body_count == 0u &&
+        p->total_particle_count == 0u) {
         return Status::Ok;
     }
     const size_t nl = p->total_link_count;
@@ -481,6 +527,23 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
          cudaMemcpyAsync(data.body_angular_velocity,
                          data.snapshot_body_angular_velocity, nb * sizeof(Vec3),
                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
+        return Status::Failed;
+    }
+    // APPEND the particle restore (snapshot -> live, env-major total particle
+    // count) so a coupled world's cloth/fluid slice returns to its cooked initial
+    // state. Additive; 0 particles skips it (byte-identical to a particle-free
+    // world). Particles carry no row accumulator beyond the lambda cleared above.
+    const size_t np = p->total_particle_count;
+    if (np > 0u &&
+        (cudaMemcpyAsync(data.particle_pos, data.snapshot_particle_pos,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.particle_prev_pos, data.snapshot_particle_prev_pos,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.particle_vel, data.snapshot_particle_vel,
+                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess)) {
         return Status::Failed;
     }
     return Status::Ok;

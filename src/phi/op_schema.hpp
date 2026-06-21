@@ -6,23 +6,23 @@
 // ggml/llama.cpp analogy: NkOp is the GGML_OP enum; each <Op>Params is the
 // op-specific parameter block that travels with an OpCall (phi/backend.hpp).
 //
-// CONTRACT (M1, frozen plan spec):
-//   * NkOp has exactly 30 named ops + a trailing `Count` sentinel. (M9 T7
-//     appended StepBackward, the diffsim contact-free single-step adjoint; M9
-//     T11 Phase 2 appended ParticleParticleContact, the id-10 cross-system
-//     particle-particle non-penetration co-step. M10 RL-completion appended
-//     ReadoutUnionContactObs, the union-only per-env contact observation
-//     readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family. L1-b
-//     appended ApplyImplicitDamping, the standalone backward-Euler joint
-//     viscous-damping velocity correction extracted from the deleted FUSED
-//     contact solve — strictly ADDITIVE, emitted ONLY when fold_drive_damping.)
-//   * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
-//     spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
-//     carry a minimal plausible field set where obvious, or a reserved POD
-//     otherwise. They are fleshed out when each op is actually implemented
-//     (M3-M6). DO NOT depend on any field below being final outside M1.
-//   * Pure C++ — ZERO CUDA types. The op *implementations* (M3+) live in the
-//     backend and receive `const void* params` re-cast to the matching POD.
+// CONTRACT (, frozen plan spec):
+// * NkOp has exactly 30 named ops + a trailing `Count` sentinel. (
+// appended StepBackward, the diffsim contact-free single-step adjoint; 
+// Appended ParticleParticleContact, the cross-system
+// particle-particle non-penetration co-step. Optional RL initial-condition randomization appended
+// ReadoutUnionContactObs, the union-only per-env contact observation
+// readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family. 
+// appended ApplyImplicitDamping, the standalone backward-Euler joint
+// viscous-damping velocity correction extracted from the deleted FUSED
+// contact solve — strictly ADDITIVE, emitted ONLY when fold_drive_damping.)
+// * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
+// spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
+// carry a minimal plausible field set where obvious, or a reserved POD
+// otherwise. They are fleshed out when each op is actually implemented
+// (-). DO NOT depend on any field below being final outside .
+// * Pure C++ — ZERO CUDA types. The op *implementations* (+) live in the
+// backend and receive `const void* params` re-cast to the matching POD.
 //
 // This header is included by both host (.cpp) and device (.cu) TUs, so it must
 // stay free of STL containers and of anything not trivially copyable.
@@ -66,7 +66,7 @@ enum class NkOp : uint16_t {
     AbaForward,            // Featherstone ABA forward dynamics (q,qd -> qdd)
     IntegrateVelocity,     // qd += qdd * dt
     FkWorldPoses,          // forward kinematics -> per-link world poses
-    IntegratePosition,     // q  += qd  * dt
+    IntegratePosition,     // q += qd * dt
     CrbaComputeM,          // composite rigid-body M (joint-space inertia)
     CrbaFactorM,           // LTDL / Cholesky factorization of M
     ApplyImplicitDamping,  // standalone backward-Euler joint viscous-damping
@@ -104,21 +104,21 @@ enum class NkOp : uint16_t {
     ResetEnvs,             // per-env reset to initial state
     SnapshotState,         // capture full world state
     RestoreState,          // restore from a snapshot
-    // L1-c: ReadoutUnionContactObs (union-only per-env contact obs) was DELETED.
+    // ReadoutUnionContactObs (union-only per-env contact obs) was DELETED.
     // Removing the enum value is safe — NkOp ids are runtime-only dispatch, never
-    // serialized (goldens byte-exact across the L1-a/L1-b enum shifts).
+    // serialized (goldens byte-exact across the enum shifts).
 
     // --- domain randomization -------------------------------------------
     RandomizeMaterialBuckets, // per-env material bucket randomization
     RandomizeBodyParams,      // per-env body/inertia randomization
 
-    // --- differentiable rollout (M9 T7) ---------------------------------
+    // --- differentiable rollout ---------------------------------
     StepBackward,          // diffsim contact-free single-step reverse adjoint
 
-    // --- cross-system particle contact (M9 T11 Phase 2) -----------------
-    ParticleParticleContact, // id-10 class-blind unilateral non-penetration co-step
+    // --- cross-system particle contact (Cross-system) -----------------
+    ParticleParticleContact, // class-blind unilateral non-penetration co-step
 
-    // --- general contact pipeline Phase 0 (B2) --------------------------
+    // --- general contact pipeline (B2) --------------------------
     SyncLinkBodyPose,      // copy each articulation link's FK world pose into its
                            // owning body_pose row (composing link_geom_local) so
                            // artic links enter the LBVH as collidables. Gated to
@@ -135,7 +135,7 @@ enum class NkOp : uint16_t {
                             // Runs AFTER the rigid narrowphase + BEFORE AssembleRows;
                             // PairDriven-family-gated (early-exit otherwise).
 
-    // --- general contact pipeline Phase 2 (H3) --------------------------
+    // --- general contact pipeline (H3) --------------------------
     NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
                             // (convex, heightfield) candidate pair, walk the
                             // overlapped grid cells, emit 2 TRIANGLE_PRISM
@@ -154,11 +154,11 @@ enum class NkOp : uint16_t {
 //
 // All are trivially-copyable aggregates. `reserved` fields keep the structs
 // non-empty and stable in size while their real fields are designed in later
-// milestones; they MUST stay POD.
+// op params; they MUST stay POD.
 // ---------------------------------------------------------------------------
 
 // --- articulated-body dynamics ------------------------------------------
-// M3b note: ops carry the launch-geometry counts (total_link_count /
+// Note: ops carry the launch-geometry counts (total_link_count /
 // articulation_count / max_dof) in their params because ModelView/DataView are
 // pure pointer aggregates; the Pipeline fills them from the Model capacities.
 struct ApplyDrivesParams {
@@ -168,8 +168,8 @@ struct ApplyDrivesParams {
     // IMPLICITLY downstream (the production batched + single-env paths). 0 =>
     // explicit -Kd*qdot in the drive (the legacy pre-implicit oracle form).
     uint32_t defer_velocity_damping;
-    // M4: drive mode. 0 = position PD hold drive (ApplyPositionDriveKernel, the
-    // M3 batched articulated path). 1 = direct torque drive (the union
+    // The rigid-body arm: drive mode. 0 = position PD hold drive (ApplyPositionDriveKernel, the
+    // batched articulated path). 1 = direct torque drive (the union
     // world's LaunchApplyTorqueDriveKernels port: tau = clamp(drive_target,
     // +/-drive_force_limit) — drive_target carries the per-link torque).
     uint32_t mode;
@@ -186,7 +186,7 @@ struct IntegrateVelocityParams {
     float    gravity_z;    // floating-base velocity integrate re-derives a_grav
     uint32_t total_link_count;
     uint32_t articulation_count;
-    // M4: movable rigid-body gravity velocity-kick arm (the union world's
+    // The rigid-body arm: movable rigid-body gravity velocity-kick arm (the union world's
     // per-body `linear_velocity.z += g*dt` for inv_mass > 0). 0 = no bodies.
     uint32_t total_body_count;
 };
@@ -200,7 +200,7 @@ struct IntegratePositionParams {
     float    dt;
     uint32_t total_link_count;
     uint32_t articulation_count;
-    // M4: movable rigid-body symplectic-Euler position arm (the union world's
+    // The rigid-body arm: movable rigid-body symplectic-Euler position arm (the union world's
     // IntegrateBodyPosition port). 0 = no bodies.
     uint32_t total_body_count;
     // Split-impulse: advance position by (real+pseudo)*dt while the persisted
@@ -239,7 +239,7 @@ struct ApplyImplicitDampingParams {
 };
 
 // --- broadphase / spatial acceleration ----------------------------------
-// M5: the broadphase ops (BuildAabbs/LbvhBuild/LbvhQueryPairs) and the SDF
+// the broadphase ops (BuildAabbs/LbvhBuild/LbvhQueryPairs) and the SDF
 // narrowphase EARLY-EXIT unless family == kContactFamilyPairDriven (the union
 // slot-template and fused-foot paths do their own detection and never read the
 // pair stream). The pair-driven ops carry their launch geometry in params (the
@@ -277,9 +277,9 @@ struct ParticleGridBuildParams {
     uint32_t particle_count;    // total particles (env-major)
     float    grid_min[3];       // grid lower corner
     uint32_t grid_dims[3];      // grid resolution (PER ENV)
-    // M6: which position field the grid is built over. PBF builds the neighbor
+    // which position field the grid is built over. PBF builds the neighbor
     // list on the PREDICTED positions (legacy PBF step order), so pos_source == 1
-    // routes the op to pbf_predicted_pos; 0 == particle_pos (the M5 default).
+    // routes the op to pbf_predicted_pos; 0 == particle_pos (the default).
     uint32_t pos_source;        // 0 = particle_pos, 1 = pbf_predicted_pos
     // Env-private grids (review fix): cell keys are offset env*cells so envs
     // never share a cell (env-major replicated particles would otherwise see
@@ -297,38 +297,38 @@ inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
 // (mirrors nk::ContactFamily; a plain u32 so the POD stays header-light).
-//   0 = FusedFoot  (DEAD: the M3 articulation foot pipeline RUNTIME was deleted in
-//       L1-b; the constant is retained, dead, until the L1-d enum collapse — no
-//       op dispatches on it anymore)
-//   1 = UnionCsr   (M4 union compliant-CSR pipeline)
-//   2 = PairDriven (M5 generalized broadphase->narrowphase: BuildAabbs/Lbvh*/
-//       candidate_pairs -> NarrowphasePrimitives (amf:: analytic set + sphere x
-//       hull) + NarrowphaseSdf (SAMP x SDF grid). The general default for every
-//       non-union cooked model. The broadphase + SDF ops EARLY-EXIT for UnionCsr
-//       so that gate-pinned path stays bit-identical.)
-inline constexpr uint32_t kContactFamilyFusedFoot  = 0u;  // L1-b: dead constant.
+// 0 = FusedFoot (DEAD: the articulation foot pipeline RUNTIME was deleted in
+// ; the constant is retained, dead, until the enum collapse — no
+// op dispatches on it anymore)
+// 1 = UnionCsr (union compliant-CSR pipeline)
+// 2 = PairDriven (generalized broadphase->narrowphase: BuildAabbs/Lbvh*/
+// candidate_pairs -> NarrowphasePrimitives (amf:: analytic set + sphere x
+// hull) + NarrowphaseSdf (SAMP x SDF grid). The general default for every
+// non-union cooked model. The broadphase + SDF ops EARLY-EXIT for UnionCsr
+// so that gate-pinned path stays bit-identical.)
+inline constexpr uint32_t kContactFamilyFusedFoot  = 0u;  // dead constant.
 inline constexpr uint32_t kContactFamilyUnionCsr   = 1u;
 inline constexpr uint32_t kContactFamilyPairDriven = 2u;
 
 struct NarrowphasePrimitivesParams {
     float contact_margin;
     uint8_t max_contacts_per_pair;
-    // M3b first batch (foot sphere x ground plane, the production Go2/H1 path):
+    // first batch (foot sphere x ground plane, the production Go2/H1 path):
     float    ground_height;
     uint32_t foot_count;        // active rows of the Model foot_shape table
     uint32_t env_count;
     uint32_t base_link_count;   // links per env (replica stride)
-    // M4 union family (kContactFamilyUnionCsr): per-(env x union-slot) analytic
+    // union family (kContactFamilyUnionCsr): per-(env x union-slot) analytic
     // detection (foot sphere x plane / finger sphere x hull / body box x plane).
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env (Model union_slots size)
     uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
     uint32_t bodies_per_env;
     uint32_t hull_vert_count;   // live verts of the hull_verts pool
-    // M6: particle coupling (the kUSlotParticleSphere* union classes form the
+    // particle coupling (the kUSlotParticleSphere* union classes form the
     // particle side's world sphere from particle_pos[env*particles_per_env+link]).
     uint32_t particles_per_env;
-    // L1-b: these two fields drove the (now-deleted) FUSED foot slot re-keying.
+    // these two fields drove the (now-deleted) FUSED foot slot re-keying.
     // They are retained in the POD for layout stability (no op reads them anymore;
     // multi-body dog<->dog collision rides the GENERAL PairDriven path). K ==
     // articulations_per_env; max_foot_contacts == the per-artic stride.
@@ -336,14 +336,14 @@ struct NarrowphasePrimitivesParams {
     uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (dead with FUSED)
 };
 
-// General contact pipeline Phase 0 (B2): SyncLinkBodyPose. One thread per
+// General contact pipeline (B2): SyncLinkBodyPose. One thread per
 // articulation link copies its FK world pose (link_pose[l]) into its owning
 // body_pose row (body_pose[link_body[l]]), composing the cooked link_geom_local
 // offset so an offset collidable is posed in world space. This is what makes
 // articulation links visible to the LBVH (BuildAabbsKernel reads body_pose),
 // the load-bearing prerequisite for general body<->body contact. EARLY-EXITS
 // unless family == kContactFamilyPairDriven (so the UnionCsr graph is
-// byte-untouched in Phase 0). link_body is the MODEL table (template-local body
+// byte-untouched before the general path is wired). link_body is the MODEL table (template-local body
 // row per link); the kernel adds the per-env body offset for the global body_pose
 // index.
 struct SyncLinkBodyPoseParams {
@@ -353,7 +353,7 @@ struct SyncLinkBodyPoseParams {
     uint32_t bodies_per_env;  // body rows per env (the per-env body stride)
 };
 
-// General contact pipeline Phase 2 (H3): the per-cell heightfield midphase. One
+// General contact pipeline (H3): the per-cell heightfield midphase. One
 // thread per (env x candidate slot); when the slot's broadphase pair is (convex,
 // heightfield) it projects the convex's world AABB into heightfield-LOCAL space,
 // maps it to the overlapped grid cell range, and for EACH cell emits its 2
@@ -408,6 +408,12 @@ struct NarrowphaseBodyParticleParams {
     uint32_t cands_per_particle;  // reserved contact slots per particle
     float    particle_radius;     // the particle collision radius (sphere on the path)
     float    contact_margin;
+    // The PBF/SoftFluid fluid-slice predict writes the gravity-integrated position
+    // into pbf_predicted_pos, leaving particle_pos at step-start. Route the fluid
+    // slice's detection at the predicted position (consistent with the grid build's
+    // pos_source) so a fast fluid particle brakes within one step instead of lagging.
+    uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
+    uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
     // -- the heightfield descriptor (HeightfieldData mirror, same names/types as
     // NarrowphaseHeightfieldParams) so a sphere particle walks the cooked grid. ---
     uint32_t has_heightfield;   // 0 == no cooked heightfield (the field arm is inert)
@@ -418,14 +424,14 @@ struct NarrowphaseBodyParticleParams {
     uint32_t data_offset;       // base index into the `heights` field
 };
 
-// Spec-fixed semantic fields (M1): {contact_margin, max_contacts_per_pair}.
-// M5 appends the pair-driven launch geometry: the op samples each sampling
+// Spec-fixed semantic fields : {contact_margin, max_contacts_per_pair}.
+// appends the pair-driven launch geometry: the op samples each sampling
 // shape's SAMP point slice against the OTHER shape's cooked SDF grid (plan
-// §3.5). EARLY-EXITS unless family == kContactFamilyPairDriven.
+// the spec). EARLY-EXITS unless family == kContactFamilyPairDriven.
 struct NarrowphaseSdfParams {
     float   contact_margin;
     uint8_t max_contacts_per_pair;
-    // -- appended launch geometry (M5) -----------------------------------
+    // -- appended launch geometry -----------------------------------
     uint32_t family;            // kContactFamily* (PairDriven => sample)
     uint32_t env_count;
     uint32_t bodies_per_env;
@@ -435,7 +441,7 @@ struct NarrowphaseSdfParams {
 
 struct ContactTangentBasisParams {
     uint32_t slot_count;        // env_count * max_contacts_per_env
-    // L1-b: the FUSED tangent kernel was deleted. The op is now enqueued ONLY for
+    // the FUSED tangent kernel was deleted. The op is now enqueued ONLY for
     // the PairDriven family (the union family emits its tangent spokes inside
     // AssembleRows), and it unconditionally reads the unified ucontact_normal
     // (elem:4) -> ucontact_tangent1/2. The field is retained for layout/diagnostics.
@@ -449,7 +455,7 @@ struct AssembleRowsParams {
     uint32_t env_count;
     uint32_t articulation_count;
     uint32_t total_link_count;
-    // M4 union family:
+    // union family:
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env
     uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
@@ -457,7 +463,7 @@ struct AssembleRowsParams {
     uint32_t base_link_count;   // links per env (replica stride)
     float    solref[2];         // merged contact solref (union family)
     float    solimp[5];         // merged contact solimp (union family)
-    uint32_t particles_per_env; // M6 particle coupling (kUSlotParticleSphere*).
+    uint32_t particles_per_env; // particle coupling (kUSlotParticleSphere*).
     uint32_t num_material_buckets;  // 0 == no authored materials -> model defaults.
     // Per-system body<->particle friction; n_soft_particles splits per-env
     // [soft|fluid] so a side reads soft vs fluid mu, mixed with the body by solmix=max.
@@ -466,8 +472,8 @@ struct AssembleRowsParams {
     float    particle_fluid_friction;// fluid mu (~0: a foot slides tangentially).
 };
 
-// Spec-fixed semantic fields (M1): {dt, vel_iters, pos_iters}. The fields BELOW
-// the spec triplet are the M3b-precedent LAUNCH-GEOMETRY transport (op_schema
+// Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
+// the spec triplet are the precedent LAUNCH-GEOMETRY transport (op_schema
 // header note: "ops carry the launch-geometry counts in their params because
 // ModelView/DataView are pure pointer aggregates") plus the per-family solver
 // constants that are Model properties (the fused family's legacy knobs). They
@@ -477,7 +483,7 @@ struct SolveRowsBlockIslandParams {
     float dt;
     uint16_t vel_iters;
     uint16_t pos_iters;
-    // -- appended launch geometry + Model-derived solver constants (M4) ------
+    // -- appended launch geometry + Model-derived solver constants ------
     uint32_t family;             // kContactFamily*
     uint32_t total_islands;      // union family: schedule island count (grid x)
     uint32_t max_dof;            // dof_stride == the M tile stride
@@ -489,7 +495,7 @@ struct SolveRowsBlockIslandParams {
     // Fused-family legacy knobs (Model properties; unused by the union family):
     float    friction_coefficient;
     float    baumgarte_max_velocity;
-    // (L1-b: the FUSED-family `apply_implicit_damping` knob was REMOVED — the
+    // (: the FUSED-family `apply_implicit_damping` knob was REMOVED — the
     // implicit joint-damping seed moved out of the deleted FUSED solve kernel
     // into the standalone NkOp::ApplyImplicitDamping op; nothing in the solve op
     // reads it any more.)
@@ -509,7 +515,7 @@ struct SolveRowsBlockIslandParams {
 };
 
 // --- particle (XPBD / PBF) substep --------------------------------------
-// M6 prediction-mode selector (the XPBD vs PBF predict semantics DIVERGE — the
+// Prediction-mode selector (the XPBD vs PBF predict semantics DIVERGE — the
 // XPBD predict folds gravity into the position WITHOUT mutating velocity and
 // snapshots prev_pos, while PBF kicks the velocity by g*dt then predicts into a
 // SEPARATE pbf_predicted_pos buffer). The op param carries the mode so the ONE
@@ -517,7 +523,7 @@ struct SolveRowsBlockIslandParams {
 inline constexpr uint32_t kParticleModeNone = 0u;  // no particles (early-exit)
 inline constexpr uint32_t kParticleModeXpbd = 1u;  // XPBD soft/cloth predict
 inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
-// COUPLED mode (M6): particles co-step against rigid/artic bodies through the
+// COUPLED mode : particles co-step against rigid/artic bodies through the
 // unified row solve (the ParticleInvMass arm). The contact solve corrects the
 // particle VELOCITY between the position predict and the position finalize (the
 // legacy unified_costep pre/couple/post ordering, reproduced inside the fixed
@@ -527,15 +533,15 @@ inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
 // (XPBD soft-constraint / PBF density) velocity with the contact velocity
 // delta — exactly v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
 inline constexpr uint32_t kParticleModeCoupled = 3u;
-// M9 T11 SOFT+FLUID co-residence mode: ONE Model holds a soft (XPBD) particle
+// SOFT+FLUID co-residence mode: ONE Model holds a soft (XPBD) particle
 // set in [0, n_soft) and a fluid (PBF) particle set in [n_soft, particles_per_env)
 // per env (contiguous [soft | fluid] split, mirrors the co-step's [xpbd | pbf]
 // union with split n_x 1:1). The predict/finalize ops branch per-particle on the
 // within-env local index vs n_soft (soft => XPBD predict/correct; fluid => PBF
 // predict/finalize). The PBF density/lambda/neighbor solve is SCOPED to the fluid
 // slice (a soft particle must NOT contribute to fluid density); the XPBD
-// constraints are edge-based so they only touch the soft slice. The id-10
-// cross-contact (Phase 2) runs over the FULL union.
+// constraints are edge-based so they only touch the soft slice. The 
+// cross-contact runs over the FULL union.
 inline constexpr uint32_t kParticleModeSoftFluid = 4u;
 
 // Common particle launch geometry (the views are pure pointer aggregates, so
@@ -554,7 +560,7 @@ struct ParticlePredictParams {
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;   // total env-major particles
     uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
-    // M9 T11 SoftFluid: the per-env [soft | fluid] split + per-env stride. The
+    // SoftFluid: the per-env [soft | fluid] split + per-env stride. The
     // SoftFluid predict/finalize kernels branch per-particle on (i % per_env) vs
     // n_soft. 0 for the single-system modes (unused).
     uint32_t n_soft_particles; // per-env soft count (split index)
@@ -567,7 +573,7 @@ struct XpbdProjectParams {
     uint32_t dist_con_count;   // total env-major distance constraints
     uint32_t bend_con_count;   // total env-major bend constraints
     uint32_t vol_con_count;    // total env-major volume constraints
-    // M9 T11: total env-major shape-match cluster count (XPBD id 9). 0 == none.
+    // total env-major shape-match cluster count (XPBD id 9). 0 == none.
     // Solved LAST in the XPBD sweep (after dist/bend/vol), the legacy
     // XPBD-sweep order, so it pulls the projected config toward the rigid goal.
     uint32_t shape_match_cluster_count;
@@ -583,8 +589,8 @@ struct PbfDensityLambdaParams {
     uint16_t clamp_overdensity;// 1 => clamp C_i >= 0 (no surface cohesion pull)
     float    dt;               // substep dt (for the boundary clamp + apply)
     uint32_t boundary_enabled; // 1 => apply the floor clamp in the apply pass
-    float    floor_z;          // boundary floor (the M5 grid is z-up; legacy y).
-    // M9 T11 SoftFluid: scope the density/lambda solve to the fluid slice. A soft
+    float    floor_z;          // boundary floor (the grid is z-up; legacy y).
+    // SoftFluid: scope the density/lambda solve to the fluid slice. A soft
     // particle (within-env local index < n_soft) must NOT contribute to fluid
     // density. 0 == single-system PBF (every particle is fluid).
     uint32_t n_soft_particles;  // per-env soft count (fluid slice = [n_soft, per_env))
@@ -597,7 +603,7 @@ struct PbfApplyDeltaParams {
     uint32_t particle_count;
     uint32_t boundary_enabled;
     float    floor_z;
-    // M9 T11 SoftFluid: fluid slice scope (see PbfDensityLambdaParams).
+    // SoftFluid: fluid slice scope (see PbfDensityLambdaParams).
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
 };
@@ -613,14 +619,14 @@ struct ParticleFinalizeParams {
     float    xsph_viscosity_c;     // XSPH velocity-smoothing coefficient
     float    surface_tension_gamma;// Akinci cohesion coefficient
     float    rest_density;         // rho0 (for the XSPH density normalization)
-    // M9 T11 SoftFluid: the per-env [soft | fluid] split + per-env stride. The
+    // SoftFluid: the per-env [soft | fluid] split + per-env stride. The
     // SoftFluid finalize branches per-particle (soft => XPBD correct; fluid =>
     // PBF finalize). The polish passes are scoped to the fluid slice. 0 == single.
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
 };
 
-// M9 T11 Phase 2 — id-10 cross-system particle-particle CONTACT (the op-ified
+// Cross-system — cross-system particle-particle CONTACT (the op-ified
 // legacy cross-system particle co-step). A class-blind
 // unilateral non-penetration row over the FULL [soft | fluid] union (the row math
 // does NOT branch on soft vs fluid). Mirrors ParticleParticleContactParams 1:1
@@ -642,7 +648,7 @@ struct ParticleParticleContactParams {
     uint32_t particle_count;    // total env-major union particles.
     // The per-env [soft | fluid] split + stride; the contact row is class-blind so
     // these are carried only for symmetry with the other particle ops + future
-    // per-env scoping. The id-10 math reads the FULL union (no soft/fluid branch).
+    // per-env scoping. The math reads the FULL union (no soft/fluid branch).
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
 };
@@ -662,7 +668,7 @@ struct ExportObsParams {
     uint32_t obs_width;         // floats per env in obs_buffer
 };
 
-// L1-c: ReadoutUnionContactObsParams (the union-only per-env contact obs params)
+// ReadoutUnionContactObsParams (the union-only per-env contact obs params)
 // was DELETED here along with its op + kernel. Grasp/union moved to RL.
 
 // ResetEnvs: per-env masked snapshot restore. The env-id list is uploaded into
@@ -673,18 +679,23 @@ struct ResetEnvsParams {
     uint32_t base_link_count;
     uint32_t lambda_stride;     // row slots per env (== max_rows_per_env)
     uint32_t articulation_count;
-    // M7 T1: movable rigid-body restore arm. body_count is the PER-ENV body
+    // movable rigid-body restore arm. body_count is the PER-ENV body
     // stride (bodies_per_env); ResetEnvsKernel restores each reset env's body
     // slice [env*body_count, env*body_count+body_count) from the snapshot_body_*
     // fields. 0 => no bodies (the articulation-only path stays byte-identical).
     uint32_t body_count;        // bodies per env (snapshot_body_* slice stride)
-    // M10 RL-completion: OPTIONAL per-env Philox initial-condition randomization,
+    // Per-env particle stride (particles_per_env): ResetEnvsKernel restores each
+    // reset env's particle slice [env*particle_count, +particle_count) from the
+    // snapshot_particle_* fields so a coupled-world per-env reset is particle-
+    // complete. 0 => no particles (the articulation/body path stays byte-identical).
+    uint32_t particle_count;    // particles per env (snapshot_particle_* slice stride)
+    // OPTIONAL per-env Philox initial-condition randomization,
     // applied ON TOP of the snapshot restore. ALL fields default-zero (this POD
     // is value-init), and EACH perturbation is gated `if (half != 0)` in the
     // kernel, so an all-zero params (every existing go2/fused caller) yields the
-    // VERBATIM snapshot copy — byte-identical to the pre-M10 reset.
+    // VERBATIM snapshot copy — byte-identical to the pre- reset.
     uint64_t ic_seed;           // Philox seed (0 default; combined with ic_episode)
-    uint32_t ic_episode;        // bumped each Reset() so successive resets differ
+    uint32_t ic_episode;        // bumped each Reset so successive resets differ
     // Name-agnostic single-body position jitter override: the reset op applies
     // jitter_body_xyz to whichever body slot jitter_body_index names (was the
     // cup-specific cup_body_index/jitter_cup_xy; a general reset must not bake an
@@ -698,10 +709,14 @@ struct ResetEnvsParams {
 struct SnapshotStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
-    // M7 T1: env-major total movable rigid-body count (bodies_per_env*env_count).
+    // env-major total movable rigid-body count (bodies_per_env*env_count).
     // OpSnapshotState appends the body_pose/lin/ang D2D copies after the four
     // articulation copies. 0 => no bodies (articulation snapshot byte-identical).
     uint32_t total_body_count;
+    // Env-major total particle count (particles_per_env*env_count). OpSnapshotState
+    // appends the particle pos/prev_pos/vel D2D copies; 0 => no particle slice
+    // (snapshot byte-identical to a particle-free world).
+    uint32_t total_particle_count;
 };
 
 // RestoreState: bulk snapshot -> live restore + clear the carried accumulators
@@ -710,10 +725,14 @@ struct RestoreStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
     uint32_t row_slot_count;    // env_count * max_rows_per_env (lambda clear)
-    // M7 T1: env-major total movable rigid-body count (bodies_per_env*env_count).
+    // env-major total movable rigid-body count (bodies_per_env*env_count).
     // OpRestoreState appends the body_pose/lin/ang snapshot->live copies after
     // the articulation restore. 0 => no bodies (articulation restore unchanged).
     uint32_t total_body_count;
+    // Env-major total particle count (particles_per_env*env_count). OpRestoreState
+    // appends the particle pos/prev_pos/vel snapshot->live copies; 0 => no particle
+    // slice (restore byte-identical to a particle-free world).
+    uint32_t total_particle_count;
 };
 
 // --- domain randomization -----------------------------------------------
@@ -726,7 +745,7 @@ struct RandomizeBodyParamsParams {
     float range;           // +/- fractional perturbation
 };
 
-// --- differentiable rollout (M9 T7) -------------------------------------
+// --- differentiable rollout -------------------------------------
 // StepBackward: the contact-free single-step reverse adjoint. The articulation
 // device state (q/qdot/link_*/joint_*) comes from ModelView/DataView like every
 // other articulation op; the EXTRA buffers the adjoint needs are caller-owned

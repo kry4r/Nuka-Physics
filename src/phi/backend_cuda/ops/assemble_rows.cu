@@ -1,24 +1,24 @@
 // ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M4 AssembleRows (the §3.4 row-assembly op).
+// PHI v2 CUDA backend — AssembleRows (the spec row-assembly op).
 //
 // Contact families behind the ONE op (params->family):
 //
-//   FUSED (kContactFamilyFusedFoot) — DEAD as of L1-b: the FUSED contact RUNTIME
-//   was deleted (solve_rows.cu / contacts_foot.cu kernels gone, and the pipeline
-//   no longer selects this family). The OpAssembleRowsFused branch below is now
-//   UNREACHABLE — no cooked model is FusedFoot anymore — and is retained, dead,
-//   only until the L1-d enum collapse removes it wholesale. (Its kernels are the
-//   line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.)
+// FUSED (kContactFamilyFusedFoot) — DEAD as of : the FUSED contact RUNTIME
+// was deleted (solve_rows.cu / contacts_foot.cu kernels gone, and the pipeline
+// no longer selects this family). The OpAssembleRowsFused branch below is now
+// UNREACHABLE — no cooked model is FusedFoot anymore — and is retained, dead,
+// only until the enum collapse removes it wholesale. (Its kernels are the
+// line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.)
 //
-//   UNION (kContactFamilyUnionCsr) — DELETED in L1-c: the legacy coresident
-//   union world's CSR row assembly (EmitUnionRowsKernel / OpAssembleRowsUnion)
-//   was removed wholesale. Grasp moved to RL; the ONE general path is PairDriven.
+// UNION (kContactFamilyUnionCsr) — DELETED in : the legacy coresident
+// union world's CSR row assembly (EmitUnionRowsKernel / OpAssembleRowsUnion)
+// was removed wholesale. Grasp moved to RL; the ONE general path is PairDriven.
 //
-//   PAIRDRIVEN (kContactFamilyPairDriven) — the ONE general path: the broadphase
-//   -> narrowphase manifolds (ucontact_*) are turned into solver rows (urows) by
-//   EmitPairDrivenRowsKernel + the shared chain-J / row_minv_jt / row_meff hoists.
-//   Entirely arena-resident; ZERO host participation; every launch shape is a
-//   fixed function of the capacities -> CUDA-graph capturable.
+// PAIRDRIVEN (kContactFamilyPairDriven) — the ONE general path: the broadphase
+// -> narrowphase manifolds (ucontact_*) are turned into solver rows (urows) by
+// EmitPairDrivenRowsKernel + the shared chain-J / row_minv_jt / row_meff hoists.
+// Entirely arena-resident; ZERO host participation; every launch shape is a
+// fixed function of the capacities -> CUDA-graph capturable.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -42,8 +42,8 @@ constexpr float kFltMax = 3.402823466e+38f;
 
 // Per-shape material lives in mat_buckets (8 f32/bucket) keyed per body row by
 // mat_index. Lane meaning mirrors ModelMaterialBucket (cook side):
-//   [0]=static mu [1]=dynamic mu [2]=restitution [3]=solref timeconst
-//   [4]=solref dampratio [5]=density [6]=sdf cell [7]=reserved.
+// [0]=static mu [1]=dynamic mu [2]=restitution [3]=solref timeconst
+// [4]=solref dampratio [5]=density [6]=sdf cell [7]=reserved.
 constexpr uint32_t kMatBucketStride = 8u;
 constexpr uint32_t kMatLaneFriction = 0u;
 constexpr uint32_t kMatLaneSolref0 = 3u;
@@ -96,7 +96,7 @@ __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
 
 // ===========================================================================
 // SHARED + FUSED-family kernels — MOVED VERBATIM from the transitional
-// ops/solve_articulated.cu (M3b), which this file replaces. Bodies are
+// ops/solve_articulated.cu , which this file replaces. Bodies are
 // line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.
 // ===========================================================================
 
@@ -106,7 +106,7 @@ __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
 // (The union family launches this over ROW slots — same kernel, the per-slot
 // inputs are gathered per row; an inactive row carries the kInvalidLink
 // sentinel and is skipped, leaving its memset-zero J row.)
-// C3 (general contact pipeline Phase 0) — CONTACT POINT/NORMAL FRAME DECISION.
+// C3 (general contact pipeline) — CONTACT POINT/NORMAL FRAME DECISION.
 // The unified contact buffer (the FUSED contact_*, the union ucontact_*, and the
 // general PairDriven manifold) stores the contact POINT in WORLD space and the
 // contact NORMAL (A->B) in WORLD space. Newton stores points in BODY frame +
@@ -114,8 +114,8 @@ __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
 // minimal D1 churn, because this chain-Jacobian kernel ALREADY consumes a world
 // point + world normal directly (contact_point_world / contact_normal_world
 // below) — re-keying to body-frame storage would require a per-row world-recompose
-// with no functional gain in Phase 0. Body-frame storage is deferred to the
-// collide-once / reuse-across-substeps optimization (out of Phase-0 scope). This
+// with no functional gain before the general path is wired. Body-frame storage is deferred to the
+// collide-once / reuse-across-substeps optimization (out of scope for the initial wiring). This
 // is the ONE documented representation feeding AssembleRows for every family.
 __global__ void ComputeContactChainJacobianKernel(
     ArticulationDeviceState state,
@@ -157,7 +157,7 @@ __global__ void ComputeContactChainJacobianKernel(
             }
 
             if (type == ArticulationJointType::FloatingBase) {
-                // T8b: floating-base root contributes 6 columns (see
+                // Floating-base root contributes 6 columns (see
                 // articulation_jacobian.cu for the frame contract).
                 const math::Quat base_rot = state.base_pose[articulation].rotation;
                 const math::Vec3 base_origin = state.base_pose[articulation].position;
@@ -307,7 +307,7 @@ __global__ void AssembleArticulatedContactRowsKernel(
 }
 
 // ===========================================================================
-// UNION-family kernels (M4 NEW).
+// UNION-family kernels (NEW).
 // ===========================================================================
 
 // Vec3 normalize — EXACT host math::Vec3::Normalized expression (len = sqrt,
@@ -351,10 +351,10 @@ __global__ void PackQdotFlatKernel(const Spatial6* __restrict__ link_velocity,
     (void)k;
 }
 
-// L1-c: EmitUnionRowsKernel (the UnionCsr K2 row emitter) was DELETED here. The
+// EmitUnionRowsKernel (the UnionCsr K2 row emitter) was DELETED here. The
 // ONE general path emits its rows via EmitPairDrivenRowsKernel below.
 
-// K1 (PairDriven, S3): pack the per-ARTICULATION flat qdot tiles. One thread per
+// K1 (PairDriven): pack the per-ARTICULATION flat qdot tiles. One thread per
 // (global artic x DOF). dof_to_link/component are the per:dog TEMPLATE map; for
 // co-resident dog a the same template-local (link, component) applies to the
 // articulation's links, which live contiguously at a*links_per_dog within the env
@@ -419,16 +419,16 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
 // live ComputeRowMeffPairDrivenKernel and ComputeContactEffectiveMassKernel.)
 
 // ===========================================================================
-// GENERAL CONTACT PIPELINE — Phase 1B PairDriven-family assembly (S1/S2/S5).
+// GENERAL CONTACT PIPELINE (PairDriven) PairDriven-family assembly .
 //
 // The third OpAssembleRows branch (the union/fused arms are LITERALLY unchanged,
 // the H1 union golden + go2 FusedFoot golden D1 invariant). Per active unified
 // contact slot (the pair-driven narrowphase's ucontact_* manifold + the C1/C2
 // (a,b) collidable ids) it resolves each side via the registry (body_to_link /
 // body_to_articulation / shape_table body_id) into {kNkSideArtic, real artic id
-// (S1), owning link}, {kNkSideRigid, body row}, or {kNkSideStatic}, and fills a
+// , owning link}, {kNkSideRigid, body row}, or {kNkSideStatic}, and fills a
 // COUPLED two-sided NkRow + the side-A chain-J gather (row_cj_*) AND the side-B
-// chain-J gather (row_cj_*_b, S2). The chain-J kernel + K4a/K4b then run with
+// chain-J gather (row_cj_*_b). The chain-J kernel + K4a/K4b then run with
 // the side-B second passes. The Jv reduction / two-sided apply / mixed-island
 // coupling are ALL the existing SolveUnionRowWarp + island solver, unchanged.
 // ===========================================================================
@@ -742,7 +742,7 @@ __global__ void EmitPairDrivenRowsKernel(
     if (active_rows > 0u) atomicAdd(&row_count[env], active_rows);
 }
 
-// K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row (S2). Mirrors
+// K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row . Mirrors
 // ComputeRowMinvJtKernel but gates on row.b.kind and tiles by row.b.index.
 __global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
                                         const float* __restrict__ chain_jacobian_b,
@@ -833,7 +833,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         (p->articulation_count > 0u && p->env_count > 0u)
             ? (p->articulation_count / p->env_count) : 0u;
 
-    // K1: pack the per-articulation flat qdot tiles (S3: one tile per co-resident
+    // K1: pack the per-articulation flat qdot tiles (one tile per co-resident
     // articulation, qdot_flat[artic_global*max_dof + k]). PackQdotFlatKernel is
     // keyed per env*max_dof -> for K>1 launch over articulation_count*max_dof so
     // every dog's tile is packed. dof_to_link/component are per:dof (TEMPLATE),
@@ -850,7 +850,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    artics_per_env, data.qdot_flat);
     }
 
-    // K2: emit the pair-driven rows (S1/S2/S5).
+    // K2: emit the pair-driven rows .
     {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
@@ -1014,7 +1014,7 @@ Status OpAssembleRowsFused(const ModelView& model, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-// L1-c: OpAssembleRowsUnion (the UnionCsr K1-K4 assembly orchestrator) was
+// OpAssembleRowsUnion (the UnionCsr K1-K4 assembly orchestrator) was
 // DELETED here. The ONE general path assembles via OpAssembleRowsPairDriven.
 
 Status OpAssembleRows(const ModelView& model, const DataView& data,
@@ -1026,8 +1026,8 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
     if (p->family == kContactFamilyPairDriven) {
         return OpAssembleRowsPairDriven(model, data, p, stream);
     }
-    // L1-b/L1-d dead fallthrough: the FUSED family is unreachable (no cooked
-    // model selects it). Retained until the L1-d enum collapse removes it.
+    // dead fallthrough: the FUSED family is unreachable (no cooked
+    // model selects it). Retained until the enum collapse removes it.
     return OpAssembleRowsFused(model, data, p, stream);
 }
 

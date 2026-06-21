@@ -192,7 +192,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                                            nuka_world_handle* out);
 
 // A COUPLED world: a rigid/articulated robot cooked from `desc->scene_path` PLUS
-// cloth/tet (XPBD) and/or fluid (PBF) particles, all stepping on the ONE general
+// cloth (XPBD) and/or fluid (PBF) particles, all stepping on the ONE general
 // contact pipeline with two-way body<->particle coupling (a robot link is just a
 // collidable body, a particle is a sphere; the medium difference is DATA -- per-
 // system friction). The robot is cooked through the SAME scene->CookToModel path
@@ -555,7 +555,7 @@ typedef enum nuka_state_field_t {
     // is picked up by the NEXT Step. Persistent => round-trips reset.
     NUKA_FIELD_JOINT_FEEDFORWARD = 22,
     // READ (per-particle). The live particle WORLD positions of a coupled world
-    // (cloth/tet/fluid), env-major: float3[env_count * particles_per_env], index
+    // (cloth/fluid), env-major: float3[env_count * particles_per_env], index
     // (env * particles_per_env + particle), element_stride_bytes == 3*sizeof(float),
     // dtype == 0 (FLOAT32). The soft slice occupies [0, n_soft), the fluid slice
     // [n_soft, particles_per_env) (the cook's [soft|fluid] layout). On a world with

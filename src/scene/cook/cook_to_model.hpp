@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nk CookToModel — SceneIR -> {nk::Model, SceneMap} (plan §3.3 / M3).
+// nk CookToModel — SceneIR -> {nk::Model, SceneMap} (the design /).
 //
 // Drives the EXISTING cook (scene::CookScene for the heavy lifting: V-HACD /
 // SDF / filters; runtime::articulation::CookArticulations for the kinematic
@@ -35,15 +35,15 @@ struct CookToModelResult {
 // EntityId<->row SceneMap. env_count must be >= 1 (clamped to 1 if 0).
 CookToModelResult CookToModel(const SceneIR& scene, int env_count);
 
-// B1 (general contact pipeline Phase 1B): cook options. contact_family selects the
-// stepped contact path. L1-b: the legacy FusedFoot runtime is DELETED, so the cook
+// B1 (general contact pipeline (PairDriven)): cook options. contact_family selects the
+// stepped contact path. : the legacy FusedFoot runtime is DELETED, so the cook
 // always routes the GENERAL LBVH -> cvx narrowphase -> mixed-island solve path —
 // PairDriven is now the DEFAULT. The cook resizes the per-env row budget for the
 // general per-candidate-slot row layout and sets model.contact_family = PairDriven
 // (so the pipeline routes the general assembly/solve). H1 grasp keeps UnionCsr
 // (union_cook). Cross-env filtering is left ON for PairDriven multi-dog-in-one-env
 // (intra-env collidables collide). The FusedFoot enum value is retained (dead)
-// until the L1-d enum collapse.
+// until the enum collapse.
 enum class CookContactFamily { FusedFoot, PairDriven };
 struct CookToModelOptions {
     CookContactFamily contact_family = CookContactFamily::PairDriven;
@@ -81,7 +81,7 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base);
 
 // ---------------------------------------------------------------------------
-// M6 — particle cook (plan §3.10 "粒子 XPBD/PBF"). Stage an XPBD soft body or a
+// particle cook (the design "粒子 XPBD/PBF"). Stage an XPBD soft body or a
 // PBF fluid into the nk::Model particle block + set the particle/constraint
 // capacities. The cook layer is PURE C++ (nk_engine lint scope: zero CUDA
 // tokens), so it CANNOT include the legacy runtime::soft/fluid world headers
@@ -100,7 +100,7 @@ struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
 struct CookBendCon { uint32_t p[4]; math::Vec3 k[4]; float compliance_alpha; };
 // One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
 struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
-// One XPBD shape-match cluster (M9 T11; the de-interleaved XpbdShapeMatchCluster).
+// One XPBD shape-match cluster (; the de-interleaved XpbdShapeMatchCluster).
 // Variable-size cluster pulled toward the rigid transform of its rest shape.
 // particle[i] indexes the soft particle set; rest_positions[i] is x_i^0; the
 // cluster weight m_i defaults to the particle's mass when omitted (see the cook).
@@ -118,7 +118,7 @@ struct XpbdCookInput {
     std::vector<CookDistanceCon> distance;
     std::vector<CookBendCon>     bend;
     std::vector<CookVolumeCon>   volume;
-    std::vector<CookShapeMatchCluster> shape_match;  // M9 T11 (id 9).
+    std::vector<CookShapeMatchCluster> shape_match;  // (id 9).
     uint16_t solver_iterations = 1u;
     // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
     float    friction = 0.6f;
@@ -156,7 +156,7 @@ struct PbfCookInput {
 void CookPbfParticles(nk::Model& model, uint32_t env_count,
                       const PbfCookInput& in);
 
-// M9 T11 Phase 2 — id-10 cross-system contact params for the co-residence cook.
+// Cross-system — cross-system contact params for the co-residence cook.
 // The class-blind unilateral non-penetration co-step over the FULL [soft | fluid]
 // union (op-ified cross-system particle co-step). d_min ==
 // 2*contact_radius (uniform radius); <= 0 disables the op (the default). The cook
@@ -168,7 +168,7 @@ struct SoftFluidContactInput {
     uint32_t solver_iterations  = 1u;    // Jacobi gather+apply sweeps (>= 1)
 };
 
-// M9 T11 two-system cook: stage BOTH a soft (XPBD) particle set AND a fluid (PBF)
+// Two-system cook: stage BOTH a soft (XPBD) particle set AND a fluid (PBF)
 // particle set co-resident into ONE Model with a contiguous [soft | fluid] layout
 // (the soft particles occupy [0, n_soft), the fluid [n_soft, particles_per_env)).
 // The soft XPBD constraint indices stay in the soft slice; the fluid particles are
@@ -178,8 +178,8 @@ struct SoftFluidContactInput {
 // CookXpbdParticles + the shape-match block; a fluid-only cook (soft empty,
 // n_soft 0) is byte-identical to CookPbfParticles. The two single-system cooks
 // remain the canonical paths; this is the co-residence composer. The optional
-// `contact` block enables the id-10 cross-system non-penetration co-step over the
-// union (default-off => Phase-1 behavior: the two slices co-step independently).
+// `contact` block enables the cross-system non-penetration co-step over the
+// union (default-off => behavior: the two slices co-step independently).
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
                             const XpbdCookInput& soft, const PbfCookInput& fluid,
                             const SoftFluidContactInput& contact = {});

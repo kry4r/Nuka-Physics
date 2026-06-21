@@ -8,24 +8,24 @@
 // block-island PGS. No per-medium branch, no special coupler.
 //
 // FLOW (one thread per (env x env-local particle)):
-//   1. Build the particle's query AABB (sphere of particle_radius) at its position.
-//   2. Traverse the env's arena LBVH (data.lbvh_nodes, the env*(2N-1) node slice the
-//      broadphase built) for overlapping collidable bodies, collected into a private
-//      insertion-sorted candidate list capped at kCrossSystemMaxCandidates (the
-//      cross_system_query CSR pattern). For a <2-collidable env (no LBVH) it scans
-//      the body AABBs directly. A particle exceeding the cap ORs kEnvStatusPairOverflow.
-//   3. For each candidate body run the sphere-vs-shape manifold: amf::Sphere{Sphere,
-//      Box,Plane} inline, cvx::SphereHull (the EPA-bypass closest-point query) for a
-//      convex hull, a face-only handler for the heightfield (the SphereHull/EPA
-//      shallow-penetration dead band is avoided exactly as the heightfield path does).
-//   4. Write the manifold into the particle's RESERVED contact-slot sub-range
-//      [slot_base + pi*cands_per_particle + k]. The per-particle base is a FIXED
-//      (non-atomic) function of the particle index, so the body<->particle slot stream
-//      is bit-D1 by construction AND occupies a deterministic sub-range relative to the
-//      racy rigid-rigid slots [0, pair_count) — the cross-stream ordering guard. Side A
-//      == the particle (GLOBAL id + the kUContactSideParticle index-kind tag), side B
-//      == the body collidable (kUContactSideBody); the manifold normal is the
-//      separation dir for the particle (push it off the body).
+// 1. Build the particle's query AABB (sphere of particle_radius) at its position.
+// 2. Traverse the env's arena LBVH (data.lbvh_nodes, the env*(2N-1) node slice the
+// broadphase built) for overlapping collidable bodies, collected into a private
+// insertion-sorted candidate list capped at kCrossSystemMaxCandidates (the
+// cross_system_query CSR pattern). For a <2-collidable env (no LBVH) it scans
+// the body AABBs directly. A particle exceeding the cap ORs kEnvStatusPairOverflow.
+// 3. For each candidate body run the sphere-vs-shape manifold: amf::Sphere{Sphere,
+// Box,Plane} inline, cvx::SphereHull (the EPA-bypass closest-point query) for a
+// convex hull, a face-only handler for the heightfield (the SphereHull/EPA
+// shallow-penetration dead band is avoided exactly as the heightfield path does).
+// 4. Write the manifold into the particle's RESERVED contact-slot sub-range
+// [slot_base + pi*cands_per_particle + k]. The per-particle base is a FIXED
+// (non-atomic) function of the particle index, so the body<->particle slot stream
+// is bit-D1 by construction AND occupies a deterministic sub-range relative to the
+// racy rigid-rigid slots [0, pair_count) — the cross-stream ordering guard. Side A
+// == the particle (GLOBAL id + the kUContactSideParticle index-kind tag), side B
+// == the body collidable (kUContactSideBody); the manifold normal is the
+// separation dir for the particle (push it off the body).
 //
 // FAMILY GATING (D1): EARLY-EXITS unless family == kContactFamilyPairDriven.
 // ---------------------------------------------------------------------------
@@ -332,6 +332,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ hull_verts,
     const Vec3* __restrict__ particle_pos,
+    const Vec3* __restrict__ pbf_predicted_pos,
     const cg::LbvhNode* __restrict__ lbvh_nodes,
     const Vec3* __restrict__ body_aabb_lo,
     const Vec3* __restrict__ body_aabb_hi,
@@ -377,7 +378,16 @@ __global__ void NarrowphaseBodyParticleKernel(
     if (N == 0u) return;
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
-    const Vec3 center = particle_pos[global_particle];
+    // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position
+    // (the gravity-integrated pos the density solve uses), consistent with the
+    // particle-particle grid; the soft slice + pure-Xpbd/Coupled keep particle_pos
+    // (their predict already wrote it).
+    const bool fluid_predicted = pp.fluid_pos_source != 0u &&
+                                 pi >= pp.n_soft_particles &&
+                                 pbf_predicted_pos != nullptr;
+    const Vec3 center =
+        fluid_predicted ? pbf_predicted_pos[global_particle]
+                        : particle_pos[global_particle];
     const float radius = pp.particle_radius;
     const collision::AABB query = ParticleAabb(center, radius + pp.contact_margin);
 
@@ -497,6 +507,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const float*>(model.hull_verts),
                static_cast<const Vec3*>(data.particle_pos),
+               static_cast<const Vec3*>(data.pbf_predicted_pos),
                reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
                static_cast<const Vec3*>(data.body_aabb_lo),
                static_cast<const Vec3*>(data.body_aabb_hi),

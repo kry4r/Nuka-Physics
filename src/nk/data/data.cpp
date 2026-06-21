@@ -140,6 +140,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticlePrevPos:     v.particle_prev_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleVel:         v.particle_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleInvMass:     v.particle_inv_mass = static_cast<float*>(p); break;
+        // Particle snapshot fields (restore source for a coupled-world Reset). Bound
+        // here so OpSnapshotState/OpRestoreState/OpResetEnvs see live arena pointers
+        // (an unbound field stays null and the snapshot/restore copy would fail).
+        case FieldId::SnapshotParticlePos:     v.snapshot_particle_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::SnapshotParticlePrevPos: v.snapshot_particle_prev_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::SnapshotParticleVel:     v.snapshot_particle_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
         case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
         case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;

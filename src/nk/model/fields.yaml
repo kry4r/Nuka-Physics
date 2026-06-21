@@ -696,3 +696,15 @@ fields:
   # is byte-stable (the D1 invariant).
   - {name: ucontact_a_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: ucontact_b_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+
+  # =========================================================================
+  # Particle reset/snapshot state (the restore source for a coupled-world Reset):
+  # mirror the LIVE particle_pos / particle_prev_pos / particle_vel (per:particle)
+  # 1:1 so SnapshotState/RestoreState round-trip the cloth/fluid slice, not just
+  # the robot. A particle-free world sizes these zero -> the snapshot/restore is a
+  # genuine no-op (byte-identical). APPENDED LAST so every pre-existing arena
+  # offset is byte-stable (the D1 invariant).
+  # =========================================================================
+  - {name: snapshot_particle_pos,      dtype: vec3, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
+  - {name: snapshot_particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data}

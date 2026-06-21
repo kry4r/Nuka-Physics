@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,50 @@ nuka_coupled_particles_desc_t MediaDesc(bool at_feet, float contact_radius = 0.0
     return p;
 }
 
+// A robot + CLOTH-ONLY descriptor (no fluid). The cloth membrane is pinned at a
+// plane ABOVE the standing feet so the front feet poke up through it and HOLD it
+// up: at_feet the interior is supported by the feet, the sunk control sags freely.
+// The plane height + a larger contact radius put the feet in solid contact (a
+// cloth resting just under the feet sags away and barely touches a standing foot).
+nuka_coupled_particles_desc_t ClothOnlyDesc(bool at_feet) {
+    nuka_coupled_particles_desc_t p{};
+    const float dz = at_feet ? 0.0f : kSinkOffset;
+    p.cloth_nx = 15u;
+    p.cloth_ny = 15u;
+    p.cloth_spacing = 0.025f;
+    p.cloth_origin_x = 0.062f;        // straddling the two front feet.
+    p.cloth_origin_y = 0.0f;
+    p.cloth_origin_z = 0.28f + dz;    // above the foot centres (~0.2545).
+    p.cloth_particle_mass = 0.01f;
+    p.cloth_friction = 0.6f;
+    p.cloth_bend_alpha = 1.0e-4f;
+    p.cloth_iters = 24u;
+    p.fluid_spacing = 0.0f;           // cloth-only.
+    p.contact_radius = 0.025f;
+    return p;
+}
+
+// A robot + FLUID-ONLY descriptor (no cloth). The pool FLOOR sits just below a rear
+// foot so the settled pool stays at the foot rather than draining out of reach; the
+// foot then displaces it. The sunk control drops the whole pool (and floor) away.
+nuka_coupled_particles_desc_t FluidOnlyDesc(bool at_feet) {
+    nuka_coupled_particles_desc_t p{};
+    const float dz = at_feet ? 0.0f : kSinkOffset;
+    p.cloth_nx = 0u;                  // fluid-only.
+    p.cloth_ny = 0u;
+    p.fluid_min_x = -0.42f; p.fluid_min_y = -0.09f;
+    p.fluid_max_x = -0.23f; p.fluid_max_y = 0.12f;
+    p.fluid_spacing = 0.022f;
+    p.fluid_min_z = 0.245f + dz;      // floor just below the rear foot (~0.237 bottom).
+    p.fluid_max_z = 0.32f + dz;
+    p.fluid_rest_density = 1000.0f;
+    p.fluid_floor_z = 0.245f + dz;
+    p.fluid_friction = 0.0f;
+    p.fluid_iters = 6u;
+    p.contact_radius = 0.012f;
+    return p;
+}
+
 nuka_world_desc_t WorldDesc(const std::string& scene, uint32_t terrain) {
     nuka_world_desc_t d{};
     d.scene_path = scene.c_str();
@@ -164,6 +209,44 @@ double CoupledMediaRefRelL1(nuka_device_handle device, const std::string& scene,
         WorldGuard w;
         const nuka_world_desc_t d = WorldDesc(scene, 0u);
         const nuka_coupled_particles_desc_t p = MediaDesc(at_feet, contact_radius);
+        if (nuka_world_create_coupled_from_scene(device, &d, &p, &w.handle) !=
+            NUKA_RESULT_OK) {
+            return false;
+        }
+        for (uint32_t s = 0; s < steps; ++s) {
+            if (nuka_world_step(w.handle) != NUKA_RESULT_OK) return false;
+        }
+        size_t fpe = 0u;
+        *out = DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION, &fpe);
+        return fpe == 3u && !out->empty();
+    };
+    std::vector<float> at_feet, control;
+    if (!run(true, &at_feet) || !run(false, &control)) return -1.0;
+    if (at_feet.size() != control.size()) return -1.0;
+    const size_t n_total = at_feet.size() / 3u;
+    if (particles_out != nullptr) *particles_out = n_total;
+    // The control's media (and floor) are a constant kSinkOffset below the at-feet
+    // world; subtracting it cancels the offset, so a residual is the robot's effect.
+    double l1 = 0.0;
+    for (size_t i = 0; i < n_total; ++i) {
+        const double a = at_feet[i * 3u + 2u];
+        const double c = control[i * 3u + 2u] - kSinkOffset;
+        l1 += std::fabs(a - c);
+    }
+    return l1;
+}
+
+// Reference-relative particle L1 for a SINGLE-medium coupled world: the descriptor
+// is `desc_fn(at_feet)` (one medium present, the other zeroed out). A residual > 0
+// means the robot displaced that lone medium through the body<->particle coupling.
+double SingleMediumRefRelL1(
+    nuka_device_handle device, const std::string& scene, uint32_t steps,
+    size_t* particles_out,
+    const std::function<nuka_coupled_particles_desc_t(bool)>& desc_fn) {
+    auto run = [&](bool at_feet, std::vector<float>* out) -> bool {
+        WorldGuard w;
+        const nuka_world_desc_t d = WorldDesc(scene, 0u);
+        const nuka_coupled_particles_desc_t p = desc_fn(at_feet);
         if (nuka_world_create_coupled_from_scene(device, &d, &p, &w.handle) !=
             NUKA_RESULT_OK) {
             return false;
@@ -364,6 +447,47 @@ TEST(CoupledWorldCAbi, DefaultContactRadiusStillCouples) {
            "default is not wired (the robot passes through the medium)";
 }
 
+// (3b) CLOTH-ONLY (no fluid): a robot + cloth-only coupled world still couples. The
+// body<->particle contact radius derives from the cooked contact diameter, which the
+// SoftFluid single-medium cook now wires on the soft-only fast path too; pre-fix the
+// radius was 0 and the robot tunnelled through the cloth (no displacement, no flag).
+TEST(CoupledWorldCAbi, ClothOnlyCouplesThroughBridge) {
+    if (!SceneAvailable()) GTEST_SKIP() << "Go2 stand scene is not available";
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const std::string scene = ScenePath();
+    size_t particles = 0u;
+    const double l1 = SingleMediumRefRelL1(device.handle, scene, /*steps=*/300u,
+                                           &particles, &ClothOnlyDesc);
+    std::printf("[coupled-cloth-only] particles=%zu media_ref_rel_L1=%.4f\n", particles,
+                l1);
+    ASSERT_GE(l1, 0.0) << "the cloth-only coupled world failed to build/step";
+    EXPECT_GT(l1, 0.02)
+        << "a robot + cloth-only coupled world produced no coupling -> the single-medium "
+           "soft cook drops the contact radius (the robot passes through the cloth)";
+}
+
+// (3c) FLUID-ONLY (no cloth): a robot + fluid-only coupled world still couples, by the
+// SAME single-medium fix on the fluid-only fast path. Pre-fix the body<->particle radius
+// was 0 and the robot tunnelled through the pool.
+TEST(CoupledWorldCAbi, FluidOnlyCouplesThroughBridge) {
+    if (!SceneAvailable()) GTEST_SKIP() << "Go2 stand scene is not available";
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const std::string scene = ScenePath();
+    size_t particles = 0u;
+    const double l1 = SingleMediumRefRelL1(device.handle, scene, /*steps=*/400u,
+                                           &particles, &FluidOnlyDesc);
+    std::printf("[coupled-fluid-only] particles=%zu media_ref_rel_L1=%.4f\n", particles,
+                l1);
+    ASSERT_GE(l1, 0.0) << "the fluid-only coupled world failed to build/step";
+    EXPECT_GT(l1, 0.02)
+        << "a robot + fluid-only coupled world produced no coupling -> the single-medium "
+           "fluid cook drops the contact radius (the robot passes through the pool)";
+}
+
 // (4) BATCHED (env_count > 1): a coupled world cooks + steps N independent envs on the
 // ONE pipeline. The particle field is N*P env-major and every env is bit-identical (a
 // coupled world is just more bodies/particles on the same batched, D1-replicated path).
@@ -410,4 +534,69 @@ TEST(CoupledWorldCAbi, BatchedCoupledWorldReplicatesAcrossEnvs) {
                 kEnvs, per_env, mismatches);
     EXPECT_EQ(mismatches, 0u)
         << "batched coupled envs diverged -> the coupled path is not D1-replicated";
+}
+
+// (5) RESET IS PARTICLE-COMPLETE: a coupled world stepped until the medium drifts,
+// then reset, returns its particle slice to the cooked initial lattice bit-for-bit.
+// Pre-fix the snapshot/restore touched no particle field, so reset was a SILENT
+// partial reset (robot reset, cloth/fluid frozen at the drifted state). The bulk
+// nuka_world_reset and the per-env nuka_world_reset_envs both round-trip particles.
+TEST(CoupledWorldCAbi, ResetRestoresParticleStateBitExact) {
+    if (!SceneAvailable()) GTEST_SKIP() << "Go2 stand scene is not available";
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const std::string scene = ScenePath();
+    WorldGuard w;
+    const nuka_world_desc_t d = WorldDesc(scene, 0u);
+    const nuka_coupled_particles_desc_t p = MediaDesc(/*at_feet=*/true);
+    ASSERT_EQ(nuka_world_create_coupled_from_scene(device.handle, &d, &p, &w.handle),
+              NUKA_RESULT_OK);
+    ASSERT_NE(w.handle, nullptr);
+
+    // The cooked initial particle lattice (before any step).
+    const std::vector<float> cooked =
+        DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION);
+    ASSERT_FALSE(cooked.empty());
+
+    // Step until the medium drifts well away from the cooked lattice.
+    for (uint32_t s = 0; s < 200u; ++s) {
+        ASSERT_EQ(nuka_world_step(w.handle), NUKA_RESULT_OK);
+    }
+    const std::vector<float> drifted =
+        DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION);
+    ASSERT_EQ(drifted.size(), cooked.size());
+    double drift_l1 = 0.0;
+    for (size_t i = 0; i < drifted.size(); ++i)
+        drift_l1 += std::fabs(static_cast<double>(drifted[i]) - cooked[i]);
+    std::printf("[coupled-reset] particles=%zu drift_L1=%.4f\n", cooked.size() / 3u,
+                drift_l1);
+    ASSERT_GT(drift_l1, 0.01)
+        << "the medium never drifted -> the reset round-trip is untested";
+
+    // BULK reset -> the particle slice returns to the cooked lattice bit-for-bit.
+    ASSERT_EQ(nuka_world_reset(w.handle), NUKA_RESULT_OK);
+    const std::vector<float> after_bulk =
+        DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION);
+    ASSERT_EQ(after_bulk.size(), cooked.size());
+    size_t bulk_mismatches = 0u;
+    for (size_t i = 0; i < cooked.size(); ++i)
+        if (after_bulk[i] != cooked[i]) ++bulk_mismatches;
+    EXPECT_EQ(bulk_mismatches, 0u)
+        << "nuka_world_reset left the particle slice stale (silent partial reset)";
+
+    // Drift again, then PER-ENV reset (env 0) -> same bit-exact particle restore.
+    for (uint32_t s = 0; s < 200u; ++s) {
+        ASSERT_EQ(nuka_world_step(w.handle), NUKA_RESULT_OK);
+    }
+    const uint32_t env0 = 0u;
+    ASSERT_EQ(nuka_world_reset_envs(w.handle, &env0, 1u), NUKA_RESULT_OK);
+    const std::vector<float> after_env =
+        DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION);
+    ASSERT_EQ(after_env.size(), cooked.size());
+    size_t env_mismatches = 0u;
+    for (size_t i = 0; i < cooked.size(); ++i)
+        if (after_env[i] != cooked[i]) ++env_mismatches;
+    EXPECT_EQ(env_mismatches, 0u)
+        << "nuka_world_reset_envs left the particle slice stale (silent partial reset)";
 }
