@@ -29,9 +29,11 @@
 #include "scene/cooker.hpp"
 #include "scene/format/nks.hpp"  // native .nks loader (parity with scene.cpp)
 
+#include "import/cooker/fluid_cooker.hpp"  // CookFluidBox (reused fluid lattice cook)
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
+#include "runtime/soft/cloth_topology.hpp"  // BuildClothConstraints (reused cloth topo)
 #include "math/transform.hpp"       // M10 co-residence: replica placement transform
 #include "scene/scene_compose.hpp"  // M10 co-residence: compose K replicas pre-cook
 #include "scene/scene_ir.hpp"
@@ -40,6 +42,7 @@
 #include "scene/terrain/heightfield_sample.hpp"   // the ONE bilinear obs sampler
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -126,6 +129,386 @@ void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* rec
         articulation::BuildArticulationHostState({arts.front()}, blob.bodies);
 }
 
+// Build the cloth XPBD cook input from the compact coupled descriptor: a flat
+// (nx x ny) lattice at the authored origin, the whole perimeter pinned (a taut
+// membrane), meshed into triangles whose stretch+bend constraints come from the
+// engine's BuildClothConstraints. Empty input when the cloth extent is absent.
+nuka::scene::cook::XpbdCookInput BuildClothCookInput(
+    const nuka_coupled_particles_desc_t& p) {
+    nuka::scene::cook::XpbdCookInput in;
+    if (p.cloth_nx < 2u || p.cloth_ny < 2u || p.cloth_spacing <= 0.0f) {
+        return in;  // no cloth (the SoftFluid cook treats an empty soft set as none).
+    }
+    const uint32_t nx = p.cloth_nx, ny = p.cloth_ny;
+    const float s = p.cloth_spacing;
+    const float x0 = p.cloth_origin_x - 0.5f * static_cast<float>(nx - 1u) * s;
+    const float y0 = p.cloth_origin_y - 0.5f * static_cast<float>(ny - 1u) * s;
+    std::vector<nuka::math::Vec3> rest;
+    rest.reserve(static_cast<size_t>(nx) * ny);
+    for (uint32_t j = 0u; j < ny; ++j) {
+        for (uint32_t i = 0u; i < nx; ++i) {
+            rest.push_back(nuka::math::Vec3{x0 + static_cast<float>(i) * s,
+                                            y0 + static_cast<float>(j) * s,
+                                            p.cloth_origin_z});
+        }
+    }
+    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
+    std::vector<nuka::runtime::soft::ClothTriangle> tris;
+    for (uint32_t j = 0u; j + 1u < ny; ++j) {
+        for (uint32_t i = 0u; i + 1u < nx; ++i) {
+            tris.push_back({{idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u)}});
+            tris.push_back({{idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)}});
+        }
+    }
+    nuka::runtime::soft::ClothTopologyOptions opts;
+    opts.distance_compliance_alpha = 0.0f;
+    opts.bend_compliance_alpha = p.cloth_bend_alpha;
+    nuka::runtime::soft::XpbdConstraintSet cs;
+    nuka::runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
+
+    in.positions = rest;
+    in.velocities.assign(rest.size(), nuka::math::Vec3::Zero());
+    const float mass = p.cloth_particle_mass > 0.0f ? p.cloth_particle_mass : 0.01f;
+    in.inv_mass.assign(rest.size(), 1.0f / mass);
+    const uint32_t last_i = nx - 1u, last_j = ny - 1u;  // pin the whole perimeter.
+    for (uint32_t k = 0u; k < nx; ++k) {
+        in.inv_mass[idx(k, 0u)] = 0.0f;
+        in.inv_mass[idx(k, last_j)] = 0.0f;
+    }
+    for (uint32_t k = 0u; k < ny; ++k) {
+        in.inv_mass[idx(0u, k)] = 0.0f;
+        in.inv_mass[idx(last_i, k)] = 0.0f;
+    }
+    for (const auto& dc : cs.distance) {
+        in.distance.push_back(
+            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
+    }
+    for (const auto& bc : cs.bend) {
+        nuka::scene::cook::CookBendCon c;
+        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        c.compliance_alpha = bc.compliance_alpha;
+        in.bend.push_back(c);
+    }
+    in.solver_iterations =
+        static_cast<uint16_t>(p.cloth_iters != 0u ? p.cloth_iters : 1u);
+    in.friction = p.cloth_friction;
+    return in;
+}
+
+// Build the fluid PBF cook input from the compact coupled descriptor: an AABB box
+// filled on a uniform lattice by the engine's CookFluidBox, with the uniform-grid
+// domain sized to enclose the box + headroom. Empty input when the fluid is absent.
+nuka::scene::cook::PbfCookInput BuildFluidCookInput(
+    const nuka_coupled_particles_desc_t& p) {
+    nuka::scene::cook::PbfCookInput in;
+    if (p.fluid_spacing <= 0.0f || p.fluid_max_x <= p.fluid_min_x ||
+        p.fluid_max_y <= p.fluid_min_y || p.fluid_max_z <= p.fluid_min_z) {
+        return in;  // no fluid.
+    }
+    nuka::import::cooker::FluidBoxSpec spec;
+    spec.min_corner = {p.fluid_min_x, p.fluid_min_y, p.fluid_min_z};
+    spec.max_corner = {p.fluid_max_x, p.fluid_max_y, p.fluid_max_z};
+    spec.spacing = p.fluid_spacing;
+    spec.rest_density = p.fluid_rest_density > 0.0f ? p.fluid_rest_density : 1000.0f;
+    const nuka::runtime::fluid::PbfParticleSet box =
+        nuka::import::cooker::CookFluidBox(spec);
+
+    in.positions = box.positions;
+    in.velocities.assign(box.positions.size(), nuka::math::Vec3::Zero());
+    in.particle_mass = box.particle_mass;
+    in.rest_density = spec.rest_density;
+    const float h = 1.5f * p.fluid_spacing;  // SPH support over the lattice spacing.
+    in.support_radius = h;
+    in.cfm_epsilon = 1.0e-6f;
+    in.iters = static_cast<uint16_t>(p.fluid_iters != 0u ? p.fluid_iters : 4u);
+    in.clamp_overdensity = true;
+    in.boundary_enabled = true;
+    in.floor_z = p.fluid_floor_z;
+    in.friction = p.fluid_friction;
+    // Uniform-grid domain: enclose the box + lateral/vertical headroom so a particle
+    // pushed out of the box still finds neighbours (the grid is rebuilt per step).
+    const nuka::math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
+    in.grid_min = nuka::math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
+                                   std::min(lo.z, p.fluid_floor_z) - h};
+    auto cells = [h](float extent) {
+        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
+    };
+    in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
+    in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
+    in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
+    return in;
+}
+
+// The cooked products a world-create entry assembles before building the live world:
+// the robot Model, the composed scene, the baked terrain grid, the resolved gravity,
+// the control mode + the validated device. Shared by the scene-only and coupled
+// entries; the coupled entry cooks particles onto `model` before FinishWorldCreate.
+struct PreparedWorld {
+    nuka::nk::Model model;
+    nuka::scene::SceneIR scene;
+    nuka::terrain::HeightField terrain;
+    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
+    articulation::ControlMode control_mode = articulation::ControlMode::PDPosition;
+    DeviceRecord* device_record = nullptr;
+};
+
+// Validate `desc`, load + compose the scene, cook it to an nk::Model, bake the
+// optional heightfield + recompute its budget, and resolve gravity. Returns OK with
+// `out` filled, or the specific error the create contract reports. This is the ONE
+// scene->Model cook path; both create entries call it (the coupled entry then cooks
+// particles onto out->model). MUST be called inside a try (CookToModel may throw).
+nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
+                                   const nuka_world_desc_t* desc,
+                                   PreparedWorld* out) {
+    if (desc == nullptr || desc->scene_path == nullptr || desc->fixed_dt <= 0.0f) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (desc->env_count == 0u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    // Determinism level: 0 = D1/Strong (default), 1 = D2/Weak. Reject other values.
+    // The nk pipeline runs the D1 schedule only; D2 currently selects the same
+    // kernels and is behaviorally identical (NOT a separate path).
+    if (desc->determinism > 1u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    // Control mode: 0 PDPosition + 1 Torque are wired onto the ONE nk::World (presets
+    // of the one affine actuator). The other modes have no op kernel yet -> rejected
+    // NOT_SUPPORTED. A value above the enum range is an outright INVALID_ARG.
+    if (!articulation::IsControlModeImplemented(desc->control_mode)) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    const auto control_mode =
+        static_cast<articulation::ControlMode>(desc->control_mode);
+    if (control_mode != articulation::ControlMode::PDPosition &&
+        control_mode != articulation::ControlMode::Torque) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // preset not yet wired on the nk world.
+    }
+
+    auto* device_record = nuka::c_abi::DeviceTable().Get(device);
+    if (device_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    // The nk::World ctor REQUIRES the phi v2 device/backend acquired at create.
+    if (device_record->phi_device == nullptr || device_record->backend == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    nuka::scene::SceneIR scene;
+    if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &scene)) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    // CO-RESIDENCE: compose the authored scene with itself instance_count times at
+    // distinct XY so the cook emits K SEPARATE articulations co-resident in one env.
+    // 0/1 == single instance -> the loop never runs -> BYTE-IDENTICAL single-artic.
+    if (desc->instance_count > 1u) {
+        const float spacing =
+            (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
+        for (uint32_t i = 1u; i < desc->instance_count; ++i) {
+            nuka::scene::SceneIR replica;
+            if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
+                return NUKA_RESULT_NOT_SUPPORTED;
+            }
+            nuka::math::Transform place = nuka::math::Transform::Identity();
+            place.position.x = spacing * static_cast<float>(i);
+            scene = nuka::scene::Compose(scene, replica, place,
+                                         "dog" + std::to_string(i) + "_");
+        }
+    }
+
+    // Cook the authored scene to an nk::Model (the GENERAL LBVH+cvx narrowphase +
+    // mixed-island solve; CookToModel always returns a PairDriven model). The world
+    // runs EXACTLY the cooked scene physics -- it does NOT inject a synthetic ground.
+    nuka::scene::cook::CookToModelResult cooked =
+        nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
+
+    // Route the declared control mode onto the cooked Model's drive_mode (PDPosition
+    // -> 0 position-PD kernel, Torque -> 1 direct-torque kernel). PDPosition is a
+    // no-op (drive_mode defaults to 0 => the PD goldens stay byte-identical).
+    cooked.model.drive_mode =
+        (control_mode == articulation::ControlMode::Torque) ? 1u : 0u;
+
+    // When the caller requests a baked heightfield (contact_family == 1), build the
+    // ONE source-of-truth HeightField -- from a grayscale IMAGE if set, else the
+    // parametric generator -- then cook it. A zero-init desc => flat => byte-identical
+    // to no terrain. The obs/spawn sampler reads the SAME grid (stored on the record).
+    nuka::terrain::HeightField cooked_terrain;
+    if (desc->contact_family == 1u) {
+        nuka::nk::Model& m = cooked.model;
+        const uint32_t orig_bodies = m.capacities.bodies_per_env;
+        m.body_init.resize(orig_bodies);  // heightfield seeds at orig_bodies.
+        const uint32_t nrow =
+            desc->heightfield_nrow != 0u ? desc->heightfield_nrow : 41u;
+        const uint32_t ncol =
+            desc->heightfield_ncol != 0u ? desc->heightfield_ncol : 41u;
+        const float cell =
+            desc->heightfield_cell > 0.0f ? desc->heightfield_cell : 0.25f;
+
+        const bool image_path = desc->heightfield_image_path != nullptr &&
+                                desc->heightfield_image_path[0] != '\0';
+        if (image_path) {
+            // The grid is centred at the world origin (corner = -radius); a malformed
+            // image is a LOUD INVALID_ARG, never a silent flat fallback.
+            const float rx = desc->heightfield_radius_x > 0.0f
+                                 ? desc->heightfield_radius_x
+                                 : 0.5f * static_cast<float>(ncol - 1u) * cell;
+            const float ry = desc->heightfield_radius_y > 0.0f
+                                 ? desc->heightfield_radius_y
+                                 : 0.5f * static_cast<float>(nrow - 1u) * cell;
+            std::string err;
+            if (!nuka::terrain::LoadHeightFieldFromImage(
+                    desc->heightfield_image_path, rx, ry,
+                    desc->heightfield_elevation_z, desc->heightfield_base_z,
+                    nuka::math::Vec3{-rx, -ry, 0.0f}, cooked_terrain, err)) {
+                return NUKA_RESULT_INVALID_ARG;
+            }
+        } else {
+            // Parametric: the generator fills the grid ONCE from the desc knobs. The
+            // heightfield_terrain_type is a LEGACY selector the C-ABI maps to
+            // parametric feature amplitudes (the engine has no terrain types).
+            nuka::terrain::TerrainGenConfig cfg;
+            cfg.nrow = nrow;
+            cfg.ncol = ncol;
+            cfg.cell_x = cell;
+            cfg.cell_y = cell;
+            const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell;
+            const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell;
+            cfg.origin = nuka::math::Vec3{-half_x, -half_y, 0.0f};
+            cfg.base_z = cooked.model.ground_height;
+            switch (desc->heightfield_terrain_type) {
+                case 1u:  // stairs (climbing rings).
+                    cfg.ring_rise = desc->terrain_step_height;
+                    cfg.ring_width = desc->terrain_step_width;
+                    cfg.ring_platform = desc->terrain_platform_width;
+                    cfg.ring_count = 8u;
+                    break;
+                case 2u:  // pit (descending rings).
+                    cfg.ring_rise = -desc->terrain_step_height;
+                    cfg.ring_width = desc->terrain_step_width;
+                    cfg.ring_platform = desc->terrain_platform_width;
+                    cfg.ring_count = 8u;
+                    break;
+                case 3u:  // hashed bumps.
+                    cfg.bump_height = desc->terrain_grid_height_max;
+                    cfg.bump_cell = desc->terrain_grid_width;
+                    break;
+                case 4u:  // tiled multi-feature field (the complex scene).
+                    cfg.ring_rise = desc->terrain_step_height;
+                    cfg.ring_width = desc->terrain_step_width;
+                    cfg.ring_platform = desc->terrain_platform_width;
+                    cfg.ring_count = 8u;
+                    cfg.bump_height = desc->terrain_grid_height_max;
+                    cfg.bump_cell = desc->terrain_grid_width;
+                    cfg.feature_cell = 5.0f;
+                    cfg.feature_margin = 0.6f;
+                    break;
+                case 5u:  // curriculum tile grid (level rows x type cols).
+                    cfg.ring_rise = desc->terrain_step_height;
+                    cfg.ring_width = desc->terrain_step_width;
+                    cfg.ring_platform = desc->terrain_platform_width;
+                    cfg.bump_height = desc->terrain_grid_height_max;
+                    cfg.bump_cell = desc->terrain_grid_width;
+                    cfg.feature_cell = desc->terrain_feature_cell > 0.0f
+                                           ? desc->terrain_feature_cell
+                                           : 6.0f;
+                    cfg.feature_margin = 0.6f;
+                    cfg.curric_levels = desc->curric_levels;
+                    cfg.curric_types = desc->curric_types;
+                    break;
+                default:  // 0 flat: every amplitude 0.
+                    break;
+            }
+            if (!nuka::terrain::GenerateHeightField(cfg, cooked_terrain)) {
+                return NUKA_RESULT_INVALID_ARG;
+            }
+        }
+        nuka::scene::cook::CookHeightfieldGrid(m, cooked_terrain);
+
+        nuka::nk::ModelCapacities& cap = m.capacities;
+        // bodies_per_env (the LBVH leaf count) includes every static terrain
+        // collidable; the CONTACT budget is driven by the DYNAMIC collidables (+1 for
+        // the static ground) at 4 candidate slots each -- the SAME rule the cook uses.
+        cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
+        cap.max_bodies_total = static_cast<uint32_t>(m.shape_table_rows.size());
+        constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+        constexpr uint32_t kStaticCollidables = 1u;
+        const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
+        const uint32_t rigid_base =
+            dynamic_collidables * kCandidatePairsPerCollidable;
+        cap.max_contacts_per_env = rigid_base;
+        cap.max_rows_per_env =
+            cap.max_contacts_per_env * nuka::nk::kPairDrivenRowsPerSlot;
+        // A coupled world (terrain AND particles) keeps the body<->particle slot
+        // reserve disjoint above the just-recomputed rigid base -- the SAME additive
+        // rule the cook uses. No-op when particles_per_env == 0.
+        nuka::scene::cook::GrowContactBudgetForParticles(cap, rigid_base);
+    }
+
+    // Resolve world gravity (Z-up). A zero-initialized desc substitutes the shared
+    // standard-Earth default; any non-zero component takes the caller's full vector.
+    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
+    if (desc->gravity_x != 0.0f || desc->gravity_y != 0.0f ||
+        desc->gravity_z != 0.0f) {
+        gravity = {desc->gravity_x, desc->gravity_y, desc->gravity_z};
+    }
+
+    out->model = std::move(cooked.model);
+    out->scene = std::move(scene);
+    out->terrain = std::move(cooked_terrain);
+    out->gravity = gravity;
+    out->control_mode = control_mode;
+    out->device_record = device_record;
+    return NUKA_RESULT_OK;
+}
+
+// Build the live WorldRecord from a cooked Model + the composed scene and insert it
+// into the WorldTable. Shared by the scene-only and the coupled (scene + particles)
+// create entries so the record assembly is ONE path -- the coupled entry differs only
+// in cooking particles onto `cooked_model` before this runs. On success writes `out`
+// and returns OK; on a failed World build returns INTERNAL and leaves `out` null.
+nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
+                                nuka::scene::SceneIR&& scene,
+                                nuka::terrain::HeightField&& cooked_terrain,
+                                DeviceRecord* device_record, float fixed_dt,
+                                uint32_t env_count,
+                                articulation::ControlMode control_mode,
+                                const nuka::math::Vec3& gravity,
+                                nuka_world_handle* out) {
+    auto record = std::make_unique<WorldRecord>();
+    record->device = device_record;
+    record->env_count = env_count;
+    record->control_mode = control_mode;
+    record->cooked_terrain = std::move(cooked_terrain);  // obs/spawn read this.
+    record->step_options.dt = fixed_dt;
+    record->step_options.gravity = gravity;
+
+    nuka::nk::Pipeline::SolverConfig cfg;
+    cfg.dt = fixed_dt;
+    cfg.gravity[0] = gravity.x;
+    cfg.gravity[1] = gravity.y;
+    cfg.gravity[2] = gravity.z;
+
+    record->world = std::make_unique<nuka::nk::World>(
+        std::move(cooked_model), env_count, device_record->phi_device,
+        device_record->backend, cfg);
+    if (!record->world->Ready()) {
+        return NUKA_RESULT_INTERNAL;
+    }
+
+    // Transitional host mirror for the diffsim backward + set_link_mass + DR
+    // (host dI/dmass + spatial-inertia rebuild). HOST-ONLY -- device writes target
+    // the nk arena. Particles carry no articulation, so this covers the robot only.
+    CaptureArticulationHostMirror(scene, record.get());
+
+    // Retain the FINAL composed scene so a camera-sensor attach builds the per-env
+    // visual binding from the SAME ECS the cook saw (host data only).
+    record->scene = std::make_unique<nuka::scene::SceneIR>(std::move(scene));
+
+    *out = WorldTable().Insert(std::move(record));
+    return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
+}
+
 }  // namespace
 
 }  // namespace nuka::c_abi
@@ -139,278 +522,94 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         return NUKA_RESULT_INVALID_ARG;
     }
     *out = nullptr;
-    if (desc == nullptr || desc->scene_path == nullptr || desc->fixed_dt <= 0.0f) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    if (desc->env_count == 0u) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    // Determinism level: 0 = D1/Strong (default), 1 = D2/Weak. Reject other
-    // values defensively. M10 NAMED GAP: the nk::World pipeline runs the D1
-    // schedule only; the Weak (D2) escape hatch is RL-adjacent and is rebuilt on
-    // the nk world at M10. Today D2 selects the same (D1) kernels and is
-    // behaviorally identical, so we accept it but it is NOT a separate path.
-    if (desc->determinism > 1u) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    // Control mode (T1 unified-actuator wire): 0 = PDPosition and 1 = Torque are
-    // both wired onto the ONE generic nk::World -- OpApplyDrives carries both the
-    // position-PD kernel (mode 0) and the direct-torque kernel (mode 1), selected
-    // by model.drive_mode, which we route from desc->control_mode below. These are
-    // PRESETS of the one affine actuator, not separate solver paths. The remaining
-    // modes (2 Velocity / 3 ComputedTorque / 4 Osc / 5 Actuator) have no op kernel
-    // on the unified world yet -> still rejected with NOT_SUPPORTED rather than
-    // silently mis-actuate (the affine evaluator + those presets land in a later
-    // phase). A value ABOVE the enum's range is an outright INVALID_ARG.
-    if (!nuka::runtime::articulation::IsControlModeImplemented(
-            desc->control_mode)) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    const auto control_mode = static_cast<nuka::runtime::articulation::ControlMode>(
-        desc->control_mode);
-    if (control_mode != nuka::runtime::articulation::ControlMode::PDPosition &&
-        control_mode != nuka::runtime::articulation::ControlMode::Torque) {
-        return NUKA_RESULT_NOT_SUPPORTED;  // preset not yet wired on the nk world.
-    }
-
-    auto* device_record = nuka::c_abi::DeviceTable().Get(device);
-    if (device_record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    // The DeviceRecord acquired the phi v2 device/backend at create (M9 T2). The
-    // nk::World ctor REQUIRES them (it borrows the backend); do NOT re-init.
-    if (device_record->phi_device == nullptr || device_record->backend == nullptr) {
-        return NUKA_RESULT_NOT_SUPPORTED;
-    }
-
     try {
-        nuka::scene::SceneIR scene;
-        if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &scene)) {
-            return NUKA_RESULT_NOT_SUPPORTED;
+        nuka::c_abi::PreparedWorld prepared;
+        const nuka_result_t prep =
+            nuka::c_abi::PrepareWorldFromDesc(device, desc, &prepared);
+        if (prep != NUKA_RESULT_OK) {
+            return prep;
+        }
+        // Build + insert the live world (the shared record-assembly path).
+        return nuka::c_abi::FinishWorldCreate(
+            std::move(prepared.model), std::move(prepared.scene),
+            std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
+            desc->env_count, prepared.control_mode, prepared.gravity, out);
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_create_coupled_from_scene(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    const nuka_coupled_particles_desc_t* particles, nuka_world_handle* out) {
+    if (out == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    *out = nullptr;
+    if (particles == nullptr) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    try {
+        // Cook the robot + scene through the SAME path the scene-only entry uses.
+        nuka::c_abi::PreparedWorld prepared;
+        const nuka_result_t prep =
+            nuka::c_abi::PrepareWorldFromDesc(device, desc, &prepared);
+        if (prep != NUKA_RESULT_OK) {
+            return prep;
         }
 
-        // M10 CO-RESIDENCE (dog-dog collision foundation, owner bottom line):
-        // compose the authored scene with itself instance_count times at distinct
-        // XY so the cook emits K SEPARATE articulations co-resident in one env (the
-        // WP1/WP5-8 multi-dog path). A reload per replica (not a copy) mirrors
-        // tests/scenario/multi_dog_costep.cpp::CookKFloatDogs exactly. 0/1 ==
-        // single instance -> the loop body never runs -> the scene + cook are
-        // BYTE-IDENTICAL to every legacy single-articulation create (D1 safe).
-        if (desc->instance_count > 1u) {
-            const float spacing =
-                (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
-            for (uint32_t i = 1u; i < desc->instance_count; ++i) {
-                nuka::scene::SceneIR replica;
-                if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
-                    return NUKA_RESULT_NOT_SUPPORTED;
-                }
-                nuka::math::Transform place = nuka::math::Transform::Identity();
-                place.position.x = spacing * static_cast<float>(i);
-                scene = nuka::scene::Compose(scene, replica, place,
-                                             "dog" + std::to_string(i) + "_");
+        // Build the two media's cook inputs from the compact C descriptor (reusing
+        // the engine's cloth-topology + fluid-box cookers -- NO duplicated cook math).
+        const bool has_cloth = particles->cloth_nx >= 2u &&
+                               particles->cloth_ny >= 2u &&
+                               particles->cloth_spacing > 0.0f;
+        const bool has_fluid =
+            particles->fluid_spacing > 0.0f &&
+            particles->fluid_max_x > particles->fluid_min_x &&
+            particles->fluid_max_y > particles->fluid_min_y &&
+            particles->fluid_max_z > particles->fluid_min_z;
+        if (!has_cloth && !has_fluid) {
+            // A particle-free world must use nuka_world_create_from_scene.
+            return NUKA_RESULT_INVALID_ARG;
+        }
+
+        nuka::scene::cook::XpbdCookInput cloth =
+            nuka::c_abi::BuildClothCookInput(*particles);
+        nuka::scene::cook::PbfCookInput fluid =
+            nuka::c_abi::BuildFluidCookInput(*particles);
+
+        // Contact diameter = 2*contact_radius, or the smaller present medium's lattice
+        // spacing when 0 (a particle is then half a cell) so a defaults-only world
+        // still couples. Routed through the cook's contact block, NOT poked after, so
+        // the cook widens the union neighbor grid to cover it.
+        float contact_d_min = 2.0f * particles->contact_radius;
+        if (contact_d_min <= 0.0f) {
+            if (has_cloth) contact_d_min = particles->cloth_spacing;
+            if (has_fluid) {
+                contact_d_min =
+                    (contact_d_min > 0.0f)
+                        ? std::min(contact_d_min, particles->fluid_spacing)
+                        : particles->fluid_spacing;
             }
         }
+        nuka::scene::cook::SoftFluidContactInput contact;
+        contact.contact_d_min = contact_d_min;
 
-        // Cook the authored scene to an nk::Model (mirrors recorder.cpp). The
-        // unified world runs EXACTLY the cooked scene physics -- it does NOT inject
-        // a synthetic ground. A scene that wants seated feet authors a ground at or
-        // above the feet (or requests a baked heightfield, below). go2_stand.usda
-        // authors NO ground -> its feet (z ~ 0.28) float above z = 0 -> no
-        // foot-ground reaction -> the world reproduces the owner MJX golden's
-        // free-space fixed-base PD stance to 1e-4 (the golden's ground truth).
-        // Auto-seating would load the feet and diverge the golden by ~1 rad -- i.e.
-        // it would change the physics the golden pins, and is a per-scene
-        // special-case the unified-world directive forbids.
-        // ONE-GENERAL-SOLVER landing (L1-b): the FUSED runtime is DELETED, so every
-        // world cooks through the GENERAL LBVH+cvx narrowphase + mixed-island solve
-        // (CookToModel always returns a PairDriven model). desc->contact_family no
-        // longer selects FUSED-vs-general (it is retained in the struct, removed in a
-        // later milestone); it now only requests the baked-heightfield collidable
-        // (below), the surface the general feet collide against.
-        nuka::scene::cook::CookToModelResult cooked = nuka::scene::cook::CookToModel(
-            scene, static_cast<int>(desc->env_count));
+        // Cook the media onto the robot Model via the ONE general particle cook (the
+        // [soft|fluid] layout); the disjoint body<->particle slot reserve sits above
+        // the rigid budget the prepare step set.
+        nuka::scene::cook::CookSoftFluidParticles(prepared.model, desc->env_count,
+                                                  cloth, fluid, contact);
 
-        // T1 (unified-actuator wire): route the declared control mode onto the
-        // cooked Model's drive_mode, which the Pipeline copies into the ApplyDrives
-        // op params (pipeline.cpp: p_apply_drives_.mode = model.drive_mode).
-        // PDPosition -> 0 (position-PD kernel), Torque -> 1 (direct-torque kernel).
-        // CookToModel defaults drive_mode to 0, so for PDPosition this assignment is
-        // a no-op (the op graph + every drive byte is unchanged => the PD goldens
-        // stay byte-identical). For Torque it flips the ApplyDrives op to the torque
-        // preset that already lives in OpApplyDrives.
-        cooked.model.drive_mode =
-            (control_mode == nuka::runtime::articulation::ControlMode::Torque) ? 1u
-                                                                               : 0u;
-
-        // On the general path the feet have NO analytic terrain to detect against;
-        // they collide with a real STATIC heightfield collidable. When the caller
-        // requests a baked heightfield (contact_family == 1), build the ONE source-
-        // of-truth HeightField -- from a grayscale IMAGE if heightfield_image_path is
-        // set, else from the parametric generator selected by heightfield_terrain_type
-        // and the terrain_* knobs -- then cook it. The obs/spawn sampler reads the
-        // SAME grid (stored on the record), so obs and physics agree by construction.
-        // A zero-init desc => a flat parametric grid => byte-identical to no terrain.
-        nuka::terrain::HeightField cooked_terrain;
-        if (desc->contact_family == 1u) {
-            nuka::nk::Model& m = cooked.model;
-            const uint32_t orig_bodies = m.capacities.bodies_per_env;
-            m.body_init.resize(orig_bodies);  // heightfield seeds at orig_bodies.
-            const uint32_t nrow =
-                desc->heightfield_nrow != 0u ? desc->heightfield_nrow : 41u;
-            const uint32_t ncol =
-                desc->heightfield_ncol != 0u ? desc->heightfield_ncol : 41u;
-            const float cell =
-                desc->heightfield_cell > 0.0f ? desc->heightfield_cell : 0.25f;
-
-            const bool image_path = desc->heightfield_image_path != nullptr &&
-                                    desc->heightfield_image_path[0] != '\0';
-            if (image_path) {
-                // Load the grayscale height map. A malformed/unsupported image is a
-                // LOUD INVALID_ARG, never a silent flat fallback. The grid is centred
-                // at the world origin (corner = -radius), matching the parametric path.
-                const float rx = desc->heightfield_radius_x > 0.0f
-                                     ? desc->heightfield_radius_x
-                                     : 0.5f * static_cast<float>(ncol - 1u) * cell;
-                const float ry = desc->heightfield_radius_y > 0.0f
-                                     ? desc->heightfield_radius_y
-                                     : 0.5f * static_cast<float>(nrow - 1u) * cell;
-                std::string err;
-                if (!nuka::terrain::LoadHeightFieldFromImage(
-                        desc->heightfield_image_path, rx, ry,
-                        desc->heightfield_elevation_z, desc->heightfield_base_z,
-                        nuka::math::Vec3{-rx, -ry, 0.0f}, cooked_terrain, err)) {
-                    return NUKA_RESULT_INVALID_ARG;
-                }
-            } else {
-                // Parametric: the generator fills the grid ONCE from the desc knobs.
-                nuka::terrain::TerrainGenConfig cfg;
-                cfg.nrow = nrow;
-                cfg.ncol = ncol;
-                cfg.cell_x = cell;
-                cfg.cell_y = cell;
-                const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell;
-                const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell;
-                cfg.origin = nuka::math::Vec3{-half_x, -half_y, 0.0f};
-                cfg.base_z = cooked.model.ground_height;
-                // The desc's heightfield_terrain_type is a LEGACY selector the C-ABI
-                // maps to parametric feature amplitudes -- the engine has no terrain
-                // types (MuJoCo hfield model). 0 flat, 1 stairs, 2 pit, 3 boxes, 4
-                // composite (the tiled multi-feature field). The terrain_* knobs are
-                // the shared feature parameters.
-                switch (desc->heightfield_terrain_type) {
-                    case 1u:  // stairs (climbing rings).
-                        cfg.ring_rise = desc->terrain_step_height;
-                        cfg.ring_width = desc->terrain_step_width;
-                        cfg.ring_platform = desc->terrain_platform_width;
-                        cfg.ring_count = 8u;
-                        break;
-                    case 2u:  // pit (descending rings).
-                        cfg.ring_rise = -desc->terrain_step_height;
-                        cfg.ring_width = desc->terrain_step_width;
-                        cfg.ring_platform = desc->terrain_platform_width;
-                        cfg.ring_count = 8u;
-                        break;
-                    case 3u:  // hashed bumps.
-                        cfg.bump_height = desc->terrain_grid_height_max;
-                        cfg.bump_cell = desc->terrain_grid_width;
-                        break;
-                    case 4u:  // tiled multi-feature field (the complex scene).
-                        cfg.ring_rise = desc->terrain_step_height;
-                        cfg.ring_width = desc->terrain_step_width;
-                        cfg.ring_platform = desc->terrain_platform_width;
-                        cfg.ring_count = 8u;
-                        cfg.bump_height = desc->terrain_grid_height_max;
-                        cfg.bump_cell = desc->terrain_grid_width;
-                        cfg.feature_cell = 5.0f;
-                        cfg.feature_margin = 0.6f;
-                        break;
-                    case 5u:  // curriculum tile grid (level rows x type cols).
-                        cfg.ring_rise = desc->terrain_step_height;
-                        cfg.ring_width = desc->terrain_step_width;
-                        cfg.ring_platform = desc->terrain_platform_width;
-                        cfg.bump_height = desc->terrain_grid_height_max;
-                        cfg.bump_cell = desc->terrain_grid_width;
-                        cfg.feature_cell = desc->terrain_feature_cell > 0.0f
-                                               ? desc->terrain_feature_cell
-                                               : 6.0f;
-                        cfg.feature_margin = 0.6f;
-                        cfg.curric_levels = desc->curric_levels;
-                        cfg.curric_types = desc->curric_types;
-                        break;
-                    default:  // 0 flat: every amplitude 0.
-                        break;
-                }
-                if (!nuka::terrain::GenerateHeightField(cfg, cooked_terrain)) {
-                    return NUKA_RESULT_INVALID_ARG;
-                }
-            }
-            nuka::scene::cook::CookHeightfieldGrid(m, cooked_terrain);
-
-            nuka::nk::ModelCapacities& cap = m.capacities;
-            // bodies_per_env (the LBVH leaf count) MUST include every static terrain
-            // collidable -- they are real broadphase leaves a foot pairs against. The
-            // CONTACT budget, however, is driven by the DYNAMIC collidables only: a
-            // static-static pair is filtered (no reaction side), so every solvable
-            // contact has >=1 dynamic side. Budgeting (dynamic + 1) * 4 candidate
-            // slots per env stays bounded as static terrain geometry grows. This is
-            // the SAME per-dynamic-body rule the cook uses; the static ground is +1.
-            cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
-            cap.max_bodies_total =
-                static_cast<uint32_t>(m.shape_table_rows.size());
-            constexpr uint32_t kCandidatePairsPerCollidable = 4u;
-            constexpr uint32_t kStaticCollidables = 1u;
-            const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
-            cap.max_contacts_per_env =
-                dynamic_collidables * kCandidatePairsPerCollidable;
-            cap.max_rows_per_env =
-                cap.max_contacts_per_env * nuka::nk::kPairDrivenRowsPerSlot;
-        }
-
-        // Resolve world gravity (Z-up). A zero-initialized desc (all three 0.0)
-        // substitutes the shared standard-Earth default so a legacy create is
-        // byte-identical; any non-zero component takes the caller's full vector.
-        nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
-        if (desc->gravity_x != 0.0f || desc->gravity_y != 0.0f ||
-            desc->gravity_z != 0.0f) {
-            gravity = {desc->gravity_x, desc->gravity_y, desc->gravity_z};
-        }
-
-        auto record = std::make_unique<nuka::c_abi::WorldRecord>();
-        record->device = device_record;
-        record->env_count = desc->env_count;
-        record->control_mode = control_mode;
-        record->cooked_terrain = std::move(cooked_terrain);  // obs/spawn read this.
-        // dt/gravity scalars for the diffsim RolloutParams + the InvariantWorldView.
-        record->step_options.dt = desc->fixed_dt;
-        record->step_options.gravity = gravity;
-
-        // Solver config for the nk Pipeline. dt/gravity from the desc; the
-        // articulation/contact knobs default from the Model (recorder.cpp seeds
-        // only dt/gravity, the same as here).
-        nuka::nk::Pipeline::SolverConfig cfg;
-        cfg.dt = desc->fixed_dt;
-        cfg.gravity[0] = gravity.x;
-        cfg.gravity[1] = gravity.y;
-        cfg.gravity[2] = gravity.z;
-
-        record->world = std::make_unique<nuka::nk::World>(
-            std::move(cooked.model), desc->env_count, device_record->phi_device,
-            device_record->backend, cfg);
-        if (!record->world->Ready()) {
-            return NUKA_RESULT_INTERNAL;
-        }
-
-        // Transitional host mirror for the diffsim backward + set_link_mass + DR
-        // (host dI/dmass + spatial-inertia rebuild). Byte-identical to the legacy
-        // path (same cook). HOST-ONLY -- device writes target the nk arena.
-        nuka::c_abi::CaptureArticulationHostMirror(scene, record.get());
-
-        // Retain the FINAL composed scene so a camera-sensor attach builds the
-        // per-env visual binding from the SAME ECS the cook saw (host data only).
-        record->scene = std::make_unique<nuka::scene::SceneIR>(std::move(scene));
-
-        *out = nuka::c_abi::WorldTable().Insert(std::move(record));
-        return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
+        // Build + insert the live coupled world (the SAME record-assembly path).
+        return nuka::c_abi::FinishWorldCreate(
+            std::move(prepared.model), std::move(prepared.scene),
+            std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
+            desc->env_count, prepared.control_mode, prepared.gravity, out);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

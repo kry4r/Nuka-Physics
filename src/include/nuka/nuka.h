@@ -190,6 +190,65 @@ typedef struct nuka_world_desc_t {
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                                            const nuka_world_desc_t* desc,
                                            nuka_world_handle* out);
+
+// A COUPLED world: a rigid/articulated robot cooked from `desc->scene_path` PLUS
+// cloth/tet (XPBD) and/or fluid (PBF) particles, all stepping on the ONE general
+// contact pipeline with two-way body<->particle coupling (a robot link is just a
+// collidable body, a particle is a sphere; the medium difference is DATA -- per-
+// system friction). The robot is cooked through the SAME scene->CookToModel path
+// nuka_world_create_from_scene uses; the particles are then cooked onto that Model
+// via the engine's particle cook (no scene-file particle schema yet, so the media
+// are described programmatically here). The world steps/reads/resets through the
+// EXISTING nuka_world_step / nuka_world_get_buffer_view / nuka_world_reset entries;
+// read the live particle state via NUKA_FIELD_PARTICLE_POSITION/_VELOCITY.
+//
+// REACHABILITY SCOPE: this is the create+step+read FLOOR for a coupled world (the
+// demo / sim substrate). Full RL on coupled worlds (obs/action/reward layouts over
+// the particle state) is a separate RL-track follow-on; this entry does NOT add an
+// RL stack -- it makes a coupled world creatable + steppable + readable.
+//
+// A cloth patch is a flat (cloth_nx x cloth_ny) lattice (>=2 each) at
+// cloth_origin_{x,y,z} with cloth_spacing edge; its perimeter is pinned (a taut
+// membrane). A fluid box fills the AABB [fluid_min, fluid_max] at fluid_spacing on a
+// z-up boundary floor at fluid_floor_z. Either medium is OMITTED by leaving its
+// count/extent zero; at least one medium must be present (else INVALID_ARG -- use
+// nuka_world_create_from_scene for a particle-free world).
+typedef struct nuka_coupled_particles_desc_t {
+    // --- cloth (XPBD soft) lattice; cloth_nx == 0 OR cloth_ny == 0 => no cloth ---
+    uint32_t cloth_nx;            // lattice columns (>= 2 to mesh; 0 => no cloth).
+    uint32_t cloth_ny;            // lattice rows (>= 2 to mesh).
+    float    cloth_spacing;       // lattice edge length, m (> 0 when present).
+    float    cloth_origin_x;      // lattice centre X, m.
+    float    cloth_origin_y;      // lattice centre Y, m.
+    float    cloth_origin_z;      // lattice plane Z, m.
+    float    cloth_particle_mass; // per-particle mass, kg (> 0; e.g. 0.01).
+    float    cloth_friction;      // body<->cloth mu (finite => the foot grips/drags).
+    float    cloth_bend_alpha;    // XPBD bend compliance (>= 0; 0 => stiff).
+    uint32_t cloth_iters;         // XPBD solver iterations (0 => 1).
+    // --- fluid (PBF) box; any fluid extent <= 0 => no fluid ---------------------
+    float    fluid_min_x, fluid_min_y, fluid_min_z;  // box min corner, m.
+    float    fluid_max_x, fluid_max_y, fluid_max_z;  // box max corner (> min).
+    float    fluid_spacing;       // lattice spacing / support cell, m (> 0).
+    float    fluid_rest_density;  // rho0, kg/m^3 (> 0; e.g. 1000).
+    float    fluid_floor_z;       // z-up PBF boundary floor, m.
+    float    fluid_friction;      // body<->fluid mu (~0 => the foot slides).
+    uint32_t fluid_iters;         // PBF density iterations (0 => 4).
+    // Particle collision radius for BOTH media: a foot touches a particle when their
+    // spheres overlap. The body<->particle contact d_min == 2*this (0 => engine
+    // default sized from the smaller medium spacing).
+    float    contact_radius;
+} nuka_coupled_particles_desc_t;
+
+// Create a coupled world. `desc` is the same robot/world descriptor
+// nuka_world_create_from_scene takes (scene_path, env_count, dt, gravity, control
+// mode, optional baked heightfield); `particles` describes the coupled media.
+// Steps/reads through the existing world entries. Returns INVALID_ARG if neither
+// medium is present, NOT_SUPPORTED if no CUDA backend, OUT_OF_MEMORY / INTERNAL on
+// a build failure (e.g. the particle contact budget overflowing the slot block).
+nuka_result_t nuka_world_create_coupled_from_scene(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    const nuka_coupled_particles_desc_t* particles, nuka_world_handle* out);
+
 void nuka_world_destroy(nuka_world_handle world);
 nuka_result_t nuka_world_step(nuka_world_handle world);
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count);
@@ -494,7 +553,18 @@ typedef enum nuka_state_field_t {
     // env-major, element_stride_bytes == sizeof(float), dtype == 0 (FLOAT32);
     // slot 0 is the inert root, actuated joints are [1..base_link_count). A write
     // is picked up by the NEXT Step. Persistent => round-trips reset.
-    NUKA_FIELD_JOINT_FEEDFORWARD = 22
+    NUKA_FIELD_JOINT_FEEDFORWARD = 22,
+    // READ (per-particle). The live particle WORLD positions of a coupled world
+    // (cloth/tet/fluid), env-major: float3[env_count * particles_per_env], index
+    // (env * particles_per_env + particle), element_stride_bytes == 3*sizeof(float),
+    // dtype == 0 (FLOAT32). The soft slice occupies [0, n_soft), the fluid slice
+    // [n_soft, particles_per_env) (the cook's [soft|fluid] layout). On a world with
+    // no particles it RESOLVES as an empty view (element_count == 0), not an error.
+    // Read of the coupled medium's state; a write is overwritten by the NEXT Step.
+    NUKA_FIELD_PARTICLE_POSITION = 23,
+    // READ (per-particle). The live particle velocities, same layout/stride/dtype as
+    // NUKA_FIELD_PARTICLE_POSITION; an empty view (element_count == 0) when no particles.
+    NUKA_FIELD_PARTICLE_VELOCITY = 24
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {

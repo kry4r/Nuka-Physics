@@ -236,6 +236,93 @@ public:
         return new World(h, env_count, base_link_count, dt);
     }
 
+    // Create a COUPLED world: a robot cooked from `scene_path` PLUS cloth (XPBD)
+    // and/or fluid (PBF) particles, stepping on the ONE general contact pipeline with
+    // two-way body<->particle coupling. The MINIMAL reachability surface (create +
+    // step + read) for a coupled world; full RL obs/action/reward over the particle
+    // state is a separate RL-track follow-on, NOT built here. Read the live media via
+    // buffer_view(Field.PARTICLE_POSITION / PARTICLE_VELOCITY). A cloth patch is a
+    // flat (cloth_nx x cloth_ny) lattice (perimeter pinned); a fluid box fills an AABB
+    // on a z-up floor; either is omitted by leaving its extent zero (>= one required).
+    static World* create_coupled_from_scene(
+        Device* device, const std::string& scene_path, uint32_t env_count, float dt,
+        uint32_t control_mode, uint32_t contact_family,
+        uint32_t heightfield_terrain_type, float terrain_step_height,
+        float terrain_step_width, float terrain_platform_width,
+        float terrain_grid_width, float terrain_grid_height_max, uint32_t cloth_nx,
+        uint32_t cloth_ny, float cloth_spacing, float cloth_origin_x,
+        float cloth_origin_y, float cloth_origin_z, float cloth_particle_mass,
+        float cloth_friction, float cloth_bend_alpha, uint32_t cloth_iters,
+        float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
+        float fluid_max_y, float fluid_max_z, float fluid_spacing,
+        float fluid_rest_density, float fluid_floor_z, float fluid_friction,
+        uint32_t fluid_iters, float contact_radius) {
+        if (device == nullptr || !device->valid()) {
+            throw std::runtime_error("create_coupled_from_scene: invalid device");
+        }
+        if (control_mode > 1u) {
+            throw std::runtime_error(
+                "create_coupled_from_scene: control_mode must be 0 (PDPosition) or "
+                "1 (Torque)");
+        }
+        nuka_world_desc_t desc{};
+        desc.scene_path = scene_path.c_str();
+        desc.env_count = env_count;
+        desc.fixed_dt = dt;
+        desc.control_mode = static_cast<uint8_t>(control_mode);
+        desc.contact_family = contact_family;  // 1 == bake a heightfield collidable.
+        desc.heightfield_terrain_type = heightfield_terrain_type;
+        desc.terrain_step_height = terrain_step_height;
+        desc.terrain_step_width = terrain_step_width;
+        desc.terrain_platform_width = terrain_platform_width;
+        desc.terrain_grid_width = terrain_grid_width;
+        desc.terrain_grid_height_max = terrain_grid_height_max;
+
+        nuka_coupled_particles_desc_t parts{};
+        parts.cloth_nx = cloth_nx;
+        parts.cloth_ny = cloth_ny;
+        parts.cloth_spacing = cloth_spacing;
+        parts.cloth_origin_x = cloth_origin_x;
+        parts.cloth_origin_y = cloth_origin_y;
+        parts.cloth_origin_z = cloth_origin_z;
+        parts.cloth_particle_mass = cloth_particle_mass;
+        parts.cloth_friction = cloth_friction;
+        parts.cloth_bend_alpha = cloth_bend_alpha;
+        parts.cloth_iters = cloth_iters;
+        parts.fluid_min_x = fluid_min_x;
+        parts.fluid_min_y = fluid_min_y;
+        parts.fluid_min_z = fluid_min_z;
+        parts.fluid_max_x = fluid_max_x;
+        parts.fluid_max_y = fluid_max_y;
+        parts.fluid_max_z = fluid_max_z;
+        parts.fluid_spacing = fluid_spacing;
+        parts.fluid_rest_density = fluid_rest_density;
+        parts.fluid_floor_z = fluid_floor_z;
+        parts.fluid_friction = fluid_friction;
+        parts.fluid_iters = fluid_iters;
+        parts.contact_radius = contact_radius;
+
+        nuka_world_handle h = nullptr;
+        check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
+              "nuka_world_create_coupled_from_scene");
+
+        nuka_buffer_view_t qv{};
+        check(nuka_world_get_buffer_view(h, NUKA_FIELD_JOINT_POSITION, &qv),
+              "nuka_world_get_buffer_view(JOINT_POSITION)");
+        const uint32_t base_link_count =
+            (env_count > 0u) ? (uint32_t)(qv.element_count / env_count) : 0u;
+        World* w = new World(h, env_count, base_link_count, dt);
+        // Cache the per-env particle count from the PARTICLE_POSITION view (env-major,
+        // element_count == env_count * particles_per_env).
+        nuka_buffer_view_t pv{};
+        if (nuka_world_get_buffer_view(h, NUKA_FIELD_PARTICLE_POSITION, &pv) ==
+                NUKA_RESULT_OK &&
+            env_count > 0u) {
+            w->particle_count_ = static_cast<uint32_t>(pv.element_count / env_count);
+        }
+        return w;
+    }
+
     void destroy() {
         if (h_ != nullptr) {
             nuka_world_destroy(h_);
@@ -361,6 +448,9 @@ public:
 
     uint32_t env_count() const { return env_count_; }
     uint32_t base_link_count() const { return base_link_count_; }
+    // Per-env particle count of a coupled world (0 if particle-free). buffer_view(
+    // Field.PARTICLE_POSITION) has element_count == env_count * particle_count.
+    uint32_t particle_count() const { return particle_count_; }
     // action_dim == the number of ACTUATED joint DOFs a policy controls ==
     // base_link_count_ - 1. The engine's JOINT_POSITION / DRIVE_TARGET buffers are
     // base_link_count_ wide; slot 0 is the root link, which on a floating base
@@ -531,6 +621,9 @@ private:
     uint32_t env_count_ = 0u;
     uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
+    // Per-env particle count of a coupled world (0 for a particle-free world); cached
+    // from the PARTICLE_POSITION view at create so a caller can reshape the field.
+    uint32_t particle_count_ = 0u;
     // Last attached camera image size + cameras per env (the (E,S,H,W,ch) shaping).
     uint32_t sensor_width_ = 0u;
     uint32_t sensor_height_ = 0u;
@@ -1117,6 +1210,12 @@ NB_MODULE(_nuka_ext, m) {
         // tau += joint_f in every control mode, after actuator saturation. Same
         // layout/slot map as DRIVE_TARGET; writable zero-copy. Default 0 => no-op.
         .value("JOINT_FEEDFORWARD", NUKA_FIELD_JOINT_FEEDFORWARD)
+        // Coupled-world (cloth/tet/fluid) live particle state (read; per-particle
+        // Vec3, env-major). buffer_view shape (env_count*particles_per_env, 3) float32
+        // -- the soft slice [0, n_soft), the fluid slice [n_soft, P). An empty view
+        // (element_count == 0) on a world with no particles.
+        .value("PARTICLE_POSITION", NUKA_FIELD_PARTICLE_POSITION)
+        .value("PARTICLE_VELOCITY", NUKA_FIELD_PARTICLE_VELOCITY)
         .export_values();
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
@@ -1213,6 +1312,37 @@ NB_MODULE(_nuka_ext, m) {
                     "3=RandomBoxes) and Field.ENV_TERRAIN_DIFFICULTY (default 1.0, "
                     "scales the vertical feature height) via buffer_view. All-zero "
                     "terrain == byte-identical to a world created without terrain.")
+        .def_static(
+            "create_coupled_from_scene", &World::create_coupled_from_scene,
+            nb::arg("device"), nb::arg("scene_path"), nb::arg("env_count") = 1u,
+            nb::arg("dt") = 1.0f / 240.0f, nb::arg("control_mode") = 0u,
+            nb::arg("contact_family") = 0u, nb::arg("heightfield_terrain_type") = 0u,
+            nb::arg("terrain_step_height") = 0.0f, nb::arg("terrain_step_width") = 0.0f,
+            nb::arg("terrain_platform_width") = 0.0f, nb::arg("terrain_grid_width") = 0.0f,
+            nb::arg("terrain_grid_height_max") = 0.0f, nb::arg("cloth_nx") = 0u,
+            nb::arg("cloth_ny") = 0u, nb::arg("cloth_spacing") = 0.0f,
+            nb::arg("cloth_origin_x") = 0.0f, nb::arg("cloth_origin_y") = 0.0f,
+            nb::arg("cloth_origin_z") = 0.0f, nb::arg("cloth_particle_mass") = 0.01f,
+            nb::arg("cloth_friction") = 0.6f, nb::arg("cloth_bend_alpha") = 1.0e-4f,
+            nb::arg("cloth_iters") = 24u, nb::arg("fluid_min_x") = 0.0f,
+            nb::arg("fluid_min_y") = 0.0f, nb::arg("fluid_min_z") = 0.0f,
+            nb::arg("fluid_max_x") = 0.0f, nb::arg("fluid_max_y") = 0.0f,
+            nb::arg("fluid_max_z") = 0.0f, nb::arg("fluid_spacing") = 0.0f,
+            nb::arg("fluid_rest_density") = 1000.0f, nb::arg("fluid_floor_z") = 0.0f,
+            nb::arg("fluid_friction") = 0.0f, nb::arg("fluid_iters") = 4u,
+            nb::arg("contact_radius") = 0.0f, nb::rv_policy::take_ownership,
+            "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
+            "and/or fluid (PBF) particles, stepping on the ONE general contact "
+            "pipeline with two-way body<->particle coupling. The MINIMAL create + "
+            "step + read floor for a coupled world (full RL obs/action over the "
+            "particle state is a separate follow-on, NOT here). Read the live media "
+            "via buffer_view(Field.PARTICLE_POSITION / PARTICLE_VELOCITY); "
+            "particle_count gives the per-env count. A cloth patch is a flat "
+            "(cloth_nx x cloth_ny) perimeter-pinned lattice at cloth_origin_*; a "
+            "fluid box fills the AABB [fluid_min, fluid_max] on a z-up floor at "
+            "fluid_floor_z. Omit a medium by leaving its extent zero (>= one "
+            "required). contact_family == 1 also bakes a heightfield collidable "
+            "(the same terrain_* knobs create_from_scene takes).")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
@@ -1252,6 +1382,11 @@ NB_MODULE(_nuka_ext, m) {
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)
+        .def_prop_ro("particle_count", &World::particle_count,
+                     "Per-env particle count of a coupled world (0 if particle-free). "
+                     "buffer_view(Field.PARTICLE_POSITION) has element_count == "
+                     "env_count * particle_count, each element a Vec3 (the soft slice "
+                     "[0,n_soft), the fluid slice [n_soft,particle_count)).")
         .def_prop_ro("action_dim", &World::action_dim,
                      "Actuated joint DOFs a policy controls (12 for Go2) == "
                      "base_link_count - 1. The DRIVE_TARGET / JOINT_POSITION "

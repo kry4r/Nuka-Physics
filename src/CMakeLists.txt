@@ -1367,6 +1367,10 @@ if(CMAKE_CUDA_COMPILER)
             # nuka_scene_cook transitively pulls nuka_nk + nuka_scene +
             # nuka_articulation; nks::Load lives in nuka_import (already linked).
             nuka_scene_cook
+            # The coupled-world create entry (c_abi/world.cpp) reuses the cloth-
+            # topology + fluid-box cookers (BuildClothConstraints / CookFluidBox),
+            # which live in nuka_runtime_gpu, to build the particle cook inputs.
+            nuka_runtime_gpu
             # The device-resident batched camera-sensor surface (c_abi/sensor.cpp):
             # nuka_render = the cook->visual bridge (BuildRenderWorld /
             # RenderWorldToTwoLevelScene + the SensorBackendI interface);

@@ -73,6 +73,13 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
 uint32_t CookHeightfieldGrid(nk::Model& model,
                              const ::nuka::terrain::HeightField& hf);
 
+// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
+// body<->body slot count) for body<->particle rows; idempotent, byte-identical when
+// particles_per_env == 0 (the reserve is then 0). The c_abi terrain cook recomputes
+// the rigid base after appending terrain collidables and re-applies this so a world
+// with BOTH terrain and particles keeps the rigid + particle slot ranges disjoint.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base);
+
 // ---------------------------------------------------------------------------
 // M6 — particle cook (plan §3.10 "粒子 XPBD/PBF"). Stage an XPBD soft body or a
 // PBF fluid into the nk::Model particle block + set the particle/constraint
