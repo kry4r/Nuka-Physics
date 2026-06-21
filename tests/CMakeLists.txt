@@ -985,6 +985,9 @@ if(CMAKE_CUDA_COMPILER)
         # lift) and a dynamic presser is arrested by the cloth (body-side reaction
         # lambda>0 vs a no-cloth control) -- all via the body<->particle row solver.
         scenario/cloth_presser_two_way.cpp
+        # 3D soft tet body <-> rigid two-way coupling on the same body<->particle row
+        # a cloth particle uses (deform + rest-on-floor reaction + volume recovery).
+        scenario/soft_tet_presser_two_way.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
