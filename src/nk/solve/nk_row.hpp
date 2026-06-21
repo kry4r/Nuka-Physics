@@ -45,6 +45,15 @@ inline constexpr uint32_t kNkSideArtic    = 1u;  // ArticulationChainJ
 inline constexpr uint32_t kNkSideParticle = 2u;  // ParticleInvMass
 inline constexpr uint32_t kNkSideStatic   = 3u;  // StaticNull
 
+// Per-contact-slot side-kind tag for the unified contact buffer's a/b index
+// channel. It declares what each ucontact_a/b index ADDRESSES so the row
+// assembly resolves the side before any body-row table lookup: a body-local
+// collidable row (resolved via shape_table -> Static/Rigid/Artic) or a global
+// particle id (resolved against the particle state). The zero default is the
+// body-row meaning, so a zero-initialized slot resolves exactly as before.
+inline constexpr uint32_t kUContactSideBody     = 0u;  // index = body-local row
+inline constexpr uint32_t kUContactSideParticle = 1u;  // index = global particle
+
 namespace nk_row_flags {
 inline constexpr uint32_t kActive   = 1u << 0;  // slot live this step (watermark)
 inline constexpr uint32_t kFriction = 1u << 1;  // pyramid spoke (vs normal row)

@@ -210,6 +210,8 @@ struct DataView {
     ::nuka::math::Vec3* body_pseudo_angular_velocity = nullptr;  // per:body arena:scratch owner:data
     ::nuka::math::Vec3* particle_pseudo_vel = nullptr;  // per:particle arena:scratch owner:data
     float* row_pseudo_lambda = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* ucontact_a_kind = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
+    uint32_t* ucontact_b_kind = nullptr;  // per:contact_slot arena:scratch owner:data elem:4
 };
 
 } // namespace nuka::phi

@@ -499,22 +499,30 @@ constexpr uint32_t kPdPtsPerSlot = nk::kPairDrivenPtsPerSlot;   // 4
 constexpr uint32_t kPdSpokes     = nk::kPairDrivenSpokesPerPt;  // 4
 constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
 
-// Resolve a collidable body row -> reaction side. body_id == -1 (from shape_table)
-// is static; an articulation-link body row resolves to (real artic id, owning
-// global link); a free-rigid body row resolves to the rigid side. Returns the
-// side kind; out_artic / out_link valid only for the artic kind; out_body for
-// the rigid kind. env-major: body_to_* are TEMPLATE-local (per:body), so the
-// global body row == env*bodies_per_env + local; the global link == env*base_link
-// + template_link; the global artic == env*artics_per_env + local_artic.
-__device__ uint32_t ResolvePairSide(const float* shape_table,
+// Resolve a contact side -> reaction side. The side-kind TAG (nk::kUContactSide*)
+// is consulted FIRST: it declares whether `index` is a body-local collidable row
+// or a global particle id, so a non-body index never reaches the shape_table
+// body-row lookup. For a body-local index: body_id == -1 (from shape_table) is
+// static; an articulation-link body row resolves to (real artic id, owning global
+// link); a free-rigid body row resolves to the rigid side. Returns the side kind;
+// out_artic / out_link valid only for the artic kind; out_body for the rigid kind.
+// env-major: body_to_* are TEMPLATE-local (per:body), so the global body row ==
+// env*bodies_per_env + local; the global link == env*base_link + template_link;
+// the global artic == env*artics_per_env + local_artic.
+__device__ uint32_t ResolvePairSide(uint32_t side_kind,
+                                    const float* shape_table,
                                     const uint32_t* body_to_link,
                                     const uint32_t* body_to_articulation,
-                                    uint32_t env, uint32_t local_body,
+                                    uint32_t env, uint32_t index,
                                     uint32_t bodies_per_env, uint32_t base_link_count,
                                     uint32_t artics_per_env,
                                     uint32_t* out_artic, uint32_t* out_link,
                                     uint32_t* out_body) {
     *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u;
+    if (side_kind != nk::kUContactSideBody) {
+        return kNkSideStatic;  // non-body channel: no body-row reaction here.
+    }
+    const uint32_t local_body = index;
     const PrimShapeDev s = LoadPrimShape(shape_table, local_body);
     if (s.body_id < 0) {
         return kNkSideStatic;  // static ground / heightfield collidable.
@@ -566,6 +574,8 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ ucontact_depth,
     const uint32_t* __restrict__ ucontact_a,
     const uint32_t* __restrict__ ucontact_b,
+    const uint32_t* __restrict__ ucontact_a_kind,
+    const uint32_t* __restrict__ ucontact_b_kind,
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ shape_table,
     const uint32_t* __restrict__ body_to_link,
@@ -599,18 +609,26 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t art_a = ~0u, link_a = ~0u, body_a = ~0u;
     uint32_t art_b = ~0u, link_b = ~0u, body_b = ~0u;
     uint32_t local_a = ~0u, local_b = ~0u;
+    uint32_t side_kind_a = nk::kUContactSideBody, side_kind_b = nk::kUContactSideBody;
     int32_t bid_a = -1, bid_b = -1;
     if (n_active > 0u) {
         local_a = ucontact_a[static_cast<size_t>(gid) * 4u];
         local_b = ucontact_b[static_cast<size_t>(gid) * 4u];
-        bid_a = LoadPrimShape(shape_table, local_a).body_id;
-        bid_b = LoadPrimShape(shape_table, local_b).body_id;
-        kind_a = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
-                                 env, local_a, bodies_per_env, base_link_count,
-                                 artics_per_env, &art_a, &link_a, &body_a);
-        kind_b = ResolvePairSide(shape_table, body_to_link, body_to_articulation,
-                                 env, local_b, bodies_per_env, base_link_count,
-                                 artics_per_env, &art_b, &link_b, &body_b);
+        side_kind_a = ucontact_a_kind[static_cast<size_t>(gid) * 4u];
+        side_kind_b = ucontact_b_kind[static_cast<size_t>(gid) * 4u];
+        // body_id only meaningful for a body-local index (material read below).
+        bid_a = (side_kind_a == nk::kUContactSideBody)
+                    ? LoadPrimShape(shape_table, local_a).body_id : -1;
+        bid_b = (side_kind_b == nk::kUContactSideBody)
+                    ? LoadPrimShape(shape_table, local_b).body_id : -1;
+        kind_a = ResolvePairSide(side_kind_a, shape_table, body_to_link,
+                                 body_to_articulation, env, local_a, bodies_per_env,
+                                 base_link_count, artics_per_env, &art_a, &link_a,
+                                 &body_a);
+        kind_b = ResolvePairSide(side_kind_b, shape_table, body_to_link,
+                                 body_to_articulation, env, local_b, bodies_per_env,
+                                 base_link_count, artics_per_env, &art_b, &link_b,
+                                 &body_b);
     }
     const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
                           : (kind_a == kNkSideRigid) ? body_a : ~0u;
@@ -857,6 +875,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.ucontact_depth),
                    static_cast<const uint32_t*>(data.ucontact_a),
                    static_cast<const uint32_t*>(data.ucontact_b),
+                   static_cast<const uint32_t*>(data.ucontact_a_kind),
+                   static_cast<const uint32_t*>(data.ucontact_b_kind),
                    static_cast<const math::Transform*>(data.body_pose),
                    static_cast<const float*>(model.shape_table),
                    static_cast<const uint32_t*>(model.body_to_link),

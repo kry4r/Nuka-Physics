@@ -223,6 +223,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // body_pseudo_angular_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_pseudo_vel
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_pseudo_lambda
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_a_kind
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_b_kind
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {
