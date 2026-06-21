@@ -560,6 +560,8 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
                     qd[r] += w[r] * delta;
                 }
             } else if (dyn && wlane == 0u) {
+                // Particle pseudo-vel feeds the body side's split-impulse; the particle's
+                // own position is owned by its medium (XPBD/PBF), not integrated here.
                 if (code & kSlimDynParticle) {
                     if (particle_pseudo_vel != nullptr &&
                         particle_inv_mass != nullptr) {
