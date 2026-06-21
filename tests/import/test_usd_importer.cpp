@@ -150,12 +150,14 @@ TEST(UsdImporter, LoadsTextUsdExtensionThroughAdapter) {
     std::filesystem::remove(usd_path);
 }
 
-TEST(UsdImporter, BinaryUsdExtensionReportsOpenUsdSdkAdapterRequirement) {
+TEST(UsdImporter, NonCrateBinaryUsdReportsOpenUsdSdkAdapterRequirement) {
+    // A binary .usd that is NOT a USDC crate (no PXR-USDC magic, not text) is not
+    // natively readable and must report the OpenUSD SDK adapter requirement.
     const auto usd_path = TempUsdPath("nuka_binary_scene.usd");
     {
         std::ofstream out(usd_path, std::ios::binary);
-        out << "PXR-USDC";
-        out.put('\0');
+        const unsigned char bytes[] = {0x00, 0x01, 0x02, 0x03, 0x7f, 0x80, 0xfe, 0xff};
+        out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
     }
 
     const std::string message = ExceptionTextForLoadUsd(usd_path.string());
@@ -166,12 +168,15 @@ TEST(UsdImporter, BinaryUsdExtensionReportsOpenUsdSdkAdapterRequirement) {
     std::filesystem::remove(usd_path);
 }
 
-TEST(UsdImporter, UsdcAndUsdzRouteThroughOpenUsdSdkAdapterDiagnostics) {
+TEST(UsdImporter, UsdcReadsViaCrateReaderAndUsdzRequiresOpenUsdAdapter) {
+    // .usdc routes to the self-written crate reader (a malformed crate yields a
+    // "USDC:" diagnostic); .usdz is not crate-readable -> OpenUSD adapter required.
     const auto usdc_path = TempUsdPath("nuka_scene.usdc");
     const auto usdz_path = TempUsdPath("nuka_scene.usdz");
     {
         std::ofstream usdc(usdc_path, std::ios::binary);
         usdc << "PXR-USDC";
+        usdc.put('\0');
         std::ofstream usdz(usdz_path, std::ios::binary);
         usdz << "PK";
     }
@@ -179,8 +184,8 @@ TEST(UsdImporter, UsdcAndUsdzRouteThroughOpenUsdSdkAdapterDiagnostics) {
     const std::string usdc_message = ExceptionTextForLoadUsd(usdc_path.string());
     const std::string usdz_message = ExceptionTextForLoadUsd(usdz_path.string());
 
-    EXPECT_NE(usdc_message.find("OpenUSD SDK adapter"), std::string::npos);
     EXPECT_NE(usdc_message.find("USDC"), std::string::npos);
+    EXPECT_EQ(usdc_message.find("OpenUSD SDK adapter"), std::string::npos);
     EXPECT_NE(usdz_message.find("OpenUSD SDK adapter"), std::string::npos);
     EXPECT_NE(usdz_message.find("USDZ"), std::string::npos);
 
