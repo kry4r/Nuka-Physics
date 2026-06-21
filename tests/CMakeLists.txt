@@ -485,6 +485,26 @@ add_test(NAME VisualMeshCook
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(VisualMeshCook PROPERTIES LABELS "full")
 
+# Fluid marching-cubes isosurface mesher (runtime::fluid::MarchFluidSurface).
+# HOST-ONLY (no Vulkan device / no CUDA): runs the mesher as a pure function of a
+# synthetic settled-pool / sphere particle set and asserts determinism (D1),
+# watertight-ish closure, envelope tracking, and unit gradient normals. Links
+# nuka_render (where the mesher lives) like the visual-mesh cook gate above.
+add_executable(nuka_fluid_surface_mesher_test
+    runtime/test_fluid_surface_mesher.cpp
+)
+target_include_directories(nuka_fluid_surface_mesher_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(nuka_fluid_surface_mesher_test
+    PRIVATE
+        nuka_render
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_fluid_surface_mesher_test
+    PROPERTIES LABELS "fast_full")
+
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test
     runtime/test_world_build.cpp
