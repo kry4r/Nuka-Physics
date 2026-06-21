@@ -29,6 +29,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
 #include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
@@ -51,6 +52,25 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // per-env candidate-slot capacity == collidable_count * this. Named (not a baked
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
 constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+
+// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
+// body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base) {
+    if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
+    const uint64_t reserve =
+        static_cast<uint64_t>(cap.particles_per_env) *
+        collision::gpu::kBodyParticleContactSlotsPerParticle;
+    const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
+    if (total > 0xFFFFFFFFull ||
+        total * nk::kPairDrivenRowsPerSlot > 0xFFFFFFFFull) {
+        throw std::runtime_error(
+            "CookToModel: body<->particle contact budget overflows u32 "
+            "(too many particles for the per-env contact slot block)");
+    }
+    cap.max_contacts_per_env = static_cast<uint32_t>(total);
+    cap.max_rows_per_env =
+        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+}
 
 // M7 T5b — resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
@@ -1185,6 +1205,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
         }
     }
 
+    const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     cap.dist_cons_per_env = dn;
     cap.bend_cons_per_env = bn;
@@ -1192,6 +1213,9 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     cap.shape_match_slots_per_env   = scn;
     cap.shape_match_members_per_env =
         static_cast<uint32_t>(mp.sm_particles.size());
+    // Reserve a disjoint body<->particle slot sub-range above the rigid budget
+    // (no-op when there are no body contacts -> particle-only cooks byte-identical).
+    GrowContactBudgetForParticles(cap, rigid_base);
     // n_soft_particles is left at its default (0); it is only consulted for the
     // SoftFluid mode (CookSoftFluidParticles sets it). The single-system Xpbd
     // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
@@ -1234,10 +1258,14 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     mp.boundary_enabled = in.boundary_enabled;
     mp.floor_z = in.floor_z;
 
+    const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     // Per-env uniform-grid cell capacity (sizes grid_cell_start/end; the
     // ParticleGridBuild op fails loudly if the live dims exceed it).
     cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
+    // Reserve a disjoint body<->particle slot sub-range above the rigid budget
+    // (no-op when there are no body contacts -> particle-only cooks byte-identical).
+    GrowContactBudgetForParticles(cap, rigid_base);
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1278,9 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+    // The body<->body budget before any particle growth; the final reserve recomputes
+    // from this for the full [soft|fluid] count so the soft slice is not double-counted.
+    const uint32_t rigid_base = cap.max_contacts_per_env;
 
     // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
     // byte-identical to the single-system cook (so the existing single-system
@@ -1334,6 +1365,9 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     cap.particles_per_env = n_soft + n_fluid;
     cap.max_grid_cells =
         fluid.grid_dims[0] * fluid.grid_dims[1] * fluid.grid_dims[2];
+    // Reserve a disjoint body<->particle slot sub-range above the rigid budget for
+    // the FULL union (recomputed from rigid_base, overriding the inner soft growth).
+    GrowContactBudgetForParticles(cap, rigid_base);
 }
 
 } // namespace nuka::scene::cook

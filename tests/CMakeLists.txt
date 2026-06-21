@@ -966,6 +966,14 @@ if(CMAKE_CUDA_COMPILER)
         # mu) grips (friction lambda>0 + tangential bounded), the fluid slice (mu~0)
         # slides (friction lambda~0 + tangential free) while its normal row still brakes.
         scenario/body_particle_friction.cpp
+        # Body<->particle contact-BUDGET disjointness: a cooked scene with a static
+        # ground box, a dynamic box on it (a body<->body contact), AND >= 64 particles
+        # whose reserve dwarfs the rigid candidate budget. The cook grows
+        # max_contacts_per_env additively so the rigid [0, rigid_cap) and body<->particle
+        # [rigid_cap, total) slot sub-ranges are disjoint -- the rigid contact SURVIVES
+        # the particle writes (pre-reserve it was clobbered). + a particle over its
+        # body-contact slots flags kEnvStatusPairOverflow LOUD (no silent drop).
+        scenario/body_particle_budget_disjoint.cpp
         # SoftFluid finalize composition: a soft particle braked by a static-floor
         # coupling row must STAY braked through a FULL World::Step. The SoftFluid
         # finalize reproduces the projection velocity AND composes the contact

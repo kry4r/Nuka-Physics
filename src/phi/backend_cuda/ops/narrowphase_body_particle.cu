@@ -314,7 +314,9 @@ __global__ void NarrowphaseBodyParticleKernel(
     const amf::PrimParams ps = MakeParticleSphere(center, radius);
     uint32_t written = 0u;
     uint32_t emitted_points = 0u;
-    for (uint32_t ci = 0u; ci < ncand && written < pp.cands_per_particle; ++ci) {
+    // Walk all gathered candidates: write the first cands_per_particle (deterministic
+    // ascending-body order), flag any excess loud via kEnvStatusPairOverflow.
+    for (uint32_t ci = 0u; ci < ncand; ++ci) {
         const uint32_t body = cand[ci];
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
         const math::Transform xb = body_pose[env * N + body];
@@ -352,6 +354,12 @@ __global__ void NarrowphaseBodyParticleKernel(
         }
         if (m.point_count == 0u) continue;
 
+        // More real body contacts than reserved slots: keep the first
+        // cands_per_particle (deterministic order) and flag the drop loud.
+        if (written >= pp.cands_per_particle) {
+            if (env_status != nullptr) atomicOr(&env_status[env], kEnvStatusPairOverflow);
+            continue;
+        }
         const uint32_t slot = slot0 + written;
         if (slot >= pp.slot_stride) {
             if (env_status != nullptr) atomicOr(&env_status[env], kEnvStatusPairOverflow);

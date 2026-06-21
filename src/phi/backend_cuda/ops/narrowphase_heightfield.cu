@@ -480,7 +480,9 @@ __global__ void NarrowphaseHeightfieldKernel(
     const uint32_t env = gid / hp.slot_stride;
     const uint32_t slot = gid - env * hp.slot_stride;
     const uint32_t live = pair_count[env];
-    if (slot >= live || slot >= hp.slot_stride) return;  // not a live candidate.
+    // Body<->body candidates fill [0, rigid_slot_cap); slots above belong to the
+    // body<->particle narrowphase (== slot_stride when no particles -> identical).
+    if (slot >= live || slot >= hp.rigid_slot_cap) return;  // not a live candidate.
 
     const uint32_t a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
     const uint32_t b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];

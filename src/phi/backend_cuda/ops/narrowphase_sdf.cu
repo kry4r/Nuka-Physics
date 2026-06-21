@@ -215,6 +215,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t env_count,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
+                                    uint32_t rigid_slot_cap,
                                     uint32_t k,
                                     float margin,
                                     uint32_t* __restrict__ ucount,
@@ -232,7 +233,9 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
     if (gid >= total) return;
     const uint32_t env = gid / slot_stride;
     const uint32_t slot = gid - env * slot_stride;
-    if (slot >= pair_count[env]) return;  // not a live candidate.
+    // Body<->body candidates fill [0, rigid_slot_cap); slots above belong to the
+    // body<->particle narrowphase (== slot_stride when no particles -> identical).
+    if (slot >= pair_count[env] || slot >= rigid_slot_cap) return;
 
     // Own ONLY slots the analytic/cvx (NarrowphasePrimitives) + heightfield ops
     // left EMPTY: a hull body may ALSO carry an SDF grid (the cook binds sdf_grid
@@ -342,6 +345,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                static_cast<const math::Vec3*>(model.sdf_cell_gradients),
                static_cast<const math::Transform*>(data.body_pose),
                p->env_count, p->bodies_per_env, p->max_contacts_per_env,
+               p->rigid_slot_cap,
                static_cast<uint32_t>(p->max_contacts_per_pair), p->contact_margin,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
