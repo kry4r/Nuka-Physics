@@ -3070,6 +3070,39 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # Soft<->rigid coupling headline clip: a soft tet ball (a sphere rest-lattice
+    # tessellated into distance + volume tets) dropped onto a static ground plane on
+    # the ONE general body<->particle row solver. STEPS nk::World on CUDA and renders
+    # the live deforming surface mesh on the CUDA RT backend (--gpu --beauty) or
+    # lavapipe raster. Links the tet topology builder (nuka_runtime_gpu) + the CUDA
+    # ray tracer (nuka_phi2_rt) + the full physics + render stack.
+    add_executable(nuka_soft_ball_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/soft_ball_demo.cpp
+    )
+    add_dependencies(nuka_soft_ball_demo nuka_codegen)
+    target_compile_definitions(nuka_soft_ball_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_soft_ball_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_soft_ball_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # Go2 HANDSTAND (倒立) hero clip -- the same offscreen GO2W-replay renderer as
     # go2_walk_video (Load(go2.nks) -> CookToModel SceneMap -> BuildRenderWorld ->
     # drive each visual instance from the dumped per-sub-step link_pose), but with a
