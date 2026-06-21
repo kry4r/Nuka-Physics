@@ -30,7 +30,10 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -264,6 +267,103 @@ TEST(XpbdCookerDeterminism, RepeatedCooksAreByteIdentical) {
             EXPECT_EQ(ConstraintBytes(CookXpbdSoftBody(spec)), golden)
                 << "cook run " << run << " differs byte-wise";
         }
+    }
+}
+
+// --- Sphere rest-lattice tetrahedraliser -----------------------------------
+
+TEST(TetLatticeSphere, BoundaryIsWatertightSingleComponent) {
+    using nuka::runtime::soft::BuildSphereTetLattice;
+    using nuka::runtime::soft::ExtractBoundaryTriangles;
+    using nuka::runtime::soft::TetLattice;
+    const float radius = 0.10f;
+    const uint32_t cells = 8u;
+    const float cell_len = 2.0f * radius / static_cast<float>(cells);
+    const TetLattice lat =
+        BuildSphereTetLattice(Vec3{0, 0, 0}, radius, cells, cell_len);
+    ASSERT_FALSE(lat.tets.empty());
+    ASSERT_FALSE(lat.rest.empty());
+    for (const Vec3& p : lat.rest)  // every kept vertex is inside the radius.
+        EXPECT_LE(p.LengthSq(), radius * radius + 1.0e-6f);
+
+    const std::vector<uint32_t> tris = ExtractBoundaryTriangles(lat.rest, lat.tets);
+    ASSERT_FALSE(tris.empty());
+    ASSERT_EQ(tris.size() % 3u, 0u);
+
+    // Watertight closed manifold: every undirected edge is shared by exactly two
+    // boundary triangles (no boundary/crack edges, no non-manifold edges).
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> edge_count;
+    auto add_edge = [&](uint32_t a, uint32_t b) {
+        if (a > b) std::swap(a, b);
+        ++edge_count[{a, b}];
+    };
+    for (size_t t = 0; t + 2 < tris.size(); t += 3) {
+        add_edge(tris[t], tris[t + 1]);
+        add_edge(tris[t + 1], tris[t + 2]);
+        add_edge(tris[t + 2], tris[t]);
+    }
+    uint32_t open = 0u, nonmanifold = 0u;
+    for (const auto& kv : edge_count) {
+        if (kv.second == 1u) ++open;
+        else if (kv.second != 2u) ++nonmanifold;
+    }
+    EXPECT_EQ(open, 0u) << "boundary surface has open (crack) edges";
+    EXPECT_EQ(nonmanifold, 0u) << "boundary surface has non-manifold edges";
+
+    // Euler characteristic of a closed sphere-topology surface is 2 (one shell).
+    std::set<uint32_t> used;
+    for (uint32_t v : tris) used.insert(v);
+    const int V = static_cast<int>(used.size());
+    const int E = static_cast<int>(edge_count.size());
+    const int F = static_cast<int>(tris.size() / 3u);
+    EXPECT_EQ(V - E + F, 2) << "boundary is not a single closed shell";
+}
+
+// --- Embedded smooth skin over a tet cage ----------------------------------
+
+TEST(EmbeddedSkin, RestReconstructsAndIsRigidMotionExact) {
+    using nuka::runtime::soft::BuildIcosphere;
+    using nuka::runtime::soft::BuildSphereTetLattice;
+    using nuka::runtime::soft::DeformEmbeddedSkin;
+    using nuka::runtime::soft::EmbeddedSkin;
+    using nuka::runtime::soft::EmbedSurfaceInTetCage;
+    using nuka::runtime::soft::TetLattice;
+    using nuka::runtime::soft::TriMesh;
+
+    const float radius = 0.10f;
+    const uint32_t cells = 8u;
+    const float cell_len = 2.0f * radius / static_cast<float>(cells);
+    const TetLattice lat = BuildSphereTetLattice(Vec3{0, 0, 0}, radius, cells, cell_len);
+    const TriMesh skin = BuildIcosphere(Vec3{0, 0, 0}, radius, 3u);
+    ASSERT_FALSE(skin.positions.empty());
+
+    uint32_t extrapolated = 0u;
+    const EmbeddedSkin e = EmbedSurfaceInTetCage(skin.positions, skin.triangles,
+                                                 lat.rest, lat.tets, &extrapolated);
+    ASSERT_EQ(e.binds.size(), skin.positions.size());
+    ASSERT_EQ(e.triangles, skin.triangles);
+
+    // Rest reconstruction: the stored bind reproduces each skin vertex at rest.
+    std::vector<Vec3> recon;
+    DeformEmbeddedSkin(e, lat.rest, recon);
+    ASSERT_EQ(recon.size(), skin.positions.size());
+    for (size_t v = 0; v < recon.size(); ++v) {
+        EXPECT_NEAR(recon[v].x, skin.positions[v].x, 1e-5f);
+        EXPECT_NEAR(recon[v].y, skin.positions[v].y, 1e-5f);
+        EXPECT_NEAR(recon[v].z, skin.positions[v].z, 1e-5f);
+    }
+
+    // Rigid-motion exactness: translating every cage vertex translates every skin
+    // vertex by the SAME vector (affine blend, weights sum to 1).
+    const Vec3 shift{0.37f, -0.21f, 0.58f};
+    std::vector<Vec3> moved = lat.rest;
+    for (Vec3& p : moved) p += shift;
+    std::vector<Vec3> recon_moved;
+    DeformEmbeddedSkin(e, moved, recon_moved);
+    for (size_t v = 0; v < recon_moved.size(); ++v) {
+        EXPECT_NEAR(recon_moved[v].x, skin.positions[v].x + shift.x, 1e-5f);
+        EXPECT_NEAR(recon_moved[v].y, skin.positions[v].y + shift.y, 1e-5f);
+        EXPECT_NEAR(recon_moved[v].z, skin.positions[v].z + shift.z, 1e-5f);
     }
 }
 
