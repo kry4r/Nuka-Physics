@@ -310,6 +310,36 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
+        // Body/artic <-> particle narrowphase. Runs AFTER the rigid narrowphase
+        // (which filled the rigid candidate slots [0, pair_count) racily) and BEFORE
+        // AssembleRows. It treats each particle as a SPHERE of its radius and writes
+        // its body manifolds into a RESERVED contact-slot sub-range at the TOP of the
+        // per-env block, deterministic relative to the rigid slots (the cross-stream
+        // ordering guard). The particle collision radius is the cooked d_min/2 (the
+        // same uniform radius the particle-particle co-step uses). Gated on actual
+        // particles; a particle-free world emits no op -> byte-identical.
+        if (has_particles) {
+            const uint32_t cands_per_particle = 4u;  // reserved body slots / particle.
+            const uint32_t reserve =
+                cap.particles_per_env * cands_per_particle;
+            // Reserve the TOP `reserve` slots for particles; rigid slots grow from 0.
+            const uint32_t particle_base =
+                cap.max_contacts_per_env > reserve
+                    ? (cap.max_contacts_per_env - reserve) : 0u;
+            p_np_body_particle_.family = family;
+            p_np_body_particle_.env_count = env_count;
+            p_np_body_particle_.bodies_per_env = cap.bodies_per_env;
+            p_np_body_particle_.particles_per_env = cap.particles_per_env;
+            p_np_body_particle_.slot_stride = cap.max_contacts_per_env;
+            p_np_body_particle_.particle_slot_base = particle_base;
+            p_np_body_particle_.cands_per_particle = cands_per_particle;
+            // A particle is a sphere of d_min/2 on the ONE path (the cooked uniform
+            // contact radius); 0 leaves the op inert (no collision radius cooked).
+            p_np_body_particle_.particle_radius = 0.5f * mp.pp_contact_d_min;
+            p_np_body_particle_.contact_margin = cfg.contact_margin;
+            add(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle_);
+        }
+
         // ContactTangentBasis: the ONE general PairDriven path. The op builds the
         // tangents over the unified contact buffer (ucontact_*).
         p_tangent_.slot_count = slot_count;

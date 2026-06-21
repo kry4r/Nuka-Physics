@@ -661,6 +661,9 @@ if(CMAKE_CUDA_COMPILER)
         # the cooked `heights` grid, never an in-kernel SampleTerrainHeight).
         # PairDriven-family-gated (inert for UnionCsr).
         phi/backend_cuda/ops/narrowphase_heightfield.cu
+        # Body/artic <-> soft/fluid particle narrowphase (particle = sphere on the
+        # ONE path; PairDriven-family-gated).
+        phi/backend_cuda/ops/narrowphase_body_particle.cu
         # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
         # + generalized pair-driven narrowphase (analytic prim set + sphere x
         # hull) + the SDF main path (SAMP x cooked sparse SDF grid). Ports of
