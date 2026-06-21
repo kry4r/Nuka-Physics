@@ -106,8 +106,19 @@ RenderBeautyKernel(PinholeCamera camera,
         const Vec3 hit{ray.origin.x + bt * ray.dir.x, ray.origin.y + bt * ray.dir.y,
                        ray.origin.z + bt * ray.dir.z};
         const Vec3 Vv = RtNormalize<Real>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
-        Vec3 col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
-                               light, sky, hit, Nf, Vv, mat, &rng);
+        Vec3 col;
+        if (mat.transmission > 0.0f) {
+            // Dielectric arm: smooth normal + Fresnel reflect/refract + Beer; the
+            // __noinline__ shader keeps the opaque (transmission==0) frame byte-exact.
+            const Vec3 sn = SmoothWorldNormal(instances, bp, u, v, n);
+            const float tv = sn.x * (-ray.dir.x) + sn.y * (-ray.dir.y) + sn.z * (-ray.dir.z);
+            const Vec3 Nt = (tv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
+            col = ShadeTransmissive(tlas_nodes, tlas_leaf_count, instances, materials,
+                                    light, sky, hit, Nt, Vv, mat, &rng);
+        } else {
+            col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
+                              light, sky, hit, Nf, Vv, mat, &rng);
+        }
         // Height/distance fog toward the sky-horizon: blend by 1-exp(-density*t).
         if (sky.fog_density > 0.0f) {
             const float f = 1.0f - expf(-sky.fog_density * bt);

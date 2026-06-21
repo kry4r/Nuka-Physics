@@ -20,6 +20,7 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "render/mesh_normals.hpp"
 #include "render/render_world.hpp"
 #include "render/rt_adapter.hpp"
 #include "render/rt_backend.hpp"
@@ -31,8 +32,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace nuka;
@@ -57,6 +61,32 @@ render::MeshGeometry BoxGeometry(math::Vec3 he) {
         4,5,6, 4,6,7,   0,3,2, 0,2,1,   1,2,6, 1,6,5,
         0,4,7, 0,7,3,   2,3,7, 2,7,6,   0,1,5, 0,5,4,
     };
+    return g;
+}
+
+// A coarse UV sphere as positions + indices -- faceted enough that smooth
+// per-vertex normals visibly diverge from the flat per-face fallback.
+render::MeshGeometry SphereGeometry(float radius, uint32_t rings, uint32_t sectors) {
+    render::MeshGeometry g;
+    for (uint32_t r = 0; r <= rings; ++r) {
+        const float theta = static_cast<float>(r) / static_cast<float>(rings) * kPi;
+        for (uint32_t s = 0; s <= sectors; ++s) {
+            const float phi = static_cast<float>(s) / static_cast<float>(sectors) * 2.0f * kPi;
+            const float x = std::sin(theta) * std::cos(phi);
+            const float y = std::cos(theta);
+            const float z = std::sin(theta) * std::sin(phi);
+            g.positions.push_back(radius * x);
+            g.positions.push_back(radius * y);
+            g.positions.push_back(radius * z);
+        }
+    }
+    const uint32_t stride = sectors + 1u;
+    for (uint32_t r = 0; r < rings; ++r) {
+        for (uint32_t s = 0; s < sectors; ++s) {
+            const uint32_t a = r * stride + s, b = a + stride;
+            g.indices.insert(g.indices.end(), {a, a + 1u, b, b, a + 1u, b + 1u});
+        }
+    }
     return g;
 }
 
@@ -293,4 +323,289 @@ TEST(RenderWorldRt, NonTrivialCoverage) {
     EXPECT_EQ(fb.width, kW);
     EXPECT_EQ(fb.height, kH);
     EXPECT_GT(HitPixels(fb), 0u) << "rendered frame has no geometry";
+}
+
+// ---------------------------------------------------------------------------
+// Smooth-normal + refractive-dielectric beauty coverage: an opaque transmission==0
+// no-op gate, a transmissive slab that bends + Beer-darkens the background, and a
+// transmissive sphere whose refraction shifts when per-vertex normals are supplied.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kRW = 200u;
+constexpr uint32_t kRH = 200u;
+
+// Order-independent FNV-1a checksum over a float buffer's raw bytes (the no-op
+// gate prints this so a clean-tree run can be compared bit-for-bit).
+uint64_t Fnv1a(const std::vector<float>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const auto* p = reinterpret_cast<const unsigned char*>(v.data());
+    const size_t n = v.size() * sizeof(float);
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+void WritePpm(const rt::Framebuffer& fb, const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%u %u\n255\n", fb.width, fb.height);
+    std::vector<unsigned char> row(static_cast<size_t>(fb.width) * 3u);
+    for (uint32_t y = 0; y < fb.height; ++y) {
+        for (uint32_t x = 0; x < fb.width; ++x) {
+            const size_t i = (static_cast<size_t>(y) * fb.width + x) * 3u;
+            for (int c = 0; c < 3; ++c) {
+                float v = fb.color[i + c];
+                v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                row[x * 3u + c] = static_cast<unsigned char>(v * 255.0f + 0.5f);
+            }
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+}
+
+rt::BeautyOptions FixedBeauty() {
+    rt::BeautyOptions o;
+    o.samples = 8u;
+    o.shadow_rays = 2u;
+    o.ao_samples = 2u;
+    o.gi_bounces = 1u;
+    o.seed = 0x1234abcdu;
+    o.transmit_bounces = 2u;
+    return o;
+}
+
+// Camera looking along +Y at a back wall, with room for a slab in between.
+rt::PinholeCamera RefractCamera() {
+    return rt::BuildPinhole({0.0f, -3.0f, 0.6f}, {0.0f, 1.5f, 0.6f},
+                            {0.0f, 0.0f, 1.0f}, 0.40f * kPi, kRW, kRH);
+}
+
+// A back wall with a bright vertical bar (the background "feature" refraction
+// bends), plus an optional transmissive slab in front. transmission/absorption/
+// slab_hy parameterize the dielectric; transmission<=0 => an opaque control slab.
+render::RenderWorld BuildRefractWorld(bool with_slab, float transmission, float absorption,
+                                      float slab_hy) {
+    render::RenderWorld world;
+    const uint32_t wall = world.meshes.InternPrimitive(
+        "wall", [] { return BoxGeometry({2.5f, 0.05f, 1.6f}); });
+    const uint32_t bar = world.meshes.InternPrimitive(
+        "bar", [] { return BoxGeometry({0.18f, 0.04f, 1.2f}); });
+
+    world.materials.push_back(MakeMat(0.20f, 0.22f, 0.26f, 0.0f, 0.8f));  // 0 grey wall
+    world.materials.push_back(MakeMat(0.95f, 0.80f, 0.10f, 0.0f, 0.4f));  // 1 bright bar
+    // 2 = slab material. transmission>0 => a CLEAR liquid (near-zero albedo, its look
+    // is refraction+Fresnel+Beer); transmission==0 => a mid-grey opaque control slab.
+    const bool clear = transmission > 0.0f;
+    scene::RenderMaterial slab = clear ? MakeMat(0.02f, 0.03f, 0.04f, 0.0f, 0.05f)
+                                       : MakeMat(0.55f, 0.57f, 0.60f, 0.0f, 0.3f);
+    slab.transmission = transmission;
+    slab.ior = 1.33f;
+    slab.absorption[0] = absorption; slab.absorption[1] = absorption * 0.6f;
+    slab.absorption[2] = absorption * 0.4f;
+    world.materials.push_back(slab);
+
+    render::RenderInstance wi; wi.mesh_id = wall; wi.render_material_id = 0u;
+    wi.world_xform = {{0.0f, 1.6f, 0.6f}, math::Quat::Identity()};
+    world.instances.push_back(wi);
+
+    render::RenderInstance bi; bi.mesh_id = bar; bi.render_material_id = 1u;
+    bi.world_xform = {{0.0f, 1.55f, 0.6f}, math::Quat::Identity()};
+    world.instances.push_back(bi);
+
+    if (with_slab) {
+        const uint32_t slab_mesh = world.meshes.InternPrimitive(
+            "slab" + std::to_string(slab_hy),
+            [slab_hy] { return BoxGeometry({1.0f, slab_hy, 1.0f}); });
+        render::RenderInstance si; si.mesh_id = slab_mesh; si.render_material_id = 2u;
+        si.world_xform = {{0.0f, -0.2f, 0.6f}, math::Quat::Identity()};
+        world.instances.push_back(si);
+    }
+
+    render::RenderLight light;
+    light.color = {1.0f, 0.98f, 0.95f}; light.intensity = 4.0f;
+    light.world_xform = {{-1.5f, -2.0f, 2.5f}, math::Quat::Identity()};
+    world.lights.push_back(light);
+    return world;
+}
+
+float MeanLuma(const rt::Framebuffer& fb) {
+    double s = 0.0; const size_t n = fb.color.size() / 3u;
+    for (size_t i = 0; i < n; ++i) {
+        s += 0.2126 * fb.color[i * 3] + 0.7152 * fb.color[i * 3 + 1] +
+             0.0722 * fb.color[i * 3 + 2];
+    }
+    return n ? static_cast<float>(s / static_cast<double>(n)) : 0.0f;
+}
+
+// Mean luma over the central column band where the slab covers the bright bar.
+float CenterBandLuma(const rt::Framebuffer& fb) {
+    double s = 0.0; size_t cnt = 0;
+    const uint32_t x0 = fb.width * 3u / 8u, x1 = fb.width * 5u / 8u;
+    const uint32_t y0 = fb.height / 4u, y1 = fb.height * 3u / 4u;
+    for (uint32_t y = y0; y < y1; ++y) {
+        for (uint32_t x = x0; x < x1; ++x) {
+            const size_t i = (static_cast<size_t>(y) * fb.width + x) * 3u;
+            s += 0.2126 * fb.color[i] + 0.7152 * fb.color[i + 1] + 0.0722 * fb.color[i + 2];
+            ++cnt;
+        }
+    }
+    return cnt ? static_cast<float>(s / static_cast<double>(cnt)) : 0.0f;
+}
+
+// transmission==0 NO-OP GATE: a fixed-seed beauty render of the OPAQUE test world.
+// Prints an FNV checksum of the color buffer so a clean-tree run proves the bytes
+// are unchanged by this change (the opaque path takes no transmissive branch).
+TEST(RenderWorldRtBeauty, OpaqueBeautyNoOpChecksum) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+
+    const render::RenderWorld world = BuildTestRenderWorld();
+    const rt::TwoLevelScene scene = render::RenderWorldToTwoLevelScene(world);
+    const rt::PinholeCamera camera = TestCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+
+    render::RtSceneHandle* h = backend->BuildScene(scene);
+    ASSERT_NE(h, nullptr);
+    const rt::Framebuffer a = backend->TraceBeautyToHost(h, scene, camera, opt);
+    const rt::Framebuffer b = backend->TraceBeautyToHost(h, scene, camera, opt);
+    backend->FreeScene(h);
+
+    EXPECT_TRUE(FramebuffersByteEqual(a, b)) << "fixed-seed beauty not reproducible";
+    std::printf("OPAQUE_BEAUTY_COLOR_FNV1A=%llu\n",
+                static_cast<unsigned long long>(Fnv1a(a.color)));
+    WritePpm(a, "out/rt_opaque_beauty.ppm");
+    EXPECT_GT(MeanLuma(a), 0.0f);
+}
+
+// REFRACTION: a transmissive slab in front of a bright bar must (a) shift/alter the
+// covered pixels vs both the no-slab and an opaque-slab control (bent background),
+// and (b) darken with more absorption (Beer-Lambert).
+TEST(RenderWorldRtBeauty, RefractionBendsBackgroundAndBeerDarkens) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+    const rt::PinholeCamera camera = RefractCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+
+    const auto trace = [&](const render::RenderWorld& w) {
+        const rt::TwoLevelScene s = render::RenderWorldToTwoLevelScene(w);
+        render::RtSceneHandle* h = backend->BuildScene(s);
+        const rt::Framebuffer fb = backend->TraceBeautyToHost(h, s, camera, opt);
+        backend->FreeScene(h);
+        return fb;
+    };
+
+    const rt::Framebuffer no_slab = trace(BuildRefractWorld(false, 0.0f, 0.0f, 0.4f));
+    const rt::Framebuffer opaque  = trace(BuildRefractWorld(true, 0.0f, 0.0f, 0.4f));
+    const rt::Framebuffer clear   = trace(BuildRefractWorld(true, 1.0f, 0.0f, 0.4f));
+    const rt::Framebuffer tinted  = trace(BuildRefractWorld(true, 1.0f, 1.5f, 0.4f));
+
+    WritePpm(no_slab, "out/rt_refract_no_slab.ppm");
+    WritePpm(opaque,  "out/rt_refract_opaque_slab.ppm");
+    WritePpm(clear,   "out/rt_refract_clear_liquid.ppm");
+    WritePpm(tinted,  "out/rt_refract_beer_tinted.ppm");
+
+    const size_t n = clear.color.size() / 3u;
+
+    // (a) TRANSMITS vs hides: where the slab covers the bright bar, the clear liquid
+    // shows the bar's warm chroma (R+G) through it; the opaque grey slab blocks it.
+    const float clear_band  = CenterBandLuma(clear);
+    const float opaque_band = CenterBandLuma(opaque);
+    std::printf("CENTER_BAND_LUMA clear=%.5f opaque=%.5f no_slab=%.5f\n",
+                clear_band, opaque_band, CenterBandLuma(no_slab));
+    size_t clear_vs_opaque = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float dr = std::fabs(clear.color[i * 3] - opaque.color[i * 3]);
+        const float dg = std::fabs(clear.color[i * 3 + 1] - opaque.color[i * 3 + 1]);
+        const float db = std::fabs(clear.color[i * 3 + 2] - opaque.color[i * 3 + 2]);
+        if (dr + dg + db > 0.06f) ++clear_vs_opaque;
+    }
+    std::printf("CLEAR_VS_OPAQUE_DIFF_PIXELS=%zu of %zu\n", clear_vs_opaque, n);
+    EXPECT_GT(clear_vs_opaque, n / 20u)
+        << "clear liquid must look different from an opaque slab (it transmits)";
+
+    // (a') Refraction BENDS: the clear-slab image differs from the no-slab image in
+    // the covered region (the bar is shifted/distorted), not a passthrough copy.
+    size_t diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float d = std::fabs(clear.color[i * 3 + 1] - no_slab.color[i * 3 + 1]);
+        if (d > 0.02f) ++diff;
+    }
+    std::printf("REFRACT_DIFF_PIXELS=%zu of %zu\n", diff, n);
+    EXPECT_GT(diff, n / 100u) << "clear slab must visibly refract (bend) the background";
+
+    // (b) Beer-Lambert: more absorption darkens the transmitted band.
+    const float clear_l = CenterBandLuma(clear), tinted_l = CenterBandLuma(tinted);
+    std::printf("BEER center clear=%.5f tinted=%.5f\n", clear_l, tinted_l);
+    EXPECT_LT(tinted_l, clear_l * 0.9f) << "Beer-Lambert must darken the thicker tint";
+}
+
+// SMOOTH NORMALS: a transmissive sphere refracts the bright-bar background. With
+// per-vertex smooth normals supplied the bend differs from the faceted flat fallback
+// -- this is the only test that exercises SmoothWorldNormal's barycentric blend.
+TEST(RenderWorldRtBeauty, SmoothNormalsAlterRefraction) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+    const rt::PinholeCamera camera = RefractCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+
+    const auto build = [](bool smooth) {
+        render::RenderWorld w;
+        const uint32_t wall = w.meshes.InternPrimitive(
+            "sn_wall", [] { return BoxGeometry({2.5f, 0.05f, 1.6f}); });
+        const uint32_t bar = w.meshes.InternPrimitive(
+            "sn_bar", [] { return BoxGeometry({0.18f, 0.04f, 1.2f}); });
+        const uint32_t ball = w.meshes.InternPrimitive(
+            smooth ? "sn_ball_smooth" : "sn_ball_flat", [smooth] {
+                render::MeshGeometry g = SphereGeometry(0.6f, 12u, 16u);
+                if (smooth) g.normals = render::SmoothNormals(g.positions, g.indices);
+                return g;
+            });
+        w.materials.push_back(MakeMat(0.20f, 0.22f, 0.26f, 0.0f, 0.8f));  // wall
+        w.materials.push_back(MakeMat(0.95f, 0.80f, 0.10f, 0.0f, 0.4f));  // bar
+        scene::RenderMaterial glass = MakeMat(0.02f, 0.03f, 0.04f, 0.0f, 0.05f);
+        glass.transmission = 1.0f; glass.ior = 1.45f;
+        w.materials.push_back(glass);
+
+        render::RenderInstance wi; wi.mesh_id = wall; wi.render_material_id = 0u;
+        wi.world_xform = {{0.0f, 1.6f, 0.6f}, math::Quat::Identity()};
+        w.instances.push_back(wi);
+        render::RenderInstance bi; bi.mesh_id = bar; bi.render_material_id = 1u;
+        bi.world_xform = {{0.0f, 1.55f, 0.6f}, math::Quat::Identity()};
+        w.instances.push_back(bi);
+        render::RenderInstance si; si.mesh_id = ball; si.render_material_id = 2u;
+        si.world_xform = {{0.0f, 0.0f, 0.6f}, math::Quat::Identity()};
+        w.instances.push_back(si);
+
+        render::RenderLight light;
+        light.color = {1.0f, 0.98f, 0.95f}; light.intensity = 4.0f;
+        light.world_xform = {{-1.5f, -2.0f, 2.5f}, math::Quat::Identity()};
+        w.lights.push_back(light);
+        return w;
+    };
+
+    const auto trace = [&](const render::RenderWorld& w) {
+        const rt::TwoLevelScene s = render::RenderWorldToTwoLevelScene(w);
+        render::RtSceneHandle* h = backend->BuildScene(s);
+        const rt::Framebuffer fb = backend->TraceBeautyToHost(h, s, camera, opt);
+        backend->FreeScene(h);
+        return fb;
+    };
+
+    const rt::Framebuffer flat   = trace(build(false));
+    const rt::Framebuffer smooth = trace(build(true));
+    WritePpm(flat,   "out/rt_normals_flat.ppm");
+    WritePpm(smooth, "out/rt_normals_smooth.ppm");
+
+    ASSERT_EQ(flat.color.size(), smooth.color.size());
+    const size_t n = smooth.color.size() / 3u;
+    size_t diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float dr = std::fabs(smooth.color[i * 3] - flat.color[i * 3]);
+        const float dg = std::fabs(smooth.color[i * 3 + 1] - flat.color[i * 3 + 1]);
+        const float db = std::fabs(smooth.color[i * 3 + 2] - flat.color[i * 3 + 2]);
+        if (dr + dg + db > 0.05f) ++diff;
+    }
+    std::printf("SMOOTH_VS_FLAT_DIFF_PIXELS=%zu of %zu\n", diff, n);
+    EXPECT_GT(diff, n / 100u)
+        << "per-vertex smooth normals must alter the refraction vs the flat fallback";
 }
