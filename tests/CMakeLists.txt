@@ -129,6 +129,35 @@ if(TARGET nuka)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             PROPERTIES LABELS "full")
 
+        # --- Coupled world (robot + cloth/fluid particles) C ABI bridge ---------
+        # Create + step + read a coupled world through nuka_world_create_coupled_
+        # from_scene; prove two-way coupling fires through the C step path and the
+        # terrain+particle budget reserve stays disjoint.
+        add_executable(nuka_coupled_world_cabi_test
+            c_abi/test_coupled_world.cpp
+        )
+
+        target_compile_definitions(nuka_coupled_world_cabi_test
+            PRIVATE
+                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        )
+
+        target_include_directories(nuka_coupled_world_cabi_test
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src/include
+        )
+
+        target_link_libraries(nuka_coupled_world_cabi_test
+            PRIVATE
+                nuka
+                CUDA::cudart
+                GTest::gtest_main
+        )
+
+        gtest_discover_tests(nuka_coupled_world_cabi_test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            PROPERTIES LABELS "full")
+
         # --- Device-resident batched camera sensor C ABI (attach/render/view) --
         # The in-the-loop obs surface: attach a camera to an N-env world, render
         # every env into ONE device AOV tensor, read it back zero-copy via

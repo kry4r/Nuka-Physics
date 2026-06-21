@@ -341,3 +341,82 @@ TEST(BodyParticleBudget, SoftFluidCookGrowsAdditivelyNoDoubleCount) {
     EXPECT_EQ(cap.max_rows_per_env,
               cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot);
 }
+
+// The c_abi terrain cook path RECOMPUTES the rigid contact budget after appending a
+// static heightfield collidable; the fix re-applies the additive body<->particle
+// reserve via the SAME GrowContactBudgetForParticles helper, so a coupled world with
+// terrain keeps the rigid + particle slot ranges DISJOINT (pre-fix the recompute
+// clobbered the reserve back to the rigid base, overlapping the particle slots).
+// This pins the recompute arithmetic with real numbers (cook-only, no CUDA backend).
+TEST(BodyParticleBudget, CAbiTerrainRecomputeReappliesParticleReserve) {
+    nk::Model m;
+    AddBox(m, Vec3{0.0f, 0.0f, 0.0f}, 0.5f, 0.0f, 0);   // a static ground body.
+    AddBox(m, Vec3{0.0f, 0.0f, 0.58f}, 0.1f, 1.0f, 1);  // a dynamic body (the robot).
+    nk::ModelCapacities& cap = m.capacities;
+    const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
+    cap.env_count = 1u;
+    cap.bodies_per_env = bodies;
+    cap.max_bodies_total = bodies;
+    cap.max_contacts_per_env = RigidBudget(bodies);  // CookToModel's rigid base.
+    cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+
+    // Cook 64 particles -> the additive reserve far exceeds the rigid base.
+    cook::XpbdCookInput soft;
+    for (uint32_t i = 0; i < 64u; ++i)
+        soft.positions.push_back(Vec3{0.01f * static_cast<float>(i), 0.0f, 0.515f});
+    soft.velocities.assign(64u, Vec3::Zero());
+    soft.inv_mass.assign(64u, 1.0f / 0.01f);
+    cook::CookXpbdParticles(m, 1u, soft);
+    const uint32_t parts = cap.particles_per_env;
+    ASSERT_EQ(parts, 64u);
+    const uint32_t cook_total = cap.max_contacts_per_env;  // rigid_base + 64*slots.
+
+    // Replay the c_abi terrain recompute (world.cpp): appending one static
+    // heightfield collidable raises the LBVH leaf count, then the rigid contact
+    // budget is recomputed as (dynamic_bodies + 1 static) * 4 candidate slots.
+    constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+    constexpr uint32_t kStaticCollidables = 1u;
+    const uint32_t orig_bodies = bodies;  // bodies_per_env BEFORE the heightfield.
+    const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
+    const uint32_t terrain_rigid_base =
+        dynamic_collidables * kCandidatePairsPerCollidable;
+    cap.max_contacts_per_env = terrain_rigid_base;  // the recompute (would clobber).
+    cap.max_rows_per_env =
+        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    const uint32_t clobbered_total = cap.max_contacts_per_env;
+
+    // THE FIX: re-apply the additive body<->particle reserve on top of the recomputed
+    // rigid base (the same call world.cpp makes).
+    cook::GrowContactBudgetForParticles(cap, terrain_rigid_base);
+
+    std::fprintf(stderr,
+                 "[terrain-budget] parts=%u cook_total=%u terrain_rigid_base=%u "
+                 "clobbered_total=%u regrown_total=%u\n",
+                 parts, cook_total, terrain_rigid_base, clobbered_total,
+                 cap.max_contacts_per_env);
+
+    // The recompute alone DID drop the budget to the rigid base (the bug surface).
+    EXPECT_EQ(clobbered_total, terrain_rigid_base);
+    EXPECT_LT(clobbered_total, cook_total)
+        << "the recompute did not actually drop the particle reserve (test is moot)";
+    // After the fix the budget is the disjoint sum: terrain rigid base + the FULL
+    // particle reserve, with the rigid slots [0, terrain_rigid_base) below the
+    // particle slots [terrain_rigid_base, total).
+    EXPECT_EQ(cap.max_contacts_per_env, terrain_rigid_base + parts * kSlotsPerParticle)
+        << "the terrain recompute did not re-apply the body<->particle reserve";
+    EXPECT_EQ(cap.max_rows_per_env,
+              cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot);
+    EXPECT_GT(cap.max_contacts_per_env, terrain_rigid_base)
+        << "the particle slot sub-range is empty -> particles would overlap rigid";
+
+    // A world with NO particles is byte-identical through the same recompute+regrow
+    // (the reserve is then 0): GrowContactBudgetForParticles leaves the rigid base.
+    nk::ModelCapacities bare{};
+    bare.particles_per_env = 0u;
+    bare.max_contacts_per_env = terrain_rigid_base;
+    bare.max_rows_per_env = terrain_rigid_base * nk::kPairDrivenRowsPerSlot;
+    cook::GrowContactBudgetForParticles(bare, terrain_rigid_base);
+    EXPECT_EQ(bare.max_contacts_per_env, terrain_rigid_base)
+        << "the regrow must be a no-op (byte-identical) on a particle-free world";
+    EXPECT_EQ(bare.max_rows_per_env, terrain_rigid_base * nk::kPairDrivenRowsPerSlot);
+}

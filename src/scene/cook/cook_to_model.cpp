@@ -53,25 +53,6 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
 constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
-// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
-// body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
-void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base) {
-    if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
-    const uint64_t reserve =
-        static_cast<uint64_t>(cap.particles_per_env) *
-        collision::gpu::kBodyParticleContactSlotsPerParticle;
-    const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
-    if (total > 0xFFFFFFFFull ||
-        total * nk::kPairDrivenRowsPerSlot > 0xFFFFFFFFull) {
-        throw std::runtime_error(
-            "CookToModel: body<->particle contact budget overflows u32 "
-            "(too many particles for the per-env contact slot block)");
-    }
-    cap.max_contacts_per_env = static_cast<uint32_t>(total);
-    cap.max_rows_per_env =
-        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
-}
-
 // M7 T5b — resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
 //   (1) the InitialStateComponent set on the articulation root entity by
@@ -238,6 +219,25 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
 }
 
 }  // namespace
+
+// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
+// body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base) {
+    if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
+    const uint64_t reserve =
+        static_cast<uint64_t>(cap.particles_per_env) *
+        collision::gpu::kBodyParticleContactSlotsPerParticle;
+    const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
+    if (total > 0xFFFFFFFFull ||
+        total * nk::kPairDrivenRowsPerSlot > 0xFFFFFFFFull) {
+        throw std::runtime_error(
+            "CookToModel: body<->particle contact budget overflows u32 "
+            "(too many particles for the per-env contact slot block)");
+    }
+    cap.max_contacts_per_env = static_cast<uint32_t>(total);
+    cap.max_rows_per_env =
+        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+}
 
 namespace {
 
