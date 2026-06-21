@@ -415,66 +415,8 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
     row_minv_jt[gid] = acc;
 }
 
-// K4b: per-row effective mass — ComputeCompliantEffectiveMass hoisted to
-// assembly: diagonal = side-a invMass + side-b invMass + R, recip with the
-// legacy 1e-12 floor. Side dispatch mirrors CompliantSideEffectiveInvMass.
-__global__ void ComputeRowMeffKernel(const NkRow* __restrict__ urows,
-                                     const float* __restrict__ chain_jacobian,
-                                     const float* __restrict__ row_minv_jt,
-                                     const float* __restrict__ body_inv_mass,
-                                     const math::Vec3* __restrict__ body_inv_inertia,
-                                     const float* __restrict__ particle_inv_mass,
-                                     uint32_t total_rows,
-                                     uint32_t dof_stride,
-                                     float* __restrict__ row_meff) {
-    const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
-    if (rs >= total_rows) return;
-    const NkRow row = urows[rs];
-    if (!(row.flags & nk::nk_row_flags::kActive)) {
-        row_meff[rs] = 0.0f;
-        return;
-    }
-    float diagonal = 0.0f;
-    const NkRowSide sides[2] = {row.a, row.b};
-    for (int s = 0; s < 2; ++s) {
-        const NkRowSide& sd = sides[s];
-        switch (sd.kind) {
-            case kNkSideRigid: {
-                // RigidEffectiveInvMass: inv_mass*|jlin|^2 + jang^2 . invI.
-                const float im = body_inv_mass[sd.index];
-                const math::Vec3 ii = body_inv_inertia[sd.index];
-                diagonal += im * Dot3(sd.jlin, sd.jlin);
-                diagonal += sd.jang.x * sd.jang.x * ii.x;
-                diagonal += sd.jang.y * sd.jang.y * ii.y;
-                diagonal += sd.jang.z * sd.jang.z * ii.z;
-                break;
-            }
-            case kNkSideArtic: {
-                // ArticulationEffectiveInvMass: denom = sum_r J[r] * w[r] —
-                // w[r] is the SAME inner product the legacy computed inline.
-                const float* const J =
-                    chain_jacobian + static_cast<size_t>(rs) * dof_stride;
-                const float* const w =
-                    row_minv_jt + static_cast<size_t>(rs) * dof_stride;
-                float denom = 0.0f;
-                for (uint32_t r = 0u; r < dof_stride; ++r) {
-                    denom += J[r] * w[r];
-                }
-                diagonal += denom;
-                break;
-            }
-            case kNkSideParticle:
-                diagonal += particle_inv_mass != nullptr
-                                ? particle_inv_mass[sd.index] * Dot3(sd.jlin, sd.jlin)
-                                : 0.0f;
-                break;
-            default:
-                break;  // StaticNull: zero reaction.
-        }
-    }
-    diagonal += row.compliance_alpha;  // + R (dual regularizer)
-    row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
-}
+// (union-era ComputeRowMeffKernel deleted — never launched; superseded by the
+// live ComputeRowMeffPairDrivenKernel and ComputeContactEffectiveMassKernel.)
 
 // ===========================================================================
 // GENERAL CONTACT PIPELINE — Phase 1B PairDriven-family assembly (S1/S2/S5).
@@ -504,15 +446,15 @@ constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
 // or a global particle id, so a non-body index never reaches the shape_table
 // body-row lookup. A particle channel resolves to the particle side with the
 // GLOBAL particle id carried in `index` (the narrowphase wrote it global). For a
-// body-local index: body_id == -1 (from shape_table) is static; an articulation-
-// link body row resolves to (real artic id, owning global link); a free-rigid body
-// row resolves to the rigid side. Returns the side kind; out_artic / out_link valid
-// only for the artic kind; out_body for the rigid kind; out_particle for particle.
-// env-major: body_to_* are TEMPLATE-local (per:body), so the global body row ==
-// env*bodies_per_env + local; the global link == env*base_link + template_link;
-// the global artic == env*artics_per_env + local_artic.
+// body-local index: body_id < 0 (the caller's already-loaded shape body_id) is
+// static; an articulation-link body row resolves to (real artic id, owning global
+// link); a free-rigid body row resolves to the rigid side. Returns the side kind;
+// out_artic / out_link valid only for the artic kind; out_body for the rigid kind;
+// out_particle for particle. env-major: body_to_* are TEMPLATE-local (per:body),
+// so the global body row == env*bodies_per_env + local; the global link ==
+// env*base_link + template_link; the global artic == env*artics_per_env + local.
 __device__ uint32_t ResolvePairSide(uint32_t side_kind,
-                                    const float* shape_table,
+                                    int32_t body_id,
                                     const uint32_t* body_to_link,
                                     const uint32_t* body_to_articulation,
                                     uint32_t env, uint32_t index,
@@ -531,8 +473,7 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
         return kNkSideStatic;  // unknown channel: no reaction here.
     }
     const uint32_t local_body = index;
-    const PrimShapeDev s = LoadPrimShape(shape_table, local_body);
-    if (s.body_id < 0) {
+    if (body_id < 0) {
         return kNkSideStatic;  // static ground / heightfield collidable.
     }
     const uint32_t tmpl_link = (local_body < bodies_per_env)
@@ -646,11 +587,11 @@ __global__ void EmitPairDrivenRowsKernel(
                     ? LoadPrimShape(shape_table, local_a).body_id : -1;
         bid_b = (side_kind_b == nk::kUContactSideBody)
                     ? LoadPrimShape(shape_table, local_b).body_id : -1;
-        kind_a = ResolvePairSide(side_kind_a, shape_table, body_to_link,
+        kind_a = ResolvePairSide(side_kind_a, bid_a, body_to_link,
                                  body_to_articulation, env, local_a, bodies_per_env,
                                  base_link_count, artics_per_env, &art_a, &link_a,
                                  &body_a, &part_a);
-        kind_b = ResolvePairSide(side_kind_b, shape_table, body_to_link,
+        kind_b = ResolvePairSide(side_kind_b, bid_b, body_to_link,
                                  body_to_articulation, env, local_b, bodies_per_env,
                                  base_link_count, artics_per_env, &art_b, &link_b,
                                  &body_b, &part_b);

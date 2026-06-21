@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include "collision/particle_uniform_grid.hpp"  // kParticleGridMaxNeighbors (canonical)
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
@@ -53,11 +54,11 @@ using mg::Dot;
 using mg::Scale;
 using mg::Sub;
 namespace fl = ::nuka::runtime::fluid;
+namespace cg = ::nuka::collision::gpu;
 
 constexpr uint32_t kBlockSize = 128u;
-// Mirror collision/particle_uniform_grid.hpp kParticleGridMaxNeighbors — the
-// per-particle private CSR slice stride the M5 GridFillKernel wrote.
-constexpr uint32_t kNeighborStride = 32u;
+// Per-particle private CSR slice stride the GridFillKernel wrote == the shared
+// cap cg::kParticleGridMaxNeighbors; base = i * cg::kParticleGridMaxNeighbors.
 
 // M9 T11 SoftFluid: within-env local particle index (env-major: env e owns
 // [e*per_env, e*per_env+per_env); the soft sub-slice is the first n_soft of each
@@ -433,7 +434,7 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
 // =============================================================================
 // PBF kernels — VERBATIM from the legacy PBF fluid stepper. The ONLY change is the
 // neighbor read: the M5 arena grid writes a PRIVATE per-particle slice
-// (neighbor_idx[i*32 + k], count[i]), so `base = i * kNeighborStride` here in
+// (neighbor_idx[i*32 + k], count[i]), so `base = i * kParticleGridMaxNeighbors` in
 // place of the legacy flat `neighbor_offsets[i]`. The k-loop order is identical.
 // =============================================================================
 
@@ -491,7 +492,7 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
     }
     const math::Vec3 pi = predicted[i];
     float rho = particle_mass * fl::Poly6FromR2(0.0f, coeffs);
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
@@ -533,7 +534,7 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
         return;
     }
     const math::Vec3 pi = predicted[i];
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
     math::Vec3 grad_i{0.0f, 0.0f, 0.0f};
     float sum_grad_sq = 0.0f;
@@ -578,7 +579,7 @@ __global__ void PbfComputeCorrectionKernel(
     }
     const math::Vec3 pi = predicted[i];
     const float lam_i = lambda[i];
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
     math::Vec3 dp{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -671,7 +672,7 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
     }
     const math::Vec3 pi = positions[i];
     const math::Vec3 vi = velocities[i];
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
     math::Vec3 acc{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -731,7 +732,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
         return;  // SoftFluid: a soft owner is not nudged by fluid cohesion.
     }
     const math::Vec3 pi = positions[i];
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
     math::Vec3 force{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -916,8 +917,8 @@ __global__ void SoftFluidPredictKernel(uint32_t particle_count,
 // and v_final == pbd_v -> byte-identical to the plain v = (pos_proj - prev)/dt. The
 // soft branch then carries the contact displacement (v_final - pbd_v)*dt onto the
 // projected position; adding the +0.0 displacement leaves it bit-identical. The
-// fluid branch commits pos = predicted, the contact correction propagating through
-// velocity into the next predict.
+// fluid branch likewise carries dv*dt onto the predicted position (dv == +0.0 ->
+// pos == predicted, bit-identical to the verbatim PbfFinalizeKernel).
 __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
                                         uint32_t n_soft,
                                         uint32_t per_env,
@@ -952,14 +953,15 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
         positions[i] = math::Vec3{p_proj.x + dv.x * dt, p_proj.y + dv.y * dt,
                                   p_proj.z + dv.z * dt};
     } else {
-        // pbd_v = (predicted - pos)/dt; add the contact delta; commit pos = pred
-        // (dv == 0 -> velocity bit-identical to the verbatim PbfFinalizeKernel).
+        // pbd_v = (predicted - pos)/dt; add the contact delta; carry dv*dt onto the
+        // predicted pos (dv == 0 -> bit-identical to the verbatim PbfFinalizeKernel).
         const math::Vec3 p0 = positions[i];
         const math::Vec3 pp = predicted[i];
         const math::Vec3 pbd_v{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
                                (pp.z - p0.z) * inv_dt};
         velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
-        positions[i] = pp;
+        positions[i] = math::Vec3{pp.x + dv.x * dt, pp.y + dv.y * dt,
+                                  pp.z + dv.z * dt};
     }
 }
 
@@ -981,7 +983,7 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
 // pass A: compute each union particle's HALF correction (Jacobi gather, read-only
 // on positions). One thread per union particle i; for every penetrating neighbor j
 // accumulate i's own half of the mass-weighted symmetric projection. VERBATIM body
-// from the legacy kernel; base = i*kNeighborStride is the only indexing change.
+// from the legacy kernel; base = i*kParticleGridMaxNeighbors is the only change.
 __global__ void PpContactHalfCorrectionKernel(
     uint32_t union_count,
     const math::Vec3* __restrict__ positions,
@@ -997,7 +999,7 @@ __global__ void PpContactHalfCorrectionKernel(
     }
     const math::Vec3 pi = positions[i];
     const float wi = inv_mass[i];
-    const uint32_t base = i * kNeighborStride;
+    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
     const uint32_t n = neighbor_counts[i];
 
     float dx = 0.0f;

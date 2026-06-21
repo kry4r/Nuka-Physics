@@ -39,6 +39,7 @@
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
 #include "collision/particle_grid_traversal.cuh"  // ParticleGridConfigDevice / QueryParticleNeighbors
+#include "collision/particle_uniform_grid.hpp"     // kParticleGridMaxNeighbors (canonical)
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
@@ -56,10 +57,7 @@ namespace cg = ::nuka::collision::gpu;
 constexpr uint32_t kBlockSize = 128u;
 // env_status diagnostic bits (kEnvStatus*) are shared in op_schema.hpp so the
 // broadphase, particle-grid, and CRBA ops agree on the readout layout.
-// Canonical value lives in collision/particle_uniform_grid.hpp:43 (host header,
-// non-CUDA include chain). FLAG: the divergence-proof home is the already-shared
-// particle_grid_traversal.cuh — once it re-exports the constant, delete this mirror.
-constexpr uint32_t kParticleGridMaxNeighbors = 32u;  // mirror particle_uniform_grid.
+// The per-particle neighbor cap is the canonical cg::kParticleGridMaxNeighbors.
 
 // shape_table record: R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape). Lanes 0..7 unchanged; lanes 8/9 = body_id (int32) +
@@ -390,10 +388,10 @@ __global__ void GridCountKernel(uint32_t particle_count,
     if (i >= particle_count) return;
     const math::Vec3 pm = pos[i];
     const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
-    uint32_t scratch[kParticleGridMaxNeighbors];
+    uint32_t scratch[cg::kParticleGridMaxNeighbors];
     const uint32_t n = cg::QueryParticleNeighbors(
         make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
-        cell_end + cbase, idx_sorted, pos, scratch, kParticleGridMaxNeighbors,
+        cell_end + cbase, idx_sorted, pos, scratch, cg::kParticleGridMaxNeighbors,
         nullptr);
     counts[i] = n;
 }
@@ -577,7 +575,7 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_offset,
-               kParticleGridMaxNeighbors, data.grid_neighbor_idx,
+               cg::kParticleGridMaxNeighbors, data.grid_neighbor_idx,
                data.grid_neighbor_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
