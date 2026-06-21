@@ -323,6 +323,10 @@ public:
         // constraints (edge-based) reference only the soft slice. For the
         // single-system modes (Xpbd/Pbf/Coupled) it is 0 (Xpbd) or unused.
         uint32_t n_soft_particles = 0u;
+        // Per-system body<->particle contact mu: soft finite (a foot grips cloth),
+        // fluid ~0 (a foot slides); mixed with the body side by solmix=max.
+        float    soft_friction  = 0.6f;
+        float    fluid_friction = 0.0f;
         // PBF fluid params (Macklin & Mueller 2013 + p10-B polish).
         float    pbf_rest_density   = 0.0f;   // rho0 (0 disables PBF)
         float    pbf_support_radius = 0.0f;   // h (== grid query radius / cell)

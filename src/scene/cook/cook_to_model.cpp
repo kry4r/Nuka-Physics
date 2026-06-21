@@ -1102,6 +1102,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
 
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Xpbd;
+    mp.soft_friction = in.friction;  // body<->soft contact mu (solmix=max).
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1204,6 +1205,7 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
 
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Pbf;
+    mp.fluid_friction = in.friction;  // body<->fluid contact mu (solmix=max).
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1290,6 +1292,9 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     }
 
     // 3) Carry the PBF fluid params + uniform-grid domain (the fluid slice solve).
+    //    The soft slice mu was set by the CookXpbdParticles call above; the fluid
+    //    slice carries its own (body<->particle contact, solmix=max with the body).
+    mp.fluid_friction     = fluid.friction;
     mp.pbf_rest_density   = fluid.rest_density;
     mp.pbf_support_radius = fluid.support_radius;
     mp.pbf_particle_mass  = fluid.particle_mass;
