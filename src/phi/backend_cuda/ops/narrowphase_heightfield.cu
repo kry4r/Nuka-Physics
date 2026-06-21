@@ -54,6 +54,7 @@
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind
 #include "math/transform.hpp"
 #include "nk/model/generated/views.hpp"        // ModelView / DataView
+#include "nk/solve/nk_row.hpp"                  // kUContactSideBody (side-kind tag)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"  // PrimShapeDev / LoadPrimShape / PrimRotate
@@ -469,6 +470,8 @@ __global__ void NarrowphaseHeightfieldKernel(
     float* __restrict__ udepth,
     uint32_t* __restrict__ ucontact_a,
     uint32_t* __restrict__ ucontact_b,
+    uint32_t* __restrict__ ucontact_a_kind,
+    uint32_t* __restrict__ ucontact_b_kind,
     uint32_t* __restrict__ ucontact_gen,
     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -614,10 +617,14 @@ __global__ void NarrowphaseHeightfieldKernel(
             udepth[at] = out4[i].depth;
             ucontact_a[at] = conv_local;   // side a = the convex body row.
             ucontact_b[at] = hf_local;     // side b = the heightfield (static).
+            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
         } else {
             upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
             ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
+            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
         }
     }
     if (kept > 0 && contact_count != nullptr) {
@@ -647,6 +654,7 @@ Status OpNarrowphaseHeightfield(const ModelView& model, const DataView& data,
                static_cast<const float*>(model.heights), *p,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
+               data.ucontact_a_kind, data.ucontact_b_kind,
                data.ucontact_gen, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

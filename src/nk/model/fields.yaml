@@ -682,3 +682,17 @@ fields:
   - {name: body_pseudo_angular_velocity, dtype: vec3, per: body,     arena: scratch, owner: data}
   - {name: particle_pseudo_vel,    dtype: vec3,     per: particle, arena: scratch, owner: data}
   - {name: row_pseudo_lambda,      dtype: f32,      per: row_slot, arena: scratch, owner: data}
+
+  # =========================================================================
+  # Per-slot side-kind tag for the unified contact buffer's a/b index channel.
+  # DATA, per contact_slot, elem:4 (one tag per <=4-pt manifold point, matching
+  # ucontact_a/ucontact_b). The tag (nk::kUContactSide*) declares what the paired
+  # ucontact_a/ucontact_b index ADDRESSES — a body-local collidable row or a
+  # global particle id — so the row assembly resolves a side before the
+  # shape_table body-row lookup, never aliasing a particle id into the body-row
+  # space. The narrowphase writers stamp the body default for every slot they
+  # emit; the zero-init scratch default is also the body meaning, so a slot
+  # resolves exactly as before. APPENDED LAST so every pre-existing arena offset
+  # is byte-stable (the D1 invariant).
+  - {name: ucontact_a_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_b_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}

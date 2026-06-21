@@ -29,6 +29,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/solve/nk_row.hpp"                  // kUContactSideBody (side-kind tag)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"  // kShapeTableRowStride (shared)
@@ -222,6 +223,8 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     float* __restrict__ udepth,
                                     uint32_t* __restrict__ ucontact_a,
                                     uint32_t* __restrict__ ucontact_b,
+                                    uint32_t* __restrict__ ucontact_a_kind,
+                                    uint32_t* __restrict__ ucontact_b_kind,
                                     uint32_t* __restrict__ ucontact_gen,
                                     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -289,10 +292,14 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             upoint[at] = pt[i]; unormal[at] = nm[i]; udepth[at] = dp[i];
             ucontact_a[at] = sample_body;  // side a = the sampling body (sep dir).
             ucontact_b[at] = target_body;  // side b = the SDF body.
+            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
         } else {
             upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
             ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
+            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
         }
     }
     if (kept > 0u && contact_count != nullptr) {
@@ -338,6 +345,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                static_cast<uint32_t>(p->max_contacts_per_pair), p->contact_margin,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
+               data.ucontact_a_kind, data.ucontact_b_kind,
                data.ucontact_gen, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

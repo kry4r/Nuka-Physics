@@ -186,6 +186,8 @@ enum class FieldId : uint16_t {
     BodyPseudoAngularVelocity,  // body_pseudo_angular_velocity (per:body arena:scratch owner:data)
     ParticlePseudoVel,  // particle_pseudo_vel (per:particle arena:scratch owner:data)
     RowPseudoLambda,  // row_pseudo_lambda (per:row_slot arena:scratch owner:data)
+    UcontactAKind,  // ucontact_a_kind (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactBKind,  // ucontact_b_kind (per:contact_slot arena:scratch owner:data elem:4)
     Count
 };
 

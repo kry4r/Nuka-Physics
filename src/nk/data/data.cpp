@@ -96,6 +96,11 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::UcontactA:           v.ucontact_a = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactB:           v.ucontact_b = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactGen:         v.ucontact_gen = static_cast<uint32_t*>(p); break;
+        // Per-slot side-kind tag for each ucontact_a/ucontact_b index (a body-local
+        // collidable row vs a global particle id); the assembly resolves the side
+        // by this tag before the shape_table body-row lookup.
+        case FieldId::UcontactAKind:       v.ucontact_a_kind = static_cast<uint32_t*>(p); break;
+        case FieldId::UcontactBKind:       v.ucontact_b_kind = static_cast<uint32_t*>(p); break;
         // C4 (general contact pipeline Phase 1A): per-point tangent basis for the
         // unified PairDriven contact buffer (ComputeUnionContactTangentBasisKernel).
         case FieldId::UcontactTangent1:    v.ucontact_tangent1 = static_cast<math::Vec3*>(p); break;

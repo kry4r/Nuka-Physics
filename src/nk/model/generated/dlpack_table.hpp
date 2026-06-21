@@ -202,6 +202,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyPseudoAngularVelocity, DlpackDtype::kF32, 2, false, false},  // body_pseudo_angular_velocity
     {FieldId::ParticlePseudoVel, DlpackDtype::kF32, 2, false, false},  // particle_pseudo_vel
     {FieldId::RowPseudoLambda, DlpackDtype::kF32, 1, false, false},  // row_pseudo_lambda
+    {FieldId::UcontactAKind, DlpackDtype::kU32, 2, false, false},  // ucontact_a_kind
+    {FieldId::UcontactBKind, DlpackDtype::kU32, 2, false, false},  // ucontact_b_kind
 };
 
 } // namespace nuka::nk
