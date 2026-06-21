@@ -437,10 +437,12 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
 // place of the legacy flat `neighbor_offsets[i]`. The k-loop order is identical.
 // =============================================================================
 
-// predict: v += dt*g ; pbf_predicted = p + dt*v (positions left at t0). Verbatim.
+// predict: v += dt*g ; pbf_predicted = p + dt*v. Plus v_pre saved AFTER gravity =
+// the velocity the body<->particle row solve reads (finalize subtracts it off).
 __global__ void PbfPredictKernel(uint32_t particle_count,
                                  const math::Vec3* __restrict__ positions,
                                  math::Vec3* __restrict__ velocities,
+                                 math::Vec3* __restrict__ v_pre,
                                  math::Vec3* __restrict__ predicted_positions,
                                  const float* __restrict__ inv_masses,
                                  math::Vec3 gravity,
@@ -460,6 +462,7 @@ __global__ void PbfPredictKernel(uint32_t particle_count,
         v.z += dt * gravity.z;
         velocities[i] = v;
     }
+    v_pre[i] = v;  // pre-contact (post-gravity) velocity the solve reads.
     const math::Vec3 p = positions[i];
     predicted_positions[i] =
         math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
@@ -614,13 +617,13 @@ __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
     predicted[i] = out;
 }
 
-// finalize: v = (predicted - position)/dt ; position = predicted. Verbatim
-// (pinned particles, inv_mass 0, keep their velocity + held position — the
-// boundary-anchor extension; inert for the fluid-only world).
+// finalize: v = (predicted-position)/dt + (v_now-v_pre); pos = predicted + dv*dt.
+// dv == +0.0 when no row touched the particle -> byte-identical to the plain finalize.
 __global__ void PbfFinalizeKernel(uint32_t particle_count,
                                   math::Vec3* __restrict__ positions,
                                   const math::Vec3* __restrict__ predicted,
                                   math::Vec3* __restrict__ velocities,
+                                  const math::Vec3* __restrict__ v_pre,
                                   const float* __restrict__ inv_masses,
                                   float inv_dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -632,9 +635,14 @@ __global__ void PbfFinalizeKernel(uint32_t particle_count,
     }
     const math::Vec3 p0 = positions[i];
     const math::Vec3 pp = predicted[i];
-    velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
-                               (pp.z - p0.z) * inv_dt};
-    positions[i] = pp;
+    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
+    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
+    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
+    const float dt = 1.0f / inv_dt;
+    velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt + dv.x,
+                               (pp.y - p0.y) * inv_dt + dv.y,
+                               (pp.z - p0.z) * inv_dt + dv.z};
+    positions[i] = math::Vec3{pp.x + dv.x * dt, pp.y + dv.y * dt, pp.z + dv.z * dt};
 }
 
 // XSPH viscosity compute (read-only into the delta scratch). Verbatim, plus the
@@ -1072,7 +1080,8 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
     } else {  // kParticleModePbf
         LaunchCuda(PbfPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_vel,
-                   data.pbf_predicted_pos, data.particle_inv_mass, g, p->dt);
+                   data.particle_v_pre, data.pbf_predicted_pos,
+                   data.particle_inv_mass, g, p->dt);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1241,14 +1250,11 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         }
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
-    // PBF: finalize v from the corrected predicted positions + commit, then the
-    // gated post-finalize polish (XSPH viscosity / Akinci cohesion) — exactly the
-    // legacy PBF-step order. The polish reuses THIS step's neighbor grid (the
-    // M5 arena CSR, still live) and the position-delta scratch (free post-finalize).
-    // n_soft == 0 here (single-system) so the fluid-slice guards are inert.
+    // PBF: finalize composes the density-projection velocity with the body<->particle
+    // contact correction, then the gated post-finalize polish (XSPH/cohesion).
     LaunchCuda(PbfFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                N, data.particle_pos, data.pbf_predicted_pos, data.particle_vel,
-               data.particle_inv_mass, 1.0f / p->dt);
+               data.particle_v_pre, data.particle_inv_mass, 1.0f / p->dt);
     if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
         const fl::PbfKernelCoeffs coeffs = fl::MakePbfKernelCoeffs(p->support_radius);
         LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
