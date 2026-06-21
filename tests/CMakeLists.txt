@@ -1004,6 +1004,9 @@ if(CMAKE_CUDA_COMPILER)
         # cloth patch (coupling row whose BODY side maps to an articulation link, and
         # the reaction reaches the single revolute qdot + tip pose vs a no-patch control).
         scenario/articulated_link_particle_coupling.cpp
+        # Go2 articulation + cloth (XPBD) + fluid (PBF) co-resident in ONE world, feet
+        # coupling to both media's slices through the SAME body<->particle row solver.
+        scenario/robot_cloth_fluid_coresident.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
