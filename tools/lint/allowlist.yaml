@@ -27,6 +27,11 @@ allowlist:
     match: "atomicAdd(&visit[node], 1u)"
     reason: "LBVH refit visit-counter (uint32), identical scheme to the build's propagation. Not a float accumulation."
 
+  - path: src/collision/lbvh_batched.cuh
+    pattern: float_atomic_add
+    match: "atomicAdd(&visit[vbase + node], 1u)"
+    reason: "Batched LBVH bottom-up AABB propagation visit-counter (uint32, per-env vbase offset). Order-independent fminf/fmaxf merge, fenced for visibility; same scheme as broadphase_lbvh.cu/lbvh_refit.cu. Not a float accumulation."
+
   - path: src/collision/lbvh_traversal.cuh
     pattern: float_atomic_add
     match: "atomicAdd(out_pair_count, 1u)"
