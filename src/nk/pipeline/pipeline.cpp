@@ -18,6 +18,15 @@ namespace nuka::nk {
 inline constexpr uint8_t kMaxContactsPerPair =
     static_cast<uint8_t>(constraint::ContactManifold::kMaxPoints);
 
+void Pipeline::AddOp(phi::NkOp op, const void* params, phi::Device* device) {
+    // Capability query (the spec): with a device, emit only ops the backend
+    // implements (unimplemented = a later system).
+    if (device != nullptr && !phi::DeviceSupportsOp(device, op)) {
+        return;
+    }
+    calls_.push_back(phi::OpCall{op, params});
+}
+
 void Pipeline::Build(const Model& model, const SolverConfig& cfg,
                      phi::Device* device) {
     calls_.clear();
@@ -82,12 +91,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             : kFallbackContactsPerArtic;
 
     auto add = [&](phi::NkOp op, const void* params) {
-        // Capability query (the spec): with a device, emit only ops the backend
-        // implements (unimplemented = a later system).
-        if (device != nullptr && !phi::DeviceSupportsOp(device, op)) {
-            return;
-        }
-        calls_.push_back(phi::OpCall{op, params});
+        AddOp(op, params, device);
     };
 
     // the spec FIXED order:
@@ -162,6 +166,32 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         (particle_mode == phi::kParticleModeSoftFluid) ||
         (particle_mode == phi::kParticleModeCoupled &&
          coupled_internal == phi::kCoupledInternalPbf);
+
+    // The build-time coupling context: the row provider's PreCouple/PostCouple
+    // fill the Pipeline-owned PODs from these resolved scalars at their original
+    // insertion points; Couple is wired (inert for the row path) before the solve.
+    CouplingBuildCtx coupling_ctx;
+    coupling_ctx.model = &model;
+    coupling_ctx.device = device;
+    coupling_ctx.pipeline = this;
+    coupling_ctx.family = family;
+    coupling_ctx.env_count = env_count;
+    coupling_ctx.bodies_per_env = cap.bodies_per_env;
+    coupling_ctx.particles_per_env = cap.particles_per_env;
+    coupling_ctx.max_contacts_per_env = cap.max_contacts_per_env;
+    coupling_ctx.rigid_cap = rigid_cap;
+    coupling_ctx.particle_mode = particle_mode;
+    coupling_ctx.coupled_internal = coupled_internal;
+    coupling_ctx.particle_count = particle_count;
+    coupling_ctx.n_soft = n_soft;
+    coupling_ctx.dt = cfg.dt;
+    coupling_ctx.contact_margin = cfg.contact_margin;
+    coupling_ctx.pos_pass =
+        (has_contacts && family == phi::kContactFamilyPairDriven &&
+         cfg.pos_iters > 0u) ? 1u : 0u;
+    coupling_ctx.p_np_body_particle = &p_np_body_particle_;
+    coupling_ctx.p_part_finalize = &p_part_finalize_;
+    coupling_ctx.p_pp_contact = &p_pp_contact_;
 
     if (has_particles) {
         p_part_predict_.dt = cfg.dt;
@@ -333,69 +363,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
-        // Body/artic <-> particle narrowphase. Runs AFTER the rigid narrowphase
-        // (which filled the rigid candidate slots [0, pair_count) racily) and BEFORE
-        // AssembleRows. It treats each particle as a SPHERE of its radius and writes
-        // its body manifolds into a RESERVED contact-slot sub-range at the TOP of the
-        // per-env block, deterministic relative to the rigid slots (the cross-stream
-        // ordering guard). The particle collision radius is the cooked d_min/2 (the
-        // same uniform radius the particle-particle co-step uses). Gated on actual
-        // particles; a particle-free world emits no op -> byte-identical.
+        // Body/artic <-> particle narrowphase (the row provider's pre-coupling
+        // emission). Runs AFTER the rigid narrowphase and BEFORE AssembleRows,
+        // inside has_collidables. Gated on actual particles; a particle-free world
+        // emits no op -> byte-identical.
         if (has_particles) {
-            const uint32_t cands_per_particle =
-                collision::gpu::kBodyParticleContactSlotsPerParticle;
-            // particle_base == rigid_cap by construction: particles take the top
-            // [rigid_cap, total) range above the rigid [0, rigid_cap) sub-range.
-            p_np_body_particle_.family = family;
-            p_np_body_particle_.env_count = env_count;
-            p_np_body_particle_.bodies_per_env = cap.bodies_per_env;
-            p_np_body_particle_.particles_per_env = cap.particles_per_env;
-            p_np_body_particle_.slot_stride = cap.max_contacts_per_env;
-            p_np_body_particle_.particle_slot_base = rigid_cap;
-            p_np_body_particle_.cands_per_particle = cands_per_particle;
-            // A particle is a sphere of d_min/2 on the ONE path (the cooked uniform
-            // contact radius); 0 leaves the op inert (no collision radius cooked).
-            p_np_body_particle_.particle_radius = 0.5f * mp.pp_contact_d_min;
-            p_np_body_particle_.contact_margin = cfg.contact_margin;
-            // Detect the fluid slice at its predicted position (the gravity-integrated
-            // pos the density solve uses) for PBF/SoftFluid, consistent with the
-            // particle grid's pos_source -- kills the one-step fluid<->body contact
-            // lag. The soft slice + pure-Xpbd/Coupled keep particle_pos (n_soft=0 for
-            // pure Pbf routes every particle; the SoftFluid split routes [n_soft, P)).
-            p_np_body_particle_.fluid_pos_source =
-                (particle_mode == phi::kParticleModePbf ||
-                 particle_mode == phi::kParticleModeSoftFluid)
-                    ? 1u : 0u;
-            p_np_body_particle_.n_soft_particles = n_soft;
-            // Warp-per-particle only pays off when a collider has a WIDE hull whose
-            // SupportHull scan dominates; an analytic-only collider world (box/sphere/
-            // plane walls) keeps thread-per-particle so 31 lanes don't idle. The
-            // threshold is the cook-time max hull vcount -> a model property, not a
-            // per-scene branch; both launch paths are byte-identical.
-            uint32_t max_hull_vcount = 0u;
-            for (const auto& sh : model.shape_table_rows)
-                max_hull_vcount = std::max(max_hull_vcount, sh.hull_vert_count);
-            constexpr uint32_t kWarpHullVcountThreshold = 256u;
-            p_np_body_particle_.warp_per_particle =
-                (max_hull_vcount > kWarpHullVcountThreshold) ? 1u : 0u;
-            // The heightfield descriptor (the SAME single cooked field the rigid
-            // heightfield narrowphase wires) so a sphere particle walks the grid.
-            if (!model.heightfields.empty()) {
-                const nk::HeightfieldData& hfd = model.heightfields.front();
-                p_np_body_particle_.has_heightfield = 1u;
-                p_np_body_particle_.origin_x = hfd.origin.x;
-                p_np_body_particle_.origin_y = hfd.origin.y;
-                p_np_body_particle_.origin_z = hfd.origin.z;
-                p_np_body_particle_.cell_size = hfd.cell_size;
-                p_np_body_particle_.nrow = hfd.nrow;
-                p_np_body_particle_.ncol = hfd.ncol;
-                p_np_body_particle_.min_z = hfd.min_z;
-                p_np_body_particle_.max_z = hfd.max_z;
-                p_np_body_particle_.data_offset = hfd.data_offset;
-            } else {
-                p_np_body_particle_.has_heightfield = 0u;
-            }
-            add(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle_);
+            row_coupling_provider_.PreCouple(coupling_ctx);
         }
 
         // ContactTangentBasis: the ONE general PairDriven path. The op builds the
@@ -549,6 +522,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // The per-articulation slot stride MUST match the detection/assembly
         // (slot_base = articulation * stride). Data-driven; 4 at K<=1.
         p_solve_.contact_slots_per_artic = contact_slots_per_artic;
+        // Pre-solve coupling seam: each registered provider's Couple funnels its
+        // two-way reaction into the shared body sink before the single solve. The
+        // row provider emits nothing here (it rides this solve); a grid-transfer
+        // provider emits its umbrella op here.
+        if (has_particles) {
+            row_coupling_provider_.Couple(coupling_ctx);
+        }
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
     }
 
@@ -565,43 +545,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::IntegratePosition, &p_int_pos_);
     }
 
+    // The row provider's post-coupling emission (ParticleFinalize +
+    // ParticleParticleContact). Runs AFTER IntegratePosition at the TOP level
+    // (NOT inside has_collidables) and BEFORE ReadoutContactWrench, the original
+    // position. Gated on actual particles -> byte-identical when absent.
     if (has_particles) {
-        p_part_finalize_.dt = cfg.dt;
-        p_part_finalize_.mode = particle_mode;
-        p_part_finalize_.particle_count = particle_count;
-        p_part_finalize_.coupled_internal = coupled_internal;
-        // PBF post-finalize polish (gated inert when the coefficient is 0).
-        p_part_finalize_.support_radius = mp.pbf_support_radius;
-        p_part_finalize_.particle_mass  = mp.pbf_particle_mass;
-        p_part_finalize_.xsph_viscosity_c = mp.pbf_xsph_viscosity;
-        p_part_finalize_.surface_tension_gamma = mp.pbf_surface_tension;
-        p_part_finalize_.rest_density = mp.pbf_rest_density;
-        p_part_finalize_.n_soft_particles = n_soft;
-        p_part_finalize_.particles_per_env = per_env_particles;
-        // Carry the split-impulse pseudo velocity onto the final particle position
-        // only when the position pass is active (the same predicate IntegratePosition
-        // uses for bodies); else the pseudo pointer is null -> byte-identical.
-        p_part_finalize_.pos_pass =
-            (has_contacts && family == phi::kContactFamilyPairDriven &&
-             cfg.pos_iters > 0u) ? 1u : 0u;
-        add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
-
-        // Cross-system: the cross-system particle-particle contact co-step
-        // (the op-ified cross-system particle co-step). Runs AFTER ParticleFinalize
-        // (incl. the fluid-slice polish), correcting the committed union positions
-        // (particle_pos) over the union grid CSR built this step. ONLY the SoftFluid
-        // mode emits real work; the single-system Xpbd/Pbf paths carry the op only
-        // as an inert no-op (mode-gated early-exit) so they stay byte-identical.
-        p_pp_contact_.contact_distance_d_min =
-            particle_mode == phi::kParticleModeSoftFluid ? mp.pp_contact_d_min : 0.0f;
-        p_pp_contact_.compliance_alpha = mp.pp_contact_compliance;
-        p_pp_contact_.solver_iterations =
-            mp.pp_contact_iters == 0u ? 1u : mp.pp_contact_iters;
-        p_pp_contact_.mode = particle_mode;
-        p_pp_contact_.particle_count = particle_count;
-        p_pp_contact_.n_soft_particles = n_soft;
-        p_pp_contact_.particles_per_env = per_env_particles;
-        add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
+        row_coupling_provider_.PostCouple(coupling_ctx);
     }
 
     // ReadoutContactWrench: the general per-env contact-wrench readout over the

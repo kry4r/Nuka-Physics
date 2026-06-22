@@ -31,6 +31,8 @@
 // (test_coupling_framework). Specific production pairs (rigid<->MPM, cloth<->rigid)
 // are v0.9 R8 -- each becomes a CandidatePair source feeding this same emitter,
 // NOT a new hand-written O(N^2) kernel (the win over Genesis).
+// Scope: ROW-coupled media only. Grid-transfer media (MPM) couple through a
+// background grid as a SECOND CouplingProvider, not a contact-row source.
 //
 // Co-step ordering (Genesis simulator.py, research-genesis.md:18,99):
 // preprocess -> pre_coupling (each system advances) -> couple (emit + solve these

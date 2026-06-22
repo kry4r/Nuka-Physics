@@ -1112,6 +1112,28 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    # --- CouplingProvider op-list identity (the body↔particle row provider) -----
+    # Pure-host structural proof: builds a cooked-Model matrix through
+    # Pipeline::Build and asserts the emitted OpCall sequence + a FULL byte memcmp
+    # of each moved Params POD is identical build-to-build and at the canonical
+    # positions. No CUDA at runtime (Build with device==nullptr); links nuka_nk
+    # (Pipeline/Model) + nuka_phi2 (the op-schema/backend types nuka_nk needs).
+    add_executable(nuka_coupling_provider_test
+        scenario/coupling_provider_op_list.cpp
+    )
+    add_dependencies(nuka_coupling_provider_test nuka_codegen)
+    target_include_directories(nuka_coupling_provider_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_coupling_provider_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_coupling_provider_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "fast_full")
+
     # M9 T14: nuka_cook_settle_determinism_test MERGED into nuka_scenario_test
     # (scenario/cook_settle_determinism.cpp; the scenario category exe above).
 
