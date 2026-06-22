@@ -140,6 +140,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         : mp.mode == Model::ParticleMode::Pbf ? phi::kParticleModePbf
         : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
         : mp.mode == Model::ParticleMode::SoftFluid ? phi::kParticleModeSoftFluid
+        : mp.mode == Model::ParticleMode::Mpm ? phi::kParticleModeMpm
                                                   : phi::kParticleModeNone;
     // SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
     const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid

@@ -26,6 +26,7 @@ void RegisterNkNarrowphaseSdfOps();   // narrowphase_sdf.cu (M5)
 void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
 void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkParticleOps();         // particles.cu (M6)
+void RegisterNkMpmOps();              // mpm.cu (MLS-MPM transfers)
 void RegisterNkReadoutOps();          // readout.cu
 void RegisterNkDiffsimBackwardOps();  // diffsim_backward.cu (M9 T7)
 

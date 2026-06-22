@@ -146,6 +146,25 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SnapshotParticlePos:     v.snapshot_particle_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::SnapshotParticlePrevPos: v.snapshot_particle_prev_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::SnapshotParticleVel:     v.snapshot_particle_vel = static_cast<math::Vec3*>(p); break;
+        // MLS-MPM env-private background grid + per-particle continuum state +
+        // snapshot triple + P2G gather scratch + material table (all data-owned;
+        // an unbound field stays null and the MPM op would deref nullptr).
+        case FieldId::GridMass:            v.grid_mass = static_cast<float*>(p); break;
+        case FieldId::GridMomentum:        v.grid_momentum = static_cast<math::Vec3*>(p); break;
+        case FieldId::GridVelocity:        v.grid_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::GridForce:           v.grid_force = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleF:           v.particle_F = static_cast<float*>(p); break;
+        case FieldId::ParticleC:           v.particle_C = static_cast<float*>(p); break;
+        case FieldId::ParticleVol0:        v.particle_vol0 = static_cast<float*>(p); break;
+        case FieldId::ParticlePlastic:     v.particle_plastic = static_cast<float*>(p); break;
+        case FieldId::ParticleMaterialId:  v.particle_material_id = static_cast<uint32_t*>(p); break;
+        case FieldId::SnapshotParticleF:       v.snapshot_particle_F = static_cast<float*>(p); break;
+        case FieldId::SnapshotParticleC:       v.snapshot_particle_C = static_cast<float*>(p); break;
+        case FieldId::SnapshotParticlePlastic: v.snapshot_particle_plastic = static_cast<float*>(p); break;
+        case FieldId::MpmGridCellKey:      v.mpm_grid_cell_key = static_cast<uint32_t*>(p); break;
+        case FieldId::MpmGridPartIdx:      v.mpm_grid_part_idx = static_cast<uint32_t*>(p); break;
+        case FieldId::MpmSortScratch:      v.mpm_sort_scratch = static_cast<uint8_t*>(p); break;
+        case FieldId::MpmMaterialTable:    v.mpm_material_table = static_cast<float*>(p); break;
         case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
         case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
         case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;

@@ -739,3 +739,34 @@ fields:
   # is byte-stable (the D1 invariant).
   # =========================================================================
   - {name: grid_sort_scratch, dtype: u8, per: scalar, count: "grid_sort_scratch_bytes", arena: scratch, owner: data}
+
+  # MLS-MPM env-private background grid (dense Cartesian nodes; scratch, rebuilt
+  # every transfer). 0 nodes for a non-MPM world -> zero-byte segment. APPENDED LAST.
+  - {name: grid_mass,     dtype: f32,  per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_momentum, dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_velocity, dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_force,    dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+
+  # MLS-MPM per-particle continuum state (F deformation gradient init I, C APIC
+  # affine init 0, vol0 lattice volume, plastic hardening, material_id). APPENDED LAST.
+  - {name: particle_F,           dtype: f32, per: particle, arena: persistent, owner: data, elem: 9, flags: [diff]}
+  - {name: particle_C,           dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
+  - {name: particle_vol0,        dtype: f32, per: particle, arena: persistent, owner: data}
+  - {name: particle_plastic,     dtype: f32, per: particle, arena: persistent, owner: data}
+  - {name: particle_material_id, dtype: u32, per: particle, arena: persistent, owner: data}
+
+  # MLS-MPM snapshot triple for the mutable F/C/plastic (the Reset restore source;
+  # vol0/material_id are cook-constant, not snapshotted). APPENDED LAST.
+  - {name: snapshot_particle_F,       dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
+  - {name: snapshot_particle_C,       dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
+  - {name: snapshot_particle_plastic, dtype: f32, per: particle, arena: persistent, owner: data}
+
+  # MLS-MPM P2G deterministic-gather scratch (cub radix-sort temp + sorted key/idx
+  # out buffers, sized at World construct -> no mid-capture cudaMalloc). APPENDED LAST.
+  - {name: mpm_grid_cell_key,  dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: mpm_grid_part_idx,  dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: mpm_sort_scratch,   dtype: u8,  per: scalar, count: "mpm_grid_sort_scratch_bytes", arena: scratch, owner: data}
+
+  # MLS-MPM material table (global flat f32 pool like mat_buckets; stride
+  # MpmMaterial::kValueCount, resolved in ElementCount). APPENDED LAST.
+  - {name: mpm_material_table, dtype: f32, per: scalar, count: "mpm_material_count*6", arena: persistent, owner: data}

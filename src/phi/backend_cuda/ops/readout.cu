@@ -191,7 +191,16 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  Vec3* particle_vel,
                                  const Vec3* snapshot_particle_pos,
                                  const Vec3* snapshot_particle_prev_pos,
-                                 const Vec3* snapshot_particle_vel) {
+                                 const Vec3* snapshot_particle_vel,
+                                 // MLS-MPM mutable continuum restore (F/C elem:9 +
+                                 // plastic). nullptr when the world has no MPM
+                                 // fields (the copies are guarded below).
+                                 float* particle_F,
+                                 float* particle_C,
+                                 float* particle_plastic,
+                                 const float* snapshot_particle_F,
+                                 const float* snapshot_particle_C,
+                                 const float* snapshot_particle_plastic) {
     const uint32_t slot = blockIdx.x;
     if (slot >= id_count) {
         return;
@@ -258,6 +267,14 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
         particle_pos[pidx] = snapshot_particle_pos[pidx];
         particle_prev_pos[pidx] = snapshot_particle_prev_pos[pidx];
         particle_vel[pidx] = snapshot_particle_vel[pidx];
+        // MLS-MPM continuum state (guarded; null when the world has no MPM fields).
+        if (particle_F != nullptr) {
+            for (uint32_t k = 0u; k < 9u; ++k) {
+                particle_F[pidx * 9u + k] = snapshot_particle_F[pidx * 9u + k];
+                particle_C[pidx * 9u + k] = snapshot_particle_C[pidx * 9u + k];
+            }
+            particle_plastic[pidx] = snapshot_particle_plastic[pidx];
+        }
     }
 }
 
@@ -406,7 +423,14 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
                static_cast<Vec3*>(data.particle_vel),
                static_cast<const Vec3*>(data.snapshot_particle_pos),
                static_cast<const Vec3*>(data.snapshot_particle_prev_pos),
-               static_cast<const Vec3*>(data.snapshot_particle_vel));
+               static_cast<const Vec3*>(data.snapshot_particle_vel),
+               // MLS-MPM mutable continuum restore (null when no MPM fields).
+               static_cast<float*>(data.particle_F),
+               static_cast<float*>(data.particle_C),
+               static_cast<float*>(data.particle_plastic),
+               static_cast<const float*>(data.snapshot_particle_F),
+               static_cast<const float*>(data.snapshot_particle_C),
+               static_cast<const float*>(data.snapshot_particle_plastic));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -469,6 +493,20 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          stream) != cudaSuccess ||
          cudaMemcpyAsync(data.snapshot_particle_vel, data.particle_vel,
                          np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess)) {
+        return Status::Failed;
+    }
+    // APPEND the mutable MLS-MPM continuum snapshot (F/C are elem:9, plastic 1).
+    // Additive; 0 particles skips it. vol0/material_id are cook-constant (not here).
+    if (np > 0u && data.particle_F != nullptr &&
+        (cudaMemcpyAsync(data.snapshot_particle_F, data.particle_F,
+                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_C, data.particle_C,
+                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.snapshot_particle_plastic, data.particle_plastic,
+                         np * sizeof(float), cudaMemcpyDeviceToDevice,
                          stream) != cudaSuccess)) {
         return Status::Failed;
     }
@@ -543,6 +581,20 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
                          stream) != cudaSuccess ||
          cudaMemcpyAsync(data.particle_vel, data.snapshot_particle_vel,
                          np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess)) {
+        return Status::Failed;
+    }
+    // APPEND the inverse MLS-MPM continuum restore (snapshot -> live). Additive;
+    // 0 particles skips it. vol0/material_id are cook-constant (not restored here).
+    if (np > 0u && data.particle_F != nullptr &&
+        (cudaMemcpyAsync(data.particle_F, data.snapshot_particle_F,
+                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.particle_C, data.snapshot_particle_C,
+                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
+                         stream) != cudaSuccess ||
+         cudaMemcpyAsync(data.particle_plastic, data.snapshot_particle_plastic,
+                         np * sizeof(float), cudaMemcpyDeviceToDevice,
                          stream) != cudaSuccess)) {
         return Status::Failed;
     }

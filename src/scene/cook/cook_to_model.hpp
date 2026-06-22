@@ -122,12 +122,56 @@ struct XpbdCookInput {
     uint16_t solver_iterations = 1u;
     // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
     float    friction = 0.6f;
+    // Per-medium solver selection carried from the Scene IR SoftBodyComponent.
+    // Xpbd (default) cooks the existing XPBD soft body byte-identically; Mpm
+    // routes the cook to CookMpmParticles instead (ParticleMode::Mpm + material).
+    nk::Model::ParticleMode solver = nk::Model::ParticleMode::Xpbd;
 };
 
 // Stage an XPBD soft body into the Model (single-env template; SeedInitialState
 // replicates env-major). Sets particles_per_env / dist/bend/vol_cons_per_env.
 void CookXpbdParticles(nk::Model& model, uint32_t env_count,
                        const XpbdCookInput& in);
+
+// One MLS-MPM material the cook appends to model.mpm_materials (the constitutive
+// branch, later, reads it). Mirrors nk::MpmMaterial 1:1.
+struct MpmMaterialInput {
+    float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
+    float dp_friction = 0.0f, dp_cohesion = 0.0f;
+    float model_kind = 0.0f;  // 0 = elastic, 1 = Drucker-Prager.
+};
+
+struct MpmCookInput {
+    std::vector<math::Vec3> positions;     // per-particle rest state
+    std::vector<math::Vec3> velocities;    // per-particle initial velocity
+    std::vector<float>      inv_mass;      // 1/mass (0 == pinned)
+    std::vector<float>      vol0;           // per-particle sampling-lattice volume
+    MpmMaterialInput        material;       // appended to model.mpm_materials (id 0)
+    math::Vec3 grid_origin{0.0f, 0.0f, 0.0f};  // world corner of node (0,0,0)
+    uint32_t   grid_dims[3] = {0u, 0u, 0u};    // per-env node resolution
+    float      dx = 0.0f;                       // uniform node spacing (> 0).
+};
+
+// Stage an MLS-MPM bulk-soft body into the Model (single-env template; F=identity,
+// C=0, vol0 from the lattice). Sets ParticleMode::Mpm + the grid/material caps;
+// reuses the SAME particle-slot reserve as CookXpbdParticles (coupling one-path).
+void CookMpmParticles(nk::Model& model, uint32_t env_count,
+                      const MpmCookInput& in);
+
+// Per-medium solver dispatch for a BULK-SOFT body (the only medium MPM admits).
+// Routes by in.solver: Xpbd -> CookXpbdParticles (byte-identical default); Mpm ->
+// CookMpmParticles built from `mpm` (the grid/material the XpbdCookInput lacks).
+// `mpm` is consulted ONLY for the Mpm branch. Throws LOUDLY on an unsupported
+// in.solver (anything but Xpbd/Mpm).
+void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
+                           const XpbdCookInput& in, const MpmCookInput& mpm);
+
+// LOUD cook-time rejection of an unsupported medium x sim_method combination
+// (cloth -> MlsMpm and fluid -> MlsMpm are refused; cloth stays XPBD permanently,
+// fluid stays PBF in the first batch). Throws std::runtime_error; a no-op for the
+// default (Xpbd) selector so every existing scene cooks byte-identically.
+void RejectUnsupportedClothFluidMpm(
+    nk::Model::ParticleMode cloth_solver, nk::Model::ParticleMode fluid_solver);
 
 struct PbfCookInput {
     std::vector<math::Vec3> positions;     // CookFluidBox lattice

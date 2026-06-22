@@ -1095,6 +1095,7 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
     if (p->mode == kParticleModeNone || p->particle_count == 0u) {
         return Status::Ok;  // no particles: inert (the union/foot graph never adds it).
     }
+    if (p->mode == kParticleModeMpm) return Status::Ok;  // MPM advances via its own transfer ops
     const uint32_t blocks = (p->particle_count + kBlockSize - 1u) / kBlockSize;
     const math::Vec3 g{p->gravity[0], p->gravity[1], p->gravity[2]};
     if (p->mode == kParticleModeXpbd) {
@@ -1292,6 +1293,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     if (p->mode == kParticleModeNone || p->particle_count == 0u) {
         return Status::Ok;
     }
+    if (p->mode == kParticleModeMpm) return Status::Ok;  // MPM advances via its own transfer ops
     const uint32_t N = p->particle_count;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
     // The split-impulse positional push-out the row solve accumulated this step;

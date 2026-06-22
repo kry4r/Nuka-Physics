@@ -686,6 +686,10 @@ if(CMAKE_CUDA_COMPILER)
         # (predict / xpbd project / pbf density-lambda / pbf apply / finalize),
         # the particle side of the unified row solve.
         phi/backend_cuda/ops/particles.cu
+        # MLS-MPM transfer ops (P2G deterministic gather + G2P + grid clear) — the
+        # inert round-trip scaffold; reachable through RegisterNkMpmOps, not yet in
+        # Pipeline::Build's op list.
+        phi/backend_cuda/ops/mpm.cu
         phi/backend_cuda/ops/readout.cu
         # M9 T7: NkOp::StepBackward — the diffsim contact-free single-step reverse
         # adjoint, kernel moved VERBATIM from the deleted diffsim/step_backward.cu

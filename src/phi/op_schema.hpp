@@ -55,6 +55,7 @@ inline constexpr uint32_t kSdfHeaderStride = 8u;
 inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pairs dropped
 inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
+inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM particle outside grid AABB
 
 // ---------------------------------------------------------------------------
 // NkOp — the closed op set. uint16_t backing so an op id fits a single field
@@ -97,6 +98,11 @@ enum class NkOp : uint16_t {
     PbfDensityLambda,      // PBF density constraint lambda
     PbfApplyDelta,         // PBF position delta apply
     ParticleFinalize,      // v = (x* - x)/dt; commit x
+
+    // --- MLS-MPM transfers (inert round-trip scaffold) ------------------
+    MpmGridClear,          // zero grid_mass/momentum/velocity/force (env-private grid)
+    MpmP2G,                // deterministic gather particles -> grid (mass + APIC momentum)
+    MpmG2P,                // gather grid -> particle velocity + affine C
 
     // --- readout / RL substrate -----------------------------------------
     ReadoutContactWrench,  // per-link contact wrench readout
@@ -300,6 +306,31 @@ inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 // Host-callable (defined in broadphase.cu) so the World sizes the grid_sort_scratch
 // arena field BEFORE allocation -> no mid-capture cudaMalloc. 0 for 0 particles.
 uint64_t GridSortScratchBytes(uint32_t particle_count);
+
+// --- MLS-MPM transfers (inert round-trip scaffold) ----------------------
+// Shared launch geometry for the MPM transfer ops. The grid is env-private:
+// node keys are env-offset (env*nodes_per_env + local), mirroring the particle
+// CSR grid, so replicated envs never cross-couple. grid_dims/origin/inv_dx define
+// the dense Cartesian lattice; particle_count is the env-major particle total.
+struct MpmGridParams {
+    uint32_t particle_count;     // total env-major particles (0 => inert no-op)
+    uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
+    uint32_t env_count;
+    uint32_t nodes_per_env;      // per-env grid node count (mpm_grid_nodes_per_env)
+    uint32_t grid_dims[3];       // per-env node resolution (nx, ny, nz)
+    float    grid_origin[3];     // world-space corner of node (0,0,0)
+    float    dx;                 // uniform node spacing
+    float    dt;                 // step dt (unused while grid_force == 0)
+};
+using MpmGridClearParams = MpmGridParams;
+using MpmP2GParams       = MpmGridParams;
+using MpmG2PParams       = MpmGridParams;
+
+// Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-
+// gather cub radix sort temp + the sorted key/idx out buffers, 256B-aligned).
+// Host-callable (defined in mpm.cu) so World sizes the field before allocation
+// -> no mid-capture cudaMalloc. 0 for 0 particles.
+uint64_t MpmSortScratchBytes(uint32_t particle_count);
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
@@ -555,6 +586,9 @@ inline constexpr uint32_t kParticleModeCoupled = 3u;
 // constraints are edge-based so they only touch the soft slice. The 
 // cross-contact runs over the FULL union.
 inline constexpr uint32_t kParticleModeSoftFluid = 4u;
+// MLS-MPM continuum medium: the particle set is advanced by the P2G ->
+// grid-update -> G2P transfer loop (a new ParticleMode value, not a step branch).
+inline constexpr uint32_t kParticleModeMpm = 5u;
 
 // Common particle launch geometry (the views are pure pointer aggregates, so
 // every particle op carries its counts). particle_count == total env-major

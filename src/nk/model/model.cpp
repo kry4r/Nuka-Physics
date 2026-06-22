@@ -117,6 +117,23 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::GridSortScratch) {
             return grid_sort_scratch_bytes;
         }
+        // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
+        // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
+        if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
+            id == FieldId::GridVelocity || id == FieldId::GridForce) {
+            return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
+                   static_cast<uint64_t>(env_count);
+        }
+        // MLS-MPM P2G deterministic-gather scratch (u8 bytes): sized by World
+        // construct; 0 for a non-MPM world.
+        if (id == FieldId::MpmSortScratch) {
+            return mpm_grid_sort_scratch_bytes;
+        }
+        // MLS-MPM material table (flat f32 pool, like mat_buckets): rows x stride
+        // via the named constant (never a magic literal). 0 for a non-MPM world.
+        if (id == FieldId::MpmMaterialTable) {
+            return static_cast<uint64_t>(mpm_material_count) * MpmMaterial::kValueCount;
+        }
         // obs_buffer: the cook-derived per-env observation width x env_count (the
         // symbolic fields.yaml count "obs_width*env_count"). 0 obs_width is a flat
         // per-env row so the readout has a defined (empty) destination.
@@ -896,6 +913,9 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.body_to_articulation = std::move(src.body_to_articulation);
     dst.heightfields = std::move(src.heightfields);
     dst.heightfield_heights = std::move(src.heightfield_heights);
+    // MLS-MPM material table: MISSING here dropped it on every move, so the World
+    // seed guard saw an empty table and skipped staging it (device table all-zero).
+    dst.mpm_materials = std::move(src.mpm_materials);
 }
 
 }  // namespace

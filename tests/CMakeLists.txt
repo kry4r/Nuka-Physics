@@ -1075,6 +1075,14 @@ if(CMAKE_CUDA_COMPILER)
         # round-trip + StepOnce same-frame). Pure host/Data path (no Vulkan), so it
         # runs in build-cuda128 alongside the other scenario gates.
         scenario/viewer_move_entity.cpp
+        # MLS-MPM transfer ROUND-TRIP IDENTITY gate: clear -> P2G (deterministic
+        # gather, no atomics) -> G2P with C=0/F=I reproduces particle velocity; the
+        # gather is byte-identical run-to-run; snapshot/restore round-trips F; an
+        # out-of-AABB particle flags the env-status escape bit.
+        scenario/mpm_transfer_roundtrip.cpp
+        # FR7 per-medium solver selector (host cook): a bulk-soft body cooks XPBD by
+        # default (byte-identical) and MPM when selected; cloth/fluid -> mlsmpm throw.
+        scenario/mpm_sim_method_selector.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test

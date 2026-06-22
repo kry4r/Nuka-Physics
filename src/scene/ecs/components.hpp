@@ -146,6 +146,11 @@ struct SoftBodyComponent {
     float    young            = 0.0f;
     float    poisson          = 0.0f;
     float    xpbd_compliance  = 0.0f;
+    // Per-medium solver selection. Xpbd (default) = the existing position-based
+    // soft solver; MlsMpm = the continuum MPM medium. Default preserves the
+    // byte-identical cook for every existing scene.
+    enum class SimMethod : uint8_t { Xpbd = 0, MlsMpm = 1 };
+    SimMethod sim_method = SimMethod::Xpbd;
 };
 
 struct FluidComponent {
