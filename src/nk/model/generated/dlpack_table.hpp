@@ -212,6 +212,22 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VolColorSegments, DlpackDtype::kU32, 1, false, false},  // vol_color_segments
     {FieldId::SmColorSegments, DlpackDtype::kU32, 1, false, false},  // sm_color_segments
     {FieldId::GridSortScratch, DlpackDtype::kU8, 1, false, false},  // grid_sort_scratch
+    {FieldId::GridMass, DlpackDtype::kF32, 1, false, false},  // grid_mass
+    {FieldId::GridMomentum, DlpackDtype::kF32, 2, false, false},  // grid_momentum
+    {FieldId::GridVelocity, DlpackDtype::kF32, 2, false, false},  // grid_velocity
+    {FieldId::GridForce, DlpackDtype::kF32, 2, false, false},  // grid_force
+    {FieldId::ParticleF, DlpackDtype::kF32, 2, true, false},  // particle_F
+    {FieldId::ParticleC, DlpackDtype::kF32, 2, false, false},  // particle_C
+    {FieldId::ParticleVol0, DlpackDtype::kF32, 1, false, false},  // particle_vol0
+    {FieldId::ParticlePlastic, DlpackDtype::kF32, 1, false, false},  // particle_plastic
+    {FieldId::ParticleMaterialId, DlpackDtype::kU32, 1, false, false},  // particle_material_id
+    {FieldId::SnapshotParticleF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_F
+    {FieldId::SnapshotParticleC, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_C
+    {FieldId::SnapshotParticlePlastic, DlpackDtype::kF32, 1, false, false},  // snapshot_particle_plastic
+    {FieldId::MpmGridCellKey, DlpackDtype::kU32, 1, false, false},  // mpm_grid_cell_key
+    {FieldId::MpmGridPartIdx, DlpackDtype::kU32, 1, false, false},  // mpm_grid_part_idx
+    {FieldId::MpmSortScratch, DlpackDtype::kU8, 1, false, false},  // mpm_sort_scratch
+    {FieldId::MpmMaterialTable, DlpackDtype::kF32, 1, false, false},  // mpm_material_table
 };
 
 } // namespace nuka::nk

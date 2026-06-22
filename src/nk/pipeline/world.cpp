@@ -26,6 +26,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.grid_sort_scratch_bytes = phi::GridSortScratchBytes(
         model_.capacities.particles_per_env * model_.capacities.env_count);
 
+    // Size the MLS-MPM P2G deterministic-gather scratch the same way; 0 for a
+    // non-MPM world (zero-byte segment, byte-inert).
+    model_.capacities.mpm_grid_sort_scratch_bytes = phi::MpmSortScratchBytes(
+        model_.capacities.particles_per_env * model_.capacities.env_count);
+
     // The init-time buffer type (stream-less default-stream device type — fine
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);
@@ -210,6 +215,54 @@ bool World::SeedInitialState() {
                                vel.size() * sizeof(math::Vec3)) ||
             !data_.UploadField(FieldId::ParticleInvMass, inv_mass.data(),
                                inv_mass.size() * sizeof(float))) {
+            return false;
+        }
+        // MLS-MPM per-particle continuum seed (F=identity, vol0, material_id),
+        // gated mode==Mpm so a non-MPM world writes EXACTLY today's bytes (the new
+        // fields stay at their 0-byte segments). C is the arena zero default.
+        if (mp.mode == Model::ParticleMode::Mpm) {
+            std::vector<float> F(static_cast<size_t>(P) * E * 9u, 0.0f);
+            std::vector<float> vol0(static_cast<size_t>(P) * E, 0.0f);
+            std::vector<uint32_t> mat(static_cast<size_t>(P) * E, 0u);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t i = 0; i < P; ++i) {
+                    const size_t at = static_cast<size_t>(e) * P + i;
+                    float* f = F.data() + at * 9u;
+                    if ((static_cast<size_t>(i) + 1u) * 9u <= mp.initial_F.size()) {
+                        for (uint32_t k = 0; k < 9u; ++k) f[k] = mp.initial_F[i * 9u + k];
+                    } else {
+                        f[0] = 1.0f; f[4] = 1.0f; f[8] = 1.0f;  // identity fallback.
+                    }
+                    vol0[at] = i < mp.initial_vol0.size() ? mp.initial_vol0[i] : 0.0f;
+                    mat[at] = i < mp.initial_material_id.size()
+                                  ? mp.initial_material_id[i] : 0u;
+                }
+            }
+            if (!data_.UploadField(FieldId::ParticleF, F.data(),
+                                   F.size() * sizeof(float)) ||
+                !data_.UploadField(FieldId::ParticleVol0, vol0.data(),
+                                   vol0.size() * sizeof(float)) ||
+                !data_.UploadField(FieldId::ParticleMaterialId, mat.data(),
+                                   mat.size() * sizeof(uint32_t))) {
+                return false;
+            }
+        }
+    }
+
+    // MLS-MPM material table (global; data-owned, flat f32 pool like mat_buckets).
+    // 0 materials -> the segment is zero bytes and this block no-ops (byte-inert).
+    if (cap.mpm_material_count > 0 && !model_.mpm_materials.empty()) {
+        const uint32_t stride = MpmMaterial::kValueCount;
+        std::vector<float> host(static_cast<size_t>(cap.mpm_material_count) * stride, 0.0f);
+        for (uint32_t r = 0; r < cap.mpm_material_count &&
+                             r < model_.mpm_materials.size(); ++r) {
+            const MpmMaterial& mm = model_.mpm_materials[r];
+            float* dst = host.data() + static_cast<size_t>(r) * stride;
+            dst[0] = mm.youngs; dst[1] = mm.poisson; dst[2] = mm.density;
+            dst[3] = mm.dp_friction; dst[4] = mm.dp_cohesion; dst[5] = mm.model_kind;
+        }
+        if (!data_.UploadField(FieldId::MpmMaterialTable, host.data(),
+                               host.size() * sizeof(float))) {
             return false;
         }
     }

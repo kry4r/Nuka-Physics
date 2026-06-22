@@ -220,6 +220,22 @@ struct DataView {
     ::nuka::math::Vec3* snapshot_particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
     ::nuka::math::Vec3* snapshot_particle_vel = nullptr;  // per:particle arena:persistent owner:data
     uint8_t* grid_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes
+    float* grid_mass = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    ::nuka::math::Vec3* grid_momentum = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    ::nuka::math::Vec3* grid_velocity = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    ::nuka::math::Vec3* grid_force = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    float* particle_F = nullptr;  // per:particle arena:persistent owner:data elem:9 flags:[diff]
+    float* particle_C = nullptr;  // per:particle arena:persistent owner:data elem:9
+    float* particle_vol0 = nullptr;  // per:particle arena:persistent owner:data
+    float* particle_plastic = nullptr;  // per:particle arena:persistent owner:data
+    uint32_t* particle_material_id = nullptr;  // per:particle arena:persistent owner:data
+    float* snapshot_particle_F = nullptr;  // per:particle arena:persistent owner:data elem:9
+    float* snapshot_particle_C = nullptr;  // per:particle arena:persistent owner:data elem:9
+    float* snapshot_particle_plastic = nullptr;  // per:particle arena:persistent owner:data
+    uint32_t* mpm_grid_cell_key = nullptr;  // per:particle arena:scratch owner:data
+    uint32_t* mpm_grid_part_idx = nullptr;  // per:particle arena:scratch owner:data
+    uint8_t* mpm_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_sort_scratch_bytes
+    float* mpm_material_table = nullptr;  // per:scalar arena:persistent owner:data count:mpm_material_count*6
 };
 
 } // namespace nuka::phi

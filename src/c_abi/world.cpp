@@ -577,6 +577,17 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             return NUKA_RESULT_INVALID_ARG;
         }
 
+        // Per-medium solver selection (FR7). The coupled desc's media are cloth
+        // (XPBD) + fluid (PBF); soft_sim_method == mlsmpm is rejected LOUDLY for
+        // whichever medium is present (cloth stays XPBD, fluid stays PBF), never a
+        // silent fallback. 0 (PB default) cooks byte-identically.
+        const auto sel = particles->soft_sim_method == 1u
+                             ? nuka::nk::Model::ParticleMode::Mpm
+                             : nuka::nk::Model::ParticleMode::Xpbd;
+        nuka::scene::cook::RejectUnsupportedClothFluidMpm(
+            has_cloth ? sel : nuka::nk::Model::ParticleMode::Xpbd,
+            has_fluid ? sel : nuka::nk::Model::ParticleMode::Xpbd);
+
         nuka::scene::cook::XpbdCookInput cloth =
             nuka::c_abi::BuildClothCookInput(*particles);
         nuka::scene::cook::PbfCookInput fluid =

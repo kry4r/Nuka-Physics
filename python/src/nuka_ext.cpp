@@ -256,7 +256,7 @@ public:
         float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
         float fluid_max_y, float fluid_max_z, float fluid_spacing,
         float fluid_rest_density, float fluid_floor_z, float fluid_friction,
-        uint32_t fluid_iters, float contact_radius) {
+        uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
         }
@@ -301,6 +301,7 @@ public:
         parts.fluid_friction = fluid_friction;
         parts.fluid_iters = fluid_iters;
         parts.contact_radius = contact_radius;
+        parts.soft_sim_method = soft_sim_method;  // 0 = xpbd default, 1 = mlsmpm.
 
         nuka_world_handle h = nullptr;
         check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
@@ -1330,7 +1331,8 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("fluid_max_z") = 0.0f, nb::arg("fluid_spacing") = 0.0f,
             nb::arg("fluid_rest_density") = 1000.0f, nb::arg("fluid_floor_z") = 0.0f,
             nb::arg("fluid_friction") = 0.0f, nb::arg("fluid_iters") = 4u,
-            nb::arg("contact_radius") = 0.0f, nb::rv_policy::take_ownership,
+            nb::arg("contact_radius") = 0.0f, nb::arg("soft_sim_method") = 0u,
+            nb::rv_policy::take_ownership,
             "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
             "and/or fluid (PBF) particles, stepping on the ONE general contact "
             "pipeline with two-way body<->particle coupling. The MINIMAL create + "

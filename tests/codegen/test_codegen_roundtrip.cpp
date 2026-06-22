@@ -52,6 +52,43 @@ TEST(CodegenRoundtrip, RegenExitsZeroForCurrentIrSet) {
     std::filesystem::remove_all(temp);
 }
 
+namespace {
+std::string ReadAll(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+}  // namespace
+
+// The four committed nk field headers must BYTE-MATCH a fresh regen of fields.yaml
+// (the stale-header guard the exit-0 test above does not catch: edit yaml, forget
+// to regen + commit, or hand-edit a header). Regens into a temp --fields-output-dir
+// and byte-diffs each output against the committed src/nk/model/generated/*.hpp.
+TEST(CodegenRoundtrip, CommittedNkFieldHeadersMatchFreshRegen) {
+    const auto temp = std::filesystem::temp_directory_path() / "nuka_nk_fields_out";
+    std::filesystem::remove_all(temp);
+    std::filesystem::create_directories(temp);
+
+    const std::string command = std::string("\"") + NUKA_PYTHON_EXECUTABLE +
+        "\" \"" + (SourceRoot() / "tools/codegen/regen.py").string() +
+        "\" --fields-output-dir \"" + temp.string() + "\"";
+    ASSERT_EQ(RunCommand(command), 0);
+
+    const auto committed = SourceRoot() / "src/nk/model/generated";
+    const std::array<const char*, 4> headers = {
+        "field_ids.hpp", "views.hpp", "arena_layout.hpp", "dlpack_table.hpp"};
+    for (const char* h : headers) {
+        const auto fresh = temp / h;
+        const auto on_disk = committed / h;
+        ASSERT_TRUE(std::filesystem::exists(fresh)) << fresh;
+        ASSERT_TRUE(std::filesystem::exists(on_disk)) << on_disk;
+        EXPECT_EQ(ReadAll(on_disk), ReadAll(fresh))
+            << "committed " << h << " is stale vs a fresh regen of fields.yaml "
+            << "(run: python tools/codegen/regen.py and commit the 4 headers)";
+    }
+    std::filesystem::remove_all(temp);
+}
+
 TEST(CodegenRoundtrip, GeneratedFilesCarryDoNotEditHeader) {
     const auto generated = SourceRoot() / "src/codegen/generated";
     const std::array<const char*, 19> files = {

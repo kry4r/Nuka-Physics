@@ -233,6 +233,22 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vol_color_segments
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sm_color_segments
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // grid_sort_scratch
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_mass
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_momentum
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_velocity
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_force
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // particle_F
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // particle_C
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_vol0
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_plastic
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_material_id
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // snapshot_particle_F
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // snapshot_particle_C
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // snapshot_particle_plastic
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // mpm_grid_cell_key
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // mpm_grid_part_idx
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // mpm_sort_scratch
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mpm_material_table
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

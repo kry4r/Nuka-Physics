@@ -84,6 +84,16 @@ struct ModelCapacities {
     // sort/scan temp + out buffers; sized at World construct, 0 == no particles).
     uint64_t grid_sort_scratch_bytes = 0;
 
+    // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
+    // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
+    uint32_t mpm_grid_nodes_per_env = 0;
+    // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
+    // sort temp + out buffers; sized at World construct; 0 == no MPM particles).
+    uint64_t mpm_grid_sort_scratch_bytes = 0;
+    // MLS-MPM material-table row count (indexed by particle_material_id); 0 for a
+    // non-MPM world -> zero-byte mpm_material_table segment.
+    uint32_t mpm_material_count = 0;
+
     // H1 (general contact pipeline Phase 0) — total cooked heightfield-grid cells
     // (sum over all heightfield collidables of nrow*ncol). Sizes the GLOBAL
     // `heights[]` Model field. 0 for every current scene (the cook fill is H2,
@@ -215,6 +225,15 @@ struct ModelMaterialBucket {
     float values[kValueCount] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
 };
 
+// One MLS-MPM material: elastic moduli + Drucker-Prager params, indexed by the
+// per-particle material id. The constitutive branch reads these (not yet wired).
+struct MpmMaterial {
+    static constexpr uint32_t kValueCount = 6u;  // f32 count of this POD (table stride).
+    float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
+    float dp_friction = 0.0f, dp_cohesion = 0.0f;
+    float model_kind = 0.0f;  // 0 = fixed-corotated/Neo-Hookean elastic, 1 = Drucker-Prager
+};
+
 // ---------------------------------------------------------------------------
 // M4: the UNION (CSR compliant) contact family — Model-side authoring tables.
 // ---------------------------------------------------------------------------
@@ -264,6 +283,7 @@ public:
     std::vector<ModelShape>         shapes;             // cooked shape rows (per env).
     std::vector<ModelMaterialBucket> material_buckets;  // (num_buckets) bucket table.
     std::vector<uint32_t>           body_material_bucket;  // per body-row bucket index.
+    std::vector<MpmMaterial>        mpm_materials;      // (mpm_material_count) MPM table.
 
     // -- articulation contact pipeline config (M3b foot sphere x ground) -----
     // feet: derived by CookToModel (every Sphere shape owned by an articulation
@@ -295,7 +315,7 @@ public:
     // (split n_x) 1:1, so the Phase-2 id-10 cross-contact port is near-verbatim
     // (global g < n_soft => soft, else fluid).
     enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3,
-                                        SoftFluid = 4 };
+                                        SoftFluid = 4, Mpm = 5 };
     // In Coupled mode, which internal dynamics run alongside the contact coupling:
     // None (free point masses), Xpbd (soft constraints), Pbf (fluid density).
     enum class CoupledInternal : uint8_t { None = 0, Xpbd = 1, Pbf = 2 };
@@ -307,6 +327,12 @@ public:
         std::vector<math::Vec3> initial_pos;
         std::vector<math::Vec3> initial_vel;
         std::vector<float>      inv_mass;
+        // MLS-MPM per-particle init (single-env template; replicated env-major).
+        // F seeded identity, vol0 from the sampling lattice, material_id indexes
+        // mpm_materials. Empty for a non-MPM cook (C is the arena zero default).
+        std::vector<float>      initial_F;           // 9 floats/particle (identity)
+        std::vector<float>      initial_vol0;         // 1/particle
+        std::vector<uint32_t>   initial_material_id;  // 1/particle
         // XPBD constraint templates (single-env; staged + dispatched per env).
         std::vector<uint32_t> dist_a, dist_b;     // distance endpoints
         std::vector<float>    dist_rest, dist_alpha;
@@ -356,6 +382,11 @@ public:
         // Boundary floor (z-up; the M5 grid + particle ops are z-up).
         bool  boundary_enabled = false;
         float floor_z = 0.0f;
+        // MLS-MPM env-private background grid descriptor (its OWN fields, NOT the PBF
+        // domain above). The grid-transfer coupling provider builds MpmGridParams from these.
+        math::Vec3 mpm_grid_min{0.0f, 0.0f, 0.0f};
+        uint32_t   mpm_grid_dims[3] = {0u, 0u, 0u};
+        float      mpm_cell_size = 0.0f;
         // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
         // (the op-ified cross-system particle-particle co-step). The
         // class-blind unilateral non-penetration co-step runs AFTER finalize over

@@ -1221,6 +1221,97 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
 }
 
+void CookMpmParticles(nk::Model& model, uint32_t env_count,
+                      const MpmCookInput& in) {
+    const uint32_t envs = env_count > 0 ? env_count : 1u;
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+    if (in.dx <= 0.0f || in.grid_dims[0] == 0u || in.grid_dims[1] == 0u ||
+        in.grid_dims[2] == 0u) {
+        throw std::runtime_error(
+            "CookMpmParticles: an MLS-MPM medium needs a positive cell size dx and "
+            "non-zero grid_dims (the env-private background grid)");
+    }
+
+    nk::Model::ModelParticles& mp = model.particles;
+    mp.mode = nk::Model::ParticleMode::Mpm;
+    mp.initial_pos = in.positions;
+    mp.initial_vel = in.velocities;
+    mp.inv_mass = in.inv_mass;
+    if (mp.initial_vel.size() != mp.initial_pos.size()) {
+        mp.initial_vel.assign(mp.initial_pos.size(), math::Vec3::Zero());
+    }
+    if (mp.inv_mass.size() != mp.initial_pos.size()) {
+        mp.inv_mass.assign(mp.initial_pos.size(), 1.0f);
+    }
+    // F seeded to identity per particle; C is the arena zero default.
+    const size_t n = mp.initial_pos.size();
+    mp.initial_F.assign(n * 9u, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        mp.initial_F[i * 9u + 0u] = 1.0f;
+        mp.initial_F[i * 9u + 4u] = 1.0f;
+        mp.initial_F[i * 9u + 8u] = 1.0f;
+    }
+    mp.initial_vol0 = in.vol0;
+    if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
+    mp.initial_material_id.assign(n, 0u);
+
+    // The single cooked material (id 0). The constitutive branch reads it later.
+    nk::MpmMaterial m0;
+    m0.youngs = in.material.youngs; m0.poisson = in.material.poisson;
+    m0.density = in.material.density; m0.dp_friction = in.material.dp_friction;
+    m0.dp_cohesion = in.material.dp_cohesion; m0.model_kind = in.material.model_kind;
+    model.mpm_materials = {m0};
+    cap.mpm_material_count = 1u;
+
+    // Env-private dense grid sizing (the node product, loud u32 overflow guard).
+    const uint64_t nodes64 = static_cast<uint64_t>(in.grid_dims[0]) *
+                             in.grid_dims[1] * in.grid_dims[2];
+    if (nodes64 > 0xFFFFFFFFull) {
+        throw std::runtime_error(
+            "CookMpmParticles: the MPM grid node count (dims product) overflows u32");
+    }
+    cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nodes64);
+    mp.mpm_grid_min = in.grid_origin;
+    mp.mpm_grid_dims[0] = in.grid_dims[0];
+    mp.mpm_grid_dims[1] = in.grid_dims[1];
+    mp.mpm_grid_dims[2] = in.grid_dims[2];
+    mp.mpm_cell_size = in.dx;
+
+    const uint32_t rigid_base = cap.max_contacts_per_env;
+    cap.particles_per_env = static_cast<uint32_t>(n);
+    // Reuse the SAME disjoint body<->particle slot reserve as the XPBD cook so
+    // coupling stays one-path (no-op when there are no body contacts).
+    GrowContactBudgetForParticles(cap, rigid_base);
+}
+
+void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
+                           const XpbdCookInput& in, const MpmCookInput& mpm) {
+    if (in.solver == nk::Model::ParticleMode::Xpbd) {
+        CookXpbdParticles(model, env_count, in);
+        return;
+    }
+    if (in.solver == nk::Model::ParticleMode::Mpm) {
+        CookMpmParticles(model, env_count, mpm);
+        return;
+    }
+    throw std::runtime_error(
+        "CookSoftBodyParticles: a bulk-soft body solver must be Xpbd or Mpm");
+}
+
+void RejectUnsupportedClothFluidMpm(nk::Model::ParticleMode cloth_solver,
+                                    nk::Model::ParticleMode fluid_solver) {
+    if (cloth_solver == nk::Model::ParticleMode::Mpm) {
+        throw std::runtime_error(
+            "cloth -> mlsmpm is not supported: cloth stays XPBD permanently (MPM is "
+            "structurally weak for thin shells)");
+    }
+    if (fluid_solver == nk::Model::ParticleMode::Mpm) {
+        throw std::runtime_error(
+            "fluid -> mlsmpm is not supported in the first batch: fluid stays PBF");
+    }
+}
+
 void CookPbfParticles(nk::Model& model, uint32_t env_count,
                       const PbfCookInput& in) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;

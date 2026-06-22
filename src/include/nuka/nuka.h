@@ -237,6 +237,11 @@ typedef struct nuka_coupled_particles_desc_t {
     // spheres overlap. The body<->particle contact d_min == 2*this (0 => engine
     // default sized from the smaller medium spacing).
     float    contact_radius;
+    // Per-medium solver selection (0 = xpbd/PB default => byte-identical cook;
+    // 1 = mlsmpm). cloth + mlsmpm and fluid + mlsmpm are rejected LOUDLY at cook
+    // (cloth stays XPBD, fluid stays PBF in the first batch). A zero-initialized
+    // desc selects the PB default, so an existing caller is unaffected.
+    uint32_t soft_sim_method;
 } nuka_coupled_particles_desc_t;
 
 // Create a coupled world. `desc` is the same robot/world descriptor

@@ -196,6 +196,22 @@ enum class FieldId : uint16_t {
     VolColorSegments,  // vol_color_segments (per:scalar arena:persistent owner:model count:xpbd_vol_colors*2)
     SmColorSegments,  // sm_color_segments (per:scalar arena:persistent owner:model count:xpbd_sm_colors*2)
     GridSortScratch,  // grid_sort_scratch (per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes)
+    GridMass,  // grid_mass (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridMomentum,  // grid_momentum (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridVelocity,  // grid_velocity (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridForce,  // grid_force (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    ParticleF,  // particle_F (per:particle arena:persistent owner:data elem:9 flags:[diff])
+    ParticleC,  // particle_C (per:particle arena:persistent owner:data elem:9)
+    ParticleVol0,  // particle_vol0 (per:particle arena:persistent owner:data)
+    ParticlePlastic,  // particle_plastic (per:particle arena:persistent owner:data)
+    ParticleMaterialId,  // particle_material_id (per:particle arena:persistent owner:data)
+    SnapshotParticleF,  // snapshot_particle_F (per:particle arena:persistent owner:data elem:9)
+    SnapshotParticleC,  // snapshot_particle_C (per:particle arena:persistent owner:data elem:9)
+    SnapshotParticlePlastic,  // snapshot_particle_plastic (per:particle arena:persistent owner:data)
+    MpmGridCellKey,  // mpm_grid_cell_key (per:particle arena:scratch owner:data)
+    MpmGridPartIdx,  // mpm_grid_part_idx (per:particle arena:scratch owner:data)
+    MpmSortScratch,  // mpm_sort_scratch (per:scalar arena:scratch owner:data count:mpm_grid_sort_scratch_bytes)
+    MpmMaterialTable,  // mpm_material_table (per:scalar arena:persistent owner:data count:mpm_material_count*6)
     Count
 };
 
