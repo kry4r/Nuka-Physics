@@ -191,6 +191,11 @@ enum class FieldId : uint16_t {
     SnapshotParticlePos,  // snapshot_particle_pos (per:particle arena:persistent owner:data)
     SnapshotParticlePrevPos,  // snapshot_particle_prev_pos (per:particle arena:persistent owner:data)
     SnapshotParticleVel,  // snapshot_particle_vel (per:particle arena:persistent owner:data)
+    DistColorSegments,  // dist_color_segments (per:scalar arena:persistent owner:model count:xpbd_dist_colors*2)
+    BendColorSegments,  // bend_color_segments (per:scalar arena:persistent owner:model count:xpbd_bend_colors*2)
+    VolColorSegments,  // vol_color_segments (per:scalar arena:persistent owner:model count:xpbd_vol_colors*2)
+    SmColorSegments,  // sm_color_segments (per:scalar arena:persistent owner:model count:xpbd_sm_colors*2)
+    GridSortScratch,  // grid_sort_scratch (per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes)
     Count
 };
 

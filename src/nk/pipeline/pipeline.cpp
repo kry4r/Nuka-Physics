@@ -473,6 +473,22 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_xpbd_.bend_con_count = bend_count;
         p_xpbd_.vol_con_count  = vol_count;
         p_xpbd_.shape_match_cluster_count = sm_cluster_count;
+        // Graph-coloring: per-family color counts + per-env strides so the colored
+        // kernels iterate the single-env color ranges env-major in parallel.
+        p_xpbd_.dist_colors = cap.xpbd_dist_colors;
+        p_xpbd_.bend_colors = cap.xpbd_bend_colors;
+        p_xpbd_.vol_colors  = cap.xpbd_vol_colors;
+        p_xpbd_.sm_colors   = cap.xpbd_sm_colors;
+        p_xpbd_.env_count   = env_count;
+        p_xpbd_.dist_cons_per_env   = cap.dist_cons_per_env;
+        p_xpbd_.bend_cons_per_env   = cap.bend_cons_per_env;
+        p_xpbd_.vol_cons_per_env    = cap.vol_cons_per_env;
+        p_xpbd_.sm_clusters_per_env = cap.shape_match_slots_per_env;
+        p_xpbd_.sm_members_per_env  = cap.shape_match_members_per_env;
+        p_xpbd_.dist_color_segments = model.dist_color_segments.data();
+        p_xpbd_.bend_color_segments = model.bend_color_segments.data();
+        p_xpbd_.vol_color_segments  = model.vol_color_segments.data();
+        p_xpbd_.sm_color_segments   = model.sm_color_segments.data();
         add(phi::NkOp::XpbdProject, &p_xpbd_);
 
         // PbfDensityLambda / PbfApplyDelta: the PBF density-projection. Inert for
@@ -562,6 +578,12 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_finalize_.rest_density = mp.pbf_rest_density;
         p_part_finalize_.n_soft_particles = n_soft;
         p_part_finalize_.particles_per_env = per_env_particles;
+        // Carry the split-impulse pseudo velocity onto the final particle position
+        // only when the position pass is active (the same predicate IntegratePosition
+        // uses for bodies); else the pseudo pointer is null -> byte-identical.
+        p_part_finalize_.pos_pass =
+            (has_contacts && family == phi::kContactFamilyPairDriven &&
+             cfg.pos_iters > 0u) ? 1u : 0u;
         add(phi::NkOp::ParticleFinalize, &p_part_finalize_);
 
         // Cross-system: the cross-system particle-particle contact co-step

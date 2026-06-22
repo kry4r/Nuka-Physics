@@ -54,6 +54,13 @@ struct ModelCapacities {
     // the total flat cluster-MEMBER pool size (sum_c n_c). 0 == no shape-match.
     uint32_t shape_match_slots_per_env   = 0;  // XPBD shape-match cluster count / env.
     uint32_t shape_match_members_per_env = 0;  // flat cluster-member pool / env.
+    // Graph-coloring color counts per XPBD family (single-env template; a color
+    // is an independent constraint set sharing no particle). Built by
+    // nk::XpbdColoring; size the per-family color-segment tables (pairs/color).
+    uint32_t xpbd_dist_colors = 0;
+    uint32_t xpbd_bend_colors = 0;
+    uint32_t xpbd_vol_colors  = 0;
+    uint32_t xpbd_sm_colors   = 0;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -72,6 +79,10 @@ struct ModelCapacities {
     // grid_cell_start/grid_cell_end arena fields (cells x env_count); the
     // ParticleGridBuild op fails LOUDLY if the live dims product exceeds it.
     uint32_t max_grid_cells       = 0;
+
+    // Byte size of the grid_sort_scratch arena field (the ParticleGridBuild cub
+    // sort/scan temp + out buffers; sized at World construct, 0 == no particles).
+    uint64_t grid_sort_scratch_bytes = 0;
 
     // H1 (general contact pipeline Phase 0) — total cooked heightfield-grid cells
     // (sum over all heightfield collidables of nrow*ncol). Sizes the GLOBAL
@@ -395,6 +406,13 @@ public:
     std::vector<uint32_t> schedule_islands;         // quads {seg_off, seg_cnt, flags, env}
     uint32_t schedule_island_count  = 0;
     uint32_t schedule_segment_count = 0;
+    // XPBD graph-coloring color-segment tables (filled by nk::XpbdColoring BEFORE
+    // UploadTo; staged into the *_color_segments Model fields). Each is a flat
+    // {offset, count} u32 PAIR per color over the single-env constraint template.
+    std::vector<uint32_t> dist_color_segments;
+    std::vector<uint32_t> bend_color_segments;
+    std::vector<uint32_t> vol_color_segments;
+    std::vector<uint32_t> sm_color_segments;
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.

@@ -728,6 +728,7 @@ if(CMAKE_CUDA_COMPILER)
         nk/pipeline/pipeline.cpp
         nk/pipeline/world.cpp
         nk/solve/schedule.cpp
+        nk/solve/xpbd_coloring.cpp
     )
     set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

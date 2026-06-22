@@ -112,6 +112,11 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return static_cast<uint64_t>(max_grid_cells) *
                    static_cast<uint64_t>(env_count);
         }
+        // Particle-grid sort/scan scratch (u8 bytes): one GLOBAL buffer for the
+        // single grid op, sized by World construct; 0 for a particle-free world.
+        if (id == FieldId::GridSortScratch) {
+            return grid_sort_scratch_bytes;
+        }
         // obs_buffer: the cook-derived per-env observation width x env_count (the
         // symbolic fields.yaml count "obs_width*env_count"). 0 obs_width is a flat
         // per-env row so the readout has a defined (empty) destination.
@@ -124,6 +129,20 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // for every current scene (no cook fills it yet) -> a zero-byte segment.
         if (id == FieldId::Heights) {
             return static_cast<uint64_t>(max_heightfield_cells);
+        }
+        // XPBD graph-coloring color-segment tables: a {offset,count} PAIR per
+        // color, GLOBAL (single-env template). 0 colors -> a zero-byte segment.
+        if (id == FieldId::DistColorSegments) {
+            return static_cast<uint64_t>(xpbd_dist_colors) * 2ull;
+        }
+        if (id == FieldId::BendColorSegments) {
+            return static_cast<uint64_t>(xpbd_bend_colors) * 2ull;
+        }
+        if (id == FieldId::VolColorSegments) {
+            return static_cast<uint64_t>(xpbd_vol_colors) * 2ull;
+        }
+        if (id == FieldId::SmColorSegments) {
+            return static_cast<uint64_t>(xpbd_sm_colors) * 2ull;
         }
         // LBVH per-env Karras tree: (2N-1) nodes/env (N = bodies_per_env), 9 f32
         // lanes/node, env_count envs. The kernel strides by env*(2N-1) so the
@@ -454,6 +473,28 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        // XPBD color-segment tables: copy the flat {offset,count}/color pairs
+        // (GLOBAL single-env template; the ElementCount sizes the segment exactly).
+        case FieldId::DistColorSegments:
+            if (!dist_color_segments.empty())
+                std::memcpy(dst, dist_color_segments.data(),
+                            dist_color_segments.size() * sizeof(uint32_t));
+            break;
+        case FieldId::BendColorSegments:
+            if (!bend_color_segments.empty())
+                std::memcpy(dst, bend_color_segments.data(),
+                            bend_color_segments.size() * sizeof(uint32_t));
+            break;
+        case FieldId::VolColorSegments:
+            if (!vol_color_segments.empty())
+                std::memcpy(dst, vol_color_segments.data(),
+                            vol_color_segments.size() * sizeof(uint32_t));
+            break;
+        case FieldId::SmColorSegments:
+            if (!sm_color_segments.empty())
+                std::memcpy(dst, sm_color_segments.data(),
+                            sm_color_segments.size() * sizeof(uint32_t));
+            break;
         // ---------------------------------------------------------------
         // M6 XPBD constraint templates (owner:model). The single-env template
         // is replicated env-major; env e's constraints get their particle
@@ -718,6 +759,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::SmParticles:           v.sm_particles = static_cast<uint32_t*>(p); break;
         case FieldId::SmRestQ:               v.sm_rest_q = static_cast<math::Vec3*>(p); break;
         case FieldId::SmMass:                v.sm_mass = static_cast<float*>(p); break;
+        case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
+        case FieldId::BendColorSegments:     v.bend_color_segments = static_cast<uint32_t*>(p); break;
+        case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
+        case FieldId::SmColorSegments:       v.sm_color_segments = static_cast<uint32_t*>(p); break;
         default: break;  // a data-owned field id: not a ModelView member.
     }
 }
@@ -827,6 +872,10 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.schedule_islands = std::move(src.schedule_islands);
     dst.schedule_island_count = src.schedule_island_count;
     dst.schedule_segment_count = src.schedule_segment_count;
+    dst.dist_color_segments = std::move(src.dist_color_segments);
+    dst.bend_color_segments = std::move(src.bend_color_segments);
+    dst.vol_color_segments = std::move(src.vol_color_segments);
+    dst.sm_color_segments = std::move(src.sm_color_segments);
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved
     // Model silently dropped every pair-driven collision table, staging zeros).
     dst.excluded_pairs = std::move(src.excluded_pairs);

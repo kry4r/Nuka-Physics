@@ -164,6 +164,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridNeighborOffset:  v.grid_neighbor_offset = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborCount:   v.grid_neighbor_count = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborIdx:     v.grid_neighbor_idx = static_cast<uint32_t*>(p); break;
+        case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
         case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;
         case FieldId::ObsBuffer:           v.obs_buffer = static_cast<float*>(p); break;

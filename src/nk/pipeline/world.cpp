@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "nk/solve/schedule.hpp"
+#include "nk/solve/xpbd_coloring.hpp"
 
 namespace nuka::nk {
 
@@ -20,6 +21,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         model_.capacities.env_count = env_count;
     }
 
+    // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
+    // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
+    model_.capacities.grid_sort_scratch_bytes = phi::GridSortScratchBytes(
+        model_.capacities.particles_per_env * model_.capacities.env_count);
+
     // The init-time buffer type (stream-less default-stream device type — fine
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);
@@ -32,6 +38,12 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     // BEFORE UploadTo, which stages the triple into the Model device buffer.
     // Runtime steps never re-color (the plan-replay anchor).
     SolveSchedule::Build(&model_);
+
+    // 0b. Graph-color the XPBD constraint families ONCE (a general solver
+    // property): reorder each family into color-contiguous order so the device
+    // projects a color's constraints in parallel (no shared particle => race-
+    // free, no atomics) while colors run in fixed order — deterministic.
+    XpbdColoring::Build(&model_);
 
     // 1. Upload the Model's constant tables into ONE device buffer + fill view.
     if (model_.UploadTo(bt, &model_view_) != phi::Status::Ok) {
@@ -371,10 +383,10 @@ phi::Status World::StepPlanned() {
                                        calls.data(),
                                        static_cast<int>(calls.size()));
         if (plan_ == nullptr) {
-            // No capturable plan: an op in the list is not graph-captureable
-            // (today: the thrust sorts in ParticleGridBuild / LbvhBuild — the
-            // named PBF Step-only debt). Honest Unsupported; the caller falls
-            // back to Step().
+            // No capturable plan: an op in the list could not be graph-captured.
+            // Every op is capture-safe today (the particle-grid sort/scan draw from
+            // pre-allocated scratch), so a healthy world never lands here; an honest
+            // Unsupported lets the caller fall back to Step() if it ever does.
             return phi::Status::Unsupported;
         }
     }

@@ -708,3 +708,34 @@ fields:
   - {name: snapshot_particle_pos,      dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: snapshot_particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: snapshot_particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data}
+
+  # =========================================================================
+  # XPBD GRAPH-COLORING color-segment tables — MODEL (cook-constant solver
+  # property, built by nk::XpbdColoring at World construct from the cooked
+  # constraint SoA). Each family's constraints are REORDERED into color-
+  # contiguous order; a color is an independent set sharing no particle, so all
+  # of a color's constraints project in PARALLEL (one thread per constraint, no
+  # write race, no atomics) while colors run in fixed order — parallel
+  # Gauss-Seidel, deterministic. Each table is a flat {offset, count} u32 PAIR
+  # per color, GLOBAL (the single-env template; the device kernel adds the
+  # per-env constraint stride). Sized 2*<family>_colors. A particle-free or
+  # constraint-free world resolves <family>_colors == 0 -> a zero-byte segment
+  # (byte-inert; rigid-only worlds keep every field offset). APPENDED LAST so
+  # every pre-existing arena/Model offset is byte-stable (the D1 invariant).
+  # =========================================================================
+  - {name: dist_color_segments, dtype: u32, per: scalar, count: "xpbd_dist_colors*2", arena: persistent, owner: model}
+  - {name: bend_color_segments, dtype: u32, per: scalar, count: "xpbd_bend_colors*2", arena: persistent, owner: model}
+  - {name: vol_color_segments,  dtype: u32, per: scalar, count: "xpbd_vol_colors*2",  arena: persistent, owner: model}
+  - {name: sm_color_segments,   dtype: u32, per: scalar, count: "xpbd_sm_colors*2",   arena: persistent, owner: model}
+
+  # =========================================================================
+  # PARTICLE-GRID SORT SCRATCH — DATA (scratch). The pre-allocated byte arena the
+  # ParticleGridBuild cub radix sort + exclusive scan draw temp storage + the sort
+  # output buffers from, so they never cudaMalloc mid CUDA-graph capture (cub takes
+  # explicit temp storage and never synchronizes -> capture-safe). Sized at World
+  # construction from the cub temp-storage query + the two out buffers for the total
+  # particle count (grid_sort_scratch_bytes); 0 bytes for a particle-free world ->
+  # zero-byte segment (byte-inert). APPENDED LAST so every pre-existing arena offset
+  # is byte-stable (the D1 invariant).
+  # =========================================================================
+  - {name: grid_sort_scratch, dtype: u8, per: scalar, count: "grid_sort_scratch_bytes", arena: scratch, owner: data}
