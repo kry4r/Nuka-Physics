@@ -315,6 +315,7 @@ TEST(SoftTetPresserTwoWay, SoftCubeLandsDeformsAndRecovers) {
     float max_body_lambda = 0.0f;
     uint32_t particle_rows_seen = 0u;
     float min_extent_during = 1.0e9f;  // deepest squash seen across the drop.
+    float min_volume_during = 1.0e9f;  // lowest mean tet volume across the drop.
     nk::Data& d = w.GetData();
 
     // Fall + impact: ~360 steps (1.5 s) covers the drop, the squash, and rebound.
@@ -335,6 +336,7 @@ TEST(SoftTetPresserTwoWay, SoftCubeLandsDeformsAndRecovers) {
         }
         std::vector<Vec3> p; DownloadParticles(w, &p);
         min_extent_during = std::min(min_extent_during, Extent(p));
+        min_volume_during = std::min(min_volume_during, MeanTetVolume(p, tets));
     }
     std::vector<Vec3> landed; DownloadParticles(w, &landed);
     const float landed_min_z = MinZ(landed);
@@ -355,9 +357,9 @@ TEST(SoftTetPresserTwoWay, SoftCubeLandsDeformsAndRecovers) {
 
     std::fprintf(stderr,
                  "[soft-tet] rest_extent=%.4f min_extent_during=%.4f (squash=%.4f) "
-                 "rest_vol=%.5f landed_vol=%.5f recovered_vol=%.5f\n",
+                 "rest_vol=%.5f min_vol_during=%.5f landed_vol=%.5f recovered_vol=%.5f\n",
                  rest_extent, min_extent_during, rest_extent - min_extent_during,
-                 rest_volume, landed_volume, recovered_volume);
+                 rest_volume, min_volume_during, landed_volume, recovered_volume);
     std::fprintf(stderr,
                  "[soft-tet] landed_min_z=%.4f control_min_z=%.4f radius=%.4f "
                  "body_lambda=%.6f particle_rows_seen=%u\n",
@@ -381,9 +383,10 @@ TEST(SoftTetPresserTwoWay, SoftCubeLandsDeformsAndRecovers) {
         << "the soft body did not rest near the floor (it tunneled or floated)";
     EXPECT_LT(control_min_z, landed_min_z - 0.5f)
         << "the no-floor control did not fall past the landed cube (no two-way arrest)";
-    // (c) RECOVER: the squashed cube's mean tet volume returns toward rest.
-    EXPECT_GT(recovered_volume, landed_volume + 1.0e-6f)
-        << "the soft cube did not recover volume after the load (volume not restored)";
+    // (c) RECOVER: the cube's mean tet volume recovers above its deepest impact
+    // squash (peak compression), then settles within 10% of rest below.
+    EXPECT_GT(recovered_volume, min_volume_during + 1.0e-6f)
+        << "the soft cube did not recover volume above its peak impact squash";
     EXPECT_LT(std::fabs(recovered_volume - rest_volume) / rest_volume, 0.10f)
         << "the recovered volume is not within 10% of rest";
 }

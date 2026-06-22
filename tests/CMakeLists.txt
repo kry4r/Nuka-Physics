@@ -1261,6 +1261,9 @@ if(CMAKE_CUDA_COMPILER)
         runtime/test_pbf_viscosity.cpp
         runtime/test_pbf_surface_tension.cpp
         runtime/test_pbf_v2_invariant.cpp
+        # CUDA-graph capture parity: the PBF grid op now captures (StepPlanned Ok)
+        # and graph replay == eager Step byte-for-byte (pre-allocated sort scratch).
+        runtime/test_pbf_graph_capture.cpp
     )
 
     target_link_libraries(nuka_pbf_test
@@ -3091,6 +3094,28 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_scene_cook
             nuka_render
             nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # XPBD constraint-solve micro-benchmark (serial vs colored solver timing).
+    add_executable(nuka_xpbd_solve_bench
+        ${CMAKE_SOURCE_DIR}/examples/demo/xpbd_solve_bench.cpp
+    )
+    add_dependencies(nuka_xpbd_solve_bench nuka_codegen)
+    target_include_directories(nuka_xpbd_solve_bench
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_xpbd_solve_bench
+        PRIVATE
+            nuka_scene_cook
             nuka_nk
             nuka_phi2
             nuka_runtime_gpu

@@ -81,6 +81,10 @@ struct ModelView {
     uint32_t* body_to_link = nullptr;  // per:body arena:persistent owner:model
     uint32_t* body_to_articulation = nullptr;  // per:body arena:persistent owner:model
     float* heights = nullptr;  // per:scalar arena:persistent owner:model count:max_heightfield_cells
+    uint32_t* dist_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_dist_colors*2
+    uint32_t* bend_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_bend_colors*2
+    uint32_t* vol_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_vol_colors*2
+    uint32_t* sm_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_sm_colors*2
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -215,6 +219,7 @@ struct DataView {
     ::nuka::math::Vec3* snapshot_particle_pos = nullptr;  // per:particle arena:persistent owner:data
     ::nuka::math::Vec3* snapshot_particle_prev_pos = nullptr;  // per:particle arena:persistent owner:data
     ::nuka::math::Vec3* snapshot_particle_vel = nullptr;  // per:particle arena:persistent owner:data
+    uint8_t* grid_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes
 };
 
 } // namespace nuka::phi

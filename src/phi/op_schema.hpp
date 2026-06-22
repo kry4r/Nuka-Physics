@@ -294,6 +294,13 @@ struct ParticleGridBuildParams {
 inline constexpr uint32_t kGridPosSourceParticlePos = 0u;
 inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 
+// Byte size of the pre-allocated scratch ParticleGridBuild's cub radix sort +
+// exclusive scan draw temp storage + sort output buffers from, for
+// `particle_count` keys (cub size queries + the two out buffers, 256B-aligned).
+// Host-callable (defined in broadphase.cu) so the World sizes the grid_sort_scratch
+// arena field BEFORE allocation -> no mid-capture cudaMalloc. 0 for 0 particles.
+uint64_t GridSortScratchBytes(uint32_t particle_count);
+
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
 // (mirrors nk::ContactFamily; a plain u32 so the POD stays header-light).
@@ -582,6 +589,29 @@ struct XpbdProjectParams {
     // Solved LAST in the XPBD sweep (after dist/bend/vol), the legacy
     // XPBD-sweep order, so it pulls the projected config toward the rigid goal.
     uint32_t shape_match_cluster_count;
+    // Graph-coloring: per-family color counts + per-env constraint/cluster/member
+    // strides. The colored kernels project a color's constraints in PARALLEL
+    // (one thread per (env, constraint); the color segment table gives the
+    // single-env [offset,count) range, the stride lifts it env-major). 0 colors
+    // for a family means it has no constraints (inert).
+    uint32_t dist_colors;
+    uint32_t bend_colors;
+    uint32_t vol_colors;
+    uint32_t sm_colors;
+    uint32_t env_count;
+    uint32_t dist_cons_per_env;
+    uint32_t bend_cons_per_env;
+    uint32_t vol_cons_per_env;
+    uint32_t sm_clusters_per_env;
+    uint32_t sm_members_per_env;
+    // HOST pointers to the per-family {offset,count}/color segment tables (the
+    // Model host vectors, valid for the World's lifetime). The op reads them to
+    // size each color's launch (the within-color thread count); the launches run
+    // in fixed color order so the per-color barrier is the launch boundary.
+    const uint32_t* dist_color_segments;
+    const uint32_t* bend_color_segments;
+    const uint32_t* vol_color_segments;
+    const uint32_t* sm_color_segments;
 };
 
 struct PbfDensityLambdaParams {
@@ -629,6 +659,9 @@ struct ParticleFinalizeParams {
     // PBF finalize). The polish passes are scoped to the fluid slice. 0 == single.
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
+    // Split-impulse position pass active: carry the per-particle pseudo velocity
+    // onto the final position (non-penetration push-out). 0 leaves it byte-identical.
+    uint32_t pos_pass;
 };
 
 // Cross-system — cross-system particle-particle CONTACT (the op-ified

@@ -207,6 +207,11 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SnapshotParticlePos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_pos
     {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_prev_pos
     {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_vel
+    {FieldId::DistColorSegments, DlpackDtype::kU32, 1, false, false},  // dist_color_segments
+    {FieldId::BendColorSegments, DlpackDtype::kU32, 1, false, false},  // bend_color_segments
+    {FieldId::VolColorSegments, DlpackDtype::kU32, 1, false, false},  // vol_color_segments
+    {FieldId::SmColorSegments, DlpackDtype::kU32, 1, false, false},  // sm_color_segments
+    {FieldId::GridSortScratch, DlpackDtype::kU8, 1, false, false},  // grid_sort_scratch
 };
 
 } // namespace nuka::nk

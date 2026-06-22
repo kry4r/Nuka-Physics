@@ -91,13 +91,13 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         return nullptr;
     }
     bool ok = true;
-    // An op that allocates during capture (the ported thrust grid/LBVH sorts use
-    // a caching allocator that cudaMalloc's mid-capture) throws std::bad_alloc
-    // (cudaErrorStreamCaptureUnsupported). Catch it so plan_create returns a clean
-    // nullptr (the caller falls back to Step) instead of unwinding through the C
-    // ABI vtable. The capture MUST still be ended (a left-open capture poisons the
-    // stream for the next StepPlanned). NAMED debt: a non-captureable op makes its
-    // scene Step-only — the PBF grid is the one such op today.
+    // Defensive guard: should an op ever allocate on the stream mid-capture it
+    // throws std::bad_alloc (cudaErrorStreamCaptureUnsupported); catch it so
+    // plan_create returns a clean nullptr (the caller falls back to Step) instead
+    // of unwinding through the C ABI vtable. The capture MUST still be ended (a
+    // left-open capture poisons the stream for the next StepPlanned). Every op is
+    // capture-safe today (the particle-grid sort/scan draw from pre-allocated
+    // scratch), so this path is not taken on the supported scenes.
     try {
         for (int i = 0; i < n_calls; ++i) {
             if (DispatchOn(model, data, calls[i], cb->capture) != Status::Ok) {

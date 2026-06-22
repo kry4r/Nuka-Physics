@@ -11,10 +11,12 @@
 //
 // KERNEL BODIES ARE LINE-BY-LINE PORTS of the standalone collision sources
 // (broadphase_lbvh.cu / lbvh_traversal.cuh / particle_uniform_grid.cu) — the
-// algorithm + the 2x thrust::stable_sort_by_key D1 anchors are preserved; only
-// the I/O wiring changes (inputs are the arena/Model device pointers, the node/
-// morton/visit scratch is preallocated arena-resident, the output is the
-// candidate_pairs / grid_* Data fields).
+// algorithm + the particle-grid stable radix sort + exclusive scan D1 anchors are
+// preserved (cub::DeviceRadixSort::SortPairs + DeviceScan::ExclusiveScan, the very
+// primitives thrust dispatched to, drawing from a pre-allocated scratch so the op
+// captures into a CUDA graph). Only the I/O wiring changes (inputs are the arena/
+// Model device pointers; node/morton/visit + sort scratch are arena-resident; the
+// output is the candidate_pairs / grid_* Data fields).
 //
 // FAMILY GATING (plan §3.5 / op_schema kContactFamily*): the broadphase ops do
 // real work ONLY for kContactFamilyPairDriven. The union slot-template family
@@ -29,11 +31,8 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/scan.h>
-#include <thrust/sort.h>
-#include <thrust/tuple.h>
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
 
 #include "collision/lbvh_batched.cuh"   // BuildLbvhBatchedNodes (shared env-build)
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
@@ -55,6 +54,39 @@ namespace {
 
 namespace cg = ::nuka::collision::gpu;
 constexpr uint32_t kBlockSize = 128u;
+
+// Round up to the 256B section alignment the Arena lays the scratch out at (so
+// every sub-region of grid_sort_scratch is 256B-aligned device memory).
+constexpr uint64_t kScratchAlign = 256u;
+inline __host__ uint64_t AlignScratch(uint64_t v) {
+    return (v + (kScratchAlign - 1u)) & ~(kScratchAlign - 1u);
+}
+
+// 256B-aligned partition of grid_sort_scratch [cub temp | keys-out | idx-out].
+// Sizes the segment (World construct) and partitions it (the op) identically.
+struct GridSortScratchLayout {
+    uint64_t temp_bytes = 0u;     // cub temp-storage region size (max of sort/scan).
+    uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
+    uint64_t idx_off    = 0u;     // byte offset of the sorted-idx out buffer.
+    uint64_t total      = 0u;     // full segment byte size.
+    explicit GridSortScratchLayout(uint32_t particle_count) {
+        const int n = static_cast<int>(particle_count);
+        size_t sort_bytes = 0u;
+        (void)cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+            nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), n);
+        size_t scan_bytes = 0u;
+        (void)cub::DeviceScan::ExclusiveScan(
+            nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), cub::Sum(), 0u, n);
+        temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
+        const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
+        keys_off = AlignScratch(temp_bytes);
+        idx_off  = AlignScratch(keys_off + nbytes);
+        total    = AlignScratch(idx_off + nbytes);
+    }
+};
 // env_status diagnostic bits (kEnvStatus*) are shared in op_schema.hpp so the
 // broadphase, particle-grid, and CRBA ops agree on the readout layout.
 // The per-particle neighbor cap is the canonical cg::kParticleGridMaxNeighbors.
@@ -544,12 +576,26 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
             ? static_cast<const math::Vec3*>(data.pbf_predicted_pos)
             : static_cast<const math::Vec3*>(data.particle_pos);
 
+    // Partition the pre-allocated scratch [cub temp | keys-out | idx-out] so the
+    // sort/scan never cudaMalloc/sync mid-capture (the grid op joins the graph).
+    const GridSortScratchLayout sl(Np);
+    char* sbase = reinterpret_cast<char*>(data.grid_sort_scratch);
+    void* sort_temp = sbase;
+    uint32_t* keys_out = reinterpret_cast<uint32_t*>(sbase + sl.keys_off);
+    uint32_t* idx_out  = reinterpret_cast<uint32_t*>(sbase + sl.idx_off);
+    size_t sort_temp_bytes = static_cast<size_t>(sl.temp_bytes);
     LaunchCuda(GridCellKeysKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, cfg, Ppe, cells, data.grid_cell_key,
                data.grid_particle_idx);
-    thrust::stable_sort_by_key(thrust::cuda::par.on(stream),
-                               data.grid_cell_key, data.grid_cell_key + Np,
-                               data.grid_particle_idx);
+    // Stable radix sort (byte-identical to the prior thrust stable_sort_by_key,
+    // which dispatched here); out-of-place, then D2D-copied back to keep in-place.
+    (void)cub::DeviceRadixSort::SortPairs(
+        sort_temp, sort_temp_bytes, data.grid_cell_key, keys_out,
+        data.grid_particle_idx, idx_out, static_cast<int>(Np), 0, 32, stream);
+    (void)cudaMemcpyAsync(data.grid_cell_key, keys_out, Np * sizeof(uint32_t),
+                          cudaMemcpyDeviceToDevice, stream);
+    (void)cudaMemcpyAsync(data.grid_particle_idx, idx_out, Np * sizeof(uint32_t),
+                          cudaMemcpyDeviceToDevice, stream);
     {  // zero the per-env cell ranges (cells x env_count entries).
         const uint32_t zn = cells * E;
         const uint32_t b = (zn + kBlockSize - 1u) / kBlockSize;
@@ -568,10 +614,14 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     LaunchCuda(GridCountKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_count);
-    // Exclusive scan of the count -> flat CSR offset (M6 flat consumer).
-    thrust::exclusive_scan(thrust::cuda::par.on(stream),
-                           data.grid_neighbor_count, data.grid_neighbor_count + Np,
-                           data.grid_neighbor_offset);
+    // Exclusive scan of the count -> flat CSR offset (byte-identical to the prior
+    // thrust exclusive_scan; out-of-place, reusing the capture-safe temp region).
+    {
+        size_t scan_temp_bytes = static_cast<size_t>(sl.temp_bytes);
+        (void)cub::DeviceScan::ExclusiveScan(
+            sort_temp, scan_temp_bytes, data.grid_neighbor_count,
+            data.grid_neighbor_offset, cub::Sum(), 0u, static_cast<int>(Np), stream);
+    }
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
                data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_offset,
@@ -581,6 +631,13 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
 }
 
 }  // namespace
+
+uint64_t GridSortScratchBytes(uint32_t particle_count) {
+    if (particle_count == 0u) {
+        return 0u;
+    }
+    return GridSortScratchLayout(particle_count).total;
+}
 
 void RegisterNkBroadphaseOps() {
     SetCudaOp(NkOp::BuildAabbs, &OpBuildAabbs);
