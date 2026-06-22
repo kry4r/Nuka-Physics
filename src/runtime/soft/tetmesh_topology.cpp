@@ -336,6 +336,47 @@ EmbeddedSkin EmbedSurfaceInTetCage(const std::vector<math::Vec3>& skin_rest,
     return e;
 }
 
+EmbeddedSkin EmbedSurfaceInParticleSet(const std::vector<math::Vec3>& skin_rest,
+                                       const std::vector<uint32_t>& skin_tris,
+                                       const std::vector<math::Vec3>& particle_rest) {
+    EmbeddedSkin e;
+    e.triangles = skin_tris;
+    e.binds.resize(skin_rest.size());
+    constexpr uint32_t K = 4u;
+    for (size_t s = 0; s < skin_rest.size(); ++s) {
+        const math::Vec3& p = skin_rest[s];
+        // Smallest-K nearest particles by squared distance (insertion into a K slot).
+        uint32_t idx[K] = {0u, 0u, 0u, 0u};
+        float d2[K] = {1e30f, 1e30f, 1e30f, 1e30f};
+        for (size_t q = 0; q < particle_rest.size(); ++q) {
+            const float dq = (particle_rest[q] - p).LengthSq();
+            int slot = -1;
+            for (int k = 0; k < static_cast<int>(K); ++k)
+                if (dq < d2[k]) { slot = k; break; }
+            if (slot < 0) continue;
+            for (int k = static_cast<int>(K) - 1; k > slot; --k) {
+                d2[k] = d2[k - 1]; idx[k] = idx[k - 1];
+            }
+            d2[slot] = dq; idx[slot] = static_cast<uint32_t>(q);
+        }
+        // Inverse-distance weights normalized to Σ == 1 (a coincident particle pins
+        // the vertex to it); the blend is affine over the nearest-K particle cloud.
+        float w[K], sum = 0.0f;
+        for (int k = 0; k < static_cast<int>(K); ++k) {
+            const float dist = std::sqrt(std::max(d2[k], 0.0f));
+            w[k] = 1.0f / (dist + 1e-4f);
+            sum += w[k];
+        }
+        const float inv = sum > 1e-12f ? 1.0f / sum : 0.0f;
+        SkinVertexBind& b = e.binds[s];
+        for (int k = 0; k < static_cast<int>(K); ++k) {
+            b.vi[k] = idx[k];
+            b.w[k] = w[k] * inv;
+        }
+    }
+    return e;
+}
+
 void DeformEmbeddedSkin(const EmbeddedSkin& e,
                         const std::vector<math::Vec3>& tet_live,
                         std::vector<math::Vec3>& out) {
@@ -344,6 +385,30 @@ void DeformEmbeddedSkin(const EmbeddedSkin& e,
         const SkinVertexBind& b = e.binds[v];
         out[v] = tet_live[b.vi[0]] * b.w[0] + tet_live[b.vi[1]] * b.w[1] +
                  tet_live[b.vi[2]] * b.w[2] + tet_live[b.vi[3]] * b.w[3];
+    }
+}
+
+void SmoothSurface(const std::vector<uint32_t>& triangles, uint32_t iterations,
+                   float lambda, std::vector<math::Vec3>& positions) {
+    if (iterations == 0u || lambda <= 0.0f || positions.empty()) return;
+    // Unique undirected edge neighbours per vertex (built once from the triangles).
+    std::vector<std::set<uint32_t>> adj(positions.size());
+    auto link = [&](uint32_t a, uint32_t b) { adj[a].insert(b); adj[b].insert(a); };
+    for (size_t t = 0; t + 2 < triangles.size(); t += 3) {
+        link(triangles[t], triangles[t + 1]);
+        link(triangles[t + 1], triangles[t + 2]);
+        link(triangles[t + 2], triangles[t]);
+    }
+    std::vector<math::Vec3> next(positions.size());
+    for (uint32_t it = 0; it < iterations; ++it) {
+        for (size_t v = 0; v < positions.size(); ++v) {
+            if (adj[v].empty()) { next[v] = positions[v]; continue; }
+            math::Vec3 c{0.0f, 0.0f, 0.0f};
+            for (uint32_t n : adj[v]) c += positions[n];
+            c = c * (1.0f / static_cast<float>(adj[v].size()));
+            next[v] = positions[v] + (c - positions[v]) * lambda;
+        }
+        positions.swap(next);
     }
 }
 

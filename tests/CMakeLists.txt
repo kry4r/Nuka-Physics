@@ -1083,6 +1083,10 @@ if(CMAKE_CUDA_COMPILER)
         # FR7 per-medium solver selector (host cook): a bulk-soft body cooks XPBD by
         # default (byte-identical) and MPM when selected; cloth/fluid -> mlsmpm throw.
         scenario/mpm_sim_method_selector.cpp
+        # MLS-MPM elastic jelly-ball gate: a fixed-corotated ball drops onto the static
+        # floor plane (grid BC), squashes <= ~25%, recovers, no collapse/spike/escape,
+        # >= 5 s, finite, two-run byte-identical (the deterministic gather).
+        scenario/mpm_jelly_ball.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test
@@ -3120,6 +3124,38 @@ if(NK_BUILD_VULKAN_VALIDATION)
     target_include_directories(nuka_soft_ball_demo
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(nuka_soft_ball_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # MLS-MPM headline clip: a fixed-corotated elastic jelly ball (densely sampled
+    # on a lattice, sim_method=mlsmpm via the config selector) dropped onto the
+    # STATIC floor plane (the grid BC, no dynamic body). STEPS nk::World on CUDA and
+    # renders the live deforming surface (skin bound to the nearest MPM particles) on
+    # the CUDA RT backend (--gpu --beauty) or lavapipe raster. Replaces the soft-ball.
+    add_executable(nuka_mpm_jelly_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/mpm_jelly_demo.cpp
+    )
+    add_dependencies(nuka_mpm_jelly_demo nuka_codegen)
+    target_compile_definitions(nuka_mpm_jelly_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_mpm_jelly_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_mpm_jelly_demo
         PRIVATE
             nuka_scene_cook
             nuka_render

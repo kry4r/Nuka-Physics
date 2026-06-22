@@ -1257,6 +1257,12 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.initial_material_id.assign(n, 0u);
 
     // The single cooked material (id 0). The constitutive branch reads it later.
+    // Reject kind 1 loudly: granular Drucker-Prager would silently run as elastic.
+    if (in.material.model_kind > 0.5f && in.material.model_kind < 1.5f) {
+        throw std::runtime_error(
+            "CookMpmParticles: granular Drucker-Prager MPM (model_kind == 1) is not "
+            "yet implemented");
+    }
     nk::MpmMaterial m0;
     m0.youngs = in.material.youngs; m0.poisson = in.material.poisson;
     m0.density = in.material.density; m0.dp_friction = in.material.dp_friction;
@@ -1277,6 +1283,13 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.mpm_grid_dims[1] = in.grid_dims[1];
     mp.mpm_grid_dims[2] = in.grid_dims[2];
     mp.mpm_cell_size = in.dx;
+    mp.mpm_substeps = in.substeps == 0u ? 1u : in.substeps;
+    // Store a unit floor normal (the grid BC reads it as unit) + the plane offset.
+    const math::Vec3 fn = in.floor_normal;
+    const float nlen = fn.Length();
+    mp.mpm_floor_normal = nlen > 1e-6f ? fn * (1.0f / nlen) : math::Vec3{0.0f, 0.0f, 1.0f};
+    mp.mpm_floor_d = in.floor_d;
+    mp.mpm_floor_friction = in.floor_friction;
 
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(n);

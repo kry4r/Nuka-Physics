@@ -1,17 +1,22 @@
 // ---------------------------------------------------------------------------
-// MLS-MPM transfer ops (APIC; Hu et al. 2018) — the INERT round-trip scaffold.
+// MLS-MPM continuum step (APIC; Hu et al. 2018) — the umbrella MpmStep op.
 //
-// Three file-local kernels reachable through RegisterNkMpmOps: clear the
-// env-private background grid, deterministically GATHER particles -> grid (mass +
-// APIC momentum, NO float atomics), and gather grid -> particle velocity + affine
-// C. No constitutive force in this scaffold (grid_force stays 0), so a clear ->
-// P2G -> G2P round-trip with C=0, F=I is the identity on the velocity field.
+// ONE registered op whose body iterates a substep loop of file-local kernels:
+//   clear -> P2G (mass + APIC momentum + constitutive node force) -> grid update
+//   (gravity + momentum->velocity normalize + static-plane BC) -> G2P (recover
+//   v_p + affine C_p; advect x_p; write the final particle_vel) -> F-update.
+// The medium couples to the floor entirely through the static-plane grid BC; the
+// G2P velocity IS the particle's final velocity (no dv-compose — the row path's).
 //
 // Determinism: particles are radix-sorted by env-offset MPM cell key, then each
 // grid node sums its 3^3-stencil particle contributions in the sorted order. The
 // __fadd_rn pins the accumulation ORDER (run-to-run deterministic); inner products
 // stay FMA-contractible (compile-time deterministic). The grid is env-private
 // (env-offset node keys) so replicated envs never cross-couple.
+//
+// The constitutive P(F) (fixed-corotated / Neo-Hookean elastic) is computed from a
+// self-written deterministic 3x3 SVD (fixed iteration count, no data-dependent
+// branch) so the node force is D1.
 // ---------------------------------------------------------------------------
 
 #include <climits>
@@ -63,6 +68,150 @@ struct MpmSortScratchLayout {
         total    = AlignScratch(idx_off + nbytes);
     }
 };
+
+// ===========================================================================
+// File-local 3x3 helpers (row-major float[9]; the particle_F/C packing) and a
+// deterministic SVD/polar for the constitutive stress.
+// ===========================================================================
+
+// C = A * B (row-major 3x3).
+__device__ __forceinline__ void Mat3Mul(const float* A, const float* B, float* C) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            C[r * 3 + c] = __fadd_rn(__fadd_rn(A[r * 3 + 0] * B[0 * 3 + c],
+                                               A[r * 3 + 1] * B[1 * 3 + c]),
+                                     A[r * 3 + 2] * B[2 * 3 + c]);
+}
+
+// C = A * B^T (row-major 3x3).
+__device__ __forceinline__ void Mat3MulT(const float* A, const float* B, float* C) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            C[r * 3 + c] = __fadd_rn(__fadd_rn(A[r * 3 + 0] * B[c * 3 + 0],
+                                               A[r * 3 + 1] * B[c * 3 + 1]),
+                                     A[r * 3 + 2] * B[c * 3 + 2]);
+}
+
+__device__ __forceinline__ float Mat3Det(const float* F) {
+    return F[0] * (F[4] * F[8] - F[5] * F[7]) -
+           F[1] * (F[3] * F[8] - F[5] * F[6]) +
+           F[2] * (F[3] * F[7] - F[4] * F[6]);
+}
+
+// Transposed inverse F^{-T} (row-major). Returns false (and leaves out unset) for a
+// near-singular F so the caller can fall back to a zero stress (degenerate cell).
+__device__ __forceinline__ bool Mat3InvTranspose(const float* F, float* out, float det) {
+    if (fabsf(det) < 1e-12f) return false;
+    const float inv = 1.0f / det;
+    // Cofactor matrix C; F^{-1} = C^T/det, so F^{-T} = C/det.
+    out[0] = (F[4] * F[8] - F[5] * F[7]) * inv;
+    out[1] = (F[5] * F[6] - F[3] * F[8]) * inv;
+    out[2] = (F[3] * F[7] - F[4] * F[6]) * inv;
+    out[3] = (F[2] * F[7] - F[1] * F[8]) * inv;
+    out[4] = (F[0] * F[8] - F[2] * F[6]) * inv;
+    out[5] = (F[1] * F[6] - F[0] * F[7]) * inv;
+    out[6] = (F[1] * F[5] - F[2] * F[4]) * inv;
+    out[7] = (F[2] * F[3] - F[0] * F[5]) * inv;
+    out[8] = (F[0] * F[4] - F[1] * F[3]) * inv;
+    return true;
+}
+
+// One symmetric Jacobi rotation zeroing S(p,q): rotate columns p,q of S and
+// accumulate into V (the eigenvectors). Fixed-angle, no data-dependent branch on
+// magnitude (a sub-tolerance off-diagonal yields a ~identity rotation), so the
+// sweep count is constant -> the decomposition is bit-reproducible (D1).
+__device__ __forceinline__ void JacobiRotate(float* S, float* V, int p, int q) {
+    const float spq = S[p * 3 + q];
+    if (spq == 0.0f) return;
+    const float spp = S[p * 3 + p], sqq = S[q * 3 + q];
+    const float theta = (sqq - spp) / (2.0f * spq);
+    const float sign = theta >= 0.0f ? 1.0f : -1.0f;
+    const float t = sign / (fabsf(theta) + sqrtf(theta * theta + 1.0f));
+    const float c = 1.0f / sqrtf(t * t + 1.0f);
+    const float s = t * c;
+    for (int k = 0; k < 3; ++k) {
+        const float sik = S[k * 3 + p], siq = S[k * 3 + q];
+        S[k * 3 + p] = c * sik - s * siq;
+        S[k * 3 + q] = s * sik + c * siq;
+    }
+    for (int k = 0; k < 3; ++k) {
+        const float skp = S[p * 3 + k], skq = S[q * 3 + k];
+        S[p * 3 + k] = c * skp - s * skq;
+        S[q * 3 + k] = s * skp + c * skq;
+        const float vkp = V[k * 3 + p], vkq = V[k * 3 + q];
+        V[k * 3 + p] = c * vkp - s * vkq;
+        V[k * 3 + q] = s * vkp + c * vkq;
+    }
+}
+
+// Deterministic 3x3 SVD F = U * diag(sig) * V^T. Symmetric-eigen on A = F^T F via a
+// fixed 8-sweep Jacobi (V = eigenvectors, sig^2 = eigenvalues), then U = F V / sig.
+// A near-zero singular value falls back to the corresponding V column so U stays a
+// rotation (the cell is degenerate; the stress there is ~0).
+__device__ __forceinline__ void Svd3(const float* F, float* U, float* sig, float* V) {
+    float A[9];
+    // A := F^T F (symmetric); its eigenvectors are the right singular vectors V.
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            A[r * 3 + c] = __fadd_rn(__fadd_rn(F[0 * 3 + r] * F[0 * 3 + c],
+                                               F[1 * 3 + r] * F[1 * 3 + c]),
+                                     F[2 * 3 + r] * F[2 * 3 + c]);
+    for (int k = 0; k < 9; ++k) V[k] = (k % 4 == 0) ? 1.0f : 0.0f;  // V = I.
+    for (int sweep = 0; sweep < 8; ++sweep) {
+        JacobiRotate(A, V, 0, 1);
+        JacobiRotate(A, V, 0, 2);
+        JacobiRotate(A, V, 1, 2);
+    }
+    float s2[3] = {A[0], A[4], A[8]};
+    // Floor the singular values so volumetric stress stays bounded as J -> 0.
+    for (int i = 0; i < 3; ++i) sig[i] = fmaxf(sqrtf(fmaxf(s2[i], 0.0f)), 0.05f);
+    // U columns = F * V_col / sig (fall back to V_col when sig ~ 0).
+    for (int c = 0; c < 3; ++c) {
+        float fc[3];
+        for (int r = 0; r < 3; ++r)
+            fc[r] = F[r * 3 + 0] * V[0 * 3 + c] + F[r * 3 + 1] * V[1 * 3 + c] +
+                    F[r * 3 + 2] * V[2 * 3 + c];
+        if (sig[c] > 1e-8f) {
+            const float inv = 1.0f / sig[c];
+            for (int r = 0; r < 3; ++r) U[r * 3 + c] = fc[r] * inv;
+        } else {
+            for (int r = 0; r < 3; ++r) U[r * 3 + c] = V[r * 3 + c];
+        }
+    }
+    // Reflect (not just rotate): if det(U) < 0 flip the smallest-magnitude singular
+    // value so R = U V^T is the closest proper rotation (handles inverted elements).
+    if (Mat3Det(U) < 0.0f) {
+        int kmin = 0;
+        if (fabsf(sig[1]) < fabsf(sig[kmin])) kmin = 1;
+        if (fabsf(sig[2]) < fabsf(sig[kmin])) kmin = 2;
+        for (int r = 0; r < 3; ++r) U[r * 3 + kmin] = -U[r * 3 + kmin];
+        sig[kmin] = -sig[kmin];
+    }
+}
+
+// First Piola-Kirchhoff stress P(F). Fixed-corotated (Stomakhin 2012):
+// P = 2*mu*(F - R) + lambda*(J-1)*J*F^{-T}, R = U V^T from the SVD. Neo-Hookean
+// (model_kind==2 elastic alternative): P = mu*(F - F^{-T}) + lambda*log(J)*F^{-T}.
+// Row-major float[9]; mu/lambda are the Lame moduli.
+__device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambda,
+                                           float model_kind, float* P) {
+    const float J = Mat3Det(F);
+    float FinvT[9];
+    const bool ok = Mat3InvTranspose(F, FinvT, J);
+    if (!ok) { for (int k = 0; k < 9; ++k) P[k] = 0.0f; return; }
+    if (model_kind > 1.5f) {  // Neo-Hookean elastic (kind 2).
+        const float lj = logf(fmaxf(J, 1e-8f));
+        for (int k = 0; k < 9; ++k)
+            P[k] = mu * (F[k] - FinvT[k]) + lambda * lj * FinvT[k];
+        return;
+    }
+    float U[9], sig[3], V[9], R[9];
+    Svd3(F, U, sig, V);
+    Mat3MulT(U, V, R);  // R = U * V^T (proper rotation).
+    const float coef = lambda * (J - 1.0f) * J;
+    for (int k = 0; k < 9; ++k)
+        P[k] = 2.0f * mu * (F[k] - R[k]) + coef * FinvT[k];
+}
 
 // Quadratic B-spline base node + the 3 per-axis weights. The particle sits in the
 // stencil [base, base+2]; fx is the particle offset from base in cell units.
@@ -161,18 +310,24 @@ __global__ void MpmCellKeysKernel(uint32_t particle_count,
 // Node i sums the contributions of every particle whose 3^3 stencil includes i,
 // i.e. particles whose base cell lies in [i-2, i] per axis. The sorted particle
 // stream (by env-offset cell key) is scanned per candidate cell in a fixed order
-// with __fadd_rn -> bit-reproducible run-to-run (NO atomics).
+// with __fadd_rn -> bit-reproducible run-to-run (NO atomics). Accumulates mass +
+// APIC momentum + the constitutive node force -N_i*V0*(4/dx^2)*P(F)*F^T*(x_i-x_p).
 __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                    const m::Vec3* __restrict__ pos,
                                    const float* __restrict__ inv_mass,
                                    const m::Vec3* __restrict__ vel,
                                    const float* __restrict__ part_C,
+                                   const float* __restrict__ part_F,
+                                   const float* __restrict__ part_vol0,
+                                   const uint32_t* __restrict__ part_mat,
+                                   const float* __restrict__ material_table,
+                                   uint32_t material_count,
                                    const uint32_t* __restrict__ sorted_keys,
                                    const uint32_t* __restrict__ sorted_idx,
                                    uint32_t particle_count, uint32_t particles_per_env,
                                    uint32_t nodes_per_env, uint32_t cells_per_env,
                                    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
-                                   float inv_dx, float dx, m::Vec3 origin,
+                                   float inv_dx, float dx, float dt, m::Vec3 origin,
                                    float* __restrict__ grid_mass,
                                    m::Vec3* __restrict__ grid_momentum) {
     const uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
@@ -184,6 +339,7 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
     const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
     const m::Vec3 xi = m::Vec3{origin.x + nx * dx, origin.y + ny * dx,
                                origin.z + nz * dx};
+    const float stress_scale = 4.0f * inv_dx * inv_dx;  // W^{-1} = 4/dx^2 (quadratic).
     float mass = 0.0f;
     m::Vec3 mom = m::Vec3::Zero();
     // Scan the 3^3 base cells that can place a particle's stencil on this node.
@@ -231,6 +387,34 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                     mom.x = __fadd_rn(mom.x, wm * (vp.x + cterm.x));
                     mom.y = __fadd_rn(mom.y, wm * (vp.y + cterm.y));
                     mom.z = __fadd_rn(mom.z, wm * (vp.z + cterm.z));
+                    // Constitutive node-momentum impulse dt * f_i folded into momentum,
+                    // f_i = -w * V0 * (4/dx^2) * P(F) F^T (x_i - x_p).
+                    if (part_F != nullptr && part_vol0 != nullptr && dt > 0.0f) {
+                        const float vol0 = part_vol0[p];
+                        if (vol0 > 0.0f) {
+                            const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
+                            float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
+                            if (material_table != nullptr && mid < material_count) {
+                                const float* mr = material_table +
+                                                  static_cast<size_t>(mid) * 6u;
+                                youngs = mr[0]; poisson = mr[1]; kind = mr[5];
+                            }
+                            const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+                            const float mu = youngs / (2.0f * (1.0f + poisson));
+                            const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+                            const float* F = part_F + static_cast<size_t>(p) * 9u;
+                            float P[9], stress[9];
+                            FirstPiola(F, mu, lambda, kind, P);
+                            Mat3MulT(P, F, stress);  // P * F^T (the Cauchy-stress-like term).
+                            const float coef = -w * vol0 * stress_scale;
+                            mom.x = __fadd_rn(mom.x, dt * coef * (stress[0] * dpos.x +
+                                              stress[1] * dpos.y + stress[2] * dpos.z));
+                            mom.y = __fadd_rn(mom.y, dt * coef * (stress[3] * dpos.x +
+                                              stress[4] * dpos.y + stress[5] * dpos.z));
+                            mom.z = __fadd_rn(mom.z, dt * coef * (stress[6] * dpos.x +
+                                              stress[7] * dpos.y + stress[8] * dpos.z));
+                        }
+                    }
                 }
             }
         }
@@ -239,31 +423,64 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
     grid_momentum[node] = mom;
 }
 
-// --- grid velocity normalize (v = (mv)/m where m > 0) -----------------------
-__global__ void MpmGridVelocityKernel(uint32_t total_nodes,
-                                      const float* __restrict__ mass,
-                                      const m::Vec3* __restrict__ momentum,
-                                      m::Vec3* __restrict__ velocity) {
+// --- grid update: gravity kick + momentum->velocity normalize + static-plane BC -
+// One thread per node. m*v_hat = m*v + dt*(m*g) (the constitutive impulse was
+// folded into momentum in P2G); normalize; then project velocity against the static
+// floor plane (no-penetration normal + Coulomb friction). The plane is static so
+// its surface velocity is zero -> no grid->body reaction (the dynamic body is later).
+__global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env,
+                                    uint32_t dims_x, uint32_t dims_y, float dx,
+                                    m::Vec3 origin, m::Vec3 gravity, float dt,
+                                    m::Vec3 plane_n, float plane_d, float plane_mu,
+                                    const float* __restrict__ mass,
+                                    const m::Vec3* __restrict__ momentum,
+                                    m::Vec3* __restrict__ velocity) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_nodes) return;
     const float mi = mass[i];
-    velocity[i] = (mi > 0.0f) ? (momentum[i] * (1.0f / mi)) : m::Vec3::Zero();
+    if (mi <= 0.0f) { velocity[i] = m::Vec3::Zero(); return; }
+    m::Vec3 v = momentum[i] * (1.0f / mi) + gravity * dt;  // symplectic Euler kick.
+    // Static-plane BC: a node at/below the plane gets a no-penetration normal cut +
+    // Coulomb friction on the tangential component against the removed normal impulse.
+    const uint32_t local = i % nodes_per_env;
+    const int32_t nx = static_cast<int32_t>(local % dims_x);
+    const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
+    const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
+    const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
+    const float sd = plane_n.x * xi.x + plane_n.y * xi.y + plane_n.z * xi.z - plane_d;
+    if (sd <= 0.0f) {
+        const float vn = v.Dot(plane_n);
+        if (vn < 0.0f) {  // moving into the plane: remove the inward normal component.
+            const m::Vec3 vt = v - plane_n * vn;       // tangential velocity.
+            const float vt_len = sqrtf(vt.LengthSq());
+            const float coulomb = plane_mu * (-vn);    // friction budget.
+            if (vt_len <= coulomb || vt_len < 1e-8f) {
+                v = m::Vec3::Zero();                   // sticks (static friction).
+            } else {
+                v = vt * (1.0f - coulomb / vt_len);    // dynamic friction drag.
+            }
+        }
+    }
+    velocity[i] = v;
 }
 
 // --- G2P gather (one thread per particle; race-free, naturally D1) ----------
 // v_p = sum_i N_i v_i; C_p = (4/dx^2) sum_i N_i v_i (x_i - x_p)^T (the MLS fit).
+// Advects x_p += dt*v_p and writes the recovered v_p DIRECTLY into particle_vel
+// (the MPM particle's final velocity — no finalize dv-compose).
 __global__ void MpmG2PGatherKernel(uint32_t particle_count,
-                                   const m::Vec3* __restrict__ pos,
                                    uint32_t particles_per_env, uint32_t nodes_per_env,
                                    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
-                                   float inv_dx, float dx, m::Vec3 origin,
+                                   float inv_dx, float dx, float dt, m::Vec3 origin,
+                                   const float* __restrict__ inv_mass,
                                    const m::Vec3* __restrict__ grid_velocity,
+                                   m::Vec3* __restrict__ part_pos,
                                    m::Vec3* __restrict__ part_vel,
                                    float* __restrict__ part_C) {
     const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= particle_count) return;
     const uint32_t env = p / particles_per_env;
-    const m::Vec3 xp = pos[p];
+    const m::Vec3 xp = part_pos[p];
     const Bspline wxs = QuadWeights((xp.x - origin.x) * inv_dx);
     const Bspline wys = QuadWeights((xp.y - origin.y) * inv_dx);
     const Bspline wzs = QuadWeights((xp.z - origin.z) * inv_dx);
@@ -294,28 +511,95 @@ __global__ void MpmG2PGatherKernel(uint32_t particle_count,
     float* Cd = part_C + static_cast<size_t>(p) * 9u;
     for (int32_t k = 0; k < 9; ++k) Cd[k] = C[k] * scale;
     part_vel[p] = vp;
+    // Advect only a movable particle (a pinned inv_mass==0 sample holds position).
+    if (inv_mass == nullptr || inv_mass[p] > 0.0f) {
+        part_pos[p] = xp + vp * dt;
+    }
 }
 
-Status OpMpmGridClear(const ModelView& /*model*/, const DataView& data,
-                      const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const MpmGridParams*>(params);
-    if (p == nullptr) return Status::Failed;
-    const uint64_t total = static_cast<uint64_t>(p->nodes_per_env) * p->env_count;
-    if (total == 0u) return Status::Ok;
-    if (total > 0xFFFFFFFFull) return Status::Failed;  // u32 node-id key overflow.
-    const uint32_t n = static_cast<uint32_t>(total);
-    const uint32_t blocks = (n + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(MpmGridClearKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               n, data.grid_mass, data.grid_momentum, data.grid_velocity,
+// --- F-update: F^{n+1} = (I + dt*C) F^n (reads the C just written by G2P) ----
+__global__ void MpmUpdateFKernel(uint32_t particle_count, float dt,
+                                 const float* __restrict__ part_C,
+                                 float* __restrict__ part_F) {
+    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= particle_count) return;
+    const float* C = part_C + static_cast<size_t>(p) * 9u;
+    float* F = part_F + static_cast<size_t>(p) * 9u;
+    float IpdtC[9];
+    for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
+    IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
+    float Fn[9];
+    for (int k = 0; k < 9; ++k) Fn[k] = F[k];
+    Mat3Mul(IpdtC, Fn, F);  // F <- (I + dt*C) * F.
+}
+
+// Partition the pre-allocated scratch [cub temp | keys-out | idx-out] (host-side,
+// so the sort never cudaMalloc/syncs mid-capture; the gather joins the graph).
+struct MpmScratch {
+    void* sort_temp = nullptr;
+    uint32_t* keys_out = nullptr;
+    uint32_t* idx_out = nullptr;
+    size_t sort_temp_bytes = 0u;
+};
+inline MpmScratch PartitionScratch(void* base, uint32_t Np) {
+    const MpmSortScratchLayout sl(Np);
+    char* sbase = reinterpret_cast<char*>(base);
+    MpmScratch s;
+    s.sort_temp = sbase;
+    s.keys_out = reinterpret_cast<uint32_t*>(sbase + sl.keys_off);
+    s.idx_out  = reinterpret_cast<uint32_t*>(sbase + sl.idx_off);
+    s.sort_temp_bytes = static_cast<size_t>(sl.temp_bytes);
+    return s;
+}
+
+// One MLS-MPM substep: clear -> P2G(force) -> grid update + BC -> G2P -> F-update,
+// each kernel launch a barrier (the launch boundary is the inter-phase barrier).
+void LaunchSubstep(const MpmStepParams& p, const DataView& data, float dt_sub,
+                   uint32_t Np, uint32_t Ppe, uint32_t cpe, uint32_t total_nodes,
+                   float inv_dx, const m::Vec3& origin, cudaStream_t stream) {
+    const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
+    const uint32_t pblocks = (Np + kBlockSize - 1u) / kBlockSize;
+    LaunchCuda(MpmGridClearKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
+               total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
                data.grid_force);
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
+               data.particle_pos, Ppe, inv_dx, origin, p.grid_dims[0], p.grid_dims[1],
+               p.grid_dims[2], cpe, data.mpm_grid_cell_key, data.mpm_grid_part_idx,
+               data.env_status);
+    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, Np);
+    (void)cub::DeviceRadixSort::SortPairs(
+        sc.sort_temp, sc.sort_temp_bytes, data.mpm_grid_cell_key, sc.keys_out,
+        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(Np), 0, 32, stream);
+    LaunchCuda(MpmP2GGatherKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
+               total_nodes, data.particle_pos, data.particle_inv_mass,
+               data.particle_vel, data.particle_C, data.particle_F,
+               data.particle_vol0, data.particle_material_id, data.mpm_material_table,
+               p.material_count, sc.keys_out, sc.idx_out, Np, Ppe, p.nodes_per_env,
+               cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx,
+               dt_sub, origin, data.grid_mass, data.grid_momentum);
+    const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
+    const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
+    LaunchCuda(MpmGridUpdateKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
+               total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx,
+               origin, g, dt_sub, pn, p.plane_d, p.plane_mu, data.grid_mass,
+               data.grid_momentum, data.grid_velocity);
+    LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
+               Ppe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
+               inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
+               data.grid_velocity, data.particle_pos, data.particle_vel,
+               data.particle_C);
+    LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
+               dt_sub, data.particle_C, data.particle_F);
 }
 
-Status OpMpmP2G(const ModelView& /*model*/, const DataView& data,
-                const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const MpmGridParams*>(params);
+Status OpMpmStep(const ModelView& /*model*/, const DataView& data,
+                 const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const MpmStepParams*>(params);
     if (p == nullptr) return Status::Failed;
-    if (p->particle_count == 0u || p->nodes_per_env == 0u || p->dx <= 0.0f) {
+    // Defensive inertness (the build-time add() gate already keeps this op off a
+    // non-MPM op list): nothing to do without MPM particles / a grid / a cell size.
+    if (p->mode != kParticleModeMpm || p->particle_count == 0u ||
+        p->nodes_per_env == 0u || p->dx <= 0.0f) {
         return Status::Ok;
     }
     const uint64_t total_nodes64 =
@@ -328,78 +612,28 @@ Status OpMpmP2G(const ModelView& /*model*/, const DataView& data,
     if (cells_per_env * p->env_count > 0xFFFFFFFFull) return Status::Failed;
     const uint32_t Np = p->particle_count;
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
-    const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
-    // LOUD invariants: particle_count must fit the scratch/env_status footprint and
-    // cub's int num_items (the SortPairs / scratch-layout sizes static_cast to int).
+    // LOUD invariants: the count fits the per-env footprint + cub's int num_items.
     if (static_cast<uint64_t>(Np) >
         static_cast<uint64_t>(Ppe) * p->env_count) return Status::Failed;
     if (static_cast<uint64_t>(Np) > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
+    const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
+    const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const float inv_dx = 1.0f / p->dx;
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
-
-    // Partition the pre-allocated scratch [cub temp | keys-out | idx-out] so the
-    // sort never cudaMalloc/syncs mid-capture (the gather joins the graph).
-    const MpmSortScratchLayout sl(Np);
-    char* sbase = reinterpret_cast<char*>(data.mpm_sort_scratch);
-    void* sort_temp = sbase;
-    uint32_t* keys_out = reinterpret_cast<uint32_t*>(sbase + sl.keys_off);
-    uint32_t* idx_out  = reinterpret_cast<uint32_t*>(sbase + sl.idx_off);
-    size_t sort_temp_bytes = static_cast<size_t>(sl.temp_bytes);
-    const uint32_t pblocks = (Np + kBlockSize - 1u) / kBlockSize;
-    if (data.env_status != nullptr) {  // clear THIS op's grid-escape bit per env.
+    const uint32_t substeps = p->substeps == 0u ? 1u : p->substeps;
+    const float dt_sub = p->dt / static_cast<float>(substeps);
+    // Clear THIS op's grid-escape bit per env once (the per-substep cell-key kernel
+    // ORs into it without re-clearing, so an escape in any substep stays flagged).
+    if (data.env_status != nullptr) {
         const uint32_t e = p->env_count == 0u ? 1u : p->env_count;
         const uint32_t eb = (e + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(MpmClearEscapeBitKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
                    data.env_status, e);
     }
-    LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
-               data.particle_pos, Ppe, inv_dx, origin, p->grid_dims[0],
-               p->grid_dims[1], p->grid_dims[2], cpe, data.mpm_grid_cell_key,
-               data.mpm_grid_part_idx, data.env_status);
-    // Stable radix sort the (cell key -> particle index) pairs into the out
-    // buffers (stable => byte-identical run-to-run), then a node-parallel gather.
-    (void)cub::DeviceRadixSort::SortPairs(
-        sort_temp, sort_temp_bytes, data.mpm_grid_cell_key, keys_out,
-        data.mpm_grid_part_idx, idx_out, static_cast<int>(Np), 0, 32, stream);
-    const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
-    const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(MpmP2GGatherKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, data.particle_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_C, keys_out, idx_out, Np, Ppe,
-               p->nodes_per_env, cpe, p->grid_dims[0], p->grid_dims[1],
-               p->grid_dims[2], inv_dx, p->dx, origin, data.grid_mass,
-               data.grid_momentum);
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-}
-
-Status OpMpmG2P(const ModelView& /*model*/, const DataView& data,
-                const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const MpmGridParams*>(params);
-    if (p == nullptr) return Status::Failed;
-    if (p->particle_count == 0u || p->nodes_per_env == 0u || p->dx <= 0.0f) {
-        return Status::Ok;
+    for (uint32_t s = 0; s < substeps; ++s) {
+        LaunchSubstep(*p, data, dt_sub, Np, Ppe, cpe, total_nodes, inv_dx, origin,
+                      stream);
     }
-    const uint64_t total_nodes64 =
-        static_cast<uint64_t>(p->nodes_per_env) * p->env_count;
-    if (total_nodes64 > 0xFFFFFFFFull) return Status::Failed;
-    const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
-    const float inv_dx = 1.0f / p->dx;
-    const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
-    const uint32_t Np = p->particle_count;
-    const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
-    // LOUD invariant: env=p/Ppe reads the env-private grid, so the count must fit
-    // the per-env footprint (else the gather reads grid nodes of a missing env).
-    if (static_cast<uint64_t>(Np) >
-        static_cast<uint64_t>(Ppe) * p->env_count) return Status::Failed;
-    // Grid momentum -> velocity, then a race-free per-particle gather.
-    const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(MpmGridVelocityKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity);
-    const uint32_t pblocks = (Np + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
-               data.particle_pos, Ppe, p->nodes_per_env, p->grid_dims[0],
-               p->grid_dims[1], p->grid_dims[2], inv_dx, p->dx, origin,
-               data.grid_velocity, data.particle_vel, data.particle_C);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -411,9 +645,7 @@ uint64_t MpmSortScratchBytes(uint32_t particle_count) {
 }
 
 void RegisterNkMpmOps() {
-    SetCudaOp(NkOp::MpmGridClear, &OpMpmGridClear);
-    SetCudaOp(NkOp::MpmP2G, &OpMpmP2G);
-    SetCudaOp(NkOp::MpmG2P, &OpMpmG2P);
+    SetCudaOp(NkOp::MpmStep, &OpMpmStep);
 }
 
 }  // namespace nuka::phi

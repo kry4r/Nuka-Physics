@@ -29,6 +29,7 @@ struct CouplingBuildCtx {
     uint32_t particle_count = 0u;
     uint32_t n_soft = 0u;
     float    dt = 0.0f;
+    float    gravity[3] = {0.0f, 0.0f, 0.0f};  // world gravity (the MPM grid kick).
     float    contact_margin = 0.0f;
     uint32_t pos_pass = 0u;          // split-impulse pos pass active (finalize)
 
@@ -36,6 +37,11 @@ struct CouplingBuildCtx {
     phi::NarrowphaseBodyParticleParams* p_np_body_particle = nullptr;
     phi::ParticleFinalizeParams*        p_part_finalize = nullptr;
     phi::ParticleParticleContactParams* p_pp_contact = nullptr;
+    phi::MpmStepParams*                 p_mpm_step = nullptr;
+
+    // MLS-MPM grid provider scalars (resolved once in Build from the cooked Model).
+    // has_mpm gates the grid provider's MpmStep emit; 0 elsewhere -> no MpmStep op.
+    uint32_t has_mpm = 0u;
 
     // Append one op; defined in pipeline.cpp where Pipeline is complete so the
     // capability query + push match the builder's local `add` lambda exactly.
@@ -65,6 +71,17 @@ struct RowCouplingProvider final : CouplingProvider {
     void PreCouple(const CouplingBuildCtx&) const override;
     void Couple(const CouplingBuildCtx&) const override;
     void PostCouple(const CouplingBuildCtx&) const override;
+};
+
+// The grid-transfer provider: an MLS-MPM medium couples through the env-private
+// background grid. It emits ONE umbrella MpmStep op at the pre-solve Couple seam
+// (build-time gated on the cooked has_mpm, so a non-MPM world emits no op at all).
+// PreCouple/PostCouple are empty — the grid medium's velocity arrives via G2P (no
+// per-particle row, no finalize dv-compose).
+struct MpmCouplingProvider final : CouplingProvider {
+    void PreCouple(const CouplingBuildCtx&) const override {}
+    void Couple(const CouplingBuildCtx&) const override;
+    void PostCouple(const CouplingBuildCtx&) const override {}
 };
 
 } // namespace nuka::nk

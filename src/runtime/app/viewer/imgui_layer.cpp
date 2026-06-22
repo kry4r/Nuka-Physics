@@ -348,7 +348,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             if (ui_state.drive_dirty.size() != n) ui_state.drive_dirty.assign(n, 0u);
             const bool have_labels = (ui_state.dof_labels.size() == n);
             for (size_t d = 0; d < n; ++d) {
-                char id[24];
+                char id[32];  // "##drive" + up to a 20-digit size_t + null.
                 std::snprintf(id, sizeof(id), "##drive%zu", d);
                 char label[64];
                 if (have_labels && !ui_state.dof_labels[d].empty()) {

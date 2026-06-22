@@ -117,10 +117,26 @@ EmbeddedSkin EmbedSurfaceInTetCage(const std::vector<math::Vec3>& skin_rest,
                                    const std::vector<TetMeshTet>& tets,
                                    uint32_t* out_extrapolated = nullptr);
 
-// Deform the embedded skin by the live cage: out[v] = Σ_i w_i * tet_live[vi_i], an
-// affine blend (smooth, exact under rigid/affine cage motion). out sizes to binds.
+// Embed any surface in a dense PARTICLE set: bind each skin vertex to its K=4
+// NEAREST particles (rest configuration) with normalized inverse-distance weights
+// (Σ w == 1). Reuses the SkinVertexBind/EmbeddedSkin (vi index particles now) so
+// DeformEmbeddedSkin blends from the live particle positions UNCHANGED. A dense
+// MPM particle fill has no out-of-set vertex, so the blend cannot spike on crush.
+EmbeddedSkin EmbedSurfaceInParticleSet(const std::vector<math::Vec3>& skin_rest,
+                                       const std::vector<uint32_t>& skin_tris,
+                                       const std::vector<math::Vec3>& particle_rest);
+
+// Deform the embedded skin by the live cage/particles: out[v] = Σ_i w_i*driver[vi_i],
+// an affine blend (smooth, exact under rigid/affine motion). out sizes to binds.
 void DeformEmbeddedSkin(const EmbeddedSkin& e,
                         const std::vector<math::Vec3>& tet_live,
                         std::vector<math::Vec3>& out);
+
+// Laplacian-smooth a closed triangle surface in place: each vertex moves a
+// `lambda` fraction toward its edge-neighbour centroid, for `iterations` passes.
+// Removes high-frequency facet/cage corrugation from a deformed embedded skin
+// while preserving the gross shape (the smoothing is a pure mesh operation).
+void SmoothSurface(const std::vector<uint32_t>& triangles, uint32_t iterations,
+                   float lambda, std::vector<math::Vec3>& positions);
 
 } // namespace nuka::runtime::soft
