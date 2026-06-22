@@ -36,6 +36,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_bodies       = cap.bodies_per_env > 0;
     const bool has_particles    = cap.particles_per_env > 0;
     const bool has_contacts     = cap.max_rows_per_env > 0;
+    // A cooked MLS-MPM medium (mode == Mpm + a sized grid). Gates the MpmStep emit
+    // build-time so a non-MPM world's op list is byte-identical (no MpmStep OpCall).
+    const bool has_mpm =
+        has_particles && model.particles.mode == Model::ParticleMode::Mpm &&
+        cap.mpm_grid_nodes_per_env > 0u;
     // gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
     // on actual contact capacity. For every cooked-with-contacts world this equals
     // the old structural test -- the cook sizes max_contacts_per_env ==
@@ -186,6 +191,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     coupling_ctx.particle_count = particle_count;
     coupling_ctx.n_soft = n_soft;
     coupling_ctx.dt = cfg.dt;
+    coupling_ctx.gravity[0] = cfg.gravity[0];
+    coupling_ctx.gravity[1] = cfg.gravity[1];
+    coupling_ctx.gravity[2] = cfg.gravity[2];
     coupling_ctx.contact_margin = cfg.contact_margin;
     coupling_ctx.pos_pass =
         (has_contacts && family == phi::kContactFamilyPairDriven &&
@@ -193,6 +201,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
     coupling_ctx.p_part_finalize = &p_part_finalize_;
     coupling_ctx.p_pp_contact = &p_pp_contact_;
+    coupling_ctx.p_mpm_step = &p_mpm_step_;
+    coupling_ctx.has_mpm = has_mpm ? 1u : 0u;
 
     if (has_particles) {
         p_part_predict_.dt = cfg.dt;
@@ -492,6 +502,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_pbf_apply_.particles_per_env = per_env_particles;
         add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
     }
+
+    // The MLS-MPM grid-transfer provider's Couple: ONE umbrella MpmStep op at the
+    // pre-solve coupling seam (the substep loop is self-contained relative to the
+    // single SolveRowsBlockIsland). Build-time gated on has_mpm -> a non-MPM world
+    // emits no op (op list byte-identical). Emitted whether or not there are rows
+    // (the static-plane BC needs no body, so an MPM-only world has no contacts).
+    mpm_coupling_provider_.Couple(coupling_ctx);
 
     if (has_contacts) {
         // The rigid-body arm: the spec-fixed SolveRowsBlockIslandParams takes over the slot

@@ -88,6 +88,38 @@ void RowCouplingProvider::Couple(const CouplingBuildCtx&) const {
     // there is no extra op. A grid-transfer provider emits its umbrella here.
 }
 
+void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
+    // Build-time gate: emit the umbrella ONLY for a cooked MPM medium, so the op
+    // LIST of a non-MPM world is byte-identical to master (not merely inert).
+    if (ctx.has_mpm == 0u || ctx.p_mpm_step == nullptr) return;
+    const Model& model = *ctx.model;
+    const Model::ModelParticles& mp = model.particles;
+    phi::MpmStepParams& p = *ctx.p_mpm_step;
+    p.particle_count = ctx.particle_count;
+    p.particles_per_env = ctx.particles_per_env;
+    p.env_count = ctx.env_count;
+    p.nodes_per_env = model.capacities.mpm_grid_nodes_per_env;
+    p.grid_dims[0] = mp.mpm_grid_dims[0];
+    p.grid_dims[1] = mp.mpm_grid_dims[1];
+    p.grid_dims[2] = mp.mpm_grid_dims[2];
+    p.grid_origin[0] = mp.mpm_grid_min.x;
+    p.grid_origin[1] = mp.mpm_grid_min.y;
+    p.grid_origin[2] = mp.mpm_grid_min.z;
+    p.dx = mp.mpm_cell_size;
+    p.dt = ctx.dt;
+    p.mode = ctx.particle_mode;
+    p.substeps = mp.mpm_substeps == 0u ? 1u : mp.mpm_substeps;
+    p.material_count = model.capacities.mpm_material_count;
+    for (int k = 0; k < 3; ++k) p.gravity[k] = ctx.gravity[k];
+    // The static floor plane (z-up). Coulomb mu reuses the body<->soft friction.
+    p.plane_n[0] = mp.mpm_floor_normal.x;
+    p.plane_n[1] = mp.mpm_floor_normal.y;
+    p.plane_n[2] = mp.mpm_floor_normal.z;
+    p.plane_d = mp.mpm_floor_d;
+    p.plane_mu = mp.mpm_floor_friction;
+    ctx.Emit(phi::NkOp::MpmStep, &p);
+}
+
 void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
     const Model& model = *ctx.model;
     phi::ParticleFinalizeParams& p_part_finalize = *ctx.p_part_finalize;

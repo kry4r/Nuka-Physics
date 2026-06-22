@@ -76,10 +76,12 @@ private:
     // (each op appears at most once per step).
     std::vector<phi::OpCall> calls_;
 
-    // The build-time coupling provider for the body↔particle row path. Owned by
-    // the Pipeline (its lifetime parallels the Params PODs); consulted only at
-    // Build, never at step time.
+    // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
+    // Owned by the Pipeline (their lifetime parallels the Params PODs); consulted
+    // only at Build, never at step time. The grid provider emits its umbrella op
+    // ONLY for a cooked MPM medium (build-time gated -> non-MPM op list unchanged).
     RowCouplingProvider row_coupling_provider_;
+    MpmCouplingProvider mpm_coupling_provider_;
 
     // Stable param storage: one slot per op kind. Reserved so push_back never
     // reallocates (each op is emitted at most once). Plain value members keep
@@ -110,6 +112,7 @@ private:
     phi::PbfApplyDeltaParams          p_pbf_apply_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ParticleParticleContactParams p_pp_contact_{};
+    phi::MpmStepParams                p_mpm_step_{};   // MLS-MPM umbrella step.
     phi::ReadoutContactWrenchParams   p_readout_{};
     // L1-c: p_union_obs_ (the union-only per-env contact-obs readout params)
     // was DELETED with the UnionCsr path / ReadoutUnionContactObs op.

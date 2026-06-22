@@ -99,10 +99,10 @@ enum class NkOp : uint16_t {
     PbfApplyDelta,         // PBF position delta apply
     ParticleFinalize,      // v = (x* - x)/dt; commit x
 
-    // --- MLS-MPM transfers (inert round-trip scaffold) ------------------
-    MpmGridClear,          // zero grid_mass/momentum/velocity/force (env-private grid)
-    MpmP2G,                // deterministic gather particles -> grid (mass + APIC momentum)
-    MpmG2P,                // gather grid -> particle velocity + affine C
+    // --- MLS-MPM continuum step -----------------------------------------
+    MpmStep,               // one umbrella op: predict -> clear -> P2G -> grid-update +
+                           // static-plane BC -> G2P -> F-update, iterated substeps times
+                           // (file-local kernels). Emitted at the pre-solve coupling seam.
 
     // --- readout / RL substrate -----------------------------------------
     ReadoutContactWrench,  // per-link contact wrench readout
@@ -307,12 +307,14 @@ inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 // arena field BEFORE allocation -> no mid-capture cudaMalloc. 0 for 0 particles.
 uint64_t GridSortScratchBytes(uint32_t particle_count);
 
-// --- MLS-MPM transfers (inert round-trip scaffold) ----------------------
-// Shared launch geometry for the MPM transfer ops. The grid is env-private:
-// node keys are env-offset (env*nodes_per_env + local), mirroring the particle
-// CSR grid, so replicated envs never cross-couple. grid_dims/origin/inv_dx define
-// the dense Cartesian lattice; particle_count is the env-major particle total.
-struct MpmGridParams {
+// --- MLS-MPM continuum step ---------------------------------------------
+// The single umbrella MpmStep op's params. The grid is env-private: node keys are
+// env-offset (env*nodes_per_env + local), mirroring the particle CSR grid, so
+// replicated envs never cross-couple. grid_dims/origin/dx define the dense
+// Cartesian lattice; particle_count is the env-major particle total. The op
+// iterates the substep loop (clear -> P2G(force) -> grid-update + static-plane BC
+// -> G2P -> F-update) substeps times at dt/substeps; gravity is the grid kick.
+struct MpmStepParams {
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
     uint32_t env_count;
@@ -320,11 +322,18 @@ struct MpmGridParams {
     uint32_t grid_dims[3];       // per-env node resolution (nx, ny, nz)
     float    grid_origin[3];     // world-space corner of node (0,0,0)
     float    dx;                 // uniform node spacing
-    float    dt;                 // step dt (unused while grid_force == 0)
+    float    dt;                 // full World.Step dt (split across substeps)
+    uint32_t mode;               // kParticleMode* (MpmStep runs only for kParticleModeMpm)
+    uint32_t substeps;           // internal explicit substeps per World.Step (>=1)
+    uint32_t material_count;     // mpm_material_table rows (indexed by particle_material_id)
+    float    gravity[3];         // world-frame gravity applied on the grid each substep
+    // Static-plane floor BC (z-up: n=(0,0,1), d=floor_z). A grid node at/below the
+    // plane gets a no-penetration normal projection + Coulomb friction (mu). Static
+    // => zero surface velocity => no grid->body reaction (the dynamic body is later).
+    float    plane_n[3];
+    float    plane_d;
+    float    plane_mu;
 };
-using MpmGridClearParams = MpmGridParams;
-using MpmP2GParams       = MpmGridParams;
-using MpmG2PParams       = MpmGridParams;
 
 // Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-
 // gather cub radix sort temp + the sorted key/idx out buffers, 256B-aligned).

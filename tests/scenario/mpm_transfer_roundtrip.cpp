@@ -1,13 +1,13 @@
 // ---------------------------------------------------------------------------
-// MLS-MPM transfer ROUND-TRIP IDENTITY gate (the inert-scaffold proof).
+// MLS-MPM transfer ROUND-TRIP IDENTITY gate (the umbrella-op transfer proof).
 //
 // Builds a small MLS-MPM particle set + an env-private background grid, seeds
-// C=0 / F=I / zero grid force / a known particle velocity, and dispatches
-// MpmGridClear -> MpmP2G -> MpmG2P DIRECTLY through the backend (the transfer-only
-// path; NOT the step loop). Asserts:
+// C=0 / F=I / a known particle velocity, and runs the umbrella MpmStep with
+// substeps=1, zero gravity, and the floor plane sunk far below (no BC fires). With
+// F=I the constitutive stress P(I)=0, so the step is the pure APIC transfer:
 //   (1) the G2P-recovered velocity reproduces the seeded velocity (the APIC
-//       transfer with C=0 is the identity on a constant velocity field);
-//   (2) MpmP2G run twice is BIT-identical (the deterministic gather, NO atomics);
+//       transfer with C=0 / P(I)=0 is the identity on a constant velocity field);
+//   (2) MpmStep run twice is BIT-identical (the deterministic gather, NO atomics);
 //   (3) the snapshot/restore round-trips F/C (the three readout.cu sites);
 //   (4) a particle outside the grid AABB flags the env-status escape bit.
 // ---------------------------------------------------------------------------
@@ -100,8 +100,9 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     return m;
 }
 
-nphi::MpmGridParams MakeParams(const nk::Model& m) {
-    nphi::MpmGridParams p{};
+// MpmStep at substeps=1, zero gravity, floor sunk far below: the pure transfer.
+nphi::MpmStepParams MakeParams(const nk::Model& m) {
+    nphi::MpmStepParams p{};
     p.particle_count = m.capacities.particles_per_env;  // env_count == 1.
     p.particles_per_env = m.capacities.particles_per_env;
     p.env_count = 1u;
@@ -111,13 +112,18 @@ nphi::MpmGridParams MakeParams(const nk::Model& m) {
     p.grid_origin[2] = kOrigin.z;
     p.dx = kDx;
     p.dt = 1.0f / 240.0f;
+    p.mode = nphi::kParticleModeMpm;
+    p.substeps = 1u;
+    p.material_count = m.capacities.mpm_material_count;
+    p.gravity[0] = 0.0f; p.gravity[1] = 0.0f; p.gravity[2] = 0.0f;
+    p.plane_n[0] = 0.0f; p.plane_n[1] = 0.0f; p.plane_n[2] = 1.0f;
+    p.plane_d = -1.0e6f;   // sink the floor far below -> no BC alters the transfer.
+    p.plane_mu = 0.0f;
     return p;
 }
 
-bool RunTransfer(nk::World& w, const nphi::MpmGridParams& p) {
-    return w.DispatchOp(nphi::NkOp::MpmGridClear, &p) == nphi::Status::Ok &&
-           w.DispatchOp(nphi::NkOp::MpmP2G, &p) == nphi::Status::Ok &&
-           w.DispatchOp(nphi::NkOp::MpmG2P, &p) == nphi::Status::Ok;
+bool RunTransfer(nk::World& w, const nphi::MpmStepParams& p) {
+    return w.DispatchOp(nphi::NkOp::MpmStep, &p) == nphi::Status::Ok;
 }
 
 }  // namespace
@@ -132,7 +138,7 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
 
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());
-    nphi::MpmGridParams p = MakeParams(w.GetModel());
+    nphi::MpmStepParams p = MakeParams(w.GetModel());
     ASSERT_TRUE(RunTransfer(w, p));
 
     std::vector<Vec3> out(np, Vec3::Zero());
@@ -161,9 +167,8 @@ TEST(MpmTransferRoundtrip, P2GGatherByteIdenticalRunToRun) {
         const uint32_t nodes = m.capacities.mpm_grid_nodes_per_env;
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
         if (!w.Ready()) return false;
-        nphi::MpmGridParams p = MakeParams(w.GetModel());
-        if (w.DispatchOp(nphi::NkOp::MpmGridClear, &p) != nphi::Status::Ok) return false;
-        if (w.DispatchOp(nphi::NkOp::MpmP2G, &p) != nphi::Status::Ok) return false;
+        nphi::MpmStepParams p = MakeParams(w.GetModel());
+        if (w.DispatchOp(nphi::NkOp::MpmStep, &p) != nphi::Status::Ok) return false;
         mass.assign(nodes, 0.0f);
         mom.assign(nodes, Vec3::Zero());
         return w.GetData().DownloadField(nk::FieldId::GridMass, mass.data(),
@@ -212,13 +217,12 @@ TEST(MpmTransferRoundtrip, SnapshotRestoreRoundTripsF) {
     }
 }
 
-// Run clear -> P2G and return the env-status word (escape-bit probe).
+// Run MpmStep and return the env-status word (escape-bit probe).
 uint32_t EscapeStatusAfterP2G(Backend& b, nk::Model m) {
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     EXPECT_TRUE(w.Ready());
-    nphi::MpmGridParams p = MakeParams(w.GetModel());
-    EXPECT_EQ(nphi::Status::Ok, w.DispatchOp(nphi::NkOp::MpmGridClear, &p));
-    EXPECT_EQ(nphi::Status::Ok, w.DispatchOp(nphi::NkOp::MpmP2G, &p));
+    nphi::MpmStepParams p = MakeParams(w.GetModel());
+    EXPECT_EQ(nphi::Status::Ok, w.DispatchOp(nphi::NkOp::MpmStep, &p));
     uint32_t status = 0u;
     EXPECT_TRUE(w.GetData().DownloadField(nk::FieldId::EnvStatus, &status,
                                           sizeof(uint32_t)));

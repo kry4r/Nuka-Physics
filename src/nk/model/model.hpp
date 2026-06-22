@@ -231,7 +231,8 @@ struct MpmMaterial {
     static constexpr uint32_t kValueCount = 6u;  // f32 count of this POD (table stride).
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    float model_kind = 0.0f;  // 0 = fixed-corotated/Neo-Hookean elastic, 1 = Drucker-Prager
+    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean.
+    float model_kind = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -383,10 +384,18 @@ public:
         bool  boundary_enabled = false;
         float floor_z = 0.0f;
         // MLS-MPM env-private background grid descriptor (its OWN fields, NOT the PBF
-        // domain above). The grid-transfer coupling provider builds MpmGridParams from these.
+        // domain above). The grid-transfer coupling provider builds MpmStepParams from these.
         math::Vec3 mpm_grid_min{0.0f, 0.0f, 0.0f};
         uint32_t   mpm_grid_dims[3] = {0u, 0u, 0u};
         float      mpm_cell_size = 0.0f;
+        // MLS-MPM internal explicit substeps per World.Step (CFL headroom for a stiff
+        // medium); the cook sets it from the material/dt. 0 => 1 substep.
+        uint32_t   mpm_substeps = 1u;
+        // MLS-MPM static floor plane (z-up: n=(0,0,1), d=floor height). The grid BC
+        // projects node velocity against this plane (no-penetration + Coulomb mu).
+        math::Vec3 mpm_floor_normal{0.0f, 0.0f, 1.0f};
+        float      mpm_floor_d = 0.0f;
+        float      mpm_floor_friction = 0.4f;
         // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
         // (the op-ified cross-system particle-particle co-step). The
         // class-blind unilateral non-penetration co-step runs AFTER finalize over

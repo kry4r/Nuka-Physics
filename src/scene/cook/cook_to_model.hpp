@@ -138,7 +138,8 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
 struct MpmMaterialInput {
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    float model_kind = 0.0f;  // 0 = elastic, 1 = Drucker-Prager.
+    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean.
+    float model_kind = 0.0f;
 };
 
 struct MpmCookInput {
@@ -150,6 +151,13 @@ struct MpmCookInput {
     math::Vec3 grid_origin{0.0f, 0.0f, 0.0f};  // world corner of node (0,0,0)
     uint32_t   grid_dims[3] = {0u, 0u, 0u};    // per-env node resolution
     float      dx = 0.0f;                       // uniform node spacing (> 0).
+    // Internal explicit substeps per World.Step (CFL headroom for a stiff medium).
+    uint32_t   substeps = 1u;
+    // Static floor plane the grid BC projects against (z-up). normal need not be
+    // unit (the BC normalizes); friction is the Coulomb mu on the tangential drag.
+    math::Vec3 floor_normal{0.0f, 0.0f, 1.0f};
+    float      floor_d = 0.0f;
+    float      floor_friction = 0.4f;
 };
 
 // Stage an MLS-MPM bulk-soft body into the Model (single-env template; F=identity,
