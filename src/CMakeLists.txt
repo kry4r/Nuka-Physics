@@ -726,6 +726,7 @@ if(CMAKE_CUDA_COMPILER)
         nk/data/arena.cpp
         nk/data/data.cpp
         nk/pipeline/pipeline.cpp
+        nk/pipeline/coupling_provider.cpp
         nk/pipeline/world.cpp
         nk/solve/schedule.cpp
         nk/solve/xpbd_coloring.cpp

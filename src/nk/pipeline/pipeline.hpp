@@ -16,6 +16,7 @@
 
 #include "phi/backend.hpp"     // OpCall
 #include "phi/op_schema.hpp"   // NkOp + <Op>Params
+#include "nk/pipeline/coupling_provider.hpp"  // CouplingProvider / RowCouplingProvider
 
 namespace nuka::nk {
 
@@ -63,12 +64,22 @@ public:
     size_t Size() const { return calls_.size(); }
 
 private:
+    // The single op-emission helper (capability query + push). The builder and
+    // the coupling providers both append through it so the emit semantics match.
+    void AddOp(phi::NkOp op, const void* params, phi::Device* device);
+    friend struct CouplingBuildCtx;
+
     // Append an op with its params; the params live in `param_storage_` (a node-
     // stable deque-like vector of variant blocks) so addresses never move after
     // Build returns. We keep one typed vector per param POD; pointers into a
     // reserved vector are stable because we reserve to the worst-case count
     // (each op appears at most once per step).
     std::vector<phi::OpCall> calls_;
+
+    // The build-time coupling provider for the body↔particle row path. Owned by
+    // the Pipeline (its lifetime parallels the Params PODs); consulted only at
+    // Build, never at step time.
+    RowCouplingProvider row_coupling_provider_;
 
     // Stable param storage: one slot per op kind. Reserved so push_back never
     // reallocates (each op is emitted at most once). Plain value members keep
