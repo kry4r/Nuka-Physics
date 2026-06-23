@@ -168,6 +168,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridBodyDp:          v.grid_body_dp = static_cast<math::Vec3*>(p); break;
         case FieldId::GridBodyOwner:       v.grid_body_owner = static_cast<uint32_t*>(p); break;
         case FieldId::MpmBodyReaction:     v.mpm_body_reaction = static_cast<math::Vec3*>(p); break;
+        case FieldId::MpmBodyAngReaction:  v.mpm_body_ang_reaction = static_cast<math::Vec3*>(p); break;
         case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
         case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
         case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;

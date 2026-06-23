@@ -781,3 +781,7 @@ fields:
   - {name: grid_body_dp,     dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
   - {name: grid_body_owner,  dtype: u32,  per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
   - {name: mpm_body_reaction, dtype: vec3, per: body, arena: scratch, owner: data, flags: [readout]}
+  # Angular companion of mpm_body_reaction: the per-body grid->body torque impulse
+  # the link-row gather sums, which the per-articulation deposit chain-walks into
+  # qdot_flat. The free-rigid path applies its torque inline and leaves this zero.
+  - {name: mpm_body_ang_reaction, dtype: vec3, per: body, arena: scratch, owner: data, flags: [readout]}

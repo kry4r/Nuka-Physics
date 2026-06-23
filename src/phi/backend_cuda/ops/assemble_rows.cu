@@ -85,11 +85,6 @@ __device__ math::Vec3 ScaleVec(math::Vec3 v, float s) {
     return {v.x * s, v.y * s, v.z * s};
 }
 
-// articulation_jacobian.cu: RotateByQuat = the defensive-normalize variant.
-__forceinline__ __device__ math::Vec3 RotateByQuat(math::Quat q, math::Vec3 v) {
-    return mg::RotateByQuatNormalized(q, v);
-}
-
 __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
     return JointDofCountDevice(type);
 }
@@ -142,58 +137,18 @@ __global__ void ComputeContactChainJacobianKernel(
     const math::Vec3 normal = NormalizeOrUp(contact_normal_world[contact]);
     float* const out_row = out_chain_jacobian + static_cast<size_t>(contact) * dof_stride;
 
-    // Walk from the contact's link up to the root. parent_link is articulation-
-    // local; the root's parent is the ~0u sentinel.
+    // Walk from the contact's link up to the root, emitting each ancestor joint's
+    // column via the shared chain-J builder. The scalar-direction column is the
+    // wrench (f=normal, tau=0) case; the deposit path feeds it a full wrench. The
+    // out_row slice is zeroed by the launcher, so the helper's += writes once.
     uint32_t link = contact_link;
     while (link != kInvalidLink) {
-        const ArticulationJointType type = state.joint_type[link];
-        const uint32_t dof_count = JointDofCount(type);
-        if (dof_count != 0u) {
-            // dof_index(link): base-inclusive prefix sum of per-joint DOF counts
-            // across the articulation's links in [offset, link).
-            uint32_t dof_index = 0u;
-            for (uint32_t k = offset; k < link; ++k) {
-                dof_index += JointDofCount(state.joint_type[k]);
-            }
-
-            if (type == ArticulationJointType::FloatingBase) {
-                // Floating-base root contributes 6 columns (see
-                // articulation_jacobian.cu for the frame contract).
-                const math::Quat base_rot = state.base_pose[articulation].rotation;
-                const math::Vec3 base_origin = state.base_pose[articulation].position;
-                const math::Vec3 lever = Sub(point, base_origin);
-                const math::Vec3 ex = RotateByQuat(base_rot, {1.0f, 0.0f, 0.0f});
-                const math::Vec3 ey = RotateByQuat(base_rot, {0.0f, 1.0f, 0.0f});
-                const math::Vec3 ez = RotateByQuat(base_rot, {0.0f, 0.0f, 1.0f});
-                const float ang[3] = {Dot(Cross(ex, lever), normal),
-                                      Dot(Cross(ey, lever), normal),
-                                      Dot(Cross(ez, lever), normal)};
-                const float lin[3] = {Dot(ex, normal), Dot(ey, normal),
-                                      Dot(ez, normal)};
-                for (uint32_t b = 0u; b < 3u; ++b) {
-                    if (dof_index + b < dof_stride) {
-                        out_row[dof_index + b] = ang[b];
-                    }
-                    if (dof_index + 3u + b < dof_stride) {
-                        out_row[dof_index + 3u + b] = lin[b];
-                    }
-                }
-            } else {
-                const math::Vec3 axis_world =
-                    RotateByQuat(state.link_pose[link].rotation, state.joint_axis[link]);
-                float entry = 0.0f;
-                if (type == ArticulationJointType::Prismatic) {
-                    entry = Dot(axis_world, normal);
-                } else {  // Revolute
-                    const math::Vec3 lever = Sub(point, state.link_pose[link].position);
-                    entry = Dot(Cross(axis_world, lever), normal);
-                }
-                if (dof_index < dof_stride) {
-                    out_row[dof_index] = entry;
-                }
-            }
+        if (JointDofCount(state.joint_type[link]) != 0u) {
+            const uint32_t dof_index = LocalDofIndexDevice(state, offset, link);
+            AccumulateChainJointForce(state, articulation, link, dof_index,
+                                      dof_stride, point, normal,
+                                      math::Vec3{0.0f, 0.0f, 0.0f}, out_row);
         }
-
         const uint32_t parent_local = state.parent_link[link];
         link = (parent_local == kInvalidLink) ? kInvalidLink : (offset + parent_local);
     }

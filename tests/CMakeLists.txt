@@ -1091,6 +1091,10 @@ if(CMAKE_CUDA_COMPILER)
         # the per-substep grid->body reaction balances gravity (m*g*dt), the free-fall
         # BITE drops the box, two runs byte-identical (the deterministic per-body gather).
         scenario/rigid_on_mpm_rest.cpp
+        # Articulated-LINK <-> MPM coupling gate: a fixed-base prismatic-Z link rests
+        # on an MPM bed; the link's grid reaction seeds qdot_flat via M^-1 J^T (support,
+        # balance, BITE, two-run byte-identical, one-way bit cleared, 2-link reduction).
+        scenario/artic_link_on_mpm_rest.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test

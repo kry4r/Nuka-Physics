@@ -30,6 +30,7 @@
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/ops/articulation_types.cuh"  // chain-J helper + device state
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/sdf_types.cuh"     // SdfRotate / SdfInverseTransformPoint
@@ -267,13 +268,15 @@ __global__ void MpmClearEscapeBitKernel(uint32_t* env_status, uint32_t env_count
     env_status[e] &= ~kEnvStatusMpmGridEscape;
 }
 
-// Zero the per-body reaction probe once per step so it holds the impulse summed
-// over THIS step's substeps (the balance diagnostic; not a behavior input).
-__global__ void MpmClearBodyReactionKernel(uint32_t total_bodies,
-                                          m::Vec3* reaction) {
+// Zero the per-body reaction probes once per step so they hold the impulse summed
+// over THIS step's substeps (linear = balance diagnostic; angular = the deposit
+// torque the per-articulation M^-1 J^T pass consumes).
+__global__ void MpmClearBodyReactionKernel(uint32_t total_bodies, m::Vec3* reaction,
+                                          m::Vec3* ang_reaction) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= total_bodies) return;
     reaction[b] = m::Vec3::Zero();
+    if (ang_reaction != nullptr) ang_reaction[b] = m::Vec3::Zero();
 }
 
 // --- cell key (the particle's base-node cell, env-offset) -------------------
@@ -588,8 +591,9 @@ __global__ void MpmGridBodyProjectKernel(
     }
 }
 
-// Per-body deterministic gather of -dp / -(x-xb)xdp over the nodes it owns; the
-// free-rigid sink gets it, an articulated body raises kEnvStatusMpmOneWayBody.
+// Per-body deterministic gather of -dp / -(x-xb)xdp over the nodes it owns. A
+// free-rigid body applies the impulse inline; an articulation-link body (cooked
+// inv_mass==0) stores the linear+angular reaction for the per-articulation deposit.
 __global__ void MpmGridBodyReactKernel(
     uint32_t total_bodies, uint32_t bodies_per_env, uint32_t nodes_per_env,
     uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
@@ -599,11 +603,14 @@ __global__ void MpmGridBodyReactKernel(
     const uint32_t* __restrict__ body_to_link,
     const m::Vec3* __restrict__ body_dp, const uint32_t* __restrict__ body_owner,
     m::Vec3* __restrict__ body_lin_vel, m::Vec3* __restrict__ body_ang_vel,
-    m::Vec3* __restrict__ body_reaction, uint32_t* __restrict__ env_status) {
+    m::Vec3* __restrict__ body_reaction, m::Vec3* __restrict__ body_ang_reaction) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= total_bodies) return;
     const float im = body_inv_mass[b];
-    if (im <= 0.0f) return;  // immovable body: no reaction (the static case).
+    const bool is_link = (body_to_link != nullptr) && (body_to_link[b] != ~0u);
+    // A free-rigid immovable body (static ground/wall) imposes no reaction; a link
+    // row is cooked inv_mass==0 yet DOES react through its articulation, so it runs.
+    if (im <= 0.0f && !is_link) return;
     const uint32_t env = b / bodies_per_env;
     const m::Vec3 xb = body_pose[b].position;
     const uint64_t base = static_cast<uint64_t>(env) * nodes_per_env;
@@ -630,8 +637,7 @@ __global__ void MpmGridBodyReactKernel(
     // IS the substep impulse (no dt scale).
     const m::Vec3 lin_impulse = dp_sum * (-1.0f);
     const m::Vec3 ang_impulse = tq_sum * (-1.0f);
-    const bool free_rigid = (body_to_link == nullptr) || (body_to_link[b] == ~0u);
-    if (free_rigid) {  // the solve_rows.cu free-rigid apply form.
+    if (!is_link) {  // the solve_rows.cu free-rigid apply form.
         body_lin_vel[b].x += lin_impulse.x * im;
         body_lin_vel[b].y += lin_impulse.y * im;
         body_lin_vel[b].z += lin_impulse.z * im;
@@ -641,15 +647,79 @@ __global__ void MpmGridBodyReactKernel(
             body_ang_vel[b].y += ang_impulse.y * ii.y;
             body_ang_vel[b].z += ang_impulse.z * ii.z;
         }
-    } else if (env_status != nullptr &&
-               (dp_sum.x != 0.0f || dp_sum.y != 0.0f || dp_sum.z != 0.0f)) {
-        // Articulated link owns in-band nodes but its reaction is deferred: be loud.
-        atomicOr(&env_status[b / bodies_per_env], kEnvStatusMpmOneWayBody);
     }
-    if (body_reaction != nullptr) {  // accumulate the impulse for the balance probe.
+    if (body_reaction != nullptr) {  // accumulate the linear impulse (balance probe).
         body_reaction[b].x += lin_impulse.x;
         body_reaction[b].y += lin_impulse.y;
         body_reaction[b].z += lin_impulse.z;
+    }
+    // A link body's torque impulse feeds the per-articulation M^-1 J^T deposit.
+    if (is_link && body_ang_reaction != nullptr) {
+        body_ang_reaction[b].x += ang_impulse.x;
+        body_ang_reaction[b].y += ang_impulse.y;
+        body_ang_reaction[b].z += ang_impulse.z;
+    }
+}
+
+// One thread per ARTICULATION. Loops its link bodies in ascending global-row order,
+// chain-walks each link's grid reaction wrench into the generalized force g, sums,
+// applies M^-1 once, and seeds qdot_flat[tile] += M^-1 J^T wrench. Single writer per
+// tile (Go2's 4 feet share one tile) -> race-free + deterministic (fixed order).
+__global__ void MpmArticReactDepositKernel(
+    nkops::ArticulationDeviceState state, uint32_t artic_count, uint32_t artics_per_env,
+    uint32_t bodies_per_env, uint32_t base_link_count, uint32_t max_dof,
+    const m::Transform* __restrict__ body_pose,
+    const uint32_t* __restrict__ body_to_link,
+    const m::Vec3* __restrict__ body_reaction,
+    const m::Vec3* __restrict__ body_ang_reaction,
+    const float* __restrict__ m_inv, float* __restrict__ qdot_flat) {
+    const uint32_t ag = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ag >= artic_count) return;
+    if (max_dof == 0u || max_dof > nkops::kMaxArticulationDof) return;
+    const uint32_t ape = (artics_per_env == 0u) ? 1u : artics_per_env;
+    const uint32_t env = ag / ape;
+    float g[nkops::kMaxArticulationDof];
+    for (uint32_t k = 0u; k < max_dof; ++k) g[k] = 0.0f;
+    // Sum each owned link's J^T wrench. Ascending body row -> deterministic g.
+    const uint32_t row0 = env * bodies_per_env;
+    for (uint32_t lb = 0u; lb < bodies_per_env; ++lb) {
+        const uint32_t tmpl_link = body_to_link[lb];
+        if (tmpl_link == ~0u) continue;                 // free rigid / static row.
+        const uint32_t gl_link = env * base_link_count + tmpl_link;
+        if (gl_link >= state.total_link_count) continue;
+        // Derive offset from the link's OWN articulation (the assemble_rows.cu
+        // reference), then skip if it is not this thread's tile -> race-free.
+        const uint32_t articulation = state.link_to_articulation[gl_link];
+        if (articulation != ag) continue;
+        const uint32_t b = row0 + lb;
+        const m::Vec3 f = body_reaction[b];
+        const m::Vec3 tau = body_ang_reaction[b];
+        if (f.x == 0.0f && f.y == 0.0f && f.z == 0.0f &&
+            tau.x == 0.0f && tau.y == 0.0f && tau.z == 0.0f) continue;
+        const uint32_t offset = state.articulation_link_offset[articulation];
+        const m::Vec3 point = body_pose[b].position;  // == the react gather anchor.
+        // Bounded root-walk: a chain is at most total_link_count deep, and every link
+        // is range-checked, so a malformed parent map can never spin the GPU.
+        uint32_t link = gl_link;
+        for (uint32_t depth = 0u; link != ~0u && depth < state.total_link_count; ++depth) {
+            if (link >= state.total_link_count) break;
+            if (nkops::JointDofCountDevice(state.joint_type[link]) != 0u) {
+                const uint32_t dof_index =
+                    nkops::LocalDofIndexDevice(state, offset, link);
+                nkops::AccumulateChainJointForce(state, articulation, link, dof_index,
+                                                 max_dof, point, f, tau, g);
+            }
+            const uint32_t parent_local = state.parent_link[link];
+            link = (parent_local == ~0u) ? ~0u : (offset + parent_local);
+        }
+    }
+    // delta-qdot = M^-1 g (ascending c, plain +=); seed the per-artic flat tile.
+    const size_t tile = static_cast<size_t>(ag) * max_dof * max_dof;
+    for (uint32_t r = 0u; r < max_dof; ++r) {
+        const float* Minv = m_inv + tile + static_cast<size_t>(r) * max_dof;
+        float acc = 0.0f;
+        for (uint32_t c = 0u; c < max_dof; ++c) acc += Minv[c] * g[c];
+        qdot_flat[static_cast<size_t>(ag) * max_dof + r] += acc;
     }
 }
 
@@ -793,7 +863,7 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    data.body_pose, data.body_inv_mass, data.body_inv_inertia,
                    model.body_to_link, data.grid_body_dp, data.grid_body_owner,
                    data.body_linear_velocity, data.body_angular_velocity,
-                   data.mpm_body_reaction, data.env_status);
+                   data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
     LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
                Ppe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
@@ -850,11 +920,30 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         const uint32_t tb = p->bodies_per_env * p->env_count;
         const uint32_t bb = (tb + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(MpmClearBodyReactionKernel, dim3(bb), dim3(kBlockSize), 0u,
-                   stream, tb, data.mpm_body_reaction);
+                   stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
     for (uint32_t s = 0; s < substeps; ++s) {
         LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, cpe, total_nodes, inv_dx,
                       origin, stream);
+    }
+    // Articulated-link deposit: the link rows' net grid reaction (summed over the
+    // substeps above) becomes delta-qdot via M^-1 J^T into the per-articulation
+    // qdot_flat tile, which SolveRowsBlockIsland seeds from. Once per Step, after the
+    // substep loop (m_inv + the kinematic frame are constant across substeps, and
+    // M^-1 is linear, so the summed-wrench deposit equals the per-substep sum).
+    if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
+        p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
+        data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&
+        data.m_inv != nullptr) {
+        const uint32_t total_links = p->base_link_count * p->env_count;
+        const nkops::ArticulationDeviceState state =
+            nkops::MakeArticulationDeviceState(model, data, total_links, p->artic_count);
+        const uint32_t ablocks = (p->artic_count + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
+                   stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
+                   p->base_link_count, p->max_dof, data.body_pose, model.body_to_link,
+                   data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
+                   data.qdot_flat);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
