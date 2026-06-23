@@ -396,6 +396,15 @@ public:
         math::Vec3 mpm_floor_normal{0.0f, 0.0f, 1.0f};
         float      mpm_floor_d = 0.0f;
         float      mpm_floor_friction = 0.4f;
+        // MLS-MPM dynamic-body grid BC: a cooked body's SDF is rasterized onto the
+        // grid and the node velocity projected onto its surface velocity (Coulomb
+        // mpm_body_friction, |phi| band mpm_body_band cells). The grid provider
+        // turns the BC on whenever a collidable body co-resides with the medium.
+        float      mpm_body_friction = 0.4f;
+        float      mpm_body_band = 0.0f;        // 0 => the provider defaults it to dx.
+        // Free-fall diagnostic: disable ONLY the dynamic-body BC (the static-plane
+        // BC stays on). A test sets it to prove the held-up state is BC-caused.
+        bool       mpm_bite_disable_dynamic_bc = false;
         // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
         // (the op-ified cross-system particle-particle co-step). The
         // class-blind unilateral non-penetration co-step runs AFTER finalize over

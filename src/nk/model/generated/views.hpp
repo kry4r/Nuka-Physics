@@ -236,6 +236,9 @@ struct DataView {
     uint32_t* mpm_grid_part_idx = nullptr;  // per:particle arena:scratch owner:data
     uint8_t* mpm_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_sort_scratch_bytes
     float* mpm_material_table = nullptr;  // per:scalar arena:persistent owner:data count:mpm_material_count*6
+    ::nuka::math::Vec3* grid_body_dp = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint32_t* grid_body_owner = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    ::nuka::math::Vec3* mpm_body_reaction = nullptr;  // per:body arena:scratch owner:data flags:[readout]
 };
 
 } // namespace nuka::phi

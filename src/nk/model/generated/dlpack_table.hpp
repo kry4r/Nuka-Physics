@@ -228,6 +228,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::MpmGridPartIdx, DlpackDtype::kU32, 1, false, false},  // mpm_grid_part_idx
     {FieldId::MpmSortScratch, DlpackDtype::kU8, 1, false, false},  // mpm_sort_scratch
     {FieldId::MpmMaterialTable, DlpackDtype::kF32, 1, false, false},  // mpm_material_table
+    {FieldId::GridBodyDp, DlpackDtype::kF32, 2, false, false},  // grid_body_dp
+    {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false, false},  // grid_body_owner
+    {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_reaction
 };
 
 } // namespace nuka::nk

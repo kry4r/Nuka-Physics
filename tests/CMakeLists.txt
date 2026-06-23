@@ -1087,6 +1087,10 @@ if(CMAKE_CUDA_COMPILER)
         # floor plane (grid BC), squashes <= ~25%, recovers, no collapse/spike/escape,
         # >= 5 s, finite, two-run byte-identical (the deterministic gather).
         scenario/mpm_jelly_ball.cpp
+        # Two-way rigid <-> MPM coupling gate: a free rigid box rests on an MPM bed;
+        # the per-substep grid->body reaction balances gravity (m*g*dt), the free-fall
+        # BITE drops the box, two runs byte-identical (the deterministic per-body gather).
+        scenario/rigid_on_mpm_rest.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test
@@ -3156,6 +3160,38 @@ if(NK_BUILD_VULKAN_VALIDATION)
     target_include_directories(nuka_mpm_jelly_demo
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(nuka_mpm_jelly_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # Two-way rigid<->MPM headline clip: a free rigid box presses into a firm MLS-MPM
+    # bed (sim_method=mlsmpm via the config selector); the grid->box reaction holds
+    # the box up and the bed deforms under it. STEPS nk::World on CUDA and renders the
+    # box cube (posed from body_pose) + the bed isosurface (the fluid marching-cubes
+    # mesher over the MPM particle set) on the CUDA RT backend or lavapipe raster.
+    add_executable(nuka_mpm_rigid_rest_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/mpm_rigid_rest_demo.cpp
+    )
+    add_dependencies(nuka_mpm_rigid_rest_demo nuka_codegen)
+    target_compile_definitions(nuka_mpm_rigid_rest_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_mpm_rigid_rest_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_mpm_rigid_rest_demo
         PRIVATE
             nuka_scene_cook
             nuka_render
