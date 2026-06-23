@@ -120,13 +120,21 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     // Dynamic-body grid BC: on whenever a collidable body co-resides with the
     // medium (a body's SDF then rasterizes onto the grid + the reaction lands in
     // the shared body sink). Data-driven; an MPM-only world has no body -> off.
-    // The grid reaction lands only for free-rigid SDF-cooked bodies; an articulated
-    // or analytic-only body rasterizes one-way and raises kEnvStatusMpmOneWayBody.
+    // The grid reaction lands for free-rigid SDF-cooked bodies (inline) and for
+    // articulation links (M^-1 J^T into qdot_flat); only an analytic-only body with
+    // no cooked SDF stays one-way and raises kEnvStatusMpmOneWayBody.
     p.dynamic_body_bc = ctx.bodies_per_env > 0u ? 1u : 0u;
     p.bite_disable_dynamic_bc = mp.mpm_bite_disable_dynamic_bc ? 1u : 0u;
     p.bodies_per_env = ctx.bodies_per_env;
     p.body_mu = mp.mpm_body_friction;
     p.body_band = mp.mpm_body_band > 0.0f ? mp.mpm_body_band : mp.mpm_cell_size;
+    // Articulation deposit: a link body's grid reaction becomes delta-qdot via
+    // M^-1 J^T into qdot_flat, which SolveRowsBlockIsland seeds from. 0 articulations
+    // -> the deposit kernel never launches (a body-only MPM world is unchanged).
+    p.artic_count = ctx.articulation_count;
+    p.max_dof = ctx.max_dof;
+    p.base_link_count = ctx.base_link_count;
+    p.artics_per_env = ctx.artics_per_env;
     ctx.Emit(phi::NkOp::MpmStep, &p);
 }
 

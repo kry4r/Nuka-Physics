@@ -231,6 +231,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridBodyDp, DlpackDtype::kF32, 2, false, false},  // grid_body_dp
     {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false, false},  // grid_body_owner
     {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_reaction
+    {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_ang_reaction
 };
 
 } // namespace nuka::nk

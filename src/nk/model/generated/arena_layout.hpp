@@ -252,6 +252,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_body_dp
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_body_owner
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // mpm_body_reaction
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // mpm_body_ang_reaction
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

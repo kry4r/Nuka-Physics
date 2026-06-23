@@ -26,6 +26,7 @@
 
 #include <cstdint>
 
+#include "math/cuda_vec_ops.cuh"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"
@@ -184,6 +185,48 @@ __forceinline__ __device__ uint32_t LocalDofIndexDevice(const ArticulationDevice
         index += JointDofCountDevice(state.joint_type[k]);
     }
     return index;
+}
+
+// Generalized force g[dof] += J_dof^T . wrench for ONE joint, the chain-Jacobian
+// column builder generalized from a unit scalar direction to a full spatial
+// wrench (force f, torque tau at `point`). The scalar-direction case (the
+// AssembleRows chain-J) is f=dir, tau=0: tau then contributes an exact +0.0f, so
+// that path stays bit-identical. Accumulates into `out` (caller zero-inits), so
+// many chains summing onto shared ancestor DOFs (a floating base under several
+// feet) compose. Indices guarded by `dof_stride`; FloatingBase emits 6 columns.
+__forceinline__ __device__ void AccumulateChainJointForce(
+    const ArticulationDeviceState& state, uint32_t articulation, uint32_t link,
+    uint32_t dof_index, uint32_t dof_stride, ::nuka::math::Vec3 point,
+    ::nuka::math::Vec3 f, ::nuka::math::Vec3 tau, float* out) {
+    namespace mg = ::nuka::math::gpu;
+    const ArticulationJointType type = state.joint_type[link];
+    if (type == ArticulationJointType::FloatingBase) {
+        const math::Quat base_rot = state.base_pose[articulation].rotation;
+        const math::Vec3 base_origin = state.base_pose[articulation].position;
+        const math::Vec3 lever = mg::Sub(point, base_origin);
+        const math::Vec3 ex = mg::RotateByQuatNormalized(base_rot, {1.0f, 0.0f, 0.0f});
+        const math::Vec3 ey = mg::RotateByQuatNormalized(base_rot, {0.0f, 1.0f, 0.0f});
+        const math::Vec3 ez = mg::RotateByQuatNormalized(base_rot, {0.0f, 0.0f, 1.0f});
+        const float ang[3] = {mg::Dot(mg::Cross(ex, lever), f) + mg::Dot(ex, tau),
+                              mg::Dot(mg::Cross(ey, lever), f) + mg::Dot(ey, tau),
+                              mg::Dot(mg::Cross(ez, lever), f) + mg::Dot(ez, tau)};
+        const float lin[3] = {mg::Dot(ex, f), mg::Dot(ey, f), mg::Dot(ez, f)};
+        for (uint32_t b = 0u; b < 3u; ++b) {
+            if (dof_index + b < dof_stride) out[dof_index + b] += ang[b];
+            if (dof_index + 3u + b < dof_stride) out[dof_index + 3u + b] += lin[b];
+        }
+        return;
+    }
+    const math::Vec3 axis_world =
+        mg::RotateByQuatNormalized(state.link_pose[link].rotation, state.joint_axis[link]);
+    float entry = 0.0f;
+    if (type == ArticulationJointType::Prismatic) {
+        entry = mg::Dot(axis_world, f);
+    } else {  // Revolute
+        const math::Vec3 lever = mg::Sub(point, state.link_pose[link].position);
+        entry = mg::Dot(mg::Cross(axis_world, lever), f) + mg::Dot(axis_world, tau);
+    }
+    if (dof_index < dof_stride) out[dof_index] += entry;
 }
 
 // --- ModelView/DataView -> legacy kernel-parameter struct ------------------

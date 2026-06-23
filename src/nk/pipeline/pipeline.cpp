@@ -183,6 +183,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     coupling_ctx.family = family;
     coupling_ctx.env_count = env_count;
     coupling_ctx.bodies_per_env = cap.bodies_per_env;
+    coupling_ctx.articulation_count = articulation_cnt;
+    coupling_ctx.max_dof = max_dof;
+    coupling_ctx.base_link_count = base_link_count;
+    coupling_ctx.artics_per_env = artics_per_env;
     coupling_ctx.particles_per_env = cap.particles_per_env;
     coupling_ctx.max_contacts_per_env = cap.max_contacts_per_env;
     coupling_ctx.rigid_cap = rigid_cap;

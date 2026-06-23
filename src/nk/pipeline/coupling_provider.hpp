@@ -21,6 +21,13 @@ struct CouplingBuildCtx {
     uint32_t family = 0u;
     uint32_t env_count = 0u;
     uint32_t bodies_per_env = 0u;
+    // Articulation deposit dims (resolved in Build): the global articulation count,
+    // per-articulation DOF, links/env, and co-resident articulations/env. The MPM
+    // provider forwards them so the link-row grid reaction can chain-walk into qdot.
+    uint32_t articulation_count = 0u;
+    uint32_t max_dof = 0u;
+    uint32_t base_link_count = 0u;
+    uint32_t artics_per_env = 1u;
     uint32_t particles_per_env = 0u;
     uint32_t max_contacts_per_env = 0u;
     uint32_t rigid_cap = 0u;

@@ -56,8 +56,8 @@ inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pa
 inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
 inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM particle outside grid AABB
-// A body rasterizes onto the MPM grid but its reaction is NOT deposited back:
-// an articulated link (deferred M^-1 J^T) or an analytic-only body (no SDF grid).
+// An analytic-only collidable (no cooked SDF grid) imposes a one-way grid BC: it
+// has no SDF to rasterize, so the medium feels it but no reaction is deposited back.
 inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;
 
 // ---------------------------------------------------------------------------
@@ -343,13 +343,20 @@ struct MpmStepParams {
     // and deposits the equal-and-opposite reaction into the shared body sink. The
     // grid provider's Couple sets it; default 0 => the static-plane-only path.
     uint32_t dynamic_body_bc;
-    // Free-fall BITE: disable ONLY the dynamic-body kernels (the static-plane BC
-    // stays on, so the medium still rests on the floor). Proves the held-up state
-    // is caused by the dynamic-body BC, not an artifact. Default 0.
+    // Free-fall BITE: disable the dynamic-body grid coupling -- both the per-substep
+    // BC and the per-Step M^-1 J^T deposit (the static-plane BC stays on, so the
+    // medium still rests on the floor). Proves the held-up state is the dynamic-body
+    // coupling, not an artifact. Default 0.
     uint32_t bite_disable_dynamic_bc;
     uint32_t bodies_per_env;     // collidable body rows / env (the BC body loop).
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
     float    body_band;          // SDF |phi| band (cells nearer than this are BC nodes).
+    // Articulation deposit dims (the link-row grid reaction -> qdot_flat seed). All
+    // 0 for a body-only / MPM-only world -> the deposit kernel never launches.
+    uint32_t artic_count;        // GLOBAL articulations (artics_per_env * env_count).
+    uint32_t max_dof;            // per-articulation generalized DOF (the m_inv tile side).
+    uint32_t base_link_count;    // links per env (global link = env*base_link_count+tmpl).
+    uint32_t artics_per_env;     // co-resident articulations per env (>=1 when artic).
 };
 
 // Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-
