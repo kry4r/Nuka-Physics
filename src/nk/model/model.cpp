@@ -119,8 +119,10 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
+        // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).
         if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
-            id == FieldId::GridVelocity || id == FieldId::GridForce) {
+            id == FieldId::GridVelocity || id == FieldId::GridForce ||
+            id == FieldId::GridBodyDp || id == FieldId::GridBodyOwner) {
             return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
                    static_cast<uint64_t>(env_count);
         }

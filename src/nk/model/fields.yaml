@@ -770,3 +770,14 @@ fields:
   # MLS-MPM material table (global flat f32 pool like mat_buckets; stride
   # MpmMaterial::kValueCount, resolved in ElementCount). APPENDED LAST.
   - {name: mpm_material_table, dtype: f32, per: scalar, count: "mpm_material_count*6", arena: persistent, owner: data}
+
+  # MLS-MPM dynamic-body grid BC handoff (per grid node) + the per-body reaction
+  # diagnostic. grid_body_dp is the node momentum change the BC imposed; the owning
+  # body global index lives in grid_body_owner (~0u when no body is in band). The
+  # per-body reaction kernel gathers grid_body_dp over its owned nodes (ascending
+  # node order, __fadd_rn) and deposits into the body sink + sums the impulse into
+  # mpm_body_reaction (the gate balance probe, NOT a behavior input). 0 nodes/bodies
+  # for a non-MPM world -> zero-byte segments. APPENDED LAST.
+  - {name: grid_body_dp,     dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_body_owner,  dtype: u32,  per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: mpm_body_reaction, dtype: vec3, per: body, arena: scratch, owner: data, flags: [readout]}

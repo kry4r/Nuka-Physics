@@ -56,6 +56,9 @@ inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pa
 inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
 inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM particle outside grid AABB
+// A body rasterizes onto the MPM grid but its reaction is NOT deposited back:
+// an articulated link (deferred M^-1 J^T) or an analytic-only body (no SDF grid).
+inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;
 
 // ---------------------------------------------------------------------------
 // NkOp — the closed op set. uint16_t backing so an op id fits a single field
@@ -313,7 +316,8 @@ uint64_t GridSortScratchBytes(uint32_t particle_count);
 // replicated envs never cross-couple. grid_dims/origin/dx define the dense
 // Cartesian lattice; particle_count is the env-major particle total. The op
 // iterates the substep loop (clear -> P2G(force) -> grid-update + static-plane BC
-// -> G2P -> F-update) substeps times at dt/substeps; gravity is the grid kick.
+// -> [dynamic-body BC + reaction] -> G2P -> F-update) substeps times at dt/substeps;
+// gravity is the grid kick. The dynamic-body BC runs only when dynamic_body_bc != 0.
 struct MpmStepParams {
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
@@ -333,6 +337,19 @@ struct MpmStepParams {
     float    plane_n[3];
     float    plane_d;
     float    plane_mu;
+    // Dynamic-body grid BC (the two-way coupling). When dynamic_body_bc != 0 the
+    // substep loop rasterizes each cooked body's SDF onto the grid, projects the
+    // node velocity onto the body surface velocity (no-penetration + Coulomb mu),
+    // and deposits the equal-and-opposite reaction into the shared body sink. The
+    // grid provider's Couple sets it; default 0 => the static-plane-only path.
+    uint32_t dynamic_body_bc;
+    // Free-fall BITE: disable ONLY the dynamic-body kernels (the static-plane BC
+    // stays on, so the medium still rests on the floor). Proves the held-up state
+    // is caused by the dynamic-body BC, not an artifact. Default 0.
+    uint32_t bite_disable_dynamic_bc;
+    uint32_t bodies_per_env;     // collidable body rows / env (the BC body loop).
+    float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
+    float    body_band;          // SDF |phi| band (cells nearer than this are BC nodes).
 };
 
 // Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-

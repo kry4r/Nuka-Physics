@@ -26,12 +26,15 @@
 
 #include <cub/device/device_radix_sort.cuh>
 
+#include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/sdf_types.cuh"     // SdfRotate / SdfInverseTransformPoint
 #include "phi/op_schema.hpp"
+#include "runtime/sdf/sparse_sdf_query.cuh"       // SparseSdfDevice / sparse_sdf_sample
 
 namespace nuka::phi {
 
@@ -264,6 +267,15 @@ __global__ void MpmClearEscapeBitKernel(uint32_t* env_status, uint32_t env_count
     env_status[e] &= ~kEnvStatusMpmGridEscape;
 }
 
+// Zero the per-body reaction probe once per step so it holds the impulse summed
+// over THIS step's substeps (the balance diagnostic; not a behavior input).
+__global__ void MpmClearBodyReactionKernel(uint32_t total_bodies,
+                                          m::Vec3* reaction) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_bodies) return;
+    reaction[b] = m::Vec3::Zero();
+}
+
 // --- cell key (the particle's base-node cell, env-offset) -------------------
 __global__ void MpmCellKeysKernel(uint32_t particle_count,
                                   const m::Vec3* __restrict__ pos,
@@ -464,6 +476,183 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
     velocity[i] = v;
 }
 
+// Shape-table lane 7 (sdf_grid; ~0u when the shape has no cooked SDF), canonical
+// row stride. Mirrors the narrowphase reader so the body BC samples the same grids.
+namespace sdfq = ::nuka::runtime::sdf;
+__forceinline__ __device__ uint32_t ShapeSdfGrid(const float* table, uint32_t row) {
+    return __float_as_uint(
+        table[static_cast<size_t>(row) * nuka::phi::kShapeTableRowStride + 7u]);
+}
+// Shape-table lane 5 (contype; 0 => not a contact collider).
+__forceinline__ __device__ uint32_t ShapeContype(const float* table, uint32_t row) {
+    return __float_as_uint(
+        table[static_cast<size_t>(row) * nuka::phi::kShapeTableRowStride + 5u]);
+}
+// Load one SDF grid view from the Model sdf_* tables (header floats + flat cells).
+__forceinline__ __device__ sdfq::SparseSdfDevice LoadGrid(
+    const float* headers, const uint32_t* counts, const uint64_t* keys,
+    const float* values, const m::Vec3* grads, uint32_t grid) {
+    const float* h = headers + static_cast<size_t>(grid) * nuka::phi::kSdfHeaderStride;
+    sdfq::SparseSdfDevice s;
+    s.origin = {h[0], h[1], h[2]};
+    s.voxel_size = h[3];
+    s.dims[0] = __float_as_uint(h[4]);
+    s.dims[1] = __float_as_uint(h[5]);
+    s.dims[2] = __float_as_uint(h[6]);
+    const uint32_t off = __float_as_uint(h[7]);
+    s.cell_keys = keys + off;
+    s.cell_values = values + off;
+    s.cell_gradients = grads + off;
+    s.cell_count = counts[grid];
+    return s;
+}
+
+// Project the node velocity onto the surface velocity of its deepest-covering
+// body; record dp = m*(v_after-v_before) + the owner for the reaction gather.
+__global__ void MpmGridBodyProjectKernel(
+    uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
+    float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
+    const m::Transform* __restrict__ body_pose,
+    const m::Vec3* __restrict__ body_lin_vel,
+    const m::Vec3* __restrict__ body_ang_vel,
+    const float* __restrict__ shape_table, const float* __restrict__ sdf_headers,
+    const uint32_t* __restrict__ sdf_cell_count,
+    const uint64_t* __restrict__ sdf_keys, const float* __restrict__ sdf_values,
+    const m::Vec3* __restrict__ sdf_grads, const float* __restrict__ mass,
+    m::Vec3* __restrict__ velocity, m::Vec3* __restrict__ body_dp,
+    uint32_t* __restrict__ body_owner, uint32_t* __restrict__ env_status) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_nodes) return;
+    body_dp[i] = m::Vec3::Zero();
+    body_owner[i] = ~0u;
+    const float mi = mass[i];
+    if (mi <= 0.0f) return;
+    const uint32_t env = i / nodes_per_env;
+    const uint32_t local = i % nodes_per_env;
+    const int32_t nx = static_cast<int32_t>(local % dims_x);
+    const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
+    const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
+    const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
+    // Pick the body whose SDF places this node deepest inside its band (most
+    // negative phi) -> a single deterministic owner per node.
+    uint32_t best_body = ~0u;
+    float best_phi = band;
+    m::Vec3 best_n = m::Vec3::Zero();
+    for (uint32_t bl = 0u; bl < bodies_per_env; ++bl) {
+        const uint32_t grid = ShapeSdfGrid(shape_table, bl);
+        if (grid == ~0u) {
+            // Collidable body with no cooked SDF imposes no grid BC: raise a bit.
+            if (ShapeContype(shape_table, bl) != 0u && env_status != nullptr)
+                atomicOr(&env_status[env], kEnvStatusMpmOneWayBody);
+            continue;
+        }
+        const m::Transform xf = body_pose[env * bodies_per_env + bl];
+        const m::Vec3 q = nkops::SdfInverseTransformPoint(xf, xi);
+        const sdfq::SparseSdfDevice sg = LoadGrid(sdf_headers, sdf_cell_count,
+                                                  sdf_keys, sdf_values, sdf_grads, grid);
+        m::Vec3 grad{0.0f, 0.0f, 0.0f};
+        const float phi = sdfq::sparse_sdf_sample(sg, q, grad);
+        if (phi >= sdfq::SparseSdfDevice::kOutsideBand || phi >= best_phi) continue;
+        const m::Vec3 gw = nkops::SdfRotate(xf.rotation, grad);
+        const float gl = sqrtf(gw.LengthSq());
+        if (gl < 1.0e-8f) continue;
+        best_phi = phi;
+        best_body = env * bodies_per_env + bl;
+        best_n = gw * (1.0f / gl);
+    }
+    if (best_body == ~0u) return;
+    // Body surface velocity at the node: v_b + w_b x (xi - body_origin).
+    const m::Vec3 xb = body_pose[best_body].position;
+    const m::Vec3 vb = (body_lin_vel != nullptr) ? body_lin_vel[best_body]
+                                                  : m::Vec3::Zero();
+    const m::Vec3 wb = (body_ang_vel != nullptr) ? body_ang_vel[best_body]
+                                                  : m::Vec3::Zero();
+    const m::Vec3 r = xi - xb;
+    const m::Vec3 v_surf = vb + wb.Cross(r);
+    const m::Vec3 v_before = velocity[i];
+    m::Vec3 v_rel = v_before - v_surf;
+    const float vn = v_rel.Dot(best_n);
+    if (vn < 0.0f) {  // approaching the body surface: project + friction.
+        v_rel = v_rel - best_n * vn;            // tangential remainder.
+        const float vt_len = sqrtf(v_rel.LengthSq());
+        const float coulomb = body_mu * (-vn);
+        if (vt_len <= coulomb || vt_len < 1.0e-8f) {
+            v_rel = m::Vec3::Zero();            // sticks (static friction).
+        } else {
+            v_rel = v_rel * (1.0f - coulomb / vt_len);
+        }
+        const m::Vec3 v_after = v_surf + v_rel;
+        velocity[i] = v_after;
+        body_dp[i] = (v_after - v_before) * mi;
+        body_owner[i] = best_body;
+    }
+}
+
+// Per-body deterministic gather of -dp / -(x-xb)xdp over the nodes it owns; the
+// free-rigid sink gets it, an articulated body raises kEnvStatusMpmOneWayBody.
+__global__ void MpmGridBodyReactKernel(
+    uint32_t total_bodies, uint32_t bodies_per_env, uint32_t nodes_per_env,
+    uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
+    const m::Transform* __restrict__ body_pose,
+    const float* __restrict__ body_inv_mass,
+    const m::Vec3* __restrict__ body_inv_inertia,
+    const uint32_t* __restrict__ body_to_link,
+    const m::Vec3* __restrict__ body_dp, const uint32_t* __restrict__ body_owner,
+    m::Vec3* __restrict__ body_lin_vel, m::Vec3* __restrict__ body_ang_vel,
+    m::Vec3* __restrict__ body_reaction, uint32_t* __restrict__ env_status) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_bodies) return;
+    const float im = body_inv_mass[b];
+    if (im <= 0.0f) return;  // immovable body: no reaction (the static case).
+    const uint32_t env = b / bodies_per_env;
+    const m::Vec3 xb = body_pose[b].position;
+    const uint64_t base = static_cast<uint64_t>(env) * nodes_per_env;
+    m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
+    m::Vec3 tq_sum = m::Vec3::Zero();   // sum of (x-xb) x dp.
+    for (uint32_t local = 0u; local < nodes_per_env; ++local) {
+        const uint64_t node = base + local;
+        if (body_owner[node] != b) continue;
+        const m::Vec3 dp = body_dp[node];
+        const int32_t nx = static_cast<int32_t>(local % dims_x);
+        const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
+        const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
+        const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
+        const m::Vec3 r = xi - xb;
+        dp_sum.x = __fadd_rn(dp_sum.x, dp.x);
+        dp_sum.y = __fadd_rn(dp_sum.y, dp.y);
+        dp_sum.z = __fadd_rn(dp_sum.z, dp.z);
+        const m::Vec3 tq = r.Cross(dp);
+        tq_sum.x = __fadd_rn(tq_sum.x, tq.x);
+        tq_sum.y = __fadd_rn(tq_sum.y, tq.y);
+        tq_sum.z = __fadd_rn(tq_sum.z, tq.z);
+    }
+    // Reaction = -dp (equal-and-opposite); dp is the per-substep momentum, so it
+    // IS the substep impulse (no dt scale).
+    const m::Vec3 lin_impulse = dp_sum * (-1.0f);
+    const m::Vec3 ang_impulse = tq_sum * (-1.0f);
+    const bool free_rigid = (body_to_link == nullptr) || (body_to_link[b] == ~0u);
+    if (free_rigid) {  // the solve_rows.cu free-rigid apply form.
+        body_lin_vel[b].x += lin_impulse.x * im;
+        body_lin_vel[b].y += lin_impulse.y * im;
+        body_lin_vel[b].z += lin_impulse.z * im;
+        if (body_ang_vel != nullptr && body_inv_inertia != nullptr) {
+            const m::Vec3 ii = body_inv_inertia[b];
+            body_ang_vel[b].x += ang_impulse.x * ii.x;
+            body_ang_vel[b].y += ang_impulse.y * ii.y;
+            body_ang_vel[b].z += ang_impulse.z * ii.z;
+        }
+    } else if (env_status != nullptr &&
+               (dp_sum.x != 0.0f || dp_sum.y != 0.0f || dp_sum.z != 0.0f)) {
+        // Articulated link owns in-band nodes but its reaction is deferred: be loud.
+        atomicOr(&env_status[b / bodies_per_env], kEnvStatusMpmOneWayBody);
+    }
+    if (body_reaction != nullptr) {  // accumulate the impulse for the balance probe.
+        body_reaction[b].x += lin_impulse.x;
+        body_reaction[b].y += lin_impulse.y;
+        body_reaction[b].z += lin_impulse.z;
+    }
+}
+
 // --- G2P gather (one thread per particle; race-free, naturally D1) ----------
 // v_p = sum_i N_i v_i; C_p = (4/dx^2) sum_i N_i v_i (x_i - x_p)^T (the MLS fit).
 // Advects x_p += dt*v_p and writes the recovered v_p DIRECTLY into particle_vel
@@ -554,9 +743,10 @@ inline MpmScratch PartitionScratch(void* base, uint32_t Np) {
 
 // One MLS-MPM substep: clear -> P2G(force) -> grid update + BC -> G2P -> F-update,
 // each kernel launch a barrier (the launch boundary is the inter-phase barrier).
-void LaunchSubstep(const MpmStepParams& p, const DataView& data, float dt_sub,
-                   uint32_t Np, uint32_t Ppe, uint32_t cpe, uint32_t total_nodes,
-                   float inv_dx, const m::Vec3& origin, cudaStream_t stream) {
+void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
+                   const DataView& data, float dt_sub, uint32_t Np, uint32_t Ppe,
+                   uint32_t cpe, uint32_t total_nodes, float inv_dx,
+                   const m::Vec3& origin, cudaStream_t stream) {
     const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
     const uint32_t pblocks = (Np + kBlockSize - 1u) / kBlockSize;
     LaunchCuda(MpmGridClearKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
@@ -583,6 +773,28 @@ void LaunchSubstep(const MpmStepParams& p, const DataView& data, float dt_sub,
                total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx,
                origin, g, dt_sub, pn, p.plane_d, p.plane_mu, data.grid_mass,
                data.grid_momentum, data.grid_velocity);
+    // Dynamic-body grid BC + two-way reaction (between grid-update and G2P). The
+    // BITE disables ONLY these kernels (the static-plane BC above stays on).
+    if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u &&
+        p.bodies_per_env > 0u) {
+        const uint32_t total_bodies = p.bodies_per_env * p.env_count;
+        const uint32_t bblocks = (total_bodies + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(MpmGridBodyProjectKernel, dim3(nblocks), dim3(kBlockSize), 0u,
+                   stream, total_nodes, p.nodes_per_env, p.grid_dims[0],
+                   p.grid_dims[1], p.dx, origin, p.bodies_per_env, p.body_mu,
+                   p.body_band, data.body_pose, data.body_linear_velocity,
+                   data.body_angular_velocity, model.shape_table, model.sdf_headers,
+                   model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
+                   model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
+                   data.grid_body_dp, data.grid_body_owner, data.env_status);
+        LaunchCuda(MpmGridBodyReactKernel, dim3(bblocks), dim3(kBlockSize), 0u,
+                   stream, total_bodies, p.bodies_per_env, p.nodes_per_env,
+                   p.grid_dims[0], p.grid_dims[1], p.dx, origin,
+                   data.body_pose, data.body_inv_mass, data.body_inv_inertia,
+                   model.body_to_link, data.grid_body_dp, data.grid_body_owner,
+                   data.body_linear_velocity, data.body_angular_velocity,
+                   data.mpm_body_reaction, data.env_status);
+    }
     LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
                Ppe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
                inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
@@ -592,7 +804,7 @@ void LaunchSubstep(const MpmStepParams& p, const DataView& data, float dt_sub,
                dt_sub, data.particle_C, data.particle_F);
 }
 
-Status OpMpmStep(const ModelView& /*model*/, const DataView& data,
+Status OpMpmStep(const ModelView& model, const DataView& data,
                  const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const MpmStepParams*>(params);
     if (p == nullptr) return Status::Failed;
@@ -607,9 +819,11 @@ Status OpMpmStep(const ModelView& /*model*/, const DataView& data,
     const uint64_t cells_per_env =
         static_cast<uint64_t>(p->grid_dims[0]) * p->grid_dims[1] * p->grid_dims[2];
     if (cells_per_env == 0u) return Status::Ok;
-    // LOUD overflow: the env-offset node/cell key must fit a u32 (never silent).
+    // LOUD overflow: the env-offset node/cell key + total-body launch must fit u32.
     if (total_nodes64 > 0xFFFFFFFFull) return Status::Failed;
     if (cells_per_env * p->env_count > 0xFFFFFFFFull) return Status::Failed;
+    if (static_cast<uint64_t>(p->bodies_per_env) * p->env_count > 0xFFFFFFFFull)
+        return Status::Failed;
     const uint32_t Np = p->particle_count;
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
     // LOUD invariants: the count fits the per-env footprint + cub's int num_items.
@@ -630,9 +844,17 @@ Status OpMpmStep(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(MpmClearEscapeBitKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
                    data.env_status, e);
     }
+    // Zero the per-step reaction probe so it accumulates only this step's substeps.
+    if (p->dynamic_body_bc != 0u && p->bodies_per_env > 0u &&
+        data.mpm_body_reaction != nullptr) {
+        const uint32_t tb = p->bodies_per_env * p->env_count;
+        const uint32_t bb = (tb + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(MpmClearBodyReactionKernel, dim3(bb), dim3(kBlockSize), 0u,
+                   stream, tb, data.mpm_body_reaction);
+    }
     for (uint32_t s = 0; s < substeps; ++s) {
-        LaunchSubstep(*p, data, dt_sub, Np, Ppe, cpe, total_nodes, inv_dx, origin,
-                      stream);
+        LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, cpe, total_nodes, inv_dx,
+                      origin, stream);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

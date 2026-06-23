@@ -212,6 +212,9 @@ enum class FieldId : uint16_t {
     MpmGridPartIdx,  // mpm_grid_part_idx (per:particle arena:scratch owner:data)
     MpmSortScratch,  // mpm_sort_scratch (per:scalar arena:scratch owner:data count:mpm_grid_sort_scratch_bytes)
     MpmMaterialTable,  // mpm_material_table (per:scalar arena:persistent owner:data count:mpm_material_count*6)
+    GridBodyDp,  // grid_body_dp (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridBodyOwner,  // grid_body_owner (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    MpmBodyReaction,  // mpm_body_reaction (per:body arena:scratch owner:data flags:[readout])
     Count
 };
 
