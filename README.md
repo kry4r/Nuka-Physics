@@ -55,8 +55,10 @@
 | Articulated multibody (Featherstone / ABA) | **Production** | drives the 4096-env Go2; CRBA/ABA, multi-articulation co-residence |
 | Rigid + general contact | **Production** | LBVH → narrowphase → block-island PGS + split-impulse; MJX-parity tested |
 | Terrain / heightfield + RL locomotion | **Production** | the climbing demo above; height-scan obs, PPO-trained |
-| Soft body — XPBD (distance/bend/volume/shape-match) | Functional | tested; Cosserat rods forward-only (no adjoint yet); no demo |
-| Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; tested; no demo |
+| Soft body — XPBD (distance/bend/volume/shape-match) | Functional | cloth + 3D tet; two-way coupled to rigid through the general solver; Cosserat rods forward-only (no adjoint yet); tested |
+| Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; two-way coupled to rigid (foot-splash); tested |
+| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic constitutive; two-way rigid↔grid coupling on the same general path; deterministic; granular (sand) + demos in progress |
+| Rigid/articulation ↔ soft / fluid / cloth (two-way) | Functional | the general row solver emits rigid↔particle coupling rows — a foot pushes cloth, splashes fluid, dents a tet; one path; tested |
 | Differentiable sim (rigid + articulated) | Functional | analytical adjoint — **contact-free** path |
 | Rendering | Functional | Vulkan raster + self-written CUDA path tracer (sun/shadow/AO/GI/sky) |
 | RL / training | Functional | rl_games PPO, gym + Isaac-Lab-compat, zero-copy DLPack (torch/JAX) |
@@ -68,12 +70,12 @@
 The north star is **one general solver that couples rigid, soft, fluid, and articulated multibody two-way**. Honest distance today:
 
 - ✅ **Rigid + multibody, unified.** One general PGS path resolves rigid + articulation + static sides in a single kernel (MJX-parity). This pillar is *done*.
-- 🟡 **Soft (XPBD) + fluid (PBF) exist and step**, and **co-reside in one `nk::World`** — but in a parallel position-based particle lane, not yet inside the unified row solver.
-- 🟡 **Soft↔fluid co-residence works** (shared step, density-scope isolation); the cross-slice contact op is coded and runs, lightly tested.
-- ❌ **Rigid/articulation ↔ soft/fluid coupling: not yet.** The general row assembly does not emit rigid↔particle rows, so a foot can't yet push cloth or splash fluid *through the solver*. The generic coupling-row framework is written but unwired.
+- ✅ **Soft (XPBD cloth + 3D tet), fluid (PBF), and an MLS-MPM continuum lane step and co-reside** in one `nk::World` (shared step, density-scope isolation).
+- ✅ **Rigid/articulation ↔ soft / fluid / cloth is two-way through the one solver.** The general row assembly emits rigid↔particle coupling rows, so a foot pushes cloth, splashes fluid, and dents a tet *through the solver*. MLS-MPM couples as a first-class peer: a `CouplingProvider` funnels both contact-rows and grid-transfer into one body-side reaction sink, deterministically.
+- 🟡 **Polished coupled demo videos in progress** (soft-ball slam · cloth-onto-Go2 · creature-in-water-pool · Go2-on-sand); **MLS-MPM granular (sand)** is the next constitutive model.
 - ❌ **Differentiability does not extend through contact / coupling** yet.
 
-**Remaining gap:** wire the coupling-row framework into the step loop, teach the general assembly to emit rigid↔particle coupling rows, add rigid↔soft / rigid↔fluid tests + demos, then extend the adjoint through contact. The multibody+rigid half is production; soft and fluid are present but not yet coupled to it through the one solver.
+**Remaining gap:** add the MLS-MPM granular (Drucker–Prager) model for sand, land the polished coupled demo videos, then extend the adjoint through contact. The rigid + multibody + coupling spine is in; soft, fluid, and MPM all couple to it through the one path.
 
 ## Roadmap
 
@@ -81,8 +83,9 @@ The north star is **one general solver that couples rigid, soft, fluid, and arti
 - [x] Terrain / heightfield locomotion + in-engine RL
 - [x] Soft (XPBD) and fluid (PBF) standalone + co-residence
 - [x] Self-written CUDA path-tracer beauty render
-- [ ] **Rigid ↔ soft / fluid two-way coupling in the general solver** (wire the coupling-row framework)
-- [ ] Soft / fluid demos + rigid-coupling tests
+- [x] **Rigid ↔ soft / fluid / cloth two-way coupling in the general solver** + rigid-coupling tests
+- [x] MLS-MPM (grid + APIC + elastic) two-way coupled to rigid on the one path
+- [ ] MLS-MPM granular (sand) + polished coupled demo videos (soft-slam · cloth-drape · water-pool · Go2-on-sand)
 - [ ] Differentiable contact (d/dM, d/dJ) + floating-base orientation channel
 - [ ] RT renderer speedup — denoiser + FP32 beauty TU (OptiX under evaluation)
 - [ ] Second PHI backend (multi-backend beyond CUDA)
