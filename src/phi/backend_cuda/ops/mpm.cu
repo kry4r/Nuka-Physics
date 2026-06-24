@@ -44,6 +44,11 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 
+// MLS-MPM material-table row stride (f32 per row). Must match
+// MpmMaterial::kValueCount: youngs poisson density dp_friction dp_cohesion
+// model_kind | bulk_modulus tait_gamma viscosity.
+constexpr uint32_t kMpmMatStride = 9u;
+
 // Round up to the 256B section alignment the Arena lays scratch out at, so every
 // sub-region of mpm_sort_scratch is 256B-aligned device memory.
 constexpr uint64_t kScratchAlign = 256u;
@@ -298,13 +303,14 @@ __global__ void MpmCellKeysKernel(uint32_t particle_count,
     const int32_t bx = static_cast<int32_t>(floorf(gx - 0.5f));
     const int32_t by = static_cast<int32_t>(floorf(gy - 0.5f));
     const int32_t bz = static_cast<int32_t>(floorf(gz - 0.5f));
-    // A base outside [0, dims-2] flags a loud grid-AABB escape. Flag non-finite
-    // directly; widen base+2 to i64 so an INT_MAX-saturated huge coord still trips.
+    // Walled x/y faces + plane floor contain a pressed particle (flag only a base off
+    // the grid there); the open +z top flags a stencil clip (base+2 past the ceiling).
     const bool nonfinite = !isfinite(gx) || !isfinite(gy) || !isfinite(gz);
-    const bool escaped = nonfinite || bx < 0 || by < 0 || bz < 0 ||
-                         static_cast<int64_t>(bx) + 2 >= static_cast<int64_t>(dims_x) ||
-                         static_cast<int64_t>(by) + 2 >= static_cast<int64_t>(dims_y) ||
-                         static_cast<int64_t>(bz) + 2 >= static_cast<int64_t>(dims_z);
+    const int64_t bx64 = bx, by64 = by, bz64 = bz;
+    const bool escaped = nonfinite ||
+                         bx64 < 0 || bx64 >= static_cast<int64_t>(dims_x) ||
+                         by64 < 0 || by64 >= static_cast<int64_t>(dims_y) ||
+                         bz64 < 0 || bz64 + 2 >= static_cast<int64_t>(dims_z);
     if (escaped && env_status != nullptr) {
         atomicOr(&env_status[env], kEnvStatusMpmGridEscape);
     }
@@ -409,18 +415,47 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                         if (vol0 > 0.0f) {
                             const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
                             float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
+                            float bulk = 0.0f, tait_gamma = 0.0f, visc = 0.0f;
                             if (material_table != nullptr && mid < material_count) {
                                 const float* mr = material_table +
-                                                  static_cast<size_t>(mid) * 6u;
+                                                  static_cast<size_t>(mid) * kMpmMatStride;
                                 youngs = mr[0]; poisson = mr[1]; kind = mr[5];
+                                bulk = mr[6]; tait_gamma = mr[7]; visc = mr[8];
                             }
-                            const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
-                            const float mu = youngs / (2.0f * (1.0f + poisson));
-                            const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
                             const float* F = part_F + static_cast<size_t>(p) * 9u;
-                            float P[9], stress[9];
-                            FirstPiola(F, mu, lambda, kind, P);
-                            Mat3MulT(P, F, stress);  // P * F^T (the Cauchy-stress-like term).
+                            float stress[9];
+                            if (kind > 2.5f) {  // weakly-compressible fluid (kind 3).
+                                // Kirchhoff stress J*sigma = -p*J*I, Tait EOS, no tension;
+                                // optional viscosity J*mu*(C+C^T) from the live affine C.
+                                // J is floored in the F-update, so the unclamped Tait
+                                // pressure stays finite and the restoring force is strong.
+                                const float J = Mat3Det(F);
+                                const float pr = fmaxf(
+                                    bulk * (powf(J, -tait_gamma) - 1.0f), 0.0f);
+                                const float diag = -pr * J;
+                                stress[0] = diag; stress[1] = 0.0f; stress[2] = 0.0f;
+                                stress[3] = 0.0f; stress[4] = diag; stress[5] = 0.0f;
+                                stress[6] = 0.0f; stress[7] = 0.0f; stress[8] = diag;
+                                if (visc > 0.0f) {
+                                    const float Jv = J * visc;
+                                    stress[0] += Jv * 2.0f * C[0];
+                                    stress[4] += Jv * 2.0f * C[4];
+                                    stress[8] += Jv * 2.0f * C[8];
+                                    const float s01 = Jv * (C[1] + C[3]);
+                                    const float s02 = Jv * (C[2] + C[6]);
+                                    const float s12 = Jv * (C[5] + C[7]);
+                                    stress[1] += s01; stress[3] += s01;
+                                    stress[2] += s02; stress[6] += s02;
+                                    stress[5] += s12; stress[7] += s12;
+                                }
+                            } else {  // fixed-corotated / Neo-Hookean elastic.
+                                const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+                                const float mu = youngs / (2.0f * (1.0f + poisson));
+                                const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+                                float P[9];
+                                FirstPiola(F, mu, lambda, kind, P);
+                                Mat3MulT(P, F, stress);  // P * F^T (Cauchy-stress-like).
+                            }
                             const float coef = -w * vol0 * stress_scale;
                             mom.x = __fadd_rn(mom.x, dt * coef * (stress[0] * dpos.x +
                                               stress[1] * dpos.y + stress[2] * dpos.z));
@@ -476,6 +511,16 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
             }
         }
     }
+    // Separating domain-wall BC on the OUTERMOST x/y boundary node ring: cut only the
+    // OUTWARD-normal velocity (a node never pushed past the grid box). A no-op for any
+    // scene whose mass stays >= 2 cells off the x/y faces (a massless ring node returns
+    // above); the elastic gates' >= 4*dx margin keeps those nodes massless.
+    const int32_t hx = static_cast<int32_t>(dims_x) - 1;
+    const int32_t hy = static_cast<int32_t>(dims_y) - 1;
+    if (nx == 0 && v.x < 0.0f) v.x = 0.0f;
+    else if (nx == hx && v.x > 0.0f) v.x = 0.0f;
+    if (ny == 0 && v.y < 0.0f) v.y = 0.0f;
+    else if (ny == hy && v.y > 0.0f) v.y = 0.0f;
     velocity[i] = v;
 }
 
@@ -769,27 +814,60 @@ __global__ void MpmG2PGatherKernel(uint32_t particle_count,
     const float scale = 4.0f * inv_dx * inv_dx;
     float* Cd = part_C + static_cast<size_t>(p) * 9u;
     for (int32_t k = 0; k < 9; ++k) Cd[k] = C[k] * scale;
-    part_vel[p] = vp;
     // Advect only a movable particle (a pinned inv_mass==0 sample holds position).
-    if (inv_mass == nullptr || inv_mass[p] > 0.0f) {
-        part_pos[p] = xp + vp * dt;
-    }
+    if (inv_mass != nullptr && inv_mass[p] <= 0.0f) { part_vel[p] = vp; return; }
+    m::Vec3 np = xp + vp * dt;
+    // Separating domain walls at the grid-box faces (x/y both sides + z floor; +z stays
+    // open). Clamp position and drop the outward velocity so nothing leaks or injects.
+    const float xlo = origin.x + dx, xhi = origin.x + (dims_x - 2) * dx;
+    const float ylo = origin.y + dx, yhi = origin.y + (dims_y - 2) * dx;
+    const float zlo = origin.z + dx;
+    if (np.x < xlo) { np.x = xlo; vp.x = fmaxf(vp.x, 0.0f); }
+    else if (np.x > xhi) { np.x = xhi; vp.x = fminf(vp.x, 0.0f); }
+    if (np.y < ylo) { np.y = ylo; vp.y = fmaxf(vp.y, 0.0f); }
+    else if (np.y > yhi) { np.y = yhi; vp.y = fminf(vp.y, 0.0f); }
+    if (np.z < zlo) { np.z = zlo; vp.z = fmaxf(vp.z, 0.0f); }
+    part_vel[p] = vp;
+    part_pos[p] = np;
 }
 
-// --- F-update: F^{n+1} = (I + dt*C) F^n (reads the C just written by G2P) ----
+// --- F-update: elastic F^{n+1} = (I + dt*C) F^n; fluid (kind 3) tracks volume off the
+// divergence J *= (1 + dt*tr C), keeping F = cbrt(J)*I (no shear-driven inversion).
 __global__ void MpmUpdateFKernel(uint32_t particle_count, float dt,
                                  const float* __restrict__ part_C,
-                                 float* __restrict__ part_F) {
+                                 const uint32_t* __restrict__ part_mat,
+                                 const float* __restrict__ material_table,
+                                 uint32_t material_count, uint32_t particles_per_env,
+                                 float* __restrict__ part_F,
+                                 uint32_t* __restrict__ env_status) {
     const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= particle_count) return;
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
-    float IpdtC[9];
-    for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
-    IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
-    float Fn[9];
-    for (int k = 0; k < 9; ++k) Fn[k] = F[k];
-    Mat3Mul(IpdtC, Fn, F);  // F <- (I + dt*C) * F.
+    float kind = 0.0f;
+    if (part_mat != nullptr && material_table != nullptr) {
+        const uint32_t mid = part_mat[p];
+        if (mid < material_count) kind = material_table[static_cast<size_t>(mid) *
+                                                        kMpmMatStride + 5u];
+    }
+    if (kind > 2.5f) {  // fluid: volume-only update J *= (1 + dt*tr C), F = cbrt(J)*I.
+        // Shear leaves a fluid's volume unchanged, so track J off the divergence tr(C);
+        // no det of the full affine map => no shear-driven inversion at a hard impact.
+        const float Jraw = Mat3Det(F) * (1.0f + dt * (C[0] + C[4] + C[8]));
+        if (Jraw <= 0.0f && env_status != nullptr)
+            atomicOr(&env_status[p / particles_per_env], kEnvStatusMpmGridEscape);
+        // Floor/ceil J so an explicit overshoot stays finite and self-recovers (water
+        // is near-incompressible; J leaves [0.83,1.01] only on a transient overshoot).
+        const float s = cbrtf(fminf(fmaxf(Jraw, 0.3f), 3.0f));
+        for (int k = 0; k < 9; ++k) F[k] = (k % 4 == 0) ? s : 0.0f;
+    } else {  // elastic: F^{n+1} = (I + dt*C) F^n.
+        float IpdtC[9];
+        for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
+        IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
+        float Fn[9];
+        for (int k = 0; k < 9; ++k) Fn[k] = F[k];
+        Mat3Mul(IpdtC, Fn, F);  // (I + dt*C) * F^n.
+    }
 }
 
 // Partition the pre-allocated scratch [cub temp | keys-out | idx-out] (host-side,
@@ -871,7 +949,9 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                data.grid_velocity, data.particle_pos, data.particle_vel,
                data.particle_C);
     LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
-               dt_sub, data.particle_C, data.particle_F);
+               dt_sub, data.particle_C, data.particle_material_id,
+               data.mpm_material_table, p.material_count, Ppe, data.particle_F,
+               data.env_status);
 }
 
 Status OpMpmStep(const ModelView& model, const DataView& data,

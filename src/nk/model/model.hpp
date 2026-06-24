@@ -225,14 +225,17 @@ struct ModelMaterialBucket {
     float values[kValueCount] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
 };
 
-// One MLS-MPM material: elastic moduli + Drucker-Prager params, indexed by the
-// per-particle material id. The constitutive branch reads these (not yet wired).
+// One MLS-MPM material: elastic moduli + Drucker-Prager params + weakly-compressible
+// fluid params, indexed by the per-particle material id. model_kind selects which
+// the constitutive branch reads; fluid (3) reads bulk_modulus/tait_gamma/viscosity.
 struct MpmMaterial {
-    static constexpr uint32_t kValueCount = 6u;  // f32 count of this POD (table stride).
+    static constexpr uint32_t kValueCount = 9u;  // f32 count of this POD (table stride).
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean.
+    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean,
+    // 3 = weakly-compressible fluid (Tait EOS).
     float model_kind = 0.0f;
+    float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
 };
 
 // ---------------------------------------------------------------------------

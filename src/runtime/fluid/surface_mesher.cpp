@@ -404,6 +404,214 @@ float DensityAt(const math::Vec3& x, const std::vector<math::Vec3>& pts,
     return rho;
 }
 
+// Per-particle anisotropic kernel transform G (Yu & Turk 2013, Eq. 16): a symmetric
+// PD 3x3 mapping world offsets into the unit kernel space so a stretched water sheet
+// flattens and an isolated splash droplet stays round. `det` caches det(G).
+struct AnisoKernel {
+    float g[6];  // packed symmetric: xx, yy, zz, xy, xz, yz.
+    float det;
+    math::Vec3 center;  // smoothed kernel center x-bar (Eq. 6).
+};
+
+// Cyclic Jacobi eigensolve of a symmetric 3x3 into descending eigenvalues `w` and
+// orthonormal columns `V` (Eq. 12-13). Fixed sweep count keeps it deterministic.
+void JacobiEig3(const float a[6], float w[3], float V[9]) {
+    float A[3][3] = {{a[0], a[3], a[4]}, {a[3], a[1], a[5]}, {a[4], a[5], a[2]}};
+    V[0] = V[4] = V[8] = 1.0f;
+    V[1] = V[2] = V[3] = V[5] = V[6] = V[7] = 0.0f;
+    for (int sweep = 0; sweep < 12; ++sweep) {
+        const int pq[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+        for (int s = 0; s < 3; ++s) {
+            const int pp = pq[s][0], qq = pq[s][1];
+            const float apq = A[pp][qq];
+            if (std::fabs(apq) < 1e-20f) continue;
+            const float theta = (A[qq][qq] - A[pp][pp]) / (2.0f * apq);
+            const float t = (theta >= 0.0f ? 1.0f : -1.0f) /
+                            (std::fabs(theta) + std::sqrt(theta * theta + 1.0f));
+            const float c = 1.0f / std::sqrt(t * t + 1.0f);
+            const float sn = t * c;
+            for (int k = 0; k < 3; ++k) {
+                const float akp = A[k][pp], akq = A[k][qq];
+                A[k][pp] = c * akp - sn * akq;
+                A[k][qq] = sn * akp + c * akq;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const float apk = A[pp][k], aqk = A[qq][k];
+                A[pp][k] = c * apk - sn * aqk;
+                A[qq][k] = sn * apk + c * aqk;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const float vkp = V[k * 3 + pp], vkq = V[k * 3 + qq];
+                V[k * 3 + pp] = c * vkp - sn * vkq;
+                V[k * 3 + qq] = sn * vkp + c * vkq;
+            }
+        }
+    }
+    w[0] = A[0][0]; w[1] = A[1][1]; w[2] = A[2][2];
+    // Sort eigenpairs descending so sigma1 >= sigma2 >= sigma3 (Eq. 12).
+    for (int i = 0; i < 2; ++i)
+        for (int j = i + 1; j < 3; ++j)
+            if (w[j] > w[i]) {
+                std::swap(w[i], w[j]);
+                for (int k = 0; k < 3; ++k) std::swap(V[k * 3 + i], V[k * 3 + j]);
+            }
+}
+
+// Build the per-particle anisotropic transforms G (Eq. 6-16) over the particle set.
+// Neighbors are gathered within 2h (the grid cell == h, so a 5x5x5 block) so the
+// covariance/smoothing see the full kernel support. Reconstruction only -- the
+// smoothed centers never feed back to the sim. Ascending neighbor order keeps D1.
+std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
+                                           const ParticleGrid& g,
+                                           const FluidSurfaceParams& p) {
+    const size_t n = pts.size();
+    const float h = p.h;
+    const float two_h = 2.0f * h;
+    const float two_h2 = two_h * two_h;
+    auto weight = [&](float r) {
+        if (r >= two_h) return 0.0f;
+        const float u = r / two_h;
+        return 1.0f - u * u * u;  // Eq. 11.
+    };
+    auto gather = [&](const math::Vec3& x, auto&& fn) {
+        const int cx = g.Clamp(static_cast<int>(std::floor((x.x - g.origin.x) / g.cell)), g.nx);
+        const int cy = g.Clamp(static_cast<int>(std::floor((x.y - g.origin.y) / g.cell)), g.ny);
+        const int cz = g.Clamp(static_cast<int>(std::floor((x.z - g.origin.z) / g.cell)), g.nz);
+        for (int dz = -2; dz <= 2; ++dz) {
+            const int iz = cz + dz; if (iz < 0 || iz >= g.nz) continue;
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int iy = cy + dy; if (iy < 0 || iy >= g.ny) continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int ix = cx + dx; if (ix < 0 || ix >= g.nx) continue;
+                    const int c = g.CellOf(ix, iy, iz);
+                    const int b = g.cell_start[static_cast<size_t>(c)];
+                    const int e = g.cell_start[static_cast<size_t>(c) + 1u];
+                    for (int k = b; k < e; ++k) fn(g.order[static_cast<size_t>(k)]);
+                }
+            }
+        }
+    };
+
+    // Eq. 6: Laplacian position pre-smooth -> kernel centers x-bar.
+    std::vector<math::Vec3> centers(n);
+    for (size_t i = 0; i < n; ++i) {
+        const math::Vec3 xi = pts[i];
+        math::Vec3 sum{0, 0, 0}; float wsum = 0.0f;
+        gather(xi, [&](uint32_t j) {
+            const math::Vec3 d = pts[j] - xi;
+            const float w = weight(std::sqrt(d.Dot(d)));
+            if (w <= 0.0f) return;
+            sum += pts[j] * w; wsum += w;
+        });
+        const math::Vec3 mean = wsum > 0.0f ? sum * (1.0f / wsum) : xi;
+        centers[i] = xi * (1.0f - p.aniso_lambda) + mean * p.aniso_lambda;
+    }
+
+    std::vector<AnisoKernel> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        const math::Vec3 xi = pts[i];
+        // Eq. 10: weighted mean position of the neighborhood.
+        math::Vec3 mean{0, 0, 0}; float wsum = 0.0f; uint32_t cnt = 0u;
+        gather(xi, [&](uint32_t j) {
+            const math::Vec3 d = pts[j] - xi;
+            if (d.Dot(d) >= two_h2) return;
+            const float w = weight(std::sqrt(d.Dot(d)));
+            if (w <= 0.0f) return;
+            mean += pts[j] * w; wsum += w; ++cnt;
+        });
+        if (wsum > 0.0f) mean = mean * (1.0f / wsum);
+        // Eq. 9: weighted covariance about the weighted mean.
+        float cov[6] = {0, 0, 0, 0, 0, 0}; float cwsum = 0.0f;
+        gather(xi, [&](uint32_t j) {
+            const math::Vec3 d0 = pts[j] - xi;
+            if (d0.Dot(d0) >= two_h2) return;
+            const float w = weight(std::sqrt(d0.Dot(d0)));
+            if (w <= 0.0f) return;
+            const math::Vec3 d = pts[j] - mean;
+            cov[0] += w * d.x * d.x; cov[1] += w * d.y * d.y; cov[2] += w * d.z * d.z;
+            cov[3] += w * d.x * d.y; cov[4] += w * d.x * d.z; cov[5] += w * d.y * d.z;
+            cwsum += w;
+        });
+        AnisoKernel ak;
+        ak.center = centers[i];
+        if (cwsum <= 0.0f || cnt <= 1u) {
+            // No neighborhood: a spherical kernel of radius ~h.
+            const float s = p.aniso_kn / h;
+            ak.g[0] = ak.g[1] = ak.g[2] = s; ak.g[3] = ak.g[4] = ak.g[5] = 0.0f;
+            ak.det = s * s * s;
+            out[i] = ak; continue;
+        }
+        for (float& c : cov) c /= cwsum;
+        float w[3], V[9];
+        JacobiEig3(cov, w, V);
+        // Eq. 12-15: clamp small eigenvalues, scale by k_s, or go isotropic if isolated.
+        float sigma[3];
+        if (cnt > p.aniso_n_eps) {
+            const float s1 = w[0];
+            for (int k = 0; k < 3; ++k)
+                sigma[k] = p.aniso_ks * std::max(w[k], s1 / p.aniso_kr);
+        } else {
+            sigma[0] = sigma[1] = sigma[2] = p.aniso_kn;
+        }
+        // Eq. 16: G = (1/h) R Sigma^{-1} R^T. Sigma diagonal -> inverse is reciprocal.
+        const float inv[3] = {1.0f / sigma[0], 1.0f / sigma[1], 1.0f / sigma[2]};
+        float G[6];
+        G[0] = (V[0] * V[0] * inv[0] + V[1] * V[1] * inv[1] + V[2] * V[2] * inv[2]);
+        G[1] = (V[3] * V[3] * inv[0] + V[4] * V[4] * inv[1] + V[5] * V[5] * inv[2]);
+        G[2] = (V[6] * V[6] * inv[0] + V[7] * V[7] * inv[1] + V[8] * V[8] * inv[2]);
+        G[3] = (V[0] * V[3] * inv[0] + V[1] * V[4] * inv[1] + V[2] * V[5] * inv[2]);
+        G[4] = (V[0] * V[6] * inv[0] + V[1] * V[7] * inv[1] + V[2] * V[8] * inv[2]);
+        G[5] = (V[3] * V[6] * inv[0] + V[4] * V[7] * inv[1] + V[5] * V[8] * inv[2]);
+        const float inv_h = 1.0f / h;
+        for (float& gg : G) gg *= inv_h;
+        for (int k = 0; k < 6; ++k) ak.g[k] = G[k];
+        // det(G) = (1/h)^3 / (sigma1 sigma2 sigma3) (R orthonormal).
+        ak.det = (inv_h * inv_h * inv_h) / (sigma[0] * sigma[1] * sigma[2]);
+        out[i] = ak;
+    }
+    return out;
+}
+
+// Anisotropic density at x (Eq. 7-8): sum_j det(G_j) * P(||G_j (x - center_j)||)
+// over particles whose stretched kernel reaches x (2h grid block). The radial
+// profile P is the SAME Poly6 the isotropic field uses, evaluated at the kernel-
+// space radius mapped back into [0,h]. Accumulates ascending neighbor order (D1).
+float DensityAtAniso(const math::Vec3& x, const std::vector<AnisoKernel>& ker,
+                     const ParticleGrid& g, const FluidSurfaceParams& p) {
+    const int cx = g.Clamp(static_cast<int>(std::floor((x.x - g.origin.x) / g.cell)), g.nx);
+    const int cy = g.Clamp(static_cast<int>(std::floor((x.y - g.origin.y) / g.cell)), g.ny);
+    const int cz = g.Clamp(static_cast<int>(std::floor((x.z - g.origin.z) / g.cell)), g.nz);
+    const float h = p.h;
+    float rho = 0.0f;
+    for (int dz = -2; dz <= 2; ++dz) {
+        const int iz = cz + dz; if (iz < 0 || iz >= g.nz) continue;
+        for (int dy = -2; dy <= 2; ++dy) {
+            const int iy = cy + dy; if (iy < 0 || iy >= g.ny) continue;
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int ix = cx + dx; if (ix < 0 || ix >= g.nx) continue;
+                const int c = g.CellOf(ix, iy, iz);
+                const int b = g.cell_start[static_cast<size_t>(c)];
+                const int e = g.cell_start[static_cast<size_t>(c) + 1u];
+                for (int k = b; k < e; ++k) {
+                    const uint32_t j = g.order[static_cast<size_t>(k)];
+                    const AnisoKernel& a = ker[j];
+                    const math::Vec3 d = x - a.center;
+                    // r' = G_j d (symmetric G); kernel-space radius in [0, h].
+                    const math::Vec3 gr{
+                        a.g[0] * d.x + a.g[3] * d.y + a.g[4] * d.z,
+                        a.g[3] * d.x + a.g[1] * d.y + a.g[5] * d.z,
+                        a.g[4] * d.x + a.g[5] * d.y + a.g[2] * d.z};
+                    const float kr2 = gr.Dot(gr);   // (||G d|| in 1/h units).
+                    const float r2 = kr2 * h * h;    // map back to [0,h] for Poly6.
+                    if (r2 >= h * h) continue;
+                    rho += p.particle_mass * a.det * h * h * h * Poly6FromR2Host(r2, h);
+                }
+            }
+        }
+    }
+    return rho;
+}
+
 }  // namespace
 
 render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_positions,
@@ -432,7 +640,42 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
     const int gx = std::max(1, static_cast<int>(std::ceil((grid_hi.x - grid_lo.x) / ch)));
     const int gy = std::max(1, static_cast<int>(std::ceil((grid_hi.y - grid_lo.y) / ch)));
     const int gz = std::max(1, static_cast<int>(std::ceil((grid_hi.z - grid_lo.z) / ch)));
-    const float iso = p.iso_fraction * p.rest_density_rho0;
+    float iso = p.iso_fraction * p.rest_density_rho0;
+
+    // Anisotropic kernels (opt-in): precompute the per-particle ellipsoid transforms.
+    // The unified `density`/`gradient` close over the active field so the rest of the
+    // marcher is identical for both paths.
+    const std::vector<AnisoKernel> ker =
+        p.anisotropic ? BuildAnisoKernels(particle_positions, grid, p)
+                      : std::vector<AnisoKernel>{};
+    auto density = [&](const math::Vec3& x) -> float {
+        return p.anisotropic ? DensityAtAniso(x, ker, grid, p)
+                             : DensityAt(x, particle_positions, grid, p, nullptr);
+    };
+    if (p.anisotropic) {
+        // Calibrate the iso level to the anisotropic field's own interior density so
+        // `iso_fraction` keeps its meaning regardless of k_s units: sample the field
+        // at every smoothed kernel center and take a robust upper percentile as rho0.
+        std::vector<float> rho_at(n, 0.0f);
+        for (size_t i = 0; i < n; ++i) rho_at[i] = density(ker[i].center);
+        std::sort(rho_at.begin(), rho_at.end());
+        const float rho0 = rho_at[(rho_at.size() * 90u) / 100u];
+        iso = p.iso_fraction * rho0;
+    }
+    auto gradient = [&](const math::Vec3& x) -> math::Vec3 {
+        if (!p.anisotropic) {
+            math::Vec3 grad{0, 0, 0};
+            DensityAt(x, particle_positions, grid, p, &grad);
+            return grad;
+        }
+        // Central finite difference of the anisotropic field (the analytic Poly6
+        // gradient no longer matches a stretched kernel).
+        const float e = 0.25f * ch;
+        return math::Vec3{
+            (density(math::Vec3{x.x + e, x.y, x.z}) - density(math::Vec3{x.x - e, x.y, x.z})) / (2.0f * e),
+            (density(math::Vec3{x.x, x.y + e, x.z}) - density(math::Vec3{x.x, x.y - e, x.z})) / (2.0f * e),
+            (density(math::Vec3{x.x, x.y, x.z + e}) - density(math::Vec3{x.x, x.y, x.z - e})) / (2.0f * e)};
+    };
 
     // Sample the density field at every voxel corner once (cached so each sample
     // costs one neighbor query, not eight). Corner (i,j,k) -> linear (k*(gy+1)+j)*(gx+1)+i.
@@ -449,8 +692,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
     for (int k = 0; k < sz; ++k) {
         for (int j = 0; j < sy; ++j) {
             for (int i = 0; i < sx; ++i) {
-                field[sidx(i, j, k)] = DensityAt(sample_pos(i, j, k), particle_positions,
-                                                 grid, p, nullptr);
+                field[sidx(i, j, k)] = density(sample_pos(i, j, k));
             }
         }
     }
@@ -503,8 +745,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         out.positions.push_back(vp.z);
         // Outward normal = -grad(density) (toward decreasing density); fall back to
         // +Z if the gradient is degenerate so the shader never normalizes zero.
-        math::Vec3 grad{0.0f, 0.0f, 0.0f};
-        DensityAt(vp, particle_positions, grid, p, &grad);
+        const math::Vec3 grad = gradient(vp);
         math::Vec3 nrm{-grad.x, -grad.y, -grad.z};
         const float nl = std::sqrt(nrm.Dot(nrm));
         if (nl > 1e-12f) {
@@ -551,8 +792,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
                     const math::Vec3 gn = (pb - pa).Cross(pc - pa);
                     const math::Vec3 ctr{(pa.x + pb.x + pc.x) / 3.0f, (pa.y + pb.y + pc.y) / 3.0f,
                                          (pa.z + pb.z + pc.z) / 3.0f};
-                    math::Vec3 grad{0.0f, 0.0f, 0.0f};
-                    DensityAt(ctr, particle_positions, grid, p, &grad);
+                    const math::Vec3 grad = gradient(ctr);
                     if (gn.Dot(math::Vec3{-grad.x, -grad.y, -grad.z}) < 0.0f) {
                         std::swap(b, c);  // flip to outward winding.
                     }

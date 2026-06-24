@@ -15,6 +15,11 @@
 </p>
 <p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ full 1080p video</a></sub></p>
 
+<p align="center">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="90%" alt="A rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
+</p>
+<p align="center"><sub>A heavy rigid Stanford bunny plunges into a <b>two-way MLS-MPM water pool</b> — crown splash, central jet, radiating ripples, then sinks and rests — through the <b>same general body↔particle coupling</b>, rendered by the self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">▶ full 1080p video</a></sub></p>
+
 ## Why Nuka
 
 - **One GPU, thousands of articulated envs.** The same cooked world template steps thousands of environments GPU-resident — the substrate for large-scale RL.
@@ -57,7 +62,7 @@
 | Terrain / heightfield + RL locomotion | **Production** | the climbing demo above; height-scan obs, PPO-trained |
 | Soft body — XPBD (distance/bend/volume/shape-match) | Functional | cloth + 3D tet; two-way coupled to rigid through the general solver; Cosserat rods forward-only (no adjoint yet); tested |
 | Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; two-way coupled to rigid (foot-splash); tested |
-| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic constitutive; two-way rigid↔grid coupling on the same general path; deterministic; granular (sand) + demos in progress |
+| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic + weakly-compressible **fluid** constitutive (Tait EOS); two-way rigid↔grid coupling on the same general path (the bunny-in-water demo above); deterministic; granular (sand) in progress |
 | Rigid/articulation ↔ soft / fluid / cloth (two-way) | Functional | the general row solver emits rigid↔particle coupling rows — a foot pushes cloth, splashes fluid, dents a tet; one path; tested |
 | Differentiable sim (rigid + articulated) | Functional | analytical adjoint — **contact-free** path |
 | Rendering | Functional | Vulkan raster + self-written CUDA path tracer (sun/shadow/AO/GI/sky) |

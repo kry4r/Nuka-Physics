@@ -129,6 +129,10 @@ struct BeautyOptions {
     float fog_density = 0.0f;                     // per-metre extinction (0 = off)
     float sky_intensity = 1.0f;                   // scales the sky-dome ambient
 
+    // Sun disc baked into the sky so reflective/transmissive surfaces show a crisp
+    // specular glint. Zero radiance (default) leaves the sky byte-identical.
+    math::Vec3 sun_disc_radiance{0.0f, 0.0f, 0.0f};
+
     // Host-download gate (default all => byte-unchanged). RenderBeautyToAovs and
     // the device-resident path ignore it; only the host RenderBeauty copy uses it.
     AovDownloadMask download;

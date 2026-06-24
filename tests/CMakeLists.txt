@@ -1091,6 +1091,12 @@ if(CMAKE_CUDA_COMPILER)
         # the per-substep grid->body reaction balances gravity (m*g*dt), the free-fall
         # BITE drops the box, two runs byte-identical (the deterministic per-body gather).
         scenario/rigid_on_mpm_rest.cpp
+        # MLS-MPM weakly-compressible FLUID constitutive gate (model_kind == 3): a
+        # fluid column settles in the domain box -> hydrostatic pressure (1-J) rises
+        # with depth + flat free surface (J~1); grid mass/momentum byte-identical
+        # run-to-run + grid mass == particle mass; a heavy body into the pool
+        # decelerates with a non-zero reaction sink (two-way through the same grid).
+        scenario/mpm_fluid_rest.cpp
         # Articulated-LINK <-> MPM coupling gate: a fixed-base prismatic-Z link rests
         # on an MPM bed; the link's grid reaction seeds qdot_flat via M^-1 J^T (support,
         # balance, BITE, two-run byte-identical, one-way bit cleared, 2-link reduction).
@@ -3196,6 +3202,41 @@ if(NK_BUILD_VULKAN_VALIDATION)
     target_include_directories(nuka_mpm_rigid_rest_demo
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(nuka_mpm_rigid_rest_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
+    # Demo 1 headline clip: a heavy rigid Stanford bunny dropped into an MLS-MPM
+    # water pool (weakly-compressible FLUID constitutive model_kind==3, Tait EOS),
+    # TWO-WAY coupled through the env-private grid (the SAME grid BC the floor uses).
+    # STEPS nk::World on CUDA and renders the live MPM fluid marching-cubes isosurface
+    # as a refractive dielectric with teal depth absorption (ior 1.33, transmit
+    # bounces, Taubin smoothing) + the bunny (SDF collider, posed from body_pose) + a
+    # checker pool bottom on the CUDA RT beauty backend. --dump/--from decouple the
+    # ~once sim from cheap render iteration; writes a PNG sequence (-> mp4).
+    add_executable(nuka_mpm_water_drop_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/mpm_water_drop_demo.cpp
+    )
+    add_dependencies(nuka_mpm_water_drop_demo nuka_codegen)
+    target_compile_definitions(nuka_mpm_water_drop_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_mpm_water_drop_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_mpm_water_drop_demo
         PRIVATE
             nuka_scene_cook
             nuka_render
