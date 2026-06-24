@@ -52,6 +52,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -740,6 +741,22 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.sky_intensity = opt.sky_intensity;
     sky.transmit_bounces = opt.transmit_bounces;
     sky.smooth_normals = opt.smooth_normals ? 1u : 0u;
+    // Sun disc in the environment: a crisp glint for reflective/transmissive surfaces.
+    // Zero radiance keeps the sky byte-identical for every other caller.
+    sky.sun_radiance = opt.sun_disc_radiance;
+    const float disc_lum = opt.sun_disc_radiance.x + opt.sun_disc_radiance.y + opt.sun_disc_radiance.z;
+    if (disc_lum > 0.0f) {
+        const float len = std::sqrt(scene.light.direction.x * scene.light.direction.x +
+                                    scene.light.direction.y * scene.light.direction.y +
+                                    scene.light.direction.z * scene.light.direction.z);
+        const float inv = len > 1.0e-6f ? 1.0f / len : 0.0f;
+        sky.sun_dir = math::Vec3{-scene.light.direction.x * inv, -scene.light.direction.y * inv,
+                                 -scene.light.direction.z * inv};
+        sky.sun_cos_radius = std::cos(opt.sun_angular_radius);
+    } else {
+        sky.sun_dir = math::Vec3{0.0f, 0.0f, 0.0f};
+        sky.sun_cos_radius = 0.0f;
+    }
 
     // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
     LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,

@@ -55,7 +55,7 @@ inline constexpr uint32_t kSdfHeaderStride = 8u;
 inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pairs dropped
 inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
-inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM particle outside grid AABB
+inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM open-face escape / inverted F
 // An analytic-only collidable (no cooked SDF grid) imposes a one-way grid BC: it
 // has no SDF to rasterize, so the medium feels it but no reaction is deposited back.
 inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;

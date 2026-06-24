@@ -1267,6 +1267,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     m0.youngs = in.material.youngs; m0.poisson = in.material.poisson;
     m0.density = in.material.density; m0.dp_friction = in.material.dp_friction;
     m0.dp_cohesion = in.material.dp_cohesion; m0.model_kind = in.material.model_kind;
+    m0.bulk_modulus = in.material.bulk_modulus; m0.tait_gamma = in.material.tait_gamma;
+    m0.viscosity = in.material.viscosity;
     model.mpm_materials = {m0};
     cap.mpm_material_count = 1u;
 

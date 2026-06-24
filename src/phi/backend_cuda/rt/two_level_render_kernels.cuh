@@ -151,6 +151,10 @@ struct BeautyParams {
     float sky_intensity;
     uint32_t transmit_bounces;  // dielectric reflect/refract recursion depth cap
     uint32_t smooth_normals;    // 1 => opaque arm uses per-vertex smooth normals (trailing: keeps offsets)
+    // Sun disc baked into the environment so reflective/transmissive surfaces show a
+    // crisp specular glint. sun_dir points toward the sun; radiance is its disc color.
+    Vec3 sun_dir, sun_radiance;
+    float sun_cos_radius;       // cos of the disc half-angle; <= 0 disables the disc
 };
 
 // AOV destination pointers for ONE frame (raw device pointers). null skips that
@@ -293,12 +297,15 @@ struct BlasAnyHit {
 
 // TLAS any-hit functor: transform the ray into the instance-local frame and run
 // the INNER any-hit traversal over the BLAS; true iff this instance occludes.
+// `materials` (optional, null in the golden) lets clear dielectric instances pass
+// shadow rays so water/glass does not cast an opaque shadow on what is below it.
 template <typename Real = double>
 struct TlasAnyHit {
     const LbvhNode* __restrict__ tlas_nodes;
     const DevInstance* __restrict__ instances;
     float t_min;
     float dist;
+    const Material* __restrict__ materials = nullptr;
     __device__ bool operator()(int32_t leaf_node,
                                const Vec3& origin,
                                const Vec3& dir) const {
@@ -306,6 +313,9 @@ struct TlasAnyHit {
         const DevInstance& I = instances[inst];
         if (I.blas_leaf_count == 0u) {
             return false;
+        }
+        if (materials != nullptr && materials[I.material_id].transmission > 0.0f) {
+            return false;  // transmissive surfaces do not occlude direct light.
         }
         Vec3 o_l, d_l;
         TransformRayToLocal(I.transform, origin, dir, &o_l, &d_l);
@@ -328,8 +338,9 @@ __device__ __forceinline__ bool AnyOccluder(const LbvhNode* __restrict__ tlas_no
                                             const Vec3& origin,
                                             const Vec3& dir,
                                             float t_min,
-                                            float dist) {
-    TlasAnyHit<Real> leaf{tlas_nodes, instances, t_min, dist};
+                                            float dist,
+                                            const Material* __restrict__ materials = nullptr) {
+    TlasAnyHit<Real> leaf{tlas_nodes, instances, t_min, dist, materials};
     if (tlas_leaf_count == 1u) {
         return leaf(0, origin, dir);
     } else if (tlas_leaf_count >= 2u) {
@@ -469,17 +480,30 @@ NUKA_RT_HD inline Vec3 SampleCone(const Vec3& L, float ang, float u1, float u2) 
 // horizon blend; below-horizon fades to a neutral ground fill so bounce rays that
 // escape downward still pick up plausible fill instead of pure black.
 NUKA_RT_HD inline Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
+    Vec3 c;
     if (dir.z >= 0.0f) {
         const float up = dir.z;   // 0 horizon .. 1 zenith
         const float w = up * up;  // bias color toward horizon
-        return Vec3{sky.sky_bottom.x + (sky.sky_top.x - sky.sky_bottom.x) * w,
-                    sky.sky_bottom.y + (sky.sky_top.y - sky.sky_bottom.y) * w,
-                    sky.sky_bottom.z + (sky.sky_top.z - sky.sky_bottom.z) * w};
+        c = Vec3{sky.sky_bottom.x + (sky.sky_top.x - sky.sky_bottom.x) * w,
+                 sky.sky_bottom.y + (sky.sky_top.y - sky.sky_bottom.y) * w,
+                 sky.sky_bottom.z + (sky.sky_top.z - sky.sky_bottom.z) * w};
+    } else {
+        const float w = fminf(1.0f, -dir.z * 1.5f);
+        c = Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
+                 sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
+                 sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
     }
-    const float w = fminf(1.0f, -dir.z * 1.5f);
-    return Vec3{sky.sky_bottom.x + (sky.sky_ground.x - sky.sky_bottom.x) * w,
-                sky.sky_bottom.y + (sky.sky_ground.y - sky.sky_bottom.y) * w,
-                sky.sky_bottom.z + (sky.sky_ground.z - sky.sky_bottom.z) * w};
+    // Sun disc: a sharp bright cap where the ray points within the disc half-angle,
+    // soft-edged over the outer tenth so glints read crisp but not aliased.
+    if (sky.sun_cos_radius > 0.0f) {
+        const float cd = dir.x * sky.sun_dir.x + dir.y * sky.sun_dir.y + dir.z * sky.sun_dir.z;
+        if (cd > sky.sun_cos_radius) {
+            const float edge = 1.0f - sky.sun_cos_radius;
+            const float t = edge > 1.0e-6f ? fminf(1.0f, (cd - sky.sun_cos_radius) / (0.1f * edge)) : 1.0f;
+            c.x += sky.sun_radiance.x * t; c.y += sky.sun_radiance.y * t; c.z += sky.sun_radiance.z * t;
+        }
+    }
+    return c;
 }
 
 // Unit direction toward the (analytic) sun/point light from a world point.
@@ -497,6 +521,7 @@ __device__ __forceinline__ Vec3 SunDir(const Light& light, const Vec3& hit) {
 static __device__ __noinline__ Vec3 ShadeEnvOpaque(const LbvhNode* __restrict__ tlas_nodes,
                                               uint32_t tlas_leaf_count,
                                               const DevInstance* __restrict__ instances,
+                                              const Material* __restrict__ materials,
                                               const Light& light, const BeautyParams& sky,
                                               const Vec3& hit, const Vec3& Nf,
                                               const Material& mat) {
@@ -507,7 +532,8 @@ static __device__ __noinline__ Vec3 ShadeEnvOpaque(const LbvhNode* __restrict__ 
     const Vec3 so{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
     const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
     const float vis =
-        AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, so, Ls, eps, RtMissDepth())
+        AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, so, Ls, eps, RtMissDepth(),
+                           materials)
             ? 0.0f : 1.0f;
     const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
     const Vec3 amb = SkyColor(Nf, sky);  // cheap sky-dome ambient so creases aren't black
@@ -544,7 +570,8 @@ static __device__ __noinline__ Vec3 TraceEnv(const LbvhNode* __restrict__ tlas_n
         return Vec3{s.x * bmat.albedo.x, s.y * bmat.albedo.y, s.z * bmat.albedo.z};
     }
     const Vec3 bhit{ro.x + bt * rd.x, ro.y + bt * rd.y, ro.z + bt * rd.z};
-    return ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, light, sky, bhit, bnf, bmat);
+    return ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, materials, light, sky, bhit,
+                          bnf, bmat);
 }
 
 // Refract `i` (unit, incident) about unit normal `n` with relative index `eta`
@@ -645,8 +672,8 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
             // Hit an opaque body inside/behind the medium -> shade and stop.
             const float hnv = hn.x * (-rd.x) + hn.y * (-rd.y) + hn.z * (-rd.z);
             const Vec3 hnf = (hnv < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
-            const Vec3 sh = ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, light, sky,
-                                           hpt, hnf, hmat);
+            const Vec3 sh = ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, materials,
+                                           light, sky, hpt, hnf, hmat);
             transmitted = Vec3{thr.x * sh.x, thr.y * sh.y, thr.z * sh.z};
             break;
         }
@@ -707,7 +734,7 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
         const Vec3 Lk = SampleCone(Ls, sky.sun_angular_radius, rng->NextF(), rng->NextF());
         if (Lk.x * Nf.x + Lk.y * Nf.y + Lk.z * Nf.z <= 0.0f) continue;
         if (!AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, sorigin, Lk, eps,
-                                RtMissDepth())) {
+                                RtMissDepth(), materials)) {
             vis += 1.0f;
         }
     }

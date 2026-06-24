@@ -599,6 +599,10 @@ void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp
     sky->sky_ground = cfg.sky_ground;
     sky->fog_color = cfg.fog_color;
     sky->fog_density = cfg.fog_density;
+    // Batched sensors carry no sun disc -> the sky stays byte-identical.
+    sky->sun_dir = Vec3{0.0f, 0.0f, 0.0f};
+    sky->sun_radiance = Vec3{0.0f, 0.0f, 0.0f};
+    sky->sun_cos_radius = 0.0f;
 }
 
 // (Re)fill the per-env material/light/ambient tables from the base set + the

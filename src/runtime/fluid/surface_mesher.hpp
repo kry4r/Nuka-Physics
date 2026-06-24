@@ -32,6 +32,17 @@ struct FluidSurfaceParams {
     float particle_mass = 1.0f;      // m (uniform across the fluid).
     float cell_size = 0.0f;          // MC voxel edge; <= 0 => 0.5 * h.
 
+    // Anisotropic surface kernels (Yu & Turk 2013): per-particle covariance shapes
+    // each kernel into an ellipsoid so the surface flattens along the fluid and
+    // splash particles stay round. Opt-in; default off keeps the isotropic field
+    // byte-identical for every existing caller.
+    bool anisotropic = false;
+    float aniso_lambda = 0.95f;      // position pre-smooth blend (Eq. 6).
+    float aniso_kr = 4.0f;           // eigenvalue clamp ratio sigma1/k_r (Eq. 12-14).
+    float aniso_kn = 0.5f;           // isolated-particle isotropic scale (Eq. 15).
+    float aniso_ks = 1.0f;           // interior anisotropy scale, recalibrated to units.
+    uint32_t aniso_n_eps = 25u;      // neighbor count below which a particle is isolated.
+
     // Resolved MC voxel edge (the explicit cell_size, else a fraction of h).
     float CellSize() const { return cell_size > 0.0f ? cell_size : 0.5f * h; }
 };

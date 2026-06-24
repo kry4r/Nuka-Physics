@@ -138,8 +138,10 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
 struct MpmMaterialInput {
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean.
+    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean,
+    // 3 = weakly-compressible fluid (Tait EOS, reads the three fields below).
     float model_kind = 0.0f;
+    float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
 };
 
 struct MpmCookInput {

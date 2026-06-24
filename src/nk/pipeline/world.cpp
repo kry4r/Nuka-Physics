@@ -260,6 +260,7 @@ bool World::SeedInitialState() {
             float* dst = host.data() + static_cast<size_t>(r) * stride;
             dst[0] = mm.youngs; dst[1] = mm.poisson; dst[2] = mm.density;
             dst[3] = mm.dp_friction; dst[4] = mm.dp_cohesion; dst[5] = mm.model_kind;
+            dst[6] = mm.bulk_modulus; dst[7] = mm.tait_gamma; dst[8] = mm.viscosity;
         }
         if (!data_.UploadField(FieldId::MpmMaterialTable, host.data(),
                                host.size() * sizeof(float))) {
