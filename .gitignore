@@ -8,6 +8,10 @@ cmake-build-*/
 # Working/process notes, logs, and crash dumps (not shipped)
 subagent-plans/
 docs/plans/
+docs/specs/
+.g1e_logs/
+.g2_logs/
+*.lock
 core.*
 *.log
 

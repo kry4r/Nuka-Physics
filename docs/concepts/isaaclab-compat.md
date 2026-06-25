@@ -98,5 +98,4 @@ diff-sim than Isaac Lab is. The distinction: Nuka uses a **full analytical
 reverse-mode adjoint** through Featherstone dynamics, whereas Brax's contact
 gradient is a **stop-gradient** approximation. Nuka also guarantees **strong
 (D1) bit-exact determinism**, which the JAX-XLA-based simulators do not promise
-across runs/hardware. See the [launch blog](../blog/2026-06-01-v05-launch.md) for
-the full comparison.
+across runs/hardware.

@@ -67,5 +67,4 @@ step is comfortably under the 1 ms / env-step target. At 4096-env production
 batches the step is compute-bound, so launch-overhead optimizations (e.g. the
 opt-in, bit-exact CUDA-graph step path) are determinism-preserving mechanisms
 rather than speedups. The absolute master-plan step-time gate is validated on a
-reference RTX 5080 — see
-[the v0.3 test & perf report](../architecture/2026-05-31-v03-test-and-perf-report.md).
+reference RTX 5080.
