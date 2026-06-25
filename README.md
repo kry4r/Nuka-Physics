@@ -10,15 +10,24 @@
   <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-success" alt="determinism">
 </p>
 
-<p align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="90%" alt="Go2 robots climbing procedural terrain"></a>
-</p>
-<p align="center"><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — rendered by the self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ full 1080p video</a></sub></p>
-
-<p align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="90%" alt="A rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
-</p>
-<p align="center"><sub>A heavy rigid Stanford bunny plunges into a <b>two-way MLS-MPM water pool</b> — crown splash, central jet, radiating ripples, then sinks and rests — through the <b>same general body↔particle coupling</b>, rendered by the self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">▶ full 1080p video</a></sub></p>
+<table align="center" width="100%">
+<tr>
+<td colspan="2" align="center">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots climbing procedural terrain"></a>
+  <br><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ full 1080p video</a></sub>
+</td>
+</tr>
+<tr>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="A rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
+  <br><sub>A rigid Stanford bunny plunges into a <b>two-way MLS-MPM water pool</b> — crown splash, central jet, radiating ripples, then sinks. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">▶ full 1080p video</a></sub>
+</td>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="An MLS-MPM elastic jelly ball drops and squashes"></a>
+  <br><sub>An <b>MLS-MPM elastic jelly ball</b> drops, squashes, and rebounds — soft continuum two-way coupled to the ground on the <b>same general solver</b>, deterministic. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">▶ full video</a></sub>
+</td>
+</tr>
+</table>
 
 ## Why Nuka
 
@@ -62,7 +71,7 @@
 | Terrain / heightfield + RL locomotion | **Production** | the climbing demo above; height-scan obs, PPO-trained |
 | Soft body — XPBD (distance/bend/volume/shape-match) | Functional | cloth + 3D tet; two-way coupled to rigid through the general solver; Cosserat rods forward-only (no adjoint yet); tested |
 | Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; two-way coupled to rigid (foot-splash); tested |
-| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic + weakly-compressible **fluid** constitutive (Tait EOS); two-way rigid↔grid coupling on the same general path (the bunny-in-water demo above); deterministic; granular (sand) in progress |
+| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic + weakly-compressible **fluid** constitutive (Tait EOS); two-way rigid↔grid coupling on the same general path (the jelly-ball and bunny-in-water demos above); deterministic; granular (sand) in progress |
 | Rigid/articulation ↔ soft / fluid / cloth (two-way) | Functional | the general row solver emits rigid↔particle coupling rows — a foot pushes cloth, splashes fluid, dents a tet; one path; tested |
 | Differentiable sim (rigid + articulated) | Functional | analytical adjoint — **contact-free** path |
 | Rendering | Functional | Vulkan raster + self-written CUDA path tracer (sun/shadow/AO/GI/sky) |
@@ -77,7 +86,7 @@ The north star is **one general solver that couples rigid, soft, fluid, and arti
 - ✅ **Rigid + multibody, unified.** One general PGS path resolves rigid + articulation + static sides in a single kernel (MJX-parity). This pillar is *done*.
 - ✅ **Soft (XPBD cloth + 3D tet), fluid (PBF), and an MLS-MPM continuum lane step and co-reside** in one `nk::World` (shared step, density-scope isolation).
 - ✅ **Rigid/articulation ↔ soft / fluid / cloth is two-way through the one solver.** The general row assembly emits rigid↔particle coupling rows, so a foot pushes cloth, splashes fluid, and dents a tet *through the solver*. MLS-MPM couples as a first-class peer: a `CouplingProvider` funnels both contact-rows and grid-transfer into one body-side reaction sink, deterministically.
-- 🟡 **Polished coupled demo videos in progress** (soft-ball slam · cloth-onto-Go2 · creature-in-water-pool · Go2-on-sand); **MLS-MPM granular (sand)** is the next constitutive model.
+- 🟡 **Coupled demo videos:** soft-ball slam ✅ and bunny-in-water ✅ shipped (above); cloth-onto-Go2 and Go2-on-sand in progress. **MLS-MPM granular (sand)** is the next constitutive model.
 - ❌ **Differentiability does not extend through contact / coupling** yet.
 
 **Remaining gap:** add the MLS-MPM granular (Drucker–Prager) model for sand, land the polished coupled demo videos, then extend the adjoint through contact. The rigid + multibody + coupling spine is in; soft, fluid, and MPM all couple to it through the one path.
