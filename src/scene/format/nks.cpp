@@ -217,7 +217,7 @@ MediaRecord::Kind MediaKindFromName(const std::string& s) {
     if (s == "cloth") return MediaRecord::Kind::Cloth;
     if (s == "soft_tet") return MediaRecord::Kind::SoftTet;
     if (s == "fluid") return MediaRecord::Kind::Fluid;
-    return MediaRecord::Kind::Cloth;
+    throw std::runtime_error("nks: unknown media kind '" + s + "'");
 }
 
 const char* MediaMethodName(MediaRecord::Method m) {
@@ -232,7 +232,7 @@ MediaRecord::Method MediaMethodFromName(const std::string& s) {
     if (s == "xpbd") return MediaRecord::Method::Xpbd;
     if (s == "pbf") return MediaRecord::Method::Pbf;
     if (s == "mlsmpm") return MediaRecord::Method::MlsMpm;
-    return MediaRecord::Method::Xpbd;
+    throw std::runtime_error("nks: unknown media method '" + s + "'");
 }
 
 // ---------------------------------------------------------------------------

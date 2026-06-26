@@ -204,6 +204,19 @@ nuka_result_t nuka_scene_add_rigid_primitive(
             default:
                 return NUKA_RESULT_INVALID_ARG;
         }
+        // A box/sphere/capsule needs positive extents (zero/negative cooks degenerate
+        // geometry); a plane carries no extent.
+        if (type == nscene::ShapeType::Sphere && desc->dims[0] <= 0.0f) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
+        if (type == nscene::ShapeType::Capsule &&
+            (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f)) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
+        if (type == nscene::ShapeType::Box &&
+            (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f || desc->dims[2] <= 0.0f)) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
         // A plane is inherently static (an infinite movable plane is nonsensical).
         const bool is_static =
             (type == nscene::ShapeType::Plane) ? true : (desc->is_static != 0u);
