@@ -135,6 +135,8 @@ struct Args {
     uint32_t samples = 16u;
     uint32_t drape = 800u;  // drape sim/render steps: full fall -> drape -> settle.
     bool probe = false;
+    bool dump_checksum = false;  // print the cloth PARTICLE_POSITION checksum, then exit.
+    uint32_t dump_steps = 60u;   // steps of the settle control before the second dump.
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -152,6 +154,8 @@ Args ParseArgs(int argc, char** argv) {
         else if (s == "--gpu") a.gpu = true;
         else if (s == "--beauty") { a.beauty = true; a.gpu = true; }
         else if (s == "--probe") a.probe = true;
+        else if (s == "--dump-checksum") a.dump_checksum = true;
+        else if (s == "--dump-steps") a.dump_steps = next_u(a.dump_steps);
         else if (s == "--out-dir" && i + 1 < argc) a.out_dir = argv[++i];
         else if (s == "--png-dir" && i + 1 < argc) a.png_dir = argv[++i];
     }
@@ -321,6 +325,18 @@ RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
     s.a_kind = u(16); s.a_index = u(17);
     s.b_kind = u(24); s.b_index = u(25);
     return s;
+}
+
+// FNV-1a 64-bit over a float buffer's raw bytes: a stable cross-language hash of
+// the PARTICLE_POSITION field for the Python facade's cook byte-identity check.
+uint64_t Fnv1a(const float* data, size_t n_floats) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(data);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n_floats * sizeof(float); ++i) {
+        h ^= static_cast<uint64_t>(bytes[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
 }
 
 }  // namespace
@@ -564,6 +580,38 @@ int main(int argc, char** argv) {
     auto download_links = [&]() {
         data.DownloadField(nk::FieldId::LinkPose, link_pose.data(), L * sizeof(Transform));
     };
+
+    // CHECKSUM dump (opt-in, default off): the cloth PARTICLE_POSITION right after
+    // cook (the rest lattice) and after K steps of the settle control, hashed for the
+    // Python facade's byte-identity cross-check. Exits before render -> the default
+    // run (no --dump-checksum) is byte-identical.
+    if (args.dump_checksum) {
+        // NK_CHECKSUM_DUMP=<path> additionally writes the raw cook + after_steps
+        // P*Vec3 buffers so a full-field deviation can be measured offline.
+        std::FILE* df = nullptr;
+        if (const char* p = std::getenv("NK_CHECKSUM_DUMP")) df = std::fopen(p, "wb");
+        auto dump = [&](const char* tag, uint32_t k) {
+            download_pos();
+            const float* f = reinterpret_cast<const float*>(pos.data());
+            const size_t nf = static_cast<size_t>(P) * 3u;
+            std::printf("[checksum] %s P=%u steps=%u base_xy=(%.6f,%.6f) fnv=%llu first=",
+                        tag, P, k, base_xy.x, base_xy.y,
+                        static_cast<unsigned long long>(Fnv1a(f, nf)));
+            for (uint32_t c = 0; c < 12u && c < nf; ++c)
+                std::printf("%s%.9g", c ? "," : "", f[c]);
+            std::printf("\n");
+            if (df != nullptr) std::fwrite(f, sizeof(float), nf, df);
+        };
+        dump("cook", 0u);
+        for (uint32_t s = 0; s < args.dump_steps; ++s) {
+            hold_dog();
+            hold_cloth();
+            world.Step();
+        }
+        dump("after_steps", args.dump_steps);
+        if (df != nullptr) std::fclose(df);
+        return 0;
+    }
 
     // SETTLE the dog (cloth held flat above the trunk) off-camera. The base is
     // pinned and the legs PD-hold, so the stance is reached quickly.

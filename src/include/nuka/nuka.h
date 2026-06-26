@@ -252,6 +252,16 @@ typedef struct nuka_coupled_particles_desc_t {
     float aero_normal;
     float aero_tangent;
     float aero_max_dv;
+    // World SolverConfig overrides (1:1 with nk::Pipeline::SolverConfig), so a coupled
+    // scene can author the contact solve. Each 0 keeps the engine default, so a
+    // zero-initialized desc takes the SAME code path as today (byte-identical):
+    // solver_vel_iters 0=>32, solver_pos_iters 0=>4, solver_contact_margin 0.0=>0.0,
+    // solver_max_pairs 0=>0; baumgarte_max_velocity 0.0 keeps the cooked model default.
+    uint32_t solver_vel_iters;
+    uint32_t solver_pos_iters;
+    float    solver_contact_margin;
+    uint32_t solver_max_pairs;
+    float    baumgarte_max_velocity;
 } nuka_coupled_particles_desc_t;
 
 // Create a coupled world. `desc` is the same robot/world descriptor

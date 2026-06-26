@@ -101,6 +101,13 @@ from .noise import (  # noqa: F401
 # set_physics_material/settle/save. NOT a special grasp/union type.
 from .scene import Scene  # noqa: F401
 
+# Authoring facade (pure python over the prebuilt bindings): geometry-only morphs,
+# constitutive materials, surfaces + SimOptions assemble a coupled world; control
+# drives it. The facade assembler is nuka.author.Scene (the top-level nuka.Scene
+# stays the generic scene-graph editor above); these helpers do not conflict.
+from . import author  # noqa: F401
+from .author import SimOptions, materials, morphs, surfaces  # noqa: F401
+
 # Re-export the field enum members at top level for convenience.
 RIGID_BODY_TRANSFORM = Field.RIGID_BODY_TRANSFORM
 ARTICULATION_LINK_POSE = Field.ARTICULATION_LINK_POSE
@@ -207,6 +214,11 @@ __all__ = [
     "World",
     "Tape",
     "Scene",
+    "author",
+    "morphs",
+    "materials",
+    "surfaces",
+    "SimOptions",
     "Field",
     "sync",
     "__engine_version__",
