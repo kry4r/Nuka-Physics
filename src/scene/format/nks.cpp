@@ -7,7 +7,8 @@
 //     "physics_materials": { "<name>": {...} },   // keyed by material name
 //     "render_materials":  { "<name>": {...} },   // keyed by material name
 //     "tree": [ <node>, ... ],                    // SceneGraph pre-order, nested
-//     "sensors": [...], "exclude_pairs": [...], "contact_pairs": [...] }
+//     "sensors": [...], "exclude_pairs": [...], "contact_pairs": [...],
+//     "media": [ <media>, ... ] }                  // cloth/soft-tet/fluid records
 //
 // The `tree` section is the SceneGraph serialized in PRE-ORDER via
 // SceneGraph::Traverse: each node is { "name": <single segment>, optional
@@ -204,6 +205,36 @@ DecomposeMode DecomposeModeFromName(const std::string& s) {
     return DecomposeMode::Auto;
 }
 
+const char* MediaKindName(MediaRecord::Kind k) {
+    switch (k) {
+        case MediaRecord::Kind::Cloth:   return "cloth";
+        case MediaRecord::Kind::SoftTet: return "soft_tet";
+        case MediaRecord::Kind::Fluid:   return "fluid";
+    }
+    return "cloth";
+}
+MediaRecord::Kind MediaKindFromName(const std::string& s) {
+    if (s == "cloth") return MediaRecord::Kind::Cloth;
+    if (s == "soft_tet") return MediaRecord::Kind::SoftTet;
+    if (s == "fluid") return MediaRecord::Kind::Fluid;
+    return MediaRecord::Kind::Cloth;
+}
+
+const char* MediaMethodName(MediaRecord::Method m) {
+    switch (m) {
+        case MediaRecord::Method::Xpbd:   return "xpbd";
+        case MediaRecord::Method::Pbf:    return "pbf";
+        case MediaRecord::Method::MlsMpm: return "mlsmpm";
+    }
+    return "xpbd";
+}
+MediaRecord::Method MediaMethodFromName(const std::string& s) {
+    if (s == "xpbd") return MediaRecord::Method::Xpbd;
+    if (s == "pbf") return MediaRecord::Method::Pbf;
+    if (s == "mlsmpm") return MediaRecord::Method::MlsMpm;
+    return MediaRecord::Method::Xpbd;
+}
+
 // ---------------------------------------------------------------------------
 // math <-> json
 // ---------------------------------------------------------------------------
@@ -262,6 +293,11 @@ Value FloatArray(const float* p, int n) {
     for (int i = 0; i < n; ++i) a.PushBack(Value::Float(p[i]));
     return a;
 }
+
+// An AssetRef serializes as its "<nka>#TAG/idx" text (empty string for an empty
+// ref); the .nka chunk bytes a media baked-mesh ref points at are not read here.
+Value AssetRefJson(const AssetRef& r) { return Value::Str(ToString(r)); }
+AssetRef AssetRefFromJson(const Value& v) { return ParseAssetRef(v.AsString()); }
 
 // ---------------------------------------------------------------------------
 // Save
@@ -468,6 +504,89 @@ Value SaveSensor(const SensorDesc& s) {
         l.Set("max_range", Value::Float(s.lidar.max_range));
         o.Set("lidar", std::move(l));
     }
+    return o;
+}
+
+// A media entry (cloth / soft-tet / fluid). Every block is written verbatim (like
+// SaveShape) so any MediaRecord round-trips field-for-field whatever populated it.
+Value SaveMedia(const MediaRecord& m) {
+    Value o = Value::Object();
+    o.Set("name", Value::Str(m.name));
+    o.Set("kind", Value::Str(MediaKindName(m.kind)));
+    o.Set("method", Value::Str(MediaMethodName(m.method)));
+    o.Set("render_material_id",
+          Value::Int(static_cast<int64_t>(m.render_material_id)));
+    o.Set("baked", AssetRefJson(m.baked));
+
+    Value cg = Value::Object();
+    cg.Set("nx", Value::Int(m.cloth_grid.nx));
+    cg.Set("ny", Value::Int(m.cloth_grid.ny));
+    cg.Set("spacing", Value::Float(m.cloth_grid.spacing));
+    cg.Set("origin", Vec3Json(m.cloth_grid.origin));
+    cg.Set("free", Value::Bool(m.cloth_grid.free));
+    o.Set("cloth_grid", std::move(cg));
+
+    Value ts = Value::Object();
+    ts.Set("center", Vec3Json(m.tet_sphere.center));
+    ts.Set("radius", Value::Float(m.tet_sphere.radius));
+    ts.Set("cells", Value::Int(m.tet_sphere.cells));
+    ts.Set("cell_len", Value::Float(m.tet_sphere.cell_len));
+    o.Set("tet_sphere", std::move(ts));
+
+    Value fb = Value::Object();
+    fb.Set("min", Vec3Json(m.fluid_box.min));
+    fb.Set("max", Vec3Json(m.fluid_box.max));
+    fb.Set("spacing", Value::Float(m.fluid_box.spacing));
+    o.Set("fluid_box", std::move(fb));
+
+    Value xp = Value::Object();
+    xp.Set("particle_mass", Value::Float(m.xpbd.particle_mass));
+    xp.Set("friction", Value::Float(m.xpbd.friction));
+    xp.Set("distance_alpha", Value::Float(m.xpbd.distance_alpha));
+    xp.Set("bend_alpha", Value::Float(m.xpbd.bend_alpha));
+    xp.Set("volume_alpha", Value::Float(m.xpbd.volume_alpha));
+    xp.Set("iters", Value::Int(m.xpbd.iters));
+    xp.Set("aero_drag_normal", Value::Float(m.xpbd.aero_drag_normal));
+    xp.Set("aero_drag_tangent", Value::Float(m.xpbd.aero_drag_tangent));
+    xp.Set("aero_drag_max_dv", Value::Float(m.xpbd.aero_drag_max_dv));
+    o.Set("xpbd", std::move(xp));
+
+    Value pb = Value::Object();
+    pb.Set("rest_density", Value::Float(m.pbf.rest_density));
+    pb.Set("support_scale", Value::Float(m.pbf.support_scale));
+    pb.Set("iters", Value::Int(m.pbf.iters));
+    pb.Set("friction", Value::Float(m.pbf.friction));
+    pb.Set("clamp_overdensity", Value::Bool(m.pbf.clamp_overdensity));
+    pb.Set("walls_enabled", Value::Bool(m.pbf.walls_enabled));
+    pb.Set("walls_min", Vec3Json(m.pbf.walls_min));
+    pb.Set("walls_max", Vec3Json(m.pbf.walls_max));
+    pb.Set("floor_z", Value::Float(m.pbf.floor_z));
+    pb.Set("boundary_layers", Value::Int(m.pbf.boundary_layers));
+    o.Set("pbf", std::move(pb));
+
+    Value mp = Value::Object();
+    mp.Set("youngs", Value::Float(m.mpm.youngs));
+    mp.Set("poisson", Value::Float(m.mpm.poisson));
+    mp.Set("density", Value::Float(m.mpm.density));
+    mp.Set("dp_friction", Value::Float(m.mpm.dp_friction));
+    mp.Set("dp_cohesion", Value::Float(m.mpm.dp_cohesion));
+    mp.Set("model_kind", Value::Float(m.mpm.model_kind));
+    mp.Set("bulk_modulus", Value::Float(m.mpm.bulk_modulus));
+    mp.Set("tait_gamma", Value::Float(m.mpm.tait_gamma));
+    mp.Set("viscosity", Value::Float(m.mpm.viscosity));
+    mp.Set("dx", Value::Float(m.mpm.dx));
+    mp.Set("substeps", Value::Int(m.mpm.substeps));
+    mp.Set("floor_normal", Vec3Json(m.mpm.floor_normal));
+    mp.Set("floor_d", Value::Float(m.mpm.floor_d));
+    mp.Set("floor_friction", Value::Float(m.mpm.floor_friction));
+    o.Set("mpm", std::move(mp));
+
+    Value rs = Value::Object();
+    rs.Set("normal_offset", Value::Float(m.render_skin.normal_offset));
+    rs.Set("smooth_iters", Value::Int(m.render_skin.smooth_iters));
+    rs.Set("smooth_lambda", Value::Float(m.render_skin.smooth_lambda));
+    rs.Set("skin_mesh", AssetRefJson(m.render_skin.skin_mesh));
+    o.Set("render_skin", std::move(rs));
     return o;
 }
 
@@ -778,6 +897,15 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
             pairs.PushBack(std::move(o));
         }
         root.Set("contact_pairs", std::move(pairs));
+    }
+
+    // -- media (cloth / soft-tet / fluid) -----------------------------------
+    // First-class media records the cook reads; emitted only when present so a
+    // media-free scene's bytes are unchanged. Authoring order == Media() order.
+    if (!scene.Media().empty()) {
+        Value media = Value::Array();
+        for (const MediaRecord& m : scene.Media()) media.PushBack(SaveMedia(m));
+        root.Set("media", std::move(media));
     }
 
     // -- M7 metadata: initial_state / settle (only when present) ------------
@@ -1208,6 +1336,96 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             ov.margin = cp.At("margin").AsFloat();
             ov.gap = cp.At("gap").AsFloat();
             scene.AddContactPair(ov);
+        }
+    }
+
+    // -- media (cloth / soft-tet / fluid) -----------------------------------
+    // Each read keeps the record's struct default when absent, so a hand-authored
+    // .nks may omit any block/field it does not use (kind + method are required).
+    if (const Value* media = root.Find("media")) {
+        auto f = [](const Value& o, const char* k, float d) {
+            const Value* v = o.Find(k); return v ? v->AsFloat() : d; };
+        auto u = [](const Value& o, const char* k, uint32_t d) {
+            const Value* v = o.Find(k);
+            return v ? static_cast<uint32_t>(v->AsInt()) : d; };
+        auto b = [](const Value& o, const char* k, bool d) {
+            const Value* v = o.Find(k); return v ? v->AsBool() : d; };
+        auto v3 = [](const Value& o, const char* k, math::Vec3 d) {
+            const Value* v = o.Find(k); return v ? Vec3FromJson(*v) : d; };
+
+        for (const Value& mv : media->Elements()) {
+            MediaRecord rec;
+            if (const Value* nm = mv.Find("name")) rec.name = nm->AsString();
+            rec.kind = MediaKindFromName(mv.At("kind").AsString());
+            rec.method = MediaMethodFromName(mv.At("method").AsString());
+            rec.render_material_id = u(mv, "render_material_id", rec.render_material_id);
+            if (const Value* bk = mv.Find("baked")) rec.baked = AssetRefFromJson(*bk);
+
+            if (const Value* cg = mv.Find("cloth_grid")) {
+                rec.cloth_grid.nx = u(*cg, "nx", rec.cloth_grid.nx);
+                rec.cloth_grid.ny = u(*cg, "ny", rec.cloth_grid.ny);
+                rec.cloth_grid.spacing = f(*cg, "spacing", rec.cloth_grid.spacing);
+                rec.cloth_grid.origin = v3(*cg, "origin", rec.cloth_grid.origin);
+                rec.cloth_grid.free = b(*cg, "free", rec.cloth_grid.free);
+            }
+            if (const Value* ts = mv.Find("tet_sphere")) {
+                rec.tet_sphere.center = v3(*ts, "center", rec.tet_sphere.center);
+                rec.tet_sphere.radius = f(*ts, "radius", rec.tet_sphere.radius);
+                rec.tet_sphere.cells = u(*ts, "cells", rec.tet_sphere.cells);
+                rec.tet_sphere.cell_len = f(*ts, "cell_len", rec.tet_sphere.cell_len);
+            }
+            if (const Value* fb = mv.Find("fluid_box")) {
+                rec.fluid_box.min = v3(*fb, "min", rec.fluid_box.min);
+                rec.fluid_box.max = v3(*fb, "max", rec.fluid_box.max);
+                rec.fluid_box.spacing = f(*fb, "spacing", rec.fluid_box.spacing);
+            }
+            if (const Value* xp = mv.Find("xpbd")) {
+                rec.xpbd.particle_mass = f(*xp, "particle_mass", rec.xpbd.particle_mass);
+                rec.xpbd.friction = f(*xp, "friction", rec.xpbd.friction);
+                rec.xpbd.distance_alpha = f(*xp, "distance_alpha", rec.xpbd.distance_alpha);
+                rec.xpbd.bend_alpha = f(*xp, "bend_alpha", rec.xpbd.bend_alpha);
+                rec.xpbd.volume_alpha = f(*xp, "volume_alpha", rec.xpbd.volume_alpha);
+                rec.xpbd.iters = static_cast<uint16_t>(u(*xp, "iters", rec.xpbd.iters));
+                rec.xpbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.xpbd.aero_drag_normal);
+                rec.xpbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.xpbd.aero_drag_tangent);
+                rec.xpbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.xpbd.aero_drag_max_dv);
+            }
+            if (const Value* pb = mv.Find("pbf")) {
+                rec.pbf.rest_density = f(*pb, "rest_density", rec.pbf.rest_density);
+                rec.pbf.support_scale = f(*pb, "support_scale", rec.pbf.support_scale);
+                rec.pbf.iters = static_cast<uint16_t>(u(*pb, "iters", rec.pbf.iters));
+                rec.pbf.friction = f(*pb, "friction", rec.pbf.friction);
+                rec.pbf.clamp_overdensity = b(*pb, "clamp_overdensity", rec.pbf.clamp_overdensity);
+                rec.pbf.walls_enabled = b(*pb, "walls_enabled", rec.pbf.walls_enabled);
+                rec.pbf.walls_min = v3(*pb, "walls_min", rec.pbf.walls_min);
+                rec.pbf.walls_max = v3(*pb, "walls_max", rec.pbf.walls_max);
+                rec.pbf.floor_z = f(*pb, "floor_z", rec.pbf.floor_z);
+                rec.pbf.boundary_layers = u(*pb, "boundary_layers", rec.pbf.boundary_layers);
+            }
+            if (const Value* mp = mv.Find("mpm")) {
+                rec.mpm.youngs = f(*mp, "youngs", rec.mpm.youngs);
+                rec.mpm.poisson = f(*mp, "poisson", rec.mpm.poisson);
+                rec.mpm.density = f(*mp, "density", rec.mpm.density);
+                rec.mpm.dp_friction = f(*mp, "dp_friction", rec.mpm.dp_friction);
+                rec.mpm.dp_cohesion = f(*mp, "dp_cohesion", rec.mpm.dp_cohesion);
+                rec.mpm.model_kind = f(*mp, "model_kind", rec.mpm.model_kind);
+                rec.mpm.bulk_modulus = f(*mp, "bulk_modulus", rec.mpm.bulk_modulus);
+                rec.mpm.tait_gamma = f(*mp, "tait_gamma", rec.mpm.tait_gamma);
+                rec.mpm.viscosity = f(*mp, "viscosity", rec.mpm.viscosity);
+                rec.mpm.dx = f(*mp, "dx", rec.mpm.dx);
+                rec.mpm.substeps = u(*mp, "substeps", rec.mpm.substeps);
+                rec.mpm.floor_normal = v3(*mp, "floor_normal", rec.mpm.floor_normal);
+                rec.mpm.floor_d = f(*mp, "floor_d", rec.mpm.floor_d);
+                rec.mpm.floor_friction = f(*mp, "floor_friction", rec.mpm.floor_friction);
+            }
+            if (const Value* rs = mv.Find("render_skin")) {
+                rec.render_skin.normal_offset = f(*rs, "normal_offset", rec.render_skin.normal_offset);
+                rec.render_skin.smooth_iters = u(*rs, "smooth_iters", rec.render_skin.smooth_iters);
+                rec.render_skin.smooth_lambda = f(*rs, "smooth_lambda", rec.render_skin.smooth_lambda);
+                if (const Value* sm = rs->Find("skin_mesh"))
+                    rec.render_skin.skin_mesh = AssetRefFromJson(*sm);
+            }
+            scene.AddMedia(std::move(rec));
         }
     }
 

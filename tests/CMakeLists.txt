@@ -1243,6 +1243,32 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_cuda_runtime_test
         PROPERTIES LABELS "full")
 
+    # --- .nks media + rigid-primitive roundtrip. Host/CPU only (no device step):
+    # Saves/Loads a SceneIR with cloth + soft-tet media + an authored ground box and
+    # asserts the records round-trip field-equal + the cloth cooks to the frozen
+    # lattice FNV. Links nuka_scene_cook for BuildClothXpbdInput (CUDA-language lib,
+    # hence inside the CMAKE_CUDA_COMPILER guard; the test runs no device code).
+    add_executable(nuka_nks_media_roundtrip_test
+        scenario/nks_media_roundtrip.cpp
+    )
+    target_include_directories(nuka_nks_media_roundtrip_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_nks_media_roundtrip_test
+        PRIVATE
+            nuka_scene_cook
+            nuka_cooker
+            nuka_scene
+            nuka_import
+            nuka_runtime_gpu
+            nuka_nk
+            GTest::gtest_main
+    )
+    add_dependencies(nuka_nks_media_roundtrip_test nuka_codegen)
+    add_test(NAME NksMediaRoundtrip
+             COMMAND nuka_nks_media_roundtrip_test
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(NksMediaRoundtrip PROPERTIES LABELS "fast_full")
+
     # --- v0.7 p09-D: XPBD soft-body COOKER tests (exit-crit 3) -------------
     # PURE host/CPU: cooks programmatic XpbdSoftBodySpecs and asserts the
     # returned XpbdConstraintSet (counts + the two param->engine mappings +
