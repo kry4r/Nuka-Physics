@@ -218,6 +218,12 @@ struct PbfCookInput {
     float      floor_z = 0.0f;             // z-up boundary floor.
     // body<->fluid contact mu, ~0 so a foot slides (splash stays normal/PBF-driven).
     float      friction = 0.0f;
+    // Pinned-boundary confinement: walls_enabled appends boundary_layers floor-slab
+    // layers + a side-wall ring (all inv_mass 0). Off => byte-identical fluid cook.
+    bool       walls_enabled   = false;
+    math::Vec3 walls_min{0.0f, 0.0f, 0.0f};
+    math::Vec3 walls_max{0.0f, 0.0f, 0.0f};
+    uint32_t   boundary_layers = 0u;
 };
 
 // Stage a PBF fluid into the Model (single-env template; SeedInitialState
@@ -268,6 +274,14 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
 // grid extent is absent (nx<2 / ny<2 / spacing<=0).
 XpbdCookInput BuildClothXpbdInput(const MediaRecord& media);
 
+// Build the XPBD cook input for a tet-soft MediaRecord from its sphere rest-lattice
+// (soft::BuildSphereTetLattice + BuildTetMeshConstraints). Empty when extent absent.
+XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media);
+
+// Build the MLS-MPM cook input for a tet-soft / fluid MediaRecord: particles sampled
+// from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.
+MpmCookInput BuildMpmInput(const MediaRecord& media);
+
 // The cloth lattice render-surface triangle list (two triangles per quad, the SAME
 // row-major winding BuildClothXpbdInput meshes the constraints with). Empty when the
 // grid extent is absent. Indexes the [0, nx*ny) cloth particles (laid out first).
@@ -278,12 +292,8 @@ std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
 // + headroom. Empty when the box extent is absent.
 PbfCookInput BuildFluidPbfInput(const MediaRecord& media);
 
-// Dispatch a validated media list onto an ALREADY-cooked Model: XPBD media (cloth)
-// concatenate into the soft slice, the one PBF fluid fills the fluid slice, via the
-// SAME CookSoftFluidParticles. particle_contact_radius sets the body<->particle /
-// cross-system contact diameter (2*radius, or the smaller medium spacing when 0). An
-// empty list is a no-op (the Model keeps ParticleMode::None, byte-identical); a
-// tet-soft or MLS-MPM medium throws (only cloth XPBD + fluid PBF are cooked here).
+// Dispatch a validated media list onto an ALREADY-cooked Model: an all-XPBD/PBF list
+// routes through CookSoftFluidParticles, a lone MLS-MPM medium through CookSoftBodyParticles.
 void CookSceneMedia(nk::Model& model, uint32_t env_count,
                     const std::vector<MediaRecord>& media,
                     float particle_contact_radius = 0.0f);
