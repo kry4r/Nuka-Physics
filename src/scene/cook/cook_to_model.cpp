@@ -38,6 +38,10 @@
 #include "scene/cooker.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/graph/scene_graph.hpp"
+// The cloth-topology + fluid-box cookers (CUDA-free POD products); the media cook
+// reuses them to build the particle inputs instead of reimplementing the math.
+#include "runtime/soft/cloth_topology.hpp"   // BuildClothConstraints
+#include "import/cooker/fluid_cooker.hpp"     // CookFluidBox
 
 namespace nuka::scene::cook {
 
@@ -1390,16 +1394,42 @@ void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
         "CookSoftBodyParticles: a bulk-soft body solver must be Xpbd or Mpm");
 }
 
-void RejectUnsupportedClothFluidMpm(nk::Model::ParticleMode cloth_solver,
-                                    nk::Model::ParticleMode fluid_solver) {
-    if (cloth_solver == nk::Model::ParticleMode::Mpm) {
-        throw std::runtime_error(
-            "cloth -> mlsmpm is not supported: cloth stays XPBD permanently (MPM is "
-            "structurally weak for thin shells)");
+void ValidateMedia(const std::vector<MediaRecord>& media) {
+    using Kind = MediaRecord::Kind;
+    using Method = MediaRecord::Method;
+    uint32_t n_mpm = 0u, n_non_mpm = 0u, n_pbf_fluid = 0u;
+    for (const MediaRecord& m : media) {
+        bool legal = false;
+        switch (m.kind) {
+            case Kind::Cloth:   legal = m.method == Method::Xpbd; break;
+            case Kind::SoftTet: legal = m.method == Method::Xpbd ||
+                                        m.method == Method::MlsMpm; break;
+            case Kind::Fluid:   legal = m.method == Method::Pbf ||
+                                        m.method == Method::MlsMpm; break;
+        }
+        if (!legal) {
+            throw std::runtime_error(
+                "ValidateMedia: illegal medium (kind x method) -- cloth must solve "
+                "with XPBD, a tet-soft body with XPBD or MLS-MPM, a fluid with PBF or "
+                "MLS-MPM");
+        }
+        if (m.method == Method::MlsMpm) ++n_mpm; else ++n_non_mpm;
+        if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
     }
-    if (fluid_solver == nk::Model::ParticleMode::Mpm) {
+    if (n_mpm > 0u && n_non_mpm > 0u) {
         throw std::runtime_error(
-            "fluid -> mlsmpm is not supported in the first batch: fluid stays PBF");
+            "ValidateMedia: an MLS-MPM medium may not co-reside with an XPBD/PBF "
+            "medium in one Model (MPM is its own ParticleMode)");
+    }
+    if (n_pbf_fluid > 1u) {
+        throw std::runtime_error(
+            "ValidateMedia: a Model carries one PBF fluid slice; a second PBF fluid "
+            "medium is not representable");
+    }
+    if (n_mpm > 1u) {
+        throw std::runtime_error(
+            "ValidateMedia: a Model carries one MLS-MPM medium; a second is not "
+            "representable");
     }
 }
 
@@ -1564,6 +1594,240 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget for
     // the FULL union (recomputed from rigid_base, overriding the inner soft growth).
     GrowContactBudgetForParticles(cap, rigid_base);
+}
+
+// ---------------------------------------------------------------------------
+// Media records -> particle cook (the per-medium builders + the list dispatch).
+// ---------------------------------------------------------------------------
+
+XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
+    XpbdCookInput in;
+    const MediaRecord::ClothGrid& g = media.cloth_grid;
+    if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) {
+        return in;  // no cloth (an empty soft set is treated as none).
+    }
+    const uint32_t nx = g.nx, ny = g.ny;
+    const float s = g.spacing;
+    const float x0 = g.origin.x - 0.5f * static_cast<float>(nx - 1u) * s;
+    const float y0 = g.origin.y - 0.5f * static_cast<float>(ny - 1u) * s;
+    std::vector<math::Vec3> rest;
+    rest.reserve(static_cast<size_t>(nx) * ny);
+    for (uint32_t j = 0u; j < ny; ++j) {
+        for (uint32_t i = 0u; i < nx; ++i) {
+            rest.push_back(math::Vec3{x0 + static_cast<float>(i) * s,
+                                      y0 + static_cast<float>(j) * s, g.origin.z});
+        }
+    }
+    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
+    std::vector<runtime::soft::ClothTriangle> tris;
+    for (uint32_t j = 0u; j + 1u < ny; ++j) {
+        for (uint32_t i = 0u; i + 1u < nx; ++i) {
+            tris.push_back({{idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u)}});
+            tris.push_back({{idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)}});
+        }
+    }
+    runtime::soft::ClothTopologyOptions opts;
+    opts.distance_compliance_alpha = media.xpbd.distance_alpha;
+    opts.bend_compliance_alpha = media.xpbd.bend_alpha;
+    runtime::soft::XpbdConstraintSet cs;
+    runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
+
+    in.positions = rest;
+    in.velocities.assign(rest.size(), math::Vec3::Zero());
+    const float mass =
+        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
+    in.inv_mass.assign(rest.size(), 1.0f / mass);
+    // free == false pins the whole perimeter (a taut membrane); free leaves every
+    // particle dynamic (a free drape).
+    if (!g.free) {
+        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+        for (uint32_t k = 0u; k < nx; ++k) {
+            in.inv_mass[idx(k, 0u)] = 0.0f;
+            in.inv_mass[idx(k, last_j)] = 0.0f;
+        }
+        for (uint32_t k = 0u; k < ny; ++k) {
+            in.inv_mass[idx(0u, k)] = 0.0f;
+            in.inv_mass[idx(last_i, k)] = 0.0f;
+        }
+    }
+    for (const auto& dc : cs.distance) {
+        in.distance.push_back(
+            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
+    }
+    for (const auto& bc : cs.bend) {
+        CookBendCon c;
+        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        c.compliance_alpha = bc.compliance_alpha;
+        in.bend.push_back(c);
+    }
+    in.solver_iterations =
+        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
+    in.friction = media.xpbd.friction;
+    // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
+    // triangles only when active (all-zero coeffs => no op => byte-identical cook).
+    in.aero_drag_normal = media.xpbd.aero_drag_normal;
+    in.aero_drag_tangent = media.xpbd.aero_drag_tangent;
+    in.aero_drag_max_dv = media.xpbd.aero_drag_max_dv;
+    if (media.xpbd.aero_drag_normal > 0.0f || media.xpbd.aero_drag_tangent > 0.0f) {
+        in.aero_triangles.reserve(tris.size());
+        for (const auto& t : tris) {
+            in.aero_triangles.push_back({t.v[0], t.v[1], t.v[2]});
+        }
+    }
+    return in;
+}
+
+std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media) {
+    std::vector<uint32_t> tris;
+    const MediaRecord::ClothGrid& g = media.cloth_grid;
+    if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) return tris;
+    const uint32_t nx = g.nx, ny = g.ny;
+    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
+    for (uint32_t j = 0u; j + 1u < ny; ++j) {
+        for (uint32_t i = 0u; i + 1u < nx; ++i) {
+            tris.insert(tris.end(), {idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u),
+                                     idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)});
+        }
+    }
+    return tris;
+}
+
+PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
+    PbfCookInput in;
+    const MediaRecord::FluidBox& b = media.fluid_box;
+    if (b.spacing <= 0.0f || b.max.x <= b.min.x || b.max.y <= b.min.y ||
+        b.max.z <= b.min.z) {
+        return in;  // no fluid.
+    }
+    import::cooker::FluidBoxSpec spec;
+    spec.min_corner = b.min;
+    spec.max_corner = b.max;
+    spec.spacing = b.spacing;
+    spec.rest_density = media.pbf.rest_density > 0.0f ? media.pbf.rest_density : 1000.0f;
+    const runtime::fluid::PbfParticleSet box = import::cooker::CookFluidBox(spec);
+
+    in.positions = box.positions;
+    in.velocities.assign(box.positions.size(), math::Vec3::Zero());
+    in.particle_mass = box.particle_mass;
+    in.rest_density = spec.rest_density;
+    const float support_scale =
+        media.pbf.support_scale > 0.0f ? media.pbf.support_scale : 1.5f;
+    const float h = support_scale * b.spacing;  // SPH support over the lattice spacing.
+    in.support_radius = h;
+    in.cfm_epsilon = 1.0e-6f;
+    in.iters = static_cast<uint16_t>(media.pbf.iters != 0u ? media.pbf.iters : 4u);
+    in.clamp_overdensity = media.pbf.clamp_overdensity;
+    in.boundary_enabled = true;
+    in.floor_z = media.pbf.floor_z;
+    in.friction = media.pbf.friction;
+    // Uniform-grid domain: enclose the box + lateral/vertical headroom so a particle
+    // pushed out of the box still finds neighbours (the grid is rebuilt per step).
+    const math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
+    in.grid_min = math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
+                             std::min(lo.z, media.pbf.floor_z) - h};
+    auto cells = [h](float extent) {
+        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
+    };
+    in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
+    in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
+    in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
+    return in;
+}
+
+namespace {
+
+// The body<->particle / cross-system contact diameter: 2*radius when authored, else
+// the smaller present medium lattice spacing (a particle is then ~ half a cell).
+float CrossContactDMin(const std::vector<MediaRecord>& media,
+                       float particle_contact_radius) {
+    float d_min = 2.0f * particle_contact_radius;
+    if (d_min > 0.0f) return d_min;
+    for (const MediaRecord& m : media) {
+        float sp = 0.0f;
+        if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
+        else if (m.kind == MediaRecord::Kind::Fluid) sp = m.fluid_box.spacing;
+        if (sp > 0.0f) d_min = (d_min > 0.0f) ? std::min(d_min, sp) : sp;
+    }
+    return d_min;
+}
+
+// Concatenate one XPBD medium into the soft slice, rebasing constraint particle
+// indices by the running particle count (base 0 for a single medium => a copy).
+void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
+    const uint32_t base = static_cast<uint32_t>(dst.positions.size());
+    dst.positions.insert(dst.positions.end(), src.positions.begin(),
+                         src.positions.end());
+    dst.velocities.insert(dst.velocities.end(), src.velocities.begin(),
+                          src.velocities.end());
+    dst.inv_mass.insert(dst.inv_mass.end(), src.inv_mass.begin(), src.inv_mass.end());
+    for (CookDistanceCon dc : src.distance) {
+        dc.a += base; dc.b += base; dst.distance.push_back(dc);
+    }
+    for (CookBendCon bc : src.bend) {
+        for (uint32_t k = 0u; k < 4u; ++k) bc.p[k] += base;
+        dst.bend.push_back(bc);
+    }
+    for (CookVolumeCon vc : src.volume) {
+        for (uint32_t k = 0u; k < 4u; ++k) vc.p[k] += base;
+        dst.volume.push_back(vc);
+    }
+    for (CookShapeMatchCluster sm : src.shape_match) {
+        for (uint32_t& pi : sm.particle) pi += base;
+        dst.shape_match.push_back(std::move(sm));
+    }
+    for (std::array<uint32_t, 3> t : src.aero_triangles) {
+        t[0] += base; t[1] += base; t[2] += base;
+        dst.aero_triangles.push_back(t);
+    }
+    // The soft slice carries one solver/friction/aero set (per-medium override is the
+    // medium's own); a single soft medium sets them verbatim.
+    dst.solver_iterations = src.solver_iterations;
+    dst.friction = src.friction;
+    dst.aero_drag_normal = src.aero_drag_normal;
+    dst.aero_drag_tangent = src.aero_drag_tangent;
+    dst.aero_drag_max_dv = src.aero_drag_max_dv;
+    dst.solver = src.solver;
+}
+
+}  // namespace
+
+void CookSceneMedia(nk::Model& model, uint32_t env_count,
+                    const std::vector<MediaRecord>& media,
+                    float particle_contact_radius) {
+    if (media.empty()) return;  // no media -> ParticleMode::None (byte-identical).
+    ValidateMedia(media);
+
+    XpbdCookInput soft;
+    PbfCookInput fluid;
+    bool have_soft = false, have_fluid = false;
+    for (const MediaRecord& m : media) {
+        if (m.kind == MediaRecord::Kind::Cloth &&
+            m.method == MediaRecord::Method::Xpbd) {
+            AppendSoftMedium(soft, BuildClothXpbdInput(m));
+            have_soft = true;
+        } else if (m.kind == MediaRecord::Kind::Fluid &&
+                   m.method == MediaRecord::Method::Pbf) {
+            fluid = BuildFluidPbfInput(m);  // ValidateMedia guarantees at most one.
+            have_fluid = true;
+        } else {
+            throw std::runtime_error(
+                "CookSceneMedia: only cloth (XPBD) and fluid (PBF) media are cooked "
+                "through the orchestrator; this medium is a tet-soft or MLS-MPM body");
+        }
+    }
+    if (!have_soft && !have_fluid) return;
+
+    SoftFluidContactInput contact;
+    contact.contact_d_min = CrossContactDMin(media, particle_contact_radius);
+    CookSoftFluidParticles(model, env_count, soft, fluid, contact);
+}
+
+CookToModelResult CookSceneToModel(const SceneIR& scene, int env_count,
+                                   const CookToModelOptions& options) {
+    CookToModelResult result = CookToModel(scene, env_count, options);
+    const uint32_t envs = env_count > 0 ? static_cast<uint32_t>(env_count) : 1u;
+    CookSceneMedia(result.model, envs, scene.Media());
+    return result;
 }
 
 } // namespace nuka::scene::cook

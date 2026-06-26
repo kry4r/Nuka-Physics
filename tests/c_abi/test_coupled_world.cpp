@@ -600,3 +600,47 @@ TEST(CoupledWorldCAbi, ResetRestoresParticleStateBitExact) {
     EXPECT_EQ(env_mismatches, 0u)
         << "nuka_world_reset_envs left the particle slice stale (silent partial reset)";
 }
+
+// (6) COOK BYTE-IDENTITY CANARY: a defaults-only coupled CLOTH world cooked through
+// the media-record orchestrator must reproduce the FROZEN after-cook PARTICLE_POSITION
+// FNV-1a (the value the Python cloth-authoring gate pins). The cook lattice is a pure
+// function of the cloth grid params, so this is insensitive to the robot scene and the
+// solver knobs; any drift means the flat-desc -> MediaRecord -> cook re-point changed a
+// translated field, an order, or a default. FNV constants match the demo / gate hash.
+TEST(CoupledWorldCAbi, DefaultsClothCookFnvMatchesFrozenCanary) {
+    const std::filesystem::path nks = SourcePath("examples/scenes/go2.nks");
+    if (!std::filesystem::exists(nks)) GTEST_SKIP() << "go2.nks scene is not available";
+    DeviceGuard device;
+    ASSERT_NE(device.handle, nullptr);
+
+    const std::string scene = nks.string();  // outlive the borrowed d.scene_path.
+    WorldGuard w;
+    nuka_world_desc_t d = WorldDesc(scene, 1u);  // contact_family 1 == flat heightfield.
+
+    // The go2_cloth_drape demo cloth params (the gate's defaults-only `base`).
+    nuka_coupled_particles_desc_t p{};
+    p.cloth_nx = 55u; p.cloth_ny = 51u; p.cloth_spacing = 0.024f;
+    p.cloth_origin_x = 0.0f; p.cloth_origin_y = 0.0f; p.cloth_origin_z = 0.90f;
+    p.cloth_particle_mass = 0.012f; p.cloth_friction = 1.8f;
+    p.cloth_bend_alpha = 0.09f; p.cloth_iters = 80u; p.cloth_free = 1u;
+    p.aero_normal = 30.0f; p.aero_tangent = 0.12f; p.aero_max_dv = 0.16f;
+    p.contact_radius = 0.022f;
+    ASSERT_EQ(nuka_world_create_coupled_from_scene(device.handle, &d, &p, &w.handle),
+              NUKA_RESULT_OK);
+
+    const std::vector<float> cooked =
+        DownloadField(w.handle, NUKA_FIELD_PARTICLE_POSITION);
+    ASSERT_EQ(cooked.size(), static_cast<size_t>(p.cloth_nx) * p.cloth_ny * 3u);
+
+    const auto* bytes = reinterpret_cast<const unsigned char*>(cooked.data());
+    uint64_t fnv = 1469598103934665603ull;
+    for (size_t i = 0; i < cooked.size() * sizeof(float); ++i) {
+        fnv ^= static_cast<uint64_t>(bytes[i]);
+        fnv *= 1099511628211ull;
+    }
+    std::printf("[coupled-cook-fnv] P=%zu fnv=%llu\n", cooked.size() / 3u,
+                static_cast<unsigned long long>(fnv));
+    EXPECT_EQ(fnv, 777503423208024307ull)
+        << "the re-pointed media-record cloth cook is NOT byte-identical to the frozen "
+           "after-cook PARTICLE_POSITION canary";
+}

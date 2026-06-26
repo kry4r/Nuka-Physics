@@ -29,11 +29,9 @@
 #include "scene/cooker.hpp"
 #include "scene/format/nks.hpp"  // native .nks loader (parity with scene.cpp)
 
-#include "import/cooker/fluid_cooker.hpp"  // CookFluidBox (reused fluid lattice cook)
 #include "import/mjcf_importer.hpp"
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
-#include "runtime/soft/cloth_topology.hpp"  // BuildClothConstraints (reused cloth topo)
 #include "math/transform.hpp"       // M10 co-residence: replica placement transform
 #include "scene/scene_compose.hpp"  // M10 co-residence: compose K replicas pre-cook
 #include "scene/scene_ir.hpp"
@@ -129,147 +127,49 @@ void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* rec
         articulation::BuildArticulationHostState({arts.front()}, blob.bodies);
 }
 
-// Build the cloth XPBD cook input from the compact coupled descriptor: a flat
-// (nx x ny) lattice at the authored origin, the whole perimeter pinned (a taut
-// membrane), meshed into triangles whose stretch+bend constraints come from the
-// engine's BuildClothConstraints. Empty input when the cloth extent is absent.
-nuka::scene::cook::XpbdCookInput BuildClothCookInput(
-    const nuka_coupled_particles_desc_t& p) {
-    nuka::scene::cook::XpbdCookInput in;
-    if (p.cloth_nx < 2u || p.cloth_ny < 2u || p.cloth_spacing <= 0.0f) {
-        return in;  // no cloth (the SoftFluid cook treats an empty soft set as none).
-    }
-    const uint32_t nx = p.cloth_nx, ny = p.cloth_ny;
-    const float s = p.cloth_spacing;
-    const float x0 = p.cloth_origin_x - 0.5f * static_cast<float>(nx - 1u) * s;
-    const float y0 = p.cloth_origin_y - 0.5f * static_cast<float>(ny - 1u) * s;
-    std::vector<nuka::math::Vec3> rest;
-    rest.reserve(static_cast<size_t>(nx) * ny);
-    for (uint32_t j = 0u; j < ny; ++j) {
-        for (uint32_t i = 0u; i < nx; ++i) {
-            rest.push_back(nuka::math::Vec3{x0 + static_cast<float>(i) * s,
-                                            y0 + static_cast<float>(j) * s,
-                                            p.cloth_origin_z});
-        }
-    }
-    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
-    std::vector<nuka::runtime::soft::ClothTriangle> tris;
-    for (uint32_t j = 0u; j + 1u < ny; ++j) {
-        for (uint32_t i = 0u; i + 1u < nx; ++i) {
-            tris.push_back({{idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u)}});
-            tris.push_back({{idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)}});
-        }
-    }
-    nuka::runtime::soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = p.cloth_bend_alpha;
-    nuka::runtime::soft::XpbdConstraintSet cs;
-    nuka::runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
-
-    in.positions = rest;
-    in.velocities.assign(rest.size(), nuka::math::Vec3::Zero());
-    const float mass = p.cloth_particle_mass > 0.0f ? p.cloth_particle_mass : 0.01f;
-    in.inv_mass.assign(rest.size(), 1.0f / mass);
-    // cloth_free == 0: pin the whole perimeter (a taut membrane). cloth_free == 1:
-    // skip the pin so every particle is dynamic (a free drape).
-    if (p.cloth_free == 0u) {
-        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
-        for (uint32_t k = 0u; k < nx; ++k) {
-            in.inv_mass[idx(k, 0u)] = 0.0f;
-            in.inv_mass[idx(k, last_j)] = 0.0f;
-        }
-        for (uint32_t k = 0u; k < ny; ++k) {
-            in.inv_mass[idx(0u, k)] = 0.0f;
-            in.inv_mass[idx(last_i, k)] = 0.0f;
-        }
-    }
-    for (const auto& dc : cs.distance) {
-        in.distance.push_back(
-            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
-    }
-    for (const auto& bc : cs.bend) {
-        nuka::scene::cook::CookBendCon c;
-        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
-    in.solver_iterations =
-        static_cast<uint16_t>(p.cloth_iters != 0u ? p.cloth_iters : 1u);
-    in.friction = p.cloth_friction;
-    // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
-    // triangles only when active (all-zero coeffs => no op => byte-identical cook).
-    in.aero_drag_normal = p.aero_normal;
-    in.aero_drag_tangent = p.aero_tangent;
-    in.aero_drag_max_dv = p.aero_max_dv;
-    if (p.aero_normal > 0.0f || p.aero_tangent > 0.0f) {
-        in.aero_triangles.reserve(tris.size());
-        for (const auto& t : tris) {
-            in.aero_triangles.push_back({t.v[0], t.v[1], t.v[2]});
-        }
-    }
-    return in;
+// Translate the compact coupled cloth slots into a first-class scene MediaRecord
+// (Cloth, XPBD by default / MLS-MPM when soft_sim_method selects it). The cook's
+// BuildClothXpbdInput reads this record; distance_alpha stays 0 (an inextensible
+// cloth), support fields are XPBD-only. Geometry-only when the extent is absent.
+nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t& p) {
+    nuka::scene::MediaRecord m;
+    m.kind = nuka::scene::MediaRecord::Kind::Cloth;
+    m.method = (p.soft_sim_method == 1u) ? nuka::scene::MediaRecord::Method::MlsMpm
+                                         : nuka::scene::MediaRecord::Method::Xpbd;
+    m.cloth_grid.nx = p.cloth_nx;
+    m.cloth_grid.ny = p.cloth_ny;
+    m.cloth_grid.spacing = p.cloth_spacing;
+    m.cloth_grid.origin = {p.cloth_origin_x, p.cloth_origin_y, p.cloth_origin_z};
+    m.cloth_grid.free = (p.cloth_free != 0u);
+    m.xpbd.particle_mass = p.cloth_particle_mass;
+    m.xpbd.friction = p.cloth_friction;
+    m.xpbd.distance_alpha = 0.0f;  // inextensible cloth (the legacy hardcoded value).
+    m.xpbd.bend_alpha = p.cloth_bend_alpha;
+    m.xpbd.iters = static_cast<uint16_t>(p.cloth_iters);
+    m.xpbd.aero_drag_normal = p.aero_normal;
+    m.xpbd.aero_drag_tangent = p.aero_tangent;
+    m.xpbd.aero_drag_max_dv = p.aero_max_dv;
+    return m;
 }
 
-// The cloth lattice render-surface triangle list (two triangles per quad, the SAME
-// row-major winding BuildClothCookInput meshes the constraints with). Empty when no
-// cloth. Indexes the [0, nx*ny) cloth particles (laid out first in the particle set).
-std::vector<uint32_t> BuildClothSurfaceTriangles(
-    const nuka_coupled_particles_desc_t& p) {
-    std::vector<uint32_t> tris;
-    if (p.cloth_nx < 2u || p.cloth_ny < 2u || p.cloth_spacing <= 0.0f) return tris;
-    const uint32_t nx = p.cloth_nx, ny = p.cloth_ny;
-    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
-    for (uint32_t j = 0u; j + 1u < ny; ++j) {
-        for (uint32_t i = 0u; i + 1u < nx; ++i) {
-            tris.insert(tris.end(), {idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u),
-                                     idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)});
-        }
-    }
-    return tris;
-}
-
-// Build the fluid PBF cook input from the compact coupled descriptor: an AABB box
-// filled on a uniform lattice by the engine's CookFluidBox, with the uniform-grid
-// domain sized to enclose the box + headroom. Empty input when the fluid is absent.
-nuka::scene::cook::PbfCookInput BuildFluidCookInput(
-    const nuka_coupled_particles_desc_t& p) {
-    nuka::scene::cook::PbfCookInput in;
-    if (p.fluid_spacing <= 0.0f || p.fluid_max_x <= p.fluid_min_x ||
-        p.fluid_max_y <= p.fluid_min_y || p.fluid_max_z <= p.fluid_min_z) {
-        return in;  // no fluid.
-    }
-    nuka::import::cooker::FluidBoxSpec spec;
-    spec.min_corner = {p.fluid_min_x, p.fluid_min_y, p.fluid_min_z};
-    spec.max_corner = {p.fluid_max_x, p.fluid_max_y, p.fluid_max_z};
-    spec.spacing = p.fluid_spacing;
-    spec.rest_density = p.fluid_rest_density > 0.0f ? p.fluid_rest_density : 1000.0f;
-    const nuka::runtime::fluid::PbfParticleSet box =
-        nuka::import::cooker::CookFluidBox(spec);
-
-    in.positions = box.positions;
-    in.velocities.assign(box.positions.size(), nuka::math::Vec3::Zero());
-    in.particle_mass = box.particle_mass;
-    in.rest_density = spec.rest_density;
-    const float h = 1.5f * p.fluid_spacing;  // SPH support over the lattice spacing.
-    in.support_radius = h;
-    in.cfm_epsilon = 1.0e-6f;
-    in.iters = static_cast<uint16_t>(p.fluid_iters != 0u ? p.fluid_iters : 4u);
-    in.clamp_overdensity = true;
-    in.boundary_enabled = true;
-    in.floor_z = p.fluid_floor_z;
-    in.friction = p.fluid_friction;
-    // Uniform-grid domain: enclose the box + lateral/vertical headroom so a particle
-    // pushed out of the box still finds neighbours (the grid is rebuilt per step).
-    const nuka::math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
-    in.grid_min = nuka::math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
-                                   std::min(lo.z, p.fluid_floor_z) - h};
-    auto cells = [h](float extent) {
-        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
-    };
-    in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
-    in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
-    in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
-    return in;
+// Translate the compact coupled fluid slots into a MediaRecord (Fluid, PBF by
+// default / MLS-MPM when selected). support_scale 1.5 reproduces the legacy
+// support_radius = 1.5*spacing. Geometry-only when the box extent is absent.
+nuka::scene::MediaRecord FluidMediaFromDesc(const nuka_coupled_particles_desc_t& p) {
+    nuka::scene::MediaRecord m;
+    m.kind = nuka::scene::MediaRecord::Kind::Fluid;
+    m.method = (p.soft_sim_method == 1u) ? nuka::scene::MediaRecord::Method::MlsMpm
+                                         : nuka::scene::MediaRecord::Method::Pbf;
+    m.fluid_box.min = {p.fluid_min_x, p.fluid_min_y, p.fluid_min_z};
+    m.fluid_box.max = {p.fluid_max_x, p.fluid_max_y, p.fluid_max_z};
+    m.fluid_box.spacing = p.fluid_spacing;
+    m.pbf.rest_density = p.fluid_rest_density;
+    m.pbf.support_scale = 1.5f;  // SPH support over the lattice spacing.
+    m.pbf.iters = static_cast<uint16_t>(p.fluid_iters);
+    m.pbf.friction = p.fluid_friction;
+    m.pbf.floor_z = p.fluid_floor_z;
+    m.pbf.clamp_overdensity = true;
+    return m;
 }
 
 // The cooked products a world-create entry assembles before building the live world:
@@ -608,8 +508,8 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             return prep;
         }
 
-        // Build the two media's cook inputs from the compact C descriptor (reusing
-        // the engine's cloth-topology + fluid-box cookers -- NO duplicated cook math).
+        // Translate the compact descriptor's media slots into first-class scene
+        // MediaRecords and append them to the robot scene; the cook reads the list.
         const bool has_cloth = particles->cloth_nx >= 2u &&
                                particles->cloth_ny >= 2u &&
                                particles->cloth_spacing > 0.0f;
@@ -622,50 +522,37 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             // A particle-free world must use nuka_world_create_from_scene.
             return NUKA_RESULT_INVALID_ARG;
         }
-
-        // Per-medium solver selection (FR7). The coupled desc's media are cloth
-        // (XPBD) + fluid (PBF); soft_sim_method == mlsmpm is rejected LOUDLY for
-        // whichever medium is present (cloth stays XPBD, fluid stays PBF), never a
-        // silent fallback. 0 (PB default) cooks byte-identically.
-        const auto sel = particles->soft_sim_method == 1u
-                             ? nuka::nk::Model::ParticleMode::Mpm
-                             : nuka::nk::Model::ParticleMode::Xpbd;
-        nuka::scene::cook::RejectUnsupportedClothFluidMpm(
-            has_cloth ? sel : nuka::nk::Model::ParticleMode::Xpbd,
-            has_fluid ? sel : nuka::nk::Model::ParticleMode::Xpbd);
-
-        nuka::scene::cook::XpbdCookInput cloth =
-            nuka::c_abi::BuildClothCookInput(*particles);
-        nuka::scene::cook::PbfCookInput fluid =
-            nuka::c_abi::BuildFluidCookInput(*particles);
-
-        // Contact diameter = 2*contact_radius, or the smaller present medium's lattice
-        // spacing when 0 (a particle is then half a cell) so a defaults-only world
-        // still couples. Routed through the cook's contact block, NOT poked after, so
-        // the cook widens the union neighbor grid to cover it.
-        float contact_d_min = 2.0f * particles->contact_radius;
-        if (contact_d_min <= 0.0f) {
-            if (has_cloth) contact_d_min = particles->cloth_spacing;
-            if (has_fluid) {
-                contact_d_min =
-                    (contact_d_min > 0.0f)
-                        ? std::min(contact_d_min, particles->fluid_spacing)
-                        : particles->fluid_spacing;
-            }
+        nuka::scene::MediaRecord cloth_media;
+        if (has_cloth) {
+            cloth_media = nuka::c_abi::ClothMediaFromDesc(*particles);
+            prepared.scene.AddMedia(cloth_media);
         }
-        nuka::scene::cook::SoftFluidContactInput contact;
-        contact.contact_d_min = contact_d_min;
+        if (has_fluid) {
+            prepared.scene.AddMedia(nuka::c_abi::FluidMediaFromDesc(*particles));
+        }
 
-        // Cook the media onto the robot Model via the ONE general particle cook (the
-        // [soft|fluid] layout); the disjoint body<->particle slot reserve sits above
-        // the rigid budget the prepare step set.
-        nuka::scene::cook::CookSoftFluidParticles(prepared.model, desc->env_count,
-                                                  cloth, fluid, contact);
+        // Cook the media onto the robot Model via the ONE general media dispatch (the
+        // [soft|fluid] layout, validated against the legal kind x method set: cloth
+        // XPBD + fluid PBF; soft_sim_method == mlsmpm throws LOUDLY here). The disjoint
+        // body<->particle slot reserve sits above the rigid budget the prepare step
+        // set; the contact diameter rides the descriptor radius.
+        nuka::scene::cook::CookSceneMedia(prepared.model, desc->env_count,
+                                          prepared.scene.Media(),
+                                          particles->contact_radius);
 
         // A positive baumgarte_max_velocity bounds the contact recovery push-out; 0
         // leaves the cooked model default (so a zero-init desc is byte-identical).
         if (particles->baumgarte_max_velocity > 0.0f) {
             prepared.model.baumgarte_max_velocity = particles->baumgarte_max_velocity;
+        }
+
+        // The cloth render-surface connectivity, built before the scene moves into the
+        // world record, so a live beauty render rebuilds the deforming surface from the
+        // live particle field -- the SAME lattice the physics cook meshed.
+        std::vector<uint32_t> cloth_surface_triangles;
+        if (has_cloth) {
+            cloth_surface_triangles =
+                nuka::scene::cook::BuildClothSurfaceTriangles(cloth_media);
         }
 
         // Build + insert the live coupled world (the SAME record-assembly path). The
@@ -676,13 +563,9 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             desc->env_count, prepared.control_mode, prepared.gravity, out,
             particles->solver_vel_iters, particles->solver_pos_iters,
             particles->solver_contact_margin, particles->solver_max_pairs);
-        // Retain the cloth render-surface connectivity so a live beauty render
-        // rebuilds the deforming surface from the live particle field (no second
-        // authoring path -- the SAME lattice the physics cook meshed).
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
-                record->particle_surface_triangles =
-                    nuka::c_abi::BuildClothSurfaceTriangles(*particles);
+                record->particle_surface_triangles = std::move(cloth_surface_triangles);
         }
         return result;
     } catch (const std::bad_alloc&) {

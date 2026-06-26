@@ -1080,9 +1080,14 @@ if(CMAKE_CUDA_COMPILER)
         # gather is byte-identical run-to-run; snapshot/restore round-trips F; an
         # out-of-AABB particle flags the env-status escape bit.
         scenario/mpm_transfer_roundtrip.cpp
-        # FR7 per-medium solver selector (host cook): a bulk-soft body cooks XPBD by
-        # default (byte-identical) and MPM when selected; cloth/fluid -> mlsmpm throw.
+        # Per-medium solver selector + the media-list (kind x method) validator (host
+        # cook): a bulk-soft body cooks XPBD by default (byte-identical) and MPM when
+        # selected; cloth -> MLS-MPM and MPM+XPBD/PBF mixes throw LOUDLY.
         scenario/mpm_sim_method_selector.cpp
+        # MediaRecord -> cook-input equivalence (host cook): the cloth/fluid builders
+        # over a translated MediaRecord match the legacy flat-descriptor builders
+        # field-by-field (the byte-identity proof for the cook-orchestrator re-point).
+        scenario/media_record_cook_equivalence.cpp
         # MLS-MPM elastic jelly-ball gate: a fixed-corotated ball drops onto the static
         # floor plane (grid BC), squashes <= ~25%, recovers, no collapse/spike/escape,
         # >= 5 s, finite, two-run byte-identical (the deterministic gather).

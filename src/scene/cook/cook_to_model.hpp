@@ -190,12 +190,13 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
 void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
                            const XpbdCookInput& in, const MpmCookInput& mpm);
 
-// LOUD cook-time rejection of an unsupported medium x sim_method combination
-// (cloth -> MlsMpm and fluid -> MlsMpm are refused; cloth stays XPBD permanently,
-// fluid stays PBF in the first batch). Throws std::runtime_error; a no-op for the
-// default (Xpbd) selector so every existing scene cooks byte-identically.
-void RejectUnsupportedClothFluidMpm(
-    nk::Model::ParticleMode cloth_solver, nk::Model::ParticleMode fluid_solver);
+// LOUD cook-time validation of a media list against the (kind x method) legal set
+// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rule
+// that an MLS-MPM medium may not co-reside with an XPBD/PBF medium and a Model holds
+// at most one PBF fluid slice / one MLS-MPM medium. Throws std::runtime_error on an
+// illegal pair or mix; an empty list and the all-XPBD/PBF legal cases pass (so every
+// existing scene cooks byte-identically). The single call site is CookSceneMedia.
+void ValidateMedia(const std::vector<MediaRecord>& media);
 
 struct PbfCookInput {
     std::vector<math::Vec3> positions;     // CookFluidBox lattice
@@ -251,5 +252,46 @@ struct SoftFluidContactInput {
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
                             const XpbdCookInput& soft, const PbfCookInput& fluid,
                             const SoftFluidContactInput& contact = {});
+
+// ---------------------------------------------------------------------------
+// Media records -> particle cook. The per-medium builders read a scene
+// MediaRecord and reuse the SAME constraint/lattice cookers
+// (soft::BuildClothConstraints / import::cooker::CookFluidBox) -- never
+// reimplemented. The dispatch concatenates XPBD media (cloth) into the soft slice
+// and the one PBF fluid into the fluid slice via CookSoftFluidParticles, so the
+// media list rides the EXISTING [soft | fluid] layout (no new ParticleMode).
+// ---------------------------------------------------------------------------
+
+// Build the XPBD cook input for a cloth MediaRecord: a flat (nx x ny) lattice at the
+// authored origin (perimeter pinned unless free), meshed into triangles whose
+// stretch+bend constraints come from soft::BuildClothConstraints. Empty when the
+// grid extent is absent (nx<2 / ny<2 / spacing<=0).
+XpbdCookInput BuildClothXpbdInput(const MediaRecord& media);
+
+// The cloth lattice render-surface triangle list (two triangles per quad, the SAME
+// row-major winding BuildClothXpbdInput meshes the constraints with). Empty when the
+// grid extent is absent. Indexes the [0, nx*ny) cloth particles (laid out first).
+std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
+
+// Build the PBF cook input for a fluid MediaRecord: an AABB box filled on a uniform
+// lattice by import::cooker::CookFluidBox, the uniform grid sized to enclose the box
+// + headroom. Empty when the box extent is absent.
+PbfCookInput BuildFluidPbfInput(const MediaRecord& media);
+
+// Dispatch a validated media list onto an ALREADY-cooked Model: XPBD media (cloth)
+// concatenate into the soft slice, the one PBF fluid fills the fluid slice, via the
+// SAME CookSoftFluidParticles. particle_contact_radius sets the body<->particle /
+// cross-system contact diameter (2*radius, or the smaller medium spacing when 0). An
+// empty list is a no-op (the Model keeps ParticleMode::None, byte-identical); a
+// tet-soft or MLS-MPM medium throws (only cloth XPBD + fluid PBF are cooked here).
+void CookSceneMedia(nk::Model& model, uint32_t env_count,
+                    const std::vector<MediaRecord>& media,
+                    float particle_contact_radius = 0.0f);
+
+// Orchestrator: the rigid/articulation CookToModel followed by the media-list
+// dispatch over the SAME SceneIR (ONE path). A media-free scene is byte-identical to
+// CookToModel; a scene carrying cloth/fluid media cooks them onto the rigid Model.
+CookToModelResult CookSceneToModel(const SceneIR& scene, int env_count,
+                                   const CookToModelOptions& options);
 
 } // namespace nuka::scene::cook
