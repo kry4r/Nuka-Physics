@@ -37,17 +37,11 @@ namespace {
 
 namespace cook = nuka::scene::cook;
 
-// The deforming particle surface's render skin: a thin outward inflation along the
-// smooth normal + a few Laplacian relax passes so a proud particle reads as a fold,
-// not a spike (the same skin the cloth demo's surface uses).
-constexpr float kSurfaceOffset = 0.004f;
-constexpr uint32_t kSurfaceSmoothIters = 3u;
-constexpr float kSurfaceSmoothLambda = 0.55f;
-
 // Build the world's beauty render bridge: cook the retained scene to recover the
 // EntityId<->row SceneMap, build the shared studio scene (with the world's retained
-// particle-surface topology), and create the offline RT beauty tracer. Returns the
-// result code; on OK `record->beauty` holds the built bridge.
+// per-medium particle-surface topologies + their authored render skins), and create
+// the offline RT beauty tracer. Returns the result code; on OK `record->beauty` holds
+// the built bridge.
 nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t height) {
     if (record->beauty) {
         return NUKA_RESULT_OK;
@@ -56,16 +50,24 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
     // live link/particle state is downloaded for env 0 each render.
     const cook::CookToModelResult cooked = cook::CookToModel(*record->scene, 1);
 
-    nuka::runtime::soft::SurfaceTopology topo;
-    topo.triangles = record->particle_surface_triangles;
-    topo.normal_offset = kSurfaceOffset;
-    topo.smooth_iters = kSurfaceSmoothIters;
-    topo.smooth_lambda = kSurfaceSmoothLambda;
+    // Each cooked medium's render surface (triangles + skin) drives one deforming
+    // instance; the skin params ride the medium's authored MediaRenderSkin.
+    std::vector<nuka::runtime::soft::SurfaceTopology> topologies;
+    topologies.reserve(record->particle_surfaces.size());
+    for (const cook::MediaRenderSurface& s : record->particle_surfaces) {
+        if (s.triangles.empty()) continue;
+        nuka::runtime::soft::SurfaceTopology topo;
+        topo.triangles = s.triangles;
+        topo.normal_offset = s.normal_offset;
+        topo.smooth_iters = s.smooth_iters;
+        topo.smooth_lambda = s.smooth_lambda;
+        topologies.push_back(std::move(topo));
+    }
 
     auto bridge = std::make_unique<BeautyRender>();
     bridge->scene = std::make_unique<nuka::render::StudioScene>(
-        nuka::render::BuildStudioScene(record->scene->Ecs(), cooked.scene_map, topo,
-                                       width, height));
+        nuka::render::BuildStudioScene(record->scene->Ecs(), cooked.scene_map,
+                                       topologies, width, height));
     if (bridge->scene->world.instances.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no renderable visual geometry.
     }
@@ -139,7 +141,7 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         }
         std::vector<nuka::math::Vec3> particle_pos(particle_count,
                                                    nuka::math::Vec3::Zero());
-        if (particle_count > 0u && !studio.surface_topology.triangles.empty() &&
+        if (particle_count > 0u && !studio.surfaces.empty() &&
             record->world->FieldPtr(nuka::nk::FieldId::ParticlePos) != nullptr) {
             data.DownloadField(nuka::nk::FieldId::ParticlePos, particle_pos.data(),
                                static_cast<uint64_t>(particle_count) *

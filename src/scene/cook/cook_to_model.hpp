@@ -17,6 +17,7 @@
 
 #include "math/vec3.hpp"
 #include "nk/model/model.hpp"
+#include "scene/cook/media_render_surface.hpp"
 #include "scene/scene_ir.hpp"
 #include "scene/scene_map.hpp"
 #include "scene/terrain/heightfield.hpp"
@@ -286,6 +287,17 @@ MpmCookInput BuildMpmInput(const MediaRecord& media);
 // row-major winding BuildClothXpbdInput meshes the constraints with). Empty when the
 // grid extent is absent. Indexes the [0, nx*ny) cloth particles (laid out first).
 std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
+
+// The per-medium render surfaces of a media list, base-offset to match
+// CookSceneMedia's [soft|fluid] particle layout: cloth -> the lattice faces
+// (BuildClothSurfaceTriangles), soft-tet -> the tet boundary faces
+// (runtime::soft::ExtractBoundaryTriangles over the SAME sphere rest-lattice the
+// XPBD cook meshes). A fluid (no triangulated surface) and a lone MLS-MPM medium (a
+// dense sample, not the lattice vertices) yield no surface. ONE pass in the SAME
+// medium order CookSceneMedia lays particles out -- the per-medium topology is data,
+// so the live beauty render draws each surface uniformly (no cloth-vs-tet fork).
+std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
+    const std::vector<MediaRecord>& media);
 
 // Build the PBF cook input for a fluid MediaRecord: an AABB box filled on a uniform
 // lattice by import::cooker::CookFluidBox, the uniform grid sized to enclose the box

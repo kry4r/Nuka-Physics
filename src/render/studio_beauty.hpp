@@ -34,31 +34,45 @@ class SceneMap;
 namespace nuka::render {
 
 // The studio render scene: a RenderWorld (robot link instances + a ground floor +
-// one deforming particle-surface instance) plus the per-instance link rebind it is
-// refreshed from and the cinematic RasterOptions both the demo and the bridge draw.
+// one deforming particle-surface instance PER cooked medium) plus the per-instance
+// link rebind it is refreshed from and the cinematic RasterOptions both the demo and
+// the bridge draw. The media is data (which surfaces, which triangles), not a fork.
 struct StudioScene {
+    // One cooked medium's deforming render surface: its triangle topology + render
+    // skin, the stable mesh it is rebuilt into each frame, and its RenderInstance.
+    struct DeformingSurface {
+        runtime::soft::SurfaceTopology topology;     // connectivity + inflation/relax skin.
+        uint32_t    material_id = kNoId;             // the surface's render material.
+        uint32_t    mesh_id = kNoId;                 // the (stable) deforming-surface mesh id.
+        std::size_t instance = ~std::size_t(0);      // its RenderInstance index.
+    };
+
     RenderWorld world;
     RasterOptions options;  // studio lighting/sky/floor; the caller sets camera_* each frame.
-    runtime::soft::SurfaceTopology surface_topology;  // particle-surface connectivity (empty => none).
+    std::vector<DeformingSurface> surfaces;      // one per cooked particle medium (empty => none).
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.
-    uint32_t surface_material_id = kNoId;         // the fabric material for the particle surface.
-    uint32_t surface_mesh_id = kNoId;             // the (stable) deforming-surface mesh id.
-    std::size_t surface_instance = ~std::size_t(0);  // the particle-surface RenderInstance.
 };
 
-// Build the studio scene from a cooked scene's ECS + SceneMap. `surface_topology`
-// is the particle media's triangle connectivity (empty => robot + floor only).
-// `width`/`height` seed options; the caller sets options.camera_* before each render.
+// Build the studio scene from a cooked scene's ECS + SceneMap. `surface_topologies`
+// is each particle medium's triangle connectivity (empty => robot + floor only); each
+// renders as its own deforming instance. `width`/`height` seed options; the caller
+// sets options.camera_* before each render.
+StudioScene BuildStudioScene(const scene::Registry& registry,
+                             const scene::SceneMap& map,
+                             const std::vector<runtime::soft::SurfaceTopology>& surface_topologies,
+                             uint32_t width, uint32_t height);
+
+// Single-surface convenience: wraps one (possibly empty) topology into the list form.
 StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const runtime::soft::SurfaceTopology& surface_topology,
                              uint32_t width, uint32_t height);
 
 // Refresh per-frame: each link-posed instance's world_xform = link_pose[link] o
-// visual_local; the particle surface (when present) is rebuilt from `particle_pos`
-// in place (the stable surface mesh, so the mesh table never grows across frames).
+// visual_local; every particle surface is rebuilt from `particle_pos` in place (the
+// stable per-surface mesh, so the mesh table never grows across frames).
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<math::Transform>& link_pose,
                         const std::vector<math::Vec3>& particle_pos);

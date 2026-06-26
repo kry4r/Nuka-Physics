@@ -308,11 +308,21 @@ nuka_result_t nuka_world_create_from_built_scene(nuka_device_handle device,
             desc, control_mode, cooked.model, &cooked_terrain, &gravity);
         if (terrain != NUKA_RESULT_OK) return terrain;
 
+        // Every cooked medium's render surface (built from the SAME media list before
+        // the scene moves into the record), so a beauty render rebuilds each surface.
+        std::vector<cook::MediaRenderSurface> media_surfaces =
+            cook::BuildSceneMediaRenderSurfaces(built.Media());
+
         // Build + insert the live world through the SAME record-assembly path.
-        return nuka::c_abi::FinishWorldCreate(
+        const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(cooked.model), std::move(built), std::move(cooked_terrain),
             device_record, desc->fixed_dt, desc->env_count, control_mode, gravity,
             out);
+        if (result == NUKA_RESULT_OK) {
+            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
+                record->particle_surfaces = std::move(media_surfaces);
+        }
+        return result;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

@@ -1693,6 +1693,53 @@ std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media) {
     return tris;
 }
 
+std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
+    const std::vector<MediaRecord>& media) {
+    std::vector<MediaRenderSurface> surfaces;
+    if (media.empty()) return surfaces;
+    // A lone MLS-MPM medium is its own ParticleMode (a dense sample, not the lattice
+    // vertices), so no boundary-triangle surface indexes its cooked particle set.
+    if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
+        return surfaces;
+    }
+    // Cloth + soft-tet concatenate into the soft slice in media order; track the
+    // running particle base exactly as AppendSoftMedium does (fluid is skipped).
+    uint32_t base = 0u;
+    for (const MediaRecord& m : media) {
+        std::vector<uint32_t> tris;
+        uint32_t verts = 0u;
+        if (m.kind == MediaRecord::Kind::Cloth) {
+            const MediaRecord::ClothGrid& g = m.cloth_grid;
+            if (g.nx >= 2u && g.ny >= 2u && g.spacing > 0.0f) {
+                tris = BuildClothSurfaceTriangles(m);
+                verts = g.nx * g.ny;
+            }
+        } else if (m.kind == MediaRecord::Kind::SoftTet) {
+            const MediaRecord::TetSphere& ts = m.tet_sphere;
+            if (ts.radius > 0.0f && ts.cells >= 2u && ts.cell_len > 0.0f) {
+                const runtime::soft::TetLattice lat =
+                    runtime::soft::BuildSphereTetLattice(
+                        math::Vec3{0.0f, 0.0f, 0.0f}, ts.radius, ts.cells, ts.cell_len);
+                tris = runtime::soft::ExtractBoundaryTriangles(lat.rest, lat.tets);
+                verts = static_cast<uint32_t>(lat.rest.size());
+            }
+        } else {
+            continue;  // Fluid: no triangulated surface; it does not enter the soft slice.
+        }
+        if (!tris.empty()) {
+            for (uint32_t& t : tris) t += base;
+            MediaRenderSurface s;
+            s.triangles = std::move(tris);
+            s.normal_offset = m.render_skin.normal_offset;
+            s.smooth_iters = m.render_skin.smooth_iters;
+            s.smooth_lambda = m.render_skin.smooth_lambda;
+            surfaces.push_back(std::move(s));
+        }
+        base += verts;
+    }
+    return surfaces;
+}
+
 XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
     XpbdCookInput in;
     const MediaRecord::TetSphere& ts = media.tet_sphere;

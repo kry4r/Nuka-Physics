@@ -149,6 +149,11 @@ nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t&
     m.xpbd.aero_drag_normal = p.aero_normal;
     m.xpbd.aero_drag_tangent = p.aero_tangent;
     m.xpbd.aero_drag_max_dv = p.aero_max_dv;
+    // The studio render skin the live beauty render inflates/relaxes the cloth
+    // surface with. Render-only -- not cooked, so the particle layout is unchanged.
+    m.render_skin.normal_offset = 0.004f;
+    m.render_skin.smooth_iters = 3u;
+    m.render_skin.smooth_lambda = 0.55f;
     return m;
 }
 
@@ -587,14 +592,10 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             prepared.model.baumgarte_max_velocity = particles->baumgarte_max_velocity;
         }
 
-        // The cloth render-surface connectivity, built before the scene moves into the
-        // world record, so a live beauty render rebuilds the deforming surface from the
-        // live particle field -- the SAME lattice the physics cook meshed.
-        std::vector<uint32_t> cloth_surface_triangles;
-        if (has_cloth) {
-            cloth_surface_triangles =
-                nuka::scene::cook::BuildClothSurfaceTriangles(cloth_media);
-        }
+        // Every cooked medium's render surface (built from the SAME media list before
+        // the scene moves into the record), so a beauty render rebuilds each surface.
+        std::vector<nuka::scene::cook::MediaRenderSurface> media_surfaces =
+            nuka::scene::cook::BuildSceneMediaRenderSurfaces(prepared.scene.Media());
 
         // Build + insert the live coupled world (the SAME record-assembly path). The
         // SolverConfig overrides ride the coupled desc; all-zero keeps today's cfg.
@@ -606,7 +607,7 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             particles->solver_contact_margin, particles->solver_max_pairs);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
-                record->particle_surface_triangles = std::move(cloth_surface_triangles);
+                record->particle_surfaces = std::move(media_surfaces);
         }
         return result;
     } catch (const std::bad_alloc&) {
