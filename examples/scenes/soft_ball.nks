@@ -1,0 +1,55 @@
+{
+  "nks_version": 1,
+  "physics_materials": {
+    "jelly": {
+      "static_friction": 0.6,
+      "dynamic_friction": 0.6
+    }
+  },
+  "render_materials": {
+    "jelly": {
+      "base_color": [
+        0.85,
+        0.18,
+        0.20,
+        1.0
+      ],
+      "metallic": 0.0,
+      "roughness": 0.35
+    }
+  },
+  "tree": [],
+  "sensors": [],
+  "exclude_pairs": [],
+  "contact_pairs": [],
+  "media": [
+    {
+      "name": "ball",
+      "kind": "soft_tet",
+      "method": "xpbd",
+      "render_material_id": 0,
+      "tet_sphere": {
+        "center": [
+          0.0,
+          0.0,
+          0.30
+        ],
+        "radius": 0.10,
+        "cells": 12,
+        "cell_len": 0.0166666675
+      },
+      "xpbd": {
+        "particle_mass": 0.005,
+        "friction": 0.6,
+        "distance_alpha": 3.0e-6,
+        "volume_alpha": 6.0e-6,
+        "iters": 44
+      },
+      "render_skin": {
+        "normal_offset": 0.002,
+        "smooth_iters": 6,
+        "smooth_lambda": 0.5
+      }
+    }
+  ]
+}
