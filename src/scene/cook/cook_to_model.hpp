@@ -21,6 +21,7 @@
 #include "scene/scene_map.hpp"
 #include "scene/terrain/heightfield.hpp"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -55,6 +56,11 @@ struct CookToModelOptions {
     // base / free-space scene with nothing to collide. The cooked shape_table /
     // link_geom rows stay sized consistently (just never read). Default true.
     bool enable_contacts = true;
+    // Bake a per-body SDF from that body's VISUAL trimesh and switch its collision
+    // row to kShapeSdfMesh, so particle/MPM/rigid contact rides the true silhouette
+    // (not the inset primitive). A no-op for primitive-only scenes (no visual mesh
+    // to bake). Default false leaves every existing cook byte-identical.
+    bool bake_link_sdf = false;
 };
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options);
@@ -119,6 +125,14 @@ struct XpbdCookInput {
     std::vector<CookBendCon>     bend;
     std::vector<CookVolumeCon>   volume;
     std::vector<CookShapeMatchCluster> shape_match;  // (id 9).
+    // Cloth aerodynamic-drag surface triangles (3 particle indices / triangle).
+    // Empty => no drag (the drag op is inert; the cook stays byte-identical).
+    std::vector<std::array<uint32_t, 3>> aero_triangles;
+    // Lumped anisotropic air-drag coeffs (0.5*rho*Cn, 0.5*rho*Ct) + per-step
+    // impulse clamp. All 0 => drag off. Cn >> Ct seeds flutter on a falling sheet.
+    float    aero_drag_normal  = 0.0f;
+    float    aero_drag_tangent = 0.0f;
+    float    aero_drag_max_dv  = 0.0f;
     uint16_t solver_iterations = 1u;
     // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
     float    friction = 0.6f;

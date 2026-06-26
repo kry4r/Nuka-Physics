@@ -754,6 +754,19 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
                 light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
                 light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
 
+    // Silk/satin sheen: a sun-lit grazing-angle Fresnel lobe (tinted toward the base
+    // hue) for fold luster. Gated off at sheen==0 so non-sheen materials are byte-exact.
+    if (mat.sheen > 0.0f) {
+        const float VoH = fmaxf(0.0f, V.x * H.x + V.y * H.y + V.z * H.z);
+        const float u = 1.0f - VoH;
+        const float u2 = u * u;
+        const float fh = u2 * u2 * u;             // (1 - VoH)^5
+        const float sh = mat.sheen * fh * NoL * vis;
+        direct.x += light_col.x * (0.6f + 0.4f * mat.albedo.x) * sh;
+        direct.y += light_col.y * (0.6f + 0.4f * mat.albedo.y) * sh;
+        direct.z += light_col.z * (0.6f + 0.4f * mat.albedo.z) * sh;
+    }
+
     // AO + one-bounce GI: cosine-weighted hemisphere rays. A ray that escapes the
     // AO radius (or misses) samples the sky dome; a near hit darkens the crease
     // and (for GI) picks up the bounce albedo*shade of the hit surface.

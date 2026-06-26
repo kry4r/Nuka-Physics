@@ -51,6 +51,7 @@ namespace mg = ::nuka::math::gpu;
 using mg::Add;
 using mg::Cross;
 using mg::Dot;
+using mg::Length;
 using mg::Scale;
 using mg::Sub;
 namespace fl = ::nuka::runtime::fluid;
@@ -69,6 +70,69 @@ __device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
                                          uint32_t per_env) {
     const uint32_t local = per_env > 0u ? (i % per_env) : i;
     return local < n_soft;
+}
+
+// =============================================================================
+// Cloth anisotropic AERODYNAMIC DRAG. One thread per surface triangle: build the
+// outward normal n̂ + the triangle's mean velocity v from the current positions,
+// decompose v into normal/tangent, and apply a quadratic-in-speed force
+//   F = -(Cn*|v_n|*v_n + Ct*|v_t|*v_t) * A
+// as a velocity impulse dv = (F/m)*dt scattered (atomicAdd) onto the 3 vertices
+// BEFORE the XPBD predict. The normal-dominant anisotropy (Cn >> Ct) is exactly
+// what breaks the flat-fall symmetry of a released sheet into flutter. The drag
+// op is emitted only when a coefficient is set, so a drag-free world is untouched.
+// =============================================================================
+__global__ void ClothAeroDragKernel(uint32_t tri_count,
+                                     const uint32_t* __restrict__ tri_verts,
+                                     const float* __restrict__ tri_area,
+                                     const math::Vec3* __restrict__ positions,
+                                     math::Vec3* __restrict__ velocities,
+                                     const float* __restrict__ inv_masses,
+                                     float drag_normal, float drag_tangent,
+                                     float max_dv, float dt) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tri_count) {
+        return;
+    }
+    const uint32_t ia = tri_verts[t * 3u + 0u];
+    const uint32_t ib = tri_verts[t * 3u + 1u];
+    const uint32_t ic = tri_verts[t * 3u + 2u];
+    const math::Vec3 pa = positions[ia], pb = positions[ib], pc = positions[ic];
+    const math::Vec3 nrm = Cross(Sub(pb, pa), Sub(pc, pa));  // 2*area*n̂
+    const float nlen = Length(nrm);
+    if (nlen <= 1.0e-12f) {
+        return;  // degenerate sliver: no defined normal.
+    }
+    const math::Vec3 nhat = Scale(nrm, 1.0f / nlen);
+    // Mean velocity of the face (air is still, so v_rel == v).
+    const math::Vec3 v = Scale(Add(Add(velocities[ia], velocities[ib]),
+                                   velocities[ic]), 1.0f / 3.0f);
+    const float vn = Dot(v, nhat);                 // signed normal speed
+    const math::Vec3 v_n = Scale(nhat, vn);
+    const math::Vec3 v_t = Sub(v, v_n);
+    const float vt = Length(v_t);
+    const float area = tri_area[t];
+    // F = -(Cn|v_n|v_n + Ct|v_t|v_t) A, opposing the motion in each component.
+    const math::Vec3 f = Scale(
+        Add(Scale(v_n, -drag_normal * fabsf(vn)),
+            Scale(v_t, -drag_tangent * vt)), area);
+    // Distribute the face force to its 3 vertices (each gets a third), as a
+    // per-vertex velocity impulse dv = (F_third * w) * dt, optionally clamped.
+    const math::Vec3 f_third = Scale(f, 1.0f / 3.0f);
+    const uint32_t idx[3] = {ia, ib, ic};
+    for (uint32_t k = 0; k < 3u; ++k) {
+        const uint32_t p = idx[k];
+        const float w = inv_masses[p];
+        if (w <= 0.0f) continue;  // pinned vertex.
+        math::Vec3 dv = Scale(f_third, w * dt);
+        if (max_dv > 0.0f) {
+            const float m = Length(dv);
+            if (m > max_dv) dv = Scale(dv, max_dv / m);
+        }
+        atomicAdd(&velocities[p].x, dv.x);
+        atomicAdd(&velocities[p].y, dv.y);
+        atomicAdd(&velocities[p].z, dv.z);
+    }
 }
 
 // =============================================================================
@@ -1088,6 +1152,22 @@ __global__ void PpContactApplyKernel(uint32_t union_count,
 // op entry points
 // =============================================================================
 
+Status OpParticleAeroDrag(const ModelView& model, const DataView& data,
+                          const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const AeroDragParams*>(params);
+    if (p == nullptr) return Status::Failed;
+    if (p->tri_count == 0u ||
+        (p->drag_normal == 0.0f && p->drag_tangent == 0.0f)) {
+        return Status::Ok;  // no aero triangles / drag off: inert.
+    }
+    const uint32_t blocks = (p->tri_count + kBlockSize - 1u) / kBlockSize;
+    LaunchCuda(ClothAeroDragKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+               p->tri_count, model.aero_tri_verts, model.aero_tri_area,
+               data.particle_pos, data.particle_vel, data.particle_inv_mass,
+               p->drag_normal, p->drag_tangent, p->max_dv, p->dt);
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+}
+
 Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
                          const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ParticlePredictParams*>(params);
@@ -1415,6 +1495,7 @@ Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& dat
 }  // namespace
 
 void RegisterNkParticleOps() {
+    SetCudaOp(NkOp::ParticleAeroDrag, &OpParticleAeroDrag);
     SetCudaOp(NkOp::ParticlePredict, &OpParticlePredict);
     SetCudaOp(NkOp::XpbdProject, &OpXpbdProject);
     SetCudaOp(NkOp::PbfDensityLambda, &OpPbfDensityLambda);

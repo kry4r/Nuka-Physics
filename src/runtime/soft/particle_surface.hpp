@@ -26,10 +26,15 @@ namespace nuka::runtime::soft {
 // `triangles` is a flat index list (3 vertex indices per triangle) into the
 // particle set; an optional per-vertex outward offset inflates the surface along
 // its smooth normal so a contacting body visibly touches it (the d_min/2 contact
-// convention) rather than intersecting the zero-thickness sheet.
+// convention) rather than intersecting the zero-thickness sheet. `smooth_iters`
+// applies that many Laplacian (uniform-neighbour-average) passes to the rendered
+// positions so a single proud particle relaxes into the cloth instead of becoming
+// a sharp visual spike; `smooth_lambda` is the per-pass blend weight.
 struct SurfaceTopology {
     std::vector<uint32_t> triangles;       // 3 indices per triangle
     float                 normal_offset = 0.0f;  // outward inflation along the smooth normal
+    uint32_t              smooth_iters = 0u;      // Laplacian relaxation passes (render-only)
+    float                 smooth_lambda = 0.5f;   // per-pass blend weight in [0,1]
 };
 
 // Fill `out` with a deformed surface mesh from the live particle positions and

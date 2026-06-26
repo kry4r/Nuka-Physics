@@ -758,11 +758,27 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // shape_table: one row per body, from its FIRST shape's primitive + the
         // contype/conaffinity (from the cooked filter groups when present).
         model.shape_table_rows.assign(cap.bodies_per_env, {});
-        std::vector<uint8_t> body_done(cap.bodies_per_env, 0u);
-        for (uint32_t s = 0; s < model.shapes.size(); ++s) {
+        // Per body, pick its first COLLIDING shape (contype/conaffinity != 0);
+        // a visual-only body falls back to its first shape. Keeps a real collision
+        // primitive as the body row instead of a non-colliding visual mesh.
+        auto shape_collides = [&](uint32_t i) {
+            const uint32_t ct = i < blob.contact_params.contypes.size()
+                                   ? blob.contact_params.contypes[i] : 1u;
+            const uint32_t ca = i < blob.contact_params.conaffinities.size()
+                                   ? blob.contact_params.conaffinities[i] : 1u;
+            return (ct != 0u) || (ca != 0u);
+        };
+        std::vector<uint32_t> body_shape(cap.bodies_per_env, ~0u);
+        for (uint32_t i = 0; i < model.shapes.size(); ++i) {
+            const uint32_t b = model.shapes[i].body_row;
+            if (b >= cap.bodies_per_env) continue;
+            if (body_shape[b] == ~uint32_t(0)) body_shape[b] = i;
+            else if (shape_collides(i) && !shape_collides(body_shape[b])) body_shape[b] = i;
+        }
+        for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
+            const uint32_t s = body_shape[b];
+            if (s == ~uint32_t(0)) continue;
             const nk::ModelShape& sh = model.shapes[s];
-            if (sh.body_row >= cap.bodies_per_env || body_done[sh.body_row]) continue;
-            body_done[sh.body_row] = 1u;
             nk::Model::PairDrivenShape& row = model.shape_table_rows[sh.body_row];
             row.kind = sh.kind;
             // params: sphere r / capsule r,hh / box he.xyz, by kind.
@@ -873,6 +889,38 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                         sdf.piece_sdf_indices[cgi];
                 }
             }
+
+            // Per-body VISUAL-mesh SDF: a primitive-authored body with a baked
+            // silhouette SDF gets its collision row switched to kShapeSdfMesh +
+            // sdf_grid bound, so rigid tier-select AND the particle switch route to
+            // the SDF. params[0] becomes the grid's bound radius (max |corner| in
+            // the body frame) so the broadphase AABB covers the true silhouette,
+            // not the inset primitive (else cloth within the SDF gets culled).
+            for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
+                if (b >= sdf.body_sdf_indices.size()) break;
+                const uint32_t gi = sdf.body_sdf_indices[b];
+                if (gi == kNoSdf || b >= model.shape_table_rows.size()) continue;
+                nk::Model::PairDrivenShape& row = model.shape_table_rows[b];
+                row.sdf_grid = gi;
+                row.kind = static_cast<uint8_t>(
+                    ::nuka::collision::kShapeSdfMesh);
+                const nk::Model::SdfGrid& g = model.sdf_grids[gi];
+                float max_sq = 0.0f;
+                const float ex = static_cast<float>(g.dims[0]) * g.voxel_size;
+                const float ey = static_cast<float>(g.dims[1]) * g.voxel_size;
+                const float ez = static_cast<float>(g.dims[2]) * g.voxel_size;
+                for (int corner = 0; corner < 8; ++corner) {
+                    const math::Vec3 c{
+                        g.origin.x + ((corner & 1) ? ex : 0.0f),
+                        g.origin.y + ((corner & 2) ? ey : 0.0f),
+                        g.origin.z + ((corner & 4) ? ez : 0.0f)};
+                    max_sq = std::max(max_sq, c.LengthSq());
+                }
+                row.params[0] = std::sqrt(max_sq);
+                // Populate the orphaned ModelShape.sdf_index for this body's rows.
+                for (nk::ModelShape& msh : model.shapes)
+                    if (msh.body_row == b) msh.sdf_index = gi;
+            }
         }
         cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
         cap.max_sdf_grids   = static_cast<uint32_t>(model.sdf_grids.size());
@@ -979,6 +1027,9 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
     CookSceneOptions cook_options;
     cook_options.bake_sdf = false;
     cook_options.general_single_hull = true;
+    // Per-body visual-mesh SDF (tight silhouette contact); a no-op for primitive-
+    // only scenes (no visual trimesh to bake), so it leaves their cook unchanged.
+    cook_options.bake_link_sdf = options.bake_link_sdf;
     CookToModelResult result =
         CookToModelImpl(scene, env_count, cook_options, options.enable_contacts);
     nk::Model& model = result.model;
@@ -1205,6 +1256,30 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
         }
     }
 
+    // Cloth AERODYNAMIC-DRAG surface triangles: store the 3 indices + the cooked
+    // rest area (||(b-a)x(c-a)||/2 from the rest positions). The coeffs default 0
+    // (drag off); only a caller that opts in makes the drag op live.
+    mp.aero_tri_verts.clear();
+    mp.aero_tri_area.clear();
+    const uint32_t an = static_cast<uint32_t>(in.aero_triangles.size());
+    mp.aero_tri_verts.reserve(static_cast<size_t>(an) * 3u);
+    mp.aero_tri_area.reserve(an);
+    for (uint32_t t = 0; t < an; ++t) {
+        const std::array<uint32_t, 3>& tri = in.aero_triangles[t];
+        for (uint32_t j = 0; j < 3u; ++j) mp.aero_tri_verts.push_back(tri[j]);
+        float area = 0.0f;
+        if (tri[0] < in.positions.size() && tri[1] < in.positions.size() &&
+            tri[2] < in.positions.size()) {
+            const math::Vec3 e1 = in.positions[tri[1]] - in.positions[tri[0]];
+            const math::Vec3 e2 = in.positions[tri[2]] - in.positions[tri[0]];
+            area = 0.5f * e1.Cross(e2).Length();
+        }
+        mp.aero_tri_area.push_back(area);
+    }
+    mp.aero_drag_normal  = in.aero_drag_normal;
+    mp.aero_drag_tangent = in.aero_drag_tangent;
+    mp.aero_drag_max_dv  = in.aero_drag_max_dv;
+
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     cap.dist_cons_per_env = dn;
@@ -1213,6 +1288,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     cap.shape_match_slots_per_env   = scn;
     cap.shape_match_members_per_env =
         static_cast<uint32_t>(mp.sm_particles.size());
+    cap.aero_tris_per_env = an;
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
     GrowContactBudgetForParticles(cap, rigid_base);

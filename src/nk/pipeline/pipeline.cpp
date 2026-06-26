@@ -209,6 +209,20 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     coupling_ctx.has_mpm = has_mpm ? 1u : 0u;
 
     if (has_particles) {
+        // Cloth anisotropic air drag runs BEFORE the predict so the drag-modified
+        // velocity feeds the position integration. Inert (op early-exits) unless a
+        // coefficient is set, so a drag-free world's op list is byte-identical.
+        const uint32_t aero_tri_count = cap.aero_tris_per_env * env_count;
+        if (aero_tri_count > 0u &&
+            (mp.aero_drag_normal != 0.0f || mp.aero_drag_tangent != 0.0f)) {
+            p_aero_drag_.dt = cfg.dt;
+            p_aero_drag_.drag_normal = mp.aero_drag_normal;
+            p_aero_drag_.drag_tangent = mp.aero_drag_tangent;
+            p_aero_drag_.max_dv = mp.aero_drag_max_dv;
+            p_aero_drag_.tri_count = aero_tri_count;
+            add(phi::NkOp::ParticleAeroDrag, &p_aero_drag_);
+        }
+
         p_part_predict_.dt = cfg.dt;
         p_part_predict_.gravity[0] = cfg.gravity[0];
         p_part_predict_.gravity[1] = cfg.gravity[1];
@@ -448,6 +462,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.n_soft_particles = friction_n_soft;
         p_assemble_.particle_soft_friction = mp.soft_friction;
         p_assemble_.particle_fluid_friction = mp.fluid_friction;
+        p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         add(phi::NkOp::AssembleRows, &p_assemble_);
     }
 

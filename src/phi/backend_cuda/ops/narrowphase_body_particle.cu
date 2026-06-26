@@ -47,7 +47,9 @@
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"  // PrimShapeDev / LoadPrimShape / PrimRotate
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/sdf_types.cuh"  // SdfRotate / SdfInverseTransformPoint
 #include "phi/op_schema.hpp"
+#include "runtime/sdf/sparse_sdf_query.cuh"     // sparse_sdf_sample (shared D1 query)
 
 namespace nuka::phi {
 
@@ -68,7 +70,30 @@ constexpr uint32_t kKindCapsule     = ::nuka::collision::kShapeCapsule;
 constexpr uint32_t kKindBox         = ::nuka::collision::kShapeBox;
 constexpr uint32_t kKindPlane       = ::nuka::collision::kShapePlane;
 constexpr uint32_t kKindConvexHull  = ::nuka::collision::kShapeConvexHull;
+constexpr uint32_t kKindSdfMesh     = ::nuka::collision::kShapeSdfMesh;
 constexpr uint32_t kKindHeightfield = ::nuka::collision::kShapeHeightfield;
+namespace sdfq = ::nuka::runtime::sdf;
+
+// Load one SDF grid view from the Model sdf_* device tables (mirrors
+// narrowphase_sdf.cu LoadSdfGrid + mpm.cu LoadGrid: kSdfHeaderStride f32 header +
+// flat cell arrays). cell_* point into the shared concatenated buffers.
+__device__ __forceinline__ sdfq::SparseSdfDevice LoadParticleSdfGrid(
+    const float* headers, const uint32_t* counts, const uint64_t* keys,
+    const float* values, const Vec3* grads, uint32_t grid) {
+    const float* h = headers + static_cast<size_t>(grid) * kSdfHeaderStride;
+    sdfq::SparseSdfDevice s;
+    s.origin = {h[0], h[1], h[2]};
+    s.voxel_size = h[3];
+    s.dims[0] = __float_as_uint(h[4]);
+    s.dims[1] = __float_as_uint(h[5]);
+    s.dims[2] = __float_as_uint(h[6]);
+    const uint32_t off = __float_as_uint(h[7]);
+    s.cell_keys = keys + off;
+    s.cell_values = values + off;
+    s.cell_gradients = grads + off;
+    s.cell_count = counts[grid];
+    return s;
+}
 
 // Per-particle candidate cap — the cross_system_query memory bound (the LOWEST
 // collidable indices; a deterministic subset). A particle over the cap surfaces
@@ -349,6 +374,11 @@ __global__ void NarrowphaseBodyParticleKernel(
     const Vec3* __restrict__ body_aabb_lo,
     const Vec3* __restrict__ body_aabb_hi,
     const float* __restrict__ heights,
+    const float* __restrict__ sdf_headers,
+    const uint32_t* __restrict__ sdf_cell_count,
+    const uint64_t* __restrict__ sdf_keys,
+    const float* __restrict__ sdf_values,
+    const Vec3* __restrict__ sdf_grads,
     NarrowphaseBodyParticleParams pp,
     uint32_t* __restrict__ ucount,
     Vec3* __restrict__ upoint,
@@ -484,7 +514,46 @@ __global__ void NarrowphaseBodyParticleKernel(
                     }
                 }
                 break;
-            default: break;  // SdfMesh / unknown: no analytic particle handler.
+            case kKindSdfMesh:
+                // The particle (sphere) vs the body's cooked silhouette SDF: one
+                // query of the SAME sparse_sdf_sample the rigid SDF narrowphase +
+                // the MPM grid BC call (one query, three callers). Point-vs-grid, so
+                // LANE 0 only (no wide hull to split). phi = signed distance at the
+                // particle center in the body's local frame; penetrating iff phi <
+                // radius (+ margin band). The normal is the OUTWARD SDF gradient
+                // (separation dir for the particle); depth = radius - phi.
+                if (lane == 0u && sdf_headers != nullptr) {
+                    const uint32_t grid = sb.sdf_grid;
+                    if (grid != ~0u) {
+                        const sdfq::SparseSdfDevice sg = LoadParticleSdfGrid(
+                            sdf_headers, sdf_cell_count, sdf_keys, sdf_values,
+                            sdf_grads, grid);
+                        const Vec3 q =
+                            ::nuka::phi::nkops::SdfInverseTransformPoint(xb, center);
+                        Vec3 grad{0, 0, 0};
+                        const float phi = sdfq::sparse_sdf_sample(sg, q, grad);
+                        if (phi < sdfq::SparseSdfDevice::kOutsideBand &&
+                            phi < radius + pp.contact_margin) {
+                            const Vec3 gw =
+                                ::nuka::phi::nkops::SdfRotate(xb.rotation, grad);
+                            const float gl = sqrtf(gw.x * gw.x + gw.y * gw.y +
+                                                   gw.z * gw.z);
+                            const Vec3 n = (gl > 1.0e-12f)
+                                ? Vec3{gw.x / gl, gw.y / gl, gw.z / gl}
+                                : Vec3{0.0f, 0.0f, 1.0f};
+                            ::nuka::constraint::ContactPoint pt;
+                            pt.position = Vec3{center.x - n.x * radius,
+                                               center.y - n.y * radius,
+                                               center.z - n.z * radius};
+                            pt.normal = n;             // sep dir for the particle.
+                            pt.penetration = radius - phi;
+                            pt.stable_key = 0ull;
+                            m.AddPoint(pt);
+                        }
+                    }
+                }
+                break;
+            default: break;  // unknown kind: no analytic particle handler.
         }
         // Manifold store + bookkeeping: LANE 0 ONLY (m on the other lanes is unused).
         // The whole warp keeps iterating every candidate to `ncand` so the hull
@@ -558,7 +627,12 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
                    static_cast<const Vec3*>(data.body_aabb_lo),
                    static_cast<const Vec3*>(data.body_aabb_hi),
-                   static_cast<const float*>(model.heights), *p,
+                   static_cast<const float*>(model.heights),
+                   static_cast<const float*>(model.sdf_headers),
+                   static_cast<const uint32_t*>(model.sdf_cell_count),
+                   static_cast<const uint64_t*>(model.sdf_cell_keys),
+                   static_cast<const float*>(model.sdf_cell_values),
+                   static_cast<const Vec3*>(model.sdf_cell_gradients), *p,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                    data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                    data.ucontact_a_kind, data.ucontact_b_kind, data.ucontact_gen,

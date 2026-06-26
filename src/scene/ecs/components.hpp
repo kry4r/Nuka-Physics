@@ -62,6 +62,10 @@ struct RenderMaterial {
     float emissive[3]{0.0f, 0.0f, 0.0f};
     float opacity = 1.0f;
 
+    // Grazing-angle retroreflective sheen weight (silk/satin luster), consumed only
+    // by the offline beauty path. 0 (default) is a strict no-op opaque surface.
+    float sheen = 0.0f;
+
     // Refractive dielectric (water/glass) consumed only by the offline beauty
     // path; transmission==0 (default) is a strict no-op opaque surface.
     float transmission = 0.0f;       // 0 = opaque; 1 = fully transmissive

@@ -28,7 +28,9 @@ enum class FieldPer : uint8_t {
     Articulation, ArticulationDof2,
     // Per-articulation flat-DOF tile (= articulations_per_env * max_dof);
     // the general-contact per-artic qdot_flat tile (S3). APPENDED LAST.
-    ArticulationDof
+    ArticulationDof,
+    // Per cloth aerodynamic-drag element (= aero_tris_per_env). APPENDED LAST.
+    AeroTri
 };
 
 struct FieldLayout {
@@ -181,6 +183,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_particles
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 3, 12, 0},  // sm_rest_q
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_mass
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 3, 1, 12, 0},  // aero_tri_verts
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 1, 1, 4, 0},  // aero_tri_area
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_predicted_pos
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_position_delta
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_density

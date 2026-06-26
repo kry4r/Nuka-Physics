@@ -27,6 +27,13 @@ struct CookSceneOptions {
     // still opt INTO V-HACD via Force. Auto/Skip both collapse to one hull when
     // this is set. Leaves the per-shape decompose_mode UNCHANGED when false.
     bool general_single_hull = false;
+    // Bake a narrow-band SDF per body FROM that body's VISUAL trimesh and bind it
+    // to that body's collision row, so particle/MPM/rigid contact rides the true
+    // silhouette instead of the inset collision primitive. Keys off a data property
+    // (a colliding body with a sibling visual trimesh) — no scene-name branch. A
+    // body with no visual trimesh bakes nothing, so this is a no-op for primitive-
+    // only scenes. Default false leaves every existing cook byte-identical.
+    bool bake_link_sdf = false;
 };
 
 /// Flatten the scene intermediate representation into struct-of-arrays

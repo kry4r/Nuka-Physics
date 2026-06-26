@@ -54,6 +54,7 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         // == 1 this equals dofs_per_env == PerEnvCount(Dof) EXACTLY (same element
         // count + ordering => the K==1 byte-identity invariant for qdot_flat).
         case FieldPer::ArticulationDof:  return articulations_per_env * dofs_per_env;
+        case FieldPer::AeroTri:          return aero_tris_per_env;
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
     return 0u;
@@ -655,6 +656,29 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, particles.sm_mass,
                          capacities.shape_match_members_per_env, E, sizeof(float));
             break;
+        // Cloth aero-drag templates (owner:model). The single-env triangle list is
+        // replicated env-major; each triangle's 3 particle indices are shifted by
+        // e*particles_per_env (the device particle arrays are env-major).
+        case FieldId::AeroTriVerts: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t tn = capacities.aero_tris_per_env;
+            const uint32_t pn = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t c = 0; c < tn; ++c) {
+                    for (uint32_t j = 0; j < 3u; ++j) {
+                        const size_t si = static_cast<size_t>(c) * 3u + j;
+                        if (si >= particles.aero_tri_verts.size()) continue;
+                        p[(static_cast<size_t>(e) * tn + c) * 3u + j] =
+                            particles.aero_tri_verts[si] + e * pn;
+                    }
+                }
+            }
+            break;
+        }
+        case FieldId::AeroTriArea:
+            StampPerLink(dst, particles.aero_tri_area,
+                         capacities.aero_tris_per_env, E, sizeof(float));
+            break;
         case FieldId::LinkGeomKind:
             // WP5/WP6: per-link collision primitive kind. Empty for non-dog-dog
             // cooks -> StampPerLink leaves the section zero (inactive sentinel),
@@ -778,6 +802,8 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::SmParticles:           v.sm_particles = static_cast<uint32_t*>(p); break;
         case FieldId::SmRestQ:               v.sm_rest_q = static_cast<math::Vec3*>(p); break;
         case FieldId::SmMass:                v.sm_mass = static_cast<float*>(p); break;
+        case FieldId::AeroTriVerts:          v.aero_tri_verts = static_cast<uint32_t*>(p); break;
+        case FieldId::AeroTriArea:           v.aero_tri_area = static_cast<float*>(p); break;
         case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::BendColorSegments:     v.bend_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;

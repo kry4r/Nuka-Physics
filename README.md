@@ -18,6 +18,12 @@
 </td>
 </tr>
 <tr>
+<td colspan="2" align="center">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="A square cloth drops from the air and drapes over a standing Go2 quadruped"></a>
+  <br><sub>A free square cloth flutters down through the air and <b>drapes over a standing Go2</b> — conforming to trunk, legs and feet through the <b>same general body↔particle solver</b> a foot uses on the ground, two-way, no clip-through. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">▶ full 1080p video</a></sub>
+</td>
+</tr>
+<tr>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="A rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
   <br><sub>A rigid Stanford bunny plunges into a <b>two-way MLS-MPM water pool</b> — crown splash, central jet, radiating ripples, then sinks. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">▶ full 1080p video</a></sub>
@@ -86,7 +92,7 @@ The north star is **one general solver that couples rigid, soft, fluid, and arti
 - ✅ **Rigid + multibody, unified.** One general PGS path resolves rigid + articulation + static sides in a single kernel (MJX-parity). This pillar is *done*.
 - ✅ **Soft (XPBD cloth + 3D tet), fluid (PBF), and an MLS-MPM continuum lane step and co-reside** in one `nk::World` (shared step, density-scope isolation).
 - ✅ **Rigid/articulation ↔ soft / fluid / cloth is two-way through the one solver.** The general row assembly emits rigid↔particle coupling rows, so a foot pushes cloth, splashes fluid, and dents a tet *through the solver*. MLS-MPM couples as a first-class peer: a `CouplingProvider` funnels both contact-rows and grid-transfer into one body-side reaction sink, deterministically.
-- 🟡 **Coupled demo videos:** soft-ball slam ✅ and bunny-in-water ✅ shipped (above); cloth-onto-Go2 and Go2-on-sand in progress. **MLS-MPM granular (sand)** is the next constitutive model.
+- 🟡 **Coupled demo videos:** soft-ball slam ✅, bunny-in-water ✅, and cloth-onto-Go2 ✅ shipped (above); Go2-on-sand in progress. **MLS-MPM granular (sand)** is the next constitutive model.
 - ❌ **Differentiability does not extend through contact / coupling** yet.
 
 **Remaining gap:** add the MLS-MPM granular (Drucker–Prager) model for sand, land the polished coupled demo videos, then extend the adjoint through contact. The rigid + multibody + coupling spine is in; soft, fluid, and MPM all couple to it through the one path.

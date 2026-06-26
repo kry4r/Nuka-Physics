@@ -75,6 +75,8 @@ struct ModelView {
     uint32_t* sm_particles = nullptr;  // per:shape_match_member arena:persistent owner:model
     ::nuka::math::Vec3* sm_rest_q = nullptr;  // per:shape_match_member arena:persistent owner:model
     float* sm_mass = nullptr;  // per:shape_match_member arena:persistent owner:model
+    uint32_t* aero_tri_verts = nullptr;  // per:aero_tri arena:persistent owner:model elem:3
+    float* aero_tri_area = nullptr;  // per:aero_tri arena:persistent owner:model
     uint32_t* link_geom_kind = nullptr;  // per:link arena:persistent owner:model
     float* link_geom_params = nullptr;  // per:link arena:persistent owner:model elem:4
     ::nuka::math::Transform* link_geom_local = nullptr;  // per:link arena:persistent owner:model

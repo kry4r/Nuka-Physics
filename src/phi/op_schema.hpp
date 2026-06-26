@@ -96,6 +96,7 @@ enum class NkOp : uint16_t {
     SolveRowsBlockIsland,  // block-island PGS/row solve
 
     // --- particle (XPBD / PBF) substep ----------------------------------
+    ParticleAeroDrag,      // cloth anisotropic air-drag velocity impulse (pre-predict)
     ParticlePredict,       // predict x* = x + v*dt + g
     XpbdProject,           // XPBD constraint projection sweep
     PbfDensityLambda,      // PBF density constraint lambda
@@ -546,6 +547,9 @@ struct AssembleRowsParams {
     uint32_t n_soft_particles;       // per-env soft/fluid split (0 => no soft slice).
     float    particle_soft_friction; // soft/cloth mu (finite: a foot grips/drags).
     float    particle_fluid_friction;// fluid mu (~0: a foot slides tangentially).
+    // Cap on the contact normal aref so a deep contact recovers over several steps,
+    // not in one fling. +inf default == non-binding (byte-identical). Model property.
+    float    baumgarte_max_velocity;
 };
 
 // Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
@@ -632,6 +636,21 @@ inline constexpr uint32_t kParticleModeMpm = 5u;
 inline constexpr uint32_t kCoupledInternalNone = 0u;
 inline constexpr uint32_t kCoupledInternalXpbd = 1u;
 inline constexpr uint32_t kCoupledInternalPbf  = 2u;
+
+// Cloth anisotropic AERODYNAMIC DRAG (pre-predict velocity impulse). One thread
+// per surface triangle forms the outward normal + mean velocity from the current
+// positions and applies F = -(Cn*|v_n|*v_n + Ct*|v_t|*v_t)*A as dv = (F/m)*dt to
+// the 3 vertices (atomic scatter; a vertex is shared by several triangles). The
+// normal-dominant anisotropy (drag_normal >> drag_tangent) destabilizes a flat
+// falling sheet into flutter. Emitted ONLY when tri_count>0 and a coeff is set
+// (a drag-free world never emits it -> byte-identical).
+struct AeroDragParams {
+    float    dt;
+    float    drag_normal;      // lumped 0.5*rho*Cn (normal-dominant)
+    float    drag_tangent;     // lumped 0.5*rho*Ct
+    float    max_dv;           // per-step impulse clamp (0 == uncapped)
+    uint32_t tri_count;        // total env-major aero triangles (0 == inert)
+};
 
 struct ParticlePredictParams {
     float    dt;

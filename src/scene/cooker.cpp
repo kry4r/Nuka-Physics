@@ -11,7 +11,9 @@
 #include "scene/asset/asset_cache.hpp"       // M2c: content-addressed cook cache
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -151,6 +153,94 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
     if (unique_out) *unique_out = table.Count();
     if (total_out)  *total_out = total;
     if (bytes_out)  *bytes_out = bytes;
+}
+
+// Bake a narrow-band SDF per body FROM that body's VISUAL trimesh and bind it to
+// that body's collision row, so particle/MPM/rigid contact rides the true
+// silhouette (kills clip-through + gives a rounded grippable surface) instead of
+// the inset collision primitive. Keys off a DATA property — a colliding body
+// whose sibling visual shape carries triangles — never a scene name. The visual
+// triangles are expressed in the body's COLLISION-primitive frame (the frame the
+// runtime poses the body row in: link_pose o link_geom_local) so the cooked grid
+// samples correctly under FK. Reuses the shared SDF bake backend + content-hash
+// cache (deterministic, dedup'd against the convex-piece SDFs).
+void CookLinkVisualSdfs(const SceneIR& scene, CookedBlob& blob) {
+    blob.sdfs.body_sdf_indices.assign(blob.body_count, kNoSdf);
+    const auto& shapes = scene.Shapes();
+
+    // Per body: the FIRST colliding shape (its local frame anchors the bake). A body
+    // may carry SEVERAL visual geoms (the Go2 trunk has 5 shell pieces); merge them
+    // ALL so the SDF hugs the WHOLE silhouette, not one detail piece.
+    auto collides = [](const CollisionShapeRecord& s) {
+        return s.contype != 0u || s.conaffinity != 0u;
+    };
+    std::vector<uint32_t> body_collide_shape(blob.body_count, ~0u);
+    for (uint32_t i = 0; i < shapes.size(); ++i) {
+        const CollisionShapeRecord& s = shapes[i];
+        if (s.body_id >= blob.body_count) continue;
+        if (collides(s) && body_collide_shape[s.body_id] == ~uint32_t(0))
+            body_collide_shape[s.body_id] = i;
+    }
+
+    // Solid fill (scoped here) so a deep interior point has a signed value+gradient
+    // and a penetrating particle recovers instead of sinking through the unbanded core.
+    import::cooker::SparseSdfParams params;
+    params.voxel_size = 0.004f;
+    params.band_voxels = 12u;
+    params.solid = true;
+    const import::cooker::SdfBakeBackend& backend =
+        import::cooker::DefaultSdfBakeBackend();
+    AssetCache asset_cache(kDecomposeCacheDir);
+    std::unordered_map<std::string, uint32_t> by_hash;  // hash -> sdf index
+
+    for (uint32_t b = 0; b < blob.body_count; ++b) {
+        const uint32_t cs = body_collide_shape[b];
+        if (cs == ~uint32_t(0)) continue;
+        // Express every visual geom on this body in the collision primitive's local
+        // frame (the frame the runtime poses the body row in) and concatenate. The
+        // index buffer is rebased per geom into the merged vertex pool.
+        const math::Transform to_collision = shapes[cs].local_transform.Inverse();
+        std::vector<float> verts;
+        std::vector<uint32_t> idx;
+        for (uint32_t i = 0; i < shapes.size(); ++i) {
+            const CollisionShapeRecord& vis = shapes[i];
+            if (vis.body_id != b || collides(vis)) continue;
+            if (vis.mesh_vertices.empty() || vis.mesh_indices.empty()) continue;
+            const math::Transform xform = to_collision * vis.local_transform;
+            const uint32_t base = static_cast<uint32_t>(verts.size() / 3u);
+            const uint32_t vn = static_cast<uint32_t>(vis.mesh_vertices.size() / 3u);
+            for (uint32_t v = 0; v < vn; ++v) {
+                const math::Vec3 p = xform.TransformPoint(
+                    {vis.mesh_vertices[v * 3u], vis.mesh_vertices[v * 3u + 1u],
+                     vis.mesh_vertices[v * 3u + 2u]});
+                verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+            }
+            for (uint32_t e : vis.mesh_indices) idx.push_back(base + e);
+        }
+        const uint32_t vcount = static_cast<uint32_t>(verts.size() / 3u);
+        const uint32_t tcount = static_cast<uint32_t>(idx.size() / 3u);
+        if (vcount == 0u || tcount == 0u) continue;
+
+        const std::string key =
+            backend.CacheKey(verts.data(), vcount, idx.data(), tcount, params);
+        const auto it = by_hash.find(key);
+        if (it != by_hash.end()) { blob.sdfs.body_sdf_indices[b] = it->second; continue; }
+        const bool diag = std::getenv("NK_SDF_COOK_DIAG") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto sdf = asset_cache.GetOrCookSdf(
+            verts.data(), vcount, idx.data(), tcount, params,
+            [&] { return backend.Bake(verts.data(), vcount, idx.data(), tcount, params); });
+        if (diag) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[sdf_cook] body %u verts=%u tris=%u cells=%u %.0f ms\n",
+                         b, vcount, tcount, sdf.CellCount(), ms);
+        }
+        if (sdf.CellCount() == 0u) continue;  // degenerate; leave kNoSdf.
+        const uint32_t sdf_idx = AppendSdf(blob.sdfs, sdf);
+        by_hash.emplace(key, sdf_idx);
+        blob.sdfs.body_sdf_indices[b] = sdf_idx;
+    }
 }
 
 // Resolve the cooked per-shape friction μ from the per-shape override and the
@@ -475,6 +565,12 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
                          "consider coarser voxel_size or more aggressive sharing.\n",
                          static_cast<unsigned long long>(bytes), unique, total);
         }
+    }
+
+    // Per-body visual-mesh SDF (the tight silhouette for particle/MPM/rigid
+    // contact). A no-op for primitive-only scenes (no visual trimesh to bake).
+    if (options.bake_link_sdf) {
+        CookLinkVisualSdfs(scene, blob);
     }
 
     const auto& sensors = scene.Sensors();

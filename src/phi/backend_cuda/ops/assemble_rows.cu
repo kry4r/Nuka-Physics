@@ -506,7 +506,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float particle_soft_friction, float particle_fluid_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
-    float dt,
+    float dt, float baumgarte_max_velocity,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
@@ -631,7 +631,9 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.group_first = base;
                 row.group_normal_count = kPdPtsPerSlot;
                 row.env = env;
-                row.rhs = compliant.aref_bias;
+                // Cap aref so the target separating velocity aref*dt <=
+                // baumgarte_max_velocity (+inf default => byte-identical): bounded recovery.
+                row.rhs = fminf(compliant.aref_bias, baumgarte_max_velocity / dt);
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
@@ -829,7 +831,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->particle_soft_friction, p->particle_fluid_friction,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
-                   p->dt, p->env_count, p->union_slot_count, p->rows_per_env,
+                   p->dt, p->baumgarte_max_velocity,
+                   p->env_count, p->union_slot_count, p->rows_per_env,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,

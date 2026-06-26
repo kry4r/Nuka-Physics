@@ -102,6 +102,12 @@ struct CookedSdfTable {
     // pieces). kNoSdf if no SDF for that piece.
     std::vector<uint32_t>   piece_sdf_indices;
 
+    // Per-body SDF index baked from that body's VISUAL mesh (length == body_count
+    // when populated). kNoSdf for a body with no visual-mesh SDF. The grid hugs the
+    // body's true silhouette so particle/MPM/rigid contact rides it, not the inset
+    // collision primitive. Shares this same flat cell storage as the piece SDFs.
+    std::vector<uint32_t>   body_sdf_indices;
+
     uint32_t Count() const { return static_cast<uint32_t>(voxel_sizes.size()); }
 };
 
