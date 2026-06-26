@@ -53,12 +53,14 @@ class SimOptions:
     0 == flat). ``gravity`` (m/s^2) is the world acceleration; all-zero is the
     engine default (standard Earth).
 
-    The ``contact_radius`` (m) particle sphere radius and the ``solver_*`` +
-    ``baumgarte_max_velocity`` ``nk::Pipeline::SolverConfig`` overrides apply on the
-    cloth fast path; each 0 keeps the engine default, so a defaults-only world is
-    byte-identical. The general builder path (any tet/fluid/rigid primitive)
-    derives the particle radius from the lattice spacing and does not take a
-    SolverConfig override -- setting either there raises.
+    The ``solver_*`` + ``baumgarte_max_velocity`` ``nk::Pipeline::SolverConfig``
+    overrides apply on BOTH paths (the cloth fast path and the general
+    builder path), so an authored soft body can request a tighter contact solve
+    (more position-correction sweeps, a speculative contact margin). Each 0 keeps
+    the engine default, so a defaults-only world is byte-identical. The
+    ``contact_radius`` (m) particle sphere radius applies on the cloth fast path
+    only; the general builder path derives the particle radius from the lattice
+    spacing, so setting ``contact_radius`` there raises.
     """
 
     dt: float = 1.0 / 240.0
@@ -188,7 +190,7 @@ class Scene:
                        rigids) -> "_nuka.World":
         o = self.options
         media = grids + tets + fluids
-        self._reject_fast_path_only(media)
+        self._reject_contact_radius(media)
         if len(scenes) > 1:
             raise ValueError(
                 f"Scene.build needs at most one NKS base scene (got {len(scenes)})")
@@ -206,18 +208,18 @@ class Scene:
                 control_mode=int(o.control_mode),
                 contact_family=int(o.contact_family),
                 heightfield_terrain_type=int(o.heightfield_terrain_type),
-                gravity_x=gx, gravity_y=gy, gravity_z=gz)
+                gravity_x=gx, gravity_y=gy, gravity_z=gz,
+                solver_vel_iters=int(o.solver_vel_iters),
+                solver_pos_iters=int(o.solver_pos_iters),
+                solver_contact_margin=float(o.solver_contact_margin),
+                solver_max_pairs=int(o.solver_max_pairs),
+                baumgarte_max_velocity=float(o.baumgarte_max_velocity))
         finally:
             builder.destroy()
         return world
 
-    def _reject_fast_path_only(self, media) -> None:
+    def _reject_contact_radius(self, media) -> None:
         o = self.options
-        if (o.solver_vel_iters or o.solver_pos_iters or o.solver_contact_margin
-                or o.solver_max_pairs or o.baumgarte_max_velocity):
-            raise ValueError(
-                "Scene.build: the solver_* / baumgarte SolverConfig overrides apply "
-                "only on the cloth fast path, not the general media+primitive path.")
         if float(o.contact_radius) != 0.0 or any(
                 e.contact_radius is not None for e in media):
             raise ValueError(

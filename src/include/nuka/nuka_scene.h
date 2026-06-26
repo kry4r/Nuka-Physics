@@ -297,16 +297,33 @@ nuka_result_t nuka_scene_add_rigid_primitive(nuka_scene_handle scene,
 nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
                                    const nuka_media_desc_t* desc);
 
+// Optional nk::Pipeline::SolverConfig overrides for the built-scene world (1:1 with
+// the coupled desc's solver_* block, applied through the SAME FinishWorldCreate). A
+// soft body authors a tighter contact solve here (more position-correction sweeps, a
+// speculative contact margin) without touching nuka_world_desc_t (the file-scene
+// golden path). Each 0 keeps the engine default, so a NULL pointer OR a
+// zero-initialized struct cooks/builds BYTE-IDENTICALLY to a defaults-only world.
+typedef struct nuka_built_scene_options_t {
+    uint32_t solver_vel_iters;       // contact PGS sweeps (0 => 32).
+    uint32_t solver_pos_iters;       // split-impulse position-correction sweeps (0 => 4).
+    float    solver_contact_margin;  // speculative contact band, m (0.0 => 0.0).
+    uint32_t solver_max_pairs;       // broadphase pair-stream capacity (0 => engine default).
+    float    baumgarte_max_velocity; // contact recovery push-out bound, m/s (0.0 => model default).
+} nuka_built_scene_options_t;
+
 // Cook the built scene's SceneIR via the SAME cook::CookSceneToModel a file scene
 // uses (rigid + media, ONE orchestrator) and build the world through the SAME
 // record-assembly path nuka_world_create_from_scene uses. `desc->scene_path` is
 // IGNORED (the scene comes from the handle); the other desc fields (env_count, dt,
-// control_mode, gravity, optional baked heightfield) apply as usual. An illegal
-// media mix throws at cook -> a non-OK result. Returns NULL_HANDLE on a bad scene /
-// device handle, INVALID_ARG on a bad desc, NOT_SUPPORTED with no CUDA backend.
+// control_mode, gravity, optional baked heightfield) apply as usual. `options` (NULL
+// => all defaults) carries the SolverConfig overrides, mirroring how the coupled
+// entry carries them on its particles desc. An illegal media mix throws at cook -> a
+// non-OK result. Returns NULL_HANDLE on a bad scene / device handle, INVALID_ARG on a
+// bad desc, NOT_SUPPORTED with no CUDA backend.
 nuka_result_t nuka_world_create_from_built_scene(nuka_device_handle device,
                                                  const nuka_world_desc_t* desc,
                                                  nuka_scene_handle scene,
+                                                 const nuka_built_scene_options_t* options,
                                                  nuka_world_handle* out);
 
 #ifdef __cplusplus

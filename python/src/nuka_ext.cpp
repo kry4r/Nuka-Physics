@@ -354,7 +354,9 @@ public:
         float terrain_step_height, float terrain_step_width,
         float terrain_platform_width, float terrain_grid_width,
         float terrain_grid_height_max, float gravity_x, float gravity_y,
-        float gravity_z) {
+        float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
+        float solver_contact_margin, uint32_t solver_max_pairs,
+        float baumgarte_max_velocity) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
         }
@@ -391,8 +393,18 @@ public:
         desc.gravity_y = gravity_y;
         desc.gravity_z = gravity_z;
 
+        // SolverConfig overrides (0 => engine default => byte-identical), carried like
+        // the coupled cloth path carries them on its particles desc.
+        nuka_built_scene_options_t opts{};
+        opts.solver_vel_iters = solver_vel_iters;
+        opts.solver_pos_iters = solver_pos_iters;
+        opts.solver_contact_margin = solver_contact_margin;
+        opts.solver_max_pairs = solver_max_pairs;
+        opts.baumgarte_max_velocity = baumgarte_max_velocity;
+
         nuka_world_handle h = nullptr;
-        check(nuka_world_create_from_built_scene(device->raw(), &desc, scene_h, &h),
+        check(nuka_world_create_from_built_scene(device->raw(), &desc, scene_h,
+                                                 &opts, &h),
               "nuka_world_create_from_built_scene");
 
         // Derive base_link_count from the JOINT_POSITION view (0 for a robot-free
@@ -1385,7 +1397,9 @@ public:
                  float terrain_step_height, float terrain_step_width,
                  float terrain_platform_width, float terrain_grid_width,
                  float terrain_grid_height_max, float gravity_x, float gravity_y,
-                 float gravity_z) {
+                 float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
+                 float solver_contact_margin, uint32_t solver_max_pairs,
+                 float baumgarte_max_velocity) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
         }
@@ -1394,7 +1408,8 @@ public:
             heightfield_terrain_type, heightfield_nrow, heightfield_ncol,
             heightfield_cell, terrain_step_height, terrain_step_width,
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
-            gravity_x, gravity_y, gravity_z);
+            gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
+            solver_contact_margin, solver_max_pairs, baumgarte_max_velocity);
     }
 
     void destroy() {
@@ -2459,13 +2474,18 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("terrain_grid_width") = 0.0f,
              nb::arg("terrain_grid_height_max") = 0.0f, nb::arg("gravity_x") = 0.0f,
              nb::arg("gravity_y") = 0.0f, nb::arg("gravity_z") = 0.0f,
+             nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
+             nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
+             nb::arg("baumgarte_max_velocity") = 0.0f,
              nb::rv_policy::take_ownership,
              "Cook the built scene to a live nuka.World on `device` via the SAME "
              "CookSceneToModel + record assembly a file scene uses (rigid + media, "
              "ONE cook). Steps/reads like any World; read media via "
              "buffer_view(Field.PARTICLE_POSITION). contact_family == 1 bakes a "
              "heightfield collidable (the same terrain_* knobs create_from_scene "
-             "takes). gravity_* default 0 => standard Earth.")
+             "takes). gravity_* default 0 => standard Earth. The solver_* / "
+             "baumgarte_max_velocity SolverConfig overrides default 0 => engine "
+             "default => byte-identical to a defaults-only built scene.")
         .def("destroy", &SceneBuilder::destroy, "Destroy the scene-builder handle.")
         .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; })
         .def("__exit__",
