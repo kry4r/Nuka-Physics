@@ -1,9 +1,12 @@
 // ---------------------------------------------------------------------------
-// FR7 config-time per-medium solver selector (host cook assertions).
+// Config-time per-medium solver selector + the media-list validator (host cook
+// assertions, no GPU).
 //
 // A bulk-soft body cooks as XPBD by DEFAULT (byte-identical to today) and as MPM
-// when the solver selection is Mpm; cloth -> mlsmpm and fluid -> mlsmpm are
-// rejected LOUDLY at cook (never a silent fallback). No GPU needed.
+// when the solver selection is Mpm. The media-list validator (ValidateMedia)
+// enforces the legal (kind x method) set -- cloth must be XPBD, a fluid PBF or
+// MLS-MPM -- and rejects an MLS-MPM medium co-resident with an XPBD/PBF medium,
+// all LOUDLY (never a silent fallback).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -81,18 +84,37 @@ TEST(MpmSimMethodSelector, MlsMpmSolverCooksMpm) {
     }
 }
 
-// cloth -> mlsmpm and fluid -> mlsmpm are rejected LOUDLY (cloth stays XPBD,
-// fluid stays PBF); the default selector is a no-op (no throw).
-TEST(MpmSimMethodSelector, ClothFluidMpmRejectedLoudly) {
-    EXPECT_THROW(cook::RejectUnsupportedClothFluidMpm(
-                     nk::Model::ParticleMode::Mpm, nk::Model::ParticleMode::Xpbd),
+// The media-list validator: cloth must be XPBD, a fluid PBF or MLS-MPM; an MLS-MPM
+// medium may not co-reside with an XPBD/PBF medium. Illegal pairs / mixes throw
+// LOUDLY; the wired legal cases (cloth XPBD, fluid PBF) and the empty list pass.
+TEST(MpmSimMethodSelector, MediaValidatorRejectsIllegalLoudly) {
+    using MediaRecord = nuka::scene::MediaRecord;
+    auto medium = [](MediaRecord::Kind k, MediaRecord::Method m) {
+        MediaRecord r; r.kind = k; r.method = m; return r;
+    };
+    const MediaRecord cloth_xpbd = medium(MediaRecord::Kind::Cloth,
+                                          MediaRecord::Method::Xpbd);
+    const MediaRecord fluid_pbf  = medium(MediaRecord::Kind::Fluid,
+                                          MediaRecord::Method::Pbf);
+
+    EXPECT_NO_THROW(cook::ValidateMedia({}))
+        << "an empty media list is a no-op (byte-identical cook)";
+    EXPECT_NO_THROW(cook::ValidateMedia({cloth_xpbd, fluid_pbf}))
+        << "the wired legal pair (cloth XPBD + fluid PBF) must pass";
+    EXPECT_THROW(cook::ValidateMedia(
+                     {medium(MediaRecord::Kind::Cloth, MediaRecord::Method::MlsMpm)}),
                  std::runtime_error)
-        << "cloth -> mlsmpm must throw (cloth stays XPBD permanently)";
-    EXPECT_THROW(cook::RejectUnsupportedClothFluidMpm(
-                     nk::Model::ParticleMode::Xpbd, nk::Model::ParticleMode::Mpm),
+        << "cloth -> MLS-MPM must throw (cloth stays XPBD)";
+    EXPECT_THROW(cook::ValidateMedia(
+                     {medium(MediaRecord::Kind::Fluid, MediaRecord::Method::Xpbd)}),
                  std::runtime_error)
-        << "fluid -> mlsmpm must throw (fluid stays PBF in the first batch)";
-    EXPECT_NO_THROW(cook::RejectUnsupportedClothFluidMpm(
-        nk::Model::ParticleMode::Xpbd, nk::Model::ParticleMode::Xpbd))
-        << "the default (Xpbd) selector must be a no-op (byte-identical cook)";
+        << "fluid -> XPBD must throw";
+    EXPECT_THROW(cook::ValidateMedia(
+                     {medium(MediaRecord::Kind::SoftTet, MediaRecord::Method::MlsMpm),
+                      cloth_xpbd}),
+                 std::runtime_error)
+        << "an MLS-MPM medium co-resident with an XPBD/PBF medium must throw";
+    EXPECT_NO_THROW(cook::ValidateMedia(
+        {medium(MediaRecord::Kind::Fluid, MediaRecord::Method::MlsMpm)}))
+        << "a lone fluid-as-MLS-MPM medium is a legal pair";
 }
