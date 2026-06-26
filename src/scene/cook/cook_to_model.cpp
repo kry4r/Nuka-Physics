@@ -40,8 +40,9 @@
 #include "scene/graph/scene_graph.hpp"
 // The cloth-topology + fluid-box cookers (CUDA-free POD products); the media cook
 // reuses them to build the particle inputs instead of reimplementing the math.
-#include "runtime/soft/cloth_topology.hpp"   // BuildClothConstraints
-#include "import/cooker/fluid_cooker.hpp"     // CookFluidBox
+#include "runtime/soft/cloth_topology.hpp"     // BuildClothConstraints
+#include "runtime/soft/tetmesh_topology.hpp"   // BuildSphereTetLattice / BuildTetMeshConstraints
+#include "import/cooker/fluid_cooker.hpp"       // CookFluidBox
 
 namespace nuka::scene::cook {
 
@@ -1692,6 +1693,90 @@ std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media) {
     return tris;
 }
 
+XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
+    XpbdCookInput in;
+    const MediaRecord::TetSphere& ts = media.tet_sphere;
+    if (ts.radius <= 0.0f || ts.cells < 2u || ts.cell_len <= 0.0f) {
+        return in;  // no tet body (an empty soft set is treated as none).
+    }
+    // The lattice is built at the origin and translated to the authored center, so the
+    // rest constraints (translation-invariant lengths/volumes) come from the origin set.
+    const runtime::soft::TetLattice lat = runtime::soft::BuildSphereTetLattice(
+        math::Vec3{0.0f, 0.0f, 0.0f}, ts.radius, ts.cells, ts.cell_len);
+    std::vector<math::Vec3> init = lat.rest;
+    for (math::Vec3& p : init) p = p + ts.center;
+
+    runtime::soft::TetMeshTopologyOptions opts;
+    opts.distance_compliance_alpha = media.xpbd.distance_alpha;
+    opts.volume_compliance_alpha = media.xpbd.volume_alpha;
+    opts.emit_distance_constraints = true;
+    runtime::soft::XpbdConstraintSet cs;
+    runtime::soft::BuildTetMeshConstraints(lat.rest, lat.tets, opts, cs);
+
+    in.positions = init;
+    in.velocities.assign(init.size(), math::Vec3::Zero());
+    const float mass =
+        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
+    in.inv_mass.assign(init.size(), 1.0f / mass);  // free (unpinned) solid.
+    for (const auto& dc : cs.distance) {
+        in.distance.push_back(
+            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
+    }
+    for (const auto& vc : cs.volume) {
+        CookVolumeCon c;
+        for (uint32_t j = 0u; j < 4u; ++j) c.p[j] = vc.particle[j];
+        c.rest_volume_times6 = vc.rest_volume_times6;
+        c.compliance_alpha = vc.compliance_alpha;
+        in.volume.push_back(c);
+    }
+    in.solver_iterations =
+        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
+    in.friction = media.xpbd.friction;
+    return in;
+}
+
+// Append the pinned-boundary container (floor slab + side-wall ring) for a confined PBF
+// pool, then fill in.inv_mass (free fluid = 1/mass, every boundary particle pinned 0).
+static void AppendFluidConfinement(PbfCookInput& in, const MediaRecord& media) {
+    const MediaRecord::FluidBox& fb = media.fluid_box;
+    const MediaPbfMaterial& pbf = media.pbf;
+    const uint32_t n_free = static_cast<uint32_t>(in.positions.size());
+    const float s = fb.spacing;
+    const int L = static_cast<int>(pbf.boundary_layers);
+
+    const float wc_x = 0.5f * (pbf.walls_min.x + pbf.walls_max.x);
+    const float wc_y = 0.5f * (pbf.walls_min.y + pbf.walls_max.y);
+    const int nbx = static_cast<int>(std::ceil(0.5f * (pbf.walls_max.x - pbf.walls_min.x) / s));
+    const int nby = static_cast<int>(std::ceil(0.5f * (pbf.walls_max.y - pbf.walls_min.y) / s));
+    // CookFluidBox samples cell-centered, so the first fluid layer sits half a cell
+    // above the box floor; the slab stacks downward from there.
+    const float pool_bottom = fb.min.z + 0.5f * s;
+
+    // Floor slab: `boundary_layers` filled pinned layers below the fluid bottom.
+    for (int layer = 1; layer <= L; ++layer) {
+        const float bz = pool_bottom - static_cast<float>(layer) * s;
+        for (int iy = -nby; iy <= nby; ++iy)
+            for (int ix = -nbx; ix <= nbx; ++ix)
+                in.positions.push_back(
+                    math::Vec3{wc_x + static_cast<float>(ix) * s,
+                               wc_y + static_cast<float>(iy) * s, bz});
+    }
+    // Side walls: a pinned ring `boundary_layers` thick just outside the box footprint,
+    // from the fluid bottom up to the box top, confining the column laterally.
+    for (float z = pool_bottom; z <= pbf.walls_max.z + 1.0e-4f; z += s)
+        for (int iy = -(nby + L); iy <= nby + L; ++iy)
+            for (int ix = -(nbx + L); ix <= nbx + L; ++ix) {
+                if (std::abs(ix) <= nbx && std::abs(iy) <= nby) continue;  // box interior.
+                in.positions.push_back(
+                    math::Vec3{wc_x + static_cast<float>(ix) * s,
+                               wc_y + static_cast<float>(iy) * s, z});
+            }
+
+    const float im = in.particle_mass > 0.0f ? 1.0f / in.particle_mass : 0.0f;
+    in.inv_mass.assign(in.positions.size(), 0.0f);  // boundary pinned.
+    for (uint32_t i = 0; i < n_free; ++i) in.inv_mass[i] = im;  // free fluid.
+}
+
 PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
     PbfCookInput in;
     const MediaRecord::FluidBox& b = media.fluid_box;
@@ -1707,7 +1792,6 @@ PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
     const runtime::fluid::PbfParticleSet box = import::cooker::CookFluidBox(spec);
 
     in.positions = box.positions;
-    in.velocities.assign(box.positions.size(), math::Vec3::Zero());
     in.particle_mass = box.particle_mass;
     in.rest_density = spec.rest_density;
     const float support_scale =
@@ -1720,17 +1804,107 @@ PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
     in.boundary_enabled = true;
     in.floor_z = media.pbf.floor_z;
     in.friction = media.pbf.friction;
-    // Uniform-grid domain: enclose the box + lateral/vertical headroom so a particle
-    // pushed out of the box still finds neighbours (the grid is rebuilt per step).
-    const math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
-    in.grid_min = math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
-                             std::min(lo.z, media.pbf.floor_z) - h};
     auto cells = [h](float extent) {
         return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
     };
-    in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
-    in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
-    in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
+    const math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
+    if (!media.pbf.walls_enabled) {
+        // Uniform-grid domain: enclose the box + lateral/vertical headroom so a
+        // particle pushed out of the box still finds neighbours (rebuilt per step).
+        in.velocities.assign(in.positions.size(), math::Vec3::Zero());
+        in.grid_min = math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
+                                 std::min(lo.z, media.pbf.floor_z) - h};
+        in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
+        in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
+        in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
+        return in;
+    }
+    // Confined pool: append the pinned container, then size the grid over the union
+    // of the fluid + boundary particles + a crown headroom above the box top.
+    in.walls_enabled = true;
+    in.walls_min = media.pbf.walls_min;
+    in.walls_max = media.pbf.walls_max;
+    in.boundary_layers = media.pbf.boundary_layers;
+    AppendFluidConfinement(in, media);
+    in.velocities.assign(in.positions.size(), math::Vec3::Zero());
+    math::Vec3 pmin{1.0e30f, 1.0e30f, 1.0e30f}, pmax{-1.0e30f, -1.0e30f, -1.0e30f};
+    for (const math::Vec3& p : in.positions) {
+        pmin = math::Vec3{std::min(pmin.x, p.x), std::min(pmin.y, p.y), std::min(pmin.z, p.z)};
+        pmax = math::Vec3{std::max(pmax.x, p.x), std::max(pmax.y, p.y), std::max(pmax.z, p.z)};
+    }
+    const float headroom = (hi.z - lo.z) + 4.0f * h;  // crown room above the box top.
+    in.grid_min = math::Vec3{pmin.x - 2.0f * h, pmin.y - 2.0f * h, pmin.z - 2.0f * h};
+    in.grid_dims[0] = cells((pmax.x - pmin.x) + 4.0f * h);
+    in.grid_dims[1] = cells((pmax.y - pmin.y) + 4.0f * h);
+    in.grid_dims[2] = cells((pmax.z - in.grid_min.z) + headroom);
+    return in;
+}
+
+MpmCookInput BuildMpmInput(const MediaRecord& media) {
+    MpmCookInput in;
+    const MediaMpmMaterial& mp = media.mpm;
+    const float density = mp.density > 0.0f ? mp.density : 1000.0f;
+    math::Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};  // geometry AABB.
+    float vol0 = 0.0f;                                       // per-particle sampling volume.
+
+    if (media.kind == MediaRecord::Kind::Fluid) {
+        const MediaRecord::FluidBox& b = media.fluid_box;
+        if (b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
+            b.max.z > b.min.z) {
+            import::cooker::FluidBoxSpec spec;
+            spec.min_corner = b.min;
+            spec.max_corner = b.max;
+            spec.spacing = b.spacing;
+            spec.rest_density = density;
+            in.positions = import::cooker::CookFluidBox(spec).positions;
+            vol0 = b.spacing * b.spacing * b.spacing;
+            lo = b.min;
+            hi = b.max;
+        }
+    } else {  // SoftTet (ValidateMedia rejects a cloth -> MLS-MPM medium).
+        const MediaRecord::TetSphere& ts = media.tet_sphere;
+        if (ts.radius > 0.0f && ts.cells >= 2u && ts.cell_len > 0.0f) {
+            const runtime::soft::TetLattice lat = runtime::soft::BuildSphereTetLattice(
+                math::Vec3{0.0f, 0.0f, 0.0f}, ts.radius, ts.cells, ts.cell_len);
+            in.positions = lat.rest;
+            for (math::Vec3& p : in.positions) p = p + ts.center;
+            vol0 = ts.cell_len * ts.cell_len * ts.cell_len;
+            lo = ts.center - math::Vec3{ts.radius, ts.radius, ts.radius};
+            hi = ts.center + math::Vec3{ts.radius, ts.radius, ts.radius};
+        }
+    }
+    const size_t n = in.positions.size();
+    in.velocities.assign(n, math::Vec3::Zero());
+    in.inv_mass.assign(n, vol0 > 0.0f ? 1.0f / (density * vol0) : 0.0f);
+    in.vol0.assign(n, vol0);
+    in.material.youngs = mp.youngs;
+    in.material.poisson = mp.poisson;
+    in.material.density = density;
+    in.material.dp_friction = mp.dp_friction;
+    in.material.dp_cohesion = mp.dp_cohesion;
+    in.material.model_kind = mp.model_kind;
+    in.material.bulk_modulus = mp.bulk_modulus;
+    in.material.tait_gamma = mp.tait_gamma;
+    in.material.viscosity = mp.viscosity;
+    in.dx = mp.dx;
+    in.substeps = mp.substeps;
+    in.floor_normal = mp.floor_normal;
+    in.floor_d = mp.floor_d;
+    in.floor_friction = mp.floor_friction;
+    // Env-private background grid: enclose the geometry + its floor + motion headroom
+    // (a body's own height above, so a bounce/splash stays inside the grid).
+    if (mp.dx > 0.0f) {
+        const float margin = 4.0f * mp.dx;
+        const float base_z = std::min(lo.z, mp.floor_d) - margin;
+        const float top_z = hi.z + (hi.z - lo.z) + margin;
+        in.grid_origin = math::Vec3{lo.x - margin, lo.y - margin, base_z};
+        auto cells = [&](float extent) {
+            return static_cast<uint32_t>(std::ceil(extent / mp.dx)) + 1u;
+        };
+        in.grid_dims[0] = cells((hi.x - lo.x) + 2.0f * margin);
+        in.grid_dims[1] = cells((hi.y - lo.y) + 2.0f * margin);
+        in.grid_dims[2] = cells(top_z - base_z);
+    }
     return in;
 }
 
@@ -1745,6 +1919,7 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
     for (const MediaRecord& m : media) {
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
+        else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
         else if (m.kind == MediaRecord::Kind::Fluid) sp = m.fluid_box.spacing;
         if (sp > 0.0f) d_min = (d_min > 0.0f) ? std::min(d_min, sp) : sp;
     }
@@ -1797,22 +1972,30 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     if (media.empty()) return;  // no media -> ParticleMode::None (byte-identical).
     ValidateMedia(media);
 
+    // MLS-MPM is its own ParticleMode; ValidateMedia guarantees a lone MPM medium with
+    // no XPBD/PBF co-resident, so it routes through CookSoftBodyParticles (Mpm branch).
+    if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
+        XpbdCookInput soft_mpm;
+        soft_mpm.solver = nk::Model::ParticleMode::Mpm;  // the cook dispatch selector.
+        CookSoftBodyParticles(model, env_count, soft_mpm, BuildMpmInput(media.front()));
+        return;
+    }
+
+    // XPBD soft (cloth + tet-soft, concatenated) + the one PBF fluid, unioned into the
+    // [soft | fluid] slice. Past the MPM gate every medium is XPBD/PBF (ValidateMedia).
     XpbdCookInput soft;
     PbfCookInput fluid;
     bool have_soft = false, have_fluid = false;
     for (const MediaRecord& m : media) {
-        if (m.kind == MediaRecord::Kind::Cloth &&
-            m.method == MediaRecord::Method::Xpbd) {
+        if (m.kind == MediaRecord::Kind::Cloth) {
             AppendSoftMedium(soft, BuildClothXpbdInput(m));
             have_soft = true;
-        } else if (m.kind == MediaRecord::Kind::Fluid &&
-                   m.method == MediaRecord::Method::Pbf) {
-            fluid = BuildFluidPbfInput(m);  // ValidateMedia guarantees at most one.
+        } else if (m.kind == MediaRecord::Kind::SoftTet) {
+            AppendSoftMedium(soft, BuildSoftTetXpbdInput(m));
+            have_soft = true;
+        } else {  // Fluid (PBF; ValidateMedia guarantees at most one).
+            fluid = BuildFluidPbfInput(m);
             have_fluid = true;
-        } else {
-            throw std::runtime_error(
-                "CookSceneMedia: only cloth (XPBD) and fluid (PBF) media are cooked "
-                "through the orchestrator; this medium is a tet-soft or MLS-MPM body");
         }
     }
     if (!have_soft && !have_fluid) return;

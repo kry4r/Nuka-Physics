@@ -13,9 +13,11 @@
 
 #include <vector>
 
+#include "import/cooker/fluid_cooker.hpp"  // CookFluidBox (predicts the MPM fluid count)
 #include "math/vec3.hpp"
 #include "nk/model/model.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/scene_ir.hpp"
 
 namespace {
 
@@ -117,4 +119,60 @@ TEST(MpmSimMethodSelector, MediaValidatorRejectsIllegalLoudly) {
     EXPECT_NO_THROW(cook::ValidateMedia(
         {medium(MediaRecord::Kind::Fluid, MediaRecord::Method::MlsMpm)}))
         << "a lone fluid-as-MLS-MPM medium is a legal pair";
+}
+
+// A lone fluid MLS-MPM medium routes through CookSceneMedia onto ParticleMode::Mpm with
+// the box lattice particle count + one cooked material + a non-empty env-private grid.
+TEST(MpmSimMethodSelector, FluidMlsMpmMediaRoutesToMpmCook) {
+    using MediaRecord = nuka::scene::MediaRecord;
+    MediaRecord m;
+    m.kind = MediaRecord::Kind::Fluid;
+    m.method = MediaRecord::Method::MlsMpm;
+    m.fluid_box.min = {-0.05f, -0.05f, 0.0f};
+    m.fluid_box.max = {0.05f, 0.05f, 0.10f};
+    m.fluid_box.spacing = 0.02f;
+    m.mpm.density = 1000.0f;
+    m.mpm.model_kind = 3.0f;          // weakly-compressible fluid.
+    m.mpm.bulk_modulus = 2.0e5f;
+    m.mpm.tait_gamma = 7.0f;
+    m.mpm.dx = 0.02f;
+    m.mpm.substeps = 20u;
+
+    nuka::import::cooker::FluidBoxSpec spec;
+    spec.min_corner = m.fluid_box.min; spec.max_corner = m.fluid_box.max;
+    spec.spacing = 0.02f; spec.rest_density = 1000.0f;
+    const uint32_t expect = static_cast<uint32_t>(
+        nuka::import::cooker::CookFluidBox(spec).positions.size());
+    ASSERT_GT(expect, 0u);
+
+    nk::Model model;
+    cook::CookSceneMedia(model, 1u, {m});
+    EXPECT_EQ(model.particles.mode, nk::Model::ParticleMode::Mpm);
+    EXPECT_EQ(model.capacities.particles_per_env, expect);
+    EXPECT_EQ(model.capacities.mpm_material_count, 1u);
+    EXPECT_GT(model.capacities.mpm_grid_nodes_per_env, 0u);
+    ASSERT_FALSE(model.mpm_materials.empty());
+    EXPECT_FLOAT_EQ(model.mpm_materials[0].model_kind, 3.0f);
+    EXPECT_FLOAT_EQ(model.mpm_materials[0].bulk_modulus, 2.0e5f);
+}
+
+// A lone tet-soft MLS-MPM medium routes onto ParticleMode::Mpm from the sphere lattice.
+TEST(MpmSimMethodSelector, SoftTetMlsMpmMediaRoutesToMpmCook) {
+    using MediaRecord = nuka::scene::MediaRecord;
+    MediaRecord m;
+    m.kind = MediaRecord::Kind::SoftTet;
+    m.method = MediaRecord::Method::MlsMpm;
+    m.tet_sphere.center = {0.0f, 0.0f, 0.20f};
+    m.tet_sphere.radius = 0.10f;
+    m.tet_sphere.cells = 8u;
+    m.tet_sphere.cell_len = 2.0f * 0.10f / 8.0f;
+    m.mpm.density = 1000.0f;
+    m.mpm.youngs = 3.0e4f; m.mpm.poisson = 0.3f; m.mpm.model_kind = 0.0f;
+    m.mpm.dx = 0.025f; m.mpm.substeps = 20u;
+
+    nk::Model model;
+    cook::CookSceneMedia(model, 1u, {m});
+    EXPECT_EQ(model.particles.mode, nk::Model::ParticleMode::Mpm);
+    EXPECT_GT(model.capacities.particles_per_env, 0u);
+    EXPECT_EQ(model.capacities.mpm_material_count, 1u);
 }

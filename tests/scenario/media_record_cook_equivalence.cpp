@@ -17,9 +17,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "import/cooker/fluid_cooker.hpp"   // CookFluidBox (legacy fluid reference)
+#include "import/cooker/fluid_cooker.hpp"     // CookFluidBox (legacy fluid reference)
 #include "math/vec3.hpp"
-#include "runtime/soft/cloth_topology.hpp"  // BuildClothConstraints (legacy reference)
+#include "runtime/soft/cloth_topology.hpp"    // BuildClothConstraints (legacy reference)
+#include "runtime/soft/tetmesh_topology.hpp"  // BuildSphereTetLattice (legacy tet reference)
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
 
@@ -222,7 +223,12 @@ void ExpectXpbdEqual(const cook::XpbdCookInput& a, const cook::XpbdCookInput& b)
         }
         EXPECT_EQ(a.bend[i].compliance_alpha, b.bend[i].compliance_alpha);
     }
-    EXPECT_EQ(a.volume.size(), b.volume.size());
+    ASSERT_EQ(a.volume.size(), b.volume.size()) << "volume size";
+    for (size_t i = 0; i < a.volume.size(); ++i) {
+        for (uint32_t k = 0; k < 4u; ++k) EXPECT_EQ(a.volume[i].p[k], b.volume[i].p[k]);
+        EXPECT_EQ(a.volume[i].rest_volume_times6, b.volume[i].rest_volume_times6);
+        EXPECT_EQ(a.volume[i].compliance_alpha, b.volume[i].compliance_alpha);
+    }
     EXPECT_EQ(a.shape_match.size(), b.shape_match.size());
     ASSERT_EQ(a.aero_triangles.size(), b.aero_triangles.size()) << "aero size";
     for (size_t i = 0; i < a.aero_triangles.size(); ++i)
@@ -308,4 +314,153 @@ TEST(MediaRecordCookEquivalence, FluidMatchesLegacy) {
     p.fluid_spacing = 0.022f; p.fluid_rest_density = 1000.0f;
     p.fluid_floor_z = 0.12f; p.fluid_friction = 0.05f; p.fluid_iters = 4u;
     ExpectPbfEqual(cook::BuildFluidPbfInput(FluidMedia(p)), LegacyFluidCookInput(p));
+}
+
+// ---- soft-tet: a verbatim copy of soft_ball_demo.cpp BuildBallInput (the reference) ----
+
+cook::XpbdCookInput LegacySoftTetCookInput(float radius, uint32_t cells, float cell_len,
+                                           float center_z, float mass, float dist_alpha,
+                                           float vol_alpha, uint16_t iters, float friction) {
+    namespace soft = nuka::runtime::soft;
+    const soft::TetLattice lat =
+        soft::BuildSphereTetLattice(Vec3{0.0f, 0.0f, 0.0f}, radius, cells, cell_len);
+    std::vector<Vec3> init = lat.rest;
+    for (Vec3& p : init) p.z += center_z;
+    soft::TetMeshTopologyOptions opts;
+    opts.distance_compliance_alpha = dist_alpha;
+    opts.volume_compliance_alpha = vol_alpha;
+    opts.emit_distance_constraints = true;
+    soft::XpbdConstraintSet cs;
+    soft::BuildTetMeshConstraints(lat.rest, lat.tets, opts, cs);
+    cook::XpbdCookInput in;
+    in.positions = init;
+    in.velocities.assign(init.size(), Vec3::Zero());
+    in.inv_mass.assign(init.size(), 1.0f / mass);
+    for (const auto& dc : cs.distance)
+        in.distance.push_back(
+            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
+    for (const auto& vc : cs.volume) {
+        cook::CookVolumeCon c;
+        for (uint32_t j = 0; j < 4u; ++j) c.p[j] = vc.particle[j];
+        c.rest_volume_times6 = vc.rest_volume_times6;
+        c.compliance_alpha = vc.compliance_alpha;
+        in.volume.push_back(c);
+    }
+    in.solver_iterations = iters;
+    in.friction = friction;
+    return in;
+}
+
+MediaRecord SoftTetMedia(float radius, uint32_t cells, float cell_len, float center_z,
+                         float mass, float dist_alpha, float vol_alpha, uint16_t iters,
+                         float friction) {
+    MediaRecord m;
+    m.kind = MediaRecord::Kind::SoftTet;
+    m.method = MediaRecord::Method::Xpbd;
+    m.tet_sphere.center = {0.0f, 0.0f, center_z};
+    m.tet_sphere.radius = radius;
+    m.tet_sphere.cells = cells;
+    m.tet_sphere.cell_len = cell_len;
+    m.xpbd.particle_mass = mass;
+    m.xpbd.friction = friction;
+    m.xpbd.distance_alpha = dist_alpha;
+    m.xpbd.volume_alpha = vol_alpha;
+    m.xpbd.iters = iters;
+    return m;
+}
+
+// Soft-tet: BuildSoftTetXpbdInput(media) == the demo's BuildBallInput, field-by-field
+// (sphere rest-lattice -> distance+volume constraints). The soft-ball demo params.
+TEST(MediaRecordCookEquivalence, SoftTetMatchesDemoBall) {
+    const float radius = 0.10f, cell_len = 2.0f * 0.10f / 12.0f, center_z = 0.16f;
+    const float mass = 0.01f, dist_alpha = 3.0e-6f, vol_alpha = 1.5e-6f, friction = 0.6f;
+    const uint32_t cells = 12u;
+    const uint16_t iters = 40u;
+    const MediaRecord m = SoftTetMedia(radius, cells, cell_len, center_z, mass,
+                                       dist_alpha, vol_alpha, iters, friction);
+    const cook::XpbdCookInput got = cook::BuildSoftTetXpbdInput(m);
+    EXPECT_GT(got.positions.size(), 0u) << "the sphere lattice must produce particles";
+    EXPECT_GT(got.volume.size(), 0u) << "a tet body must emit volume constraints";
+    EXPECT_EQ(got.bend.size(), 0u) << "a tet body has no bend constraints";
+    ExpectXpbdEqual(got, LegacySoftTetCookInput(radius, cells, cell_len, center_z, mass,
+                                                dist_alpha, vol_alpha, iters, friction));
+}
+
+// ---- fluid confinement (the pinned-boundary container) ----
+
+// walls_enabled == false: byte-identical to today (no confinement, inv_mass empty).
+TEST(MediaRecordCookEquivalence, FluidConfinementOffByteIdentical) {
+    FlatDesc p{};
+    p.fluid_min_x = -0.20f; p.fluid_min_y = -0.20f; p.fluid_min_z = 0.0f;
+    p.fluid_max_x = 0.20f; p.fluid_max_y = 0.20f; p.fluid_max_z = 0.20f;
+    p.fluid_spacing = 0.025f; p.fluid_rest_density = 1000.0f;
+    MediaRecord m = FluidMedia(p);
+    m.pbf.walls_enabled = false;       // default; assert explicitly.
+    m.pbf.boundary_layers = 2u;        // ignored while walls are off.
+    const cook::PbfCookInput in = cook::BuildFluidPbfInput(m);
+    ExpectPbfEqual(in, LegacyFluidCookInput(p));
+    EXPECT_TRUE(in.inv_mass.empty()) << "walls off must leave inv_mass to the PBF cook";
+}
+
+// walls_enabled == true: free fluid unchanged + a pinned floor slab matching the
+// water_pool_demo.cpp:248-257 math + pinned side walls; every boundary particle pinned.
+TEST(MediaRecordCookEquivalence, FluidConfinementGeneratesPinnedContainer) {
+    const float s = 0.025f, floor_z = 0.0f;
+    const float half_foot = 0.5f * (28.0f - 1.0f) * s;     // demo kHalfFoot.
+    const float wall_inner = half_foot + 0.6f * s;          // demo kWallInner.
+    const float pool_bottom = floor_z + 0.5f * s;           // demo kPoolBottomZ.
+
+    MediaRecord m;
+    m.kind = MediaRecord::Kind::Fluid;
+    m.method = MediaRecord::Method::Pbf;
+    m.fluid_box.min = {-half_foot, -half_foot, floor_z};
+    m.fluid_box.max = {half_foot, half_foot, floor_z + 10.0f * s};
+    m.fluid_box.spacing = s;
+    m.pbf.rest_density = 1000.0f;
+    m.pbf.support_scale = 1.5f;
+    m.pbf.floor_z = floor_z;
+    m.pbf.walls_enabled = true;
+    m.pbf.walls_min = {-wall_inner, -wall_inner, floor_z};
+    m.pbf.walls_max = {wall_inner, wall_inner, floor_z + 0.30f};
+    m.pbf.boundary_layers = 2u;
+
+    const cook::PbfCookInput in = cook::BuildFluidPbfInput(m);
+
+    nuka::import::cooker::FluidBoxSpec spec;
+    spec.min_corner = m.fluid_box.min; spec.max_corner = m.fluid_box.max;
+    spec.spacing = s; spec.rest_density = 1000.0f;
+    const auto box = nuka::import::cooker::CookFluidBox(spec);
+    const uint32_t n_free = static_cast<uint32_t>(box.positions.size());
+    ASSERT_GT(n_free, 0u);
+    ASSERT_GT(in.positions.size(), n_free) << "confinement particles must be appended";
+
+    // The free fluid (the CookFluidBox lattice) is unchanged and free (1/mass).
+    ExpectVec3Eq(std::vector<Vec3>(in.positions.begin(), in.positions.begin() + n_free),
+                 box.positions, "free fluid");
+    ASSERT_EQ(in.inv_mass.size(), in.positions.size());
+    const float im = 1.0f / in.particle_mass;
+    for (uint32_t i = 0; i < n_free; ++i) EXPECT_EQ(in.inv_mass[i], im);
+    for (size_t i = n_free; i < in.inv_mass.size(); ++i)
+        EXPECT_EQ(in.inv_mass[i], 0.0f) << "boundary particle " << i << " is not pinned";
+
+    // The floor slab reproduces the demo's 248-257 math exactly (emitted first).
+    const int nb = static_cast<int>(std::ceil(wall_inner / s));
+    std::vector<Vec3> demo_slab;
+    for (int layer = 1; layer <= 2; ++layer) {
+        const float bz = pool_bottom - static_cast<float>(layer) * s;
+        for (int iy = -nb; iy <= nb; ++iy)
+            for (int ix = -nb; ix <= nb; ++ix)
+                demo_slab.push_back(Vec3{static_cast<float>(ix) * s,
+                                         static_cast<float>(iy) * s, bz});
+    }
+    ASSERT_GE(in.positions.size(), n_free + demo_slab.size());
+    for (size_t k = 0; k < demo_slab.size(); ++k) {
+        EXPECT_EQ(in.positions[n_free + k].x, demo_slab[k].x) << "slab[" << k << "].x";
+        EXPECT_EQ(in.positions[n_free + k].y, demo_slab[k].y) << "slab[" << k << "].y";
+        EXPECT_EQ(in.positions[n_free + k].z, demo_slab[k].z) << "slab[" << k << "].z";
+    }
+    // Side walls follow the slab (lateral ring, at/above the fluid bottom).
+    EXPECT_GT(in.positions.size(), n_free + demo_slab.size()) << "side walls must exist";
+    for (size_t i = n_free + demo_slab.size(); i < in.positions.size(); ++i)
+        EXPECT_GE(in.positions[i].z, pool_bottom - 1.0e-4f);
 }
