@@ -1354,6 +1354,11 @@ if(CMAKE_CUDA_COMPILER)
         # on the device's OWNED phi v2 backend (mirrors recorder.cpp) and runs
         # cook::Settle. NOT a special grasp/union type -- one entry, any format.
         c_abi/scene.cpp
+        # The BUILT-SCENE authoring surface (program rigid primitives + TAGGED media
+        # records, then cook via the SAME CookSceneToModel a file scene uses). Reuses
+        # the scene handle (SceneTable) + the shared world-create helpers in world.cpp
+        # -> ONE nk::World on the ONE cook path (no second world type). Host-only.
+        c_abi/scene_builder.cpp
         # The device-resident batched camera-sensor surface (attach/render/view):
         # cooks the world's retained scene to the per-env visual binding via
         # BuildRenderWorld + RenderWorldToTwoLevelScene (nuka_render) and drives the

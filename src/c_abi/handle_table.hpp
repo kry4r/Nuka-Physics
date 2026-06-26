@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_scene.h"  // nuka_scene_t (the built-scene handle tag)
 
 #include <cstdint>
 #include <mutex>
@@ -58,9 +59,13 @@ private:
 
 struct DeviceRecord;
 struct WorldRecord;
+struct SceneRecord;
 
 HandleTable<nuka_device_t, DeviceRecord>& DeviceTable();
 HandleTable<nuka_world_t, WorldRecord>& WorldTable();
+// The built-scene authoring handle table (shared so the scene-builder TU + the
+// built-scene world create reach the SAME SceneRecord the load/edit surface owns).
+HandleTable<nuka_scene_t, SceneRecord>& SceneTable();
 
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept;
 nuka_result_t RunNoThrow(void (*fn)(void*), void* user) noexcept;

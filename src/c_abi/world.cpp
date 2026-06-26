@@ -193,7 +193,78 @@ struct PreparedWorld {
 nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
                                    const nuka_world_desc_t* desc,
                                    PreparedWorld* out) {
-    if (desc == nullptr || desc->scene_path == nullptr || desc->fixed_dt <= 0.0f) {
+    // Validate the desc + resolve the device/backend + control mode (the shared gate;
+    // the file-load path REQUIRES a scene_path -- the built-scene path passes false).
+    DeviceRecord* device_record = nullptr;
+    articulation::ControlMode control_mode = articulation::ControlMode::PDPosition;
+    const nuka_result_t valid = ValidateWorldDescAndDevice(
+        device, desc, /*require_scene_path=*/true, &device_record, &control_mode);
+    if (valid != NUKA_RESULT_OK) {
+        return valid;
+    }
+
+    nuka::scene::SceneIR scene;
+    if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &scene)) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    // CO-RESIDENCE: compose the authored scene with itself instance_count times at
+    // distinct XY so the cook emits K SEPARATE articulations co-resident in one env.
+    // 0/1 == single instance -> the loop never runs -> BYTE-IDENTICAL single-artic.
+    if (desc->instance_count > 1u) {
+        const float spacing =
+            (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
+        for (uint32_t i = 1u; i < desc->instance_count; ++i) {
+            nuka::scene::SceneIR replica;
+            if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
+                return NUKA_RESULT_NOT_SUPPORTED;
+            }
+            nuka::math::Transform place = nuka::math::Transform::Identity();
+            place.position.x = spacing * static_cast<float>(i);
+            scene = nuka::scene::Compose(scene, replica, place,
+                                         "dog" + std::to_string(i) + "_");
+        }
+    }
+
+    // Cook the authored scene to an nk::Model (the GENERAL LBVH+cvx narrowphase +
+    // mixed-island solve; CookToModel always returns a PairDriven model). The world
+    // runs EXACTLY the cooked scene physics -- it does NOT inject a synthetic ground.
+    nuka::scene::cook::CookToModelResult cooked =
+        nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
+
+    // Route control mode -> drive_mode, bake the optional heightfield collidable,
+    // and resolve gravity (the post-cook step both create paths share).
+    nuka::terrain::HeightField cooked_terrain;
+    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
+    const nuka_result_t terrain = ApplyControlTerrainGravity(
+        desc, control_mode, cooked.model, &cooked_terrain, &gravity);
+    if (terrain != NUKA_RESULT_OK) {
+        return terrain;
+    }
+
+    out->model = std::move(cooked.model);
+    out->scene = std::move(scene);
+    out->terrain = std::move(cooked_terrain);
+    out->gravity = gravity;
+    out->control_mode = control_mode;
+    out->device_record = device_record;
+    return NUKA_RESULT_OK;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Shared world-create helpers (declared in c_abi/internal.hpp): the validation /
+// post-cook / record-assembly steps the built-scene create reuses (no 2nd path).
+// ---------------------------------------------------------------------------
+
+nuka_result_t ValidateWorldDescAndDevice(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    bool require_scene_path, DeviceRecord** out_device,
+    articulation::ControlMode* out_mode) {
+    if (desc == nullptr ||
+        (require_scene_path && desc->scene_path == nullptr) ||
+        desc->fixed_dt <= 0.0f) {
         return NUKA_RESULT_INVALID_ARG;
     }
     if (desc->env_count == 0u) {
@@ -226,49 +297,27 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
     if (device_record->phi_device == nullptr || device_record->backend == nullptr) {
         return NUKA_RESULT_NOT_SUPPORTED;
     }
+    *out_device = device_record;
+    *out_mode = control_mode;
+    return NUKA_RESULT_OK;
+}
 
-    nuka::scene::SceneIR scene;
-    if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &scene)) {
-        return NUKA_RESULT_NOT_SUPPORTED;
-    }
-
-    // CO-RESIDENCE: compose the authored scene with itself instance_count times at
-    // distinct XY so the cook emits K SEPARATE articulations co-resident in one env.
-    // 0/1 == single instance -> the loop never runs -> BYTE-IDENTICAL single-artic.
-    if (desc->instance_count > 1u) {
-        const float spacing =
-            (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
-        for (uint32_t i = 1u; i < desc->instance_count; ++i) {
-            nuka::scene::SceneIR replica;
-            if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
-                return NUKA_RESULT_NOT_SUPPORTED;
-            }
-            nuka::math::Transform place = nuka::math::Transform::Identity();
-            place.position.x = spacing * static_cast<float>(i);
-            scene = nuka::scene::Compose(scene, replica, place,
-                                         "dog" + std::to_string(i) + "_");
-        }
-    }
-
-    // Cook the authored scene to an nk::Model (the GENERAL LBVH+cvx narrowphase +
-    // mixed-island solve; CookToModel always returns a PairDriven model). The world
-    // runs EXACTLY the cooked scene physics -- it does NOT inject a synthetic ground.
-    nuka::scene::cook::CookToModelResult cooked =
-        nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
-
+nuka_result_t ApplyControlTerrainGravity(
+    const nuka_world_desc_t* desc, articulation::ControlMode control_mode,
+    nuka::nk::Model& model, nuka::terrain::HeightField* out_terrain,
+    nuka::math::Vec3* out_gravity) {
     // Route the declared control mode onto the cooked Model's drive_mode (PDPosition
     // -> 0 position-PD kernel, Torque -> 1 direct-torque kernel). PDPosition is a
     // no-op (drive_mode defaults to 0 => the PD goldens stay byte-identical).
-    cooked.model.drive_mode =
+    model.drive_mode =
         (control_mode == articulation::ControlMode::Torque) ? 1u : 0u;
 
     // When the caller requests a baked heightfield (contact_family == 1), build the
     // ONE source-of-truth HeightField -- from a grayscale IMAGE if set, else the
     // parametric generator -- then cook it. A zero-init desc => flat => byte-identical
     // to no terrain. The obs/spawn sampler reads the SAME grid (stored on the record).
-    nuka::terrain::HeightField cooked_terrain;
     if (desc->contact_family == 1u) {
-        nuka::nk::Model& m = cooked.model;
+        nuka::nk::Model& m = model;
         const uint32_t orig_bodies = m.capacities.bodies_per_env;
         m.body_init.resize(orig_bodies);  // heightfield seeds at orig_bodies.
         const uint32_t nrow =
@@ -293,7 +342,7 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
             if (!nuka::terrain::LoadHeightFieldFromImage(
                     desc->heightfield_image_path, rx, ry,
                     desc->heightfield_elevation_z, desc->heightfield_base_z,
-                    nuka::math::Vec3{-rx, -ry, 0.0f}, cooked_terrain, err)) {
+                    nuka::math::Vec3{-rx, -ry, 0.0f}, *out_terrain, err)) {
                 return NUKA_RESULT_INVALID_ARG;
             }
         } else {
@@ -308,7 +357,7 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
             const float half_x = 0.5f * static_cast<float>(ncol - 1u) * cell;
             const float half_y = 0.5f * static_cast<float>(nrow - 1u) * cell;
             cfg.origin = nuka::math::Vec3{-half_x, -half_y, 0.0f};
-            cfg.base_z = cooked.model.ground_height;
+            cfg.base_z = model.ground_height;
             switch (desc->heightfield_terrain_type) {
                 case 1u:  // stairs (climbing rings).
                     cfg.ring_rise = desc->terrain_step_height;
@@ -352,11 +401,11 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
                 default:  // 0 flat: every amplitude 0.
                     break;
             }
-            if (!nuka::terrain::GenerateHeightField(cfg, cooked_terrain)) {
+            if (!nuka::terrain::GenerateHeightField(cfg, *out_terrain)) {
                 return NUKA_RESULT_INVALID_ARG;
             }
         }
-        nuka::scene::cook::CookHeightfieldGrid(m, cooked_terrain);
+        nuka::scene::cook::CookHeightfieldGrid(m, *out_terrain);
 
         nuka::nk::ModelCapacities& cap = m.capacities;
         // bodies_per_env (the LBVH leaf count) includes every static terrain
@@ -385,19 +434,13 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
         desc->gravity_z != 0.0f) {
         gravity = {desc->gravity_x, desc->gravity_y, desc->gravity_z};
     }
-
-    out->model = std::move(cooked.model);
-    out->scene = std::move(scene);
-    out->terrain = std::move(cooked_terrain);
-    out->gravity = gravity;
-    out->control_mode = control_mode;
-    out->device_record = device_record;
+    *out_gravity = gravity;
     return NUKA_RESULT_OK;
 }
 
 // Build the live WorldRecord from a cooked Model + the composed scene and insert it
-// into the WorldTable. Shared by the scene-only and the coupled (scene + particles)
-// create entries so the record assembly is ONE path -- the coupled entry differs only
+// into the WorldTable. Shared by the scene-only, coupled (scene + particles), and
+// built-scene create entries so the record assembly is ONE path -- they differ only
 // in cooking particles onto `cooked_model` before this runs. On success writes `out`
 // and returns OK; on a failed World build returns INTERNAL and leaves `out` null.
 // `solver_*` override the world SolverConfig (each 0 keeps the engine default, so the
@@ -411,10 +454,10 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 articulation::ControlMode control_mode,
                                 const nuka::math::Vec3& gravity,
                                 nuka_world_handle* out,
-                                uint32_t solver_vel_iters = 0u,
-                                uint32_t solver_pos_iters = 0u,
-                                float solver_contact_margin = 0.0f,
-                                uint32_t solver_max_pairs = 0u) {
+                                uint32_t solver_vel_iters,
+                                uint32_t solver_pos_iters,
+                                float solver_contact_margin,
+                                uint32_t solver_max_pairs) {
     auto record = std::make_unique<WorldRecord>();
     record->device = device_record;
     record->env_count = env_count;
@@ -454,8 +497,6 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     *out = WorldTable().Insert(std::move(record));
     return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
 }
-
-}  // namespace
 
 }  // namespace nuka::c_abi
 

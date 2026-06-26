@@ -30,7 +30,11 @@ struct SensorDesc; // scene/scene_ir.hpp -- accumulated mount list (vector membe
 namespace nuka::nk {
 class World;  // nk/pipeline/world.hpp -- fwd-declared (held by unique_ptr below;
               // complete in world.cpp where the World ctor runs).
+class Model;  // nk/model/model.hpp -- a cooked Model (passed by &&/& to the
+              // shared world-create helpers below; complete at each call site).
 }  // namespace nuka::nk
+
+namespace nuka::math { struct Vec3; }  // math/vec3.hpp (gravity vector param).
 
 namespace nuka::render {
 class SensorBackendI;     // render/sensor_backend.hpp -- the batched sensor facet.
@@ -281,5 +285,39 @@ struct SceneRecord {
     SceneRecord(const SceneRecord&) = delete;
     SceneRecord& operator=(const SceneRecord&) = delete;
 };
+
+// --- shared world-create helpers (defined in world.cpp) ---------------------
+// The pieces nuka_world_create_from_scene assembles, factored so the built-scene
+// create (c_abi/scene_builder.cpp) cooks the SAME way without a second world path.
+
+// Validate the world desc + resolve the device/backend and control mode. When
+// require_scene_path is true the desc MUST carry a scene_path (the file-load
+// path); the built-scene path passes false (its scene comes from a handle).
+nuka_result_t ValidateWorldDescAndDevice(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    bool require_scene_path, DeviceRecord** out_device,
+    runtime::articulation::ControlMode* out_mode);
+
+// Route the control mode onto the cooked Model's drive_mode, bake the optional
+// heightfield collidable (desc->contact_family == 1) and resolve world gravity.
+// Mutates `model`; writes the baked terrain + gravity. Returns INVALID_ARG on a
+// malformed terrain source (else OK). The post-cook step both create paths share.
+nuka_result_t ApplyControlTerrainGravity(
+    const nuka_world_desc_t* desc,
+    runtime::articulation::ControlMode control_mode, nuka::nk::Model& model,
+    nuka::terrain::HeightField* out_terrain, nuka::math::Vec3* out_gravity);
+
+// Build the live nk::World from a cooked Model + scene and insert it into the
+// WorldTable (the ONE record-assembly path). The solver_* override the world
+// SolverConfig (each 0 keeps the engine default). On success writes *out and
+// returns OK; on a failed build returns INTERNAL and leaves *out null.
+nuka_result_t FinishWorldCreate(
+    nuka::nk::Model&& cooked_model, nuka::scene::SceneIR&& scene,
+    nuka::terrain::HeightField&& cooked_terrain, DeviceRecord* device_record,
+    float fixed_dt, uint32_t env_count,
+    runtime::articulation::ControlMode control_mode,
+    const nuka::math::Vec3& gravity, nuka_world_handle* out,
+    uint32_t solver_vel_iters = 0u, uint32_t solver_pos_iters = 0u,
+    float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u);
 
 } // namespace nuka::c_abi

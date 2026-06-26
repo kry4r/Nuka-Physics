@@ -67,21 +67,24 @@ SceneRecord::~SceneRecord() = default;
 SceneRecord::SceneRecord(SceneRecord&&) noexcept = default;
 SceneRecord& SceneRecord::operator=(SceneRecord&&) noexcept = default;
 
+// The built-scene handle table (declared in handle_table.hpp). Shared so the
+// scene-builder TU + the built-scene world create reach the SAME SceneRecord.
+HandleTable<nuka_scene_t, SceneRecord>& SceneTable() {
+    static HandleTable<nuka_scene_t, SceneRecord> table;
+    return table;
+}
+
 }  // namespace nuka::c_abi
 
 namespace {
 
 using nuka::c_abi::DeviceRecord;
 using nuka::c_abi::SceneRecord;
+using nuka::c_abi::SceneTable;  // the shared table (defined in nuka::c_abi above).
 namespace cook = nuka::scene::cook;
 namespace nks = nuka::scene::nks;
 namespace nphi = nuka::phi;
 namespace nk = nuka::nk;
-
-nuka::c_abi::HandleTable<nuka_scene_t, SceneRecord>& SceneTable() {
-    static nuka::c_abi::HandleTable<nuka_scene_t, SceneRecord> table;
-    return table;
-}
 
 // Dispatch by file extension to the right importer / .nks loader -- the SAME
 // dispatch world.cpp's create path uses (kept in sync deliberately; this is the
