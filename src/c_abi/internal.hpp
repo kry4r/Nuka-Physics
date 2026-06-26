@@ -16,6 +16,7 @@
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/control_mode.hpp"
 #include "runtime/step_options.hpp"
+#include "scene/cook/media_render_surface.hpp"
 #include "scene/terrain/heightfield.hpp"
 
 #include <memory>
@@ -157,10 +158,10 @@ struct WorldRecord {
     // the World/backend drop. Null until render_beauty runs.
     std::unique_ptr<BeautyRender> beauty;
 
-    // The render-surface triangle connectivity of the world's particle media (the
-    // cloth lattice), retained at coupled-create so a live beauty render rebuilds the
+    // One render surface per cooked particle medium (cloth lattice faces, soft-tet
+    // boundary faces), retained at world-create so a live beauty render rebuilds each
     // deforming surface from the live particle positions. Empty when no surface media.
-    std::vector<uint32_t> particle_surface_triangles;
+    std::vector<nuka::scene::cook::MediaRenderSurface> particle_surfaces;
 
     DeviceRecord* device = nullptr;
 

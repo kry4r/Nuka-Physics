@@ -15,6 +15,7 @@
 #include "render/rt_framebuffer_to_report.hpp"
 
 #include <cstdint>
+#include <string>
 
 namespace nuka::render {
 
@@ -51,9 +52,17 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const soft::SurfaceTopology& surface_topology,
                              uint32_t width, uint32_t height) {
+    std::vector<soft::SurfaceTopology> topologies;
+    if (!surface_topology.triangles.empty()) topologies.push_back(surface_topology);
+    return BuildStudioScene(registry, map, topologies, width, height);
+}
+
+StudioScene BuildStudioScene(const scene::Registry& registry,
+                             const scene::SceneMap& map,
+                             const std::vector<soft::SurfaceTopology>& surface_topologies,
+                             uint32_t width, uint32_t height) {
     StudioScene s;
     s.world = BuildRenderWorld(registry, map);
-    s.surface_topology = surface_topology;
 
     // The per-instance link + geom-local rebind (the proven shape->link rebind):
     // a non-static instance follows LinkPose[row] composed with its visual offset.
@@ -81,7 +90,17 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
     s.world.materials.push_back(Mk(0.400f, 0.035f, 0.060f, 0.00f, 0.58f, 0.6f));  // 4 crimson silk
     s.world.materials.push_back(Mk(0.190f, 0.196f, 0.210f, 0.02f, 0.82f));  // 5 studio floor
     s.world.default_material_id = kMatShell;
-    s.surface_material_id = kMatCloth;
+
+    // Each cooked medium with a triangulated surface becomes one deforming instance;
+    // the crimson media material reads as fabric on a cloth and a jelly on a soft body.
+    s.surfaces.clear();
+    for (const soft::SurfaceTopology& topo : surface_topologies) {
+        if (topo.triangles.empty()) continue;
+        StudioScene::DeformingSurface ds;
+        ds.topology = topo;
+        ds.material_id = kMatCloth;
+        s.surfaces.push_back(std::move(ds));
+    }
 
     auto link_role_material = [&](uint32_t link, const Transform& vlocal) -> uint32_t {
         if (link == 0u) return kMatShell;
@@ -143,24 +162,27 @@ void PublishStudioScene(StudioScene& scene,
         if (lk < link_pose.size())
             scene.world.instances[i].world_xform = link_pose[lk] * scene.visual_local[i];
     }
-    if (scene.surface_topology.triangles.empty()) return;
 
-    // Rebuild the deforming surface from the live particles; the mesh id is stable
-    // (interned once) so the mesh table never grows across frames.
-    MeshGeometry surf;
-    soft::BuildSurfaceMesh(particle_pos, scene.surface_topology, surf);
-    if (scene.surface_mesh_id == kNoId) {
-        scene.surface_mesh_id =
-            scene.world.meshes.InternPrimitive("particle_surface", [&] { return surf; });
-        RenderInstance ci;
-        ci.mesh_id = scene.surface_mesh_id;
-        ci.render_material_id = scene.surface_material_id;
-        ci.world_xform = Transform::Identity();
-        ci.pose_source.kind = PoseSource::Kind::Static;
-        scene.world.instances.push_back(ci);
-        scene.surface_instance = scene.world.instances.size() - 1u;
-    } else {
-        scene.world.meshes.ReplaceGeometry(scene.surface_mesh_id, std::move(surf));
+    // Rebuild every deforming surface from the live particles over its own triangle
+    // topology; each mesh id is stable (interned once) so the table never grows.
+    for (std::size_t si = 0; si < scene.surfaces.size(); ++si) {
+        StudioScene::DeformingSurface& surf = scene.surfaces[si];
+        if (surf.topology.triangles.empty()) continue;
+        MeshGeometry mesh;
+        soft::BuildSurfaceMesh(particle_pos, surf.topology, mesh);
+        if (surf.mesh_id == kNoId) {
+            surf.mesh_id = scene.world.meshes.InternPrimitive(
+                "particle_surface" + std::to_string(si), [&] { return mesh; });
+            RenderInstance ci;
+            ci.mesh_id = surf.mesh_id;
+            ci.render_material_id = surf.material_id;
+            ci.world_xform = Transform::Identity();
+            ci.pose_source.kind = PoseSource::Kind::Static;
+            scene.world.instances.push_back(ci);
+            surf.instance = scene.world.instances.size() - 1u;
+        } else {
+            scene.world.meshes.ReplaceGeometry(surf.mesh_id, std::move(mesh));
+        }
     }
 }
 
