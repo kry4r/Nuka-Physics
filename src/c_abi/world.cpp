@@ -170,14 +170,18 @@ nuka::scene::cook::XpbdCookInput BuildClothCookInput(
     in.velocities.assign(rest.size(), nuka::math::Vec3::Zero());
     const float mass = p.cloth_particle_mass > 0.0f ? p.cloth_particle_mass : 0.01f;
     in.inv_mass.assign(rest.size(), 1.0f / mass);
-    const uint32_t last_i = nx - 1u, last_j = ny - 1u;  // pin the whole perimeter.
-    for (uint32_t k = 0u; k < nx; ++k) {
-        in.inv_mass[idx(k, 0u)] = 0.0f;
-        in.inv_mass[idx(k, last_j)] = 0.0f;
-    }
-    for (uint32_t k = 0u; k < ny; ++k) {
-        in.inv_mass[idx(0u, k)] = 0.0f;
-        in.inv_mass[idx(last_i, k)] = 0.0f;
+    // cloth_free == 0: pin the whole perimeter (a taut membrane). cloth_free == 1:
+    // skip the pin so every particle is dynamic (a free drape).
+    if (p.cloth_free == 0u) {
+        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+        for (uint32_t k = 0u; k < nx; ++k) {
+            in.inv_mass[idx(k, 0u)] = 0.0f;
+            in.inv_mass[idx(k, last_j)] = 0.0f;
+        }
+        for (uint32_t k = 0u; k < ny; ++k) {
+            in.inv_mass[idx(0u, k)] = 0.0f;
+            in.inv_mass[idx(last_i, k)] = 0.0f;
+        }
     }
     for (const auto& dc : cs.distance) {
         in.distance.push_back(
@@ -192,6 +196,17 @@ nuka::scene::cook::XpbdCookInput BuildClothCookInput(
     in.solver_iterations =
         static_cast<uint16_t>(p.cloth_iters != 0u ? p.cloth_iters : 1u);
     in.friction = p.cloth_friction;
+    // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
+    // triangles only when active (all-zero coeffs => no op => byte-identical cook).
+    in.aero_drag_normal = p.aero_normal;
+    in.aero_drag_tangent = p.aero_tangent;
+    in.aero_drag_max_dv = p.aero_max_dv;
+    if (p.aero_normal > 0.0f || p.aero_tangent > 0.0f) {
+        in.aero_triangles.reserve(tris.size());
+        for (const auto& t : tris) {
+            in.aero_triangles.push_back({t.v[0], t.v[1], t.v[2]});
+        }
+    }
     return in;
 }
 
@@ -801,6 +816,66 @@ nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
         out_heights[i] = nuka::terrain::SampleHeightFieldZ(hf, xs[i], ys[i]);
     }
     return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
+                                      uint32_t link_index, char* out, size_t cap,
+                                      size_t* out_len) {
+    if (out_len != nullptr) {
+        *out_len = 0u;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (record->scene == nullptr ||
+        record->articulation_host.articulations.empty()) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // no cooked articulation retained.
+    }
+    try {
+        // Cooked link -> its body row. The host mirror covers articulation 0 (the
+        // co-residence case mirrors only the first dog, the existing host limitation).
+        const auto& topo = record->articulation_host.articulations.front();
+        if (link_index >= topo.link_bodies.size()) {
+            return NUKA_RESULT_INVALID_ARG;
+        }
+        const nuka::scene::BodyId body = topo.link_bodies[link_index];
+        const nuka::scene::SceneIR& scene = *record->scene;
+
+        // The DOF name is the joint whose CHILD is this link's body (the actuated
+        // joint). The root (no parent joint) falls back to the link body's name.
+        std::string name;
+        for (const auto& joint : scene.Joints()) {
+            if (joint.child_body == body) {
+                name = joint.name;
+                break;
+            }
+        }
+        if (name.empty() && body < scene.Bodies().size()) {
+            name = scene.Bodies()[body].name;
+        }
+
+        if (out_len != nullptr) {
+            *out_len = name.size();  // set first so the caller can resize + retry.
+        }
+        if (out == nullptr) {
+            return NUKA_RESULT_OK;  // size query: *out_len holds the needed length.
+        }
+        if (name.size() + 1u > cap) {
+            return NUKA_RESULT_INVALID_ARG;  // LOUD: too small to hold name + NUL.
+        }
+        for (size_t i = 0u; i < name.size(); ++i) {
+            out[i] = name[i];
+        }
+        out[name.size()] = '\0';
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 } // extern "C"

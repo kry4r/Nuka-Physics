@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cstdint>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -256,7 +257,8 @@ public:
         float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
         float fluid_max_y, float fluid_max_z, float fluid_spacing,
         float fluid_rest_density, float fluid_floor_z, float fluid_friction,
-        uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method) {
+        uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method,
+        bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
         }
@@ -302,6 +304,10 @@ public:
         parts.fluid_iters = fluid_iters;
         parts.contact_radius = contact_radius;
         parts.soft_sim_method = soft_sim_method;  // 0 = xpbd default, 1 = mlsmpm.
+        parts.cloth_free = cloth_free ? 1u : 0u;   // 1 = skip perimeter pin (free drape).
+        parts.aero_normal = aero_normal;           // anisotropic aero drag (0 = off).
+        parts.aero_tangent = aero_tangent;
+        parts.aero_max_dv = aero_max_dv;
 
         nuka_world_handle h = nullptr;
         check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
@@ -477,6 +483,20 @@ public:
             throw std::runtime_error("buffer_view: engine returned null device_ptr");
         }
         return view;
+    }
+
+    // Cooked DOF name of articulation-local link `link` (0 == root). A two-call
+    // size-query then fill (an empty name returns ""). Resolves through the cooked
+    // articulation joint table (correct under CookArticulations reordering).
+    std::string dof_name(uint32_t link) const {
+        size_t need = 0u;
+        check(nuka_world_get_dof_name(h_, link, nullptr, 0u, &need),
+              "nuka_world_get_dof_name(size)");
+        std::string buf(need + 1u, '\0');
+        check(nuka_world_get_dof_name(h_, link, buf.data(), buf.size(), &need),
+              "nuka_world_get_dof_name");
+        buf.resize(need);
+        return buf;
     }
 
     // Device-resident batched camera sensor: S cameras per env into a single
@@ -1217,6 +1237,11 @@ NB_MODULE(_nuka_ext, m) {
         // (element_count == 0) on a world with no particles.
         .value("PARTICLE_POSITION", NUKA_FIELD_PARTICLE_POSITION)
         .value("PARTICLE_VELOCITY", NUKA_FIELD_PARTICLE_VELOCITY)
+        // Cooked rigid-body SoA world linear/angular velocity (per-body Vec3,
+        // env-major). buffer_view shape (env_count, bodies_per_env, 3) float32; an
+        // empty view on a body-free world. Writable via upload_field to park a body.
+        .value("BODY_LINEAR_VELOCITY", NUKA_FIELD_BODY_LINEAR_VELOCITY)
+        .value("BODY_ANGULAR_VELOCITY", NUKA_FIELD_BODY_ANGULAR_VELOCITY)
         .export_values();
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
@@ -1332,6 +1357,8 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("fluid_rest_density") = 1000.0f, nb::arg("fluid_floor_z") = 0.0f,
             nb::arg("fluid_friction") = 0.0f, nb::arg("fluid_iters") = 4u,
             nb::arg("contact_radius") = 0.0f, nb::arg("soft_sim_method") = 0u,
+            nb::arg("cloth_free") = false, nb::arg("aero_normal") = 0.0f,
+            nb::arg("aero_tangent") = 0.0f, nb::arg("aero_max_dv") = 0.0f,
             nb::rv_policy::take_ownership,
             "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
             "and/or fluid (PBF) particles, stepping on the ONE general contact "
@@ -1344,7 +1371,11 @@ NB_MODULE(_nuka_ext, m) {
             "fluid box fills the AABB [fluid_min, fluid_max] on a z-up floor at "
             "fluid_floor_z. Omit a medium by leaving its extent zero (>= one "
             "required). contact_family == 1 also bakes a heightfield collidable "
-            "(the same terrain_* knobs create_from_scene takes).")
+            "(the same terrain_* knobs create_from_scene takes). cloth_free (default "
+            "False): when True the cloth perimeter is NOT pinned -> a free drape "
+            "instead of a taut membrane. aero_normal/aero_tangent/aero_max_dv (default "
+            "0 == off): anisotropic cloth aerodynamic drag (lumped 0.5*rho*Cn, "
+            "0.5*rho*Ct, per-step dv clamp); all-zero keeps the cook byte-identical.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
@@ -1407,6 +1438,165 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("field"),
             "Raw engine device pointer (int) backing `field` -- for zero-copy "
             "verification (torch.from_dlpack(...).data_ptr() must equal it).")
+        // General host->field byte upload (1:1 with nk::Data::UploadField): the one
+        // control verb a choreography uses to re-seat BASE_POSE, zero LINK_VELOCITY,
+        // park a body, etc. `data` is a HOST contiguous array; `offset` is in SCALARS
+        // of its dtype. An over-range write is a LOUD error, never a silent clamp.
+        .def(
+            "upload_field",
+            [](World& w, nuka_state_field_t field, nb::ndarray<nb::c_contig> data,
+               size_t offset) {
+                if (data.device_type() != nb::device::cpu::value) {
+                    throw std::runtime_error(
+                        "upload_field: data must be a HOST array (CPU). For zero-copy "
+                        "device writes use buffer_view(field) instead.");
+                }
+                const size_t itemsize = data.itemsize();
+                check(nuka_world_upload_field(w.raw(), field, data.data(),
+                                              data.size() * itemsize,
+                                              offset * itemsize),
+                      "nuka_world_upload_field");
+            },
+            nb::arg("field"), nb::arg("data"), nb::arg("offset") = size_t{0},
+            "Copy a HOST contiguous array into `field`'s live device buffer at scalar "
+            "`offset` (1:1 with nk::Data::UploadField). The general byte-level control "
+            "path: e.g. re-seat BASE_POSE (7 floats/env), zero LINK_VELOCITY, park a "
+            "BODY_LINEAR_VELOCITY, hold a PARTICLE_POSITION pin. An over-range write or "
+            "an unknown field raises (never a silent clamp). data dtype must match the "
+            "field (float32 for all but the uint32 index/type fields).")
+        // General field->host byte download (1:1 with nk::Data::DownloadField).
+        .def(
+            "download_field",
+            [](World& w, nuka_state_field_t field, size_t offset,
+               size_t count) -> nb::object {
+                nuka_buffer_view_t view = w.get_view(field);
+                const size_t fpe = (view.element_stride_bytes >= sizeof(float))
+                                       ? (view.element_stride_bytes / sizeof(float))
+                                       : 1u;
+                const size_t total = view.element_count * fpe;  // 4-byte scalars.
+                if (offset > total) {
+                    throw std::runtime_error("download_field: offset beyond field");
+                }
+                const size_t n = (count == 0u) ? (total - offset) : count;
+                if (offset + n > total) {
+                    throw std::runtime_error("download_field: range exceeds field");
+                }
+                size_t shape[1] = {n};
+                if (view.dtype == 1u) {
+                    uint32_t* buf = new uint32_t[n ? n : 1u];
+                    check(nuka_world_download_field(w.raw(), field, buf, n * 4u,
+                                                    offset * 4u),
+                          "nuka_world_download_field");
+                    nb::capsule owner(buf, [](void* p) noexcept {
+                        delete[] static_cast<uint32_t*>(p);
+                    });
+                    return nb::cast(
+                        nb::ndarray<nb::numpy, uint32_t>(buf, 1, shape, owner));
+                }
+                float* buf = new float[n ? n : 1u];
+                check(nuka_world_download_field(w.raw(), field, buf, n * 4u,
+                                                offset * 4u),
+                      "nuka_world_download_field");
+                nb::capsule owner(buf, [](void* p) noexcept {
+                    delete[] static_cast<float*>(p);
+                });
+                return nb::cast(nb::ndarray<nb::numpy, float>(buf, 1, shape, owner));
+            },
+            nb::arg("field"), nb::arg("offset") = size_t{0},
+            nb::arg("count") = size_t{0},
+            "Download `field` to a HOST numpy array (1:1 with "
+            "nk::Data::DownloadField). offset/count are in SCALARS (count 0 == the "
+            "whole field from offset). float32 for all but the uint32 index/type "
+            "fields. The read mirror of upload_field for round-trip verification.")
+        // Name->DOF introspection. The cooked DOF names (joint-resolved, correct
+        // under CookArticulations reordering) and the regex/keyword resolvers.
+        .def(
+            "dof_names",
+            [](World& w) -> std::vector<std::string> {
+                std::vector<std::string> names;
+                names.reserve(w.base_link_count());
+                for (uint32_t l = 0u; l < w.base_link_count(); ++l) {
+                    names.push_back(w.dof_name(l));
+                }
+                return names;
+            },
+            "The cooked DOF name of every articulation-local link (index 0 == root, "
+            "1..base_link_count-1 == the actuated joints in cooked order). Each name "
+            "is the joint whose child is that link (the root falls back to its body "
+            "name).")
+        .def(
+            "dof_index",
+            [](World& w, const std::string& pattern) -> nb::object {
+                // A leading 'entity/' selector is informational in a single-
+                // articulation world; match the tail against each cooked DOF name.
+                std::string pat = pattern;
+                const size_t slash = pat.find_last_of('/');
+                if (slash != std::string::npos) {
+                    pat = pat.substr(slash + 1u);
+                }
+                std::regex re(pat);
+                std::vector<int32_t> cols;
+                for (uint32_t l = 0u; l < w.base_link_count(); ++l) {
+                    const std::string name = w.dof_name(l);
+                    if (!name.empty() && std::regex_search(name, re)) {
+                        cols.push_back(static_cast<int32_t>(l));
+                    }
+                }
+                int32_t* buf = new int32_t[cols.size() ? cols.size() : 1u];
+                for (size_t i = 0u; i < cols.size(); ++i) {
+                    buf[i] = cols[i];
+                }
+                nb::capsule owner(buf, [](void* p) noexcept {
+                    delete[] static_cast<int32_t*>(p);
+                });
+                size_t shape[1] = {cols.size()};
+                return nb::cast(nb::ndarray<nb::numpy, int32_t>(buf, 1, shape, owner));
+            },
+            nb::arg("pattern"),
+            "Resolve a regex over the cooked DOF names to the matching per-env link "
+            "COLUMN indices (int32, in [0, base_link_count)). The per-link buffers "
+            "(DRIVE_TARGET / JOINT_POSITION / ...) are (env_count, base_link_count): "
+            "index them as tensor[:, world.dof_index(pat)]. A leading 'entity/' is "
+            "stripped. Correct under CookArticulations joint reordering (matches "
+            "names, never positions).")
+        .def(
+            "stand_targets",
+            [](World& w, nb::kwargs joints) -> nb::object {
+                const uint32_t blc = w.base_link_count();
+                const uint32_t adim = w.action_dim();  // actuated slots [1, blc).
+                float* buf = new float[adim ? adim : 1u];
+                for (uint32_t i = 0u; i < adim; ++i) {
+                    buf[i] = 0.0f;
+                }
+                for (uint32_t l = 1u; l < blc; ++l) {
+                    const std::string name = w.dof_name(l);
+                    if (name.empty()) {
+                        continue;
+                    }
+                    for (auto [key, val] : joints) {
+                        const std::string k = nb::cast<std::string>(key);
+                        // 'entity' is reserved (the per-entity scoping the facade adds).
+                        if (k == "entity") {
+                            continue;
+                        }
+                        if (std::regex_search(name, std::regex(k))) {
+                            buf[l - 1u] = nb::cast<float>(val);
+                        }
+                    }
+                }
+                nb::capsule owner(buf, [](void* p) noexcept {
+                    delete[] static_cast<float*>(p);
+                });
+                size_t shape[1] = {adim};
+                return nb::cast(nb::ndarray<nb::numpy, float>(buf, 1, shape, owner));
+            },
+            "Build an (action_dim,) target vector for the actuated joints (cooked "
+            "slots [1, base_link_count)) by matching each joint's cooked DOF name "
+            "against the keyword names (each key is a regex/substring; matched joints "
+            "take that value, unmatched stay 0). E.g. stand_targets(thigh=0.8, "
+            "calf=-1.5, hip=0.1) -> a crouch; assign into DRIVE_TARGET[:, 1:]. A "
+            "reserved 'entity=' kwarg is ignored (per-entity scoping arrives with the "
+            "scene facade).")
         .def("__enter__", [](World& w) -> World& { return w; })
         .def("__exit__",
              [](World& w, nb::object, nb::object, nb::object) { w.destroy(); },
