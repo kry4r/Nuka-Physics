@@ -272,10 +272,10 @@ nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
     }
 }
 
-nuka_result_t nuka_world_create_from_built_scene(nuka_device_handle device,
-                                                 const nuka_world_desc_t* desc,
-                                                 nuka_scene_handle scene,
-                                                 nuka_world_handle* out) {
+nuka_result_t nuka_world_create_from_built_scene(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    nuka_scene_handle scene, const nuka_built_scene_options_t* options,
+    nuka_world_handle* out) {
     if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
     *out = nullptr;
     if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
@@ -308,16 +308,26 @@ nuka_result_t nuka_world_create_from_built_scene(nuka_device_handle device,
             desc, control_mode, cooked.model, &cooked_terrain, &gravity);
         if (terrain != NUKA_RESULT_OK) return terrain;
 
+        // A positive baumgarte_max_velocity bounds the contact recovery push-out (the
+        // SAME model override the coupled entry applies); 0 keeps the cooked default.
+        if (options != nullptr && options->baumgarte_max_velocity > 0.0f) {
+            cooked.model.baumgarte_max_velocity = options->baumgarte_max_velocity;
+        }
+
         // Every cooked medium's render surface (built from the SAME media list before
         // the scene moves into the record), so a beauty render rebuilds each surface.
         std::vector<cook::MediaRenderSurface> media_surfaces =
             cook::BuildSceneMediaRenderSurfaces(built.Media());
 
-        // Build + insert the live world through the SAME record-assembly path.
+        // Build + insert the live world through the SAME record-assembly path. The
+        // SolverConfig overrides ride `options`; all-zero/NULL keeps today's cfg.
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(cooked.model), std::move(built), std::move(cooked_terrain),
             device_record, desc->fixed_dt, desc->env_count, control_mode, gravity,
-            out);
+            out, options ? options->solver_vel_iters : 0u,
+            options ? options->solver_pos_iters : 0u,
+            options ? options->solver_contact_margin : 0.0f,
+            options ? options->solver_max_pairs : 0u);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
                 record->particle_surfaces = std::move(media_surfaces);

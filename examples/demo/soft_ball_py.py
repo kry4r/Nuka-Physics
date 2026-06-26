@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Drop a soft tet ball onto a ground -- authored ENTIRELY from Python.
 
-Builds a coupled world through the nuka authoring facade: a static floor slab (the
-PHYSICS ground) + a ``TetSphere`` soft body (an XPBD tet rest-lattice with distance
-+ volume constraints) authored above it, cooked through the general ``SceneBuilder``
-media path (``Scene.build``). The DROP is a CONTROL input (``SoftDrop`` holds the
-ball airborne, then releases it) and the floor is held by a CONTROL pose-pin
-(``PinBody``) -- never baked onto a morph. The ball falls under gravity, the volume
-constraint squashes + recovers it on the floor through the ONE general
-body<->particle row solver, and each frame beauty-renders the LIVE world with
-``World.render_beauty``: the deforming tet boundary surface (rebuilt from the live
-particle field each frame) over a studio floor, hero-orbited like the cloth demo.
+Builds a world through the nuka authoring facade: a flat baked ground (the general,
+margin-aware particle-ground the cloth also pools onto, ``contact_family=1``) + a
+``TetSphere`` soft body (an XPBD tet rest-lattice with distance + volume constraints)
+authored above it, cooked through the general ``SceneBuilder`` media path
+(``Scene.build``). The DROP is a CONTROL input (``SoftDrop`` holds the ball airborne,
+then releases it, then a settle drag) -- never baked onto a morph. The ball falls
+under gravity, the volume constraint squashes + recovers it on the ground through the
+ONE general body<->particle row solver, and each frame beauty-renders the LIVE world
+with ``World.render_beauty``: the deforming tet boundary surface (rebuilt from the
+live particle field each frame) over a studio floor, hero-orbited like the cloth demo.
+
+The contact is TIGHT: the authored ``SimOptions`` request a strong contact solve
+(extra split-impulse position sweeps + a speculative margin) through the built-scene
+SolverConfig overrides, so the ball rests with its bottom AT the floor (z = 0) with no
+penetration -- not hidden below the studio floor. (An analytic box-slab floor cannot
+give non-penetrating particle contact: a particle whose centre crosses into the box
+gets a degenerate sideways push, so the ball sinks. The flat baked ground is the
+margin-aware face contact the cloth already rests on -- ONE general path, no box.)
 
 Pure Python over the prebuilt nuka module -- NO recompile. Writes
 out/soft_py/frame_####.png (and an mp4 when ffmpeg is on PATH).
@@ -30,15 +38,30 @@ from PIL import Image
 
 import nuka
 from nuka.author import Scene, SimOptions, materials, morphs, surfaces
-from nuka.author.control import PinBody, SoftDrop
+from nuka.author.control import SoftDrop
 from nuka.author.render import smoothstep
 
-# A ~0.10 m soft sphere dropped from this centre height onto a floor slab whose top
-# is z = 0. A coarse tet cage (its boundary faces render, smoothed by the render
-# skin); a light, gentle drop so the squash + recovery reads on the floor.
-RADIUS, CELLS, DROP_Z = 0.10, 10, 0.20
-FLOOR_HALF_Z = 0.5            # a thick slab so the ball cannot squeeze out the bottom.
+# A ~0.10 m soft sphere dropped from this centre height onto the flat ground (z = 0);
+# a gentle drop so the squash + recovery reads and the ball settles round, not warped.
+RADIUS, CELLS, DROP_Z = 0.10, 12, 0.118
 HOLD, WIDTH, HEIGHT, SPP = 8, 1280, 720, 16
+
+# Tight-contact SolverConfig overrides threaded through the built-scene path: extra
+# split-impulse position sweeps + a speculative margin expel penetration, Baumgarte-bounded.
+SOLVER = dict(solver_vel_iters=96, solver_pos_iters=44, solver_contact_margin=0.045,
+              solver_max_pairs=96, baumgarte_max_velocity=0.8)
+
+
+def settle_damp(step):
+    """Per-step settle drag: light through the fall + first squash (a natural impact),
+    ramping heavier across the settle so the soft pulse dies and the ball comes to a
+    clean rest on the ground. A control INPUT (uniform velocity drag), not a solver fork."""
+    lo, hi, s0, s1 = 0.02, 0.10, 70, 160
+    if step < s0:
+        return lo
+    if step >= s1:
+        return hi
+    return lo + (hi - lo) * (step - s0) / (s1 - s0)
 
 
 def main():
@@ -50,27 +73,20 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     dev = nuka.Device.create(0)
 
-    # Assemble the coupled world: a static box-slab floor (top at z = 0, the physics
-    # ground) + a tet-soft sphere authored above it (XPBD distance + volume), with a
-    # render skin (a thin outward inflation + Laplacian relax) so the coarse tet
-    # boundary reads smooth. The general SceneBuilder path runs at default (Earth)
-    # gravity. (A plane primitive has a degenerate broadphase AABB for particle
-    # contact, so the floor is a finite slab; studio_beauty draws its own floor.)
-    scene = Scene(SimOptions(dt=1.0 / 240.0, env_count=1))
-    scene.add_entity(morphs.Box((1.5, 1.5, FLOOR_HALF_Z), pos=(0.0, 0.0, -FLOOR_HALF_Z)),
-                     materials.Rigid(friction=0.8, static=True))
+    # A flat baked ground (contact_family=1, the cloth's margin-aware particle-ground) +
+    # a tet-soft sphere above it (XPBD distance + volume) with a smoothing render skin.
+    scene = Scene(SimOptions(dt=1.0 / 240.0, env_count=1, contact_family=1,
+                             heightfield_terrain_type=0, **SOLVER))
     scene.add_entity(
         morphs.TetSphere((0.0, 0.0, DROP_Z), RADIUS, CELLS),
-        materials.Soft.XPBD(mass=0.0015, friction=0.6,
-                            distance_alpha=3.0e-6, volume_alpha=1.0e-6, iters=40),
-        surfaces.Soft(offset=0.004, smooth_iters=6, smooth_lambda=0.5))
+        materials.Soft.XPBD(mass=0.005, friction=0.6,
+                            distance_alpha=3.0e-6, volume_alpha=6.0e-6, iters=44),
+        surfaces.Soft(offset=0.002, smooth_iters=6, smooth_lambda=0.5))
     world = scene.build(dev)
     print(f"soft world: links={world.base_link_count} particles={world.particle_count}")
 
-    # CONTROL layer: pin the static floor slab at its authored pose each step (a
-    # built-scene static body carries no seeded device pose), and the drop -- hold the
-    # ball airborne, release it, then a gentle settle drag.
-    floor = PinBody(world, pos=(0.0, 0.0, -FLOOR_HALF_Z), body_index=0)
+    # CONTROL layer: the drop -- hold the ball airborne, release it, then the settle
+    # drag. The ground is baked static (no per-step pose pin needed).
     drop = SoftDrop(world)
 
     frames = []
@@ -96,17 +112,15 @@ def main():
         print(f"frame {len(frames):2d} step {step:4d} centroid_z={cz:+.4f} "
               f"nonbg={nonbg} -> {path}")
 
-    # Airborne hold, then drop + squash + settle. The floor is pinned EVERY step.
+    # Airborne hold, then drop + squash + settle.
     for _ in range(HOLD):
-        floor.pin()
         drop.hold()
         world.step()
     drop.release()
     render(0)
     for s in range(1, total):
-        floor.pin()
         world.step()
-        drop.damp(0.02)
+        drop.damp(settle_damp(s))
         if s % args.stride == 0 or s + 1 == total:
             render(s)
 
