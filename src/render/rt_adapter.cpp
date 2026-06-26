@@ -68,6 +68,7 @@ rt::Material RenderMaterialToRt(const scene::RenderMaterial& m) {
     out.transmission = m.transmission;
     out.ior = m.ior;
     out.absorption = {m.absorption[0], m.absorption[1], m.absorption[2]};
+    out.sheen = m.sheen;
     return out;
 }
 

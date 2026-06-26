@@ -27,6 +27,9 @@ struct SparseSdfParams {
     uint32_t band_voxels     = 4u;    // narrow band half-width N: store |phi| <= N*h
     float    auto_resolution = 64.0f; // when voxel_size==0: longest AABB axis / this
     float    padding_voxels  = 1.0f;  // extra voxels of AABB padding (>= 1 recommended)
+    // Fill the full enclosed interior (not just the |phi|<=band shell) so a deep
+    // inside point has a value+gradient. Off => narrow-band-only (byte-identical).
+    bool     solid           = false;
 };
 
 /// One cooked narrow-band SDF (mesh-local frame). cell_keys[n] packs the voxel

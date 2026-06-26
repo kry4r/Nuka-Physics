@@ -54,6 +54,9 @@ struct ModelCapacities {
     // the total flat cluster-MEMBER pool size (sum_c n_c). 0 == no shape-match.
     uint32_t shape_match_slots_per_env   = 0;  // XPBD shape-match cluster count / env.
     uint32_t shape_match_members_per_env = 0;  // flat cluster-member pool / env.
+    // Cloth aerodynamic-drag element count / env (one per surface triangle). 0 ==
+    // no drag (the drag op is not emitted -> a drag-free cook is byte-identical).
+    uint32_t aero_tris_per_env           = 0;
     // Graph-coloring color counts per XPBD family (single-env template; a color
     // is an independent constraint set sharing no particle). Built by
     // nk::XpbdColoring; size the per-family color-segment tables (pairs/color).
@@ -357,6 +360,18 @@ public:
         std::vector<uint32_t>   sm_particles;       // flat pool (sum n_c)
         std::vector<math::Vec3> sm_rest_q;          // flat pool (q_i = x_i^0 - c0)
         std::vector<float>      sm_mass;            // flat pool (m_i weight)
+        // Cloth AERODYNAMIC-DRAG element templates (single-env; one per surface
+        // triangle). aero_tri_verts = 3 particle indices / triangle, aero_tri_area
+        // = rest-space area / triangle. Empty for a drag-free cook.
+        std::vector<uint32_t>   aero_tri_verts;     // 3 / triangle
+        std::vector<float>      aero_tri_area;      // 1 / triangle
+        // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
+        // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
+        // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into
+        // flutter. drag_max_dv caps the per-step impulse magnitude (0 == uncapped).
+        float    aero_drag_normal    = 0.0f;
+        float    aero_drag_tangent   = 0.0f;
+        float    aero_drag_max_dv    = 0.0f;
         uint16_t xpbd_iters = 1;
         // M9 T11 two-system [soft | fluid] split index: the fluid particles
         // occupy [n_soft_particles, particles_per_env). For SoftFluid mode the

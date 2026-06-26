@@ -144,6 +144,8 @@ enum class FieldId : uint16_t {
     SmParticles,  // sm_particles (per:shape_match_member arena:persistent owner:model)
     SmRestQ,  // sm_rest_q (per:shape_match_member arena:persistent owner:model)
     SmMass,  // sm_mass (per:shape_match_member arena:persistent owner:model)
+    AeroTriVerts,  // aero_tri_verts (per:aero_tri arena:persistent owner:model elem:3)
+    AeroTriArea,  // aero_tri_area (per:aero_tri arena:persistent owner:model)
     PbfPredictedPos,  // pbf_predicted_pos (per:particle arena:scratch owner:data)
     PbfPositionDelta,  // pbf_position_delta (per:particle arena:scratch owner:data)
     PbfDensity,  // pbf_density (per:particle arena:scratch owner:data)

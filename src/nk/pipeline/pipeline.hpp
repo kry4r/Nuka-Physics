@@ -106,6 +106,7 @@ private:
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
     phi::SolveRowsBlockIslandParams   p_solve_{};
+    phi::AeroDragParams               p_aero_drag_{};
     phi::ParticlePredictParams        p_part_predict_{};
     phi::XpbdProjectParams            p_xpbd_{};
     phi::PbfDensityLambdaParams       p_pbf_density_{};

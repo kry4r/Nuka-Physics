@@ -31,6 +31,9 @@ struct Material {
     float transmission = 0.0f;            // 0 = opaque; 1 = fully transmissive
     float ior = 1.0f;                     // refractive index (water ~1.33)
     math::Vec3 absorption{0.0f, 0.0f, 0.0f};  // per-metre Beer-Lambert extinction
+    // Grazing retroreflective sheen weight (silk/satin), beauty-only. 0 (default) is a
+    // strict no-op: ShadeDirect ignores it and ShadeBeauty skips the term byte-exactly.
+    float sheen = 0.0f;
 };
 
 // One analytic light. directional == true: `direction` is the (unit) direction

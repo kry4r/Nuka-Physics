@@ -160,6 +160,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SmParticles, DlpackDtype::kU32, 1, false, false},  // sm_particles
     {FieldId::SmRestQ, DlpackDtype::kF32, 2, false, false},  // sm_rest_q
     {FieldId::SmMass, DlpackDtype::kF32, 1, false, false},  // sm_mass
+    {FieldId::AeroTriVerts, DlpackDtype::kU32, 2, false, false},  // aero_tri_verts
+    {FieldId::AeroTriArea, DlpackDtype::kF32, 1, false, false},  // aero_tri_area
     {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false, false},  // pbf_predicted_pos
     {FieldId::PbfPositionDelta, DlpackDtype::kF32, 2, false, false},  // pbf_position_delta
     {FieldId::PbfDensity, DlpackDtype::kF32, 1, false, false},  // pbf_density

@@ -3253,6 +3253,38 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # Cloth<->rigid coupling headline clip: a free unpinned square cloth sheet released
+    # above a PD-standing Go2 (full per-link collision skeleton cooked from go2.nks)
+    # drapes over the body on the ONE general body<->particle row solver. STEPS nk::World
+    # on CUDA and renders the live deforming cloth surface mesh + the FK-posed Go2 visuals
+    # on the CUDA RT backend (--gpu --beauty) or lavapipe raster.
+    add_executable(nuka_go2_cloth_drape_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_cloth_drape_demo.cpp
+    )
+    add_dependencies(nuka_go2_cloth_drape_demo nuka_codegen)
+    target_compile_definitions(nuka_go2_cloth_drape_demo
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_go2_cloth_drape_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_cloth_drape_demo
+        PRIVATE
+            nuka_scene_cook
+            nuka_render
+            nuka_phi2_rt
+            nuka_nk
+            nuka_phi2
+            nuka_runtime_gpu
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # XPBD constraint-solve micro-benchmark (serial vs colored solver timing).
     add_executable(nuka_xpbd_solve_bench
         ${CMAKE_SOURCE_DIR}/examples/demo/xpbd_solve_bench.cpp

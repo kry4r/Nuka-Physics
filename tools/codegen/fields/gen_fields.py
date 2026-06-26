@@ -71,6 +71,9 @@ VALID_PER = {
     # articulations_per_env == 1 it collapses element-for-element onto `dof` (the
     # K==1 D1 invariant).
     "articulation_dof",
+    # Per cloth aerodynamic-drag element (one per surface triangle). 0 elements
+    # for any non-cloth or drag-free cook -> a zero-byte segment.
+    "aero_tri",
 }
 VALID_ARENA = {"persistent", "scratch", "tape"}
 VALID_OWNER = {"model", "data"}
@@ -253,7 +256,9 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "    Articulation, ArticulationDof2,",
         "    // Per-articulation flat-DOF tile (= articulations_per_env * max_dof);",
         "    // the general-contact per-artic qdot_flat tile (S3). APPENDED LAST.",
-        "    ArticulationDof",
+        "    ArticulationDof,",
+        "    // Per cloth aerodynamic-drag element (= aero_tris_per_env). APPENDED LAST.",
+        "    AeroTri",
         "};",
         "",
         "struct FieldLayout {",
@@ -282,6 +287,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "env_dof2": "EnvDof2", "scalar": "Scalar",
         "articulation": "Articulation", "articulation_dof2": "ArticulationDof2",
         "articulation_dof": "ArticulationDof",
+        "aero_tri": "AeroTri",
     }
     scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
                    "transform": 4, "spatial6": 4, "mat36": 4}

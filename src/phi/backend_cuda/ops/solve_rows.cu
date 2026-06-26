@@ -340,7 +340,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                                        : lambda[gslot];
         // rhs holds aref (a reference ACCELERATION); the velocity-impulse PGS
         // scales by dt. The -R*old_impulse regularizer feedback matches the
-        // (A+R) denominator (the C5c-2 fix) — both legacy-preserved.
+        // (A+R) denominator (the C5c-2 fix) — both legacy-preserved. (aref is
+        // bounded at the SOURCE in assembly, so this hot FMA chain is byte-identical.)
         const float rhs_v = sr->rhs * dt;
         const float lambda_inc =
             effective_mass * (rhs_v - jv - sr->R * old_impulse);
@@ -480,7 +481,8 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
                                      const float* __restrict__ particle_inv_mass,
                                      math::Vec3* __restrict__ particle_pseudo_vel,
                                      uint32_t dof_stride,
-                                     float beta, float slop, float dt) {
+                                     float beta, float slop, float dt,
+                                     float baumgarte_max_velocity) {
     const SlimRow sr = MakeSlimRow(urows[gslot], env_row_base, env_artic_base);
     const uint32_t flags = sr.flags;
     if (!(flags & nk::nk_row_flags::kActive) ||
@@ -530,9 +532,11 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
         if (code & kSlimBArt) jv += art_jv_b;
         else if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
 
-        // Target pseudo separating velocity from the geometric penetration.
+        // Pseudo separating velocity from the penetration, capped at
+        // baumgarte_max_velocity (+inf default => byte-identical) for bounded push-out.
         const float depth = row_penetration[gslot];
-        const float bias = beta * fmaxf(depth - slop, 0.0f) / dt;
+        const float bias =
+            fminf(beta * fmaxf(depth - slop, 0.0f) / dt, baumgarte_max_velocity);
         const float effective_mass = row_meff[gslot];
         const float old_imp = row_pseudo_lambda[gslot];
         // GEOMETRIC projection: no -R*lambda compliance term (this is position,
@@ -632,7 +636,8 @@ __global__ void SolveRowsBlockIslandKernel(
     uint32_t vel_iters,
     uint32_t pos_iters,
     float pos_beta, float pos_slop,
-    float dt) {
+    float dt,
+    float baumgarte_max_velocity) {
     const uint32_t island = blockIdx.x;
     if (island >= total_islands) {
         return;
@@ -840,7 +845,8 @@ __global__ void SolveRowsBlockIslandKernel(
                         body_pseudo_lin_vel, body_pseudo_ang_vel,
                         body_inv_mass, body_inv_inertia,
                         particle_inv_mass, particle_pseudo_vel,
-                        dof_stride, pos_beta, pos_slop, dt);
+                        dof_stride, pos_beta, pos_slop, dt,
+                        baumgarte_max_velocity);
                 }
                 __syncthreads();
             }
@@ -1042,7 +1048,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    with_b_arm ? 1u : 0u,
                    static_cast<uint32_t>(p->vel_iters),
                    static_cast<uint32_t>(p->pos_iters),
-                   p->pos_beta, p->pos_slop, p->dt);
+                   p->pos_beta, p->pos_slop, p->dt,
+                   p->baumgarte_max_velocity);
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
 

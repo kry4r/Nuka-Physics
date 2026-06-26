@@ -56,7 +56,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -443,6 +443,16 @@ fields:
   - {name: sm_particles,      dtype: u32,  per: shape_match_member, arena: persistent, owner: model}
   - {name: sm_rest_q,         dtype: vec3, per: shape_match_member, arena: persistent, owner: model}
   - {name: sm_mass,           dtype: f32,  per: shape_match_member, arena: persistent, owner: model}
+
+  # =========================================================================
+  # CLOTH AERODYNAMIC DRAG — MODEL. Per surface triangle: the 3 particle indices
+  # and the rest-space area. The drag op forms each triangle's outward normal +
+  # mean velocity and applies an anisotropic (normal-dominant) quadratic air force
+  # as a pre-solve velocity impulse. 0 triangles (the default) => the op is never
+  # emitted, so a drag-free cook is byte-identical.
+  # =========================================================================
+  - {name: aero_tri_verts,    dtype: u32,  per: aero_tri, arena: persistent, owner: model, elem: 3}
+  - {name: aero_tri_area,     dtype: f32,  per: aero_tri, arena: persistent, owner: model}
 
   # =========================================================================
   # PARTICLE (PBF fluid) — DATA. Source: nk fluid ops. The fluid shares particle_pos/

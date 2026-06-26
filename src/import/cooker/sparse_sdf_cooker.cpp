@@ -244,6 +244,7 @@ SparseSdfData CookSparseSdf(const float* vertices, uint32_t vertex_count,
     const int compute_band = band + 1;
     const double band_dist = static_cast<double>(band) * h;       // store |phi| <= this
     const int total_margin = compute_band + std::max(pad, 0);
+    const int reach_voxels = compute_band;
 
     // Origin = padded min corner, so all voxel indices are >= 0.
     double origin[3];
@@ -272,7 +273,7 @@ SparseSdfData CookSparseSdf(const float* vertices, uint32_t vertex_count,
     std::unordered_map<uint64_t, Cell> cells;
     cells.reserve(tris.size() * 64u);
 
-    const double cell_reach = static_cast<double>(compute_band) * h;
+    const double cell_reach = static_cast<double>(reach_voxels) * h;
 
     auto voxel_center = [&](int i, int j, int k) -> Vec3d {
         return {origin[0] + (static_cast<double>(i) + 0.0) * h,
@@ -331,6 +332,122 @@ SparseSdfData CookSparseSdf(const float* vertices, uint32_t vertex_count,
         c.has_phi = true;
     }
 
+    // Solid fill: exterior-flood from the grid boundary (blocked by the surface);
+    // the enclosed complement is interior, depth-filled by an inward fast-sweep.
+    if (params.solid) {
+        const int nx = static_cast<int>(dims[0]);
+        const int ny = static_cast<int>(dims[1]);
+        const int nz = static_cast<int>(dims[2]);
+        const size_t ncell = static_cast<size_t>(nx) * ny * nz;
+        auto lin = [&](int i, int j, int k) -> size_t {
+            return (static_cast<size_t>(k) * ny + j) * nx + i;
+        };
+        auto find_cell = [&](int i, int j, int k) -> Cell* {
+            const uint64_t key = nuka::runtime::sdf::PackSdfCellKey(
+                static_cast<uint32_t>(i), static_cast<uint32_t>(j),
+                static_cast<uint32_t>(k));
+            auto it = cells.find(key);
+            return (it == cells.end()) ? nullptr : &it->second;
+        };
+        // 0=unknown, 1=exterior (flood-reached), 2=surface-band (phi>=0 wall).
+        std::vector<uint8_t> state(ncell, 0u);
+        // An interior-band cell (phi<0) BLOCKS the exterior flood (it is the inner
+        // surface); an exterior-band cell (phi>=0) is itself exterior + a wall.
+        for (uint64_t key : visited_keys) {
+            uint32_t ui, uj, uk;
+            nuka::runtime::sdf::UnpackSdfCellKey(key, ui, uj, uk);
+            if (ui >= static_cast<uint32_t>(nx) || uj >= static_cast<uint32_t>(ny) ||
+                uk >= static_cast<uint32_t>(nz)) continue;
+            const Cell& c = cells[key];
+            if (c.has_phi && c.phi >= 0.0) state[lin(ui, uj, uk)] = 2u;  // wall.
+        }
+        // BFS the exterior from every boundary cell that is not a phi<0 surface cell.
+        std::vector<int> stack;
+        stack.reserve(ncell / 8u + 16u);
+        auto is_inner_surface = [&](int i, int j, int k) -> bool {
+            const Cell* c = find_cell(i, j, k);
+            return c != nullptr && c->has_phi && c->phi < 0.0;
+        };
+        auto push_ext = [&](int i, int j, int k) {
+            if (i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz) return;
+            const size_t id = lin(i, j, k);
+            if (state[id] == 1u) return;                  // already exterior.
+            if (is_inner_surface(i, j, k)) return;        // surface blocks the flood.
+            state[id] = 1u;
+            stack.push_back(static_cast<int>(id));
+        };
+        for (int k = 0; k < nz; ++k)
+            for (int j = 0; j < ny; ++j)
+                for (int i = 0; i < nx; ++i)
+                    if (i == 0 || j == 0 || k == 0 || i == nx - 1 || j == ny - 1 ||
+                        k == nz - 1)
+                        push_ext(i, j, k);
+        while (!stack.empty()) {
+            const int id = stack.back(); stack.pop_back();
+            const int i = id % nx;
+            const int j = (id / nx) % ny;
+            const int k = id / (nx * ny);
+            push_ext(i - 1, j, k); push_ext(i + 1, j, k);
+            push_ext(i, j - 1, k); push_ext(i, j + 1, k);
+            push_ext(i, j, k - 1); push_ext(i, j, k + 1);
+        }
+        // Interior = not exterior-reached and not a wall. Seed interior-band cells
+        // (exact phi<0) and inward fast-sweep phi = nb.phi - h over interior cells.
+        auto is_interior = [&](int i, int j, int k) -> bool {
+            if (i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz) return false;
+            const size_t id = lin(i, j, k);
+            return state[id] == 0u;  // unknown == enclosed (flood never reached it).
+        };
+        const double kInf = 1.0e30;
+        auto relax = [&](int i, int j, int k, int di, int dj, int dk) -> bool {
+            if (!is_interior(i, j, k)) return false;
+            const Cell* cc0 = find_cell(i, j, k);
+            // Keep EXACT band cells (|phi|<=band); only fill the deeper interior.
+            if (cc0 != nullptr && cc0->has_phi && std::abs(cc0->phi) <= band_dist)
+                return false;
+            const Cell* nb = find_cell(i + di, j + dj, k + dk);
+            if (nb == nullptr || !nb->has_phi || nb->phi >= 0.0) return false;
+            const double cand = nb->phi - h;
+            const uint64_t key = nuka::runtime::sdf::PackSdfCellKey(
+                static_cast<uint32_t>(i), static_cast<uint32_t>(j),
+                static_cast<uint32_t>(k));
+            Cell& cc = cells[key];
+            const double cur = cc.has_phi ? cc.phi : -kInf;
+            if (cand > cur) {
+                cc.phi = cand; cc.has_phi = true; cc.dist2 = cand * cand;
+                cc.sign_dot = -1.0;
+                return true;
+            }
+            return false;
+        };
+        const int max_sweeps = nx + ny + nz + 8;
+        for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+            bool changed = false;
+            const bool fwd = (sweep & 1) == 0;
+            for (int kk = 0; kk < nz; ++kk) {
+                const int k = fwd ? kk : (nz - 1 - kk);
+                for (int jj = 0; jj < ny; ++jj) {
+                    const int j = fwd ? jj : (ny - 1 - jj);
+                    for (int ii = 0; ii < nx; ++ii) {
+                        const int i = fwd ? ii : (nx - 1 - ii);
+                        changed |= relax(i, j, k, -1, 0, 0);
+                        changed |= relax(i, j, k, +1, 0, 0);
+                        changed |= relax(i, j, k, 0, -1, 0);
+                        changed |= relax(i, j, k, 0, +1, 0);
+                        changed |= relax(i, j, k, 0, 0, -1);
+                        changed |= relax(i, j, k, 0, 0, +1);
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        // Refresh the sorted key list so Pass 3 sees the filled interior cells.
+        visited_keys.clear();
+        visited_keys.reserve(cells.size());
+        for (const auto& kv : cells) visited_keys.push_back(kv.first);
+        std::sort(visited_keys.begin(), visited_keys.end());
+    }
+
     // --- Pass 3: central-diff gradient + narrow-band extraction ------------
     // Only emit voxels with |phi| <= band_dist (drops the +1 guard ring). The
     // gradient uses neighbors at +/-1 voxel; those exist in `cells` because we
@@ -350,7 +467,13 @@ SparseSdfData CookSparseSdf(const float* vertices, uint32_t vertex_count,
     band_keys.reserve(visited_keys.size());
     for (uint64_t key : visited_keys) {
         const Cell& c = cells[key];
-        if (c.has_phi && std::abs(c.phi) <= band_dist) {
+        if (!c.has_phi) continue;
+        // Narrow band keeps |phi|<=band on BOTH sides. Solid additionally keeps the
+        // WHOLE interior (phi<0, computed by the enlarged reach) so a deep inside
+        // point has a value+gradient; exterior beyond the band is still dropped.
+        const bool in_band = std::abs(c.phi) <= band_dist;
+        const bool keep_interior = params.solid && c.phi < 0.0;
+        if (in_band || keep_interior) {
             band_keys.push_back(key);
         }
     }
@@ -444,6 +567,8 @@ std::string ComputeSdfCacheKey(const float* vertices, uint32_t vertex_count,
     hasher.Update(&params.band_voxels, sizeof(params.band_voxels));
     hasher.Update(&params.auto_resolution, sizeof(params.auto_resolution));
     hasher.Update(&params.padding_voxels, sizeof(params.padding_voxels));
+    const uint8_t solid_byte = params.solid ? 1u : 0u;
+    hasher.Update(&solid_byte, sizeof(solid_byte));
     return nuka::sha256::ToHex(hasher.Final());
 }
 
