@@ -258,7 +258,10 @@ public:
         float fluid_max_y, float fluid_max_z, float fluid_spacing,
         float fluid_rest_density, float fluid_floor_z, float fluid_friction,
         uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method,
-        bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv) {
+        bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv,
+        uint32_t solver_vel_iters, uint32_t solver_pos_iters,
+        float solver_contact_margin, uint32_t solver_max_pairs,
+        float baumgarte_max_velocity) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
         }
@@ -308,6 +311,12 @@ public:
         parts.aero_normal = aero_normal;           // anisotropic aero drag (0 = off).
         parts.aero_tangent = aero_tangent;
         parts.aero_max_dv = aero_max_dv;
+        // World SolverConfig overrides (0 = keep the engine default => byte-identical).
+        parts.solver_vel_iters = solver_vel_iters;
+        parts.solver_pos_iters = solver_pos_iters;
+        parts.solver_contact_margin = solver_contact_margin;
+        parts.solver_max_pairs = solver_max_pairs;
+        parts.baumgarte_max_velocity = baumgarte_max_velocity;
 
         nuka_world_handle h = nullptr;
         check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
@@ -1359,6 +1368,9 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("contact_radius") = 0.0f, nb::arg("soft_sim_method") = 0u,
             nb::arg("cloth_free") = false, nb::arg("aero_normal") = 0.0f,
             nb::arg("aero_tangent") = 0.0f, nb::arg("aero_max_dv") = 0.0f,
+            nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
+            nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
+            nb::arg("baumgarte_max_velocity") = 0.0f,
             nb::rv_policy::take_ownership,
             "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
             "and/or fluid (PBF) particles, stepping on the ONE general contact "
@@ -1375,7 +1387,11 @@ NB_MODULE(_nuka_ext, m) {
             "False): when True the cloth perimeter is NOT pinned -> a free drape "
             "instead of a taut membrane. aero_normal/aero_tangent/aero_max_dv (default "
             "0 == off): anisotropic cloth aerodynamic drag (lumped 0.5*rho*Cn, "
-            "0.5*rho*Ct, per-step dv clamp); all-zero keeps the cook byte-identical.")
+            "0.5*rho*Ct, per-step dv clamp); all-zero keeps the cook byte-identical. "
+            "solver_vel_iters/solver_pos_iters/solver_contact_margin/solver_max_pairs "
+            "+ baumgarte_max_velocity override the world SolverConfig (1:1 with "
+            "nk::Pipeline::SolverConfig); each 0 keeps the engine default, so a "
+            "defaults-only call is byte-identical to today.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")

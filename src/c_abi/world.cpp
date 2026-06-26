@@ -500,6 +500,9 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
 // create entries so the record assembly is ONE path -- the coupled entry differs only
 // in cooking particles onto `cooked_model` before this runs. On success writes `out`
 // and returns OK; on a failed World build returns INTERNAL and leaves `out` null.
+// `solver_*` override the world SolverConfig (each 0 keeps the engine default, so the
+// scene-only entry never passes them and stays byte-identical). The coupled entry
+// forwards the desc's solver knobs here.
 nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 nuka::scene::SceneIR&& scene,
                                 nuka::terrain::HeightField&& cooked_terrain,
@@ -507,7 +510,11 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t env_count,
                                 articulation::ControlMode control_mode,
                                 const nuka::math::Vec3& gravity,
-                                nuka_world_handle* out) {
+                                nuka_world_handle* out,
+                                uint32_t solver_vel_iters = 0u,
+                                uint32_t solver_pos_iters = 0u,
+                                float solver_contact_margin = 0.0f,
+                                uint32_t solver_max_pairs = 0u) {
     auto record = std::make_unique<WorldRecord>();
     record->device = device_record;
     record->env_count = env_count;
@@ -521,6 +528,12 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     cfg.gravity[0] = gravity.x;
     cfg.gravity[1] = gravity.y;
     cfg.gravity[2] = gravity.z;
+    // Each non-zero override replaces a default; all-zero leaves cfg exactly as built
+    // above (dt + gravity only), so an unset caller is byte-identical to today.
+    if (solver_vel_iters != 0u) cfg.vel_iters = static_cast<uint16_t>(solver_vel_iters);
+    if (solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(solver_pos_iters);
+    if (solver_contact_margin > 0.0f) cfg.contact_margin = solver_contact_margin;
+    if (solver_max_pairs != 0u) cfg.max_pairs = solver_max_pairs;
 
     record->world = std::make_unique<nuka::nk::World>(
         std::move(cooked_model), env_count, device_record->phi_device,
@@ -649,11 +662,20 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         nuka::scene::cook::CookSoftFluidParticles(prepared.model, desc->env_count,
                                                   cloth, fluid, contact);
 
-        // Build + insert the live coupled world (the SAME record-assembly path).
+        // A positive baumgarte_max_velocity bounds the contact recovery push-out; 0
+        // leaves the cooked model default (so a zero-init desc is byte-identical).
+        if (particles->baumgarte_max_velocity > 0.0f) {
+            prepared.model.baumgarte_max_velocity = particles->baumgarte_max_velocity;
+        }
+
+        // Build + insert the live coupled world (the SAME record-assembly path). The
+        // SolverConfig overrides ride the coupled desc; all-zero keeps today's cfg.
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
-            desc->env_count, prepared.control_mode, prepared.gravity, out);
+            desc->env_count, prepared.control_mode, prepared.gravity, out,
+            particles->solver_vel_iters, particles->solver_pos_iters,
+            particles->solver_contact_margin, particles->solver_max_pairs);
         // Retain the cloth render-surface connectivity so a live beauty render
         // rebuilds the deforming surface from the live particle field (no second
         // authoring path -- the SAME lattice the physics cook meshed).
