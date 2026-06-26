@@ -31,6 +31,10 @@ from ._nuka_ext import (  # noqa: F401
     Field,
     World,
     Tape,
+    # Built-scene authoring: program rigid primitives + TAGGED media records, then
+    # build() cooks them through the SAME CookSceneToModel a file scene uses (the
+    # general media authoring substrate -- tet-soft / fluid / a second cloth).
+    SceneBuilder,
     sync,
     __engine_version__,
     DETERMINISM_STRONG,
@@ -42,6 +46,18 @@ from ._nuka_ext import (  # noqa: F401
     CONTROL_MODE_COMPUTED_TORQUE,
     CONTROL_MODE_OSC,
     CONTROL_MODE_ACTUATOR,
+    # SceneBuilder.add_rigid_primitive(kind=...) codes.
+    PRIMITIVE_PLANE,
+    PRIMITIVE_BOX,
+    PRIMITIVE_SPHERE,
+    PRIMITIVE_CAPSULE,
+    # SceneBuilder.add_media(kind=..., method=...) codes.
+    MEDIA_CLOTH,
+    MEDIA_SOFT_TET,
+    MEDIA_FLUID,
+    MEDIA_METHOD_XPBD,
+    MEDIA_METHOD_PBF,
+    MEDIA_METHOD_MLSMPM,
     # Device-resident batched camera sensor: the AOV plane + the mount frame.
     SensorChannel,
     SensorMount,
@@ -214,6 +230,17 @@ __all__ = [
     "World",
     "Tape",
     "Scene",
+    "SceneBuilder",
+    "PRIMITIVE_PLANE",
+    "PRIMITIVE_BOX",
+    "PRIMITIVE_SPHERE",
+    "PRIMITIVE_CAPSULE",
+    "MEDIA_CLOTH",
+    "MEDIA_SOFT_TET",
+    "MEDIA_FLUID",
+    "MEDIA_METHOD_XPBD",
+    "MEDIA_METHOD_PBF",
+    "MEDIA_METHOD_MLSMPM",
     "author",
     "morphs",
     "materials",

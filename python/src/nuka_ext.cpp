@@ -339,6 +339,82 @@ public:
         return w;
     }
 
+    // Create a world from a BUILT scene handle (nuka.SceneBuilder): a SceneIR of
+    // rigid primitives + TAGGED media records cooked through the SAME
+    // CookSceneToModel a file scene uses. The general media authoring path -- a
+    // tet-soft body / a fluid box / a second cloth are authored as media records,
+    // never as flat coupled-desc slots. desc->scene_path is unused (the scene is
+    // the handle). A C++ helper called by SceneBuilder.build (not bound directly:
+    // the scene handle is not a Python type).
+    static World* create_from_built_scene(
+        Device* device, nuka_scene_handle scene_h, uint32_t env_count, float dt,
+        uint32_t control_mode, uint32_t determinism, uint32_t contact_family,
+        uint32_t heightfield_terrain_type, uint32_t heightfield_nrow,
+        uint32_t heightfield_ncol, float heightfield_cell,
+        float terrain_step_height, float terrain_step_width,
+        float terrain_platform_width, float terrain_grid_width,
+        float terrain_grid_height_max, float gravity_x, float gravity_y,
+        float gravity_z) {
+        if (device == nullptr || !device->valid()) {
+            throw std::runtime_error("create_from_built_scene: invalid device");
+        }
+        if (scene_h == nullptr) {
+            throw std::runtime_error(
+                "create_from_built_scene: invalid scene handle");
+        }
+        if (determinism > 1u) {
+            throw std::runtime_error(
+                "create_from_built_scene: determinism must be 0 (Strong) or 1 (Weak)");
+        }
+        if (control_mode > 1u) {
+            throw std::runtime_error(
+                "create_from_built_scene: control_mode must be 0 (PDPosition) or "
+                "1 (Torque)");
+        }
+        nuka_world_desc_t desc{};
+        desc.scene_path = nullptr;  // the scene comes from the handle, not a file.
+        desc.env_count = env_count;
+        desc.fixed_dt = dt;
+        desc.control_mode = static_cast<uint8_t>(control_mode);
+        desc.determinism = static_cast<uint8_t>(determinism);
+        desc.contact_family = contact_family;
+        desc.heightfield_terrain_type = heightfield_terrain_type;
+        desc.heightfield_nrow = heightfield_nrow;
+        desc.heightfield_ncol = heightfield_ncol;
+        desc.heightfield_cell = heightfield_cell;
+        desc.terrain_step_height = terrain_step_height;
+        desc.terrain_step_width = terrain_step_width;
+        desc.terrain_platform_width = terrain_platform_width;
+        desc.terrain_grid_width = terrain_grid_width;
+        desc.terrain_grid_height_max = terrain_grid_height_max;
+        desc.gravity_x = gravity_x;
+        desc.gravity_y = gravity_y;
+        desc.gravity_z = gravity_z;
+
+        nuka_world_handle h = nullptr;
+        check(nuka_world_create_from_built_scene(device->raw(), &desc, scene_h, &h),
+              "nuka_world_create_from_built_scene");
+
+        // Derive base_link_count from the JOINT_POSITION view (0 for a robot-free
+        // soft/fluid scene with no articulation -- a tolerant query, not a hard fail).
+        nuka_buffer_view_t qv{};
+        uint32_t base_link_count = 0u;
+        if (nuka_world_get_buffer_view(h, NUKA_FIELD_JOINT_POSITION, &qv) ==
+                NUKA_RESULT_OK &&
+            env_count > 0u) {
+            base_link_count = static_cast<uint32_t>(qv.element_count / env_count);
+        }
+        World* w = new World(h, env_count, base_link_count, dt);
+        // Cache the per-env particle count from the PARTICLE_POSITION view.
+        nuka_buffer_view_t pv{};
+        if (nuka_world_get_buffer_view(h, NUKA_FIELD_PARTICLE_POSITION, &pv) ==
+                NUKA_RESULT_OK &&
+            env_count > 0u) {
+            w->particle_count_ = static_cast<uint32_t>(pv.element_count / env_count);
+        }
+        return w;
+    }
+
     void destroy() {
         if (h_ != nullptr) {
             nuka_world_destroy(h_);
@@ -1161,6 +1237,180 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// SceneBuilder wrapper (RAII) -- the BUILT-SCENE authoring surface (nuka_scene.h).
+// Program a SceneIR of rigid primitives + media records, then build() cooks it
+// through the SAME CookSceneToModel a file scene uses. This is the general media
+// authoring substrate: a tet-soft body / a fluid box / a second cloth are added
+// as TAGGED media records (add_media), never as flat coupled-desc slots. Reuses
+// the same scene handle the load/edit Scene class uses; only build() touches a
+// device. NOT a special media world -- one cook, one nk::World. (kind/method ints
+// are PRIMITIVE_*/MEDIA_*/MEDIA_METHOD_* module constants.)
+// ---------------------------------------------------------------------------
+class SceneBuilder {
+public:
+    static SceneBuilder* create(const std::string& base_path) {
+        // "" => an EMPTY scene (robot-free); a non-empty path imports that base
+        // scene (the robot) so primitives/media are added ON TOP.
+        nuka_scene_handle h =
+            nuka_scene_create(base_path.empty() ? nullptr : base_path.c_str());
+        if (h == nullptr) {
+            throw std::runtime_error(
+                "SceneBuilder: nuka_scene_create failed (bad base scene path?)");
+        }
+        return new SceneBuilder(h);
+    }
+
+    // One rigid collision primitive. dims by kind: BOX [hx,hy,hz]; SPHERE [r];
+    // CAPSULE [r,half_height]; PLANE []. pos [x,y,z], quat [w,x,y,z] (empty quat
+    // => identity). PLANE is always static. friction < 0 inherits the material mu.
+    void add_rigid_primitive(uint32_t kind, const std::vector<float>& dims,
+                             const std::vector<float>& pos,
+                             const std::vector<float>& quat, bool is_static,
+                             float mass, float friction) {
+        if (dims.size() > 3) {
+            throw std::runtime_error("add_rigid_primitive: dims must be <= 3 floats");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error(
+                "add_rigid_primitive: pos must be 3 floats (x,y,z)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "add_rigid_primitive: quat must be 4 floats (w,x,y,z)");
+        }
+        nuka_rigid_primitive_desc_t d{};
+        d.kind = kind;
+        for (size_t i = 0; i < dims.size() && i < 3; ++i) d.dims[i] = dims[i];
+        for (size_t i = 0; i < pos.size() && i < 3; ++i) d.pos[i] = pos[i];
+        for (size_t i = 0; i < quat.size() && i < 4; ++i) d.quat[i] = quat[i];
+        d.is_static = is_static ? 1u : 0u;
+        d.mass = mass;
+        d.friction = friction;
+        check(nuka_scene_add_rigid_primitive(h_, &d),
+              "nuka_scene_add_rigid_primitive");
+    }
+
+    // One media record. kind (MEDIA_*) selects the geometry block read; method
+    // (MEDIA_METHOD_*) selects the material block. Illegal (kind x method) raises.
+    void add_media(uint32_t kind, uint32_t method, uint32_t cloth_nx,
+                   uint32_t cloth_ny, float cloth_spacing,
+                   const std::vector<float>& cloth_origin, bool cloth_free,
+                   const std::vector<float>& tet_center, float tet_radius,
+                   uint32_t tet_cells, float tet_cell_len,
+                   const std::vector<float>& fluid_min,
+                   const std::vector<float>& fluid_max, float fluid_spacing,
+                   float xpbd_particle_mass, float xpbd_friction,
+                   float xpbd_distance_alpha, float xpbd_bend_alpha,
+                   float xpbd_volume_alpha, uint32_t xpbd_iters,
+                   float xpbd_aero_normal, float xpbd_aero_tangent,
+                   float xpbd_aero_max_dv, float pbf_rest_density,
+                   float pbf_support_scale, uint32_t pbf_iters, float pbf_friction,
+                   bool pbf_clamp_overdensity, bool pbf_walls_enabled,
+                   const std::vector<float>& pbf_walls_min,
+                   const std::vector<float>& pbf_walls_max, float pbf_floor_z,
+                   uint32_t pbf_boundary_layers, float mpm_youngs,
+                   float mpm_poisson, float mpm_density, float mpm_model_kind,
+                   float mpm_bulk_modulus, float mpm_tait_gamma, float mpm_viscosity,
+                   float mpm_dx, uint32_t mpm_substeps,
+                   const std::vector<float>& mpm_floor_normal, float mpm_floor_d,
+                   float mpm_floor_friction, float skin_normal_offset,
+                   uint32_t skin_smooth_iters, float skin_smooth_lambda,
+                   uint32_t render_material_id) {
+        auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
+            if (v.empty()) return;
+            if (v.size() != 3) {
+                throw std::runtime_error(std::string(what) + " must be 3 floats");
+            }
+            out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+        };
+        nuka_media_desc_t d{};
+        d.kind = kind;
+        d.method = method;
+        d.cloth_nx = cloth_nx;
+        d.cloth_ny = cloth_ny;
+        d.cloth_spacing = cloth_spacing;
+        vec3(cloth_origin, d.cloth_origin, "cloth_origin");
+        d.cloth_free = cloth_free ? 1u : 0u;
+        vec3(tet_center, d.tet_center, "tet_center");
+        d.tet_radius = tet_radius;
+        d.tet_cells = tet_cells;
+        d.tet_cell_len = tet_cell_len;
+        vec3(fluid_min, d.fluid_min, "fluid_min");
+        vec3(fluid_max, d.fluid_max, "fluid_max");
+        d.fluid_spacing = fluid_spacing;
+        d.xpbd_particle_mass = xpbd_particle_mass;
+        d.xpbd_friction = xpbd_friction;
+        d.xpbd_distance_alpha = xpbd_distance_alpha;
+        d.xpbd_bend_alpha = xpbd_bend_alpha;
+        d.xpbd_volume_alpha = xpbd_volume_alpha;
+        d.xpbd_iters = xpbd_iters;
+        d.xpbd_aero_drag_normal = xpbd_aero_normal;
+        d.xpbd_aero_drag_tangent = xpbd_aero_tangent;
+        d.xpbd_aero_drag_max_dv = xpbd_aero_max_dv;
+        d.pbf_rest_density = pbf_rest_density;
+        d.pbf_support_scale = pbf_support_scale;
+        d.pbf_iters = pbf_iters;
+        d.pbf_friction = pbf_friction;
+        d.pbf_clamp_overdensity = pbf_clamp_overdensity ? 1u : 0u;
+        d.pbf_walls_enabled = pbf_walls_enabled ? 1u : 0u;
+        vec3(pbf_walls_min, d.pbf_walls_min, "pbf_walls_min");
+        vec3(pbf_walls_max, d.pbf_walls_max, "pbf_walls_max");
+        d.pbf_floor_z = pbf_floor_z;
+        d.pbf_boundary_layers = pbf_boundary_layers;
+        d.mpm_youngs = mpm_youngs;
+        d.mpm_poisson = mpm_poisson;
+        d.mpm_density = mpm_density;
+        d.mpm_model_kind = mpm_model_kind;
+        d.mpm_bulk_modulus = mpm_bulk_modulus;
+        d.mpm_tait_gamma = mpm_tait_gamma;
+        d.mpm_viscosity = mpm_viscosity;
+        d.mpm_dx = mpm_dx;
+        d.mpm_substeps = mpm_substeps;
+        vec3(mpm_floor_normal, d.mpm_floor_normal, "mpm_floor_normal");
+        d.mpm_floor_d = mpm_floor_d;
+        d.mpm_floor_friction = mpm_floor_friction;
+        d.skin_normal_offset = skin_normal_offset;
+        d.skin_smooth_iters = skin_smooth_iters;
+        d.skin_smooth_lambda = skin_smooth_lambda;
+        d.render_material_id = render_material_id;
+        check(nuka_scene_add_media(h_, &d), "nuka_scene_add_media");
+    }
+
+    // Cook the built scene to a live nk::World on `device` (the SAME cook + record
+    // assembly a file scene uses). Returns a nuka.World stepped/read like any other.
+    World* build(Device* device, uint32_t env_count, float dt, uint32_t control_mode,
+                 uint32_t determinism, uint32_t contact_family,
+                 uint32_t heightfield_terrain_type, uint32_t heightfield_nrow,
+                 uint32_t heightfield_ncol, float heightfield_cell,
+                 float terrain_step_height, float terrain_step_width,
+                 float terrain_platform_width, float terrain_grid_width,
+                 float terrain_grid_height_max, float gravity_x, float gravity_y,
+                 float gravity_z) {
+        if (device == nullptr) {
+            throw std::runtime_error("SceneBuilder.build: device is None");
+        }
+        return World::create_from_built_scene(
+            device, h_, env_count, dt, control_mode, determinism, contact_family,
+            heightfield_terrain_type, heightfield_nrow, heightfield_ncol,
+            heightfield_cell, terrain_step_height, terrain_step_width,
+            terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
+            gravity_x, gravity_y, gravity_z);
+    }
+
+    void destroy() {
+        if (h_ != nullptr) {
+            nuka_scene_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~SceneBuilder() { destroy(); }
+
+private:
+    explicit SceneBuilder(nuka_scene_handle h) : h_(h) {}
+    nuka_scene_handle h_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 NB_MODULE(_nuka_ext, m) {
@@ -1196,6 +1446,21 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("CONTROL_MODE_COMPUTED_TORQUE") = uint32_t{3};
     m.attr("CONTROL_MODE_OSC") = uint32_t{4};
     m.attr("CONTROL_MODE_ACTUATOR") = uint32_t{5};
+
+    // SceneBuilder.add_rigid_primitive(kind=...) codes (nuka_primitive_kind_t).
+    m.attr("PRIMITIVE_PLANE") = uint32_t{0};
+    m.attr("PRIMITIVE_BOX") = uint32_t{1};
+    m.attr("PRIMITIVE_SPHERE") = uint32_t{2};
+    m.attr("PRIMITIVE_CAPSULE") = uint32_t{3};
+    // SceneBuilder.add_media(kind=...) / (method=...) codes (nuka_media_kind_t /
+    // nuka_media_method_t). Legal pairs: cloth=XPBD; soft_tet=XPBD|MLSMPM;
+    // fluid=PBF|MLSMPM (an illegal pair raises at add_media).
+    m.attr("MEDIA_CLOTH") = uint32_t{0};
+    m.attr("MEDIA_SOFT_TET") = uint32_t{1};
+    m.attr("MEDIA_FLUID") = uint32_t{2};
+    m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
+    m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
+    m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
 
     // v0.5 p04 N1 sim-to-real sensor-noise kinds (the int values
     // World.set_sensor_noise(kind=...) accepts). NONE (0, default) clears the
@@ -2123,6 +2388,88 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](Scene& s) -> Scene& { return s; })
         .def("__exit__",
              [](Scene& s, nb::object, nb::object, nb::object) { s.destroy(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    nb::class_<SceneBuilder>(m, "SceneBuilder")
+        .def_static("create", &SceneBuilder::create, nb::arg("base_path") = std::string(),
+                    nb::rv_policy::take_ownership,
+                    "Create a built-scene authoring handle. base_path=\"\" (default) "
+                    "starts an EMPTY scene (robot-free soft/fluid); a non-empty path "
+                    "imports that base scene (e.g. a robot .nks/.xml/.urdf/.usd) so "
+                    "primitives/media are added ON TOP. The general media authoring "
+                    "substrate -- one cook, one nk::World.")
+        .def("add_rigid_primitive", &SceneBuilder::add_rigid_primitive,
+             nb::arg("kind"), nb::arg("dims") = std::vector<float>{},
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{}, nb::arg("static") = false,
+             nb::arg("mass") = 1.0f, nb::arg("friction") = -1.0f,
+             "Add a rigid collision primitive (one body + one shape). kind is a "
+             "PRIMITIVE_* code (PLANE/BOX/SPHERE/CAPSULE). dims by kind: BOX "
+             "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]; PLANE []. pos "
+             "[x,y,z], quat [w,x,y,z] (empty quat => identity). PLANE is always "
+             "static. friction < 0 (default) inherits the material mu; >= 0 is an "
+             "explicit per-shape override.")
+        .def("add_media", &SceneBuilder::add_media, nb::arg("kind"),
+             nb::arg("method"), nb::arg("cloth_nx") = 0u, nb::arg("cloth_ny") = 0u,
+             nb::arg("cloth_spacing") = 0.0f,
+             nb::arg("cloth_origin") = std::vector<float>{},
+             nb::arg("cloth_free") = false,
+             nb::arg("tet_center") = std::vector<float>{},
+             nb::arg("tet_radius") = 0.0f, nb::arg("tet_cells") = 0u,
+             nb::arg("tet_cell_len") = 0.0f,
+             nb::arg("fluid_min") = std::vector<float>{},
+             nb::arg("fluid_max") = std::vector<float>{},
+             nb::arg("fluid_spacing") = 0.0f, nb::arg("xpbd_particle_mass") = 0.0f,
+             nb::arg("xpbd_friction") = 0.6f, nb::arg("xpbd_distance_alpha") = 0.0f,
+             nb::arg("xpbd_bend_alpha") = 0.0f, nb::arg("xpbd_volume_alpha") = 0.0f,
+             nb::arg("xpbd_iters") = 0u, nb::arg("xpbd_aero_normal") = 0.0f,
+             nb::arg("xpbd_aero_tangent") = 0.0f, nb::arg("xpbd_aero_max_dv") = 0.0f,
+             nb::arg("pbf_rest_density") = 0.0f, nb::arg("pbf_support_scale") = 0.0f,
+             nb::arg("pbf_iters") = 0u, nb::arg("pbf_friction") = 0.0f,
+             nb::arg("pbf_clamp_overdensity") = true,
+             nb::arg("pbf_walls_enabled") = false,
+             nb::arg("pbf_walls_min") = std::vector<float>{},
+             nb::arg("pbf_walls_max") = std::vector<float>{},
+             nb::arg("pbf_floor_z") = 0.0f, nb::arg("pbf_boundary_layers") = 0u,
+             nb::arg("mpm_youngs") = 0.0f, nb::arg("mpm_poisson") = 0.0f,
+             nb::arg("mpm_density") = 0.0f, nb::arg("mpm_model_kind") = 0.0f,
+             nb::arg("mpm_bulk_modulus") = 0.0f, nb::arg("mpm_tait_gamma") = 0.0f,
+             nb::arg("mpm_viscosity") = 0.0f, nb::arg("mpm_dx") = 0.0f,
+             nb::arg("mpm_substeps") = 0u,
+             nb::arg("mpm_floor_normal") = std::vector<float>{},
+             nb::arg("mpm_floor_d") = 0.0f, nb::arg("mpm_floor_friction") = 0.4f,
+             nb::arg("skin_normal_offset") = 0.0f, nb::arg("skin_smooth_iters") = 0u,
+             nb::arg("skin_smooth_lambda") = 0.5f,
+             nb::arg("render_material_id") = uint32_t{0xFFFFFFFFu},
+             "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
+             "FLUID); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind selects "
+             "the geometry block (cloth_*/tet_*/fluid_*); method selects the "
+             "material block (xpbd_*/pbf_*/mpm_*). Material scalars at 0 take the "
+             "cook's own defaults. An illegal (kind x method) pair raises here; an "
+             "MPM + XPBD/PBF mix raises at build().")
+        .def("build", &SceneBuilder::build, nb::arg("device"),
+             nb::arg("env_count") = 1u, nb::arg("dt") = 1.0f / 240.0f,
+             nb::arg("control_mode") = 0u, nb::arg("determinism") = 0u,
+             nb::arg("contact_family") = 0u, nb::arg("heightfield_terrain_type") = 0u,
+             nb::arg("heightfield_nrow") = 0u, nb::arg("heightfield_ncol") = 0u,
+             nb::arg("heightfield_cell") = 0.0f, nb::arg("terrain_step_height") = 0.0f,
+             nb::arg("terrain_step_width") = 0.0f,
+             nb::arg("terrain_platform_width") = 0.0f,
+             nb::arg("terrain_grid_width") = 0.0f,
+             nb::arg("terrain_grid_height_max") = 0.0f, nb::arg("gravity_x") = 0.0f,
+             nb::arg("gravity_y") = 0.0f, nb::arg("gravity_z") = 0.0f,
+             nb::rv_policy::take_ownership,
+             "Cook the built scene to a live nuka.World on `device` via the SAME "
+             "CookSceneToModel + record assembly a file scene uses (rigid + media, "
+             "ONE cook). Steps/reads like any World; read media via "
+             "buffer_view(Field.PARTICLE_POSITION). contact_family == 1 bakes a "
+             "heightfield collidable (the same terrain_* knobs create_from_scene "
+             "takes). gravity_* default 0 => standard Earth.")
+        .def("destroy", &SceneBuilder::destroy, "Destroy the scene-builder handle.")
+        .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; })
+        .def("__exit__",
+             [](SceneBuilder& b, nb::object, nb::object, nb::object) { b.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 

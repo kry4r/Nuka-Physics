@@ -153,6 +153,162 @@ nuka_result_t nuka_scene_settle(nuka_scene_handle scene,
 // INTERNAL / PARSE_ERROR on a write failure.
 nuka_result_t nuka_scene_save(nuka_scene_handle scene, const char* nks_path);
 
+// ---------------------------------------------------------------------------
+// Built-scene authoring: program a SceneIR (rigid primitives + media records)
+// and cook it through the SAME CookSceneToModel a file scene uses. This is the
+// GENERAL media authoring substrate -- a tet-soft body / a fluid box / a second
+// cloth go through nuka_scene_add_media (a TAGGED record), never by accreting
+// flat slots onto nuka_coupled_particles_desc_t. The handle owns one in-memory
+// SceneIR (the SAME SceneRecord nuka_scene_load returns); nuka_scene_destroy
+// frees it. ADDITIVE: a built scene with zero primitives + zero media that
+// imports a file cooks byte-identically to nuka_world_create_from_scene.
+// ---------------------------------------------------------------------------
+
+// A rigid collision primitive (one body + one shape). dims by kind: BOX uses
+// dims[0..2] as the half-extents (x,y,z); SPHERE uses dims[0] as the radius;
+// CAPSULE uses dims[0] radius + dims[1] half-height (local Z axis); PLANE uses
+// none (an infinite ground plane is always static). pos[3] is (x,y,z) metres,
+// quat[4] is (w,x,y,z) -- an all-zero quat reads as identity.
+typedef enum nuka_primitive_kind_t {
+    NUKA_PRIMITIVE_PLANE   = 0,
+    NUKA_PRIMITIVE_BOX     = 1,
+    NUKA_PRIMITIVE_SPHERE  = 2,
+    NUKA_PRIMITIVE_CAPSULE = 3
+} nuka_primitive_kind_t;
+
+typedef struct nuka_rigid_primitive_desc_t {
+    uint32_t kind;        // nuka_primitive_kind_t
+    float    dims[3];     // half-extents / radius / (radius,half_height) by kind.
+    float    pos[3];      // world position (x,y,z).
+    float    quat[4];     // world orientation (w,x,y,z); all-zero => identity.
+    uint32_t is_static;   // 1 => static (inv_mass 0); 0 => movable (PLANE forces 1).
+    float    mass;        // body mass kg when movable (<= 0 => 1.0). Ignored if static.
+    float    friction;    // per-shape Coulomb mu (< 0 => inherit the material default).
+} nuka_rigid_primitive_desc_t;
+
+// What a medium IS (solver routing) and HOW it solves (one method per medium).
+// The legal (kind x method) set is enforced by the SAME cook validator: cloth =
+// XPBD; soft-tet = XPBD or MLS-MPM; fluid = PBF or MLS-MPM. An illegal pair is
+// rejected LOUDLY (INVALID_ARG) at nuka_scene_add_media; an MPM + XPBD/PBF mix is
+// rejected at cook (nuka_world_create_from_built_scene).
+typedef enum nuka_media_kind_t {
+    NUKA_MEDIA_CLOTH    = 0,
+    NUKA_MEDIA_SOFT_TET = 1,
+    NUKA_MEDIA_FLUID    = 2
+} nuka_media_kind_t;
+
+typedef enum nuka_media_method_t {
+    NUKA_MEDIA_METHOD_XPBD   = 0,
+    NUKA_MEDIA_METHOD_PBF    = 1,
+    NUKA_MEDIA_METHOD_MLSMPM = 2
+} nuka_media_method_t;
+
+// A TAGGED media record: `kind` + `method` select which geometry block and which
+// constitutive material block the cook reads (the others are ignored). Each field
+// maps 1:1 to a scene::MediaRecord field -- no magic layout, no new physics. A
+// zero-initialized desc with only the relevant block filled is the intended use.
+typedef struct nuka_media_desc_t {
+    uint32_t kind;    // nuka_media_kind_t
+    uint32_t method;  // nuka_media_method_t
+
+    // -- geometry (the block matching `kind`) -------------------------------
+    // CLOTH: a flat (cloth_nx x cloth_ny) lattice (>= 2 each) at cloth_origin
+    // with cloth_spacing edge; perimeter pinned unless cloth_free.
+    uint32_t cloth_nx, cloth_ny;
+    float    cloth_spacing;
+    float    cloth_origin[3];
+    uint32_t cloth_free;         // 1 => free drape; 0 => perimeter pinned.
+    // SOFT_TET: a sphere tet-lattice at tet_center, tet_radius, tet_cells cells
+    // per axis, tet_cell_len cell edge.
+    float    tet_center[3];
+    float    tet_radius;
+    uint32_t tet_cells;
+    float    tet_cell_len;
+    // FLUID: an AABB box [fluid_min, fluid_max] sampled at fluid_spacing.
+    float    fluid_min[3];
+    float    fluid_max[3];
+    float    fluid_spacing;
+
+    // -- constitutive material (the block matching `method`) -----------------
+    // XPBD (cloth uses distance+bend; soft-tet uses distance+volume).
+    float    xpbd_particle_mass;
+    float    xpbd_friction;
+    float    xpbd_distance_alpha;
+    float    xpbd_bend_alpha;
+    float    xpbd_volume_alpha;
+    uint32_t xpbd_iters;
+    float    xpbd_aero_drag_normal;
+    float    xpbd_aero_drag_tangent;
+    float    xpbd_aero_drag_max_dv;
+    // PBF (fluid). support_radius = pbf_support_scale * fluid_spacing. The walls
+    // fields generate a pinned boundary slab + side ring (box confinement).
+    float    pbf_rest_density;
+    float    pbf_support_scale;
+    uint32_t pbf_iters;
+    float    pbf_friction;
+    uint32_t pbf_clamp_overdensity;  // 1 => clamp over-density (the default).
+    uint32_t pbf_walls_enabled;      // 1 => append the pinned confinement container.
+    float    pbf_walls_min[3];
+    float    pbf_walls_max[3];
+    float    pbf_floor_z;
+    uint32_t pbf_boundary_layers;
+    // MLS-MPM (soft-tet / fluid). model_kind 0 corotated, 2 neo-hookean, 3 fluid.
+    float    mpm_youngs;
+    float    mpm_poisson;
+    float    mpm_density;
+    float    mpm_dp_friction;
+    float    mpm_dp_cohesion;
+    float    mpm_model_kind;
+    float    mpm_bulk_modulus;
+    float    mpm_tait_gamma;
+    float    mpm_viscosity;
+    float    mpm_dx;
+    uint32_t mpm_substeps;
+    float    mpm_floor_normal[3];
+    float    mpm_floor_d;
+    float    mpm_floor_friction;
+
+    // -- render skin (surface bake metadata; consumed downstream, not the cook) -
+    float    skin_normal_offset;
+    uint32_t skin_smooth_iters;
+    float    skin_smooth_lambda;
+    uint32_t render_material_id;     // ~0u (0xFFFFFFFF) => none.
+} nuka_media_desc_t;
+
+// Create a built-scene handle owning one in-memory SceneIR. A non-empty
+// `base_scene_path` imports that scene (e.g. a robot .nks/.xml/.urdf/.usd) as the
+// base so primitives/media are added ON TOP; NULL or "" starts EMPTY (a robot-free
+// soft/fluid scene). Returns NULL on a load failure / out of memory (use
+// nuka_scene_load directly when the failure reason is needed). Freed via
+// nuka_scene_destroy (the SAME destroy the load handle uses).
+nuka_scene_handle nuka_scene_create(const char* base_scene_path);
+
+// Add a rigid collision primitive (one body + one shape) to the built scene via
+// SceneIR::AddRigidBody + AddCollisionShape (the records the file cook also reads).
+// Returns NULL_HANDLE on a bad handle, INVALID_ARG on a NULL / unknown-kind desc.
+nuka_result_t nuka_scene_add_rigid_primitive(nuka_scene_handle scene,
+                                             const nuka_rigid_primitive_desc_t* desc);
+
+// Add a media record (cloth / soft-tet / fluid) to the built scene via
+// SceneIR::AddMedia. The single record's (kind x method) legality is checked
+// immediately by the cook's ValidateMedia -> INVALID_ARG on an illegal pair (the
+// cross-medium MPM+XPBD/PBF mix is checked at cook). Returns NULL_HANDLE on a bad
+// handle, INVALID_ARG on a NULL / unknown-kind / unknown-method / illegal-pair desc.
+nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
+                                   const nuka_media_desc_t* desc);
+
+// Cook the built scene's SceneIR via the SAME cook::CookSceneToModel a file scene
+// uses (rigid + media, ONE orchestrator) and build the world through the SAME
+// record-assembly path nuka_world_create_from_scene uses. `desc->scene_path` is
+// IGNORED (the scene comes from the handle); the other desc fields (env_count, dt,
+// control_mode, gravity, optional baked heightfield) apply as usual. An illegal
+// media mix throws at cook -> a non-OK result. Returns NULL_HANDLE on a bad scene /
+// device handle, INVALID_ARG on a bad desc, NOT_SUPPORTED with no CUDA backend.
+nuka_result_t nuka_world_create_from_built_scene(nuka_device_handle device,
+                                                 const nuka_world_desc_t* desc,
+                                                 nuka_scene_handle scene,
+                                                 nuka_world_handle* out);
+
 #ifdef __cplusplus
 }
 #endif
