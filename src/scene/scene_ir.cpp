@@ -35,6 +35,7 @@ SceneIR::SceneIR(const SceneIR& other)
       cameras_(other.cameras_),
       lights_(other.lights_),
       actuators_(other.actuators_),
+      media_(other.media_),
       exclude_pairs_(other.exclude_pairs_),
       contact_pairs_(other.contact_pairs_),
       initial_state_(other.initial_state_),
@@ -57,6 +58,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     cameras_       = other.cameras_;
     lights_        = other.lights_;
     actuators_     = other.actuators_;
+    media_         = other.media_;
     exclude_pairs_ = other.exclude_pairs_;
     contact_pairs_ = other.contact_pairs_;
     initial_state_ = other.initial_state_;   // authored metadata (not from records)
@@ -78,6 +80,7 @@ void SceneIR::RebuildFacade() {
     body_entity_.clear();
     shape_entity_.clear();
     joint_entity_.clear();
+    media_entity_.clear();
     body_node_.clear();
     material_ids_.clear();
 
@@ -101,6 +104,11 @@ void SceneIR::RebuildFacade() {
     }
     for (const ActuatorRecord& rec : actuators_) {
         ProjectActuator(rec);
+    }
+    // Media hangs free under root (no body dependency); projected after bodies so
+    // a copied/rebuilt scene keeps its media entities.
+    for (const MediaRecord& rec : media_) {
+        ProjectMedia(rec);
     }
 }
 
@@ -209,6 +217,15 @@ ActuatorId SceneIR::AddActuator(ActuatorRecord record) {
     return id;
 }
 
+MediaId SceneIR::AddMedia(MediaRecord record) {
+    const auto id = static_cast<MediaId>(media_.size());
+    record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
+    media_.push_back(std::move(record));
+    ProjectMedia(media_.back());
+    return id;
+}
+
 void SceneIR::AddExcludePair(BodyId a, BodyId b) {
     // Canonicalize as (min,max) so (a,b) and (b,a) store identically. No dedup
     // here — that (and the filter policy) is C1c.
@@ -231,6 +248,7 @@ size_t SceneIR::MaterialCount() const { return materials_.size(); }
 size_t SceneIR::CameraCount() const { return cameras_.size(); }
 size_t SceneIR::LightCount() const { return lights_.size(); }
 size_t SceneIR::ActuatorCount() const { return actuators_.size(); }
+size_t SceneIR::MediaCount() const { return media_.size(); }
 
 const RigidBodyRecord& SceneIR::GetBody(BodyId id) const {
     if (id >= bodies_.size()) {
@@ -286,6 +304,13 @@ const ActuatorRecord& SceneIR::GetActuator(ActuatorId id) const {
         throw std::out_of_range("SceneIR::GetActuator - invalid ActuatorId");
     }
     return actuators_[id];
+}
+
+const MediaRecord& SceneIR::GetMedia(MediaId id) const {
+    if (id >= media_.size()) {
+        throw std::out_of_range("SceneIR::GetMedia - invalid MediaId");
+    }
+    return media_[id];
 }
 
 RigidBodyRecord& SceneIR::GetBodyMut(BodyId id) {
@@ -352,6 +377,14 @@ ActuatorRecord& SceneIR::GetActuatorMut(ActuatorId id) {
     return actuators_[id];
 }
 
+MediaRecord& SceneIR::GetMediaMut(MediaId id) {
+    if (id >= media_.size()) {
+        throw std::out_of_range("SceneIR::GetMediaMut - invalid MediaId");
+    }
+    facade_dirty_ = true;  // record mutation bypasses write-through
+    return media_[id];
+}
+
 const std::vector<RigidBodyRecord>& SceneIR::Bodies() const { return bodies_; }
 const std::vector<JointRecord>& SceneIR::Joints() const { return joints_; }
 const std::vector<CollisionShapeRecord>& SceneIR::Shapes() const { return shapes_; }
@@ -360,6 +393,7 @@ const std::vector<MaterialRecord>& SceneIR::Materials() const { return materials
 const std::vector<CameraRecord>& SceneIR::Cameras() const { return cameras_; }
 const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }
 const std::vector<ActuatorRecord>& SceneIR::Actuators() const { return actuators_; }
+const std::vector<MediaRecord>& SceneIR::Media() const { return media_; }
 const std::vector<std::pair<BodyId, BodyId>>& SceneIR::ExcludePairs() const {
     return exclude_pairs_;
 }
@@ -382,6 +416,10 @@ EntityId SceneIR::EntityOfShape(ShapeId id) const {
 EntityId SceneIR::EntityOfJoint(JointId id) const {
     EnsureFacade();
     return id < joint_entity_.size() ? joint_entity_[id] : kInvalidEntity;
+}
+EntityId SceneIR::EntityOfMedia(MediaId id) const {
+    EnsureFacade();
+    return id < media_entity_.size() ? media_entity_[id] : kInvalidEntity;
 }
 
 // Lazy facade resync. Get*Mut hands out mutable record references that bypass
@@ -476,6 +514,20 @@ LightComponent::Type LightCompTypeFromLightType(LightType type) {
         case LightType::Area:        return LightComponent::Type::Area;
     }
     return LightComponent::Type::Point;
+}
+
+SystemKindComponent::K SystemKindFromMediaKind(MediaRecord::Kind kind) {
+    switch (kind) {
+        case MediaRecord::Kind::Cloth:   return SystemKindComponent::Cloth;
+        case MediaRecord::Kind::SoftTet: return SystemKindComponent::Soft;
+        case MediaRecord::Kind::Fluid:   return SystemKindComponent::Fluid;
+    }
+    return SystemKindComponent::Soft;
+}
+
+SoftBodyComponent::SimMethod SimMethodFromMediaMethod(MediaRecord::Method method) {
+    return method == MediaRecord::Method::MlsMpm ? SoftBodyComponent::SimMethod::MlsMpm
+                                                 : SoftBodyComponent::SimMethod::Xpbd;
 }
 
 // Stable node name for an UNNAMED record: derive from the RECORD identity
@@ -778,6 +830,42 @@ void SceneIR::ProjectActuator(const ActuatorRecord& rec) {
     ac.stiffness    = rec.gain;
     ac.effort_limit = rec.force_limit;
     ecs_.Add(target, std::move(ac));
+}
+
+void SceneIR::ProjectMedia(const MediaRecord& rec) {
+    if (rec.id >= media_entity_.size()) {
+        media_entity_.resize(rec.id + 1, kInvalidEntity);
+    }
+
+    // A medium is a free scene object: its own entity + node under root carrying
+    // the solver-routing kind and a per-kind soft/fluid constitutive component.
+    const EntityId entity = ecs_.Create();
+    auto node = tree_.AddEntity(entity, tree_.Root(),
+                                StableAutoName("media", rec.id, rec.name));
+    ecs_.BindNode(entity, node);
+    ecs_.Add(entity, NameComponent{node->name});
+    ecs_.Add(entity, SystemKindComponent{SystemKindFromMediaKind(rec.kind)});
+
+    if (rec.kind == MediaRecord::Kind::Fluid) {
+        FluidComponent fl;
+        fl.particle_size = rec.fluid_box.spacing;
+        fl.rho0 = (rec.method == MediaRecord::Method::MlsMpm) ? rec.mpm.density
+                                                              : rec.pbf.rest_density;
+        ecs_.Add(entity, std::move(fl));
+    } else {
+        SoftBodyComponent sb;
+        sb.sim_method        = SimMethodFromMediaMethod(rec.method);
+        sb.tet_or_cloth_mesh = rec.baked;
+        if (rec.method == MediaRecord::Method::MlsMpm) {
+            sb.young   = rec.mpm.youngs;
+            sb.poisson = rec.mpm.poisson;
+        } else {
+            sb.xpbd_compliance = rec.xpbd.distance_alpha;
+        }
+        ecs_.Add(entity, std::move(sb));
+    }
+
+    media_entity_[rec.id] = entity;
 }
 
 } // namespace nuka::scene
