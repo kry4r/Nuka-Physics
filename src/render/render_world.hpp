@@ -95,6 +95,12 @@ public:
     const MeshGeometry& Geometry(uint32_t mesh_id) const { return meshes_[mesh_id]; }
     MeshSource          Source(uint32_t mesh_id) const { return sources_[mesh_id]; }
 
+    // Replace an interned mesh's geometry in place (a deforming particle surface
+    // updates its ONE mesh each frame; id/key stay stable so the table never grows).
+    void ReplaceGeometry(uint32_t mesh_id, MeshGeometry geometry) {
+        meshes_[mesh_id] = std::move(geometry);
+    }
+
     // Intern a mesh decoded from a .nka MESH chunk keyed by its AssetRef. The
     // first call with a given ref loads + decodes (via `loader`) and stores it;
     // subsequent calls with an equal ref return the same id. `loader` returns the

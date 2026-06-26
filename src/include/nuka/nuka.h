@@ -639,6 +639,47 @@ nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
                                       size_t* out_len);
 
 // ---------------------------------------------------------------------------
+// Offline beauty render of the LIVE world: a one-off HOST RGB image of the world's
+// CURRENT state via the self-written offline CUDA path-tracer (NOT the gated
+// realtime Vulkan present). The robot link visuals are FK-posed from the live link
+// poses, any particle media is surfaced from the live particle field, and a studio
+// floor is drawn -- lit/shaded by the SHARED studio render scene (identical to the
+// go2_cloth_drape demo). Renders env 0. The render scene is built ONCE (lazily, from
+// the world's retained scene + cooked particle-surface topology) and refreshed from
+// the live state each call. This is how a Python script reproduces the cloth video.
+// ---------------------------------------------------------------------------
+
+// Pinhole camera for nuka_world_render_beauty: positioned at `eye`, looking at
+// `look`, with `up` the world up (e.g. 0,0,1) and `fov_deg` the vertical field of
+// view (degrees).
+typedef struct nuka_beauty_camera_t {
+    float eye[3];
+    float look[3];
+    float up[3];
+    float fov_deg;
+} nuka_beauty_camera_t;
+
+// Render the live world to a HOST RGB image. width*height*3 RGB samples are written
+// to `out_rgb` row-major (top row first; R,G,B per pixel). `dtype` selects the
+// sample type: 0 == uint8 in [0,255], 1 == float32 in [0,1]. `spp` is the beauty
+// sample count (0 => an engine default).
+//
+// SIZE QUERY: out_rgb == NULL returns OK with *out_pixel_count = width*height*3 (the
+// scalar count to allocate); no render runs. Otherwise out_capacity (in SCALARS)
+// must be >= width*height*3 (INVALID_ARG if short), and *out_pixel_count (may be
+// NULL) receives width*height*3.
+//
+// NOT_SUPPORTED if no offline CUDA RT backend is available or the world has no
+// renderable visual geometry. INVALID_ARG on a null camera, an unknown dtype, or
+// zero width/height.
+nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
+                                       const nuka_beauty_camera_t* camera,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t spp, uint8_t dtype,
+                                       void* out_rgb, size_t out_capacity,
+                                       size_t* out_pixel_count);
+
+// ---------------------------------------------------------------------------
 // Device-resident batched camera sensor: S cameras per env (each on its own mount)
 // rendered into a single (env_count, sensors_per_env, height, width, channels)
 // device tensor (no host download). The same RT tracer at a cheap sensor profile;

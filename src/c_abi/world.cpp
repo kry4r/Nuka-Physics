@@ -210,6 +210,24 @@ nuka::scene::cook::XpbdCookInput BuildClothCookInput(
     return in;
 }
 
+// The cloth lattice render-surface triangle list (two triangles per quad, the SAME
+// row-major winding BuildClothCookInput meshes the constraints with). Empty when no
+// cloth. Indexes the [0, nx*ny) cloth particles (laid out first in the particle set).
+std::vector<uint32_t> BuildClothSurfaceTriangles(
+    const nuka_coupled_particles_desc_t& p) {
+    std::vector<uint32_t> tris;
+    if (p.cloth_nx < 2u || p.cloth_ny < 2u || p.cloth_spacing <= 0.0f) return tris;
+    const uint32_t nx = p.cloth_nx, ny = p.cloth_ny;
+    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
+    for (uint32_t j = 0u; j + 1u < ny; ++j) {
+        for (uint32_t i = 0u; i + 1u < nx; ++i) {
+            tris.insert(tris.end(), {idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u),
+                                     idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)});
+        }
+    }
+    return tris;
+}
+
 // Build the fluid PBF cook input from the compact coupled descriptor: an AABB box
 // filled on a uniform lattice by the engine's CookFluidBox, with the uniform-grid
 // domain sized to enclose the box + headroom. Empty input when the fluid is absent.
@@ -632,10 +650,19 @@ nuka_result_t nuka_world_create_coupled_from_scene(
                                                   cloth, fluid, contact);
 
         // Build + insert the live coupled world (the SAME record-assembly path).
-        return nuka::c_abi::FinishWorldCreate(
+        const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
             desc->env_count, prepared.control_mode, prepared.gravity, out);
+        // Retain the cloth render-surface connectivity so a live beauty render
+        // rebuilds the deforming surface from the live particle field (no second
+        // authoring path -- the SAME lattice the physics cook meshed).
+        if (result == NUKA_RESULT_OK) {
+            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
+                record->particle_surface_triangles =
+                    nuka::c_abi::BuildClothSurfaceTriangles(*particles);
+        }
+        return result;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
