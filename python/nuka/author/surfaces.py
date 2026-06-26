@@ -1,9 +1,11 @@
 """Surface / membrane behaviors for the authoring facade.
 
 ``Cloth(free=, aero=)`` is the drape membrane: ``free`` skips the perimeter pin
-(a free drape instead of a taut membrane) and ``aero`` is the anisotropic
-aerodynamic drag ``(normal, tangent, max_dv)``. Maps to ``cloth_free`` +
-``aero_normal / aero_tangent / aero_max_dv``; all-zero aero keeps the cook
+(a free drape) and ``aero`` is the anisotropic drag ``(normal, tangent, max_dv)``.
+``Soft(offset=, smooth_iters=, smooth_lambda=)`` is the render skin baked over a
+tet/fluid medium (a normal offset + Laplacian smoothing). A surface maps onto the
+``cloth_free``/``aero_*`` cook kwargs (fast path) or the matching
+``SceneBuilder.add_media`` kwargs (builder path); all-zero aero keeps the cook
 byte-identical.
 """
 
@@ -20,15 +22,41 @@ class ClothSurface:
     free: bool = False
     aero: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
-    def cook_kwargs(self) -> dict:
+    def _aero3(self) -> Tuple[float, float, float]:
         if len(self.aero) != 3:
             raise ValueError("surfaces.Cloth: aero must be (normal, tangent, max_dv)")
-        n, t, dv = (float(x) for x in self.aero)
+        return tuple(float(x) for x in self.aero)
+
+    def cook_kwargs(self) -> dict:
+        n, t, dv = self._aero3()
         return dict(cloth_free=bool(self.free), aero_normal=n,
                     aero_tangent=t, aero_max_dv=dv)
 
+    def media_kwargs(self) -> dict:
+        """The cloth free/aero block for ``SceneBuilder.add_media`` (builder path)."""
+        n, t, dv = self._aero3()
+        return dict(cloth_free=bool(self.free), xpbd_aero_normal=n,
+                    xpbd_aero_tangent=t, xpbd_aero_max_dv=dv)
 
-# The public surface name (``surfaces.Cloth(free=..., aero=...)``).
+
+@_dc.dataclass(frozen=True)
+class SoftSurface:
+    """A render skin baked over a tet/fluid medium: a ``offset`` m normal inflation
+    and ``smooth_iters`` Laplacian passes at ``smooth_lambda`` (consumed downstream
+    by the surface bake, not the cook)."""
+
+    offset: float = 0.0
+    smooth_iters: int = 0
+    smooth_lambda: float = 0.5
+
+    def media_kwargs(self) -> dict:
+        return dict(skin_normal_offset=float(self.offset),
+                    skin_smooth_iters=int(self.smooth_iters),
+                    skin_smooth_lambda=float(self.smooth_lambda))
+
+
+# The public surface names (``surfaces.Cloth(...)`` / ``surfaces.Soft(...)``).
 Cloth = ClothSurface
+Soft = SoftSurface
 
-__all__ = ["Cloth", "ClothSurface"]
+__all__ = ["Cloth", "ClothSurface", "Soft", "SoftSurface"]
