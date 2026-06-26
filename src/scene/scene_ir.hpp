@@ -19,6 +19,7 @@
 // for purity (it returns by value and callers assert the base is unchanged).
 // ---------------------------------------------------------------------------
 
+#include "scene/asset/asset_ref.hpp"
 #include "scene/canonical_types.hpp"
 #include "scene/cook/settle_spec.hpp"   // SettleSpec (plain data; persisted IC seam)
 #include "scene/ecs/entity.hpp"
@@ -231,6 +232,113 @@ struct ContactPairOverride {
 };
 
 // ---------------------------------------------------------------------------
+// Media records (cloth / soft tet / fluid). Each field maps 1:1 to an existing
+// cook input; one geometry/material variant is used per MediaRecord::Kind.
+// ---------------------------------------------------------------------------
+
+// Constitutive material for an XPBD medium (cloth uses distance+bend, tet uses
+// distance+volume — one block). Fields map 1:1 to cook::XpbdCookInput.
+struct MediaXpbdMaterial {
+    float    particle_mass     = 0.0f;
+    float    friction          = 0.6f;   // body<->soft contact mu
+    float    distance_alpha    = 0.0f;   // distance-constraint compliance
+    float    bend_alpha        = 0.0f;   // cloth bend compliance
+    float    volume_alpha      = 0.0f;   // tet volume compliance
+    uint16_t iters             = 1u;     // solver iterations
+    float    aero_drag_normal  = 0.0f;
+    float    aero_drag_tangent = 0.0f;
+    float    aero_drag_max_dv  = 0.0f;
+};
+
+// Constitutive material for a PBF fluid. rest_density / support_scale / iters /
+// friction map to cook::PbfCookInput; the wall fields carry box confinement.
+struct MediaPbfMaterial {
+    float    rest_density      = 0.0f;
+    float    support_scale     = 0.0f;   // support_radius = support_scale * spacing
+    uint16_t iters             = 4u;
+    float    friction          = 0.0f;
+    bool     clamp_overdensity = true;
+    // Box confinement; the cook generates a pinned boundary slab from boundary_layers.
+    bool       walls_enabled   = false;
+    math::Vec3 walls_min{0.0f, 0.0f, 0.0f};
+    math::Vec3 walls_max{0.0f, 0.0f, 0.0f};
+    float      floor_z         = 0.0f;
+    uint32_t   boundary_layers = 0u;
+};
+
+// Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
+// plus the cook::MpmCookInput grid/floor scalars.
+struct MediaMpmMaterial {
+    float youngs       = 0.0f;
+    float poisson      = 0.0f;
+    float density      = 0.0f;
+    float dp_friction  = 0.0f;
+    float dp_cohesion  = 0.0f;
+    float model_kind   = 0.0f;   // 0 corotated, 2 neo-hookean, 3 weakly-compressible fluid
+    float bulk_modulus = 0.0f;
+    float tait_gamma   = 0.0f;
+    float viscosity    = 0.0f;
+    float      dx             = 0.0f;   // uniform grid node spacing
+    uint32_t   substeps       = 1u;
+    math::Vec3 floor_normal{0.0f, 0.0f, 1.0f};
+    float      floor_d        = 0.0f;
+    float      floor_friction = 0.4f;
+};
+
+// Render-skin metadata for surface baking. The cloth fields mirror the particle
+// SurfaceTopology (inflation + Laplacian relax); skin_mesh refs a baked tet skin.
+struct MediaRenderSkin {
+    float    normal_offset = 0.0f;   // outward inflation along the smooth normal
+    uint32_t smooth_iters  = 0u;     // Laplacian relaxation passes (render-only)
+    float    smooth_lambda = 0.5f;   // per-pass blend weight in [0,1]
+    AssetRef skin_mesh;              // embedded tet skin chunk; empty => particle surface
+};
+
+// A first-class media entry: WHAT it is (kind), HOW it solves (method),
+// procedural-or-baked geometry, a constitutive material, and a render skin.
+struct MediaRecord {
+    std::string name;
+    MediaId     id = kInvalidMedia;
+
+    // WHAT it is (solver routing) and HOW it solves (one method per medium).
+    enum class Kind   : uint8_t { Cloth, SoftTet, Fluid };
+    enum class Method : uint8_t { Xpbd, Pbf, MlsMpm };
+    Kind   kind   = Kind::Cloth;
+    Method method = Method::Xpbd;
+
+    // Procedural geometry (one populated per kind); a baked .obj/.nka mesh
+    // medium references its chunk via `baked` instead.
+    struct ClothGrid {
+        uint32_t   nx = 0u, ny = 0u;
+        float      spacing = 0.0f;
+        math::Vec3 origin{0.0f, 0.0f, 0.0f};
+        bool       free = false;
+    };
+    struct TetSphere {
+        math::Vec3 center{0.0f, 0.0f, 0.0f};
+        float      radius = 0.0f;
+        uint32_t   cells = 0u;
+        float      cell_len = 0.0f;
+    };
+    struct FluidBox {
+        math::Vec3 min{0.0f, 0.0f, 0.0f};
+        math::Vec3 max{0.0f, 0.0f, 0.0f};
+        float      spacing = 0.0f;
+    };
+    ClothGrid cloth_grid{};
+    TetSphere tet_sphere{};
+    FluidBox  fluid_box{};
+    AssetRef  baked;            // .nka tet/cloth chunk; empty => procedural.
+
+    MediaXpbdMaterial xpbd{};
+    MediaPbfMaterial  pbf{};
+    MediaMpmMaterial  mpm{};
+
+    MediaRenderSkin render_skin{};
+    uint32_t        render_material_id = kInvalidMaterial;
+};
+
+// ---------------------------------------------------------------------------
 // SceneIR
 // ---------------------------------------------------------------------------
 
@@ -262,6 +370,7 @@ public:
     CameraId AddCamera(CameraRecord record);
     LightId AddLight(LightRecord record);
     ActuatorId AddActuator(ActuatorRecord record);
+    MediaId  AddMedia(MediaRecord record);
 
     // Record an explicit collision-exclusion between two bodies. Stored
     // canonicalized as (min,max) so call order does not matter. The filter
@@ -283,6 +392,7 @@ public:
     size_t CameraCount()    const;
     size_t LightCount()     const;
     size_t ActuatorCount()  const;
+    size_t MediaCount()     const;
 
     // -- accessors ----------------------------------------------------------
     const RigidBodyRecord&      GetBody(BodyId id)    const;
@@ -293,6 +403,7 @@ public:
     const CameraRecord&         GetCamera(CameraId id) const;
     const LightRecord&          GetLight(LightId id) const;
     const ActuatorRecord&       GetActuator(ActuatorId id) const;
+    const MediaRecord&          GetMedia(MediaId id) const;
 
     // Mutable record access. Mutating a record through these BYPASSES the Add*
     // write-through, so each Get*Mut marks the facade DIRTY; the next facade
@@ -307,6 +418,7 @@ public:
     CameraRecord&         GetCameraMut(CameraId id);
     LightRecord&          GetLightMut(LightId id);
     ActuatorRecord&       GetActuatorMut(ActuatorId id);
+    MediaRecord&          GetMediaMut(MediaId id);
 
     // -- bulk accessors -----------------------------------------------------
     const std::vector<RigidBodyRecord>&      Bodies()  const;
@@ -317,6 +429,7 @@ public:
     const std::vector<CameraRecord>&         Cameras() const;
     const std::vector<LightRecord>&          Lights() const;
     const std::vector<ActuatorRecord>&       Actuators() const;
+    const std::vector<MediaRecord>&          Media() const;
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
@@ -347,6 +460,7 @@ public:
     EntityId EntityOfBody(BodyId id)   const;
     EntityId EntityOfShape(ShapeId id) const;
     EntityId EntityOfJoint(JointId id) const;
+    EntityId EntityOfMedia(MediaId id) const;
 
 private:
     // Rebuild tree_ + ecs_ from the current record vectors (used by the copy
@@ -365,6 +479,7 @@ private:
     void ProjectCamera(const CameraRecord& rec);
     void ProjectLight(const LightRecord& rec);
     void ProjectActuator(const ActuatorRecord& rec);
+    void ProjectMedia(const MediaRecord& rec);
 
     std::vector<RigidBodyRecord>      bodies_;
     std::vector<JointRecord>          joints_;
@@ -374,6 +489,7 @@ private:
     std::vector<CameraRecord>         cameras_;
     std::vector<LightRecord>          lights_;
     std::vector<ActuatorRecord>       actuators_;
+    std::vector<MediaRecord>          media_;
     std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
     std::vector<ContactPairOverride>       contact_pairs_;
 
@@ -391,6 +507,7 @@ private:
     std::vector<EntityId>                    body_entity_;
     std::vector<EntityId>                    shape_entity_;
     std::vector<EntityId>                    joint_entity_;
+    std::vector<EntityId>                    media_entity_;
     std::vector<std::shared_ptr<SceneNode>>  body_node_;
 
     // MaterialId -> {physics-material id, render-material id} in the Registry's
