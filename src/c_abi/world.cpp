@@ -521,6 +521,12 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         if (prep != NUKA_RESULT_OK) {
             return prep;
         }
+        // The file-load entry cooks the robot + an optional heightfield only; a scene
+        // that declares media must use nuka_world_create_from_built_scene (LOUD, never
+        // a silent drop of the declared particles).
+        if (!prepared.scene.Media().empty()) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
         // Build + insert the live world (the shared record-assembly path).
         return nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
