@@ -138,25 +138,31 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     //    an empty view (element_count == 0) on a no-particle world. ------------
     {NUKA_FIELD_PARTICLE_POSITION,      kStrideVec3,  kWireDtypeF32, nk::FieldId::ParticlePos},
     {NUKA_FIELD_PARTICLE_VELOCITY,      kStrideVec3,  kWireDtypeF32, nk::FieldId::ParticleVel},
+    // -- field 25/26: per-body world LINEAR / ANGULAR velocity (Vec3, 12 B) of the
+    //    cooked rigid SoA (per:body; empty view on a body-free world). ---------------
+    {NUKA_FIELD_BODY_LINEAR_VELOCITY,   kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyLinearVelocity},
+    {NUKA_FIELD_BODY_ANGULAR_VELOCITY,  kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyAngularVelocity},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
-// The table must cover exactly the 25 public fields (0..24), one row each, in
-// integer order. PARTICLE_VELOCITY == 24 is the highest public field; the count
+// The table must cover exactly the 27 public fields (0..26), one row each, in
+// integer order. BODY_ANGULAR_VELOCITY == 26 is the highest public field; the count
 // is one past it. (Append-only: bump this together with a new trailing row.)
 // Fields 0..19 are byte-pinned by the RL contract; fields 20/21 are the Go2-on-
 // stairs per-env terrain controls; field 22 is the unified-actuator feed-forward
-// joint force; fields 23/24 are the coupled-world particle position/velocity (all
-// appended, never reordered).
-static_assert(kDlpackFieldCount == 25u,
-              "dlpack_table must hold exactly the 25 public state fields");
+// joint force; fields 23/24 are the coupled-world particle position/velocity; fields
+// 25/26 are the per-body linear/angular velocity (all appended, never reordered).
+static_assert(kDlpackFieldCount == 27u,
+              "dlpack_table must hold exactly the 27 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_PARTICLE_VELOCITY) == 24,
+              "public field enum range changed — review the RL binary contract");
+static_assert(static_cast<int>(NUKA_FIELD_BODY_ANGULAR_VELOCITY) == 26,
               "public field enum range changed — review the RL binary contract");
 
 // Resolve a public field's canonical descriptor. Returns nullptr if the field

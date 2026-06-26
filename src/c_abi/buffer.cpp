@@ -110,4 +110,86 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
     }
 }
 
+// Host->field byte upload (1:1 with nk::Data::UploadField), resolving the public
+// field to its nk::FieldId through the SAME dlpack_table bridge get_buffer_view uses.
+nuka_result_t nuka_world_upload_field(nuka_world_handle world,
+                                      nuka_state_field_t field,
+                                      const void* bytes, size_t nbytes,
+                                      size_t byte_offset) {
+    if (bytes == nullptr && nbytes > 0u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    if (nbytes == 0u) {
+        return NUKA_RESULT_OK;
+    }
+    try {
+        const nuka::c_abi::DlpackFieldRow* row =
+            nuka::c_abi::FindDlpackFieldRow(field);
+        if (row == nullptr || row->field_id == nuka::c_abi::kNoFieldId) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        if (record->world->FieldPtr(row->field_id) == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;  // capacity-0 field on this scene.
+        }
+        const bool ok = record->world->GetData().UploadField(
+            row->field_id, bytes, static_cast<uint64_t>(nbytes),
+            static_cast<uint64_t>(byte_offset));
+        return ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;  // over-range == LOUD.
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+// Field->host byte download (1:1 with nk::Data::DownloadField); the read mirror of
+// nuka_world_upload_field with the identical resolution + LOUD over-range contract.
+nuka_result_t nuka_world_download_field(nuka_world_handle world,
+                                        nuka_state_field_t field,
+                                        void* bytes, size_t nbytes,
+                                        size_t byte_offset) {
+    if (bytes == nullptr && nbytes > 0u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    if (nbytes == 0u) {
+        return NUKA_RESULT_OK;
+    }
+    try {
+        const nuka::c_abi::DlpackFieldRow* row =
+            nuka::c_abi::FindDlpackFieldRow(field);
+        if (row == nullptr || row->field_id == nuka::c_abi::kNoFieldId) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        if (record->world->FieldPtr(row->field_id) == nullptr) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        const bool ok = record->world->GetData().DownloadField(
+            row->field_id, bytes, static_cast<uint64_t>(nbytes),
+            static_cast<uint64_t>(byte_offset));
+        return ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 } // extern "C"

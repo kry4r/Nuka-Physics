@@ -242,6 +242,16 @@ typedef struct nuka_coupled_particles_desc_t {
     // (cloth stays XPBD, fluid stays PBF in the first batch). A zero-initialized
     // desc selects the PB default, so an existing caller is unaffected.
     uint32_t soft_sim_method;
+    // Cloth perimeter pin. 0 (default) pins the whole perimeter (a taut membrane);
+    // 1 skips the pin so the sheet is a free drape (every particle dynamic).
+    uint32_t cloth_free;
+    // Cloth anisotropic aerodynamic drag, passed straight to XpbdCookInput.aero_drag_*
+    // (lumped 0.5*rho*Cn normal, 0.5*rho*Ct tangent, per-step velocity-delta clamp).
+    // All 0 (default) => no drag op emitted => byte-identical cook; when any is > 0
+    // the cloth surface triangles seed the drag op.
+    float aero_normal;
+    float aero_tangent;
+    float aero_max_dv;
 } nuka_coupled_particles_desc_t;
 
 // Create a coupled world. `desc` is the same robot/world descriptor
@@ -569,7 +579,17 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_PARTICLE_POSITION = 23,
     // READ (per-particle). The live particle velocities, same layout/stride/dtype as
     // NUKA_FIELD_PARTICLE_POSITION; an empty view (element_count == 0) when no particles.
-    NUKA_FIELD_PARTICLE_VELOCITY = 24
+    NUKA_FIELD_PARTICLE_VELOCITY = 24,
+    // READ/WRITE (general). The cooked rigid-body SoA world-frame LINEAR / ANGULAR
+    // velocity (runtime::rigid::BodyState; nk FieldId BodyLinearVelocity /
+    // BodyAngularVelocity). Vec3 per body, env-major: element_count ==
+    // env_count*bodies_per_env, index (env*bodies_per_env + body),
+    // element_stride_bytes == 3*sizeof(float), dtype == 0 (FLOAT32). Bodies are the
+    // cooked rigid rows (articulation link bodies + free rigid bodies). A body-free
+    // world resolves an empty view (element_count == 0). Written via
+    // nuka_world_upload_field to park a free body (e.g. the water-demo bunny hold).
+    NUKA_FIELD_BODY_LINEAR_VELOCITY = 25,
+    NUKA_FIELD_BODY_ANGULAR_VELOCITY = 26
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {
@@ -584,6 +604,39 @@ typedef struct nuka_buffer_view_t {
 nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
                                          nuka_state_field_t field,
                                          nuka_buffer_view_t* out);
+
+// Host<->field byte transfer for ANY served field (1:1 with nk::Data::UploadField /
+// DownloadField). `bytes` is a HOST buffer of `nbytes`; `byte_offset` is relative to
+// the field's Arena segment base. This is the GENERAL control verb a demo's
+// choreography uses to re-seat NUKA_FIELD_BASE_POSE, zero NUKA_FIELD_LINK_VELOCITY,
+// park a body, etc. -- the single byte-level write path (the writable buffer-view
+// fields are also writable this way; a read-only view's backing Data field is too).
+// INVALID_ARG if [byte_offset, byte_offset+nbytes) exceeds the field's segment (a
+// LOUD failure, never a silent clamp) or bytes==NULL with nbytes>0. NOT_SUPPORTED if
+// the field is unknown or has no nk Data field (e.g. a control-input alias, or a
+// capacity-0 field on this scene). nbytes==0 is a no-op OK.
+nuka_result_t nuka_world_upload_field(nuka_world_handle world,
+                                      nuka_state_field_t field,
+                                      const void* bytes, size_t nbytes,
+                                      size_t byte_offset);
+nuka_result_t nuka_world_download_field(nuka_world_handle world,
+                                        nuka_state_field_t field,
+                                        void* bytes, size_t nbytes,
+                                        size_t byte_offset);
+
+// Resolve the cooked DOF NAME of articulation-local link `link_index` (0 == the
+// root; 1..base_link_count-1 == the actuated joints in COOKED order). Writes the
+// NUL-terminated name into `out` and the length (excluding NUL) into *out_len (may
+// be NULL). The name is the joint whose CHILD is that link (else the link body's
+// name; empty for an unnamed/root link). A NULL `out` is a SIZE QUERY: it returns OK
+// with *out_len set to the needed length (allocate len+1, retry). INVALID_ARG if
+// link_index is out of range, or if a non-NULL `cap` cannot hold name + NUL (*out_len
+// is still set to the needed length). NOT_SUPPORTED if no cooked articulation is
+// retained. Resolves through the cooked articulation joint table, so a regex
+// name->column map is correct under CookArticulations joint reordering.
+nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
+                                      uint32_t link_index, char* out, size_t cap,
+                                      size_t* out_len);
 
 // ---------------------------------------------------------------------------
 // Device-resident batched camera sensor: S cameras per env (each on its own mount)
