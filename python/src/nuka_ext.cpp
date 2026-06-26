@@ -1508,6 +1508,55 @@ NB_MODULE(_nuka_ext, m) {
             "nk::Data::DownloadField). offset/count are in SCALARS (count 0 == the "
             "whole field from offset). float32 for all but the uint32 index/type "
             "fields. The read mirror of upload_field for round-trip verification.")
+        // Offline beauty render of the LIVE world -> a HOST (H,W,3) numpy image.
+        .def(
+            "render_beauty",
+            [](World& w, std::array<float, 3> eye, std::array<float, 3> look,
+               std::array<float, 3> up, float fov_deg, uint32_t width,
+               uint32_t height, uint32_t spp, const std::string& dtype) -> nb::object {
+                nuka_beauty_camera_t cam{};
+                for (int i = 0; i < 3; ++i) {
+                    cam.eye[i] = eye[i]; cam.look[i] = look[i]; cam.up[i] = up[i];
+                }
+                cam.fov_deg = fov_deg;
+                const bool as_float = (dtype == "float" || dtype == "float32" ||
+                                       dtype == "f4" || dtype == "f");
+                const size_t n = static_cast<size_t>(width) * height * 3u;
+                size_t shape[3] = {height, width, 3u};
+                if (as_float) {
+                    float* buf = new float[n ? n : 1u];
+                    check(nuka_world_render_beauty(w.raw(), &cam, width, height, spp,
+                                                   1u, buf, n, nullptr),
+                          "nuka_world_render_beauty");
+                    nb::capsule owner(buf, [](void* p) noexcept {
+                        delete[] static_cast<float*>(p);
+                    });
+                    return nb::cast(
+                        nb::ndarray<nb::numpy, float>(buf, 3, shape, owner));
+                }
+                uint8_t* buf = new uint8_t[n ? n : 1u];
+                check(nuka_world_render_beauty(w.raw(), &cam, width, height, spp, 0u,
+                                               buf, n, nullptr),
+                      "nuka_world_render_beauty");
+                nb::capsule owner(buf, [](void* p) noexcept {
+                    delete[] static_cast<uint8_t*>(p);
+                });
+                return nb::cast(
+                    nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, owner));
+            },
+            nb::arg("eye"), nb::arg("look"),
+            nb::arg("up") = std::array<float, 3>{{0.0f, 0.0f, 1.0f}},
+            nb::arg("fov_deg") = 40.0f, nb::arg("width") = 1280u,
+            nb::arg("height") = 720u, nb::arg("spp") = 16u,
+            nb::arg("dtype") = std::string("uint8"),
+            "Beauty-render the world's CURRENT state to a HOST (height, width, 3) "
+            "numpy image with the offline CUDA path-tracer (the shared studio look: "
+            "FK-posed robot link visuals + the live particle surface + a studio "
+            "floor, lit like the go2_cloth_drape demo). eye/look/up are world-space "
+            "3-vectors; fov_deg is the vertical FOV; spp the beauty sample count. "
+            "dtype 'uint8' -> uint8 [0,255] (default) or 'float'/'float32' -> float32 "
+            "[0,1]. Renders env 0. Raises NOT_SUPPORTED if no offline RT backend or "
+            "the world has no renderable geometry.")
         // Name->DOF introspection. The cooked DOF names (joint-resolved, correct
         // under CookArticulations reordering) and the regex/keyword resolvers.
         .def(

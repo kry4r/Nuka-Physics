@@ -56,9 +56,7 @@
 #include "phi/backend.hpp"
 #include "render/raster/vulkan_raster_renderer.hpp"
 #include "render/render_world.hpp"
-#include "render/rt_adapter.hpp"
-#include "render/rt_backend.hpp"
-#include "render/rt_framebuffer_to_report.hpp"
+#include "render/studio_beauty.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/particle_surface.hpp"
@@ -76,7 +74,6 @@ namespace nphi = nuka::phi;
 namespace cook = nuka::scene::cook;
 namespace soft = nuka::runtime::soft;
 namespace render = nuka::render;
-namespace rt = nuka::rt;
 namespace terrain = nuka::terrain;
 using nuka::math::Quat;
 using nuka::math::Transform;
@@ -276,25 +273,6 @@ nk::Pipeline::SolverConfig Cfg() {
 }
 
 // ---- render helpers -------------------------------------------------------
-nuka::scene::RenderMaterial Mk(float r, float g, float b, float metallic, float rough,
-                               float sheen = 0.0f) {
-    nuka::scene::RenderMaterial m;
-    m.base_color[0] = r; m.base_color[1] = g; m.base_color[2] = b; m.base_color[3] = 1.0f;
-    m.metallic = metallic; m.roughness = rough; m.sheen = sheen;
-    return m;
-}
-
-render::MeshGeometry MakeFloorGeo(float half, float z) {
-    render::MeshGeometry g;
-    const float xs[2] = {-half, half};
-    const float ys[2] = {-half, half};
-    for (int yi = 0; yi < 2; ++yi)
-        for (int xi = 0; xi < 2; ++xi)
-            g.positions.insert(g.positions.end(), {xs[xi], ys[yi], z});
-    g.indices.insert(g.indices.end(), {0u, 1u, 3u, 0u, 3u, 2u});
-    return g;
-}
-
 bool WritePpm(const render::VulkanOffscreenReport& rep, const std::string& path) {
     if (rep.pixels.empty() || rep.width == 0u || rep.height == 0u) return false;
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -327,83 +305,6 @@ bool WritePng(const render::VulkanOffscreenReport& rep, const std::string& path)
     if (rc == 0) std::filesystem::remove(tmp, ec);
     return rc == 0;
 }
-
-// ---- CUDA ray-traced backend (the GPU render path; mirrors go2_terrain_demo's
-// GpuRenderer but enables smooth_normals so the fabric wrinkles + the Go2 shell
-// shade smoothly, not faceted). ---------------------------------------------
-class GpuRenderer {
-public:
-    explicit GpuRenderer(const render::RenderWorld& rw) {
-        backend_ = render::CreateCudaRtBackend();
-        if (!backend_) return;
-        scene_ = render::RenderWorldToTwoLevelScene(rw);
-        handle_ = backend_->BuildScene(scene_);
-    }
-    ~GpuRenderer() { if (backend_ && handle_) backend_->FreeScene(handle_); }
-    bool ok() const { return backend_ != nullptr && handle_ != nullptr; }
-    void SetBeauty(bool on, uint32_t samples) { beauty_ = on; samples_ = samples; }
-
-    render::VulkanOffscreenReport Render(const render::RenderWorld& rw,
-                                         const render::RasterOptions& opts) {
-        // The cloth surface deforms every frame, so its BLAS is rebuilt: free the
-        // prior handle and rebuild over the CURRENT meshes (offline by design).
-        if (backend_ && handle_) backend_->FreeScene(handle_);
-        scene_ = render::RenderWorldToTwoLevelScene(rw);
-        handle_ = backend_->BuildScene(scene_);
-        ApplyLighting(opts);
-        const rt::PinholeCamera cam = CameraFromOptions(opts);
-        rt::Framebuffer fb;
-        if (beauty_) fb = backend_->TraceBeautyToHost(handle_, scene_, cam, BeautyFromOptions(opts));
-        else fb = backend_->TraceToHost(handle_, scene_, cam);
-        return render::FramebufferToReport(fb, opts.background);
-    }
-
-private:
-    void ApplyLighting(const render::RasterOptions& opts) {
-        rt::Light& l = scene_.light;
-        l.directional = true;
-        Vec3 to_sun{opts.sun_direction[0], opts.sun_direction[1], opts.sun_direction[2]};
-        if (to_sun.Length() > 1e-6f) to_sun = to_sun.Normalized();
-        l.direction = -to_sun;  // RasterOptions points TOWARD the sun; rt travels AWAY.
-        l.color = {opts.sun_color[0], opts.sun_color[1], opts.sun_color[2]};
-        l.intensity = 1.0f;
-        scene_.ambient.color = {
-            0.5f * (opts.sun_ambient_sky[0] + opts.sun_ambient_ground[0]),
-            0.5f * (opts.sun_ambient_sky[1] + opts.sun_ambient_ground[1]),
-            0.5f * (opts.sun_ambient_sky[2] + opts.sun_ambient_ground[2])};
-    }
-    rt::PinholeCamera CameraFromOptions(const render::RasterOptions& opts) {
-        const float vfov = opts.camera_fov_degrees * (kPi / 180.0f);
-        return rt::BuildPinhole(opts.camera_eye, opts.camera_target, opts.camera_up,
-                                vfov, opts.width, opts.height);
-    }
-    rt::BeautyOptions BeautyFromOptions(const render::RasterOptions& opts) {
-        rt::BeautyOptions b;
-        b.samples = samples_;
-        b.shadow_rays = (opts.shadow_strength > 0.0f) ? 6u : 1u;
-        b.sun_angular_radius = 0.045f;
-        b.gi_bounces = 1u;
-        b.ao_samples = 4u;
-        b.ao_radius = 0.7f;
-        b.seed = 0x9e3779b9u;
-        b.smooth_normals = true;  // fabric wrinkles + shell shade smoothly, not faceted.
-        b.sky_top = {opts.sky_top[0], opts.sky_top[1], opts.sky_top[2]};
-        b.sky_bottom = {opts.sky_bottom[0], opts.sky_bottom[1], opts.sky_bottom[2]};
-        b.sky_ground = {opts.ground_color[0], opts.ground_color[1], opts.ground_color[2]};
-        b.fog_color = {opts.fog_color[0], opts.fog_color[1], opts.fog_color[2]};
-        b.fog_density = opts.fog_density;
-        b.sky_intensity = 0.30f;
-        b.download = rt::AovDownloadMask{};
-        b.download.depth = false; b.download.normal = false;
-        b.download.albedo = false; b.download.uv = false;
-        return b;
-    }
-    std::unique_ptr<render::RtBackendI> backend_;
-    render::RtSceneHandle* handle_ = nullptr;
-    rt::TwoLevelScene scene_;
-    bool beauty_ = false;
-    uint32_t samples_ = 16u;
-};
 
 // NkRow packs to 32 f32: [0]=flags [7]=upper, a.kind [16] a.index [17],
 // b.kind [24] b.index [25]. (Mirrors articulated_link_particle_coupling.)
@@ -1015,113 +916,26 @@ int main(int argc, char** argv) {
         return ok ? 0 : 5;
     }
 
-    // ---- RENDER: FK-rebind the Go2 visuals from the SAME go2.nks ---------------
+    // ---- RENDER: the SHARED studio scene (the demo + the live-render bridge draw
+    // ONE render setup: robot link visuals + the deforming cloth surface + floor +
+    // the crimson-velvet palette + cinematic lighting). FK-rebinds from go2.nks. ---
     cook::CookToModelResult cooked = cook::CookToModel(scene, 1);
-    render::RenderWorld rw = render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
-    if (rw.instances.empty()) {
-        std::fprintf(stderr, "[go2_cloth_drape] FATAL: BuildRenderWorld produced 0 instances\n");
+    const soft::SurfaceTopology topo = MakeClothTopology();
+    render::StudioScene studio =
+        render::BuildStudioScene(scene.Ecs(), cooked.scene_map, topo, args.width, args.height);
+    if (studio.world.instances.empty()) {
+        std::fprintf(stderr, "[go2_cloth_drape] FATAL: BuildStudioScene produced 0 instances\n");
         return 4;
     }
-    // Per-instance link + geom-local (the proven shape->link rebind).
-    std::vector<uint32_t> inst_link(rw.instances.size(), 0u);
-    std::vector<Transform> inst_vlocal(rw.instances.size(), Transform::Identity());
-    uint32_t n_rebound = 0u, n_static = 0u, n_oob = 0u;
-    for (size_t i = 0; i < rw.instances.size(); ++i) {
-        const render::PoseSource& ps = rw.instances[i].pose_source;
-        if (ps.kind == render::PoseSource::Kind::Static || ps.row == render::kNoId) { ++n_static; continue; }
-        if (ps.row < L) { inst_link[i] = ps.row; inst_vlocal[i] = rw.instances[i].cached_visual_local; ++n_rebound; }
-        else ++n_oob;
-    }
-    if (n_oob > 0u) {
-        std::fprintf(stderr, "[go2_cloth_drape] FATAL: %u instances reference link >= %u\n", n_oob, L);
-        return 5;
-    }
-    std::printf("[go2_cloth_drape] RenderWorld: instances=%u meshes=%u rebound=%u static=%u\n",
-                rw.InstanceCount(), rw.meshes.Count(), n_rebound, n_static);
-
-    // Premium studio material override (the go2_walk_video hero look).
-    rw.materials.clear();
-    const uint32_t kMatShell = 0u, kMatMetal = 1u, kMatFoot = 2u, kMatAccent = 3u;
-    const uint32_t kMatCloth = 4u, kMatFloor = 5u;
-    rw.materials.push_back(Mk(0.072f, 0.076f, 0.085f, 0.05f, 0.55f));  // 0 shell charcoal
-    rw.materials.push_back(Mk(0.090f, 0.096f, 0.110f, 0.85f, 0.34f));  // 1 dark gunmetal
-    rw.materials.push_back(Mk(0.045f, 0.045f, 0.050f, 0.04f, 0.72f));  // 2 dark rubber foot
-    rw.materials.push_back(Mk(0.16f,  0.180f, 0.225f, 0.65f, 0.30f));  // 3 cool steel accent
-    // Deep crimson matte fabric: a saturated dielectric at fabric roughness with only a
-    // faint grazing sheen (mat.sheen) for velvet quality, not a glossy glint. Env-tunable.
-    {
-        float cr = 0.400f, cg = 0.035f, cb = 0.060f, crough = 0.58f, csheen = 0.6f;
-        if (const char* v = std::getenv("NK_CLOTH_ROUGH")) crough = std::atof(v);
-        if (const char* v = std::getenv("NK_CLOTH_SHEEN")) csheen = std::atof(v);
-        if (const char* v = std::getenv("NK_CLOTH_R")) cr = std::atof(v);
-        if (const char* v = std::getenv("NK_CLOTH_G")) cg = std::atof(v);
-        if (const char* v = std::getenv("NK_CLOTH_B")) cb = std::atof(v);
-        rw.materials.push_back(Mk(cr, cg, cb, 0.00f, crough, csheen));  // 4 crimson silk
-    }
-    rw.materials.push_back(Mk(0.190f, 0.196f, 0.210f, 0.02f, 0.82f));  // 5 studio floor (cool neutral)
-    rw.default_material_id = kMatShell;
-    auto link_role_material = [&](uint32_t link, const Transform& vlocal) -> uint32_t {
-        if (link == 0u) return kMatShell;
-        const uint32_t k = ((link - 1u) % 3u);
-        if (k == 0u) return kMatMetal;
-        if (k == 1u) return kMatShell;
-        return (vlocal.position.z < -0.15f) ? kMatFoot : kMatMetal;
-    };
-    int accent_inst = -1;
-    for (size_t i = 0; i < rw.instances.size(); ++i) {
-        rw.instances[i].render_material_id = link_role_material(inst_link[i], inst_vlocal[i]);
-        if (inst_link[i] == 0u) accent_inst = static_cast<int>(i);
-    }
-    if (accent_inst >= 0) rw.instances[static_cast<size_t>(accent_inst)].render_material_id = kMatAccent;
-    const uint32_t go2_inst_end = rw.InstanceCount();
-
-    // The floor + cloth instances are appended after the Go2 instances; their
-    // world_xform is driven directly (the cloth verts are world-space). The cloth
-    // mesh is re-interned each frame as the sheet deforms.
-    const soft::SurfaceTopology topo = MakeClothTopology();
-    {
-        const uint32_t floor_mesh = rw.meshes.InternPrimitive(
-            "floor", [&] { return MakeFloorGeo(8.0f, 0.0f); });
-        render::RenderInstance fi;
-        fi.mesh_id = floor_mesh; fi.render_material_id = kMatFloor;
-        fi.world_xform = Transform::Identity();
-        fi.pose_source.kind = render::PoseSource::Kind::Static;
-        rw.instances.push_back(fi);
-    }
-
-    // Publish the Go2 visuals from the live link poses (world_xform = link o local).
-    auto publish_go2 = [&]() {
-        for (size_t i = 0; i < go2_inst_end; ++i)
-            rw.instances[i].world_xform = link_pose[inst_link[i]] * inst_vlocal[i];
-    };
-    // Rebuild the cloth surface mesh from the live particles each frame and bind it
-    // as ONE instance. The mesh library caches by key, so a per-frame key forces a
-    // fresh build of the deforming surface (both backends re-read the world).
-    constexpr size_t kNoCloth = ~size_t(0);
-    size_t cloth_inst_ = kNoCloth;
-    auto publish_cloth = [&](uint32_t frame) {
-        render::MeshGeometry cloth_geo;
-        soft::BuildSurfaceMesh(pos, topo, cloth_geo);
-        char key[32];
-        std::snprintf(key, sizeof(key), "cloth:live:%u", frame);
-        const uint32_t cloth_mesh = rw.meshes.InternPrimitive(key, [&] { return cloth_geo; });
-        if (cloth_inst_ == kNoCloth) {
-            render::RenderInstance ci;
-            ci.mesh_id = cloth_mesh; ci.render_material_id = kMatCloth;
-            ci.world_xform = Transform::Identity();
-            ci.pose_source.kind = render::PoseSource::Kind::Static;
-            rw.instances.push_back(ci);
-            cloth_inst_ = rw.instances.size() - 1u;
-        } else {
-            rw.instances[cloth_inst_].mesh_id = cloth_mesh;
-        }
-    };
+    std::printf("[go2_cloth_drape] StudioScene: instances=%u meshes=%u link_instances=%u\n",
+                studio.world.InstanceCount(), studio.world.meshes.Count(),
+                studio.link_instance_count);
 
     // ---- renderer (lavapipe raster preview OR CUDA RT beauty hero) -------------
     std::unique_ptr<render::VulkanRasterRenderer> renderer;
-    std::unique_ptr<GpuRenderer> gpu;
+    std::unique_ptr<render::StudioRtRenderer> gpu;
     if (args.gpu) {
-        gpu = std::make_unique<GpuRenderer>(rw);
+        gpu = std::make_unique<render::StudioRtRenderer>();
         if (!gpu->ok()) { std::fprintf(stderr, "[go2_cloth_drape] --gpu: no CUDA RT backend\n"); return 6; }
         gpu->SetBeauty(args.beauty, args.samples);
         std::printf("[go2_cloth_drape] renderer: CUDA RT (%s)\n", args.beauty ? "BEAUTY" : "flat");
@@ -1131,30 +945,8 @@ int main(int argc, char** argv) {
         std::printf("[go2_cloth_drape] renderer ICD: %s | particles=%u\n", renderer->DeviceName().c_str(), P);
     }
     auto render_frame = [&](const render::RasterOptions& o) {
-        return gpu ? gpu->Render(rw, o) : renderer->Render(rw, o);
+        return gpu ? gpu->Render(studio.world, o) : renderer->Render(studio.world, o);
     };
-
-    render::RasterOptions opts;
-    opts.width = args.width; opts.height = args.height;
-    opts.draw_ground = false;  // explicit floor mesh (the beauty path has no implicit floor).
-    opts.hero_framing = false;
-    opts.use_camera_override = true;
-    opts.camera_up = {0.0f, 0.0f, 1.0f};
-    opts.camera_fov_degrees = 40.0f;
-    opts.background = {14, 17, 23, 255};
-    opts.ground_color[0] = 0.180f; opts.ground_color[1] = 0.190f; opts.ground_color[2] = 0.210f;
-    opts.contact_shadow_strength = 0.0f;
-    opts.use_sun_light = true;
-    opts.sun_direction[0] = 0.42f; opts.sun_direction[1] = -0.34f; opts.sun_direction[2] = 0.50f;
-    opts.sun_color[0] = 2.80f; opts.sun_color[1] = 2.70f; opts.sun_color[2] = 2.55f;
-    opts.sun_ambient_sky[0] = 0.16f; opts.sun_ambient_sky[1] = 0.19f; opts.sun_ambient_sky[2] = 0.26f;
-    opts.sun_ambient_ground[0] = 0.10f; opts.sun_ambient_ground[1] = 0.10f; opts.sun_ambient_ground[2] = 0.11f;
-    opts.shadow_strength = 0.9f;
-    opts.shadow_map_size = 2048u;
-    opts.shadow_bias = 0.0020f;
-    opts.sky_gradient = true;
-    opts.sky_top[0] = 0.22f; opts.sky_top[1] = 0.32f; opts.sky_top[2] = 0.52f;
-    opts.sky_bottom[0] = 0.58f; opts.sky_bottom[1] = 0.66f; opts.sky_bottom[2] = 0.74f;
 
     auto smoothstep = [](float t) { t = std::max(0.0f, std::min(1.0f, t)); return t * t * (3.0f - 2.0f * t); };
 
@@ -1170,8 +962,7 @@ int main(int argc, char** argv) {
     auto render_one = [&](uint32_t step, const std::string* png) {
         download_links();
         download_pos();
-        publish_go2();
-        publish_cloth(written);
+        render::PublishStudioScene(studio, link_pose, pos);
         const float t = kDrape > 1u ? static_cast<float>(step) / static_cast<float>(kDrape - 1u) : 0.0f;
         const float e = smoothstep(t);
         const float az = -0.50f + 1.05f * e;                 // side -> front-3/4 arc.
@@ -1180,12 +971,12 @@ int main(int argc, char** argv) {
         // tighten onto the draped dog + the hem pooling on the floor.
         const float radius = 1.95f - 0.55f * e;
         const Vec3 look{base_xy.x + 0.05f, base_xy.y, 0.42f - 0.24f * e};
-        opts.camera_eye = {look.x + radius * std::cos(elev) * std::sin(az),
-                           look.y - radius * std::cos(elev) * std::cos(az),
-                           look.z + radius * std::sin(elev)};
-        opts.camera_target = look;
+        studio.options.camera_eye = {look.x + radius * std::cos(elev) * std::sin(az),
+                                     look.y - radius * std::cos(elev) * std::cos(az),
+                                     look.z + radius * std::sin(elev)};
+        studio.options.camera_target = look;
 
-        render::VulkanOffscreenReport rep = render_frame(opts);
+        render::VulkanOffscreenReport rep = render_frame(studio.options);
         char name[40];
         std::snprintf(name, sizeof(name), "frame_%06u.ppm", written);
         WritePpm(rep, args.out_dir + "/" + name);

@@ -35,6 +35,8 @@ class World;  // nk/pipeline/world.hpp -- fwd-declared (held by unique_ptr below
 namespace nuka::render {
 class SensorBackendI;     // render/sensor_backend.hpp -- the batched sensor facet.
 struct SensorSceneHandle; // backend-owned built scene; freed via FreeSensorScene.
+struct StudioScene;       // render/studio_beauty.hpp -- the shared studio render scene.
+class StudioRtRenderer;   // render/studio_beauty.hpp -- the offline RT beauty tracer.
 }  // namespace nuka::render
 
 namespace nuka::c_abi {
@@ -111,6 +113,22 @@ struct SensorAttachment {
     SensorAttachment& operator=(const SensorAttachment&) = delete;
 };
 
+// The world's offline beauty render bridge (lazily built by the first render_beauty
+// call): the shared studio render scene built once from the world's cooked scene +
+// the live RT beauty tracer. Held by unique_ptrs to fwd-declared render types so this
+// header stays free of the render headers; the out-of-line dtor (render_beauty.cpp)
+// destroys them where they are complete. Rebuilt if the image size changes.
+struct BeautyRender {
+    std::unique_ptr<nuka::render::StudioScene> scene;
+    std::unique_ptr<nuka::render::StudioRtRenderer> renderer;
+    BeautyRender();     // out-of-line in render_beauty.cpp (StudioScene incomplete here).
+    ~BeautyRender();    // out-of-line in render_beauty.cpp.
+    BeautyRender(BeautyRender&&) = delete;
+    BeautyRender& operator=(BeautyRender&&) = delete;
+    BeautyRender(const BeautyRender&) = delete;
+    BeautyRender& operator=(const BeautyRender&) = delete;
+};
+
 struct WorldRecord {
     // M9 T5/T6: the ONE generic live sim — Scene->CookToModel->nk::World. Owns
     // the device-resident Model+Data+Pipeline. BORROWS the DeviceRecord's phi v2
@@ -129,6 +147,16 @@ struct WorldRecord {
     // The batched camera sensor (lazily built by attach). Declared AFTER `world` so
     // it is destroyed BEFORE the World/backend drop. Null until a sensor is attached.
     std::unique_ptr<SensorAttachment> sensor;
+
+    // The offline beauty render bridge (lazily built by the first render_beauty call).
+    // Declared AFTER `world` so it (and the RT backend/scene it owns) tears down BEFORE
+    // the World/backend drop. Null until render_beauty runs.
+    std::unique_ptr<BeautyRender> beauty;
+
+    // The render-surface triangle connectivity of the world's particle media (the
+    // cloth lattice), retained at coupled-create so a live beauty render rebuilds the
+    // deforming surface from the live particle positions. Empty when no surface media.
+    std::vector<uint32_t> particle_surface_triangles;
 
     DeviceRecord* device = nullptr;
 

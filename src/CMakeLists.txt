@@ -144,6 +144,10 @@ add_library(nuka_render STATIC
     # Host, CUDA-free glue mapping the path-tracer's linear-float rt::Framebuffer
     # to the RGBA8 VulkanOffscreenReport (ACES + sRGB, matching mesh_pbr.frag).
     render/rt_framebuffer_to_report.cpp
+    # The shared studio render scene (robot links + deforming particle surface +
+    # studio floor + cinematic options) the cloth demo AND the live-render bridge
+    # draw. Reaches the offline RT tracer only via render::RtBackendI (zero CUDA).
+    render/studio_beauty.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
     # M11 INT-4 (OD-2): the OPT-IN, default-OFF exportable per-instance transform
@@ -1350,6 +1354,10 @@ if(CMAKE_CUDA_COMPILER)
         # BuildRenderWorld + RenderWorldToTwoLevelScene (nuka_render) and drives the
         # batched sensor backend (strong CreateCudaSensorBackend from nuka_phi2_rt).
         c_abi/sensor.cpp
+        # The offline beauty render of the LIVE world (host RGB image): the shared
+        # studio render scene (BuildStudioScene / PublishStudioScene from nuka_render)
+        # + the offline RT beauty tracer (strong CreateCudaRtBackend from nuka_phi2_rt).
+        c_abi/render_beauty.cpp
         collision/contact_stream_driver.cpp
     )
 
