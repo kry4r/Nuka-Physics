@@ -3465,6 +3465,38 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # go2_play_smoke -- headless closed-loop smoke: cook go2_terrain30.nks via the
+    # editor load path, attach the Go2PolicyController, drive N control steps, and
+    # assert the dogs stay in a sane standing band over the retained terrain.
+    add_executable(nuka_go2_play_smoke
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_play_smoke.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+    )
+    add_dependencies(nuka_go2_play_smoke nuka_codegen)
+    target_compile_definitions(nuka_go2_play_smoke
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_go2_play_smoke
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_play_smoke
+        PRIVATE
+            nuka_inference
+            nuka_policy_mlp
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # L1-c: the nuka_union_throughput demo exe (examples/demo/union_throughput.cpp)
     # was DELETED with the UnionCsr path -- it measured batched UnionCsr
     # H1+cup+table throughput via BuildNkUnionModel (union_nk_model.cpp, gone). The
