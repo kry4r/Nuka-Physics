@@ -817,6 +817,32 @@ if(CMAKE_CUDA_COMPILER)
     nuka_set_warnings(nuka_scene_cook)
 
     # -------------------------------------------------------------------------
+    # nuka_policy_mlp — host MLP policy runner (no libtorch, zero deps): the flat-
+    # binary loader + linear/ELU forward + RunningMeanStd normalize. Used by the
+    # inference controller and the C++-vs-Python validation tool.
+    # -------------------------------------------------------------------------
+    add_library(nuka_policy_mlp STATIC
+        runtime/inference/mlp_policy.cpp
+    )
+    set_target_properties(nuka_policy_mlp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nuka_policy_mlp PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    nuka_set_warnings(nuka_policy_mlp)
+
+    # -------------------------------------------------------------------------
+    # nuka_inference — scene controllers built on the policy runner. Go2Policy-
+    # Controller reads world state via the Data seam, builds the height-scan obs,
+    # runs the MLP, and writes PD drive targets. Links the policy runner + nk
+    # (World/Data/FieldId); the terrain sampler is header-only.
+    # -------------------------------------------------------------------------
+    add_library(nuka_inference STATIC
+        runtime/inference/go2_policy_controller.cpp
+    )
+    set_target_properties(nuka_inference PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nuka_inference PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_inference PUBLIC nuka_policy_mlp nuka_nk)
+    nuka_set_warnings(nuka_inference)
+
+    # -------------------------------------------------------------------------
     # nuka_app — M8 host frame-loop spine (runtime/app/): PosePublisher +
     # systems + Simulation. Steps an nk::World and (when a renderer is attached
     # + enabled) publishes its FK poses into a render::RenderWorld and rasters an
@@ -879,6 +905,7 @@ if(CMAKE_CUDA_COMPILER)
     if(NK_BUILD_VULKAN_VALIDATION)
         add_library(nuka_viewer STATIC
             runtime/app/viewer/camera_controller.cpp
+            runtime/app/viewer/file_dialog.cpp
             runtime/app/viewer/imgui_layer.cpp
         )
         set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -919,6 +946,8 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_present
                 nuka_imgui
                 nuka_app
+                nuka_inference
+                nuka_policy_mlp
                 nuka_scene_cook
                 nuka_render
                 nuka_nk
@@ -1532,4 +1561,35 @@ if(CMAKE_CUDA_COMPILER)
             nuka_scene
     )
     nuka_set_warnings(nuka_field_scene)
+
+    # Author a Go2-on-composite-rolling-heightfield .nks the editor simulates: a
+    # first-class COLLISION TerrainRecord + a visual surface + K floating dogs.
+    add_executable(nuka_go2_terrain_field
+        ${CMAKE_SOURCE_DIR}/tools/scene/go2_terrain_field.cpp
+    )
+    target_include_directories(nuka_go2_terrain_field
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_go2_terrain_field
+        PRIVATE
+            nuka_import
+            nuka_scene_cook   # GenerateHeightField (transitively pulls nuka_scene)
+    )
+    nuka_set_warnings(nuka_go2_terrain_field)
+
+    # C++-vs-Python policy parity gate: load a flat policy binary + the torch golden
+    # (export_go2_policy.py) and assert the host MlpPolicy forward matches < 1e-4.
+    add_executable(nuka_mlp_policy_validate
+        ${CMAKE_SOURCE_DIR}/tools/inference/mlp_policy_validate.cpp
+    )
+    target_include_directories(nuka_mlp_policy_validate
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_mlp_policy_validate
+        PRIVATE
+            nuka_policy_mlp
+    )
+    nuka_set_warnings(nuka_mlp_policy_validate)
 endif()
