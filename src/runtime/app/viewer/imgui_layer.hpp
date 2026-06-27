@@ -10,8 +10,8 @@
 //     teal-accented (accent-filled active Play), heading font for the title.
 //   * Stats panel       -- step time (ms) / fps / sub-steps / DOF / contact cap /
 //     env index as tidy labeled rows + colored badges (accent=live, muted=idle).
-//   * Scene tree        -- the RenderWorld instances (name, mesh source real vs
-//     primitive, material) in a styled tree.
+//   * Scene tree        -- the SceneGraph hierarchy (robots as collapsible
+//     path-prefixed subtrees, terrain/media at root) with per-node kind badges.
 //   * Camera panel      -- orbit/pan/zoom readout + reset + fov slider (wires the
 //     CameraController).
 //
@@ -38,10 +38,15 @@
 // ---------------------------------------------------------------------------
 
 #include "render/render_world.hpp"
+#include "scene/ecs/entity.hpp"
 
 #include <cstdint>
 #include <string>
 #include <vector>
+
+namespace nuka::scene {
+class SceneIR;
+}
 
 namespace nuka::runtime::app::viewer {
 
@@ -55,14 +60,13 @@ class CameraController;
 // (no time input) is what makes the GATE-B composite deterministic.
 // ---------------------------------------------------------------------------
 struct ViewerUiState {
-    bool     playing       = false;   // open PAUSED on the authored pose; Play/Step advances
-    float    speed         = 1.0f;    // x0.25 .. x4 multiplier
-    uint32_t env_index     = 0u;      // selected env (D4)
-    uint32_t selected_inst = ~0u;     // scene-tree selection (highlight only)
+    bool     playing   = false;   // open PAUSED on the authored pose; Play/Step advances
+    float    speed     = 1.0f;    // x0.25 .. x4 multiplier
+    uint32_t env_index = 0u;      // selected env (D4)
 
-    // VIEW-3: the entity the picker selected (the RenderInstance's entity index);
-    // ~0u == nothing selected. The Entity panel reads this; the picker writes it.
-    uint32_t selected_entity = ~0u;
+    // The single selection key: the picked/clicked ENTITY (viewport picker + tree
+    // click write it; tree highlight + Entity panel read it). kInvalidEntity = none.
+    nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;
 
     // VIEW-2: the GENERIC per-DOF drive-target editor state. `drive_targets[d]` is
     // the slider value for DOF d of the SELECTED env; `drive_dirty[d]` latches when
@@ -84,19 +88,13 @@ struct ViewerUiState {
     bool camera_reset    = false;
 
     // ---- editor Load state (empty-start + runtime load) --------------------
-    // The editor opens with NO scene. `has_scene`/`loaded_path` are set by the
-    // viewer each frame so the Load panel + the model panels know whether a world
-    // is cooked (panels read "no scene" gracefully when false). `scene_files` is the
-    // viewer's one-time scan of examples/scenes + out for .nks; the Load panel lists
-    // them. A click (or the Load button over `load_path`) sets `load_request` (a
-    // one-shot path the viewer consumes through the SAME LoadEditorScene path the
-    // --scene flag uses); `unload_request` tears the current scene back to empty.
-    bool                     has_scene      = false;   // viewer-set: a world is cooked
-    std::string              loaded_path;              // viewer-set: shown in the panel
-    std::vector<std::string> scene_files;              // viewer-filled discovered .nks
-    char                     load_path[512] = {0};     // editable path field
-    std::string              load_request;             // one-shot: path to load
-    bool                     unload_request = false;   // one-shot: drop to empty
+    // Viewer-set has_scene/loaded_path; the panel's "Open Scene" / load_path set
+    // load_request (consumed via LoadEditorScene); unload_request drops to empty.
+    bool        has_scene      = false;   // viewer-set: a world is cooked
+    std::string loaded_path;              // viewer-set: shown in the panel
+    char        load_path[512] = {0};     // editable path field (dialog fallback)
+    std::string load_request;             // one-shot: path to load
+    bool        unload_request = false;   // one-shot: drop to empty
 };
 
 // ---------------------------------------------------------------------------
@@ -136,12 +134,11 @@ public:
     // settings are not lost). Standalone (no Vulkan); idempotent.
     void EnableDocking();
 
-    // Record all panels into the current ImGui frame. `world` feeds the scene
-    // tree, `stats` the stats panel, `camera` the camera panel readout + fov
-    // slider, and `ui_state` the transport (mutated in place). NO Vulkan, NO time
-    // input -- deterministic given identical inputs (GATE-B D1).
+    // Record all panels into the current ImGui frame. `scene` (nullable: empty
+    // editor) drives the scene tree; deterministic given identical inputs.
     void RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
-                  CameraController& camera, ViewerUiState& ui_state);
+                  CameraController& camera, ViewerUiState& ui_state,
+                  const nuka::scene::SceneIR* scene = nullptr);
 
 private:
     // The docking layout is built ONCE (the first frame the dockspace exists). A

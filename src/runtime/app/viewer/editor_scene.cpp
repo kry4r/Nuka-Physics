@@ -75,6 +75,7 @@ std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
         auto es = std::make_unique<EditorScene>();
         es->path = path;
         es->caps = cooked.model.capacities;  // copy BEFORE the model is moved
+        es->terrain = std::move(cooked.terrain);  // retained for height-scan obs
         es->scene = std::move(scene);
         es->world = std::make_unique<nk::World>(std::move(cooked.model), 1u, device,
                                                 backend, DefaultCfg(dt));

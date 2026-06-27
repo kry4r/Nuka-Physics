@@ -218,14 +218,13 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     stats.frame_index = 7u; stats.device_name = "offscreen";
     nuka::runtime::app::viewer::ViewerUiState ui_state;
     ui_state.playing = true; ui_state.speed = 1.0f;
-    // VIEW-2/3 (R12): FIXED drive-panel + entity-selection state so the new panels
-    // record DETERMINISTICALLY (no time/animation widget). Pre-seed a few DOF
-    // sliders to fixed values + select instance 1; drive_dirty stays all-zero (no
-    // slider interaction happens in the offscreen record) so the record is steady.
+    // FIXED drive-panel + entity-selection state so the new panels record
+    // DETERMINISTICALLY (no time/animation widget). Pre-seed a few DOF sliders to
+    // fixed values + select the steel box's entity; drive_dirty stays all-zero so
+    // the offscreen record is steady (no slider interaction happens).
     ui_state.drive_targets = {0.10f, -0.25f, 0.50f, 0.0f, 1.23f, -0.75f};
     ui_state.drive_dirty.assign(ui_state.drive_targets.size(), 0u);
-    ui_state.selected_inst = 1u;  // the steel box (a movable-looking inst in the tree)
-    ui_state.selected_entity = world.instances[1].entity.index;
+    ui_state.selected_entity = world.instances[1].entity;  // the steel box
 
     // Build one ImGui frame with a fixed display size; record the panels.
     auto build_ui = [&]() -> int {

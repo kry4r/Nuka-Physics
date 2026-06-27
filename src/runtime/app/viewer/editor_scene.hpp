@@ -19,6 +19,7 @@
 #include "runtime/app/simulation.hpp"
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
+#include "scene/terrain/heightfield.hpp"
 
 #include <memory>
 #include <string>
@@ -38,6 +39,9 @@ struct EditorScene {
     nuka::nk::ModelCapacities                        caps{};
     nuka::scene::SceneGraph                          editor_graph;
     std::string                                      path;
+    // The baked terrain grid (valid when the .nks carried a TerrainRecord); a scene
+    // controller samples it for the height-scan obs. Invalid for terrain-free scenes.
+    nuka::terrain::HeightField                       terrain;
 
     EditorScene() = default;
     EditorScene(const EditorScene&) = delete;
