@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 namespace {

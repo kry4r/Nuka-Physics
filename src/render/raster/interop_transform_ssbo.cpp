@@ -10,7 +10,11 @@
 
 #include "render/raster/interop_transform_ssbo.hpp"
 
+// close() for the exported fd is POSIX-only; the OPAQUE_FD path is inert on
+// Windows (no vkGetMemoryFdKHR), so the fd is never taken there.
+#ifndef _WIN32
 #include <unistd.h>  // close()
+#endif
 
 namespace nuka::render {
 
@@ -188,7 +192,9 @@ void InteropTransformSsbo::Destroy() {
         if (buffer_ != VK_NULL_HANDLE) { vkDestroyBuffer(device_, buffer_, nullptr); buffer_ = VK_NULL_HANDLE; }
         if (memory_ != VK_NULL_HANDLE) { vkFreeMemory(device_, memory_, nullptr); memory_ = VK_NULL_HANDLE; }
     }
+#ifndef _WIN32
     if (exported_fd_ >= 0) { ::close(exported_fd_); exported_fd_ = -1; }
+#endif
     descriptor_set_ = VK_NULL_HANDLE;
     size_bytes_ = 0;
     capacity_ = 0;

@@ -20,14 +20,20 @@
 
 #include "phi/interop_scatter.hpp"
 
+// GCC/Clang weak (overridden by the strong cuda_vk_scatter.cu symbol when
+// nuka_phi2_interop links); MSVC lacks the attribute, so the fallback is empty.
+#if defined(_MSC_VER)
+#define NK_WEAK_FALLBACK
+#else
+#define NK_WEAK_FALLBACK __attribute__((weak))
+#endif
+
 namespace nuka::phi {
 
-// __attribute__((weak)): overridden by the strong symbol in
-// phi/backend_cuda/interop/cuda_vk_scatter.cu when nuka_phi2_interop is linked.
-__attribute__((weak)) std::unique_ptr<InteropScatterI> CreateCudaVkScatter() {
+NK_WEAK_FALLBACK std::unique_ptr<InteropScatterI> CreateCudaVkScatter() {
     return nullptr;
 }
 
-__attribute__((weak)) bool CudaVkScatterAvailable() { return false; }
+NK_WEAK_FALLBACK bool CudaVkScatterAvailable() { return false; }
 
 }  // namespace nuka::phi

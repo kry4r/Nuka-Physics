@@ -15,6 +15,14 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# MSVC's traditional preprocessor is non-conforming; CUDA 13 CCCL headers reject
+# it. Use the conforming preprocessor for both the C++ and CUDA host passes.
+if(MSVC)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
+
 # Guard against in-source builds
 include(cmake/PreventInSourceBuilds.cmake)
 
