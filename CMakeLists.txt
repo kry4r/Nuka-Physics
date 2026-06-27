@@ -254,9 +254,24 @@ if(NK_BUILD_VULKAN_VALIDATION)
         endif()
         message(STATUS "M8.5: ImGui viewport gated ON (NK_BUILD_VULKAN_VALIDATION); "
                        "X11 at ${X11_INCLUDE_DIR}, xcb header present.")
+    else()
+        # GLFW: the Windows window + Vulkan-surface + input backend (owner decision:
+        # GLFW on Windows, xcb on Linux). Vendored at tag 3.4; it backs both
+        # GlfwWindowSurface and the imgui_impl_glfw platform backend added below.
+        FetchContent_Declare(
+            glfw
+            GIT_REPOSITORY https://github.com/glfw/glfw.git
+            GIT_TAG        3.4
+        )
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(glfw)
     endif()
 
-    add_library(imgui STATIC
+    set(NUKA_IMGUI_SOURCES
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui.cpp
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui_draw.cpp
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui_tables.cpp
@@ -264,6 +279,13 @@ if(NK_BUILD_VULKAN_VALIDATION)
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui_demo.cpp
         ${CMAKE_SOURCE_DIR}/external/imgui/backends/imgui_impl_vulkan.cpp
     )
+    # The GLFW platform backend gives ImGui keyboard/char/mouse input for free on
+    # Windows; Linux keeps the self-fed xcb input path (no glfw backend compiled).
+    if(WIN32)
+        list(APPEND NUKA_IMGUI_SOURCES
+            ${CMAKE_SOURCE_DIR}/external/imgui/backends/imgui_impl_glfw.cpp)
+    endif()
+    add_library(imgui STATIC ${NUKA_IMGUI_SOURCES})
     # SYSTEM include so ImGui's own warnings never reach -Werror and its sources are
     # not lint-scoped. The backend includes "imgui.h" relative to the imgui root and
     # "backends/imgui_impl_vulkan.h", so both external/imgui and external/imgui itself
@@ -272,6 +294,9 @@ if(NK_BUILD_VULKAN_VALIDATION)
         ${CMAKE_SOURCE_DIR}/external/imgui
         ${CMAKE_SOURCE_DIR}/external/imgui/backends)
     target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+    if(WIN32)
+        target_link_libraries(imgui PUBLIC glfw)
+    endif()
     set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 

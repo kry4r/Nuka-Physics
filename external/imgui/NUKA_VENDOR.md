@@ -38,7 +38,8 @@ core vs backend versions corrupts the font-atlas / texture lifecycle — pinned 
 ### Backend (`backends/`)
 | File | Why |
 |---|---|
-| `imgui_impl_vulkan.h` / `.cpp` | the ONLY backend vendored. The PLATFORM backend is the self-written xcb one (M8.5 T2, Decision D1 = xcb, NOT GLFW) — so `imgui_impl_glfw`/`imgui_impl_sdl` are deliberately NOT vendored. |
+| `imgui_impl_vulkan.h` / `.cpp` | the renderer backend (all platforms). |
+| `imgui_impl_glfw.h` / `.cpp` | the PLATFORM backend on Windows (GLFW window/surface/input). Linux keeps the self-written xcb backend (no glfw backend compiled there), so it is added to the `imgui` lib only on `WIN32`. Copied at the same tag/SHA as core. |
 
 ### Fonts (`fonts/`) — the custom-beautified look (OWNER UI requirement)
 | File | License | Why |

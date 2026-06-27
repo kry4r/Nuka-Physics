@@ -542,10 +542,19 @@ struct VulkanRasterRenderer::Impl {
         std::vector<const char*> instance_exts;
         if (present_capable) {
             const bool has_surface     = InstanceExtensionAvailable("VK_KHR_surface");
-            const bool has_xcb         = InstanceExtensionAvailable("VK_KHR_xcb_surface");
             const bool has_headless    = InstanceExtensionAvailable("VK_EXT_headless_surface");
             if (has_surface)  instance_exts.push_back("VK_KHR_surface");
-            if (has_xcb)      instance_exts.push_back("VK_KHR_xcb_surface");
+            // The platform surface ext for the chosen windowing backend: win32 on
+            // Windows (GLFW), xcb on Linux (the self-written xcb backend).
+#ifdef _WIN32
+            if (InstanceExtensionAvailable("VK_KHR_win32_surface")) {
+                instance_exts.push_back("VK_KHR_win32_surface");
+            }
+#else
+            if (InstanceExtensionAvailable("VK_KHR_xcb_surface")) {
+                instance_exts.push_back("VK_KHR_xcb_surface");
+            }
+#endif
             if (has_headless) instance_exts.push_back("VK_EXT_headless_surface");
         }
         create_info.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());

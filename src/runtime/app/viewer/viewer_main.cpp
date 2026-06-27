@@ -33,6 +33,12 @@
 #include <vulkan/vulkan.h>
 
 #include "imgui.h"
+#ifdef _WIN32
+// The GLFW platform backend feeds ImGui keyboard/char/mouse on Windows (the xcb
+// build self-feeds io). It draws nothing -- imgui_impl_vulkan stays the renderer.
+// imgui_impl_glfw.h forward-declares GLFWwindow, so no GLFW header is needed here.
+#include "backends/imgui_impl_glfw.h"
+#endif
 
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
@@ -286,6 +292,11 @@ int main(int argc, char** argv) {
         return 5;
     }
 
+    // Grab the native window handle BEFORE the surface is moved into the present
+    // renderer, so the GLFW ImGui backend can bind it (Windows only; nullptr else).
+    void* native_window = surface->NativeWindowHandle();
+    (void)native_window;
+
     std::unique_ptr<render::PresentRenderer> present;
     try {
         present = std::make_unique<render::PresentRenderer>(std::move(surface));
@@ -364,6 +375,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[nuka_viewer] ImGui init failed\n");
         return 7;
     }
+#ifdef _WIN32
+    // Bind the GLFW platform backend (install_callbacks=true chains the window
+    // backend's callbacks) so ImGui receives keyboard/char/mouse from glfw.
+    if (native_window != nullptr) {
+        ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(native_window), true);
+    }
+#endif
 
     // ---- 4. UI + camera state -------------------------------------------------
     viewer::ImGuiLayer ui;
@@ -431,18 +449,27 @@ int main(int argc, char** argv) {
         const uint32_t vp_w = present->Report().width;
         const uint32_t vp_h = present->Report().height;
         for (const window::WindowEvent& ev : events) {
+            // On Windows the GLFW ImGui backend feeds io mouse/wheel directly, so
+            // the manual io feeds are skipped there (else double input); the camera
+            // + picker still read the WindowEvents below on both platforms.
             switch (ev.type) {
                 case window::WindowEvent::Type::MouseMove:
+#ifndef _WIN32
                     io.AddMousePosEvent(static_cast<float>(ev.mouse_x),
                                         static_cast<float>(ev.mouse_y));
+#endif
                     last_mouse_x = static_cast<float>(ev.mouse_x);
                     last_mouse_y = static_cast<float>(ev.mouse_y);
                     break;
                 case window::WindowEvent::Type::MouseButton:
+#ifndef _WIN32
                     io.AddMouseButtonEvent(ToImGuiMouseButton(ev.button), ev.pressed);
+#endif
                     break;
                 case window::WindowEvent::Type::Scroll:
+#ifndef _WIN32
                     io.AddMouseWheelEvent(0.0f, static_cast<float>(ev.scroll_delta));
+#endif
                     break;
                 case window::WindowEvent::Type::Key:
                     if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
@@ -581,6 +608,10 @@ int main(int argc, char** argv) {
         io.DisplaySize = ImVec2(static_cast<float>(present->Report().width),
                                 static_cast<float>(present->Report().height));
         io.DeltaTime = (dt > 0.0) ? static_cast<float>(dt) : (1.0f / 60.0f);
+#ifdef _WIN32
+        // Pull glfw input into io before ImGui::NewFrame (must precede it).
+        if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
+#endif
         imgui.NewFrame();
         ui.RecordUi(sim.GetRenderWorld(), stats, camera, ui_state);
         ImGui::Render();
@@ -659,6 +690,9 @@ int main(int argc, char** argv) {
     }
 
     present->WaitIdle();
+#ifdef _WIN32
+    if (native_window != nullptr) ImGui_ImplGlfw_Shutdown();
+#endif
     imgui.Shutdown();
 
     std::printf("[nuka_viewer] done: frames=%llu presented=%d last_step_healthy=%s\n",

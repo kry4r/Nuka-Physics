@@ -336,17 +336,26 @@ endif()
 # HOST-ONLY / zero-CUDA-token: pure C++ / Vulkan / xcb.
 # ---------------------------------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
+    # Platform surface backend: GLFW on Windows, the self-written xcb backend on
+    # Linux. Each TU carries its own MakeSurface factory, so only one is compiled.
+    if(WIN32)
+        set(NUKA_WINDOW_SURFACE_SRC render/window/window_surface_glfw.cpp)
+    else()
+        set(NUKA_WINDOW_SURFACE_SRC render/window/window_surface.cpp)
+    endif()
     add_library(nuka_present STATIC
         render/raster/vulkan_present_renderer.cpp
-        render/window/window_surface.cpp
+        ${NUKA_WINDOW_SURFACE_SRC}
     )
     add_dependencies(nuka_present nuka_render_shaders)
 
     target_include_directories(nuka_present
         PUBLIC
             ${CMAKE_SOURCE_DIR}/src
-            ${X11_INCLUDE_DIR}
     )
+    if(NOT WIN32)
+        target_include_directories(nuka_present PUBLIC ${X11_INCLUDE_DIR})
+    endif()
 
     target_compile_definitions(nuka_present
         PRIVATE
@@ -357,22 +366,30 @@ if(NK_BUILD_VULKAN_VALIDATION)
             NUKA_RASTER_MESH_INSTANCED_VERT_SPV="${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
     )
 
-    # libxcb: the self-written surface backend uses xcb directly. X11_xcb_LIB is set
-    # by find_package(X11) when the xcb component is present; fall back to the bare
+    # Windowing dep: GLFW (Windows) vs libxcb + dl (Linux). X11_xcb_LIB is set by
+    # find_package(X11) when the xcb component is present; fall back to the bare
     # library name otherwise (the dev header + so are verified present at configure).
-    if(X11_xcb_LIB)
-        set(NUKA_XCB_LIB ${X11_xcb_LIB})
+    if(WIN32)
+        target_link_libraries(nuka_present
+            PUBLIC
+                nuka_render
+                Vulkan::Vulkan
+                glfw
+        )
     else()
-        set(NUKA_XCB_LIB xcb)
+        if(X11_xcb_LIB)
+            set(NUKA_XCB_LIB ${X11_xcb_LIB})
+        else()
+            set(NUKA_XCB_LIB xcb)
+        endif()
+        target_link_libraries(nuka_present
+            PUBLIC
+                nuka_render
+                Vulkan::Vulkan
+                ${NUKA_XCB_LIB}
+                ${CMAKE_DL_LIBS}
+        )
     endif()
-
-    target_link_libraries(nuka_present
-        PUBLIC
-            nuka_render
-            Vulkan::Vulkan
-            ${NUKA_XCB_LIB}
-            ${CMAKE_DL_LIBS}
-    )
 
     nuka_set_warnings(nuka_present)
 endif()
