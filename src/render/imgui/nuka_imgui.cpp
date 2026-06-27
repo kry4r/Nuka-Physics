@@ -294,20 +294,11 @@ bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
     return true;
 }
 
-bool NukaImGuiContext::RebuildForRenderPass(const NukaImGuiInitInfo& info) {
-    if (!initialized_) return false;
-    // Re-init ONLY the Vulkan backend half against the new render pass; the ImGui
-    // context (docking layout, theme, fonts, panel state) is left intact. The font
-    // atlas re-uploads lazily on the next NewFrame.
-    ImGui_ImplVulkan_Shutdown();
-    ImGui_ImplVulkan_InitInfo vk = ToVulkanInitInfo(info);
-    if (!ImGui_ImplVulkan_Init(&vk)) {
-        // The backend is now down but the context survives; mark uninitialized so
-        // RenderDrawData/NewFrame no-op rather than touch a dead backend.
-        initialized_ = false;
-        return false;
-    }
-    return true;
+void NukaImGuiContext::NotifySwapchainRecreated(uint32_t min_image_count) {
+    if (!initialized_) return;
+    // The recreated present pass is render-pass-compatible, so the pipeline is reused;
+    // only the image count needs a refresh (no-op when minImageCount is unchanged).
+    ImGui_ImplVulkan_SetMinImageCount(min_image_count);
 }
 
 void NukaImGuiContext::NewFrame() {

@@ -139,6 +139,10 @@ public:
     // that the in-flight frames may reference, e.g. the ImGui backend).
     void WaitIdle();
 
+    // Capture the TRUE presented pixels of DrawFrame index `frame_index` (0-based) to
+    // a binary PPM at `ppm_path` (swapchain readback, bypasses DWM/WGC). <0 disables.
+    void SetCaptureFrame(int frame_index, std::string ppm_path);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

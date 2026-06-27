@@ -233,13 +233,18 @@ int main(int argc, char** argv) {
     std::string scene_path;          // no default scene -> require --scene.
     int max_frames = 0;  // 0 -> run until the window closes (interactive).
     float dt = kDefaultDt;           // overridable physics timestep (--dt).
+    int capture_frame = -1;          // -1 -> no swapchain readback capture.
+    std::string capture_out = "nuka_present_capture.ppm";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--dt" && i + 1 < argc) dt = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--capture-frame" && i + 1 < argc) capture_frame = std::atoi(argv[++i]);
+        else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
         else if (a == "--help") {
-            std::printf("usage: nuka_viewer --scene <.nks> [--frames N] [--dt SECONDS]\n");
+            std::printf("usage: nuka_viewer --scene <.nks> [--frames N] [--dt SECONDS] "
+                        "[--capture-frame N --capture-out FILE.ppm]\n");
             return 0;
         }
     }
@@ -304,6 +309,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[nuka_viewer] PresentRenderer ctor failed: %s\n", e.what());
         return 6;
     }
+    if (capture_frame >= 0) present->SetCaptureFrame(capture_frame, capture_out);
 
     // ---- 2b. CUDA<->Vulkan interop publisher (M11 INT-8) -- zero-copy device
     // scatter behind the PosePublisher seam, with GRACEFUL FALLBACK to
@@ -652,30 +658,9 @@ int main(int argc, char** argv) {
             break;
         }
         if (r == render::PresentFrameResult::Recreated) {
-            // VIEW-5: the swapchain (and its present render pass) was rebuilt on
-            // OUT_OF_DATE/SUBOPTIMAL (resize). The ImGui Vulkan backend's pipeline
-            // is now bound to the STALE pass -> rebind it to the renderer's CURRENT
-            // present pass + image counts so the overlay keeps drawing. The ImGui
-            // context (docking layout / panels) survives the rebind.
-            render::RendererVulkanHandles rh = present->VulkanHandles();
-            nuka::render::imgui::NukaImGuiInitInfo rinfo;
-            rinfo.api_version     = rh.api_version;
-            rinfo.instance        = reinterpret_cast<NukaVkInstance>(rh.instance);
-            rinfo.physical_device = reinterpret_cast<NukaVkPhysicalDevice>(rh.physical_device);
-            rinfo.device          = reinterpret_cast<NukaVkDevice>(rh.device);
-            rinfo.queue_family    = rh.graphics_family;
-            rinfo.queue           = reinterpret_cast<NukaVkQueue>(rh.graphics_queue);
-            rinfo.descriptor_pool = reinterpret_cast<NukaVkDescriptorPool>(rh.imgui_descriptor_pool);
-            rinfo.min_image_count = present->MinImageCount();
-            rinfo.image_count     = present->SwapchainImageCount();
-            rinfo.render_pass     = reinterpret_cast<NukaVkRenderPass>(present->PresentRenderPass());
-            rinfo.subpass         = 0u;
-            if (!imgui.RebuildForRenderPass(rinfo)) {
-                std::fprintf(stderr, "[nuka_viewer] ImGui rebind after swapchain "
-                             "recreate failed at frame %llu\n",
-                             static_cast<unsigned long long>(frame_index));
-                break;
-            }
+            // Swapchain + present pass were rebuilt on resize/maximize. The new pass is
+            // render-pass-compatible, so ImGui keeps drawing; just refresh the image count.
+            imgui.NotifySwapchainRecreated(present->MinImageCount());
         }
         if (r == render::PresentFrameResult::Presented) ++presented;
 

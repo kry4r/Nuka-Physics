@@ -147,14 +147,16 @@ Mat4 Perspective(float fov_y_radians, float aspect, float z_near, float z_far) {
     return r;
 }
 
-// M8.5 T4: mirrors the offscreen renderer's PushBlock + SceneUbo (same shaders).
+// Mirrors the offscreen renderer's PushBlock + SceneUbo byte-for-byte (the
+// mesh.vert / mesh_pbr.frag shaders are shared, so the layouts MUST agree).
 struct PushBlock {
     float model[16];
     float base_color[4];
-    float mr[4];        // x metallic, y roughness, z opacity, w pad
-    float emissive[4];  // rgb emissive, a pad
+    float mr[4];            // x metallic, y roughness, z opacity, w pad
+    float emissive[4];      // rgb emissive, a pad
+    float ground_shadow[4]; // xy contact centre, z radius (0=off), w strength
 };
-static_assert(sizeof(PushBlock) == 112, "PushBlock must stay <=128 push-constant bytes");
+static_assert(sizeof(PushBlock) == 128, "PushBlock must match the shared push range");
 
 // Sizes SceneUbo.lights[]; MUST equal the GLSL NUKA_MAX_LIGHTS in
 // render/raster/shaders/light_limits.glsl (the single shader-side source).
@@ -170,9 +172,12 @@ struct SceneUbo {
     float    ambient[4];
     float    ambient_ground[4];
     int32_t  counts[4];
+    float    fog[4];               // rgb haze, w density (0 => fog OFF)
     GpuLight lights[kMaxUboLights];
+    float    light_view_proj[16];  // sun world->clip (shadows; unused here)
+    float    shadow_params[4];     // x strength (0 => OFF), y bias, z texel, w pad
 };
-static_assert(sizeof(SceneUbo) == 512, "SceneUbo must match the std140 shader block");
+static_assert(sizeof(SceneUbo) == 608, "SceneUbo must match the std140 shader block");
 
 // Build the per-frame SceneUbo (camera + light rig). Same default 3-point rig +
 // hemispheric ambient as the offscreen renderer (kept in sync deliberately).
@@ -264,6 +269,29 @@ struct GpuBuffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
+// Write a host-mapped 8-bit swapchain readback as a binary PPM (P6) -- the reliable
+// on-screen capture, bypassing DWM/WGC (which can return a stale flip-model thumbnail).
+void WritePpm(const std::string& path, const uint8_t* pixels, uint32_t w, uint32_t h,
+              bool bgr_swap) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::fprintf(stderr, "[present] capture: cannot open %s\n", path.c_str());
+        return;
+    }
+    f << "P6\n" << w << ' ' << h << "\n255\n";
+    std::vector<uint8_t> row(static_cast<size_t>(w) * 3u);
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* src = pixels + static_cast<size_t>(y) * w * 4u;
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = src + static_cast<size_t>(x) * 4u;
+            row[x * 3 + 0] = bgr_swap ? p[2] : p[0];
+            row[x * 3 + 1] = p[1];
+            row[x * 3 + 2] = bgr_swap ? p[0] : p[2];
+        }
+        f.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+}
+
 // Camera resolution mirrors the offscreen renderer (so present and offscreen
 // frame the same scene identically -- the offscreen path stays the visual oracle).
 struct ResolvedCamera {
@@ -337,6 +365,15 @@ struct PresentRenderer::Impl {
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView    depth_view = VK_NULL_HANDLE;
 
+    // set 0, binding 1 (the shared mesh_pbr.frag's uShadowMap): a persistent 1x1
+    // dummy depth texture. Shadows are OFF in the present path (shadow_params.x==0)
+    // so it is never sampled; it exists only to COMPLETE the descriptor set the
+    // shared fragment shader statically declares. Extent-independent -> created once.
+    VkImage        shadow_dummy_image = VK_NULL_HANDLE;
+    VkDeviceMemory shadow_dummy_memory = VK_NULL_HANDLE;
+    VkImageView    shadow_dummy_view = VK_NULL_HANDLE;
+    VkSampler      shadow_sampler = VK_NULL_HANDLE;
+
     VkRenderPass     present_pass = VK_NULL_HANDLE;
     VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;  // set 0: per-frame SceneUbo
     VkDescriptorPool scene_pool = VK_NULL_HANDLE;
@@ -377,6 +414,12 @@ struct PresentRenderer::Impl {
 
     PresentReport report;
     bool should_close = false;
+
+    // Optional swapchain readback: when draw_counter_ reaches capture_frame_, the
+    // presented image is copied to a host buffer and written to capture_path_ (PPM).
+    int         capture_frame_ = -1;
+    std::string capture_path_;
+    uint64_t    draw_counter_ = 0;
 
     VkDevice         device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -433,6 +476,7 @@ struct PresentRenderer::Impl {
         // long-running viewer (CreatePipeline used to recreate them unconditionally
         // while DestroySwapchainDependents never freed them).
         CreateShaderModules();
+        CreateShadowDummy();
         NegotiateSurface();
         CreateSwapchain();
         CreatePresentRenderPass();
@@ -467,6 +511,10 @@ struct PresentRenderer::Impl {
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
         if (frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, frag_module, nullptr);
         if (instanced_vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, instanced_vert_module, nullptr);
+        if (shadow_sampler != VK_NULL_HANDLE) vkDestroySampler(device, shadow_sampler, nullptr);
+        if (shadow_dummy_view != VK_NULL_HANDLE) vkDestroyImageView(device, shadow_dummy_view, nullptr);
+        if (shadow_dummy_image != VK_NULL_HANDLE) vkDestroyImage(device, shadow_dummy_image, nullptr);
+        if (shadow_dummy_memory != VK_NULL_HANDLE) vkFreeMemory(device, shadow_dummy_memory, nullptr);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
         // ORDERED teardown (the VkSurfaceKHR is owned by window_surface but was
         // created against the renderer's VkInstance): the surface MUST be destroyed
@@ -749,6 +797,101 @@ struct PresentRenderer::Impl {
         }
     }
 
+    // 1x1 dummy depth texture + sampler bound at set 0 binding 1 so the shared
+    // mesh_pbr.frag's uShadowMap is always a valid descriptor (shadows OFF here,
+    // so it is never read). Created once; the layout transition uses a one-shot
+    // command buffer. Mirrors the offscreen renderer's EnsureShadowSampler.
+    void CreateShadowDummy() {
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = kDepthFormat;
+        image_info.extent = {1u, 1u, 1u};
+        image_info.mipLevels = 1u;
+        image_info.arrayLayers = 1u;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        CheckVk(vkCreateImage(device, &image_info, nullptr, &shadow_dummy_image),
+                "vkCreateImage(present-shadow)");
+
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device, shadow_dummy_image, &req);
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &shadow_dummy_memory),
+                "vkAllocateMemory(present-shadow)");
+        CheckVk(vkBindImageMemory(device, shadow_dummy_image, shadow_dummy_memory, 0),
+                "vkBindImageMemory(present-shadow)");
+
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = shadow_dummy_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = kDepthFormat;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        view_info.subresourceRange.levelCount = 1u;
+        view_info.subresourceRange.layerCount = 1u;
+        CheckVk(vkCreateImageView(device, &view_info, nullptr, &shadow_dummy_view),
+                "vkCreateImageView(present-shadow)");
+
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_NEAREST;
+        si.minFilter = VK_FILTER_NEAREST;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        si.maxLod = 0.0f;
+        CheckVk(vkCreateSampler(device, &si, nullptr, &shadow_sampler),
+                "vkCreateSampler(present-shadow)");
+
+        // One-shot UNDEFINED -> DEPTH_STENCIL_READ_ONLY transition so sampling is legal.
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = command_pool;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1u;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        CheckVk(vkAllocateCommandBuffers(device, &cmd_alloc, &cmd),
+                "vkAllocateCommandBuffers(present-shadow)");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(present-shadow)");
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = shadow_dummy_image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+        barrier.srcAccessMask = 0u;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &barrier);
+        CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present-shadow)");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &cmd;
+        CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE),
+                "vkQueueSubmit(present-shadow)");
+        CheckVk(vkQueueWaitIdle(graphics_queue), "vkQueueWaitIdle(present-shadow)");
+        vkFreeCommandBuffers(device, command_pool, 1u, &cmd);
+    }
+
     void CreatePipeline() {
         // Same shaders + push-block layout as the offscreen pipeline, but built
         // against the PRESENT render pass (different attachment format -> a
@@ -756,17 +899,23 @@ struct PresentRenderer::Impl {
         // created once (CreateShaderModules at ctor) and REUSED across swapchain
         // recreates -> no per-resize module leak.
 
-        // Set 0, binding 0: per-frame SceneUbo (camera + light rig). Same layout
-        // as the offscreen renderer (shared shaders).
-        VkDescriptorSetLayoutBinding ubo_binding{};
-        ubo_binding.binding = 0u;
-        ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        ubo_binding.descriptorCount = 1u;
-        ubo_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        // Set 0: binding 0 = per-frame SceneUbo (camera + light rig); binding 1 =
+        // the shadow map sampler. BOTH match the offscreen renderer's layout (the
+        // shared mesh_pbr.frag statically declares the sampler at binding 1, so the
+        // present set must provide it even though shadows are OFF here).
+        std::array<VkDescriptorSetLayoutBinding, 2> set_bindings{};
+        set_bindings[0].binding = 0u;
+        set_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        set_bindings[0].descriptorCount = 1u;
+        set_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        set_bindings[1].binding = 1u;
+        set_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        set_bindings[1].descriptorCount = 1u;
+        set_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        set_info.bindingCount = 1u;
-        set_info.pBindings = &ubo_binding;
+        set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
+        set_info.pBindings = set_bindings.data();
         CheckVk(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &scene_set_layout),
                 "vkCreateDescriptorSetLayout(present-scene)");
 
@@ -997,12 +1146,14 @@ struct PresentRenderer::Impl {
 
     // Persistent per-frame-in-flight SceneUbo buffers + descriptor sets.
     void CreateSceneDescriptors() {
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight};
+        const std::array<VkDescriptorPoolSize, 2> sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = kFramesInFlight;
-        pool_info.poolSizeCount = 1u;
-        pool_info.pPoolSizes = &size;
+        pool_info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+        pool_info.pPoolSizes = sizes.data();
         CheckVk(vkCreateDescriptorPool(device, &pool_info, nullptr, &scene_pool),
                 "vkCreateDescriptorPool(present-scene)");
         for (uint32_t i = 0; i < kFramesInFlight; ++i) {
@@ -1018,14 +1169,25 @@ struct PresentRenderer::Impl {
             CheckVk(vkAllocateDescriptorSets(device, &alloc, &slot.set),
                     "vkAllocateDescriptorSets(present-scene)");
             VkDescriptorBufferInfo buffer_info{slot.buffer, 0u, sizeof(SceneUbo)};
-            VkWriteDescriptorSet write{};
-            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            write.dstSet = slot.set;
-            write.dstBinding = 0u;
-            write.descriptorCount = 1u;
-            write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            write.pBufferInfo = &buffer_info;
-            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+            VkDescriptorImageInfo shadow_info{};
+            shadow_info.sampler = shadow_sampler;
+            shadow_info.imageView = shadow_dummy_view;
+            shadow_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            std::array<VkWriteDescriptorSet, 2> writes{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = slot.set;
+            writes[0].dstBinding = 0u;
+            writes[0].descriptorCount = 1u;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &buffer_info;
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = slot.set;
+            writes[1].dstBinding = 1u;
+            writes[1].descriptorCount = 1u;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[1].pImageInfo = &shadow_info;
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(),
+                                   0u, nullptr);
         }
     }
 
@@ -1255,6 +1417,15 @@ struct PresentRenderer::Impl {
             vkUnmapMemory(device, ubo_slots[frame].memory);
         }
 
+        const bool do_capture =
+            (capture_frame_ >= 0 && draw_counter_ == static_cast<uint64_t>(capture_frame_));
+        GpuBuffer capture_buf{};
+        if (do_capture) {
+            capture_buf = CreateHostBuffer(
+                static_cast<VkDeviceSize>(extent.width) * extent.height * 4u,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+
         // -- record ----------------------------------------------------------
         VkCommandBuffer cmd = command_buffers[frame];
         CheckVk(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
@@ -1335,6 +1506,39 @@ struct PresentRenderer::Impl {
         }
 
         vkCmdEndRenderPass(cmd);
+
+        // Reliable capture: copy the just-presented image (now PRESENT_SRC) into a
+        // host buffer, then restore PRESENT_SRC so the present still succeeds.
+        if (do_capture) {
+            VkImageMemoryBarrier to_src{};
+            to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.image = images[image_index];
+            to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+            to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                 1, &to_src);
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1u;
+            region.imageExtent = {extent.width, extent.height, 1u};
+            vkCmdCopyImageToBuffer(cmd, images[image_index],
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buf.buffer,
+                                   1u, &region);
+            VkImageMemoryBarrier to_present = to_src;
+            to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            to_present.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_present.dstAccessMask = 0u;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
+                                 1, &to_present);
+        }
         CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present)");
 
         // -- submit ----------------------------------------------------------
@@ -1383,8 +1587,26 @@ struct PresentRenderer::Impl {
             Destroy(draw.pos); Destroy(draw.nrm); Destroy(draw.idx);
         }
 
+        if (do_capture) {
+            void* mapped = nullptr;
+            if (vkMapMemory(device, capture_buf.memory, 0,
+                            static_cast<VkDeviceSize>(extent.width) * extent.height * 4u, 0,
+                            &mapped) == VK_SUCCESS) {
+                const bool bgr_swap = (surface_format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                       surface_format == VK_FORMAT_B8G8R8A8_SRGB);
+                WritePpm(capture_path_, static_cast<const uint8_t*>(mapped), extent.width,
+                         extent.height, bgr_swap);
+                vkUnmapMemory(device, capture_buf.memory);
+                std::fprintf(stderr, "[present] captured frame %llu -> %s (%ux%u)\n",
+                             static_cast<unsigned long long>(draw_counter_),
+                             capture_path_.c_str(), extent.width, extent.height);
+            }
+            Destroy(capture_buf);
+        }
+
         current_frame = (current_frame + 1u) % kFramesInFlight;
         ++report.frames_presented;
+        ++draw_counter_;
 
         if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
             RecreateSwapchain();
@@ -1441,6 +1663,11 @@ bool PresentRenderer::ShouldClose() const { return impl_->should_close; }
 
 void PresentRenderer::WaitIdle() {
     if (impl_->device != VK_NULL_HANDLE) vkDeviceWaitIdle(impl_->device);
+}
+
+void PresentRenderer::SetCaptureFrame(int frame_index, std::string ppm_path) {
+    impl_->capture_frame_ = frame_index;
+    impl_->capture_path_ = std::move(ppm_path);
 }
 
 void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout,
