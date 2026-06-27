@@ -243,18 +243,18 @@ target_include_directories(nuka_sha256 SYSTEM INTERFACE
 # SYSTEM include everywhere so its warnings are suppressed and it stays OUT of the
 # zero-CUDA `src/render/**` lint scope. HOST-ONLY C++/Vulkan (no CUDA).
 if(NK_BUILD_VULKAN_VALIDATION)
-    # xcb / X11 dev headers (the windowing dep the T2 surface backend needs --
-    # Decision D1 = self-written xcb, NOT GLFW). We only WIRE the find here; T2
-    # writes the surface code. Required so a missing windowing toolkit fails loudly
-    # at configure rather than at T2 link time.
-    find_package(X11 REQUIRED)
-    if(NOT X11_xcb_FOUND AND NOT EXISTS "/usr/include/xcb/xcb.h")
-        message(FATAL_ERROR
-            "M8.5 viewport needs libxcb dev headers (/usr/include/xcb/xcb.h); "
-            "X11 found but xcb component missing.")
+    # xcb/X11 windowing dep for the Linux swapchain present backend. Windows uses a
+    # Win32 surface and the offscreen render path needs no xcb, so the find is skipped.
+    if(NOT WIN32)
+        find_package(X11 REQUIRED)
+        if(NOT X11_xcb_FOUND AND NOT EXISTS "/usr/include/xcb/xcb.h")
+            message(FATAL_ERROR
+                "M8.5 viewport needs libxcb dev headers (/usr/include/xcb/xcb.h); "
+                "X11 found but xcb component missing.")
+        endif()
+        message(STATUS "M8.5: ImGui viewport gated ON (NK_BUILD_VULKAN_VALIDATION); "
+                       "X11 at ${X11_INCLUDE_DIR}, xcb header present.")
     endif()
-    message(STATUS "M8.5: ImGui viewport gated ON (NK_BUILD_VULKAN_VALIDATION); "
-                   "X11 at ${X11_INCLUDE_DIR}, xcb header present.")
 
     add_library(imgui STATIC
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui.cpp
