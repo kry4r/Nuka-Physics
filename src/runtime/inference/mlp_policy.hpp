@@ -29,6 +29,24 @@ public:
     // A no-op when not Ready. The dot products accumulate in double for stability.
     void Forward(const float* obs, float* out) const;
 
+    // Read-only view of one dense layer (weights row-major [out, in]). Pointers stay
+    // valid while the policy is loaded; the host arrays own the storage. The device
+    // port (GpuMlp) uploads these to reproduce the same forward.
+    struct LayerView {
+        uint32_t in = 0, out = 0, act = 0;  // act: 1 == ELU, 0 == linear
+        const float* w = nullptr;           // [out*in]
+        const float* b = nullptr;           // [out]
+    };
+    uint32_t LayerCount() const { return static_cast<uint32_t>(layers_.size()); }
+    LayerView GetLayer(uint32_t i) const {
+        const Layer& L = layers_[i];
+        return LayerView{L.in, L.out, L.act, L.w.data(), L.b.data()};
+    }
+    const float* Mean() const { return mean_.data(); }
+    const float* Std() const { return std_.data(); }
+    float Clip() const { return clip_; }
+    float EluAlpha() const { return elu_alpha_; }
+
 private:
     struct Layer {
         uint32_t in = 0, out = 0, act = 0;  // act: 1 == ELU, 0 == linear
