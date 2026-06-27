@@ -22,9 +22,15 @@
 #include "imgui_internal.h"  // DockBuilder* for the one-time default layout
 
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/file_dialog.hpp"
+#include "scene/ecs/components.hpp"
+#include "scene/ecs/registry.hpp"
+#include "scene/graph/scene_graph.hpp"
+#include "scene/scene_ir.hpp"
 
 #include <cstdio>
 #include <iterator>  // std::size for array-derived loop bounds
+#include <memory>
 
 namespace nuka::runtime::app::viewer {
 
@@ -99,6 +105,74 @@ const char* MeshSourceLabel(render::MeshSource s) {
     return s == render::MeshSource::NkaMesh ? "mesh" : "prim";
 }
 
+// A node's display kind: a short badge label + its color, derived from the
+// entity's components (a path-prefix robot GROUP carries only a name -> "group").
+struct NodeKind {
+    const char* label;
+    ImVec4      color;
+};
+
+NodeKind ClassifyNode(const nuka::scene::Registry& reg, nuka::scene::EntityId e) {
+    using namespace nuka::scene;
+    if (e == kInvalidEntity || !reg.Alive(e)) return {"scene", kTextDim};
+    if (const auto* sk = reg.Get<SystemKindComponent>(e)) {
+        switch (sk->kind) {
+            case SystemKindComponent::Articulated: return {"artic", kAccent};
+            case SystemKindComponent::Soft:        return {"soft", kAccent};
+            case SystemKindComponent::Cloth:       return {"cloth", kAccent};
+            case SystemKindComponent::Fluid:       return {"fluid", kAccent};
+            case SystemKindComponent::Rigid:       break;  // refine below
+        }
+    }
+    if (const auto* body = reg.Get<RigidBodyComponent>(e)) {
+        return body->kinematic ? NodeKind{"static", kTextDim} : NodeKind{"body", kText};
+    }
+    if (reg.Has<JointComponent>(e))          return {"joint", kAccentDim};
+    if (reg.Has<CollisionShapeComponent>(e)) return {"geom", kTextDim};
+    if (reg.Has<VisualMeshComponent>(e))     return {"visual", kTextDim};
+    if (reg.Has<CameraComponent>(e))         return {"cam", kTextDim};
+    if (reg.Has<LightComponent>(e))          return {"light", kTextDim};
+    return {"group", kTextDim};
+}
+
+// Recursively emit one ImGui TreeNode per SceneGraph node (name + kind badge);
+// robots collapse as path-prefixed subtrees. Selection is keyed on node->entity.
+void RecordSceneNode(const nuka::scene::Registry& reg,
+                     const std::shared_ptr<nuka::scene::SceneNode>& node,
+                     ViewerUiState& ui, int depth) {
+    if (!node) return;
+    const NodeKind kind = ClassifyNode(reg, node->entity);
+    const bool has_children = static_cast<bool>(node->first_child);
+    const bool valid_entity = node->entity != nuka::scene::kInvalidEntity;
+    const bool selected = valid_entity && node->entity == ui.selected_entity;
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                               ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                               ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (!has_children) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    if (selected)      flags |= ImGuiTreeNodeFlags_Selected;
+
+    // Open only the root once so the top level (terrain + robot groups) shows;
+    // deeper internals stay collapsed until the user expands them.
+    ImGui::SetNextItemOpen(depth == 0, ImGuiCond_Once);
+    ImGui::PushID(static_cast<int>(node->id));
+    const char* name = node->name.empty() ? "(unnamed)" : node->name.c_str();
+    const bool open = ImGui::TreeNodeEx("##node", flags, "%s", name);
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && valid_entity) {
+        ui.selected_entity = node->entity;
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(kind.color, "[%s]", kind.label);
+
+    if (open && has_children) {
+        for (auto child = node->first_child; child; child = child->next_sibling) {
+            RecordSceneNode(reg, child, ui, depth + 1);
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -143,7 +217,8 @@ void ImGuiLayer::EnableDocking() {
 }
 
 void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
-                          CameraController& camera, ViewerUiState& ui_state) {
+                          CameraController& camera, ViewerUiState& ui_state,
+                          const nuka::scene::SceneIR* scene) {
     // -- the host dockspace (passthru central node -> viewport shows through) ---
     const ImGuiID dockspace_id =
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
@@ -214,10 +289,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     }
 
     // ======================================================================
-    // LOAD PANEL -- the editor's runtime scene loader. Lists the discovered .nks
-    // (examples/scenes + out) and a free path field; a click or the Load button
-    // sets load_request, which the viewer feeds to the SAME LoadEditorScene path
-    // the --scene flag uses. Unload drops back to the empty editor.
+    // LOAD PANEL -- "Open Scene" runs the native OS file dialog (filtered to .nks);
+    // a manual path field is the fallback. Both set load_request; Unload drops empty.
     // ======================================================================
     if (ImGui::Begin("Load")) {
         SectionHeader("Scene");
@@ -228,26 +301,24 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             if (ImGui::Button("Unload", ImVec2(-1.0f, 0.0f))) ui_state.unload_request = true;
         } else {
             ImGui::TextColored(kTextDim, "no scene loaded");
-            ImGui::TextColored(kTextDim, "pick a scene below");
+            ImGui::TextColored(kTextDim, "open a scene to begin");
         }
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        SectionHeader("Available");
-        if (ui_state.scene_files.empty()) {
-            ImGui::TextColored(kTextDim, "no .nks found");
-        } else {
-            for (const std::string& f : ui_state.scene_files) {
-                const bool sel = (ui_state.loaded_path == f);
-                if (ImGui::Selectable(f.c_str(), sel)) {
-                    std::snprintf(ui_state.load_path, sizeof(ui_state.load_path), "%s",
-                                  f.c_str());
-                    ui_state.load_request = f;
-                }
+        SectionHeader("Open");
+        // Game-engine-style browse: the native OS Open dialog filtered to .nks
+        // feeds the SAME load_request seam the runtime Load consumes.
+        if (ImGui::Button("Open Scene...", ImVec2(-1.0f, 0.0f))) {
+            const std::string picked = OpenFileDialog("Open Scene", "Nuka scenes", "*.nks");
+            if (!picked.empty()) {
+                std::snprintf(ui_state.load_path, sizeof(ui_state.load_path), "%s",
+                              picked.c_str());
+                ui_state.load_request = picked;
             }
         }
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        ImGui::TextColored(kTextDim, "path");
+        ImGui::TextColored(kTextDim, "or type a path");
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputText("##loadpath", ui_state.load_path, sizeof(ui_state.load_path));
         if (ImGui::Button("Load", ImVec2(-1.0f, 0.0f)) && ui_state.load_path[0] != '\0') {
@@ -311,37 +382,19 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     ImGui::End();
 
     // ======================================================================
-    // SCENE TREE -- RenderWorld instances (mesh source / material) in a styled tree.
+    // SCENE TREE -- the SceneGraph hierarchy (robots as collapsible subtrees,
+    // terrain/media at root) with kind badges; selection keyed on node->entity.
     // ======================================================================
     if (ImGui::Begin("Scene")) {
         SectionHeader("Scene Tree");
-        char node[80];
-        std::snprintf(node, sizeof(node), "World  (%u instances, %u meshes, %u materials)",
-                      world.InstanceCount(), world.meshes.Count(), world.MaterialCount());
-        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-        if (ImGui::TreeNode(node)) {
-            for (uint32_t i = 0; i < world.InstanceCount(); ++i) {
-                const render::RenderInstance& inst = world.instances[i];
-                const bool real = (inst.mesh_id != render::kNoId &&
-                                   inst.mesh_id < world.meshes.Count() &&
-                                   world.meshes.Source(inst.mesh_id) == render::MeshSource::NkaMesh);
-                char label[96];
-                std::snprintf(label, sizeof(label), "entity %u  [%s]  mat %u",
-                              inst.entity.index,
-                              inst.mesh_id == render::kNoId ? "none"
-                                  : MeshSourceLabel(world.meshes.Source(inst.mesh_id)),
-                              inst.render_material_id);
-                const bool selected = (ui_state.selected_inst == i);
-                // Real .nka meshes get an accent dot; primitive fallbacks a dim dot.
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                const ImVec2 cp = ImGui::GetCursorScreenPos();
-                dl->AddCircleFilled(ImVec2(cp.x + 4.0f, cp.y + ImGui::GetTextLineHeight() * 0.5f),
-                                    3.0f, Col(real ? kAccent : kTextDim));
-                ImGui::Indent(14.0f);
-                if (ImGui::Selectable(label, selected)) ui_state.selected_inst = i;
-                ImGui::Unindent(14.0f);
-            }
-            ImGui::TreePop();
+        if (scene == nullptr) {
+            ImGui::TextColored(kTextDim, "no scene loaded");
+        } else {
+            ImGui::TextColored(kTextDim, "%u instances  %u meshes  %u materials",
+                               world.InstanceCount(), world.meshes.Count(),
+                               world.MaterialCount());
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            RecordSceneNode(scene->Ecs(), scene->Tree().Root(), ui_state, 0);
         }
     }
     ImGui::End();
@@ -420,44 +473,62 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     ImGui::End();
 
     // ======================================================================
-    // ENTITY PANEL (VIEW-3) -- inspector for the picked entity (selected_entity /
-    // selected_inst). Read-only readout of the selection the ray-picker set; the
-    // drag handler moves it via the command queue (MoveEntity). Fixed selection
-    // records deterministically (GATE-B).
+    // ENTITY PANEL -- inspector for ui_state.selected_entity (tree click or picker):
+    // its render instance (pose / mesh) + scene node (name / path via NodeOf).
     // ======================================================================
     if (ImGui::Begin("Entity")) {
         SectionHeader("Selection");
-        if (ui_state.selected_inst == ~0u ||
-            ui_state.selected_inst >= world.InstanceCount()) {
+        const bool has_sel = ui_state.selected_entity != nuka::scene::kInvalidEntity;
+        const render::RenderInstance* inst = nullptr;
+        if (has_sel) {
+            for (const render::RenderInstance& ri : world.instances) {
+                if (ri.entity == ui_state.selected_entity) { inst = &ri; break; }
+            }
+        }
+        if (!has_sel) {
             ImGui::TextColored(kTextDim, "nothing selected");
             ImGui::Dummy(ImVec2(0.0f, 4.0f));
-            ImGui::TextColored(kTextDim, "Ctrl+LMB a body to pick");
+            ImGui::TextColored(kTextDim, "click a node or Ctrl+LMB a body");
         } else {
-            const render::RenderInstance& inst =
-                world.instances[ui_state.selected_inst];
-            char buf[80];
-            std::snprintf(buf, sizeof(buf), "%u", inst.entity.index);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%u", ui_state.selected_entity.index);
             StatRow("entity", buf, kAccent);
-            const char* kind = "static";
-            switch (inst.pose_source.kind) {
-                case render::PoseSource::Kind::Link:   kind = "link";   break;
-                case render::PoseSource::Kind::Body:   kind = "body";   break;
-                case render::PoseSource::Kind::Base:   kind = "base";   break;
-                case render::PoseSource::Kind::Static: kind = "static"; break;
+            // Node name + path from the authoritative tree (NodeOf bridges entity->node).
+            if (scene != nullptr) {
+                if (const auto n = scene->Ecs().NodeOf(ui_state.selected_entity)) {
+                    StatRow("node", n->name.empty() ? "(unnamed)" : n->name.c_str(), kText);
+                    const std::string path = scene->Tree().PathOf(n);
+                    if (!path.empty()) StatRow("path", path.c_str(), kTextDim);
+                }
             }
-            StatRow("pose src", kind, kText);
-            std::snprintf(buf, sizeof(buf), "%u", inst.pose_source.row);
-            StatRow("row", buf, kTextDim);
-            const math::Vec3 p = inst.world_xform.position;
-            std::snprintf(buf, sizeof(buf), "%.3f  %.3f  %.3f", p.x, p.y, p.z);
-            StatRow("pos", buf, kText);
-            const bool movable = inst.pose_source.kind == render::PoseSource::Kind::Body ||
-                                 inst.pose_source.kind == render::PoseSource::Kind::Base;
-            ImGui::Dummy(ImVec2(0.0f, 4.0f));
-            if (movable)
-                Badge("MOVABLE", ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.22f), kAccent);
-            else
-                Badge("FIXED", kBgRaised, kTextDim);
+            if (inst == nullptr) {
+                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                ImGui::TextColored(kTextDim, "no renderable geometry");
+            } else {
+                const char* kind = "static";
+                switch (inst->pose_source.kind) {
+                    case render::PoseSource::Kind::Link:   kind = "link";   break;
+                    case render::PoseSource::Kind::Body:   kind = "body";   break;
+                    case render::PoseSource::Kind::Base:   kind = "base";   break;
+                    case render::PoseSource::Kind::Static: kind = "static"; break;
+                }
+                StatRow("pose src", kind, kText);
+                const bool real_mesh = inst->mesh_id != render::kNoId &&
+                                       inst->mesh_id < world.meshes.Count();
+                StatRow("mesh",
+                        real_mesh ? MeshSourceLabel(world.meshes.Source(inst->mesh_id)) : "none",
+                        kText);
+                const math::Vec3 p = inst->world_xform.position;
+                std::snprintf(buf, sizeof(buf), "%.3f  %.3f  %.3f", p.x, p.y, p.z);
+                StatRow("pos", buf, kText);
+                const bool movable = inst->pose_source.kind == render::PoseSource::Kind::Body ||
+                                     inst->pose_source.kind == render::PoseSource::Kind::Base;
+                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                if (movable)
+                    Badge("MOVABLE", ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.22f), kAccent);
+                else
+                    Badge("FIXED", kBgRaised, kTextDim);
+            }
         }
     }
     ImGui::End();

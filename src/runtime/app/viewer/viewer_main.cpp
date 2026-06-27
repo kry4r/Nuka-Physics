@@ -53,7 +53,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/imgui_layer.hpp"
-#include "scene/graph/scene_graph.hpp"          // SceneGraph::SetSelected (VIEW-3)
+#include "runtime/inference/go2_policy_controller.hpp"  // --policy closed-loop drive
 #include "scene/scene_ir.hpp"
 
 #include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget (VIEW-2)
@@ -85,27 +85,6 @@ namespace window = nuka::render::window;
 // Default physics timestep when neither --dt nor a scene override is supplied.
 constexpr float kDefaultDt = 1.0f / 240.0f;
 
-// Scan examples/scenes + out (recursive) for .nks the Load panel lists. Relative
-// to the cwd; unreadable / missing roots are skipped. Sorted, deduped by path.
-std::vector<std::string> DiscoverScenes() {
-    std::vector<std::string> out;
-    const char* roots[] = {"examples/scenes", "out"};
-    for (const char* root : roots) {
-        std::error_code ec;
-        if (!std::filesystem::is_directory(root, ec)) continue;
-        try {
-            for (const auto& e :
-                 std::filesystem::recursive_directory_iterator(root)) {
-                if (e.is_regular_file() && e.path().extension() == ".nks")
-                    out.push_back(e.path().generic_string());
-            }
-        } catch (const std::exception&) { /* skip an unreadable subtree */ }
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-
 // Seed the GENERIC per-DOF drive editor from a freshly loaded world's DriveTarget
 // field (per:link, env 0). A flat per-DOF editor, NEVER a choreography table.
 void SeedDriveTargets(viewer::ViewerUiState& ui, viewer::EditorScene& es) {
@@ -126,8 +105,7 @@ void ClearModelUi(viewer::ViewerUiState& ui) {
     ui.drive_targets.clear();
     ui.drive_dirty.clear();
     ui.dof_labels.clear();
-    ui.selected_inst = ~0u;
-    ui.selected_entity = ~0u;
+    ui.selected_entity = nuka::scene::kInvalidEntity;
     ui.playing = false;
 }
 
@@ -255,21 +233,31 @@ int main(int argc, char** argv) {
     float dt = kDefaultDt;           // overridable physics timestep (--dt).
     int capture_frame = -1;          // -1 -> no swapchain readback capture.
     std::string capture_out = "nuka_present_capture.ppm";
+    std::string policy_path;         // --policy <bin>: attach the closed-loop drive.
+    bool want_play = false;          // --play: start the transport running.
+    bool dt_set = false;             // honor an explicit --dt over the policy default.
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
-        else if (a == "--dt" && i + 1 < argc) dt = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--dt" && i + 1 < argc) { dt = static_cast<float>(std::atof(argv[++i])); dt_set = true; }
         else if (a == "--capture-frame" && i + 1 < argc) capture_frame = std::atoi(argv[++i]);
         else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
+        else if (a == "--policy" && i + 1 < argc) policy_path = argv[++i];
+        else if (a == "--play") want_play = true;
         else if (a == "--help") {
-            std::printf("usage: nuka_editor [--scene <.nks>] [--frames N] [--dt SECONDS] "
+            std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
+                        "[--frames N] [--dt SECONDS] "
                         "[--capture-frame N --capture-out FILE.ppm]\n"
-                        "  no --scene -> opens the empty editor; load scenes from the UI\n");
+                        "  no --scene -> opens the empty editor; load scenes from the UI\n"
+                        "  --policy attaches a trained locomotion controller to each load\n");
             return 0;
         }
     }
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) max_frames = std::atoi(env);
+    // The trained control rate is 0.005s; default to it when a policy is attached and
+    // no explicit --dt was given (an explicit --dt always wins).
+    if (!dt_set && !policy_path.empty()) dt = 0.005f;
     if (!(dt > 0.0f)) {
         std::fprintf(stderr, "[nuka_editor] invalid --dt %g (must be > 0)\n", dt);
         return 2;
@@ -284,6 +272,9 @@ int main(int argc, char** argv) {
     // The empty viewport draws this 0-instance world (DrawFrame just clears) until a
     // scene is loaded. `loaded` holds the cooked scene; null == empty editor.
     render::RenderWorld empty_world;
+    // The closed-loop controller (when --policy is given) must OUTLIVE the Simulation
+    // it drives, so it is declared before `loaded` (destroyed after it).
+    std::unique_ptr<nuka::runtime::inference::Go2PolicyController> policy_ctrl;
     std::unique_ptr<viewer::EditorScene> loaded;
 
     // ---- 2. window surface + present renderer ---------------------------------
@@ -351,7 +342,6 @@ int main(int argc, char** argv) {
     ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
-    ui_state.scene_files = DiscoverScenes();  // the Load panel's file list
     {
         // Frame a default box so the empty viewport has a sensible camera.
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
@@ -368,18 +358,35 @@ int main(int argc, char** argv) {
         std::unique_ptr<viewer::EditorScene> next =
             viewer::LoadEditorScene(path, dev, backend, dt);
         if (!next) return;
+        policy_ctrl.reset();       // drop any controller bound to the old scene
         loaded = std::move(next);  // old scene (if any) destructed here
         loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
         nuka::math::Vec3 lo, hi;
         SceneAabb(loaded->sim->GetRenderWorld(), &lo, &hi);
         camera.FrameAabb(lo, hi);
         SeedDriveTargets(ui_state, *loaded);
-        ui_state.selected_inst = ~0u;
-        ui_state.selected_entity = ~0u;
+        ui_state.selected_entity = nuka::scene::kInvalidEntity;
         ui_state.playing = false;  // open paused on the authored pose
+        // Attach the trained locomotion controller to this freshly cooked scene when
+        // --policy was given and the scene retained terrain (height-scan obs source).
+        if (!policy_path.empty() && nuka::terrain::IsValid(loaded->terrain)) {
+            auto pc = std::make_unique<nuka::runtime::inference::Go2PolicyController>();
+            if (pc->Init(policy_path, loaded->caps.links_per_env,
+                         loaded->caps.articulations_per_env, loaded->terrain)) {
+                policy_ctrl = std::move(pc);
+                loaded->sim->SetController(policy_ctrl.get());
+                ui_state.playing = want_play;
+                std::printf("[nuka_editor] policy attached: %s  play=%s\n",
+                            policy_path.c_str(), want_play ? "yes" : "no");
+            } else {
+                std::fprintf(stderr, "[nuka_editor] policy Init failed: %s\n",
+                             policy_path.c_str());
+            }
+        }
     };
     auto apply_unload = [&]() {
         present->WaitIdle();
+        policy_ctrl.reset();
         loaded.reset();
         ClearModelUi(ui_state);
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
@@ -391,9 +398,9 @@ int main(int argc, char** argv) {
     // once the shell is up (no startup-only cook path).
     if (!scene_path.empty()) ui_state.load_request = scene_path;
 
-    std::printf("[nuka_editor] backend=%s device=%s images=%u  (empty editor; %zu scenes found)\n",
+    std::printf("[nuka_editor] backend=%s device=%s images=%u  (empty editor)\n",
                 present->Report().backend_name.c_str(), present->DeviceName().c_str(),
-                present->SwapchainImageCount(), ui_state.scene_files.size());
+                present->SwapchainImageCount());
 
     // ---- the main loop --------------------------------------------------------
     using Clock = std::chrono::steady_clock;
@@ -480,12 +487,8 @@ int main(int argc, char** argv) {
                             sim.GetWorld().GetModel().articulation);
                         drag_inst = hit;
                         if (hit != ~0u) {
-                            ui_state.selected_inst = hit;
-                            const nuka::scene::EntityId e =
+                            ui_state.selected_entity =
                                 sim.GetRenderWorld().instances[hit].entity;
-                            ui_state.selected_entity = e.index;
-                            // VIEW-3: honor the SceneGraph editor-selection seam.
-                            loaded->editor_graph.SetSelected(loaded->scene.Ecs().NodeOf(e));
                         }
                     } else {
                         drag_inst = ~0u;  // release ends the drag
@@ -610,7 +613,10 @@ int main(int argc, char** argv) {
         if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
 #endif
         imgui.NewFrame();
-        ui.RecordUi(render_world, stats, camera, ui_state);
+        // Thread the loaded scene's SceneIR (its authoritative Tree + ECS) into the
+        // UI for the hierarchical scene tree; null while the editor is empty.
+        ui.RecordUi(render_world, stats, camera, ui_state,
+                    loaded ? &loaded->scene : nullptr);
 
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
         // owning the keyboard so typing in a panel never moves the view.
