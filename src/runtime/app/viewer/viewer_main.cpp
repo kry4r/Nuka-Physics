@@ -109,15 +109,32 @@ void ClearModelUi(viewer::ViewerUiState& ui) {
     ui.playing = false;
 }
 
-// Compute the scene AABB from the RenderWorld so the camera can frame it.
-void SceneAabb(const render::RenderWorld& world, nuka::math::Vec3* lo,
-               nuka::math::Vec3* hi) {
+// Compute the world AABB of the rendered instances so the camera can frame it.
+// When `movable_only` and at least one movable (Link/Body/Base) instance exists,
+// fit just that cluster -- so a handful of robots on a large terrain fill the view
+// instead of rendering tiny; otherwise the whole scene. General: no scene-specific
+// camera, the predicate is "is this instance driven by physics".
+void SceneAabb(const render::RenderWorld& world, bool movable_only,
+               nuka::math::Vec3* lo, nuka::math::Vec3* hi) {
+    bool has_movable = false;
+    if (movable_only) {
+        for (const render::RenderInstance& inst : world.instances) {
+            if (inst.pose_source.kind != render::PoseSource::Kind::Static) {
+                has_movable = true;
+                break;
+            }
+        }
+    }
+    const bool restrict_movable = movable_only && has_movable;
     const float fmax = std::numeric_limits<float>::max();
     *lo = {fmax, fmax, fmax};
     *hi = {-fmax, -fmax, -fmax};
     bool any = false;
     for (const render::RenderInstance& inst : world.instances) {
         if (inst.mesh_id == render::kNoId || inst.mesh_id >= world.meshes.Count()) continue;
+        if (restrict_movable && inst.pose_source.kind == render::PoseSource::Kind::Static) {
+            continue;
+        }
         const render::MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
         for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
             const nuka::math::Vec3 local{geo.positions[v], geo.positions[v + 1],
@@ -236,6 +253,10 @@ int main(int argc, char** argv) {
     std::string policy_path;         // --policy <bin>: attach the closed-loop drive.
     bool want_play = false;          // --play: start the transport running.
     bool dt_set = false;             // honor an explicit --dt over the policy default.
+    // --cam tx,ty,tz,dist,yaw_deg,pitch_deg : explicit orbit override (else auto-frame).
+    bool cam_on = false;
+    nuka::math::Vec3 cam_target{};
+    float cam_dist = 0.0f, cam_yaw = 0.0f, cam_pitch = 0.0f;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -245,12 +266,25 @@ int main(int argc, char** argv) {
         else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
         else if (a == "--policy" && i + 1 < argc) policy_path = argv[++i];
         else if (a == "--play") want_play = true;
+        else if (a == "--cam" && i + 1 < argc) {
+            float yd = 0.0f, pd = 0.0f;
+            if (std::sscanf(argv[++i], "%f,%f,%f,%f,%f,%f", &cam_target.x, &cam_target.y,
+                            &cam_target.z, &cam_dist, &yd, &pd) == 6) {
+                cam_yaw = yd * 3.14159265358979323846f / 180.0f;
+                cam_pitch = pd * 3.14159265358979323846f / 180.0f;
+                cam_on = true;
+            } else {
+                std::fprintf(stderr, "[nuka_editor] --cam wants tx,ty,tz,dist,yaw_deg,pitch_deg\n");
+            }
+        }
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
+                        "[--cam tx,ty,tz,dist,yaw_deg,pitch_deg] "
                         "[--capture-frame N --capture-out FILE.ppm]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
-                        "  --policy attaches a trained locomotion controller to each load\n");
+                        "  --policy attaches a trained locomotion controller to each load\n"
+                        "  --cam overrides the auto-frame (default: fit the moving-instance cluster)\n");
             return 0;
         }
     }
@@ -342,6 +376,17 @@ int main(int argc, char** argv) {
     ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
+    // Frame the world: honor an explicit --cam, else auto-fit the moving-instance
+    // cluster (the robots) so they fill the view rather than the whole terrain.
+    auto frame_world = [&](const render::RenderWorld& rw) {
+        if (cam_on) {
+            camera.SetView(cam_target, cam_dist, cam_yaw, cam_pitch);
+            return;
+        }
+        nuka::math::Vec3 lo, hi;
+        SceneAabb(rw, /*movable_only=*/true, &lo, &hi);
+        camera.FrameAabb(lo, hi);
+    };
     {
         // Frame a default box so the empty viewport has a sensible camera.
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
@@ -361,9 +406,7 @@ int main(int argc, char** argv) {
         policy_ctrl.reset();       // drop any controller bound to the old scene
         loaded = std::move(next);  // old scene (if any) destructed here
         loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
-        nuka::math::Vec3 lo, hi;
-        SceneAabb(loaded->sim->GetRenderWorld(), &lo, &hi);
-        camera.FrameAabb(lo, hi);
+        frame_world(loaded->sim->GetRenderWorld());
         SeedDriveTargets(ui_state, *loaded);
         ui_state.selected_entity = nuka::scene::kInvalidEntity;
         ui_state.playing = false;  // open paused on the authored pose
@@ -572,15 +615,11 @@ int main(int argc, char** argv) {
         // Reset / camera-reset re-frame the active world (the empty world frames a
         // default box). Reset re-frames the camera, the cheap honest action.
         if (ui_state.reset_requested) {
-            nuka::math::Vec3 lo, hi;
-            SceneAabb(render_world, &lo, &hi);
-            camera.FrameAabb(lo, hi);
+            frame_world(render_world);
             ui_state.reset_requested = false;
         }
         if (ui_state.camera_reset) {
-            nuka::math::Vec3 lo, hi;
-            SceneAabb(render_world, &lo, &hi);
-            camera.FrameAabb(lo, hi);
+            frame_world(render_world);
             ui_state.camera_reset = false;
         }
 

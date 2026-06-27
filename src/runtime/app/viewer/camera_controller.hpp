@@ -82,6 +82,10 @@ public:
     // AABB so SOMETHING is always well-composed. Safe with a degenerate AABB.
     void FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max);
 
+    // Set the orbit state directly (the --cam override): focus `target`, dolly
+    // `distance`, `yaw`/`pitch` in radians. Clamped to the same sane bounds.
+    void SetView(const math::Vec3& target, float distance, float yaw, float pitch);
+
     // ---- resolved readout (for the imgui camera panel) ---------------------
     math::Vec3 ResolvedEye() const;
     math::Vec3 ResolvedTarget() const { return target_; }

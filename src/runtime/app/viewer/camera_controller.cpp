@@ -194,4 +194,12 @@ void CameraController::FrameAabb(const math::Vec3& aabb_min, const math::Vec3& a
     pitch_ = 0.45f;
 }
 
+void CameraController::SetView(const math::Vec3& target, float distance, float yaw,
+                              float pitch) {
+    target_   = target;
+    distance_ = std::clamp(distance, kMinDistance, kMaxDistance);
+    yaw_      = yaw;
+    pitch_    = std::clamp(pitch, -kMaxPitch, kMaxPitch);
+}
+
 }  // namespace nuka::runtime::app::viewer
