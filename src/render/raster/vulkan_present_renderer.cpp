@@ -269,6 +269,30 @@ struct GpuBuffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
+// A cheap O(1) content signature for a mesh: stream sizes + storage addresses + a
+// few sampled values. A scene swap or an in-place ReplaceGeometry (which re-allocs
+// the vectors) yields a new signature -> the device-local cache rebuilds; identical
+// geometry hashes equal and is reused. Never 0 (0 marks an unused cache slot).
+uint64_t MeshSignature(const MeshGeometry& geo) {
+    uint64_t h = 1469598103934665603ull;  // FNV-1a offset basis
+    auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    mix(geo.positions.size());
+    mix(geo.normals.size());
+    mix(geo.indices.size());
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.positions.data())));
+    mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geo.indices.data())));
+    auto sample = [&](const std::vector<float>& v, size_t i) {
+        if (i < v.size()) { uint32_t b = 0; std::memcpy(&b, &v[i], 4); mix(b); }
+    };
+    if (!geo.positions.empty()) {
+        sample(geo.positions, 0);
+        sample(geo.positions, geo.positions.size() / 2);
+        sample(geo.positions, geo.positions.size() - 1);
+    }
+    if (!geo.indices.empty()) { mix(geo.indices.front()); mix(geo.indices.back()); }
+    return h | 1ull;
+}
+
 // Write a host-mapped 8-bit swapchain readback as a binary PPM (P6) -- the reliable
 // on-screen capture, bypassing DWM/WGC (which can return a stale flip-model thumbnail).
 void WritePpm(const std::string& path, const uint8_t* pixels, uint32_t w, uint32_t h,
@@ -401,12 +425,26 @@ struct PresentRenderer::Impl {
                      VkDescriptorSet set = VK_NULL_HANDLE; };
     std::array<UboSlot, kFramesInFlight> ubo_slots{};
 
-    // Per-frame-in-flight sync + command buffers.
+    // Per-frame-in-flight sync + command buffers. render_finished is PER SWAPCHAIN
+    // IMAGE (indexed by image_index), not per frame-in-flight: acquire returns an
+    // image only after its prior present consumed that image's semaphore, so signaling
+    // it again is safe without a per-frame present stall.
     std::array<VkSemaphore, kFramesInFlight>     image_available{};
-    std::array<VkSemaphore, kFramesInFlight>     render_finished{};
+    std::vector<VkSemaphore>                     render_finished;
     std::array<VkFence, kFramesInFlight>         in_flight{};
     std::array<VkCommandBuffer, kFramesInFlight> command_buffers{};
     uint32_t current_frame = 0u;
+
+    // Device-local geometry cached per mesh_id, uploaded once and reused every frame.
+    // `signature` is the content signature it was built from; a mismatch (scene swap
+    // or in-place replace) rebuilds the slot. The buffers are NOT swapchain-dependent,
+    // so a resize never re-uploads geometry.
+    struct MeshCacheEntry {
+        uint64_t  signature = 0;  // 0 = unused slot
+        GpuBuffer pos, nrm, idx;
+        uint32_t  index_count = 0;
+    };
+    std::vector<MeshCacheEntry> mesh_cache;
 
     // Per-swapchain-image: a fence pointer tracking which in-flight frame last
     // used it (avoid presenting into an image still being read).
@@ -496,10 +534,10 @@ struct PresentRenderer::Impl {
 
     ~Impl() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
-        DestroySwapchainDependents();
+        DestroyMeshCache();
+        DestroySwapchainDependents();  // frees the per-image render_finished semaphores
         for (uint32_t i = 0; i < kFramesInFlight; ++i) {
             if (image_available[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, image_available[i], nullptr);
-            if (render_finished[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, render_finished[i], nullptr);
             if (in_flight[i] != VK_NULL_HANDLE) vkDestroyFence(device, in_flight[i], nullptr);
         }
         for (auto& slot : ubo_slots) {
@@ -657,6 +695,15 @@ struct PresentRenderer::Impl {
                     "vkCreateImageView(swapchain)");
         }
         images_in_flight.assign(count, VK_NULL_HANDLE);
+
+        // One render-finished semaphore per swapchain image (see the member note).
+        render_finished.resize(count);
+        VkSemaphoreCreateInfo sem_info{};
+        sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        for (uint32_t i = 0; i < count; ++i) {
+            CheckVk(vkCreateSemaphore(device, &sem_info, nullptr, &render_finished[i]),
+                    "vkCreateSemaphore(renderFinished-per-image)");
+        }
     }
 
     void CreatePresentRenderPass() {
@@ -1200,8 +1247,6 @@ struct PresentRenderer::Impl {
         for (uint32_t i = 0; i < kFramesInFlight; ++i) {
             CheckVk(vkCreateSemaphore(device, &sem_info, nullptr, &image_available[i]),
                     "vkCreateSemaphore(imageAvailable)");
-            CheckVk(vkCreateSemaphore(device, &sem_info, nullptr, &render_finished[i]),
-                    "vkCreateSemaphore(renderFinished)");
             CheckVk(vkCreateFence(device, &fence_info, nullptr, &in_flight[i]),
                     "vkCreateFence(inFlight)");
         }
@@ -1218,6 +1263,10 @@ struct PresentRenderer::Impl {
     }
 
     void DestroySwapchainDependents() {
+        for (VkSemaphore s : render_finished) {
+            if (s != VK_NULL_HANDLE) vkDestroySemaphore(device, s, nullptr);
+        }
+        render_finished.clear();
         for (VkFramebuffer fb : framebuffers) {
             if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fb, nullptr);
         }
@@ -1264,7 +1313,7 @@ struct PresentRenderer::Impl {
         report.height = extent.height;
     }
 
-    // -- per-frame transient geometry upload (mirrors the offscreen draw) ------
+    // -- host-visible buffer (per-frame SceneUbo, readback, staging) -----------
     GpuBuffer CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
         GpuBuffer res;
         VkBufferCreateInfo info{};
@@ -1300,8 +1349,134 @@ struct PresentRenderer::Impl {
         if (buf.memory != VK_NULL_HANDLE) { vkFreeMemory(device, buf.memory, nullptr); buf.memory = VK_NULL_HANDLE; }
     }
 
+    // A device-local buffer (TRANSFER_DST so a staging copy can fill it). Filled once
+    // via a one-shot transfer; reused every frame -> no per-frame upload.
+    GpuBuffer CreateDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+        GpuBuffer res;
+        VkBufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = size;
+        info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        CheckVk(vkCreateBuffer(device, &info, nullptr, &res.buffer), "vkCreateBuffer(present-device)");
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device, res.buffer, &req);
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &res.memory),
+                "vkAllocateMemory(present-device)");
+        CheckVk(vkBindBufferMemory(device, res.buffer, res.memory, 0),
+                "vkBindBufferMemory(present-device)");
+        return res;
+    }
+
+    VkCommandBuffer BeginOneShot() {
+        VkCommandBufferAllocateInfo ca{};
+        ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ca.commandPool = command_pool;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1u;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        CheckVk(vkAllocateCommandBuffers(device, &ca, &cmd), "vkAllocateCommandBuffers(present-oneshot)");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(present-oneshot)");
+        return cmd;
+    }
+
+    void EndOneShotAndWait(VkCommandBuffer cmd) {
+        CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present-oneshot)");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &cmd;
+        CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE), "vkQueueSubmit(present-oneshot)");
+        CheckVk(vkQueueWaitIdle(graphics_queue), "vkQueueWaitIdle(present-oneshot)");
+        vkFreeCommandBuffers(device, command_pool, 1u, &cmd);
+    }
+
+    // Bring the device-local geometry cache in sync with `world`'s mesh table: keep it
+    // sized to the table, (re)upload any referenced mesh whose content signature
+    // changed (scene swap / in-place replace), and free dropped slots. Steady state =
+    // a signature check per referenced mesh and NO GPU work. Any actual mutation first
+    // waits the device idle so no in-flight frame still references a freed buffer.
+    void SyncMeshCache(const RenderWorld& world) {
+        const size_t mesh_count = world.meshes.Count();
+        std::vector<uint32_t> rebuild;
+        std::vector<uint64_t> rebuild_sig;
+        std::vector<char> seen(mesh_count, 0);
+        for (const RenderInstance& inst : world.instances) {
+            const uint32_t id = inst.mesh_id;
+            if (id == kNoId || id >= mesh_count || seen[id]) continue;
+            const MeshGeometry& geo = world.meshes.Geometry(id);
+            if (geo.Empty()) continue;
+            seen[id] = 1;
+            const uint64_t sig = MeshSignature(geo);
+            const bool current = (id < mesh_cache.size() && mesh_cache[id].signature == sig);
+            if (!current) { rebuild.push_back(id); rebuild_sig.push_back(sig); }
+        }
+        const bool shrink = mesh_cache.size() > mesh_count;
+        if (rebuild.empty() && !shrink) return;
+
+        vkDeviceWaitIdle(device);
+        if (shrink) {
+            for (size_t i = mesh_count; i < mesh_cache.size(); ++i) {
+                Destroy(mesh_cache[i].pos); Destroy(mesh_cache[i].nrm); Destroy(mesh_cache[i].idx);
+            }
+        }
+        mesh_cache.resize(mesh_count);
+        if (rebuild.empty()) return;
+
+        std::vector<GpuBuffer> staging;
+        staging.reserve(rebuild.size() * 3u);
+        VkCommandBuffer cmd = BeginOneShot();
+        for (size_t k = 0; k < rebuild.size(); ++k) {
+            const uint32_t id = rebuild[k];
+            MeshCacheEntry& e = mesh_cache[id];
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.idx);
+            const MeshGeometry& geo = world.meshes.Geometry(id);
+            std::vector<float> synth;
+            const std::vector<float>* nrm_src = &geo.normals;
+            if (geo.normals.size() != geo.positions.size()) {
+                synth = SynthesizeFlatNormals(geo.positions, geo.indices);
+                nrm_src = &synth;
+            }
+            const VkDeviceSize pos_bytes = geo.positions.size() * sizeof(float);
+            const VkDeviceSize nrm_bytes = nrm_src->size() * sizeof(float);
+            const VkDeviceSize idx_bytes = geo.indices.size() * sizeof(uint32_t);
+            e.pos = CreateDeviceLocalBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            e.nrm = CreateDeviceLocalBuffer(nrm_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            e.idx = CreateDeviceLocalBuffer(idx_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            e.index_count = static_cast<uint32_t>(geo.indices.size());
+            auto stage_copy = [&](const void* data, VkDeviceSize n, const GpuBuffer& dst) {
+                GpuBuffer s = CreateHostBuffer(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                Upload(s, data, static_cast<size_t>(n));
+                VkBufferCopy region{0u, 0u, n};
+                vkCmdCopyBuffer(cmd, s.buffer, dst.buffer, 1u, &region);
+                staging.push_back(s);
+            };
+            stage_copy(geo.positions.data(), pos_bytes, e.pos);
+            stage_copy(nrm_src->data(), nrm_bytes, e.nrm);
+            stage_copy(geo.indices.data(), idx_bytes, e.idx);
+            e.signature = rebuild_sig[k];
+        }
+        EndOneShotAndWait(cmd);
+        for (GpuBuffer& s : staging) Destroy(s);
+    }
+
+    void DestroyMeshCache() {
+        for (MeshCacheEntry& e : mesh_cache) {
+            Destroy(e.pos); Destroy(e.nrm); Destroy(e.idx);
+        }
+        mesh_cache.clear();
+    }
+
     struct InstanceDraw {
-        GpuBuffer pos, nrm, idx;
+        VkBuffer  pos = VK_NULL_HANDLE, nrm = VK_NULL_HANDLE, idx = VK_NULL_HANDLE;  // cache-owned
         uint32_t  index_count = 0;
         Mat4      model;
         float     base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
@@ -1342,7 +1517,11 @@ struct PresentRenderer::Impl {
         }
         images_in_flight[image_index] = in_flight[frame];
 
-        // -- build per-instance geometry + scene AABB (same as the offscreen path).
+        // Bring the device-local geometry cache up to date (uploads only on a
+        // geometry-set change). Per-frame work below is just transforms + materials.
+        SyncMeshCache(world);
+
+        // -- build per-instance draws from the cached geometry + scene AABB.
         std::vector<InstanceDraw> draws;
         draws.reserve(world.instances.size());
         math::Vec3 aabb_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
@@ -1350,15 +1529,24 @@ struct PresentRenderer::Impl {
         math::Vec3 aabb_max{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
                             -std::numeric_limits<float>::max()};
         bool has_geometry = false;
+        // The world AABB is consumed ONLY by the auto-frame camera (no override, no
+        // scene camera); skip the per-vertex sweep when a camera is supplied.
+        const bool needs_aabb = !options.use_camera_override && world.CameraCount() == 0u;
         const uint32_t instance_total = static_cast<uint32_t>(world.instances.size());
         for (uint32_t inst_idx = 0; inst_idx < instance_total; ++inst_idx) {
             const RenderInstance& inst = world.instances[inst_idx];
             if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
             const MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
             if (geo.Empty()) continue;
+            const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
+            if (cached.index_count == 0u) continue;  // not cached (defensive)
             InstanceDraw draw;
             draw.instance_row = inst_idx;
             draw.model = TransformToMatrix(inst.world_xform);
+            draw.pos = cached.pos.buffer;
+            draw.nrm = cached.nrm.buffer;
+            draw.idx = cached.idx.buffer;
+            draw.index_count = cached.index_count;
             if (inst.render_material_id != kNoId &&
                 inst.render_material_id < world.materials.size()) {
                 const scene::RenderMaterial& mat = world.materials[inst.render_material_id];
@@ -1373,29 +1561,15 @@ struct PresentRenderer::Impl {
                 draw.emissive[1] = mat.emissive[1];
                 draw.emissive[2] = mat.emissive[2];
             }
-            const VkDeviceSize pos_bytes = geo.positions.size() * sizeof(float);
-            draw.pos = CreateHostBuffer(pos_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-            Upload(draw.pos, geo.positions.data(), pos_bytes);
-            std::vector<float> normals;
-            const std::vector<float>* normal_src = &geo.normals;
-            if (geo.normals.size() != geo.positions.size()) {
-                normals = SynthesizeFlatNormals(geo.positions, geo.indices);
-                normal_src = &normals;
-            }
-            const VkDeviceSize nrm_bytes = normal_src->size() * sizeof(float);
-            draw.nrm = CreateHostBuffer(nrm_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-            Upload(draw.nrm, normal_src->data(), nrm_bytes);
-            const VkDeviceSize idx_bytes = geo.indices.size() * sizeof(uint32_t);
-            draw.idx = CreateHostBuffer(idx_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-            Upload(draw.idx, geo.indices.data(), idx_bytes);
-            draw.index_count = static_cast<uint32_t>(geo.indices.size());
-            for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
-                const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
-                const math::Vec3 wp = inst.world_xform.TransformPoint(local);
-                aabb_min.x = std::min(aabb_min.x, wp.x); aabb_min.y = std::min(aabb_min.y, wp.y);
-                aabb_min.z = std::min(aabb_min.z, wp.z); aabb_max.x = std::max(aabb_max.x, wp.x);
-                aabb_max.y = std::max(aabb_max.y, wp.y); aabb_max.z = std::max(aabb_max.z, wp.z);
-                has_geometry = true;
+            if (needs_aabb) {
+                for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
+                    const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
+                    const math::Vec3 wp = inst.world_xform.TransformPoint(local);
+                    aabb_min.x = std::min(aabb_min.x, wp.x); aabb_min.y = std::min(aabb_min.y, wp.y);
+                    aabb_min.z = std::min(aabb_min.z, wp.z); aabb_max.x = std::max(aabb_max.x, wp.x);
+                    aabb_max.y = std::max(aabb_max.y, wp.y); aabb_max.z = std::max(aabb_max.z, wp.z);
+                    has_geometry = true;
+                }
             }
             draws.push_back(std::move(draw));
         }
@@ -1489,10 +1663,10 @@ struct PresentRenderer::Impl {
             vkCmdPushConstants(cmd, active_layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
                                sizeof(PushBlock), &push);
-            std::array<VkBuffer, 2> vbuffers{draw.pos.buffer, draw.nrm.buffer};
+            std::array<VkBuffer, 2> vbuffers{draw.pos, draw.nrm};
             std::array<VkDeviceSize, 2> offsets{0u, 0u};
             vkCmdBindVertexBuffers(cmd, 0u, 2u, vbuffers.data(), offsets.data());
-            vkCmdBindIndexBuffer(cmd, draw.idx.buffer, 0u, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(cmd, draw.idx, 0u, VK_INDEX_TYPE_UINT32);
             // INT-F1: on the instanced path, firstInstance == the SSBO row so
             // gl_InstanceIndex picks the right scattered transform (the draw loop
             // skipped geometry-less instances, so the SSBO row != compacted index).
@@ -1551,15 +1725,10 @@ struct PresentRenderer::Impl {
         submit.commandBufferCount = 1u;
         submit.pCommandBuffers = &cmd;
         submit.signalSemaphoreCount = 1u;
-        // NOTE: render_finished is indexed by frame-in-flight, NOT by swapchain
-        // image. That is only safe because this frame's per-frame fence wait
-        // (vkWaitForFences at the top of DrawFrame + the free-wait below)
-        // fully serializes each frame slot's submit->present before the slot is
-        // reused, so a render_finished[frame] can never be in two presents at
-        // once. A proper per-image render_finished[] (one per swapchain image,
-        // signalled by the present-image producer) is the correct fix and is
-        // deferred (M9 present-render-finished per-image variant).
-        submit.pSignalSemaphores = &render_finished[frame];
+        // render_finished is indexed by swapchain IMAGE: the present that displayed an
+        // image must release it before acquire can return it again, so re-signaling
+        // render_finished[image_index] is safe with no per-frame present stall.
+        submit.pSignalSemaphores = &render_finished[image_index];
         CheckVk(vkResetFences(device, 1u, &in_flight[frame]), "vkResetFences");
         CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, in_flight[frame]), "vkQueueSubmit(present)");
 
@@ -1567,27 +1736,20 @@ struct PresentRenderer::Impl {
         VkPresentInfoKHR present{};
         present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present.waitSemaphoreCount = 1u;
-        present.pWaitSemaphores = &render_finished[frame];
+        present.pWaitSemaphores = &render_finished[image_index];
         present.swapchainCount = 1u;
         present.pSwapchains = &swapchain;
         present.pImageIndices = &image_index;
         const VkResult present_result = vkQueuePresentKHR(present_queue, &present);
 
-        // The transient per-frame geometry can be freed once the fence (set on
-        // submit) is reached -- but to keep this simple + correct we wait on the
-        // device-side fence for THIS frame before the NEXT use of it (the
-        // vkWaitForFences at the top), and free here after a queue wait scoped to
-        // the just-submitted work. For a showcase viewer the per-frame waitidle on
-        // the in-flight fence is acceptable; we instead free after the present by
-        // waiting this frame's fence (bounded, only this submit).
-        CheckVk(vkWaitForFences(device, 1u, &in_flight[frame], VK_TRUE,
-                                std::numeric_limits<uint64_t>::max()),
-                "vkWaitForFences(free)");
-        for (InstanceDraw& draw : draws) {
-            Destroy(draw.pos); Destroy(draw.nrm); Destroy(draw.idx);
-        }
-
+        // Geometry is cached + persistent, so there is nothing transient to free and
+        // the frame pipelines (the top-of-frame fence wait bounds frames-in-flight).
+        // The readback path is the one exception: the copy lives in THIS command
+        // buffer, so wait its fence before mapping the host-visible capture buffer.
         if (do_capture) {
+            CheckVk(vkWaitForFences(device, 1u, &in_flight[frame], VK_TRUE,
+                                    std::numeric_limits<uint64_t>::max()),
+                    "vkWaitForFences(capture)");
             void* mapped = nullptr;
             if (vkMapMemory(device, capture_buf.memory, 0,
                             static_cast<VkDeviceSize>(extent.width) * extent.height * 4u, 0,
