@@ -253,6 +253,7 @@ int main(int argc, char** argv) {
     std::string policy_path;         // --policy <bin>: attach the closed-loop drive.
     bool want_play = false;          // --play: start the transport running.
     bool dt_set = false;             // honor an explicit --dt over the policy default.
+    bool force_host_policy = false;  // --host-policy: run the host MLP (A/B vs GPU).
     // --cam tx,ty,tz,dist,yaw_deg,pitch_deg : explicit orbit override (else auto-frame).
     bool cam_on = false;
     nuka::math::Vec3 cam_target{};
@@ -266,6 +267,7 @@ int main(int argc, char** argv) {
         else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
         else if (a == "--policy" && i + 1 < argc) policy_path = argv[++i];
         else if (a == "--play") want_play = true;
+        else if (a == "--host-policy") force_host_policy = true;
         else if (a == "--cam" && i + 1 < argc) {
             float yd = 0.0f, pd = 0.0f;
             if (std::sscanf(argv[++i], "%f,%f,%f,%f,%f,%f", &cam_target.x, &cam_target.y,
@@ -284,6 +286,7 @@ int main(int argc, char** argv) {
                         "[--capture-frame N --capture-out FILE.ppm]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
+                        "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
                         "  --cam overrides the auto-frame (default: fit the moving-instance cluster)\n");
             return 0;
         }
@@ -416,11 +419,13 @@ int main(int argc, char** argv) {
             auto pc = std::make_unique<nuka::runtime::inference::Go2PolicyController>();
             if (pc->Init(policy_path, loaded->caps.links_per_env,
                          loaded->caps.articulations_per_env, loaded->terrain)) {
+                if (force_host_policy) pc->SetUseGpu(false);  // A/B: host round-trip
                 policy_ctrl = std::move(pc);
                 loaded->sim->SetController(policy_ctrl.get());
                 ui_state.playing = want_play;
-                std::printf("[nuka_editor] policy attached: %s  play=%s\n",
-                            policy_path.c_str(), want_play ? "yes" : "no");
+                std::printf("[nuka_editor] policy attached: %s  play=%s  path=%s\n",
+                            policy_path.c_str(), want_play ? "yes" : "no",
+                            policy_ctrl->UsingGpu() ? "GPU" : "host");
             } else {
                 std::fprintf(stderr, "[nuka_editor] policy Init failed: %s\n",
                              policy_path.c_str());
@@ -452,6 +457,13 @@ int main(int argc, char** argv) {
     uint64_t frame_index = 0;
     int presented = 0;
     bool last_step_healthy = true;
+    // Headless fps instrumentation: the swapchain readback is the only trusted
+    // on-screen proof on Windows (GameViewer/WGC return stale frames), so report the
+    // gate numerically. step_ms (physics+policy+publish, no present) is the decisive
+    // before/after of the policy round-trip; frame_ms is the end-to-end pace.
+    double ft_sum = 0.0, ft_min = 1e30, ft_max = 0.0, st_sum = 0.0;
+    uint64_t ft_n = 0;
+    constexpr uint64_t kFpsWarmup = 30u;
     // A pace ceiling so an unbounded loop never busy-spins; FIFO present is the real
     // cap at the display refresh, so this sits well above 60.
     const auto frame_budget = std::chrono::duration<double>(1.0 / 240.0);
@@ -719,6 +731,21 @@ int main(int argc, char** argv) {
 
         ++frame_index;
 
+        if (frame_dt > 0.0 && frame_index > kFpsWarmup) {
+            const double fms = frame_dt * 1000.0;
+            ft_sum += fms;
+            st_sum += step_ms;
+            ++ft_n;
+            ft_min = std::min(ft_min, fms);
+            ft_max = std::max(ft_max, fms);
+            if (frame_index % 120u == 0u) {
+                std::printf("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f\n",
+                            static_cast<unsigned long long>(frame_index), fps_ema, fms,
+                            step_ms);
+                std::fflush(stdout);
+            }
+        }
+
         // -- pace (no busy-spin) ------------------------------------------------
         const auto spent = std::chrono::duration<double>(Clock::now() - now);
         if (spent < frame_budget) {
@@ -740,5 +767,13 @@ int main(int argc, char** argv) {
     std::printf("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
                 static_cast<unsigned long long>(frame_index), presented,
                 last_step_healthy ? "yes" : "no");
+    if (ft_n > 0) {
+        const double mean_fms = ft_sum / static_cast<double>(ft_n);
+        const double mean_sms = st_sum / static_cast<double>(ft_n);
+        std::printf("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f "
+                    "(min=%.2f max=%.2f) mean_step_ms=%.2f\n",
+                    static_cast<unsigned long long>(ft_n), 1000.0 / mean_fms, mean_fms,
+                    ft_min, ft_max, mean_sms);
+    }
     return 0;
 }
