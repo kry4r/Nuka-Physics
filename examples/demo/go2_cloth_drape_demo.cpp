@@ -342,7 +342,11 @@ uint64_t Fnv1a(const float* data, size_t n_floats) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // Windows lacks line buffering; unbuffered progress.
+#else
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered progress.
+#endif
     const Args args = ParseArgs(argc, argv);
 
     if (!std::filesystem::exists(kNksPath)) {
