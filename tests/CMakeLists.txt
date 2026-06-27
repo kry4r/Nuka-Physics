@@ -3436,6 +3436,35 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
+    # scene_load_probe -- headless load-path check: compiles the real editor_scene.cpp
+    # and runs viewer::LoadEditorScene over every discovered .nks with no window.
+    add_executable(nuka_scene_load_probe
+        ${CMAKE_SOURCE_DIR}/examples/demo/scene_load_probe.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+    )
+    add_dependencies(nuka_scene_load_probe nuka_codegen)
+    target_compile_definitions(nuka_scene_load_probe
+        PRIVATE
+            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+            NK_BUILD_VULKAN_VALIDATION)
+    target_include_directories(nuka_scene_load_probe
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_scene_load_probe
+        PRIVATE
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+    )
+
     # L1-c: the nuka_union_throughput demo exe (examples/demo/union_throughput.cpp)
     # was DELETED with the UnionCsr path -- it measured batched UnionCsr
     # H1+cup+table throughput via BuildNkUnionModel (union_nk_model.cpp, gone). The
