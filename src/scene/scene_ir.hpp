@@ -338,6 +338,35 @@ struct MediaRecord {
     uint32_t        render_material_id = kInvalidMaterial;
 };
 
+// A first-class terrain field: the parametric elevation grid the cook bakes into a
+// static heightfield collidable (the ONE terrain::HeightField source). Fields mirror
+// terrain::TerrainGenConfig 1:1 -- the engine has NO terrain-type enum: a flat field
+// is every amplitude 0, a staircase is ring_rise>0, the composite rolling field is
+// feature_cell>0. base_z is the absolute ground floor. An optional grayscale image
+// source fills the grid instead when image_path is set.
+struct TerrainRecord {
+    std::string name;
+    uint32_t   nrow = 0u, ncol = 0u;       // grid rows (+Y) / cols (+X).
+    float      cell = 0.0f;                 // square cell spacing (cell_x == cell_y).
+    math::Vec3 origin{0.0f, 0.0f, 0.0f};    // world corner cell (0,0).
+    float      base_z = 0.0f;               // absolute z of the ground floor.
+
+    // Parametric feature amplitudes (each independent; 0 == absent).
+    float    grade_x = 0.0f, grade_y = 0.0f;
+    float    ring_rise = 0.0f, ring_width = 0.0f, ring_platform = 0.0f;
+    uint32_t ring_count = 0u;
+    float    bump_height = 0.0f, bump_cell = 0.0f;
+    float    feature_cell = 0.0f, feature_margin = 0.0f;
+    uint32_t feature_seed = 0u;
+    uint32_t curric_levels = 0u, curric_types = 0u;
+
+    // Optional grayscale height-map source. Non-empty => the image fills the grid
+    // (placed by radius/elevation) and the parametric amplitudes above are ignored.
+    std::string image_path;
+    float       image_radius_x = 0.0f, image_radius_y = 0.0f;
+    float       image_elevation_z = 0.0f;
+};
+
 // ---------------------------------------------------------------------------
 // SceneIR
 // ---------------------------------------------------------------------------
@@ -372,6 +401,11 @@ public:
     ActuatorId AddActuator(ActuatorRecord record);
     MediaId  AddMedia(MediaRecord record);
 
+    // Authored terrain field (scene-global config, like gravity; NOT a tree node).
+    // Persisted by .nks, consumed by the cook (CookToModel bakes it into the static
+    // heightfield collidable). Copied verbatim by the copy ctor / assignment.
+    TerrainId AddTerrain(TerrainRecord record);
+
     // Record an explicit collision-exclusion between two bodies. Stored
     // canonicalized as (min,max) so call order does not matter. The filter
     // POLICY that consumes this list (and the <contact><pair> explicit-override
@@ -393,6 +427,7 @@ public:
     size_t LightCount()     const;
     size_t ActuatorCount()  const;
     size_t MediaCount()     const;
+    size_t TerrainCount()   const;
 
     // -- accessors ----------------------------------------------------------
     const RigidBodyRecord&      GetBody(BodyId id)    const;
@@ -404,6 +439,7 @@ public:
     const LightRecord&          GetLight(LightId id) const;
     const ActuatorRecord&       GetActuator(ActuatorId id) const;
     const MediaRecord&          GetMedia(MediaId id) const;
+    const TerrainRecord&        GetTerrain(TerrainId id) const;
 
     // Mutable record access. Mutating a record through these BYPASSES the Add*
     // write-through, so each Get*Mut marks the facade DIRTY; the next facade
@@ -419,6 +455,7 @@ public:
     LightRecord&          GetLightMut(LightId id);
     ActuatorRecord&       GetActuatorMut(ActuatorId id);
     MediaRecord&          GetMediaMut(MediaId id);
+    TerrainRecord&        GetTerrainMut(TerrainId id);
 
     // -- bulk accessors -----------------------------------------------------
     const std::vector<RigidBodyRecord>&      Bodies()  const;
@@ -430,6 +467,7 @@ public:
     const std::vector<LightRecord>&          Lights() const;
     const std::vector<ActuatorRecord>&       Actuators() const;
     const std::vector<MediaRecord>&          Media() const;
+    const std::vector<TerrainRecord>&        Terrain() const;
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
@@ -496,6 +534,7 @@ private:
     // -- authored metadata (M7; not facade-derived, copied verbatim) --------
     SceneInitialState  initial_state_;
     cook::SettleSpec   settle_;
+    std::vector<TerrainRecord> terrain_;
 
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;

@@ -31,6 +31,10 @@ namespace nuka::scene::cook {
 struct CookToModelResult {
     nk::Model model;
     SceneMap  scene_map;
+    // The baked terrain grid when the scene carried a TerrainRecord (empty/invalid
+    // otherwise). Retained so obs/spawn/render sample the SAME grid the cook staged
+    // for contact (SampleHeightFieldZ). IsValid(terrain) == false for a terrain-free scene.
+    ::nuka::terrain::HeightField terrain;
 };
 
 // Cook a SceneIR into an nk::Model replicated across `env_count` envs, plus the
@@ -79,6 +83,18 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
 // (a build error, not a silent reinterpretation -- the device locator is one cell).
 uint32_t CookHeightfieldGrid(nk::Model& model,
                              const ::nuka::terrain::HeightField& hf);
+
+// Bake a HeightField into the model as the static terrain collidable AND recompute
+// the contact budget -- the ONE terrain bake both the editor cook (from a SceneIR
+// TerrainRecord) and the c_abi built-scene path (from a nuka_world_desc terrain) call
+// so terrain enters the model through identical code. Seeds the heightfield collidable
+// at `orig_bodies` (overwriting the static ground-plane shape row appended there, so
+// the collidable count is unchanged), then sets bodies_per_env / max_bodies_total /
+// the per-candidate-slot row budget by the SAME (dynamic+1 static)*4 rule the body cook
+// uses, and grows the body<->particle reserve. Returns the heightfield collidable's body row.
+uint32_t CookTerrainIntoModel(nk::Model& model,
+                              const ::nuka::terrain::HeightField& hf,
+                              uint32_t orig_bodies);
 
 // Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
 // body<->body slot count) for body<->particle rows; idempotent, byte-identical when

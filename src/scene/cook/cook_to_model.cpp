@@ -32,6 +32,7 @@
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
+#include "scene/terrain/heightfield_loaders.hpp"  // parametric/image grid fill
 #include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
@@ -996,6 +997,38 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             static_cast<uint32_t>(model.shape_table_rows.size());
     }
 
+    // Terrain bake (gated on a TerrainRecord -> terrain-free scenes stay byte-
+    // identical): build the HeightField, bake via the shared helper, retain it.
+    if (!scene.Terrain().empty()) {
+        const TerrainRecord& tr = scene.Terrain().front();
+        ::nuka::terrain::HeightField hf;
+        if (!tr.image_path.empty()) {
+            std::string err;
+            if (!::nuka::terrain::LoadHeightFieldFromImage(
+                    tr.image_path, tr.image_radius_x, tr.image_radius_y,
+                    tr.image_elevation_z, tr.base_z, tr.origin, hf, err)) {
+                throw std::runtime_error("CookToModel: terrain image load failed: " + err);
+            }
+        } else {
+            ::nuka::terrain::TerrainGenConfig cfg;
+            cfg.nrow = tr.nrow;            cfg.ncol = tr.ncol;
+            cfg.cell_x = tr.cell;         cfg.cell_y = tr.cell;
+            cfg.origin = tr.origin;       cfg.base_z = tr.base_z;
+            cfg.grade_x = tr.grade_x;     cfg.grade_y = tr.grade_y;
+            cfg.ring_rise = tr.ring_rise; cfg.ring_width = tr.ring_width;
+            cfg.ring_platform = tr.ring_platform; cfg.ring_count = tr.ring_count;
+            cfg.bump_height = tr.bump_height;     cfg.bump_cell = tr.bump_cell;
+            cfg.feature_cell = tr.feature_cell;   cfg.feature_margin = tr.feature_margin;
+            cfg.feature_seed = tr.feature_seed;
+            cfg.curric_levels = tr.curric_levels; cfg.curric_types = tr.curric_types;
+            if (!::nuka::terrain::GenerateHeightField(cfg, hf)) {
+                throw std::runtime_error("CookToModel: degenerate terrain config");
+            }
+        }
+        CookTerrainIntoModel(model, hf, cap.bodies_per_env);
+        result.terrain = std::move(hf);
+    }
+
     return result;
 }
 
@@ -1163,6 +1196,33 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
         model.shape_table_rows.resize(body_row + 1u);
     }
     model.shape_table_rows[body_row] = sh;
+    return body_row;
+}
+
+// The ONE terrain bake (see cook_to_model.hpp). Stages the heightfield collidable
+// over the static ground-plane row at `orig_bodies` and recomputes the contact budget.
+uint32_t CookTerrainIntoModel(nk::Model& model,
+                              const ::nuka::terrain::HeightField& hf,
+                              uint32_t orig_bodies) {
+    // The heightfield seeds at orig_bodies (it overwrites the static ground-plane
+    // shape row appended there, keeping the collidable count unchanged).
+    model.body_init.resize(orig_bodies);
+    const uint32_t body_row = CookHeightfieldGrid(model, hf);
+
+    nk::ModelCapacities& cap = model.capacities;
+    // bodies_per_env (the LBVH leaf count) now includes the static terrain collidable;
+    // the CONTACT budget is the dynamic collidables (+1 static) at 4 candidate slots
+    // each -- the SAME rule the body cook uses (the heightfield replaced the plane).
+    cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
+    cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+    constexpr uint32_t kStaticCollidables = 1u;
+    const uint32_t rigid_base =
+        (orig_bodies + kStaticCollidables) * kCandidatePairsPerCollidable;
+    cap.max_contacts_per_env = rigid_base;
+    cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    // A coupled world (terrain AND particles) keeps the body<->particle slot reserve
+    // disjoint above the rigid base -- no-op when particles_per_env == 0.
+    GrowContactBudgetForParticles(cap, rigid_base);
     return body_row;
 }
 

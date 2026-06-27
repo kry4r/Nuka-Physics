@@ -39,8 +39,9 @@ SceneIR::SceneIR(const SceneIR& other)
       exclude_pairs_(other.exclude_pairs_),
       contact_pairs_(other.contact_pairs_),
       initial_state_(other.initial_state_),
-      settle_(other.settle_) {
-    // initial_state_ / settle_ are authored metadata, NOT projected
+      settle_(other.settle_),
+      terrain_(other.terrain_) {
+    // initial_state_ / settle_ / terrain_ are authored metadata, NOT projected
     // from records, so they must be copied explicitly (RebuildFacade only
     // rebuilds the tree/ECS from records and would otherwise drop them).
     RebuildFacade();
@@ -63,6 +64,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     contact_pairs_ = other.contact_pairs_;
     initial_state_ = other.initial_state_;   // authored metadata (not from records)
     settle_        = other.settle_;
+    terrain_       = other.terrain_;
     RebuildFacade();
     return *this;
 }
@@ -226,6 +228,12 @@ MediaId SceneIR::AddMedia(MediaRecord record) {
     return id;
 }
 
+TerrainId SceneIR::AddTerrain(TerrainRecord record) {
+    const auto id = static_cast<TerrainId>(terrain_.size());
+    terrain_.push_back(std::move(record));  // authored metadata: no facade projection
+    return id;
+}
+
 void SceneIR::AddExcludePair(BodyId a, BodyId b) {
     // Canonicalize as (min,max) so (a,b) and (b,a) store identically. No dedup
     // here — that (and the filter policy) is C1c.
@@ -249,6 +257,7 @@ size_t SceneIR::CameraCount() const { return cameras_.size(); }
 size_t SceneIR::LightCount() const { return lights_.size(); }
 size_t SceneIR::ActuatorCount() const { return actuators_.size(); }
 size_t SceneIR::MediaCount() const { return media_.size(); }
+size_t SceneIR::TerrainCount() const { return terrain_.size(); }
 
 const RigidBodyRecord& SceneIR::GetBody(BodyId id) const {
     if (id >= bodies_.size()) {
@@ -311,6 +320,13 @@ const MediaRecord& SceneIR::GetMedia(MediaId id) const {
         throw std::out_of_range("SceneIR::GetMedia - invalid MediaId");
     }
     return media_[id];
+}
+
+const TerrainRecord& SceneIR::GetTerrain(TerrainId id) const {
+    if (id >= terrain_.size()) {
+        throw std::out_of_range("SceneIR::GetTerrain - invalid TerrainId");
+    }
+    return terrain_[id];
 }
 
 RigidBodyRecord& SceneIR::GetBodyMut(BodyId id) {
@@ -385,6 +401,13 @@ MediaRecord& SceneIR::GetMediaMut(MediaId id) {
     return media_[id];
 }
 
+TerrainRecord& SceneIR::GetTerrainMut(TerrainId id) {
+    if (id >= terrain_.size()) {
+        throw std::out_of_range("SceneIR::GetTerrainMut - invalid TerrainId");
+    }
+    return terrain_[id];  // authored metadata: no facade dependency
+}
+
 const std::vector<RigidBodyRecord>& SceneIR::Bodies() const { return bodies_; }
 const std::vector<JointRecord>& SceneIR::Joints() const { return joints_; }
 const std::vector<CollisionShapeRecord>& SceneIR::Shapes() const { return shapes_; }
@@ -394,6 +417,7 @@ const std::vector<CameraRecord>& SceneIR::Cameras() const { return cameras_; }
 const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }
 const std::vector<ActuatorRecord>& SceneIR::Actuators() const { return actuators_; }
 const std::vector<MediaRecord>& SceneIR::Media() const { return media_; }
+const std::vector<TerrainRecord>& SceneIR::Terrain() const { return terrain_; }
 const std::vector<std::pair<BodyId, BodyId>>& SceneIR::ExcludePairs() const {
     return exclude_pairs_;
 }
