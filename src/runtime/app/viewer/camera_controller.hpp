@@ -64,6 +64,11 @@ public:
     // cursor is over a panel). Returns true if the event changed the camera.
     bool HandleEvent(const window::WindowEvent& ev, bool allow_drag, bool allow_scroll);
 
+    // Fly the orbit rig (target + eye move together) from WASD/QE input over `dt`
+    // seconds. forward/right walk the horizon-projected view plane (W/S, A/D), up is
+    // world +Z (Q/E); inputs in [-1,1], speed scales with dolly distance.
+    void Move(float forward, float right, float up, float dt);
+
     // ---- per-frame ---------------------------------------------------------
     // Recompute eye/up from yaw/pitch/distance/target and write the override into
     // `out` (use_camera_override = true). fov is taken from this->fov_degrees so
@@ -107,6 +112,7 @@ public:
     float orbit_speed = 0.008f;  // radians per pixel of mouse drag
     float pan_speed   = 0.0018f; // world units per pixel, scaled by distance
     float zoom_speed  = 0.12f;   // fraction of distance per wheel tick
+    float move_speed  = 1.5f;    // WASD world units/sec at dolly distance 1
 
 private:
     // Spherical orbit state about `target_`.

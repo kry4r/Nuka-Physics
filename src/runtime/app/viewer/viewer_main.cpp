@@ -620,6 +620,23 @@ int main(int argc, char** argv) {
 #endif
         imgui.NewFrame();
         ui.RecordUi(sim.GetRenderWorld(), stats, camera, ui_state);
+
+        // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
+        // owning the keyboard so typing in a panel never moves the view.
+        if (!io.WantCaptureKeyboard) {
+            float cf = 0.0f, cr = 0.0f, cu = 0.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_D)) cr += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_A)) cr -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_E)) cu += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_Q)) cu -= 1.0f;
+            if (cf != 0.0f || cr != 0.0f || cu != 0.0f) {
+                const bool sprint = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                                    ImGui::IsKeyDown(ImGuiKey_RightShift);
+                camera.Move(cf, cr, cu, static_cast<float>(frame_dt) * (sprint ? 4.0f : 1.0f));
+            }
+        }
         ImGui::Render();
 
         // VIEW-2: upload any drive sliders that moved this frame into the LIVE nk
