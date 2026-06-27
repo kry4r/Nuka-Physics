@@ -40,7 +40,10 @@ layout(set = 0, binding = 0) uniform SceneUbo {
     vec4     ambient;
     vec4     ambient_ground;
     ivec4    counts;
+    vec4     fog;
     GpuLight lights[kMaxLights];
+    mat4     light_view_proj;
+    vec4     shadow_params;
 } scene;
 
 // set 1, binding 0: the device-local per-instance transform SSBO (interop). std430
