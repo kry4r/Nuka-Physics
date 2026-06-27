@@ -402,7 +402,9 @@ int main(int argc, char** argv) {
     uint64_t frame_index = 0;
     int presented = 0;
     bool last_step_healthy = true;
-    const auto frame_budget = std::chrono::duration<double>(1.0 / 60.0);
+    // A pace ceiling so an unbounded loop never busy-spins; FIFO present is the real
+    // cap at the display refresh, so this sits well above 60.
+    const auto frame_budget = std::chrono::duration<double>(1.0 / 240.0);
 
     // VIEW-3/4: picker + drag state. Ctrl is tracked by RESOLVED keysym (keymap-
     // independent), matching camera_controller's Shift handling. The window backend
