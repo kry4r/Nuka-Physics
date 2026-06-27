@@ -34,6 +34,14 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 
+// cub::Sum was removed in CUDA 13's CCCL; cuda::std::plus replaces it there.
+#if __CUDACC_VER_MAJOR__ >= 13
+#include <cuda/std/functional>
+namespace { using NkScanSumOp = ::cuda::std::plus<>; }
+#else
+namespace { using NkScanSumOp = ::cub::Sum; }
+#endif
+
 #include "collision/lbvh_batched.cuh"   // BuildLbvhBatchedNodes (shared env-build)
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
@@ -79,7 +87,7 @@ struct GridSortScratchLayout {
         size_t scan_bytes = 0u;
         (void)cub::DeviceScan::ExclusiveScan(
             nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), cub::Sum(), 0u, n);
+            static_cast<uint32_t*>(nullptr), NkScanSumOp{}, 0u, n);
         temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
         const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
@@ -620,7 +628,7 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
         size_t scan_temp_bytes = static_cast<size_t>(sl.temp_bytes);
         (void)cub::DeviceScan::ExclusiveScan(
             sort_temp, scan_temp_bytes, data.grid_neighbor_count,
-            data.grid_neighbor_offset, cub::Sum(), 0u, static_cast<int>(Np), stream);
+            data.grid_neighbor_offset, NkScanSumOp{}, 0u, static_cast<int>(Np), stream);
     }
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
