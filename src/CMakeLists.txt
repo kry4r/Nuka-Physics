@@ -867,13 +867,12 @@ if(CMAKE_CUDA_COMPILER)
     nuka_set_warnings(nuka_app)
 
     # -------------------------------------------------------------------------
-    # nuka_viewer (M8.5 T3) -- the windowed realtime viewer: imgui_layer (the
-    # custom-beautified UI panels) + camera_controller (orbit/pan/zoom) + the
-    # `nuka_viewer` exe (viewer_main). Drives Simulation::FramePublish (step +
-    # publish) and presents each frame via nuka_present, with the imgui_layer as
-    # the present-pass overlay. GATED behind NK_BUILD_VULKAN_VALIDATION (D3): the
-    # default build-cuda128 config never sees it (opt-in, like the recorder). It
-    # links nuka_present (swapchain + xcb), nuka_imgui (Dear ImGui glue + theme),
+    # nuka_viewer -- the editor UI static lib: imgui_layer (the custom-beautified
+    # UI panels) + camera_controller (orbit/pan/zoom). The nuka_editor exe links it.
+    # Drives Simulation::FramePublish (step + publish) and presents each frame via
+    # nuka_present, with the imgui_layer as the present-pass overlay. GATED behind
+    # NK_BUILD_VULKAN_VALIDATION: the default build-cuda128 config never sees it. It
+    # links nuka_present (swapchain), nuka_imgui (Dear ImGui glue + theme),
     # nuka_app (the frame-loop spine), and the nk physics libs (for the cook +
     # nk::World fixture). HOST-ONLY / zero-CUDA-token.
     # -------------------------------------------------------------------------
@@ -899,17 +898,22 @@ if(CMAKE_CUDA_COMPILER)
         )
         nuka_set_warnings(nuka_viewer)
 
-        add_executable(nuka_viewer_exe
+        # nuka_editor -- the windowed scene EDITOR exe (viewer_main + editor_scene,
+        # the runtime .nks load path). Opens EMPTY and loads / swaps scenes at runtime
+        # through ONE LoadEditorScene path the --scene flag also drives. OUTPUT_NAME is
+        # nuka_editor -> build-win-editor/src/nuka_editor.exe.
+        add_executable(nuka_editor_exe
             runtime/app/viewer/viewer_main.cpp
+            runtime/app/viewer/editor_scene.cpp
         )
-        add_dependencies(nuka_viewer_exe nuka_render_shaders)
-        set_target_properties(nuka_viewer_exe PROPERTIES OUTPUT_NAME nuka_viewer)
-        target_include_directories(nuka_viewer_exe
+        add_dependencies(nuka_editor_exe nuka_render_shaders)
+        set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka_editor)
+        target_include_directories(nuka_editor_exe
             PRIVATE
                 ${CMAKE_SOURCE_DIR}/src
         )
-        target_compile_definitions(nuka_viewer_exe PRIVATE NK_BUILD_VULKAN_VALIDATION)
-        target_link_libraries(nuka_viewer_exe
+        target_compile_definitions(nuka_editor_exe PRIVATE NK_BUILD_VULKAN_VALIDATION)
+        target_link_libraries(nuka_editor_exe
             PRIVATE
                 nuka_viewer
                 nuka_present
@@ -919,11 +923,6 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_render
                 nuka_nk
                 nuka_phi2
-                # M11 INT-8: the CUDA interop scatter (strong CreateCudaVkScatter,
-                # wins over nuka_app's weak fallback). Listed BEFORE nuka_app via the
-                # link order so the strong symbol resolves; with whole-archive-free
-                # static linking the strong def is pulled because viewer_main
-                # references CreateCudaVkScatter.
                 nuka_phi2_interop
                 nuka_runtime
                 nuka_import
@@ -935,7 +934,7 @@ if(CMAKE_CUDA_COMPILER)
                 imgui
                 Vulkan::Vulkan
         )
-        nuka_set_warnings(nuka_viewer_exe)
+        nuka_set_warnings(nuka_editor_exe)
     endif()
 
     add_library(nuka_runtime_gpu STATIC
@@ -1517,4 +1516,20 @@ if(CMAKE_CUDA_COMPILER)
             nuka_scene
     )
     nuka_set_warnings(nuka_cook_scene)
+
+    # Compose a robot .nks over a procedural field heightfield (visual-mesh
+    # surface + N re-rooted robots on the local surface). HOST-ONLY.
+    add_executable(nuka_field_scene
+        ${CMAKE_SOURCE_DIR}/tools/scene/field_scene.cpp
+    )
+    target_include_directories(nuka_field_scene
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_field_scene
+        PRIVATE
+            nuka_import
+            nuka_scene
+    )
+    nuka_set_warnings(nuka_field_scene)
 endif()

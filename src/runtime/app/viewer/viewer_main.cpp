@@ -1,30 +1,31 @@
 // ---------------------------------------------------------------------------
-// nuka_viewer -- the M8.5 windowed realtime viewer entry (T3, the user-facing
-// deliverable). Drives the physics sim and shows it inside the custom-beautified
-// Dear ImGui UI over the swapchain present path.
+// nuka_editor -- the windowed scene editor entry. Opens EMPTY (no world cooked),
+// renders the Dear ImGui shell over the swapchain, and loads / swaps scenes at
+// runtime through ONE load path.
 //
-// PIPELINE (recon §2 Phase 3 + the decisions in §8):
-//   1. Cook a real .nks scene -> nk::World (the render_frame_loop_smoke fixture:
-//      Load(.nks) -> CookToModel -> nk::World) + a RenderWorld from the same cook.
-//   2. HostDownloadPublisher + Simulation over them (the M8 frame-loop spine).
-//   3. MakeSurface (xcb under Xvfb here / headless on a modern loader) ->
-//      PresentRenderer (the swapchain renderer) -> NukaImGuiContext (init against
-//      the present pass + the renderer's descriptor pool).
-//   4. The main loop, until the window closes:
-//        poll window events -> feed ImGui io + CameraController + CommandQueue
-//        -> Simulation::FramePublish (step + publish, NO offscreen draw)
-//        -> PresentRenderer::DrawFrame(RenderWorld, camera opts, overlay = the
-//           imgui_layer record) -> pace to the target frame interval.
+// PIPELINE:
+//   1. Stand up the persistent shell FIRST (no scene): phi device + backend,
+//      MakeSurface -> PresentRenderer (swapchain) -> NukaImGuiContext over the
+//      present pass + the renderer's descriptor pool. The viewport clears to the
+//      background until a scene is loaded.
+//   2. Runtime load (the ONE path): LoadEditorScene(path) cooks a .nks ->
+//      nk::World + RenderWorld + Simulation, swapped into `loaded`. The Load UI
+//      button and the --scene flag both go through it -- --scene just seeds a load
+//      request the loop honors after the shell is up (no startup-only cook).
+//   3. The main loop, until the window closes:
+//        process a pending load/unload (WaitIdle -> teardown -> rebuild -> reframe)
+//        -> poll window events -> ImGui io + CameraController + CommandQueue
+//        -> Simulation::FramePublish (step + publish; skipped while empty)
+//        -> PresentRenderer::DrawFrame(active or empty RenderWorld, camera opts,
+//           overlay = the imgui_layer record) -> pace to the frame interval.
 //
-// PRESENT egress is DIRECT-to-swapchain (D-open-Q 7); the offscreen Render() stays
-// the untouched D1 oracle. Host-download pose is fine for M8.5 (interop = M11).
+// PRESENT egress is DIRECT-to-swapchain; the offscreen Render() stays the untouched
+// D1 oracle. The editor publishes poses via each loaded scene's HostDownloadPublisher
+// (the general path that fits any instance count across runtime swaps).
 //
-// HEADLESS-SAFE: the whole loop runs under Xvfb (the present substrate is T2-/
-// vkcube-proven there). A frame budget (--frames / NUKA_VIEWER_FRAMES) makes it
-// CI-runnable for a few frames without a human at the window.
-//
-// GATING: this exe is built ONLY when NK_BUILD_VULKAN_VALIDATION is ON (D3); the
-// default build-cuda128 config never sees it (opt-in, like the recorder).
+// HEADLESS-SAFE: a frame budget (--frames / NUKA_VIEWER_FRAMES) + swapchain readback
+// (--capture-frame) make both the empty shell and a runtime load verifiable without
+// a human at the window. GATING: built ONLY when NK_BUILD_VULKAN_VALIDATION is ON.
 //
 // HOST-ONLY / zero-CUDA-token: pure host C++/Vulkan/ImGui. The only device touch
 // is nk::World step + DownloadField (through the phi v2 vtable in nuka_nk).
@@ -42,26 +43,21 @@
 
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
-#include "phi/interop_scatter.hpp"  // ExternalMemoryDesc (CUDA-free seam, INT-8)
 #include "render/imgui/nuka_imgui.hpp"
-#include "render/raster/interop_transform_ssbo.hpp"  // exportable SSBO (INT-4)
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
 #include "runtime/app/command_queue.hpp"        // MoveEntity command (VIEW-4)
-#include "runtime/app/cuda_vulkan_interop.hpp"  // CudaVulkanInteropPublisher (INT-6)
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/imgui_layer.hpp"
-#include "scene/cook/cook_to_model.hpp"
-#include "scene/format/nks.hpp"
 #include "scene/graph/scene_graph.hpp"          // SceneGraph::SetSelected (VIEW-3)
 #include "scene/scene_ir.hpp"
 
 #include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget (VIEW-2)
 #include "nk/model/model.hpp"
-#include "nk/pipeline/world.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -73,6 +69,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -84,31 +81,54 @@ namespace app = nuka::runtime::app;
 namespace viewer = nuka::runtime::app::viewer;
 namespace render = nuka::render;
 namespace window = nuka::render::window;
-namespace cook = nuka::scene::cook;
 
 // Default physics timestep when neither --dt nor a scene override is supplied.
 constexpr float kDefaultDt = 1.0f / 240.0f;
 
-// Strip shape mesh geometry so CookToModel skips the heavy V-HACD pass (the
-// viewer validates the LIVE loop, not collision-hull fidelity -- same trick the
-// frame-loop smoke uses). Pose Data fields the publisher reads are unaffected.
-nuka::scene::SceneIR LoadLightScene(const std::string& path) {
-    nuka::scene::SceneIR scene = nuka::scene::nks::Load(path);
-    for (size_t i = 0; i < scene.ShapeCount(); ++i) {
-        auto& shape = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
-        shape.mesh_vertices.clear();
-        shape.mesh_indices.clear();
+// Scan examples/scenes + out (recursive) for .nks the Load panel lists. Relative
+// to the cwd; unreadable / missing roots are skipped. Sorted, deduped by path.
+std::vector<std::string> DiscoverScenes() {
+    std::vector<std::string> out;
+    const char* roots[] = {"examples/scenes", "out"};
+    for (const char* root : roots) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(root, ec)) continue;
+        try {
+            for (const auto& e :
+                 std::filesystem::recursive_directory_iterator(root)) {
+                if (e.is_regular_file() && e.path().extension() == ".nks")
+                    out.push_back(e.path().generic_string());
+            }
+        } catch (const std::exception&) { /* skip an unreadable subtree */ }
     }
-    return scene;
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
-nk::Pipeline::SolverConfig DefaultCfg(float dt) {
-    nk::Pipeline::SolverConfig cfg;
-    cfg.dt = dt;
-    cfg.gravity[0] = 0.0f;
-    cfg.gravity[1] = 0.0f;
-    cfg.gravity[2] = -9.81f;
-    return cfg;
+// Seed the GENERIC per-DOF drive editor from a freshly loaded world's DriveTarget
+// field (per:link, env 0). A flat per-DOF editor, NEVER a choreography table.
+void SeedDriveTargets(viewer::ViewerUiState& ui, viewer::EditorScene& es) {
+    ui.drive_targets.clear();
+    ui.drive_dirty.clear();
+    ui.dof_labels.clear();
+    if (es.caps.links_per_env > 0u) {
+        ui.drive_targets.assign(es.caps.links_per_env, 0.0f);
+        ui.drive_dirty.assign(es.caps.links_per_env, 0u);
+        es.sim->GetWorld().GetData().DownloadField(
+            nk::FieldId::DriveTarget, ui.drive_targets.data(),
+            static_cast<uint64_t>(es.caps.links_per_env) * sizeof(float), 0);
+    }
+}
+
+// Drop all model-bound UI state back to the empty-editor defaults.
+void ClearModelUi(viewer::ViewerUiState& ui) {
+    ui.drive_targets.clear();
+    ui.drive_dirty.clear();
+    ui.dof_labels.clear();
+    ui.selected_inst = ~0u;
+    ui.selected_entity = ~0u;
+    ui.playing = false;
 }
 
 // Compute the scene AABB from the RenderWorld so the camera can frame it.
@@ -229,8 +249,8 @@ uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w,
 }  // namespace
 
 int main(int argc, char** argv) {
-    // ---- args: scene path (REQUIRED), frame budget (0 = run until close), dt ----
-    std::string scene_path;          // no default scene -> require --scene.
+    // ---- args: scene path (OPTIONAL -> empty editor), frame budget, dt ----------
+    std::string scene_path;          // empty -> open EMPTY; --scene seeds a load.
     int max_frames = 0;  // 0 -> run until the window closes (interactive).
     float dt = kDefaultDt;           // overridable physics timestep (--dt).
     int capture_frame = -1;          // -1 -> no swapchain readback capture.
@@ -243,57 +263,41 @@ int main(int argc, char** argv) {
         else if (a == "--capture-frame" && i + 1 < argc) capture_frame = std::atoi(argv[++i]);
         else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
         else if (a == "--help") {
-            std::printf("usage: nuka_viewer --scene <.nks> [--frames N] [--dt SECONDS] "
-                        "[--capture-frame N --capture-out FILE.ppm]\n");
+            std::printf("usage: nuka_editor [--scene <.nks>] [--frames N] [--dt SECONDS] "
+                        "[--capture-frame N --capture-out FILE.ppm]\n"
+                        "  no --scene -> opens the empty editor; load scenes from the UI\n");
             return 0;
         }
     }
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) max_frames = std::atoi(env);
-
-    if (scene_path.empty()) {
-        std::fprintf(stderr, "[nuka_viewer] no scene: pass --scene <.nks> "
-                             "(see --help)\n");
-        return 2;
-    }
     if (!(dt > 0.0f)) {
-        std::fprintf(stderr, "[nuka_viewer] invalid --dt %g (must be > 0)\n", dt);
-        return 2;
-    }
-    if (!std::filesystem::exists(scene_path)) {
-        std::fprintf(stderr, "[nuka_viewer] scene not found: %s\n", scene_path.c_str());
+        std::fprintf(stderr, "[nuka_editor] invalid --dt %g (must be > 0)\n", dt);
         return 2;
     }
 
-    // ---- 1. physics backend + cook -> nk::World + RenderWorld ------------------
+    // ---- 1. physics backend (scene-independent; no world cooked yet) -----------
     nphi::Device* dev = nphi::InitBestDevice();
-    if (!dev) { std::fprintf(stderr, "[nuka_viewer] no physics device\n"); return 3; }
+    if (!dev) { std::fprintf(stderr, "[nuka_editor] no physics device\n"); return 3; }
     nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
-    if (!backend) { std::fprintf(stderr, "[nuka_viewer] no physics backend\n"); return 3; }
+    if (!backend) { std::fprintf(stderr, "[nuka_editor] no physics backend\n"); return 3; }
 
-    const nuka::scene::SceneIR scene = LoadLightScene(scene_path);
-    cook::CookToModelResult cooked = cook::CookToModel(scene, 1);
-    render::RenderWorld render_world =
-        render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
-
-    const nk::ModelCapacities caps = cooked.model.capacities;  // copy BEFORE move.
-    nk::World world(std::move(cooked.model), 1u, dev, backend, DefaultCfg(dt));
-    if (!world.Ready()) { std::fprintf(stderr, "[nuka_viewer] world not ready\n"); return 4; }
-
-    app::HostDownloadPublisher publisher;
-    app::Simulation sim(world, publisher, std::move(render_world));
+    // The empty viewport draws this 0-instance world (DrawFrame just clears) until a
+    // scene is loaded. `loaded` holds the cooked scene; null == empty editor.
+    render::RenderWorld empty_world;
+    std::unique_ptr<viewer::EditorScene> loaded;
 
     // ---- 2. window surface + present renderer ---------------------------------
     window::SurfaceBackendKind kind = window::SurfaceBackendKind::None;
     std::unique_ptr<window::WindowSurface> surface;
     try {
-        surface = window::MakeSurface("Nuka Physics Viewer", 1280, 720, &kind);
+        surface = window::MakeSurface("Nuka Editor", 1280, 720, &kind);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[nuka_viewer] MakeSurface threw: %s\n", e.what());
+        std::fprintf(stderr, "[nuka_editor] MakeSurface threw: %s\n", e.what());
         return 5;
     }
     if (!surface || kind == window::SurfaceBackendKind::None) {
-        std::fprintf(stderr, "[nuka_viewer] no window surface (no display / no surface ext). "
-                             "Run under: xvfb-run -a -s '-screen 0 1280x720x24' nuka_viewer\n");
+        std::fprintf(stderr, "[nuka_editor] no window surface (no display / no surface ext). "
+                             "Run under: xvfb-run -a -s '-screen 0 1280x720x24' nuka_editor\n");
         return 5;
     }
 
@@ -306,60 +310,13 @@ int main(int argc, char** argv) {
     try {
         present = std::make_unique<render::PresentRenderer>(std::move(surface));
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[nuka_viewer] PresentRenderer ctor failed: %s\n", e.what());
+        std::fprintf(stderr, "[nuka_editor] PresentRenderer ctor failed: %s\n", e.what());
         return 6;
     }
     if (capture_frame >= 0) present->SetCaptureFrame(capture_frame, capture_out);
 
-    // ---- 2b. CUDA<->Vulkan interop publisher (M11 INT-8) -- zero-copy device
-    // scatter behind the PosePublisher seam, with GRACEFUL FALLBACK to
-    // HostDownloadPublisher. On this lavapipe/CPU-Vulkan box the exportable SSBO is
-    // unsupported (vkGetMemoryFdKHR absent) -> TryEnable returns false -> we keep
-    // `publisher` (HostDownloadPublisher). On a display+NVIDIA machine the SSBO
-    // exports an OPAQUE_FD, the CUDA scatter imports it, and the sim publishes the
-    // physics device state with NO D2H copy. The interop publisher + SSBO must
-    // outlive `sim` (declared at function scope).
-    render::RendererVulkanHandles vk_handles = present->VulkanHandles();
-    render::InteropTransformSsbo  interop_ssbo;
-    app::CudaVulkanInteropPublisher interop_publisher;
-    bool interop_active = false;
-    if (nphi::CudaVkScatterAvailable()) {
-        const uint32_t cap = std::max<uint32_t>(sim.GetRenderWorld().InstanceCount(), 1u);
-        if (interop_ssbo.Create(reinterpret_cast<VkDevice>(vk_handles.device),
-                                reinterpret_cast<VkPhysicalDevice>(vk_handles.physical_device),
-                                cap)) {
-            nphi::ExternalMemoryDesc mem;
-            mem.fd = interop_ssbo.TakeExportedFd();
-            mem.size_bytes = interop_ssbo.SizeBytes();
-            mem.dedicated = interop_ssbo.Dedicated();
-            interop_active = interop_publisher.TryEnable(
-                sim.GetWorld(), sim.GetRenderWorld(), mem, cap);
-        }
-    }
-    if (interop_active) {
-        // INT-F1: close the producer->consumer loop. The publisher SCATTERS the
-        // composed transforms into the SSBO; wire that SAME SSBO into the present
-        // renderer's instanced pipeline (set 1) so the draw READS the scattered
-        // device transforms by gl_InstanceIndex (true zero-copy, no per-draw
-        // world_xform). If the present renderer cannot build the instanced pipeline,
-        // it is NOT genuine zero-copy -> revert to HostDownloadPublisher so the
-        // scatter output is never silently drawn over frozen bind poses.
-        present->SetInteropTransforms(
-            reinterpret_cast<render::NkVkDescriptorSetLayout>(interop_ssbo.SetLayout()),
-            reinterpret_cast<render::NkVkDescriptorSet>(interop_ssbo.DescriptorSet()));
-        if (present->InteropDrawActive()) {
-            sim.SetPublisher(interop_publisher);  // zero-copy device scatter -> SSBO -> instanced draw
-            std::printf("[nuka_viewer] CUDA<->Vulkan interop ACTIVE "
-                        "(zero-copy transform SSBO + instanced draw)\n");
-        } else {
-            interop_active = false;
-            std::printf("[nuka_viewer] interop scatter available but the instanced draw "
-                        "pipeline did not install -> HostDownloadPublisher (no frozen draw)\n");
-        }
-    } else {
-        std::printf("[nuka_viewer] interop unavailable -> HostDownloadPublisher "
-                    "(graceful fallback; expected on lavapipe / no external-memory-fd)\n");
-    }
+    // Pose egress is each loaded scene's HostDownloadPublisher -- the general path
+    // that fits ANY instance count, so runtime scene swaps need no fixed-size wiring.
 
     // ---- 3. ImGui context bound to the present pass + the renderer pool --------
     render::RendererVulkanHandles vk = present->VulkanHandles();
@@ -378,7 +335,7 @@ int main(int argc, char** argv) {
 
     nuka::render::imgui::NukaImGuiContext imgui;
     if (!imgui.Init(info)) {
-        std::fprintf(stderr, "[nuka_viewer] ImGui init failed\n");
+        std::fprintf(stderr, "[nuka_editor] ImGui init failed\n");
         return 7;
     }
 #ifdef _WIN32
@@ -389,41 +346,54 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // ---- 4. UI + camera state -------------------------------------------------
+    // ---- 4. UI + camera state (empty editor; nothing cooked yet) --------------
     viewer::ImGuiLayer ui;
     ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
+    ui_state.scene_files = DiscoverScenes();  // the Load panel's file list
     {
-        nuka::math::Vec3 lo, hi;
-        // Publish once so the RenderWorld holds live poses before framing.
-        sim.FramePublish(nullptr, /*do_step=*/false);
-        SceneAabb(sim.GetRenderWorld(), &lo, &hi);
+        // Frame a default box so the empty viewport has a sensible camera.
+        const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
+        const nuka::math::Vec3 hi{1.0f, 1.0f, 1.0f};
         camera.FrameAabb(lo, hi);
     }
 
-    // VIEW-2: seed the GENERIC per-DOF drive-target editor from the cooked
-    // DriveTarget field for env 0 (DriveTarget is per:link -> links_per_env floats
-    // per env). The slider edits feed FieldId::DriveTarget LIVE each frame. This is
-    // a flat per-DOF editor, NOT a hardcoded choreography (OD-7).
-    if (caps.links_per_env > 0u) {
-        ui_state.drive_targets.assign(caps.links_per_env, 0.0f);
-        ui_state.drive_dirty.assign(caps.links_per_env, 0u);
-        sim.GetWorld().GetData().DownloadField(
-            nk::FieldId::DriveTarget, ui_state.drive_targets.data(),
-            static_cast<uint64_t>(caps.links_per_env) * sizeof(float), 0);
-    }
+    // The ONE runtime load: teardown the current scene (if any), cook the new one,
+    // swap it in, reframe the camera + reset model-bound UI. WaitIdle first so no
+    // in-flight frame references the world / RenderWorld being freed. A failed load
+    // leaves the editor exactly as it was.
+    auto apply_load = [&](const std::string& path) {
+        present->WaitIdle();
+        std::unique_ptr<viewer::EditorScene> next =
+            viewer::LoadEditorScene(path, dev, backend, dt);
+        if (!next) return;
+        loaded = std::move(next);  // old scene (if any) destructed here
+        loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
+        nuka::math::Vec3 lo, hi;
+        SceneAabb(loaded->sim->GetRenderWorld(), &lo, &hi);
+        camera.FrameAabb(lo, hi);
+        SeedDriveTargets(ui_state, *loaded);
+        ui_state.selected_inst = ~0u;
+        ui_state.selected_entity = ~0u;
+        ui_state.playing = false;  // open paused on the authored pose
+    };
+    auto apply_unload = [&]() {
+        present->WaitIdle();
+        loaded.reset();
+        ClearModelUi(ui_state);
+        const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
+        const nuka::math::Vec3 hi{1.0f, 1.0f, 1.0f};
+        camera.FrameAabb(lo, hi);
+    };
 
-    // VIEW-3: a viewer-owned editor SceneGraph honoring the SceneGraph::SetSelected
-    // seam. The SceneIR (`scene`) is RETAINED at function scope (its Ecs() resolves
-    // entity->node); `editor_graph` shares those nodes via the registry backref, so
-    // SetSelected(weak) tracks the picked node without copying the tree.
-    nuka::scene::SceneGraph editor_graph;
+    // --scene goes through the SAME runtime load: seed a request the loop honors
+    // once the shell is up (no startup-only cook path).
+    if (!scene_path.empty()) ui_state.load_request = scene_path;
 
-    std::printf("[nuka_viewer] backend=%s device=%s images=%u scene=%s dof=%u instances=%u\n",
+    std::printf("[nuka_editor] backend=%s device=%s images=%u  (empty editor; %zu scenes found)\n",
                 present->Report().backend_name.c_str(), present->DeviceName().c_str(),
-                present->SwapchainImageCount(), scene_path.c_str(), caps.dofs_per_env,
-                sim.GetRenderWorld().InstanceCount());
+                present->SwapchainImageCount(), ui_state.scene_files.size());
 
     // ---- the main loop --------------------------------------------------------
     using Clock = std::chrono::steady_clock;
@@ -447,6 +417,15 @@ int main(int argc, char** argv) {
     std::vector<window::WindowEvent> events;
     while (!present->ShouldClose()) {
         if (max_frames > 0 && static_cast<int>(frame_index) >= max_frames) break;
+
+        // -- honor a pending Load / Unload (UI or --scene) before anything reads the
+        // world this frame. Unload first so a request for both ends empty-then-load.
+        if (ui_state.unload_request) { apply_unload(); ui_state.unload_request = false; }
+        if (!ui_state.load_request.empty()) {
+            const std::string path = ui_state.load_request;
+            ui_state.load_request.clear();
+            apply_load(path);
+        }
 
         // -- poll + dispatch input ----------------------------------------------
         events.clear();
@@ -484,10 +463,11 @@ int main(int argc, char** argv) {
                     break;
             }
 
-            // -- VIEW-3/4: Ctrl+LMB pick + drag (only when ImGui isn't capturing
-            // the mouse and Ctrl is held -> never fights the orbit camera). --------
+            // -- VIEW-3/4: Ctrl+LMB pick + drag (only when a scene is loaded, ImGui
+            // isn't capturing the mouse, and Ctrl is held -> never fights orbit). ----
             const bool over_ui = io.WantCaptureMouse;
-            if (ctrl_down && !over_ui) {
+            if (loaded && ctrl_down && !over_ui) {
+                app::Simulation& sim = *loaded->sim;
                 if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
                     if (ev.pressed) {
                         const viewer::Ray ray = camera.ScreenRay(
@@ -503,7 +483,7 @@ int main(int argc, char** argv) {
                                 sim.GetRenderWorld().instances[hit].entity;
                             ui_state.selected_entity = e.index;
                             // VIEW-3: honor the SceneGraph editor-selection seam.
-                            editor_graph.SetSelected(scene.Ecs().NodeOf(e));
+                            loaded->editor_graph.SetSelected(loaded->scene.Ecs().NodeOf(e));
                         }
                     } else {
                         drag_inst = ~0u;  // release ends the drag
@@ -549,66 +529,75 @@ int main(int argc, char** argv) {
             fps_ema = (fps_ema == 0.0) ? inst_fps : (fps_ema * 0.9 + inst_fps * 0.1);
         }
 
-        // -- step + publish (no offscreen draw; the present path draws) ---------
+        // -- step + publish (only when a scene is loaded; the empty editor just
+        // clears + draws the shell). The present path draws either way. -----------
+        const render::RenderWorld& render_world =
+            loaded ? loaded->sim->GetRenderWorld() : empty_world;
+        double step_ms = 0.0;
         app::InputIntents intents;
-        const bool do_step = ui_state.playing || ui_state.step_requested;
-        const auto step_t0 = Clock::now();
-        last_step_healthy = sim.FramePublish(&intents, do_step);
-        const double step_ms =
-            std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
+        if (loaded) {
+            app::Simulation& sim = *loaded->sim;
+            const bool do_step = ui_state.playing || ui_state.step_requested;
+            const auto step_t0 = Clock::now();
+            last_step_healthy = sim.FramePublish(&intents, do_step);
+            step_ms = std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
 
-        // Apply queue-dispatched control intents (out-of-band producers) on top of
-        // the in-UI transport edits.
-        if (intents.toggle_play) ui_state.playing = !ui_state.playing;
-        if (intents.set_play) ui_state.playing = intents.play_value;
-        if (intents.reset) ui_state.reset_requested = true;
-        if (intents.camera_reset) ui_state.camera_reset = true;
-        if (intents.set_env) {
-            // Honor the documented PosePublisher wrap contract at the call site:
-            // clamp the requested env into [0, env_count) so an out-of-band SetEnv
-            // never selects past the world's env range (env_count==1 today -> the
-            // value is always pinned to 0).
-            const uint32_t env_count =
-                (caps.env_count > 0u) ? caps.env_count : 1u;
-            const uint32_t env = intents.env_value % env_count;
-            ui_state.env_index = env;
-            sim.SetEnvIndex(env);
+            // Apply queue-dispatched control intents (out-of-band producers) on top
+            // of the in-UI transport edits.
+            if (intents.toggle_play) ui_state.playing = !ui_state.playing;
+            if (intents.set_play) ui_state.playing = intents.play_value;
+            if (intents.reset) ui_state.reset_requested = true;
+            if (intents.camera_reset) ui_state.camera_reset = true;
+            if (intents.set_env) {
+                // Honor the PosePublisher wrap contract: clamp the requested env into
+                // [0, env_count) so an out-of-band SetEnv never reads out of range.
+                const uint32_t env_count =
+                    (loaded->caps.env_count > 0u) ? loaded->caps.env_count : 1u;
+                const uint32_t env = intents.env_value % env_count;
+                ui_state.env_index = env;
+                sim.SetEnvIndex(env);
+            }
+        } else {
+            last_step_healthy = true;  // nothing to step in the empty editor
         }
-        // VIEW-6: the in-UI Step button (ui_state.step_requested) was consumed by
-        // `do_step` this frame -> clear the one-shot edge. An OUT-OF-BAND queued
-        // StepOnce is now honored SAME-FRAME inside FramePublish (the queue is
-        // drained before the step decision), so it must NOT also be folded into the
-        // next frame (that would double-step). Just clear the transport edge.
+        // The in-UI Step button (step_requested) was consumed by `do_step` this
+        // frame -> clear the one-shot edge (a queued StepOnce is honored in-frame).
         ui_state.step_requested = false;
 
-        // Reset request: re-frame the camera (a full re-cook is viewer-policy / M11;
-        // here Reset re-frames + clears velocity-free, the cheap honest action).
+        // Reset / camera-reset re-frame the active world (the empty world frames a
+        // default box). Reset re-frames the camera, the cheap honest action.
         if (ui_state.reset_requested) {
             nuka::math::Vec3 lo, hi;
-            SceneAabb(sim.GetRenderWorld(), &lo, &hi);
+            SceneAabb(render_world, &lo, &hi);
             camera.FrameAabb(lo, hi);
             ui_state.reset_requested = false;
         }
         if (ui_state.camera_reset) {
             nuka::math::Vec3 lo, hi;
-            SceneAabb(sim.GetRenderWorld(), &lo, &hi);
+            SceneAabb(render_world, &lo, &hi);
             camera.FrameAabb(lo, hi);
             ui_state.camera_reset = false;
         }
 
-        // -- stats for the UI ---------------------------------------------------
+        // -- stats for the UI (zeroed model facts while empty) ------------------
         viewer::ViewerStats stats;
         stats.step_time_ms  = static_cast<float>(step_ms);
         stats.fps           = static_cast<float>(fps_ema);
         stats.sub_steps     = 1u;
-        stats.dof           = caps.dofs_per_env;
-        stats.links         = caps.links_per_env;
-        stats.bodies        = caps.bodies_per_env;
-        stats.contact_cap   = caps.max_contacts_per_env;
-        stats.draw_calls    = sim.GetRenderWorld().InstanceCount();
+        if (loaded) {
+            stats.dof         = loaded->caps.dofs_per_env;
+            stats.links       = loaded->caps.links_per_env;
+            stats.bodies      = loaded->caps.bodies_per_env;
+            stats.contact_cap = loaded->caps.max_contacts_per_env;
+        }
+        stats.draw_calls    = render_world.InstanceCount();
         stats.frame_index   = frame_index;
         stats.step_healthy  = last_step_healthy;
         stats.device_name   = present->DeviceName();
+
+        // Surface the load state to the UI (panels read "no scene" gracefully).
+        ui_state.has_scene   = static_cast<bool>(loaded);
+        ui_state.loaded_path = loaded ? loaded->path : std::string();
 
         // -- ImGui frame: set display size/dt, record panels, render draw data --
         io.DisplaySize = ImVec2(static_cast<float>(present->Report().width),
@@ -619,7 +608,7 @@ int main(int argc, char** argv) {
         if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
 #endif
         imgui.NewFrame();
-        ui.RecordUi(sim.GetRenderWorld(), stats, camera, ui_state);
+        ui.RecordUi(render_world, stats, camera, ui_state);
 
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
         // owning the keyboard so typing in a panel never moves the view.
@@ -643,16 +632,16 @@ int main(int argc, char** argv) {
         // Data (FieldId::DriveTarget, env-major: env*links_per_env + dof). Per-DOF
         // upload of ONLY the changed rows; the general write path (UploadField),
         // never a choreography table. R13: runtime Data only, never the .nks.
-        if (caps.links_per_env > 0u &&
+        if (loaded && loaded->caps.links_per_env > 0u &&
             ui_state.drive_dirty.size() == ui_state.drive_targets.size()) {
-            const uint32_t per_env = caps.links_per_env;
+            const uint32_t per_env = loaded->caps.links_per_env;
             const uint32_t env =
-                (caps.env_count > 0u) ? (ui_state.env_index % caps.env_count) : 0u;
+                (loaded->caps.env_count > 0u) ? (ui_state.env_index % loaded->caps.env_count) : 0u;
             for (uint32_t d = 0; d < ui_state.drive_targets.size(); ++d) {
                 if (!ui_state.drive_dirty[d]) continue;
                 const uint64_t at =
                     (static_cast<uint64_t>(env) * per_env + d) * sizeof(float);
-                sim.GetWorld().GetData().UploadField(
+                loaded->sim->GetWorld().GetData().UploadField(
                     nk::FieldId::DriveTarget, &ui_state.drive_targets[d],
                     sizeof(float), at);
                 ui_state.drive_dirty[d] = 0u;
@@ -666,11 +655,11 @@ int main(int argc, char** argv) {
         camera.WriteOptions(opts);
 
         render::PresentFrameResult r = present->DrawFrame(
-            sim.GetRenderWorld(), opts,
+            render_world, opts,
             [&imgui](void* cmd) { imgui.RenderDrawData(
                 reinterpret_cast<NukaVkCommandBuffer>(cmd)); });
         if (r == render::PresentFrameResult::Error) {
-            std::fprintf(stderr, "[nuka_viewer] present error at frame %llu\n",
+            std::fprintf(stderr, "[nuka_editor] present error at frame %llu\n",
                          static_cast<unsigned long long>(frame_index));
             break;
         }
@@ -697,7 +686,11 @@ int main(int argc, char** argv) {
 #endif
     imgui.Shutdown();
 
-    std::printf("[nuka_viewer] done: frames=%llu presented=%d last_step_healthy=%s\n",
+    // Tear the loaded world down while the present renderer + backend are still
+    // alive (no in-flight frame after WaitIdle).
+    loaded.reset();
+
+    std::printf("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
                 static_cast<unsigned long long>(frame_index), presented,
                 last_step_healthy ? "yes" : "no");
     return 0;
