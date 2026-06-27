@@ -92,6 +92,25 @@ bool CameraController::HandleEvent(const window::WindowEvent& ev, bool allow_dra
     }
 }
 
+void CameraController::Move(float forward, float right_in, float up, float dt) {
+    if (dt <= 0.0f) return;
+    // Horizon-projected view forward + horizontal right (z=0) so WASD walks the
+    // ground plane; Q/E rides world up. Move target_; eye follows rigidly.
+    const math::Vec3 eye = ResolvedEye();
+    math::Vec3 fwd = target_ - eye;
+    fwd.z = 0.0f;
+    if (fwd.LengthSq() < 1e-8f) fwd = math::Vec3{-std::cos(yaw_), -std::sin(yaw_), 0.0f};
+    fwd = fwd.Normalized();
+    const math::Vec3 world_up{0.0f, 0.0f, 1.0f};
+    math::Vec3 right = fwd.Cross(world_up);
+    if (right.LengthSq() < 1e-8f) right = math::Vec3{1.0f, 0.0f, 0.0f};
+    right = right.Normalized();
+    const float step = move_speed * std::max(distance_, 0.5f) * dt;
+    target_ += fwd * (forward * step);
+    target_ += right * (right_in * step);
+    target_ += world_up * (up * step);
+}
+
 math::Vec3 CameraController::ResolvedEye() const {
     // Spherical -> cartesian about +Z up. pitch elevates above the XY horizon.
     const float cp = std::cos(pitch_);

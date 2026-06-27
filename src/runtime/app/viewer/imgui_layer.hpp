@@ -55,7 +55,7 @@ class CameraController;
 // (no time input) is what makes the GATE-B composite deterministic.
 // ---------------------------------------------------------------------------
 struct ViewerUiState {
-    bool     playing       = true;    // sim advancing vs paused
+    bool     playing       = false;   // open PAUSED on the authored pose; Play/Step advances
     float    speed         = 1.0f;    // x0.25 .. x4 multiplier
     uint32_t env_index     = 0u;      // selected env (D4)
     uint32_t selected_inst = ~0u;     // scene-tree selection (highlight only)
