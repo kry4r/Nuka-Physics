@@ -127,6 +127,50 @@ void PrintRow(const char* tag, int ctrl, const ZStats& s) {
     std::fflush(stdout);
 }
 
+// Host-oracle vs GPU-resident parity: run ONE control step with each controller on
+// the SAME initial world state and compare the DriveTarget they write. Neither steps
+// physics, so the obs source fields are unchanged between the two evaluations -- the
+// delta isolates obs-assembly + MLP + drive-write GPU-vs-host. Gate < 1e-4.
+int RunGpuParity(viewer::EditorScene& es, nphi::Backend* backend,
+                 const std::string& policy, float vx, float vy, float vw) {
+    const uint32_t L = es.caps.links_per_env;
+    const uint32_t dogs = es.caps.articulations_per_env;
+    inf::Go2PolicyController host_ctrl, gpu_ctrl;
+    if (!host_ctrl.Init(policy, L, dogs, es.terrain) ||
+        !gpu_ctrl.Init(policy, L, dogs, es.terrain)) {
+        std::fprintf(stderr, "[parity] controller init failed\n");
+        return 6;
+    }
+    host_ctrl.SetUseGpu(false);
+    if (!gpu_ctrl.UsingGpu()) {
+        std::fprintf(stderr, "[parity] GPU path unavailable\n");
+        return 6;
+    }
+    host_ctrl.SetCommand(vx, vy, vw);
+    gpu_ctrl.SetCommand(vx, vy, vw);
+
+    std::vector<float> a(L, 0.0f), b(L, 0.0f);
+    host_ctrl.OnStep(*es.world, 0);
+    nphi::BackendSynchronize(backend);
+    es.world->GetData().DownloadField(nuka::nk::FieldId::DriveTarget, a.data(), L * 4u, 0);
+    gpu_ctrl.OnStep(*es.world, 0);
+    nphi::BackendSynchronize(backend);
+    es.world->GetData().DownloadField(nuka::nk::FieldId::DriveTarget, b.data(), L * 4u, 0);
+
+    double maxd = 0.0;
+    uint32_t worst = 0;
+    for (uint32_t i = 0; i < L; ++i) {
+        const double d = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+        if (d > maxd) { maxd = d; worst = i; }
+    }
+    std::printf("[parity] host-vs-GPU DriveTarget: dogs=%u links/env=%u  "
+                "max|delta|=%.3e @slot %u (host=%.6f gpu=%.6f)\n",
+                dogs, L, maxd, worst, a[worst], b[worst]);
+    const bool pass = maxd < 1.0e-4;
+    std::printf("[parity] RESULT: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -135,6 +179,7 @@ int main(int argc, char** argv) {
     float dt = 0.005f, cmd_vx = 1.0f, cmd_vy = 0.0f, cmd_w = 0.0f;
     int control_steps = 400;
     bool hold = false;  // policy-free PD hold diagnostic
+    bool validate_gpu = false;  // host-oracle vs GPU-resident DriveTarget parity
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene = argv[++i];
@@ -142,6 +187,7 @@ int main(int argc, char** argv) {
         else if (a == "--dt" && i + 1 < argc) dt = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--control-steps" && i + 1 < argc) control_steps = std::atoi(argv[++i]);
         else if (a == "--hold") hold = true;
+        else if (a == "--validate-gpu") validate_gpu = true;
         else if (a == "--command" && i + 3 < argc) {
             cmd_vx = static_cast<float>(std::atof(argv[++i]));
             cmd_vy = static_cast<float>(std::atof(argv[++i]));
@@ -171,6 +217,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "go2_play_smoke: terrain not retained (height-scan impossible)\n");
         return 5;
     }
+
+    if (validate_gpu) return RunGpuParity(*es, backend, policy, cmd_vx, cmd_vy, cmd_w);
 
     inf::Go2PolicyController ctrl;
     PdHold hold_ctrl(es->caps.links_per_env, es->caps.articulations_per_env);

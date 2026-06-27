@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 #include "runtime/app/scene_controller.hpp"
+#include "runtime/inference/gpu_policy.hpp"
 #include "runtime/inference/mlp_policy.hpp"
 #include "scene/terrain/heightfield.hpp"
 
@@ -41,6 +42,7 @@ public:
         float scan_x_min = -0.8f, scan_x_max = 0.8f;
         float scan_y_min = -0.5f, scan_y_max = 0.5f;
         float scan_res = 0.1f, scan_scale = 5.0f, scan_clip = 1.0f;
+        float scan_z_offset = 0.5f;  // measured-height reference: base_z - offset - surf
         std::array<float, 3> command{1.0f, 0.0f, 0.0f};  // [vx, vy, wyaw] (forward walk)
         uint32_t decimation = 4u;
         float kp = 20.0f, kd = 0.5f;
@@ -58,7 +60,16 @@ public:
         return Init(policy_path, links_per_env, articulations_per_env, terrain, Config{});
     }
     bool Ready() const { return ready_; }
-    void SetCommand(float vx, float vy, float wyaw) { cfg_.command = {vx, vy, wyaw}; }
+    void SetCommand(float vx, float vy, float wyaw) {
+        cfg_.command = {vx, vy, wyaw};
+        gpu_.SetCommand(vx, vy, wyaw);
+    }
+
+    // Production drives the GPU-resident path (zero host round-trip); the host MLP
+    // stays the numeric ORACLE. SetUseGpu(false) forces the host path (validation
+    // A/B + the no-CUDA fallback). UsingGpu() reports the resolved choice.
+    void SetUseGpu(bool on) { use_gpu_ = on && gpu_.Ready(); }
+    bool UsingGpu() const { return use_gpu_; }
 
     void OnStep(nk::World& world, uint32_t env_index) override;
 
@@ -67,9 +78,10 @@ private:
     void BuildObs(uint32_t dog, float* obs) const;
 
     MlpPolicy policy_;
+    Go2GpuPolicy gpu_;
     Config cfg_;
     ::nuka::terrain::HeightField terrain_;
-    bool ready_ = false, gains_applied_ = false;
+    bool ready_ = false, gains_applied_ = false, use_gpu_ = false;
     uint32_t links_per_env_ = 0, num_dogs_ = 0, links_per_dog_ = 0;
     uint32_t scan_nx_ = 0, scan_ny_ = 0, scan_n_ = 0;
     uint64_t step_ = 0;

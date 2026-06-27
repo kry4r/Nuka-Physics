@@ -829,17 +829,31 @@ if(CMAKE_CUDA_COMPILER)
     nuka_set_warnings(nuka_policy_mlp)
 
     # -------------------------------------------------------------------------
+    # nuka_inference_gpu — the device-resident policy: general batched MLP kernels
+    # + the Go2 obs-assembly / drive-write kernels (runtime/inference/gpu_policy.cu).
+    # A control step reads the device fields directly and stays on the world backend
+    # main stream, so it issues NO host round-trip. Links nuka_phi2 for the opaque-
+    # backend main-stream accessor (the interop-scatter precedent).
+    # -------------------------------------------------------------------------
+    add_library(nuka_inference_gpu STATIC
+        runtime/inference/gpu_policy.cu
+    )
+    set_target_properties(nuka_inference_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nuka_inference_gpu PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_inference_gpu PUBLIC nuka_phi2 CUDA::cudart)
+
+    # -------------------------------------------------------------------------
     # nuka_inference — scene controllers built on the policy runner. Go2Policy-
     # Controller reads world state via the Data seam, builds the height-scan obs,
-    # runs the MLP, and writes PD drive targets. Links the policy runner + nk
-    # (World/Data/FieldId); the terrain sampler is header-only.
+    # runs the MLP, and writes PD drive targets. Production drives the GPU-resident
+    # path (nuka_inference_gpu); the host MLP stays the numeric oracle.
     # -------------------------------------------------------------------------
     add_library(nuka_inference STATIC
         runtime/inference/go2_policy_controller.cpp
     )
     set_target_properties(nuka_inference PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_inference PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_inference PUBLIC nuka_policy_mlp nuka_nk)
+    target_link_libraries(nuka_inference PUBLIC nuka_policy_mlp nuka_nk nuka_inference_gpu)
     nuka_set_warnings(nuka_inference)
 
     # -------------------------------------------------------------------------
@@ -1592,4 +1606,21 @@ if(CMAKE_CUDA_COMPILER)
             nuka_policy_mlp
     )
     nuka_set_warnings(nuka_mlp_policy_validate)
+
+    # nuka_gpu_mlp_policy_validate -- the GPU-vs-host (and GPU-vs-torch) inference
+    # parity harness: same weights into the host oracle + device GpuMlp, assert
+    # max|GPU - host| < 1e-4.
+    add_executable(nuka_gpu_mlp_policy_validate
+        ${CMAKE_SOURCE_DIR}/tools/inference/gpu_mlp_policy_validate.cpp
+    )
+    target_include_directories(nuka_gpu_mlp_policy_validate
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_gpu_mlp_policy_validate
+        PRIVATE
+            nuka_policy_mlp
+            nuka_inference_gpu
+    )
+    nuka_set_warnings(nuka_gpu_mlp_policy_validate)
 endif()

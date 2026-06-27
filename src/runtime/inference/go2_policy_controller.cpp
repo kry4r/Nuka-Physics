@@ -73,6 +73,46 @@ bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_pe
     obs_.resize(policy_.ObsDim());
     mu_.resize(policy_.ActDim());
     last_action_.assign(static_cast<size_t>(num_dogs_) * kJoints, 0.0f);
+
+    // Stand up the GPU-resident policy from the SAME weights + contract; production
+    // drives it, the host MLP above remains the validation oracle. A GPU init
+    // failure degrades to the host path (use_gpu_ stays false).
+    Go2GpuContract gc;
+    for (uint32_t u = 0; u < kJoints; ++u) {
+        gc.default_angles[u] = cfg_.default_angles[u];
+        gc.slot_of_urdf[u] = cfg_.slot_of_urdf[u];
+        gc.force_limit[u] = cfg_.force_limit[u];
+    }
+    gc.lin_vel_scale = cfg_.lin_vel_scale;
+    gc.ang_vel_scale = cfg_.ang_vel_scale;
+    gc.dof_pos_scale = cfg_.dof_pos_scale;
+    gc.dof_vel_scale = cfg_.dof_vel_scale;
+    gc.cmd_scale[0] = cfg_.cmd_scale[0];
+    gc.cmd_scale[1] = cfg_.cmd_scale[1];
+    gc.cmd_scale[2] = cfg_.cmd_scale[2];
+    gc.command[0] = cfg_.command[0];
+    gc.command[1] = cfg_.command[1];
+    gc.command[2] = cfg_.command[2];
+    gc.action_scale = cfg_.action_scale;
+    gc.obs_clip = cfg_.obs_clip;
+    gc.action_clip = cfg_.action_clip;
+    gc.scan_x_min = cfg_.scan_x_min;
+    gc.scan_y_min = cfg_.scan_y_min;
+    gc.scan_res = cfg_.scan_res;
+    gc.scan_scale = cfg_.scan_scale;
+    gc.scan_clip = cfg_.scan_clip;
+    gc.scan_z_offset = cfg_.scan_z_offset;
+    gc.kp = cfg_.kp;
+    gc.kd = cfg_.kd;
+    gc.njoints = kJoints;
+    gc.proprio_dim = kProprio;
+    gc.scan_nx = scan_nx_;
+    gc.scan_ny = scan_ny_;
+    use_gpu_ = gpu_.Init(policy_, gc, terrain_, links_per_env_, num_dogs_,
+                         links_per_dog_);
+    if (!use_gpu_) {
+        std::fprintf(stderr, "[go2_policy] GPU policy init failed; host fallback\n");
+    }
     ready_ = true;
     return true;
 }
@@ -152,8 +192,9 @@ void Go2PolicyController::BuildObs(uint32_t dog, float* obs) const {
             const float wx = bx + (px * cy - py * sy);
             const float wy = by + (px * sy + py * cy);
             const float surf = ::nuka::terrain::SampleHeightFieldZ(terrain_, wx, wy);
-            const float val = Clampf(bz - 0.5f - surf, -cfg_.scan_clip, cfg_.scan_clip) *
-                              cfg_.scan_scale;
+            const float val =
+                Clampf(bz - cfg_.scan_z_offset - surf, -cfg_.scan_clip, cfg_.scan_clip) *
+                cfg_.scan_scale;
             obs[kProprio + ix * scan_ny_ + iy] = val;
         }
     }
@@ -161,6 +202,30 @@ void Go2PolicyController::BuildObs(uint32_t dog, float* obs) const {
 
 void Go2PolicyController::OnStep(nk::World& world, uint32_t env_index) {
     if (!ready_) return;
+
+    // GPU-resident path: obs-assembly -> MLP -> drive-write run entirely on the
+    // world backend's main stream (it reads the device fields directly), so a
+    // control step issues NO device<->host copy. void* keeps this TU CUDA-free.
+    if (use_gpu_) {
+        void* backend = static_cast<void*>(world.Backend());
+        if (!gains_applied_) {
+            gpu_.ApplyGains(backend,
+                            world.FieldPtr<float>(nk::FieldId::DriveStiffness),
+                            world.FieldPtr<float>(nk::FieldId::DriveDamping),
+                            world.FieldPtr<float>(nk::FieldId::DriveForceLimit),
+                            env_index);
+            gains_applied_ = true;
+        }
+        if ((step_++ % cfg_.decimation) != 0u) return;
+        gpu_.Step(backend, world.FieldPtr<float>(nk::FieldId::LinkPose),
+                  world.FieldPtr<float>(nk::FieldId::LinkVelocity),
+                  world.FieldPtr<float>(nk::FieldId::Q),
+                  world.FieldPtr<float>(nk::FieldId::Qdot),
+                  world.FieldPtr<float>(nk::FieldId::BasePose),
+                  world.FieldPtr<float>(nk::FieldId::DriveTarget), env_index);
+        return;
+    }
+
     if (!gains_applied_) {
         ApplyGains(world, env_index);
         gains_applied_ = true;
