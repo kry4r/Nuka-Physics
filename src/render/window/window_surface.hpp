@@ -90,6 +90,11 @@ public:
     virtual uint32_t        Height() const = 0;
     virtual const char*     BackendName() const = 0;
 
+    // The native platform window handle (GLFWwindow* on the GLFW backend) so a
+    // caller can bind a platform ImGui backend (imgui_impl_glfw). nullptr when the
+    // backend has no such handle (xcb / headless), which keep self-fed input.
+    virtual void* NativeWindowHandle() const { return nullptr; }
+
     // The instance extensions THIS backend needs enabled on the VkInstance for
     // CreateSurface to succeed (e.g. {"VK_KHR_surface","VK_KHR_xcb_surface"}).
     // The caller enables these on its instance before CreateSurface. Static-ish:
@@ -104,6 +109,7 @@ enum class SurfaceBackendKind : uint8_t {
     None,       // no backend could be created (no display / no surface ext)
     Xcb,        // self-written xcb window (the live path here, under Xvfb)
     Headless,   // VK_EXT_headless_surface (modern loader / CI only)
+    Glfw,       // GLFW window + VkSurfaceKHR (the Windows present path)
 };
 
 // ---------------------------------------------------------------------------
