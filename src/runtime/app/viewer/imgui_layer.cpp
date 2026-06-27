@@ -114,15 +114,19 @@ static void BuildDefaultDockLayout(ImGuiID dockspace_id) {
     ImGuiID central = dockspace_id;
     ImGuiID left  = ImGui::DockBuilderSplitNode(central, ImGuiDir_Left, 0.24f, nullptr, &central);
     ImGuiID right = ImGui::DockBuilderSplitNode(central, ImGuiDir_Right, 0.26f, nullptr, &central);
-    ImGuiID left_bottom = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.55f, nullptr, &left);
+    // The left column is three stacked nodes: Load (top), Stats (middle), Scene
+    // (bottom) -- the Load panel leads so an empty editor still offers it first.
+    ImGuiID left_mid    = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.68f, nullptr, &left);
+    ImGuiID left_bottom = ImGui::DockBuilderSplitNode(left_mid, ImGuiDir_Down, 0.5f, nullptr, &left_mid);
 
     ImGuiID right_bottom =
         ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.55f, nullptr, &right);
 
-    ImGui::DockBuilderDockWindow("Stats", left);
+    ImGui::DockBuilderDockWindow("Load", left);
+    ImGui::DockBuilderDockWindow("Stats", left_mid);
     ImGui::DockBuilderDockWindow("Scene", left_bottom);
     ImGui::DockBuilderDockWindow("Camera", right);
-    // VIEW-2/3: the Drive editor + the Entity inspector share the lower-right node.
+    // The Drive editor + the Entity inspector share the lower-right node.
     ImGui::DockBuilderDockWindow("Drive", right_bottom);
     ImGui::DockBuilderDockWindow("Entity", right_bottom);
     ImGui::DockBuilderFinish(dockspace_id);
@@ -161,11 +165,14 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                  ImGuiWindowFlags_NoMove;
         if (ImGui::Begin("##transport", nullptr, flags)) {
             PushHeadingFont();
-            ImGui::TextColored(kAccent, "NUKA");
+            ImGui::TextColored(kAccent, "NUKA EDITOR");
             PopFont();
             ImGui::SameLine();
-            ImGui::TextColored(kTextDim, "| physics viewport");
+            ImGui::TextColored(kTextDim, ui_state.has_scene ? "| live" : "| no scene");
             ImGui::SameLine(0.0f, 18.0f);
+
+            // Transport drives the live world; disabled until a scene is loaded.
+            if (!ui_state.has_scene) ImGui::BeginDisabled();
 
             // Play / Pause -- accent-FILLED when active (the showcase accent use).
             if (ui_state.playing) {
@@ -185,6 +192,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::SameLine();
             if (ImGui::Button("Reset")) ui_state.reset_requested = true;
 
+            if (!ui_state.has_scene) ImGui::EndDisabled();
+
             ImGui::SameLine(0.0f, 18.0f);
             ImGui::TextColored(kTextDim, "speed");
             ImGui::SameLine();
@@ -203,6 +212,49 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         }
         ImGui::End();
     }
+
+    // ======================================================================
+    // LOAD PANEL -- the editor's runtime scene loader. Lists the discovered .nks
+    // (examples/scenes + out) and a free path field; a click or the Load button
+    // sets load_request, which the viewer feeds to the SAME LoadEditorScene path
+    // the --scene flag uses. Unload drops back to the empty editor.
+    // ======================================================================
+    if (ImGui::Begin("Load")) {
+        SectionHeader("Scene");
+        if (ui_state.has_scene) {
+            ImGui::TextColored(kTextDim, "loaded");
+            ImGui::TextColored(kAccent, "%s", ui_state.loaded_path.c_str());
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            if (ImGui::Button("Unload", ImVec2(-1.0f, 0.0f))) ui_state.unload_request = true;
+        } else {
+            ImGui::TextColored(kTextDim, "no scene loaded");
+            ImGui::TextColored(kTextDim, "pick a scene below");
+        }
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        SectionHeader("Available");
+        if (ui_state.scene_files.empty()) {
+            ImGui::TextColored(kTextDim, "no .nks found");
+        } else {
+            for (const std::string& f : ui_state.scene_files) {
+                const bool sel = (ui_state.loaded_path == f);
+                if (ImGui::Selectable(f.c_str(), sel)) {
+                    std::snprintf(ui_state.load_path, sizeof(ui_state.load_path), "%s",
+                                  f.c_str());
+                    ui_state.load_request = f;
+                }
+            }
+        }
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::TextColored(kTextDim, "path");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##loadpath", ui_state.load_path, sizeof(ui_state.load_path));
+        if (ImGui::Button("Load", ImVec2(-1.0f, 0.0f)) && ui_state.load_path[0] != '\0') {
+            ui_state.load_request = ui_state.load_path;
+        }
+    }
+    ImGui::End();
 
     // ======================================================================
     // STATS PANEL -- hero step-time + tidy labeled rows + a LIVE/IDLE badge.

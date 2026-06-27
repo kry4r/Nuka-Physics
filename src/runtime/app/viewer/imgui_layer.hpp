@@ -82,6 +82,21 @@ struct ViewerUiState {
     bool step_requested  = false;
     bool reset_requested = false;
     bool camera_reset    = false;
+
+    // ---- editor Load state (empty-start + runtime load) --------------------
+    // The editor opens with NO scene. `has_scene`/`loaded_path` are set by the
+    // viewer each frame so the Load panel + the model panels know whether a world
+    // is cooked (panels read "no scene" gracefully when false). `scene_files` is the
+    // viewer's one-time scan of examples/scenes + out for .nks; the Load panel lists
+    // them. A click (or the Load button over `load_path`) sets `load_request` (a
+    // one-shot path the viewer consumes through the SAME LoadEditorScene path the
+    // --scene flag uses); `unload_request` tears the current scene back to empty.
+    bool                     has_scene      = false;   // viewer-set: a world is cooked
+    std::string              loaded_path;              // viewer-set: shown in the panel
+    std::vector<std::string> scene_files;              // viewer-filled discovered .nks
+    char                     load_path[512] = {0};     // editable path field
+    std::string              load_request;             // one-shot: path to load
+    bool                     unload_request = false;   // one-shot: drop to empty
 };
 
 // ---------------------------------------------------------------------------
