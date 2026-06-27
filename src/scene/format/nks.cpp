@@ -590,6 +590,36 @@ Value SaveMedia(const MediaRecord& m) {
     return o;
 }
 
+// A terrain field. Every parametric amplitude is written verbatim so any
+// TerrainRecord round-trips field-for-field (the engine has no terrain types).
+Value SaveTerrain(const TerrainRecord& t) {
+    Value o = Value::Object();
+    o.Set("name", Value::Str(t.name));
+    o.Set("nrow", Value::Int(t.nrow));
+    o.Set("ncol", Value::Int(t.ncol));
+    o.Set("cell", Value::Float(t.cell));
+    o.Set("origin", Vec3Json(t.origin));
+    o.Set("base_z", Value::Float(t.base_z));
+    o.Set("grade_x", Value::Float(t.grade_x));
+    o.Set("grade_y", Value::Float(t.grade_y));
+    o.Set("ring_rise", Value::Float(t.ring_rise));
+    o.Set("ring_width", Value::Float(t.ring_width));
+    o.Set("ring_platform", Value::Float(t.ring_platform));
+    o.Set("ring_count", Value::Int(t.ring_count));
+    o.Set("bump_height", Value::Float(t.bump_height));
+    o.Set("bump_cell", Value::Float(t.bump_cell));
+    o.Set("feature_cell", Value::Float(t.feature_cell));
+    o.Set("feature_margin", Value::Float(t.feature_margin));
+    o.Set("feature_seed", Value::Int(t.feature_seed));
+    o.Set("curric_levels", Value::Int(t.curric_levels));
+    o.Set("curric_types", Value::Int(t.curric_types));
+    o.Set("image_path", Value::Str(t.image_path));
+    o.Set("image_radius_x", Value::Float(t.image_radius_x));
+    o.Set("image_radius_y", Value::Float(t.image_radius_y));
+    o.Set("image_elevation_z", Value::Float(t.image_elevation_z));
+    return o;
+}
+
 // Cameras / lights serialize from their ECS COMPONENT inline on their own tree
 // node (see SaveNode): the component is a 1:1 projection of the record, the node
 // carries the name, and the attached body is the parent body node — so there is
@@ -906,6 +936,14 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         Value media = Value::Array();
         for (const MediaRecord& m : scene.Media()) media.PushBack(SaveMedia(m));
         root.Set("media", std::move(media));
+    }
+
+    // -- terrain (parametric heightfield field) -----------------------------
+    // Emitted only when present so a terrain-free scene's bytes are unchanged.
+    if (!scene.Terrain().empty()) {
+        Value terrain = Value::Array();
+        for (const TerrainRecord& t : scene.Terrain()) terrain.PushBack(SaveTerrain(t));
+        root.Set("terrain", std::move(terrain));
     }
 
     // -- M7 metadata: initial_state / settle (only when present) ------------
@@ -1426,6 +1464,45 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     rec.render_skin.skin_mesh = AssetRefFromJson(*sm);
             }
             scene.AddMedia(std::move(rec));
+        }
+    }
+
+    // -- terrain (parametric heightfield field) -----------------------------
+    // Each read keeps the record's struct default when absent (hand-authorable).
+    if (const Value* terrain = root.Find("terrain")) {
+        auto f = [](const Value& o, const char* k, float d) {
+            const Value* v = o.Find(k); return v ? v->AsFloat() : d; };
+        auto u = [](const Value& o, const char* k, uint32_t d) {
+            const Value* v = o.Find(k);
+            return v ? static_cast<uint32_t>(v->AsInt()) : d; };
+        auto v3 = [](const Value& o, const char* k, math::Vec3 d) {
+            const Value* v = o.Find(k); return v ? Vec3FromJson(*v) : d; };
+        for (const Value& tv : terrain->Elements()) {
+            TerrainRecord rec;
+            if (const Value* nm = tv.Find("name")) rec.name = nm->AsString();
+            rec.nrow = u(tv, "nrow", rec.nrow);
+            rec.ncol = u(tv, "ncol", rec.ncol);
+            rec.cell = f(tv, "cell", rec.cell);
+            rec.origin = v3(tv, "origin", rec.origin);
+            rec.base_z = f(tv, "base_z", rec.base_z);
+            rec.grade_x = f(tv, "grade_x", rec.grade_x);
+            rec.grade_y = f(tv, "grade_y", rec.grade_y);
+            rec.ring_rise = f(tv, "ring_rise", rec.ring_rise);
+            rec.ring_width = f(tv, "ring_width", rec.ring_width);
+            rec.ring_platform = f(tv, "ring_platform", rec.ring_platform);
+            rec.ring_count = u(tv, "ring_count", rec.ring_count);
+            rec.bump_height = f(tv, "bump_height", rec.bump_height);
+            rec.bump_cell = f(tv, "bump_cell", rec.bump_cell);
+            rec.feature_cell = f(tv, "feature_cell", rec.feature_cell);
+            rec.feature_margin = f(tv, "feature_margin", rec.feature_margin);
+            rec.feature_seed = u(tv, "feature_seed", rec.feature_seed);
+            rec.curric_levels = u(tv, "curric_levels", rec.curric_levels);
+            rec.curric_types = u(tv, "curric_types", rec.curric_types);
+            if (const Value* ip = tv.Find("image_path")) rec.image_path = ip->AsString();
+            rec.image_radius_x = f(tv, "image_radius_x", rec.image_radius_x);
+            rec.image_radius_y = f(tv, "image_radius_y", rec.image_radius_y);
+            rec.image_elevation_z = f(tv, "image_elevation_z", rec.image_elevation_z);
+            scene.AddTerrain(std::move(rec));
         }
     }
 

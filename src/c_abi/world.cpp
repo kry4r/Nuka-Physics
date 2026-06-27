@@ -410,26 +410,10 @@ nuka_result_t ApplyControlTerrainGravity(
                 return NUKA_RESULT_INVALID_ARG;
             }
         }
-        nuka::scene::cook::CookHeightfieldGrid(m, *out_terrain);
-
-        nuka::nk::ModelCapacities& cap = m.capacities;
-        // bodies_per_env (the LBVH leaf count) includes every static terrain
-        // collidable; the CONTACT budget is driven by the DYNAMIC collidables (+1 for
-        // the static ground) at 4 candidate slots each -- the SAME rule the cook uses.
-        cap.bodies_per_env = static_cast<uint32_t>(m.body_init.size());
-        cap.max_bodies_total = static_cast<uint32_t>(m.shape_table_rows.size());
-        constexpr uint32_t kCandidatePairsPerCollidable = 4u;
-        constexpr uint32_t kStaticCollidables = 1u;
-        const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
-        const uint32_t rigid_base =
-            dynamic_collidables * kCandidatePairsPerCollidable;
-        cap.max_contacts_per_env = rigid_base;
-        cap.max_rows_per_env =
-            cap.max_contacts_per_env * nuka::nk::kPairDrivenRowsPerSlot;
-        // A coupled world (terrain AND particles) keeps the body<->particle slot
-        // reserve disjoint above the just-recomputed rigid base -- the SAME additive
-        // rule the cook uses. No-op when particles_per_env == 0.
-        nuka::scene::cook::GrowContactBudgetForParticles(cap, rigid_base);
+        // Bake the field + recompute the budget through the ONE shared helper the
+        // editor cook (from a SceneIR TerrainRecord) also calls -- terrain enters the
+        // model through identical code regardless of the authoring source.
+        nuka::scene::cook::CookTerrainIntoModel(m, *out_terrain, orig_bodies);
     }
 
     // Resolve world gravity (Z-up). A zero-initialized desc substitutes the shared
