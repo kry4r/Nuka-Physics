@@ -16,6 +16,7 @@
 #include "runtime/inference/go2_policy_controller.hpp"
 #include "scene/terrain/heightfield_sample.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -171,6 +172,53 @@ int RunGpuParity(viewer::EditorScene& es, nphi::Backend* backend,
     return pass ? 0 : 1;
 }
 
+// Per-control-step policy cost on this device: host OnStep (the D2H + host MLP + H2D
+// round-trip) vs GPU OnStep (kernels enqueued on the backend stream). decimation=1 so
+// every call computes. The host loop self-synchronizes (DownloadField); the GPU loop
+// is enqueue + one final sync (the cost the host frame thread actually pays).
+int RunPolicyBench(viewer::EditorScene& es, nphi::Backend* backend,
+                   const std::string& policy) {
+    using Clock = std::chrono::steady_clock;
+    const uint32_t L = es.caps.links_per_env;
+    const uint32_t dogs = es.caps.articulations_per_env;
+    inf::Go2PolicyController::Config cfg;
+    cfg.decimation = 1u;
+    inf::Go2PolicyController host_ctrl, gpu_ctrl;
+    if (!host_ctrl.Init(policy, L, dogs, es.terrain, cfg) ||
+        !gpu_ctrl.Init(policy, L, dogs, es.terrain, cfg)) {
+        std::fprintf(stderr, "[bench] controller init failed\n");
+        return 6;
+    }
+    host_ctrl.SetUseGpu(false);
+    if (!gpu_ctrl.UsingGpu()) {
+        std::fprintf(stderr, "[bench] GPU path unavailable\n");
+        return 6;
+    }
+    const int N = 100;
+    host_ctrl.OnStep(*es.world, 0);
+    gpu_ctrl.OnStep(*es.world, 0);
+    nphi::BackendSynchronize(backend);
+
+    auto t0 = Clock::now();
+    for (int i = 0; i < N; ++i) host_ctrl.OnStep(*es.world, 0);
+    nphi::BackendSynchronize(backend);
+    const double host_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / N;
+
+    auto g0 = Clock::now();
+    for (int i = 0; i < N; ++i) gpu_ctrl.OnStep(*es.world, 0);
+    nphi::BackendSynchronize(backend);
+    const double gpu_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - g0).count() / N;
+
+    std::printf("[bench] per-control-step policy cost (dogs=%u, decimation=1):\n", dogs);
+    std::printf("[bench]   HOST round-trip : %.3f ms/step\n", host_ms);
+    std::printf("[bench]   GPU  enqueue    : %.3f ms/step\n", gpu_ms);
+    std::printf("[bench]   speedup         : %.1fx\n",
+                gpu_ms > 0.0 ? host_ms / gpu_ms : 0.0);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -180,6 +228,7 @@ int main(int argc, char** argv) {
     int control_steps = 400;
     bool hold = false;  // policy-free PD hold diagnostic
     bool validate_gpu = false;  // host-oracle vs GPU-resident DriveTarget parity
+    bool bench_policy = false;   // time host round-trip vs GPU enqueue per control step
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene = argv[++i];
@@ -188,6 +237,7 @@ int main(int argc, char** argv) {
         else if (a == "--control-steps" && i + 1 < argc) control_steps = std::atoi(argv[++i]);
         else if (a == "--hold") hold = true;
         else if (a == "--validate-gpu") validate_gpu = true;
+        else if (a == "--bench-policy") bench_policy = true;
         else if (a == "--command" && i + 3 < argc) {
             cmd_vx = static_cast<float>(std::atof(argv[++i]));
             cmd_vy = static_cast<float>(std::atof(argv[++i]));
@@ -219,6 +269,7 @@ int main(int argc, char** argv) {
     }
 
     if (validate_gpu) return RunGpuParity(*es, backend, policy, cmd_vx, cmd_vy, cmd_w);
+    if (bench_policy) return RunPolicyBench(*es, backend, policy);
 
     inf::Go2PolicyController ctrl;
     PdHold hold_ctrl(es->caps.links_per_env, es->caps.articulations_per_env);
