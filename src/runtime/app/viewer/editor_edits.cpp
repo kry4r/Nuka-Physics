@@ -308,6 +308,67 @@ std::string DeleteSubtree(EditorScene& es, const std::string& path) {
     return parent_path;
 }
 
+std::string ReparentNode(EditorScene& es, const std::string& path,
+                         const std::string& new_parent_path) {
+    const auto node = es.scene.Tree().NodeOf(path);
+    if (!node) return "";
+    const scene::BodyId b = BodyOfEntity(es.scene, node->entity);
+    if (b == scene::kInvalidBody) return "";  // only body subtrees reparent
+
+    // Jointed / settled bodies carry articulation structure a reparent would
+    // reshape; decline rather than silently miswire it (same guard as delete).
+    for (size_t j = 0; j < es.scene.JointCount(); ++j) {
+        const scene::JointRecord& jr = es.scene.GetJoint(static_cast<scene::JointId>(j));
+        if (jr.parent_body == b || jr.child_body == b) return "";
+    }
+    if (!es.scene.InitialState().empty()) return "";
+
+    // The new parent body (kInvalidBody when reparenting under a group / root).
+    scene::BodyId new_parent = scene::kInvalidBody;
+    std::string group_prefix;
+    if (!new_parent_path.empty()) {
+        const auto pnode = es.scene.Tree().NodeOf(new_parent_path);
+        if (!pnode) return "";
+        new_parent = BodyOfEntity(es.scene, pnode->entity);
+        if (new_parent == b) return "";  // no self-parenting
+        if (new_parent == scene::kInvalidBody) group_prefix = new_parent_path;
+    }
+
+    // Reject a cycle: the new parent must not be b or one of b's descendants.
+    if (new_parent != scene::kInvalidBody) {
+        std::vector<bool> desc(es.scene.RigidBodyCount(), false);
+        desc[b] = true;
+        for (bool more = true; more;) {
+            more = false;
+            for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
+                const scene::BodyId p = es.scene.GetBody(i).parent_id;
+                if (!desc[i] && p != scene::kInvalidBody && p < desc.size() && desc[p]) {
+                    desc[i] = true;
+                    more = true;
+                }
+            }
+        }
+        if (new_parent < desc.size() && desc[new_parent]) return "";
+    }
+
+    // Preserve the world pose: re-express it in the new parent body's frame (or world
+    // for a group / root parent). The leaf name moves under the new group prefix.
+    const math::Transform b_world =
+        AuthoredWorldTransform(es.scene, es.scene.EntityOfBody(b));
+    math::Transform parent_world = math::Transform::Identity();
+    if (new_parent != scene::kInvalidBody)
+        parent_world = AuthoredWorldTransform(es.scene, es.scene.EntityOfBody(new_parent));
+
+    std::string nm = es.scene.GetBody(b).name;
+    const size_t slash = nm.rfind('/');
+    const std::string leaf = (slash == std::string::npos) ? nm : nm.substr(slash + 1);
+    scene::RigidBodyRecord& rec = es.scene.GetBodyMut(b);
+    rec.parent_id = new_parent;
+    rec.name = group_prefix.empty() ? leaf : group_prefix + "/" + leaf;
+    rec.local_transform = parent_world.Inverse() * b_world;
+    return PathOfEntity(es.scene, es.scene.EntityOfBody(b));
+}
+
 // -- euler<->quat (intrinsic XYZ, degrees) ----------------------------------
 
 math::Quat QuatFromEulerDeg(const math::Vec3& deg) {
