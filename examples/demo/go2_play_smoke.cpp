@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -349,6 +350,22 @@ int main(int argc, char** argv) {
         worst.rel_max = std::max(worst.rel_max, s.rel_max);
         worst.nan = std::max(worst.nan, s.nan);
         if (c + 1 == 100 || c + 1 == control_steps) PrintRow("RUN", c + 1, s);
+    }
+
+    // NUKA_WALL_TIMING: clean steady-state wall-clock of the pure physics step
+    // (no controller/publish/event-sync) to cross-check the per-op breakdown.
+    if (const char* wt = std::getenv("NUKA_WALL_TIMING")) {
+        (void)wt;
+        const int N = 200;
+        nphi::BackendSynchronize(backend);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < N; ++i) es->world->Step();
+        nphi::BackendSynchronize(backend);
+        const double ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count() / N;
+        std::printf("[smoke] WALL pure-step: %.3f ms/step  (%.1f fps)  contacts standing\n",
+                    ms, ms > 0.0 ? 1000.0 / ms : 0.0);
     }
 
     {

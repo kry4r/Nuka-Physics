@@ -257,6 +257,16 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_body_owner
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // mpm_body_reaction
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // mpm_body_ang_reaction
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // cc_parent
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // cc_root
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // cc_artic_first
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // cc_body_first
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // cc_particle_first
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // island_root_sorted
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // island_rows
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 4, 1, 16, 0},  // island_quads
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // island_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // island_cub_temp
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

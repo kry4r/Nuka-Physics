@@ -118,6 +118,15 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::GridSortScratch) {
             return grid_sort_scratch_bytes;
         }
+        // Dynamic-island component count (BuildSolveIslands): the solve grid
+        // watermark — one global u32.
+        if (id == FieldId::IslandCount) {
+            return 1ull;
+        }
+        // BuildSolveIslands cub radix-sort temp (u8 bytes), sized at World construct.
+        if (id == FieldId::IslandCubTemp) {
+            return island_cub_temp_bytes;
+        }
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
         // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).

@@ -31,6 +31,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.mpm_grid_sort_scratch_bytes = phi::MpmSortScratchBytes(
         model_.capacities.particles_per_env * model_.capacities.env_count);
 
+    // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
+    // total row capacity so the sort captures into the graph; 0 if no rows (inert).
+    model_.capacities.island_cub_temp_bytes = phi::IslandSortScratchBytes(
+        model_.capacities.max_rows_per_env * model_.capacities.env_count);
+
     // The init-time buffer type (stream-less default-stream device type — fine
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);
