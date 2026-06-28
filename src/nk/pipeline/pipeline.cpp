@@ -566,6 +566,17 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         if (has_particles) {
             row_coupling_provider_.Couple(coupling_ctx);
         }
+        // Dynamic connected-component islanding: re-derive the true solve islands
+        // from the ACTIVE rows each step (the PairDriven family's cook-time schedule
+        // is the conservative one-island-per-env bound). Runs after the rows are
+        // assembled + before the solve consumes them.
+        p_islands_.family = family;
+        p_islands_.env_count = env_count;
+        p_islands_.rows_per_env = cap.max_rows_per_env;
+        p_islands_.articulation_count = articulation_cnt;
+        p_islands_.bodies_per_env = cap.bodies_per_env;
+        p_islands_.particles_per_env = cap.particles_per_env;
+        add(phi::NkOp::BuildSolveIslands, &p_islands_);
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
     }
 

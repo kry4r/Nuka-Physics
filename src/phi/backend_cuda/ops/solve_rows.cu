@@ -157,12 +157,15 @@ constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 // family stages every row-scaled array in shared (its carve is unchanged).
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
                                 uint32_t qdot_floats, bool cache_jw,
-                                bool pos_pass) {
+                                bool pos_pass, uint32_t k_tiles) {
     if (!cache_jw) {
         // PairDriven: only the qdot tile(s) live in shared; lambda/meff/order/seg
         // are read from GLOBAL, so the carve does not scale with rows_per_env. The
         // split-impulse position pass adds a parallel pseudo qdot tile (same size).
-        return sizeof(float) * qdot_floats * (pos_pass ? 2u : 1u);
+        // The dynamic-island path also carves a per-component tile present/list pair
+        // (k_tiles u32 each) so the load/scatter touch ONLY this island's tiles.
+        return sizeof(float) * qdot_floats * (pos_pass ? 2u : 1u) +
+               sizeof(uint32_t) * 2ull * k_tiles;
     }
     const uint64_t jw = 2ull * rows_per_env * dof_stride;
     const uint64_t slim = sizeof(SlimRow) * rows_per_env;
@@ -627,6 +630,7 @@ __global__ void SolveRowsBlockIslandKernel(
     math::Vec3* __restrict__ body_pseudo_lin_vel, // per-body pseudo lin vel (or null)
     math::Vec3* __restrict__ body_pseudo_ang_vel, // per-body pseudo ang vel (or null)
     math::Vec3* __restrict__ particle_pseudo_vel, // per-particle pseudo vel (or null)
+    const uint32_t* __restrict__ island_count_dev, // dynamic island count (or null)
     uint32_t total_islands,
     uint32_t rows_per_env,
     uint32_t dof_stride,
@@ -639,11 +643,18 @@ __global__ void SolveRowsBlockIslandKernel(
     float dt,
     float baumgarte_max_velocity) {
     const uint32_t island = blockIdx.x;
-    if (island >= total_islands) {
+    // Dynamic islanding (PairDriven): the live component count is a DEVICE scalar
+    // (BuildSolveIslands writes it each step) and the grid is the static max-island
+    // bound, so blocks past the live count early-exit. Static schedule: total_islands.
+    const bool dynamic = (island_count_dev != nullptr);
+    const uint32_t live_islands = dynamic ? *island_count_dev : total_islands;
+    if (island >= live_islands) {
         return;
     }
     // Read the island's quad via the named record (same memory as the raw
-    // stride-4 layout; reinterpret keeps the schedule array untouched).
+    // stride-4 layout; reinterpret keeps the schedule array untouched). For the
+    // dynamic schedule the quad is {row_off, row_cnt, flags, env} indexing the
+    // pre-grouped island_rows (each row its OWN color); static: {seg_off, seg_cnt}.
     const IslandRecord rec =
         reinterpret_cast<const IslandRecord*>(islands)[island];
     const uint32_t seg_off = rec.seg_off;
@@ -691,6 +702,12 @@ __global__ void SolveRowsBlockIslandKernel(
     SlimRow* slim_sh = nullptr;
     uint32_t* order_sh = nullptr;
     uint32_t* seg_sh = nullptr;
+    // Dynamic-island per-component tile working set (PairDriven): a present-bitmap +
+    // compacted list of THIS component's env-local artic tiles, carved after the
+    // qdot region(s). The load/scatter touch ONLY these tiles so concurrent
+    // same-env components never race on qdot_flat. Unused by the Union path.
+    uint32_t* tile_present = nullptr;
+    uint32_t* tile_list = nullptr;
     if (cache_jw) {
         lambda_sh = qdot_sh + qdot_floats;
         meff_sh = lambda_sh + rows_per_env;
@@ -701,21 +718,59 @@ __global__ void SolveRowsBlockIslandKernel(
         order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
         seg_sh = order_sh + rows_per_env;                        // 2R u32
     } else {
-        // PairDriven GLOBAL order/segment scratch: this env's DISJOINT region of
-        // 3*rows_per_env u32 (one block per env => race-free). order is the first
-        // rows_per_env u32; segments are the following 2*rows_per_env u32.
-        const size_t env_scratch_base =
-            static_cast<size_t>(3u) * env_row_base;
-        order_sh = pd_solve_scratch + env_scratch_base;
+        float* const tile_base =
+            qdot_sh + static_cast<size_t>(qdot_floats) * (pos_pass ? 2u : 1u);
+        tile_present = reinterpret_cast<uint32_t*>(tile_base);
+        tile_list = tile_present + k_tiles;
+        // Static PairDriven fallback (dynamic == false): the legacy GLOBAL
+        // order/segment scratch (one block per env). The dynamic path reads the
+        // pre-grouped row_order directly and never touches this scratch.
+        order_sh = pd_solve_scratch + static_cast<size_t>(3u) * env_row_base;
         seg_sh = order_sh + rows_per_env;                        // 2R u32
     }
+    __shared__ uint32_t tile_cnt_sh;
 
     const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
+    // Dynamic path: collect THIS component's distinct env-local artic tiles into
+    // tile_list (present-bitmap then compact). The component's rows all live in this
+    // block (the union-find merged every shared tile), so its tile set is closed.
+    if (dynamic && has_artic) {
+        for (uint32_t i = lane; i < k_tiles; i += blockDim.x) tile_present[i] = 0u;
+        if (lane == 0u) tile_cnt_sh = 0u;
+        __syncthreads();
+        for (uint32_t r = lane; r < seg_cnt; r += blockDim.x) {
+            const NkRow& row = urows[row_order[seg_off + r]];
+            if (row.a.kind == kNkSideArtic && row.a.index >= env_artic_base) {
+                atomicOr(&tile_present[row.a.index - env_artic_base], 1u);
+            }
+            if (row.b.kind == kNkSideArtic && row.b.index >= env_artic_base) {
+                atomicOr(&tile_present[row.b.index - env_artic_base], 1u);
+            }
+        }
+        __syncthreads();
+        for (uint32_t t = lane; t < k_tiles; t += blockDim.x) {
+            if (tile_present[t] != 0u) tile_list[atomicAdd(&tile_cnt_sh, 1u)] = t;
+        }
+        __syncthreads();
+    }
     if (has_artic) {
-        // load EVERY co-resident articulation tile of this env (K tiles). At
-        // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
-        for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
-            qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
+        if (dynamic) {
+            // load ONLY this component's tiles (into their env-local qdot_sh slots);
+            // the unloaded slots are never read (no component row touches them).
+            const uint32_t tc = tile_cnt_sh;
+            for (uint32_t u = 0u; u < tc; ++u) {
+                const uint32_t tile = tile_list[u];
+                for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
+                    qdot_sh[tile * dof_stride + k] = qdot_flat[
+                        static_cast<size_t>(env_artic_base + tile) * dof_stride + k];
+                }
+            }
+        } else {
+            // load EVERY co-resident articulation tile of this env (K tiles). At
+            // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
+            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
+            }
         }
     }
     // Union stages lambda / meff / slim records in shared; PairDriven reads lambda /
@@ -745,7 +800,12 @@ __global__ void SolveRowsBlockIslandKernel(
     // dropping inactive rows / empty segments here only removes NO-OP visits —
     // the surviving execution order is the schedule\'s order, unchanged.
     __shared__ uint32_t live_seg_cnt_sh;
-    if (lane == 0u) {
+    if (dynamic) {
+        // The dynamic schedule already grouped the component's ACTIVE rows in
+        // row_order[seg_off .. seg_off+seg_cnt), each its OWN color (serial GS, the
+        // bit-identical single-island order). No compaction / scratch needed.
+        if (lane == 0u) live_seg_cnt_sh = seg_cnt;
+    } else if (lane == 0u) {
         uint32_t out_rows = 0u;
         uint32_t out_segs = 0u;
         const uint32_t span_start =
@@ -779,14 +839,17 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t nwarps = blockDim.x >> 5u;
     for (uint32_t it = 0u; it < vel_iters; ++it) {
         for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-            const uint32_t off = seg_sh[2u * s + 0u];
-            const uint32_t cnt = seg_sh[2u * s + 1u];
+            // Dynamic: the s-th unit is one component row at row_order[seg_off+s]
+            // (its own color). Static: the s-th compacted color segment in seg_sh.
+            const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
+            const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
+            const uint32_t* const obase = dynamic ? row_order : order_sh;
             // One WARP per row of the color (rows of one color share no
             // mutable state — warp-level parallel is exactly the old
             // thread-level parallel, with the row\'s inner work distributed
             // across the warp\'s lanes).
             for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                const uint32_t gslot = order_sh[off + idx];
+                const uint32_t gslot = obase[off + idx];
                 // Union: shared J/w cache indexed by env-local slot. PairDriven:
                 // GLOBAL J/w/J_b/w_b indexed by the global slot (j_row == gslot).
                 const float* Ja = cache_jw ? J_sh : chain_jacobian;
@@ -820,8 +883,13 @@ __global__ void SolveRowsBlockIslandKernel(
             }
         }
         // Zero this island's per-row pseudo accumulators (global, race-free per
-        // island). Walk the compacted ACTIVE rows.
-        if (live_seg_cnt > 0u) {
+        // island). Dynamic: the component rows in row_order[seg_off..); static: the
+        // compacted ACTIVE rows in order_sh.
+        if (dynamic) {
+            for (uint32_t i = lane; i < seg_cnt; i += blockDim.x) {
+                row_pseudo_lambda[row_order[seg_off + i]] = 0.0f;
+            }
+        } else if (live_seg_cnt > 0u) {
             const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
             const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
             const uint32_t island_rows = last_off + last_cnt;
@@ -832,10 +900,11 @@ __global__ void SolveRowsBlockIslandKernel(
         __syncthreads();
         for (uint32_t it = 0u; it < pos_iters; ++it) {
             for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-                const uint32_t off = seg_sh[2u * s + 0u];
-                const uint32_t cnt = seg_sh[2u * s + 1u];
+                const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
+                const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
+                const uint32_t* const obase = dynamic ? row_order : order_sh;
                 for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                    const uint32_t gslot = order_sh[off + idx];
+                    const uint32_t gslot = obase[off + idx];
                     SolvePositionRowWarp(
                         gslot, env_row_base, env_artic_base, gslot, wlane,
                         row_meff, row_penetration, row_pseudo_lambda,
@@ -902,15 +971,20 @@ __global__ void SolveRowsBlockIslandKernel(
             // base_link_count / k_tiles.
             const uint32_t links_per_dog =
                 (k_tiles > 0u) ? (base_link_count / k_tiles) : base_link_count;
-            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
-                const uint32_t a = i / dof_stride;       // env-local tile
-                const uint32_t k = i - a * dof_stride;   // DOF within tile
+            // Dynamic: scatter ONLY this component's tiles (tile_list[0..tile_cnt)),
+            // so concurrent same-env components never write the same qdot_flat slot.
+            // Static: ALL k_tiles. Both use the per-tile template map (a*links_per_dog).
+            const uint32_t scatter_tiles = dynamic ? tile_cnt_sh : k_tiles;
+            for (uint32_t i = lane; i < scatter_tiles * dof_stride; i += blockDim.x) {
+                const uint32_t u = i / dof_stride;       // tile slot in the iteration
+                const uint32_t k = i - u * dof_stride;   // DOF within tile
+                const uint32_t a = dynamic ? tile_list[u] : u;  // env-local tile
                 const size_t flat = static_cast<size_t>(env) * dof_stride + k;
                 const uint32_t tmpl_link = dof_to_link[flat];
                 const uint32_t comp = dof_to_component[flat];
                 const uint32_t link = tmpl_link + a * links_per_dog;
                 const size_t gl = static_cast<size_t>(env) * base_link_count + link;
-                const float v = qdot_sh[i];
+                const float v = qdot_sh[static_cast<size_t>(a) * dof_stride + k];
                 if (comp != ~0u) {
                     link_velocity[gl].v[comp] = v;
                 } else {
@@ -921,7 +995,7 @@ __global__ void SolveRowsBlockIslandKernel(
                 // mirroring the real scatter (so IntegratePosition reads it
                 // additively without touching the persisted velocity).
                 if (pos_pass) {
-                    const float vp = qdot_pseudo_sh[i];
+                    const float vp = qdot_pseudo_sh[static_cast<size_t>(a) * dof_stride + k];
                     if (comp != ~0u) {
                         link_velocity_pseudo[gl].v[comp] = vp;
                     } else {
@@ -956,6 +1030,17 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         const uint32_t artics_per_env =
             (p->articulation_count > 0u && p->env_count > 0u)
                 ? (p->articulation_count / p->env_count) : 1u;
+        // Dynamic islanding (PairDriven): the grid is the static MAX-island bound —
+        // each component consumes >=1 distinct dynamic entity (the broadphase drops
+        // static-static pairs), so #components <= artics + bodies + particles. The
+        // kernel reads the LIVE component count from data.island_count and early-exits
+        // the surplus blocks. UnionCsr keeps its cook-time island count.
+        const uint32_t max_island_bound =
+            p->articulation_count + p->total_body_count + p->total_particle_count;
+        const uint32_t grid_islands = with_b_arm ? max_island_bound : p->total_islands;
+        if (grid_islands == 0u) {
+            return Status::Ok;
+        }
         // qdot region: legacy kMaxArticulationDof reservation for UnionCsr (the
         // H1-golden footprint), the compact K-tile reservation for PairDriven .
         const uint32_t qdot_floats =
@@ -964,10 +1049,11 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         const bool pos_pass = (p->pos_iters > 0u) && with_b_arm;
         // Union caches J/w in shared (cache_jw == !with_b_arm); PairDriven reads
         // them from global (bounded shared), so its carve excludes the J/w regions.
-        // The position pass adds a parallel pseudo qdot tile (PairDriven only).
+        // The position pass adds a parallel pseudo qdot tile + the dynamic-island
+        // per-component tile working set (PairDriven only).
         const size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
                                                       qdot_floats, !with_b_arm,
-                                                      pos_pass);
+                                                      pos_pass, artics_per_env);
         // One-time opt-in past the 48 KB default dynamic-shared carve-out
         // (sm_8x+ allows ~99 KB/block). Host-side attribute set — NOT a
         // stream op, so it is graph-capture-safe; cached so the steady-state
@@ -1008,7 +1094,15 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 }
             }
         }
-        LaunchCuda(SolveRowsBlockIslandKernel, dim3(p->total_islands),
+        // PairDriven reads the per-step dynamic schedule (data.island_quads /
+        // island_rows + the device island_count watermark); UnionCsr reads its
+        // cook-time schedule (model.island_row_offsets / row_order, count via param).
+        const uint32_t* const islands_in = with_b_arm
+            ? data.island_quads : static_cast<const uint32_t*>(model.island_row_offsets);
+        const uint32_t* const row_order_in = with_b_arm
+            ? data.island_rows : static_cast<const uint32_t*>(model.row_order);
+        const uint32_t* const island_count_dev = with_b_arm ? data.island_count : nullptr;
+        LaunchCuda(SolveRowsBlockIslandKernel, dim3(grid_islands),
                    dim3(kIslandBlockSize), static_cast<uint32_t>(shared_bytes),
                    stream,
                    reinterpret_cast<const NkRow*>(data.urows),
@@ -1029,9 +1123,9 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<const math::Vec3*>(data.body_inv_inertia),
                    static_cast<const float*>(data.particle_inv_mass),
                    data.particle_vel,
-                   static_cast<const uint32_t*>(model.island_row_offsets),
+                   islands_in,
                    static_cast<const uint32_t*>(model.island_color_segments),
-                   static_cast<const uint32_t*>(model.row_order),
+                   row_order_in,
                    static_cast<const uint32_t*>(model.dof_to_link),
                    static_cast<const uint32_t*>(model.dof_to_component),
                    data.pd_solve_scratch,
@@ -1043,6 +1137,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    pos_pass ? data.body_pseudo_linear_velocity : nullptr,
                    pos_pass ? data.body_pseudo_angular_velocity : nullptr,
                    pos_pass ? data.particle_pseudo_vel : nullptr,
+                   island_count_dev,
                    p->total_islands, p->rows_per_env, p->max_dof,
                    p->base_link_count, artics_per_env,
                    with_b_arm ? 1u : 0u,

@@ -21,7 +21,73 @@
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace nuka::phi {
+
+// NUKA_STEP_TIMING: env-gated per-op GPU-time breakdown, off by default.
+// Brackets each dispatched op with CUDA events; a warmup gate skips the transient.
+namespace {
+const char* NkOpName(int op) {
+    switch (op) {
+        case 0: return "ApplyDrives"; case 1: return "AbaForward";
+        case 2: return "IntegrateVelocity"; case 3: return "FkWorldPoses";
+        case 4: return "IntegratePosition"; case 5: return "CrbaComputeM";
+        case 6: return "CrbaFactorM"; case 7: return "ApplyImplicitDamping";
+        case 8: return "BuildAabbs"; case 9: return "LbvhBuild";
+        case 10: return "LbvhQueryPairs"; case 11: return "ParticleGridBuild";
+        case 12: return "NarrowphasePrimitives"; case 13: return "NarrowphaseSdf";
+        case 14: return "ContactTangentBasis"; case 15: return "AssembleRows";
+        case 16: return "SolveRowsBlockIsland"; case 24: return "ReadoutContactWrench";
+        case 33: return "SyncLinkBodyPose"; case 35: return "NarrowphaseHeightfield";
+        case 36: return "BuildSolveIslands";
+        default: return "op";
+    }
+}
+struct OpProfiler {
+    static constexpr int kN = 64;
+    double ms[kN] = {0.0};
+    unsigned long long calls[kN] = {0};
+    cudaEvent_t a = nullptr, b = nullptr;
+    bool seen[kN] = {false};
+    long step = 0, warmup = 200;
+    bool on = false, init = false;
+    static OpProfiler& Get() { static OpProfiler p; return p; }
+    void Ensure() {
+        if (init) return;
+        init = true;
+        const char* e = std::getenv("NUKA_STEP_TIMING");
+        on = (e != nullptr && e[0] != '0');
+        const char* w = std::getenv("NUKA_STEP_TIMING_WARMUP");
+        if (w != nullptr) warmup = std::atol(w);
+        if (on) {
+            cudaEventCreate(&a);
+            cudaEventCreate(&b);
+            std::atexit(&OpProfiler::Dump);
+        }
+    }
+    static void Dump() {
+        OpProfiler& p = Get();
+        double tot = 0.0;
+        unsigned long long steps = 0;
+        for (int i = 0; i < kN; ++i) { tot += p.ms[i]; if (p.calls[i] > steps) steps = p.calls[i]; }
+        if (steps == 0) return;
+        std::printf("\n[NUKA_STEP_TIMING] steady-state per-op GPU ms (steps=%llu, warmup=%ld)\n",
+                    steps, p.warmup);
+        std::printf("  %-24s %10s %12s %8s\n", "op", "ms/step", "total_ms", "%%");
+        for (int i = 0; i < kN; ++i) {
+            if (p.calls[i] == 0) continue;
+            const double per = p.ms[i] / static_cast<double>(p.calls[i]);
+            std::printf("  %-24s %10.3f %12.2f %7.1f%%\n", NkOpName(i), per, p.ms[i],
+                        tot > 0.0 ? 100.0 * p.ms[i] / tot : 0.0);
+        }
+        std::printf("  %-24s %10.3f %12.2f\n", "TOTAL/step",
+                    tot / static_cast<double>(steps), tot);
+        std::fflush(stdout);
+    }
+};
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Concrete Plan / Event.
@@ -73,7 +139,33 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
     // they REQUIRE the current device to match the stream's device, which a
     // caller thread may not have set).
     (void)cudaSetDevice(cb->device_id);
-    return DispatchOn(model, data, call, cb->main);
+    OpProfiler& prof = OpProfiler::Get();
+    prof.Ensure();
+    if (!prof.on) {
+        return DispatchOn(model, data, call, cb->main);
+    }
+    const int oid = static_cast<int>(call.op);
+    // Step boundary = an op id repeats since the last boundary (robust to the
+    // one-off construction/seed dispatches that precede the step loop).
+    if (oid >= 0 && oid < OpProfiler::kN) {
+        if (prof.seen[oid]) {
+            ++prof.step;
+            for (int i = 0; i < OpProfiler::kN; ++i) prof.seen[i] = false;
+        }
+        prof.seen[oid] = true;
+    }
+    const bool acc = (prof.step > prof.warmup) && oid >= 0 && oid < OpProfiler::kN;
+    if (acc) cudaEventRecord(prof.a, cb->main);
+    const Status s = DispatchOn(model, data, call, cb->main);
+    if (acc) {
+        cudaEventRecord(prof.b, cb->main);
+        cudaEventSynchronize(prof.b);
+        float el = 0.0f;
+        cudaEventElapsedTime(&el, prof.a, prof.b);
+        prof.ms[oid] += static_cast<double>(el);
+        prof.calls[oid] += 1;
+    }
+    return s;
 }
 
 void BackendSynchronizeImpl(Backend* b) {

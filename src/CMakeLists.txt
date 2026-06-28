@@ -702,6 +702,7 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/narrowphase_prims.cu
         phi/backend_cuda/ops/narrowphase_sdf.cu
         phi/backend_cuda/ops/assemble_rows.cu
+        phi/backend_cuda/ops/build_islands.cu
         phi/backend_cuda/ops/solve_rows.cu
         # M6 multi-physics coupled co-step: XPBD soft + PBF fluid kernel ports
         # (predict / xpbd project / pbf density-lambda / pbf apply / finalize),

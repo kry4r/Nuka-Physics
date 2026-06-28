@@ -156,6 +156,15 @@ enum class NkOp : uint16_t {
                             // (stable prior NkOp values). PairDriven-family-gated
                             // (early-exit for UnionCsr).
 
+    // --- dynamic solve islanding --------------------------------------
+    BuildSolveIslands,      // per-step connected-components over the ACTIVE contact
+                            // rows -> one island per independent component, emitted
+                            // as the dynamic schedule SolveRowsBlockIsland reads.
+                            // Runs AFTER AssembleRows + BEFORE SolveRowsBlockIsland;
+                            // PairDriven-family-gated. APPENDED after the prior ops
+                            // (stable NkOp values; execution order is the pipeline's,
+                            // not the enum value).
+
     Count                  // sentinel: number of ops (NOT an op)
 };
 
@@ -310,6 +319,25 @@ inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
 // Host-callable (defined in broadphase.cu) so the World sizes the grid_sort_scratch
 // arena field BEFORE allocation -> no mid-capture cudaMalloc. 0 for 0 particles.
 uint64_t GridSortScratchBytes(uint32_t particle_count);
+
+// Byte size of the pre-allocated island_cub_temp the BuildSolveIslands op draws its
+// cub radix-sort temp storage from, for `total_rows` row slots. Host-callable
+// (defined in build_islands.cu) so the World sizes the field BEFORE allocation ->
+// no mid-capture cudaMalloc. 0 for 0 rows.
+uint64_t IslandSortScratchBytes(uint32_t total_rows);
+
+// Dynamic solve-island build (connected components over the active contact rows).
+// All launch geometry is a fixed function of the capacities (graph-capturable); the
+// op partitions the rows by union-find each step and emits the device schedule the
+// SolveRowsBlockIsland op reads (island_rows/island_quads/island_tiles/island_count).
+struct BuildSolveIslandsParams {
+    uint32_t family;             // kContactFamily* (PairDriven runs; else early-exit)
+    uint32_t env_count;
+    uint32_t rows_per_env;       // row-slot capacity per env
+    uint32_t articulation_count; // global artic count (== artics_per_env * env_count)
+    uint32_t bodies_per_env;     // movable rigid body count per env
+    uint32_t particles_per_env;  // particle count per env
+};
 
 // --- MLS-MPM continuum step ---------------------------------------------
 // The single umbrella MpmStep op's params. The grid is env-private: node keys are

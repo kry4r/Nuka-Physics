@@ -242,6 +242,16 @@ struct DataView {
     uint32_t* grid_body_owner = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
     ::nuka::math::Vec3* mpm_body_reaction = nullptr;  // per:body arena:scratch owner:data flags:[readout]
     ::nuka::math::Vec3* mpm_body_ang_reaction = nullptr;  // per:body arena:scratch owner:data flags:[readout]
+    uint32_t* cc_parent = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* cc_root = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* cc_artic_first = nullptr;  // per:articulation arena:scratch owner:data
+    uint32_t* cc_body_first = nullptr;  // per:body arena:scratch owner:data
+    uint32_t* cc_particle_first = nullptr;  // per:particle arena:scratch owner:data
+    uint32_t* island_root_sorted = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* island_rows = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* island_quads = nullptr;  // per:row_slot arena:scratch owner:data elem:4
+    uint32_t* island_count = nullptr;  // per:scalar arena:scratch owner:data count:1
+    uint8_t* island_cub_temp = nullptr;  // per:scalar arena:scratch owner:data count:island_cub_temp_bytes
 };
 
 } // namespace nuka::phi

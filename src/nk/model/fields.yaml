@@ -795,3 +795,27 @@ fields:
   # the link-row gather sums, which the per-articulation deposit chain-walks into
   # qdot_flat. The free-rigid path applies its torque inline and leaves this zero.
   - {name: mpm_body_ang_reaction, dtype: vec3, per: body, arena: scratch, owner: data, flags: [readout]}
+
+  # =========================================================================
+  # DYNAMIC SOLVE ISLANDS (PairDriven connected-components). A per-step device
+  # pass (BuildSolveIslands) partitions the ACTIVE contact rows into independent
+  # components by union-find over the GLOBAL coupling keys each row touches (artic
+  # side a/b, rigid body, particle) + the friction-group anchor, then emits one
+  # island per component so the solve runs disjoint components on PARALLEL blocks.
+  # Each component keeps its rows in ASCENDING slot order (bit-identical to the
+  # single-island-per-env sweep). cc_* = the union-find + radix-sort working set;
+  # island_* = the emitted schedule the solve reads (island_quads stride 4 =
+  # {row_off,row_cnt,flags,env} indexing island_rows; the solve derives each
+  # component's articulation tile subset from its own rows). Sized to the row/entity
+  # capacity. APPENDED LAST so every pre-existing arena offset is byte-stable.
+  # =========================================================================
+  - {name: cc_parent,          dtype: u32, per: row_slot,     arena: scratch, owner: data}
+  - {name: cc_root,            dtype: u32, per: row_slot,     arena: scratch, owner: data}
+  - {name: cc_artic_first,     dtype: u32, per: articulation, arena: scratch, owner: data}
+  - {name: cc_body_first,      dtype: u32, per: body,         arena: scratch, owner: data}
+  - {name: cc_particle_first,  dtype: u32, per: particle,     arena: scratch, owner: data}
+  - {name: island_root_sorted, dtype: u32, per: row_slot,     arena: scratch, owner: data}
+  - {name: island_rows,        dtype: u32, per: row_slot,     arena: scratch, owner: data}
+  - {name: island_quads,       dtype: u32, per: row_slot,     arena: scratch, owner: data, elem: 4}
+  - {name: island_count,       dtype: u32, per: scalar, count: "1",                     arena: scratch, owner: data}
+  - {name: island_cub_temp,    dtype: u8,  per: scalar, count: "island_cub_temp_bytes", arena: scratch, owner: data}

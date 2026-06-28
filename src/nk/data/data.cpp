@@ -169,6 +169,17 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridBodyOwner:       v.grid_body_owner = static_cast<uint32_t*>(p); break;
         case FieldId::MpmBodyReaction:     v.mpm_body_reaction = static_cast<math::Vec3*>(p); break;
         case FieldId::MpmBodyAngReaction:  v.mpm_body_ang_reaction = static_cast<math::Vec3*>(p); break;
+        // Dynamic solve islands (BuildSolveIslands union-find + emit working set).
+        case FieldId::CcParent:            v.cc_parent = static_cast<uint32_t*>(p); break;
+        case FieldId::CcRoot:              v.cc_root = static_cast<uint32_t*>(p); break;
+        case FieldId::CcArticFirst:        v.cc_artic_first = static_cast<uint32_t*>(p); break;
+        case FieldId::CcBodyFirst:         v.cc_body_first = static_cast<uint32_t*>(p); break;
+        case FieldId::CcParticleFirst:     v.cc_particle_first = static_cast<uint32_t*>(p); break;
+        case FieldId::IslandRootSorted:    v.island_root_sorted = static_cast<uint32_t*>(p); break;
+        case FieldId::IslandRows:          v.island_rows = static_cast<uint32_t*>(p); break;
+        case FieldId::IslandQuads:         v.island_quads = static_cast<uint32_t*>(p); break;
+        case FieldId::IslandCount:         v.island_count = static_cast<uint32_t*>(p); break;
+        case FieldId::IslandCubTemp:       v.island_cub_temp = static_cast<uint8_t*>(p); break;
         case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
         case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
         case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;

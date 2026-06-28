@@ -218,6 +218,16 @@ enum class FieldId : uint16_t {
     GridBodyOwner,  // grid_body_owner (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     MpmBodyReaction,  // mpm_body_reaction (per:body arena:scratch owner:data flags:[readout])
     MpmBodyAngReaction,  // mpm_body_ang_reaction (per:body arena:scratch owner:data flags:[readout])
+    CcParent,  // cc_parent (per:row_slot arena:scratch owner:data)
+    CcRoot,  // cc_root (per:row_slot arena:scratch owner:data)
+    CcArticFirst,  // cc_artic_first (per:articulation arena:scratch owner:data)
+    CcBodyFirst,  // cc_body_first (per:body arena:scratch owner:data)
+    CcParticleFirst,  // cc_particle_first (per:particle arena:scratch owner:data)
+    IslandRootSorted,  // island_root_sorted (per:row_slot arena:scratch owner:data)
+    IslandRows,  // island_rows (per:row_slot arena:scratch owner:data)
+    IslandQuads,  // island_quads (per:row_slot arena:scratch owner:data elem:4)
+    IslandCount,  // island_count (per:scalar arena:scratch owner:data count:1)
+    IslandCubTemp,  // island_cub_temp (per:scalar arena:scratch owner:data count:island_cub_temp_bytes)
     Count
 };
 

@@ -87,6 +87,10 @@ struct ModelCapacities {
     // sort/scan temp + out buffers; sized at World construct, 0 == no particles).
     uint64_t grid_sort_scratch_bytes = 0;
 
+    // Byte size of the island_cub_temp field (the BuildSolveIslands cub radix-sort
+    // temp over the total row capacity; sized at World construct, 0 == no rows).
+    uint64_t island_cub_temp_bytes = 0;
+
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;

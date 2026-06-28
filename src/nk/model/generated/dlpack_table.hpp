@@ -234,6 +234,16 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false, false},  // grid_body_owner
     {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_reaction
     {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_ang_reaction
+    {FieldId::CcParent, DlpackDtype::kU32, 1, false, false},  // cc_parent
+    {FieldId::CcRoot, DlpackDtype::kU32, 1, false, false},  // cc_root
+    {FieldId::CcArticFirst, DlpackDtype::kU32, 1, false, false},  // cc_artic_first
+    {FieldId::CcBodyFirst, DlpackDtype::kU32, 1, false, false},  // cc_body_first
+    {FieldId::CcParticleFirst, DlpackDtype::kU32, 1, false, false},  // cc_particle_first
+    {FieldId::IslandRootSorted, DlpackDtype::kU32, 1, false, false},  // island_root_sorted
+    {FieldId::IslandRows, DlpackDtype::kU32, 1, false, false},  // island_rows
+    {FieldId::IslandQuads, DlpackDtype::kU32, 2, false, false},  // island_quads
+    {FieldId::IslandCount, DlpackDtype::kU32, 1, false, false},  // island_count
+    {FieldId::IslandCubTemp, DlpackDtype::kU8, 1, false, false},  // island_cub_temp
 };
 
 } // namespace nuka::nk
