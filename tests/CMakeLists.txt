@@ -445,6 +445,23 @@ add_test(NAME SceneRoundtrip
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(SceneRoundtrip PROPERTIES LABELS "fast_full")
 
+# Editor edit -> nks::Save -> reload gate: transform + material edits persist and
+# collision mesh geometry survives (the LoadLightScene data-loss trap is avoided).
+add_executable(nuka_editor_edit_roundtrip_test
+    scenario/editor_edit_roundtrip.cpp
+)
+target_link_libraries(nuka_editor_edit_roundtrip_test
+    PRIVATE
+        nuka_scene
+        nuka_import
+        nuka_cooker
+        GTest::gtest_main
+)
+add_test(NAME EditorEditRoundtrip
+         COMMAND nuka_editor_edit_roundtrip_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(EditorEditRoundtrip PROPERTIES LABELS "fast_full")
+
 # --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
 # examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
 # + initial_state + settle) and asserts byte-identical re-save + section
