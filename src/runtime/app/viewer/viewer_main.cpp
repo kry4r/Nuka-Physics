@@ -252,6 +252,7 @@ int main(int argc, char** argv) {
     std::string capture_out = "nuka_present_capture.ppm";
     std::string policy_path;         // --policy <bin>: attach the closed-loop drive.
     bool want_play = false;          // --play: start the transport running.
+    bool want_planned = false;       // --planned: CUDA-graph step (one launch/frame).
     bool dt_set = false;             // honor an explicit --dt over the policy default.
     bool force_host_policy = false;  // --host-policy: run the host MLP (A/B vs GPU).
     // --cam tx,ty,tz,dist,yaw_deg,pitch_deg : explicit orbit override (else auto-frame).
@@ -267,6 +268,7 @@ int main(int argc, char** argv) {
         else if (a == "--capture-out" && i + 1 < argc) capture_out = argv[++i];
         else if (a == "--policy" && i + 1 < argc) policy_path = argv[++i];
         else if (a == "--play") want_play = true;
+        else if (a == "--planned") want_planned = true;
         else if (a == "--host-policy") force_host_policy = true;
         else if (a == "--cam" && i + 1 < argc) {
             float yd = 0.0f, pd = 0.0f;
@@ -408,6 +410,7 @@ int main(int argc, char** argv) {
         if (!next) return;
         policy_ctrl.reset();       // drop any controller bound to the old scene
         loaded = std::move(next);  // old scene (if any) destructed here
+        loaded->sim->SetPlannedStep(want_planned);  // CUDA-graph replay when --planned
         loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
         frame_world(loaded->sim->GetRenderWorld());
         SeedDriveTargets(ui_state, *loaded);
