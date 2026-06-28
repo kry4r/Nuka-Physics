@@ -177,6 +177,16 @@ struct MaterialRecord {
     float roughness                        = 0.5f;
     float metallic                         = 0.0f;
 
+    // Render-only beauty fields (1:1 with RenderMaterial). emissive lights both
+    // tiers; sheen/transmission/ior/absorption are consumed by the offline beauty
+    // path. Defaults are strict no-ops, so a material lacking these keys on disk
+    // reconstructs the identical RenderMaterial (no cook / render change).
+    math::Vec3 emissive                    = {0.0f, 0.0f, 0.0f};
+    float sheen                            = 0.0f;
+    float transmission                     = 0.0f;
+    float ior                              = 1.0f;
+    math::Vec3 absorption                  = {0.0f, 0.0f, 0.0f};
+
     // Per-material default friction coefficient μ (owner Q8 "per-material μ").
     // Resolved into the per-shape cooked μ at cook time when a shape does not
     // carry an explicit per-shape override (see cooker.cpp precedence). (v0.8 C1a)

@@ -20,4 +20,9 @@ namespace nuka::runtime::app::viewer {
 std::string OpenFileDialog(const char* title, const char* filter_label,
                            const char* filter_glob);
 
+// The OS file-SAVE dialog (Windows GetSaveFileNameW; Linux zenity --save).
+// `suggested` seeds the filename. Returns the chosen path, or "" on cancel.
+std::string SaveFileDialog(const char* title, const char* filter_label,
+                           const char* filter_glob, const char* suggested);
+
 }  // namespace nuka::runtime::app::viewer

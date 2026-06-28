@@ -28,16 +28,17 @@ namespace nk = nuka::nk;
 namespace cook = nuka::scene::cook;
 namespace render = nuka::render;
 
-// Strip collision mesh geometry so CookToModel skips the heavy V-HACD pass (the
-// editor validates the live loop, not hull fidelity). Visual meshes are untouched.
-nuka::scene::SceneIR LoadLightScene(const std::string& path) {
-    nuka::scene::SceneIR scene = nuka::scene::nks::Load(path);
-    for (size_t i = 0; i < scene.ShapeCount(); ++i) {
-        auto& shape = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
+// Strip collision mesh geometry from a COPY so CookToModel skips the heavy V-HACD
+// pass (the editor cooks for the live loop, not hull fidelity). The original keeps
+// its geometry so Save round-trips it -- a stripped Save would lose collision data.
+nuka::scene::SceneIR LightCookCopy(const nuka::scene::SceneIR& full) {
+    nuka::scene::SceneIR light = full;
+    for (size_t i = 0; i < light.ShapeCount(); ++i) {
+        auto& shape = light.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
         shape.mesh_vertices.clear();
         shape.mesh_indices.clear();
     }
-    return scene;
+    return light;
 }
 
 nk::Pipeline::SolverConfig DefaultCfg(float dt) {
@@ -67,16 +68,19 @@ std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
     // Catch any throw from the cook/build/World chain (parse error, unrepresentable
     // cook, device-alloc) so a bad Load fails gracefully instead of killing the window.
     try {
-        nuka::scene::SceneIR scene = LoadLightScene(path);
-        cook::CookToModelResult cooked = cook::CookToModel(scene, 1);
+        // Load the FULL scene (collision meshes intact) as the editable authority,
+        // then cook from a light copy so the live loop / behavior is unchanged.
+        nuka::scene::SceneIR full = nuka::scene::nks::Load(path);
+        nuka::scene::SceneIR light = LightCookCopy(full);
+        cook::CookToModelResult cooked = cook::CookToModel(light, 1);
         render::RenderWorld render_world =
-            render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
+            render::BuildRenderWorld(light.Ecs(), cooked.scene_map);
 
         auto es = std::make_unique<EditorScene>();
         es->path = path;
         es->caps = cooked.model.capacities;  // copy BEFORE the model is moved
         es->terrain = std::move(cooked.terrain);  // retained for height-scan obs
-        es->scene = std::move(scene);
+        es->scene = std::move(full);
         es->world = std::make_unique<nk::World>(std::move(cooked.model), 1u, device,
                                                 backend, DefaultCfg(dt));
         if (!es->world || !es->world->Ready()) {

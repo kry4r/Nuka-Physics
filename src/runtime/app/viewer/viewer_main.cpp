@@ -51,9 +51,11 @@
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"  // --policy closed-loop drive
+#include "scene/format/nks.hpp"                   // nks::Save (persist edits)
 #include "scene/scene_ir.hpp"
 
 #include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget (VIEW-2)
@@ -259,6 +261,12 @@ int main(int argc, char** argv) {
     bool cam_on = false;
     nuka::math::Vec3 cam_target{};
     float cam_dist = 0.0f, cam_yaw = 0.0f, cam_pitch = 0.0f;
+    // Headless editing aids: pre-select a node by path + apply a sample material
+    // recolor through the general edit seam (so a capture shows a populated
+    // inspector + a viewport change with no interactive mouse).
+    std::string select_path;
+    bool  edit_color_on = false;
+    float edit_color[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -279,6 +287,13 @@ int main(int argc, char** argv) {
                 cam_on = true;
             } else {
                 std::fprintf(stderr, "[nuka_editor] --cam wants tx,ty,tz,dist,yaw_deg,pitch_deg\n");
+            }
+        }
+        else if (a == "--select" && i + 1 < argc) select_path = argv[++i];
+        else if (a == "--edit-color" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%f,%f,%f", &edit_color[0], &edit_color[1],
+                            &edit_color[2]) == 3) {
+                edit_color_on = true;
             }
         }
         else if (a == "--help") {
@@ -315,6 +330,24 @@ int main(int argc, char** argv) {
     // it drives, so it is declared before `loaded` (destroyed after it).
     std::unique_ptr<nuka::runtime::inference::Go2PolicyController> policy_ctrl;
     std::unique_ptr<viewer::EditorScene> loaded;
+    // The general edit machinery: entity->record reverse index (rebuilt per load)
+    // and the last entity the inspector was seeded from (re-seed on a new pick).
+    viewer::EntityRecordIndex record_index;
+    nuka::scene::EntityId     last_seeded = nuka::scene::kInvalidEntity;
+
+    // Resolve a node PATH to its entity by matching SceneGraph::PathOf (the headless
+    // --select aid + a general path lookup). kInvalidEntity when no node matches.
+    auto entity_of_path = [](const viewer::EditorScene& es,
+                             const std::string& path) -> nuka::scene::EntityId {
+        nuka::scene::EntityId found = nuka::scene::kInvalidEntity;
+        const nuka::scene::SceneGraph& tree = es.scene.Tree();
+        tree.Traverse(tree.Root(), [&](const std::shared_ptr<nuka::scene::SceneNode>& n) {
+            if (found == nuka::scene::kInvalidEntity && tree.PathOf(n) == path) {
+                found = n->entity;
+            }
+        });
+        return found;
+    };
 
     // ---- 2. window surface + present renderer ---------------------------------
     window::SurfaceBackendKind kind = window::SurfaceBackendKind::None;
@@ -414,7 +447,34 @@ int main(int argc, char** argv) {
         loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
         frame_world(loaded->sim->GetRenderWorld());
         SeedDriveTargets(ui_state, *loaded);
+        // The general edit machinery for this scene: rebuild the entity->record
+        // reverse index, reset the inspector, seed the Save path from the source.
+        record_index.Build(loaded->scene);
+        ui_state.inspector = viewer::InspectorState{};
+        last_seeded = nuka::scene::kInvalidEntity;
+        std::snprintf(ui_state.save_path, sizeof(ui_state.save_path), "%s", path.c_str());
+        ui_state.save_dirty = false;
         ui_state.selected_entity = nuka::scene::kInvalidEntity;
+        // Headless aids: pre-select a node + apply a sample recolor via the seam.
+        if (!select_path.empty()) {
+            const nuka::scene::EntityId e = entity_of_path(*loaded, select_path);
+            if (e != nuka::scene::kInvalidEntity) ui_state.selected_entity = e;
+            else std::fprintf(stderr, "[nuka_editor] --select: no node at '%s'\n",
+                              select_path.c_str());
+        }
+        if (edit_color_on && ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+            const viewer::MaterialBinding mb =
+                viewer::ResolveMaterial(*loaded, record_index, ui_state.selected_entity);
+            if (mb.valid) {
+                nuka::scene::RenderMaterial m =
+                    loaded->sim->GetRenderWorld().materials[mb.render_slot];
+                m.base_color[0] = edit_color[0];
+                m.base_color[1] = edit_color[1];
+                m.base_color[2] = edit_color[2];
+                viewer::ApplyMaterialEdit(*loaded, mb, m, /*commit=*/true);
+                ui_state.save_dirty = true;
+            }
+        }
         ui_state.playing = false;  // open paused on the authored pose
         // Attach the trained locomotion controller to this freshly cooked scene when
         // --policy was given and the scene retained terrain (height-scan obs source).
@@ -440,9 +500,79 @@ int main(int argc, char** argv) {
         policy_ctrl.reset();
         loaded.reset();
         ClearModelUi(ui_state);
+        record_index = viewer::EntityRecordIndex{};
+        ui_state.inspector = viewer::InspectorState{};
+        last_seeded = nuka::scene::kInvalidEntity;
+        ui_state.save_dirty = false;
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
         const nuka::math::Vec3 hi{1.0f, 1.0f, 1.0f};
         camera.FrameAabb(lo, hi);
+    };
+
+    // Seed the inspector's editable values from the selected instance (world pose +
+    // material). Called when the selection changes; the viewer also tracks a
+    // movable body's live pose each frame while the user is not editing.
+    auto seed_inspector = [&](nuka::scene::EntityId e) {
+        viewer::InspectorState& ins = ui_state.inspector;
+        ins = viewer::InspectorState{};
+        if (!loaded || e == nuka::scene::kInvalidEntity) return;
+        const render::RenderInstance* inst =
+            viewer::InstanceOfEntity(loaded->sim->GetRenderWorld(), e);
+        if (inst == nullptr) return;
+        ins.valid   = true;
+        ins.movable = viewer::IsMovableInstance(*inst, *loaded);
+        const nuka::math::Vec3 p = inst->world_xform.position;
+        ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
+        const nuka::math::Vec3 rd = viewer::EulerDegFromQuat(inst->world_xform.rotation);
+        ins.rot_deg[0] = rd.x; ins.rot_deg[1] = rd.y; ins.rot_deg[2] = rd.z;
+        const viewer::MaterialBinding mb =
+            viewer::ResolveMaterial(*loaded, record_index, e);
+        if (mb.valid) {
+            const nuka::scene::RenderMaterial& m =
+                loaded->sim->GetRenderWorld().materials[mb.render_slot];
+            ins.has_material = true;
+            for (int k = 0; k < 4; ++k) ins.base_color[k] = m.base_color[k];
+            ins.roughness = m.roughness; ins.metallic = m.metallic;
+            for (int k = 0; k < 3; ++k) ins.emissive[k] = m.emissive[k];
+            ins.sheen = m.sheen; ins.transmission = m.transmission; ins.ior = m.ior;
+            for (int k = 0; k < 3; ++k) ins.absorption[k] = m.absorption[k];
+        }
+    };
+
+    // Apply the inspector's pending edits through the general seam: live every
+    // frame a widget moves, persist the record on the commit (edit-finished) frame.
+    auto apply_inspector_edits = [&]() {
+        if (!loaded) return;
+        viewer::InspectorState& ins = ui_state.inspector;
+        const nuka::scene::EntityId e = ui_state.selected_entity;
+        if (!ins.valid || e == nuka::scene::kInvalidEntity) return;
+        if (ins.transform_changed || ins.transform_commit) {
+            nuka::math::Transform world;
+            world.position = nuka::math::Vec3{ins.pos[0], ins.pos[1], ins.pos[2]};
+            world.rotation = viewer::QuatFromEulerDeg(
+                nuka::math::Vec3{ins.rot_deg[0], ins.rot_deg[1], ins.rot_deg[2]});
+            viewer::ApplyTransformEdit(*loaded, record_index, e, world, ins.transform_commit);
+            if (ins.transform_commit) ui_state.save_dirty = true;
+            ins.transform_changed = false; ins.transform_commit = false;
+        }
+        if (ins.has_material && (ins.material_changed || ins.material_commit)) {
+            const viewer::MaterialBinding mb =
+                viewer::ResolveMaterial(*loaded, record_index, e);
+            nuka::scene::RenderMaterial m;
+            if (mb.render_slot != render::kNoId &&
+                mb.render_slot < loaded->sim->GetRenderWorld().MaterialCount()) {
+                m = loaded->sim->GetRenderWorld().materials[mb.render_slot];
+            }
+            for (int k = 0; k < 4; ++k) m.base_color[k] = ins.base_color[k];
+            m.opacity = ins.base_color[3];
+            m.roughness = ins.roughness; m.metallic = ins.metallic;
+            for (int k = 0; k < 3; ++k) m.emissive[k] = ins.emissive[k];
+            m.sheen = ins.sheen; m.transmission = ins.transmission; m.ior = ins.ior;
+            for (int k = 0; k < 3; ++k) m.absorption[k] = ins.absorption[k];
+            viewer::ApplyMaterialEdit(*loaded, mb, m, ins.material_commit);
+            if (ins.material_commit) ui_state.save_dirty = true;
+            ins.material_changed = false; ins.material_commit = false;
+        }
     };
 
     // --scene goes through the SAME runtime load: seed a request the loop honors
@@ -666,11 +796,50 @@ int main(int argc, char** argv) {
         // Pull glfw input into io before ImGui::NewFrame (must precede it).
         if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
 #endif
+        // Re-seed the inspector on a new selection; otherwise track a movable body's
+        // live pose while the user is not actively editing it.
+        if (loaded) {
+            if (ui_state.selected_entity != last_seeded) {
+                seed_inspector(ui_state.selected_entity);
+                last_seeded = ui_state.selected_entity;
+            } else if (ui_state.inspector.valid && ui_state.inspector.movable &&
+                       !ui_state.inspector.transform_changed) {
+                if (const render::RenderInstance* inst = viewer::InstanceOfEntity(
+                        loaded->sim->GetRenderWorld(), ui_state.selected_entity)) {
+                    const nuka::math::Vec3 p = inst->world_xform.position;
+                    ui_state.inspector.pos[0] = p.x;
+                    ui_state.inspector.pos[1] = p.y;
+                    ui_state.inspector.pos[2] = p.z;
+                    const nuka::math::Vec3 rd =
+                        viewer::EulerDegFromQuat(inst->world_xform.rotation);
+                    ui_state.inspector.rot_deg[0] = rd.x;
+                    ui_state.inspector.rot_deg[1] = rd.y;
+                    ui_state.inspector.rot_deg[2] = rd.z;
+                }
+            }
+        }
+
         imgui.NewFrame();
         // Thread the loaded scene's SceneIR (its authoritative Tree + ECS) into the
         // UI for the hierarchical scene tree; null while the editor is empty.
         ui.RecordUi(render_world, stats, camera, ui_state,
                     loaded ? &loaded->scene : nullptr);
+
+        // Apply the inspector's pending edits (live + commit) through the general
+        // seam, then honor a pending Save of the full-fidelity scene.
+        apply_inspector_edits();
+        if (loaded && !ui_state.save_request.empty()) {
+            const std::string sp = ui_state.save_request;
+            ui_state.save_request.clear();
+            try {
+                nuka::scene::nks::Save(loaded->scene, sp);
+                ui_state.save_dirty = false;
+                std::printf("[nuka_editor] saved %s\n", sp.c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[nuka_editor] save failed: %s: %s\n",
+                             sp.c_str(), e.what());
+            }
+        }
 
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
         // owning the keyboard so typing in a panel never moves the view.

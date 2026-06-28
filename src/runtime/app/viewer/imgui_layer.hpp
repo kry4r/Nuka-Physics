@@ -53,6 +53,39 @@ namespace nuka::runtime::app::viewer {
 class CameraController;
 
 // ---------------------------------------------------------------------------
+// InspectorState -- the editable property values for the selected entity. The
+// viewer SEEDS these from the authoritative scene when the selection changes (and
+// re-reads a movable body's live pose each frame); the inspector widgets WRITE
+// them and latch `*_changed` (a value moved -> live preview update) / `*_commit`
+// (the edit finished -> persist the record). This is the SAME seam the Drive panel
+// uses: the UI mutates plain state + flags, the viewer applies via the general
+// edit path. NO nk / RenderWorld dependency lands in the UI layer.
+// ---------------------------------------------------------------------------
+struct InspectorState {
+    bool  valid   = false;    // a selectable, editable entity is bound
+    bool  movable = false;    // physics-driven (teleports) vs static placement
+
+    // transform (WORLD pose of the instance; rotation as intrinsic-XYZ degrees)
+    float pos[3]     = {0.0f, 0.0f, 0.0f};
+    float rot_deg[3] = {0.0f, 0.0f, 0.0f};
+    bool  transform_changed = false;  // a transform widget moved this frame (live)
+    bool  transform_commit  = false;  // edit finished -> persist the record
+
+    // material (present only when the selection carries an editable material)
+    bool  has_material = false;
+    float base_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float roughness     = 0.5f;
+    float metallic      = 0.0f;
+    float emissive[3]   = {0.0f, 0.0f, 0.0f};
+    float sheen         = 0.0f;   // RT-only (offline beauty)
+    float transmission  = 0.0f;   // RT-only
+    float ior           = 1.0f;   // RT-only
+    float absorption[3] = {0.0f, 0.0f, 0.0f};  // RT-only
+    bool  material_changed = false;
+    bool  material_commit  = false;
+};
+
+// ---------------------------------------------------------------------------
 // ViewerUiState -- the mutable transport / selection state the toolbar drives and
 // the viewer reads to pace the simulation. RecordUi() mutates this in response to
 // button clicks (play_toggled / step_requested / reset_requested are one-shot
@@ -95,6 +128,26 @@ struct ViewerUiState {
     char        load_path[512] = {0};     // editable path field (dialog fallback)
     std::string load_request;             // one-shot: path to load
     bool        unload_request = false;   // one-shot: drop to empty
+
+    // ---- editing -----------------------------------------------------------
+    // The inspector's editable property state for selected_entity (seeded by the
+    // viewer, written by the inspector widgets, applied via the general edit seam).
+    InspectorState inspector;
+    // One-shot: a path to Save the edited scene to (Save / Save As). save_dirty is
+    // a viewer-set hint that the in-memory scene has unsaved edits.
+    std::string    save_request;
+    char           save_path[512] = {0};
+    bool           save_dirty = false;
+
+    // ---- tree edit ops (Stage 3) -------------------------------------------
+    // One-shot structural-edit requests keyed on selected_entity (the chosen
+    // parent / target). The viewer applies them through the general SceneIR seam.
+    enum class AddKind : uint8_t { None, RigidBox, RigidSphere, MediaCloth };
+    AddKind     add_request = AddKind::None;  // add a child under the selection
+    bool        delete_request = false;       // delete selection + its subtree
+    std::string reparent_to_path;             // reparent selection under this path
+    char        rename_buf[256] = {0};        // rename field for the selection
+    bool        rename_request = false;       // commit the rename_buf
 };
 
 // ---------------------------------------------------------------------------

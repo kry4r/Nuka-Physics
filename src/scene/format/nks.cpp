@@ -644,6 +644,17 @@ Value SaveRenderMaterial(const MaterialRecord& m) {
     o.Set("base_color", std::move(bc));
     o.Set("metallic", Value::Float(m.metallic));
     o.Set("roughness", Value::Float(m.roughness));
+    // Beauty fields are emitted ONLY when non-default so an all-default material
+    // serializes byte-identically to a pre-beauty-field scene (no golden churn).
+    if (m.emissive.x != 0.0f || m.emissive.y != 0.0f || m.emissive.z != 0.0f) {
+        o.Set("emissive", Vec3Json(m.emissive));
+    }
+    if (m.sheen != 0.0f) o.Set("sheen", Value::Float(m.sheen));
+    if (m.transmission != 0.0f) o.Set("transmission", Value::Float(m.transmission));
+    if (m.ior != 1.0f) o.Set("ior", Value::Float(m.ior));
+    if (m.absorption.x != 0.0f || m.absorption.y != 0.0f || m.absorption.z != 0.0f) {
+        o.Set("absorption", Vec3Json(m.absorption));
+    }
     return o;
 }
 
@@ -1017,6 +1028,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.alpha = FloatAt(bc, 3, "base_color");
                 rec.metallic = rm.At("metallic").AsFloat();
                 rec.roughness = rm.At("roughness").AsFloat();
+                if (const Value* em = rm.Find("emissive")) rec.emissive = Vec3FromJson(*em);
+                if (const Value* sh = rm.Find("sheen")) rec.sheen = sh->AsFloat();
+                if (const Value* tr = rm.Find("transmission")) rec.transmission = tr->AsFloat();
+                if (const Value* io = rm.Find("ior")) rec.ior = io->AsFloat();
+                if (const Value* ab = rm.Find("absorption")) rec.absorption = Vec3FromJson(*ab);
                 if (phys) {
                     if (const Value* pm = phys->Find(kv.first)) {
                         rec.friction_mu = pm->At("static_friction").AsFloat();
@@ -1630,6 +1646,11 @@ void ApplyOverrides(SceneIR& scene, const Value& overlay) {
                 if (const Value* a = mat->Find("alpha")) m.alpha = a->AsFloat();
                 if (const Value* r = mat->Find("roughness")) m.roughness = r->AsFloat();
                 if (const Value* me = mat->Find("metallic")) m.metallic = me->AsFloat();
+                if (const Value* em = mat->Find("emissive")) m.emissive = Vec3FromJson(*em);
+                if (const Value* sh = mat->Find("sheen")) m.sheen = sh->AsFloat();
+                if (const Value* tr = mat->Find("transmission")) m.transmission = tr->AsFloat();
+                if (const Value* io = mat->Find("ior")) m.ior = io->AsFloat();
+                if (const Value* ab = mat->Find("absorption")) m.absorption = Vec3FromJson(*ab);
                 if (const Value* fr = mat->Find("friction_mu")) m.friction_mu = fr->AsFloat();
             }
         }

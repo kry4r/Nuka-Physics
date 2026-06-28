@@ -583,6 +583,15 @@ void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
     rm.opacity   = rec.alpha;
     rm.roughness = rec.roughness;
     rm.metallic  = rec.metallic;
+    rm.emissive[0] = rec.emissive.x;
+    rm.emissive[1] = rec.emissive.y;
+    rm.emissive[2] = rec.emissive.z;
+    rm.sheen        = rec.sheen;
+    rm.transmission = rec.transmission;
+    rm.ior          = rec.ior;
+    rm.absorption[0] = rec.absorption.x;
+    rm.absorption[1] = rec.absorption.y;
+    rm.absorption[2] = rec.absorption.z;
 
     PhysicsMaterial pm;
     if (rec.friction_mu >= 0.0f) {
