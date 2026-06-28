@@ -86,4 +86,27 @@ void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
 math::Quat QuatFromEulerDeg(const math::Vec3& deg);
 math::Vec3 EulerDegFromQuat(const math::Quat& q);
 
+// -- scene-tree structural edits --------------------------------------------
+// These mutate es.scene's RECORDS (the authority); the derived tree / ECS / entity
+// ids re-project afterward, so the viewer rebuilds its record index + re-resolves
+// selection by PATH. Add / Delete need a re-cook (RecookEditorScene); Rename does
+// not (a node name does not reach the cooked model). They take + return tree PATHS
+// because a path is the only identity stable across the re-projection.
+
+// Replace the leaf segment of the record-backed node at `path` with `new_leaf` (one
+// segment, no '/'). A body keeps any group prefix in its record name; a shape / media
+// sets its record name. Returns the node's new path, or "" if `path` is a pure group
+// (derived, not authored), is not record-backed, or `new_leaf` is empty/invalid.
+std::string RenameNode(EditorScene& es, const std::string& path,
+                       const std::string& new_leaf);
+
+// Add a movable unit-box body (+ box shape + neutral material) under the body or
+// group at `parent_path` ("" -> scene root). Returns the new node's path, or "".
+std::string AddBoxChild(EditorScene& es, const std::string& parent_path);
+
+// Remove the body subtree rooted at `path` (its bodies + shapes + the joints that
+// touch them) by rebuilding the authority without them. Returns the parent path to
+// reselect, or "" when `path` is not a body node.
+std::string DeleteSubtree(EditorScene& es, const std::string& path);
+
 }  // namespace nuka::runtime::app::viewer

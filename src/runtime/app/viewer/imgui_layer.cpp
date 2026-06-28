@@ -163,6 +163,20 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && valid_entity) {
         ui.selected_entity = node->entity;
     }
+    // Right-click context menu: the structural tree edits, keyed on THIS node (the
+    // viewer applies them through the general SceneIR seam + a re-cook).
+    if (ImGui::BeginPopupContextItem("##nodectx")) {
+        if (valid_entity) ui.selected_entity = node->entity;
+        ImGui::TextColored(kTextDim, "%s", name);
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(150.0f);
+        ImGui::InputTextWithHint("##rn", "new name", ui.rename_buf, sizeof(ui.rename_buf));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Rename")) { ui.rename_request = true; ImGui::CloseCurrentPopup(); }
+        if (ImGui::MenuItem("Add box child")) ui.add_box_request = true;
+        if (ImGui::MenuItem("Delete subtree")) ui.delete_request = true;
+        ImGui::EndPopup();
+    }
     ImGui::SameLine();
     ImGui::TextColored(kind.color, "[%s]", kind.label);
 

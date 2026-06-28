@@ -163,6 +163,151 @@ void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
     rec.absorption  = math::Vec3{mat.absorption[0], mat.absorption[1], mat.absorption[2]};
 }
 
+// -- scene-tree structural edits --------------------------------------------
+
+namespace {
+
+// The path of `entity`'s node in the current (possibly just re-projected) facade.
+std::string PathOfEntity(const scene::SceneIR& s, scene::EntityId e) {
+    return s.Tree().PathOf(s.Ecs().NodeOf(e));
+}
+
+// The BodyId an entity backs, or kInvalidBody. Linear over a handful of bodies.
+scene::BodyId BodyOfEntity(const scene::SceneIR& s, scene::EntityId e) {
+    for (scene::BodyId i = 0; i < s.RigidBodyCount(); ++i)
+        if (s.EntityOfBody(i) == e) return i;
+    return scene::kInvalidBody;
+}
+
+}  // namespace
+
+std::string RenameNode(EditorScene& es, const std::string& path,
+                       const std::string& new_leaf) {
+    if (new_leaf.empty() || new_leaf.find('/') != std::string::npos) return "";
+    const auto node = es.scene.Tree().NodeOf(path);
+    if (!node) return "";
+    const scene::EntityId e = node->entity;
+
+    for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
+        if (es.scene.EntityOfBody(i) != e) continue;
+        // Replace the record name's last '/'-segment, preserving any group prefix.
+        std::string nm = es.scene.GetBody(i).name;
+        const size_t slash = nm.rfind('/');
+        es.scene.GetBodyMut(i).name =
+            (slash == std::string::npos) ? new_leaf : nm.substr(0, slash + 1) + new_leaf;
+        return PathOfEntity(es.scene, es.scene.EntityOfBody(i));
+    }
+    for (scene::ShapeId i = 0; i < es.scene.ShapeCount(); ++i) {
+        if (es.scene.EntityOfShape(i) != e) continue;
+        es.scene.GetShapeMut(i).name = new_leaf;
+        return PathOfEntity(es.scene, es.scene.EntityOfShape(i));
+    }
+    for (scene::MediaId i = 0; i < es.scene.MediaCount(); ++i) {
+        if (es.scene.EntityOfMedia(i) != e) continue;
+        es.scene.GetMediaMut(i).name = new_leaf;
+        return PathOfEntity(es.scene, es.scene.EntityOfMedia(i));
+    }
+    return "";  // pure group / not record-backed
+}
+
+std::string AddBoxChild(EditorScene& es, const std::string& parent_path) {
+    scene::BodyId parent_body = scene::kInvalidBody;
+    if (const auto parent = es.scene.Tree().NodeOf(parent_path))
+        parent_body = BodyOfEntity(es.scene, parent->entity);
+
+    scene::RigidBodyRecord b;
+    b.is_static = false;
+    b.mass = 1.0f;
+    // Under a parent body the name is the bare leaf; under a group / root the group
+    // prefix path carries it there. A small +Z offset keeps it visible, not buried.
+    b.parent_id = parent_body;
+    b.name = (parent_body != scene::kInvalidBody || parent_path.empty())
+                 ? std::string("box")
+                 : parent_path + "/box";
+    b.local_transform.position = math::Vec3{0.0f, 0.0f, 0.5f};
+    const scene::BodyId nb = es.scene.AddRigidBody(b);
+
+    scene::MaterialRecord m;
+    m.name = "box_mat";
+    m.base_color = math::Vec3{0.72f, 0.72f, 0.75f};
+    const scene::MaterialId mid = es.scene.AddMaterial(m);
+
+    scene::CollisionShapeRecord s;
+    s.body_id = nb;
+    s.type = scene::ShapeType::Box;
+    s.half_extents = math::Vec3{0.25f, 0.25f, 0.25f};
+    s.material_id = mid;
+    s.name = "box_geom";
+    es.scene.AddCollisionShape(s);
+
+    return PathOfEntity(es.scene, es.scene.EntityOfBody(nb));
+}
+
+std::string DeleteSubtree(EditorScene& es, const std::string& path) {
+    const auto node = es.scene.Tree().NodeOf(path);
+    if (!node) return "";
+    const scene::BodyId root = BodyOfEntity(es.scene, node->entity);
+    if (root == scene::kInvalidBody) return "";  // only body subtrees delete
+
+    // The deleted set: the root body + every transitive child (parent_id chain).
+    std::vector<bool> del(es.scene.RigidBodyCount(), false);
+    del[root] = true;
+    for (bool more = true; more;) {
+        more = false;
+        for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
+            const scene::BodyId p = es.scene.GetBody(i).parent_id;
+            if (!del[i] && p != scene::kInvalidBody && p < del.size() && del[p]) {
+                del[i] = true;
+                more = true;
+            }
+        }
+    }
+
+    // Articulated removal (joints / sensors / settled IC referencing the subtree)
+    // needs a reviewed cross-table remap; decline rather than risk a silent miswire.
+    for (size_t j = 0; j < es.scene.JointCount(); ++j) {
+        const scene::JointRecord& jr = es.scene.GetJoint(static_cast<scene::JointId>(j));
+        if ((jr.parent_body != scene::kInvalidBody && jr.parent_body < del.size() &&
+             del[jr.parent_body]) ||
+            (jr.child_body != scene::kInvalidBody && jr.child_body < del.size() &&
+             del[jr.child_body]))
+            return "";
+    }
+    if (!es.scene.InitialState().empty()) return "";
+
+    // Rebuild the authority without the deleted bodies / their shapes: replay kept
+    // bodies in id order (parents first) with an old->new remap; metadata verbatim.
+    const std::string parent_path =
+        node->parent.lock() ? es.scene.Tree().PathOf(node->parent.lock()) : std::string();
+    scene::SceneIR out;
+    std::vector<scene::BodyId> remap(es.scene.RigidBodyCount(), scene::kInvalidBody);
+    for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
+        if (del[i]) continue;
+        scene::RigidBodyRecord b = es.scene.GetBody(i);
+        if (b.parent_id != scene::kInvalidBody) b.parent_id = remap[b.parent_id];
+        b.id = scene::kInvalidBody;  // AddRigidBody assigns the dense id
+        remap[i] = out.AddRigidBody(b);
+    }
+    for (size_t i = 0; i < es.scene.MaterialCount(); ++i)
+        out.AddMaterial(es.scene.GetMaterial(static_cast<scene::MaterialId>(i)));
+    for (scene::ShapeId i = 0; i < es.scene.ShapeCount(); ++i) {
+        scene::CollisionShapeRecord s = es.scene.GetShape(i);
+        if (s.body_id != scene::kInvalidBody && s.body_id < del.size() && del[s.body_id])
+            continue;
+        if (s.body_id != scene::kInvalidBody) s.body_id = remap[s.body_id];
+        s.id = 0;
+        out.AddCollisionShape(s);
+    }
+    for (size_t i = 0; i < es.scene.MediaCount(); ++i)
+        out.AddMedia(es.scene.GetMedia(static_cast<scene::MediaId>(i)));
+    for (size_t i = 0; i < es.scene.TerrainCount(); ++i)
+        out.AddTerrain(es.scene.GetTerrain(static_cast<scene::TerrainId>(i)));
+    out.SettleMut() = es.scene.Settle();
+
+    es.scene = std::move(out);
+    return parent_path;
+}
+
 // -- euler<->quat (intrinsic XYZ, degrees) ----------------------------------
 
 math::Quat QuatFromEulerDeg(const math::Vec3& deg) {
