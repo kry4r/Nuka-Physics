@@ -267,6 +267,9 @@ int main(int argc, char** argv) {
     std::string select_path;
     bool  edit_color_on = false;
     float edit_color[3] = {0.0f, 0.0f, 0.0f};
+    bool  edit_move_on = false;
+    float edit_move[3] = {0.0f, 0.0f, 0.0f};   // a position delta on the selection
+    std::string save_to;                       // one-shot Save after the load edits
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -296,6 +299,13 @@ int main(int argc, char** argv) {
                 edit_color_on = true;
             }
         }
+        else if (a == "--edit-move" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%f,%f,%f", &edit_move[0], &edit_move[1],
+                            &edit_move[2]) == 3) {
+                edit_move_on = true;
+            }
+        }
+        else if (a == "--save-to" && i + 1 < argc) save_to = argv[++i];
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -475,6 +485,20 @@ int main(int argc, char** argv) {
                 ui_state.save_dirty = true;
             }
         }
+        if (edit_move_on && ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+            if (const render::RenderInstance* inst = viewer::InstanceOfEntity(
+                    loaded->sim->GetRenderWorld(), ui_state.selected_entity)) {
+                nuka::math::Transform world = inst->world_xform;
+                world.position.x += edit_move[0];
+                world.position.y += edit_move[1];
+                world.position.z += edit_move[2];
+                viewer::ApplyTransformEdit(*loaded, record_index, ui_state.selected_entity,
+                                           world, /*commit=*/true);
+                ui_state.save_dirty = true;
+            }
+        }
+        // Headless one-shot Save (verifies the full editor save path end-to-end).
+        if (!save_to.empty()) ui_state.save_request = save_to;
         ui_state.playing = false;  // open paused on the authored pose
         // Attach the trained locomotion controller to this freshly cooked scene when
         // --policy was given and the scene retained terrain (height-scan obs source).
