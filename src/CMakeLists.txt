@@ -947,6 +947,7 @@ if(CMAKE_CUDA_COMPILER)
         add_executable(nuka_editor_exe
             runtime/app/viewer/viewer_main.cpp
             runtime/app/viewer/editor_scene.cpp
+            runtime/app/viewer/editor_edits.cpp
         )
         add_dependencies(nuka_editor_exe nuka_render_shaders)
         set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka_editor)

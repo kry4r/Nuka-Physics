@@ -324,6 +324,31 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         if (ImGui::Button("Load", ImVec2(-1.0f, 0.0f)) && ui_state.load_path[0] != '\0') {
             ui_state.load_request = ui_state.load_path;
         }
+
+        // -- Save: write the edited scene (full fidelity) back to .nks ----------
+        if (ui_state.has_scene) {
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            SectionHeader("Save");
+            if (ui_state.save_dirty) {
+                Badge("UNSAVED", ImVec4(kWarn.x, kWarn.y, kWarn.z, 0.22f), kWarn);
+                ImGui::SameLine();
+            }
+            ImGui::TextColored(kTextDim, "edits persist to .nks (+ sibling .nka)");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##savepath", ui_state.save_path, sizeof(ui_state.save_path));
+            if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)) && ui_state.save_path[0] != '\0') {
+                ui_state.save_request = ui_state.save_path;
+            }
+            if (ImGui::Button("Save As...", ImVec2(-1.0f, 0.0f))) {
+                const std::string picked =
+                    SaveFileDialog("Save Scene", "Nuka scenes", "*.nks", ui_state.save_path);
+                if (!picked.empty()) {
+                    std::snprintf(ui_state.save_path, sizeof(ui_state.save_path), "%s",
+                                  picked.c_str());
+                    ui_state.save_request = picked;
+                }
+            }
+        }
     }
     ImGui::End();
 
@@ -473,8 +498,10 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     ImGui::End();
 
     // ======================================================================
-    // ENTITY PANEL -- inspector for ui_state.selected_entity (tree click or picker):
-    // its render instance (pose / mesh) + scene node (name / path via NodeOf).
+    // ENTITY PANEL -- the editable inspector for ui_state.selected_entity. Reads
+    // identity (name / path / pose-src) and EDITS Transform + Material; the widget
+    // values + dirty/commit latches are applied by the viewer through the general
+    // edit seam (the SAME pattern as the Drive panel above).
     // ======================================================================
     if (ImGui::Begin("Entity")) {
         SectionHeader("Selection");
@@ -493,7 +520,6 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             char buf[96];
             std::snprintf(buf, sizeof(buf), "%u", ui_state.selected_entity.index);
             StatRow("entity", buf, kAccent);
-            // Node name + path from the authoritative tree (NodeOf bridges entity->node).
             if (scene != nullptr) {
                 if (const auto n = scene->Ecs().NodeOf(ui_state.selected_entity)) {
                     StatRow("node", n->name.empty() ? "(unnamed)" : n->name.c_str(), kText);
@@ -501,33 +527,84 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                     if (!path.empty()) StatRow("path", path.c_str(), kTextDim);
                 }
             }
-            if (inst == nullptr) {
-                ImGui::Dummy(ImVec2(0.0f, 4.0f));
-                ImGui::TextColored(kTextDim, "no renderable geometry");
-            } else {
-                const char* kind = "static";
-                switch (inst->pose_source.kind) {
-                    case render::PoseSource::Kind::Link:   kind = "link";   break;
-                    case render::PoseSource::Kind::Body:   kind = "body";   break;
-                    case render::PoseSource::Kind::Base:   kind = "base";   break;
-                    case render::PoseSource::Kind::Static: kind = "static"; break;
-                }
-                StatRow("pose src", kind, kText);
+            if (inst != nullptr) {
                 const bool real_mesh = inst->mesh_id != render::kNoId &&
                                        inst->mesh_id < world.meshes.Count();
                 StatRow("mesh",
                         real_mesh ? MeshSourceLabel(world.meshes.Source(inst->mesh_id)) : "none",
-                        kText);
-                const math::Vec3 p = inst->world_xform.position;
-                std::snprintf(buf, sizeof(buf), "%.3f  %.3f  %.3f", p.x, p.y, p.z);
-                StatRow("pos", buf, kText);
-                const bool movable = inst->pose_source.kind == render::PoseSource::Kind::Body ||
-                                     inst->pose_source.kind == render::PoseSource::Kind::Base;
-                ImGui::Dummy(ImVec2(0.0f, 4.0f));
-                if (movable)
-                    Badge("MOVABLE", ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.22f), kAccent);
-                else
-                    Badge("FIXED", kBgRaised, kTextDim);
+                        kTextDim);
+            }
+            ImGui::SameLine();
+            if (ui_state.inspector.movable)
+                Badge("MOVABLE", ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.22f), kAccent);
+            else
+                Badge("FIXED", kBgRaised, kTextDim);
+
+            InspectorState& ins = ui_state.inspector;
+            if (!ins.valid) {
+                ImGui::Dummy(ImVec2(0.0f, 6.0f));
+                ImGui::TextColored(kTextDim, "no editable geometry");
+            } else {
+                // -- Transform ---------------------------------------------------
+                ImGui::Dummy(ImVec2(0.0f, 6.0f));
+                SectionHeader("Transform");
+                bool t_changed = false, t_commit = false;
+                ImGui::TextColored(kTextDim, "position");
+                ImGui::SetNextItemWidth(-1.0f);
+                t_changed |= ImGui::DragFloat3("##pos", ins.pos, 0.01f, 0.0f, 0.0f, "%.3f");
+                t_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                ImGui::TextColored(kTextDim, "rotation (deg)");
+                ImGui::SetNextItemWidth(-1.0f);
+                t_changed |= ImGui::DragFloat3("##rot", ins.rot_deg, 0.5f, 0.0f, 0.0f, "%.1f");
+                t_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                ins.transform_changed = t_changed;
+                ins.transform_commit  = t_commit;
+
+                // -- Material ----------------------------------------------------
+                if (ins.has_material) {
+                    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+                    SectionHeader("Material");
+                    bool m_changed = false, m_commit = false;
+                    ImGui::TextColored(kTextDim, "base color");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::ColorEdit4("##basecol", ins.base_color,
+                                                   ImGuiColorEditFlags_AlphaBar);
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::TextColored(kTextDim, "roughness");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::SliderFloat("##rough", &ins.roughness, 0.0f, 1.0f, "%.3f");
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::TextColored(kTextDim, "metallic");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::SliderFloat("##metal", &ins.metallic, 0.0f, 1.0f, "%.3f");
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::TextColored(kTextDim, "emissive");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::ColorEdit3("##emis", ins.emissive,
+                                                   ImGuiColorEditFlags_HDR |
+                                                   ImGuiColorEditFlags_Float);
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+
+                    // Beauty-only fields: badged RT (the raster preview ignores them).
+                    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                    Badge("RT", ImVec4(kAccentDim.x, kAccentDim.y, kAccentDim.z, 0.30f), kAccent);
+                    ImGui::SameLine();
+                    ImGui::TextColored(kTextDim, "offline beauty only");
+                    ImGui::TextColored(kTextDim, "transmission");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::SliderFloat("##transm", &ins.transmission, 0.0f, 1.0f, "%.3f");
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::TextColored(kTextDim, "ior");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::SliderFloat("##ior", &ins.ior, 1.0f, 2.5f, "%.3f");
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::TextColored(kTextDim, "sheen");
+                    ImGui::SetNextItemWidth(-1.0f);
+                    m_changed |= ImGui::SliderFloat("##sheen", &ins.sheen, 0.0f, 1.0f, "%.3f");
+                    m_commit  |= ImGui::IsItemDeactivatedAfterEdit();
+                    ins.material_changed = m_changed;
+                    ins.material_commit  = m_commit;
+                }
             }
         }
     }
