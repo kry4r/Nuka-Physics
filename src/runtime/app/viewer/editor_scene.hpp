@@ -57,4 +57,10 @@ std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
                                              nuka::phi::Device* device,
                                              nuka::phi::Backend* backend, float dt);
 
+// Re-cook an existing EditorScene in place from its (mutated) SceneIR authority --
+// the general path a structural tree edit takes to rebuild world + RenderWorld.
+// The caller WaitIdle's first. Returns false (world/sim left reset) on cook failure.
+bool RecookEditorScene(EditorScene& es, nuka::phi::Device* device,
+                       nuka::phi::Backend* backend, float dt);
+
 }  // namespace nuka::runtime::app::viewer

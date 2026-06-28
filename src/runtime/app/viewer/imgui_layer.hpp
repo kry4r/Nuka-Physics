@@ -159,15 +159,14 @@ struct ViewerUiState {
     char           save_path[512] = {0};
     bool           save_dirty = false;
 
-    // ---- tree edit ops (Stage 3) -------------------------------------------
+    // ---- tree edit ops -----------------------------------------------------
     // One-shot structural-edit requests keyed on selected_entity (the chosen
-    // parent / target). The viewer applies them through the general SceneIR seam.
-    enum class AddKind : uint8_t { None, RigidBox, RigidSphere, MediaCloth };
-    AddKind     add_request = AddKind::None;  // add a child under the selection
-    bool        delete_request = false;       // delete selection + its subtree
-    std::string reparent_to_path;             // reparent selection under this path
-    char        rename_buf[256] = {0};        // rename field for the selection
-    bool        rename_request = false;       // commit the rename_buf
+    // parent / target). The viewer applies them through the general SceneIR seam,
+    // re-cooking the world for the structural ones (add / delete).
+    bool        add_box_request = false;   // add a box body under the selection
+    bool        delete_request  = false;   // delete the selection + its subtree
+    char        rename_buf[256] = {0};     // rename field for the selection
+    bool        rename_request  = false;   // commit rename_buf onto the selection
 };
 
 // ---------------------------------------------------------------------------

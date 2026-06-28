@@ -271,6 +271,10 @@ int main(int argc, char** argv) {
     float edit_move[3] = {0.0f, 0.0f, 0.0f};   // a position delta on the selection
     std::string save_to;                       // one-shot Save after the load edits
     std::string gizmo_op;                       // headless gizmo mode: move | rotate
+    // Headless tree-edit aids on the --select'd node (apply on the first frame).
+    std::string rename_to;                      // --rename NEW: rename the selection
+    bool        add_box_on = false;             // --add-box: box child under selection
+    bool        delete_on  = false;             // --delete: remove selection subtree
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -308,6 +312,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--save-to" && i + 1 < argc) save_to = argv[++i];
         else if (a == "--gizmo-op" && i + 1 < argc) gizmo_op = argv[++i];
+        else if (a == "--rename" && i + 1 < argc) rename_to = argv[++i];
+        else if (a == "--add-box") add_box_on = true;
+        else if (a == "--delete") delete_on = true;
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -501,6 +508,15 @@ int main(int argc, char** argv) {
         }
         if (gizmo_op == "rotate") ui_state.gizmo.op = viewer::GizmoState::Op::Rotate;
         else if (gizmo_op == "move") ui_state.gizmo.op = viewer::GizmoState::Op::Translate;
+        // Headless tree edits: queue a request on the selection; apply_tree_edits
+        // applies it at the top of the first frame, before the Save below.
+        if (!rename_to.empty()) {
+            std::snprintf(ui_state.rename_buf, sizeof(ui_state.rename_buf), "%s",
+                          rename_to.c_str());
+            ui_state.rename_request = true;
+        }
+        if (add_box_on) ui_state.add_box_request = true;
+        if (delete_on) ui_state.delete_request = true;
         // Headless one-shot Save (verifies the full editor save path end-to-end).
         if (!save_to.empty()) ui_state.save_request = save_to;
         ui_state.playing = false;  // open paused on the authored pose
@@ -535,6 +551,53 @@ int main(int argc, char** argv) {
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
         const nuka::math::Vec3 hi{1.0f, 1.0f, 1.0f};
         camera.FrameAabb(lo, hi);
+    };
+
+    // Apply a one-shot scene-tree edit (rename / add box / delete) queued on the
+    // selection. Runs at the TOP of a frame, before the render-world reference is
+    // bound, so a structural re-cook never dangles it. The selection is resolved to
+    // a stable PATH first (entity ids do not survive the edit's re-projection), and
+    // re-resolved by path afterward.
+    auto apply_tree_edits = [&]() {
+        if (!loaded) return;
+        const bool want_rename = ui_state.rename_request;
+        const bool want_add    = ui_state.add_box_request;
+        const bool want_delete = ui_state.delete_request;
+        ui_state.rename_request = ui_state.add_box_request = ui_state.delete_request = false;
+        if (!(want_rename || want_add || want_delete)) return;
+
+        std::string target_path;
+        if (ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+            if (const auto n = loaded->scene.Ecs().NodeOf(ui_state.selected_entity))
+                target_path = loaded->scene.Tree().PathOf(n);
+        }
+
+        std::string focus;          // node to reselect after the edit
+        bool structural = false;
+        if (want_rename && !target_path.empty()) {
+            focus = viewer::RenameNode(*loaded, target_path, ui_state.rename_buf);
+        } else if (want_add) {
+            focus = viewer::AddBoxChild(*loaded, target_path);  // "" -> scene root
+            structural = true;
+        } else if (want_delete && !target_path.empty()) {
+            focus = viewer::DeleteSubtree(*loaded, target_path);
+            structural = true;
+        }
+
+        if (structural) {
+            present->WaitIdle();
+            if (!viewer::RecookEditorScene(*loaded, dev, backend, dt))
+                std::fprintf(stderr, "[nuka_editor] re-cook after tree edit failed\n");
+        }
+        record_index.Build(loaded->scene);
+        ui_state.selected_entity = nuka::scene::kInvalidEntity;
+        if (!focus.empty()) {
+            if (const auto n = loaded->scene.Tree().NodeOf(focus))
+                ui_state.selected_entity = n->entity;
+        }
+        ui_state.inspector = viewer::InspectorState{};
+        last_seeded = nuka::scene::kInvalidEntity;
+        ui_state.save_dirty = true;
     };
 
     // Seed the inspector's editable values from the selected instance (world pose +
@@ -651,6 +714,9 @@ int main(int argc, char** argv) {
             ui_state.load_request.clear();
             apply_load(path);
         }
+        // Structural tree edits re-cook the world; apply them here, before the loop
+        // binds its render-world reference, so the rebuild never dangles it.
+        apply_tree_edits();
 
         // -- poll + dispatch input ----------------------------------------------
         events.clear();
