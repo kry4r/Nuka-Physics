@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
@@ -559,6 +560,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // The per-articulation slot stride MUST match the detection/assembly
         // (slot_base = articulation * stride). Data-driven; 4 at K<=1.
         p_solve_.contact_slots_per_artic = contact_slots_per_artic;
+        // Validation A/B: force the cook-time static schedule (the byte-identity
+        // reference for the dynamic islanding). Read once at Build (graph-safe).
+        const char* fsi = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
+        p_solve_.force_static_islands = (fsi != nullptr && fsi[0] == '1') ? 1u : 0u;
         // Pre-solve coupling seam: each registered provider's Couple funnels its
         // two-way reaction into the shared body sink before the single solve. The
         // row provider emits nothing here (it rides this solve); a grid-transfer

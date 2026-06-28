@@ -599,6 +599,20 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
     }
 }
 
+// The per-DOF scatter target: the global link row + spatial component the cooked
+// dof maps route this articulation tile's DOF to (comp==~0u => a 1-DOF joint qdot).
+__device__ __forceinline__ void ArticDofTarget(
+    uint32_t env, uint32_t a, uint32_t k, uint32_t dof_stride,
+    uint32_t links_per_dog, uint32_t base_link_count,
+    const uint32_t* __restrict__ dof_to_link,
+    const uint32_t* __restrict__ dof_to_component,
+    uint32_t& comp, size_t& gl) {
+    const size_t flat = static_cast<size_t>(env) * dof_stride + k;
+    comp = dof_to_component[flat];
+    const uint32_t link = dof_to_link[flat] + a * links_per_dog;
+    gl = static_cast<size_t>(env) * base_link_count + link;
+}
+
 __global__ void SolveRowsBlockIslandKernel(
     const NkRow* __restrict__ urows,
     float* __restrict__ lambda,
@@ -979,11 +993,9 @@ __global__ void SolveRowsBlockIslandKernel(
                 const uint32_t u = i / dof_stride;       // tile slot in the iteration
                 const uint32_t k = i - u * dof_stride;   // DOF within tile
                 const uint32_t a = dynamic ? tile_list[u] : u;  // env-local tile
-                const size_t flat = static_cast<size_t>(env) * dof_stride + k;
-                const uint32_t tmpl_link = dof_to_link[flat];
-                const uint32_t comp = dof_to_component[flat];
-                const uint32_t link = tmpl_link + a * links_per_dog;
-                const size_t gl = static_cast<size_t>(env) * base_link_count + link;
+                uint32_t comp; size_t gl;
+                ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
+                               dof_to_link, dof_to_component, comp, gl);
                 const float v = qdot_sh[static_cast<size_t>(a) * dof_stride + k];
                 if (comp != ~0u) {
                     link_velocity[gl].v[comp] = v;
@@ -1009,6 +1021,34 @@ __global__ void SolveRowsBlockIslandKernel(
     }
 }
 
+// Flush qdot_flat -> link_velocity for an articulation no active row claimed
+// (cc_artic_first==sentinel): the static all-tiles scatter did this every step.
+__global__ void FlushOrphanArticKernel(
+    const uint32_t* __restrict__ cc_artic_first, uint32_t artic_count,
+    uint32_t artics_per_env, uint32_t dof_stride, uint32_t base_link_count,
+    const float* __restrict__ qdot_flat, Spatial6* __restrict__ link_velocity,
+    float* __restrict__ qdot, const uint32_t* __restrict__ dof_to_link,
+    const uint32_t* __restrict__ dof_to_component) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= artic_count * dof_stride) return;
+    const uint32_t ag = t / dof_stride;
+    if (cc_artic_first[ag] != ~0u) return;  // a contact row already solved this tile.
+    const uint32_t k = t - ag * dof_stride;
+    const uint32_t ape = (artics_per_env == 0u) ? 1u : artics_per_env;
+    const uint32_t env = ag / ape;
+    const uint32_t a = ag - env * ape;       // env-local tile (env_artic_base + a == ag).
+    const uint32_t links_per_dog = (ape > 0u) ? (base_link_count / ape) : base_link_count;
+    uint32_t comp; size_t gl;
+    ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
+                   dof_to_link, dof_to_component, comp, gl);
+    const float v = qdot_flat[static_cast<size_t>(ag) * dof_stride + k];
+    if (comp != ~0u) {
+        link_velocity[gl].v[comp] = v;
+    } else {
+        qdot[gl] = v;
+    }
+}
+
 // --- op entry point ---------------------------------------------------------
 
 Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
@@ -1030,14 +1070,17 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         const uint32_t artics_per_env =
             (p->articulation_count > 0u && p->env_count > 0u)
                 ? (p->articulation_count / p->env_count) : 1u;
+        // The dynamic CC pass runs for PairDriven; the validation hook forces the
+        // cook-time static schedule (the byte-identity reference) instead.
+        const bool run_dynamic = with_b_arm && (p->force_static_islands == 0u);
         // Dynamic islanding (PairDriven): the grid is the static MAX-island bound —
         // each component consumes >=1 distinct dynamic entity (the broadphase drops
         // static-static pairs), so #components <= artics + bodies + particles. The
         // kernel reads the LIVE component count from data.island_count and early-exits
-        // the surplus blocks. UnionCsr keeps its cook-time island count.
+        // the surplus blocks. The static schedule keeps its cook-time island count.
         const uint32_t max_island_bound =
             p->articulation_count + p->total_body_count + p->total_particle_count;
-        const uint32_t grid_islands = with_b_arm ? max_island_bound : p->total_islands;
+        const uint32_t grid_islands = run_dynamic ? max_island_bound : p->total_islands;
         if (grid_islands == 0u) {
             return Status::Ok;
         }
@@ -1070,10 +1113,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 opted_in_bytes = shared_bytes;
             }
         }
-        // Zero the GLOBAL pseudo accumulators the position pass touches (the
-        // per-link pseudo tiles are zeroed in-kernel). The rigid/particle pseudo
-        // velocities accumulate across the sweep, so they start from zero each
-        // step (no cross-step energy carry). pos_iters==0 leaves them untouched.
+        // Zero every GLOBAL pseudo accumulator (rigid/particle/articulation): the
+        // dynamic schedule rewrites only solved tiles, so a dropped tile reads 0 here.
         if (pos_pass) {
             if (p->total_body_count > 0u && data.body_pseudo_linear_velocity != nullptr) {
                 const size_t bbytes =
@@ -1093,15 +1134,35 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                     return Status::Failed;
                 }
             }
+            const size_t total_link_count =
+                static_cast<size_t>(p->base_link_count) * p->env_count;
+            const size_t total_artic_dof =
+                static_cast<size_t>(p->articulation_count) * p->max_dof;
+            if (total_link_count > 0u && data.qdot_pseudo != nullptr) {
+                if (cudaMemsetAsync(data.qdot_pseudo, 0,
+                                    total_link_count * sizeof(float), stream) !=
+                        cudaSuccess ||
+                    cudaMemsetAsync(data.link_velocity_pseudo, 0,
+                                    total_link_count * sizeof(Spatial6), stream) !=
+                        cudaSuccess) {
+                    return Status::Failed;
+                }
+            }
+            if (total_artic_dof > 0u && data.qdot_pseudo_flat != nullptr) {
+                if (cudaMemsetAsync(data.qdot_pseudo_flat, 0,
+                                    total_artic_dof * sizeof(float), stream) !=
+                        cudaSuccess) {
+                    return Status::Failed;
+                }
+            }
         }
-        // PairDriven reads the per-step dynamic schedule (data.island_quads /
-        // island_rows + the device island_count watermark); UnionCsr reads its
-        // cook-time schedule (model.island_row_offsets / row_order, count via param).
-        const uint32_t* const islands_in = with_b_arm
+        // Dynamic schedule: the per-step CC pass (island_quads/rows + island_count).
+        // Static schedule: the cook-time arrays (model.island_row_offsets/row_order).
+        const uint32_t* const islands_in = run_dynamic
             ? data.island_quads : static_cast<const uint32_t*>(model.island_row_offsets);
-        const uint32_t* const row_order_in = with_b_arm
+        const uint32_t* const row_order_in = run_dynamic
             ? data.island_rows : static_cast<const uint32_t*>(model.row_order);
-        const uint32_t* const island_count_dev = with_b_arm ? data.island_count : nullptr;
+        const uint32_t* const island_count_dev = run_dynamic ? data.island_count : nullptr;
         LaunchCuda(SolveRowsBlockIslandKernel, dim3(grid_islands),
                    dim3(kIslandBlockSize), static_cast<uint32_t>(shared_bytes),
                    stream,
@@ -1145,6 +1206,21 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<uint32_t>(p->pos_iters),
                    p->pos_beta, p->pos_slop, p->dt,
                    p->baumgarte_max_velocity);
+        // Flush the articulation tiles the dynamic schedule dropped (the static path
+        // scatters all tiles in-kernel). cc_artic_first is BuildSolveIslands' claim table.
+        if (run_dynamic && p->articulation_count > 0u && p->max_dof > 0u &&
+            data.cc_artic_first != nullptr) {
+            const uint32_t flush_threads = p->articulation_count * p->max_dof;
+            const uint32_t flush_blocks =
+                (flush_threads + kIslandBlockSize - 1u) / kIslandBlockSize;
+            LaunchCuda(FlushOrphanArticKernel, dim3(flush_blocks),
+                       dim3(kIslandBlockSize), 0u, stream,
+                       data.cc_artic_first, p->articulation_count, artics_per_env,
+                       p->max_dof, p->base_link_count, data.qdot_flat,
+                       reinterpret_cast<Spatial6*>(data.link_velocity), data.qdot,
+                       static_cast<const uint32_t*>(model.dof_to_link),
+                       static_cast<const uint32_t*>(model.dof_to_component));
+        }
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
 

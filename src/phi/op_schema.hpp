@@ -620,6 +620,9 @@ struct SolveRowsBlockIslandParams {
     uint32_t total_particle_count;
     float    pos_beta;
     float    pos_slop;
+    // Validation hook (NUKA_FORCE_STATIC_ISLANDS): run the conservative cook-time
+    // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
+    uint32_t force_static_islands;
 };
 
 // --- particle (XPBD / PBF) substep --------------------------------------
