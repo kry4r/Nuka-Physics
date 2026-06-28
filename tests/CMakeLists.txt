@@ -1106,6 +1106,9 @@ if(CMAKE_CUDA_COMPILER)
         # on an MPM bed; the link's grid reaction seeds qdot_flat via M^-1 J^T (support,
         # balance, BITE, two-run byte-identical, one-way bit cleared, 2-link reduction).
         scenario/artic_link_on_mpm_rest.cpp
+        # Dynamic island solve == the static one-island-per-env schedule, bit-for-bit,
+        # in the contact->airborne (pos_iters>0) and multi-env mixed-contact regimes.
+        scenario/island_byte_identity.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test
