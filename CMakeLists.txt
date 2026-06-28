@@ -278,6 +278,9 @@ if(NK_BUILD_VULKAN_VALIDATION)
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui_widgets.cpp
         ${CMAKE_SOURCE_DIR}/external/imgui/imgui_demo.cpp
         ${CMAKE_SOURCE_DIR}/external/imgui/backends/imgui_impl_vulkan.cpp
+        # ImGuizmo (MIT, vendored): the in-viewport transform gizmo. One TU; it
+        # links into the same imgui static lib and shares its SYSTEM include scope.
+        ${CMAKE_SOURCE_DIR}/external/imguizmo/ImGuizmo.cpp
     )
     # The GLFW platform backend gives ImGui keyboard/char/mouse input for free on
     # Windows; Linux keeps the self-fed xcb input path (no glfw backend compiled).
@@ -292,7 +295,8 @@ if(NK_BUILD_VULKAN_VALIDATION)
     # are on the path.
     target_include_directories(imgui SYSTEM PUBLIC
         ${CMAKE_SOURCE_DIR}/external/imgui
-        ${CMAKE_SOURCE_DIR}/external/imgui/backends)
+        ${CMAKE_SOURCE_DIR}/external/imgui/backends
+        ${CMAKE_SOURCE_DIR}/external/imguizmo)
     target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
     if(WIN32)
         target_link_libraries(imgui PUBLIC glfw)

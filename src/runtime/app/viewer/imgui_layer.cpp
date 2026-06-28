@@ -20,6 +20,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"  // DockBuilder* for the one-time default layout
+#include "ImGuizmo.h"        // in-viewport transform gizmo (vendored, MIT)
 
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
@@ -28,6 +29,7 @@
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <iterator>  // std::size for array-derived loop bounds
 #include <memory>
@@ -173,6 +175,72 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
     ImGui::PopID();
 }
 
+// -- gizmo matrix helpers (column-major float[16], glm/ImGuizmo convention) -----
+// Mirror the renderer's camera basis + transform layout so the gizmo lands ON the
+// rendered object. The projection is GL-style (y-up NDC): ImGuizmo applies its own
+// screen y-flip, so the Vulkan y-flip is intentionally absent here.
+
+void ModelMatrix(const math::Transform& t, float* m) {
+    const math::Quat q = t.rotation.Normalized();
+    const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    m[0] = 1.0f - 2.0f * (yy + zz); m[1] = 2.0f * (xy + wz);         m[2]  = 2.0f * (xz - wy); m[3] = 0.0f;
+    m[4] = 2.0f * (xy - wz);        m[5] = 1.0f - 2.0f * (xx + zz);  m[6]  = 2.0f * (yz + wx); m[7] = 0.0f;
+    m[8] = 2.0f * (xz + wy);        m[9] = 2.0f * (yz - wx);         m[10] = 1.0f - 2.0f * (xx + yy); m[11] = 0.0f;
+    m[12] = t.position.x; m[13] = t.position.y; m[14] = t.position.z; m[15] = 1.0f;
+}
+
+// Extract pos + (orthonormal) rotation from a column-major model matrix. Scale is
+// ignored by construction -- Translate/Rotate keep the 3x3 a pure rotation.
+math::Transform TransformFromModel(const float* m) {
+    math::Transform t;
+    t.position = math::Vec3{m[12], m[13], m[14]};
+    const float r00 = m[0], r10 = m[1], r20 = m[2];
+    const float r01 = m[4], r11 = m[5], r21 = m[6];
+    const float r02 = m[8], r12 = m[9], r22 = m[10];
+    const float trace = r00 + r11 + r22;
+    math::Quat q;
+    if (trace > 0.0f) {
+        float s = std::sqrt(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s; q.x = (r21 - r12) / s; q.y = (r02 - r20) / s; q.z = (r10 - r01) / s;
+    } else if (r00 > r11 && r00 > r22) {
+        float s = std::sqrt(1.0f + r00 - r11 - r22) * 2.0f;
+        q.w = (r21 - r12) / s; q.x = 0.25f * s; q.y = (r01 + r10) / s; q.z = (r02 + r20) / s;
+    } else if (r11 > r22) {
+        float s = std::sqrt(1.0f + r11 - r00 - r22) * 2.0f;
+        q.w = (r02 - r20) / s; q.x = (r01 + r10) / s; q.y = 0.25f * s; q.z = (r12 + r21) / s;
+    } else {
+        float s = std::sqrt(1.0f + r22 - r00 - r11) * 2.0f;
+        q.w = (r10 - r01) / s; q.x = (r02 + r20) / s; q.y = (r12 + r21) / s; q.z = 0.25f * s;
+    }
+    t.rotation = q.Normalized();
+    return t;
+}
+
+void ViewMatrix(const math::Vec3& eye, const math::Vec3& target,
+                const math::Vec3& up, float* m) {
+    const math::Vec3 f = (target - eye).Normalized();
+    math::Vec3 s = f.Cross(up);
+    if (s.LengthSq() < 1e-12f) s = math::Vec3{1.0f, 0.0f, 0.0f};
+    s = s.Normalized();
+    const math::Vec3 u = s.Cross(f);
+    m[0] = s.x; m[4] = s.y; m[8]  = s.z;  m[12] = -s.Dot(eye);
+    m[1] = u.x; m[5] = u.y; m[9]  = u.z;  m[13] = -u.Dot(eye);
+    m[2] = -f.x; m[6] = -f.y; m[10] = -f.z; m[14] = f.Dot(eye);
+    m[3] = 0.0f; m[7] = 0.0f; m[11] = 0.0f; m[15] = 1.0f;
+}
+
+void ProjMatrixGL(float fov_y_rad, float aspect, float znear, float zfar, float* m) {
+    const float t = std::tan(fov_y_rad * 0.5f);
+    for (int i = 0; i < 16; ++i) m[i] = 0.0f;
+    m[0] = 1.0f / (aspect * t);
+    m[5] = 1.0f / t;  // GL y-up NDC (ImGuizmo flips to screen itself)
+    m[10] = (zfar + znear) / (znear - zfar);
+    m[11] = -1.0f;
+    m[14] = (2.0f * zfar * znear) / (znear - zfar);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -227,6 +295,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         BuildDefaultDockLayout(dockspace_id);
         dock_built_ = true;
     }
+
+    // Arm ImGuizmo for this frame (perspective camera). DrawGizmo runs after the
+    // panels so its handles overlay the central viewport.
+    ImGuizmo::SetOrthographic(false);
+    ImGuizmo::BeginFrame();
 
     // ======================================================================
     // TRANSPORT TOOLBAR -- a slim accent-styled bar pinned to the top.
@@ -560,6 +633,22 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 ins.transform_changed = t_changed;
                 ins.transform_commit  = t_commit;
 
+                // -- Gizmo mode (the in-viewport handles share this edit seam) ----
+                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                GizmoState& gz = ui_state.gizmo;
+                ImGui::Checkbox("gizmo", &gz.enabled);
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!gz.enabled);
+                if (ImGui::RadioButton("move", gz.op == GizmoState::Op::Translate))
+                    gz.op = GizmoState::Op::Translate;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("rotate", gz.op == GizmoState::Op::Rotate))
+                    gz.op = GizmoState::Op::Rotate;
+                ImGui::SameLine();
+                bool local = gz.local;
+                if (ImGui::Checkbox("local", &local)) gz.local = local;
+                ImGui::EndDisabled();
+
                 // -- Material ----------------------------------------------------
                 if (ins.has_material) {
                     ImGui::Dummy(ImVec2(0.0f, 8.0f));
@@ -609,6 +698,48 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         }
     }
     ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// DrawGizmo -- the in-viewport transform manipulator. Builds the SAME camera
+// basis the renderer uses (right-handed LookAt, world +Z up; GL-NDC projection so
+// ImGuizmo's own screen flip lands the handles ON the rendered object), runs the
+// gizmo over the selected entity's WORLD pose, and on a drag rewrites `world` +
+// latches `changed` so the viewer routes the result through the general edit seam.
+// gizmo.active latches when the handles are hovered/used (orbit + picking stand
+// down). A no-op when disabled / unselected. Must run inside the ImGui frame,
+// after RecordUi (which armed ImGuizmo for this frame).
+// ---------------------------------------------------------------------------
+void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
+                           ViewerUiState& ui_state, math::Transform& world, bool& changed) {
+    changed = false;
+    GizmoState& gz = ui_state.gizmo;
+    if (!gz.enabled || ui_state.selected_entity == nuka::scene::kInvalidEntity ||
+        vp_w == 0u || vp_h == 0u) {
+        gz.active = false;
+        return;
+    }
+
+    float view[16], proj[16], model[16];
+    ViewMatrix(camera.ResolvedEye(), camera.ResolvedTarget(),
+               math::Vec3{0.0f, 0.0f, 1.0f}, view);
+    const float aspect = static_cast<float>(vp_w) / static_cast<float>(vp_h);
+    ProjMatrixGL(camera.fov_degrees * 3.14159265358979323846f / 180.0f, aspect,
+                 0.05f, 500.0f, proj);
+    ModelMatrix(world, model);
+
+    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
+    ImGuizmo::SetRect(0.0f, 0.0f, static_cast<float>(vp_w), static_cast<float>(vp_h));
+    const ImGuizmo::OPERATION op =
+        (gz.op == GizmoState::Op::Rotate) ? ImGuizmo::ROTATE : ImGuizmo::TRANSLATE;
+    const ImGuizmo::MODE mode = gz.local ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+    ImGuizmo::Manipulate(view, proj, op, mode, model);
+
+    gz.active = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+    if (ImGuizmo::IsUsing()) {
+        world = TransformFromModel(model);
+        changed = true;
+    }
 }
 
 }  // namespace nuka::runtime::app::viewer
