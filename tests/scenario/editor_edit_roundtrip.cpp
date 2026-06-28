@@ -209,6 +209,66 @@ TEST(EditorEditRoundtrip, EditsPersistAndCollisionSurvives) {
     EXPECT_FALSE(loaded.GetShape(lhull).mesh_vertices.empty());
 }
 
+// Tree-edit record shapes survive Save+reload: a renamed shape, plus an added box
+// body + shape + material (the records AddBoxChild emits). Mirrors the editor's
+// record-level mutations so the serialization the tree ops depend on stays covered.
+TEST(EditorEditRoundtrip, TreeEditsPersist) {
+    SceneIR scene = BuildEditableDemo();
+
+    // Rename the "skin" shape -> "crate" (the editor's record-name edit).
+    ShapeId skin = scene.ShapeCount();
+    for (ShapeId i = 0; i < scene.ShapeCount(); ++i) {
+        if (scene.GetShape(i).name == "skin") { skin = i; break; }
+    }
+    ASSERT_LT(skin, scene.ShapeCount());
+    scene.GetShapeMut(skin).name = "crate";
+
+    // Add a movable box body + box shape + material (the AddBoxChild records).
+    RigidBodyRecord nb;
+    nb.name = "addbox";
+    nb.is_static = false;
+    nb.local_transform.position = {0.0f, 0.0f, 0.5f};
+    const BodyId nbid = scene.AddRigidBody(nb);
+    MaterialRecord nm;
+    nm.name = "addbox_mat";
+    nm.base_color = {0.72f, 0.72f, 0.75f};
+    const MaterialId nmid = scene.AddMaterial(nm);
+    CollisionShapeRecord ns;
+    ns.body_id = nbid;
+    ns.type = ShapeType::Box;
+    ns.half_extents = {0.25f, 0.25f, 0.25f};
+    ns.material_id = nmid;
+    ns.name = "addbox_geom";
+    scene.AddCollisionShape(ns);
+
+    TempDir tmp;
+    const std::string path = tmp.File("treeedit.nks").string();
+    nks::Save(scene, path);
+    const SceneIR loaded = nks::Load(path);
+
+    // Rename persisted: "crate" present, "skin" gone.
+    bool has_crate = false, has_skin = false;
+    for (ShapeId i = 0; i < loaded.ShapeCount(); ++i) {
+        const std::string& n = loaded.GetShape(i).name;
+        if (n == "crate") has_crate = true;
+        if (n == "skin")  has_skin = true;
+    }
+    EXPECT_TRUE(has_crate) << "shape rename did not persist";
+    EXPECT_FALSE(has_skin) << "old shape name survived the rename";
+
+    // Add persisted: the new body + its shape + material all survive the round-trip.
+    bool has_body = false, has_geom = false, has_mat = false;
+    for (BodyId i = 0; i < loaded.RigidBodyCount(); ++i)
+        if (loaded.GetBody(i).name == "addbox") has_body = true;
+    for (ShapeId i = 0; i < loaded.ShapeCount(); ++i)
+        if (loaded.GetShape(i).name == "addbox_geom") has_geom = true;
+    for (MaterialId i = 0; i < loaded.MaterialCount(); ++i)
+        if (loaded.GetMaterial(i).name == "addbox_mat") has_mat = true;
+    EXPECT_TRUE(has_body) << "added body did not persist";
+    EXPECT_TRUE(has_geom) << "added shape did not persist";
+    EXPECT_TRUE(has_mat) << "added material did not persist";
+}
+
 // Negative control: the light-strip path (what the editor must NOT save from)
 // loses collision geometry -- the trap the full-fidelity load avoids.
 TEST(EditorEditRoundtrip, LightStripWouldLoseCollision) {
