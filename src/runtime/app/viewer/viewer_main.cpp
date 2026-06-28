@@ -270,6 +270,7 @@ int main(int argc, char** argv) {
     bool  edit_move_on = false;
     float edit_move[3] = {0.0f, 0.0f, 0.0f};   // a position delta on the selection
     std::string save_to;                       // one-shot Save after the load edits
+    std::string gizmo_op;                       // headless gizmo mode: move | rotate
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -306,6 +307,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--save-to" && i + 1 < argc) save_to = argv[++i];
+        else if (a == "--gizmo-op" && i + 1 < argc) gizmo_op = argv[++i];
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -497,6 +499,8 @@ int main(int argc, char** argv) {
                 ui_state.save_dirty = true;
             }
         }
+        if (gizmo_op == "rotate") ui_state.gizmo.op = viewer::GizmoState::Op::Rotate;
+        else if (gizmo_op == "move") ui_state.gizmo.op = viewer::GizmoState::Op::Translate;
         // Headless one-shot Save (verifies the full editor save path end-to-end).
         if (!save_to.empty()) ui_state.save_request = save_to;
         ui_state.playing = false;  // open paused on the authored pose
@@ -729,9 +733,11 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Camera gets the event only if ImGui is not capturing that input AND a
-            // Ctrl-drag is not in progress (so picking never spins the camera).
-            const bool cam_allow = !io.WantCaptureMouse && !(ctrl_down);
+            // Camera gets the event only if ImGui is not capturing that input, a
+            // Ctrl-drag is not in progress, and the gizmo is not in use (so neither
+            // picking nor the transform handles ever spin the camera).
+            const bool cam_allow =
+                !io.WantCaptureMouse && !ctrl_down && !ui_state.gizmo.active;
             camera.HandleEvent(ev, /*allow_drag=*/cam_allow,
                                /*allow_scroll=*/!io.WantCaptureMouse);
         }
@@ -848,6 +854,28 @@ int main(int argc, char** argv) {
         // UI for the hierarchical scene tree; null while the editor is empty.
         ui.RecordUi(render_world, stats, camera, ui_state,
                     loaded ? &loaded->scene : nullptr);
+
+        // In-viewport transform gizmo over the selected entity's LIVE world pose.
+        // A drag rewrites the pose and routes it through the SAME edit seam the
+        // inspector uses (ApplyTransformEdit); the inspector's numeric rows re-seed
+        // from the live pose next frame, so the two stay in lockstep.
+        if (loaded && ui_state.selected_entity != nuka::scene::kInvalidEntity &&
+            ui_state.inspector.valid) {
+            if (const render::RenderInstance* gi = viewer::InstanceOfEntity(
+                    loaded->sim->GetRenderWorld(), ui_state.selected_entity)) {
+                nuka::math::Transform gworld = gi->world_xform;
+                bool gizmo_changed = false;
+                ui.DrawGizmo(camera, vp_w, vp_h, ui_state, gworld, gizmo_changed);
+                if (gizmo_changed) {
+                    viewer::ApplyTransformEdit(*loaded, record_index,
+                                               ui_state.selected_entity, gworld,
+                                               /*commit=*/true);
+                    ui_state.save_dirty = true;
+                }
+            }
+        } else {
+            ui_state.gizmo.active = false;  // nothing to manipulate this frame
+        }
 
         // Apply the inspector's pending edits (live + commit) through the general
         // seam, then honor a pending Save of the full-fidelity scene.

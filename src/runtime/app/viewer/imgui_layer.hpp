@@ -37,6 +37,7 @@
 // viewer; it pulls no Vulkan headers.
 // ---------------------------------------------------------------------------
 
+#include "math/transform.hpp"
 #include "render/render_world.hpp"
 #include "scene/ecs/entity.hpp"
 
@@ -83,6 +84,23 @@ struct InspectorState {
     float absorption[3] = {0.0f, 0.0f, 0.0f};  // RT-only
     bool  material_changed = false;
     bool  material_commit  = false;
+};
+
+// ---------------------------------------------------------------------------
+// GizmoState -- the in-viewport transform manipulator settings for the selected
+// entity. It edits the SAME world transform the inspector does: Translate and
+// Rotate map 1:1 onto the rigid math::Transform. There is deliberately NO Scale
+// op -- the engine transform carries no scale, so a scale handle could not round-
+// trip through the records (it would be a non-persisting hack). The viewer reads
+// op/space + enabled, and writes `active` (the gizmo is hovered/dragged) so camera
+// orbit and entity picking stand down while the user manipulates it.
+// ---------------------------------------------------------------------------
+struct GizmoState {
+    enum class Op : uint8_t { Translate, Rotate };
+    bool enabled = true;             // master toggle (Entity panel)
+    Op   op      = Op::Translate;    // active manipulation
+    bool local   = false;            // local frame vs world frame
+    bool active  = false;            // viewer-set: hovered/used this frame
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +151,8 @@ struct ViewerUiState {
     // The inspector's editable property state for selected_entity (seeded by the
     // viewer, written by the inspector widgets, applied via the general edit seam).
     InspectorState inspector;
+    // The in-viewport transform gizmo settings (shares the inspector's edit seam).
+    GizmoState     gizmo;
     // One-shot: a path to Save the edited scene to (Save / Save As). save_dirty is
     // a viewer-set hint that the in-memory scene has unsaved edits.
     std::string    save_request;
@@ -192,6 +212,16 @@ public:
     void RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
                   CameraController& camera, ViewerUiState& ui_state,
                   const nuka::scene::SceneIR* scene = nullptr);
+
+    // Draw + run the transform gizmo for the selected entity over the viewport.
+    // `world` is the entity's current WORLD pose; on a manipulation it is rewritten
+    // with the new pose and `changed` latches true, so the viewer routes the result
+    // through the SAME edit seam the inspector uses. `ui_state.gizmo.active` is set
+    // when the gizmo is hovered/dragged (the viewer suppresses orbit + picking).
+    // Call AFTER RecordUi each frame; a no-op when the gizmo is disabled. Uses the
+    // CameraController's resolved basis/fov so it aligns with the rendered image.
+    void DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
+                   ViewerUiState& ui_state, math::Transform& world, bool& changed);
 
 private:
     // The docking layout is built ONCE (the first frame the dockspace exists). A
