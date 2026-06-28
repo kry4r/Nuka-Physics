@@ -24,8 +24,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace nuka::runtime::inference {
@@ -581,10 +583,42 @@ void Go2GpuPolicy::Step(void* backend, const float* link_pose,
     p.num_dogs = g.num_dogs;
     p.links_per_dog = g.links_per_dog;
 
+    // Optional diagnostic: split host-enqueue vs on-stream GPU time of the policy
+    // kernels (NUKA_POLICY_TIMING). Off in production -- the sync would defeat the
+    // zero-round-trip path; it exists only to locate a stall.
+    static const bool timing = std::getenv("NUKA_POLICY_TIMING") != nullptr;
+    static cudaEvent_t e0 = nullptr, e1 = nullptr;
+    static uint64_t tcount = 0;
+    std::chrono::steady_clock::time_point h0;
+    if (timing) {
+        if (e0 == nullptr) {
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+        }
+        h0 = std::chrono::steady_clock::now();
+        cudaEventRecord(e0, s);
+    }
+
     Go2ProprioKernel<<<Grid(g.num_dogs), kBlock, 0, s>>>(p);
     Go2HeightScanKernel<<<Grid(g.num_dogs * g.scan_n), kBlock, 0, s>>>(p);
     g.mlp.impl_->ForwardDevice(g.d_obs, g.d_act, g.num_dogs, s);
     Go2DriveWriteKernel<<<Grid(g.num_dogs * g.c.njoints), kBlock, 0, s>>>(p);
+
+    if (timing) {
+        cudaEventRecord(e1, s);
+        const double host_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - h0)
+                .count();
+        cudaEventSynchronize(e1);
+        float gpu_ms = 0.0f;
+        cudaEventElapsedTime(&gpu_ms, e0, e1);
+        if ((tcount++ % 32u) == 0u) {
+            std::fprintf(stderr,
+                         "[policy_timing] host_enqueue=%.3f ms  gpu_kernels=%.3f ms\n",
+                         host_ms, static_cast<double>(gpu_ms));
+        }
+    }
 }
 
 }  // namespace nuka::runtime::inference
