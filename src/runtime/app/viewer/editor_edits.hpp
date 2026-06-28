@@ -109,4 +109,10 @@ std::string AddBoxChild(EditorScene& es, const std::string& parent_path);
 // reselect, or "" when `path` is not a body node.
 std::string DeleteSubtree(EditorScene& es, const std::string& path);
 
+// Move the body subtree at `path` under the body / group at `new_parent_path` ("" ->
+// scene root), preserving its world pose. Returns the node's new path, or "" when
+// `path` is not a body, the move is a cycle, or the body is jointed / settled.
+std::string ReparentNode(EditorScene& es, const std::string& path,
+                         const std::string& new_parent_path);
+
 }  // namespace nuka::runtime::app::viewer

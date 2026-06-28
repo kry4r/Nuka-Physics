@@ -275,6 +275,7 @@ int main(int argc, char** argv) {
     std::string rename_to;                      // --rename NEW: rename the selection
     bool        add_box_on = false;             // --add-box: box child under selection
     bool        delete_on  = false;             // --delete: remove selection subtree
+    std::string reparent_to;                    // --reparent DST: move --select under DST
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -315,6 +316,7 @@ int main(int argc, char** argv) {
         else if (a == "--rename" && i + 1 < argc) rename_to = argv[++i];
         else if (a == "--add-box") add_box_on = true;
         else if (a == "--delete") delete_on = true;
+        else if (a == "--reparent" && i + 1 < argc) reparent_to = argv[++i];
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -517,6 +519,13 @@ int main(int argc, char** argv) {
         }
         if (add_box_on) ui_state.add_box_request = true;
         if (delete_on) ui_state.delete_request = true;
+        if (!reparent_to.empty() &&
+            ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+            if (const auto n = loaded->scene.Ecs().NodeOf(ui_state.selected_entity))
+                ui_state.reparent_src = loaded->scene.Tree().PathOf(n);
+            ui_state.reparent_dst = reparent_to;
+            ui_state.reparent_request = true;
+        }
         // Headless one-shot Save (verifies the full editor save path end-to-end).
         if (!save_to.empty()) ui_state.save_request = save_to;
         ui_state.playing = false;  // open paused on the authored pose
@@ -560,11 +569,13 @@ int main(int argc, char** argv) {
     // re-resolved by path afterward.
     auto apply_tree_edits = [&]() {
         if (!loaded) return;
-        const bool want_rename = ui_state.rename_request;
-        const bool want_add    = ui_state.add_box_request;
-        const bool want_delete = ui_state.delete_request;
+        const bool want_rename   = ui_state.rename_request;
+        const bool want_add      = ui_state.add_box_request;
+        const bool want_delete   = ui_state.delete_request;
+        const bool want_reparent = ui_state.reparent_request;
         ui_state.rename_request = ui_state.add_box_request = ui_state.delete_request = false;
-        if (!(want_rename || want_add || want_delete)) return;
+        ui_state.reparent_request = false;
+        if (!(want_rename || want_add || want_delete || want_reparent)) return;
 
         std::string target_path;
         if (ui_state.selected_entity != nuka::scene::kInvalidEntity) {
@@ -574,7 +585,13 @@ int main(int argc, char** argv) {
 
         std::string focus;          // node to reselect after the edit
         bool structural = false;
-        if (want_rename && !target_path.empty()) {
+        if (want_reparent) {
+            focus = viewer::ReparentNode(*loaded, ui_state.reparent_src,
+                                         ui_state.reparent_dst);
+            ui_state.reparent_src.clear();
+            ui_state.reparent_dst.clear();
+            structural = true;
+        } else if (want_rename && !target_path.empty()) {
             focus = viewer::RenameNode(*loaded, target_path, ui_state.rename_buf);
         } else if (want_add) {
             focus = viewer::AddBoxChild(*loaded, target_path);  // "" -> scene root

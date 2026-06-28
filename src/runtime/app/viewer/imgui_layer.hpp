@@ -167,6 +167,11 @@ struct ViewerUiState {
     bool        delete_request  = false;   // delete the selection + its subtree
     char        rename_buf[256] = {0};     // rename field for the selection
     bool        rename_request  = false;   // commit rename_buf onto the selection
+    // A tree drag-drop fills these (source node path -> new parent path) for one
+    // reparent; the viewer consumes + clears them. Empty dst = scene root.
+    std::string reparent_src;
+    std::string reparent_dst;
+    bool        reparent_request = false;
 };
 
 // ---------------------------------------------------------------------------

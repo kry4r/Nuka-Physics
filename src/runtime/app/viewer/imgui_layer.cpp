@@ -141,7 +141,7 @@ NodeKind ClassifyNode(const nuka::scene::Registry& reg, nuka::scene::EntityId e)
 // robots collapse as path-prefixed subtrees. Selection is keyed on node->entity.
 void RecordSceneNode(const nuka::scene::Registry& reg,
                      const std::shared_ptr<nuka::scene::SceneNode>& node,
-                     ViewerUiState& ui, int depth) {
+                     ViewerUiState& ui, int depth, const std::string& path) {
     if (!node) return;
     const NodeKind kind = ClassifyNode(reg, node->entity);
     const bool has_children = static_cast<bool>(node->first_child);
@@ -163,6 +163,22 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && valid_entity) {
         ui.selected_entity = node->entity;
     }
+    // Drag a node onto another to reparent it under that node (drop on the root
+    // "Scene" -> scene root). The payload is the source node's tree path.
+    if (valid_entity && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+        ImGui::SetDragDropPayload("NUKA_NODE", path.c_str(),
+                                  path.size() + 1);
+        ImGui::TextUnformatted(path.c_str());
+        ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("NUKA_NODE")) {
+            ui.reparent_src.assign(static_cast<const char*>(pl->Data));
+            ui.reparent_dst = path;  // this node is the new parent
+            ui.reparent_request = true;
+        }
+        ImGui::EndDragDropTarget();
+    }
     // Right-click context menu: the structural tree edits, keyed on THIS node (the
     // viewer applies them through the general SceneIR seam + a re-cook).
     if (ImGui::BeginPopupContextItem("##nodectx")) {
@@ -182,7 +198,9 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
 
     if (open && has_children) {
         for (auto child = node->first_child; child; child = child->next_sibling) {
-            RecordSceneNode(reg, child, ui, depth + 1);
+            const std::string child_path =
+                path.empty() ? child->name : path + "/" + child->name;
+            RecordSceneNode(reg, child, ui, depth + 1, child_path);
         }
         ImGui::TreePop();
     }
@@ -506,7 +524,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                world.InstanceCount(), world.meshes.Count(),
                                world.MaterialCount());
             ImGui::Dummy(ImVec2(0.0f, 4.0f));
-            RecordSceneNode(scene->Ecs(), scene->Tree().Root(), ui_state, 0);
+            RecordSceneNode(scene->Ecs(), scene->Tree().Root(), ui_state, 0, std::string());
         }
     }
     ImGui::End();
