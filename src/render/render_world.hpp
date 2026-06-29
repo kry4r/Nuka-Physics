@@ -210,6 +210,13 @@ struct RenderLight {
 // ---------------------------------------------------------------------------
 struct RenderWorld {
     std::vector<RenderInstance>        instances;
+
+    // Read-only viewport debug overlay: collider wireframe proxies + contact
+    // markers, drawn by the raster present pass's see-through debug pipeline AFTER
+    // the opaque scene. Empty by default; the opaque pass, picker, and path-tracer
+    // ignore it, so a non-overlay frame is byte-identical to the real instance set.
+    std::vector<RenderInstance>        debug_instances;
+
     MeshLibrary                        meshes;
     std::vector<scene::RenderMaterial> materials;  // indexed by render_material_id
     std::vector<RenderCamera>          cameras;

@@ -668,6 +668,13 @@ struct VulkanRasterRenderer::Impl {
         queue_info.pQueuePriorities = &kQueuePriority;
 
         VkPhysicalDeviceFeatures features{};
+        // PRESENT enables fillModeNonSolid (when offered) so the viewer's see-through
+        // collider debug pass can rasterize wireframe; OFFSCREEN keeps zero features.
+        if (present_capable) {
+            VkPhysicalDeviceFeatures supported{};
+            vkGetPhysicalDeviceFeatures(physical, &supported);
+            features.fillModeNonSolid = supported.fillModeNonSolid;
+        }
         VkDeviceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         create_info.queueCreateInfoCount = 1u;

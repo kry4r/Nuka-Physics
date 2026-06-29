@@ -7,10 +7,10 @@
 // live BodyPose, and a small marker at every active contact point.
 //
 // READ-ONLY: it mutates nothing in the SceneIR / physics and is independent of
-// the edit / undo path. Debug instances are APPENDED to the RenderWorld with a
-// sentinel entity + a non-movable pose source (so the viewport picker + scene
-// tree resolve real entities only) and CLEARED at the start of each rebuild, so
-// with both toggles off the RenderWorld is left byte-identical to the real set.
+// the edit / undo path. Debug instances go into RenderWorld's dedicated
+// `debug_instances` channel (cleared each rebuild) with a sentinel entity + a
+// non-movable pose source, so the real instance set, picker, and scene tree are
+// untouched and a both-toggles-off frame is byte-identical to the real set.
 //
 // HOST-ONLY / zero-CUDA-token: device reads go only through Data::DownloadField.
 // ---------------------------------------------------------------------------
@@ -81,6 +81,7 @@ private:
     // Reused host staging for the per-frame field downloads (allocation-free after
     // the first rebuild).
     std::vector<math::Transform> body_poses_;
+    std::vector<math::Transform> link_poses_;
     std::vector<float>           body_inv_mass_;
     std::vector<uint32_t>        ucontact_counts_;
     std::vector<math::Vec3>      ucontact_points_;

@@ -31,6 +31,10 @@ constexpr scene::EntityId kDebugEntity{~uint32_t(0), ~uint32_t(0) - 1u};
 // materials after a re-cook rebuilt RenderWorld::materials without them.
 constexpr float kContactSig[3] = {1.0f, 0.45f, 0.05f};
 
+// See-through alpha for the debug proxies. The present pass's wireframe pipeline
+// draws opaque lines (blend off) and ignores this; the translucent fallback uses it.
+constexpr float kDebugOverlayAlpha = 0.5f;
+
 // Cooked collision-shape kinds (CollisionShapeComponent::Kind / shape_kind.hpp).
 constexpr uint32_t kKindSphere  = 0u;
 constexpr uint32_t kKindCapsule = 1u;
@@ -138,7 +142,7 @@ void SetColor(scene::RenderMaterial& mat, float r, float g, float b, float e) {
     mat.emissive[0] = r * e; mat.emissive[1] = g * e; mat.emissive[2] = b * e;
     mat.metallic = 0.0f;
     mat.roughness = 1.0f;
-    mat.opacity = 1.0f;
+    mat.opacity = kDebugOverlayAlpha;
 }
 
 render::RenderInstance MakeDebugInstance(uint32_t mesh_id, uint32_t material_id,
@@ -192,17 +196,20 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
     if (shapes.empty()) return 0u;
     const uint32_t env = (env_count > 0u) ? (env_index % env_count) : 0u;
 
-    // Shapes [0,bodies) are body-attached: world pose == BodyPose[i] (the exact frame
-    // the narrowphase collides with; an articulation link's geom offset is pre-baked
-    // in). A collider is STATIC only if it is implicit ground (no body row) or a free
-    // body with inv_mass 0 -- an articulation link (body_to_link != ~0u) is dynamic
-    // even though its body-row inv_mass is 0 (its mass lives in the articulation).
-    const auto& body_to_link = model.body_to_link;  // host; empty without an articulation
+    // A body-attached collider's live frame: an articulation LINK reads
+    // LinkPose[link] o link_geom_local[link] (its BodyPose row is unpopulated until a
+    // step syncs it); a free body reads BodyPose[i]; implicit ground is world origin.
+    // STATIC only if implicit ground or a free body with inv_mass 0 -- a link
+    // (body_to_link != ~0u) is dynamic though its body-row inv_mass is 0.
+    const auto& body_to_link = model.body_to_link;                    // host; empty w/o articulation
+    const auto& link_geom_local = model.articulation.link_geom_local; // host; per template link
+    const uint32_t links = model.capacities.links_per_env;
     static_assert(sizeof(Transform) == 7u * sizeof(float), "BodyPose wire layout");
     body_poses_.assign(bodies ? bodies : 1u, Transform::Identity());
     body_inv_mass_.assign(bodies ? bodies : 1u, 0.0f);
+    link_poses_.assign(links ? links : 1u, Transform::Identity());
+    nk::Data& data = world.GetData();
     if (bodies > 0u) {
-        nk::Data& data = world.GetData();
         const uint64_t base = static_cast<uint64_t>(env) * bodies;
         if (!data.DownloadField(nk::FieldId::BodyPose, body_poses_.data(),
                                 static_cast<uint64_t>(bodies) * sizeof(Transform),
@@ -213,15 +220,28 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
             return 0u;
         }
     }
+    if (links > 0u &&
+        !data.DownloadField(nk::FieldId::LinkPose, link_poses_.data(),
+                            static_cast<uint64_t>(links) * sizeof(Transform),
+                            static_cast<uint64_t>(env) * links * sizeof(Transform))) {
+        return 0u;
+    }
 
     uint32_t emitted = 0u;
     char key[96];
     for (uint32_t i = 0; i < shapes.size(); ++i) {
         const auto& sh = shapes[i];
         const bool has_body = (i < bodies);
-        const Transform pose = has_body ? body_poses_[i] : Transform::Identity();
         const bool is_link =
             has_body && i < body_to_link.size() && body_to_link[i] != ~uint32_t(0);
+        Transform pose = Transform::Identity();
+        if (is_link) {
+            const uint32_t l = body_to_link[i];
+            if (l < link_poses_.size()) pose = link_poses_[l];
+            if (l < link_geom_local.size()) pose = pose * link_geom_local[l];
+        } else if (has_body) {
+            pose = body_poses_[i];
+        }
         const bool is_static = has_body ? (!is_link && body_inv_mass_[i] == 0.0f) : true;
         const uint32_t mat = is_static ? mat_static_ : mat_dynamic_;
         uint32_t mesh_id = render::kNoId;
@@ -261,7 +281,7 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
                 continue;
         }
         if (budget == 0u) break;
-        render_world.instances.push_back(MakeDebugInstance(mesh_id, mat, pose));
+        render_world.debug_instances.push_back(MakeDebugInstance(mesh_id, mat, pose));
         --budget;
         ++emitted;
     }
@@ -301,7 +321,7 @@ uint32_t DebugOverlay::AppendContacts(nk::World& world,
         for (uint32_t p = 0; p < cnt; ++p) {
             if (budget == 0u) return emitted;
             const Vec3& pt = ucontact_points_[static_cast<size_t>(s) * 4u + p];
-            render_world.instances.push_back(
+            render_world.debug_instances.push_back(
                 MakeDebugInstance(mesh_id, mat_contact_, Transform{pt, math::Quat::Identity()}));
             --budget;
             ++emitted;
@@ -312,13 +332,9 @@ uint32_t DebugOverlay::AppendContacts(nk::World& world,
 
 void DebugOverlay::Rebuild(nk::World& world, render::RenderWorld& render_world,
                            uint32_t env_index, bool show_colliders, bool show_contacts) {
-    // Drop the prior debug layer: pop the sentinel-tagged tail (always the strict
-    // tail until the next rebuild). Self-healing across re-cooks -- a rebuilt
-    // RenderWorld carries no tagged tail, so nothing real is ever removed.
-    while (!render_world.instances.empty() &&
-           render_world.instances.back().entity == kDebugEntity) {
-        render_world.instances.pop_back();
-    }
+    // The overlay owns the dedicated debug channel outright: clear it each rebuild.
+    // The real `instances` set is never touched, so a non-overlay frame is untouched.
+    render_world.debug_instances.clear();
     last_colliders_ = last_contacts_ = last_skipped_ = 0u;
     if (!show_colliders && !show_contacts) return;
 
