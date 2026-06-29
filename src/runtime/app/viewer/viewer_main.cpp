@@ -53,6 +53,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
+#include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/script_host.hpp"     // embedded-python live-world bridge
 #include "runtime/inference/go2_policy_controller.hpp"  // --policy closed-loop drive
@@ -297,6 +298,8 @@ int main(int argc, char** argv) {
     bool        add_box_on = false;             // --add-box: box child under selection
     bool        delete_on  = false;             // --delete: remove selection subtree
     std::string reparent_to;                    // --reparent DST: move --select under DST
+    bool        headless_undo = false;          // --undo: fire one undo after the load edit
+    bool        headless_redo = false;          // --redo: fire one redo after the undo
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -339,12 +342,15 @@ int main(int argc, char** argv) {
         else if (a == "--add-box") add_box_on = true;
         else if (a == "--delete") delete_on = true;
         else if (a == "--reparent" && i + 1 < argc) reparent_to = argv[++i];
+        else if (a == "--undo") headless_undo = true;
+        else if (a == "--redo") headless_redo = true;
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
                         "[--cam tx,ty,tz,dist,yaw_deg,pitch_deg] "
                         "[--capture-frame N --capture-out FILE.ppm]\n"
                         "  [--run-script FILE.py runs a script once against the loaded scene]\n"
+                        "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -379,6 +385,20 @@ int main(int argc, char** argv) {
     viewer::EntityRecordIndex record_index;
     nuka::scene::EntityId     last_seeded = nuka::scene::kInvalidEntity;
 
+    // Reversible-edit history (cleared on a scene swap -- no undo across loads). A
+    // drag/slide fires many *_changed frames but records ONE op on its *_commit /
+    // gizmo drag-release: BEFORE is captured at the gesture start, AFTER at commit.
+    viewer::EditStack       edit_stack;
+    bool                    xform_gesture_active = false;  // inspector or gizmo drag
+    bool                    xform_dirty = false;           // the gizmo drag moved it
+    std::string             xform_gesture_path;
+    nuka::math::Transform   xform_before;
+    nuka::math::Transform   xform_after;                   // latest pose during a drag
+    bool                    mat_gesture_active = false;
+    std::string             mat_gesture_path;
+    nuka::scene::RenderMaterial mat_before{};
+    bool                    gizmo_using_prev = false;
+
     // Resolve a node PATH to its entity by matching SceneGraph::PathOf (the headless
     // --select aid + a general path lookup). kInvalidEntity when no node matches.
     auto entity_of_path = [](const viewer::EditorScene& es,
@@ -391,6 +411,15 @@ int main(int argc, char** argv) {
             }
         });
         return found;
+    };
+
+    // The tree PATH of an entity (the identity an undo op resolves against -- stable
+    // across re-projection). Empty when the entity has no node / no scene is loaded.
+    auto path_of_entity = [&](nuka::scene::EntityId e) -> std::string {
+        if (!loaded || e == nuka::scene::kInvalidEntity) return std::string();
+        if (const auto n = loaded->scene.Ecs().NodeOf(e))
+            return loaded->scene.Tree().PathOf(n);
+        return std::string();
     };
 
     // ---- 2. window surface + present renderer ---------------------------------
@@ -503,6 +532,9 @@ int main(int argc, char** argv) {
         script_host.SetContext({loaded.get(), &record_index, &ui_state});
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
+        // A new scene has no edit history (undo across loads is out of scope).
+        edit_stack.Clear();
+        xform_gesture_active = mat_gesture_active = gizmo_using_prev = false;
         std::snprintf(ui_state.save_path, sizeof(ui_state.save_path), "%s", path.c_str());
         ui_state.save_dirty = false;
         ui_state.selected_entity = nuka::scene::kInvalidEntity;
@@ -517,24 +549,30 @@ int main(int argc, char** argv) {
             const viewer::MaterialBinding mb =
                 viewer::ResolveMaterial(*loaded, record_index, ui_state.selected_entity);
             if (mb.valid) {
-                nuka::scene::RenderMaterial m =
+                const nuka::scene::RenderMaterial before =
                     loaded->sim->GetRenderWorld().materials[mb.render_slot];
+                nuka::scene::RenderMaterial m = before;
                 m.base_color[0] = edit_color[0];
                 m.base_color[1] = edit_color[1];
                 m.base_color[2] = edit_color[2];
                 viewer::ApplyMaterialEdit(*loaded, mb, m, /*commit=*/true);
+                edit_stack.Record(viewer::MakeMaterialOp(
+                    loaded.get(), path_of_entity(ui_state.selected_entity), before, m));
                 ui_state.save_dirty = true;
             }
         }
         if (edit_move_on && ui_state.selected_entity != nuka::scene::kInvalidEntity) {
             if (const render::RenderInstance* inst = viewer::InstanceOfEntity(
                     loaded->sim->GetRenderWorld(), ui_state.selected_entity)) {
-                nuka::math::Transform world = inst->world_xform;
+                const nuka::math::Transform before = inst->world_xform;
+                nuka::math::Transform world = before;
                 world.position.x += edit_move[0];
                 world.position.y += edit_move[1];
                 world.position.z += edit_move[2];
                 viewer::ApplyTransformEdit(*loaded, record_index, ui_state.selected_entity,
                                            world, /*commit=*/true);
+                edit_stack.Record(viewer::MakeTransformOp(
+                    loaded.get(), path_of_entity(ui_state.selected_entity), before, world));
                 ui_state.save_dirty = true;
             }
         }
@@ -588,6 +626,8 @@ int main(int argc, char** argv) {
         script_host.SetContext({nullptr, &record_index, &ui_state});
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
+        edit_stack.Clear();
+        xform_gesture_active = mat_gesture_active = gizmo_using_prev = false;
         ui_state.save_dirty = false;
         const nuka::math::Vec3 lo{-1.0f, -1.0f, 0.0f};
         const nuka::math::Vec3 hi{1.0f, 1.0f, 1.0f};
@@ -615,22 +655,32 @@ int main(int argc, char** argv) {
                 target_path = loaded->scene.Tree().PathOf(n);
         }
 
+        // Snapshot the authority BEFORE the edit; a structural op reverts by
+        // restoring it (the simplest correct general structural undo).
+        nuka::scene::SceneIR before = loaded->scene;
+        const auto bodies_before = loaded->scene.RigidBodyCount();
+
         std::string focus;          // node to reselect after the edit
         bool structural = false;
+        bool changed = false;       // the mutator actually altered the scene
         if (want_reparent) {
             focus = viewer::ReparentNode(*loaded, ui_state.reparent_src,
                                          ui_state.reparent_dst);
             ui_state.reparent_src.clear();
             ui_state.reparent_dst.clear();
             structural = true;
+            changed = !focus.empty();
         } else if (want_rename && !target_path.empty()) {
             focus = viewer::RenameNode(*loaded, target_path, ui_state.rename_buf);
+            changed = !focus.empty();
         } else if (want_add) {
             focus = viewer::AddBoxChild(*loaded, target_path);  // "" -> scene root
             structural = true;
+            changed = !focus.empty();
         } else if (want_delete && !target_path.empty()) {
             focus = viewer::DeleteSubtree(*loaded, target_path);
             structural = true;
+            changed = loaded->scene.RigidBodyCount() < bodies_before;
         }
 
         if (structural) {
@@ -646,7 +696,15 @@ int main(int argc, char** argv) {
         }
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
-        ui_state.save_dirty = true;
+        // Record the reversible op only when the scene actually changed (a declined
+        // reparent / non-body delete leaves it untouched -> nothing to undo).
+        if (changed) {
+            ui_state.save_dirty = true;
+            nuka::scene::SceneIR after = loaded->scene;
+            edit_stack.Record(viewer::MakeStructuralOp(loaded.get(), &record_index, dev,
+                                                       backend, dt, std::move(before),
+                                                       std::move(after)));
+        }
     };
 
     // Seed the inspector's editable values from the selected instance (world pose +
@@ -691,8 +749,22 @@ int main(int argc, char** argv) {
             world.position = nuka::math::Vec3{ins.pos[0], ins.pos[1], ins.pos[2]};
             world.rotation = viewer::QuatFromEulerDeg(
                 nuka::math::Vec3{ins.rot_deg[0], ins.rot_deg[1], ins.rot_deg[2]});
+            // Open a gesture at the first changed frame: capture the pre-edit world
+            // pose as BEFORE (the instance still holds it -- the edit lands below).
+            if (!xform_gesture_active) {
+                xform_gesture_active = true;
+                xform_gesture_path = path_of_entity(e);
+                if (const render::RenderInstance* gi = viewer::InstanceOfEntity(
+                        loaded->sim->GetRenderWorld(), e))
+                    xform_before = gi->world_xform;
+            }
             viewer::ApplyTransformEdit(*loaded, record_index, e, world, ins.transform_commit);
-            if (ins.transform_commit) ui_state.save_dirty = true;
+            if (ins.transform_commit) {
+                ui_state.save_dirty = true;
+                edit_stack.Record(viewer::MakeTransformOp(loaded.get(), xform_gesture_path,
+                                                          xform_before, world));
+                xform_gesture_active = false;
+            }
             ins.transform_changed = false; ins.transform_commit = false;
         }
         if (ins.has_material && (ins.material_changed || ins.material_commit)) {
@@ -703,6 +775,12 @@ int main(int argc, char** argv) {
                 mb.render_slot < loaded->sim->GetRenderWorld().MaterialCount()) {
                 m = loaded->sim->GetRenderWorld().materials[mb.render_slot];
             }
+            // Capture the pre-edit material as BEFORE at the gesture start.
+            if (!mat_gesture_active) {
+                mat_gesture_active = true;
+                mat_gesture_path = path_of_entity(e);
+                mat_before = m;
+            }
             for (int k = 0; k < 4; ++k) m.base_color[k] = ins.base_color[k];
             m.opacity = ins.base_color[3];
             m.roughness = ins.roughness; m.metallic = ins.metallic;
@@ -710,9 +788,28 @@ int main(int argc, char** argv) {
             m.sheen = ins.sheen; m.transmission = ins.transmission; m.ior = ins.ior;
             for (int k = 0; k < 3; ++k) m.absorption[k] = ins.absorption[k];
             viewer::ApplyMaterialEdit(*loaded, mb, m, ins.material_commit);
-            if (ins.material_commit) ui_state.save_dirty = true;
+            if (ins.material_commit) {
+                ui_state.save_dirty = true;
+                edit_stack.Record(viewer::MakeMaterialOp(loaded.get(), mat_gesture_path,
+                                                         mat_before, m));
+                mat_gesture_active = false;
+            }
             ins.material_changed = false; ins.material_commit = false;
         }
+    };
+
+    // Resync after an undo/redo lands (the op already restored the world / record +
+    // rebuilt the index for a structural revert; clear the selection + inspector so
+    // stale ids never linger). Property reverts queue a MoveEntity the frame's own
+    // FramePublish drains; structural reverts re-cooked the sim.
+    auto post_edit_resync = [&]() {
+        if (!loaded) return;
+        record_index.Build(loaded->scene);
+        ui_state.selected_entity = nuka::scene::kInvalidEntity;
+        ui_state.inspector = viewer::InspectorState{};
+        last_seeded = nuka::scene::kInvalidEntity;
+        xform_gesture_active = mat_gesture_active = gizmo_using_prev = false;
+        ui_state.save_dirty = true;
     };
 
     // --scene goes through the SAME runtime load: seed a request the loop honors
@@ -767,6 +864,30 @@ int main(int argc, char** argv) {
         // Structural tree edits re-cook the world; apply them here, before the loop
         // binds its render-world reference, so the rebuild never dangles it.
         apply_tree_edits();
+
+        // Headless undo/redo trigger: fire one of each after the load edit recorded
+        // (frame 0 = load + edit; undo at 1, redo at 2) so a --capture-frame proves it.
+        if (headless_undo && frame_index == 1u) ui_state.undo_request = true;
+        if (headless_redo && frame_index == 2u) ui_state.redo_request = true;
+
+        // Apply a pending undo/redo BETWEEN frames (never inside RecordUi): WaitIdle
+        // first since a structural revert re-cooks (the RecookEditorScene contract).
+        if (ui_state.undo_request) {
+            ui_state.undo_request = false;
+            if (loaded && edit_stack.CanUndo()) {
+                present->WaitIdle();
+                edit_stack.Undo();
+                post_edit_resync();
+            }
+        }
+        if (ui_state.redo_request) {
+            ui_state.redo_request = false;
+            if (loaded && edit_stack.CanRedo()) {
+                present->WaitIdle();
+                edit_stack.Redo();
+                post_edit_resync();
+            }
+        }
 
         // --run-script execs a file ONCE (the same embedded path the Run button uses)
         // after the first load; its captured output (incl. any traceback) -> stderr.
@@ -952,6 +1073,10 @@ int main(int argc, char** argv) {
         // Surface the load state to the UI (panels read "no scene" gracefully).
         ui_state.has_scene   = static_cast<bool>(loaded);
         ui_state.loaded_path = loaded ? loaded->path : std::string();
+        // The toolbar Undo/Redo buttons enable from these hints (read, not mutated,
+        // by the deterministic RecordUi path).
+        ui_state.can_undo = edit_stack.CanUndo();
+        ui_state.can_redo = edit_stack.CanRedo();
 
         // -- ImGui frame: set display size/dt, record panels, render draw data --
         io.DisplaySize = ImVec2(static_cast<float>(present->Report().width),
@@ -998,18 +1123,40 @@ int main(int argc, char** argv) {
             ui_state.inspector.valid) {
             if (const render::RenderInstance* gi = viewer::InstanceOfEntity(
                     loaded->sim->GetRenderWorld(), ui_state.selected_entity)) {
-                nuka::math::Transform gworld = gi->world_xform;
+                const nuka::math::Transform pre_drag = gi->world_xform;
+                nuka::math::Transform gworld = pre_drag;
                 bool gizmo_changed = false;
                 ui.DrawGizmo(camera, vp_w, vp_h, ui_state, gworld, gizmo_changed);
+                const bool using_now = ui_state.gizmo.using_now;
+                // The drag (IsUsing rising->falling) is ONE coalesced op: BEFORE at
+                // the press, AFTER the latest pose, recorded on release.
+                if (using_now && !gizmo_using_prev && !xform_gesture_active) {
+                    xform_gesture_active = true;
+                    xform_dirty = false;
+                    xform_gesture_path = path_of_entity(ui_state.selected_entity);
+                    xform_before = pre_drag;
+                    xform_after = pre_drag;
+                }
                 if (gizmo_changed) {
                     viewer::ApplyTransformEdit(*loaded, record_index,
                                                ui_state.selected_entity, gworld,
                                                /*commit=*/true);
                     ui_state.save_dirty = true;
+                    xform_after = gworld;
+                    xform_dirty = true;
                 }
+                if (!using_now && gizmo_using_prev && xform_gesture_active) {
+                    if (xform_dirty)
+                        edit_stack.Record(viewer::MakeTransformOp(
+                            loaded.get(), xform_gesture_path, xform_before, xform_after));
+                    xform_gesture_active = false;
+                }
+                gizmo_using_prev = using_now;
             }
         } else {
             ui_state.gizmo.active = false;  // nothing to manipulate this frame
+            ui_state.gizmo.using_now = false;
+            gizmo_using_prev = false;
         }
 
         // Apply the inspector's pending edits (live + commit) through the general
@@ -1044,6 +1191,18 @@ int main(int argc, char** argv) {
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
         // owning the keyboard so typing in a panel never moves the view.
         if (!io.WantCaptureKeyboard) {
+            // Ctrl-Z = undo, Ctrl-Y / Ctrl-Shift-Z = redo (edge-triggered; the request
+            // is applied at the top of the next frame, same gating as the camera keys).
+            const bool ctrl_held = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
+                                   ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+            const bool shift_held = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                                    ImGui::IsKeyDown(ImGuiKey_RightShift);
+            if (ctrl_held && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift_held)
+                ui_state.undo_request = true;
+            if (ctrl_held && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+                              (shift_held && ImGui::IsKeyPressed(ImGuiKey_Z, false))))
+                ui_state.redo_request = true;
+
             float cf = 0.0f, cr = 0.0f, cu = 0.0f;
             if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
             if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;

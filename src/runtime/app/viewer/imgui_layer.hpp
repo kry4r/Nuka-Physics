@@ -101,6 +101,8 @@ struct GizmoState {
     Op   op      = Op::Translate;    // active manipulation
     bool local   = false;            // local frame vs world frame
     bool active  = false;            // viewer-set: hovered/used this frame
+    bool using_now = false;          // viewer-set: dragging this frame (drag-end = the
+                                     // undo coalescing boundary; one op per drag)
 };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +139,15 @@ struct ViewerUiState {
     bool step_requested  = false;
     bool reset_requested = false;
     bool camera_reset    = false;
+
+    // Undo/redo. can_* are viewer-set hints (the EditStack depth) the toolbar reads
+    // to enable/disable its buttons; *_request are one-shot edges the toolbar (and
+    // the Ctrl-Z/Y key path) set and the viewer applies BETWEEN frames (never in
+    // RecordUi) so the deterministic record path is untouched.
+    bool can_undo      = false;
+    bool can_redo      = false;
+    bool undo_request  = false;
+    bool redo_request  = false;
 
     // ---- editor Load state (empty-start + runtime load) --------------------
     // Viewer-set has_scene/loaded_path; the panel's "Open Scene" / load_path set

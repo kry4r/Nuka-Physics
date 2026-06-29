@@ -374,6 +374,17 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::SameLine();
             if (ImGui::Button("Reset")) ui_state.reset_requested = true;
 
+            // Undo / Redo -- one-shot requests the viewer applies between frames;
+            // each disabled when its history is empty (viewer-set can_* hints).
+            ImGui::SameLine(0.0f, 12.0f);
+            ImGui::BeginDisabled(!ui_state.can_undo);
+            if (ImGui::Button("Undo")) ui_state.undo_request = true;
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!ui_state.can_redo);
+            if (ImGui::Button("Redo")) ui_state.redo_request = true;
+            ImGui::EndDisabled();
+
             if (!ui_state.has_scene) ImGui::EndDisabled();
 
             ImGui::SameLine(0.0f, 18.0f);
@@ -806,6 +817,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     if (!gz.enabled || ui_state.selected_entity == nuka::scene::kInvalidEntity ||
         vp_w == 0u || vp_h == 0u) {
         gz.active = false;
+        gz.using_now = false;
         return;
     }
 
@@ -825,6 +837,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     ImGuizmo::Manipulate(view, proj, op, mode, model);
 
     gz.active = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+    gz.using_now = ImGuizmo::IsUsing();
     if (ImGuizmo::IsUsing()) {
         world = TransformFromModel(model);
         changed = true;
