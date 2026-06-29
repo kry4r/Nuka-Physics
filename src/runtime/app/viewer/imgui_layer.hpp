@@ -146,6 +146,26 @@ struct ViewerUiState {
     std::vector<std::string> dof_labels;    // optional, size 0 or == drive_targets
     bool                     show_drive_panel = true;
 
+    // Interactive keyboard teleop: a THIRD drive producer beside the Drive sliders and
+    // the --policy controller, applied in the input loop (never RecordUi) and gated on
+    // ImGui not owning the keyboard. Per-DOF nudges ([ / ]) write the SAME drive_targets
+    // / drive_dirty seam; WASD/QE feed a [vx,vy,wyaw] command into a command-consuming
+    // controller. The steps are editable defaults (no magic numbers); teleop_cmd is
+    // viewer-set for the panel display.
+    bool  teleop_enabled = false;   // master toggle (Teleop section)
+    int   teleop_dof     = 0;       // the DOF [ / ] nudge moves (clamped to range)
+    float teleop_step    = 0.05f;   // per-key-press drive-target nudge (rad / units)
+    float teleop_lin     = 1.0f;    // WASD planar-velocity command magnitude
+    float teleop_yaw     = 1.0f;    // QE yaw-rate command magnitude
+    float teleop_cmd[3]  = {0.0f, 0.0f, 0.0f};  // viewer-set live (vx,vy,wyaw)
+    // PD-hold makes drive targets effective for policy-free direct joint control:
+    // the viewer uploads uniform gains to the actuated joints on the rising edge. The
+    // gains are editable defaults (no magic numbers). Ignored when a command-consuming
+    // controller (e.g. a policy) is attached -- it owns the gains.
+    bool  teleop_hold = false;
+    float teleop_kp   = 20.0f;
+    float teleop_kd   = 0.5f;
+
     // One-shot edge flags set by RecordUi(), consumed + cleared by the viewer.
     bool play_toggled    = false;
     bool step_requested  = false;

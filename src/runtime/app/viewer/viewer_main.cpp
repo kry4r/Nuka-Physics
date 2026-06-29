@@ -55,8 +55,10 @@
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
+#include "runtime/app/viewer/drive_hold.hpp"       // general PD-hold gain enable (teleop)
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/script_host.hpp"     // embedded-python live-world bridge
+#include "runtime/app/viewer/teleop.hpp"           // keyboard teleop input -> command mapping
 #include "runtime/inference/go2_policy_controller.hpp"  // --policy closed-loop drive
 #include "scene/format/nks.hpp"                   // nks::Save (persist edits)
 #include "scene/scene_ir.hpp"
@@ -321,6 +323,14 @@ int main(int argc, char** argv) {
     int         reset_at_frame = -1;            // --reset-at N: fire transport Reset at frame N
     bool        show_colliders_on = false;      // --show-colliders: collider overlay in capture
     bool        show_contacts_on  = false;      // --show-contacts: contact overlay in capture
+    // Headless teleop aids (mirror the interactive keyboard producer for a capture):
+    // --teleop-nudge DOF,DELTA PD-holds + nudges one drive target; --teleop-cmd feeds
+    // a [vx,vy,wyaw] command to an attached command-consuming controller.
+    bool        teleop_nudge_on = false;
+    int         teleop_nudge_dof = 0;
+    float       teleop_nudge_delta = 0.0f;
+    bool        teleop_cmd_on = false;
+    float       teleop_cmd_arg[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -370,6 +380,17 @@ int main(int argc, char** argv) {
         else if (a == "--reset-at" && i + 1 < argc) reset_at_frame = std::atoi(argv[++i]);
         else if (a == "--show-colliders") show_colliders_on = true;
         else if (a == "--show-contacts") show_contacts_on = true;
+        else if (a == "--teleop-nudge" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%d,%f", &teleop_nudge_dof, &teleop_nudge_delta) == 2)
+                teleop_nudge_on = true;
+            else std::fprintf(stderr, "[nuka_editor] --teleop-nudge wants DOF,DELTA\n");
+        }
+        else if (a == "--teleop-cmd" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%f,%f,%f", &teleop_cmd_arg[0], &teleop_cmd_arg[1],
+                            &teleop_cmd_arg[2]) == 3)
+                teleop_cmd_on = true;
+            else std::fprintf(stderr, "[nuka_editor] --teleop-cmd wants VX,VY,WYAW\n");
+        }
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -380,6 +401,8 @@ int main(int argc, char** argv) {
                         "  [--spawn box|sphere|capsule|plane spawns a primitive body after load]\n"
                         "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
                         "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
+                        "  [--teleop-nudge DOF,DELTA PD-holds the robot + nudges one drive target]\n"
+                        "  [--teleop-cmd VX,VY,WYAW feeds a command to a command-consuming controller]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -677,6 +700,30 @@ int main(int argc, char** argv) {
                              policy_path.c_str());
             }
         }
+        // Headless teleop: PD-hold + nudge one drive target (the existing per-DOF upload
+        // sends it next frame), or feed a command to a command-consuming controller.
+        const bool cmd_ctrl = policy_ctrl && policy_ctrl->AcceptsCommand();
+        if (teleop_nudge_on && !cmd_ctrl &&
+            teleop_nudge_dof >= 0 &&
+            static_cast<size_t>(teleop_nudge_dof) < ui_state.drive_targets.size()) {
+            viewer::ApplyHoldGains(loaded->sim->GetWorld(),
+                                   loaded->caps.env_count, ui_state.teleop_kp,
+                                   ui_state.teleop_kd);
+            ui_state.teleop_enabled = true;
+            ui_state.teleop_hold = true;
+            ui_state.teleop_dof = teleop_nudge_dof;
+            ui_state.drive_targets[teleop_nudge_dof] += teleop_nudge_delta;
+            ui_state.drive_dirty[teleop_nudge_dof] = 1u;
+            std::printf("[nuka_editor] teleop nudge: dof %d += %g (PD-hold kp=%g kd=%g)\n",
+                        teleop_nudge_dof, teleop_nudge_delta, ui_state.teleop_kp,
+                        ui_state.teleop_kd);
+        }
+        if (teleop_cmd_on && cmd_ctrl) {
+            policy_ctrl->SetCommandVector(teleop_cmd_arg, 3);
+            ui_state.teleop_enabled = true;
+            std::printf("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n",
+                        teleop_cmd_arg[0], teleop_cmd_arg[1], teleop_cmd_arg[2]);
+        }
     };
     auto apply_unload = [&]() {
         present->WaitIdle();
@@ -921,6 +968,7 @@ int main(int argc, char** argv) {
     constexpr uint32_t kKeyCtrlR = 0xffe4u;  // XKB_KEY_Control_R / XK_Control_R
     bool     ctrl_down = false;
     uint32_t drag_inst = ~0u;          // the instance being dragged (~0u == none)
+    bool     teleop_hold_prev = false; // PD-hold rising-edge latch (apply gains once)
     float    last_mouse_x = 0.0f;
     float    last_mouse_y = 0.0f;
 
@@ -1328,13 +1376,49 @@ int main(int argc, char** argv) {
                               (shift_held && ImGui::IsKeyPressed(ImGuiKey_Z, false))))
                 ui_state.redo_request = true;
 
+            // Teleop: a THIRD drive producer. Per-DOF nudges ([ / ] , / .) write the
+            // SAME drive_targets / drive_dirty seam the Drive sliders use; WASD/QE feed
+            // a [vx,vy,wyaw] command to a command-consuming controller, which then OWNS
+            // WASD (the camera fly stands down so it never fights the robot).
+            app::SceneController* ctrl = loaded ? loaded->sim->Controller() : nullptr;
+            const bool cmd_ctrl = ctrl != nullptr && ctrl->AcceptsCommand();
+            bool teleop_owns_wasd = false;
+            if (ui_state.teleop_enabled) {
+                // PD-hold rising edge: make drive targets effective for direct control.
+                if (ui_state.teleop_hold && !teleop_hold_prev && loaded && !cmd_ctrl)
+                    viewer::ApplyHoldGains(loaded->sim->GetWorld(), loaded->caps.env_count,
+                                           ui_state.teleop_kp, ui_state.teleop_kd);
+                viewer::TeleopKeys tk;
+                tk.dof_minus = ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false) ||
+                               ImGui::IsKeyPressed(ImGuiKey_Comma, false);
+                tk.dof_plus  = ImGui::IsKeyPressed(ImGuiKey_RightBracket, false) ||
+                               ImGui::IsKeyPressed(ImGuiKey_Period, false);
+                tk.dof_prev  = ImGui::IsKeyPressed(ImGuiKey_Minus, false);
+                tk.dof_next  = ImGui::IsKeyPressed(ImGuiKey_Equal, false);
+                tk.fwd = ImGui::IsKeyDown(ImGuiKey_W); tk.back = ImGui::IsKeyDown(ImGuiKey_S);
+                tk.strafe_l = ImGui::IsKeyDown(ImGuiKey_A); tk.strafe_r = ImGui::IsKeyDown(ImGuiKey_D);
+                tk.yaw_l = ImGui::IsKeyDown(ImGuiKey_Q); tk.yaw_r = ImGui::IsKeyDown(ImGuiKey_E);
+                const uint32_t dof_count =
+                    static_cast<uint32_t>(ui_state.drive_targets.size());
+                const viewer::TeleopResult tr =
+                    viewer::ApplyTeleop(true, tk, ui_state, dof_count);
+                if (cmd_ctrl) {
+                    ctrl->SetCommandVector(tr.command, 3);  // zero on release stops it
+                    teleop_owns_wasd = true;
+                }
+            }
+            teleop_hold_prev = ui_state.teleop_hold;
+
+            // WASD/QE fly the camera unless teleop owns WASD for the robot.
             float cf = 0.0f, cr = 0.0f, cu = 0.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_D)) cr += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_A)) cr -= 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_E)) cu += 1.0f;
-            if (ImGui::IsKeyDown(ImGuiKey_Q)) cu -= 1.0f;
+            if (!teleop_owns_wasd) {
+                if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_D)) cr += 1.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_A)) cr -= 1.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_E)) cu += 1.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_Q)) cu -= 1.0f;
+            }
             if (cf != 0.0f || cr != 0.0f || cu != 0.0f) {
                 const bool sprint = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
                                     ImGui::IsKeyDown(ImGuiKey_RightShift);

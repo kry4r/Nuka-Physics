@@ -65,6 +65,14 @@ public:
         gpu_.SetCommand(vx, vy, wyaw);
     }
 
+    // General command seam: a locomotion command consumer. Teleop / scripts write a
+    // [vx, vy, wyaw] vector through the base SceneController without knowing the type.
+    bool AcceptsCommand() const override { return true; }
+    void SetCommandVector(const float* cmd, uint32_t count) override {
+        SetCommand(count > 0u ? cmd[0] : 0.0f, count > 1u ? cmd[1] : 0.0f,
+                   count > 2u ? cmd[2] : 0.0f);
+    }
+
     // Production drives the GPU-resident path (zero host round-trip); the host MLP
     // stays the numeric ORACLE. SetUseGpu(false) forces the host path (validation
     // A/B + the no-CUDA fallback). UsingGpu() reports the resolved choice.
