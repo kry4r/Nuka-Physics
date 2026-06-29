@@ -147,15 +147,22 @@ struct Expected { bool primitive = false; bool is_static = false; Transform pose
 
 std::vector<Expected> ExpectedColliders(nuka::nk::World& w) {
     const auto& rows = w.GetModel().shape_table_rows;
-    const auto& b2l = w.GetModel().body_to_link;  // host; empty without an articulation
+    const auto& b2l = w.GetModel().body_to_link;                    // host; empty w/o articulation
+    const auto& lgl = w.GetModel().articulation.link_geom_local;    // host; per template link
     const uint32_t bodies = w.GetModel().capacities.bodies_per_env;
-    std::vector<Transform> poses(bodies);
-    std::vector<float> invm(bodies, 0.0f);
+    const uint32_t links  = w.GetModel().capacities.links_per_env;
+    std::vector<Transform> poses(bodies ? bodies : 1u, Transform::Identity());
+    std::vector<Transform> lposes(links ? links : 1u, Transform::Identity());
+    std::vector<float> invm(bodies ? bodies : 1u, 0.0f);
     if (bodies > 0u) {
         w.GetData().DownloadField(FieldId::BodyPose, poses.data(),
                                   static_cast<uint64_t>(bodies) * sizeof(Transform), 0);
         w.GetData().DownloadField(FieldId::BodyInvMass, invm.data(),
                                   static_cast<uint64_t>(bodies) * sizeof(float), 0);
+    }
+    if (links > 0u) {
+        w.GetData().DownloadField(FieldId::LinkPose, lposes.data(),
+                                  static_cast<uint64_t>(links) * sizeof(Transform), 0);
     }
     std::vector<Expected> out;
     out.reserve(rows.size());
@@ -165,7 +172,14 @@ std::vector<Expected> ExpectedColliders(nuka::nk::World& w) {
         const bool has_body = (i < bodies);
         const bool is_link = has_body && i < b2l.size() && b2l[i] != ~uint32_t(0);
         e.is_static = has_body ? (!is_link && invm[i] == 0.0f) : true;
-        e.pose = has_body ? poses[i] : Transform::Identity();
+        // A link reads LinkPose o link_geom_local; a free body reads BodyPose.
+        if (is_link) {
+            const uint32_t l = b2l[i];
+            if (l < lposes.size()) e.pose = lposes[l];
+            if (l < lgl.size()) e.pose = e.pose * lgl[l];
+        } else if (has_body) {
+            e.pose = poses[i];
+        }
         out.push_back(e);
     }
     return out;
@@ -216,15 +230,16 @@ TEST_F(EditorOverlay, CollidersMatchCookedPrimitives) {
 
     EXPECT_EQ(overlay.LastColliderCount(), prims);
     EXPECT_EQ(overlay.LastSkippedShapes(), 0u);  // every shape is a primitive
-    ASSERT_EQ(rw.instances.size(), real + prims) << "one proxy appended per collider";
+    EXPECT_EQ(rw.instances.size(), real) << "the real instance set is never touched";
+    ASSERT_EQ(rw.debug_instances.size(), prims) << "one proxy per collider in the debug channel";
 
-    // The proxies are the tail, in cooked-primitive order; each must sit at its
-    // expected frame and carry the kind-correct colour.
+    // The proxies are in cooked-primitive order; each must sit at its expected
+    // frame and carry the kind-correct colour.
     uint32_t green = 0u, magenta = 0u, moved = 0u;
-    size_t at = real;
-    for (size_t i = 0; i < exp.size() && at < rw.instances.size(); ++i) {
+    size_t at = 0u;
+    for (size_t i = 0; i < exp.size() && at < rw.debug_instances.size(); ++i) {
         if (!exp[i].primitive) continue;
-        const render::RenderInstance& inst = rw.instances[at++];
+        const render::RenderInstance& inst = rw.debug_instances[at++];
         EXPECT_EQ(inst.entity.index, ~uint32_t(0))  // sentinel: pick / tree never see it
             << "debug proxy must carry the non-entity sentinel";
         EXPECT_LT(TformDiff(inst.world_xform, exp[i].pose), kTol)
@@ -276,12 +291,13 @@ TEST_F(EditorOverlay, ContactsMatchSolverBuffer) {
     EXPECT_EQ(overlay.LastContactCount(), cc)
         << "marker count must match the solver's contact watermark";
     EXPECT_EQ(overlay.LastContactCount(), summed);
-    ASSERT_EQ(rw.instances.size(), real + overlay.LastContactCount());
+    EXPECT_EQ(rw.instances.size(), real) << "the real instance set is never touched";
+    ASSERT_EQ(rw.debug_instances.size(), overlay.LastContactCount());
 
     // Every marker sits at a real manifold point and near the slab/box interface
     // (slab top z=0.1; markers within a small penetration band of it).
-    for (size_t k = real; k < rw.instances.size(); ++k) {
-        const Vec3 p = rw.instances[k].world_xform.position;
+    for (size_t k = 0; k < rw.debug_instances.size(); ++k) {
+        const Vec3 p = rw.debug_instances[k].world_xform.position;
         bool found = false;
         for (uint32_t s = 0; s < max_c && !found; ++s)
             for (uint32_t e = 0; e < std::min<uint32_t>(ucount[s], 4u); ++e) {
@@ -307,12 +323,15 @@ TEST_F(EditorOverlay, OverlayOffRestoresRealInstances) {
     const size_t real = rw.instances.size();
     viewer::DebugOverlay overlay;
 
-    overlay.Rebuild(w, rw, 0u, false, false);             // off: no-op append
+    overlay.Rebuild(w, rw, 0u, false, false);             // off: nothing emitted
     EXPECT_EQ(rw.instances.size(), real);
-    overlay.Rebuild(w, rw, 0u, true, true);               // on: grows
-    EXPECT_GT(rw.instances.size(), real);
-    overlay.Rebuild(w, rw, 0u, false, false);             // off again: clears the layer
-    EXPECT_EQ(rw.instances.size(), real) << "debug layer not cleared on toggle-off";
+    EXPECT_TRUE(rw.debug_instances.empty());
+    overlay.Rebuild(w, rw, 0u, true, true);               // on: the debug channel grows
+    EXPECT_EQ(rw.instances.size(), real) << "the real instance set is never touched";
+    EXPECT_GT(rw.debug_instances.size(), 0u);
+    overlay.Rebuild(w, rw, 0u, false, false);             // off again: clears the channel
+    EXPECT_EQ(rw.instances.size(), real);
+    EXPECT_TRUE(rw.debug_instances.empty()) << "debug channel not cleared on toggle-off";
 }
 
 // Real-robot scale: a go2 cooks to many DYNAMIC primitive link colliders (green),
@@ -337,13 +356,16 @@ TEST_F(EditorOverlay, Go2ManyCollidersAligned) {
     viewer::DebugOverlay overlay;
     overlay.Rebuild(w, rw, 0u, true, false);
     EXPECT_EQ(overlay.LastColliderCount(), prims);
+    EXPECT_EQ(rw.instances.size(), real) << "the real instance set is never touched";
+    ASSERT_EQ(rw.debug_instances.size(), prims);
 
-    size_t at = real;
+    size_t at = 0u;
     float worst = 0.0f;
     uint32_t green = 0u;
-    for (size_t i = 0; i < exp.size() && at < rw.instances.size(); ++i) {
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (size_t i = 0; i < exp.size() && at < rw.debug_instances.size(); ++i) {
         if (!exp[i].primitive) continue;
-        const render::RenderInstance& inst = rw.instances[at++];
+        const render::RenderInstance& inst = rw.debug_instances[at++];
         worst = std::max(worst, TformDiff(inst.world_xform, exp[i].pose));
         const float* c = rw.materials[inst.render_material_id].base_color;
         if (exp[i].is_static) {
@@ -353,12 +375,21 @@ TEST_F(EditorOverlay, Go2ManyCollidersAligned) {
         } else {
             ++green;
             EXPECT_TRUE(IsGreen(c)) << "a go2 link collider must be dynamic (green)";
+            const Vec3 p = inst.world_xform.position;
+            lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+            hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
         }
     }
-    std::printf("[overlay] go2 colliders=%u static=%u green=%u worst pose residual=%.2e\n",
-                prims, statics, green, worst);
+    // The link colliders must SPAN the dog's body, not collapse to one point -- a
+    // regression to the BodyPose-zero bug would pile every link proxy at the origin.
+    const float spread =
+        std::sqrt((hi.x - lo.x) * (hi.x - lo.x) + (hi.y - lo.y) * (hi.y - lo.y) +
+                  (hi.z - lo.z) * (hi.z - lo.z));
+    std::printf("[overlay] go2 colliders=%u static=%u green=%u worst pose residual=%.2e spread=%.3f\n",
+                prims, statics, green, worst, spread);
     std::fflush(stdout);
     EXPECT_LT(worst, kTol) << "go2 proxies must align to their live link poses";
+    EXPECT_GT(spread, 0.3f) << "link colliders collapsed to a point (BodyPose-zero regression)";
     EXPECT_EQ(green, prims - statics) << "every dynamic primitive collider is green";
     EXPECT_GT(green, 10u) << "the dog's link colliders are dynamic";
 }
