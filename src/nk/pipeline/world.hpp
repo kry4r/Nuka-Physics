@@ -136,6 +136,9 @@ private:
     phi::ResetEnvsParams     reset_params_{};
     phi::SnapshotStateParams snapshot_params_{};
     phi::RestoreStateParams  restore_params_{};
+    // FK refresh after a restore: recompute the link world poses from the restored
+    // base_pose + q so a consumer renders / reads obs at rest without first stepping.
+    phi::FkWorldPosesParams  fk_params_{};
 };
 
 } // namespace nuka::nk

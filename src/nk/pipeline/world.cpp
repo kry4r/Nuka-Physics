@@ -114,6 +114,10 @@ bool World::SeedInitialState() {
     // forward-dynamics foundation; the co-step spike does not reset.)
     reset_params_.articulation_count = cap.articulations_per_env * E;
     reset_params_.body_count = cap.bodies_per_env;
+    // FK refresh params: the total co-resident articulation + link counts the
+    // post-restore FkWorldPoses dispatch uses (0 links -> Reset skips the FK).
+    fk_params_.articulation_count = cap.articulations_per_env * E;
+    fk_params_.total_link_count = L * E;
     // Per-env particle stride: the per-env reset restores each listed env's
     // particle slice from the snapshot (0 for a particle-free world -> the
     // particle loop no-ops, byte-identical).
@@ -462,26 +466,39 @@ phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
     // a pure no-op for every existing caller — the kernel's per-perturbation
     // `if (half != 0)` gates skip every draw and the reset is byte-identical.
     ++reset_params_.ic_episode;
+    phi::Status st;
     if (env_ids.empty()) {
         // Bulk restore: snapshot -> live + clear qddot/tau/lambda (device-side).
-        return DispatchOp(phi::NkOp::RestoreState, &restore_params_);
-    }
-    // Per-env masked reset: validate host-side (a bad id must never OOB-write),
-    // upload the ids into the reset_env_ids field, dispatch ResetEnvs.
-    const uint32_t env_count = model_.capacities.env_count;
-    for (uint32_t id : env_ids) {
-        if (id >= env_count) {
+        st = DispatchOp(phi::NkOp::RestoreState, &restore_params_);
+    } else {
+        // Per-env masked reset: validate host-side (a bad id must never OOB-write),
+        // upload the ids into the reset_env_ids field, dispatch ResetEnvs.
+        const uint32_t env_count = model_.capacities.env_count;
+        for (uint32_t id : env_ids) {
+            if (id >= env_count) {
+                return phi::Status::Failed;
+            }
+        }
+        const uint32_t count = static_cast<uint32_t>(
+            env_ids.size() > env_count ? env_count : env_ids.size());
+        if (!data_.UploadField(FieldId::ResetEnvIds, env_ids.data(),
+                               static_cast<uint64_t>(count) * sizeof(uint32_t))) {
             return phi::Status::Failed;
         }
+        reset_params_.count = count;
+        st = DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
     }
-    const uint32_t count = static_cast<uint32_t>(
-        env_ids.size() > env_count ? env_count : env_ids.size());
-    if (!data_.UploadField(FieldId::ResetEnvIds, env_ids.data(),
-                           static_cast<uint64_t>(count) * sizeof(uint32_t))) {
-        return phi::Status::Failed;
+    if (st != phi::Status::Ok) {
+        return st;
     }
-    reset_params_.count = count;
-    return DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
+    // Recompute the FK-derived link world poses from the restored base_pose + q so a
+    // consumer renders / reads obs at the authored rest pose without first stepping
+    // (the snapshot carries base_pose + q, not the derived link_pose). A particle-only
+    // world has no links and skips it.
+    if (fk_params_.total_link_count > 0u) {
+        st = DispatchOp(phi::NkOp::FkWorldPoses, &fk_params_);
+    }
+    return st;
 }
 
 phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
