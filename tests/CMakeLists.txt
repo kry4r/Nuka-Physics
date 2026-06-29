@@ -496,6 +496,39 @@ gtest_discover_tests(nuka_editor_undo_roundtrip_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Editor primitive-spawn round-trip gate: for each of box/sphere/capsule/plane, spawn
+# through SpawnPrimitive -> assert the authority + cook grew (body/shapes/material +
+# render instance + movable row), Save+reload survives the records and the bytes, and
+# undo/redo restore exactly. Compiles the host-only editor edit seams in directly.
+add_executable(nuka_editor_spawn_roundtrip_test
+    scenario/editor_spawn_roundtrip.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_edits.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_undo.cpp
+)
+add_dependencies(nuka_editor_spawn_roundtrip_test nuka_codegen)
+target_include_directories(nuka_editor_spawn_roundtrip_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_spawn_roundtrip_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_spawn_roundtrip_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # Editor true-physics-Reset round-trip gate: cook a real EditorScene (articulation +
 # the soft / cloth / fluid demo media), evolve it, fire ResetEditorScenePhysics, and
 # assert the authored qpos / root / particle state returns with zeroed velocities and
