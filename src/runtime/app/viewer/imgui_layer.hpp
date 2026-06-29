@@ -122,6 +122,12 @@ struct ViewerUiState {
     float    speed     = 1.0f;    // x0.25 .. x4 multiplier
     uint32_t env_index = 0u;      // selected env (D4)
 
+    // Read-only physics debug overlays (Show panel). Transient toggles read ONLY by
+    // the between-frames overlay rebuild -- never serialized into the deterministic
+    // record, so the default-off path leaves the rendered frame byte-identical.
+    bool show_colliders = false;
+    bool show_contacts  = false;
+
     // The single selection key: the picked/clicked ENTITY (viewport picker + tree
     // click write it; tree highlight + Entity panel read it). kInvalidEntity = none.
     nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;

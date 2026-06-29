@@ -529,10 +529,19 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // terrain/media at root) with kind badges; selection keyed on node->entity.
     // ======================================================================
     if (ImGui::Begin("Scene")) {
-        SectionHeader("Scene Tree");
         if (scene == nullptr) {
+            SectionHeader("Scene Tree");
             ImGui::TextColored(kTextDim, "no scene loaded");
         } else {
+            // Read-only debug-draw toggles (Isaac-style Show-by-Type): collider
+            // proxies + live contact points. The viewer rebuilds the overlay between
+            // frames from these flags; nothing here mutates the scene.
+            SectionHeader("Show");
+            ImGui::Checkbox("colliders", &ui_state.show_colliders);
+            ImGui::SameLine();
+            ImGui::Checkbox("contacts", &ui_state.show_contacts);
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+            SectionHeader("Scene Tree");
             ImGui::TextColored(kTextDim, "%u instances  %u meshes  %u materials",
                                world.InstanceCount(), world.meshes.Count(),
                                world.MaterialCount());

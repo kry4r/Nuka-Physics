@@ -51,6 +51,7 @@
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/debug_overlay.hpp"   // read-only collider / contact overlays
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
@@ -302,6 +303,8 @@ int main(int argc, char** argv) {
     bool        headless_undo = false;          // --undo: fire one undo after the load edit
     bool        headless_redo = false;          // --redo: fire one redo after the undo
     int         reset_at_frame = -1;            // --reset-at N: fire transport Reset at frame N
+    bool        show_colliders_on = false;      // --show-colliders: collider overlay in capture
+    bool        show_contacts_on  = false;      // --show-contacts: contact overlay in capture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -348,6 +351,8 @@ int main(int argc, char** argv) {
         else if (a == "--undo") headless_undo = true;
         else if (a == "--redo") headless_redo = true;
         else if (a == "--reset-at" && i + 1 < argc) reset_at_frame = std::atoi(argv[++i]);
+        else if (a == "--show-colliders") show_colliders_on = true;
+        else if (a == "--show-contacts") show_contacts_on = true;
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -356,6 +361,7 @@ int main(int argc, char** argv) {
                         "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                         "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
                         "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
+                        "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -492,6 +498,11 @@ int main(int argc, char** argv) {
     ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
+    // Read-only physics debug overlays: rebuilt from the live world between frames.
+    // The headless --show-* flags seed the toggles; the Show panel drives them live.
+    viewer::DebugOverlay debug_overlay;
+    ui_state.show_colliders = show_colliders_on;
+    ui_state.show_contacts  = show_contacts_on;
     // The embedded interpreter + built-in `nuka` module, bound to the active world via
     // SetContext on every load. Scripts run on this loop, OUTSIDE the offscreen gates.
     viewer::ScriptHost script_host;
@@ -526,6 +537,7 @@ int main(int argc, char** argv) {
         if (!next) return;
         policy_ctrl.reset();       // drop any controller bound to the old scene
         loaded = std::move(next);  // old scene (if any) destructed here
+        debug_overlay.Reset();     // forget materials cached against the prior world
         loaded->sim->SetPlannedStep(want_planned);  // CUDA-graph replay when --planned
         loaded->sim->FramePublish(nullptr, /*do_step=*/false);  // poses before framing
         frame_world(loaded->sim->GetRenderWorld());
@@ -1261,6 +1273,15 @@ int main(int argc, char** argv) {
         opts.width  = present->Report().width;
         opts.height = present->Report().height;
         camera.WriteOptions(opts);
+
+        // Read-only debug overlays, rebuilt from the live world after this frame's
+        // pose publishes + edits and just before the draw. Off by default -> the
+        // RenderWorld is left as the real instance set (GATE-B byte-identical).
+        if (loaded) {
+            debug_overlay.Rebuild(loaded->sim->GetWorld(), loaded->sim->GetRenderWorld(),
+                                  ui_state.env_index, ui_state.show_colliders,
+                                  ui_state.show_contacts);
+        }
 
         render::PresentFrameResult r = present->DrawFrame(
             render_world, opts,

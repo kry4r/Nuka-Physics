@@ -957,6 +957,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_scene.cpp
             runtime/app/viewer/editor_edits.cpp
             runtime/app/viewer/editor_undo.cpp
+            runtime/app/viewer/debug_overlay.cpp
             runtime/app/viewer/script_host.cpp
         )
         add_dependencies(nuka_editor_exe nuka_render_shaders)
