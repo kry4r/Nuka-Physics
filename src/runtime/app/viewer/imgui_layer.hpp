@@ -172,6 +172,14 @@ struct ViewerUiState {
     std::string reparent_src;
     std::string reparent_dst;
     bool        reparent_request = false;
+
+    // ---- live-world scripting console --------------------------------------
+    // The Script panel edits `script_buf` + latches the run/clear flags; the viewer
+    // execs it and writes the captured output to `console_log` (no interpreter here).
+    char        script_buf[16384] = {0};
+    std::string console_log;
+    bool        script_run_request   = false;
+    bool        script_clear_request = false;
 };
 
 // ---------------------------------------------------------------------------

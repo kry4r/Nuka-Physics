@@ -944,10 +944,19 @@ if(CMAKE_CUDA_COMPILER)
         # the runtime .nks load path). Opens EMPTY and loads / swaps scenes at runtime
         # through ONE LoadEditorScene path the --scene flag also drives. OUTPUT_NAME is
         # nuka_editor -> build-win-editor/src/nuka_editor.exe.
+        # Embedded CPython for the live-world script console: a built-in `nuka` module
+        # in the exe (NOT the pip package). Development.Embed pins the system libpython.
+        find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
+            OUTPUT_VARIABLE NUKA_PY_HOME)
+        message(STATUS "nuka_editor: embedding python ${Python3_VERSION} (home ${NUKA_PY_HOME})")
+
         add_executable(nuka_editor_exe
             runtime/app/viewer/viewer_main.cpp
             runtime/app/viewer/editor_scene.cpp
             runtime/app/viewer/editor_edits.cpp
+            runtime/app/viewer/script_host.cpp
         )
         add_dependencies(nuka_editor_exe nuka_render_shaders)
         set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka_editor)
@@ -955,9 +964,14 @@ if(CMAKE_CUDA_COMPILER)
             PRIVATE
                 ${CMAKE_SOURCE_DIR}/src
         )
-        target_compile_definitions(nuka_editor_exe PRIVATE NK_BUILD_VULKAN_VALIDATION)
+        # Python headers as SYSTEM so libpython's macros never trip -Werror.
+        target_include_directories(nuka_editor_exe SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+        target_compile_definitions(nuka_editor_exe PRIVATE
+            NK_BUILD_VULKAN_VALIDATION
+            NUKA_PY_HOME="${NUKA_PY_HOME}")
         target_link_libraries(nuka_editor_exe
             PRIVATE
+                Python3::Python
                 nuka_viewer
                 nuka_present
                 nuka_imgui

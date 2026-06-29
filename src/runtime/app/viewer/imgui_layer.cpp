@@ -299,6 +299,8 @@ static void BuildDefaultDockLayout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow("Load", left);
     ImGui::DockBuilderDockWindow("Stats", left_mid);
     ImGui::DockBuilderDockWindow("Scene", left_bottom);
+    // The live-world Script console shares the lower-left node (tabbed with Scene).
+    ImGui::DockBuilderDockWindow("Script", left_bottom);
     ImGui::DockBuilderDockWindow("Camera", right);
     // The Drive editor + the Entity inspector share the lower-right node.
     ImGui::DockBuilderDockWindow("Drive", right_bottom);
@@ -728,6 +730,61 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 }
             }
         }
+    }
+    ImGui::End();
+
+    // ======================================================================
+    // SCRIPT PANEL -- the live-world console: a multiline editor + Run (the viewer
+    // execs it) and a read-only Console of the captured output. It touches ONLY plain
+    // ui_state (no interpreter / time input), so a fixed state records deterministic.
+    // ======================================================================
+    if (ImGui::Begin("Script")) {
+        SectionHeader("Live Script");
+        ImGui::TextColored(kTextDim, ui_state.has_scene
+                                         ? "runs against the loaded world (nuka.*)"
+                                         : "load a scene, then nuka.* drives it");
+
+        const float avail_y = ImGui::GetContentRegionAvail().y;
+        float editor_h = avail_y * 0.5f;
+        if (editor_h < 80.0f) editor_h = 80.0f;
+        ImGui::InputTextMultiline("##scriptsrc", ui_state.script_buf,
+                                  sizeof(ui_state.script_buf), ImVec2(-1.0f, editor_h),
+                                  ImGuiInputTextFlags_AllowTabInput);
+
+        bool run_now = false;
+        ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.06f, 0.07f, 1.0f));
+        if (ImGui::Button("Run")) run_now = true;
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Console")) ui_state.script_clear_request = true;
+        ImGui::SameLine();
+        ImGui::TextColored(kTextDim, "Ctrl+Enter");
+
+        // Ctrl+Enter runs only when this window holds focus (so typing elsewhere
+        // never fires it, and a no-input frame records deterministically).
+        const bool ctrl_enter =
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl)) &&
+            ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        if (run_now || ctrl_enter) ui_state.script_run_request = true;
+
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        SectionHeader("Console");
+        ImGui::BeginChild("##console", ImVec2(-1.0f, -1.0f), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        if (ui_state.console_log.empty()) {
+            ImGui::TextColored(kTextDim, "(no output yet)");
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, kText);
+            ImGui::TextUnformatted(ui_state.console_log.c_str(),
+                                   ui_state.console_log.c_str() +
+                                       ui_state.console_log.size());
+            ImGui::PopStyleColor();
+        }
+        // Keep the newest output in view when already pinned to the bottom.
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
     }
     ImGui::End();
 }
