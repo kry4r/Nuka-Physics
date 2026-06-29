@@ -19,6 +19,7 @@
 #include <exception>
 #include <filesystem>
 #include <utility>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 
@@ -59,7 +60,10 @@ bool CookSceneInto(EditorScene& es, nuka::phi::Device* device,
                    nuka::phi::Backend* backend, float dt) {
     if (!(dt > 1e-6f)) dt = 1.0f / 240.0f;
     nuka::scene::SceneIR light = LightCookCopy(es.scene);
-    cook::CookToModelResult cooked = cook::CookToModel(light, 1);
+    // The full-scene orchestrator: rigid/articulation cook + the media-list cook that
+    // turns soft / cloth / fluid records into particles (a no-op for media-free
+    // scenes, so go2 / h1 cook byte-identically). The SAME path the C-ABI builder uses.
+    cook::CookToModelResult cooked = cook::CookSceneToModel(light, 1, {});
     render::RenderWorld render_world =
         render::BuildRenderWorld(light.Ecs(), cooked.scene_map);
 
@@ -125,6 +129,30 @@ bool RecookEditorScene(EditorScene& es, nuka::phi::Device* device,
         std::fprintf(stderr, "[nuka_editor] re-cook failed: unknown error\n");
         return false;
     }
+}
+
+bool ResetEditorScenePhysics(EditorScene& es) {
+    if (!es.world || !es.world->Ready()) return false;
+    // Restore the construction-time snapshot for every env: authored qpos / root pose
+    // / particle state, with qdot / link & body / particle velocities returned to the
+    // seeded (zero) initial and qddot / tau / lambda cleared -- the canonical device
+    // reset shared with the RL path.
+    if (es.world->Reset() != nuka::phi::Status::Ok) return false;
+    // The snapshot does not carry drive targets, so re-seed them (env-major) to the
+    // authored hold-drive values a live Drive edit may have overwritten. A particle-
+    // only world has no links and skips this.
+    const nk::Model& model = es.world->GetModel();
+    const uint32_t L = model.capacities.links_per_env;
+    const uint32_t E = (model.capacities.env_count > 0u) ? model.capacities.env_count : 1u;
+    if (L > 0u && !model.hold_drives.targets.empty()) {
+        std::vector<float> host(static_cast<size_t>(L) * E, 0.0f);
+        for (uint32_t e = 0; e < E; ++e)
+            for (uint32_t l = 0; l < L && l < model.hold_drives.targets.size(); ++l)
+                host[static_cast<size_t>(e) * L + l] = model.hold_drives.targets[l];
+        es.world->GetData().UploadField(nk::FieldId::DriveTarget, host.data(),
+                                        host.size() * sizeof(float));
+    }
+    return true;
 }
 
 }  // namespace nuka::runtime::app::viewer
