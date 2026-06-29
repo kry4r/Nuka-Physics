@@ -830,6 +830,14 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::IsKeyPressed(ImGuiKey_Enter, false);
         if (run_now || ctrl_enter) ui_state.script_run_request = true;
 
+        // Persist the buffer as a first-class /script node (Save writes it inline) or
+        // load the selected node's source back -- a scene's scripts live in the scene.
+        if (ImGui::Button("Attach as Node")) ui_state.script_attach_request = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Load Node")) ui_state.script_load_request = true;
+        ImGui::SameLine();
+        ImGui::TextColored(kTextDim, "%d /script node(s)", ui_state.script_node_count);
+
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         SectionHeader("Console");
         ImGui::BeginChild("##console", ImVec2(-1.0f, -1.0f), true,

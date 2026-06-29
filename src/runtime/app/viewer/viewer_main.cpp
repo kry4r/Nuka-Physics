@@ -544,6 +544,15 @@ int main(int argc, char** argv) {
         camera.FrameAabb(lo, hi);
     }
 
+    // Append captured script output to the console, trimmed to the trailing cap so a
+    // chatty (or repeatedly-failing) callback can never grow it without bound.
+    auto console_append = [&](const std::string& s) {
+        if (s.empty()) return;
+        ui_state.console_log += s;
+        if (ui_state.console_log.size() > kConsoleLogCap)
+            ui_state.console_log.erase(0, ui_state.console_log.size() - kConsoleLogCap);
+    };
+
     // The ONE runtime load: teardown the current scene (if any), cook the new one,
     // swap it in, reframe the camera + reset model-bound UI. WaitIdle first so no
     // in-flight frame references the world / RenderWorld being freed. A failed load
@@ -563,8 +572,15 @@ int main(int argc, char** argv) {
         // The general edit machinery for this scene: rebuild the entity->record
         // reverse index, reset the inspector, seed the Save path from the source.
         record_index.Build(loaded->scene);
-        // Point the live-world scripting bridge at this freshly cooked scene.
+        // Point the live-world scripting bridge at this freshly cooked scene, then
+        // register every /script node it carries and fire on_ready once -- so on_step /
+        // on_reset are defined before the first Play. Scripts run OUTSIDE the gates.
         script_host.SetContext({loaded.get(), &record_index, &ui_state});
+        script_host.ClearScripts();
+        for (const auto& sr : loaded->scene.Scripts())
+            console_append(script_host.RegisterScript(sr.stable_id, sr.source));
+        console_append(script_host.DispatchReady());
+        ui_state.script_node_count = static_cast<int>(loaded->scene.ScriptCount());
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
         // A new scene has no edit history (undo across loads is out of scope).
@@ -668,8 +684,11 @@ int main(int argc, char** argv) {
         loaded.reset();
         ClearModelUi(ui_state);
         record_index = viewer::EntityRecordIndex{};
-        // Drop the scripting bridge to the empty editor (scene-gated calls raise).
+        // Drop the scripting bridge + every registered script to the empty editor
+        // (scene-gated calls raise; no lifecycle dispatch without a world).
         script_host.SetContext({nullptr, &record_index, &ui_state});
+        script_host.ClearScripts();
+        ui_state.script_node_count = 0;
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
         edit_stack.Clear();
@@ -1082,6 +1101,11 @@ int main(int argc, char** argv) {
             last_step_healthy = sim.FramePublish(&intents, do_step);
             step_ms = std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
 
+            // Lifecycle on_step: once per stepped frame, BETWEEN frames (never in
+            // RecordUi), isolated + held to the tight per-call budget so a heavy or
+            // throwing callback can never spin or TDR the frame.
+            if (do_step) console_append(script_host.DispatchStep());
+
             // Apply queue-dispatched control intents (out-of-band producers) on top
             // of the in-UI transport edits.
             if (intents.toggle_play) ui_state.playing = !ui_state.playing;
@@ -1113,6 +1137,9 @@ int main(int argc, char** argv) {
                 if (!viewer::ResetEditorScenePhysics(*loaded))
                     std::fprintf(stderr, "[nuka_editor] reset: physics re-seed failed\n");
                 loaded->sim->FramePublish(nullptr, /*do_step=*/false);
+                // Lifecycle on_reset: right after the physics re-seed + pose republish,
+                // so a script can re-apply its own post-reset state (same isolation).
+                console_append(script_host.DispatchReset());
                 ui_state.playing = false;  // land at rest on the authored pose
             }
             frame_world(render_world);
@@ -1252,9 +1279,38 @@ int main(int argc, char** argv) {
         }
         if (ui_state.script_run_request) {
             ui_state.script_run_request = false;
-            ui_state.console_log += script_host.RunString(ui_state.script_buf);
-            if (ui_state.console_log.size() > kConsoleLogCap)
-                ui_state.console_log.erase(0, ui_state.console_log.size() - kConsoleLogCap);
+            console_append(script_host.RunString(ui_state.script_buf));
+        }
+        // Attach the editor buffer as a persisted /script node: a stable id unique
+        // among the scene's scripts, added through the general SceneIR seam (Save
+        // persists it), then registered + on_ready fired so it is live at once.
+        if (ui_state.script_attach_request) {
+            ui_state.script_attach_request = false;
+            if (loaded) {
+                uint64_t next_id = 1;
+                for (const auto& sr : loaded->scene.Scripts())
+                    if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
+                nuka::scene::ScriptRecord rec;
+                rec.stable_id = next_id;
+                rec.source = ui_state.script_buf;
+                loaded->scene.AddScript(rec);
+                record_index.Build(loaded->scene);
+                console_append(script_host.RegisterScript(rec.stable_id, rec.source));
+                console_append(script_host.DispatchReady());
+                ui_state.script_node_count = static_cast<int>(loaded->scene.ScriptCount());
+                ui_state.save_dirty = true;
+            }
+        }
+        // Load the selected /script node's source back into the editor buffer.
+        if (ui_state.script_load_request) {
+            ui_state.script_load_request = false;
+            if (loaded && ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+                if (const auto* sc = loaded->scene.Ecs().Get<nuka::scene::ScriptComponent>(
+                        ui_state.selected_entity)) {
+                    std::snprintf(ui_state.script_buf, sizeof(ui_state.script_buf), "%s",
+                                  sc->source.c_str());
+                }
+            }
         }
 
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not

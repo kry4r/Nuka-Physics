@@ -592,6 +592,53 @@ gtest_discover_tests(nuka_editor_debug_overlay_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Editor live-world script LIFECYCLE gate: cook a real EditorScene, embed the
+# ScriptHost bound to it, register a /script node, and drive the SAME step + reset
+# path the viewer does -- asserting on_ready (once) / on_step (each step, reaching the
+# live world) / on_reset (after the reset entry) fire, and a throwing callback is
+# caught + bounded-disabled while a sibling keeps running. Compiles the host-only
+# script_host / editor_scene / editor_edits seams in directly + embeds CPython, so it
+# is built ONLY where Python3 Development.Embed is present (skipped otherwise).
+find_package(Python3 QUIET COMPONENTS Interpreter Development.Embed)
+if(Python3_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
+        OUTPUT_VARIABLE NUKA_TEST_PY_HOME)
+    add_executable(nuka_editor_script_lifecycle_test
+        scenario/editor_script_lifecycle.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/script_host.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_edits.cpp
+    )
+    add_dependencies(nuka_editor_script_lifecycle_test nuka_codegen)
+    target_include_directories(nuka_editor_script_lifecycle_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(nuka_editor_script_lifecycle_test
+        SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+    target_compile_definitions(nuka_editor_script_lifecycle_test
+        PRIVATE NUKA_PY_HOME="${NUKA_TEST_PY_HOME}")
+    target_link_libraries(nuka_editor_script_lifecycle_test
+        PRIVATE
+            Python3::Python
+            nuka_app
+            nuka_scene_cook
+            nuka_render
+            nuka_nk
+            nuka_phi2
+            nuka_runtime
+            nuka_import
+            nuka_cooker
+            nuka_articulation_gpu
+            nuka_collision_gpu
+            nuka_core
+            nuka_phi
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_editor_script_lifecycle_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        PROPERTIES LABELS "full")
+endif()
+
 # --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
 # examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
 # + initial_state + settle) and asserts byte-identical re-save + section

@@ -207,6 +207,12 @@ struct ViewerUiState {
     std::string console_log;
     bool        script_run_request   = false;
     bool        script_clear_request = false;
+    // /script node persistence (lifecycle scripts live in the scene): attach the
+    // buffer as a first-class node, load the selected node's source back, and a
+    // viewer-set count for the panel (fixed state records deterministically).
+    bool        script_attach_request = false;
+    bool        script_load_request   = false;
+    int         script_node_count     = 0;
 };
 
 // ---------------------------------------------------------------------------
