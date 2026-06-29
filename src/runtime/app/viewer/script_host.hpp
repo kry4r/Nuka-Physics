@@ -51,6 +51,35 @@ public:
     // is interrupted by a watchdog after a wall-clock budget.
     std::string RunString(const std::string& code);
 
+    // -- lifecycle scripts (/script nodes) ----------------------------------
+    // Which lifecycle hook a dispatch invokes / a query reports on.
+    enum class Callback { Ready, Step, Reset };
+
+    // Register (or REPLACE, keyed by stable_id) a lifecycle script: exec `source`
+    // once in its OWN namespace, defining optional on_ready/on_step/on_reset. The
+    // body runs through the same isolation + budget as RunString; the captured
+    // output (incl. any traceback) is returned. Does NOT itself fire on_ready.
+    std::string RegisterScript(uint64_t stable_id, const std::string& source);
+
+    // Forget every registered lifecycle script (called on unload / before reload).
+    void ClearScripts();
+
+    // Registered lifecycle-script count (editor / test introspection).
+    size_t ScriptCount() const;
+
+    // Invoke a lifecycle hook on every registered script, each isolated + held to a
+    // tight per-call budget. on_ready fires AT MOST ONCE per script. A throwing
+    // callback is caught (its first traceback returned) and DISABLED after a bounded
+    // number of consecutive failures, so it never spins or spams the editor. Returns
+    // any captured output (callbacks are usually silent).
+    std::string DispatchReady();
+    std::string DispatchStep();
+    std::string DispatchReset();
+
+    // True iff `cb` has been disabled (after the bounded retry) for the script with
+    // `stable_id`. False for an unknown id or a still-live callback.
+    bool CallbackDisabled(uint64_t stable_id, Callback cb) const;
+
 private:
     bool valid_ = false;
 };

@@ -28,8 +28,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 namespace {
@@ -40,15 +42,36 @@ namespace render = nuka::render;
 // The live world the built-in module mutates; updated by ScriptHost::SetContext.
 ScriptContext g_ctx;
 
-// Wall-clock budget one Run gets before the hang guard interrupts it (env override
-// NUKA_SCRIPT_BUDGET_S). A pure-Python runaway unwinds; a blocked C call does not.
+// Wall-clock budget one Run / one script REGISTRATION (a one-time exec) gets before
+// the hang guard interrupts it (env NUKA_SCRIPT_BUDGET_S). A pure-Python runaway
+// unwinds; a blocked C call does not.
 constexpr double kDefaultBudgetSeconds = 5.0;
+// A per-frame LIFECYCLE callback (on_step runs every step) gets a far tighter budget
+// (env NUKA_SCRIPT_CALLBACK_BUDGET_S): a normal callback is sub-millisecond, so this
+// ceiling only ever trips a runaway and keeps one call an order of magnitude under
+// the GPU TDR window -- never a frame a user would notice as a hang.
+constexpr double kDefaultCallbackBudgetSeconds = 0.1;
+// Consecutive failures a lifecycle callback is allowed before it is DISABLED, so a
+// throwing on_step is reported once then never spams the console every frame.
+constexpr int kMaxCallbackFailures = 3;
 // Console text returned by one Run is capped to this many trailing bytes.
 constexpr size_t kRunOutputCap = 256u * 1024u;
 
 // Steady-clock deadline (epoch count) the per-line trace hook enforces; 0 = inactive.
 // A pure-Python runaway unwinds at the budget; a blocked C call is not traced.
 std::atomic<long long> g_deadline{0};
+
+// A registered lifecycle script: its stable id + its OWN globals namespace (holding
+// the exec'd on_ready/on_step/on_reset) + per-callback consecutive-failure counters
+// and disable latches so one broken callback never spins or spams the editor.
+struct RegisteredScript {
+    uint64_t  stable_id = 0;
+    PyObject* ns        = nullptr;   // owned: the script's globals dict
+    bool      ready_fired    = false;
+    int       ready_fails    = 0, step_fails    = 0, reset_fails    = 0;
+    bool      ready_disabled = false, step_disabled = false, reset_disabled = false;
+};
+std::vector<RegisteredScript> g_scripts;
 
 unsigned long long PackEntity(const scene::EntityId& e) {
     return (static_cast<unsigned long long>(e.index) << 32) |
@@ -330,6 +353,111 @@ double BudgetSeconds() {
     return kDefaultBudgetSeconds;
 }
 
+double CallbackBudgetSeconds() {
+    if (const char* s = std::getenv("NUKA_SCRIPT_CALLBACK_BUDGET_S")) {
+        const double v = std::atof(s);
+        if (v > 0.0) return v;
+    }
+    return kDefaultCallbackBudgetSeconds;
+}
+
+// Redirect sys.stdout/stderr to a fresh StringIO + arm the per-line hang guard at
+// `budget` seconds, run `invoke` (a new ref, or null with a Python error set on
+// failure), report SystemExit / traceback into the captured text, restore the
+// streams and return the drained text. *ok=false iff the call raised (after report).
+// The ONE capture+isolate path RunString and every lifecycle callback share.
+std::string RunCaptured(double budget, bool* ok,
+                        const std::function<PyObject*()>& invoke) {
+    *ok = true;
+    PyObject* io_mod = PyImport_ImportModule("io");
+    PyObject* sink = (io_mod != nullptr) ? PyObject_CallMethod(io_mod, "StringIO", nullptr)
+                                         : nullptr;
+    PyObject* sys_mod = PyImport_ImportModule("sys");
+    PyObject* old_out = (sys_mod != nullptr) ? PyObject_GetAttrString(sys_mod, "stdout") : nullptr;
+    PyObject* old_err = (sys_mod != nullptr) ? PyObject_GetAttrString(sys_mod, "stderr") : nullptr;
+    if (sys_mod != nullptr && sink != nullptr) {
+        PyObject_SetAttrString(sys_mod, "stdout", sink);
+        PyObject_SetAttrString(sys_mod, "stderr", sink);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                              std::chrono::duration<double>(budget));
+    g_deadline.store(deadline.time_since_epoch().count());
+    PyEval_SetTrace(&TraceHangGuard, nullptr);
+
+    PyObject* result = invoke();
+
+    PyEval_SetTrace(nullptr, nullptr);
+    g_deadline.store(0);
+
+    if (result == nullptr) {
+        *ok = false;
+        // SystemExit must NOT propagate (it would terminate the editor); report it.
+        if (PyErr_ExceptionMatches(PyExc_SystemExit)) {
+            PyErr_Clear();
+            if (sink != nullptr) {
+                PyObject* w = PyObject_CallMethod(
+                    sink, "write", "s",
+                    "SystemExit ignored (a script cannot exit the editor)\n");
+                Py_XDECREF(w);
+            }
+        } else {
+            PyErr_Print();  // traceback -> the redirected sys.stderr (sink)
+        }
+    } else {
+        Py_DECREF(result);
+    }
+
+    if (sys_mod != nullptr) {
+        if (old_out != nullptr) PyObject_SetAttrString(sys_mod, "stdout", old_out);
+        if (old_err != nullptr) PyObject_SetAttrString(sys_mod, "stderr", old_err);
+    }
+    std::string out;
+    if (sink != nullptr) {
+        PyObject* val = PyObject_CallMethod(sink, "getvalue", nullptr);
+        if (val != nullptr) {
+            Py_ssize_t len = 0;
+            const char* s = PyUnicode_AsUTF8AndSize(val, &len);
+            if (s != nullptr) out.assign(s, static_cast<size_t>(len));
+            Py_DECREF(val);
+        }
+    }
+    Py_XDECREF(old_out);
+    Py_XDECREF(old_err);
+    Py_XDECREF(sink);
+    Py_XDECREF(sys_mod);
+    Py_XDECREF(io_mod);
+    return out;
+}
+
+// Invoke `name` on one registered script, isolated + budgeted. A missing/undefined
+// callback is a silent no-op; a throw is caught, its FIRST traceback surfaced, the
+// consecutive-failure counter advanced, and the callback DISABLED at the bound (then
+// skipped) so it never spins or spams. Returns any captured output.
+std::string CallScriptCallback(RegisteredScript& s, const char* name,
+                               int* fails, bool* disabled) {
+    if (*disabled || s.ns == nullptr) return "";
+    PyObject* fn = PyDict_GetItemString(s.ns, name);  // borrowed
+    if (fn == nullptr || PyCallable_Check(fn) == 0) return "";  // not defined: no-op
+    bool ok = true;
+    std::string out = RunCaptured(CallbackBudgetSeconds(), &ok,
+                                  [&] { return PyObject_CallObject(fn, nullptr); });
+    if (ok) {
+        *fails = 0;   // consecutive-failure streak resets on a clean call
+        return out;
+    }
+    ++*fails;
+    std::string note;
+    if (*fails == 1) note = out;  // surface the first traceback once (no per-frame spam)
+    if (*fails >= kMaxCallbackFailures) {
+        *disabled = true;
+        note += std::string("[nuka_editor] script callback '") + name +
+                "' disabled after repeated failures\n";
+    }
+    return note;
+}
+
 }  // namespace
 
 ScriptHost::ScriptHost() {
@@ -393,86 +521,109 @@ ScriptHost::ScriptHost() {
 }
 
 ScriptHost::~ScriptHost() {
-    if (valid_) Py_FinalizeEx();
+    if (valid_) {
+        ClearScripts();
+        Py_FinalizeEx();
+    }
 }
 
 void ScriptHost::SetContext(const ScriptContext& ctx) { g_ctx = ctx; }
 
 std::string ScriptHost::RunString(const std::string& code) {
     if (!valid_) return "[scripting] interpreter unavailable\n";
-
-    // Redirect sys.stdout/stderr to a fresh StringIO so print() + any traceback are
-    // captured into the returned console text.
-    PyObject* io_mod = PyImport_ImportModule("io");
-    PyObject* sink = (io_mod != nullptr) ? PyObject_CallMethod(io_mod, "StringIO", nullptr)
-                                         : nullptr;
-    PyObject* sys_mod = PyImport_ImportModule("sys");
-    PyObject* old_out = (sys_mod != nullptr) ? PyObject_GetAttrString(sys_mod, "stdout") : nullptr;
-    PyObject* old_err = (sys_mod != nullptr) ? PyObject_GetAttrString(sys_mod, "stderr") : nullptr;
-    if (sys_mod != nullptr && sink != nullptr) {
-        PyObject_SetAttrString(sys_mod, "stdout", sink);
-        PyObject_SetAttrString(sys_mod, "stderr", sink);
-    }
-
+    // Ad-hoc exec in __main__ (the Run button / --run-script), through the shared
+    // capture + hang-guard path lifecycle callbacks also use.
     PyObject* main_mod = PyImport_AddModule("__main__");  // borrowed
     PyObject* globals = (main_mod != nullptr) ? PyModule_GetDict(main_mod) : nullptr;
-
-    // Hang guard: a per-line trace hook raises once the budget is spent, so a runaway
-    // pure-Python loop unwinds (a thread blocked in a single C call is not traced).
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                              std::chrono::duration<double>(BudgetSeconds()));
-    g_deadline.store(deadline.time_since_epoch().count());
-    PyEval_SetTrace(&TraceHangGuard, nullptr);
-
-    PyObject* result = nullptr;
-    if (globals != nullptr) {
-        result = PyRun_String(code.c_str(), Py_file_input, globals, globals);
-    } else {
-        PyErr_SetString(PyExc_RuntimeError, "no __main__ namespace");
-    }
-    PyEval_SetTrace(nullptr, nullptr);
-    g_deadline.store(0);
-
-    if (result == nullptr) {
-        // SystemExit must NOT propagate (it would terminate the editor); report it.
-        if (PyErr_ExceptionMatches(PyExc_SystemExit)) {
-            PyErr_Clear();
-            if (sink != nullptr) {
-                PyObject* w = PyObject_CallMethod(
-                    sink, "write", "s",
-                    "SystemExit ignored (a script cannot exit the editor)\n");
-                Py_XDECREF(w);
-            }
-        } else {
-            PyErr_Print();  // traceback -> the redirected sys.stderr (sink)
-        }
-    } else {
-        Py_DECREF(result);
-    }
-
-    // Restore the original streams and drain the sink.
-    if (sys_mod != nullptr) {
-        if (old_out != nullptr) PyObject_SetAttrString(sys_mod, "stdout", old_out);
-        if (old_err != nullptr) PyObject_SetAttrString(sys_mod, "stderr", old_err);
-    }
-    std::string out;
-    if (sink != nullptr) {
-        PyObject* val = PyObject_CallMethod(sink, "getvalue", nullptr);
-        if (val != nullptr) {
-            Py_ssize_t len = 0;
-            const char* s = PyUnicode_AsUTF8AndSize(val, &len);
-            if (s != nullptr) out.assign(s, static_cast<size_t>(len));
-            Py_DECREF(val);
-        }
-    }
-    Py_XDECREF(old_out);
-    Py_XDECREF(old_err);
-    Py_XDECREF(sink);
-    Py_XDECREF(sys_mod);
-    Py_XDECREF(io_mod);
+    if (globals == nullptr) return "no __main__ namespace\n";
+    bool ok = true;
+    std::string out = RunCaptured(BudgetSeconds(), &ok, [&] {
+        return PyRun_String(code.c_str(), Py_file_input, globals, globals);
+    });
     if (out.size() > kRunOutputCap) out.erase(0, out.size() - kRunOutputCap);
     return out;
+}
+
+std::string ScriptHost::RegisterScript(uint64_t stable_id, const std::string& source) {
+    if (!valid_) return "[scripting] interpreter unavailable\n";
+    // Replace any existing registration with the same id (re-attach / reload).
+    for (auto it = g_scripts.begin(); it != g_scripts.end(); ++it) {
+        if (it->stable_id == stable_id) {
+            Py_XDECREF(it->ns);
+            g_scripts.erase(it);
+            break;
+        }
+    }
+    PyObject* ns = PyDict_New();
+    if (ns == nullptr) return "[scripting] could not allocate a script namespace\n";
+    if (PyObject* b = PyEval_GetBuiltins()) PyDict_SetItemString(ns, "__builtins__", b);
+    if (PyObject* nm = PyUnicode_FromString("<nuka_script>")) {
+        PyDict_SetItemString(ns, "__name__", nm);
+        Py_DECREF(nm);
+    }
+    if (PyObject* mod = PyImport_ImportModule("nuka")) {
+        PyDict_SetItemString(ns, "nuka", mod);  // call nuka.* without an explicit import
+        Py_DECREF(mod);
+    }
+
+    // Exec the source once in its own namespace, defining the lifecycle callbacks. A
+    // throw here is isolated; callbacks defined before it still register (partial).
+    bool ok = true;
+    std::string out = RunCaptured(BudgetSeconds(), &ok, [&] {
+        return PyRun_String(source.c_str(), Py_file_input, ns, ns);
+    });
+    RegisteredScript reg;
+    reg.stable_id = stable_id;
+    reg.ns = ns;
+    g_scripts.push_back(reg);
+    if (out.size() > kRunOutputCap) out.erase(0, out.size() - kRunOutputCap);
+    return out;
+}
+
+void ScriptHost::ClearScripts() {
+    for (auto& s : g_scripts) Py_XDECREF(s.ns);
+    g_scripts.clear();
+}
+
+size_t ScriptHost::ScriptCount() const { return g_scripts.size(); }
+
+std::string ScriptHost::DispatchReady() {
+    if (!valid_) return "";
+    std::string out;
+    for (auto& s : g_scripts) {
+        if (s.ready_fired) continue;  // on_ready fires at most once per script
+        s.ready_fired = true;
+        out += CallScriptCallback(s, "on_ready", &s.ready_fails, &s.ready_disabled);
+    }
+    return out;
+}
+
+std::string ScriptHost::DispatchStep() {
+    if (!valid_) return "";
+    std::string out;
+    for (auto& s : g_scripts)
+        out += CallScriptCallback(s, "on_step", &s.step_fails, &s.step_disabled);
+    return out;
+}
+
+std::string ScriptHost::DispatchReset() {
+    if (!valid_) return "";
+    std::string out;
+    for (auto& s : g_scripts)
+        out += CallScriptCallback(s, "on_reset", &s.reset_fails, &s.reset_disabled);
+    return out;
+}
+
+bool ScriptHost::CallbackDisabled(uint64_t stable_id, Callback cb) const {
+    for (const auto& s : g_scripts) {
+        if (s.stable_id != stable_id) continue;
+        switch (cb) {
+            case Callback::Ready: return s.ready_disabled;
+            case Callback::Step:  return s.step_disabled;
+            case Callback::Reset: return s.reset_disabled;
+        }
+    }
+    return false;
 }
 
 }  // namespace nuka::runtime::app::viewer
