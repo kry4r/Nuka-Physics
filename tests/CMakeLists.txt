@@ -462,6 +462,40 @@ add_test(NAME EditorEditRoundtrip
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(EditorEditRoundtrip PROPERTIES LABELS "fast_full")
 
+# Editor undo/redo state round-trip gate: for each of the six edit kinds, apply ->
+# undo restores the SceneIR (persisted .nks bytes) + the live RenderWorld exactly,
+# redo re-reaches the edited state. Cooks a real EditorScene, so it compiles the
+# editor's host-only edit seams in directly (editor_edits / editor_scene / editor_undo
+# live only in the gated editor exe) and links the cook + nk + render + app stack.
+add_executable(nuka_editor_undo_roundtrip_test
+    scenario/editor_undo_roundtrip.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_edits.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_undo.cpp
+)
+add_dependencies(nuka_editor_undo_roundtrip_test nuka_codegen)
+target_include_directories(nuka_editor_undo_roundtrip_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_undo_roundtrip_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_undo_roundtrip_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
 # examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
 # + initial_state + settle) and asserts byte-identical re-save + section
