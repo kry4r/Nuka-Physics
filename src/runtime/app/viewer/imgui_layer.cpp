@@ -692,6 +692,17 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 ImGui::SameLine();
                 bool local = gz.local;
                 if (ImGui::Checkbox("local", &local)) gz.local = local;
+                ImGui::SameLine();
+                ImGui::Checkbox("snap", &gz.snap_on);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::BeginDisabled(!gz.snap_on);
+                // ONE step field: world units (Translate) or degrees (Rotate).
+                if (gz.op == GizmoState::Op::Rotate)
+                    ImGui::DragFloat("##snapstep", &gz.snap_rotate, 0.5f, 0.0f, 0.0f, "%.1f deg");
+                else
+                    ImGui::DragFloat("##snapstep", &gz.snap_translate, 0.01f, 0.0f, 0.0f, "%.3f m");
+                ImGui::EndDisabled();
                 ImGui::EndDisabled();
 
                 // -- Material ----------------------------------------------------
@@ -834,7 +845,12 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     const ImGuizmo::OPERATION op =
         (gz.op == GizmoState::Op::Rotate) ? ImGuizmo::ROTATE : ImGuizmo::TRANSLATE;
     const ImGuizmo::MODE mode = gz.local ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
-    ImGuizmo::Manipulate(view, proj, op, mode, model);
+    // Snap step: world units for Translate, degrees for Rotate (ImGuizmo reads snap[0]).
+    const float snap_step = (gz.op == GizmoState::Op::Rotate) ? gz.snap_rotate
+                                                              : gz.snap_translate;
+    const float snap_vec[3] = {snap_step, snap_step, snap_step};
+    ImGuizmo::Manipulate(view, proj, op, mode, model, /*deltaMatrix=*/nullptr,
+                         gz.snap_on ? snap_vec : nullptr);
 
     gz.active = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
     gz.using_now = ImGuizmo::IsUsing();

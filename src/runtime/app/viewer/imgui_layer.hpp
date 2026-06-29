@@ -100,6 +100,11 @@ struct GizmoState {
     bool enabled = true;             // master toggle (Entity panel)
     Op   op      = Op::Translate;    // active manipulation
     bool local   = false;            // local frame vs world frame
+    // Grid snapping: translate step in world units, rotate step in degrees. ImGuizmo
+    // rounds the drag to the step when snap_on; the steps are user-editable defaults.
+    bool  snap_on        = false;
+    float snap_translate = 0.25f;
+    float snap_rotate    = 15.0f;
     bool active  = false;            // viewer-set: hovered/used this frame
     bool using_now = false;          // viewer-set: dragging this frame (drag-end = the
                                      // undo coalescing boundary; one op per drag)
