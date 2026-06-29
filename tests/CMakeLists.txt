@@ -496,6 +496,37 @@ gtest_discover_tests(nuka_editor_undo_roundtrip_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Editor true-physics-Reset round-trip gate: cook a real EditorScene (articulation +
+# the soft / cloth / fluid demo media), evolve it, fire ResetEditorScenePhysics, and
+# assert the authored qpos / root / particle state returns with zeroed velocities and
+# re-seeded drive targets. Compiles the host-only editor_scene seam in directly.
+add_executable(nuka_editor_reset_roundtrip_test
+    scenario/editor_reset_roundtrip.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+)
+add_dependencies(nuka_editor_reset_roundtrip_test nuka_codegen)
+target_include_directories(nuka_editor_reset_roundtrip_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_reset_roundtrip_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_reset_roundtrip_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
 # examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
 # + initial_state + settle) and asserts byte-identical re-save + section
