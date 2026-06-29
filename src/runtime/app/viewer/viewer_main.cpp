@@ -300,6 +300,7 @@ int main(int argc, char** argv) {
     std::string reparent_to;                    // --reparent DST: move --select under DST
     bool        headless_undo = false;          // --undo: fire one undo after the load edit
     bool        headless_redo = false;          // --redo: fire one redo after the undo
+    int         reset_at_frame = -1;            // --reset-at N: fire transport Reset at frame N
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
@@ -344,6 +345,7 @@ int main(int argc, char** argv) {
         else if (a == "--reparent" && i + 1 < argc) reparent_to = argv[++i];
         else if (a == "--undo") headless_undo = true;
         else if (a == "--redo") headless_redo = true;
+        else if (a == "--reset-at" && i + 1 < argc) reset_at_frame = std::atoi(argv[++i]);
         else if (a == "--help") {
             std::printf("usage: nuka_editor [--scene <.nks>] [--policy <bin>] [--play] "
                         "[--frames N] [--dt SECONDS] "
@@ -351,6 +353,7 @@ int main(int argc, char** argv) {
                         "[--capture-frame N --capture-out FILE.ppm]\n"
                         "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                         "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
+                        "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -596,7 +599,7 @@ int main(int argc, char** argv) {
         }
         // Headless one-shot Save (verifies the full editor save path end-to-end).
         if (!save_to.empty()) ui_state.save_request = save_to;
-        ui_state.playing = false;  // open paused on the authored pose
+        ui_state.playing = want_play;  // --play opens running; else paused on the pose
         // Attach the trained locomotion controller to this freshly cooked scene when
         // --policy was given and the scene retained terrain (height-scan obs source).
         if (!policy_path.empty() && nuka::terrain::IsValid(loaded->terrain)) {
@@ -869,6 +872,10 @@ int main(int argc, char** argv) {
         // (frame 0 = load + edit; undo at 1, redo at 2) so a --capture-frame proves it.
         if (headless_undo && frame_index == 1u) ui_state.undo_request = true;
         if (headless_redo && frame_index == 2u) ui_state.redo_request = true;
+        // Headless transport Reset trigger: re-seed the physics at frame N so a
+        // --capture-frame just after proves the authored pose is restored.
+        if (reset_at_frame >= 0 && static_cast<int>(frame_index) == reset_at_frame)
+            ui_state.reset_requested = true;
 
         // Apply a pending undo/redo BETWEEN frames (never inside RecordUi): WaitIdle
         // first since a structural revert re-cooks (the RecookEditorScene contract).
@@ -1043,9 +1050,17 @@ int main(int argc, char** argv) {
         // frame -> clear the one-shot edge (a queued StepOnce is honored in-frame).
         ui_state.step_requested = false;
 
-        // Reset / camera-reset re-frame the active world (the empty world frames a
-        // default box). Reset re-frames the camera, the cheap honest action.
+        // Reset re-seeds the physics to the authored initial state (between frames,
+        // never inside RecordUi), publishes the restored poses, then re-frames the
+        // camera on them. Camera-reset alone just re-frames the active world.
         if (ui_state.reset_requested) {
+            if (loaded) {
+                present->WaitIdle();
+                if (!viewer::ResetEditorScenePhysics(*loaded))
+                    std::fprintf(stderr, "[nuka_editor] reset: physics re-seed failed\n");
+                loaded->sim->FramePublish(nullptr, /*do_step=*/false);
+                ui_state.playing = false;  // land at rest on the authored pose
+            }
             frame_world(render_world);
             ui_state.reset_requested = false;
         }

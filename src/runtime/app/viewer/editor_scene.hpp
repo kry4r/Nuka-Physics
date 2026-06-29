@@ -63,4 +63,14 @@ std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
 bool RecookEditorScene(EditorScene& es, nuka::phi::Device* device,
                        nuka::phi::Backend* backend, float dt);
 
+// Re-seed an existing EditorScene's PHYSICS to its authored initial state for every
+// env: restore the cooked snapshot (authored qpos / root pose / particle state, with
+// zeroed velocities + cleared qddot/tau/lambda) and the authored drive targets a live
+// Drive edit may have overwritten. No re-cook -- the world / sim / record pointers all
+// stay valid -- so the transport Reset button and a script on_reset both call this.
+// The caller WaitIdle's first and re-publishes after. Returns false when the world is
+// unbuilt. ONE general path: the same restore covers articulation, rigid, and particle
+// (soft / cloth / fluid / MPM) media.
+bool ResetEditorScenePhysics(EditorScene& es);
+
 }  // namespace nuka::runtime::app::viewer
