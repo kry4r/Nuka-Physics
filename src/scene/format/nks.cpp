@@ -620,6 +620,17 @@ Value SaveTerrain(const TerrainRecord& t) {
     return o;
 }
 
+// A /script node: inline source + the stable id + the parent tree-path. node_id
+// goes through Int (ids increment from 0, so the double round-trip is lossless).
+Value SaveScript(const ScriptRecord& s) {
+    Value o = Value::Object();
+    o.Set("name", Value::Str(s.name));
+    o.Set("node_id", Value::Int(static_cast<int64_t>(s.stable_id)));
+    if (!s.parent_path.empty()) o.Set("parent", Value::Str(s.parent_path));
+    o.Set("source", Value::Str(s.source));
+    return o;
+}
+
 // Cameras / lights serialize from their ECS COMPONENT inline on their own tree
 // node (see SaveNode): the component is a 1:1 projection of the record, the node
 // carries the name, and the attached body is the parent body node — so there is
@@ -955,6 +966,15 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         Value terrain = Value::Array();
         for (const TerrainRecord& t : scene.Terrain()) terrain.PushBack(SaveTerrain(t));
         root.Set("terrain", std::move(terrain));
+    }
+
+    // -- scripts (/script nodes the editor's ScriptHost execs) ---------------
+    // First-class scripting nodes, emitted only when present so a script-free
+    // scene's bytes are unchanged. Authoring order == Scripts() order.
+    if (!scene.Scripts().empty()) {
+        Value scripts = Value::Array();
+        for (const ScriptRecord& s : scene.Scripts()) scripts.PushBack(SaveScript(s));
+        root.Set("scripts", std::move(scripts));
     }
 
     // -- M7 metadata: initial_state / settle (only when present) ------------
@@ -1519,6 +1539,21 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.image_radius_y = f(tv, "image_radius_y", rec.image_radius_y);
             rec.image_elevation_z = f(tv, "image_elevation_z", rec.image_elevation_z);
             scene.AddTerrain(std::move(rec));
+        }
+    }
+
+    // -- scripts (/script nodes) --------------------------------------------
+    // Each restores the inline source + stable id + parent path; absent keys keep
+    // the record default. AddScript projects a /script node + ScriptComponent.
+    if (const Value* scripts = root.Find("scripts")) {
+        for (const Value& sv : scripts->Elements()) {
+            ScriptRecord rec;
+            if (const Value* nm = sv.Find("name")) rec.name = nm->AsString();
+            if (const Value* id = sv.Find("node_id"))
+                rec.stable_id = static_cast<uint64_t>(id->AsInt());
+            if (const Value* pp = sv.Find("parent")) rec.parent_path = pp->AsString();
+            if (const Value* src = sv.Find("source")) rec.source = src->AsString();
+            scene.AddScript(std::move(rec));
         }
     }
 

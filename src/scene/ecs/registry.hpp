@@ -51,6 +51,7 @@ public:
     InitialStateComponent&    Add(EntityId e, InitialStateComponent c);
     CameraComponent&          Add(EntityId e, CameraComponent c);
     LightComponent&           Add(EntityId e, LightComponent c);
+    ScriptComponent&          Add(EntityId e, ScriptComponent c);
 
     // Get<T>(e) -> T* (null if the entity is dead or lacks the component).
     template <class T>       T* Get(EntityId e);
@@ -119,6 +120,7 @@ private:
     Pool<InitialStateComponent>   initial_states_;
     Pool<CameraComponent>         cameras_;
     Pool<LightComponent>          lights_;
+    Pool<ScriptComponent>         scripts_;
 
     // material asset tables
     std::vector<PhysicsMaterial>                  physics_materials_;
@@ -257,5 +259,6 @@ template <> inline Registry::Pool<FluidComponent>&          Registry::PoolFor<Fl
 template <> inline Registry::Pool<InitialStateComponent>&   Registry::PoolFor<InitialStateComponent>()   { return initial_states_; }
 template <> inline Registry::Pool<CameraComponent>&         Registry::PoolFor<CameraComponent>()         { return cameras_; }
 template <> inline Registry::Pool<LightComponent>&          Registry::PoolFor<LightComponent>()          { return lights_; }
+template <> inline Registry::Pool<ScriptComponent>&         Registry::PoolFor<ScriptComponent>()         { return scripts_; }
 
 } // namespace nuka::scene
