@@ -36,6 +36,7 @@ SceneIR::SceneIR(const SceneIR& other)
       lights_(other.lights_),
       actuators_(other.actuators_),
       media_(other.media_),
+      scripts_(other.scripts_),
       exclude_pairs_(other.exclude_pairs_),
       contact_pairs_(other.contact_pairs_),
       initial_state_(other.initial_state_),
@@ -60,6 +61,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     lights_        = other.lights_;
     actuators_     = other.actuators_;
     media_         = other.media_;
+    scripts_       = other.scripts_;
     exclude_pairs_ = other.exclude_pairs_;
     contact_pairs_ = other.contact_pairs_;
     initial_state_ = other.initial_state_;   // authored metadata (not from records)
@@ -83,6 +85,7 @@ void SceneIR::RebuildFacade() {
     shape_entity_.clear();
     joint_entity_.clear();
     media_entity_.clear();
+    script_entity_.clear();
     body_node_.clear();
     material_ids_.clear();
 
@@ -111,6 +114,10 @@ void SceneIR::RebuildFacade() {
     // a copied/rebuilt scene keeps its media entities.
     for (const MediaRecord& rec : media_) {
         ProjectMedia(rec);
+    }
+    // Scripts project last: parent-path resolution may reference any earlier node.
+    for (const ScriptRecord& rec : scripts_) {
+        ProjectScript(rec);
     }
 }
 
@@ -234,6 +241,15 @@ TerrainId SceneIR::AddTerrain(TerrainRecord record) {
     return id;
 }
 
+ScriptId SceneIR::AddScript(ScriptRecord record) {
+    const auto id = static_cast<ScriptId>(scripts_.size());
+    record.id = id;
+    EnsureFacade();  // incremental projection needs a current facade
+    scripts_.push_back(std::move(record));
+    ProjectScript(scripts_.back());
+    return id;
+}
+
 void SceneIR::AddExcludePair(BodyId a, BodyId b) {
     // Canonicalize as (min,max) so (a,b) and (b,a) store identically. No dedup
     // here — that (and the filter policy) is C1c.
@@ -258,6 +274,7 @@ size_t SceneIR::LightCount() const { return lights_.size(); }
 size_t SceneIR::ActuatorCount() const { return actuators_.size(); }
 size_t SceneIR::MediaCount() const { return media_.size(); }
 size_t SceneIR::TerrainCount() const { return terrain_.size(); }
+size_t SceneIR::ScriptCount() const { return scripts_.size(); }
 
 const RigidBodyRecord& SceneIR::GetBody(BodyId id) const {
     if (id >= bodies_.size()) {
@@ -327,6 +344,13 @@ const TerrainRecord& SceneIR::GetTerrain(TerrainId id) const {
         throw std::out_of_range("SceneIR::GetTerrain - invalid TerrainId");
     }
     return terrain_[id];
+}
+
+const ScriptRecord& SceneIR::GetScript(ScriptId id) const {
+    if (id >= scripts_.size()) {
+        throw std::out_of_range("SceneIR::GetScript - invalid ScriptId");
+    }
+    return scripts_[id];
 }
 
 RigidBodyRecord& SceneIR::GetBodyMut(BodyId id) {
@@ -408,6 +432,14 @@ TerrainRecord& SceneIR::GetTerrainMut(TerrainId id) {
     return terrain_[id];  // authored metadata: no facade dependency
 }
 
+ScriptRecord& SceneIR::GetScriptMut(ScriptId id) {
+    if (id >= scripts_.size()) {
+        throw std::out_of_range("SceneIR::GetScriptMut - invalid ScriptId");
+    }
+    facade_dirty_ = true;  // record mutation bypasses write-through
+    return scripts_[id];
+}
+
 const std::vector<RigidBodyRecord>& SceneIR::Bodies() const { return bodies_; }
 const std::vector<JointRecord>& SceneIR::Joints() const { return joints_; }
 const std::vector<CollisionShapeRecord>& SceneIR::Shapes() const { return shapes_; }
@@ -418,6 +450,7 @@ const std::vector<LightRecord>& SceneIR::Lights() const { return lights_; }
 const std::vector<ActuatorRecord>& SceneIR::Actuators() const { return actuators_; }
 const std::vector<MediaRecord>& SceneIR::Media() const { return media_; }
 const std::vector<TerrainRecord>& SceneIR::Terrain() const { return terrain_; }
+const std::vector<ScriptRecord>& SceneIR::Scripts() const { return scripts_; }
 const std::vector<std::pair<BodyId, BodyId>>& SceneIR::ExcludePairs() const {
     return exclude_pairs_;
 }
@@ -444,6 +477,10 @@ EntityId SceneIR::EntityOfJoint(JointId id) const {
 EntityId SceneIR::EntityOfMedia(MediaId id) const {
     EnsureFacade();
     return id < media_entity_.size() ? media_entity_[id] : kInvalidEntity;
+}
+EntityId SceneIR::EntityOfScript(ScriptId id) const {
+    EnsureFacade();
+    return id < script_entity_.size() ? script_entity_[id] : kInvalidEntity;
 }
 
 // Lazy facade resync. Get*Mut hands out mutable record references that bypass
@@ -899,6 +936,28 @@ void SceneIR::ProjectMedia(const MediaRecord& rec) {
     }
 
     media_entity_[rec.id] = entity;
+}
+
+void SceneIR::ProjectScript(const ScriptRecord& rec) {
+    if (rec.id >= script_entity_.size()) {
+        script_entity_.resize(rec.id + 1, kInvalidEntity);
+    }
+    // A /script node: its own entity + node hung under the authored parent path
+    // (root when empty / unresolved), carrying the inline source + stable id.
+    std::shared_ptr<SceneNode> parent_node = tree_.Root();
+    if (!rec.parent_path.empty()) {
+        if (auto p = tree_.NodeOf(rec.parent_path)) parent_node = p;
+    }
+    const EntityId entity = ecs_.Create();
+    auto node = tree_.AddEntity(entity, parent_node,
+                                StableAutoName("script", rec.id, rec.name));
+    ecs_.BindNode(entity, node);
+    ecs_.Add(entity, NameComponent{node->name});
+    ScriptComponent sc;
+    sc.source    = rec.source;
+    sc.stable_id = rec.stable_id;
+    ecs_.Add(entity, std::move(sc));
+    script_entity_[rec.id] = entity;
 }
 
 } // namespace nuka::scene

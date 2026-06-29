@@ -377,6 +377,18 @@ struct TerrainRecord {
     float       image_elevation_z = 0.0f;
 };
 
+// A first-class scripting node: inline source the editor's ScriptHost execs +
+// dispatches (on_ready/on_step/on_reset), a stable id that survives a reload, and
+// an explicit parent tree-path to hang the /script node under ("" => root). Persisted
+// by .nks; ignored by the cook (scripts never reach the physics model).
+struct ScriptRecord {
+    std::string name = "script";
+    ScriptId    id   = kInvalidScript;
+    std::string source;
+    uint64_t    stable_id   = 0;
+    std::string parent_path;
+};
+
 // ---------------------------------------------------------------------------
 // SceneIR
 // ---------------------------------------------------------------------------
@@ -410,6 +422,7 @@ public:
     LightId AddLight(LightRecord record);
     ActuatorId AddActuator(ActuatorRecord record);
     MediaId  AddMedia(MediaRecord record);
+    ScriptId AddScript(ScriptRecord record);
 
     // Authored terrain field (scene-global config, like gravity; NOT a tree node).
     // Persisted by .nks, consumed by the cook (CookToModel bakes it into the static
@@ -438,6 +451,7 @@ public:
     size_t ActuatorCount()  const;
     size_t MediaCount()     const;
     size_t TerrainCount()   const;
+    size_t ScriptCount()    const;
 
     // -- accessors ----------------------------------------------------------
     const RigidBodyRecord&      GetBody(BodyId id)    const;
@@ -450,6 +464,7 @@ public:
     const ActuatorRecord&       GetActuator(ActuatorId id) const;
     const MediaRecord&          GetMedia(MediaId id) const;
     const TerrainRecord&        GetTerrain(TerrainId id) const;
+    const ScriptRecord&         GetScript(ScriptId id) const;
 
     // Mutable record access. Mutating a record through these BYPASSES the Add*
     // write-through, so each Get*Mut marks the facade DIRTY; the next facade
@@ -466,6 +481,7 @@ public:
     ActuatorRecord&       GetActuatorMut(ActuatorId id);
     MediaRecord&          GetMediaMut(MediaId id);
     TerrainRecord&        GetTerrainMut(TerrainId id);
+    ScriptRecord&         GetScriptMut(ScriptId id);
 
     // -- bulk accessors -----------------------------------------------------
     const std::vector<RigidBodyRecord>&      Bodies()  const;
@@ -478,6 +494,7 @@ public:
     const std::vector<ActuatorRecord>&       Actuators() const;
     const std::vector<MediaRecord>&          Media() const;
     const std::vector<TerrainRecord>&        Terrain() const;
+    const std::vector<ScriptRecord>&         Scripts() const;
     const std::vector<std::pair<BodyId, BodyId>>& ExcludePairs() const;
     const std::vector<ContactPairOverride>&       ContactPairs() const;
 
@@ -509,6 +526,7 @@ public:
     EntityId EntityOfShape(ShapeId id) const;
     EntityId EntityOfJoint(JointId id) const;
     EntityId EntityOfMedia(MediaId id) const;
+    EntityId EntityOfScript(ScriptId id) const;
 
 private:
     // Rebuild tree_ + ecs_ from the current record vectors (used by the copy
@@ -528,6 +546,7 @@ private:
     void ProjectLight(const LightRecord& rec);
     void ProjectActuator(const ActuatorRecord& rec);
     void ProjectMedia(const MediaRecord& rec);
+    void ProjectScript(const ScriptRecord& rec);
 
     std::vector<RigidBodyRecord>      bodies_;
     std::vector<JointRecord>          joints_;
@@ -538,6 +557,7 @@ private:
     std::vector<LightRecord>          lights_;
     std::vector<ActuatorRecord>       actuators_;
     std::vector<MediaRecord>          media_;
+    std::vector<ScriptRecord>         scripts_;
     std::vector<std::pair<BodyId, BodyId>> exclude_pairs_;
     std::vector<ContactPairOverride>       contact_pairs_;
 
@@ -557,6 +577,7 @@ private:
     std::vector<EntityId>                    shape_entity_;
     std::vector<EntityId>                    joint_entity_;
     std::vector<EntityId>                    media_entity_;
+    std::vector<EntityId>                    script_entity_;
     std::vector<std::shared_ptr<SceneNode>>  body_node_;
 
     // MaterialId -> {physics-material id, render-material id} in the Registry's

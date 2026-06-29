@@ -190,4 +190,11 @@ struct LightComponent {
     float           intensity       = 1.0f;
 };
 
+// Scripting node payload: inline source + a stable id that survives a reload. The
+// blessed reversal of the otherwise-closed component set (scripts live in scenes).
+struct ScriptComponent {
+    std::string source;          // inline Python source (UTF-8)
+    uint64_t    stable_id = 0;   // serialized node identity, stable across reload
+};
+
 } // namespace nuka::scene

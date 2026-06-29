@@ -66,6 +66,7 @@ void Registry::Destroy(EntityId e) {
     initial_states_.Remove(e);
     cameras_.Remove(e);
     lights_.Remove(e);
+    scripts_.Remove(e);
 
     // Drop the node backref.
     if (e.index < node_refs_.size()) {
@@ -93,6 +94,7 @@ FluidComponent&          Registry::Add(EntityId e, FluidComponent c)          { 
 InitialStateComponent&   Registry::Add(EntityId e, InitialStateComponent c)   { NUKA_REGISTRY_ADD_GUARD(e); return initial_states_.Add(e, std::move(c)); }
 CameraComponent&         Registry::Add(EntityId e, CameraComponent c)         { NUKA_REGISTRY_ADD_GUARD(e); return cameras_.Add(e, std::move(c)); }
 LightComponent&          Registry::Add(EntityId e, LightComponent c)          { NUKA_REGISTRY_ADD_GUARD(e); return lights_.Add(e, std::move(c)); }
+ScriptComponent&         Registry::Add(EntityId e, ScriptComponent c)         { NUKA_REGISTRY_ADD_GUARD(e); return scripts_.Add(e, std::move(c)); }
 
 // -- material asset tables --------------------------------------------------
 

@@ -1419,6 +1419,28 @@ if(CMAKE_CUDA_COMPILER)
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(NksMediaRoundtrip PROPERTIES LABELS "fast_full")
 
+    # --- .nks /script node roundtrip. Host/CPU only (no device step): Saves/Loads a
+    # SceneIR with /script nodes and asserts the records + the projected
+    # ScriptComponent / parent path round-trip, plus a script-free scene stays
+    # byte-identical (the additive looser gate).
+    add_executable(nuka_nks_script_roundtrip_test
+        scenario/nks_script_roundtrip.cpp
+    )
+    target_include_directories(nuka_nks_script_roundtrip_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_nks_script_roundtrip_test
+        PRIVATE
+            nuka_scene
+            nuka_import
+            nuka_core
+            GTest::gtest_main
+    )
+    add_dependencies(nuka_nks_script_roundtrip_test nuka_codegen)
+    add_test(NAME NksScriptRoundtrip
+             COMMAND nuka_nks_script_roundtrip_test
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(NksScriptRoundtrip PROPERTIES LABELS "fast_full")
+
     # --- v0.7 p09-D: XPBD soft-body COOKER tests (exit-crit 3) -------------
     # PURE host/CPU: cooks programmatic XpbdSoftBodySpecs and asserts the
     # returned XpbdConstraintSet (counts + the two param->engine mappings +

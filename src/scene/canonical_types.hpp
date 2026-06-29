@@ -17,6 +17,7 @@ using LightId = uint32_t;
 using ActuatorId = uint32_t;
 using MediaId = uint32_t;
 using TerrainId = uint32_t;
+using ScriptId = uint32_t;
 
 constexpr BodyId  kInvalidBody  = ~uint32_t(0);
 constexpr JointId kInvalidJoint = ~uint32_t(0);
@@ -24,6 +25,7 @@ constexpr ShapeId kInvalidShape = ~uint32_t(0);   // v0.8 C1b: <pair> geom senti
 constexpr MaterialId kInvalidMaterial = ~uint32_t(0);
 constexpr MediaId kInvalidMedia = ~uint32_t(0);
 constexpr TerrainId kInvalidTerrain = ~uint32_t(0);
+constexpr ScriptId kInvalidScript = ~uint32_t(0);
 
 enum class JointType : uint8_t {
     Revolute,
