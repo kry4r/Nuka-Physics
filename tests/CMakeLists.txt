@@ -527,6 +527,38 @@ gtest_discover_tests(nuka_editor_reset_roundtrip_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Read-only debug-overlay data-path gate: cook a real EditorScene, evolve it, and
+# assert the DebugOverlay emits one collider proxy per cooked primitive (at the live
+# BodyPose, kind-coloured) + one marker per active contact point (count-matched to the
+# ContactCount watermark). Compiles the host-only editor_scene + debug_overlay seams in.
+add_executable(nuka_editor_debug_overlay_test
+    scenario/editor_debug_overlay.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/debug_overlay.cpp
+)
+add_dependencies(nuka_editor_debug_overlay_test nuka_codegen)
+target_include_directories(nuka_editor_debug_overlay_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_debug_overlay_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_debug_overlay_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
 # examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
 # + initial_state + settle) and asserts byte-identical re-save + section
