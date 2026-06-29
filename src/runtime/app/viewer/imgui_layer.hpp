@@ -39,6 +39,7 @@
 
 #include "math/transform.hpp"
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/primitive_kind.hpp"
 #include "scene/ecs/entity.hpp"
 
 #include <cstdint>
@@ -185,7 +186,11 @@ struct ViewerUiState {
     // One-shot structural-edit requests keyed on selected_entity (the chosen
     // parent / target). The viewer applies them through the general SceneIR seam,
     // re-cooking the world for the structural ones (add / delete).
-    bool        add_box_request = false;   // add a box body under the selection
+    // One-shot spawn: spawn `spawn_kind` as a free body placed near the selection
+    // (the Add picker / context menu / --spawn set it; the viewer applies it BETWEEN
+    // frames through SpawnPrimitive, never in RecordUi).
+    bool          spawn_request = false;
+    PrimitiveKind spawn_kind    = PrimitiveKind::Box;
     bool        delete_request  = false;   // delete the selection + its subtree
     char        rename_buf[256] = {0};     // rename field for the selection
     bool        rename_request  = false;   // commit rename_buf onto the selection
