@@ -210,37 +210,95 @@ std::string RenameNode(EditorScene& es, const std::string& path,
     return "";  // pure group / not record-backed
 }
 
-std::string AddBoxChild(EditorScene& es, const std::string& parent_path) {
+namespace {
+
+// Per-kind spawn geometry + dynamics. The ONE switch in the spawn path: only the
+// geometry and whether the kind is a (massless) static plane vary; everything
+// downstream (records, projection, cook, render) is general.
+struct SpawnSpec {
+    scene::ShapeType type;
+    math::Vec3       half_extents;   // box / plane
+    float            radius;         // sphere / capsule
+    float            half_height;    // capsule
+    bool             is_static;      // plane: a ground-like body has no mass
+    const char*      tag;            // node + material base name
+};
+
+SpawnSpec SpecOf(PrimitiveKind kind) {
+    switch (kind) {
+        case PrimitiveKind::Sphere:
+            return {scene::ShapeType::Sphere,  {0.25f, 0.25f, 0.25f}, 0.25f, 0.25f, false, "sphere"};
+        case PrimitiveKind::Capsule:
+            return {scene::ShapeType::Capsule, {0.20f, 0.20f, 0.45f}, 0.20f, 0.25f, false, "capsule"};
+        case PrimitiveKind::Plane:
+            return {scene::ShapeType::Plane,   {5.0f, 5.0f, 0.05f},   0.50f, 0.50f, true,  "plane"};
+        case PrimitiveKind::Box:
+        default:
+            return {scene::ShapeType::Box,     {0.25f, 0.25f, 0.25f}, 0.25f, 0.25f, false, "box"};
+    }
+}
+
+}  // namespace
+
+std::string SpawnPrimitive(EditorScene& es, PrimitiveKind kind,
+                           const math::Transform& placement,
+                           const std::string& parent_path) {
+    const SpawnSpec spec = SpecOf(kind);
+
     scene::BodyId parent_body = scene::kInvalidBody;
     if (const auto parent = es.scene.Tree().NodeOf(parent_path))
         parent_body = BodyOfEntity(es.scene, parent->entity);
 
+    // Re-express the requested WORLD placement in the parent's frame (identity for a
+    // group / root parent), matching ReparentNode's pose preservation.
+    math::Transform parent_world = math::Transform::Identity();
+    if (parent_body != scene::kInvalidBody)
+        parent_world = AuthoredWorldTransform(es.scene, es.scene.EntityOfBody(parent_body));
+
     scene::RigidBodyRecord b;
-    b.is_static = false;
-    b.mass = 1.0f;
+    b.is_static = spec.is_static;
+    b.mass = spec.is_static ? 0.0f : 1.0f;
     // Under a parent body the name is the bare leaf; under a group / root the group
-    // prefix path carries it there. A small +Z offset keeps it visible, not buried.
+    // prefix path carries it there (the tree dedupes duplicate sibling names).
     b.parent_id = parent_body;
     b.name = (parent_body != scene::kInvalidBody || parent_path.empty())
-                 ? std::string("box")
-                 : parent_path + "/box";
-    b.local_transform.position = math::Vec3{0.0f, 0.0f, 0.5f};
+                 ? std::string(spec.tag)
+                 : parent_path + "/" + spec.tag;
+    b.local_transform = parent_world.Inverse() * placement;
     const scene::BodyId nb = es.scene.AddRigidBody(b);
 
     scene::MaterialRecord m;
-    m.name = "box_mat";
+    m.name = std::string(spec.tag) + "_mat";
     m.base_color = math::Vec3{0.72f, 0.72f, 0.75f};
     const scene::MaterialId mid = es.scene.AddMaterial(m);
 
-    scene::CollisionShapeRecord s;
-    s.body_id = nb;
-    s.type = scene::ShapeType::Box;
-    s.half_extents = math::Vec3{0.25f, 0.25f, 0.25f};
-    s.material_id = mid;
-    s.name = "box_geom";
-    es.scene.AddCollisionShape(s);
+    // The colliding geom drives physics: the cook makes the body's first colliding
+    // shape its collidable row.
+    scene::CollisionShapeRecord cs;
+    cs.body_id = nb;
+    cs.type = spec.type;
+    cs.half_extents = spec.half_extents;
+    cs.radius = spec.radius;
+    cs.half_height = spec.half_height;
+    cs.material_id = mid;
+    cs.name = std::string(spec.tag) + "_geom";
+    es.scene.AddCollisionShape(cs);
+
+    // A visual-only twin (contype/conaffinity 0) projects to a VisualMeshComponent so
+    // the body renders unconditionally; the cook keeps it non-colliding (no extra row).
+    scene::CollisionShapeRecord vis = cs;
+    vis.name = std::string(spec.tag) + "_visual";
+    vis.contype = 0;
+    vis.conaffinity = 0;
+    es.scene.AddCollisionShape(vis);
 
     return PathOfEntity(es.scene, es.scene.EntityOfBody(nb));
+}
+
+std::string AddBoxChild(EditorScene& es, const std::string& parent_path) {
+    math::Transform placement;
+    placement.position = math::Vec3{0.0f, 0.0f, 0.5f};
+    return SpawnPrimitive(es, PrimitiveKind::Box, placement, parent_path);
 }
 
 std::string DeleteSubtree(EditorScene& es, const std::string& path) {

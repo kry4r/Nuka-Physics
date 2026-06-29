@@ -17,6 +17,7 @@
 #include "math/vec3.hpp"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
+#include "runtime/app/viewer/primitive_kind.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/entity.hpp"
 
@@ -100,8 +101,19 @@ math::Vec3 EulerDegFromQuat(const math::Quat& q);
 std::string RenameNode(EditorScene& es, const std::string& path,
                        const std::string& new_leaf);
 
-// Add a movable unit-box body (+ box shape + neutral material) under the body or
-// group at `parent_path` ("" -> scene root). Returns the new node's path, or "".
+// Spawn a primitive rigid body at `placement` under the body or group at
+// `parent_path` ("" -> scene root). Box/Sphere/Capsule spawn DYNAMIC + movable;
+// Plane spawns static + massless. Authors a colliding geom (physics), a visual-only
+// twin geom (a VisualMeshComponent, so the body renders in ANY scene -- a robot
+// scene's real meshes otherwise suppress the collision-proxy render), and a neutral
+// material. `placement` is the desired WORLD transform; it is re-expressed in the
+// parent's frame (identity for a group / root parent). Returns the new node's path.
+std::string SpawnPrimitive(EditorScene& es, PrimitiveKind kind,
+                           const math::Transform& placement,
+                           const std::string& parent_path = "");
+
+// Spawn a unit box +0.5 up under `parent_path` -- a named convenience over
+// SpawnPrimitive (the single general spawn entry). Returns the new node's path.
 std::string AddBoxChild(EditorScene& es, const std::string& parent_path);
 
 // Remove the body subtree rooted at `path` (its bodies + shapes + the joints that
