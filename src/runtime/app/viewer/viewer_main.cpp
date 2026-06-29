@@ -54,6 +54,7 @@
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/script_host.hpp"     // embedded-python live-world bridge
 #include "runtime/inference/go2_policy_controller.hpp"  // --policy closed-loop drive
 #include "scene/format/nks.hpp"                   // nks::Save (persist edits)
 #include "scene/scene_ir.hpp"
@@ -86,6 +87,25 @@ namespace window = nuka::render::window;
 
 // Default physics timestep when neither --dt nor a scene override is supplied.
 constexpr float kDefaultDt = 1.0f / 240.0f;
+
+// The script console retains at most this many trailing bytes of captured output.
+constexpr size_t kConsoleLogCap = 256u * 1024u;
+
+// Read a whole file into `out`. Returns false (out untouched) when it cannot open.
+bool ReadEntireFile(const std::string& path, std::string* out) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n < 0) { std::fclose(f); return false; }
+    std::string buf(static_cast<size_t>(n), '\0');
+    const size_t rd = (n > 0) ? std::fread(&buf[0], 1, static_cast<size_t>(n), f) : 0u;
+    std::fclose(f);
+    buf.resize(rd);
+    *out = std::move(buf);
+    return true;
+}
 
 // Seed the GENERIC per-DOF drive editor from a freshly loaded world's DriveTarget
 // field (per:link, env 0). A flat per-DOF editor, NEVER a choreography table.
@@ -271,6 +291,7 @@ int main(int argc, char** argv) {
     float edit_move[3] = {0.0f, 0.0f, 0.0f};   // a position delta on the selection
     std::string save_to;                       // one-shot Save after the load edits
     std::string gizmo_op;                       // headless gizmo mode: move | rotate
+    std::string run_script_path;               // --run-script: exec once after load
     // Headless tree-edit aids on the --select'd node (apply on the first frame).
     std::string rename_to;                      // --rename NEW: rename the selection
     bool        add_box_on = false;             // --add-box: box child under selection
@@ -313,6 +334,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--save-to" && i + 1 < argc) save_to = argv[++i];
         else if (a == "--gizmo-op" && i + 1 < argc) gizmo_op = argv[++i];
+        else if (a == "--run-script" && i + 1 < argc) run_script_path = argv[++i];
         else if (a == "--rename" && i + 1 < argc) rename_to = argv[++i];
         else if (a == "--add-box") add_box_on = true;
         else if (a == "--delete") delete_on = true;
@@ -322,6 +344,7 @@ int main(int argc, char** argv) {
                         "[--frames N] [--dt SECONDS] "
                         "[--cam tx,ty,tz,dist,yaw_deg,pitch_deg] "
                         "[--capture-frame N --capture-out FILE.ppm]\n"
+                        "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -435,6 +458,11 @@ int main(int argc, char** argv) {
     ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
+    // The embedded interpreter + built-in `nuka` module, bound to the active world via
+    // SetContext on every load. Scripts run on this loop, OUTSIDE the offscreen gates.
+    viewer::ScriptHost script_host;
+    if (!script_host.Valid())
+        std::fprintf(stderr, "[nuka_editor] scripting unavailable (python init failed)\n");
     // Frame the world: honor an explicit --cam, else auto-fit the moving-instance
     // cluster (the robots) so they fill the view rather than the whole terrain.
     auto frame_world = [&](const render::RenderWorld& rw) {
@@ -471,6 +499,8 @@ int main(int argc, char** argv) {
         // The general edit machinery for this scene: rebuild the entity->record
         // reverse index, reset the inspector, seed the Save path from the source.
         record_index.Build(loaded->scene);
+        // Point the live-world scripting bridge at this freshly cooked scene.
+        script_host.SetContext({loaded.get(), &record_index, &ui_state});
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
         std::snprintf(ui_state.save_path, sizeof(ui_state.save_path), "%s", path.c_str());
@@ -554,6 +584,8 @@ int main(int argc, char** argv) {
         loaded.reset();
         ClearModelUi(ui_state);
         record_index = viewer::EntityRecordIndex{};
+        // Drop the scripting bridge to the empty editor (scene-gated calls raise).
+        script_host.SetContext({nullptr, &record_index, &ui_state});
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
         ui_state.save_dirty = false;
@@ -719,6 +751,7 @@ int main(int argc, char** argv) {
     float    last_mouse_x = 0.0f;
     float    last_mouse_y = 0.0f;
 
+    bool script_ran = false;  // --run-script fires once, after the first load settles
     std::vector<window::WindowEvent> events;
     while (!present->ShouldClose()) {
         if (max_frames > 0 && static_cast<int>(frame_index) >= max_frames) break;
@@ -734,6 +767,25 @@ int main(int argc, char** argv) {
         // Structural tree edits re-cook the world; apply them here, before the loop
         // binds its render-world reference, so the rebuild never dangles it.
         apply_tree_edits();
+
+        // --run-script execs a file ONCE (the same embedded path the Run button uses)
+        // after the first load; its captured output (incl. any traceback) -> stderr.
+        if (!run_script_path.empty() && !script_ran) {
+            script_ran = true;
+            std::string code;
+            if (ReadEntireFile(run_script_path, &code)) {
+                const std::string out = script_host.RunString(code);
+                ui_state.console_log += out;
+                std::fputs(out.c_str(), stderr);
+                std::fflush(stderr);
+                std::printf("[nuka_editor] ran --run-script %s (%zu bytes captured)\n",
+                            run_script_path.c_str(), out.size());
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr, "[nuka_editor] --run-script: cannot read %s\n",
+                             run_script_path.c_str());
+            }
+        }
 
         // -- poll + dispatch input ----------------------------------------------
         events.clear();
@@ -974,6 +1026,19 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[nuka_editor] save failed: %s: %s\n",
                              sp.c_str(), e.what());
             }
+        }
+
+        // Drain the Script panel: Clear empties the console; Run execs the buffer and
+        // appends the captured output (isolated -- a script error never crashes here).
+        if (ui_state.script_clear_request) {
+            ui_state.console_log.clear();
+            ui_state.script_clear_request = false;
+        }
+        if (ui_state.script_run_request) {
+            ui_state.script_run_request = false;
+            ui_state.console_log += script_host.RunString(ui_state.script_buf);
+            if (ui_state.console_log.size() > kConsoleLogCap)
+                ui_state.console_log.erase(0, ui_state.console_log.size() - kConsoleLogCap);
         }
 
         // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
