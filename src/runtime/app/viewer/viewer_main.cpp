@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
     float edit_move[3] = {0.0f, 0.0f, 0.0f};   // a position delta on the selection
     std::string save_to;                       // one-shot Save after the load edits
     std::string gizmo_op;                       // headless gizmo mode: move | rotate
+    bool        gizmo_local = false;             // --gizmo-local: local-frame handles
     std::string run_script_path;               // --run-script: exec once after load
     // Headless tree-edit aids on the --select'd node (apply on the first frame).
     std::string rename_to;                      // --rename NEW: rename the selection
@@ -338,6 +339,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--save-to" && i + 1 < argc) save_to = argv[++i];
         else if (a == "--gizmo-op" && i + 1 < argc) gizmo_op = argv[++i];
+        else if (a == "--gizmo-local") gizmo_local = true;
         else if (a == "--run-script" && i + 1 < argc) run_script_path = argv[++i];
         else if (a == "--rename" && i + 1 < argc) rename_to = argv[++i];
         else if (a == "--add-box") add_box_on = true;
@@ -581,6 +583,7 @@ int main(int argc, char** argv) {
         }
         if (gizmo_op == "rotate") ui_state.gizmo.op = viewer::GizmoState::Op::Rotate;
         else if (gizmo_op == "move") ui_state.gizmo.op = viewer::GizmoState::Op::Translate;
+        ui_state.gizmo.local = gizmo_local;
         // Headless tree edits: queue a request on the selection; apply_tree_edits
         // applies it at the top of the first frame, before the Save below.
         if (!rename_to.empty()) {
