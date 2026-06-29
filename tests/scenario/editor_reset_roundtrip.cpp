@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -47,6 +48,7 @@ constexpr float kDt    = 1.0f / 240.0f;
 constexpr int   kSteps = 160;     // enough for a Go2 to sag / particles to fall
 constexpr float kMoved = 1.0e-3f; // the state must have evolved by at least this
 constexpr float kTol   = 1.0e-4f; // a snapshot restore is a D2D copy -> ~exact
+constexpr float kLinkTol = 1.0e-3f; // link pose is FK-recomputed -> seed-vs-FK epsilon
 
 class TempDir {
 public:
@@ -132,10 +134,13 @@ void CheckResetRoundTrip(nuka::phi::Device* dev, nuka::phi::Backend* backend,
     ASSERT_TRUE(L > 0u || P > 0u)
         << "scene has neither articulation nor particles (nothing to reset): " << nks_path;
 
-    // Authored initial state (== the construction-time snapshot), env 0.
+    // Authored initial state (== the construction-time snapshot), env 0. LinkPose is
+    // the FK-derived per-link world pose the RENDERER reads -- the reset must refresh
+    // it (it is NOT in the snapshot), else a paused post-reset view shows stale poses.
     const std::vector<float>     q0    = DlF(w, FieldId::Q, L);
     const std::vector<float>     drv0  = DlF(w, FieldId::DriveTarget, L);
     const std::vector<Transform> base0 = DlT(w, FieldId::BasePose, K);
+    const std::vector<Transform> link0 = DlT(w, FieldId::LinkPose, L);
     const std::vector<Vec3>      pos0  = DlV(w, FieldId::ParticlePos, P);
 
     // Simulate a live Drive-panel edit: overwrite the drive targets (env 0) so the
@@ -152,9 +157,12 @@ void CheckResetRoundTrip(nuka::phi::Device* dev, nuka::phi::Backend* backend,
 
     const std::vector<float>     q1    = DlF(w, FieldId::Q, L);
     const std::vector<Transform> base1 = DlT(w, FieldId::BasePose, K);
+    const std::vector<Transform> link1 = DlT(w, FieldId::LinkPose, L);
     const std::vector<Vec3>      pos1  = DlV(w, FieldId::ParticlePos, P);
     const float moved = std::max({Diff(q0, q1), DiffT(base0, base1), DiffV(pos0, pos1)});
     ASSERT_GT(moved, kMoved) << "state did not evolve under stepping: " << nks_path;
+    if (L > 0u) ASSERT_GT(DiffT(link0, link1), kMoved)
+        << "link world poses did not evolve: " << nks_path;
 
     // The single reset entry point the transport button + script on_reset both call.
     ASSERT_TRUE(viewer::ResetEditorScenePhysics(*es)) << "reset failed: " << nks_path;
@@ -163,11 +171,27 @@ void CheckResetRoundTrip(nuka::phi::Device* dev, nuka::phi::Backend* backend,
     const std::vector<float>     qd2   = DlF(w, FieldId::Qdot, L);
     const std::vector<float>     drv2  = DlF(w, FieldId::DriveTarget, L);
     const std::vector<Transform> base2 = DlT(w, FieldId::BasePose, K);
+    const std::vector<Transform> link2 = DlT(w, FieldId::LinkPose, L);
     const std::vector<Vec3>      pos2  = DlV(w, FieldId::ParticlePos, P);
     const std::vector<Vec3>      vel2  = DlV(w, FieldId::ParticleVel, P);
 
+    // Print the root base-pose Z at the three points so a large root drop (a
+    // floating base falling meters) is visible, not just asserted, plus the link-pose
+    // restore residual (the render-pose round-trip the FK refresh closes).
+    if (K > 0u && !base0.empty()) {
+        std::printf("[reset] %s root_z authored=%.4f evolved=%.4f reset=%.4f  (drop=%.4f"
+                    " link_restore_resid=%.6f)\n", nks_path.c_str(), base0[0].position.z,
+                    base1[0].position.z, base2[0].position.z,
+                    base0[0].position.z - base1[0].position.z, DiffT(link0, link2));
+        std::fflush(stdout);
+    }
+
     EXPECT_LT(Diff(q0, q2), kTol)     << "qpos not restored to authored: " << nks_path;
     EXPECT_LT(DiffT(base0, base2), kTol) << "root pose not restored: " << nks_path;
+    // The render pose: reset must refresh FK so the paused view shows the authored
+    // pose, not the evolved one. kLinkTol absorbs the FK-vs-cook seed epsilon.
+    if (L > 0u) EXPECT_LT(DiffT(link0, link2), kLinkTol)
+        << "link world poses not restored (stale render after reset): " << nks_path;
     EXPECT_LT(MaxAbs(qd2), kTol)      << "qdot not zeroed: " << nks_path;
     EXPECT_LT(Diff(drv0, drv2), kTol) << "drive targets not re-seeded to authored: " << nks_path;
     EXPECT_LT(DiffV(pos0, pos2), kTol) << "particle positions not restored: " << nks_path;
@@ -201,6 +225,38 @@ TEST_F(EditorReset, Go2Articulation) {
     const std::string scene = "examples/scenes/go2.nks";
     if (!fs::exists(scene)) GTEST_SKIP() << "go2.nks missing";
     CheckResetRoundTrip(dev_, backend_, scene);
+}
+
+// Large floating-base root drop: pure gravity (no drive edit) free-falls the Go2 root
+// by METERS over ~1 s, then Reset must snap the root AND the FK-derived link world
+// poses (the render source) back to authored exactly -- the regime a paused viewport
+// exposes. Sensitive to a stale-render reset: link poses must restore, not just qpos.
+TEST_F(EditorReset, Go2RootFreeFallRestore) {
+    const std::string scene = "examples/scenes/go2.nks";
+    if (!fs::exists(scene)) GTEST_SKIP() << "go2.nks missing";
+    auto es = viewer::LoadEditorScene(scene, dev_, backend_, kDt);
+    ASSERT_NE(es, nullptr);
+    nuka::nk::World& w = *es->world;
+    const uint32_t L = es->caps.links_per_env;
+    const uint32_t K = es->caps.articulations_per_env;
+    ASSERT_GT(K, 0u);
+    const std::vector<Transform> base0 = DlT(w, FieldId::BasePose, K);
+    const std::vector<Transform> link0 = DlT(w, FieldId::LinkPose, L);
+
+    for (int i = 0; i < 240; ++i) w.Step();  // ~1 s of free-fall
+
+    const std::vector<Transform> base1 = DlT(w, FieldId::BasePose, K);
+    const float root_drop = std::fabs(base0[0].position.z - base1[0].position.z);
+    std::printf("[reset] go2 free-fall root drop = %.4f m\n", root_drop);
+    std::fflush(stdout);
+    ASSERT_GT(root_drop, 1.0f) << "root did not free-fall meters -- regime not exercised";
+
+    ASSERT_TRUE(viewer::ResetEditorScenePhysics(*es));
+    const std::vector<Transform> base2 = DlT(w, FieldId::BasePose, K);
+    const std::vector<Transform> link2 = DlT(w, FieldId::LinkPose, L);
+    EXPECT_LT(DiffT(base0, base2), kTol) << "root base pose not restored after free-fall";
+    EXPECT_LT(DiffT(link0, link2), kLinkTol)
+        << "link world poses not restored after free-fall (stale render)";
 }
 
 // Soft body (XPBD tet): particle positions + velocities restore.
