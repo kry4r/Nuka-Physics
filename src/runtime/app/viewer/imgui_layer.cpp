@@ -653,6 +653,42 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 }
             }
         }
+
+        // -- Teleop: keyboard -> the SAME per-DOF drive seam + a policy command. The
+        // viewer reads the keys + applies it BETWEEN frames (never here); this section
+        // only edits the plain ui_state so it records deterministically (GATE-B). ----
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        SectionHeader("Teleop (keyboard)");
+        ImGui::Checkbox("enable##teleop", &ui_state.teleop_enabled);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keyboard drives the robot; ignored while a field/console has focus");
+        if (ui_state.teleop_enabled) {
+            const int dof_n = static_cast<int>(ui_state.drive_targets.size());
+            ImGui::TextColored(kTextDim, "per-DOF:  [ / ] nudge     - / = select DOF");
+            if (dof_n > 0) {
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::DragInt("##teleopdof", &ui_state.teleop_dof, 0.1f, 0, dof_n - 1, "dof %d");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::DragFloat("##teleopstep", &ui_state.teleop_step, 0.005f, 0.0f, 0.0f,
+                                 "step %.3f");
+                ImGui::Checkbox("PD-hold##teleop", &ui_state.teleop_hold);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Apply uniform PD gains so drive targets move the joints");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(70.0f);
+                ImGui::DragFloat("##teleopkp", &ui_state.teleop_kp, 0.5f, 0.0f, 0.0f, "kp %.1f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(70.0f);
+                ImGui::DragFloat("##teleopkd", &ui_state.teleop_kd, 0.05f, 0.0f, 0.0f, "kd %.2f");
+            } else {
+                ImGui::TextColored(kTextDim, "no articulation DOFs");
+            }
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            ImGui::TextColored(kTextDim, "locomotion:  WASD move   Q / E yaw  (needs a policy)");
+            ImGui::TextColored(kAccent, "cmd  vx %.2f  vy %.2f  wyaw %.2f", ui_state.teleop_cmd[0],
+                               ui_state.teleop_cmd[1], ui_state.teleop_cmd[2]);
+        }
     }
     ImGui::End();
 

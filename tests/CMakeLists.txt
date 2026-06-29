@@ -592,6 +592,38 @@ gtest_discover_tests(nuka_editor_debug_overlay_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Editor keyboard-teleop gate: the PURE mapping (synthetic key intents nudge the
+# per-DOF drive seam by EXACTLY the step / select+clamp the DOF / WASD->command, and a
+# gated tick is inert) plus the LIVE world (a nudge reaches nk::Data through the viewer
+# upload and the PD-held joint swings; a command reaches a command-consuming controller
+# through the general base interface). Compiles the host-only editor_scene seam in.
+add_executable(nuka_editor_teleop_test
+    scenario/editor_teleop.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+)
+add_dependencies(nuka_editor_teleop_test nuka_codegen)
+target_include_directories(nuka_editor_teleop_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_teleop_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_teleop_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # Editor live-world script LIFECYCLE gate: cook a real EditorScene, embed the
 # ScriptHost bound to it, register a /script node, and drive the SAME step + reset
 # path the viewer does -- asserting on_ready (once) / on_step (each step, reaching the

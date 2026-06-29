@@ -25,6 +25,17 @@ public:
     // Called once per physics step (BEFORE it) for the active env; the controller
     // owns its decimation and writes outputs via world's Data seam.
     virtual void OnStep(nk::World& world, uint32_t env_index) = 0;
+
+    // Optional command sink: a command-driven controller (e.g. a locomotion policy
+    // that consumes a velocity command) overrides these; the default ignores commands.
+    // A general producer (interactive teleop, a script) writes a command vector through
+    // this base interface without knowing the controller type -- world.Step() stays free
+    // of controller-specific branches.
+    virtual bool AcceptsCommand() const { return false; }
+    virtual void SetCommandVector(const float* cmd, uint32_t count) {
+        (void)cmd;
+        (void)count;
+    }
 };
 
 }  // namespace nuka::runtime::app
