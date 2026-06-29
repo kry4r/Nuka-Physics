@@ -93,6 +93,21 @@ constexpr float kDefaultDt = 1.0f / 240.0f;
 // The script console retains at most this many trailing bytes of captured output.
 constexpr size_t kConsoleLogCap = 256u * 1024u;
 
+// A spawned primitive is placed this far above its reference (the selection's world
+// position, or the origin) so a free body drops into the scene. A documented default,
+// not a per-scene number -- the spawn carries an explicit placement.
+constexpr float kSpawnDropHeight = 0.75f;
+
+// Parse a --spawn KIND string into a PrimitiveKind. Returns false (out untouched) on
+// an unknown kind.
+bool ParsePrimitiveKind(const std::string& s, viewer::PrimitiveKind* out) {
+    if (s == "box")     { *out = viewer::PrimitiveKind::Box;     return true; }
+    if (s == "sphere")  { *out = viewer::PrimitiveKind::Sphere;  return true; }
+    if (s == "capsule") { *out = viewer::PrimitiveKind::Capsule; return true; }
+    if (s == "plane")   { *out = viewer::PrimitiveKind::Plane;   return true; }
+    return false;
+}
+
 // Read a whole file into `out`. Returns false (out untouched) when it cannot open.
 bool ReadEntireFile(const std::string& path, std::string* out) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -297,7 +312,8 @@ int main(int argc, char** argv) {
     std::string run_script_path;               // --run-script: exec once after load
     // Headless tree-edit aids on the --select'd node (apply on the first frame).
     std::string rename_to;                      // --rename NEW: rename the selection
-    bool        add_box_on = false;             // --add-box: box child under selection
+    bool        add_box_on = false;             // --add-box: spawn a box (== --spawn box)
+    std::string spawn_kind_arg;                 // --spawn KIND: box|sphere|capsule|plane
     bool        delete_on  = false;             // --delete: remove selection subtree
     std::string reparent_to;                    // --reparent DST: move --select under DST
     bool        headless_undo = false;          // --undo: fire one undo after the load edit
@@ -346,6 +362,7 @@ int main(int argc, char** argv) {
         else if (a == "--run-script" && i + 1 < argc) run_script_path = argv[++i];
         else if (a == "--rename" && i + 1 < argc) rename_to = argv[++i];
         else if (a == "--add-box") add_box_on = true;
+        else if (a == "--spawn" && i + 1 < argc) spawn_kind_arg = argv[++i];
         else if (a == "--delete") delete_on = true;
         else if (a == "--reparent" && i + 1 < argc) reparent_to = argv[++i];
         else if (a == "--undo") headless_undo = true;
@@ -360,6 +377,7 @@ int main(int argc, char** argv) {
                         "[--capture-frame N --capture-out FILE.ppm]\n"
                         "  [--run-script FILE.py runs a script once against the loaded scene]\n"
                         "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
+                        "  [--spawn box|sphere|capsule|plane spawns a primitive body after load]\n"
                         "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
                         "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
                         "  no --scene -> opens the empty editor; load scenes from the UI\n"
@@ -603,7 +621,17 @@ int main(int argc, char** argv) {
                           rename_to.c_str());
             ui_state.rename_request = true;
         }
-        if (add_box_on) ui_state.add_box_request = true;
+        if (add_box_on) { ui_state.spawn_request = true; ui_state.spawn_kind = viewer::PrimitiveKind::Box; }
+        if (!spawn_kind_arg.empty()) {
+            viewer::PrimitiveKind k;
+            if (ParsePrimitiveKind(spawn_kind_arg, &k)) {
+                ui_state.spawn_request = true;
+                ui_state.spawn_kind = k;
+            } else {
+                std::fprintf(stderr, "[nuka_editor] --spawn: unknown kind '%s' "
+                                     "(box|sphere|capsule|plane)\n", spawn_kind_arg.c_str());
+            }
+        }
         if (delete_on) ui_state.delete_request = true;
         if (!reparent_to.empty() &&
             ui_state.selected_entity != nuka::scene::kInvalidEntity) {
@@ -660,10 +688,10 @@ int main(int argc, char** argv) {
     auto apply_tree_edits = [&]() {
         if (!loaded) return;
         const bool want_rename   = ui_state.rename_request;
-        const bool want_add      = ui_state.add_box_request;
+        const bool want_add      = ui_state.spawn_request;
         const bool want_delete   = ui_state.delete_request;
         const bool want_reparent = ui_state.reparent_request;
-        ui_state.rename_request = ui_state.add_box_request = ui_state.delete_request = false;
+        ui_state.rename_request = ui_state.spawn_request = ui_state.delete_request = false;
         ui_state.reparent_request = false;
         if (!(want_rename || want_add || want_delete || want_reparent)) return;
 
@@ -692,7 +720,18 @@ int main(int argc, char** argv) {
             focus = viewer::RenameNode(*loaded, target_path, ui_state.rename_buf);
             changed = !focus.empty();
         } else if (want_add) {
-            focus = viewer::AddBoxChild(*loaded, target_path);  // "" -> scene root
+            // Place the free body at the selection's world position (or the origin),
+            // lifted by a fixed drop height so it falls into the scene. Spawned at the
+            // root (a free top-level body), not parented under the selection.
+            nuka::math::Transform placement;
+            placement.position = nuka::math::Vec3{0.0f, 0.0f, kSpawnDropHeight};
+            if (ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+                const nuka::math::Transform w =
+                    viewer::AuthoredWorldTransform(loaded->scene, ui_state.selected_entity);
+                placement.position = w.position;
+                placement.position.z += kSpawnDropHeight;
+            }
+            focus = viewer::SpawnPrimitive(*loaded, ui_state.spawn_kind, placement, "");
             structural = true;
             changed = !focus.empty();
         } else if (want_delete && !target_path.empty()) {

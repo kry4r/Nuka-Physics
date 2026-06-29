@@ -137,6 +137,22 @@ NodeKind ClassifyNode(const nuka::scene::Registry& reg, nuka::scene::EntityId e)
     return {"group", kTextDim};
 }
 
+// The spawnable primitives + labels, shared by the Scene-panel Add picker and the
+// tree context-menu Add submenu (one list, no per-site drift).
+struct SpawnChoice { const char* label; PrimitiveKind kind; };
+constexpr SpawnChoice kSpawnChoices[] = {
+    {"Box",     PrimitiveKind::Box},
+    {"Sphere",  PrimitiveKind::Sphere},
+    {"Capsule", PrimitiveKind::Capsule},
+    {"Plane",   PrimitiveKind::Plane},
+};
+
+// Latch a one-shot spawn request (the viewer applies it between frames, never here).
+void RequestSpawn(ViewerUiState& ui, PrimitiveKind kind) {
+    ui.spawn_request = true;
+    ui.spawn_kind = kind;
+}
+
 // Recursively emit one ImGui TreeNode per SceneGraph node (name + kind badge);
 // robots collapse as path-prefixed subtrees. Selection is keyed on node->entity.
 void RecordSceneNode(const nuka::scene::Registry& reg,
@@ -189,7 +205,11 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
         ImGui::InputTextWithHint("##rn", "new name", ui.rename_buf, sizeof(ui.rename_buf));
         ImGui::SameLine();
         if (ImGui::SmallButton("Rename")) { ui.rename_request = true; ImGui::CloseCurrentPopup(); }
-        if (ImGui::MenuItem("Add box child")) ui.add_box_request = true;
+        if (ImGui::BeginMenu("Add primitive")) {
+            for (const SpawnChoice& c : kSpawnChoices)
+                if (ImGui::MenuItem(c.label)) RequestSpawn(ui, c.kind);
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Delete subtree")) ui.delete_request = true;
         ImGui::EndPopup();
     }
@@ -540,6 +560,16 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::Checkbox("colliders", &ui_state.show_colliders);
             ImGui::SameLine();
             ImGui::Checkbox("contacts", &ui_state.show_contacts);
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+            // Add picker: spawn a primitive as a free movable body near the selection
+            // (the lightweight analog of a content-browser drag-drop spawn).
+            SectionHeader("Add");
+            for (int i = 0; i < static_cast<int>(IM_ARRAYSIZE(kSpawnChoices)); ++i) {
+                if (i) ImGui::SameLine();
+                if (ImGui::SmallButton(kSpawnChoices[i].label))
+                    RequestSpawn(ui_state, kSpawnChoices[i].kind);
+            }
             ImGui::Dummy(ImVec2(0.0f, 8.0f));
             SectionHeader("Scene Tree");
             ImGui::TextColored(kTextDim, "%u instances  %u meshes  %u materials",
