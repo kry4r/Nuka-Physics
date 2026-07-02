@@ -1,10 +1,10 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::runtime::app::viewer::ImGuiLayer -- the M8.5 viewer's UI (T3).
+// nuka::runtime::app::viewer::ImGuiLayer -- the viewer's UI.
 //
 // Builds the custom-beautified Dear ImGui UI each frame into ImDrawData. It is a
 // THIN showcase shell over the existing Simulation + RenderWorld + present path
-// (recon §4: physics-PRIMARY, NOT a game engine / editor). The panels:
+// (physics-PRIMARY, not a game engine). The panels:
 //
 //   * Transport toolbar -- play / pause / step / reset / speed (x0.25..x4),
 //     teal-accented (accent-filled active Play), heading font for the title.
@@ -27,10 +27,10 @@
 // (ImGui_ImplVulkan_RenderDrawData) is the present/offscreen overlay callback,
 // NOT here -- so this header has NO Vulkan dependency.
 //
-// DETERMINISM (GATE-B): RecordUi() takes NO time/animation input -- every widget
+// DETERMINISM: RecordUi() takes NO time/animation input -- every widget
 // is driven from ViewerUiState + the snapshot. With a FIXED ViewerUiState the
 // produced ImDrawData is deterministic (two records memcmp-identical once
-// composited), which the GATE-B smoke relies on.
+// composited), which the determinism smoke relies on.
 //
 // HOST-ONLY / zero-CUDA-token. This TU includes the vendored ImGui (SYSTEM
 // include) so it is gated behind NK_BUILD_VULKAN_VALIDATION with the rest of the
@@ -116,12 +116,14 @@ struct GizmoState {
 // the viewer reads to pace the simulation. RecordUi() mutates this in response to
 // button clicks (play_toggled / step_requested / reset_requested are one-shot
 // edge flags the viewer consumes + clears each frame). Holding it as plain data
-// (no time input) is what makes the GATE-B composite deterministic.
+// (no time input) is what makes the recorded composite deterministic.
 // ---------------------------------------------------------------------------
 struct ViewerUiState {
     bool     playing   = false;   // open PAUSED on the authored pose; Play/Step advances
-    float    speed     = 1.0f;    // x0.25 .. x4 multiplier
-    uint32_t env_index = 0u;      // selected env (D4)
+    // Simulated-seconds per wall-second target: the frame loop accumulates
+    // speed * real frame time and consumes it in fixed-dt physics steps.
+    float    speed     = 1.0f;    // x0.25 .. x4
+    uint32_t env_index = 0u;      // selected env
 
     // Read-only physics debug overlays (Show panel). Transient toggles read ONLY by
     // the between-frames overlay rebuild -- never serialized into the deterministic
@@ -133,13 +135,13 @@ struct ViewerUiState {
     // click write it; tree highlight + Entity panel read it). kInvalidEntity = none.
     nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;
 
-    // VIEW-2: the GENERIC per-DOF drive-target editor state. `drive_targets[d]` is
+    // The GENERIC per-DOF drive-target editor state. `drive_targets[d]` is
     // the slider value for DOF d of the SELECTED env; `drive_dirty[d]` latches when
     // a slider moved this frame so the viewer uploads ONLY changed DOFs (per-DOF
     // FieldId::DriveTarget UploadField, env-major offset env*per_env + d). NEVER a
-    // hardcoded grasp/choreography table (OD-7: a flat per-DOF editor). `dof_labels`
+    // hardcoded grasp/choreography table (a flat per-DOF editor). `dof_labels`
     // is the OPTIONAL cooked name->dof labelling (cosmetic); empty -> "dof N".
-    // For GATE-B (R12) these are pre-seeded to FIXED values so RecordUi is
+    // For the determinism smoke these are pre-seeded to FIXED values so RecordUi is
     // deterministic (no time/animation input).
     std::vector<float>       drive_targets;
     std::vector<uint8_t>     drive_dirty;   // per-DOF "changed this frame" latch
@@ -158,6 +160,9 @@ struct ViewerUiState {
     float teleop_lin     = 1.0f;    // WASD planar-velocity command magnitude
     float teleop_yaw     = 1.0f;    // QE yaw-rate command magnitude
     float teleop_cmd[3]  = {0.0f, 0.0f, 0.0f};  // viewer-set live (vx,vy,wyaw)
+    // Persistent command baseline (--teleop-cmd / a script); keys add on top and
+    // releasing every key returns to it. Zero for pure keyboard driving.
+    float teleop_cmd_base[3] = {0.0f, 0.0f, 0.0f};
     // PD-hold makes drive targets effective for policy-free direct joint control:
     // the viewer uploads uniform gains to the actuated joints on the rising edge. The
     // gains are editable defaults (no magic numbers). Ignored when a command-consuming

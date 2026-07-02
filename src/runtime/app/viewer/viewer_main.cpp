@@ -20,7 +20,7 @@
 //           overlay = the imgui_layer record) -> pace to the frame interval.
 //
 // PRESENT egress is DIRECT-to-swapchain; the offscreen Render() stays the untouched
-// D1 oracle. The editor publishes poses via each loaded scene's HostDownloadPublisher
+// offscreen oracle. The editor publishes poses via each loaded scene's HostDownloadPublisher
 // (the general path that fits any instance count across runtime swaps).
 //
 // HEADLESS-SAFE: a frame budget (--frames / NUKA_VIEWER_FRAMES) + swapchain readback
@@ -47,7 +47,7 @@
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
-#include "runtime/app/command_queue.hpp"        // MoveEntity command (VIEW-4)
+#include "runtime/app/command_queue.hpp"        // MoveEntity command
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
@@ -63,7 +63,7 @@
 #include "scene/format/nks.hpp"                   // nks::Save (persist edits)
 #include "scene/scene_ir.hpp"
 
-#include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget (VIEW-2)
+#include "nk/model/generated/field_ids.hpp"     // FieldId::DriveTarget
 #include "nk/model/model.hpp"
 
 #include <algorithm>
@@ -74,6 +74,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -91,6 +92,14 @@ namespace window = nuka::render::window;
 
 // Default physics timestep when neither --dt nor a scene override is supplied.
 constexpr float kDefaultDt = 1.0f / 240.0f;
+
+// Physics-steps-per-frame ceiling for the speed transport: a long frame consumes
+// at most this many fixed-dt steps and drops the backlog (no death spiral).
+constexpr uint32_t kMaxStepsPerFrame = 64u;
+
+// A single frame interval longer than this is a hitch (load, resize, debugger);
+// the speed accumulator clamps to it so simulated time never jumps.
+constexpr double kMaxFrameDt = 0.25;
 
 // The script console retains at most this many trailing bytes of captured output.
 constexpr size_t kConsoleLogCap = 256u * 1024u;
@@ -241,7 +250,7 @@ bool RayAabb(const viewer::Ray& ray, const nuka::math::Vec3& lo,
     return true;
 }
 
-// VIEW-F2: the u8 value of ArticulationJointType::FloatingBase (==3). The canonical
+// The u8 value of ArticulationJointType::FloatingBase (==3). The canonical
 // enum is in runtime/articulation/articulation_state.hpp, but that header pulls in
 // <cuda_runtime.h> and this file is on the zero-CUDA-token red-line, so we mirror the
 // stable cooked-Model value here (same constant as systems.cpp::kFloatingBaseJointType).
@@ -258,7 +267,7 @@ bool IsFloatingRootLink(const render::PoseSource& src, const nk::ModelArticulati
 }
 
 // Pick the nearest MOVABLE instance the ray hits. Returns its index or ~0u.
-// VIEW-F1: a movable instance is a free body (Body), an articulation floating base
+// A movable instance is a free body (Body), an articulation floating base
 // (Base), OR the FLOATING ROOT LINK (its Link source reroutes to Base on move) --
 // so the advertised floating-base teleport is genuinely UI-reachable (the Base
 // source is never emitted by ResolvePoseSource, which has no Model; the root link is
@@ -576,6 +585,36 @@ int main(int argc, char** argv) {
             ui_state.console_log.erase(0, ui_state.console_log.size() - kConsoleLogCap);
     };
 
+    // The host-registered scripts (stable_id -> source last synced), diffed against
+    // the scene's /script records so attach / delete / undo keep the host in step.
+    std::map<uint64_t, std::string> live_scripts;
+    auto sync_scripts = [&]() {
+        std::map<uint64_t, std::string> want;
+        if (loaded)
+            for (const auto& sr : loaded->scene.Scripts()) want[sr.stable_id] = sr.source;
+        for (auto it = live_scripts.begin(); it != live_scripts.end();) {
+            if (want.count(it->first) == 0u) {
+                script_host.UnregisterScript(it->first);  // deleted node: stop its callbacks
+                it = live_scripts.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        bool registered = false;
+        for (const auto& entry : want) {
+            const auto it = live_scripts.find(entry.first);
+            if (it != live_scripts.end() && it->second == entry.second) continue;
+            // New or source-changed: (re)register replaces the old namespace, so a
+            // replaced script's previous on_step can never keep running beside it.
+            console_append(script_host.RegisterScript(entry.first, entry.second));
+            live_scripts[entry.first] = entry.second;
+            registered = true;
+        }
+        if (registered) console_append(script_host.DispatchReady());
+        ui_state.script_node_count =
+            loaded ? static_cast<int>(loaded->scene.ScriptCount()) : 0;
+    };
+
     // The ONE runtime load: teardown the current scene (if any), cook the new one,
     // swap it in, reframe the camera + reset model-bound UI. WaitIdle first so no
     // in-flight frame references the world / RenderWorld being freed. A failed load
@@ -595,15 +634,12 @@ int main(int argc, char** argv) {
         // The general edit machinery for this scene: rebuild the entity->record
         // reverse index, reset the inspector, seed the Save path from the source.
         record_index.Build(loaded->scene);
-        // Point the live-world scripting bridge at this freshly cooked scene, then
-        // register every /script node it carries and fire on_ready once -- so on_step /
-        // on_reset are defined before the first Play. Scripts run OUTSIDE the gates.
+        // Point the live-world scripting bridge at this freshly cooked scene and
+        // sync every /script node in (registers + fires on_ready once each).
         script_host.SetContext({loaded.get(), &record_index, &ui_state});
         script_host.ClearScripts();
-        for (const auto& sr : loaded->scene.Scripts())
-            console_append(script_host.RegisterScript(sr.stable_id, sr.source));
-        console_append(script_host.DispatchReady());
-        ui_state.script_node_count = static_cast<int>(loaded->scene.ScriptCount());
+        live_scripts.clear();
+        sync_scripts();
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
         // A new scene has no edit history (undo across loads is out of scope).
@@ -719,8 +755,11 @@ int main(int argc, char** argv) {
                         ui_state.teleop_kd);
         }
         if (teleop_cmd_on && cmd_ctrl) {
+            // The CLI command is the persistent BASELINE the every-frame producer
+            // re-sends (keys add on top), so it survives the interactive loop.
             policy_ctrl->SetCommandVector(teleop_cmd_arg, 3);
             ui_state.teleop_enabled = true;
+            for (int k = 0; k < 3; ++k) ui_state.teleop_cmd_base[k] = teleop_cmd_arg[k];
             std::printf("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n",
                         teleop_cmd_arg[0], teleop_cmd_arg[1], teleop_cmd_arg[2]);
         }
@@ -735,6 +774,7 @@ int main(int argc, char** argv) {
         // (scene-gated calls raise; no lifecycle dispatch without a world).
         script_host.SetContext({nullptr, &record_index, &ui_state});
         script_host.ClearScripts();
+        live_scripts.clear();
         ui_state.script_node_count = 0;
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
@@ -770,25 +810,27 @@ int main(int argc, char** argv) {
         // Snapshot the authority BEFORE the edit; a structural op reverts by
         // restoring it (the simplest correct general structural undo).
         nuka::scene::SceneIR before = loaded->scene;
-        const auto bodies_before = loaded->scene.RigidBodyCount();
+        const auto bodies_before  = loaded->scene.RigidBodyCount();
+        const auto scripts_before = loaded->scene.ScriptCount();
 
         std::string focus;          // node to reselect after the edit
-        bool structural = false;
+        bool structural = false;    // the cooked model changed -> re-cook needed
         bool changed = false;       // the mutator actually altered the scene
+        bool renamed = false;       // rename records a cheap non-structural op
         if (want_reparent) {
             focus = viewer::ReparentNode(*loaded, ui_state.reparent_src,
                                          ui_state.reparent_dst);
             ui_state.reparent_src.clear();
             ui_state.reparent_dst.clear();
-            structural = true;
             changed = !focus.empty();
+            structural = changed;
         } else if (want_rename && !target_path.empty()) {
             focus = viewer::RenameNode(*loaded, target_path, ui_state.rename_buf);
             changed = !focus.empty();
+            renamed = changed;
         } else if (want_add) {
             // Place the free body at the selection's world position (or the origin),
-            // lifted by a fixed drop height so it falls into the scene. Spawned at the
-            // root (a free top-level body), not parented under the selection.
+            // lifted by a fixed drop height so it falls into the scene.
             nuka::math::Transform placement;
             placement.position = nuka::math::Vec3{0.0f, 0.0f, kSpawnDropHeight};
             if (ui_state.selected_entity != nuka::scene::kInvalidEntity) {
@@ -798,18 +840,40 @@ int main(int argc, char** argv) {
                 placement.position.z += kSpawnDropHeight;
             }
             focus = viewer::SpawnPrimitive(*loaded, ui_state.spawn_kind, placement, "");
-            structural = true;
             changed = !focus.empty();
+            structural = changed;
         } else if (want_delete && !target_path.empty()) {
             focus = viewer::DeleteSubtree(*loaded, target_path);
-            structural = true;
-            changed = loaded->scene.RigidBodyCount() < bodies_before;
+            const bool body_deleted = loaded->scene.RigidBodyCount() < bodies_before;
+            const bool script_deleted = loaded->scene.ScriptCount() < scripts_before;
+            changed = body_deleted || script_deleted;
+            structural = body_deleted;  // a /script delete never reaches the cook
+            if (script_deleted) sync_scripts();  // unregister its callbacks now
         }
+
+        // A DECLINED edit changed nothing: keep selection / physics / history.
+        if (!changed) return;
 
         if (structural) {
             present->WaitIdle();
-            if (!viewer::RecookEditorScene(*loaded, dev, backend, dt))
-                std::fprintf(stderr, "[nuka_editor] re-cook after tree edit failed\n");
+            if (!viewer::RecookEditorScene(*loaded, dev, backend, dt)) {
+                // The old world is still live (transactional re-cook); roll the
+                // authority back to match it and surface the rejection loudly.
+                loaded->scene = std::move(before);
+                record_index.Build(loaded->scene);
+                ui_state.selected_entity = nuka::scene::kInvalidEntity;
+                if (!target_path.empty()) {
+                    if (const auto n = loaded->scene.Tree().NodeOf(target_path))
+                        ui_state.selected_entity = n->entity;
+                }
+                ui_state.inspector = viewer::InspectorState{};
+                last_seeded = nuka::scene::kInvalidEntity;
+                const char* msg =
+                    "[nuka_editor] tree edit rejected: re-cook failed; scene reverted\n";
+                std::fprintf(stderr, "%s", msg);
+                console_append(msg);
+                return;
+            }
         }
         record_index.Build(loaded->scene);
         ui_state.selected_entity = nuka::scene::kInvalidEntity;
@@ -819,10 +883,10 @@ int main(int argc, char** argv) {
         }
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
-        // Record the reversible op only when the scene actually changed (a declined
-        // reparent / non-body delete leaves it untouched -> nothing to undo).
-        if (changed) {
-            ui_state.save_dirty = true;
+        ui_state.save_dirty = true;
+        if (renamed) {
+            edit_stack.Record(viewer::MakeRenameOp(loaded.get(), target_path, focus));
+        } else {
             nuka::scene::SceneIR after = loaded->scene;
             edit_stack.Record(viewer::MakeStructuralOp(loaded.get(), &record_index, dev,
                                                        backend, dt, std::move(before),
@@ -928,6 +992,7 @@ int main(int argc, char** argv) {
     auto post_edit_resync = [&]() {
         if (!loaded) return;
         record_index.Build(loaded->scene);
+        sync_scripts();  // an undo/redo may have restored / removed /script nodes
         ui_state.selected_entity = nuka::scene::kInvalidEntity;
         ui_state.inspector = viewer::InspectorState{};
         last_seeded = nuka::scene::kInvalidEntity;
@@ -961,7 +1026,7 @@ int main(int argc, char** argv) {
     // cap at the display refresh, so this sits well above 60.
     const auto frame_budget = std::chrono::duration<double>(1.0 / 240.0);
 
-    // VIEW-3/4: picker + drag state. Ctrl is tracked by RESOLVED keysym (keymap-
+    // Picker + drag state. Ctrl is tracked by RESOLVED keysym (keymap-
     // independent), matching camera_controller's Shift handling. The window backend
     // resolves keycode->keysym; we compare XKB_KEY_*/XK_* protocol values.
     constexpr uint32_t kKeyCtrlL = 0xffe3u;  // XKB_KEY_Control_L / XK_Control_L
@@ -969,8 +1034,12 @@ int main(int argc, char** argv) {
     bool     ctrl_down = false;
     uint32_t drag_inst = ~0u;          // the instance being dragged (~0u == none)
     bool     teleop_hold_prev = false; // PD-hold rising-edge latch (apply gains once)
+    bool     teleop_prev_enabled = false;  // teleop-toggle falling edge (send one zero)
     float    last_mouse_x = 0.0f;
     float    last_mouse_y = 0.0f;
+    // The speed transport's simulated-time debt: speed * real frame time accrues
+    // here and is consumed in fixed-dt physics steps each frame.
+    double   sim_accum = 0.0;
 
     bool script_ran = false;  // --run-script fires once, after the first load settles
     std::vector<window::WindowEvent> events;
@@ -1068,11 +1137,20 @@ int main(int argc, char** argv) {
                 case window::WindowEvent::Type::Key:
                     if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
                     break;
+                case window::WindowEvent::Type::FocusLost:
+                    // Releases go to the newly focused window: drop latched state
+                    // so Ctrl / a drag can never stick across a focus switch.
+                    ctrl_down = false;
+                    drag_inst = ~0u;
+#ifndef _WIN32
+                    io.AddFocusEvent(false);  // GLFW backend feeds this on Windows
+#endif
+                    break;
                 default:
                     break;
             }
 
-            // -- VIEW-3/4: Ctrl+LMB pick + drag (only when a scene is loaded, ImGui
+            // -- Ctrl+LMB pick + drag (only when a scene is loaded, ImGui
             // isn't capturing the mouse, and Ctrl is held -> never fights orbit). ----
             const bool over_ui = io.WantCaptureMouse;
             if (loaded && ctrl_down && !over_ui) {
@@ -1096,7 +1174,7 @@ int main(int argc, char** argv) {
                 } else if (ev.type == window::WindowEvent::Type::MouseMove &&
                            drag_inst != ~0u &&
                            drag_inst < sim.GetRenderWorld().InstanceCount()) {
-                    // VIEW-4: unproject the cursor onto a view-facing plane through
+                    // Unproject the cursor onto a view-facing plane through
                     // the dragged entity's current position, then push a MoveEntity
                     // (the GENERAL path: command_queue -> ApplyMoveEntity -> Data).
                     const render::RenderInstance& inst =
@@ -1142,12 +1220,31 @@ int main(int argc, char** argv) {
             loaded ? loaded->sim->GetRenderWorld() : empty_world;
         double step_ms = 0.0;
         app::InputIntents intents;
+        uint32_t steps_taken = 0u;
         if (loaded) {
             app::Simulation& sim = *loaded->sim;
-            const bool do_step = ui_state.playing || ui_state.step_requested;
+            // Speed transport: speed = simulated seconds per wall second. Accrue
+            // speed * real frame time and consume it in fixed-dt steps, capped.
+            uint32_t steps = 0u;
+            if (ui_state.playing) {
+                sim_accum += std::min(frame_dt, kMaxFrameDt) *
+                             static_cast<double>(ui_state.speed);
+                steps = static_cast<uint32_t>(sim_accum / static_cast<double>(dt));
+                if (steps > kMaxStepsPerFrame) {
+                    steps = kMaxStepsPerFrame;
+                    sim_accum = 0.0;  // drop the backlog: bounded work per frame
+                } else {
+                    sim_accum -= static_cast<double>(steps) * static_cast<double>(dt);
+                }
+            } else {
+                sim_accum = 0.0;
+                if (ui_state.step_requested) steps = 1u;  // Step = exactly one dt
+            }
+            const bool do_step = steps > 0u;
             const auto step_t0 = Clock::now();
-            last_step_healthy = sim.FramePublish(&intents, do_step);
+            last_step_healthy = sim.FramePublish(&intents, do_step, steps);
             step_ms = std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
+            steps_taken = steps;
 
             // Lifecycle on_step: once per stepped frame, BETWEEN frames (never in
             // RecordUi), isolated + held to the tight per-call budget so a heavy or
@@ -1202,7 +1299,7 @@ int main(int argc, char** argv) {
         viewer::ViewerStats stats;
         stats.step_time_ms  = static_cast<float>(step_ms);
         stats.fps           = static_cast<float>(fps_ema);
-        stats.sub_steps     = 1u;
+        stats.sub_steps     = steps_taken;  // honest: fixed-dt steps this frame
         if (loaded) {
             stats.dof         = loaded->caps.dofs_per_env;
             stats.links       = loaded->caps.links_per_env;
@@ -1225,7 +1322,11 @@ int main(int argc, char** argv) {
         // -- ImGui frame: set display size/dt, record panels, render draw data --
         io.DisplaySize = ImVec2(static_cast<float>(present->Report().width),
                                 static_cast<float>(present->Report().height));
-        io.DeltaTime = (dt > 0.0) ? static_cast<float>(dt) : (1.0f / 60.0f);
+        // ImGui runs on WALL-CLOCK time (cursor blink, double-click, key repeat),
+        // never the physics dt -- a small --dt must not slow the UI 12x.
+        io.DeltaTime = (frame_dt > 0.0)
+                           ? static_cast<float>(std::min(frame_dt, kMaxFrameDt))
+                           : (1.0f / 60.0f);
 #ifdef _WIN32
         // Pull glfw input into io before ImGui::NewFrame (must precede it).
         if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
@@ -1329,66 +1430,80 @@ int main(int argc, char** argv) {
             ui_state.script_run_request = false;
             console_append(script_host.RunString(ui_state.script_buf));
         }
-        // Attach the editor buffer as a persisted /script node: a stable id unique
-        // among the scene's scripts, added through the general SceneIR seam (Save
-        // persists it), then registered + on_ready fired so it is live at once.
+        // Attach the editor buffer as a persisted /script node. A selected /script
+        // node UPDATES IN PLACE (same stable id -- the re-registration replaces the
+        // old namespace, so its previous callbacks stop); otherwise a new node.
         if (ui_state.script_attach_request) {
             ui_state.script_attach_request = false;
             if (loaded) {
-                uint64_t next_id = 1;
-                for (const auto& sr : loaded->scene.Scripts())
-                    if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
-                nuka::scene::ScriptRecord rec;
-                rec.stable_id = next_id;
-                rec.source = ui_state.script_buf;
-                loaded->scene.AddScript(rec);
+                nuka::scene::ScriptId sel_script = nuka::scene::kInvalidScript;
+                if (ui_state.selected_entity != nuka::scene::kInvalidEntity) {
+                    for (size_t i = 0; i < loaded->scene.ScriptCount(); ++i) {
+                        const auto sid = static_cast<nuka::scene::ScriptId>(i);
+                        if (loaded->scene.EntityOfScript(sid) == ui_state.selected_entity) {
+                            sel_script = sid;
+                            break;
+                        }
+                    }
+                }
+                std::string sel_path;  // survives the facade re-projection below
+                if (sel_script != nuka::scene::kInvalidScript)
+                    sel_path = path_of_entity(ui_state.selected_entity);
+                if (sel_script != nuka::scene::kInvalidScript) {
+                    loaded->scene.GetScriptMut(sel_script).source = ui_state.script_buf;
+                } else {
+                    uint64_t next_id = 1;
+                    for (const auto& sr : loaded->scene.Scripts())
+                        if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
+                    nuka::scene::ScriptRecord rec;
+                    rec.stable_id = next_id;
+                    rec.source = ui_state.script_buf;
+                    loaded->scene.AddScript(rec);
+                }
                 record_index.Build(loaded->scene);
-                console_append(script_host.RegisterScript(rec.stable_id, rec.source));
-                console_append(script_host.DispatchReady());
-                ui_state.script_node_count = static_cast<int>(loaded->scene.ScriptCount());
+                sync_scripts();
+                if (!sel_path.empty()) {
+                    if (const auto n = loaded->scene.Tree().NodeOf(sel_path))
+                        ui_state.selected_entity = n->entity;
+                }
                 ui_state.save_dirty = true;
             }
         }
-        // Load the selected /script node's source back into the editor buffer.
+        // Load the selected /script node's source back into the editor buffer. An
+        // oversize source is REFUSED loudly -- never silently truncated (an Attach
+        // of a truncated buffer would persist the truncation).
         if (ui_state.script_load_request) {
             ui_state.script_load_request = false;
             if (loaded && ui_state.selected_entity != nuka::scene::kInvalidEntity) {
                 if (const auto* sc = loaded->scene.Ecs().Get<nuka::scene::ScriptComponent>(
                         ui_state.selected_entity)) {
-                    std::snprintf(ui_state.script_buf, sizeof(ui_state.script_buf), "%s",
-                                  sc->source.c_str());
+                    if (sc->source.size() >= sizeof(ui_state.script_buf)) {
+                        char msg[160];
+                        std::snprintf(msg, sizeof(msg),
+                                      "[nuka_editor] script source (%zu bytes) exceeds the "
+                                      "editor buffer (%zu); NOT loaded (no truncation)\n",
+                                      sc->source.size(), sizeof(ui_state.script_buf));
+                        std::fprintf(stderr, "%s", msg);
+                        console_append(msg);
+                    } else {
+                        std::memcpy(ui_state.script_buf, sc->source.c_str(),
+                                    sc->source.size() + 1u);
+                    }
                 }
             }
         }
 
-        // WASD/QE fly the camera (Q/E = down/up, Shift = sprint), gated on ImGui not
-        // owning the keyboard so typing in a panel never moves the view.
-        if (!io.WantCaptureKeyboard) {
-            // Ctrl-Z = undo, Ctrl-Y / Ctrl-Shift-Z = redo (edge-triggered; the request
-            // is applied at the top of the next frame, same gating as the camera keys).
-            const bool ctrl_held = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
-                                   ImGui::IsKeyDown(ImGuiKey_RightCtrl);
-            const bool shift_held = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
-                                    ImGui::IsKeyDown(ImGuiKey_RightShift);
-            if (ctrl_held && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift_held)
-                ui_state.undo_request = true;
-            if (ctrl_held && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
-                              (shift_held && ImGui::IsKeyPressed(ImGuiKey_Z, false))))
-                ui_state.redo_request = true;
-
-            // Teleop: a THIRD drive producer. Per-DOF nudges ([ / ] , / .) write the
-            // SAME drive_targets / drive_dirty seam the Drive sliders use; WASD/QE feed
-            // a [vx,vy,wyaw] command to a command-consuming controller, which then OWNS
-            // WASD (the camera fly stands down so it never fights the robot).
+        // Teleop: a THIRD drive producer. The command producer runs EVERY frame --
+        // the enable toggle / ImGui keyboard capture only zero the keyboard input,
+        // so a robot mid-walk stops (teleop.hpp contract) instead of latching.
+        bool teleop_owns_wasd = false;
+        {
             app::SceneController* ctrl = loaded ? loaded->sim->Controller() : nullptr;
             const bool cmd_ctrl = ctrl != nullptr && ctrl->AcceptsCommand();
-            bool teleop_owns_wasd = false;
-            if (ui_state.teleop_enabled) {
-                // PD-hold rising edge: make drive targets effective for direct control.
-                if (ui_state.teleop_hold && !teleop_hold_prev && loaded && !cmd_ctrl)
-                    viewer::ApplyHoldGains(loaded->sim->GetWorld(), loaded->caps.env_count,
-                                           ui_state.teleop_kp, ui_state.teleop_kd);
-                viewer::TeleopKeys tk;
+            const bool active =
+                loaded && ui_state.teleop_enabled && !io.WantCaptureKeyboard;
+            viewer::TeleopKeys tk;
+            if (active) {
                 tk.dof_minus = ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false) ||
                                ImGui::IsKeyPressed(ImGuiKey_Comma, false);
                 tk.dof_plus  = ImGui::IsKeyPressed(ImGuiKey_RightBracket, false) ||
@@ -1398,16 +1513,45 @@ int main(int argc, char** argv) {
                 tk.fwd = ImGui::IsKeyDown(ImGuiKey_W); tk.back = ImGui::IsKeyDown(ImGuiKey_S);
                 tk.strafe_l = ImGui::IsKeyDown(ImGuiKey_A); tk.strafe_r = ImGui::IsKeyDown(ImGuiKey_D);
                 tk.yaw_l = ImGui::IsKeyDown(ImGuiKey_Q); tk.yaw_r = ImGui::IsKeyDown(ImGuiKey_E);
-                const uint32_t dof_count =
-                    static_cast<uint32_t>(ui_state.drive_targets.size());
-                const viewer::TeleopResult tr =
-                    viewer::ApplyTeleop(true, tk, ui_state, dof_count);
-                if (cmd_ctrl) {
-                    ctrl->SetCommandVector(tr.command, 3);  // zero on release stops it
-                    teleop_owns_wasd = true;
-                }
             }
-            teleop_hold_prev = ui_state.teleop_hold;
+            // PD-hold rising edge: make drive targets effective for direct control.
+            const bool hold_now = active && ui_state.teleop_hold && !cmd_ctrl;
+            if (hold_now && !teleop_hold_prev)
+                viewer::ApplyHoldGains(loaded->sim->GetWorld(), loaded->caps.env_count,
+                                       ui_state.teleop_kp, ui_state.teleop_kd);
+            teleop_hold_prev = hold_now;
+
+            const uint32_t dof_count =
+                static_cast<uint32_t>(ui_state.drive_targets.size());
+            const viewer::TeleopResult tr =
+                viewer::ApplyTeleop(active, tk, ui_state, dof_count);
+            if (cmd_ctrl) {
+                if (ui_state.teleop_enabled) {
+                    // Every frame: base + keys while active, ZERO while gated.
+                    ctrl->SetCommandVector(tr.command, 3);
+                } else if (teleop_prev_enabled) {
+                    // Toggle-off edge: one explicit zero stops the robot, then the
+                    // producer stands down (scripts may own the command).
+                    const float zero[3] = {0.0f, 0.0f, 0.0f};
+                    ctrl->SetCommandVector(zero, 3);
+                }
+                teleop_owns_wasd = active;
+            }
+            teleop_prev_enabled = ui_state.teleop_enabled;
+        }
+
+        // Undo/redo keys + WASD/QE camera fly, gated on ImGui not owning the
+        // keyboard so typing in a panel never moves the view.
+        if (!io.WantCaptureKeyboard) {
+            const bool ctrl_held = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
+                                   ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+            const bool shift_held = ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                                    ImGui::IsKeyDown(ImGuiKey_RightShift);
+            if (ctrl_held && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift_held)
+                ui_state.undo_request = true;
+            if (ctrl_held && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+                              (shift_held && ImGui::IsKeyPressed(ImGuiKey_Z, false))))
+                ui_state.redo_request = true;
 
             // WASD/QE fly the camera unless teleop owns WASD for the robot.
             float cf = 0.0f, cr = 0.0f, cu = 0.0f;
@@ -1427,10 +1571,10 @@ int main(int argc, char** argv) {
         }
         ImGui::Render();
 
-        // VIEW-2: upload any drive sliders that moved this frame into the LIVE nk
+        // Upload any drive sliders that moved this frame into the LIVE nk
         // Data (FieldId::DriveTarget, env-major: env*links_per_env + dof). Per-DOF
         // upload of ONLY the changed rows; the general write path (UploadField),
-        // never a choreography table. R13: runtime Data only, never the .nks.
+        // never a choreography table. Runtime Data only, never the .nks.
         if (loaded && loaded->caps.links_per_env > 0u &&
             ui_state.drive_dirty.size() == ui_state.drive_targets.size()) {
             const uint32_t per_env = loaded->caps.links_per_env;
@@ -1455,7 +1599,7 @@ int main(int argc, char** argv) {
 
         // Read-only debug overlays, rebuilt from the live world after this frame's
         // pose publishes + edits and just before the draw. Off by default -> the
-        // RenderWorld is left as the real instance set (GATE-B byte-identical).
+        // RenderWorld is left as the real instance set (byte-identical frames).
         if (loaded) {
             debug_overlay.Rebuild(loaded->sim->GetWorld(), loaded->sim->GetRenderWorld(),
                                   ui_state.env_index, ui_state.show_colliders,

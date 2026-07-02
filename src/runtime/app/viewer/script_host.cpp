@@ -585,6 +585,16 @@ void ScriptHost::ClearScripts() {
     g_scripts.clear();
 }
 
+void ScriptHost::UnregisterScript(uint64_t stable_id) {
+    for (auto it = g_scripts.begin(); it != g_scripts.end(); ++it) {
+        if (it->stable_id == stable_id) {
+            Py_XDECREF(it->ns);
+            g_scripts.erase(it);
+            return;
+        }
+    }
+}
+
 size_t ScriptHost::ScriptCount() const { return g_scripts.size(); }
 
 std::string ScriptHost::DispatchReady() {
